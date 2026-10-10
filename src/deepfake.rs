@@ -79,6 +79,9 @@ pub fn screen(path: &Path) -> DeepfakeSummary {
 }
 
 pub fn screen_with_binary(binary: &str, path: &Path) -> DeepfakeSummary {
+    // Set when the console script was refused and we ran the interpreter
+    // entry point instead, so failures name what actually ran.
+    let mut python_fallback: Option<String> = None;
     let mut command = match resolve_tool_binary(binary, &["deepfake-lens", "deepfake-lens.exe"]) {
         Ok(binary) => {
             let mut command = Command::new(&binary);
@@ -101,6 +104,7 @@ pub fn screen_with_binary(binary: &str, path: &Path) -> DeepfakeSummary {
                     ));
                 }
             };
+            python_fallback = Some(binary_error.to_string());
             let mut command = Command::new(&python);
             command
                 .arg("-m")
@@ -134,11 +138,15 @@ pub fn screen_with_binary(binary: &str, path: &Path) -> DeepfakeSummary {
         }
     };
     if !output.status.success() {
-        return DeepfakeSummary::failed(format!(
-            "deepfake-lens exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return DeepfakeSummary::failed(match &python_fallback {
+            Some(binary_error) => format!(
+                "{binary_error}; python fallback (python -m deepfake_lens.cli) exited {}: {}",
+                output.status,
+                stderr.trim()
+            ),
+            None => format!("deepfake-lens exited {}: {}", output.status, stderr.trim()),
+        });
     }
 
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -522,13 +530,14 @@ mod tests {
                 summary.error
             );
         } else {
+            // Either no interpreter resolves at all, or one does (e.g. the
+            // Windows CI image ships python) but the module isn't
+            // installed; both must report the python fallback stage.
             assert!(!summary.ok);
+            let error = summary.error.as_deref().unwrap_or("");
             assert!(
-                summary
-                    .error
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("fallback also unavailable")
+                error.contains("fallback also unavailable") || error.contains("python fallback"),
+                "unexpected error: {error}"
             );
         }
     }
