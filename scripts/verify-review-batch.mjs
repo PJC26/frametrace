@@ -251,7 +251,7 @@ async function unitTests() {
   const touch = fn('touchAnnotation');
   Object.assign(grid, { markLabel: s => s, document: { getElementById: () => null }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
   const journalSrc = [fn('snapshotIds'), fn('journalDiff'), fn('toastUndo'), fn('journaled'), fn('markStatusLabel')].join('\n');
-  runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
+  runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
   assert.equal(state.activeId, 'b');
   console.log('PASS VM empty filter, collapsed group, sequential triage');
   Object.assign(state, { marks: {}, notes: {}, tags: {}, examiner: 'New', deletedIds: ['a'], examiners: { b: 'Bob' } });
