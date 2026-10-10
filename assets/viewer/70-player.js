@@ -20,6 +20,64 @@ function togglePlayback() {
   else video.pause();
 }
 
+// --- frame step + J/K/L shuttle (Shift+J / Shift+K / Shift+L, "," / ".") ---
+const SHUTTLE_SPEEDS = [1, 2, 4];
+const shuttle = { dir: 0, level: 0, timer: null, video: null };
+
+function frameDuration() {
+  const rec = typeof selectedRecord === "function" ? selectedRecord() : null;
+  const fps = Number(rec?.fps || rec?.frameRate || rec?.frame_rate);
+  return Number.isFinite(fps) && fps >= 1 && fps <= 1000 ? 1 / fps : 1 / 30;
+}
+
+function stopShuttle() {
+  if (shuttle.timer) clearInterval(shuttle.timer);
+  shuttle.timer = null;
+  shuttle.dir = 0;
+  shuttle.level = 0;
+  shuttle.video = null;
+}
+
+function stepFrame(dir) {
+  const video = currentVideo();
+  if (!video) { toast(t("toast.noVideo")); return; }
+  stopShuttle();
+  if (!video.paused) video.pause();
+  const max = Number.isFinite(video.duration) ? video.duration : 1e9;
+  video.currentTime = Math.max(0, Math.min(max, video.currentTime + dir * frameDuration()));
+}
+
+function shuttleKey(dir) {
+  const video = currentVideo();
+  if (!video) { toast(t("toast.noVideo")); return; }
+  if (dir === 0) {
+    stopShuttle();
+    video.pause();
+    video.playbackRate = Number(state.layout.rate) || 1;
+    toast(t("toast.shuttlePause"));
+    return;
+  }
+  const sameDir = shuttle.dir === dir && shuttle.video === video && (dir < 0 || !video.paused);
+  const level = sameDir ? Math.min(SHUTTLE_SPEEDS.length - 1, shuttle.level + 1) : 0;
+  stopShuttle();
+  shuttle.dir = dir;
+  shuttle.level = level;
+  shuttle.video = video;
+  const speed = SHUTTLE_SPEEDS[level];
+  if (dir > 0) {
+    video.playbackRate = speed;
+    video.play().catch(() => {});
+  } else {
+    // Negative playbackRate is not portable: emulate by stepping back.
+    video.pause();
+    shuttle.timer = setInterval(() => {
+      if (currentVideo() !== video || video.currentTime <= 0) { stopShuttle(); return; }
+      video.currentTime = Math.max(0, video.currentTime - speed * 0.1);
+    }, 100);
+  }
+  toast(tf("toast.shuttle", { dir: dir > 0 ? "▶" : "◀", speed }));
+}
+
 function setRate(rate) {
   state.layout.rate = rate;
   saveLayout();

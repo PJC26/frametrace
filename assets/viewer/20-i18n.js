@@ -390,7 +390,11 @@ const I18N = {
     "save.title.failed": "케이스 DB 저장 실패: {err} — 약 {sec}초 후 자동으로 다시 시도합니다(클릭하면 지금 재시도). 변경 내용은 이 브라우저에 보관되어 있으니 창을 닫지 마십시오.",
     "save.title.local": "파일로 직접 연 뷰어입니다 — 마크·태그·메모는 이 브라우저에만 저장됩니다. '마크 내려받기'로 파일을 저장한 뒤 워크스테이션에서 가져오십시오.",
     "toast.saveFailed": "케이스 DB 저장 실패 — 자동으로 다시 시도합니다: {err}",
-    "warn.partialLoad": "증거 목록이 완전하지 않습니다: {total}건 중 {n}건만 불러왔습니다. 다시 불러오기 전까지 이 목록을 전체 케이스로 간주하지 마십시오."
+    "warn.partialLoad": "증거 목록이 완전하지 않습니다: {total}건 중 {n}건만 불러왔습니다. 다시 불러오기 전까지 이 목록을 전체 케이스로 간주하지 마십시오.",
+    "toast.shuttle": "셔틀 {dir} {speed}배속",
+    "toast.shuttlePause": "셔틀 정지",
+    "sc.step": "한 프레임 뒤로 / 앞으로 (일시정지 중)",
+    "sc.shuttle": "셔틀 역방향 / 정지 / 정방향 (반복 시 1×→2×→4×)"
   },
   en: {
     "unit.count": "",
@@ -783,7 +787,11 @@ const I18N = {
     "save.title.failed": "Saving to the case DB failed: {err} — retrying automatically in about {sec}s (click to retry now). Changes are kept in this browser; do not close the window.",
     "save.title.local": "Viewer opened directly from file — marks, tags and notes are stored in this browser only. Use 'Download marks' and import the file on the workstation.",
     "toast.saveFailed": "Saving to the case DB failed — retrying automatically: {err}",
-    "warn.partialLoad": "Evidence list is incomplete: loaded {n} of {total}. Do not treat this list as the whole case until it is reloaded."
+    "warn.partialLoad": "Evidence list is incomplete: loaded {n} of {total}. Do not treat this list as the whole case until it is reloaded.",
+    "toast.shuttle": "Shuttle {dir} {speed}x",
+    "toast.shuttlePause": "Shuttle stopped",
+    "sc.step": "Step one frame back / forward (pauses)",
+    "sc.shuttle": "Shuttle reverse / pause / forward (repeat: 1x, 2x, 4x)"
   }
 };
 

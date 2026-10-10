@@ -385,6 +385,11 @@ document.addEventListener("keydown", event => {
     case "0": markActive(null); break;
     case "ArrowLeft": skipVideo(-10); break;
     case "ArrowRight": skipVideo(10); break;
+    case ",": stepFrame(-1); break;
+    case ".": stepFrame(1); break;
+    case "J": shuttleKey(-1); break;
+    case "K": shuttleKey(0); break;
+    case "L": shuttleKey(1); break;
     case "[": rateStep(-1); break;
     case "]": rateStep(1); break;
     case "i": setRangePoint("in"); break;
