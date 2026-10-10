@@ -90,14 +90,21 @@ function pairKeyOf(record) {
   return base ? `${dir}|${base}` : "";
 }
 
+// PERF-06: pair key and channel code are derived from immutable record
+// fields, so they are computed once at load (record.pairKey /
+// record.channelCode) and indexed in recordsByPairKey — a dual-mode detail
+// render is an O(1) bucket lookup instead of a full-record scan that
+// re-ran both regex derivations per record per click. mediaSrcFor stays
+// per-call because it depends on the session proxy choice.
 function matesOf(record) {
-  const code = channelCodeOf(record);
-  const key = pairKeyOf(record);
+  const code = record.channelCode;
+  const key = record.pairKey;
   if (!code || !key) return [];
-  return records.filter(r =>
+  const bucket = recordsByPairKey.get(key);
+  if (!bucket) return [];
+  return bucket.filter(r =>
     r.id !== record.id &&
-    pairKeyOf(r) === key &&
-    channelCodeOf(r) && channelCodeOf(r) !== code &&
+    r.channelCode && r.channelCode !== code &&
     mediaSrcFor(r)
   );
 }
@@ -504,10 +511,12 @@ records.forEach(record => {
   record.recTime = rec ? rec.ts : null;
   record.recDay = rec ? rec.date : null;
   record.recSource = rec ? rec.source : null;
-  record.channel = channelFor(record);
+  record.channelCode = channelCodeOf(record);
+  record.channel = record.channelCode ? channelLabel(record.channelCode) : null;
+  record.pairKey = pairKeyOf(record);
   record.prefix = prefixFor(record);
   record.recType = recTypeFor(record);
-    record.originalName = originalNameFor(record);
+  record.originalName = originalNameFor(record);
   record.thumb = DATA.thumbs?.[record.id] || null;
   // Artifact filenames sanitize record ids (inode:<off>:<ino> →
   // inode_<off>_<ino>) — mirror the same mapping for the lookup.
@@ -533,14 +542,44 @@ records.forEach(record => {
 // Pre-built proxies embedded in the bundle (artifacts/proxies listing):
 // match a record by the sanitized filename prefix its proxy was written
 // under — sanitize(id) for indexed videos, sanitize(path) for the rest.
+// PERF-06: index proxy files by every "<key>_proxy_" prefix their name
+// carries (a sanitized key may itself contain "_proxy_"), keeping the
+// first listing position per prefix. Each record then resolves with Map
+// lookups — the earliest-listed match wins, exactly as the former
+// per-record linear find did, without the O(records x proxies) scan.
 const proxyFiles = Array.isArray(DATA.proxies) ? DATA.proxies : [];
+const proxyIndexByPrefix = new Map();
+proxyFiles.forEach((path, index) => {
+  const name = String(path).split(/[\\\/]/).pop() || "";
+  if (!name.endsWith(".mp4")) return;
+  for (let at = name.indexOf("_proxy_"); at >= 0; at = name.indexOf("_proxy_", at + 1)) {
+    const prefix = name.slice(0, at);
+    if (!proxyIndexByPrefix.has(prefix)) proxyIndexByPrefix.set(prefix, index);
+  }
+});
 records.forEach(record => {
-  if (!proxyFiles.length) { record.proxyPath = ""; return; }
-  const keys = [record.id, record.path].filter(Boolean).map(sanitizeSelector);
-  record.proxyPath = proxyFiles.find(path => {
-    const name = String(path).split(/[\\\/]/).pop() || "";
-    return name.endsWith(".mp4") && keys.some(key => name.startsWith(`${key}_proxy_`));
-  }) || "";
+  let best = -1;
+  for (const key of [record.id, record.path].filter(Boolean).map(sanitizeSelector)) {
+    const index = proxyIndexByPrefix.get(key);
+    if (index != null && (best < 0 || index < best)) best = index;
+  }
+  record.proxyPath = best >= 0 ? proxyFiles[best] : "";
+});
+
+// O(1) lookups for the hot paths (selectedRecord, selectedRecords,
+// dual-channel pairing) — records never change after load.
+const recordById = new Map();
+const recordIndexById = new Map();
+const recordsByPairKey = new Map();
+records.forEach((record, index) => {
+  if (!recordById.has(record.id)) {
+    recordById.set(record.id, record);
+    recordIndexById.set(record.id, index);
+  }
+  if (record.pairKey && record.channelCode) {
+    const bucket = recordsByPairKey.get(record.pairKey);
+    if (bucket) bucket.push(record); else recordsByPairKey.set(record.pairKey, [record]);
+  }
 });
 
 const state = {

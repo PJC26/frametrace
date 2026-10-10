@@ -349,6 +349,31 @@ pub fn strip_windows_extended_prefix(path: &Path) -> PathBuf {
     }
 }
 
+/// Neutralizes spreadsheet formula injection in one CSV cell, then applies
+/// RFC 4180 quoting. Evidence-derived text (file names, notes, tags) that
+/// starts with `=`, `+`, `-`, `@`, TAB or CR is evaluated as a formula by
+/// Excel/LibreOffice; such cells get a leading `'` so they open as text.
+/// Plain numbers (e.g. `-3600`, `+1.5`) are left untouched so numeric
+/// columns survive. The prefix is a CSV-only transformation; the JSON and
+/// HTML outputs keep the original value.
+pub fn csv_safe_cell(value: &str) -> String {
+    let is_number = !value.is_empty()
+        && value.parse::<f64>().is_ok()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E'));
+    let neutralized = if !is_number && value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if neutralized.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", neutralized.replace('"', "\"\""))
+    } else {
+        neutralized
+    }
+}
+
 pub fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 8);
     for ch in input.chars() {
@@ -465,7 +490,32 @@ fn percent_encode_path(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_with_timeout, unique_dir, unique_path, write_text_atomic};
+    use super::{csv_safe_cell, run_with_timeout, unique_dir, unique_path, write_text_atomic};
+
+    #[test]
+    fn csv_safe_cell_neutralizes_formula_prefixes() {
+        assert_eq!(csv_safe_cell("=1+1"), "'=1+1");
+        assert_eq!(csv_safe_cell("+cmd|' /C calc'!A0"), "'+cmd|' /C calc'!A0");
+        assert_eq!(csv_safe_cell("-2+3"), "'-2+3");
+        assert_eq!(csv_safe_cell("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(csv_safe_cell("\t=1"), "'\t=1");
+        assert_eq!(csv_safe_cell("\r=1"), "\"'\r=1\"");
+        // Neutralized and quoted when it also needs RFC 4180 quoting.
+        assert_eq!(
+            csv_safe_cell("=HYPERLINK(\"http://x\",\"y\")"),
+            "\"'=HYPERLINK(\"\"http://x\"\",\"\"y\"\")\""
+        );
+        // Ordinary values and plain numbers are untouched.
+        assert_eq!(
+            csv_safe_cell("블랙박스_20240101.mp4"),
+            "블랙박스_20240101.mp4"
+        );
+        assert_eq!(csv_safe_cell("-3600"), "-3600");
+        assert_eq!(csv_safe_cell("+1.5e3"), "+1.5e3");
+        assert_eq!(csv_safe_cell(""), "");
+        assert_eq!(csv_safe_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_safe_cell("a\"b"), "\"a\"\"b\"");
+    }
     #[test]
     fn run_with_timeout_kills_stuck_children() {
         #[cfg(target_os = "windows")]

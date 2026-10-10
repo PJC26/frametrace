@@ -14,8 +14,9 @@ function setupGridDelegation() {
     if (event.target.closest("input[type='checkbox']")) return;
     const card = event.target.closest(".card");
     if (!card) return;
-    state.activeId = card.dataset.id;
-    render();
+    // PERF-03: activating a visible card only swaps the active class and
+    // refreshes the detail pane — no filter/sort or grid rebuild.
+    setActiveCard(card.dataset.id);
   });
   els.recordGrid.addEventListener("keydown", event => {
     if (event.target.closest("input")) return;
@@ -33,18 +34,11 @@ function setupGridDelegation() {
     if (!card) return;
     if (event.key === "Enter") {
       event.stopPropagation();
-      state.activeId = card.dataset.id;
-      render();
+      setActiveCard(card.dataset.id);
       return;
     }
-    if (event.key === " ") {
-      event.preventDefault();
-      event.stopPropagation();
-      if (state.selectedIds.has(card.dataset.id)) state.selectedIds.delete(card.dataset.id);
-      else state.selectedIds.add(card.dataset.id);
-      render();
-      return;
-    }
+    // Space is not handled here: it falls through to the global handler
+    // (play/pause), matching the shortcut sheet; x toggles selection.
     const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[event.key];
     if (step) {
       event.preventDefault();
@@ -73,7 +67,7 @@ function setupGridDelegation() {
     }
     state.lastCheckedKey = id;
     shiftRange = false;
-    render();
+    refreshSelectionUi();
   });
 }
 
@@ -87,7 +81,7 @@ function applyTag(tag) {
     touchAnnotation(id);
   });
   storageSet(TAGS_KEY, state.tags);
-  render();
+  requestRender();
   toast(tf("toast.tagApplied", { n: ids.length, tag }));
 }
 
@@ -96,7 +90,7 @@ function clearTags() {
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   ids.forEach(id => { delete state.tags[id]; touchAnnotation(id); });
   storageSet(TAGS_KEY, state.tags);
-  render();
+  requestRender();
   toast(tf("toast.tagCleared", { n: ids.length }));
 }
 
@@ -163,8 +157,14 @@ function exportItem(record) {
   };
 }
 
+// Selection is usually far smaller than the case: resolve ids through the
+// index map and keep case order, instead of scanning every record.
 function selectedRecords() {
-  return records.filter(record => state.selectedIds.has(record.id));
+  return [...state.selectedIds]
+    .map(id => recordIndexById.get(id))
+    .filter(index => index != null)
+    .sort((a, b) => a - b)
+    .map(index => records[index]);
 }
 
 function copyText(text, label) {

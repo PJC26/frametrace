@@ -56,53 +56,90 @@ const PRESET_CHIPS = [
   ["mark:reviewed", "chip.markReviewed", true],
 ];
 
+// PERF-03: the haystack fields and sort keys are immutable per record, so
+// they are lowered/collated once instead of on every keystroke and render.
+// Intl.Collator replaces per-comparison localeCompare (which re-resolves
+// the locale on every call).
+const idCollator = new Intl.Collator();
+const nameCollator = new Intl.Collator("ko");
+function searchHaystack(record) {
+  if (record._hay === undefined) {
+    record._hay = [record.id, record.name, record.path, record.originalPath, record.parser, record.vendor, record.sha256, record.note, record.status]
+      .map(value => String(value ?? "").toLowerCase())
+      .join("\u0000");
+  }
+  return record._hay;
+}
+
+// Filter+sort memo. Every input of a non-annotation filter is either an
+// immutable record field or one of the state fields in the key, so the
+// result can be reused until one of them changes. Chips that read marks,
+// notes or tags ("marked:any", "mark:*", "tag:*") depend on annotation
+// state that several modules mutate directly, so those are recomputed on
+// every call rather than risk serving a stale list.
+let filteredMemo = { key: null, list: null };
+function filterMemoKey() {
+  const chip = state.chip || "";
+  if (chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:")) return null;
+  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.sortBy].join("\u0001");
+}
+
 function filteredRecords() {
+  const key = filterMemoKey();
+  if (key !== null && filteredMemo.key === key) return filteredMemo.list;
+  const list = computeFilteredRecords();
+  filteredMemo = { key, list };
+  return list;
+}
+
+function computeFilteredRecords() {
+  const chip = state.chip || "";
+  const query = state.query || "";
   const list = records.filter(record => {
     if (state.kind && record.kind !== state.kind) return false;
     if (state.recType && (record.recType || "unclassified") !== state.recType) return false;
     if (state.status && record.status !== state.status) return false;
-    if (state.chip === "anomaly" && !record.hasAnomaly) return false;
-    if (state.chip === "warning" && !(record.warnings || []).length) return false;
-    if (state.chip === "kind:recovery" && record.kind !== "candidate" && record.kind !== "filesystem") return false;
-    if (state.chip === "marked:any" && !state.marks[record.id] && !(state.tags[record.id] || []).length && !(state.notes[record.id] || "").trim()) return false;
+    if (chip === "anomaly" && !record.hasAnomaly) return false;
+    if (chip === "warning" && !(record.warnings || []).length) return false;
+    if (chip === "kind:recovery" && record.kind !== "candidate" && record.kind !== "filesystem") return false;
+    if (chip === "marked:any" && !state.marks[record.id] && !(state.tags[record.id] || []).length && !(state.notes[record.id] || "").trim()) return false;
     if (state.dateFrom || state.dateTo) {
       if (!record.recDay) return false;
       if (state.dateFrom && record.recDay < state.dateFrom) return false;
       if (state.dateTo && record.recDay > state.dateTo) return false;
     }
-    if (state.chip.startsWith("tag:")) {
-      const wanted = state.chip.slice(4);
+    if (chip.startsWith("tag:")) {
+      const wanted = chip.slice(4);
       const tags = state.tags[record.id] || [];
       if (!tags.includes(wanted)) return false;
     }
-    if (state.chip.startsWith("mark:")) {
-      const wanted = state.chip.slice(5);
+    if (chip.startsWith("mark:")) {
+      const wanted = chip.slice(5);
       const mark = state.marks[record.id];
       if (wanted === "none") { if (mark) return false; }
       else if (!mark || mark.status !== wanted) return false;
     }
-    if (!state.query) return true;
-    const haystack = [record.id, record.name, record.path, record.originalPath, record.parser, record.vendor, record.sha256, record.note, record.status];
-    return haystack.some(value => String(value ?? "").toLowerCase().includes(state.query));
+    if (!query) return true;
+    return searchHaystack(record).includes(query);
   });
-  const sorted = [...list];
+  const byId = (a, b) => idCollator.compare(String(a.id), String(b.id));
   switch (state.sortBy) {
     case "time-desc":
-      sorted.sort((a, b) => (b.recTime ?? -Infinity) - (a.recTime ?? -Infinity) || a.id.localeCompare(b.id));
+      list.sort((a, b) => (b.recTime ?? -Infinity) - (a.recTime ?? -Infinity) || byId(a, b));
       break;
     case "time-asc":
-      sorted.sort((a, b) => (a.recTime ?? Infinity) - (b.recTime ?? Infinity) || a.id.localeCompare(b.id));
+      list.sort((a, b) => (a.recTime ?? Infinity) - (b.recTime ?? Infinity) || byId(a, b));
       break;
     case "name":
-      sorted.sort((a, b) => a.name.localeCompare(b.name, "ko") || a.id.localeCompare(b.id));
+      list.sort((a, b) => nameCollator.compare(String(a.name), String(b.name)) || byId(a, b));
       break;
     case "size-desc":
-      sorted.sort((a, b) => (b.size || 0) - (a.size || 0) || a.id.localeCompare(b.id));
+      list.sort((a, b) => (b.size || 0) - (a.size || 0) || byId(a, b));
       break;
     default:
-      sorted.sort((a, b) => a.id.localeCompare(b.id));
+      list.sort(byId);
   }
-  return sorted;
+  return list;
 }
 
 function groupKeyFor(record) {
@@ -118,7 +155,7 @@ function groupKeyFor(record) {
   }
 }
 
-function selectedRecord() { return records.find(record => record.id === state.activeId); }
+function selectedRecord() { return state.activeId == null ? undefined : recordById.get(state.activeId); }
 function markOf(record) { return state.marks[record.id] || null; }
 
 function saveLayout() {
@@ -240,6 +277,24 @@ function applyVideoScale() {
   }
 }
 
+// Deepfake screening results are fixed at load — count them once.
+let dflDistributionCache = null;
+function dflDistribution() {
+  if (dflDistributionCache) return dflDistributionCache;
+  const dist = { high: 0, medium: 0, low: 0, unknown: 0, failed: 0 };
+  let screened = 0;
+  records.forEach(record => {
+    const dfl = record.dfl;
+    if (!dfl) return;
+    if (dfl.error) { dist.failed += 1; screened += 1; return; }
+    const band = String(dfl.band || "unknown");
+    if (Object.prototype.hasOwnProperty.call(dist, band)) dist[band] += 1; else dist.unknown += 1;
+    screened += 1;
+  });
+  dflDistributionCache = { dist, screened };
+  return dflDistributionCache;
+}
+
 function renderGrid(filtered) {
   if (!filtered.some(record => record.id === state.activeId)) {
     state.activeId = filtered[0]?.id || null;
@@ -253,27 +308,20 @@ function renderGrid(filtered) {
   const rangeEnd = Math.min(filtered.length, start + pageRows.length);
   const rangeStart = filtered.length ? start + 1 : 0;
   els.pageStatus.textContent = `${rangeStart}–${rangeEnd} / ${filtered.length} · ${state.currentPage}/${pageCount}`;
+  // Marks are sparse: walk the mark map, not every record (PERF-03).
   let reviewed = 0, important = 0, pending = 0;
-  records.forEach(record => {
-    const status = state.marks[record.id]?.status;
+  for (const [id, mark] of Object.entries(state.marks)) {
+    if (!recordById.has(id)) continue;
+    const status = mark?.status;
     if (status === "reviewed") reviewed += 1;
     else if (status === "important") important += 1;
     else if (status === "needs_verification") pending += 1;
-  });
+  }
   if (els.triageStatus) {
     els.triageStatus.textContent = tf("triage.line", { done: reviewed, total: records.length, imp: important, pend: pending });
   }
   if (els.dflSummary) {
-    const dist = { high: 0, medium: 0, low: 0, unknown: 0, failed: 0 };
-    let screened = 0;
-    records.forEach(record => {
-      const dfl = record.dfl;
-      if (!dfl) return;
-      if (dfl.error) { dist.failed += 1; screened += 1; return; }
-      const band = String(dfl.band || "unknown");
-      if (band in dist) dist[band] += 1; else dist.unknown += 1;
-      screened += 1;
-    });
+    const { dist, screened } = dflDistribution();
     els.dflSummary.textContent = screened
       ? tf("dfl.dist", { n: screened, total: records.length, high: dist.high, medium: dist.medium, low: dist.low, unknown: dist.unknown, failed: dist.failed, none: records.length - screened })
       : "";
@@ -430,8 +478,24 @@ function renderHistogram(filtered) {
   });
   document.getElementById("calPrev")?.addEventListener("click", () => { state.calMonth = months[mi - 1]; render(); });
   document.getElementById("calNext")?.addEventListener("click", () => { state.calMonth = months[mi + 1]; render(); });
-  const known = records.filter(record => record.recDay).map(record => record.recDay).sort();
-  els.periodLabel.textContent = known.length
-    ? tf("hist.range", { from: known[0], to: known[known.length - 1], known: known.length, total: records.length })
+  const known = knownDaySpan();
+  els.periodLabel.textContent = known.count
+    ? tf("hist.range", { from: known.from, to: known.to, known: known.count, total: records.length })
     : t("hist.none");
+}
+
+// Recorded-day span over the whole case — immutable, so computed once.
+let knownDaySpanCache = null;
+function knownDaySpan() {
+  if (knownDaySpanCache) return knownDaySpanCache;
+  let from = null, to = null, count = 0;
+  records.forEach(record => {
+    const day = record.recDay;
+    if (!day) return;
+    count += 1;
+    if (from === null || day < from) from = day;
+    if (to === null || day > to) to = day;
+  });
+  knownDaySpanCache = { from, to, count };
+  return knownDaySpanCache;
 }

@@ -134,9 +134,12 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             .unwrap_or_default()
             .to_string();
         let mut emitted = false;
+        // An mtime of 0 is a "no timestamp" placeholder (unset FAT/zip
+        // entries, failed conversions), not a real 1970 event.
         if let Some(mtime) = value
             .get("modified_unix")
             .and_then(serde_json::Value::as_u64)
+            .filter(|mtime| *mtime > 0)
         {
             emitted = true;
             events.push(TimelineEvent {
@@ -163,14 +166,21 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
         }
         for (location, raw) in creation_time_tags(&value) {
             // A tag that will not parse is excluded, never emitted as 0.
-            if let Some(ts) = parse_creation_time_unix(&raw) {
+            if let Some((ts, tz_assumed)) = parse_creation_time(&raw) {
                 emitted = true;
+                let caveat = if tz_assumed {
+                    " (tz_assumed: tag has no zone, interpreted as UTC; recorder clocks are often local time)"
+                } else {
+                    ""
+                };
                 events.push(TimelineEvent {
                     ts_unix: ts,
                     source: "ffprobe",
                     kind: "media-creation-time",
                     path: source_path.clone(),
-                    detail: format!("indexed video {id} ffprobe {location} creation_time {raw}"),
+                    detail: format!(
+                        "indexed video {id} ffprobe {location} creation_time {raw}{caveat}"
+                    ),
                 });
             }
         }
@@ -411,6 +421,13 @@ fn creation_time_tags(row: &serde_json::Value) -> Vec<(String, String)> {
 /// strings; not part of the supported API.
 #[doc(hidden)]
 pub fn parse_creation_time_unix(text: &str) -> Option<u64> {
+    parse_creation_time(text).map(|(unix, _)| unix)
+}
+
+/// `parse_creation_time_unix` plus whether the zone was assumed: `true`
+/// when the text carried no `Z`/offset and was interpreted as UTC.
+/// Impossible calendar dates (Feb 30) and second 60 are rejected.
+pub fn parse_creation_time(text: &str) -> Option<(u64, bool)> {
     let text = text.trim();
     let bytes = text.as_bytes();
     if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
@@ -419,7 +436,7 @@ pub fn parse_creation_time_unix(text: &str) -> Option<u64> {
     let year: i64 = text.get(0..4)?.parse().ok()?;
     let month: u32 = text.get(5..7)?.parse().ok()?;
     let day: u32 = text.get(8..10)?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return None;
     }
     let mut index = 10usize;
@@ -437,7 +454,7 @@ pub fn parse_creation_time_unix(text: &str) -> Option<u64> {
         let hour: i64 = time.get(0..2)?.parse().ok()?;
         let minute: i64 = time.get(3..5)?.parse().ok()?;
         let second: i64 = time.get(6..8)?.parse().ok()?;
-        if hour > 23 || minute > 59 || second > 60 {
+        if hour > 23 || minute > 59 || second > 59 {
             return None;
         }
         secs_of_day = hour * 3600 + minute * 60 + second;
@@ -450,8 +467,10 @@ pub fn parse_creation_time_unix(text: &str) -> Option<u64> {
         }
     }
     let mut offset_secs: i64 = 0;
+    let mut tz_assumed = false;
     match bytes.get(index) {
-        None | Some(b'Z') => {}
+        None => tz_assumed = true,
+        Some(b'Z') => {}
         Some(sign @ (b'+' | b'-')) => {
             let digits: String = text
                 .get(index + 1..)?
@@ -472,7 +491,16 @@ pub fn parse_creation_time_unix(text: &str) -> Option<u64> {
         Some(_) => return None,
     }
     let unix = days_from_civil(year, month, day) * 86_400 + secs_of_day - offset_secs;
-    u64::try_from(unix).ok()
+    u64::try_from(unix).ok().map(|unix| (unix, tz_assumed))
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Days since the unix epoch for a civil date (Howard Hinnant's algorithm;
@@ -693,6 +721,44 @@ mod tests {
         let err = generate_timeline(&case_dir, &outside).unwrap_err();
         assert!(err.contains("inside the case directory"), "{err}");
         assert!(!outside.exists());
+        let _ = fs::remove_dir_all(&case_dir);
+    }
+
+    #[test]
+    fn rejects_impossible_dates_and_flags_assumed_zone() {
+        assert_eq!(parse_creation_time_unix("2021-02-30T00:00:00Z"), None);
+        assert_eq!(parse_creation_time_unix("2021-02-29T00:00:00Z"), None);
+        assert!(parse_creation_time_unix("2020-02-29T00:00:00Z").is_some());
+        assert_eq!(parse_creation_time_unix("2021-04-31T00:00:00Z"), None);
+        assert_eq!(parse_creation_time_unix("2021-01-01T00:00:60Z"), None);
+        assert_eq!(
+            parse_creation_time("2021-01-01 00:00:00"),
+            Some((1_609_459_200, true))
+        );
+        assert_eq!(
+            parse_creation_time("2021-01-01T00:00:00Z"),
+            Some((1_609_459_200, false))
+        );
+        assert_eq!(
+            parse_creation_time("2021-01-01T09:00:00+09:00"),
+            Some((1_609_459_200, false))
+        );
+    }
+
+    #[test]
+    fn zero_mtime_is_not_a_timeline_event() {
+        let case_dir = temp_case("zero-mtime");
+        fs::write(
+            case_dir.join("db/videos.jsonl"),
+            "{\"id\":\"vid_1\",\"source_path\":\"/ev/a.mp4\",\"modified_unix\":0,\"ffprobe\":{\"format\":{\"tags\":{\"creation_time\":\"2021-01-01 00:00:00\"}}}}\n",
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let skipped = index_events(&case_dir, &mut events).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "media-creation-time");
+        assert!(events[0].detail.contains("tz_assumed"));
         let _ = fs::remove_dir_all(&case_dir);
     }
 

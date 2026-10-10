@@ -48,16 +48,214 @@ document.getElementById("shortcutsModal").addEventListener("keydown", e => {
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 
+// --- Undo/redo journal (UX-04) ---
+// Every examiner-visible mutation of marks / notes / tags / IN-OUT ranges
+// that goes through journaled() records a per-id before/after snapshot,
+// so a stray key or a bulk action over a large selection is reversible
+// with Ctrl+Z / Ctrl+Y (or the Undo button on the toast).
+const JOURNAL_LIMIT = 200;
+const BULK_CONFIRM_MIN = 5;
+const undoStack = [];
+const redoStack = [];
+
+function snapshotIds(ids) {
+  return ids.map(id => ({
+    id,
+    mark: state.marks[id] ? { ...state.marks[id] } : null,
+    note: Object.prototype.hasOwnProperty.call(state.notes, id) ? state.notes[id] : null,
+    tags: state.tags[id] ? [...state.tags[id]] : null,
+    range: state.ranges[id] ? { ...state.ranges[id] } : null
+  }));
+}
+
+const JOURNAL_FIELDS = ["mark", "note", "tags", "range"];
+
+// Per id, the fields a journaled action actually changed. Undo / redo
+// restore only those, so a note or tag edited later through an
+// unjournaled path (note field, detail tag buttons, custom tag input)
+// survives Ctrl+Z on an earlier mark and is not lost on redo either.
+function journalDiff(before, after) {
+  const afterById = new Map(after.map(item => [item.id, item]));
+  const changes = [];
+  for (const prev of before) {
+    const next = afterById.get(prev.id);
+    if (!next) continue;
+    const fields = JOURNAL_FIELDS.filter(field => JSON.stringify(prev[field]) !== JSON.stringify(next[field]));
+    if (fields.length) changes.push({ id: prev.id, fields, before: prev, after: next });
+  }
+  return changes;
+}
+
+function applyJournalSide(changes, side) {
+  const current = new Map(snapshotIds(changes.map(change => change.id)).map(item => [item.id, item]));
+  for (const change of changes) {
+    const id = change.id;
+    const item = change[side];
+    const now = current.get(id);
+    let annotationChanged = false;
+    for (const field of change.fields) {
+      if (field === "mark") {
+        if (item.mark) state.marks[id] = { ...item.mark }; else delete state.marks[id];
+        if (JSON.stringify(now.mark) !== JSON.stringify(item.mark)) annotationChanged = true;
+      } else if (field === "note") {
+        if (item.note == null) delete state.notes[id]; else state.notes[id] = item.note;
+        if ((now.note || "") !== (item.note || "")) annotationChanged = true;
+      } else if (field === "tags") {
+        if (item.tags) state.tags[id] = [...item.tags]; else delete state.tags[id];
+        if (JSON.stringify(now.tags || []) !== JSON.stringify(item.tags || [])) annotationChanged = true;
+      } else if (field === "range") {
+        if (item.range) state.ranges[id] = { ...item.range }; else delete state.ranges[id];
+      }
+    }
+    if (annotationChanged) touchAnnotation(id);
+  }
+  storageSet(MARKS_KEY, state.marks);
+  storageSet(NOTES_KEY, state.notes);
+  storageSet(TAGS_KEY, state.tags);
+  storageSet(RANGES_KEY, state.ranges);
+}
+
+// Toast with an inline Undo button. Only the newest undo toast is kept so
+// rapid 1/2/3 triage does not stack a column of stale buttons.
+function attachUndoButton(item) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "mini";
+  btn.style.marginLeft = "10px";
+  btn.textContent = t("undo.btn");
+  btn.addEventListener("click", () => { item.remove(); undoJournal(); });
+  item.classList.add("toast-undo");
+  item.appendChild(btn);
+}
+function toastUndo(message) {
+  const host = document.getElementById("toastHost");
+  if (!host) return;
+  host.querySelectorAll(".toast-undo").forEach(el => el.remove());
+  const item = document.createElement("div");
+  item.className = "toast";
+  const text = document.createElement("span");
+  text.textContent = message;
+  item.appendChild(text);
+  attachUndoButton(item);
+  host.appendChild(item);
+  setTimeout(() => item.remove(), 6000);
+}
+
+// Runs mutate(), journals the before/after state of `ids` when anything
+// changed, and offers Undo. When `message` is omitted and mutate() raised
+// its own toast, the Undo button is attached to that toast instead of
+// adding a second one.
+function journaled(label, ids, mutate, message) {
+  const unique = [...new Set(ids)];
+  const host = document.getElementById("toastHost");
+  const lastToastBefore = host ? host.lastElementChild : null;
+  const activeBefore = state.activeId;
+  const before = snapshotIds(unique);
+  const result = mutate();
+  const after = snapshotIds(unique);
+  const changes = journalDiff(before, after);
+  if (!changes.length) return result;
+  undoStack.push({ label, changes, activeBefore });
+  if (undoStack.length > JOURNAL_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  const raised = host && host.lastElementChild !== lastToastBefore ? host.lastElementChild : null;
+  if (message == null && raised && raised.classList.contains("toast")) {
+    host.querySelectorAll(".toast-undo").forEach(el => el.remove());
+    attachUndoButton(raised);
+  } else {
+    toastUndo(message == null ? label : message);
+  }
+  return result;
+}
+
+function focusRecordId(id) {
+  if (!id || !records.some(record => record.id === id)) return;
+  state.activeId = id;
+  const index = filteredRecords().findIndex(record => record.id === id);
+  if (index >= 0) state.currentPage = Math.floor(index / state.pageSize) + 1;
+}
+
+function undoJournal() {
+  const entry = undoStack.pop();
+  if (!entry) { toast(t("toast.nothingUndo")); return false; }
+  applyJournalSide(entry.changes, "before");
+  redoStack.push(entry);
+  focusRecordId(entry.activeBefore);
+  render();
+  updateRangeLabel();
+  toast(tf("toast.undone", { what: entry.label }));
+  return true;
+}
+
+function redoJournal() {
+  const entry = redoStack.pop();
+  if (!entry) { toast(t("toast.nothingRedo")); return false; }
+  applyJournalSide(entry.changes, "after");
+  undoStack.push(entry);
+  focusRecordId(entry.activeBefore);
+  render();
+  updateRangeLabel();
+  toast(tf("toast.redone", { what: entry.label }));
+  return true;
+}
+
+// Bulk actions over more than BULK_CONFIRM_MIN items ask first; the
+// journal still makes them undoable afterwards.
+function confirmBulk(ids, action) {
+  if (ids.length <= BULK_CONFIRM_MIN) return true;
+  return window.confirm(tf("confirm.bulk", { n: ids.length, action }));
+}
+
+function markStatusLabel(status) {
+  return status === null ? t("mark.cleared") : markLabel(status);
+}
+
+// Selection-bar mark buttons. Clearing a mark keeps the examiner's note —
+// notes are only ever edited in the note field.
+function applyMarkJournaled(status) {
+  const ids = targetIds();
+  if (!ids.length) { toast(t("toast.selectTarget")); return; }
+  const label = markStatusLabel(status);
+  if (!confirmBulk(ids, label)) return;
+  journaled(label, ids, () => {
+    const stamped = Math.floor(Date.now() / 1000);
+    ids.forEach(id => {
+      if (status === null) delete state.marks[id];
+      else state.marks[id] = { status, marked_unix: stamped };
+      touchAnnotation(id);
+    });
+    storageSet(MARKS_KEY, state.marks);
+  }, tf("toast.markApplied", { n: ids.length, status: label }));
+  render();
+}
+
+function applyTagJournaled(tag) {
+  const ids = targetIds();
+  if (ids.length && !confirmBulk(ids, tf("journal.tag", { tag }))) return;
+  journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag));
+}
+
+function clearTagsJournaled() {
+  const ids = targetIds();
+  if (ids.length && !confirmBulk(ids, t("journal.tagClear"))) return;
+  journaled(t("journal.tagClear"), ids, () => clearTags());
+}
+
 // Single-key triage: mark the active record and advance so an examiner
-// can clear a review queue without touching the mouse.
+// can clear a review queue without touching the mouse. Key 0 removes the
+// mark only — the note survives — and every mark is undoable.
 function markActive(status) {
   const before = filteredRecords();
   const index = before.findIndex(record => record.id === state.activeId);
   if (index < 0) return;
-  if (status === null) { delete state.marks[state.activeId]; state.notes[state.activeId] = ""; }
-  else state.marks[state.activeId] = { status, marked_unix: Math.floor(Date.now() / 1000) };
-  touchAnnotation(state.activeId);
-  storageSet(MARKS_KEY, state.marks);
+  const id = state.activeId;
+  const label = markStatusLabel(status);
+  journaled(label, [id], () => {
+    if (status === null) delete state.marks[id];
+    else state.marks[id] = { status, marked_unix: Math.floor(Date.now() / 1000) };
+    touchAnnotation(id);
+    storageSet(MARKS_KEY, state.marks);
+  }, tf("toast.markApplied", { n: 1, status: label }));
   const after = filteredRecords();
   const next = before.slice(index + 1).find(record => after.some(item => item.id === record.id));
   state.activeId = next?.id || after[Math.min(index, after.length - 1)]?.id || null;
@@ -65,23 +263,121 @@ function markActive(status) {
   render();
 }
 
+// --- Review progress + action scope (UX-16 / UX-04) ---
+function isReviewed(record) { return !!state.marks[record.id]; }
+
+// n / Shift+N: jump to the next / previous record in the current filter
+// order that has no mark yet, wrapping around.
+function moveToUnreviewed(step) {
+  const filtered = filteredRecords();
+  if (!filtered.length) return;
+  const start = filtered.findIndex(record => record.id === state.activeId);
+  const base = start < 0 ? (step > 0 ? -1 : 0) : start;
+  const total = filtered.length;
+  for (let offset = 1; offset <= total; offset += 1) {
+    const index = (((base + step * offset) % total) + total) % total;
+    const record = filtered[index];
+    if (!isReviewed(record)) {
+      focusRecordId(record.id);
+      render();
+      els.recordGrid.querySelector(`.card[data-id="${CSS.escape(state.activeId)}"]`)?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+  }
+  toast(t("toast.allReviewed"));
+}
+
+const reviewMeta = (() => {
+  const bar = document.getElementById("selectionBar");
+  const count = document.getElementById("selectionCount");
+  if (!bar || !count) return null;
+  const progress = document.createElement("span");
+  progress.id = "reviewProgress";
+  progress.className = "grp-label";
+  progress.style.cssText = "display:inline-flex;align-items:center;gap:6px;white-space:nowrap";
+  const meter = document.createElement("progress");
+  meter.style.cssText = "width:64px;height:8px";
+  const progressText = document.createElement("span");
+  progress.append(progressText, meter);
+  count.insertAdjacentElement("afterend", progress);
+  const scope = document.createElement("span");
+  scope.id = "markScope";
+  scope.className = "grp-label";
+  scope.style.whiteSpace = "nowrap";
+  const seg = bar.querySelector(".seg");
+  if (seg) seg.insertAdjacentElement("beforebegin", scope);
+  else bar.appendChild(scope);
+  return { count, progress, progressText, meter, scope };
+})();
+
+function updateReviewMeta() {
+  if (!reviewMeta) return;
+  const total = records.length;
+  const reviewed = records.reduce((n, record) => n + (isReviewed(record) ? 1 : 0), 0);
+  reviewMeta.progressText.textContent = tf("progress.label", { n: reviewed, m: total });
+  reviewMeta.meter.max = Math.max(1, total);
+  reviewMeta.meter.value = reviewed;
+  reviewMeta.progress.title = t("progress.title");
+  const selected = state.selectedIds.size;
+  reviewMeta.scope.textContent = selected
+    ? tf("scope.selected", { n: selected })
+    : state.activeId ? t("scope.active") : t("scope.none");
+}
+// renderMetrics() rewrites #selectionCount on every render — piggyback on
+// that instead of patching render() in a file this module doesn't own.
+if (reviewMeta && typeof MutationObserver === "function") {
+  new MutationObserver(updateReviewMeta).observe(reviewMeta.count, { childList: true, characterData: true, subtree: true });
+}
+updateReviewMeta();
+
+// --- Global keyboard (UX-03 / UX-08 / UX-15) ---
+// Only real text entry captures keys. A focused <select>, checkbox, range
+// slider or <video> keeps its own navigation keys; every other shortcut
+// still works so the viewer never seems frozen after using a filter.
+const TEXT_INPUT_TYPES = new Set(["", "text", "search", "email", "url", "tel", "password", "number", "date", "datetime-local", "month", "week", "time"]);
+const NATIVE_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", " ", "Enter", "Tab"]);
+function isTypingTarget(el) {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  if (el.tagName === "TEXTAREA") return true;
+  return el.tagName === "INPUT" && TEXT_INPUT_TYPES.has(String(el.getAttribute("type") || "").toLowerCase());
+}
+
 document.addEventListener("keydown", event => {
-  const tag = document.activeElement?.tagName;
-  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
-    if (event.key === "Escape") document.activeElement.blur();
+  if (event.defaultPrevented) return;
+  const el = document.activeElement;
+  const tag = el?.tagName;
+  if (isTypingTarget(el)) {
+    if (event.key === "Escape") el.blur();
     return;
   }
-  if (tag === "BUTTON" && (event.key === " " || event.key === "Enter")) {
-    return; // let the focused button receive its normal activation keys
+  if ((tag === "SELECT" || tag === "INPUT" || tag === "VIDEO") && NATIVE_NAV_KEYS.has(event.key)) return;
+  if ((tag === "BUTTON" || tag === "A" || tag === "SUMMARY") && (event.key === " " || event.key === "Enter")) {
+    return; // let the focused control receive its normal activation keys
   }
-  if (event.ctrlKey && (event.key === "a" || event.key === "A")) { event.preventDefault(); selectAllFiltered(); return; }
-  if (event.ctrlKey && (event.key === "d" || event.key === "D")) { event.preventDefault(); clearSelection(); return; }
+  // AltGr reports ctrl+alt on Windows layouts that type [ ] ? with it —
+  // treat it as plain typing, not as a modifier combo.
+  const altGraph = typeof event.getModifierState === "function" && event.getModifierState("AltGraph");
+  const mod = !altGraph && (event.ctrlKey || event.metaKey);
+  if (!altGraph && event.altKey) return; // Alt+Left etc. belong to the browser
+  if (mod) {
+    const key = String(event.key).toLowerCase();
+    if (key === "z" && !event.shiftKey) { event.preventDefault(); undoJournal(); }
+    else if (key === "y" || (key === "z" && event.shiftKey)) { event.preventDefault(); redoJournal(); }
+    else if (event.ctrlKey && !event.metaKey && !event.shiftKey && key === "a") { event.preventDefault(); selectAllFiltered(); }
+    else if (event.ctrlKey && !event.metaKey && !event.shiftKey && key === "d") { event.preventDefault(); clearSelection(); }
+    return; // every other Ctrl/Cmd combo (zoom, find, print…) stays the browser's
+  }
+  let handled = true;
   switch (event.key) {
     case "j": moveActive(1); break;
     case "k": moveActive(-1); break;
-    case " ": event.preventDefault(); toggleActiveSelection(); break;
+    case "n": moveToUnreviewed(1); break;
+    case "N": moveToUnreviewed(-1); break;
+    case " ": event.preventDefault(); togglePlayback(); break;
+    case "x": toggleActiveSelection(); break;
     case "Enter":
-      els.mediaStage.querySelector("video")?.play().catch(() => {});
+      currentVideo()?.play().catch(() => {});
       break;
     case "1": markActive("reviewed"); break;
     case "2": markActive("important"); break;
@@ -97,9 +393,15 @@ document.addEventListener("keydown", event => {
     case "t": toggleTheater(); break;
     case "p": togglePip(); break;
     case "?": toggleShortcuts(true); break;
-    case "Escape": toggleShortcuts(false); if (state.layout.theater) toggleTheater(); break;
-    default: break;
+    case "Escape":
+      if (tag === "SELECT" || tag === "INPUT") el.blur();
+      toggleShortcuts(false);
+      if (state.layout.theater) toggleTheater();
+      break;
+    default: handled = false; break;
   }
+  // A focused <select> would also type-ahead on the same key.
+  if (handled && tag === "SELECT") event.preventDefault();
 });
 
 els.query.addEventListener("input", () => {
@@ -232,20 +534,28 @@ function updateRangeLabel() {
   const proxyBtn = document.getElementById("btnProxy");
   if (proxyBtn) proxyBtn.classList.toggle("on", !!(record && state.proxies[record.id]));
 }
+// IN/OUT marking. The local is `now`, not `t` — shadowing the i18n t()
+// put every toast in this function into its TDZ (UX-01). A point that
+// would make OUT <= IN is rejected and the existing range kept intact.
 function setRangePoint(which) {
   const video = currentVideo();
   const record = selectedRecord();
-  if (!video || !record) { toast(t("toast.pickEvidence")); return; }
-  const t = video.currentTime;
-  const range = state.ranges[record.id] || { in: null, out: null };
-  if (which === "in") range.in = t; else range.out = t;
+  const now = video ? Number(video.currentTime) : NaN;
+  if (!video || !record || !Number.isFinite(now)) { toast(t("toast.pickEvidence")); return; }
+  const existing = state.ranges[record.id] || { in: null, out: null };
+  const range = { in: existing.in ?? null, out: existing.out ?? null };
+  if (which === "in") range.in = now; else range.out = now;
   if (Number.isFinite(range.in) && Number.isFinite(range.out) && range.out <= range.in) {
     toast(t("toast.outBeforeIn"));
-    if (which === "in") range.in = null; else range.out = null;
+    return;
   }
-  if (range.in == null && range.out == null) delete state.ranges[record.id];
-  else state.ranges[record.id] = range;
-  storageSet(RANGES_KEY, state.ranges);
+  journaled(t("journal.range"), [record.id], () => {
+    state.ranges[record.id] = range;
+    storageSet(RANGES_KEY, state.ranges);
+  }, tf("range.label", {
+    in: Number.isFinite(range.in) ? `${range.in.toFixed(1)}s` : "—",
+    out: Number.isFinite(range.out) ? `${range.out.toFixed(1)}s` : "—"
+  }));
   updateRangeLabel();
 }
 document.getElementById("btnSetIn").addEventListener("click", () => setRangePoint("in"));
@@ -348,10 +658,10 @@ document.getElementById("btnShortcuts").addEventListener("click", () => toggleSh
 document.getElementById("btnShortcutsClose").addEventListener("click", () => toggleShortcuts(false));
 document.getElementById("btnSelectFiltered").addEventListener("click", selectAllFiltered);
 document.getElementById("btnClearSelection").addEventListener("click", clearSelection);
-document.getElementById("btnMarkReviewed").addEventListener("click", () => applyMark("reviewed"));
-document.getElementById("btnMarkImportant").addEventListener("click", () => applyMark("important"));
-document.getElementById("btnMarkVerify").addEventListener("click", () => applyMark("needs_verification"));
-document.getElementById("btnMarkClear").addEventListener("click", () => applyMark(null));
+document.getElementById("btnMarkReviewed").addEventListener("click", () => applyMarkJournaled("reviewed"));
+document.getElementById("btnMarkImportant").addEventListener("click", () => applyMarkJournaled("important"));
+document.getElementById("btnMarkVerify").addEventListener("click", () => applyMarkJournaled("needs_verification"));
+document.getElementById("btnMarkClear").addEventListener("click", () => applyMarkJournaled(null));
 document.getElementById("btnCopyIds").addEventListener("click", () => {
   const ids = targetIds();
   if (ids.length) copyText(ids.join("\n"), t("copy.ids"));
@@ -384,16 +694,16 @@ function addTagPresetFromMenu() {
   addTagPreset(name);
   rebuildTagMenu();
   document.getElementById("tagPresetInput")?.focus();
-  if (targetIds().length) applyTag(name);
+  if (targetIds().length) applyTagJournaled(name);
   else if (isNew) toast(tf("toast.presetAdded", { tag: name }));
 }
 tagMenuList.addEventListener("click", e => {
   const del = e.target.closest("[data-del-preset]");
   if (del) { removeTagPreset(del.dataset.delPreset); rebuildTagMenu(); return; }
   if (e.target.closest("[data-tag-add]")) { addTagPresetFromMenu(); return; }
-  if (e.target.closest("[data-tag-clear]")) { clearTags(); return; }
+  if (e.target.closest("[data-tag-clear]")) { clearTagsJournaled(); return; }
   const apply = e.target.closest("[data-tag]");
-  if (apply) applyTag(apply.dataset.tag);
+  if (apply) applyTagJournaled(apply.dataset.tag);
 });
 tagMenuList.addEventListener("keydown", e => {
   if (e.key === "Enter" && e.target.id === "tagPresetInput") {

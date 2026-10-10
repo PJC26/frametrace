@@ -199,12 +199,31 @@ pub fn verify_chained_jsonl(path: &Path) -> Result<AuditChainVerification, Strin
 /// Fail-open is preserved: a verify that could not take the lock (or
 /// could not open the file for locking at all, e.g. read-only media)
 /// still reads unlocked rather than refusing to run.
+///
+/// A missing log is an error, never an intact empty chain: verification
+/// must not create the file it is asked to verify (deleting a log would
+/// otherwise be indistinguishable from "verified, 0 entries").
 fn read_log_for_verification(path: &Path) -> Result<String, String> {
     use std::io::Read;
     let read_error =
         |err: std::io::Error| format!("failed to read audit log {}: {err}", path.display());
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "audit log {} is not a regular file",
+                path.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "audit log {} does not exist (missing log is not verifiable; it may have been deleted)",
+                path.display()
+            ));
+        }
+        Err(err) => return Err(read_error(err)),
+    }
     match std::fs::OpenOptions::new()
-        .create(true)
         .read(true)
         .append(true)
         .open(path)
@@ -230,8 +249,7 @@ pub fn verify_chained_jsonl_keyed(
     path: &Path,
     keys: &[AuditKey],
 ) -> Result<AuditChainVerification, String> {
-    let text = read_to_string(path)
-        .map_err(|err| format!("failed to read audit log {}: {err}", path.display()))?;
+    let text = read_log_for_verification(path)?;
     verify_chained_jsonl_text(&text, &path.display().to_string(), keys)
 }
 
@@ -483,6 +501,29 @@ mod tests {
         let verification = verify_chained_jsonl(&path).unwrap();
         assert_eq!(verification.entries, 2);
         assert_ne!(verification.last_entry_sha256, "GENESIS");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verify_rejects_missing_log_without_creating_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "frametrace-audit-missing-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deleted-log.jsonl");
+
+        let err = verify_chained_jsonl(&path).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!path.exists(), "verify must not create a missing log");
+        let err = verify_chained_jsonl_keyed(&path, &[]).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!path.exists());
+        // A directory where a log is expected is not an intact chain either.
+        fs::create_dir_all(dir.join("dir-log.jsonl")).unwrap();
+        assert!(verify_chained_jsonl(&dir.join("dir-log.jsonl")).is_err());
 
         let _ = fs::remove_dir_all(dir);
     }

@@ -1,0 +1,62 @@
+name: Linux CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Frontend asset checks
+        run: |
+          node scripts/check-css.mjs
+          node scripts/check-js.mjs
+          node scripts/verify-contract-pin.mjs
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Test
+        run: cargo test --locked
+      - name: Workstation end-to-end test
+        env:
+          FRAMETRACE_IT: "1"
+        run: cargo test --locked --test workstation_e2e -- --ignored
+
+  screenshots:
+    # Drives the real workstation UI with Playwright against a synthetic
+    # dashcam case and uploads the PNGs so UI changes can be eyeballed.
+    runs-on: ubuntu-latest
+    needs: ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install Playwright
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: Capture screens
+        run: node scripts/capture-screens.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-screens
+          path: docs/screens/current/

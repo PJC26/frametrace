@@ -92,8 +92,29 @@ pub fn scan_folder(
         {
             report(processed_files, total_files);
         }
-        let metadata = fs::metadata(&path)
-            .map_err(|err| format!("failed to read metadata for {}: {err}", path.display()))?;
+        // One unreadable file (bad sector, permission, vanished) must not
+        // abort the whole scan and leave no index: record it and move on.
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                // An already-indexed file whose metadata cannot be read is
+                // still present: merge_existing_with_scan carries its record
+                // forward unchanged rather than marking it stale.
+                let key = normalize_source_key(&path.to_string_lossy());
+                if id_registry.ids_by_source.contains_key(&key) {
+                    warnings.push(format!(
+                        "metadata-error: {} ({err}); existing index record carried forward unchanged",
+                        path.display()
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "skipped unreadable file {} (metadata error: {err}); not indexed",
+                        path.display()
+                    ));
+                }
+                continue;
+            }
+        };
         total_bytes = total_bytes.saturating_add(metadata.len());
         let modified_unix = modified_unix(&metadata);
         let source_key = normalize_source_key(&path.to_string_lossy());
@@ -126,11 +147,11 @@ pub fn scan_folder(
             .to_string();
 
         let (sha256, hash_status) = if options.hash_files {
-            let file = File::open(&path)
-                .map_err(|err| format!("failed to open {} for hashing: {err}", path.display()))?;
-            let digest = sha256::digest_reader(BufReader::new(file))
-                .map_err(|err| format!("failed to hash {}: {err}", path.display()))?;
-            (Some(digest), "complete".to_string())
+            let (sha256, status, warning) = hash_with_restat(&path, &metadata);
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+            (sha256, status.to_string())
         } else {
             (None, "skipped".to_string())
         };
@@ -357,6 +378,51 @@ fn has_video_magic(path: &Path) -> bool {
         || buffer.starts_with(b"RIFF")
         || buffer.starts_with(b"IMKH")
         || buffer.starts_with(b"DHAV")
+}
+
+/// Hashes one file and re-stats it afterwards. Returns
+/// `(sha256, hash_status, warning)`:
+/// - `complete` — hashed, and size+mtime unchanged across the read;
+/// - `error` — open/read failed (the file stays indexed without a hash);
+/// - `changed-during-hash` — size or mtime moved while hashing, so the
+///   digest may describe neither version and is not recorded.
+fn hash_with_restat(
+    path: &Path,
+    before: &fs::Metadata,
+) -> (Option<String>, &'static str, Option<String>) {
+    let digest = File::open(path)
+        .map_err(|err| format!("open failed: {err}"))
+        .and_then(|file| {
+            sha256::digest_reader(BufReader::new(file)).map_err(|err| format!("read failed: {err}"))
+        });
+    let digest = match digest {
+        Ok(digest) => digest,
+        Err(err) => {
+            return (
+                None,
+                "error",
+                Some(format!(
+                    "hash error for {} ({err}); indexed with hash_status=error",
+                    path.display()
+                )),
+            );
+        }
+    };
+    let changed = match fs::metadata(path) {
+        Ok(after) => after.len() != before.len() || after.modified().ok() != before.modified().ok(),
+        Err(_) => true,
+    };
+    if changed {
+        return (
+            None,
+            "changed-during-hash",
+            Some(format!(
+                "{} changed while it was being hashed; hash not recorded (hash_status=changed-during-hash)",
+                path.display()
+            )),
+        );
+    }
+    (Some(digest), "complete", None)
 }
 
 fn modified_unix(metadata: &fs::Metadata) -> Option<u64> {
@@ -594,11 +660,14 @@ fn merge_existing_with_scan(
         } else if stale_keys.contains(&key) {
             // Duplicate spelling of an already-decided record; skip.
             continue;
-        } else if Path::new(&existing.source_path).is_file() {
+        } else if source_presence(Path::new(&existing.source_path)) != SourcePresence::Missing {
             // The file EXISTS on disk — it merely belongs to a different
             // registered source that this scan did not cover. Sequential
             // multi-source scans (README workflow: scan E:\ then
             // E:\BLACKBOX) must not mark each other's live evidence stale.
+            // A file whose metadata could not be read (permissions, symlink
+            // loop, I/O error) is not proof of absence either: it is carried
+            // forward unchanged and the scan warns "metadata-error".
             merged.push(existing);
             stale_keys.insert(key.clone());
         } else if stale_keys.insert(key.clone()) {
@@ -620,6 +689,27 @@ fn merge_existing_with_scan(
 
     merged.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(merged)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SourcePresence {
+    File,
+    /// Definitely absent: not found, a path component is not a directory,
+    /// or the path resolves to something other than a regular file.
+    Missing,
+    /// `fs::metadata` failed for a reason other than absence.
+    MetadataError,
+}
+
+fn source_presence(path: &Path) -> SourcePresence {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => SourcePresence::File,
+        Ok(_) => SourcePresence::Missing,
+        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            SourcePresence::Missing
+        }
+        Err(_) => SourcePresence::MetadataError,
+    }
 }
 
 fn load_existing_record_lines(case_dir: &Path) -> Result<Vec<IndexedRecordLine>, String> {
@@ -744,7 +834,7 @@ fn extract_scalar_value(text: &str) -> Option<String> {
                 } else if ch == '\\' {
                     escaped = true;
                 } else if ch == '"' {
-                    return Some(format!("{}{}", &text[..offset], &out));
+                    return Some(format!("{}{}", &text[..offset], out));
                 }
             }
             None
@@ -915,6 +1005,42 @@ pub(crate) fn tsv_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hash_with_restat_records_error_instead_of_aborting() {
+        let dir = std::env::temp_dir().join(format!(
+            "frametrace-scan-hash-restat-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.mp4");
+        std::fs::write(&path, b"abc").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+
+        let (sha, status, warning) = super::hash_with_restat(&path, &metadata);
+        assert_eq!(status, "complete");
+        assert_eq!(
+            sha.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert!(warning.is_none());
+
+        // Grown after the "before" stat: the digest is not trusted.
+        std::fs::write(&path, b"abcd").unwrap();
+        let (sha, status, warning) = super::hash_with_restat(&path, &metadata);
+        assert_eq!(status, "changed-during-hash");
+        assert!(sha.is_none());
+        assert!(warning.is_some());
+
+        // Unreadable (vanished) file: recorded as an error, no panic/abort.
+        std::fs::remove_file(&path).unwrap();
+        let (sha, status, warning) = super::hash_with_restat(&path, &metadata);
+        assert_eq!(status, "error");
+        assert!(sha.is_none());
+        assert!(warning.unwrap().contains("hash_status=error"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::{
         ResumeMode, RunCheckpoint, collect_video_candidates, excluded_case_dirs, looks_like_video,
         merge_existing_with_scan, scan_fingerprint, set_json_field,
@@ -1065,6 +1191,68 @@ mod tests {
         let reparsed: VideoRecord = serde_json::from_str(&record.to_json()).unwrap();
         assert_eq!(reparsed.id, record.id);
         assert_eq!(reparsed.probe.width, record.probe.width);
+    }
+
+    /// An indexed file that still exists but whose metadata cannot be read
+    /// (here: a self-referential symlink, ELOOP) must be carried forward
+    /// unchanged, not marked stale; a genuinely missing one is still stale.
+    #[cfg(unix)]
+    #[test]
+    fn metadata_error_carries_record_forward_instead_of_stale() {
+        let case_dir = std::env::temp_dir().join(format!(
+            "frametrace-metadata-error-merge-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&case_dir);
+        fs::create_dir_all(case_dir.join("db")).unwrap();
+        let looped = case_dir.join("loop.mp4");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(fs::metadata(&looped).is_err());
+        assert_eq!(
+            super::source_presence(&looped),
+            super::SourcePresence::MetadataError
+        );
+        let unreadable = VideoRecord {
+            id: "vid_000001".to_string(),
+            source_path: looped.clone(),
+            relative_path: "loop.mp4".to_string(),
+            extension: "mp4".to_string(),
+            size_bytes: 1,
+            modified_unix: None,
+            sha256: None,
+            hash_status: "skipped".to_string(),
+            probe: ProbeSummary::skipped(),
+            confidence: "extension-candidate".to_string(),
+            source_profile: SourceProfile::generic_media("test"),
+        };
+        let gone = VideoRecord {
+            id: "vid_000002".to_string(),
+            source_path: case_dir.join("gone.mp4"),
+            ..unreadable.clone()
+        };
+        let original_line = unreadable.to_json();
+        fs::write(
+            case_dir.join("db/videos.jsonl"),
+            format!("{}\n{}\n", original_line, gone.to_json()),
+        )
+        .unwrap();
+        let result = ScanResult {
+            source_path: case_dir.clone(),
+            scanned_unix: 5,
+            video_count: 0,
+            total_bytes: 0,
+            unchanged_files: 0,
+            resumed_from_checkpoint: 0,
+            warnings: Vec::new(),
+            options: ScanOptions::default(),
+            records: Vec::new(),
+        };
+        let merged = merge_existing_with_scan(&case_dir, &result).unwrap();
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0].json_line, original_line.trim());
+        assert!(!merged[0].json_line.contains("stale"));
+        assert!(merged[1].json_line.contains(r#""index_status":"stale""#));
+        let _ = fs::remove_dir_all(case_dir);
     }
 
     /// A file that vanished while indexed under BOTH the legacy `\\?\` and

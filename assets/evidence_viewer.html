@@ -202,6 +202,7 @@ __CSS__
     <span class="sep"></span>
     <input id="examinerName" type="text" placeholder="검토자" data-i18n-placeholder="sel.examiner" title="케이스에 반영될 검토자 이름" style="width:84px;height:26px;font-size:11px;">
     <button id="btnApplyMarks" type="button" class="primary" title="판독 마크·태그·메모를 케이스 DB에 반영하고 보고서를 갱신합니다 — 워크스테이션 서버 필요" data-i18n="sel.apply">케이스에 반영</button>
+    <button id="saveState" type="button" class="badge save-state ok" data-state="saved" aria-live="polite" style="cursor:pointer;font-family:inherit;">저장 상태</button>
     <div class="menu">
       <button id="btnExportMenu" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="exportMenuList" data-i18n="menu.export">보내기·복사 ▾</button>
       <div class="menu-list" id="exportMenuList" hidden>
@@ -226,10 +227,13 @@ __CSS__
       <table>
         <tbody>
           <tr><td><code>j</code> / <code>k</code></td><td data-i18n="sc.next">다음 / 이전 증거</td></tr>
-          <tr><td><code>space</code></td><td data-i18n="sc.toggle">현재 증거 선택 토글</td></tr>
+          <tr><td><code>n</code> / <code>shift+n</code></td><td data-i18n="sc.nextUnreviewed">다음 / 이전 미검토 증거</td></tr>
+          <tr><td><code>space</code></td><td data-i18n="sc.play">영상 재생 / 일시정지</td></tr>
+          <tr><td><code>x</code></td><td data-i18n="sc.toggle">현재 증거 선택 토글</td></tr>
           <tr><td><code>enter</code></td><td data-i18n="sc.preview">현재 증거 미리보기</td></tr>
           <tr><td><code>1</code> / <code>2</code> / <code>3</code></td><td data-i18n="sc.mark">현재 증거 판독 완료 / 중요 / 검증 대기 (다음으로 이동)</td></tr>
-          <tr><td><code>0</code></td><td data-i18n="sc.unmark">현재 증거 마크 해제</td></tr>
+          <tr><td><code>0</code></td><td data-i18n="sc.unmarkKeep">현재 증거 마크 해제 (메모는 유지)</td></tr>
+          <tr><td><code>ctrl+z</code> / <code>ctrl+y</code></td><td data-i18n="sc.undo">실행 취소 / 다시 실행 (마크·태그·구간)</td></tr>
           <tr><td><code>ctrl+a</code></td><td data-i18n="sc.selAll">필터 결과 전체 선택</td></tr>
           <tr><td><code>ctrl+d</code></td><td data-i18n="sc.clear">선택 해제</td></tr>
           <tr><td><code>←</code> / <code>→</code></td><td data-i18n="sc.seek">영상 10초 뒤로 / 앞으로</td></tr>

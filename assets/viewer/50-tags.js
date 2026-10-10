@@ -66,13 +66,13 @@ function selectRange(fromId, toId, checked) {
 
 function selectAllFiltered() {
   filteredRecords().forEach(record => state.selectedIds.add(record.id));
-  render();
+  refreshSelectionUi();
   toast(tf("toast.selectedAll", { n: state.selectedIds.size }));
 }
 
 function clearSelection() {
   state.selectedIds.clear();
-  render();
+  refreshSelectionUi();
 }
 
 function targetIds() {
@@ -85,13 +85,13 @@ function applyMark(status) {
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   const stamped = Math.floor(Date.now() / 1000);
   ids.forEach(id => {
-    if (status === null) { delete state.marks[id]; state.notes[id] = ""; }
+    if (status === null) delete state.marks[id];
     else state.marks[id] = { status, marked_unix: stamped };
     // touchAnnotation must run after the mutation — it snapshots the
     // resulting state into the draft that hydration replays on reload.
     touchAnnotation(id);
   });
   storageSet(MARKS_KEY, state.marks);
-  render();
+  requestRender();
   toast(tf("toast.markApplied", { n: ids.length, status: status === null ? t("mark.cleared") : markLabel(status) }));
 }

@@ -330,11 +330,10 @@ pub fn report_defense_check(case_dir: &Path, output_dir: &Path) -> Result<QaRepo
 pub fn performance_report(output_dir: &Path, rows: usize) -> Result<QaReport, String> {
     let result = case_db::benchmark_case_db(output_dir, rows)?;
     let report_path = output_dir.join("performance-report.json");
-    let rows_per_minute = if result.elapsed_ms == 0 {
-        rows as u128 * 60_000
-    } else {
-        rows as u128 * 60_000 / result.elapsed_ms
-    };
+    // elapsed_ms == 0 (sub-millisecond run): report the per-ms rate.
+    let rows_per_minute = (rows as u128 * 60_000)
+        .checked_div(result.elapsed_ms)
+        .unwrap_or(rows as u128 * 60_000);
     let passed = rows_per_minute >= 50_000;
     write_text(
         &report_path,
@@ -406,29 +405,10 @@ pub fn release_readiness_report(
     }));
 
     // The tamper-evident chain is the product's central claim; a release
-    // must not pass readiness with a torn or tampered audit log. Chained
-    // logs live under evidence/logs AND artifacts/*/ (export, batch,
-    // proxy, thumbnail logs all use append_chained_jsonl), so sweep the
-    // case tree and keep files whose first entry carries the chain schema.
+    // must not pass readiness with a torn, tampered, truncated or deleted
+    // audit log. See `audit_chain_check`.
     checks.push(run_release_check("audit_chain", || {
-        let mut logs = Vec::new();
-        collect_chained_logs(case_dir, &mut logs);
-        if logs.is_empty() {
-            return Err("no chained audit logs found in the case".to_string());
-        }
-        let mut verified = 0usize;
-        for log in &logs {
-            crate::audit::verify_chained_jsonl(log)
-                .map_err(|err| format!("{}: {}", log.display(), err))?;
-            verified += 1;
-        }
-        let report_path = output_dir.join("audit-chain-report.txt");
-        write_text(
-            &report_path,
-            &format!("audit chain verification PASS: {verified} log(s) intact\n"),
-        )
-        .map_err(|err| format!("failed to write audit chain report: {err}"))?;
-        Ok(report_path)
+        audit_chain_check(case_dir, output_dir)
     }));
 
     // The SQLite index and the JSONL compatibility artifact describe the
@@ -477,9 +457,155 @@ impl ReleaseCheck {
     }
 }
 
-/// Collects every hash-chained audit log in the case: any *.jsonl whose
-/// first non-empty line contains the chain's `previous_entry_sha256`
-/// marker. Plain data files (db/videos.jsonl, fls entries) are skipped.
+/// File name of the chain-head anchors written next to the QA report. Each
+/// run compares against the previous run's anchors so a deleted lane or a
+/// log truncated from the end (which still verifies structurally) fails.
+const AUDIT_ANCHORS_FILE: &str = "audit-chain-anchors.json";
+
+/// Verifies every audit lane in the case and anchors their heads.
+///
+/// - Every `*log.jsonl` is a lane, whatever its first line holds — an
+///   unparseable or unchained first line FAILS instead of being skipped.
+///   Other `*.jsonl` files are lanes when their first line carries the
+///   chain marker.
+/// - An empty lane fails (a chained log is never created empty).
+/// - Lanes recorded in a previous run's anchors must still exist and must
+///   not have fewer entries; with the same entry count the head must match.
+fn audit_chain_check(case_dir: &Path, output_dir: &Path) -> Result<PathBuf, String> {
+    let mut logs = Vec::new();
+    collect_chained_logs(case_dir, &mut logs);
+    if logs.is_empty() {
+        return Err("no chained audit logs found in the case".to_string());
+    }
+    let anchors_path = output_dir.join(AUDIT_ANCHORS_FILE);
+    let previous: HashMap<String, (usize, String)> = read_to_string(&anchors_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("lanes").and_then(|l| l.as_object()).cloned())
+        .map(|lanes| {
+            lanes
+                .into_iter()
+                .filter_map(|(name, lane)| {
+                    let entries = lane.get("entries")?.as_u64()? as usize;
+                    let head = lane.get("head")?.as_str()?.to_string();
+                    Some((name, (entries, head)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut failures = Vec::new();
+    let mut lanes = serde_json::Map::new();
+    let mut lines = Vec::new();
+    let mut warnings = Vec::new();
+    for log in &logs {
+        let rel = log
+            .strip_prefix(case_dir)
+            .unwrap_or(log)
+            .to_string_lossy()
+            .replace('\\', "/");
+        match crate::audit::verify_chained_jsonl(log) {
+            // A zero-byte lane nobody has anchored yet was created but never
+            // written (e.g. a log opened before its first event): warn, don't
+            // fail. Once an anchor recorded entries, emptiness is truncation.
+            Ok(result)
+                if result.entries == 0
+                    && !previous.contains_key(&rel)
+                    && fs::metadata(log).map(|m| m.len() == 0).unwrap_or(false) =>
+            {
+                warnings.push(format!("{rel}\tWARNING: empty (never written)"));
+            }
+            Ok(result) if result.entries == 0 => {
+                failures.push(format!("{rel}: lane is empty (truncated?)"));
+            }
+            Ok(result) => {
+                if let Some((prev_entries, prev_head)) = previous.get(&rel) {
+                    if result.entries < *prev_entries {
+                        failures.push(format!(
+                            "{rel}: entry count dropped from {prev_entries} to {} since the last anchor (truncated?)",
+                            result.entries
+                        ));
+                    } else if result.entries == *prev_entries
+                        && &result.last_entry_sha256 != prev_head
+                    {
+                        failures.push(format!(
+                            "{rel}: chain head changed without new entries since the last anchor"
+                        ));
+                    }
+                }
+                lines.push(format!(
+                    "{rel}\tentries={}\thead={}\t{}",
+                    result.entries,
+                    result.last_entry_sha256,
+                    result.integrity.label()
+                ));
+                lanes.insert(
+                    rel,
+                    serde_json::json!({
+                        "entries": result.entries,
+                        "head": result.last_entry_sha256,
+                        "integrity": result.integrity.label(),
+                    }),
+                );
+            }
+            Err(err) => failures.push(format!("{rel}: {err}")),
+        }
+    }
+    let mut missing: Vec<&String> = previous
+        .keys()
+        .filter(|name| {
+            !logs.iter().any(|log| {
+                log.strip_prefix(case_dir)
+                    .unwrap_or(log)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    == **name
+            })
+        })
+        .collect();
+    missing.sort();
+    for name in missing {
+        failures.push(format!(
+            "{name}: lane recorded in the last anchor is missing (deleted?)"
+        ));
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "audit chain verification FAIL: {}",
+            failures.join("; ")
+        ));
+    }
+    // Only a passing run advances the anchors; a failing run must not
+    // overwrite the evidence of what the chain looked like before.
+    write_text(
+        &anchors_path,
+        &serde_json::to_string_pretty(&serde_json::json!({ "lanes": lanes }))
+            .unwrap_or_else(|_| "{}".to_string()),
+    )
+    .map_err(|err| format!("failed to write audit chain anchors: {err}"))?;
+    let report_path = output_dir.join("audit-chain-report.txt");
+    write_text(
+        &report_path,
+        &format!(
+            "audit chain verification PASS: {} log(s) intact\n{}\n",
+            lines.len(),
+            lines
+                .iter()
+                .chain(warnings.iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .map_err(|err| format!("failed to write audit chain report: {err}"))?;
+    Ok(report_path)
+}
+
+/// Collects every audit lane in the case: every `*log.jsonl` (verified
+/// regardless of content, so a tampered first line cannot hide a lane),
+/// plus any other *.jsonl whose first non-empty line carries the chain's
+/// `previous_entry_sha256` marker. Plain data files (db/videos.jsonl, fls
+/// entries) are skipped.
 fn collect_chained_logs(case_dir: &Path, out: &mut Vec<PathBuf>) {
     let mut stack = vec![case_dir.join("evidence"), case_dir.join("artifacts")];
     while let Some(dir) = stack.pop() {
@@ -490,10 +616,22 @@ fn collect_chained_logs(case_dir: &Path, out: &mut Vec<PathBuf>) {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-                && let Ok(text) = read_to_string(&path)
-                && let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty())
-                && first.contains("previous_entry_sha256")
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let is_log_lane = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("log.jsonl"));
+            if is_log_lane
+                || read_to_string(&path).is_ok_and(|text| {
+                    text.lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .is_some_and(|first| first.contains("previous_entry_sha256"))
+                })
             {
                 out.push(path);
             }
@@ -680,9 +818,93 @@ fn simple_html_report(title: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        accuracy_report, consistency_report, normalize_stale_timestamps, read_indexed_evidence,
+        accuracy_report, audit_chain_check, consistency_report, normalize_stale_timestamps,
+        read_indexed_evidence,
     };
     use std::fs;
+
+    #[test]
+    fn audit_chain_check_fails_on_tampered_first_line_truncation_and_deletion() {
+        let root =
+            std::env::temp_dir().join(format!("frametrace-qa-audit-lanes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let case_dir = root.join("case");
+        let out = root.join("qa");
+        fs::create_dir_all(&out).unwrap();
+        let lane_a = case_dir.join("evidence/logs/anomaly-log.jsonl");
+        let lane_b = case_dir.join("artifacts/clips/export-log.jsonl");
+        for body in [r#"{"k":"1"}"#, r#"{"k":"2"}"#] {
+            crate::audit::append_chained_jsonl_keyed(&lane_a, body, None).unwrap();
+            crate::audit::append_chained_jsonl_keyed(&lane_b, body, None).unwrap();
+        }
+        // Baseline passes and records anchors with both lanes.
+        let report = audit_chain_check(&case_dir, &out).unwrap();
+        let text = fs::read_to_string(report).unwrap();
+        assert!(text.contains("anomaly-log.jsonl") && text.contains("entries=2"));
+        assert!(out.join(super::AUDIT_ANCHORS_FILE).is_file());
+
+        // Truncating the last entry still verifies structurally, but the
+        // anchor catches the dropped count.
+        let original_b = fs::read_to_string(&lane_b).unwrap();
+        let first_line = format!("{}\n", original_b.lines().next().unwrap());
+        fs::write(&lane_b, &first_line).unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("entry count dropped"), "{err}");
+
+        // Deleting a lane fails against the anchor.
+        fs::remove_file(&lane_b).unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+        fs::write(&lane_b, &original_b).unwrap();
+        audit_chain_check(&case_dir, &out).unwrap();
+
+        // A *log.jsonl whose first line is not chained is a failing lane,
+        // not a silently skipped file.
+        let original_a = fs::read_to_string(&lane_a).unwrap();
+        fs::write(&lane_a, "garbage\n").unwrap();
+        assert!(audit_chain_check(&case_dir, &out).is_err());
+        // An empty lane fails too.
+        fs::write(&lane_a, "").unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        fs::write(&lane_a, &original_a).unwrap();
+        audit_chain_check(&case_dir, &out).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audit_chain_check_warns_on_never_written_empty_lane() {
+        let root = std::env::temp_dir().join(format!(
+            "frametrace-qa-audit-empty-lane-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let case_dir = root.join("case");
+        let out = root.join("qa");
+        fs::create_dir_all(&out).unwrap();
+        let lane_a = case_dir.join("evidence/logs/anomaly-log.jsonl");
+        crate::audit::append_chained_jsonl_keyed(&lane_a, r#"{"k":"1"}"#, None).unwrap();
+        // A zero-byte lane with no anchor history: created, never written.
+        let empty = case_dir.join("artifacts/clips/export-log.jsonl");
+        fs::create_dir_all(empty.parent().unwrap()).unwrap();
+        fs::write(&empty, "").unwrap();
+        let report = audit_chain_check(&case_dir, &out).unwrap();
+        let text = fs::read_to_string(report).unwrap();
+        assert!(text.contains("PASS: 1 log(s) intact"), "{text}");
+        assert!(
+            text.contains("export-log.jsonl\tWARNING: empty (never written)"),
+            "{text}"
+        );
+        // Still passes on rerun (the empty lane was not anchored).
+        audit_chain_check(&case_dir, &out).unwrap();
+        // Once written and anchored, emptying it again is truncation.
+        crate::audit::append_chained_jsonl_keyed(&empty, r#"{"k":"1"}"#, None).unwrap();
+        audit_chain_check(&case_dir, &out).unwrap();
+        fs::write(&empty, "").unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("empty (truncated?)"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn accuracy_report_passes_for_matching_manifest() {

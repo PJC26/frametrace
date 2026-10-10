@@ -472,10 +472,9 @@ mod tests {
     fn temp_dir() -> PathBuf {
         // Root under the OS temp dir — a relative base would litter the
         // repo root with `deepfake-test*` dirs on every `cargo test` run.
-        crate::util::unique_dir(&std::env::temp_dir().join(format!(
-            "frametrace-deepfake-test-{}",
-            std::process::id()
-        )))
+        crate::util::unique_dir(
+            &std::env::temp_dir().join(format!("frametrace-deepfake-test-{}", std::process::id())),
+        )
     }
 
     /// A real executable masquerading as `deepfake-lens.exe` so

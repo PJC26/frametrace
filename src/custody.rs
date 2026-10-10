@@ -3,9 +3,16 @@
 //! Produces `reports/custody-statement.html` — a print-friendly document
 //! an examiner can hand to opposing counsel or a court together with the
 //! case package. It records the case identity, every registered evidence
-//! source (with acquisition metadata), the full job ledger, and the
-//! verification status of each chained audit log — verified live at
-//! generation time, never restated from a cached claim.
+//! source (with acquisition metadata and what was observed on disk at
+//! generation time), the full job ledger, and the verification status of
+//! each chained audit log — re-verified at generation time, never restated
+//! from a cached claim.
+//!
+//! The statement only claims what it actually checked: audit lanes are
+//! re-verified, evidence sources are re-stat'ed (presence/size), but
+//! original evidence is NOT re-hashed here, so the wording never asserts
+//! that originals are unmodified. A database that cannot be read is shown
+//! as an error, never as "no sources".
 //!
 //! The statement deliberately distinguishes original evidence from
 //! derived work products (proxies, clips, thumbnails, carved candidates)
@@ -39,12 +46,14 @@ pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
         .unwrap_or(serde_json::Value::Null);
     let sources = load_evidence_sources(case_dir);
     let jobs = load_jobs(case_dir);
+    let coverage = load_hash_coverage(case_dir);
     let logs = verify_audit_logs(case_dir);
     let html = render(
         case_dir,
         &manifest,
         &sources,
         &jobs,
+        &coverage,
         &logs,
         generated_unix as i64,
     );
@@ -63,6 +72,15 @@ struct SourceRow {
     write_protect: Option<String>,
     acquisition_tool: Option<String>,
     evidence_hash: Option<String>,
+    /// What a re-stat of `path` observed at statement generation time.
+    observed: String,
+}
+
+/// Indexed-file hash coverage from the `videos` table.
+struct HashCoverage {
+    total: i64,
+    hashed: i64,
+    errors: i64,
 }
 
 struct JobRow {
@@ -85,62 +103,101 @@ struct LogRow {
     result: Result<audit::AuditChainVerification, String>,
 }
 
-fn load_evidence_sources(case_dir: &Path) -> Vec<SourceRow> {
+/// Opens the case DB read-only, distinguishing "no database" from
+/// "database unreadable" so neither renders as an empty table.
+fn open_case_db_for_statement(case_dir: &Path) -> Result<rusqlite::Connection, String> {
     let db = case_db::case_db_path(case_dir);
-    let Ok(conn) = case_db::open_readonly_case_db(&db) else {
-        return Vec::new();
-    };
-    let mut stmt = match conn.prepare(
-        "SELECT source_id, kind, path, registered_unix, write_protect,
-                acquisition_tool, evidence_hash
-         FROM evidence_sources ORDER BY registered_unix ASC",
-    ) {
-        Ok(stmt) => stmt,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map([], |row| {
-        Ok(SourceRow {
-            source_id: row.get(0)?,
-            kind: row.get(1)?,
-            path: row.get(2)?,
-            registered_unix: row.get(3)?,
-            write_protect: row.get(4)?,
-            acquisition_tool: row.get(5)?,
-            evidence_hash: row.get(6)?,
-        })
-    })
-    .map(|rows| rows.flatten().collect())
-    .unwrap_or_default()
+    if !db.is_file() {
+        return Err(format!("case database not found: {}", db.display()));
+    }
+    case_db::open_readonly_case_db(&db)
 }
 
-fn load_jobs(case_dir: &Path) -> Vec<JobRow> {
-    let db = case_db::case_db_path(case_dir);
-    let Ok(conn) = case_db::open_readonly_case_db(&db) else {
-        return Vec::new();
-    };
-    let mut stmt = match conn.prepare(
-        "SELECT job_id, job_type, status, subject_path, started_unix,
+fn observe_path(path: &str) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => format!("present (file, {} bytes)", meta.len()),
+        Ok(meta) if meta.is_dir() => "present (directory)".to_string(),
+        Ok(_) => "present (other)".to_string(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            "not reachable at statement time".to_string()
+        }
+        Err(err) => format!("not readable: {err}"),
+    }
+}
+
+fn load_evidence_sources(case_dir: &Path) -> Result<Vec<SourceRow>, String> {
+    let conn = open_case_db_for_statement(case_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT source_id, kind, path, registered_unix, write_protect,
+                acquisition_tool, evidence_hash
+         FROM evidence_sources ORDER BY registered_unix ASC",
+        )
+        .map_err(|err| format!("failed to query evidence sources: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let path: String = row.get(2)?;
+            Ok(SourceRow {
+                source_id: row.get(0)?,
+                kind: row.get(1)?,
+                observed: observe_path(&path),
+                path,
+                registered_unix: row.get(3)?,
+                write_protect: row.get(4)?,
+                acquisition_tool: row.get(5)?,
+                evidence_hash: row.get(6)?,
+            })
+        })
+        .map_err(|err| format!("failed to query evidence sources: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read evidence source row: {err}"))
+}
+
+fn load_jobs(case_dir: &Path) -> Result<Vec<JobRow>, String> {
+    let conn = open_case_db_for_statement(case_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT job_id, job_type, status, subject_path, started_unix,
                 completed_unix, total_units, completed_units, error
          FROM jobs ORDER BY started_unix ASC",
-    ) {
-        Ok(stmt) => stmt,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map([], |row| {
-        Ok(JobRow {
-            job_id: row.get(0)?,
-            job_type: row.get(1)?,
-            status: row.get(2)?,
-            subject_path: row.get(3)?,
-            started_unix: row.get(4)?,
-            completed_unix: row.get(5)?,
-            total_units: row.get(6)?,
-            completed_units: row.get(7)?,
-            error: row.get(8)?,
+        )
+        .map_err(|err| format!("failed to query jobs: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(JobRow {
+                job_id: row.get(0)?,
+                job_type: row.get(1)?,
+                status: row.get(2)?,
+                subject_path: row.get(3)?,
+                started_unix: row.get(4)?,
+                completed_unix: row.get(5)?,
+                total_units: row.get(6)?,
+                completed_units: row.get(7)?,
+                error: row.get(8)?,
+            })
         })
-    })
-    .map(|rows| rows.flatten().collect())
-    .unwrap_or_default()
+        .map_err(|err| format!("failed to query jobs: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read job row: {err}"))
+}
+
+fn load_hash_coverage(case_dir: &Path) -> Result<HashCoverage, String> {
+    let conn = open_case_db_for_statement(case_dir)?;
+    conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN sha256 IS NOT NULL AND sha256 <> '' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN hash_status IN ('error', 'changed-during-hash') THEN 1 ELSE 0 END), 0)
+         FROM videos",
+        [],
+        |row| {
+            Ok(HashCoverage {
+                total: row.get(0)?,
+                hashed: row.get(1)?,
+                errors: row.get(2)?,
+            })
+        },
+    )
+    .map_err(|err| format!("failed to read indexed file hash coverage: {err}"))
 }
 
 fn verify_audit_logs(case_dir: &Path) -> Vec<LogRow> {
@@ -219,8 +276,9 @@ fn ts(unix: i64) -> String {
 fn render(
     case_dir: &Path,
     manifest: &serde_json::Value,
-    sources: &[SourceRow],
-    jobs: &[JobRow],
+    sources: &Result<Vec<SourceRow>, String>,
+    jobs: &Result<Vec<JobRow>, String>,
+    coverage: &Result<HashCoverage, String>,
     logs: &[LogRow],
     generated_unix: i64,
 ) -> String {
@@ -235,24 +293,78 @@ fn render(
     let generated = ts(generated_unix);
 
     let mut src_rows = String::new();
-    for s in sources {
-        src_rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td class=path>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=hash>{}</td></tr>\n",
-            esc(&s.source_id),
-            esc(&s.kind),
-            esc(&s.path),
-            ts(s.registered_unix),
-            opt(&s.write_protect),
-            opt(&s.acquisition_tool),
-            opt(&s.evidence_hash),
-        ));
-    }
-    if sources.is_empty() {
-        src_rows
-            .push_str("<tr><td colspan=7 class=empty>No evidence sources registered.</td></tr>\n");
+    let mut db_error: Option<String> = None;
+    match sources {
+        Ok(sources) => {
+            for s in sources {
+                src_rows.push_str(&format!(
+                    "<tr><td>{}</td><td>{}</td><td class=path>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=hash>{}</td><td>{}</td></tr>\n",
+                    esc(&s.source_id),
+                    esc(&s.kind),
+                    esc(&s.path),
+                    ts(s.registered_unix),
+                    opt(&s.write_protect),
+                    opt(&s.acquisition_tool),
+                    opt(&s.evidence_hash),
+                    esc(&s.observed),
+                ));
+            }
+            if sources.is_empty() {
+                src_rows.push_str(
+                    "<tr><td colspan=8 class=empty>No evidence sources registered.</td></tr>\n",
+                );
+            }
+        }
+        Err(err) => {
+            db_error = Some(err.clone());
+            src_rows.push_str(&format!(
+                "<tr><td colspan=8 class=bad>Case database unreadable — evidence sources could not be listed: {}</td></tr>\n",
+                esc(err)
+            ));
+        }
     }
 
+    let coverage_line = match coverage {
+        Ok(c) if c.total == 0 => {
+            "<p class=note>Indexed files: none recorded in the case database.</p>".to_string()
+        }
+        Ok(c) => {
+            let class = if c.hashed < c.total { "bad" } else { "ok" };
+            let errors = if c.errors > 0 {
+                format!(" ({} hash error(s))", c.errors)
+            } else {
+                String::new()
+            };
+            format!(
+                "<p class=\"note {class}\">Indexed files with a recorded SHA-256: {} of {}{errors}. Files without a recorded hash have no integrity value in this case.</p>",
+                c.hashed, c.total
+            )
+        }
+        Err(err) => {
+            if db_error.is_none() {
+                db_error = Some(err.clone());
+            }
+            format!(
+                "<p class=\"note bad\">Indexed file hash coverage unavailable: {}</p>",
+                esc(err)
+            )
+        }
+    };
+
     let mut job_rows = String::new();
+    let jobs = match jobs {
+        Ok(jobs) => jobs.as_slice(),
+        Err(err) => {
+            if db_error.is_none() {
+                db_error = Some(err.clone());
+            }
+            job_rows.push_str(&format!(
+                "<tr><td colspan=7 class=bad>Case database unreadable — job ledger could not be listed: {}</td></tr>\n",
+                esc(err)
+            ));
+            &[]
+        }
+    };
     for j in jobs {
         let units = match j.total_units {
             Some(t) => format!("{}/{}", j.completed_units, t),
@@ -273,26 +385,39 @@ fn render(
             esc(&units),
         ));
     }
-    if jobs.is_empty() {
+    if jobs.is_empty() && job_rows.is_empty() {
         job_rows.push_str("<tr><td colspan=7 class=empty>No jobs recorded.</td></tr>\n");
     }
 
     let mut log_rows = String::new();
     let mut verified = 0usize;
+    let mut structural_only = 0usize;
     let mut broken = 0usize;
     for l in logs {
         match &l.result {
             Ok(v) => {
                 verified += 1;
-                let caveat = if v.warnings.is_empty() {
+                let keyed = v.integrity == audit::AuditIntegrity::Keyed;
+                if !keyed {
+                    structural_only += 1;
+                }
+                let mut notes = v.warnings.clone();
+                if !keyed {
+                    notes.push(
+                        "structural only: detects partial edits, not a full rewrite by someone with file access"
+                            .to_string(),
+                    );
+                }
+                let caveat = if notes.is_empty() {
                     String::new()
                 } else {
-                    format!(" — {}", esc(&v.warnings.join("; ")))
+                    format!(" — {}", esc(&notes.join("; ")))
                 };
                 log_rows.push_str(&format!(
-                    "<tr><td class=path>{}</td><td>{}</td><td class=ok>{}</td><td class=hash>{}</td><td>{}{}</td></tr>\n",
+                    "<tr><td class=path>{}</td><td>{}</td><td class={}>{}</td><td class=hash>{}</td><td>{}{}</td></tr>\n",
                     esc(&l.rel_path),
                     v.entries,
+                    if keyed { "ok" } else { "warn" },
                     v.integrity.label(),
                     esc(&v.last_entry_sha256[..v.last_entry_sha256.len().min(16)]),
                     v.keyed_entries,
@@ -313,13 +438,25 @@ fn render(
         log_rows.push_str("<tr><td colspan=5 class=empty>No chained audit logs found.</td></tr>\n");
     }
 
-    let integrity_banner = if broken > 0 {
-        "<p class=banner bad>WARNING: one or more audit lanes failed verification — inspect the ledger below before relying on this package.</p>"
+    let mut integrity_banner = if broken > 0 {
+        "<p class=\"banner bad\">WARNING: one or more audit lanes failed verification — inspect the ledger below before relying on this package.</p>".to_string()
+    } else if verified > 0 && structural_only > 0 {
+        format!(
+            "<p class=\"banner warn\">Audit lanes re-checked at statement generation time: {verified} observed internally consistent; {structural_only} of them are structural-only (unsigned) and are not tamper-proof against a complete rewrite.</p>"
+        )
     } else if verified > 0 {
-        "<p class=banner ok>All discovered chained audit logs verified structurally at statement generation time.</p>"
+        format!(
+            "<p class=\"banner ok\">Audit lanes re-checked at statement generation time: all {verified} observed consistent with HMAC verification against a configured key.</p>"
+        )
     } else {
-        "<p class=banner>No chained audit logs were present to verify.</p>"
+        "<p class=banner>No chained audit logs were present to verify.</p>".to_string()
     };
+    if let Some(err) = &db_error {
+        integrity_banner.push_str(&format!(
+            "\n<p class=\"banner bad\">Case database unreadable: {} — sections 2 and 3 are incomplete.</p>",
+            esc(err)
+        ));
+    }
 
     format!(
         r#"<!DOCTYPE html>
@@ -337,16 +474,20 @@ td.hash {{ font-family: Consolas, monospace; font-size: 11px; }}
 td.empty {{ color: #888; font-style: italic; }}
 td.ok {{ color: #1d7a38; }}
 td.bad, p.banner.bad {{ color: #b3261e; }}
+td.warn, p.note.warn {{ color: #8a5a00; }}
+p.note.bad {{ color: #b3261e; font-weight: 600; }}
+p.note.ok {{ color: #1d7a38; }}
 p.banner {{ padding: 10px 14px; border-radius: 6px; font-weight: 600; }}
 p.banner.ok {{ background: #e6f4ea; color: #1d7a38; }}
 p.banner.bad {{ background: #fce8e6; }}
-p.banner:not(.ok):not(.bad) {{ background: #f1f3f4; color: #444; }}
+p.banner.warn {{ background: #fff4e0; color: #8a5a00; }}
+p.banner:not(.ok):not(.bad):not(.warn) {{ background: #f1f3f4; color: #444; }}
 .meta td:first-child {{ font-weight: 600; width: 200px; background: #f7f9fb; }}
 .note {{ font-size: 12px; color: #555; }}
 @media print {{ body {{ margin: 0; }} }}
 </style></head><body>
 <h1>Chain of Custody Statement</h1>
-<p class=note>Generated {generated} by FrameTrace — verified live at generation time. Print to PDF for submission if required.</p>
+<p class=note>Generated {generated} by FrameTrace. At generation time the audit lanes in section 4 were re-verified and the evidence source paths in section 2 were re-stat'ed (presence/size only); original evidence was not re-hashed by this statement. Print to PDF for submission if required.</p>
 {integrity_banner}
 <h2>1. Case Identity</h2>
 <table class=meta>
@@ -359,8 +500,9 @@ p.banner:not(.ok):not(.bad) {{ background: #f1f3f4; color: #444; }}
 <tr><td>Case directory</td><td class=path>{case_dir_disp}</td></tr>
 </table>
 <h2>2. Evidence Sources</h2>
-<table><tr><th>Source ID</th><th>Kind</th><th>Path</th><th>Registered (UTC)</th><th>Write-protect</th><th>Acquisition tool</th><th>Evidence hash</th></tr>
+<table><tr><th>Source ID</th><th>Kind</th><th>Path</th><th>Registered (UTC)</th><th>Write-protect</th><th>Acquisition tool</th><th>Evidence hash (as recorded, not re-verified)</th><th>Observed at generation</th></tr>
 {src_rows}</table>
+{coverage_line}
 <h2>3. Processing Ledger</h2>
 <table><tr><th>Job ID</th><th>Type</th><th>Status</th><th>Subject</th><th>Started (UTC)</th><th>Completed (UTC)</th><th>Units</th></tr>
 {job_rows}</table>
@@ -368,15 +510,19 @@ p.banner:not(.ok):not(.bad) {{ background: #f1f3f4; color: #444; }}
 <table><tr><th>Log</th><th>Entries</th><th>Integrity</th><th>Last entry SHA-256</th><th>Keyed</th></tr>
 {log_rows}</table>
 <h2>5. Scope Statement</h2>
-<p>Original evidence files registered in section 2 were not modified by this tool: all derived
+<p>FrameTrace is designed to open registered evidence read-only and to write all derived
 outputs (proxies, clips, thumbnails, carved candidates, recovered entries, telemetry reports)
-are work products written under the case directory and logged to the chained audit lanes in
-section 4. Carved and recovered items are candidates produced by signature/filesystem analysis
-and must not be represented as authenticated originals. Hash verification of any packaged file
-can be performed against <code>manifest.sha256</code> / <code>package-manifest.json</code>.</p>
+as work products under the case directory, logged to the chained audit lanes in section 4.
+This statement does not by itself establish that original evidence is unchanged: it did not
+re-hash the sources in section 2. To support that claim, re-hash each source and compare it with
+the recorded evidence hash and with the indexed SHA-256 values. Carved and recovered items are
+candidates produced by heuristic signature/filesystem analysis and must not be represented as
+authenticated originals. Hash verification of any packaged file can be performed against
+<code>manifest.sha256</code> / <code>package-manifest.json</code>.</p>
 <p class=note>Integrity labels: <code>integrity-keyed</code> = every entry HMAC-verified against a
-configured key; <code>integrity-structural-only</code> = hash-chain structure verified but entries
-are unsigned or unauthenticated. A failed lane is disclosed in section 4 rather than omitted.</p>
+configured key; <code>integrity-structural-only</code> = hash-chain structure observed consistent but
+entries are unsigned or unauthenticated, so a complete rewrite of the log by someone with file
+access would not be detected. A failed lane is disclosed in section 4 rather than omitted.</p>
 </body></html>"#,
         case_id = field("case_id"),
         title = field("title"),
@@ -402,6 +548,120 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ft-custody-{}", now_unix().unwrap()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(generate(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ok_lane(integrity: audit::AuditIntegrity) -> LogRow {
+        LogRow {
+            rel_path: "evidence/logs/anomaly-log.jsonl".to_string(),
+            result: Ok(audit::AuditChainVerification {
+                entries: 2,
+                last_entry_sha256: "ab".repeat(32),
+                keyed_entries: 0,
+                unauthenticated_keyed_entries: 0,
+                integrity,
+                warnings: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn statement_never_overclaims_and_marks_structural_lanes_amber() {
+        let html = render(
+            Path::new("/case"),
+            &serde_json::json!({"case_id": "FT-1"}),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &Ok(HashCoverage {
+                total: 4,
+                hashed: 3,
+                errors: 1,
+            }),
+            &[ok_lane(audit::AuditIntegrity::StructuralOnly)],
+            1_704_110_400,
+        );
+        assert!(!html.contains("were not modified"));
+        assert!(!html.contains("verified live"));
+        assert!(html.contains("not re-hashed"));
+        assert!(html.contains("banner warn"));
+        assert!(html.contains("class=warn>integrity-structural-only"));
+        assert!(html.contains("3 of 4"));
+        assert!(html.contains("1 hash error"));
+        assert!(html.contains("No evidence sources registered."));
+    }
+
+    #[test]
+    fn unreadable_database_is_shown_as_error_not_empty() {
+        let err = || Err::<Vec<SourceRow>, String>("disk I/O error".to_string());
+        let html = render(
+            Path::new("/case"),
+            &serde_json::Value::Null,
+            &err(),
+            &Err("disk I/O error".to_string()),
+            &Err("disk I/O error".to_string()),
+            &[ok_lane(audit::AuditIntegrity::Keyed)],
+            1_704_110_400,
+        );
+        assert!(!html.contains("No evidence sources registered."));
+        assert!(!html.contains("No jobs recorded."));
+        assert!(html.contains("Case database unreadable"));
+        assert!(html.contains("disk I/O error"));
+        assert!(html.contains("banner ok"));
+        assert!(html.contains("banner bad"));
+    }
+
+    #[test]
+    fn generate_without_db_reports_missing_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-custody-nodb-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("case.json"), r#"{"case_id":"FT-X"}"#).unwrap();
+        let out = generate(&dir).unwrap();
+        let html = std::fs::read_to_string(out).unwrap();
+        assert!(html.contains("case database not found"));
+        assert!(!html.contains("No evidence sources registered."));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observe_path_reports_presence() {
+        let file = std::env::temp_dir().join(format!("ft-custody-obs-{}", std::process::id()));
+        std::fs::write(&file, b"abc").unwrap();
+        assert_eq!(
+            observe_path(file.to_str().unwrap()),
+            "present (file, 3 bytes)"
+        );
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            observe_path(file.to_str().unwrap()),
+            "not reachable at statement time"
+        );
+    }
+
+    #[test]
+    fn hash_coverage_counts_changed_during_hash_as_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-custody-coverage-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(case_db::case_db_path(&dir)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE videos (sha256 TEXT, hash_status TEXT NOT NULL);
+                 INSERT INTO videos VALUES ('ab', 'ok'), (NULL, 'error'),
+                     (NULL, 'changed-during-hash'), (NULL, 'skipped');",
+            )
+            .unwrap();
+        }
+        let coverage = load_hash_coverage(&dir).unwrap();
+        assert_eq!(coverage.total, 4);
+        assert_eq!(coverage.hashed, 1);
+        assert_eq!(coverage.errors, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

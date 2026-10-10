@@ -99,10 +99,15 @@ pub(crate) struct JobState {
     /// marker so a spoofed `"app":"frametrace"` string on the probe port
     /// range can no longer impersonate the workstation.
     pub(crate) instance: String,
-    /// Parsed video_index.json cache for /api/records: (path, mtime,
-    /// value). A large index re-parses only when the file actually
-    /// changes, not on every page fetch.
-    pub(crate) index_cache: Option<(PathBuf, SystemTime, serde_json::Value)>,
+    /// Parsed video_index.json cache shared by /api/records and
+    /// /api/records-meta. A large index re-parses only when the file
+    /// actually changes; handlers clone the `Arc` (not the document) and
+    /// release the state lock before filtering (PERF-01).
+    pub(crate) index_cache: Option<IndexCache>,
+    /// Non-fatal step failures from the last pipeline run (FOR-08):
+    /// `(step index, message)`. Surfaced as `warnings` in /api/status so a
+    /// skipped validation/anomaly pass is never mistaken for a clean run.
+    pub(crate) warnings: Vec<(usize, String)>,
     /// True when the current case binding came from the startup
     /// workstation-session file rather than an explicit user action.
     /// The UI pauses its auto-jump to the review stage and offers
@@ -130,6 +135,7 @@ impl JobState {
             shutdown_requested: false,
             instance: new_instance_id(),
             index_cache: None,
+            warnings: Vec::new(),
             restored: false,
         }
     }
@@ -152,6 +158,9 @@ pub(crate) fn try_acquire_busy(state: &SharedState) -> Result<BusyGuard<'_>, Str
         return Err("분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.".to_string());
     }
     guard.busy = true;
+    // UX-07: a cancel aimed at a previous job must not kill this one —
+    // every run starts with a fresh cancel flag.
+    guard.cancel_requested = false;
     Ok(BusyGuard { state })
 }
 
@@ -176,6 +185,14 @@ pub(crate) fn new_instance_id() -> String {
         return String::new();
     }
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Cached parse of `db/video_index.json`, keyed by path + mtime + length.
+pub(crate) struct IndexCache {
+    pub(crate) path: PathBuf,
+    pub(crate) mtime: SystemTime,
+    pub(crate) len: u64,
+    pub(crate) value: Arc<serde_json::Value>,
 }
 
 pub(crate) type SharedState = Arc<Mutex<JobState>>;

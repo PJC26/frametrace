@@ -900,19 +900,28 @@ mod tests {
 
     #[test]
     fn carve_report_renders_summary_and_absolutizes_relative_paths() {
-        let dir = std::env::temp_dir().join(format!("ft-carve-report-{}", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("ft-carve-report-{}-{}", std::process::id(), unique));
         let carved = dir.join("artifacts/carved");
         std::fs::create_dir_all(&carved).unwrap();
         std::fs::write(carved.join("carve_1_00001000.avi"), b"x").unwrap();
-        // Relative-to-cwd-style path: <case-name>\artifacts/carved\file —
-        // resolved via the case-parent candidate.
-        let rel = format!(
-            "{}\\artifacts/carved\\carve_1_00001000.avi",
-            dir.file_name().unwrap().to_str().unwrap()
-        );
+        // Relative-to-cwd-style path: <case-name>/artifacts/carved/file,
+        // resolved via the case-parent candidate. Windows logs mix `\` and
+        // `/`; on Unix `\` is not a separator, so the fixture uses the
+        // platform's own separator to exercise the same resolution branch.
+        let case_name = dir.file_name().unwrap().to_str().unwrap();
+        let rel = if cfg!(windows) {
+            format!("{case_name}\\artifacts/carved\\carve_1_00001000.avi")
+        } else {
+            format!("{case_name}/artifacts/carved/carve_1_00001000.avi")
+        };
         let carve_log = format!(
-            "{{\"id\":\"carve_1\",\"extension\":\"avi\",\"offset\":4096,\"size_bytes\":1,\"output_path\":\"{}\",\"sha256\":\"aa\",\"validation_status\":\"candidate-unvalidated\"}}\n",
-            rel.replace('\\', "\\\\")
+            "{{\"id\":\"carve_1\",\"extension\":\"avi\",\"offset\":4096,\"size_bytes\":1,\"output_path\":{},\"sha256\":\"aa\",\"validation_status\":\"candidate-unvalidated\"}}\n",
+            serde_json::to_string(&rel).unwrap()
         );
         let html = render_carve_report_html(
             r#"{"case_id":"FT-C"}"#,
@@ -925,15 +934,26 @@ mod tests {
         assert!(html.contains("carve_1"));
         assert!(html.contains("카빙 결과"));
         assert!(html.contains("CASE_ROOT"));
-        // The relative path was resolved to an absolute one — assert the
-        // serialized output_path carries a drive-qualified prefix.
-        let drive = dir
-            .components()
-            .next()
-            .and_then(|c| c.as_os_str().to_str())
-            .unwrap_or("C:")
-            .to_string();
-        assert!(html.contains(&format!("\"output_path\":\"{}\\\\", drive)));
+        // The relative path was resolved to the absolute case-parent
+        // candidate; compare against the platform-resolved PathBuf.
+        let expected = dir.parent().unwrap().join(&rel);
+        assert!(expected.is_absolute());
+        let expected_json = serde_json::to_string(&crate::audit::path_string(&expected)).unwrap();
+        assert!(
+            html.contains(&format!("\"output_path\":{expected_json}")),
+            "expected resolved output_path {expected_json}"
+        );
+        #[cfg(windows)]
+        {
+            // Windows: the serialized path carries a drive-qualified prefix.
+            let drive = dir
+                .components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .unwrap_or("C:")
+                .to_string();
+            assert!(html.contains(&format!("\"output_path\":\"{}\\\\", drive)));
+        }
         assert!(html.contains("carve_1_00001000.avi"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -944,7 +964,18 @@ mod tests {
         let index = r#"{"videos":[]}"#;
         let filesystem = r#"{"event":"recover-inode","partition_offset":2048,"inode":"1304","output_path":"/case/artifacts/recovered/filesystem/inode_1304.bin","size_bytes":10,"sha256":"abc","validation_status":"candidate-unvalidated"}"#;
         let html = render_evidence_viewer_html(
-            manifest, index, "", filesystem, "", "", "", "{}", "{}", "{}", "{}", "[]",
+            manifest,
+            index,
+            "",
+            filesystem,
+            "",
+            "",
+            "",
+            "{}",
+            "{}",
+            "{}",
+            "{}",
+            "[]",
             Path::new("C:\\case"),
         );
         assert!(html.contains("recoveredFilesystemLog"));
@@ -963,7 +994,18 @@ mod tests {
         let deepfake =
             r#"{"vid_1":{"band":"high","score":88,"note":"</script><script>alert(1)</script>"}}"#;
         let html = render_evidence_viewer_html(
-            manifest, index, "", "", "", "", "", "{}", "{}", deepfake, "{}", "[]",
+            manifest,
+            index,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "{}",
+            "{}",
+            deepfake,
+            "{}",
+            "[]",
             Path::new("C:\\case"),
         );
         assert!(html.contains("deepfake:{\"vid_1\""));

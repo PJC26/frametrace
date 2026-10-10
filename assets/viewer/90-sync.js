@@ -33,20 +33,93 @@ document.getElementById("btnDownloadMarks").addEventListener("click", () => {
   downloadJSON(`frametrace-marks-${manifest.case_id || "case"}.json`, payload);
 });
 
-// --- Review-change protection -------------------------------------------
+// --- Review-change protection + save state (FOR-01) ----------------------
 // touchAnnotation() funnels every mark/note/tag mutation, and deletedIds
-// already tracks records changed since the last server import. pendingReviewSync
-// drives both the beforeunload guard and the debounced server auto-save, so
-// examiner work can't silently die in localStorage.
-let pendingReviewSync = state.deletedIds.length > 0;
-let autosaveTimer = null;
-const viewerIsServed = location.protocol === "http:" || location.protocol === "https:";
+// tracks records changed since the last server import. A served viewer
+// pushes those changes to the case DB on its own: debounced after edits,
+// retried with exponential backoff after a failure (busy lock, server
+// restart, network), and never dropped — the drafts stay in localStorage
+// until the server confirms them. The #saveState indicator always shows
+// which of saved / saving / N pending / FAILED applies, so an examiner
+// can never believe unsaved work reached the case.
+// `var` (not let): render() calls renderSaveState(), and these must read
+// as undefined rather than throw if a render ever runs before this file.
+var pendingReviewSync = state.deletedIds.length > 0;
+var autosaveTimer = null;
+var saveInFlight = false;   // one import at a time
+var saveQueued = false;     // a save was requested while one was in flight
+var manualQueued = false;   // "Apply to case" was pressed while one was in flight
+var saveRevision = 0;       // bumps on every change; detects edits mid-flight
+var saveFailures = 0;
+var saveError = "";
+var saveRetryAt = 0;
+var viewerIsServed = location.protocol === "http:" || location.protocol === "https:";
+var saveStateEl = document.getElementById("saveState");
+const AUTOSAVE_DEBOUNCE_MS = 2500;
+const AUTOSAVE_RETRY_BASE_MS = 2000;
+const AUTOSAVE_RETRY_MAX_MS = 60000;
+
+function autosaveRetryDelay(failures) {
+  return Math.min(AUTOSAVE_RETRY_MAX_MS, AUTOSAVE_RETRY_BASE_MS * Math.pow(2, Math.max(0, failures - 1)));
+}
+
+function pendingSaveCount() {
+  return state.deletedIds.length || (pendingReviewSync ? 1 : 0);
+}
+
+function renderSaveState() {
+  if (!saveStateEl) return;
+  const n = pendingSaveCount();
+  let cls, label, title, kind;
+  if (!viewerIsServed) {
+    kind = "local";
+    cls = "candidate";
+    label = n ? tf("save.local", { n }) : t("save.localClean");
+    title = t("save.title.local");
+  } else if (saveInFlight) {
+    kind = "saving";
+    cls = "candidate";
+    label = t("save.saving");
+    title = t("save.title.saving");
+  } else if (saveFailures > 0 && pendingReviewSync) {
+    kind = "failed";
+    cls = "failed";
+    label = tf("save.failed", { n });
+    const sec = Math.max(0, Math.ceil((saveRetryAt - Date.now()) / 1000));
+    title = tf("save.title.failed", { err: saveError || "?", sec });
+  } else if (pendingReviewSync) {
+    kind = "pending";
+    cls = "candidate";
+    label = tf("save.pending", { n });
+    title = tf("save.title.pending", { n });
+  } else {
+    kind = "saved";
+    cls = "ok";
+    label = t("save.saved");
+    title = t("save.title.saved");
+  }
+  saveStateEl.className = `badge save-state ${cls}`;
+  saveStateEl.style.fontWeight = kind === "failed" || kind === "pending" ? "700" : "";
+  saveStateEl.dataset.state = kind;
+  saveStateEl.textContent = label;
+  saveStateEl.title = title;
+  saveStateEl.setAttribute("aria-label", `${label} — ${title}`);
+}
+
+function scheduleAutosave(delay) {
+  clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(() => { autosaveTimer = null; syncMarksNow(); }, delay);
+}
 
 function markReviewDirty() {
   pendingReviewSync = true;
-  if (!viewerIsServed) return; // file:// viewing — unload warning only
-  clearTimeout(autosaveTimer);
-  autosaveTimer = setTimeout(autoApplyMarks, 2500);
+  saveRevision += 1;
+  if (viewerIsServed) {
+    // While backing off after a failure keep the backoff timer: an edit
+    // must not turn a busy server into a request-per-keystroke loop.
+    if (!(saveFailures > 0 && autosaveTimer)) scheduleAutosave(AUTOSAVE_DEBOUNCE_MS);
+  }
+  renderSaveState();
 }
 
 function clearReviewDirty() {
@@ -62,45 +135,130 @@ async function pushMarksToCase(payload) {
     headers: { "Content-Type": "text/plain" },
     body: JSON.stringify({ marks_json: JSON.stringify(payload) })
   });
-  return res.json();
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  if (!data || typeof data !== "object") {
+    return { ok: false, error: `HTTP ${res.status}` };
+  }
+  return data;
 }
 
-async function autoApplyMarks() {
-  if (!pendingReviewSync || !viewerIsServed) return;
+// One save attempt. Resolves { ok, error, offline, empty, queued }.
+// A call made while a save is in flight is queued behind it, not dropped.
+async function syncMarksNow() {
+  if (!viewerIsServed) return { ok: false, offline: true, error: t("save.offlineErr") };
+  if (saveInFlight) {
+    saveQueued = true;
+    return { ok: false, queued: true };
+  }
   const payload = marksPayload();
   if (!payload.marks.length && !payload.tags.length && !payload.deleted_ids.length) {
     clearReviewDirty();
-    return;
+    saveFailures = 0;
+    saveError = "";
+    renderSaveState();
+    return { ok: true, empty: true };
   }
+  const sentRevision = saveRevision;
+  saveInFlight = true;
+  clearTimeout(autosaveTimer);
+  autosaveTimer = null;
+  renderSaveState();
+  let result;
   try {
-    const data = await pushMarksToCase(payload);
-    if (data.ok) clearReviewDirty();
-  } catch { /* stay dirty — the next change retries */ }
+    result = await pushMarksToCase(payload);
+  } catch {
+    result = { ok: false, offline: true, error: t("save.offlineErr") };
+  }
+  saveInFlight = false;
+  if (result.ok) {
+    saveFailures = 0;
+    saveError = "";
+    saveRetryAt = 0;
+    // Edits made while the request was in flight are not in this payload:
+    // keep them pending and push again instead of clearing them.
+    if (saveRevision === sentRevision) clearReviewDirty();
+    else scheduleAutosave(AUTOSAVE_DEBOUNCE_MS);
+  } else {
+    const firstFailure = saveFailures === 0;
+    saveFailures += 1;
+    saveError = String(result.error || "?");
+    const delay = autosaveRetryDelay(saveFailures);
+    saveRetryAt = Date.now() + delay;
+    scheduleAutosave(delay);
+    if (firstFailure) toast(tf("toast.saveFailed", { err: saveError }));
+  }
+  if (manualQueued) {
+    // A queued manual apply always pushes once more and reports, even if
+    // this save already cleared pendingReviewSync.
+    manualQueued = false;
+    saveQueued = false;
+    pendingReviewSync = true;
+    renderSaveState();
+    runManualApply();
+    return result;
+  }
+  if (saveQueued) {
+    saveQueued = false;
+    if (pendingReviewSync && result.ok) scheduleAutosave(0);
+  }
+  renderSaveState();
+  return result;
+}
+
+// The debounced auto-save entry point.
+function autoApplyMarks() {
+  if (!pendingReviewSync || !viewerIsServed) return Promise.resolve({ ok: true, empty: true });
+  return syncMarksNow();
 }
 
 window.addEventListener("beforeunload", (event) => {
-  if (!pendingReviewSync && !state.deletedIds.length) return;
+  if (!pendingReviewSync && !state.deletedIds.length && !saveInFlight) return;
   event.preventDefault();
   event.returnValue = "";
+});
+
+if (saveStateEl) {
+  // Clicking the indicator saves (or retries) right away.
+  saveStateEl.addEventListener("click", () => {
+    if (!viewerIsServed) { toast(t("save.title.local")); return; }
+    if (!pendingReviewSync && !saveInFlight) { toast(t("save.title.saved")); return; }
+    syncMarksNow();
+  });
+}
+// Back online / tab visible again: retry a failed save now instead of
+// waiting out the backoff.
+window.addEventListener("online", () => { if (viewerIsServed && pendingReviewSync) scheduleAutosave(0); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && viewerIsServed && pendingReviewSync && saveFailures > 0) scheduleAutosave(0);
 });
 
 // Server-served viewers can push marks straight into the case DB instead of
 // the download → file-pick → import dance.
 document.getElementById("btnApplyMarks").addEventListener("click", async () => {
+  if (!viewerIsServed) { toast(t("offline.applyTitle")); return; }
   const payload = marksPayload();
   if (!payload.marks.length && !payload.tags.length && !payload.deleted_ids.length) { toast(t("toast.noChanges")); return; }
-  try {
-    const data = await pushMarksToCase(payload);
-    if (data.ok) {
-      clearReviewDirty();
-      toast(t("toast.applyDone"));
-    } else {
-      toast(tf("toast.applyFail", { err: data.error || "?" }));
-    }
-  } catch (err) {
-    toast(t("toast.applyOffline"));
+  // A manual apply always pushes, even if the auto-save already did, so the
+  // examiner gets an explicit confirmation and a refreshed report.
+  if (saveInFlight) {
+    manualQueued = true;
+    saveQueued = true;
+    toast(t("save.queued"));
+    return;
   }
+  await runManualApply();
 });
+
+async function runManualApply() {
+  pendingReviewSync = true;
+  const result = await syncMarksNow();
+  if (result.queued) { manualQueued = true; toast(t("save.queued")); }
+  else if (result.ok) toast(t("toast.applyDone"));
+  else if (result.offline) toast(t("toast.applyOffline"));
+  else toast(tf("toast.applyFail", { err: result.error || "?" }));
+  return result;
+}
 
 // --- 선별 결과 내보내기: 사람이 받는 형태 (CSV / 요약 리포트 / 자료 묶음) ---
 
@@ -407,21 +565,42 @@ document.getElementById("btnTimelineGen").addEventListener("click", () => loadTi
 
 // The viewer also runs standalone via file:// — server-backed features need
 // the workstation server, and marks/tags live in a different localStorage
-// origin than the served viewer, so make those limits visible up front.
-if (location.protocol === "file:") {
-  const btn = document.getElementById("btnExportSelected");
-  btn.disabled = true;
-  btn.title = t("offline.openServer");
-  const apply = document.getElementById("btnApplyMarks");
-  apply.disabled = true;
-  apply.title = t("offline.applyTitle");
-  const cap = document.getElementById("btnCaptureFrame");
-  cap.disabled = true;
-  cap.title = t("offline.serverOnly");
-  const clip = document.getElementById("btnExportClip");
-  clip.disabled = true;
-  clip.title = t("offline.serverOnly");
-  toast(t("toast.standalone"));
+// origin than the served viewer, so make those limits visible up front
+// (UX-13). Every server-only control is disabled with an explanatory
+// tooltip, so nothing prompts for input (e.g. the burn-in exhibit label)
+// only to fail afterwards. The tooltip goes through data-i18n-title so
+// applyChromeI18n() keeps it — and localizes it — on every render.
+const SERVER_ONLY_CONTROLS = [
+  ["btnExportSelected", "offline.openServer"],
+  ["btnApplyMarks", "offline.applyTitle"],
+  ["btnCaptureFrame", "offline.serverOnly"],
+  ["btnExportClip", "offline.serverOnly"],
+  ["btnExportClipBurn", "offline.serverOnly"],
+  ["btnProxy", "offline.serverOnly"],
+  ["btnTelemetry", "offline.serverOnly"],
+  ["btnTranscodeQueue", "offline.serverOnly"],
+  ["btnTimeline", "offline.serverOnly"],
+  ["btnTimelineGen", "offline.serverOnly"],
+];
+function disableServerOnlyControls() {
+  for (const [id, key] of SERVER_ONLY_CONTROLS) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    btn.disabled = true;
+    btn.setAttribute("aria-disabled", "true");
+    btn.classList.add("server-only");
+    btn.dataset.i18nTitle = key;
+    btn.title = t(key);
+  }
 }
+if (!viewerIsServed) {
+  disableServerOnlyControls();
+  toast(t("toast.standalone"));
+} else if (pendingReviewSync) {
+  // Drafts replayed from localStorage (a reload or crash before the last
+  // save landed) are pushed without waiting for the next edit.
+  scheduleAutosave(1500);
+}
+renderSaveState();
 
 state.pageSize = Number(els.pageSize.value) || 100;

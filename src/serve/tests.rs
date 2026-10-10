@@ -638,6 +638,7 @@ fn server_answers_status_env_and_guards() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    let raw_nonce = state_lock(&state).instance.clone();
     thread::spawn(move || serve_on(listener, state));
     let response = |request: &str| {
         let mut stream = TcpStream::connect(addr).unwrap();
@@ -654,6 +655,16 @@ fn server_answers_status_env_and_guards() {
         String::from_utf8_lossy(&buffer).to_string()
     };
     let status = response("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    // SEC-04: the status body publishes only the nonce fingerprint.
+    let body = &status[status.find("\r\n\r\n").unwrap() + 4..];
+    assert!(!body.contains(&raw_nonce), "raw nonce leaked: {body}");
+    assert!(body.contains(&format!(
+        "\"instance\":\"{}\"",
+        instance_fingerprint(&raw_nonce)
+    )));
+    // IPv6 loopback Host with a port is a genuine local client.
+    let ipv6 = response("GET /api/status HTTP/1.1\r\nHost: [::1]:8477\r\n\r\n");
+    assert!(ipv6.contains("200 OK"), "{ipv6}");
     assert!(status.contains("200 OK"));
     assert!(status.contains("\"has_job\":false"));
     assert!(status.contains("\"phase\":\"idle\""));
@@ -676,10 +687,16 @@ fn server_answers_status_env_and_guards() {
     assert!(csrf.contains("403"), "{csrf}");
     // Nonce gate (no FRAMETRACE_TOKEN configured): a mutating POST with
     // no nonce proof is refused before reaching the handler. The nonce
-    // itself is the "instance" value /api/status reports.
-    let nonce_start = status.find("\"instance\":\"").unwrap() + "\"instance\":\"".len();
-    let nonce = &status[nonce_start..status[nonce_start..].find('"').unwrap() + nonce_start];
+    // itself is the per-process instance value (user-private file / the
+    // planted ft_nonce cookie), not anything /api/status echoes.
+    let nonce = raw_nonce.as_str();
     assert!(!nonce.is_empty());
+    // The fingerprint is public, so it must not satisfy the gate.
+    let fingerprint_nonce = response(&format!(
+        "POST /api/start HTTP/1.1\r\nHost: 127.0.0.1\r\nX-FrameTrace-Nonce: {}\r\nContent-Type: application/json\r\nContent-Length: 33\r\n\r\n{{\"source_path\":\"C:\\\\nope\\\\missing\"}}",
+        instance_fingerprint(nonce)
+    ));
+    assert!(fingerprint_nonce.contains("401"), "{fingerprint_nonce}");
     let no_nonce = response(
         "POST /api/start HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 33\r\n\r\n{\"source_path\":\"C:\\nope\\missing\"}",
     );
@@ -882,4 +899,396 @@ fn examiner_page_auto_detects_image_extension() {
     assert!(EXAMINER_PAGE.contains("looksImage"));
     assert!(EXAMINER_PAGE.contains("\\.(e01|ex01|l01|s01|e02|ex02|l02|s02)$"));
     assert!(EXAMINER_PAGE.contains("input[name='inputKind'][value='e01']"));
+}
+
+fn post_request(path: &str, body: &str) -> Request {
+    Request {
+        method: "POST".into(),
+        path: path.into(),
+        query: String::new(),
+        body: body.into(),
+        range: None,
+        origin: None,
+        host: None,
+        cookie: None,
+        token_header: None,
+        nonce_header: None,
+    }
+}
+
+fn scratch_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ft-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// UX-07: a cancel aimed at one job must not poison every later job.
+#[test]
+fn busy_acquire_resets_stale_cancel_flag() {
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    {
+        let mut guard = state_lock(&state);
+        guard.busy = true;
+    }
+    // Cancel the "running" job, then let it end.
+    assert!(api_cancel(&state).contains("\"ok\":true"));
+    state_lock(&state).busy = false;
+    assert!(state_lock(&state).cancel_requested);
+    // The next job acquires a fresh flag and its step is not killed.
+    let busy = try_acquire_busy(&state).unwrap();
+    assert!(!state_lock(&state).cancel_requested);
+    let exe = std::env::current_exe().unwrap();
+    let result = run_step(
+        &exe,
+        &[
+            "serve::tests::spew_stderr_helper".to_string(),
+            "--exact".to_string(),
+        ],
+        &state,
+    );
+    assert!(result.is_ok(), "{result:?}");
+    drop(busy);
+    assert!(!state_lock(&state).busy);
+}
+
+/// SEC-01: open-folder only opens existing directories inside the case or
+/// approved roots — never files, missing paths, or foreign folders.
+#[test]
+fn open_folder_is_confined_to_case_directories() {
+    let root = scratch_dir("open-folder");
+    let case_dir = root.join("case");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(case_dir.join("exports/selection-1")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(case_dir.join("exports/run.exe"), b"MZ").unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    // No case bound: nothing can be opened.
+    assert!(resolve_open_folder(&state, &case_dir.to_string_lossy()).is_err());
+    {
+        let mut guard = state_lock(&state);
+        guard.case_dir = Some(case_dir.clone());
+        guard.media_roots = vec![case_dir.clone()];
+    }
+    let ok = resolve_open_folder(
+        &state,
+        &case_dir.join("exports/selection-1").to_string_lossy(),
+    );
+    assert!(ok.is_ok(), "{ok:?}");
+    for bad in [
+        String::new(),
+        case_dir
+            .join("exports/run.exe")
+            .to_string_lossy()
+            .into_owned(),
+        case_dir.join("missing").to_string_lossy().into_owned(),
+        outside.to_string_lossy().into_owned(),
+        case_dir.join("../outside").to_string_lossy().into_owned(),
+        "-help".to_string(),
+    ] {
+        assert!(resolve_open_folder(&state, &bad).is_err(), "accepted {bad}");
+    }
+    let refused = api_open_folder(
+        &post_request(
+            "/api/open-folder",
+            &serde_json::json!({"path": outside.to_string_lossy()}).to_string(),
+        ),
+        &state,
+    );
+    assert!(refused.contains("\"ok\":false"), "{refused}");
+    assert_eq!(
+        shell_path(PathBuf::from(r"\\?\C:\case")),
+        PathBuf::from(r"C:\case")
+    );
+    assert_eq!(
+        shell_path(PathBuf::from(r"\\?\UNC\srv\share")),
+        PathBuf::from(r"\\srv\share")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn host_gate_accepts_bracketed_ipv6_loopback() {
+    let request = |host: &str| Request {
+        method: "GET".into(),
+        path: "/".into(),
+        query: String::new(),
+        body: String::new(),
+        range: None,
+        origin: None,
+        host: Some(host.to_string()),
+        cookie: None,
+        token_header: None,
+        nonce_header: None,
+    };
+    for good in [
+        "[::1]:8477",
+        "[::1]",
+        "127.0.0.1:8477",
+        "LOCALHOST:1",
+        "localhost",
+    ] {
+        assert!(request_is_localhost_trusted(&request(good)), "{good}");
+    }
+    for bad in [
+        "[::2]:8477",
+        "[::1]x",
+        "127.0.0.1.evil.com",
+        "evil.com:8477",
+        "127.0.0.1@evil.com",
+        "127.0.0.1:notaport",
+        "",
+    ] {
+        assert!(!request_is_localhost_trusted(&request(bad)), "{bad}");
+    }
+}
+
+#[test]
+fn secret_comparison_is_exact() {
+    assert!(secret_eq("abc12345", "abc12345"));
+    assert!(!secret_eq("abc12345", "abc12346"));
+    assert!(!secret_eq("abc1234", "abc12345"));
+    assert!(!secret_eq("", "abc12345"));
+    let fingerprint = instance_fingerprint("0123456789abcdef");
+    assert_eq!(fingerprint.len(), 24);
+    assert_ne!(fingerprint, "0123456789abcdef");
+    assert_eq!(instance_fingerprint(""), "");
+}
+
+/// SEC-02: generated viewer/report pages render normally; any other
+/// script-capable document under the case or media roots is sandboxed
+/// and forced to download.
+#[test]
+fn untrusted_case_documents_are_sandboxed_and_downloaded() {
+    let case_dir = scratch_dir("sec02");
+    for (rel, body) in [
+        ("review/index.html", "<html>viewer</html>"),
+        ("review/evidence-viewer.html", "<html>viewer</html>"),
+        ("reports/case-report.html", "<html>report</html>"),
+        ("reports/qa/consistency-report.html", "<html>qa</html>"),
+        ("reports/package_1/review/index.html", "<html>pkg</html>"),
+        (
+            "reports/package_1/artifacts/carved/x.html",
+            "<script>evil</script>",
+        ),
+        ("evidence/fs/evil.html", "<script>evil</script>"),
+        ("evidence/fs/evil.svg", "<svg onload=alert(1)/>"),
+        ("review/thumbs/a.jpg", "jpg"),
+    ] {
+        let path = case_dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let canon = |rel: &str| case_dir.join(rel).canonicalize().unwrap();
+    for trusted in [
+        "review/index.html",
+        "review/evidence-viewer.html",
+        "reports/case-report.html",
+        "reports/qa/consistency-report.html",
+        "reports/package_1/review/index.html",
+    ] {
+        assert!(is_generated_page(&case_dir, &canon(trusted)), "{trusted}");
+    }
+    for untrusted in [
+        "reports/package_1/artifacts/carved/x.html",
+        "evidence/fs/evil.html",
+        "evidence/fs/evil.svg",
+        "review/thumbs/a.jpg",
+    ] {
+        assert!(
+            !is_generated_page(&case_dir, &canon(untrusted)),
+            "{untrusted}"
+        );
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    {
+        let mut guard = state_lock(&state);
+        guard.case_dir = Some(case_dir.clone());
+        guard.media_roots = vec![case_dir.clone()];
+    }
+    thread::spawn(move || serve_on(listener, state));
+    let head = |target: &str| {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut buffer = Vec::new();
+        stream.read_to_end(&mut buffer).unwrap();
+        let text = String::from_utf8_lossy(&buffer).to_string();
+        text[..text.find("\r\n\r\n").unwrap()].to_string()
+    };
+    let viewer = head("/review/index.html");
+    assert!(viewer.contains("200 OK"), "{viewer}");
+    assert!(viewer.contains("text/html"), "{viewer}");
+    assert!(viewer.contains("nosniff"), "{viewer}");
+    assert!(viewer.contains("frame-ancestors 'self'"), "{viewer}");
+    assert!(!viewer.contains("sandbox"), "{viewer}");
+    assert!(!viewer.contains("Content-Disposition"), "{viewer}");
+    let report = head("/case/reports/case-report.html");
+    assert!(!report.contains("Content-Disposition"), "{report}");
+    for evil in [
+        "/case/evidence/fs/evil.html",
+        "/case/evidence/fs/evil.svg",
+        "/case/reports/package_1/artifacts/carved/x.html",
+    ] {
+        let response = head(evil);
+        assert!(response.contains("200 OK"), "{response}");
+        assert!(response.contains("nosniff"), "{response}");
+        assert!(
+            response.contains("Content-Security-Policy: sandbox"),
+            "{response}"
+        );
+        assert!(
+            response.contains("Content-Disposition: attachment"),
+            "{response}"
+        );
+    }
+    let thumb = head("/review/thumbs/a.jpg");
+    assert!(thumb.contains("image/jpeg"), "{thumb}");
+    assert!(!thumb.contains("Content-Disposition"), "{thumb}");
+    // /media never trusts documents, even the generated viewer.
+    let media_html = head(&format!(
+        "/media?path={}",
+        crate::serve::percent_encode_header_value(&canon("review/index.html").to_string_lossy())
+    ));
+    assert!(
+        media_html.contains("Content-Security-Policy: sandbox"),
+        "{media_html}"
+    );
+    assert!(
+        media_html.contains("Content-Disposition: attachment"),
+        "{media_html}"
+    );
+    let _ = std::fs::remove_dir_all(&case_dir);
+}
+
+/// FOR-06: a capture whose audit entry cannot be written must fail and
+/// must not leave an unlogged artifact behind.
+#[test]
+fn capture_frame_fails_when_audit_append_fails() {
+    let case_dir = scratch_dir("capture-audit");
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case_dir.clone());
+    let body = |id: &str, time: &str| {
+        serde_json::json!({"id": id, "image": "/9j/4AAA", "time": time}).to_string()
+    };
+    // Invalid id / time are rejected before anything is written.
+    for (id, time) in [
+        ("", "1"),
+        ("vid_1", "NaN"),
+        ("vid_1", "-3"),
+        ("vid_1", "abc"),
+    ] {
+        let reply = api_capture_frame(&post_request("/api/capture-frame", &body(id, time)), &state);
+        assert!(reply.contains("\"ok\":false"), "{id}/{time}: {reply}");
+    }
+    let ok = api_capture_frame(
+        &post_request("/api/capture-frame", &body("vid_1", "1.5")),
+        &state,
+    );
+    assert!(ok.contains("\"ok\":true"), "{ok}");
+    // Make the capture log unwritable (a directory in its place).
+    let log = case_dir.join("evidence/logs/capture-log.jsonl");
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir_all(&log).unwrap();
+    let before = std::fs::read_dir(case_dir.join("artifacts/captures"))
+        .unwrap()
+        .count();
+    let failed = api_capture_frame(
+        &post_request("/api/capture-frame", &body("vid_2", "2")),
+        &state,
+    );
+    assert!(failed.contains("\"ok\":false"), "{failed}");
+    let after = std::fs::read_dir(case_dir.join("artifacts/captures"))
+        .unwrap()
+        .count();
+    assert_eq!(before, after, "unlogged capture must be removed");
+    let _ = std::fs::remove_dir_all(&case_dir);
+}
+
+/// FOR-06: selection export reports failure when its audit entry fails.
+#[test]
+fn export_selected_surfaces_audit_failure() {
+    let case_dir = scratch_dir("export-audit");
+    let source = case_dir.join("src/a.mp4");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"video").unwrap();
+    std::fs::create_dir_all(case_dir.join("evidence/logs/export-log.jsonl")).unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    {
+        let mut guard = state_lock(&state);
+        guard.case_dir = Some(case_dir.clone());
+        guard.media_roots = vec![case_dir.clone()];
+    }
+    let body = serde_json::json!({"items": [{"id": "vid_1", "path": source.to_string_lossy()}]})
+        .to_string();
+    let reply: serde_json::Value = serde_json::from_str(&api_export_selected(
+        &post_request("/api/export-selected", &body),
+        &state,
+    ))
+    .unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["unlogged"], true, "{reply}");
+    assert_eq!(reply["copied"], 1, "{reply}");
+    let _ = std::fs::remove_dir_all(&case_dir);
+}
+
+/// FOR-08: non-fatal step failures are visible in /api/status.
+#[test]
+fn step_warnings_are_reported_in_status() {
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    warn_step(&state, 3, "일괄 검증 실패, 건너뜀: boom".into());
+    let status: serde_json::Value = serde_json::from_str(&api_status(&state)).unwrap();
+    let warnings = status["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["step"], 3);
+    assert_eq!(warnings[0]["step_name"], "재생성 검증");
+    assert!(warnings[0]["message"].as_str().unwrap().contains("boom"));
+    assert!(status["logs"].to_string().contains("경고"));
+}
+
+/// PERF-01: the parsed index is shared via Arc (no deep clone per page),
+/// refreshed when the file changes, and reused by records-meta.
+#[test]
+fn records_share_cached_index_and_meta_omits_videos() {
+    let case_dir = scratch_dir("records-cache");
+    std::fs::create_dir_all(case_dir.join("db")).unwrap();
+    let index = case_dir.join("db/video_index.json");
+    std::fs::write(
+        &index,
+        r#"{"schema":"x","videos":[{"id":"vid_1","name":"a.mp4"},{"id":"vid_2","name":"b.mp4"}]}"#,
+    )
+    .unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case_dir.clone());
+    let first = cached_index(&state, &case_dir).unwrap();
+    let second = cached_index(&state, &case_dir).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    let request = Request {
+        method: "GET".into(),
+        path: "/api/records".into(),
+        query: "offset=1&limit=1".into(),
+        body: String::new(),
+        range: None,
+        origin: None,
+        host: None,
+        cookie: None,
+        token_header: None,
+        nonce_header: None,
+    };
+    let page: serde_json::Value = serde_json::from_str(&api_records(&request, &state)).unwrap();
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["videos"][0]["id"], "vid_2");
+    let meta: serde_json::Value = serde_json::from_str(&api_records_meta(&state)).unwrap();
+    assert_eq!(meta["scan"]["schema"], "x");
+    assert_eq!(meta["scan"]["videos"].as_array().unwrap().len(), 0);
+    // A changed index (different length) invalidates the cache.
+    std::fs::write(&index, r#"{"schema":"y","videos":[{"id":"vid_9"}]}"#).unwrap();
+    let third = cached_index(&state, &case_dir).unwrap();
+    assert!(!Arc::ptr_eq(&first, &third));
+    assert_eq!(third["schema"], "y");
+    let _ = std::fs::remove_dir_all(&case_dir);
 }

@@ -1,4 +1,6 @@
 let mediaRenderedFor = null;
+let telemetryDrawnFor = null;
+let telemetryDrawnKey = "";
 
 function drawTelemetry(report) {
   const canvas = document.getElementById("telemetryCanvas");
@@ -59,15 +61,27 @@ function renderDetails() {
     if (teleTitle) teleTitle.hidden = true;
     if (telePane) telePane.hidden = true;
     mediaRenderedFor = null;
+    telemetryDrawnFor = null;
     return;
   }
   els.mediaTitle.textContent = record.originalName || record.name || record.id;
   els.mediaStatus.textContent = record.status;
   els.mediaStatus.className = `badge ${statusClass(record.status)}`;
   const dualMates = state.layout.dual ? matesOf(record) : [];
-  const mediaKey = `${record.id}:${record.fileUrl}:${proxyPathFor(record)}:dual:${state.layout.dual ? dualMates.map(m => m.id).join(",") : "off"}`;
-  if (mediaRenderedFor !== mediaKey) {
-    const mediaSrc = mediaSrcFor(record);
+  const mediaSrc = mediaSrcFor(record);
+  // PERF-04: the stage (and its <video>) is rebuilt only when what it
+  // shows changes — the active id, the resolved media source(s), or the
+  // dual pairing. Checkbox, tag, mark, filter and language renders keep
+  // the existing element, so playback position and buffered ranges
+  // survive. Fallback (no-source) stages also key on the proxy auto-build
+  // state so a finished/failed build refreshes its message.
+  const mediaKey = JSON.stringify([
+    record.id,
+    mediaSrc,
+    dualMates.map(m => [m.id, mediaSrcFor(m)]),
+    mediaSrc ? "" : (proxyAutoState.get(record.id) || "")
+  ]);
+  if (mediaRenderedFor !== mediaKey || !els.mediaStage.firstElementChild) {
     const why = needsProxy(record);
     const online = location.protocol === "http:" || location.protocol === "https:";
     if (mediaSrc && dualMates.length) {
@@ -111,13 +125,20 @@ function renderDetails() {
   const mark = markOf(record);
   const recordTags = tagListFor(record);
   if (teleTitle && telePane) {
-    teleTitle.hidden = !mediaSrcFor(record);
+    teleTitle.hidden = !mediaSrc;
     const tele = record.telemetry;
     if (tele && Array.isArray(tele.points) && tele.points.length) {
       telePane.hidden = false;
-      drawTelemetry(tele);
+      // Redraw only when the report (or locale of its caption) changes.
+      const teleKey = record.id + "|" + state.locale;
+      if (telemetryDrawnFor !== tele || telemetryDrawnKey !== teleKey) {
+        drawTelemetry(tele);
+        telemetryDrawnFor = tele;
+        telemetryDrawnKey = teleKey;
+      }
     } else {
       telePane.hidden = true;
+      telemetryDrawnFor = null;
     }
   }
   document.getElementById("detailBadges").innerHTML = [
@@ -175,7 +196,7 @@ function renderDetails() {
   document.querySelectorAll(".tag-btn").forEach(btn => {
     btn.addEventListener("click", () => {
       toggleTag(record.id, btn.dataset.presetTag);
-      render();
+      requestRender();
     });
   });
   const customInput = document.getElementById("customTagInput");
@@ -225,7 +246,10 @@ function renderDetails() {
   ].join("") || `<div class="validation-item">${t("validation.none")}</div>`;
 }
 
-function renderTree() {
+// Facet counts cover the whole (immutable) record set — count once.
+let treeCountsCache = null;
+function treeCounts() {
+  if (treeCountsCache) return treeCountsCache;
   const typeCounts = new Map();
   const kindCounts = new Map();
   const dayCounts = new Map();
@@ -235,6 +259,12 @@ function renderTree() {
     kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
     if (record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
   });
+  treeCountsCache = { typeCounts, kindCounts, dayCounts };
+  return treeCountsCache;
+}
+
+function renderTree() {
+  const { typeCounts, kindCounts, dayCounts } = treeCounts();
   const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate") };
   const items = [];
   const addItems = (title, entries, activeKey, onPick) => {
@@ -249,14 +279,14 @@ function renderTree() {
       const match = [...typeCounts.entries()].find(([k]) => recTypeLabel(k) === label);
       state.recType = match ? match[0] : "";
       state.currentPage = 1;
-      render();
+      requestRender();
     });
   addItems(t("tree.kind"), new Map([...kindCounts.entries()].map(([k, c]) => [kindLabels[k] || k, c])),
     kindLabels[state.kind] || "", label => {
       state.kind = Object.entries(kindLabels).find(([, kindLabel]) => kindLabel === label)?.[0] || "";
       els.kind.value = state.kind;
       state.currentPage = 1;
-      render();
+      requestRender();
     });
   addItems(t("tree.date"), dayCounts, state.dateFrom && state.dateFrom === state.dateTo ? state.dateFrom : "", day => {
     state.dateFrom = day;
@@ -264,7 +294,7 @@ function renderTree() {
     els.dateFrom.value = day;
     els.dateTo.value = day;
     state.currentPage = 1;
-    render();
+    requestRender();
   });
   els.facetTree.innerHTML = items.map(item => item.header !== undefined
     ? `<div class="tree-sec">${escapeHtml(item.header)}</div>`
@@ -291,21 +321,40 @@ function renderMetrics() {
   const carveLink = document.getElementById("linkCarveReport");
   // The standalone page exists only when make-review found a carve log.
   if (carveLink) carveLink.hidden = carveLog.length === 0;
-  els.metricVerified.textContent = records.filter(record => record.status === "ffprobe-video-stream-confirmed" || record.status === "ffprobe-confirmed").length;
-  els.metricFailed.textContent = records.filter(record => record.status === "validation-failed").length;
+  const counts = staticMetricCounts();
+  els.metricVerified.textContent = counts.verified;
+  els.metricFailed.textContent = counts.failed;
   if (els.metricAnomaly) {
-    els.metricAnomaly.textContent = String(records.filter(record => record.hasAnomaly).length);
+    els.metricAnomaly.textContent = String(counts.anomaly);
   }
   const markCount = Object.keys(state.marks).length;
   els.selectionCount.textContent = tf("sel.count", { n: state.selectedIds.size, m: markCount });
   if (els.caseWarnings) {
-    if (inspectionWarnings.length) {
-      els.caseWarnings.hidden = false;
-      els.caseWarnings.innerHTML = `<b>${tf("warn.inspect", { n: inspectionWarnings.length })}</b>${inspectionWarnings.map(escapeHtml).join(" · ")}`;
-    } else {
-      els.caseWarnings.hidden = true;
+    // FOR-09: a partial record list the examiner chose to continue with
+    // stays flagged for the whole session, above inspection warnings.
+    const parts = [];
+    if (DATA.loadWarning) {
+      parts.push(`<b>${escapeHtml(tf("warn.partialLoad", { n: DATA.loadWarning.loaded, total: DATA.loadWarning.total }))}</b>`);
     }
+    if (inspectionWarnings.length) {
+      parts.push(`<b>${tf("warn.inspect", { n: inspectionWarnings.length })}</b>${inspectionWarnings.map(escapeHtml).join(" · ")}`);
+    }
+    els.caseWarnings.hidden = !parts.length;
+    els.caseWarnings.innerHTML = parts.join("<br>");
   }
+}
+
+let staticMetricCountsCache = null;
+function staticMetricCounts() {
+  if (staticMetricCountsCache) return staticMetricCountsCache;
+  let verified = 0, failed = 0, anomaly = 0;
+  records.forEach(record => {
+    if (record.status === "ffprobe-video-stream-confirmed" || record.status === "ffprobe-confirmed") verified += 1;
+    else if (record.status === "validation-failed") failed += 1;
+    if (record.hasAnomaly) anomaly += 1;
+  });
+  staticMetricCountsCache = { verified, failed, anomaly };
+  return staticMetricCountsCache;
 }
 
 function renderChips() {
@@ -339,7 +388,7 @@ function renderChips() {
         els.status.value = "";
       }
       state.currentPage = 1;
-      render();
+      requestRender();
     });
   });
   // Tag filter options follow the editable preset list plus any tags
@@ -352,7 +401,53 @@ function renderChips() {
   els.tagFilter.value = state.chip.startsWith("tag:") ? state.chip : "";
 }
 
+// PERF-03: requestRender() coalesces any number of state changes in one
+// frame into a single full render. render() stays synchronous for callers
+// that read the rebuilt DOM right away (focus, scrollIntoView) and cancels
+// a pending frame so the same work never runs twice.
+let renderFrame = 0;
+const scheduleFrame = typeof window.requestAnimationFrame === "function"
+  ? cb => window.requestAnimationFrame(cb)
+  : cb => setTimeout(cb, 16);
+const cancelFrame = typeof window.cancelAnimationFrame === "function"
+  ? id => window.cancelAnimationFrame(id)
+  : id => clearTimeout(id);
+function requestRender() {
+  if (renderFrame) return;
+  renderFrame = scheduleFrame(() => {
+    renderFrame = 0;
+    render();
+  });
+}
+
+// Targeted updates for the hottest interactions — no filter/sort, no grid
+// rebuild, no detail rebuild.
+function refreshSelectionUi() {
+  els.recordGrid.querySelectorAll(".card[data-id]").forEach(card => {
+    const on = state.selectedIds.has(card.dataset.id);
+    card.setAttribute("aria-selected", String(on));
+    const box = card.querySelector("input[data-check]");
+    if (box && box.checked !== on) box.checked = on;
+  });
+  renderMetrics();
+}
+
+// Activate a card that is already on the current page: swap the active
+// class and refresh the detail pane only.
+function setActiveCard(id) {
+  if (id === state.activeId) return;
+  const card = els.recordGrid.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+  state.activeId = id;
+  if (!card) { requestRender(); return; }
+  els.recordGrid.querySelectorAll(".card.active").forEach(el => { el.classList.remove("active"); el.tabIndex = -1; });
+  card.classList.add("active");
+  card.tabIndex = 0;
+  renderDetails();
+  renderMetrics();
+}
+
 function render() {
+  if (renderFrame) { cancelFrame(renderFrame); renderFrame = 0; }
   applyChromeI18n();
   // Filter+sort once per render — grid and histogram share the result.
   const filtered = filteredRecords();
@@ -362,4 +457,5 @@ function render() {
   renderTree();
   renderGrid(filtered);
   renderDetails();
+  renderSaveState();
 }

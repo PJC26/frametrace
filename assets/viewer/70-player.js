@@ -12,6 +12,14 @@ function skipVideo(delta) {
   video.currentTime = Math.max(0, Math.min(video.duration || 1e9, video.currentTime + delta));
 }
 
+// Space in both the main viewer and the popup player (UX-08).
+function togglePlayback() {
+  const video = currentVideo();
+  if (!video) { toast(t("toast.noVideo")); return; }
+  if (video.paused) video.play().catch(() => {});
+  else video.pause();
+}
+
 function setRate(rate) {
   state.layout.rate = rate;
   saveLayout();
@@ -69,10 +77,20 @@ window.__ftBridge = {
     return playerDescriptor();
   },
   toggleTag(tag) {
-    if (state.activeId) {
-      toggleTag(state.activeId, tag);
+    const id = state.activeId;
+    if (id) {
+      journaled(tf("journal.tag", { tag }), [id], () => toggleTag(id, tag));
       render();
     }
+    return playerDescriptor();
+  },
+  // Ctrl+Z / Ctrl+Y in the popup share the main viewer's journal.
+  undo() {
+    undoJournal();
+    return playerDescriptor();
+  },
+  redo() {
+    redoJournal();
     return playerDescriptor();
   },
   // Filtered list for the popup's quick-jump sidebar — mirrors the main
@@ -106,6 +124,8 @@ if (playerChannel) {
     else if (m.type === "mark") reply(window.__ftBridge.mark(m.arg));
     else if (m.type === "toggleTag") reply(window.__ftBridge.toggleTag(m.arg));
     else if (m.type === "list") reply(window.__ftBridge.list());
+    else if (m.type === "undo") reply(window.__ftBridge.undo());
+    else if (m.type === "redo") reply(window.__ftBridge.redo());
   });
 }
 
@@ -217,6 +237,7 @@ listEl.addEventListener("click",function(e){var it=e.target.closest(".li");if(!i
 listEl.addEventListener("keydown",function(e){if(e.key!=="Enter"&&e.key!==" ")return;var it=e.target.closest(".li");if(!it)return;e.preventDefault();call("focus",it.dataset.id,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});
 function nav(step,autoplay){call("navigate",step,function(r){if(!r){dead();return;}applyDesc(r.descriptor,autoplay);if(!r.moved)note(step>0?${JSON.stringify(t("player.last"))}:${JSON.stringify(t("player.first"))});else note("");});}
 function doMark(m){if(!cur)return;call("focus",cur.id,function(f){if(f===undefined){dead();return;}call("mark",m||null,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});}
+function doHist(op){call(op,null,function(d){if(d===undefined){dead();return;}applyDesc(d,false);note(op==="undo"?${JSON.stringify(t("player.undone"))}:${JSON.stringify(t("player.redone"))});});}
 function doTag(t){if(!cur)return;call("focus",cur.id,function(f){if(f===undefined){dead();return;}call("toggleTag",t,function(d){if(d===undefined){dead();return;}applyDesc(d,false);});});}
 function skip(d){v.currentTime=Math.max(0,Math.min(v.duration||1e9,v.currentTime+d));}
 function stepRate(d){var i=RATES.indexOf(Number(rate.value));var n=RATES[Math.max(0,Math.min(RATES.length-1,(i<0?3:i)+d))];rate.value=String(n);v.playbackRate=n;}
@@ -238,8 +259,17 @@ var du=c.toDataURL("image/jpeg",0.92);
 fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify({id:cur?cur.id:"unknown",image:du.slice(du.indexOf(",")+1),time:v.currentTime.toFixed(2)})}).then(function(r){return r.json()}).then(function(d){note(d.ok?${JSON.stringify(t("player.savedPfx"))}+" "+d.path:${JSON.stringify(t("player.capFailPfx"))}+" "+(d.error||""))}).catch(function(){note(${JSON.stringify(t("player.capOffline"))})});
 };
 v.addEventListener("ended",function(){nav(1,true);});
+var NAV={ArrowUp:1,ArrowDown:1,ArrowLeft:1,ArrowRight:1,Home:1,End:1,PageUp:1,PageDown:1," ":1,Enter:1,Tab:1};
 document.addEventListener("keydown",function(e){
-if(e.target&&e.target.tagName==="SELECT")return;
+var tn=e.target&&e.target.tagName;
+if(tn==="SELECT"&&NAV[e.key])return;
+var ag=e.getModifierState&&e.getModifierState("AltGraph");
+if(!ag&&(e.ctrlKey||e.metaKey)){var k=String(e.key).toLowerCase();
+if(k==="z"&&!e.shiftKey){e.preventDefault();doHist("undo");}
+else if(k==="y"||(k==="z"&&e.shiftKey)){e.preventDefault();doHist("redo");}
+return;}
+if(!ag&&e.altKey)return;
+if(tn==="SELECT")e.preventDefault();
 if(e.target&&e.target.closest&&e.target.closest("#list")){
 if(e.key==="ArrowDown"||e.key==="ArrowUp"){e.preventDefault();var items=listEl.querySelectorAll(".li");var idx=Array.prototype.indexOf.call(items,e.target);var n=items[idx+(e.key==="ArrowDown"?1:-1)];if(n)n.focus();}
 return;}

@@ -158,7 +158,8 @@ fn request_shutdown(port: u16) {
     };
     // No configured token means the mutating-request gate wants the
     // instance nonce — the shell shares the user's trust domain, so the
-    // user-private instance file (or /api/status) supplies it.
+    // user-private instance file (or the ft_nonce cookie GET / plants)
+    // supplies it.
     let nonce_header = instance_nonce(port)
         .map(|nonce| format!("X-FrameTrace-Nonce: {nonce}\r\n"))
         .unwrap_or_default();
@@ -176,8 +177,10 @@ fn request_shutdown(port: u16) {
 }
 
 /// Per-process instance nonce for the nonce gate: the instance file is
-/// authoritative (user-private); /api/status is the fallback for servers
-/// started before instance files existed.
+/// authoritative (user-private). The fallback (servers started before
+/// instance files existed, or an unreadable file) is the `ft_nonce`
+/// cookie that `GET /` plants — `/api/status`'s "instance" field is only
+/// a SHA-256 fingerprint of the nonce and would be refused with 401.
 fn instance_nonce(port: u16) -> Option<String> {
     if let Some((instance_port, instance)) = crate::serve::read_instance_file()
         && instance_port == port
@@ -188,15 +191,27 @@ fn instance_nonce(port: u16) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream
-        .write_all(b"GET /api/status HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
         .ok()?;
-    let mut body = String::new();
-    let _ = stream.read_to_string(&mut body);
-    let needle = "\"instance\":\"";
-    let start = body.find(needle)? + needle.len();
-    let end = body[start..].find('"')? + start;
-    let nonce = &body[start..end];
-    (!nonce.is_empty()).then(|| nonce.to_string())
+    let mut buffer = Vec::new();
+    let _ = stream.read_to_end(&mut buffer);
+    nonce_from_response(&String::from_utf8_lossy(&buffer))
+}
+
+/// Extracts the `ft_nonce` cookie value from a raw HTTP response's
+/// `Set-Cookie` headers (header block only; the body is ignored).
+fn nonce_from_response(response: &str) -> Option<String> {
+    let head = response.split("\r\n\r\n").next().unwrap_or(response);
+    head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("set-cookie") {
+            return None;
+        }
+        let pair = value.trim().split(';').next()?;
+        let (cookie, nonce) = pair.split_once('=')?;
+        let nonce = nonce.trim();
+        (cookie.trim() == "ft_nonce" && !nonce.is_empty()).then(|| nonce.to_string())
+    })
 }
 
 fn host_window(url: &str) -> Result<(), String> {
@@ -387,5 +402,30 @@ unsafe extern "system" fn frame_window_proc(
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nonce_from_response;
+
+    #[test]
+    fn parses_ft_nonce_from_set_cookie() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: ft_nonce=abc123; HttpOnly; SameSite=Strict; Path=/\r\n\r\n<html>ft_nonce=bogus</html>";
+        assert_eq!(nonce_from_response(response).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn missing_or_empty_cookie_yields_none() {
+        assert_eq!(
+            nonce_from_response("HTTP/1.1 200 OK\r\n\r\nft_nonce=x"),
+            None
+        );
+        assert_eq!(
+            nonce_from_response(
+                "HTTP/1.1 200 OK\r\nset-cookie: other=1\r\nSet-Cookie: ft_nonce=; Path=/\r\n\r\n"
+            ),
+            None
+        );
     }
 }

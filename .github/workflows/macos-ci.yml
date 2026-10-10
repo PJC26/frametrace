@@ -28,9 +28,7 @@ jobs:
       - name: Contract pin drift-check
         run: node scripts/verify-contract-pin.mjs
       - name: Viewer JavaScript syntax
-        run: |
-          node --check gui/evidence-viewer/app.js
-          node --check assets/evidence_viewer.js
+        run: node scripts/check-js.mjs
       - name: Install external tools
         run: brew install ffmpeg libewf sleuthkit
       - name: Test

@@ -49,8 +49,8 @@ fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String
     http_with(port, method, path, body, None)
 }
 
-/// Mutating requests need the instance nonce under the no-token gate —
-/// the workstation reports it as /api/status's "instance" field.
+/// Mutating requests need the instance nonce under the no-token gate
+/// (see `fetch_nonce`).
 fn http_with(
     port: u16,
     method: &str,
@@ -88,6 +88,29 @@ fn http_with(
         .unwrap_or(0);
     let body_at = text.find("\r\n\r\n").map(|at| at + 4).unwrap_or(0);
     (status, text[body_at..].to_string())
+}
+
+/// Reads the mutation nonce from the `ft_nonce` cookie set on a page GET.
+fn fetch_nonce(port: u16) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect workstation");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut buffer = Vec::new();
+    let _ = stream.read_to_end(&mut buffer);
+    let text = String::from_utf8_lossy(&buffer);
+    let at = text
+        .find("ft_nonce=")
+        .map(|at| at + "ft_nonce=".len())
+        .expect("GET / plants the ft_nonce cookie");
+    text[at..]
+        .split(|ch: char| ch == ';' || ch.is_whitespace())
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 /// Polls `/api/status` until `phase == {want}` or the deadline passes.
@@ -179,17 +202,9 @@ fn workstation_full_pipeline_over_http() {
         panic!("idle status failed: {code} {body}");
     }
 
-    // The mutating-request gate needs the instance nonce — read it from
-    // the status body reported above.
-    let nonce_at = body
-        .find("\"instance\":\"")
-        .map(|at| at + "\"instance\":\"".len())
-        .expect("status reports an instance nonce");
-    let nonce_end = body[nonce_at..]
-        .find('"')
-        .map(|off| nonce_at + off)
-        .expect("instance nonce is quoted");
-    let nonce = body[nonce_at..nonce_end].to_string();
+    // /api/status only publishes a fingerprint; the real nonce is planted
+    // as the ft_nonce cookie on GET responses.
+    let nonce = fetch_nonce(port);
     // A nonce-less mutating request must be refused outright.
     let (code, _) = http(port, "POST", "/api/start", Some("{}"));
     assert_eq!(code, 401, "POST without the instance nonce must be 401");

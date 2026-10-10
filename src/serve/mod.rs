@@ -238,6 +238,64 @@ pub(crate) fn open_in_explorer(path: &Path) {
     }
 }
 
+/// SEC-01: resolves an `/api/open-folder` path to a folder the shell may
+/// open. The path must exist, be a directory (never a file — on Windows
+/// `explorer.exe <file>` launches it), and sit inside the open case, the
+/// last package, or an approved media root (case/source roots).
+pub(crate) fn resolve_open_folder(state: &SharedState, raw: &str) -> Result<PathBuf, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("폴더 경로가 비어 있습니다.".into());
+    }
+    // Only the canonical (absolute) path reaches the shell, so a value like
+    // `-switch` can never be parsed as an explorer/xdg-open option.
+    let canonical = Path::new(raw)
+        .canonicalize()
+        .map_err(|_| format!("폴더가 존재하지 않습니다: {raw}"))?;
+    if !canonical.is_dir() {
+        return Err("폴더만 열 수 있습니다 (파일 경로 거부).".into());
+    }
+    let roots: Vec<PathBuf> = {
+        let guard = state_lock(state);
+        guard
+            .case_dir
+            .iter()
+            .chain(guard.package_dir.iter())
+            .chain(guard.media_roots.iter())
+            .cloned()
+            .collect()
+    };
+    if roots.iter().any(|root| path_is_under(root, &canonical)) {
+        Ok(shell_path(canonical))
+    } else {
+        Err("케이스 또는 승인된 소스 폴더 밖의 경로는 열 수 없습니다.".into())
+    }
+}
+
+/// explorer.exe does not understand the `\\?\` verbatim prefix that
+/// `canonicalize` produces on Windows; convert back to the plain form.
+pub(crate) fn shell_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+pub(crate) fn api_open_folder(request: &Request, state: &SharedState) -> String {
+    let raw = body_value(&request.body, "path").unwrap_or_default();
+    match resolve_open_folder(state, &raw) {
+        Ok(path) => {
+            open_in_explorer(&path);
+            "{\"ok\":true}".to_string()
+        }
+        Err(err) => api_err(&err),
+    }
+}
+
 pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
     // GET responses are safe to read from any origin only when the Host
     // header is loopback; a rebinding domain pointing at this port is the
@@ -268,13 +326,7 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/proxy") => json(api_proxy(request, state)),
         ("POST", "/api/advanced") => json(api_advanced(request, state)),
         ("POST", "/api/carve") => json(api_carve(request, state)),
-        ("POST", "/api/open-folder") => {
-            let path = body_value(&request.body, "path").unwrap_or_default();
-            if !path.is_empty() {
-                open_in_explorer(Path::new(&path));
-            }
-            json("{\"ok\":true}".into())
-        }
+        ("POST", "/api/open-folder") => json(api_open_folder(request, state)),
         _ => plain(404, b"not found".to_vec()),
     }
 }

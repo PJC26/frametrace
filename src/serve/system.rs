@@ -259,6 +259,17 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         .map(|index| index.to_string())
         .unwrap_or_default();
     let logs: Vec<String> = guard.logs.iter().rev().take(60).rev().cloned().collect();
+    let warnings: Vec<serde_json::Value> = guard
+        .warnings
+        .iter()
+        .map(|(step, message)| {
+            serde_json::json!({
+                "step": step,
+                "step_name": guard.step_names.get(*step).copied().unwrap_or_default(),
+                "message": message,
+            })
+        })
+        .collect();
     let opt = |value: &Option<PathBuf>| {
         value
             .as_ref()
@@ -267,12 +278,16 @@ pub(crate) fn api_status(state: &SharedState) -> String {
     serde_json::json!({
         "ok": true,
         "app": "frametrace",
-        "instance": guard.instance,
+        // SEC-04: a public fingerprint, never the raw mutation nonce.
+        "instance": instance_fingerprint(&guard.instance),
         "has_job": guard.phase != "idle",
         "phase": guard.phase,
         "restored": guard.restored,
         "busy": guard.busy,
         "steps": steps,
+        // FOR-08: non-fatal step failures; non-empty means the run is
+        // "done with warnings", not a clean pass.
+        "warnings": warnings,
         "step_names": guard.step_names,
         "current": current,
         "logs": logs,
@@ -408,14 +423,12 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     let prior_roots = restore_session()
         .and_then(|(dir, roots)| (dir == case_dir).then_some(roots))
         .unwrap_or_else(|| vec![case_dir.clone()]);
-    let extra_root = prior_roots
-        .iter()
-        .find(|root| **root != case_dir)
-        .cloned();
+    let extra_root = prior_roots.iter().find(|root| **root != case_dir).cloned();
     guard.media_roots = prior_roots;
     // An explicit open is a deliberate choice — the restored-session
     // prompt must not reappear over it.
     guard.restored = false;
+    guard.warnings = Vec::new();
     if has_review {
         guard.phase = "review-ready";
         guard.steps = [StepStatus::Done; 5];

@@ -94,8 +94,16 @@ pub(crate) fn find_running_server() -> Option<u16> {
     if let Some((port, instance)) = read_instance_file()
         && let Some(body) = probe_status_body(port)
     {
-        let needle = format!("\"instance\":\"{instance}\"");
-        if body.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+        // Current servers publish only the nonce's fingerprint (SEC-04);
+        // older builds echoed the raw nonce — accept either.
+        let matches = [instance_fingerprint(&instance), instance]
+            .iter()
+            .filter(|value| !value.is_empty())
+            .any(|value| {
+                let needle = format!("\"instance\":\"{value}\"");
+                body.windows(needle.len()).any(|w| w == needle.as_bytes())
+            });
+        if matches {
             return Some(port);
         }
         // Stale or foreign instance file: keep scanning below.

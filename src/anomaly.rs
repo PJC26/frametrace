@@ -91,8 +91,16 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     }
     // Every scan records which integrity lane ran so a report generated from
     // stored hashes is never mistaken for a full revalidation pass.
+    let mtime_unavailable = mtime_unavailable_count(&rows);
+    let mtime_note = if mtime_unavailable > 0 {
+        format!(
+            "; mtime-unavailable: {mtime_unavailable} record(s) excluded from timestamp-gap/regression checks"
+        )
+    } else {
+        String::new()
+    };
     let detail = if !rehash {
-        "stored index hashes only; pass --rehash for full revalidation".to_string()
+        format!("stored index hashes only; pass --rehash for full revalidation{mtime_note}")
     } else {
         format!(
             "live re-hashing; coverage: {} of {} records rehashed, {} no stored hash, {} missing on disk, {} unreadable or unhashable{}",
@@ -108,14 +116,15 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
                 "; coverage limitation: not every indexed file was revalidated"
             } else {
                 ""
-            }
-        )
+            },
+        ) + &mtime_note
     };
     let line = format!(
-        "{{\"schema_version\":1,\"event\":\"anomaly-scan-run\",\"scanned_unix\":{},\"hash_mode\":\"{}\",\"finding_count\":{},\"skipped_no_hash\":{},\"skipped_missing\":{},\"skipped_error\":{},\"coverage_limited\":{},\"detail\":\"{}\"}}",
+        "{{\"schema_version\":1,\"event\":\"anomaly-scan-run\",\"scanned_unix\":{},\"hash_mode\":\"{}\",\"finding_count\":{},\"mtime_unavailable\":{},\"skipped_no_hash\":{},\"skipped_missing\":{},\"skipped_error\":{},\"coverage_limited\":{},\"detail\":\"{}\"}}",
         scanned_unix,
         if rehash { "rehash" } else { "stored" },
         findings.len(),
+        mtime_unavailable,
         coverage.skipped_no_hash,
         coverage.skipped_missing,
         coverage.skipped_error,
@@ -256,28 +265,41 @@ fn index_staleness_findings(rows: &[IndexedRow]) -> Vec<Finding> {
     out
 }
 
+/// A usable mtime: `None` and the `0` placeholder (unset FAT/zip entry,
+/// failed conversion) are "unavailable", never a 1970 timestamp — feeding
+/// them into gap/regression checks fabricates findings.
+fn usable_mtime(row: &IndexedRow) -> Option<u64> {
+    row.modified_unix.filter(|mtime| *mtime > 0)
+}
+
+/// Rows excluded from timestamp checks for lack of an mtime; reported in
+/// the run record so the exclusion is disclosed, not silent.
+fn mtime_unavailable_count(rows: &[IndexedRow]) -> usize {
+    rows.iter()
+        .filter(|row| usable_mtime(row).is_none())
+        .count()
+}
+
 fn timestamp_findings(rows: &[IndexedRow]) -> Vec<Finding> {
-    let mut by_parent: std::collections::BTreeMap<String, Vec<&IndexedRow>> =
+    let mut by_parent: std::collections::BTreeMap<String, Vec<(&IndexedRow, u64)>> =
         std::collections::BTreeMap::new();
     for row in rows {
-        if row.modified_unix.is_none() {
+        let Some(mtime) = usable_mtime(row) else {
             continue;
-        }
+        };
         let parent = Path::new(&row.source_path)
             .parent()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default();
-        by_parent.entry(parent).or_default().push(row);
+        by_parent.entry(parent).or_default().push((row, mtime));
     }
 
     let mut out = Vec::new();
     for (_parent, mut group) in by_parent {
-        group.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+        group.sort_by(|a, b| a.0.source_path.cmp(&b.0.source_path));
         for window in group.windows(2) {
-            let left = window[0];
-            let right = window[1];
-            let left_ts = left.modified_unix.unwrap_or(0);
-            let right_ts = right.modified_unix.unwrap_or(0);
+            let (left, left_ts) = window[0];
+            let (right, right_ts) = window[1];
             if right_ts < left_ts {
                 out.push(Finding {
                     kind: "timestamp-regression",
@@ -688,6 +710,30 @@ mod tests {
             assert_eq!(findings.len(), 1);
             assert_eq!(findings[0].kind, "dav-date-coverage-limitation");
         }
+    }
+
+    #[test]
+    fn missing_or_zero_mtime_never_creates_timestamp_findings() {
+        let row = |id: &str, path: &str, mtime: Option<u64>| IndexedRow {
+            id: id.into(),
+            source_path: path.into(),
+            sha256: None,
+            size_bytes: None,
+            modified_unix: mtime,
+            duration_seconds: None,
+            format_name: None,
+            video_codec: None,
+            ffprobe_ok: None,
+        };
+        let rows = vec![
+            row("vid_1", "C:/ev/a.mp4", Some(1_700_000_000)),
+            row("vid_2", "C:/ev/b.mp4", None),
+            row("vid_3", "C:/ev/c.mp4", Some(0)),
+            row("vid_4", "C:/ev/d.mp4", Some(1_700_000_010)),
+        ];
+        // b/c have no usable mtime: no regression (0 < a) and no gap (d - 0).
+        assert!(timestamp_findings(&rows).is_empty());
+        assert_eq!(mtime_unavailable_count(&rows), 2);
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         guard.phase = "running";
         guard.restored = false;
         guard.cancel_requested = false;
+        guard.warnings = Vec::new();
         guard.steps = [StepStatus::Pending; 5];
         guard.step_names = job.kind.step_names().to_vec();
         guard.logs = Vec::new();
@@ -299,7 +300,7 @@ pub(crate) fn run_e01_pipeline_tail(state: SharedState, job: PipelineJob) {
             }
         }
         Err(err) => {
-            log(&state, format!("논리 색인 건너뜀: {err}"));
+            warn_step(&state, 3, format!("논리 색인 건너뜀: {err}"));
             set_step(&state, 3, StepStatus::Done);
         }
     }
@@ -311,7 +312,7 @@ pub(crate) fn run_e01_pipeline_tail(state: SharedState, job: PipelineJob) {
         &state,
     ) {
         Ok(output) => log(&state, output),
-        Err(err) => log(&state, format!("이상 징후 스캔 건너뜀: {err}")),
+        Err(err) => warn_step(&state, 4, format!("이상 징후 스캔 건너뜀: {err}")),
     }
     set_step(&state, 4, StepStatus::Running);
     match run_step(&exe, &["make-review".into(), case_text.clone()], &state) {
@@ -402,10 +403,10 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
             set_step(&state, 1, StepStatus::Done);
         }
         Err(err) => {
-            log(
-                &state,
-                format!("소스 등록 건너뜀(이미 등록된 경우 무시): {err}"),
-            );
+            // register-source is an upsert, so re-registering an already
+            // known source succeeds — any failure here is a real error the
+            // examiner must see, not an "already registered" no-op (FOR-08).
+            warn_step(&state, 1, format!("소스 등록 실패, 건너뜀: {err}"));
             set_step(&state, 1, StepStatus::Done);
         }
     }
@@ -453,13 +454,17 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
                         set_step(&state, 3, StepStatus::Done);
                     }
                     Err(err) => {
-                        log(&state, format!("일괄 검증 실패, 건너뜀: {err}"));
+                        warn_step(&state, 3, format!("일괄 검증 실패, 건너뜀: {err}"));
                         set_step(&state, 3, StepStatus::Done);
                     }
                 }
             }
             Err(err) => {
-                log(&state, format!("선택 목록 생성 실패, 검증 건너뜀: {err}"));
+                warn_step(
+                    &state,
+                    3,
+                    format!("선택 목록 생성 실패, 검증 건너뜀: {err}"),
+                );
                 set_step(&state, 3, StepStatus::Done);
             }
         }
@@ -474,7 +479,7 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
         &state,
     ) {
         Ok(output) => log(&state, output),
-        Err(err) => log(&state, format!("이상 징후 스캔 건너뜀: {err}")),
+        Err(err) => warn_step(&state, 4, format!("이상 징후 스캔 건너뜀: {err}")),
     }
 
     set_step(&state, 4, StepStatus::Running);
@@ -495,6 +500,15 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
             fail(&state, &err);
         }
     }
+}
+
+/// Records a non-fatal step failure (FOR-08): logged like before, but also
+/// kept in `JobState::warnings` so /api/status reports the run as
+/// "done with warnings" instead of a clean green pass.
+pub(crate) fn warn_step(state: &SharedState, step: usize, message: String) {
+    let mut guard = state_lock(state);
+    guard.logs.push(format!("경고: {message}"));
+    guard.warnings.push((step, message));
 }
 
 pub(crate) fn fail(state: &SharedState, message: &str) {

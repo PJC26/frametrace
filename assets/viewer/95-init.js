@@ -53,12 +53,4 @@ applyLayout();
 render();
 })();
 
-/* Data loading order:
- * 1. window.__FRAMETRACE_DATA__ already set — legacy single-file bundle
- *    (older make-review output) — use it directly.
- * 2. Served by the frametrace workstation — page the case index through
- *    /api/records + /api/records-meta so the HTML never carries a
- *    multi-hundred-MB inline payload for large cases.
- * 3. Opened as a plain file (or a server without the API) — the
- *    generated sibling data-bundle.js, which a plain <script> tag can
- *    load even under file:// where fetch() is blocked. */
+// Data loading lives in 99-loader.js (outside the IIFE; see its header).

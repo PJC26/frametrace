@@ -28,9 +28,7 @@ jobs:
       - name: Contract pin drift-check
         run: node scripts/verify-contract-pin.mjs
       - name: Viewer JavaScript syntax
-        run: |
-          node --check gui/evidence-viewer/app.js
-          node --check assets/evidence_viewer.js
+        run: node scripts/check-js.mjs
       - name: Install ffmpeg
         run: choco install ffmpeg -y --no-progress
         shell: pwsh

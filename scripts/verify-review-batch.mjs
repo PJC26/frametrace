@@ -236,7 +236,7 @@ async function unitTests() {
   const records = ['a', 'b', 'c'].map(id => ({ id }));
   const els = Object.fromEntries(['resultCount', 'pageStatus', 'prevPage', 'nextPage', 'recordGrid'].map(id => [id, {}]));
   Object.assign(state, { marks: {}, selectedIds: new Set(), pageSize: 100, currentPage: 1, groupBy: 'none', collapsedGroups: new Set() });
-  const grid = { state, records, els, t: x => x, tf, escapeHtml: x => x, groupKeyFor: () => 'group', renderCard: r => `<card>${r.id}</card>` };
+  const grid = { state, records, recordById: new Map(records.map(r => [r.id, r])), els, t: x => x, tf, escapeHtml: x => x, groupKeyFor: () => 'group', renderCard: r => `<card>${r.id}</card>` };
   const selectedSource = source.match(/^function selectedRecord\(\).*$/m)[0];
   assert.equal(runInNewContext(selectedSource + '\nselectedRecord();', grid), records[0]);
   runInNewContext(fn('renderGrid') + '\nrenderGrid([]);', grid);
@@ -249,7 +249,9 @@ async function unitTests() {
   Object.assign(grid, { MARKS_KEY: 'marks', ANNOTATIONS_KEY: 'annotations', storageSet: () => {}, markReviewDirty: () => {}, filteredRecords: () => records.filter(r => !state.marks[r.id]), render: () => runInNewContext(fn('renderGrid') + '\nrenderGrid(filteredRecords());', grid), moveActive: () => { state.activeId = 'c'; } });
   Object.assign(state, { drafts: {}, deletedIds: [], examiners: {}, notes: {}, tags: {} });
   const touch = fn('touchAnnotation');
-  runInNewContext(touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
+  Object.assign(grid, { markLabel: s => s, document: { getElementById: () => null }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
+  const journalSrc = [fn('snapshotIds'), fn('journalDiff'), fn('toastUndo'), fn('journaled'), fn('markStatusLabel')].join('\n');
+  runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
   assert.equal(state.activeId, 'b');
   console.log('PASS VM empty filter, collapsed group, sequential triage');
   Object.assign(state, { marks: {}, notes: {}, tags: {}, examiner: 'New', deletedIds: ['a'], examiners: { b: 'Bob' } });
@@ -279,7 +281,7 @@ async function unitTests() {
   // mark/tag mutation replays the old value on reload and resurrects
   // cleared annotations (or drops new ones) after hydration.
   Object.assign(state, { marks: {}, notes: {}, tags: {}, drafts: {}, deletedIds: [], selectedIds: new Set(['a']) });
-  Object.assign(grid, { toast: () => {}, markLabel: s => s, NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
+  Object.assign(grid, { toast: () => {}, requestRender: () => {}, storageSet: () => {}, MARKS_KEY: 'marks', markLabel: s => s, NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
   const ops = [fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags')].join('\n');
   runInNewContext(ops + '\napplyMark("important");', grid);
   assert.equal(state.drafts.a.mark.status, 'important');

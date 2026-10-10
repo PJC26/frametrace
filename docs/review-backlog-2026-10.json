@@ -1,0 +1,586 @@
+{
+ "findings": [
+  {
+   "id": "UX-01",
+   "severity": "critical",
+   "file": "assets/viewer/80-review.js:235-250",
+   "area": "viewer/IN-OUT",
+   "problem": "setRangePoint declares const t = video.currentTime, shadowing the i18n t(). t('toast.pickEvidence') hits the TDZ (ReferenceError) and t('toast.outBeforeIn') throws TypeError. The i/o keys and IN/OUT buttons crash with no video, and when OUT<=IN the range correction is skipped, so a malformed range survives.",
+   "proposed_fix": "Rename the local to `now`. Add a DOM test for i/o with no video and with OUT<IN. Add a lint rule against shadowing t/tf.",
+   "user_impact": "Core clip-extraction flow fails silently or accepts an invalid range."
+  },
+  {
+   "id": "FOR-01",
+   "severity": "critical",
+   "file": "assets/viewer/10-boot.js:35; 30-records.js:360-369; 90-sync.js:50-90",
+   "area": "marks persistence",
+   "problem": "Marks, notes, tags, IN/OUT and proxy choices live in per-origin localStorage. A port change (8477..8486) or a different profile shows zero marks. Server sync is debounced, failures are swallowed, it is rejected while the busy lock is held, and ranges/proxies are never synced.",
+   "proposed_fix": "Make the case DB the source of truth and load annotations on boot. Add a visible save-state indicator (saved/saving/FAILED/N pending). Retry with backoff, queue instead of dropping, persist ranges server-side, warn on divergence.",
+   "user_impact": "Hours of triage can be lost, or the examiner believes marks were saved when they were not."
+  },
+  {
+   "id": "UX-02",
+   "severity": "critical",
+   "file": "src/serve/jobs.rs:336-495; assets/examiner_app.html:226-254",
+   "area": "scan flow",
+   "problem": "Review opens only after the whole pipeline (scan, hash, ffprobe, anomalies, make-review) finishes. Steps 2-4 stay locked for hours on multi-TB sources, with only a log and no partial results.",
+   "proposed_fix": "Two-phase pipeline: fast index then open the viewer immediately; run hash/validate/anomaly as background enrichment with live record updates and a header progress chip. Show live counters.",
+   "user_impact": "First-time examiner stares at a log for hours with no confidence the scan works."
+  },
+  {
+   "id": "PERF-01",
+   "severity": "critical",
+   "file": "src/serve/records.rs:19-36,63-71; assets/viewer/99-loader.js:72-77",
+   "area": "server/loader",
+   "problem": "api_records deep-clones the whole cached index under the global mutex on every 500-row page, fetched serially: O(N^2/500) and it blocks all other endpoints. /api/records-meta re-parses video_index.json from disk uncached.",
+   "proposed_fix": "Cache the index as Arc and drop the lock before filtering. Fetch in parallel with larger pages, or stream NDJSON/gzip. Reuse the cache in records-meta and split it into lazily loaded endpoints.",
+   "user_impact": "Large cases load for minutes and stall the whole workstation."
+  },
+  {
+   "id": "PERF-02",
+   "severity": "critical",
+   "file": "assets/viewer/99-loader.js:63-96; 30-records.js",
+   "area": "viewer boot/memory",
+   "problem": "All records are downloaded and processed synchronously on the main thread (regexes, maps, proxy lookup O(records*proxies)). Thumbs, fls, carve, validation and anomaly logs are inlined in meta. There is no progress for the build phase, and records are held in about 3 forms.",
+   "proposed_fix": "Move filter/sort/facets to the server (SQLite) and request only a window. At minimum, chunk the build with idle yields, precompute fields in the indexer, build a proxy Map, paginate the logs.",
+   "user_impact": "Multi-second freeze and hundreds of MB of heap on 100k+ records; low-RAM laptops can crash."
+  },
+  {
+   "id": "UX-03",
+   "severity": "high",
+   "file": "assets/viewer/80-review.js:68-103; 70-player.js:241-252",
+   "area": "keyboard",
+   "problem": "The global keydown handler ignores ctrl/meta/alt. Ctrl+0/1/2/3, Ctrl+F/P/T and Alt+Left trigger the mark, clear, find and fullscreen actions. Ctrl+0 (zoom reset) clears the mark and the note and advances. The popup player has the same flaw.",
+   "proposed_fix": "Return early on ctrl/meta/alt except the explicit Ctrl+A/Ctrl+D/Ctrl+Z. Apply the same fix in the popup player.",
+   "user_impact": "Browser shortcuts silently destroy examiner annotations."
+  },
+  {
+   "id": "UX-04",
+   "severity": "high",
+   "file": "assets/viewer/80-review.js:52-66,87-89",
+   "area": "marks/undo",
+   "problem": "Key 0 and Clear delete the mark AND the note with no confirmation. 1/2/3 auto-advance without feedback. There is no undo for marks, tags, notes, ranges or bulk marks over many selected items. The key scope (active item) differs from the button scope (selection) with no indicator.",
+   "proposed_fix": "Add a global undo/redo journal (Ctrl+Z/Y) and an Undo toast. Keep the note when clearing a mark. Confirm bulk actions over N items. Show an 'applies to' scope label.",
+   "user_impact": "A stray key destroys written memos; bulk marks are irreversible."
+  },
+  {
+   "id": "UX-05",
+   "severity": "high",
+   "file": "assets/examiner_app.html:785-868,920-945 (jpost ~436)",
+   "area": "workstation/error states",
+   "problem": "jpost does not check r.ok or catch network and non-JSON errors. The start, recover, carve, finalize, import and adv handlers lack try/finally, so buttons stay disabled forever and hints stick on 'running...'. Poll errors are swallowed, open-folder results are ignored, and browseTo is unwrapped.",
+   "proposed_fix": "Wrap jpost to return {ok,error} and use try/finally everywhere. Add a server-lost banner driven by poll failures. Toast open-folder failures. Add retry rows in the picker.",
+   "user_impact": "A transient error leaves a dead UI that needs a reload and loses context."
+  },
+  {
+   "id": "UX-06",
+   "severity": "high",
+   "file": "assets/examiner_app.html:864-886,92-96",
+   "area": "long jobs",
+   "problem": "Recover and Carve have no progress, cancel or elapsed time, only a tiny hint line. Completion reloads the iframe (reviewFrame.src = reviewFrame.src), dropping filters, scroll, active item and unsynced marks. ETA shows only when total>0, with no throughput or current file, and there is no pre-flight disk/size estimate.",
+   "proposed_fix": "Run these through the job/status mechanism with a progress panel, throughput, current file, ETA and Cancel. Refresh viewer data via postMessage without a reload, and auto-apply marks first.",
+   "user_impact": "The user cannot decide to wait or cancel, and loses their place when the job ends."
+  },
+  {
+   "id": "FOR-02",
+   "severity": "high",
+   "file": "assets/examiner_app.html:358-370; src/serve/jobs.rs:635-772",
+   "area": "finalize/report",
+   "problem": "Finalize is one opaque button with no pre-flight (unapplied marks, unreviewed count, failed validation, important-without-note, missing examiner name, audit health). It does not sync pending viewer marks first. There are three overlapping routes for getting marks in (auto, apply button, import file) and the examiner name defaults to null.",
+   "proposed_fix": "Pre-finalize checklist dialog with blocking and warning items and jump links. Auto-apply pending marks via postMessage first. Require an examiner name. Show package checksum. Relabel or collapse the import path.",
+   "user_impact": "A court report can be generated with missing marks, unreviewed items or no examiner identity."
+  },
+  {
+   "id": "FOR-03",
+   "severity": "high",
+   "file": "src/custody.rs:379-385,225-243",
+   "area": "custody overclaim",
+   "problem": "The statement asserts evidence was 'not modified' and 'verified live', but evidence is never re-hashed. Structural-only audit lanes render green 'verified' with no tamper-proof caveat. A DB load failure prints 'No evidence sources registered'.",
+   "proposed_fix": "Re-stat and re-hash sources at generation and print a recorded-vs-observed table. Make the claims conditional and use the trust-level vocabulary. Colour structural-only lanes amber and state the limit. Show 'database unreadable' on error.",
+   "user_impact": "The examiner signs a claim the tool never tested, and it can be attacked in court."
+  },
+  {
+   "id": "FOR-04",
+   "severity": "high",
+   "file": "src/case_db/evidence.rs:6-70; src/cli/mod.rs:46,90",
+   "area": "hash provenance",
+   "problem": "evidence_hash is free text with no validation or origin. It is printed as a hash of record. Re-register silently overwrites kind/path/metadata with no audit entry.",
+   "proposed_fix": "Validate hex length. Store hash_origin and a computed_hash. Label claimed vs observed. Write a chained audit entry for every register or re-register.",
+   "user_impact": "A typo or fabricated hash appears as evidence of record."
+  },
+  {
+   "id": "FOR-05",
+   "severity": "high",
+   "file": "src/audit.rs:229-239,177-224; src/qa.rs:483-503",
+   "area": "audit verification",
+   "problem": "verify opens the log with create(true), so a missing log becomes an intact empty chain. The keyed path reads without the lock. The qa check discovers logs only if the first line contains 'previous_entry_sha256', so tampering or deleting a log still yields PASS. There is no anchor on head or entry count.",
+   "proposed_fix": "Open read-only without create. Treat every *log.jsonl as a lane and compare against an expected-lane list. Record chain-head anchors, and fail on missing lane or unparseable first line.",
+   "user_impact": "Tamper-evidence can be bypassed by deleting or truncating a log."
+  },
+  {
+   "id": "FOR-06",
+   "severity": "high",
+   "file": "src/serve/media.rs:57,668,648",
+   "area": "export/audit integrity",
+   "problem": "Audit appends use `let _ =`, so a failed write still returns ok:true. The capture entry lacks the source sha256 and the validated time. export-selected takes sha256_source from the client and never hashes the source server-side.",
+   "proposed_fix": "Propagate audit errors (ok:false or an unlogged warning). Hash source and copy in one pass and look up the recorded hash from the DB. Validate id and time.",
+   "user_impact": "Artifacts exist outside the chain of custody while the UI says saved; the manifest can claim an unverified copy."
+  },
+  {
+   "id": "FOR-07",
+   "severity": "high",
+   "file": "src/case_db/evidence.rs:96-165; src/serve/jobs.rs:635-700",
+   "area": "marks custody",
+   "problem": "Marks, tags and deletions are mutable rows with no history or tombstone. There is no chained audit entry per mark change. Import trusts the client's marked_unix and examiner, and marks-imported.json is overwritten non-atomically. Import accepts a missing case_id.",
+   "proposed_fix": "Make marks append-only with a chained entry per change and a history table. Use tombstones. Keep each import under a unique name with its SHA-256 logged, require case_id, and offer a dry-run diff.",
+   "user_impact": "An examiner's judgments can be changed or erased with no trace."
+  },
+  {
+   "id": "SEC-01",
+   "severity": "high",
+   "file": "src/serve/mod.rs:232,271 (open_in_explorer)",
+   "area": "open-folder",
+   "problem": "POST /api/open-folder passes any path to explorer.exe/xdg-open with no is_dir check or confinement. On Windows that launches executables. The nonce is the only gate and is trivially obtained.",
+   "proposed_fix": "Canonicalize, require is_dir and path_is_under(case/package/export dirs), reject files and switch-like args.",
+   "user_impact": "Arbitrary local file launch as the examiner."
+  },
+  {
+   "id": "SEC-02",
+   "severity": "high",
+   "file": "src/serve/http.rs:440-480,527,726; system.rs:388",
+   "area": "same-origin script execution",
+   "problem": "/case, /review and /media serve html/svg/js with executable MIME from the workstation origin with no CSP, sandbox or X-Frame-Options. open-case accepts any folder with case.json, so a foreign case or an HTML file in seized data runs script with access to all mutating APIs.",
+   "proposed_fix": "Serve user content as octet-stream/text with CSP sandbox and nosniff. Add CSP to generated pages. Add a trust prompt on open-case with schema and hash checks.",
+   "user_impact": "A received case package or suspect file can drive export/import/shutdown and exfiltrate data."
+  },
+  {
+   "id": "SEC-03",
+   "severity": "medium",
+   "file": "assets/viewer/70-player.js:181,97; src/html_report.rs:409",
+   "area": "script injection",
+   "problem": "openPlayerWindow uses document.write with JSON.stringify(case_id) in an inline script. JSON.stringify does not escape '<', so a crafted case_id breaks out of the script into the same origin.",
+   "proposed_fix": "Pass via data attribute/textContent or escape '<' as <. Build the popup DOM with createElement. Validate case_id at manifest load.",
+   "user_impact": "Opening the player of a tampered case runs attacker script."
+  },
+  {
+   "id": "SEC-04",
+   "severity": "medium",
+   "file": "src/serve/system.rs (api_status); src/serve/http.rs:64-77",
+   "area": "auth model",
+   "problem": "In default mode the mutation nonce is returned by unauthenticated GET /api/status and set as a cookie on every GET. Any local process can mutate and /api/browse enumerates the whole filesystem.",
+   "proposed_fix": "Generate a random token at startup by default and pass it via the launch URL/header. Drop the instance field from status, compare in constant time, confine /api/browse.",
+   "user_impact": "On shared hosts the workstation is a local file-read and launcher primitive."
+  },
+  {
+   "id": "UX-07",
+   "severity": "high",
+   "file": "src/serve/system.rs:367; src/serve/jobs.rs:58,530,543",
+   "area": "cancel state bug",
+   "problem": "cancel_requested is reset only in api_start. After one cancel, every later run_step (clip export, proxy, import, finalize, carve) kills its child immediately and fails with 'user cancelled'. child.kill() does not kill grandchildren (ffmpeg, ewfexport).",
+   "proposed_fix": "Reset the flag when acquiring the busy guard and make cancel per-run. Kill the process tree (Job Object / killpg) and add timeouts.",
+   "user_impact": "After one cancel the tool appears broken for the rest of the session; orphaned processes leave partial outputs."
+  },
+  {
+   "id": "UX-08",
+   "severity": "high",
+   "file": "assets/viewer/80-review.js:82,90-91; 70-player.js",
+   "area": "player controls",
+   "problem": "Space toggles selection instead of play/pause, contrary to the popup player and every video tool. There is no frame step, J/K/L shuttle, jump to IN/OUT, frame-accurate timecode or wall-clock time.",
+   "proposed_fix": "Space = play/pause (selection on x). Add , and . frame step, J/K/L, Shift/Alt arrows, a visible timecode with frame number, and sync the help table with the popup.",
+   "user_impact": "Frame-accurate forensic review is clumsy and muscle memory misfires."
+  },
+  {
+   "id": "UX-09",
+   "severity": "high",
+   "file": "src/serve/media.rs:77-176; assets/viewer/80-review.js:157-193,312-350",
+   "area": "clip export",
+   "problem": "Export is synchronous and holds the global busy lock (no progress/cancel), which blocks autosave and other jobs. There is no in-progress state, so double-clicks create duplicate hashed clips. Burn-in uses window.prompt. Only one IN/OUT per record, not in the report or marks JSON, and hash_source is not exposed.",
+   "proposed_fix": "Add a withBusy helper. Use a background job with progress and cancel. Add a multi-clip list per record persisted server-side and in the report. Add an exhibit modal with auto-numbering. The toast gets Open folder/Play and shows the clip SHA-256.",
+   "user_impact": "Duplicate clips, frozen app, and only one clip per video."
+  },
+  {
+   "id": "FOR-08",
+   "severity": "high",
+   "file": "src/serve/jobs.rs:428-470",
+   "area": "error recovery",
+   "problem": "Failures of register-source, validate-batch, selection and qa anomalies are logged but the step is marked Done (green). All register-source errors are treated as 'already registered'.",
+   "proposed_fix": "Add a done-with-warnings state and a post-run summary with per-step retry. Distinguish already-registered from real errors by exit code.",
+   "user_impact": "Skipped ffprobe validation looks like success and the report omits it unnoticed."
+  },
+  {
+   "id": "UX-10",
+   "severity": "high",
+   "file": "src/scan.rs:39-110; assets/examiner_app.html:362-368",
+   "area": "resume",
+   "problem": "Checkpoint resume exists but the UI never shows it. Restore requires review/index.html, so a half-finished case is not detected. There is no resume vs fresh choice.",
+   "proposed_fix": "Detect incomplete cases on launch and offer 'Resume scan (N of M done)'. Add an explicit Start fresh and show the mode in the start summary.",
+   "user_impact": "After a crash the examiner restarts hours of work."
+  },
+  {
+   "id": "UX-11",
+   "severity": "high",
+   "file": "assets/examiner_app.html:255-322",
+   "area": "first run",
+   "problem": "Hash and ffprobe default ON for any source including multi-TB. There is no source-size preview, estimate or recommendation, no mode selector, and no free-space or case-inside-source check.",
+   "proposed_fix": "After path validation show source stats and a mode selector (Quick/Standard/Full) with estimates and an auto-recommendation. Preflight: refuse or confirm when the case dir is under the source or on the source drive, with a free-space check.",
+   "user_impact": "A first-time user commits to a multi-hour run, or writes onto evidence media."
+  },
+  {
+   "id": "UX-12",
+   "severity": "high",
+   "file": "assets/examiner_app.html:246-250,338-352; assets/evidence_viewer.html",
+   "area": "structure",
+   "problem": "Two chrome layers (shell and iframe viewer) duplicate theme and language and waste vertical space. Quit lives only in the shell. Recover/carve are always visible without an image. The shell has no case breadcrumb, a no-op setStep ternary, and disabled rail steps with no explanation.",
+   "proposed_fix": "Make review a full-bleed workspace with a thin top bar (case, save state, steps). Move recover/carve to an Image tools menu with a disabled reason. Dedupe theme/lang, fix setStep, add titles to locked steps.",
+   "user_impact": "Unclear where to do what, and the review screen is cramped on small laptops."
+  },
+  {
+   "id": "UX-13",
+   "severity": "high",
+   "file": "assets/viewer/90-sync.js:411-427",
+   "area": "file:// mode",
+   "problem": "Only four buttons are disabled offline. Burn-in clip, proxy, telemetry, transcode and the timeline button stay enabled and fail with generic toasts. Burn-in prompts for a label first.",
+   "proposed_fix": "Disable all server-only buttons with a shared title in file:// and show a standalone-mode badge. Check before the prompt.",
+   "user_impact": "The user types data only to learn the feature cannot work."
+  },
+  {
+   "id": "PERF-03",
+   "severity": "high",
+   "file": "assets/viewer/40-grid.js:59-110,121; 50-tags.js; 60-details.js:355-364",
+   "area": "render pipeline",
+   "problem": "Every click, Space or mark runs a full render of roughly 10-12 O(N) passes plus a sort (localeCompare 'ko'). filteredRecords is unmemoized, search lowercases every field per keystroke, selectedRecord is an O(N) find, and moveActive re-sorts per step.",
+   "proposed_fix": "Memoize filtered+sorted with a version key, precompute a lowercase haystack and sort keys, use Intl.Collator, add id-to-index Maps, and split targeted updaters with incremental counters and rAF coalescing.",
+   "user_impact": "Visible latency on every click or arrow at 100k records; selection and scroll state are lost."
+  },
+  {
+   "id": "PERF-04",
+   "severity": "high",
+   "file": "assets/viewer/60-details.js:67-101",
+   "area": "player reload",
+   "problem": "renderDetails rebuilds the video element on every render, so unrelated actions (checkbox, tag, filter, language) reset playback position and reissue Range requests.",
+   "proposed_fix": "Rebuild the stage only when the active id or media source changes.",
+   "user_impact": "Playback position is lost mid-review."
+  },
+  {
+   "id": "PERF-05",
+   "severity": "high",
+   "file": "assets/viewer/40-grid.js:253-308; src/serve/records.rs:145-160; src/serve/http.rs",
+   "area": "grid/thumbnails",
+   "problem": "No virtualization: large page sizes build huge innerHTML, with a new Intl formatter per card. Thumbnails are one connection each with Connection: close and no cache headers. There is no onerror retry, 503 breaks images permanently, and the thumbs dir is listed on every meta call. Basename collisions in thumbByName.",
+   "proposed_fix": "Virtualized grid with cached Intl formatters. Keep-alive and immutable Cache-Control/ETag on thumbs, onerror retry, an on-demand thumbnail job, and keyed thumb lookup.",
+   "user_impact": "Thumbnails trickle in, scroll janks and images can stay broken."
+  },
+  {
+   "id": "PERF-06",
+   "severity": "high",
+   "file": "assets/viewer/30-records.js:93-102",
+   "area": "dual pairing",
+   "problem": "matesOf filters all records and recomputes pairKey/channelCode per call on every detail render in dual mode.",
+   "proposed_fix": "Precompute pairKey/channel once and index a Map for O(1) lookup.",
+   "user_impact": "Dual view stalls on each click at scale."
+  },
+  {
+   "id": "PERF-07",
+   "severity": "medium",
+   "file": "src/serve/records.rs:44-96; src/case_db/scan.rs:103-110",
+   "area": "server search",
+   "problem": "Fallback search lowercases fields per request. The FTS path materializes all ids into a HashSet and opens a new connection each time. The viewer never uses ?q=, and the client and server search contracts diverge.",
+   "proposed_fix": "Cache the id set by DB mtime or use a SQL join, pre-lowercase an in-memory index, unify the contract (including Korean normalization), use AbortController.",
+   "user_impact": "Slow API at scale and inconsistent search results."
+  },
+  {
+   "id": "FOR-09",
+   "severity": "high",
+   "file": "assets/viewer/99-loader.js:57-96; src/serve/records.rs:77-95",
+   "area": "silent truncation",
+   "problem": "Loader errors fall back silently to data-bundle.js, which may be absent, leaving an empty viewer. Offset pagination over an unstable order, with no etag, can overlap or skip when the index changes. An empty page breaks the loop silently, and the loaded count is never compared with the total.",
+   "proposed_fix": "Return an etag with each page and restart on change, use a keyset cursor, show a determinate progress bar, an error banner with retry, and a count-mismatch warning before enabling the UI.",
+   "user_impact": "A partial list can be mistaken for a complete case."
+  },
+  {
+   "id": "QA-01",
+   "severity": "high",
+   "file": ".github/workflows/ci.yml; windows-ci.yml; macos-ci.yml; scripts/*.mjs",
+   "area": "CI/UI tests",
+   "problem": "CI node --checks nonexistent paths (gui/evidence-viewer/app.js, assets/evidence_viewer.js) and never checks assets/viewer/*.js or the examiner_app.html inline script. No Linux job exists. The 20+ verify-*.mjs scripts are manual, need a hand-started server and CDP, hardcode Windows paths and fixed sleeps, and have no entry point or committed screenshots.",
+   "proposed_fix": "Add a script that concatenates viewer parts like build.rs and node --checks them plus the inline shell script, and fail if inputs are missing. Add an ubuntu job. Add a Playwright harness (free port, seeded synthetic case, fixed viewport, ko-KR) running the verify cases and button audit, with screenshots uploaded as artifacts.",
+   "user_impact": "Button and layout regressions reach users because nothing clicks the real UI."
+  },
+  {
+   "id": "QA-02",
+   "severity": "high",
+   "file": "src/html_report.rs:902-939",
+   "area": "failing test",
+   "problem": "The test fails on Linux (line 936) because it asserts Windows separators. The fixture uses backslashes, which are not separators on Unix. This is a test portability bug and the product code is not shown to be wrong.",
+   "proposed_fix": "Gate with cfg(windows) and add a cfg(unix) variant, or build the expected string from the resolved PathBuf. Use unique dirs and a platform-aware path helper.",
+   "user_impact": "A red suite on Linux blocks verification."
+  },
+  {
+   "id": "QA-03",
+   "severity": "medium",
+   "file": "src/carve.rs:237; deepfake.rs:472; html_report.rs:944,963; serve/system.rs:408; qa.rs:333; scan.rs:747; serve/media.rs:615",
+   "area": "fmt/clippy",
+   "problem": "cargo fmt --check reports 5 diffs and clippy gives 3 warnings (manual_checked_div, redundant reference, redundant into_iter), which would fail CI with -D warnings. The pinned toolchain is 1.94 while 1.97 is used locally.",
+   "proposed_fix": "Run fmt on the pinned toolchain, fix the 3 clippy items, add a hook/make target and a stable non-blocking clippy job.",
+   "user_impact": "CI fails on first run."
+  },
+  {
+   "id": "UX-14",
+   "severity": "medium",
+   "file": "assets/viewer/80-review.js:157-193; 65-actions.js; 90-sync.js:267-345",
+   "area": "loading feedback",
+   "problem": "Async buttons (capture, download-files, transcode queue) give no busy state or start toast, so the user clicks again. window.prompt/confirm/alert are blocking, unstyled and not capturable in tests.",
+   "proposed_fix": "Shared withBusy helper with spinner and label, and in-page modals replacing native dialogs.",
+   "user_impact": "Duplicate actions and uncertainty whether anything happened."
+  },
+  {
+   "id": "UX-15",
+   "severity": "medium",
+   "file": "assets/viewer/80-review.js:68-85",
+   "area": "keyboard/focus",
+   "problem": "Shortcuts are dead while any select has focus until Esc or a click. Focused buttons still fire j/k/1/2/3. Shortcut discoverability is poor: there is no help for popup keys, no '/' search, no next-unreviewed key, and Ctrl+D conflicts with the browser.",
+   "proposed_fix": "Blur selects after change and treat only text inputs as capturing. Add n/N next-unreviewed, '/' search, and a complete help overlay including the popup keys.",
+   "user_impact": "The tool seems frozen after using a filter dropdown."
+  },
+  {
+   "id": "UX-16",
+   "severity": "medium",
+   "file": "assets/viewer/80-review.js; assets/evidence_viewer.html",
+   "area": "review progress/scope",
+   "problem": "There is no overall review-progress meter (reviewed N of M) and no 'unreviewed' quick filter. The autosave and the 'apply to case' button are confusing, and the beforeunload guard fires on a mere re-sync with no count.",
+   "proposed_fix": "Pin a progress meter in the header. Autosave always with 'Saved HH:MM:SS' and relabel the button 'Refresh report'. Warn on unload only when truly unsynced, with the N shown.",
+   "user_impact": "The examiner cannot tell how far they are or whether work is saved."
+  },
+  {
+   "id": "UX-17",
+   "severity": "medium",
+   "file": "assets/evidence_viewer.html:33-45,134-166; assets/viewer/20-i18n.js; examiner_app.html",
+   "area": "i18n/labels",
+   "problem": "Many titles are hardcoded (English-only or Korean-only) rather than data-i18n-title. There are spacing typos ('구간보내기', 'DFXML보내기'). The shell has no EN locale and the theme button is hardcoded. A missing key renders the raw key. The toolbar has about 17 controls in one row.",
+   "proposed_fix": "Move all titles to i18n with a lint/test for keys and ids, fix the spacing, share the locale with the shell, group the toolbar into primary / Clip split-button / View menu and check at 1366x768.",
+   "user_impact": "A mixed-language UI looks unprofessional, and the crowded toolbar causes misclicks."
+  },
+  {
+   "id": "UX-18",
+   "severity": "medium",
+   "file": "assets/examiner_app.html:342-351,277-313,320-332",
+   "area": "workstation flows",
+   "problem": "A second viewer window has its own state and writes the same keys (last writer wins). A failed iframe shows infinite loading. The same caseDir field is used for open and start with no context-aware label. New case does location.reload(), and the dashboard link lacks rel=noopener.",
+   "proposed_fix": "Use BroadcastChannel sync or a warning, add an iframe error/timeout state with retry, add an existing-case summary with a context-aware button, reset the form in place, and fix the btnNew condition.",
+   "user_impact": "Marks overwrite each other and the user may continue the wrong case."
+  },
+  {
+   "id": "UX-19",
+   "severity": "medium",
+   "file": "assets/examiner_app.html:925-931,1004-1010,191-208",
+   "area": "log/errors",
+   "problem": "The log is reset whole every 1.2s (selection lost, forced scroll-to-bottom, aria-live floods). Copy failures are swallowed. errorHint uses loose regexes on English output and shows raw CLI text.",
+   "proposed_fix": "Append only, auto-scroll only at the bottom, remove aria-live on the log, add save-log and a copy fallback, and use structured error codes with an expandable details block.",
+   "user_impact": "The log cannot be read or selected during a run and the advice can be wrong."
+  },
+  {
+   "id": "UX-20",
+   "severity": "medium",
+   "file": "assets/examiner_app.html:1095-1157",
+   "area": "a11y/picker",
+   "problem": "The folder picker uses li tabindex=0 without roles, Space does not activate, there is no arrow navigation, and focus goes to the input. The status is not aria-live.",
+   "proposed_fix": "Use listbox/option or buttons, Up/Down/Home/End, an aria-live status, and an error row with Retry.",
+   "user_impact": "Keyboard and screen-reader users struggle to choose folders."
+  },
+  {
+   "id": "UX-21",
+   "severity": "medium",
+   "file": "assets/viewer/80-review.js:141-149,465-480; evidence_viewer.html",
+   "area": "controls/export menu",
+   "problem": "The zoom slider does nothing in fit mode and has redundant assignments. The export menu has five near-identical items with no grouping, and the CLI selection JSON is rejected by the stage-4 import.",
+   "proposed_fix": "Switch to zoom mode on slider move or disable it with a title. Group the export menu with one-line descriptions, rename the CLI item, and validate the file type on import.",
+   "user_impact": "Dead-feeling controls and wrong exports."
+  },
+  {
+   "id": "FOR-10",
+   "severity": "medium",
+   "file": "src/anomaly.rs:270-310; src/timeline.rs:413-478",
+   "area": "timestamps",
+   "problem": "A missing mtime is treated as 0, causing false timestamp-gap/regression findings. creation_time without a zone is silently treated as UTC (DVR is usually local), impossible dates and second=60 are accepted, pre-epoch values are dropped, and fractions are lost. All event times use the local clock with no timezone or skew check.",
+   "proposed_fix": "Skip None mtimes and emit mtime-unavailable. Validate dates, flag tz_assumed, add a per-case timezone setting (default KST) showing UTC and local, keep sub-seconds, and add a timestamp and monotonic sequence to every chained entry.",
+   "user_impact": "Spurious anomalies and a wrong-by-9-hours timeline are a cross-examination risk."
+  },
+  {
+   "id": "FOR-11",
+   "severity": "medium",
+   "file": "src/scan.rs:121-139,362-368,100-120,408-421",
+   "area": "scan integrity",
+   "problem": "One unreadable file aborts the entire scan with no index. mtime is truncated to seconds, so a same-size edit within the second reuses a stale hash with no changed-during-hash re-stat. The default hash=false leaves no integrity values, and the custody statement does not say so.",
+   "proposed_fix": "Record hash_status=error per file and continue. Use ns mtime plus a post-hash re-stat and a carried-forward status. Warn or default to hashing, and show 'N of M hashed' in red below 100%.",
+   "user_impact": "One bad sector kills the scan, and files may carry stale or missing hashes unnoticed."
+  },
+  {
+   "id": "FOR-12",
+   "severity": "medium",
+   "file": "src/carve.rs:337-345,782-890,1867-1886,494-540,1013-1080",
+   "area": "carve correctness",
+   "problem": "scan_complete is true even for a narrowed scan window or a short read. The MP4 'structure complete' note is emitted by coincidence at the cap. copy_ranges does not check the copied byte count or fsync before the checkpoint. The resume fingerprint is not content-based and ids can differ on resume. Reassembled hypotheses are not structurally distinguished from contiguous carves.",
+   "proposed_fix": "Set scan_complete only when the end was reached, report 'complete' only with ftyp+moov+mdat uncapped, verify the copied count and sync, include a sampled hash in the fingerprint, derive ids from offset, and add an origin field with a hypothesis badge.",
+   "user_impact": "Reports overstate recovery completeness and quality."
+  },
+  {
+   "id": "FOR-13",
+   "severity": "medium",
+   "file": "src/audit.rs:447-451,296-322; src/audit_key.rs; src/package.rs:14-130,234-262",
+   "area": "audit/package",
+   "problem": "entry_sha256 does not cover trailing fields, so junk after the last entry verifies. The symmetric HMAC is presented without a forgery caveat and no key fingerprint is recorded. package-case does not verify lanes or embed chain heads, the manifest is unsigned, and exclusions are not recorded. There is no verify-package.",
+   "proposed_fix": "Require an exact tail and reject duplicate keys. Record a key fingerprint and state the limitation. Verify lanes and embed heads at packaging, record exclusions, and add a verify-package command.",
+   "user_impact": "A recipient cannot tell whether a package is complete or tampered."
+  },
+  {
+   "id": "SEC-05",
+   "severity": "medium",
+   "file": "src/serve/media.rs:824 (csv_row)",
+   "area": "CSV injection",
+   "problem": "manifest.csv quotes only , \" CR LF. Evidence-derived fields starting with = + - @ or tab are written verbatim, so Excel evaluates them as formulas.",
+   "proposed_fix": "Prefix such cells with a quote or space in the CSV only, document it, and add a unit test.",
+   "user_impact": "Opening a handoff manifest can run formulas or exfiltrate data."
+  },
+  {
+   "id": "STR-01",
+   "severity": "high",
+   "file": "assets/examiner_app.html (1274 lines)",
+   "area": "structure",
+   "problem": "CSS, markup and about 850 lines of JS are inline in one file outside build.rs. It has its own esc that does not escape ', duplicated in viewer and html_report. There are 51 innerHTML uses and ids are not checked against markup.",
+   "proposed_fix": "Split into assets/app/*.css and NN-*.js, concatenated by build.rs into the same single-file output. Add a shared util with one esc and a Rust test that every getElementById target exists.",
+   "user_impact": "Late-found regressions and merge conflicts on every UI change."
+  },
+  {
+   "id": "STR-02",
+   "severity": "high",
+   "file": "build.rs; assets/viewer/10-boot.js,99-loader.js",
+   "area": "viewer bundle",
+   "problem": "The viewer is one IIFE spread across 12 files, so order is load-bearing and no part is independently parseable. The bundle has no per-file markers, so errors map to nothing. Sorting is by name only.",
+   "proposed_fix": "Emit per-part banners/sourceURL, assert IIFE open/close and unique two-digit prefixes in build.rs, and add a jsdom/node smoke that boots the bundle on a fixture. Do not move to ES modules because of file://.",
+   "user_impact": "Errors in the offline deliverable are hard to trace."
+  },
+  {
+   "id": "STR-03",
+   "severity": "high",
+   "file": "src/scan.rs:675-800",
+   "area": "JSONL editing",
+   "problem": "Hand-rolled JSON text splicing (set_json_field, find_top_level_key, etc.) is used even though serde_json with preserve_order is a dependency. It risks corruption on escapes, unicode and nested keys. It is pub, and IndexedRecordLine has two impl blocks.",
+   "proposed_fix": "Extract a jsonl module on serde_json, keep a byte-identical fast path only where profiled, and add property/fuzz equivalence tests including Korean and quote/backslash names.",
+   "user_impact": "A mangled record means a silently wrong evidence index."
+  },
+  {
+   "id": "STR-04",
+   "severity": "medium",
+   "file": "src/carve.rs; src/tsk.rs; src/telemetry.rs; src/html_report.rs",
+   "area": "large files",
+   "problem": "Giant mixed-concern files: carve (2837 lines), tsk (1188), telemetry (1070), html_report (1068). Pure parsers sit beside I/O, and tests are inline.",
+   "proposed_fix": "Convert to directory modules (carve/{checkpoint,signatures,extent_*,reassemble,output}, tsk/{parse,run,recover}, telemetry/{nmea,camm,extract,report}), moving tests into siblings. Add golden carve tests, one extractor per commit.",
+   "user_impact": "Edits to core recovery code carry high regression risk."
+  },
+  {
+   "id": "STR-05",
+   "severity": "medium",
+   "file": "src/tsk.rs:545-700; e01.rs:407; telemetry.rs:207-228; serve/jobs.rs; 40 Command::new sites",
+   "area": "subprocess",
+   "problem": "Subprocess execution is implemented about 4 times with inconsistent timeouts, caps and policy routing. Nothing enforces tool_policy.",
+   "proposed_fix": "Create proc.rs with run(policy,args,opts{timeout,cap,stream}), migrate callers, add clippy disallowed_methods outside proc.rs, and log invocations to the audit chain.",
+   "user_impact": "Hung tools behave differently by caller, leaving stuck jobs."
+  },
+  {
+   "id": "STR-06",
+   "severity": "medium",
+   "file": "src/tsk.rs:903; video_export.rs:526; custody.rs:186; util.rs:370; html_report.rs:671-708",
+   "area": "duplicated helpers",
+   "problem": "Two sanitize_filename implementations with different rules, a custody esc duplicating util::html_escape, and carve report JS inlined in a Rust format! string.",
+   "proposed_fix": "Keep one util::sanitize_filename with tests (Windows reserved names, Korean) and one escape. Move the carve report to an asset template.",
+   "user_impact": "Inconsistent exhibit file names and error-prone report edits."
+  },
+  {
+   "id": "STR-07",
+   "severity": "medium",
+   "file": "src/html_report.rs:463-465,511-513",
+   "area": "template injection",
+   "problem": "Placeholder .replace is order-dependent, so data containing __JS__/__CSS__ could be rewritten.",
+   "proposed_fix": "Do a single-pass substitution or put DATA last, and add a test that data containing the tokens survives.",
+   "user_impact": "A crafted file name or note could corrupt the exported review page."
+  },
+  {
+   "id": "STR-08",
+   "severity": "medium",
+   "file": "src/serve/mod.rs:10-47,271; src/serve/http.rs:28-108,290-296,455",
+   "area": "serve structure",
+   "problem": "Glob re-exports make the API surface opaque and the doc comment is misplaced. route() is a 30-arm match, and /media and /case bypass route() gating. The auth early-returns are duplicated. The IPv6 Host parse (split(':')) is dead and fail-closed. The '..' substring check gives false 403s.",
+   "proposed_fix": "Use explicit imports, a router table with an auth-class test, a single authorize() and finish(), reuse origin_authority_host, and check '..' by component.",
+   "user_impact": "Auth drift risk and occasional false 403s."
+  },
+  {
+   "id": "STR-09",
+   "severity": "medium",
+   "file": "src/cli/mod.rs; src/cli/handlers/case.rs; src/serve/jobs.rs",
+   "area": "pipeline drift",
+   "problem": "The CLI handlers and the workstation job pipeline orchestrate the same steps separately and can drift.",
+   "proposed_fix": "Extract a pipeline.rs layer with typed run_scan/carve/review/report, with a test that CLI argv and job argv agree.",
+   "user_impact": "A feature exists in the CLI but not in the UI, or the reverse."
+  },
+  {
+   "id": "SEC-06",
+   "severity": "low",
+   "file": "src/serve/jobs.rs:57-70; mod.rs:62-69; serve/http.rs:103-185; media.rs:36-60",
+   "area": "hardening",
+   "problem": "A source at a volume root exposes the whole volume via /media and persists across restarts. One-thread-per-connection with a trickle DoS and chunked bodies read as empty. 4 MiB MAX_BODY rejects 4K frame captures with a misleading 'offline' toast. Exhibit labels starting with '-' break clap, and the capture id is not validated.",
+   "proposed_fix": "Warn on a volume root and do not persist roots, scope /media to indexed paths, add request deadlines and reject chunked, send captures as binary or raise the limit, distinguish HTTP from network errors, pass --exhibit= and validate ids.",
+   "user_impact": "Over-broad access, misleading errors and failed 4K captures."
+  },
+  {
+   "id": "UX-22",
+   "severity": "low",
+   "file": "assets/viewer/40-grid.js:352-437; 60-details.js:228-292; 80-review.js:197-219",
+   "area": "calendar/tree/capture",
+   "problem": "The calendar counts only the filtered set so it collapses after a day pick, with no year jump. The day facet makes thousands of rows with per-node listeners and counts that ignore filters. Frame capture comes from the browser-decoded (possibly proxy) frame without labelling the source.",
+   "proposed_fix": "Compute facet counts excluding their own dimension, add a year>month>day tree with delegation, add a heatmap strip, and label the capture source and offer exact ffmpeg extraction.",
+   "user_impact": "Hard to navigate multi-year archives, and captures can come from a proxy unknowingly."
+  },
+  {
+   "id": "UX-23",
+   "severity": "low",
+   "file": "assets/examiner_app.html:40-42,235-236,53-57,1243-1273",
+   "area": "shell polish/a11y",
+   "problem": "The theme button is empty until sync and 'Quit' is ambiguous and visually near the theme toggle. Disabled-step contrast is below AA and focus-visible exists only for text inputs. Quit uses blocking dialogs, polls up to 60s without progress, and does not check for unsynced marks.",
+   "proposed_fix": "Rename to 'Stop server', add a help menu, add a global :focus-visible, fix contrast, and offer 'apply and quit' with an in-app modal and progress.",
+   "user_impact": "Accidental quits, invisible focus and lost marks on shutdown."
+  }
+ ],
+ "feature_ideas": [
+  "Global undo/redo journal (Ctrl+Z) with Undo toasts for marks, tags, notes, ranges and bulk actions",
+  "Persistent save-state indicator and case-DB-first annotations that survive port or profile changes",
+  "Two-phase scan: instant index then open the viewer, with hash/ffprobe/anomaly as background enrichment and live counters",
+  "Source preflight: size/file sampling, free space, case-inside-source check, mode selector (Quick/Standard/Full) with time estimates",
+  "Resume dashboard for interrupted cases ('Resume scan N of M')",
+  "Pre-finalize checklist (unreviewed, important without note, failed validation, missing examiner, audit health) with jump-to-filter links",
+  "Unified job panel (recover, carve, transcode, clip export, deepfake) with progress, throughput, ETA, cancel, history and cleanup of partial outputs",
+  "Frame-accurate player: Space play/pause, comma/period frame step, J/K/L shuttle, big timecode with wall-clock recording time, jump to IN/OUT",
+  "Named multi-clip list per video with a batch export queue, auto-numbered exhibits and visible clip SHA-256",
+  "Review progress meter, next-unreviewed (n) and next-important jumps, scope label for key vs. selection actions",
+  "Keyboard command palette (Ctrl+K) plus a complete cheat sheet covering the popup player, '/' to focus search",
+  "Cross-window sync (BroadcastChannel) for the iframe, popup and new-window viewers",
+  "Shared KO/EN catalog (JSON) for the shell, viewer and carve report, with a missing-key CI check and pseudo-locale",
+  "Server-side query engine with facet counts and a virtualized grid with infinite scroll and a day-density minimap",
+  "Thumbnail pipeline with progress, sprite strips and hover-scrub, keep-alive and immutable caching",
+  "Zoomable multi-lane timeline by channel with gap/overlap detection and a year heatmap",
+  "Saved views and filter presets with URL-hash state",
+  "verify-case and verify-package commands, a UI button, evidence drift banner on open, and an embedded result in the custody statement",
+  "Timezone-aware timeline (per-source zone, default KST) with an assumed-zone flag and DVR clock offset entry",
+  "External anchoring of chain heads (RFC 3161), an append-only examiner log with per-record history, and a two-examiner sign-off",
+  "Court-ready report mode listing limitations, trust levels per field and assumptions, with a reproducibility receipt (tool and ffmpeg versions, options, input hashes)",
+  "Carve confidence panel (origin, boundary basis, playability) with a hypothesis badge excluded from default exports",
+  "Trust prompt on opening a foreign case, a security status badge, a random per-session token by default, and a path picker confined to roots",
+  "Import-marks dry run with diff preview and automatic backup, CSV-safe plus XLSX manifest export",
+  "Playwright UI snapshot gallery (docs/screens with a contact sheet, before/after and visual-regression diffs) plus axe-core accessibility and keyboard-only walkthrough tests",
+  "frametrace demo command generating a synthetic ffmpeg-based case for onboarding, UI tests and screenshots",
+  "Button registry (id, label key, handler, shortcut) driving the toolbar, help overlay and button audit, and a doctor --ui self-test",
+  "cargo xtask check entry point so local and CI gates are identical, and viewer performance budgets in CI",
+  "Directory-by-domain module layout (recovery/analysis/output/integrity/serve/cli) with a generated module map",
+  "Duplicate and same-incident (front/rear) grouping in the grid, and an export basket with totals and reorder for the report"
+ ],
+ "persona_notes": "The primary user is a Korean forensic examiner (police, insurer or lab) who triages hundreds to 100k+ dashcam/CCTV clips on a modest Windows laptop, mostly by keyboard, may be interrupted (crash, port change, shift change), and must hand a court-defensible report to others. Trust and no silent data loss dominate. The top themes are: (1) accidental or silent loss of annotations (IN/OUT crash, modifier keys, clear-key wiping notes, localStorage-only marks, no undo, stuck buttons); (2) the tool claiming more than it verified (custody overclaims, audit-chain bypass, unlogged exports, finalizing with unsynced marks); (3) long, opaque pipelines and large-case performance (review blocked until the full scan ends, O(N^2) record loading, full re-render per click); (4) security of a local server that serves foreign case HTML same-origin and launches arbitrary paths; (5) structure and CI gaps (a nonexistent node --check path, no Linux job, UI scripts manual, giant files). All source reviews were static reading only; runtime claims (especially UX-01, UX-03, FOR-10, FOR-12 and the Windows explorer launch) should be confirmed by a quick run before fixing. Only the QA-02 test failure and the fmt/clippy results were actually executed. Screenshots can be produced headlessly with the Playwright and chromium already present in /opt (recipe unverified)."
+}

@@ -16,6 +16,16 @@ pub(crate) fn api_capture_frame(request: &Request, state: &SharedState) -> Strin
             .to_string();
     };
     let id = body_value(&request.body, "id").unwrap_or_default();
+    if id.trim().is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
+        return api_err("증거 id가 올바르지 않습니다.");
+    }
+    // The playback position is part of the custody record: it must be a
+    // finite, non-negative number of seconds (or omitted).
+    let time = body_value(&request.body, "time").unwrap_or_default();
+    let time = time.trim().to_string();
+    if !time.is_empty() && !time.parse::<f64>().is_ok_and(|t| t.is_finite() && t >= 0.0) {
+        return api_err("재생 시각 값이 올바르지 않습니다.");
+    }
     let image_b64 = body_value(&request.body, "image").unwrap_or_default();
     if image_b64.is_empty() || image_b64.len() > MAX_BODY {
         return "{\"ok\":false,\"error\":\"프레임 이미지가 비었거나 너무 큽니다.\"}".to_string();
@@ -48,13 +58,20 @@ pub(crate) fn api_capture_frame(request: &Request, state: &SharedState) -> Strin
             json_string(&err.to_string())
         );
     }
-    let digest = audit::digest_file(&target).unwrap_or_default();
     let rel = target
         .strip_prefix(&case_dir)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| target.to_string_lossy().to_string());
-    let time = body_value(&request.body, "time").unwrap_or_default();
-    let _ = audit::append_chained_jsonl(
+    // FOR-06: a capture that is not hashed and chained must not exist as
+    // an artifact while the UI reports success — remove it and fail.
+    let digest = match audit::digest_file(&target) {
+        Ok(digest) => digest,
+        Err(err) => {
+            let _ = std::fs::remove_file(&target);
+            return api_err(&format!("캡처 해시 계산 실패: {err}"));
+        }
+    };
+    let logged = audit::append_chained_jsonl(
         &case_dir.join("evidence/logs/capture-log.jsonl"),
         &format!(
             "{{\"event\":\"frame-capture\",\"record_id\":{},\"output\":{},\"sha256\":{},\"video_time_seconds\":{},\"unix\":{stamp}}}",
@@ -64,6 +81,12 @@ pub(crate) fn api_capture_frame(request: &Request, state: &SharedState) -> Strin
             json_string(&time)
         ),
     );
+    if let Err(err) = logged {
+        let _ = std::fs::remove_file(&target);
+        return api_err(&format!(
+            "감사 로그 기록 실패 — 캡처를 저장하지 않았습니다: {err}"
+        ));
+    }
     format!(
         "{{\"ok\":true,\"path\":{},\"sha256\":{}}}",
         json_string(&rel),
@@ -612,7 +635,7 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
     let mut jsonl_rows: Vec<String> = Vec::new();
     let mut copied = 0usize;
     let mut skipped = 0usize;
-    for (item, outcome) in items.iter().zip(outcomes.into_iter()) {
+    for (item, outcome) in items.iter().zip(outcomes) {
         let Some(outcome) = outcome else {
             continue;
         };
@@ -665,7 +688,9 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
         jsonl_rows.push(row.to_string());
     }
     let audit_log = case_dir.join("evidence/logs/export-log.jsonl");
-    let _ = audit::append_chained_jsonl(
+    // FOR-06: the export must not report ok:true when its audit entry was
+    // never written — the copies would sit outside the chain of custody.
+    let audit_result = audit::append_chained_jsonl(
         &audit_log,
         &format!(
             "{{\"event\":\"selection-export\",\"export_dir\":{},\"items\":{},\"copied\":{copied},\"skipped\":{skipped},\"unix\":{stamp}}}",
@@ -687,9 +712,10 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
             write(
                 "manifest-audit.json",
                 format!(
-                    "{{\"audit_log\":{},\"chain_head_sha256\":{},\"unix\":{stamp}}}\n",
+                    "{{\"audit_log\":{},\"chain_head_sha256\":{},\"audit_logged\":{},\"unix\":{stamp}}}\n",
                     json_string("evidence/logs/export-log.jsonl"),
-                    json_string(&head)
+                    json_string(&head),
+                    audit_result.is_ok()
                 ),
             )
         })
@@ -715,6 +741,17 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
         });
     if let Err(err) = result {
         return serde_json::json!({"ok": false, "error": err}).to_string();
+    }
+    if let Err(err) = audit_result {
+        return serde_json::json!({
+            "ok": false,
+            "unlogged": true,
+            "error": format!("감사 로그 기록 실패 — 내보낸 사본이 감사 체인에 기록되지 않았습니다: {err}"),
+            "export_dir": export_dir.to_string_lossy(),
+            "copied": copied,
+            "skipped": skipped,
+        })
+        .to_string();
     }
     format!(
         "{{\"ok\":true,\"export_dir\":{},\"copied\":{copied},\"skipped\":{skipped}}}",
@@ -824,13 +861,7 @@ pub(crate) fn copy_unique(source: &Path, dir: &Path, base_name: &str) -> Result<
 pub(crate) fn csv_row(fields: &[String]) -> String {
     fields
         .iter()
-        .map(|field| {
-            if field.contains([',', '"', '\n', '\r']) {
-                format!("\"{}\"", field.replace('"', "\"\""))
-            } else {
-                field.clone()
-            }
-        })
+        .map(|field| crate::util::csv_safe_cell(field))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -880,4 +911,24 @@ pub(crate) fn newest_package_dir(case_dir: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+#[cfg(test)]
+mod csv_row_tests {
+    use super::csv_row;
+
+    #[test]
+    fn csv_row_neutralizes_formulas_but_keeps_numbers() {
+        let row = csv_row(&[
+            "=HYPERLINK(\"x\")".to_string(),
+            "@SUM(A1)".to_string(),
+            "-3600".to_string(),
+            "a,b".to_string(),
+            "plain".to_string(),
+        ]);
+        assert_eq!(
+            row,
+            "\"'=HYPERLINK(\"\"x\"\")\",'@SUM(A1),-3600,\"a,b\",plain"
+        );
+    }
 }

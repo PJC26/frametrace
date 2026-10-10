@@ -7,32 +7,47 @@ use super::*;
 /// JSON block for a large case. `q` is a case-insensitive substring match
 /// over id/paths/name; the JSON index stays the shape authority so the
 /// API can never drift from what the viewer renders offline.
+/// Returns the parsed `db/video_index.json`, shared via `Arc` (PERF-01).
+/// The global state lock is held only to look up / store the cache entry —
+/// never while reading, parsing or filtering — so a large index no longer
+/// stalls every other endpoint, and a page fetch costs one `Arc` clone
+/// instead of a deep copy of the whole document.
+pub(crate) fn cached_index(
+    state: &SharedState,
+    case_dir: &Path,
+) -> Result<Arc<serde_json::Value>, &'static str> {
+    let index_path = case_dir.join("db/video_index.json");
+    let meta = index_path.metadata().map_err(|_| "no case index yet")?;
+    let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+    let len = meta.len();
+    if let Some(cache) = &state_lock(state).index_cache
+        && cache.path == index_path
+        && cache.mtime == mtime
+        && cache.len == len
+    {
+        return Ok(Arc::clone(&cache.value));
+    }
+    let text = crate::util::read_to_string(&index_path).map_err(|_| "no case index yet")?;
+    let value = Arc::new(
+        serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|_| "case index is not valid JSON")?,
+    );
+    state_lock(state).index_cache = Some(IndexCache {
+        path: index_path,
+        mtime,
+        len,
+        value: Arc::clone(&value),
+    });
+    Ok(value)
+}
+
 pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
     let Some(case_dir) = state_lock(state).case_dir.clone() else {
         return "{\"ok\":false,\"error\":\"no case open\"}".to_string();
     };
-    let index_path = case_dir.join("db/video_index.json");
-    let mtime = index_path
-        .metadata()
-        .and_then(|m| m.modified())
-        .unwrap_or(UNIX_EPOCH);
-    let index = {
-        let mut guard = state_lock(state);
-        match &guard.index_cache {
-            Some((path, cached_mtime, value)) if *path == index_path && *cached_mtime == mtime => {
-                value.clone()
-            }
-            _ => {
-                let Ok(text) = crate::util::read_to_string(&index_path) else {
-                    return "{\"ok\":false,\"error\":\"no case index yet\"}".to_string();
-                };
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-                    return "{\"ok\":false,\"error\":\"case index is not valid JSON\"}".to_string();
-                };
-                guard.index_cache = Some((index_path, mtime, value.clone()));
-                value
-            }
-        }
+    let index = match cached_index(state, &case_dir) {
+        Ok(index) => index,
+        Err(err) => return api_err(err),
     };
     let empty = Vec::new();
     let videos = index
@@ -120,11 +135,22 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
             .collect();
         serde_json::Value::Array(items)
     };
-    // The scan object minus the (paged) videos array.
-    let mut scan = read_json(case_dir.join("db/video_index.json"));
-    if let serde_json::Value::Object(map) = &mut scan {
-        map.insert("videos".to_string(), serde_json::Value::Array(Vec::new()));
-    }
+    // The scan object minus the (paged) videos array — built from the
+    // shared index cache so the (large) videos array is neither re-parsed
+    // nor cloned here.
+    let scan = match cached_index(state, &case_dir).as_deref() {
+        Ok(serde_json::Value::Object(map)) => {
+            let mut scan: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .filter(|(key, _)| key.as_str() != "videos")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            scan.insert("videos".to_string(), serde_json::Value::Array(Vec::new()));
+            serde_json::Value::Object(scan)
+        }
+        Ok(other) => other.clone(),
+        Err(_) => serde_json::Value::Null,
+    };
     let fls_entries = std::fs::read_dir(case_dir.join("db/filesystem"))
         .ok()
         .and_then(|entries| {

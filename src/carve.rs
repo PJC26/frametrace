@@ -237,8 +237,7 @@ pub fn carve_file(
     // A relative case dir logs invocation-cwd-relative output_paths that
     // no later consumer can resolve — anchor it before anything is
     // derived from it (same treatment source_path already gets).
-    std::fs::create_dir_all(case_dir)
-        .map_err(|err| format!("failed to create case dir: {err}"))?;
+    std::fs::create_dir_all(case_dir).map_err(|err| format!("failed to create case dir: {err}"))?;
     let case_dir = &crate::util::canonicalize_display(case_dir)
         .map_err(|err| format!("failed to canonicalize case dir: {err}"))?;
     if options.max_bytes < MIN_CARVE_BYTES {

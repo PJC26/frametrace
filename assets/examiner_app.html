@@ -126,6 +126,14 @@
     ol.steptrack li.done .dot { background: var(--ok); }
     ol.steptrack li.failed { color: var(--danger); }
     ol.steptrack li.failed .dot { background: var(--danger); }
+    ol.steptrack li { flex-wrap: wrap; }
+    ol.steptrack li .lbl { flex: none; white-space: nowrap; }
+    ol.steptrack li .prog { flex: 1 1 100%; display: flex; align-items: center; gap: 8px; padding-left: 16px; min-width: 0; }
+    ol.steptrack li.warned .dot { background: var(--warn); }
+    ol.steptrack li .badge.warn { background: #fbf1dc; color: #8a5f12; height: auto; min-height: 22px; padding: 2px 9px; white-space: normal; }
+    ol.steptrack li .wlist { flex: 1 1 100%; display: grid; gap: 2px; padding-left: 16px; font-size: 11.5px; color: #8a5f12; }
+    html[data-theme="dark"] ol.steptrack li .badge.warn { background: #3a2e14; color: #e8c06a; }
+    html[data-theme="dark"] ol.steptrack li .wlist { color: #e8c06a; }
     .bar { flex: 1; height: 5px; border-radius: 980px; background: #e9ecef; overflow: hidden; min-width: 60px; }
     .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 980px; width: 0; transition: width .4s; }
     .bar.indet > i { width: 40%; animation: slide 1.2s ease-in-out infinite; }
@@ -224,6 +232,43 @@
     html[data-theme="dark"] .stat.k-candidate i { color: #d97f72; }
     html[data-theme="dark"] .err { background: #3d2422; }
     html[data-theme="dark"] .modal-backdrop { background: rgba(0,0,0,.55); }
+    /* Global keyboard focus ring — every focusable control, not only inputs. */
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    input[type="text"]:focus-visible { outline: none; }
+    /* Disabled rail steps: keep text at AA contrast instead of fading the
+       whole button to 55% opacity. */
+    .navstep:disabled { opacity: 1; background: var(--bg); }
+    .navstep:disabled .nt b { color: var(--muted); }
+    .navstep:disabled .nt small { color: var(--muted); }
+    .hdr-sep { width: 1px; height: 22px; background: var(--line); margin: 0 4px 0 8px; }
+    #btnQuit { color: var(--danger); border-color: var(--line-strong); }
+    .srvbanner { position: sticky; top: 46px; z-index: 39; display: flex; gap: 10px; align-items: center; padding: 8px 16px; background: #fdeceb; color: var(--danger); border-bottom: 1px solid #f0b6b6; font-size: 13px; }
+    .srvbanner b { font-weight: 600; }
+    .srvbanner .grow { flex: 1; }
+    .srvbanner button { height: 26px; }
+    html[data-theme="dark"] .srvbanner { background: #3d2422; border-color: #6b3532; }
+    .toastbox { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 60; display: grid; gap: 6px; pointer-events: none; }
+    .toast { pointer-events: auto; background: #20242a; color: #fff; border-radius: 7px; padding: 9px 14px; font-size: 13px; box-shadow: var(--shadow); max-width: min(560px, 92vw); }
+    .toast.err { background: #8f1d14; }
+    .dlg-body { padding: 0 14px 4px; overflow: auto; font-size: 13px; line-height: 1.5; }
+    .dlg-body p { margin: 0 0 8px; }
+    .checklist { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 5px; }
+    .checklist li { display: flex; gap: 8px; align-items: flex-start; padding: 7px 10px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); }
+    .checklist li .ic { flex: 0 0 auto; width: 18px; text-align: center; font-weight: 700; }
+    .checklist li.block { border-color: #f0b6b6; }
+    .checklist li.block .ic { color: var(--danger); }
+    .checklist li.warn .ic { color: var(--warn); }
+    .checklist li.ok .ic { color: var(--ok); }
+    .checklist li small { display: block; color: var(--muted); font-size: 11.5px; }
+    .dlg-progress { font-size: 12.5px; color: var(--muted); }
+    .logtools { display: flex; gap: 6px; align-items: center; }
+    .modeinfo { font-size: 12px; color: var(--muted); margin: -6px 0 10px; }
+    .modeinfo.warn { color: var(--warn); }
+    .err details { margin-top: 6px; font-size: 12px; }
+    .err details pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; font-family: var(--mono); font-size: 11.5px; }
+    .picker-item[aria-selected="true"] { background: var(--accent-soft); }
+    .picker-item.errrow { display: flex; gap: 8px; align-items: center; cursor: default; color: var(--danger); }
+    .picker-item.errrow button { height: 24px; font-family: var(--sans); }
   </style>
 </head>
 <body>
@@ -232,9 +277,16 @@
   <h1>FrameTrace 검수 워크스테이션</h1>
   <div class="sub">로컬 전용 · 원본 증거는 읽기 전용으로만 접근합니다</div>
   <div class="env" id="env"></div>
-  <button class="quitbtn" id="btnTheme" title="테마 전환 (라이트/다크)">◐</button>
-  <button class="quitbtn" id="btnQuit" title="워크스테이션 서버를 종료합니다 — 케이스 데이터는 보존됩니다">종료</button>
+  <button class="quitbtn" id="btnTheme" title="테마 전환 (라이트/다크)" aria-label="테마 전환">◐ 테마</button>
+  <span class="hdr-sep" aria-hidden="true"></span>
+  <button class="quitbtn" id="btnQuit" title="워크스테이션 서버를 종료합니다 — 케이스 데이터와 감사 로그는 보존됩니다">⏻ 서버 종료</button>
 </header>
+<div class="srvbanner" id="serverBanner" role="alert" hidden>
+  <b>서버 연결이 끊겼습니다.</b>
+  <span class="grow" id="serverBannerMsg">frametrace-app이 실행 중인지 확인하십시오 — 자동으로 다시 연결을 시도합니다.</span>
+  <button type="button" id="btnServerRetry">지금 다시 시도</button>
+</div>
+<div class="toastbox" id="toastBox" role="status" aria-live="polite"></div>
 <div class="quitpage" id="quitPage" hidden>
   <div class="card">
     <h2>워크스테이션이 종료되었습니다</h2>
@@ -303,6 +355,14 @@
       <div class="pathstatus" id="caseStatus" aria-live="polite"></div>
     </div>
     </div>
+    <div class="fieldlabel" id="scanModeLabel">분석 모드</div>
+    <div class="seg" role="radiogroup" aria-labelledby="scanModeLabel">
+      <label title="해시·ffprobe 생략 — 파일 목록과 기본 메타데이터만 색인합니다 (대용량 소스 1차 선별용)"><input type="radio" name="scanMode" value="quick"> 빠른 선별</label>
+      <label title="ffprobe 검증만 실행, SHA-256 해시는 생략합니다"><input type="radio" name="scanMode" value="standard"> 표준</label>
+      <label title="파일별 SHA-256 + ffprobe 검증 — 소스의 모든 바이트를 읽습니다 (최종 증거용)"><input type="radio" name="scanMode" value="full" checked> 전체 (증거용)</label>
+      <label title="아래 체크박스를 직접 조정한 상태"><input type="radio" name="scanMode" value="custom"> 사용자 지정</label>
+    </div>
+    <div class="modeinfo" id="modeInfo" aria-live="polite"></div>
     <div class="checks">
       <label><input type="checkbox" id="withHash" checked> 파일별 SHA-256 해시 계산 (증거 대조용)</label>
       <label><input type="checkbox" id="withFfprobe" checked> ffprobe 재생성 검증 (코덱/길이 메타데이터)</label>
@@ -326,12 +386,16 @@
     <p class="hint">각 단계는 감사 로그에 기록됩니다. 이 탭을 닫아도 분석은 계속되지만, 결과를 보려면 페이지를 다시 열어야 합니다.</p>
     <div class="viewcols" style="grid-template-columns:300px minmax(0,1fr)">
       <ol class="steptrack" id="track"></ol>
-      <pre class="log" id="log" aria-live="polite" style="margin:0;min-height:340px"></pre>
+      <pre class="log" id="log" tabindex="0" aria-label="분석 로그 (스크롤 가능)" style="margin:0;min-height:340px"></pre>
     </div>
     <div class="row" style="margin-top:10px">
       <button id="btnCancel" style="display:none;background:#b42318;border-color:#b42318;color:#fff">분석 중단</button>
       <button id="btnNew" style="display:none">새 케이스 시작</button>
-      <button class="ghost" id="btnCopyLog">로그 복사</button>
+      <span class="logtools">
+        <button class="ghost" id="btnCopyLog">로그 복사</button>
+        <button class="ghost" id="btnSaveLog" title="현재까지의 로그를 텍스트 파일로 저장합니다">로그 저장</button>
+        <button class="ghost" id="btnLogBottom" title="로그 맨 아래로 이동하고 자동 스크롤을 다시 켭니다" hidden>↓ 최신 로그로</button>
+      </span>
     </div>
   </section>
 
@@ -361,7 +425,7 @@
         <div class="stack">
           <button class="primary" id="btnFinalize" style="height:42px">결과 보고서 생성 및 패키징</button>
           <input type="file" id="marksFile" accept=".json" style="display:none">
-          <button id="btnImportMarks">마크 파일 반영 후 보고서 갱신</button>
+          <button id="btnImportMarks" title="다른 PC·오프라인 뷰어에서 내보낸 마크 JSON을 가져올 때만 사용합니다 — 이 화면의 뷰어 마크는 자동으로 케이스에 반영됩니다">외부 마크 파일 가져오기 (보고서 갱신)</button>
         </div>
         <p class="muted" id="finalHint" style="font-size:12px;margin-top:8px"></p>
         <div class="linklist" id="finalLinks"></div>
@@ -405,11 +469,24 @@
       <input type="text" id="pickerPath" aria-label="현재 경로 — 직접 입력 후 Enter로 이동" spellcheck="false">
       <button id="pickerUp">상위</button>
     </div>
-    <ul class="picker-list" id="pickerList"></ul>
+    <ul class="picker-list" id="pickerList" role="listbox" aria-label="폴더 목록 — 위/아래 화살표로 이동, Enter 또는 Space로 열기"></ul>
     <div class="modal-foot">
-      <span class="muted" id="pickerStatus"></span>
+      <span class="muted" id="pickerStatus" role="status" aria-live="polite"></span>
       <button class="primary" id="pickerSelect">이 폴더 선택</button>
       <button id="pickerCancel">취소</button>
+    </div>
+  </div>
+</div>
+<div class="modal-backdrop" id="dlgBackdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dlgTitle">
+    <div class="modal-head">
+      <h3 id="dlgTitle"></h3>
+    </div>
+    <div class="dlg-body" id="dlgBody"></div>
+    <div class="modal-foot">
+      <span class="dlg-progress" id="dlgNote" aria-live="polite"></span>
+      <button class="primary" id="dlgOk">확인</button>
+      <button id="dlgCancel">취소</button>
     </div>
   </div>
 </div>
@@ -421,14 +498,17 @@ const esc = v => String(v ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").
 // Theme toggle — shared ft-theme key, mirrored into the embedded review
 // iframe so its chrome follows without a reload.
 const themeBtn = $("btnTheme");
+const rootEl = () => document.documentElement || { dataset: {} };
 function syncThemeBtn() {
-  const dark = document.documentElement.dataset.theme === "dark";
+  const dark = rootEl().dataset.theme === "dark";
+  // Never empty: the label always names the target theme.
   themeBtn.textContent = dark ? "☀ 라이트" : "◐ 다크";
   themeBtn.title = dark ? "라이트 테마로 전환" : "다크 테마로 전환";
+  themeBtn.setAttribute("aria-label", themeBtn.title);
 }
 themeBtn.addEventListener("click", () => {
-  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  document.documentElement.dataset.theme = next;
+  const next = rootEl().dataset.theme === "dark" ? "light" : "dark";
+  rootEl().dataset.theme = next;
   try { localStorage.setItem("ft-theme", next); } catch (e) {}
   const fr = $("reviewFrame");
   try { if (fr && fr.contentDocument) fr.contentDocument.documentElement.dataset.theme = next; } catch (e) {}
@@ -438,11 +518,109 @@ syncThemeBtn();
 
 const STEP_NAMES = ["케이스 준비", "소스 등록", "스캔 · 색인", "재생성 검증", "리뷰 생성"];
 
-async function jget(url) { const r = await fetch(url, { cache: "no-store" }); return r.json(); }
-async function jpost(url, body) {
-  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
-  return r.json();
+// Reads a fetch Response as JSON without ever throwing: HTTP errors,
+// non-JSON bodies (a proxy error page, a truncated reply) and network
+// failures all collapse to { ok:false, error } so callers have exactly one
+// failure shape to render.
+async function readJson(r) {
+  let data = null;
+  try { data = await r.json(); } catch (e) { data = null; }
+  if (!r || !r.ok) {
+    const status = r && r.status ? `HTTP ${r.status}` : "응답 없음";
+    return Object.assign({}, data && typeof data === "object" ? data : {}, {
+      ok: false,
+      error: (data && data.error) || `서버 오류 (${status})`,
+    });
+  }
+  if (!data || typeof data !== "object") return { ok: false, malformed: true, error: "서버 응답을 해석할 수 없습니다 (JSON 아님)" };
+  return data;
 }
+function netError(err) {
+  return { ok: false, network: true, error: "서버에 연결할 수 없습니다: " + ((err && err.message) || err || "network") };
+}
+// jget throws on failure (existing callers wrap it and treat a throw as
+// "unknown"); jpost never throws — it always resolves to { ok, error }.
+async function jget(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  const data = await readJson(r);
+  if (!(r && r.ok) || data.malformed) throw new Error(data.error);
+  return data;
+}
+async function jpost(url, body) {
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    return await readJson(r);
+  } catch (err) {
+    return netError(err);
+  }
+}
+
+// ---- toast: transient, non-blocking feedback ----
+function toast(msg, kind) {
+  const box = $("toastBox");
+  if (!box || typeof document.createElement !== "function") return;
+  const el = document.createElement("div");
+  el.className = "toast" + (kind === "err" ? " err" : "");
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), kind === "err" ? 7000 : 3500);
+}
+
+// ---- in-app dialog (replaces blocking confirm/alert) ----
+// askDialog resolves true on OK, false on cancel/Escape. `onOk` may return
+// false (or a Promise of false) to keep the dialog open, e.g. when a
+// required field is still empty.
+let dlgResolve = null, dlgOnOk = null, dlgLastFocus = null;
+function askDialog({ title, html, okLabel, cancelLabel, danger, onOk, focus }) {
+  if (dlgResolve) closeDialog(false);
+  dlgLastFocus = document.activeElement;
+  $("dlgTitle").textContent = title || "";
+  $("dlgBody").innerHTML = html || "";
+  $("dlgNote").textContent = "";
+  $("dlgOk").textContent = okLabel || "확인";
+  $("dlgOk").disabled = false;
+  $("dlgOk").style.background = danger ? "var(--danger)" : "";
+  $("dlgCancel").textContent = cancelLabel || "취소";
+  $("dlgCancel").hidden = cancelLabel === null;
+  $("dlgBackdrop").hidden = false;
+  dlgOnOk = onOk || null;
+  setTimeout(() => {
+    const target = (focus && $(focus)) || $("dlgOk");
+    if (target && target.focus) target.focus();
+  }, 0);
+  return new Promise(resolve => { dlgResolve = resolve; });
+}
+function closeDialog(result) {
+  $("dlgBackdrop").hidden = true;
+  const resolve = dlgResolve;
+  dlgResolve = null; dlgOnOk = null;
+  if (dlgLastFocus && dlgLastFocus.focus) { try { dlgLastFocus.focus(); } catch (e) {} }
+  if (resolve) resolve(result);
+}
+function alertDialog(title, msg) {
+  return askDialog({ title, html: `<p>${esc(msg)}</p>`, okLabel: "확인", cancelLabel: null });
+}
+$("dlgOk").addEventListener("click", async () => {
+  if (dlgOnOk) {
+    $("dlgOk").disabled = true;
+    let keep = false;
+    try { keep = (await dlgOnOk()) === false; } catch (e) { keep = true; $("dlgNote").textContent = "오류: " + (e.message || e); }
+    $("dlgOk").disabled = false;
+    if (keep) return;
+  }
+  closeDialog(true);
+});
+$("dlgCancel").addEventListener("click", () => closeDialog(false));
+$("dlgBackdrop").addEventListener("keydown", e => {
+  if (e.key === "Escape") { e.preventDefault(); closeDialog(false); return; }
+  if (e.key !== "Tab") return;
+  const focusables = [...$("dlgBackdrop").querySelectorAll("button, input, a[href], [tabindex='0']")]
+    .filter(el => !el.disabled && !el.hidden && el.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
 
 async function loadEnv() {
   try {
@@ -458,26 +636,107 @@ async function loadEnv() {
       `<span class="badge ${wf.e01 ? "ok" : "bad"}" id="ewfBadge" title="${esc(hints.e01 || "")}">libewf(E01) ${wf.e01 ? "준비됨" : "없음"}</span>` +
       badge("TSK(파일시스템)", wf.filesystem, hints.filesystem) +
       `<span class="badge" id="auditBadge" title="감사 로그 무결성은 분석 완료 후 자동 검증됩니다">감사 로그 대기</span>`;
-    if (!t.ffprobe) $("withFfprobe").checked = false;
+    ffprobeMissing = !t.ffprobe;
+    if (!t.ffprobe) { $("withFfprobe").checked = false; syncScanMode(); }
     const e01Radio = document.querySelector("input[name='inputKind'][value='e01']");
     if (e01Radio) {
-      e01Radio.disabled = !wf.e01;
+      setEnvOff(e01Radio, !wf.e01);
       $("e01Need").hidden = wf.e01;
       if (!wf.e01) e01Radio.closest("label")?.setAttribute("title", esc(hints.e01 || "libewf 도구가 필요합니다"));
     }
     // deepfake-lens is optional — grey the controls rather than letting a
     // first-time user click into a per-file "tool not found" storm.
     const dfOk = env.deepfake === true;
-    $("withDeepfake").disabled = !dfOk;
+    setEnvOff($("withDeepfake"), !dfOk);
     $("withDeepfake").closest("label")?.setAttribute("title",
       dfOk ? "" : "deepfake-lens 미설치 — pip install deepfake-lens 또는 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
     const dfBtn = document.querySelector("button[data-adv='deepfake']");
     if (dfBtn) {
-      dfBtn.disabled = !dfOk;
+      setEnvOff(dfBtn, !dfOk);
       dfBtn.setAttribute("title",
         dfOk ? "케이스의 모든 파일을 deepfake-lens로 스크리닝 — 결과는 '합성의심' 배지로 표시" : "deepfake-lens 미설치 — pip install deepfake-lens 또는 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
     }
   } catch (e) { console.error("loadEnv failed:", e); }
+}
+
+// ---- UX-11: analysis mode presets + size/placement hints ----
+let ffprobeMissing = false;
+const SCAN_MODES = {
+  quick: { hash: false, ffprobe: false },
+  standard: { hash: false, ffprobe: true },
+  full: { hash: true, ffprobe: true },
+};
+function scanMode() {
+  return document.querySelector("input[name='scanMode']:checked")?.value || "custom";
+}
+function setScanModeRadio(mode) {
+  const radio = document.querySelector(`input[name='scanMode'][value='${mode}']`);
+  if (radio) radio.checked = true;
+}
+function applyScanMode(mode) {
+  const m = SCAN_MODES[mode];
+  if (m) {
+    $("withHash").checked = m.hash;
+    // ffprobe stays off when the tool is missing, whatever the preset says.
+    $("withFfprobe").checked = m.ffprobe && !ffprobeMissing;
+  }
+  syncScanMode();
+}
+// Checkbox state is the source of truth; the radio reflects it.
+function syncScanMode() {
+  const h = $("withHash").checked, f = $("withFfprobe").checked;
+  let mode = "custom";
+  for (const [k, m] of Object.entries(SCAN_MODES)) if (m.hash === h && m.ffprobe === f) mode = k;
+  setScanModeRadio(mode);
+  updateModeInfo();
+}
+// Whole drives, device roots and forensic images are routinely hundreds of
+// GB to several TB. The server reports no source size, so this is a
+// path-shape heuristic, worded as such.
+function looksLargeSource(src) {
+  const v = String(src || "").trim();
+  if (!v) return false;
+  if (inputKind() === "e01") return true;
+  return /^[A-Za-z]:[\\/]?$/.test(v) || /^\\\\[?.]\\/.test(v) || v === "/" ||
+    /^\/(dev|media|mnt|Volumes|run\/media\/[^/]+)\/[^/]+\/?$/.test(v);
+}
+function normPath(p) {
+  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+// True when `child` is `parent` or lies beneath it (case-insensitive,
+// separator-agnostic — the workstation is primarily Windows).
+function pathInside(child, parent) {
+  const c = normPath(child), p = normPath(parent);
+  // Trailing-slash stripping turns the root "/" into "": treat it as the
+  // filesystem root, which contains every absolute path (including itself).
+  if (!p && /^\s*[\\/]+\s*$/.test(String(parent || ""))) {
+    return /^\s*[\\/]/.test(String(child || ""));
+  }
+  if (!c || !p) return false;
+  if (c === p) return true;
+  return c.startsWith(p + "/");
+}
+function updateModeInfo() {
+  const el = $("modeInfo");
+  if (!el) return;
+  const mode = scanMode();
+  const hash = $("withHash").checked;
+  const big = looksLargeSource($("sourcePath").value);
+  const lines = {
+    quick: "빠른 선별: 해시·ffprobe를 생략하고 파일 목록과 기본 메타데이터만 색인합니다 — 대용량 소스의 1차 선별용. 증거 대조용 SHA-256은 색인에 기록되지 않습니다.",
+    standard: "표준: ffprobe로 코덱·길이를 검증하고 SHA-256 해시는 생략합니다.",
+    full: "전체 (증거용): 모든 파일의 SHA-256을 계산하므로 소스의 모든 바이트를 읽습니다 — 소요 시간은 소스 크기에 비례합니다 (1 TB 기준 대략 1.5–3시간, 디스크 속도에 따라 다름).",
+    custom: "사용자 지정: 아래 체크박스 설정 그대로 실행합니다.",
+  };
+  let text = lines[mode] || lines.custom;
+  let warn = false;
+  if (big && hash) {
+    warn = true;
+    text = "⚠ 드라이브 전체 또는 디스크 이미지로 보입니다 — 수백 GB~수 TB일 수 있고, SHA-256 해시 계산이 켜져 있어 수 시간이 걸릴 수 있습니다. " +
+      "소스 크기는 서버가 제공하지 않아 정확한 예상 시간은 표시할 수 없습니다. 먼저 '빠른 선별'로 훑어본 뒤 필요한 범위만 '전체'로 분석하는 것을 권장합니다. · " + text;
+  }
+  el.className = "modeinfo" + (warn ? " warn" : "");
+  el.textContent = text;
 }
 
 function inputKind() {
@@ -490,6 +749,7 @@ function syncInputKind() {
     ? "예: D:\\Images\\blackbox.E01 (또는 Ex01/S01/L01)"
     : "예: E:\\ 또는 D:\\BLACKBOX 또는 C:\\Users\\me\\Desktop\\입수자료";
   $("verifyRow").style.display = e01 ? "flex" : "none";
+  updateModeInfo();
   validatePaths();
 }
 
@@ -547,8 +807,19 @@ $("btnRestoreNew").addEventListener("click", () => {
   showView(1);
 });
 
+// Controls that loadEnv() disabled for a missing tool carry
+// data-env-off and must stay disabled when a finished run re-enables the
+// form (otherwise the E01 radio comes back without libewf installed).
 function setInputsDisabled(disabled) {
-  document.querySelectorAll("#inputCard input, #inputCard select, #inputCard button").forEach(el => { el.disabled = disabled; });
+  document.querySelectorAll("#inputCard input, #inputCard select, #inputCard button").forEach(el => {
+    el.disabled = disabled || (el.dataset && el.dataset.envOff === "1");
+  });
+  if (!disabled && $("directE01").checked) $("skipE01Verify").disabled = true;
+}
+function setEnvOff(el, off) {
+  if (!el) return;
+  el.disabled = off;
+  if (el.dataset) { if (off) el.dataset.envOff = "1"; else delete el.dataset.envOff; }
 }
 
 function fmtBytes(value) {
@@ -566,21 +837,26 @@ function fmtEta(secs) {
   return `약 ${secs}초`;
 }
 
-function renderTrack(steps, names, progress) {
+function renderTrack(steps, names, progress, warnings) {
   const labels = (names && names.length === 5) ? names : STEP_NAMES;
   $("track").innerHTML = labels.map((name, i) => {
     const s = steps[i] || "pending";
     const cls = s === "done" ? "done" : s === "running" ? "running" : s === "failed" ? "failed" : "";
     let extra = s === "running" ? " …" : "";
+    const ws = (warnings || []).filter(w => w && w.step === i && w.message);
     if (s === "running" && progress && progress.total > 0) {
       const pct = Math.min(100, Math.round(progress.done * 100 / progress.total));
       const eta = progress.eta_secs > 0 ? ` · 남은 시간 ${fmtEta(progress.eta_secs)}` : ` · 계산 중`;
-      extra = `<span class="bar"><i style="width:${pct}%"></i></span><span class="ptext">${progress.done.toLocaleString()}/${progress.total.toLocaleString()} (${pct}%)${eta}</span>`;
+      extra = `<span class="prog"><span class="bar"><i style="width:${pct}%"></i></span><span class="ptext">${progress.done.toLocaleString()}/${progress.total.toLocaleString()} (${pct}%)${eta}</span></span>`;
     } else if (s === "running" && progress) {
       const bytes = progress.done > 0 ? `${fmtBytes(progress.done)} 기록됨 · ` : "";
-      extra = `<span class="bar indet"><i></i></span><span class="ptext">${bytes}${esc(progress.job_type)} · ${Math.floor((progress.elapsed_secs||0)/60)}:${String((progress.elapsed_secs||0)%60).padStart(2,"0")}</span>`;
+      extra = `<span class="prog"><span class="bar indet"><i></i></span><span class="ptext">${bytes}${esc(progress.job_type)} · ${Math.floor((progress.elapsed_secs||0)/60)}:${String((progress.elapsed_secs||0)%60).padStart(2,"0")}</span></span>`;
     }
-    return `<li class="${cls}"><span class="dot"></span>${esc(name)}${extra}</li>`;
+    if (s === "done" && ws.length) {
+      extra = ` <span class="badge warn" title="경고와 함께 완료">경고 ${ws.length}건과 함께 완료</span>` +
+        `<span class="wlist">${ws.map(w => `<span>• ${esc(w.message)}</span>`).join("")}</span>`;
+    }
+    return `<li class="${cls}${s === "done" && ws.length ? " warned" : ""}"><span class="dot"></span><span class="lbl">${esc(name)}</span>${extra}</li>`;
   }).join("");
 }
 
@@ -619,17 +895,116 @@ function errorHint(msg) {
   return "로그에서 실패한 단계를 확인하십시오 — 입력을 바로잡은 뒤 '분석 시작'으로 재시도할 수 있습니다.";
 }
 
+// ---- log view: append-only (UX-19) ----
+// /api/status returns the last 60 lines. Resetting the <pre> every poll
+// wiped the examiner's selection and yanked the scroll position, so only
+// the lines past the overlap with what is already shown are appended, and
+// auto-scroll happens only while the view is already at the bottom.
+let logShown = [];
+const LOG_DOM_CAP = 5000;
+function logOverlap(prev, next) {
+  // Largest k with prev's last k lines == next's first k lines.
+  const max = Math.min(prev.length, next.length);
+  for (let k = max; k > 0; k--) {
+    let same = true;
+    for (let i = 0; i < k; i++) {
+      if (prev[prev.length - k + i] !== next[i]) { same = false; break; }
+    }
+    if (same) return k;
+  }
+  return 0;
+}
+function logAtBottom(el) {
+  return (el.scrollHeight || 0) - (el.scrollTop || 0) - (el.clientHeight || 0) < 24;
+}
+function appendLogLines(lines) {
+  const el = $("log");
+  if (!Array.isArray(lines) || !lines.length) return;
+  const prevTail = logShown.slice(-lines.length);
+  if (prevTail.length === lines.length && prevTail.every((l, i) => l === lines[i])) return;
+  const k = logOverlap(prevTail, lines);
+  const fresh = lines.slice(k);
+  if (!fresh.length) return;
+  const stick = logAtBottom(el);
+  const text = (logShown.length ? "\n" : "") + fresh.join("\n");
+  if (typeof el.appendChild === "function" && typeof document.createTextNode === "function") {
+    el.appendChild(document.createTextNode(text));
+  } else {
+    el.textContent += text;
+  }
+  logShown = logShown.concat(fresh);
+  if (logShown.length > LOG_DOM_CAP) {
+    // Rare: trim from the top once, keeping the newest lines.
+    logShown = logShown.slice(-Math.floor(LOG_DOM_CAP * 0.8));
+    el.textContent = logShown.join("\n");
+  }
+  if (stick) el.scrollTop = el.scrollHeight;
+  else if ($("btnLogBottom")) $("btnLogBottom").hidden = false;
+}
+function resetLogView() {
+  logShown = [];
+  $("log").textContent = "";
+}
+
+// ---- server-lost banner (UX-05) ----
+let pollFailures = 0;
+let lastInstance = null;
+function setServerLost(lost, detail) {
+  const banner = $("serverBanner");
+  banner.hidden = !lost;
+  if (lost && detail) $("serverBannerMsg").textContent = detail;
+}
+function pollFailed(err) {
+  pollFailures += 1;
+  if (pollFailures >= 3) {
+    setServerLost(true,
+      `frametrace-app이 실행 중인지 확인하십시오 — ${pollFailures}회 연속 응답 없음, 자동으로 다시 연결을 시도합니다.` +
+      (err && err.message ? ` (${err.message})` : ""));
+  }
+}
+
 let shuttingDown = false;
+let pollTimer = 0;
+function schedulePoll(ms) {
+  clearTimeout(pollTimer);
+  // Back off while the server is unreachable so a dead server is not
+  // hammered, but never longer than 10 s so reconnects stay snappy.
+  const delay = pollFailures > 0 ? Math.min(10000, 1200 * Math.pow(1.6, Math.min(pollFailures, 6))) : ms;
+  pollTimer = setTimeout(poll, delay);
+}
+let lastStatus = null;
 async function poll() {
   if (shuttingDown) return;
+  let st;
   try {
-    const st = await jget("/api/status");
-    if (!st.has_job) { setTimeout(poll, 1500); return; }
+    st = await jget("/api/status");
+  } catch (err) {
+    pollFailed(err);
+    schedulePoll(1200);
+    return;
+  }
+  if (pollFailures >= 3) toast("서버에 다시 연결되었습니다.");
+  pollFailures = 0;
+  setServerLost(false);
+  if (lastInstance && st.instance && st.instance !== lastInstance) {
+    toast("서버가 다시 시작되었습니다 — 화면 상태를 새로 고칩니다.");
+  }
+  if (st.instance) lastInstance = st.instance;
+  lastStatus = st;
+  try {
+    applyStatus(st);
+  } catch (err) {
+    console.error("status render failed:", err);
+  }
+  schedulePoll(st.has_job ? 1200 : 1500);
+}
+$("btnServerRetry").addEventListener("click", () => { pollFailures = Math.min(pollFailures, 2); schedulePoll(0); poll(); });
+
+function applyStatus(st) {
+    if (!st.has_job) return;
     if (!jobSeen) { jobSeen = true; $("s2").disabled = false; }
-    renderTrack(st.steps || [], st.step_names, st.progress);
-    const logEl = $("log");
-    logEl.textContent = (st.logs || []).join("\n");
-    logEl.scrollTop = logEl.scrollHeight;
+    renderTrack(st.steps || [], st.step_names, st.progress, st.warnings);
+    appendLogLines(st.logs || []);
     const running = st.phase === "running";
     setInputsDisabled(running);
     $("btnStart").disabled = running || finalizing;
@@ -638,8 +1013,11 @@ async function poll() {
     $("btnNew").style.display = (!running && (st.error || st.phase !== "running")) ? "" : "none";
     if (running && !autoProgress) { autoProgress = true; showView(2); }
     const restorePending = st.restored && !restoreHandled;
-    const wantNew = sessionStorage.getItem("ft_want_new") === "1";
-    if (wantNew) sessionStorage.removeItem("ft_want_new");
+    let wantNew = false;
+    try {
+      wantNew = sessionStorage.getItem("ft_want_new") === "1";
+      if (wantNew) sessionStorage.removeItem("ft_want_new");
+    } catch (e) { /* storage blocked */ }
     const rn = $("restoreNotice");
     rn.hidden = !restorePending || wantNew;
     if (restorePending) $("restoreCase").textContent = st.case_dir || "";
@@ -648,7 +1026,11 @@ async function poll() {
       if (!reviewReady) { reviewReady = true; $("s3").disabled = false; $("s4").disabled = false; ensureReviewFrame(); }
       if (!autoReviewed && !restorePending && !wantNew) { autoReviewed = true; showView(3); }
       setStep(st.phase === "running" ? 4 : 4, 3);
-      $("finalHint").textContent = st.case_dir ? ("케이스: " + st.case_dir) : "";
+      // Only fill an idle hint — never overwrite a progress/failure message.
+      const fh = $("finalHint");
+      if (!finalizing && (!fh.textContent || fh.textContent.startsWith("케이스: "))) {
+        fh.textContent = st.case_dir ? ("케이스: " + st.case_dir) : "";
+      }
       if ((st.phase === "done" || st.phase === "finalized") && st.package_dir) {
         $("btnFinalize").disabled = false;
         $("btnFinalize").textContent = "보고서 재생성";
@@ -664,55 +1046,96 @@ async function poll() {
     } else if (running) {
       setStep(3, 2);
     }
+    const errEl = $("startErr");
     if (st.error) {
-      $("startErr").classList.add("show");
-      $("startErr").innerHTML =
-        `<div>오류: ${esc(st.error)}</div><div class="hintline">${esc(errorHint(st.error))}</div>`;
+      // Re-render only when something else replaced the box, so an
+      // expanded details block (and any selection in it) survives polls.
+      if (shownStatusError !== st.error || errEl.innerHTML !== shownStatusHtml || !/\bshow\b/.test(errEl.className)) {
+        errEl.classList.add("show");
+        errEl.innerHTML = errorHtml(st.error);
+        shownStatusError = st.error;
+        shownStatusHtml = errEl.innerHTML;
+      }
     } else {
-      $("startErr").classList.remove("show");
+      shownStatusError = null;
+      errEl.classList.remove("show");
     }
-  } catch (e) { /* server restarting */ }
-  setTimeout(poll, 1200);
+}
+let shownStatusError = null, shownStatusHtml = "";
+// Action hint first (what to do now), raw CLI output behind a disclosure.
+function errorHtml(raw) {
+  const text = String(raw || "");
+  const first = text.split(/\r?\n/)[0].slice(0, 240);
+  return `<div>오류: ${esc(first)}</div><div class="hintline">${esc(errorHint(text))}</div>` +
+    (text.length > first.length ? `<details><summary>자세한 오류 내용</summary><pre>${esc(text)}</pre></details>` : "");
 }
 
+let starting = false;
 $("btnStart").addEventListener("click", async () => {
+  if (starting) return;
   const source = $("sourcePath").value.trim();
   if (!source) { $("startErr").classList.add("show"); $("startErr").textContent = "증거 소스 경로를 입력하십시오."; return; }
   $("startErr").classList.remove("show");
-  $("btnStart").disabled = true;
-  cancelRequested = false;
-  const res = await jpost("/api/start", {
-    input_kind: inputKind(),
-    source_path: $("sourcePath").value.trim(),
-    case_dir: $("caseDir").value.trim(),
-    with_hash: $("withHash").checked,
-    with_ffprobe: $("withFfprobe").checked,
-    with_deepfake: $("withDeepfake").checked,
-    skip_e01_verify: $("skipE01Verify").checked,
-    e01_direct: inputKind() === "e01" && $("directE01").checked
-  });
-  if (!res.ok) {
-    $("btnStart").disabled = false;
-    $("startErr").classList.add("show");
-    $("startErr").textContent = "오류: " + (res.error || "시작 실패");
-    return;
+  // Preflight: never write case output inside the evidence source.
+  const caseDir = $("caseDir").value.trim();
+  if (caseDir && pathInside(caseDir, source)) {
+    const go = await askDialog({
+      title: "케이스 폴더가 증거 소스 안에 있습니다",
+      html: `<p>케이스 폴더 <code>${esc(caseDir)}</code>가 증거 소스 <code>${esc(source)}</code> 안에 있습니다.</p>` +
+        `<p>원본 증거 매체에 산출물을 기록하게 되며, 다음 스캔에서 산출물이 증거로 다시 색인될 수 있습니다. 다른 드라이브의 폴더를 지정하는 것을 강력히 권장합니다.</p>`,
+      okLabel: "그래도 진행", cancelLabel: "케이스 폴더 바꾸기", danger: true,
+    });
+    if (!go) { $("caseDir").focus(); return; }
   }
-  savePrefs({
-    inputKind: inputKind(),
-    withHash: $("withHash").checked,
-    withFfprobe: $("withFfprobe").checked,
-    withDeepfake: $("withDeepfake").checked,
-    skipE01Verify: $("skipE01Verify").checked,
-    directE01: $("directE01").checked,
-    lastSource: $("sourcePath").value.trim(),
-    lastCase: $("caseDir").value.trim(),
-  });
-  pushRecent("recentSources", $("sourcePath").value.trim());
-  pushRecent("recentCases", $("caseDir").value.trim());
-  jobSeen = true; autoProgress = true; autoReviewed = false;
-  $("s2").disabled = false;
-  showView(2);
-  setStep(3, 2);
+  starting = true;
+  $("btnStart").disabled = true;
+  const hint = $("startHint");
+  const prevHint = hint.textContent;
+  hint.textContent = "분석 시작 요청 중…";
+  cancelRequested = false;
+  let started = false;
+  try {
+    const res = await jpost("/api/start", {
+      input_kind: inputKind(),
+      source_path: source,
+      case_dir: caseDir,
+      with_hash: $("withHash").checked,
+      with_ffprobe: $("withFfprobe").checked,
+      with_deepfake: $("withDeepfake").checked,
+      skip_e01_verify: $("skipE01Verify").checked,
+      e01_direct: inputKind() === "e01" && $("directE01").checked
+    });
+    if (!res.ok) {
+      $("startErr").classList.add("show");
+      $("startErr").innerHTML = errorHtml(res.error || "시작 실패");
+      return;
+    }
+    savePrefs({
+      inputKind: inputKind(),
+      scanMode: scanMode(),
+      withHash: $("withHash").checked,
+      withFfprobe: $("withFfprobe").checked,
+      withDeepfake: $("withDeepfake").checked,
+      skipE01Verify: $("skipE01Verify").checked,
+      directE01: $("directE01").checked,
+      lastSource: source,
+      lastCase: caseDir,
+    });
+    pushRecent("recentSources", source);
+    pushRecent("recentCases", caseDir);
+    started = true;
+    resetLogView();
+    jobSeen = true; autoProgress = true; autoReviewed = false;
+    $("s2").disabled = false;
+    showView(2);
+    setStep(3, 2);
+  } finally {
+    starting = false;
+    hint.textContent = prevHint;
+    // The poll owns the steady-state enable/disable; this only undoes the
+    // optimistic disable so a failed request never strands the button.
+    $("btnStart").disabled = started || finalizing || !!(lastStatus && lastStatus.phase === "running");
+  }
 });
 
 // Switching cases must not leak the previous case's state into the UI —
@@ -734,7 +1157,8 @@ function resetCaseUi() {
   $("advOut").textContent = "";
   $("advLink").innerHTML = "";
   $("track").innerHTML = "";
-  $("log").textContent = "";
+  resetLogView();
+  shownStatusError = null;
   const audit = $("auditBadge");
   if (audit) { audit.className = "badge"; audit.textContent = "감사 로그 대기"; audit.removeAttribute("title"); }
 }
@@ -761,7 +1185,7 @@ async function openCase(dir) {
   }
   if (!res.has_review) {
     $("startErr").classList.add("show");
-    $("startErr").textContent = "케이스를 열었으나 검토 결과가 아직 없습니다 — 분석을 실행하십시오.";
+    $("startErr").textContent = "케이스를 열었으나 검토 결과가 아직 없습니다 — 이전 분석이 중단되었을 수 있습니다. 같은 증거 소스를 지정하고 '분석 시작'을 누르면 체크포인트에서 이어서 진행합니다.";
     return;
   }
   pushRecent("recentCases", dir);
@@ -772,11 +1196,22 @@ async function openCase(dir) {
 
 let cancelRequested = false;
 $("btnCancel").addEventListener("click", async () => {
-  if (!confirm("분석을 중단하시겠습니까?\n중단 후 '분석 시작'을 다시 누르면 같은 케이스를 체크포인트에서 이어서 분석합니다.")) return;
+  const go = await askDialog({
+    title: "분석 중단",
+    html: "<p>분석을 중단하시겠습니까?</p><p>중단 후 같은 소스·옵션으로 '분석 시작'을 다시 누르면 같은 케이스를 체크포인트에서 이어서 분석합니다.</p>",
+    okLabel: "분석 중단", cancelLabel: "계속 분석", danger: true, focus: "dlgCancel",
+  });
+  if (!go) return;
   cancelRequested = true;
   $("btnCancel").disabled = true;
   $("btnCancel").textContent = "중단 요청 중…";
-  await jpost("/api/cancel", {});
+  const res = await jpost("/api/cancel", {});
+  if (!res.ok) {
+    cancelRequested = false;
+    $("btnCancel").disabled = false;
+    $("btnCancel").textContent = "분석 중단";
+    toast("중단 요청 실패: " + (res.error || "알 수 없는 오류"), "err");
+  }
 });
 // Reload alone lands back on the review stage (the poll auto-jumps on a
 // completed case); the flag keeps stage 1 on this load only.
@@ -786,6 +1221,9 @@ $("btnNew").addEventListener("click", () => {
 });
 
 $("directE01").addEventListener("change", syncDirectE01);
+document.querySelectorAll("input[name='scanMode']").forEach(r => r.addEventListener("change", () => applyScanMode(r.value)));
+$("withHash").addEventListener("change", syncScanMode);
+$("withFfprobe").addEventListener("change", syncScanMode);
 // popup=yes + dimensions asks the browser for a real separate window
 // (not just another tab) — useful for dual-monitor review. The named
 // target re-focuses an already-open viewer instead of stacking copies.
@@ -865,35 +1303,180 @@ $("btnRecoverDeleted").addEventListener("click", async () => {
   const btn = $("btnRecoverDeleted");
   btn.disabled = true;
   $("recoverHint").textContent = "삭제 영상 후보 복구 중… (후보 수에 따라 시간이 걸릴 수 있습니다)";
-  const res = await jpost("/api/recover-deleted", {});
-  btn.disabled = false;
-  if (!res.ok) {
-    $("recoverHint").textContent = "복구 실패: " + (res.error || "");
-    return;
+  let done = false;
+  try {
+    const res = await jpost("/api/recover-deleted", {});
+    if (!res.ok) {
+      $("recoverHint").textContent = "복구 실패: " + (res.error || "알 수 없는 오류");
+      return;
+    }
+    done = true;
+    $("recoverHint").textContent = "복구 완료 — 뷰어를 갱신합니다.";
+    if (reviewFrameLoaded) reviewFrame.src = reviewFrame.src;
+  } finally {
+    btn.disabled = false;
+    if (!done && /중…/.test($("recoverHint").textContent)) $("recoverHint").textContent = "복구가 완료되지 않았습니다 — 다시 시도할 수 있습니다.";
   }
-  $("recoverHint").textContent = "복구 완료 — 뷰어를 갱신합니다.";
-  if (reviewFrameLoaded) reviewFrame.src = reviewFrame.src;
 });
 
-$("btnFinalize").addEventListener("click", async () => {
-  finalizing = true;
-  $("btnFinalize").disabled = true;
-  $("finalHint").textContent = "보고서 생성 중…";
-  const res = await jpost("/api/finalize", {});
-  finalizing = false;
-  $("btnFinalize").disabled = false;
-  $("finalHint").textContent = "";
-  if (!res.ok) { $("finalHint").textContent = "실패: " + (res.error || ""); return; }
-  $("finalLinks").innerHTML =
-    `<a href="/case/reports/case-report.html" target="_blank"><b>최종 결과 보고서 열기</b><span>발견 원본 영상 · 메타데이터 · SHA-256 · 발견/분석 기법 · 처리 체인</span></a>` +
-    `<a href="/case/${esc(res.package_url || "")}" target="_blank"><b>패키지 폴더 보기</b><span>체크섬 검증된 증거 패키지</span></a>` +
-    pkgExplorerLink(res.package_dir);
-  if (res.package_dir) {
-    $("pkgPath").classList.add("show");
-    $("pkgPath").textContent = "패키지: " + res.package_dir;
+// ---- FOR-02: pre-finalize checklist ----
+// Everything here comes from data that already exists: /api/status
+// (busy/phase), /api/records-meta (case manifest + marks the server has
+// applied), the embedded viewer's __frametraceSummary() and the viewer's
+// per-case localStorage drafts (= mark/note changes not yet synced to the
+// case DB). Blocking items disable "proceed"; warnings only inform.
+function viewerWindow() {
+  try { return reviewFrameLoaded ? reviewFrame.contentWindow : null; } catch (e) { return null; }
+}
+function viewerExaminerInput() {
+  try { return reviewFrameLoaded && reviewFrame.contentDocument ? reviewFrame.contentDocument.getElementById("examinerName") : null; } catch (e) { return null; }
+}
+function readLs(key) {
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+}
+async function gatherFinalizeChecks() {
+  const checks = [];
+  const add = (level, text, sub) => checks.push({ level, text, sub: sub || "" });
+  let st = null;
+  try { st = await jget("/api/status"); } catch (e) { st = null; }
+  if (!st) add("block", "서버 상태를 확인할 수 없습니다", "연결이 복구된 뒤 다시 시도하십시오.");
+  else if (st.busy) add("block", "다른 작업이 진행 중입니다", `현재 단계: ${st.phase || "-"} — 끝난 뒤 보고서를 생성하십시오.`);
+  let meta = null;
+  try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
+  const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
+  let summary = null;
+  const w = viewerWindow();
+  try { if (w && typeof w.__frametraceSummary === "function") summary = w.__frametraceSummary(); } catch (e) { summary = null; }
+
+  // Unsynced viewer changes.
+  let pending = null;
+  if (summary && Number.isFinite(summary.pending)) pending = summary.pending;
+  else if (summary && Number.isFinite(summary.unsynced)) pending = summary.unsynced;
+  else if (caseId) {
+    const drafts = readLs(`ft.viewer.${caseId}.annotations.v1`);
+    pending = drafts && typeof drafts === "object" ? Object.keys(drafts).length : 0;
   }
-  setStep(4, 4);
-  ensureReportFrame();
+  if (pending === null) add("warn", "뷰어의 미반영 마크 수를 확인할 수 없습니다", "뷰어가 아직 열리지 않았거나 케이스 정보를 읽지 못했습니다.");
+  else if (pending > 0) add("warn", `케이스에 아직 반영되지 않은 마크·메모 변경 ${pending}건`,
+    "뷰어는 변경 후 몇 초 안에 자동 반영합니다 — 잠시 뒤 '다시 확인'을 누르십시오. 계속 남아 있으면 뷰어의 저장 상태를 확인하십시오.");
+  else add("ok", "뷰어의 마크·메모가 모두 케이스에 반영되었습니다");
+
+  const marks = meta && meta.annotations && Array.isArray(meta.annotations.marks) ? meta.annotations.marks : null;
+  if (marks) {
+    const real = marks.filter(m => m && m.status && m.status !== "noted");
+    if (!real.length) add("warn", "판독 마크가 하나도 없습니다", "보고서에 검토 결과(중요/검토완료)가 표시되지 않습니다.");
+    const impNoNote = real.filter(m => m.status === "important" && !String(m.note || "").trim()).length;
+    if (impNoNote) add("warn", `메모 없는 '중요' 마크 ${impNoNote}건`, "중요 판단의 근거를 메모로 남기는 것을 권장합니다.");
+    const noExaminer = marks.filter(m => !String(m.examiner || "").trim()).length;
+    if (noExaminer) add("warn", `검토자 이름 없이 기록된 마크 ${noExaminer}건`, "이름 입력 이후 수정된 마크부터 검토자가 기록됩니다.");
+  }
+  if (summary) {
+    const total = summary.total || 0;
+    const failed = (summary.byStatus && summary.byStatus["validation-failed"]) || 0;
+    const cand = (summary.byKind && summary.byKind.candidate) || 0;
+    if (failed) add("warn", `검증 실패 항목 ${failed}건`, "보고서에 검증 실패로 표시됩니다 — 뷰어에서 확인하십시오.");
+    if (cand) add("warn", `복구 전 후보 ${cand}건`, "검증되지 않은 후보는 보고서에서 확정 복구로 주장되지 않습니다.");
+    const unmarked = Math.max(0, total - (summary.marked || 0));
+    add(unmarked ? "warn" : "ok", unmarked ? `마크하지 않은 항목 ${unmarked} / ${total}건` : `전체 ${total}건 모두 마크됨`);
+  }
+  const audit = $("auditBadge");
+  if (audit && /\bbad\b/.test(audit.className)) add("warn", "감사 로그 검증에 실패했습니다", audit.textContent);
+  else if (audit && /\bok\b/.test(audit.className)) add("ok", audit.textContent);
+  return { checks, caseId };
+}
+function renderChecklist(checks) {
+  const icon = { block: "✕", warn: "!", ok: "✓" };
+  return `<ul class="checklist">` + checks.map(c =>
+    `<li class="${c.level}"><span class="ic" aria-hidden="true">${icon[c.level]}</span><span>${esc(c.text)}` +
+    (c.sub ? `<small>${esc(c.sub)}</small>` : "") + `</span></li>`).join("") + `</ul>`;
+}
+function currentExaminerName(caseId) {
+  const vi = viewerExaminerInput();
+  if (vi && vi.value.trim()) return vi.value.trim();
+  if (caseId) { const v = readLs(`ft.viewer.${caseId}.examiner`); if (typeof v === "string" && v.trim()) return v.trim(); }
+  return loadPrefs().examinerName || "";
+}
+function propagateExaminerName(name, caseId) {
+  savePrefs({ examinerName: name });
+  const vi = viewerExaminerInput();
+  if (vi) {
+    vi.value = name;
+    try { vi.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
+  } else if (caseId) {
+    try { localStorage.setItem(`ft.viewer.${caseId}.examiner`, JSON.stringify(name)); } catch (e) {}
+  }
+}
+async function preFinalizeDialog() {
+  let state = await gatherFinalizeChecks();
+  const body = () => {
+    const blocking = state.checks.filter(c => c.level === "block").length;
+    return `<p>보고서·패키지를 생성하기 전에 아래 항목을 확인하십시오.${blocking ? " <b>차단 항목을 해결해야 진행할 수 있습니다.</b>" : ""}</p>` +
+      `<div class="field"><label class="fieldlabel" for="dlgExaminer">검토자 이름 (이후 판독 마크에 기록됨)</label>` +
+      `<input type="text" id="dlgExaminer" autocomplete="name" value="${esc(currentExaminerName(state.caseId))}" placeholder="예: 홍길동 (소속)"></div>` +
+      renderChecklist(state.checks) +
+      `<button type="button" class="ghost" id="dlgRecheck">다시 확인</button>`;
+  };
+  const wire = () => {
+    const rc = $("dlgRecheck");
+    if (rc) rc.addEventListener("click", async () => {
+      const typed = $("dlgExaminer") ? $("dlgExaminer").value : "";
+      rc.disabled = true;
+      $("dlgNote").textContent = "확인 중…";
+      state = await gatherFinalizeChecks();
+      $("dlgBody").innerHTML = body();
+      if ($("dlgExaminer")) $("dlgExaminer").value = typed;
+      $("dlgNote").textContent = "";
+      $("dlgOk").disabled = state.checks.some(c => c.level === "block");
+      wire();
+    });
+  };
+  const opened = askDialog({
+    title: "최종화 전 점검",
+    html: body(),
+    okLabel: "보고서 생성 진행",
+    cancelLabel: "취소",
+    focus: "dlgExaminer",
+    onOk: () => {
+      const name = ($("dlgExaminer") && $("dlgExaminer").value.trim()) || "";
+      if (state.checks.some(c => c.level === "block")) { $("dlgNote").textContent = "차단 항목을 먼저 해결하십시오."; return false; }
+      if (name) propagateExaminerName(name, state.caseId);
+      return true;
+    },
+  });
+  $("dlgOk").disabled = state.checks.some(c => c.level === "block");
+  wire();
+  return opened;
+}
+
+$("btnFinalize").addEventListener("click", async () => {
+  if (finalizing) return;
+  const btn = $("btnFinalize");
+  btn.disabled = true;
+  let go = false;
+  try { go = await preFinalizeDialog(); }
+  catch (err) { toast("점검 정보를 불러오지 못했습니다: " + (err.message || err), "err"); }
+  if (!go) { btn.disabled = false; return; }
+  finalizing = true;
+  $("finalHint").textContent = "보고서 생성 중… (원본 해시 재계산 포함 — 소스 크기에 따라 오래 걸릴 수 있습니다)";
+  try {
+    const res = await jpost("/api/finalize", {});
+    if (!res.ok) { $("finalHint").textContent = "실패: " + (res.error || "알 수 없는 오류"); return; }
+    $("finalHint").textContent = "보고서·패키지 생성 완료.";
+    $("finalLinks").innerHTML =
+      `<a href="/case/reports/case-report.html" target="_blank"><b>최종 결과 보고서 열기</b><span>발견 원본 영상 · 메타데이터 · SHA-256 · 발견/분석 기법 · 처리 체인</span></a>` +
+      `<a href="/case/${esc(res.package_url || "")}" target="_blank"><b>패키지 폴더 보기</b><span>체크섬 검증된 증거 패키지</span></a>` +
+      pkgExplorerLink(res.package_dir);
+    if (res.package_dir) {
+      $("pkgPath").classList.add("show");
+      $("pkgPath").textContent = "패키지: " + res.package_dir;
+    }
+    setStep(4, 4);
+    ensureReportFrame();
+  } finally {
+    finalizing = false;
+    btn.disabled = false;
+    if (/중…/.test($("finalHint").textContent)) $("finalHint").textContent = "보고서 생성이 완료되지 않았습니다 — 다시 시도할 수 있습니다.";
+  }
 });
 
 // Package dir is a server-side path, not a browsable URL — this link POSTs
@@ -903,41 +1486,65 @@ function pkgExplorerLink(dir) {
   if (!dir) return "";
   return `<a href="#" data-pkgdir="${esc(dir)}"><b>탐색기에서 패키지 폴더 열기</b><span>${esc(dir)}</span></a>`;
 }
-document.addEventListener("click", e => {
-  const a = e.target.closest("a[data-pkgdir]");
+document.addEventListener("click", async e => {
+  const a = e.target.closest && e.target.closest("a[data-pkgdir]");
   if (!a) return;
   e.preventDefault();
-  jpost("/api/open-folder", { path: a.dataset.pkgdir });
+  const res = await jpost("/api/open-folder", { path: a.dataset.pkgdir });
+  if (!res.ok) toast("폴더를 열지 못했습니다: " + (res.error || "알 수 없는 오류") + " — 경로를 직접 여십시오: " + a.dataset.pkgdir, "err");
 });
 
 $("btnImportMarks").addEventListener("click", () => $("marksFile").click());
 $("marksFile").addEventListener("change", async () => {
-  const file = $("marksFile").files[0];
+  const input = $("marksFile");
+  const file = input.files[0];
   if (!file) return;
-  const marksJson = await file.text();
+  const btn = $("btnImportMarks");
+  btn.disabled = true;
   $("finalHint").textContent = "마크 반영 및 보고서 갱신 중…";
-  const res = await jpost("/api/import-marks", { marks_json: marksJson });
-  $("finalHint").textContent = res.ok ? "보고서에 판독 마크가 반영되었습니다." : "실패: " + (res.error || "");
-  if (res.ok && !$("finalLinks").innerHTML) {
-    $("finalLinks").innerHTML =
-      `<a href="/case/${esc(res.report_url || "")}" target="_blank"><b>갱신된 최종 결과 보고서 열기</b><span>판독 마크 포함</span></a>`;
+  try {
+    let marksJson;
+    try { marksJson = await file.text(); }
+    catch (err) { $("finalHint").textContent = "실패: 파일을 읽을 수 없습니다 — " + (err.message || err); return; }
+    const res = await jpost("/api/import-marks", { marks_json: marksJson });
+    $("finalHint").textContent = res.ok ? "보고서에 판독 마크가 반영되었습니다." : "실패: " + (res.error || "알 수 없는 오류");
+    if (res.ok && !$("finalLinks").innerHTML) {
+      $("finalLinks").innerHTML =
+        `<a href="/case/${esc(res.report_url || "")}" target="_blank"><b>갱신된 최종 결과 보고서 열기</b><span>판독 마크 포함</span></a>`;
+    }
+  } finally {
+    btn.disabled = false;
+    // Same file picked twice must fire "change" again.
+    input.value = "";
+    if (/중…$/.test($("finalHint").textContent)) $("finalHint").textContent = "";
   }
 });
 
 $("btnCarve").addEventListener("click", async () => {
-  if (!confirm("export된 raw 이미지에서 영상 시그니처 카빙을 실행합니다.\n이미지 크기에 따라 시간이 걸릴 수 있습니다. 계속하시겠습니까?")) return;
+  const go = await askDialog({
+    title: "이미지 카빙",
+    html: "<p>export된 raw 이미지에서 영상 시그니처 카빙을 실행합니다.</p><p>이미지 크기에 따라 시간이 걸릴 수 있습니다. 계속하시겠습니까?</p>",
+    okLabel: "카빙 실행",
+  });
+  if (!go) return;
   const btn = $("btnCarve");
   btn.disabled = true;
   $("recoverHint").textContent = "시그니처 카빙 실행 중… (이미지 크기에 따라 시간이 걸릴 수 있습니다)";
-  const reassemble = $("chkReassemble") && $("chkReassemble").checked;
-  const res = await jpost(reassemble ? "/api/carve?reassemble=1" : "/api/carve", {});
-  btn.disabled = false;
-  if (!res.ok) {
-    $("recoverHint").textContent = "카빙 실패: " + (res.error || "");
-    return;
+  let done = false;
+  try {
+    const reassemble = $("chkReassemble") && $("chkReassemble").checked;
+    const res = await jpost(reassemble ? "/api/carve?reassemble=1" : "/api/carve", {});
+    if (!res.ok) {
+      $("recoverHint").textContent = "카빙 실패: " + (res.error || "알 수 없는 오류");
+      return;
+    }
+    done = true;
+    $("recoverHint").textContent = "카빙 완료 — 뷰어를 갱신합니다.";
+    if (reviewFrameLoaded) reviewFrame.src = reviewFrame.src;
+  } finally {
+    btn.disabled = false;
+    if (!done && /중…/.test($("recoverHint").textContent)) $("recoverHint").textContent = "카빙이 완료되지 않았습니다 — 다시 시도할 수 있습니다.";
   }
-  $("recoverHint").textContent = "카빙 완료 — 뷰어를 갱신합니다.";
-  if (reviewFrameLoaded) reviewFrame.src = reviewFrame.src;
 });
 
 document.querySelectorAll("[data-adv]").forEach(btn => {
@@ -951,16 +1558,28 @@ document.querySelectorAll("[data-adv]").forEach(btn => {
         (tool === "known-hash" ? "sha256 목록 파일" : "비교/병합할 케이스 폴더");
       return;
     }
-    if (tool === "merge" && !confirm("다른 케이스의 색인을 이 케이스에 병합합니다 (중복은 duplicate로 표시). 계속하시겠습니까?")) return;
+    if (tool === "merge") {
+      const go = await askDialog({
+        title: "케이스 병합",
+        html: "<p>다른 케이스의 색인을 이 케이스에 병합합니다 (중복은 duplicate로 표시). 계속하시겠습니까?</p>",
+        okLabel: "병합",
+      });
+      if (!go) return;
+    }
     btn.disabled = true;
     $("advOut").hidden = false;
     $("advOut").textContent = "실행 중…";
     $("advLink").innerHTML = "";
-    const res = await jpost("/api/advanced", { tool, extra });
-    btn.disabled = false;
-    $("advOut").textContent = res.ok ? (res.output || "완료") : "실패: " + (res.error || "");
-    if (res.ok && res.url) {
-      $("advLink").innerHTML = `<a href="/case/${esc(res.url)}" target="_blank">산출물 열기: ${esc(res.url)}</a>`;
+    try {
+      const res = await jpost("/api/advanced", { tool, extra });
+      $("advOut").textContent = res.ok ? (res.output || "완료") : "실패: " + (res.error || "알 수 없는 오류");
+      if (res.ok && res.url) {
+        $("advLink").innerHTML = `<a href="/case/${esc(res.url)}" target="_blank">산출물 열기: ${esc(res.url)}</a>`;
+      }
+    } finally {
+      // Re-enable unless loadEnv disabled it for a missing tool.
+      btn.disabled = !!(btn.dataset && btn.dataset.envOff === "1");
+      if ($("advOut").textContent === "실행 중…") $("advOut").textContent = "실패: 응답 없음 — 다시 시도할 수 있습니다.";
     }
   });
 });
@@ -980,6 +1599,7 @@ $("sourcePath").addEventListener("input", () => {
     syncInputKind();
     $("startErr").classList.remove("show");
   }
+  updateModeInfo();
   scheduleValidate();
 });
 $("caseDir").addEventListener("input", scheduleValidate);
@@ -1078,11 +1698,38 @@ async function validatePaths() {
     try {
       const res = await jget("/api/browse?path=" + encodeURIComponent(dir));
       if ($("caseDir").value.trim() !== dir) return;
-      if (res.exists === false) setStatus(caseEl, "", "새 케이스 폴더로 생성됩니다.");
-      else if (res.is_file) setStatus(caseEl, "err", "파일 경로입니다 — 폴더를 지정하십시오.");
-      else setStatus(caseEl, "ok", "기존 폴더입니다 — 케이스 데이터가 있으면 이어서 진행되고, '기존 케이스 열기'로 검토 화면을 바로 열 수 있습니다.");
+      const underSource = src && pathInside(dir, src);
+      if (res.is_file) setStatus(caseEl, "err", "파일 경로입니다 — 폴더를 지정하십시오.");
+      else if (underSource) setStatus(caseEl, "err", "케이스 폴더가 증거 소스 안에 있습니다 — 원본 매체에 산출물이 기록됩니다. 다른 드라이브의 폴더를 지정하십시오.");
+      else if (res.exists === false) setStatus(caseEl, "", "새 케이스 폴더로 생성됩니다. (모드: 새 분석)");
+      else if (res.is_case) {
+        // UX-10: surface what the server will do with an existing case.
+        const info = await caseResumeInfo(dir);
+        if ($("caseDir").value.trim() !== dir) return;
+        if (info.checkpoint) setStatus(caseEl, "warn",
+          "중단된 스캔 체크포인트가 있습니다 — 같은 소스·같은 옵션으로 '분석 시작'하면 완료된 파일은 건너뛰고 이어서 진행합니다 (모드: 이어서 분석). " +
+          "옵션이나 소스가 다르면 처음부터 다시 스캔합니다. 완전히 새로 시작하려면 다른(빈) 케이스 폴더를 지정하십시오.");
+        else if (info.review) setStatus(caseEl, "ok", "기존 케이스입니다 (검토 결과 있음) — '기존 케이스 열기'로 바로 검토하거나, '분석 시작'으로 같은 케이스에 다시 분석합니다.");
+        else setStatus(caseEl, "warn", "기존 케이스이지만 검토 결과가 없습니다 — 이전 분석이 끝나지 않았을 수 있습니다. '분석 시작'으로 이어서 진행하십시오.");
+      }
+      else setStatus(caseEl, "ok", "기존 폴더입니다 — 이 폴더 안에 케이스가 새로 만들어집니다.");
     } catch { setStatus(caseEl, "", ""); }
   }
+}
+
+// Probes the case folder through /api/browse (the only path API the
+// server has): db/scan-progress.jsonl exists only while a scan is
+// interrupted (finish() deletes it); review/index.html marks a completed
+// review build. The server does not expose the checkpoint's N-of-M count.
+async function caseResumeInfo(dir) {
+  const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  const base = dir.replace(/[\\/]+$/, "");
+  const probe = async rel => {
+    try { const r = await jget("/api/browse?path=" + encodeURIComponent(base + sep + rel.split("/").join(sep))); return !!r.is_file; }
+    catch { return false; }
+  };
+  const [checkpoint, review] = await Promise.all([probe("db/scan-progress.jsonl"), probe("review/index.html")]);
+  return { checkpoint, review };
 }
 
 // ---- 경로 선택 대화상자 (서버 파일시스템 탐색) ----
@@ -1099,8 +1746,8 @@ function openPicker(targetId, mode) {
   $("pickerTitle").textContent = mode === "e01" ? "E01 이미지 선택" : "폴더 선택";
   $("pickerSelect").style.display = mode === "e01" ? "none" : "";
   $("pickerBackdrop").hidden = false;
-  browseTo($(targetId).value.trim());
-  setTimeout(() => $("pickerPath").focus(), 0);
+  // Focus lands in the list (first entry) once it loads, not the path box.
+  browseTo($(targetId).value.trim(), true);
 }
 function closePicker() {
   $("pickerBackdrop").hidden = true;
@@ -1113,44 +1760,112 @@ function choose(path) {
   input.dispatchEvent(new Event("input", { bubbles: true }));
   closePicker();
 }
-async function browseTo(path) {
+// Picker rows are listbox options with a roving tabindex: one Tab stop
+// for the list, Up/Down/Home/End move, Enter/Space activate (open a
+// folder or choose an image), Backspace goes up.
+function pickerOptions() {
+  return [...$("pickerList").querySelectorAll('[role="option"]')];
+}
+function pickerFocus(el, focus) {
+  pickerOptions().forEach(o => { o.tabIndex = -1; o.setAttribute("aria-selected", "false"); });
+  if (!el) return;
+  el.tabIndex = 0;
+  el.setAttribute("aria-selected", "true");
+  if (focus !== false) el.focus();
+}
+function pickerRow(html, act, title) {
+  const li = document.createElement("li");
+  li.className = "picker-item";
+  li.setAttribute("role", "option");
+  li.setAttribute("aria-selected", "false");
+  li.tabIndex = -1;
+  li.innerHTML = html;
+  if (title) li.title = title;
+  li._act = act;
+  li.addEventListener("click", () => { pickerFocus(li, false); act(); });
+  return li;
+}
+$("pickerList").addEventListener("keydown", e => {
+  const opts = pickerOptions();
+  if (!opts.length) return;
+  const idx = opts.indexOf(document.activeElement);
+  let next = null;
+  if (e.key === "ArrowDown") next = opts[Math.min(opts.length - 1, idx + 1)];
+  else if (e.key === "ArrowUp") next = opts[Math.max(0, idx - 1)];
+  else if (e.key === "Home") next = opts[0];
+  else if (e.key === "End") next = opts[opts.length - 1];
+  else if ((e.key === "Enter" || e.key === " ") && idx >= 0 && !e.isComposing) {
+    e.preventDefault();
+    if (opts[idx]._act) opts[idx]._act();
+    return;
+  } else if (e.key === "Backspace") {
+    e.preventDefault();
+    browseTo(pickerParent, true);
+    return;
+  }
+  if (next) { e.preventDefault(); pickerFocus(next); }
+});
+let browseSeq = 0;
+async function browseTo(path, focusList) {
+  const seq = ++browseSeq;
+  const list = $("pickerList");
+  const keepFocus = focusList !== false && (focusList === true || list.contains(document.activeElement));
   $("pickerStatus").textContent = "읽는 중…";
   const files = pickerMode === "e01" ? "&files=e01" : "";
-  const res = await jget("/api/browse?path=" + encodeURIComponent(path) + files);
+  let res;
+  try {
+    res = await jget("/api/browse?path=" + encodeURIComponent(path) + files);
+  } catch (err) {
+    if (seq !== browseSeq) return;
+    list.innerHTML = "";
+    const li = document.createElement("li");
+    li.className = "picker-item errrow";
+    li.innerHTML = `<span>목록을 읽지 못했습니다: ${esc(err.message || err)}</span>`;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "다시 시도";
+    retry.addEventListener("click", () => browseTo(path, true));
+    li.appendChild(retry);
+    list.appendChild(li);
+    $("pickerStatus").textContent = "목록을 읽지 못했습니다 — 다시 시도하거나 경로를 직접 입력하십시오.";
+    if (keepFocus) retry.focus();
+    return;
+  }
+  if (seq !== browseSeq) return; // a newer navigation won
   if (res.is_file) {
     // Seeded with a file path — show its containing folder instead.
     const parent = (res.path || "").replace(/[\\/][^\\/]+$/, "");
-    if (parent && parent !== res.path) { browseTo(parent); return; }
+    if (parent && parent !== res.path) { browseTo(parent, focusList); return; }
   }
   pickerCurrent = res.path || "";
   pickerParent = res.parent || "";
   $("pickerPath").value = pickerCurrent;
   $("pickerSelect").disabled = pickerMode === "dir" && !pickerCurrent;
-  const list = $("pickerList");
   list.innerHTML = "";
   if (!res.ok || res.exists === false) {
-    list.innerHTML = `<li class="picker-item muted">${esc(res.error || "경로를 찾을 수 없습니다")}</li>`;
-    $("pickerStatus").textContent = "";
+    const li = document.createElement("li");
+    li.className = "picker-item errrow";
+    li.innerHTML = `<span>${esc(res.error || "경로를 찾을 수 없습니다")}</span>`;
+    const up = document.createElement("button");
+    up.type = "button";
+    up.textContent = "상위 폴더로";
+    up.addEventListener("click", () => browseTo(pickerParent, true));
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "다시 시도";
+    retry.addEventListener("click", () => browseTo(path, true));
+    li.append(up, retry);
+    list.appendChild(li);
+    $("pickerStatus").textContent = res.error || "경로를 찾을 수 없습니다";
+    if (keepFocus) retry.focus();
     return;
   }
-  const up = document.createElement("li");
-  up.className = "picker-item";
-  up.tabIndex = 0;
-  up.innerHTML = `<span class="dir">.. (상위 / 드라이브 목록)</span>`;
-  const goUp = () => browseTo(pickerParent);
-  up.addEventListener("click", goUp);
-  up.addEventListener("keydown", e => { if (e.key === "Enter") goUp(); });
-  list.appendChild(up);
+  list.appendChild(pickerRow(`<span class="dir">.. (상위 / 드라이브 목록)</span>`, () => browseTo(pickerParent, true)));
   for (const e of res.entries || []) {
-    const li = document.createElement("li");
-    li.className = "picker-item";
-    li.tabIndex = 0;
-    li.innerHTML = `<span class="${e.dir ? "dir" : ""}">${esc(e.name)}${e.dir ? "/" : ""}</span>` +
+    const html = `<span class="${e.dir ? "dir" : ""}">${esc(e.name)}${e.dir ? "/" : ""}</span>` +
       (e.is_case ? `<span class="muted" style="font-size:12px"> · 케이스</span>` : "");
-    const act = () => { if (e.dir) browseTo(e.path); else choose(e.path); };
-    li.addEventListener("click", act);
-    li.addEventListener("keydown", ev => { if (ev.key === "Enter") act(); });
-    list.appendChild(li);
+    list.appendChild(pickerRow(html, () => { if (e.dir) browseTo(e.path, true); else choose(e.path); },
+      e.dir ? "Enter: 폴더 열기" : "Enter: 이 이미지 선택"));
   }
   if (!(res.entries || []).length) {
     const li = document.createElement("li");
@@ -1158,7 +1873,13 @@ async function browseTo(path) {
     li.textContent = pickerMode === "e01" ? "(하위 폴더나 E01 이미지가 없습니다)" : "(하위 폴더가 없습니다)";
     list.appendChild(li);
   }
-  $("pickerStatus").textContent = res.truncated ? "항목이 많아 일부만 표시합니다 (500개 제한) — 경로를 직접 입력해도 됩니다" : "";
+  const opts = pickerOptions();
+  // First real entry (skip "..") when there is one.
+  pickerFocus(opts[1] || opts[0], keepFocus);
+  const count = (res.entries || []).length;
+  $("pickerStatus").textContent = res.truncated
+    ? "항목이 많아 일부만 표시합니다 (500개 제한) — 경로를 직접 입력해도 됩니다"
+    : `${pickerCurrent || "드라이브 목록"} — ${count}개 항목`;
 }
 
 $("btnBrowseSource").addEventListener("click", () => openPicker("sourcePath", inputKind() === "e01" ? "e01" : "dir"));
@@ -1169,7 +1890,7 @@ $("pickerBackdrop").addEventListener("click", e => { if (e.target === $("pickerB
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("pickerBackdrop").hidden) closePicker(); });
 $("pickerBackdrop").addEventListener("keydown", e => {
   if (e.key !== "Tab") return;
-  const focusables = [...$("pickerBackdrop").querySelectorAll("button, input, .picker-item[tabindex]")]
+  const focusables = [...$("pickerBackdrop").querySelectorAll("button, input, .picker-item[tabindex='0']")]
     .filter(el => !el.disabled && el.style.display !== "none");
   if (!focusables.length) return;
   const first = focusables[0], last = focusables[focusables.length - 1];
@@ -1177,8 +1898,8 @@ $("pickerBackdrop").addEventListener("keydown", e => {
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 $("pickerSelect").addEventListener("click", () => { if (pickerCurrent) choose(pickerCurrent); });
-$("pickerUp").addEventListener("click", () => browseTo(pickerParent));
-$("pickerPath").addEventListener("keydown", e => { if (e.key === "Enter") browseTo($("pickerPath").value.trim()); });
+$("pickerUp").addEventListener("click", () => browseTo(pickerParent, false));
+$("pickerPath").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) browseTo($("pickerPath").value.trim(), true); });
 
 $("btnSuggestCase").addEventListener("click", () => {
   const src = $("sourcePath").value.trim().replace(/[\\/]+$/, "");
@@ -1198,12 +1919,48 @@ $("btnSuggestCase").addEventListener("click", () => {
   validatePaths();
 });
 
+function flashLabel(btn, text, base) {
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = base; }, 1600);
+}
+function legacyCopy(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  ta.remove();
+  return ok;
+}
 $("btnCopyLog").addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText($("log").textContent);
-    $("btnCopyLog").textContent = "복사됨";
-    setTimeout(() => { $("btnCopyLog").textContent = "로그 복사"; }, 1500);
-  } catch { /* clipboard needs a secure context; 127.0.0.1 qualifies, failures are silent */ }
+  const text = $("log").textContent;
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; }
+  catch (e) { ok = legacyCopy(text); }
+  if (ok) flashLabel($("btnCopyLog"), "복사됨", "로그 복사");
+  else toast("클립보드에 복사하지 못했습니다 — '로그 저장'으로 파일로 저장하십시오.", "err");
+});
+$("btnSaveLog").addEventListener("click", () => {
+  const p2 = n => String(n).padStart(2, "0");
+  const d = new Date();
+  const name = `frametrace-log-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}.txt`;
+  const blob = new Blob([$("log").textContent], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+$("log").addEventListener("scroll", () => {
+  if (logAtBottom($("log"))) $("btnLogBottom").hidden = true;
+});
+$("btnLogBottom").addEventListener("click", () => {
+  const el = $("log");
+  el.scrollTop = el.scrollHeight;
+  $("btnLogBottom").hidden = true;
 });
 
 // Restore last-used paths/options, then validate what was restored.
@@ -1218,6 +1975,7 @@ $("btnCopyLog").addEventListener("click", async () => {
   }
   if (prefs.lastSource) $("sourcePath").value = prefs.lastSource;
   if (prefs.lastCase) $("caseDir").value = prefs.lastCase;
+  syncScanMode();
   renderRecent();
 })();
 
@@ -1239,31 +1997,86 @@ $("btnOnboardShow").addEventListener("click", () => {
 // server refuses shutdown while busy to protect audit/carve output.
 function showQuitPage() {
   shuttingDown = true;
+  clearTimeout(pollTimer);
+  setServerLost(false);
   document.querySelector(".shell").style.display = "none";
   $("env").innerHTML = "";
   $("btnQuit").style.display = "none";
   $("quitPage").hidden = false;
 }
-$("btnQuit").addEventListener("click", async () => {
-  $("btnQuit").disabled = true;
+// Unsynced viewer changes (same signal as the finalize checklist).
+async function pendingViewerChanges() {
   try {
-    const st = await jget("/api/status").catch(() => null);
-    if (st && st.busy) {
-      if (!confirm("작업이 진행 중입니다.\n중단 후 종료하시겠습니까? (케이스 데이터는 보존됩니다)")) return;
-      await jpost("/api/cancel", {}).catch(() => {});
-      let still = true;
-      for (let i = 0; i < 120 && still; i++) {
-        await new Promise(r => setTimeout(r, 500));
-        const s = await jget("/api/status").catch(() => null);
-        still = !!(s && s.busy);
-      }
-      if (still) { alert("작업이 아직 멈추지 않았습니다 — 잠시 후 다시 시도하십시오."); return; }
-    } else if (!confirm("워크스테이션을 종료하시겠습니까?\n케이스 데이터와 감사 로그는 보존됩니다.")) return;
-    const res = await jpost("/api/shutdown", {}).catch(() => null);
-    if (res && res.running) { alert("작업이 아직 진행 중입니다 — 잠시 후 다시 시도하십시오."); return; }
-    showQuitPage();
+    const w = viewerWindow();
+    const sm = w && typeof w.__frametraceSummary === "function" ? w.__frametraceSummary() : null;
+    if (sm && Number.isFinite(sm.pending)) return sm.pending;
+    if (sm && Number.isFinite(sm.unsynced)) return sm.unsynced;
+  } catch (e) { /* fall through */ }
+  if (!reviewReady) return 0;
+  try {
+    const meta = await jget("/api/records-meta");
+    const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
+    const drafts = caseId ? readLs(`ft.viewer.${caseId}.annotations.v1`) : null;
+    return drafts && typeof drafts === "object" ? Object.keys(drafts).length : 0;
+  } catch (e) { return 0; }
+}
+$("btnQuit").addEventListener("click", async () => {
+  const btn = $("btnQuit");
+  btn.disabled = true;
+  try {
+    let st = null;
+    try { st = await jget("/api/status"); } catch (e) { st = null; }
+    if (!st) {
+      await alertDialog("서버 종료", "서버에 연결할 수 없습니다 — 이미 종료되었을 수 있습니다.");
+      return;
+    }
+    const pending = await pendingViewerChanges();
+    const pendingHtml = pending > 0
+      ? `<p><b>케이스에 아직 반영되지 않은 마크·메모 변경 ${pending}건</b>이 있습니다. 서버를 종료하면 이 브라우저의 임시 저장본에만 남습니다 — 취소하고 몇 초 기다려 자동 반영된 뒤 종료하는 것을 권장합니다.</p>`
+      : "";
+    const go = await askDialog({
+      title: "워크스테이션 서버 종료",
+      html: (st.busy ? `<p><b>작업이 진행 중입니다</b> (${esc(st.phase || "")}). 작업을 중단한 뒤 서버를 종료합니다 — 중단된 분석은 다음 실행 때 체크포인트에서 이어서 진행할 수 있습니다.</p>` : "") +
+        pendingHtml +
+        `<p>서버를 종료하면 이 화면과 뷰어가 더 이상 동작하지 않습니다. 케이스 데이터와 감사 로그는 보존됩니다.<br>다시 시작하려면 frametrace-app을 실행하십시오.</p>`,
+      okLabel: st.busy ? "작업 중단 후 서버 종료" : "서버 종료",
+      cancelLabel: "계속 작업",
+      danger: true,
+      focus: "dlgCancel",
+      onOk: async () => {
+        // Status captured at dialog open may be stale: re-check before cancel.
+        let cur = null;
+        try { cur = await jget("/api/status"); } catch (e) { cur = null; }
+        if (cur && cur.busy) {
+          $("dlgNote").textContent = "작업 중단 요청 중…";
+          const cr = await jpost("/api/cancel", {});
+          if (!cr.ok) {
+            // "no job running" means it finished meanwhile — fine, unless still busy.
+            let again = null;
+            try { again = await jget("/api/status"); } catch (e) { again = null; }
+            if (!again || again.busy) { $("dlgNote").textContent = "중단 요청 실패: " + (cr.error || "알 수 없는 오류"); return false; }
+          }
+          let still = !!cr.ok;
+          for (let i = 0; i < 120 && still; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            let s2 = null;
+            try { s2 = await jget("/api/status"); } catch (e) { s2 = null; }
+            still = !!(s2 && s2.busy);
+            $("dlgNote").textContent = `작업이 멈추기를 기다리는 중… ${Math.round((i + 1) / 2)}초 / 최대 60초`;
+          }
+          if (still) { $("dlgNote").textContent = "작업이 아직 멈추지 않았습니다 — 잠시 후 다시 시도하십시오."; return false; }
+        }
+        $("dlgNote").textContent = "서버 종료 요청 중…";
+        const res = await jpost("/api/shutdown", {});
+        if (res && res.running) { $("dlgNote").textContent = "작업이 아직 진행 중입니다 — 잠시 후 다시 시도하십시오."; return false; }
+        // A network error here usually means the server already went away.
+        if (!res.ok && !res.network) { $("dlgNote").textContent = "종료 실패: " + (res.error || "알 수 없는 오류"); return false; }
+        return true;
+      },
+    });
+    if (go) showQuitPage();
   } finally {
-    $("btnQuit").disabled = false;
+    btn.disabled = false;
   }
 });
 

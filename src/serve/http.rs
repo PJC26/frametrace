@@ -64,8 +64,9 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: SharedState) -> Re
     // ft_nonce cookie on page loads, so same-origin fetches carry it
     // automatically while cross-site forms (which browsers strip it from)
     // and non-browser clients that never learned it are refused. Scripts
-    // read the nonce from /api/status's "instance" field or the
-    // user-private instance file and send X-FrameTrace-Nonce.
+    // read the nonce from the ft_nonce cookie a GET / plants or from the
+    // user-private instance file and send X-FrameTrace-Nonce
+    // (/api/status's "instance" is only a fingerprint, not the nonce).
     if token.is_none() && !matches!(request.method.as_str(), "GET" | "HEAD") {
         let instance = state_lock(&state).instance.clone();
         if !request_nonce_authorized(&request, &instance) {
@@ -288,13 +289,27 @@ pub(crate) fn request_is_localhost_trusted(request: &Request) -> bool {
         }
     }
     if let Some(host) = request.host.as_deref() {
-        let host = host.trim().to_ascii_lowercase();
-        let host_only = host.split(':').next().unwrap_or_default();
-        if !matches!(host_only, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
+        // Same authority parser as Origin: a naive split(':') turned
+        // `[::1]:8477` into `[` and rejected genuine IPv6 loopback clients.
+        let loopback_host = origin_authority_host(host.trim())
+            .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
+        if !loopback_host {
             return false;
         }
     }
     true
+}
+
+/// Constant-time string equality for secrets (token / instance nonce).
+/// The length is not secret (tokens are fixed-format), but the byte
+/// comparison never short-circuits on the first mismatch.
+pub(crate) fn secret_eq(candidate: &str, secret: &str) -> bool {
+    let (a, b) = (candidate.as_bytes(), secret.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 /// Extracts the lowercase host from the authority portion of an
@@ -356,16 +371,21 @@ pub(crate) enum AuthProof {
 /// page-initiated fetches (video elements, fetch() without headers) can
 /// only carry cookies, not custom headers.
 pub(crate) fn request_authorized(request: &Request, token: &str) -> AuthProof {
-    if request.token_header.as_deref() == Some(token) {
+    if request
+        .token_header
+        .as_deref()
+        .is_some_and(|value| secret_eq(value, token))
+    {
         return AuthProof::Header;
     }
-    if query_value(&request.query, "token").as_deref() == Some(token) {
+    if query_value(&request.query, "token").is_some_and(|value| secret_eq(&value, token)) {
         return AuthProof::Query;
     }
     let cookie_match = request.cookie.as_deref().is_some_and(|header| {
         header.split(';').any(|pair| {
             let mut parts = pair.trim().splitn(2, '=');
-            parts.next().map(str::trim) == Some("ft_token") && parts.next() == Some(token)
+            parts.next().map(str::trim) == Some("ft_token")
+                && parts.next().is_some_and(|value| secret_eq(value, token))
         })
     });
     if cookie_match {
@@ -391,18 +411,37 @@ pub(crate) fn request_nonce_authorized(request: &Request, nonce: &str) -> bool {
     if nonce.is_empty() {
         return false;
     }
-    if request.nonce_header.as_deref() == Some(nonce) {
+    if request
+        .nonce_header
+        .as_deref()
+        .is_some_and(|value| secret_eq(value, nonce))
+    {
         return true;
     }
-    if query_value(&request.query, "nonce").as_deref() == Some(nonce) {
+    if query_value(&request.query, "nonce").is_some_and(|value| secret_eq(&value, nonce)) {
         return true;
     }
     request.cookie.as_deref().is_some_and(|cookie| {
         cookie.split(';').any(|part| {
             let mut parts = part.trim().splitn(2, '=');
-            parts.next().map(str::trim) == Some("ft_nonce") && parts.next() == Some(nonce)
+            parts.next().map(str::trim) == Some("ft_nonce")
+                && parts.next().is_some_and(|value| secret_eq(value, nonce))
         })
     })
+}
+
+/// Public, non-secret fingerprint of the instance nonce. `/api/status`
+/// publishes this instead of the raw nonce (SEC-04): the UI only needs a
+/// stable per-process identity to notice restarts, and discovery can
+/// derive the same fingerprint from the user-private instance file, so the
+/// mutation secret itself is never echoed by an unauthenticated GET.
+pub(crate) fn instance_fingerprint(instance: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if instance.is_empty() {
+        return String::new();
+    }
+    let digest = Sha256::digest(format!("frametrace-instance-id:{instance}").as_bytes());
+    digest[..12].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Inserts the `ft_nonce` cookie so the served page's same-origin fetches
@@ -475,9 +514,11 @@ pub(crate) fn serve_case_file(
         Ok(file) => file,
         Err(_) => return write_simple(stream, 404, b"file not found"),
     };
+    let trusted = is_generated_page(&case_dir, &path);
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {total}\r\nCache-Control: private, max-age=60\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-        mime_for(&path)
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {total}\r\nCache-Control: private, max-age=60\r\nX-Content-Type-Options: nosniff\r\n{}Connection: close\r\n\r\n",
+        mime_for(&path),
+        content_safety_headers(&path, trusted, false)
     );
     stream
         .write_all(head.as_bytes())
@@ -521,6 +562,113 @@ pub(crate) fn path_is_under(root: &Path, candidate: &Path) -> bool {
     // case-sensitive filesystem that is a *different* directory, i.e. a
     // containment bypass.
     candidate.starts_with(&root_canonical)
+}
+
+/// Extensions a browser renders as a script-capable document when the
+/// response is navigated to directly.
+pub(crate) fn is_active_document(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "html"
+                | "htm"
+                | "xhtml"
+                | "xht"
+                | "shtml"
+                | "svg"
+                | "svgz"
+                | "xml"
+                | "xsl"
+                | "xslt"
+                | "mht"
+                | "mhtml"
+        )
+    )
+}
+
+/// SEC-02: true only for HTML pages FrameTrace itself generates — the
+/// review viewer (`review/*.html`), report pages (`reports/**.html`) and
+/// the same two locations inside a finalized `reports/package_*/` copy.
+/// Everything else under the case (extracted evidence, carved/recovered
+/// files, exports) may hold attacker-controlled bytes and is served as
+/// untrusted content. `canonical` must already be canonicalized.
+pub(crate) fn is_generated_page(case_dir: &Path, canonical: &Path) -> bool {
+    let is_html = matches!(
+        canonical
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("html" | "htm")
+    );
+    if !is_html {
+        return false;
+    }
+    let Ok(case_canonical) = case_dir.canonicalize() else {
+        return false;
+    };
+    let Ok(relative) = canonical.strip_prefix(&case_canonical) else {
+        return false;
+    };
+    let parts: Vec<String> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let mut parts: &[String] = &parts;
+    if parts.len() > 2 && parts[0] == "reports" && parts[1].starts_with("package_") {
+        parts = &parts[2..];
+    }
+    match parts.first().map(String::as_str) {
+        Some("review") => parts.len() == 2,
+        Some("reports") => {
+            parts.len() >= 2 && !parts[1..].iter().any(|part| part.starts_with("package_"))
+        }
+        _ => false,
+    }
+}
+
+/// Security headers for streamed case/media files (SEC-02).
+/// - Generated pages: may only be framed by the workstation itself.
+/// - Everything else: CSP `sandbox` (no script, opaque origin, so the
+///   workstation's mutating APIs are unreachable even if it renders), and
+///   script-capable documents are forced to download with
+///   `Content-Disposition: attachment`. Raster/video/json responses keep
+///   working because CSP and disposition do not apply to subresources.
+pub(crate) fn content_safety_headers(path: &Path, trusted_page: bool, download: bool) -> String {
+    if trusted_page {
+        return "Content-Security-Policy: frame-ancestors 'self'; object-src 'none'; base-uri 'self'\r\n"
+            .to_string();
+    }
+    let mut headers = String::from(
+        "Content-Security-Policy: sandbox; default-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'unsafe-inline'\r\n",
+    );
+    if download || is_active_document(path) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("evidence.bin");
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        // RFC 5987/6266: keep the ASCII fallback filename for old clients but
+        // also send filename*=UTF-8''<percent-encoded> so Korean/non-ASCII
+        // evidence names survive the download instead of collapsing to "___".
+        let encoded = percent_encode_header_value(name);
+        headers.push_str(&format!(
+            "Content-Disposition: attachment; filename=\"{safe}\"; filename*=UTF-8''{encoded}\r\n"
+        ));
+    }
+    headers
 }
 
 /// Streams a media file with HTTP Range support so <video> can seek.
@@ -582,29 +730,10 @@ pub(crate) fn serve_media(
     );
     // `?download=1` forces a browser save-as with the evidence filename
     // instead of inline playback. Same approved-roots containment applies.
-    if query_value(&request.query, "download").is_some() {
-        let name = canonical
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("evidence.bin");
-        let safe: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        // RFC 5987/6266: keep the ASCII fallback filename for old clients but
-        // also send filename*=UTF-8''<percent-encoded> so Korean/non-ASCII
-        // evidence names survive the download instead of collapsing to "___".
-        let encoded = percent_encode_header_value(name);
-        head.push_str(&format!(
-            "Content-Disposition: attachment; filename=\"{safe}\"; filename*=UTF-8''{encoded}\r\n"
-        ));
-    }
+    // Evidence is never trusted content: script-capable documents (html,
+    // svg, xml) are always forced to download and sandboxed (SEC-02).
+    let wants_download = query_value(&request.query, "download").is_some();
+    head.push_str(&content_safety_headers(&canonical, false, wants_download));
     if code == 206 {
         head.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
     }
