@@ -1,0 +1,3 @@
+# Pinned contracts are verified byte-for-byte (sha256) against
+# contracts/PIN.json; never let checkout rewrite their line endings.
+contracts/** -text
