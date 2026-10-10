@@ -1,0 +1,266 @@
+use super::*;
+
+/// Fingerprint of everything that decides a scan record: source path, the
+/// option set, and the collected candidate list. A rerun against different
+/// inputs resets the checkpoint instead of silently skipping fresh work.
+pub(super) fn scan_fingerprint(
+    source_dir: &Path,
+    options: &ScanOptions,
+    files: &[PathBuf],
+) -> String {
+    let mut parts = vec![
+        "scan-folder".to_string(),
+        source_dir.to_string_lossy().to_string(),
+        format!("hash_files={}", options.hash_files),
+        format!("use_ffprobe={}", options.use_ffprobe),
+        format!("max_depth={:?}", options.max_depth),
+        format!("incremental={}", options.incremental),
+    ];
+    parts.extend(files.iter().map(|path| path.to_string_lossy().to_string()));
+    checkpoint::fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// Decodes a resumed checkpoint's record lines (verbatim `videos.jsonl`
+/// records) into the replay map keyed by normalized source path. Later
+/// lines win so a reprocessed file's newest record is the one replayed.
+pub(super) fn load_checkpoint_records(
+    checkpoint: &RunCheckpoint,
+) -> Result<HashMap<String, VideoRecord>, String> {
+    let mut records = HashMap::new();
+    for line in checkpoint.data_lines() {
+        let record: VideoRecord = serde_json::from_str(line).map_err(|err| {
+            format!(
+                "checkpoint {} holds a line that is not a video record ({err}); delete it or rerun with --no-resume",
+                checkpoint.path().display()
+            )
+        })?;
+        records.insert(
+            normalize_source_key(&record.source_path.to_string_lossy()),
+            record,
+        );
+    }
+    Ok(records)
+}
+
+pub(super) struct CandidateCollection {
+    pub(super) files: Vec<PathBuf>,
+    pub(super) warnings: Vec<String>,
+}
+
+pub(super) fn collect_video_candidates(
+    source_dir: &Path,
+    max_depth: Option<usize>,
+    excluded_dirs: &[PathBuf],
+) -> Result<CandidateCollection, String> {
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    let mut queue = VecDeque::from([(source_dir.to_path_buf(), 0usize)]);
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if max_depth.is_some_and(|max| depth > max) {
+            continue;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if depth == 0 => {
+                return Err(format!("failed to read directory {}: {err}", dir.display()));
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "skipped unreadable directory {}: {err}",
+                    dir.display()
+                ));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warnings.push(format!("skipped unreadable directory entry: {err}"));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    warnings.push(format!(
+                        "skipped unreadable file type {}: {err}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                if path_is_or_is_under_excluded_dir(&path, excluded_dirs) {
+                    warnings.push(format!(
+                        "skipped FrameTrace case output directory {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                queue.push_back((path, depth + 1));
+            } else if file_type.is_file() && looks_like_video(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    out.sort();
+    Ok(CandidateCollection {
+        files: out,
+        warnings,
+    })
+}
+
+pub(super) fn excluded_case_dirs(
+    case_dir: &Path,
+    source_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let case_dir = case_dir
+        .canonicalize()
+        .unwrap_or_else(|_| case_dir.to_path_buf());
+    if case_dir == source_dir {
+        return Err(format!(
+            "source directory cannot be the FrameTrace case directory: {}",
+            source_dir.display()
+        ));
+    }
+    if case_dir.starts_with(source_dir) {
+        Ok(vec![case_dir])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+pub(super) fn path_is_or_is_under_excluded_dir(path: &Path, excluded_dirs: &[PathBuf]) -> bool {
+    excluded_dirs
+        .iter()
+        .any(|excluded| path == excluded || path.starts_with(excluded))
+}
+
+pub(super) fn looks_like_video(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return has_video_magic(path);
+    };
+    VIDEO_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+        || has_video_magic(path)
+}
+
+pub(super) fn has_video_magic(path: &Path) -> bool {
+    let file = File::open(path);
+    let Ok(file) = file else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let buffer = reader.fill_buf().unwrap_or(&[]);
+    if buffer.len() < 12 {
+        return false;
+    }
+
+    // `ftyp` must sit in an MP4 box header at the file start (4-byte size then
+    // `ftyp`). Scanning the whole buffer would misclassify any file whose text
+    // merely contains "ftyp", such as our own JSONL audit logs.
+    buffer.len() >= 8 && &buffer[4..8] == b"ftyp"
+        || buffer.starts_with(&[0x00, 0x00, 0x00, 0x01])
+        || buffer.starts_with(&[0x00, 0x00, 0x01])
+        || buffer.starts_with(b"RIFF")
+        || buffer.starts_with(b"IMKH")
+        || buffer.starts_with(b"DHAV")
+}
+
+/// Hashes one file and re-stats it afterwards. Returns
+/// `(sha256, hash_status, warning)`:
+/// - `complete` — hashed, and size+mtime unchanged across the read;
+/// - `error` — open/read failed (the file stays indexed without a hash);
+/// - `changed-during-hash` — size or mtime moved while hashing, so the
+///   digest may describe neither version and is not recorded.
+pub(super) fn hash_with_restat(
+    path: &Path,
+    before: &fs::Metadata,
+) -> (Option<String>, &'static str, Option<String>) {
+    let digest = File::open(path)
+        .map_err(|err| format!("open failed: {err}"))
+        .and_then(|file| {
+            sha256::digest_reader(BufReader::new(file)).map_err(|err| format!("read failed: {err}"))
+        });
+    let digest = match digest {
+        Ok(digest) => digest,
+        Err(err) => {
+            return (
+                None,
+                "error",
+                Some(format!(
+                    "hash error for {} ({err}); indexed with hash_status=error",
+                    path.display()
+                )),
+            );
+        }
+    };
+    let changed = match fs::metadata(path) {
+        Ok(after) => after.len() != before.len() || after.modified().ok() != before.modified().ok(),
+        Err(_) => true,
+    };
+    if changed {
+        return (
+            None,
+            "changed-during-hash",
+            Some(format!(
+                "{} changed while it was being hashed; hash not recorded (hash_status=changed-during-hash)",
+                path.display()
+            )),
+        );
+    }
+    (Some(digest), "complete", None)
+}
+
+pub(super) fn modified_unix(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+}
+
+/// Whether an incremental rescan may reuse an indexed record verbatim.
+/// The oracle is size+mtime equality (cheap, metadata-only); the record must
+/// also be unflagged (a stale or otherwise marked record is reprocessed so
+/// the marker can clear) and already carry every datum this run's options
+/// would produce — `--hash` against an unhashed record, or ffprobe against a
+/// never-probed one, reprocesses the file instead of skipping it.
+pub(super) fn record_is_unchanged(
+    existing: &IndexedRecordLine,
+    size_bytes: u64,
+    modified_unix: Option<u64>,
+    options: &ScanOptions,
+) -> bool {
+    // Substring check, not a depth-aware key lookup: a planted nested
+    // `index_status` tag inside ffprobe JSON would only force a reprocess,
+    // which is the safe direction.
+    if existing.json_line.contains("\"index_status\"") {
+        return false;
+    }
+    if existing.record.size_bytes != size_bytes || existing.record.modified_unix != modified_unix {
+        return false;
+    }
+    if options.hash_files && existing.record.sha256.is_none() {
+        return false;
+    }
+    if options.use_ffprobe && existing.record.probe.error.as_deref() == Some("ffprobe skipped") {
+        return false;
+    }
+    true
+}
+
+pub(super) fn classify_confidence(extension: &str, probe: &ProbeSummary) -> String {
+    if probe.ok {
+        "ffprobe-confirmed".to_string()
+    } else if VIDEO_EXTENSIONS.contains(&extension) {
+        "extension-candidate".to_string()
+    } else {
+        "magic-candidate".to_string()
+    }
+}
