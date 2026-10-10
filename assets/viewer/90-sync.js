@@ -1,18 +1,50 @@
+// --- IN/OUT range sync (FOR-01) ------------------------------------------
+// Ranges ride in the marks payload as `range: {in, out}` (null = unset).
+// Ids whose server and browser ranges disagree at boot stay in
+// rangeConflictIds until the examiner picks a side; while there, the
+// payload omits their range so a routine save can never overwrite the
+// other side silently.
+var rangeConflictIds = new Set();
+
+function rangeValid(range) {
+  return !!range && (Number.isFinite(range.in) || Number.isFinite(range.out));
+}
+function normRange(range) {
+  return rangeValid(range)
+    ? { in: Number.isFinite(range.in) ? range.in : null, out: Number.isFinite(range.out) ? range.out : null }
+    : null;
+}
+function sameRange(a, b) {
+  return JSON.stringify(normRange(a)) === JSON.stringify(normRange(b));
+}
+
 function marksPayload() {
   // Marks and free-text notes travel together: a record with only a note
   // is exported with status "noted" so the case DB keeps the memo.
   const ids = new Set(Object.keys(state.marks));
   Object.keys(state.notes).forEach(id => { if ((state.notes[id] || "").trim()) ids.add(id); });
+  // Self-contained on purpose (the review-batch VM harness evaluates this
+  // function alone): ranges are normalised and conflict ids read locally.
+  const conflicts = typeof rangeConflictIds === "undefined" ? new Set() : rangeConflictIds;
+  const rangeOfId = id => {
+    const r = state.ranges && state.ranges[id];
+    return r && (Number.isFinite(r.in) || Number.isFinite(r.out))
+      ? { in: Number.isFinite(r.in) ? r.in : null, out: Number.isFinite(r.out) ? r.out : null }
+      : null;
+  };
+  Object.keys(state.ranges || {}).forEach(id => { if (rangeOfId(id) && !conflicts.has(id)) ids.add(id); });
   const marks = [...ids].map(id => {
     const mark = state.marks[id];
     const note = (state.notes[id] || "").trim();
-    return {
+    const entry = {
       id,
       status: mark ? mark.status : "noted",
       marked_unix: mark ? mark.marked_unix : Math.floor(Date.now() / 1000),
       note,
       examiner: state.examiners[id] ?? ((state.examiner || "").trim() || null)
     };
+    if (!conflicts.has(id)) entry.range = rangeOfId(id) || { in: null, out: null };
+    return entry;
   });
   const tagEntries = Object.entries(state.tags).map(([id, tags]) => ({ id, tags }));
   return {
@@ -604,3 +636,81 @@ if (!viewerIsServed) {
 renderSaveState();
 
 state.pageSize = Number(els.pageSize.value) || 100;
+
+
+// --- Range divergence check on boot ---------------------------------------
+function rangeText(range) {
+  const r = normRange(range);
+  const p = v => Number.isFinite(v) ? `${v.toFixed(1)}s` : "—";
+  return r ? `${p(r.in)} ~ ${p(r.out)}` : (state.locale === "en" ? "none" : "없음");
+}
+
+function serverRanges() {
+  const map = {};
+  for (const mark of (DATA.annotations && DATA.annotations.marks) || []) {
+    if (rangeValid(mark.range)) map[mark.id] = normRange(mark.range);
+  }
+  return map;
+}
+
+function detectRangeDivergence() {
+  if (!viewerIsServed) return [];
+  const server = serverRanges();
+  const pending = new Set(state.deletedIds);
+  const ids = new Set([...Object.keys(server), ...Object.keys(state.ranges)]);
+  const diverged = [];
+  for (const id of ids) {
+    if (pending.has(id)) continue; // unsynced local edit: will be pushed, not a conflict
+    if (!sameRange(server[id], state.ranges[id])) diverged.push(id);
+  }
+  return diverged;
+}
+
+function resolveRangeDivergence(ids, side) {
+  const server = serverRanges();
+  for (const id of ids) {
+    if (side === "server") {
+      if (server[id]) state.ranges[id] = { ...server[id] }; else delete state.ranges[id];
+    }
+  }
+  storageSet(RANGES_KEY, state.ranges);
+  ids.forEach(id => rangeConflictIds.delete(id));
+  if (side === "browser") {
+    // Push the browser's version (also clears server ranges the browser lacks).
+    ids.forEach(id => touchAnnotation(id));
+  }
+  if (typeof updateRangeLabel === "function") updateRangeLabel();
+}
+
+function showRangeDivergenceBanner(ids) {
+  const en = state.locale === "en";
+  const server = serverRanges();
+  const bar = document.createElement("div");
+  bar.id = "rangeDivergenceBanner";
+  bar.setAttribute("role", "alert");
+  bar.style.cssText = "position:sticky;top:0;z-index:50;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;background:#fff3cd;color:#4a3500;border-bottom:2px solid #d9a400;font-size:13px";
+  const msg = document.createElement("span");
+  msg.style.fontWeight = "700";
+  msg.textContent = en ? `${ids.length} range(s) differ from the server` : `서버와 다른 ${ids.length}건`;
+  msg.title = ids.slice(0, 20).map(id => `${id}: ${en ? "server" : "서버"} ${rangeText(server[id])} / ${en ? "browser" : "브라우저"} ${rangeText(state.ranges[id])}`).join("\n");
+  bar.appendChild(msg);
+  const mk = (id, label, side) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "mini";
+    b.id = id;
+    b.textContent = label;
+    b.addEventListener("click", () => { resolveRangeDivergence(ids, side); bar.remove(); });
+    bar.appendChild(b);
+  };
+  mk("rangeUseServer", en ? "Use server" : "서버 기준", "server");
+  mk("rangeUseBrowser", en ? "Use browser" : "브라우저 기준", "browser");
+  document.body.insertBefore(bar, document.body.firstChild);
+}
+
+(function initRangeDivergence() {
+  const ids = detectRangeDivergence();
+  if (!ids.length) return;
+  ids.forEach(id => rangeConflictIds.add(id));
+  showRangeDivergenceBanner(ids);
+})();

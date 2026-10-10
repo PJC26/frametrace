@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) const SCHEMA_VERSION: &str = "4";
+pub(crate) const SCHEMA_VERSION: &str = "5";
 
 pub fn case_db_path(case_dir: &Path) -> PathBuf {
     case_dir.join("db/case.db")
@@ -177,6 +177,7 @@ fn init_schema_locked(conn: &Connection) -> Result<(), String> {
             apply_schema_v2_indexes(conn)?;
             apply_schema_v3_tables(conn)?;
             apply_schema_v4_columns(conn)?;
+            apply_schema_v5_columns(conn)?;
             conn.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
                 [SCHEMA_VERSION],
@@ -187,16 +188,23 @@ fn init_schema_locked(conn: &Connection) -> Result<(), String> {
             migrate_v1_to_v2(conn)?;
             migrate_v2_to_v3(conn)?;
             migrate_v3_to_v4(conn)?;
+            migrate_v4_to_v5(conn)?;
         }
         Some("2") => {
             migrate_v2_to_v3(conn)?;
             migrate_v3_to_v4(conn)?;
+            migrate_v4_to_v5(conn)?;
         }
-        Some("3") => migrate_v3_to_v4(conn)?,
+        Some("3") => {
+            migrate_v3_to_v4(conn)?;
+            migrate_v4_to_v5(conn)?;
+        }
+        Some("4") => migrate_v4_to_v5(conn)?,
         Some(SCHEMA_VERSION) => {
             apply_schema_v2_indexes(conn)?;
             apply_schema_v3_tables(conn)?;
             apply_schema_v4_columns(conn)?;
+            apply_schema_v5_columns(conn)?;
         }
         Some(version) => {
             return Err(format!("unsupported SQLite schema version: {version}"));
@@ -283,6 +291,33 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<(), String> {
         [SCHEMA_VERSION],
     )
     .map_err(|err| format!("failed to update SQLite schema version: {err}"))?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(conn: &Connection) -> Result<(), String> {
+    backup_database(conn, "4", "5")?;
+    apply_schema_v5_columns(conn)?;
+    conn.execute(
+        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+        [SCHEMA_VERSION],
+    )
+    .map_err(|err| format!("failed to update SQLite schema version: {err}"))?;
+    Ok(())
+}
+
+fn apply_schema_v5_columns(conn: &Connection) -> Result<(), String> {
+    // v5: examiner IN/OUT range (seconds) per review mark.
+    if !table_exists(conn, "review_marks")? {
+        return Ok(());
+    }
+    for column in ["range_in", "range_out"] {
+        if !table_has_column(conn, "review_marks", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE review_marks ADD COLUMN {column} REAL"
+            ))
+            .map_err(|err| format!("failed to apply SQLite v5 {column} column: {err}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -429,7 +464,9 @@ pub(crate) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, 
 
 #[cfg(test)]
 mod tests {
-    use super::{SCHEMA_VERSION, case_db_path, init_schema, open_case_db, table_exists};
+    use super::{
+        SCHEMA_VERSION, case_db_path, init_schema, open_case_db, table_exists, table_has_column,
+    };
     use rusqlite::{Connection, OptionalExtension};
     use std::fs;
 
@@ -596,6 +633,60 @@ mod tests {
             });
         assert!(backup_exists);
 
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    #[test]
+    fn migrates_v4_schema_to_v5_with_backup_and_range_columns() {
+        let case_dir = std::env::temp_dir().join(format!(
+            "frametrace-schema-v4-v5-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&case_dir);
+        fs::create_dir_all(case_dir.join("db")).unwrap();
+        let seed = Connection::open(case_db_path(&case_dir)).unwrap();
+        seed.execute_batch(
+            r#"
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta (key, value) VALUES ('schema_version', '4');
+            CREATE TABLE review_marks (
+                record_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                marked_unix INTEGER NOT NULL,
+                record_path TEXT,
+                examiner TEXT,
+                note TEXT
+            );
+            INSERT INTO review_marks (record_id, status, marked_unix, note)
+            VALUES ('vid_1', 'relevant', 5, 'keep me');
+            "#,
+        )
+        .unwrap();
+        drop(seed);
+
+        let conn = open_case_db(&case_dir).unwrap();
+        init_schema(&conn).unwrap();
+        assert_eq!(read_schema_version(&conn).as_deref(), Some("5"));
+        assert!(table_has_column(&conn, "review_marks", "range_in").unwrap());
+        assert!(table_has_column(&conn, "review_marks", "range_out").unwrap());
+        let note: String = conn
+            .query_row(
+                "SELECT note FROM review_marks WHERE record_id = 'vid_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "keep me");
+        let backup_exists = fs::read_dir(case_dir.join("db"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("case.db.backup-v4-to-v5-")
+            });
+        assert!(backup_exists);
         let _ = fs::remove_dir_all(case_dir);
     }
 

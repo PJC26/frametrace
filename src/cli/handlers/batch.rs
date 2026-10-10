@@ -573,6 +573,7 @@ pub fn import_marks(case_dir: &Path, marks_path: &Path) -> Result<(), String> {
                     .clone()
                     .or_else(|| marks_file.examiner.clone()),
                 note: entry.note.clone(),
+                range: entry.range,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
