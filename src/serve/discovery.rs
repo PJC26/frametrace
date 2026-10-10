@@ -15,10 +15,10 @@ pub(crate) fn instance_file_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".frametrace").join("server.json"))
 }
 
-/// Records `{port, pid, instance}` in a user-private file (0600 on unix).
+/// Records `{port, pid, instance, token?}` in a user-private file (0600 on unix).
 /// The nonce lets future launches distinguish the real workstation from a
 /// process that merely prints the `"app":"frametrace"` marker.
-pub(crate) fn write_instance_file(port: u16, instance: &str) {
+pub(crate) fn write_instance_file(port: u16, instance: &str, token: Option<&str>) {
     let Some(path) = instance_file_path() else {
         return;
     };
@@ -30,8 +30,12 @@ pub(crate) fn write_instance_file(port: u16, instance: &str) {
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
+    let token_field = match token {
+        Some(token) => format!(",\"token\":{}", json_string(token)),
+        None => String::new(),
+    };
     let body = format!(
-        "{{\"port\":{port},\"pid\":{},\"instance\":{}}}",
+        "{{\"port\":{port},\"pid\":{},\"instance\":{}{token_field}}}",
         std::process::id(),
         json_string(instance)
     );
@@ -44,10 +48,10 @@ pub(crate) fn write_instance_file(port: u16, instance: &str) {
     }
 }
 
-/// Reads the recorded `{port, instance}` pair, if the file exists and
-/// parses. Returns `None` for missing/corrupt files — callers then fall
-/// back to the structural port scan.
-pub(crate) fn read_instance_file() -> Option<(u16, String)> {
+/// Reads the recorded `{port, instance, token?}` triple (token: SEC-04), if
+/// the file exists and parses. Returns `None` for missing/corrupt files —
+/// callers then fall back to the structural port scan.
+pub(crate) fn read_instance_record() -> Option<(u16, String, Option<String>)> {
     let text = std::fs::read_to_string(instance_file_path()?).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let port = value.get("port")?.as_u64()? as u16;
@@ -55,16 +59,37 @@ pub(crate) fn read_instance_file() -> Option<(u16, String)> {
     if instance.is_empty() {
         return None;
     }
-    Some((port, instance))
+    let token = value
+        .get("token")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    Some((port, instance, token))
 }
 
-pub(crate) fn probe_status_body(port: u16) -> Option<Vec<u8>> {
+/// Token to reach the workstation on `port`: FRAMETRACE_TOKEN if set,
+/// else the one recorded in the user-private instance file for that port.
+pub(crate) fn token_for_port(port: u16) -> Option<String> {
+    if let Ok(token) = std::env::var("FRAMETRACE_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Some(token.trim().to_string());
+    }
+    read_instance_record()
+        .filter(|(instance_port, _, _)| *instance_port == port)
+        .and_then(|(_, _, token)| token)
+}
+
+pub(crate) fn probe_status_body(port: u16, token: Option<&str>) -> Option<Vec<u8>> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
-    stream
-        .write_all(b"GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .ok()?;
+    let auth = token
+        .map(|token| format!("X-FrameTrace-Token: {token}\r\n"))
+        .unwrap_or_default();
+    let request =
+        format!("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -91,8 +116,8 @@ pub(crate) fn probe_status_body(port: u16) -> Option<Vec<u8>> {
 /// fall back to the structural scan — but require the full status shape
 /// (`app` + `has_job` + `case_dir` keys), not just the spoofable marker.
 pub(crate) fn find_running_server() -> Option<u16> {
-    if let Some((port, instance)) = read_instance_file()
-        && let Some(body) = probe_status_body(port)
+    if let Some((port, instance, token)) = read_instance_record()
+        && let Some(body) = probe_status_body(port, token.as_deref())
     {
         // Current servers publish only the nonce's fingerprint (SEC-04);
         // older builds echoed the raw nonce — accept either.
@@ -109,7 +134,7 @@ pub(crate) fn find_running_server() -> Option<u16> {
         // Stale or foreign instance file: keep scanning below.
     }
     for port in 8477..=8486 {
-        let Some(buf) = probe_status_body(port) else {
+        let Some(buf) = probe_status_body(port, token_for_port(port).as_deref()) else {
             continue;
         };
         let has = |key: &[u8]| buf.windows(key.len()).any(|w| w == key);

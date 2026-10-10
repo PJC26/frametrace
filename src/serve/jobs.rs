@@ -526,12 +526,16 @@ pub(crate) fn fail(state: &SharedState, message: &str) {
 pub(crate) const STEP_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 
 pub(crate) fn run_step(exe: &Path, args: &[String], state: &SharedState) -> Result<String, String> {
-    let mut child = Command::new(exe)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("{} 실행 실패: {err}", exe.display()))?;
+    // Spawned as a process tree (own group / Job object) so cancel reaches
+    // the ffmpeg/ffprobe grandchildren, not just the direct child.
+    let mut tracked = super::proc::spawn_tracked(
+        Command::new(exe)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|err| format!("{} 실행 실패: {err}", exe.display()))?;
+    let child = &mut tracked.child;
     // Both pipes must be drained while the child runs: a child that fills
     // the OS pipe buffer blocks on write, and a parent that only polls
     // try_wait() then waits forever — the classic pipe deadlock. tsk.rs
@@ -540,11 +544,13 @@ pub(crate) fn run_step(exe: &Path, args: &[String], state: &SharedState) -> Resu
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
     let stdout_reader = thread::spawn(move || drain_capped(&mut stdout_pipe));
     let stderr_reader = thread::spawn(move || drain_capped(&mut stderr_pipe));
+    let mut killed = false;
     let status = loop {
-        if state_lock(state).cancel_requested {
-            let _ = child.kill();
+        if !killed && state_lock(state).cancel_requested {
+            killed = true;
+            tracked.kill_tree();
         }
-        match child.try_wait() {
+        match tracked.child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(150)),
             Err(err) => return Err(format!("{} 실행 대기 실패: {err}", exe.display())),
@@ -713,11 +719,46 @@ pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String
     "{\"ok\":true,\"report_url\":\"case/reports/case-report.html\"}".to_string()
 }
 
-pub(crate) fn api_finalize(state: &SharedState) -> String {
+/// Reviewer name as typed in the finalize dialog: trimmed, control
+/// characters dropped, capped. It is recorded, never authenticated.
+pub(crate) fn sanitize_examiner(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(120)
+        .collect()
+}
+
+/// Writes `review/signoff.json` atomically. Returns the signed unix time.
+pub(crate) fn write_signoff(case_dir: &Path, examiner: &str) -> Result<i64, String> {
+    let signed_unix = crate::util::now_unix()? as i64;
+    let body = format!(
+        "{{\"schema_version\":1,\"examiner\":{},\"signed_unix\":{signed_unix},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+        json_string(examiner)
+    );
+    let path = case_dir.join(crate::report::SIGNOFF_REL_PATH);
+    crate::util::write_text_atomic(&path, &body)
+        .map_err(|err| format!("검토자 기록 저장 실패 {}: {err}", path.display()))?;
+    Ok(signed_unix)
+}
+
+/// SHA-256 of the package's `manifest.sha256`: one value an examiner can
+/// write down to pin the whole packaged file list.
+pub(crate) fn package_manifest_sha256(package_dir: &Path) -> Option<String> {
+    audit::digest_file(&package_dir.join("manifest.sha256")).ok()
+}
+
+pub(crate) fn api_finalize(request: &Request, state: &SharedState) -> String {
     let case_dir = state_lock(state).case_dir.clone();
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
     };
+    let examiner = sanitize_examiner(&body_value(&request.body, "examiner").unwrap_or_default());
+    if examiner.is_empty() {
+        return api_err("검토자 이름을 입력하십시오 (보고서에 입력값 그대로 기록됩니다).");
+    }
     let _busy = match try_acquire_busy(state) {
         Ok(guard) => guard,
         Err(err) => return api_err(&err),
@@ -731,6 +772,22 @@ pub(crate) fn api_finalize(state: &SharedState) -> String {
             );
         }
     };
+    finalize_with_exe(&exe, &case_dir, &examiner, state)
+}
+
+/// Finalize body, parameterised on the `frametrace` executable so tests can
+/// drive the real CLI (the test binary itself is not a frametrace CLI).
+/// The caller holds the busy guard.
+pub(crate) fn finalize_with_exe(
+    exe: &Path,
+    case_dir: &Path,
+    examiner: &str,
+    state: &SharedState,
+) -> String {
+    // The sign-off must exist before make-report so the report names the reviewer.
+    if let Err(err) = write_signoff(case_dir, examiner) {
+        return api_err(&err);
+    }
     {
         let mut guard = state_lock(state);
         guard.phase = "finalizing";
@@ -743,33 +800,45 @@ pub(crate) fn api_finalize(state: &SharedState) -> String {
     // and flag hash-revalidation mismatches — the integrity claim behind a
     // finalized package should rest on live digests, not stored scan hashes.
     let report = run_step(
-        &exe,
+        exe,
         &["make-report".into(), case_text.clone(), "--rehash".into()],
         state,
     );
     let packaging = if report.is_ok() {
-        run_step(&exe, &["package-case".into(), case_text.clone()], state)
+        run_step(exe, &["package-case".into(), case_text.clone()], state)
     } else {
         report.clone()
     };
     let mut guard = state_lock(state);
     match (report, packaging) {
         (Ok(_), Ok(_)) => {
-            let package_dir = newest_package_dir(&case_dir);
+            let package_dir = newest_package_dir(case_dir);
             let package_url = package_dir
                 .as_ref()
-                .and_then(|path| path.strip_prefix(&case_dir).ok())
+                .and_then(|path| path.strip_prefix(case_dir).ok())
                 .map(|relative| relative.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
             guard.phase = "done";
             guard.busy = false;
             guard.byte_progress = None;
             guard.package_dir = package_dir.clone();
-            guard.logs.push("보고서·패키지 생성 완료.".into());
+            let manifest_sha256 = package_dir.as_deref().and_then(package_manifest_sha256);
+            guard.logs.push(format!(
+                "보고서·패키지 생성 완료. 검토자(입력값 기록): {examiner}{}",
+                manifest_sha256
+                    .as_deref()
+                    .map(|hash| format!(" · manifest.sha256 SHA-256 {hash}"))
+                    .unwrap_or_default()
+            ));
             format!(
-                "{{\"ok\":true,\"package_url\":{},\"package_dir\":{}}}",
+                "{{\"ok\":true,\"package_url\":{},\"package_dir\":{},\"examiner\":{},\"manifest_sha256\":{}}}",
                 json_string(&package_url),
-                opt_path(&package_dir)
+                opt_path(&package_dir),
+                json_string(examiner),
+                manifest_sha256
+                    .as_deref()
+                    .map(json_string)
+                    .unwrap_or_else(|| "null".to_string())
             )
         }
         (report, packaging) => {
@@ -779,6 +848,60 @@ pub(crate) fn api_finalize(state: &SharedState) -> String {
             guard.error = Some(error.clone());
             serde_json::json!({"ok": false, "error": error}).to_string()
         }
+    }
+}
+
+/// `POST /api/verify-sources` (FOR-03): live re-hash of every indexed
+/// source against the recorded SHA-256 (`qa anomalies`, which writes
+/// `evidence/logs/hash-verify.jsonl`), then refreshes the custody statement
+/// so its recorded-vs-observed table reflects this run. Cancellable like any
+/// other step.
+pub(crate) fn api_verify_sources(state: &SharedState) -> String {
+    let case_dir = state_lock(state).case_dir.clone();
+    let Some(case_dir) = case_dir else {
+        return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
+    };
+    let _busy = match try_acquire_busy(state) {
+        Ok(guard) => guard,
+        Err(err) => return api_err(&err),
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => return api_err(&err.to_string()),
+    };
+    state_lock(state)
+        .logs
+        .push("원본 재검증: 색인된 모든 원본을 다시 해시하는 중…".into());
+    let case_text = case_dir.to_string_lossy().to_string();
+    if let Err(err) = run_step(
+        &exe,
+        &["qa".into(), "anomalies".into(), case_text.clone()],
+        state,
+    ) {
+        return api_err(&err);
+    }
+    // Best effort: the custody statement is regenerated at package time too.
+    if let Err(err) = run_step(&exe, &["make-custody".into(), case_text], state) {
+        warn_step(state, 4, format!("보관 이력서 갱신 건너뜀: {err}"));
+    }
+    match crate::anomaly::latest_hash_verify_summary(&case_dir) {
+        Some(summary) => {
+            state_lock(state).logs.push(format!(
+                "원본 재검증 완료: 일치 {} · 불일치 {} · 비교 불가 {}",
+                summary.matched, summary.mismatched, summary.not_comparable
+            ));
+            serde_json::json!({
+                "ok": true,
+                "run_unix": summary.run_unix,
+                "matched": summary.matched,
+                "mismatched": summary.mismatched,
+                "not_comparable": summary.not_comparable,
+                "log": crate::anomaly::HASH_VERIFY_REL_PATH,
+                "custody_url": "case/reports/custody-statement.html",
+            })
+            .to_string()
+        }
+        None => api_err("재검증 결과 기록(hash-verify.jsonl)을 읽지 못했습니다."),
     }
 }
 

@@ -3,6 +3,9 @@
 // wait for review -> inspect a record -> generate report -> quit.
 const CDP = 'http://127.0.0.1:9223';
 const BASE = 'http://127.0.0.1:8477';
+// SEC-04: servers require a token by default; pass the one the server was started with.
+const TOKEN = process.env.FRAMETRACE_TOKEN || '';
+const AUTH_QUERY = TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : '';
 const SOURCE = 'D:\\ft-usertest\\evidence';
 const CASE = 'D:\\ft-usertest\\case-001';
 const SHOTS = 'shots-realuser';
@@ -32,7 +35,7 @@ async function main() {
       if (m.error) p.reject(new Error(m.error.message)); else p.resolve(m.result);
     }
   };
-  const { targetId } = await send(ws, 'Target.createTarget', { url: BASE + '/' });
+  const { targetId } = await send(ws, 'Target.createTarget', { url: BASE + '/' + AUTH_QUERY });
   const { sessionId } = await send(ws, 'Target.attachToTarget', { targetId, flatten: true });
   const ev = async (expr) => {
     const r = await send(ws, 'Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true, userGesture: true }, sessionId);
@@ -131,7 +134,7 @@ async function main() {
 
   // 9. Server actually dead?
   await sleep(2000);
-  const alive = await fetch(BASE + '/api/status', { signal: AbortSignal.timeout(3000) }).then(() => true).catch(() => false);
+  const alive = await fetch(BASE + '/api/status', { headers: TOKEN ? { 'X-FrameTrace-Token': TOKEN } : {}, signal: AbortSignal.timeout(3000) }).then(() => true).catch(() => false);
   console.log('9. server alive after quit:', alive);
   process.exit(0);
 }

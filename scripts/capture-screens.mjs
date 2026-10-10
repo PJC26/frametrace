@@ -63,8 +63,11 @@ if (demo.status !== 0) process.exit(1);
 
 const port = await new Promise((res, rej) => { const s = createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); s.on('error', rej); });
 const base = `http://127.0.0.1:${port}`;
+// SEC-04: the server requires a token by default; pin a known one for the harness.
+const token = 'capture-' + Math.random().toString(36).slice(2, 12);
+const authHeaders = { 'X-FrameTrace-Token': token };
 const server = spawn(exe, [String(port)], {
-  env: { ...process.env, FRAMETRACE_NO_BROWSER: '1', XDG_CONFIG_HOME: join(work, 'cfg'), APPDATA: join(work, 'cfg'), HOME: process.env.HOME },
+  env: { ...process.env, FRAMETRACE_NO_BROWSER: '1', FRAMETRACE_TOKEN: token, XDG_CONFIG_HOME: join(work, 'cfg'), APPDATA: join(work, 'cfg'), HOME: process.env.HOME },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let serverLog = '';
@@ -74,7 +77,7 @@ const cleanup = () => { try { server.kill(); } catch { /* gone */ } if (!flag('k
 process.on('exit', cleanup);
 process.on('SIGINT', () => process.exit(130));
 for (let i = 0; ; i++) {
-  try { if ((await fetch(base + '/api/status')).ok) break; } catch { /* not yet */ }
+  try { if ((await fetch(base + '/api/status', { headers: authHeaders })).ok) break; } catch { /* not yet */ }
   if (i > 100) { console.error('server did not start\n' + serverLog); process.exit(1); }
   await sleep(100);
 }
@@ -97,7 +100,7 @@ async function shot(name, desc, target = page) {
   shots.push({ name, desc, bytes: statSync(file).size });
   console.log('[shot] ' + name);
 }
-async function status() { return (await fetch(base + '/api/status')).json(); }
+async function status() { return (await fetch(base + '/api/status', { headers: authHeaders })).json(); }
 async function waitPhase(want, ms) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) { const s = await status(); if (want.includes(s.phase)) return s; if (s.phase === 'error' || s.phase === 'failed') throw new Error('pipeline ' + s.phase); await sleep(250); }
@@ -105,7 +108,7 @@ async function waitPhase(want, ms) {
 }
 
 try {
-  await page.goto(base + '/', { waitUntil: 'load' });
+  await page.goto(base + '/?token=' + token, { waitUntil: 'load' });
   await page.waitForSelector('#sourcePath');
   await sleep(600);
   await shot('00-onboarding', '첫 실행 안내 카드가 보이는 입력 화면 (First-run onboarding on the input stage)');

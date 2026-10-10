@@ -172,6 +172,8 @@ fn workstation_full_pipeline_over_http() {
     let mut child: Child = Command::new(app)
         .arg(port.to_string())
         .env("FRAMETRACE_NO_BROWSER", "1")
+        // SEC-04: the e2e exercises the nonce gate, so opt out of the default token.
+        .env("FRAMETRACE_NO_TOKEN", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -231,7 +233,13 @@ fn workstation_full_pipeline_over_http() {
     }
 
     // Finalize -> make-report + package-case.
-    let (code, body) = http_with(port, "POST", "/api/finalize", Some("{}"), Some(&nonce));
+    let (code, body) = http_with(
+        port,
+        "POST",
+        "/api/finalize",
+        Some(r#"{"examiner":"E2E Examiner"}"#),
+        Some(&nonce),
+    );
     if code != 200 || !body.contains("\"ok\":true") {
         cleanup(&mut child);
         panic!("api/finalize failed: {code} {body}");

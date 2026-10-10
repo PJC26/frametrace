@@ -576,6 +576,48 @@ document.getElementById("chain").innerHTML = chainEvents.length ? `<table>
     )
 }
 
+/// Relative path of the finalize sign-off record inside a case.
+pub const SIGNOFF_REL_PATH: &str = "review/signoff.json";
+
+/// Parses `review/signoff.json` into `(examiner, signed_unix)`.
+pub fn parse_signoff(text: &str) -> Option<(String, i64)> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let examiner = value.get("examiner")?.as_str()?.trim().to_string();
+    if examiner.is_empty() {
+        return None;
+    }
+    let signed = value
+        .get("signed_unix")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Some((examiner, signed))
+}
+
+/// Banner naming the reviewer recorded at finalize time. The wording is
+/// deliberately "recorded as entered": the workstation has no login, so the
+/// name is the examiner's own typed statement, not an authenticated identity.
+pub fn signoff_banner_html(examiner: &str, signed_unix: i64) -> String {
+    format!(
+        "<div style=\"padding:8px 16px;background:#eef4f8;border-bottom:1px solid #b9d0e0;font-size:13px\">검토자: <strong>{}</strong> (최종화 시 입력·기록된 이름이며 신원 인증은 아닙니다; 기록 시각 unix {})</div>",
+        crate::util::html_escape(examiner),
+        signed_unix
+    )
+}
+
+/// Inserts the sign-off banner right after `<body>`.
+pub fn inject_signoff_banner(html: String, examiner: &str, signed_unix: i64) -> String {
+    let banner = signoff_banner_html(examiner, signed_unix);
+    match html.find("<body>") {
+        Some(index) => format!(
+            "{}{}{}",
+            &html[..index + "<body>".len()],
+            banner,
+            &html[index + "<body>".len()..]
+        ),
+        None => format!("{banner}{html}"),
+    }
+}
+
 fn jsonl_to_array(jsonl: &str) -> String {
     // A torn final line (the documented crash survivability mode) is not
     // valid JSON; feeding it into the embedded array literal would be a
@@ -595,6 +637,23 @@ fn jsonl_to_array(jsonl: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::render_case_report;
+
+    #[test]
+    fn signoff_banner_escapes_and_is_injected_after_body() {
+        let html = super::inject_signoff_banner(
+            "<html><body><p>x</p></body></html>".to_string(),
+            "홍길동 <b>",
+            1700000000,
+        );
+        assert!(html.contains("검토자: <strong>홍길동 &lt;b&gt;</strong>"));
+        assert!(html.contains("신원 인증은 아닙니다"));
+        assert!(html.find("검토자").unwrap() < html.find("<p>x</p>").unwrap());
+        assert_eq!(
+            super::parse_signoff(r#"{"examiner":" A ","signed_unix":5}"#),
+            Some(("A".to_string(), 5))
+        );
+        assert_eq!(super::parse_signoff(r#"{"examiner":"  "}"#), None);
+    }
 
     fn render(inputs: &[(&str, &str)]) -> String {
         let lookup = |key: &str| -> String {

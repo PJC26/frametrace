@@ -1,6 +1,9 @@
 // Capture stage 3 + 4 screenshots. Prereqs: app on :8477 with case open, Edge on :9222.
 const CDP = 'http://127.0.0.1:9222';
 const BASE = 'http://127.0.0.1:8477';
+// SEC-04: servers require a token by default; pass the one the server was started with.
+const TOKEN = process.env.FRAMETRACE_TOKEN || '';
+const AUTH_QUERY = TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : '';
 const fs = await import('fs');
 let nextId = 1;
 const pending = new Map();
@@ -18,7 +21,7 @@ async function ev(ws, sid, expr) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const version = await (await fetch(CDP + '/json/version')).json();
 const ws = await connect(version.webSocketDebuggerUrl); wire(ws);
-const { targetId } = await send(ws, 'Target.createTarget', { url: BASE + '/' });
+const { targetId } = await send(ws, 'Target.createTarget', { url: BASE + '/' + AUTH_QUERY });
 const { sessionId: sid } = await send(ws, 'Target.attachToTarget', { targetId, flatten: true });
 await send(ws, 'Page.enable', {}, sid);
 await sleep(4000); // poll → auto-jump to stage 3, iframe loads

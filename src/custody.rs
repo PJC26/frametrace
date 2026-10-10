@@ -48,6 +48,7 @@ pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
     let jobs = load_jobs(case_dir);
     let coverage = load_hash_coverage(case_dir);
     let logs = verify_audit_logs(case_dir);
+    let hash_verify_html = render_hash_verify(case_dir);
     let html = render(
         case_dir,
         &manifest,
@@ -55,6 +56,7 @@ pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
         &jobs,
         &coverage,
         &logs,
+        &hash_verify_html,
         generated_unix as i64,
     );
 
@@ -219,6 +221,77 @@ fn verify_audit_logs(case_dir: &Path) -> Vec<LogRow> {
         .collect()
 }
 
+/// FOR-03: renders the "recorded vs observed" table from the newest run in
+/// `evidence/logs/hash-verify.jsonl` (written by `qa anomalies`, which the
+/// workstation's 원본 재검증 button runs). The statement itself never
+/// hashes anything; when no run exists it says so instead of implying the
+/// sources were verified.
+fn render_hash_verify(case_dir: &Path) -> String {
+    let path = case_dir.join(crate::anomaly::HASH_VERIFY_REL_PATH);
+    let Some((latest, entries)) = crate::anomaly::latest_hash_verify_run(case_dir) else {
+        return "<p class=\"note warn\">No completed live source re-hash has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>".to_string();
+    };
+    let chain = match audit::verify_chained_jsonl(&path) {
+        Ok(v) => format!("log chain: {} ({} entries)", v.integrity.label(), v.entries),
+        Err(err) => format!("log chain verification FAILED: {err}"),
+    };
+    let mut rows = String::new();
+    let (mut matched, mut mismatched, mut other) = (0usize, 0usize, 0usize);
+    for entry in &entries {
+        let get = |key: &str| entry.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        let status = get("status");
+        let (class, label) = match status {
+            "match" => {
+                matched += 1;
+                ("ok", "MATCH")
+            }
+            "mismatch" => {
+                mismatched += 1;
+                ("bad", "MISMATCH")
+            }
+            other_status => {
+                other += 1;
+                (
+                    "warn",
+                    match other_status {
+                        "missing" => "not reachable",
+                        "unreadable" => "unreadable",
+                        _ => "no recorded hash",
+                    },
+                )
+            }
+        };
+        let dash = |value: &str| {
+            if value.is_empty() {
+                "—".to_string()
+            } else {
+                esc(value)
+            }
+        };
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td class=path>{}</td><td class=hash>{}</td><td class=hash>{}</td><td class={class}>{label}</td></tr>\n",
+            esc(get("id")),
+            esc(get("source_path")),
+            dash(get("recorded_sha256")),
+            dash(get("observed_sha256")),
+        ));
+    }
+    let banner = if mismatched > 0 {
+        format!(
+            "<p class=\"banner bad\">{mismatched} indexed file(s) have a live SHA-256 that differs from the recorded one. This is an observation of a difference, not a finding of who or what changed the file.</p>"
+        )
+    } else {
+        format!(
+            "<p class=\"banner ok\">{matched} indexed file(s) re-hashed live and equal to the recorded SHA-256 ({other} not comparable).</p>"
+        )
+    };
+    format!(
+        "<p class=note>Live re-hash run at {} (newest run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
+        ts(latest),
+        crate::anomaly::HASH_VERIFY_REL_PATH,
+    )
+}
+
 fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
     if depth > 4 || !dir.is_dir() {
         return;
@@ -273,6 +346,7 @@ fn ts(unix: i64) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     case_dir: &Path,
     manifest: &serde_json::Value,
@@ -280,6 +354,7 @@ fn render(
     jobs: &Result<Vec<JobRow>, String>,
     coverage: &Result<HashCoverage, String>,
     logs: &[LogRow],
+    hash_verify_html: &str,
     generated_unix: i64,
 ) -> String {
     let field = |key: &str| -> String {
@@ -487,7 +562,7 @@ p.banner:not(.ok):not(.bad):not(.warn) {{ background: #f1f3f4; color: #444; }}
 @media print {{ body {{ margin: 0; }} }}
 </style></head><body>
 <h1>Chain of Custody Statement</h1>
-<p class=note>Generated {generated} by FrameTrace. At generation time the audit lanes in section 4 were re-verified and the evidence source paths in section 2 were re-stat'ed (presence/size only); original evidence was not re-hashed by this statement. Print to PDF for submission if required.</p>
+<p class=note>Generated {generated} by FrameTrace. At generation time the audit lanes in section 4 were re-verified and the evidence source paths in section 2 were re-stat'ed (presence/size only); original evidence was not re-hashed by this statement (section 5 shows the result of a separate live re-hash run, if one was recorded). Print to PDF for submission if required.</p>
 {integrity_banner}
 <h2>1. Case Identity</h2>
 <table class=meta>
@@ -509,7 +584,9 @@ p.banner:not(.ok):not(.bad):not(.warn) {{ background: #f1f3f4; color: #444; }}
 <h2>4. Audit Trail Integrity</h2>
 <table><tr><th>Log</th><th>Entries</th><th>Integrity</th><th>Last entry SHA-256</th><th>Keyed</th></tr>
 {log_rows}</table>
-<h2>5. Scope Statement</h2>
+<h2>5. Source Hash Re-verification (recorded vs observed)</h2>
+{hash_verify_html}
+<h2>6. Scope Statement</h2>
 <p>FrameTrace is designed to open registered evidence read-only and to write all derived
 outputs (proxies, clips, thumbnails, carved candidates, recovered entries, telemetry reports)
 as work products under the case directory, logged to the chained audit lanes in section 4.
@@ -578,6 +655,7 @@ mod tests {
                 errors: 1,
             }),
             &[ok_lane(audit::AuditIntegrity::StructuralOnly)],
+            "",
             1_704_110_400,
         );
         assert!(!html.contains("were not modified"));
@@ -600,6 +678,7 @@ mod tests {
             &Err("disk I/O error".to_string()),
             &Err("disk I/O error".to_string()),
             &[ok_lane(audit::AuditIntegrity::Keyed)],
+            "",
             1_704_110_400,
         );
         assert!(!html.contains("No evidence sources registered."));

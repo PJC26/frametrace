@@ -59,8 +59,13 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     let rows = read_indexed_rows(case_dir)?;
     let mut findings = Vec::new();
     let mut coverage = RehashCoverage::default();
+    let mut checks: Vec<HashCheck> = Vec::new();
     if rehash {
-        findings.extend(hash_revalidation_findings(&rows, &mut coverage));
+        findings.extend(hash_revalidation_findings(
+            &rows,
+            &mut coverage,
+            &mut checks,
+        ));
     } else {
         findings.extend(index_staleness_findings(&rows));
     }
@@ -69,6 +74,9 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     findings.extend(dav_frame_gap_findings(case_dir, &rows));
 
     let scanned_unix = now_unix()?;
+    if rehash {
+        write_hash_verify_log(case_dir, scanned_unix, &checks)?;
+    }
     let log_path = case_dir.join("evidence/logs/anomaly-log.jsonl");
     for finding in &findings {
         let line = format!(
@@ -171,11 +179,114 @@ pub fn hash_mismatch_finding(
     })
 }
 
-fn hash_revalidation_findings(rows: &[IndexedRow], coverage: &mut RehashCoverage) -> Vec<Finding> {
+/// One recorded-vs-observed comparison from a live re-hash pass (FOR-03).
+/// `status` is one of `match`, `mismatch`, `missing`, `unreadable`,
+/// `no-recorded-hash` — only `match`/`mismatch` carry an observed digest.
+#[derive(Debug, Clone)]
+pub struct HashCheck {
+    pub id: String,
+    pub source_path: String,
+    pub recorded: Option<String>,
+    pub observed: Option<String>,
+    pub status: &'static str,
+}
+
+/// Relative path of the per-record hash re-verification log.
+pub const HASH_VERIFY_REL_PATH: &str = "evidence/logs/hash-verify.jsonl";
+
+/// Counts from the newest run recorded in `hash-verify.jsonl`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HashVerifySummary {
+    pub run_unix: i64,
+    pub matched: usize,
+    pub mismatched: usize,
+    pub not_comparable: usize,
+}
+
+/// Newest *completed* run in `hash-verify.jsonl`: per-record entries are
+/// followed by a `hash-verify-run` marker, so a run cut short by a crash or
+/// cancel (records without a marker) is never presented as a result.
+pub fn latest_hash_verify_run(case_dir: &Path) -> Option<(i64, Vec<serde_json::Value>)> {
+    let text = read_to_string(&case_dir.join(HASH_VERIFY_REL_PATH)).ok()?;
+    let mut pending: Vec<serde_json::Value> = Vec::new();
+    let mut latest: Option<(i64, Vec<serde_json::Value>)> = None;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match value.get("event").and_then(|e| e.as_str()) {
+            Some("hash-verify") => pending.push(value),
+            Some("hash-verify-run") => {
+                let run_unix = value.get("run_unix").and_then(|v| v.as_i64()).unwrap_or(0);
+                latest = Some((run_unix, std::mem::take(&mut pending)));
+            }
+            _ => {}
+        }
+    }
+    latest
+}
+
+pub fn latest_hash_verify_summary(case_dir: &Path) -> Option<HashVerifySummary> {
+    let (run_unix, entries) = latest_hash_verify_run(case_dir)?;
+    let mut summary = HashVerifySummary {
+        run_unix,
+        ..Default::default()
+    };
+    for entry in &entries {
+        match entry.get("status").and_then(|v| v.as_str()) {
+            Some("match") => summary.matched += 1,
+            Some("mismatch") => summary.mismatched += 1,
+            _ => summary.not_comparable += 1,
+        }
+    }
+    Some(summary)
+}
+
+fn write_hash_verify_log(
+    case_dir: &Path,
+    run_unix: u64,
+    checks: &[HashCheck],
+) -> Result<(), String> {
+    let log_path = case_dir.join(HASH_VERIFY_REL_PATH);
+    let opt = |value: &Option<String>| match value {
+        Some(text) => format!("\"{}\"", json_escape(text)),
+        None => "null".to_string(),
+    };
+    for check in checks {
+        let line = format!(
+            "{{\"schema_version\":1,\"event\":\"hash-verify\",\"run_unix\":{run_unix},\"id\":\"{}\",\"source_path\":\"{}\",\"recorded_sha256\":{},\"observed_sha256\":{},\"status\":\"{}\"}}",
+            json_escape(&check.id),
+            json_escape(&check.source_path),
+            opt(&check.recorded),
+            opt(&check.observed),
+            check.status,
+        );
+        audit::append_chained_jsonl(&log_path, &line)?;
+    }
+    let summary = format!(
+        "{{\"schema_version\":1,\"event\":\"hash-verify-run\",\"run_unix\":{run_unix},\"records\":{}}}",
+        checks.len()
+    );
+    audit::append_chained_jsonl(&log_path, &summary)
+}
+
+fn hash_revalidation_findings(
+    rows: &[IndexedRow],
+    coverage: &mut RehashCoverage,
+    checks: &mut Vec<HashCheck>,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     for row in rows {
+        let mut check = HashCheck {
+            id: row.id.clone(),
+            source_path: row.source_path.clone(),
+            recorded: row.sha256.clone(),
+            observed: None,
+            status: "no-recorded-hash",
+        };
         let Some(indexed) = row.sha256.as_deref() else {
             coverage.skipped_no_hash += 1;
+            checks.push(check);
             continue;
         };
         let path = Path::new(&row.source_path);
@@ -183,17 +294,30 @@ fn hash_revalidation_findings(rows: &[IndexedRow], coverage: &mut RehashCoverage
             Ok(metadata) if metadata.is_file() => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 coverage.skipped_missing += 1;
+                check.status = "missing";
+                checks.push(check);
                 continue;
             }
             _ => {
                 coverage.skipped_error += 1;
+                check.status = "unreadable";
+                checks.push(check);
                 continue;
             }
         }
         let Ok(live) = audit::digest_file(path) else {
             coverage.skipped_error += 1;
+            check.status = "unreadable";
+            checks.push(check);
             continue;
         };
+        check.observed = Some(live.clone());
+        check.status = if indexed.eq_ignore_ascii_case(&live) {
+            "match"
+        } else {
+            "mismatch"
+        };
+        checks.push(check);
         if !indexed.eq_ignore_ascii_case(&live) {
             out.push(Finding {
                 kind: "hash-revalidation-mismatch",
