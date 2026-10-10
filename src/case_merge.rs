@@ -552,6 +552,7 @@ mod tests {
                 record_path: Some("/ev/shared.mp4".into()),
                 examiner: None,
                 note: Some("keep".into()),
+                range: None,
             }],
         )
         .unwrap();
@@ -653,6 +654,7 @@ mod tests {
                     record_path: Some("/ev/shared.mp4".into()),
                     examiner: None,
                     note: Some("keep".into()),
+                    range: None,
                 }],
             )
             .unwrap();

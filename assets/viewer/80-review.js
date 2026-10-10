@@ -105,6 +105,8 @@ function applyJournalSide(changes, side) {
         if (JSON.stringify(now.tags || []) !== JSON.stringify(item.tags || [])) annotationChanged = true;
       } else if (field === "range") {
         if (item.range) state.ranges[id] = { ...item.range }; else delete state.ranges[id];
+        // Ranges sync to the case DB (FOR-01): an undone/redone range is a pending change.
+        if (JSON.stringify(now.range) !== JSON.stringify(item.range)) annotationChanged = true;
       }
     }
     if (annotationChanged) touchAnnotation(id);
@@ -557,6 +559,8 @@ function setRangePoint(which) {
   journaled(t("journal.range"), [record.id], () => {
     state.ranges[record.id] = range;
     storageSet(RANGES_KEY, state.ranges);
+    // Ranges persist server-side (FOR-01): queue the case-DB sync.
+    touchAnnotation(record.id);
   }, tf("range.label", {
     in: Number.isFinite(range.in) ? `${range.in.toFixed(1)}s` : "—",
     out: Number.isFinite(range.out) ? `${range.out.toFixed(1)}s` : "—"

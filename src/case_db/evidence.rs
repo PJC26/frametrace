@@ -80,7 +80,17 @@ pub(crate) fn stable_source_id(kind: &str, path: &str) -> String {
     format!("src_{}", &digest[..16])
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+/// Examiner IN/OUT points in seconds. Either side may be unset. As a
+/// patch value, `{in: null, out: null}` clears a stored range.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct RangeSpan {
+    #[serde(rename = "in")]
+    pub start: Option<f64>,
+    #[serde(rename = "out")]
+    pub end: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
 pub struct ReviewMarkRow {
     pub record_id: String,
     pub status: String,
@@ -88,6 +98,9 @@ pub struct ReviewMarkRow {
     pub record_path: Option<String>,
     pub examiner: Option<String>,
     pub note: Option<String>,
+    /// `None` = leave any stored range untouched (older clients).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<RangeSpan>,
 }
 
 /// Upserts examiner review marks imported from the viewer's marks file.
@@ -125,14 +138,16 @@ pub fn patch_review_annotations(
     for mark in marks {
         tx.execute(
             r#"
-            INSERT INTO review_marks (record_id, status, marked_unix, record_path, examiner, note)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO review_marks (record_id, status, marked_unix, record_path, examiner, note, range_in, range_out)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(record_id) DO UPDATE SET
                 status = excluded.status,
                 marked_unix = excluded.marked_unix,
                 record_path = COALESCE(excluded.record_path, review_marks.record_path),
                 examiner = COALESCE(excluded.examiner, review_marks.examiner),
-                note = COALESCE(excluded.note, review_marks.note)
+                note = COALESCE(excluded.note, review_marks.note),
+                range_in = CASE WHEN ?9 THEN excluded.range_in ELSE review_marks.range_in END,
+                range_out = CASE WHEN ?9 THEN excluded.range_out ELSE review_marks.range_out END
             "#,
             params![
                 mark.record_id.as_str(),
@@ -141,6 +156,9 @@ pub fn patch_review_annotations(
                 mark.record_path.as_deref(),
                 mark.examiner.as_deref(),
                 mark.note.as_deref(),
+                mark.range.and_then(|range| range.start),
+                mark.range.and_then(|range| range.end),
+                mark.range.is_some(),
             ],
         )
         .map_err(|err| format!("failed to upsert review mark {}: {err}", mark.record_id))?;
@@ -188,17 +206,26 @@ pub fn load_review_marks(case_dir: &Path) -> Result<Vec<ReviewMarkRow>, String> 
     }
     // Read-only connections skip init_schema, so a pre-v4 case db may not
     // have the note column yet — fall back to NULLs instead of failing.
-    let has_note = table_has_column(&conn, "review_marks", "note")?;
-    let sql = if has_note {
-        "SELECT record_id, status, marked_unix, record_path, examiner, note FROM review_marks ORDER BY record_id"
+    let note_col = if table_has_column(&conn, "review_marks", "note")? {
+        "note"
     } else {
-        "SELECT record_id, status, marked_unix, record_path, examiner, NULL FROM review_marks ORDER BY record_id"
+        "NULL"
     };
+    let (in_col, out_col) = if table_has_column(&conn, "review_marks", "range_in")? {
+        ("range_in", "range_out")
+    } else {
+        ("NULL", "NULL")
+    };
+    let sql = format!(
+        "SELECT record_id, status, marked_unix, record_path, examiner, {note_col}, {in_col}, {out_col} FROM review_marks ORDER BY record_id"
+    );
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|err| format!("failed to prepare review marks query: {err}"))?;
     let rows = stmt
         .query_map([], |row| {
+            let range_in: Option<f64> = row.get(6)?;
+            let range_out: Option<f64> = row.get(7)?;
             Ok(ReviewMarkRow {
                 record_id: row.get(0)?,
                 status: row.get(1)?,
@@ -206,6 +233,10 @@ pub fn load_review_marks(case_dir: &Path) -> Result<Vec<ReviewMarkRow>, String> 
                 record_path: row.get(3)?,
                 examiner: row.get(4)?,
                 note: row.get(5)?,
+                range: (range_in.is_some() || range_out.is_some()).then_some(RangeSpan {
+                    start: range_in,
+                    end: range_out,
+                }),
             })
         })
         .map_err(|err| format!("failed to query review marks: {err}"))?;
@@ -214,4 +245,43 @@ pub fn load_review_marks(case_dir: &Path) -> Result<Vec<ReviewMarkRow>, String> 
         out.push(row.map_err(|err| format!("failed to read review mark row: {err}"))?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn mark(range: Option<RangeSpan>) -> ReviewMarkRow {
+        ReviewMarkRow {
+            record_id: "vid_1".into(),
+            status: "important".into(),
+            marked_unix: 7,
+            range,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn range_roundtrips_and_absent_range_keeps_stored_value() {
+        let dir = std::env::temp_dir().join(format!("frametrace-range-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let span = RangeSpan {
+            start: Some(1.25),
+            end: Some(9.5),
+        };
+        patch_review_annotations(&dir, &[mark(Some(span))], &[], &[]).unwrap();
+        assert_eq!(load_review_marks(&dir).unwrap()[0].range, Some(span));
+        // Older client: no range key -> stored range untouched.
+        patch_review_annotations(&dir, &[mark(None)], &[], &[]).unwrap();
+        assert_eq!(load_review_marks(&dir).unwrap()[0].range, Some(span));
+        // Explicit empty range clears it.
+        let clear = RangeSpan {
+            start: None,
+            end: None,
+        };
+        patch_review_annotations(&dir, &[mark(Some(clear))], &[], &[]).unwrap();
+        assert_eq!(load_review_marks(&dir).unwrap()[0].range, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

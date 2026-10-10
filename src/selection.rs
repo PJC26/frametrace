@@ -29,6 +29,43 @@ pub struct MarkEntry {
     pub marked_unix: Option<u64>,
     pub note: Option<String>,
     pub examiner: Option<String>,
+    /// Absent for older clients; `{in:null,out:null}` clears a stored range.
+    pub range: Option<crate::case_db::RangeSpan>,
+}
+
+fn parse_range_field(
+    item: &serde_json::Value,
+    index: usize,
+    path: &Path,
+) -> Result<Option<crate::case_db::RangeSpan>, String> {
+    let Some(raw) = item.get("range").filter(|raw| !raw.is_null()) else {
+        return Ok(None);
+    };
+    let bad = |what: &str| {
+        format!(
+            "marks entry {} in {} has invalid range: {what}",
+            index + 1,
+            path.display()
+        )
+    };
+    let obj = raw.as_object().ok_or_else(|| bad("expected an object"))?;
+    let point = |key: &str| -> Result<Option<f64>, String> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => value
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(Some)
+                .ok_or_else(|| bad(&format!("{key} must be a non-negative number"))),
+        }
+    };
+    let (start, end) = (point("in")?, point("out")?);
+    if let (Some(a), Some(b)) = (start, end)
+        && b <= a
+    {
+        return Err(bad("out must be greater than in"));
+    }
+    Ok(Some(crate::case_db::RangeSpan { start, end }))
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -306,8 +343,10 @@ pub(crate) fn parse_marks_text(text: &str, path: &Path) -> Result<MarksFile, Str
                 MARK_STATUSES.join(", ")
             ));
         }
+        let range = parse_range_field(item, index, path)?;
         marks.push(MarkEntry {
             id,
+            range,
             status,
             examiner: item
                 .get("examiner")
@@ -398,7 +437,10 @@ pub fn effective_format(item: &SelectionItem) -> Result<&'static str, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_action, effective_format, parse_marks_file, parse_selection_file};
+    use super::{
+        effective_action, effective_format, parse_marks_file, parse_marks_text,
+        parse_selection_file,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -407,6 +449,24 @@ mod tests {
             "frametrace-selection-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn parse_marks_text_accepts_and_omits_range() {
+        let p = std::path::Path::new("marks.json");
+        let text = r#"{"schema_version":2,"marks":[
+            {"id":"a","status":"important","range":{"in":1.5,"out":4}},
+            {"id":"b","status":"noted"},
+            {"id":"c","status":"noted","range":{"in":null,"out":null}},
+            {"id":"d","status":"noted","range":{"in":2}}]}"#;
+        let file = parse_marks_text(text, p).unwrap();
+        let r = |i: usize| file.marks[i].range;
+        assert_eq!(r(0).map(|x| (x.start, x.end)), Some((Some(1.5), Some(4.0))));
+        assert_eq!(r(1), None);
+        assert_eq!(r(2).map(|x| (x.start, x.end)), Some((None, None)));
+        assert_eq!(r(3).map(|x| (x.start, x.end)), Some((Some(2.0), None)));
+        let bad = r#"{"schema_version":2,"marks":[{"id":"a","status":"important","range":{"in":5,"out":2}}]}"#;
+        assert!(parse_marks_text(bad, p).is_err());
     }
 
     #[test]

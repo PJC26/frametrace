@@ -256,6 +256,7 @@ async function unitTests() {
   console.log('PASS VM empty filter, collapsed group, sequential triage');
   Object.assign(state, { marks: {}, notes: {}, tags: {}, examiner: 'New', deletedIds: ['a'], examiners: { b: 'Bob' } });
   Object.assign(grid, { manifest: { case_id: 'test' } });
+  state.ranges = {}; // range-only records are exported too (FOR-01); this block tests marks/notes
   let payload = runInNewContext(fn('marksPayload') + '\nmarksPayload();', grid);
   assert.equal(payload.protocol, 'patch-v1');
   assert.equal(JSON.stringify(payload.deleted_ids), '["a"]');
