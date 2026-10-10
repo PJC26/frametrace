@@ -155,8 +155,16 @@ body.theater .mini-info { display: none; }
 body.theater .player { height: calc(100vh - 52px); }
 
 /* ---- thumbnail grid ---- */
-.grid { overflow: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); grid-auto-rows: max-content; gap: 7px; align-content: start; padding: 2px 4px 6px 2px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer; content-visibility: auto; contain-intrinsic-size: auto 240px; }
+.grid { --card-h: 240px; overflow: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); grid-auto-rows: max-content; gap: 7px; align-content: start; padding: 2px 4px 6px 2px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer; content-visibility: auto; contain-intrinsic-size: auto var(--card-h); }
+/* PERF-02 virtual grid: rows are absolutely placed inside a spacer whose
+   height is the full list; only visible rows are in the DOM. */
+.grid.virtual { display: block; }
+.vspacer { position: relative; width: 100%; }
+.vrow { position: absolute; left: 0; right: 0; display: grid; grid-template-columns: repeat(var(--vcols, 1), minmax(0, 1fr)); gap: 7px; }
+.vrow .card { height: var(--card-h); content-visibility: visible; }
+.vspacer > .group-header { position: absolute; left: 0; right: 0; box-sizing: border-box; }
+body.vgrid #pageSize, body.vgrid #prevPage, body.vgrid #nextPage { display: none; }
 .card:hover { border-color: var(--accent); }
 .card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .card.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
