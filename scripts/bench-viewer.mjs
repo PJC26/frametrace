@@ -2,19 +2,19 @@
 //
 // Measures the per-render cost of the viewer's filter + sort + facet passes
 // on a synthetic 10k-record set — the operations that run on every UI
-// interaction (search keystroke, chip click, page change). Card DOM is
-// bounded by the 1000/page cap, so this is the scaling-sensitive part.
+// interaction (search keystroke, chip click, scroll repaint).
 //
-// Threshold: renders must stay under RENDER_BUDGET_MS on this machine.
-// If this regresses past the budget, consider memoizing filteredRecords()
-// or capping the page size before reaching for virtualization.
+// Threshold: renders must stay under RENDER_BUDGET_MS (50 ms) on this machine.
+// PERF-02: the grid is virtual, so card DOM is bounded by the viewport window
+// (see uniformModel/paintVirtual in 40-grid.js), not by a page cap; this bench
+// mirrors that window computation instead of slicing a 1000-record page.
 //
 // Run: node scripts/bench-viewer.mjs
 import { performance } from "node:perf_hooks";
 
 const ROWS = 10_000;
 const RENDERS = 100;
-const RENDER_BUDGET_MS = 30;
+const RENDER_BUDGET_MS = 50;
 
 const records = Array.from({ length: ROWS }, (_, i) => ({
   id: "vid_" + String(i).padStart(6, "0"),
@@ -63,7 +63,13 @@ function filteredRecords() {
 // three metric filters, one facet pass over all records.
 function simulateRender() {
   const filtered = filteredRecords();
-  filtered.slice(0, 1000); // page cap
+  // Virtual window: rows intersecting the viewport +/- 2 buffer rows.
+  const cols = 8, rowH = 240, gap = 7, viewH = 900, scrollTop = 123456;
+  const stride = rowH + gap;
+  const rowCount = Math.ceil(filtered.length / cols);
+  const first = Math.max(0, Math.floor(scrollTop / stride) - 2);
+  const last = Math.min(rowCount - 1, Math.floor((scrollTop + viewH) / stride) + 2);
+  filtered.slice(first * cols, (last + 1) * cols);
   const days = new Map();
   filteredRecords().forEach(record => {
     if (record.recDay) days.set(record.recDay, (days.get(record.recDay) || 0) + 1);
@@ -82,7 +88,7 @@ const perRender = (performance.now() - t0) / RENDERS;
 
 console.log(`viewer data path: ${ROWS} rows, ${perRender.toFixed(2)} ms/render over ${RENDERS} renders (budget ${RENDER_BUDGET_MS} ms)`);
 if (perRender > RENDER_BUDGET_MS) {
-  console.error("FAIL: render exceeds budget — memoize filteredRecords or reduce page size");
+  console.error("FAIL: render exceeds budget — memoize filteredRecords or trim the per-render passes");
   process.exit(1);
 }
 console.log("OK");

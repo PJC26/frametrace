@@ -295,14 +295,253 @@ function dflDistribution() {
   return dflDistributionCache;
 }
 
+// ---- PERF-02: virtual grid -------------------------------------------------
+// Only the rows intersecting the viewport (+/- VG_BUFFER_ROWS) exist in the
+// DOM, inside a spacer whose height equals the full list, so DOM size is
+// constant for 100k+ records. Rows have a fixed height (--card-h, the same
+// value contain-intrinsic-size uses) so row positions are pure arithmetic.
+// Paging (state.pageSize / prev / next) is kept as the fallback when the grid
+// has no layout box (hidden iframe) or when ?grid=paged is requested.
+const VG_BUFFER_ROWS = 2;
+const VG_MIN_CARD_W = 132;
+const VG_GAP = 7;
+const VG_HEADER_H = 30;
+let vg = null; // current virtual layout, null when the paged path is active
+let vgScrollFrame = 0;
+let lastGridActive = null;
+let gridRenderedOnce = false;
+
+// Intl formatters are expensive to construct; build once, reuse per card.
+const cardTimeFormat = new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+
+const gridForcedPaging = (() => {
+  try { return new URLSearchParams(location.search).get("grid") === "paged"; } catch { return false; }
+})();
+
+function virtualGridEnabled() {
+  return !gridForcedPaging && els.recordGrid.clientWidth > 0 && els.recordGrid.clientHeight > 0;
+}
+
+function gridMetrics() {
+  const grid = els.recordGrid;
+  const cs = getComputedStyle(grid);
+  const inner = grid.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+  const cols = Math.max(1, Math.floor((inner + VG_GAP) / (VG_MIN_CARD_W + VG_GAP)));
+  const rowH = parseFloat(cs.getPropertyValue("--card-h")) || 240;
+  return { cols, rowH };
+}
+
+function uniformModel(count, cols, rowH) {
+  const stride = rowH + VG_GAP;
+  const rowCount = Math.ceil(count / cols);
+  return {
+    rowCount,
+    total: rowCount * stride,
+    find: y => Math.max(0, Math.min(rowCount - 1, Math.floor(y / stride))),
+    get: i => ({ type: "c", s: i * cols, e: Math.min(count, (i + 1) * cols), top: i * stride, h: rowH }),
+    rowOfIndex: idx => Math.floor(idx / cols),
+  };
+}
+
+function groupedModel(filtered, cols, rowH) {
+  const counts = new Map();
+  filtered.forEach(record => {
+    const key = groupKeyFor(record);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  const rows = [];
+  let y = 0;
+  let runStart = -1, runEnd = -1;
+  const flush = () => {
+    if (runStart < 0) return;
+    for (let s = runStart; s < runEnd; s += cols) {
+      rows.push({ type: "c", s, e: Math.min(s + cols, runEnd), top: y, h: rowH });
+      y += rowH + VG_GAP;
+    }
+    runStart = -1;
+  };
+  let lastGroup = null;
+  for (let i = 0; i < filtered.length; i++) {
+    const record = filtered[i];
+    const key = groupKeyFor(record);
+    if (key !== lastGroup) {
+      lastGroup = key;
+      flush();
+      rows.push({ type: "h", key, kind: record.kind || "", count: counts.get(key) || 0, collapsed: state.collapsedGroups.has(key), top: y, h: VG_HEADER_H });
+      y += VG_HEADER_H + VG_GAP;
+    }
+    if (state.collapsedGroups.has(key)) continue;
+    if (runStart < 0) runStart = i;
+    runEnd = i + 1;
+  }
+  flush();
+  const find = target => {
+    let lo = 0, hi = rows.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (rows[mid].top <= target) lo = mid; else hi = mid - 1;
+    }
+    return Math.max(0, lo);
+  };
+  return {
+    rowCount: rows.length,
+    total: y,
+    find,
+    get: i => rows[i],
+    rowOfIndex: idx => rows.findIndex(row => row.type === "c" && idx >= row.s && idx < row.e),
+  };
+}
+
+function vgRowElement(row) {
+  if (row.type === "h") {
+    const kindAttr = state.groupBy === "kind" ? ` data-gkind="${escapeHtml(row.kind)}"` : "";
+    const holder = document.createElement("div");
+    holder.innerHTML = `<div class="group-header"${kindAttr} data-group="${escapeHtml(row.key)}" tabindex="0" role="button"><span>${escapeHtml(row.key)}</span><span class="muted">${row.count}${t("unit.count")}${row.collapsed ? ` · ${t("group.collapsed")}` : ""}</span></div>`;
+    const el = holder.firstElementChild;
+    el.style.top = row.top + "px";
+    el.style.height = row.h + "px";
+    return el;
+  }
+  const html = [];
+  for (let i = row.s; i < row.e; i++) html.push(renderCard(vg.filtered[i]));
+  const el = document.createElement("div");
+  el.className = "vrow";
+  el.setAttribute("role", "presentation");
+  el.style.top = row.top + "px";
+  el.style.height = row.h + "px";
+  el.innerHTML = html.join("");
+  return el;
+}
+
+// Create/remove only the rows whose window membership changed. `full`
+// discards every painted row (data, selection or layout changed).
+function paintVirtual(full) {
+  if (!vg) return;
+  const grid = els.recordGrid;
+  if (full) {
+    vg.spacer.textContent = "";
+    vg.painted.clear();
+  }
+  const top = Math.max(0, grid.scrollTop - 2);
+  const bottom = top + grid.clientHeight;
+  let first = 0, last = -1;
+  if (vg.model.rowCount > 0) {
+    first = Math.max(0, vg.model.find(top) - VG_BUFFER_ROWS);
+    last = Math.min(vg.model.rowCount - 1, vg.model.find(bottom) + VG_BUFFER_ROWS);
+  }
+  for (const [index, el] of vg.painted) {
+    if (index < first || index > last) { el.remove(); vg.painted.delete(index); }
+  }
+  let prev = null;
+  for (let i = first; i <= last; i++) {
+    let el = vg.painted.get(i);
+    if (!el) {
+      el = vgRowElement(vg.model.get(i));
+      vg.painted.set(i, el);
+    }
+    const expectedNext = prev ? prev.nextSibling : vg.spacer.firstChild;
+    if (el !== expectedNext) vg.spacer.insertBefore(el, expectedNext);
+    prev = el;
+  }
+  vg.first = first;
+  vg.last = last;
+  syncActiveCard();
+}
+
+function syncActiveCard() {
+  els.recordGrid.querySelectorAll(".card.active").forEach(el => {
+    if (el.dataset.id !== state.activeId) { el.classList.remove("active"); el.tabIndex = -1; }
+  });
+  if (state.activeId == null) return;
+  const card = els.recordGrid.querySelector(`.card[data-id="${CSS.escape(state.activeId)}"]`);
+  if (card && !card.classList.contains("active")) { card.classList.add("active"); card.tabIndex = 0; }
+}
+
+// Scroll the active record's row into view (nearest edge), then paint it.
+function gridEnsureActiveVisible() {
+  if (!vg || state.activeId == null) return;
+  const idx = vg.filtered.findIndex(record => record.id === state.activeId);
+  if (idx < 0) return;
+  const rowIndex = vg.model.rowOfIndex(idx);
+  if (rowIndex < 0) return;
+  const row = vg.model.get(rowIndex);
+  const grid = els.recordGrid;
+  const viewTop = grid.scrollTop;
+  const viewBottom = viewTop + grid.clientHeight;
+  if (row.top < viewTop) grid.scrollTop = row.top;
+  else if (row.top + row.h > viewBottom) grid.scrollTop = row.top + row.h - grid.clientHeight + 4;
+  paintVirtual(false);
+}
+
+function scheduleVirtualPaint() {
+  if (vgScrollFrame || !vg) return;
+  vgScrollFrame = scheduleFrame(() => { vgScrollFrame = 0; paintVirtual(false); });
+}
+
+els.recordGrid.addEventListener("scroll", scheduleVirtualPaint, { passive: true });
+if (typeof ResizeObserver === "function") {
+  let lastW = -1, lastH = -1;
+  new ResizeObserver(() => {
+    const w = els.recordGrid.clientWidth, h = els.recordGrid.clientHeight;
+    if (w === lastW && h === lastH) return;
+    const modeFlip = (lastW <= 0 || lastH <= 0) !== (w <= 0 || h <= 0);
+    lastW = w; lastH = h;
+    if (!gridRenderedOnce) return;
+    if (modeFlip || (vg && gridMetrics().cols !== vg.cols)) requestRender();
+    else scheduleVirtualPaint();
+  }).observe(els.recordGrid);
+}
+
+// j/k and arrow keys step through the whole list; moveActive (80-review.js)
+// only knows about pages and painted cards. Pre-select the page that holds
+// the next record so it takes its cheap same-page path, then scroll the
+// virtual row into view and paint it.
+{
+  const moveActiveByPage = moveActive;
+  moveActive = function moveActiveVirtual(step) {
+    if (vg && vg.filtered.length) {
+      const index = vg.filtered.findIndex(record => record.id === state.activeId);
+      const next = Math.max(0, Math.min(vg.filtered.length - 1, index < 0 ? 0 : index + step));
+      state.currentPage = Math.floor(next / state.pageSize) + 1;
+    }
+    moveActiveByPage(step);
+    gridEnsureActiveVisible();
+  };
+}
+
+function renderVirtualGrid(filtered) {
+  const grid = els.recordGrid;
+  const { cols, rowH } = gridMetrics();
+  const model = state.groupBy === "none" ? uniformModel(filtered.length, cols, rowH) : groupedModel(filtered, cols, rowH);
+  let spacer = vg?.spacer;
+  if (!spacer || spacer.parentNode !== grid) {
+    grid.textContent = "";
+    spacer = document.createElement("div");
+    spacer.className = "vspacer";
+    grid.appendChild(spacer);
+  }
+  grid.classList.add("virtual");
+  grid.style.setProperty("--vcols", String(cols));
+  spacer.style.height = model.total + "px";
+  vg = { filtered, model, cols, spacer, painted: new Map(), first: 0, last: -1 };
+  const activeChanged = state.activeId !== lastGridActive;
+  lastGridActive = state.activeId;
+  paintVirtual(true);
+  // A filter/sort/jump moved the active record: bring it into view.
+  if (activeChanged) gridEnsureActiveVisible();
+}
+
 function renderGrid(filtered) {
   if (!filtered.some(record => record.id === state.activeId)) {
     state.activeId = filtered[0]?.id || null;
   }
-  const pageCount = Math.max(1, Math.ceil(filtered.length / state.pageSize));
-  state.currentPage = Math.min(Math.max(1, state.currentPage), pageCount);
-  const start = (state.currentPage - 1) * state.pageSize;
-  const pageRows = filtered.slice(start, start + state.pageSize);
+  gridRenderedOnce = true;
+  const virtual = virtualGridEnabled();
+  document.body.classList.toggle("vgrid", virtual);
+  const pageCount = virtual ? 1 : Math.max(1, Math.ceil(filtered.length / state.pageSize));
+  state.currentPage = virtual ? 1 : Math.min(Math.max(1, state.currentPage), pageCount);
+  const start = virtual ? 0 : (state.currentPage - 1) * state.pageSize;
+  const pageRows = virtual ? filtered : filtered.slice(start, start + state.pageSize);
 
   els.resultCount.textContent = `${filtered.length}`;
   const rangeEnd = Math.min(filtered.length, start + pageRows.length);
@@ -328,6 +567,13 @@ function renderGrid(filtered) {
   }
   els.prevPage.disabled = state.currentPage <= 1;
   els.nextPage.disabled = state.currentPage >= pageCount;
+
+  if (virtual && filtered.length) {
+    renderVirtualGrid(filtered);
+    return;
+  }
+  vg = null;
+  els.recordGrid.classList.remove("virtual");
 
   const groupCounts = new Map();
   if (state.groupBy !== "none") {
@@ -385,7 +631,7 @@ function renderCard(record) {
   const recTime = record.recTime
     ? record.recSource === "name-date"
       ? record.recDay
-      : new Date(record.recTime * 1000).toLocaleString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+      : cardTimeFormat.format(new Date(record.recTime * 1000))
     : "";
   const tagsHtml = tagListFor(record).length
     ? `<div class="tag-row">${tagListFor(record).map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("")}</div>`
