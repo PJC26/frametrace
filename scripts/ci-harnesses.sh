@@ -28,6 +28,7 @@ harnesses=(
   "verify-layout"
   "verify-progress"
   "verify-finalize-sheet"
+  "verify-marks-roundtrip"
   # Adversarial-review regressions of the rebuilt shell (B1/B2/S1/S2/S4/S5).
   "verify-rebuild-regressions"
 )

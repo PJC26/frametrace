@@ -707,7 +707,8 @@ function rangeText(range) {
 function serverRanges() {
   const map = {};
   for (const mark of (DATA.annotations && DATA.annotations.marks) || []) {
-    if (rangeValid(mark.range)) map[mark.id] = normRange(mark.range);
+    const id = annotationMarkId(mark);
+    if (id && rangeValid(mark.range)) map[id] = normRange(mark.range);
   }
   return map;
 }

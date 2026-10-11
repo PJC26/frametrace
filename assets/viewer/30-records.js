@@ -658,12 +658,21 @@ function touchAnnotation(id) {
   markReviewDirty();
 }
 
+// Case-DB rows (records-meta, the exported bundle) key marks by `record_id`;
+// marks files and older bundles use `id`. Accept both, or server-saved
+// marks/notes/examiners/ranges never appear in a fresh browser.
+function annotationMarkId(mark) {
+  return mark ? (mark.id || mark.record_id || "") : "";
+}
+
 function hydrateAnnotations(annotations) {
   state.marks = {}; state.notes = {}; state.tags = {}; state.examiners = {};
   for (const mark of annotations.marks || []) {
-    if (mark.status !== "noted") state.marks[mark.id] = { status: mark.status, marked_unix: mark.marked_unix };
-    state.notes[mark.id] = mark.note || "";
-    state.examiners[mark.id] = mark.examiner || null;
+    const id = annotationMarkId(mark);
+    if (!id) continue;
+    if (mark.status !== "noted") state.marks[id] = { status: mark.status, marked_unix: mark.marked_unix };
+    state.notes[id] = mark.note || "";
+    state.examiners[id] = mark.examiner || null;
   }
   for (const entry of annotations.tags || []) state.tags[entry.id] = entry.tags;
   state.deletedIds = [];

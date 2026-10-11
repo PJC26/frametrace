@@ -276,7 +276,7 @@ async function unitTests() {
   const saved = JSON.stringify(state.drafts);
   Object.assign(state, { marks: {}, notes: {}, tags: {}, examiners: {}, deletedIds: [], drafts: JSON.parse(saved) });
   grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }] };
-  runInNewContext(fn('hydrateAnnotations') + '\nhydrateAnnotations(annotations);', grid);
+  runInNewContext(fn('annotationMarkId') + '\n' + fn('hydrateAnnotations') + '\nhydrateAnnotations(annotations);', grid);
   assert.equal(state.marks.a, undefined);
   assert.equal(state.notes.b, 'DB memo');
   assert.equal(state.examiners.b, 'Bob');

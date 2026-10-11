@@ -319,7 +319,17 @@ const chanProbe = await host.evaluate(async () => {
 check('3 ft-player channel: tokenless / foreign-token requests get no answer; the owner token does', chanProbe.none === 0 && chanProbe.wrong === 0 && chanProbe.mine === 1, JSON.stringify(chanProbe));
 
 // 5 examiner attribution: marks saved without an examiner get one later
-const lateId = await host.evaluate(() => { FTViewer.setExaminer(''); FTViewer.focus(); return document.querySelector('#recordGrid .card.active').dataset.id; });
+// Use a card that has never been marked: marks saved earlier in this run
+// already carry an examiner (and, since hydration reads `record_id`, keep it
+// after reload), so they are not "unassigned".
+const lateId = await host.evaluate(() => {
+  FTViewer.setExaminer('');
+  const card = [...document.querySelectorAll('#recordGrid .card')].find((c) => !c.querySelector('.mark-chip'));
+  return card ? card.dataset.id : null;
+});
+check('5 a never-marked card is available for the attribution test', !!lateId, String(lateId));
+await host.click(`#recordGrid .card[data-id="${lateId}"]`);
+await host.evaluate(() => FTViewer.focus());
 await host.keyboard.press('1');
 const lateEx = await host.evaluate(() => FTViewer.attributeUnassignedMarks('Late Examiner'));
 check('5 attributeUnassignedMarks(): re-pushes the unassigned mark, sets the examiner', lateEx >= 1 && await host.evaluate(() => FTViewer.getExaminer()) === 'Late Examiner', String(lateEx));
