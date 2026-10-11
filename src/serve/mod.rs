@@ -30,6 +30,8 @@ mod tests;
 #[cfg(test)]
 mod tests_hardening;
 #[cfg(test)]
+mod tests_http;
+#[cfg(test)]
 mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
