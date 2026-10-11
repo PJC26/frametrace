@@ -187,7 +187,7 @@ function refreshCaseStats() {
     if (s.byKind[k]) chips.push(`<span class="stat k-${k}"><i>${kindLabel[k]}</i>${s.byKind[k]}</span>`);
   });
   const failed = s.byStatus["validation-failed"] || 0;
-  if (failed) chips.push(`<span class="stat" style="border-color:#f0b6b6"><i style="color:#b91c1c">검증 실패</i>${failed}</span>`);
+  if (failed) chips.push(`<span class="stat k-candidate" style="border-color:#f0b6b6"><i>검증 실패</i>${failed}</span>`);
   if (s.warned) chips.push(`<span class="stat" style="border-color:#f0cf9e"><i style="color:#b2560f">경고</i>${s.warned}</span>`);
   chips.push(`<span class="stat"><i>마크</i>${s.marked}</span>`);
   if (s.noted) chips.push(`<span class="stat"><i>메모</i>${s.noted}</span>`);

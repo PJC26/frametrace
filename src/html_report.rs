@@ -1,7 +1,7 @@
 use crate::util::json_for_script;
 
 const VIEWER_TEMPLATE: &str = include_str!("../assets/evidence_viewer.html");
-const VIEWER_CSS: &str = include_str!("../assets/evidence_viewer.css");
+const VIEWER_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/evidence_viewer.css"));
 // build.rs concatenates assets/viewer/*.js into this bundle — the
 // deliverable stays a single serverless file while the source is split.
 const VIEWER_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/evidence_viewer.js"));

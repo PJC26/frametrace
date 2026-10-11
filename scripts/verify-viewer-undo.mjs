@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { viewerBundleCss } from './lib/app-bundle.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -35,7 +36,7 @@ function buildViewer() {
     thumbs: {}, annotations: {}, deepfake: {}, telemetry: {}, proxies: [],
   })};`;
   return readFileSync(join(root, 'assets/evidence_viewer.html'), 'utf8')
-    .replace('__CSS__', () => readFileSync(join(root, 'assets/evidence_viewer.css'), 'utf8'))
+    .replace('__CSS__', () => viewerBundleCss(root))
     .replace('__DATA__', () => data)
     .replace('__JS__', () => js);
 }
