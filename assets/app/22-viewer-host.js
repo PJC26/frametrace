@@ -41,8 +41,28 @@ function hostViewerBridge() {
   api.on("active-record", e => hostViewerStore({ activeId: e.detail.id }));
   api.on("locale", e => hostViewerStore({ locale: e.detail.locale }));
   api.on("theme", e => hostViewerStore({ theme: e.detail.theme }));
-  api.on("ready", () => hostViewerStore({ mounted: true, saveState: api.saveState() }));
-  api.on("destroyed", () => hostViewerStore({ mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null }));
+  // Which index generation the mounted data is (live-state, §3.2): the
+  // chip / jobs sheet compare it with the status poll's generation and
+  // offer '새 데이터 반영' — the viewer itself shows no live chip here.
+  api.on("live-state", e => hostViewerStore({ live: !!e.detail.live, liveGeneration: e.detail.generation == null ? null : e.detail.generation, canReload: e.detail.canReload !== false }));
+  api.on("ready", () => {
+    hostViewerStore({ mounted: true, saveState: api.saveState() });
+    hostViewerSeedExaminer(api);
+  });
+  api.on("destroyed", () => hostViewerStore({ mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, live: false, liveGeneration: null, canReload: true }));
+}
+
+// The hosted selection bar has no 검토자 field (the deliverables sheet's
+// #finalExaminer is the one place to type it): a viewer with no examiner
+// for this case starts from the examiner name the shell remembers, so new
+// marks keep their attribution.
+function hostViewerSeedExaminer(api) {
+  try {
+    if (typeof api.getExaminer !== "function" || String(api.getExaminer() || "").trim()) return;
+    const prefs = typeof loadPrefs === "function" ? loadPrefs() : null;
+    const name = prefs && typeof prefs.examinerName === "string" ? prefs.examinerName.trim() : "";
+    if (name) api.setExaminer(name);
+  } catch (e) { /* no stored name: marks carry none until the sheet sets one */ }
 }
 
 function hostViewerWanted() {

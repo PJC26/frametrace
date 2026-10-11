@@ -24,7 +24,7 @@ const FTStore = (() => {
     counts: { indexed: 0, total: 0, generation: 0 },
     panels: { jobs: false, finalize: false, project: false, tools: false, help: false },
     popout: { open: false, writer: "main" },
-    viewer: { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, locale: "ko", theme: "light" },
+    viewer: { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, locale: "ko", theme: "light", live: false, liveGeneration: null, canReload: true },
     server: { instance: "", lost: false, failures: 0 },
     env: null,
     ui: { home: false },

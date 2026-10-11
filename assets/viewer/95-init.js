@@ -175,6 +175,7 @@ FTViewer._attach({
     }
   },
   getExaminer: () => state.examiner || "",
+  liveState: () => liveStateDetail(),
   popout: () => openPlayerWindow(),
   toast: (message, kind) => (kind === "error" ? toastError(message) : toast(message)),
   beforeDestroy() {

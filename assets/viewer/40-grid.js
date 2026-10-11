@@ -189,8 +189,8 @@ function selectedRecord() { return state.activeId == null ? undefined : recordBy
 function markOf(record) { return state.marks[record.id] || null; }
 
 function saveLayout() {
-  const { videoMode, videoZoom, theater, dual, playerH, colSplit, rate } = state.layout;
-  storageSet(LAYOUT_KEY, { videoMode, videoZoom, theater, dual, playerH, colSplit, rate });
+  const { videoMode, videoZoom, theater, dual, stageH, colSplit, rate } = state.layout;
+  storageSet(LAYOUT_KEY, { videoMode, videoZoom, theater, dual, stageH, colSplit, rate });
 }
 
 let layoutSaveTimer = null;
@@ -201,9 +201,10 @@ function saveLayoutSoon() {
 
 function applyLayout() {
   els.root.classList.toggle("theater", !!state.layout.theater);
-  const player = ftRoot.querySelector(".player");
-  const h = Number(state.layout.playerH) || 0;
-  player.style.height = h >= 160 ? h + "px" : "";
+  // The stage is 16:9 of the media column by default (CSS aspect-ratio);
+  // a dragged #hsplitter height pins it.
+  const h = Number(state.layout.stageH) || 0;
+  els.mediaStage.style.height = h >= STAGE_MIN ? h + "px" : "";
   applyColumnSplit();
   applyVideoScale();
   els.videoMode.value = state.layout.videoMode;
@@ -218,11 +219,14 @@ function applyLayout() {
 // in CSS (grid fills, media 40% / min 420px); a dragged or keyed value is
 // stored as the browse pane percentage of .main (28–72).
 const COL_MIN = 28, COL_MAX = 72;
+// #hsplitter drag range for the video stage height (px).
+const STAGE_MIN = 120;
+const stageMax = () => Math.max(STAGE_MIN, window.innerHeight - 320);
 function applyColumnSplit() {
   const main = ftRoot.querySelector(".main");
   const pct = Number(state.layout.colSplit) || 0;
   if (pct >= COL_MIN && pct <= COL_MAX) {
-    main.style.gridTemplateColumns = `minmax(0, 1fr) 10px minmax(min(420px, 55%), ${(100 - pct).toFixed(2)}%)`;
+    main.style.gridTemplateColumns = `minmax(0, 1fr) 6px minmax(min(420px, 55%), ${(100 - pct).toFixed(2)}%)`;
   } else {
     main.style.gridTemplateColumns = "";
   }
@@ -239,10 +243,10 @@ function syncSplitterAria() {
   const pct = w > 0 ? Math.round((browse.getBoundingClientRect().width / w) * 100) : Math.round(Number(state.layout.colSplit) || 60);
   splitter.setAttribute("aria-valuenow", String(Math.max(COL_MIN, Math.min(COL_MAX, pct || 60))));
   const hs = document.getElementById("hsplitter");
-  const player = ftRoot.querySelector(".player");
-  if (hs && player) {
-    hs.setAttribute("aria-valuenow", String(Math.round(player.offsetHeight || 0)));
-    hs.setAttribute("aria-valuemax", String(Math.max(200, window.innerHeight - 200)));
+  if (hs && els.mediaStage) {
+    hs.setAttribute("aria-valuenow", String(Math.round(els.mediaStage.offsetHeight || 0)));
+    hs.setAttribute("aria-valuemin", String(STAGE_MIN));
+    hs.setAttribute("aria-valuemax", String(stageMax()));
   }
 }
 
@@ -297,21 +301,21 @@ function setupColumnSplitter() {
 
 function setupHeightSplitter() {
   const splitter = document.getElementById("hsplitter");
-  const player = ftRoot.querySelector(".player");
+  const stage = els.mediaStage;
   let startY = 0;
   let startH = 0;
   let dragging = false;
   splitter.addEventListener("pointerdown", event => {
     dragging = true;
     startY = event.clientY;
-    startH = player.offsetHeight;
+    startH = stage.offsetHeight;
     splitter.classList.add("dragging");
     splitter.setPointerCapture(event.pointerId);
     event.preventDefault();
   });
   splitter.addEventListener("pointermove", event => {
     if (!dragging) return;
-    state.layout.playerH = Math.max(160, Math.min(window.innerHeight - 260, startH + event.clientY - startY));
+    state.layout.stageH = Math.max(STAGE_MIN, Math.min(stageMax(), startH + event.clientY - startY));
     applyLayout();
   });
   const end = () => {
@@ -322,21 +326,21 @@ function setupHeightSplitter() {
   };
   splitter.addEventListener("pointerup", end);
   splitter.addEventListener("dblclick", () => {
-    state.layout.playerH = 0;
+    state.layout.stageH = 0;
     saveLayout();
     applyLayout();
   });
   splitter.addEventListener("keydown", event => {
     const step = event.shiftKey ? 80 : 20;
-    const cur = player.offsetHeight;
+    const cur = stage.offsetHeight;
     let next = null;
     if (event.key === "ArrowUp") next = cur - step;
     else if (event.key === "ArrowDown") next = cur + step;
-    else if (event.key === "Enter") { event.preventDefault(); state.layout.playerH = 0; saveLayout(); applyLayout(); return; }
+    else if (event.key === "Enter") { event.preventDefault(); state.layout.stageH = 0; saveLayout(); applyLayout(); return; }
     if (next === null) return;
     event.preventDefault();
     event.stopPropagation();
-    state.layout.playerH = Math.max(160, Math.min(window.innerHeight - 260, next));
+    state.layout.stageH = Math.max(STAGE_MIN, Math.min(stageMax(), next));
     applyLayout();
     saveLayoutSoon();
   });
@@ -933,10 +937,10 @@ function knownDaySpan() {
 // count pills, detail tabs and the thumbnail retry button. Wired once from
 // 95-init.js. Preferences are per-browser conveniences: every storage access
 // is guarded and the page works without it.
-const RAIL_KEY = "ft.viewer.rail.v1";
+const RAIL_KEY = "ft.viewer.rail.v2";
 const DENSITY_KEY = "ft.viewer.density.v1";
 const DETAIL_TAB_KEY = "ft.viewer.detailTab.v1";
-const RAIL_AUTO_BELOW = 1500;
+const RAIL_AUTO_BELOW = 1000; // docs/ui-rebuild-contract.md §6.1: open from 1000px, Ctrl+B collapses
 function prefGet(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch { return fallback; }
 }
@@ -944,8 +948,9 @@ function prefSet(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* storage blocked: keep the in-memory value */ }
 }
 
-// The rail remembers open/closed separately for wide (>=1500px) and narrow
+// The rail remembers open/closed separately for wide (>=1000px) and narrow
 // frames; narrow frames start collapsed so the grid keeps its columns.
+// v2: the threshold moved from 1500px to 1000px (1366 opens by default).
 let railPrefs = Object.assign({ wide: true, narrow: false }, prefGet(RAIL_KEY, {}) || {});
 let railWidthClass = null;
 const railClassNow = () => (window.innerWidth >= RAIL_AUTO_BELOW ? "wide" : "narrow");

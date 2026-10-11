@@ -30,6 +30,12 @@
 .bar-zone { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
 .bar-progress { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; }
 .bar-progress progress { width: 56px; height: 6px; accent-color: var(--accent); }
+/* One row from 1366px (§6.1 <= 52px): below 1600px the review count stays
+   in the pager (#triageStatus says the same), and in the workstation the
+   examiner name belongs to the deliverables sheet (#finalExaminer, which
+   calls FTViewer.setExaminer) — the hidden input keeps the value in sync. */
+@media (max-width: 1599.98px) { #selectionBar .bar-progress { display: none; } }
+.ft-viewer.hosted #selectionBar #examinerName { display: none; }
 
 /* shared geometry + secondary (outlined) look */
 #selectionBar button:where(:not(.save-ind):not(.menu-list *)), #mediaToolbar .tb-row button:where(:not(.menu-list *)) {
@@ -99,7 +105,7 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
    Player toolbar — transport row always inline; the rest inline (row 2)
    when the media column is wide, else in the 더보기 popover
    ====================================================================== */
-.player { grid-template-rows: 32px minmax(0, 1fr) auto; }
+.player { grid-template-rows: 32px auto auto; }
 .ft-viewer.theater .player { grid-template-rows: 34px minmax(0, 1fr) auto; }
 #mediaToolbar { --tb-bg: #16231f; --tb-fg: #eaf3ef; --tb-line: #4b625a; --tb-hover: #22352f; --tb-ring: #7fd6c7;
   display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 0; padding: 0; background: var(--tb-bg); color: var(--tb-fg); }
@@ -118,6 +124,16 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
 #mediaToolbar .tb-row button:where(:not(.menu-list *)).busy:disabled { background: var(--tb-hover); color: var(--tb-fg); border-color: var(--tb-ring); }
 #mediaToolbar button:where(:not(.menu-list *)):focus-visible, #mediaToolbar select:focus-visible, #mediaToolbar input:focus-visible { outline-color: var(--tb-ring); }
 #mediaToolbar kbd { background: rgba(255,255,255,.1); border-color: var(--tb-line); color: var(--media-muted); }
+/* Transport = one 44px row in a 480px media column (§6.1): seek and frame
+   step are icon buttons (their label stays as the accessible name, the
+   tooltip names the key), the step keys keep their caps because ',' / '.'
+   are not guessable; IN / OUT keep their label (the key is in the tooltip). */
+#mediaToolbar .tb-transport :is(#btnSkipBack, #btnSkipFwd, #btnStepBack, #btnStepFwd) > span { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+#mediaToolbar .tb-transport :is(#btnSkipBack, #btnSkipFwd) { width: 32px; padding: 0; }
+#mediaToolbar .tb-transport :is(#btnSetIn, #btnSetOut) kbd { display: none; }
+#mediaToolbar .tb-transport #playRate { padding: 0 4px; }
+#mediaToolbar .tb-row.tb-transport { gap: 4px; padding: 6px 8px; }
+#mediaToolbar .tb-transport :is(#btnStepBack, #btnStepFwd) { padding: 0 6px; }
 #mediaToolbar .tb-row select { height: 32px; padding: 0 8px; border-radius: var(--radius); background: var(--tb-bg); color: var(--tb-fg); border: 1px solid var(--tb-line); font-size: var(--fs-xs); }
 #mediaToolbar .tb-row input[type="range"] { width: 120px; height: 24px; padding: 0; background: transparent; border: 0; accent-color: var(--accent); }
 /* the same elements, once moved into the popover, follow the page theme */
@@ -155,9 +171,11 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
    or docked top-right when the page is embedded) — never over the bar */
 #ft-live-chip { position: static !important; right: auto !important; bottom: auto !important; z-index: auto !important; flex: 0 0 auto; max-width: min(460px, 42vw) !important; white-space: nowrap; box-shadow: none !important; }
 #ft-live-chip button { min-height: 24px; min-width: 24px; }
-/* Embed has no title row; park the live-index chip bottom-left just above
-   the action bar instead of over the top bar's buttons. */
-.ft-viewer.embed #ft-live-chip { position: fixed !important; top: auto !important; bottom: 56px !important; left: 12px !important; right: auto !important; z-index: 55 !important; box-shadow: var(--shadow, 0 4px 12px rgba(0,0,0,.2)) !important; }
+/* Embed has no title row: the chip sits inline in the pager row under the
+   grid (80-review.js), so it never covers the action bar or a card. */
+.pager #ft-live-chip { max-width: min(560px, 60%) !important; min-width: 0; flex: 0 1 auto; }
+.pager #ft-live-chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.pager #ft-live-chip > button { flex: none; }
 
 /* ======================================================================
    Command palette (Ctrl+K) — shortcuts-modal styling

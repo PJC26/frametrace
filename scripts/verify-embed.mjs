@@ -179,7 +179,7 @@ const markOf = (page, id) => page.evaluate((i) => document.querySelector(`#recor
 const host = await openPage(hostPath);
 await host.evaluate(() => {
   window.__ev = [];
-  for (const type of ['ready', 'records', 'save-state', 'dirty', 'selection', 'active-record', 'locale', 'theme', 'request-popout', 'popout', 'toast', 'error', 'destroyed']) {
+  for (const type of ['ready', 'records', 'save-state', 'dirty', 'selection', 'active-record', 'locale', 'theme', 'request-popout', 'popout', 'toast', 'error', 'destroyed', 'live-state']) {
     FTViewer.on(type, (e) => window.__ev.push({ type, detail: e.detail }));
   }
 });
@@ -234,7 +234,7 @@ await host.keyboard.press('j');
 await host.keyboard.press('1');
 await host.keyboard.press('Control+b');
 if (shellHosts) await host.evaluate(() => hCloseSheet('jobs', false));
-check('4 keys-off inputs/buttons: active card + marks unchanged', await activeId(host) === first && !(await markOf(host, first)) && await host.evaluate(() => !document.getElementById('ftViewer').classList.contains('rail-collapsed') || window.innerWidth < 1500), `active ${await activeId(host)}`);
+check('4 keys-off inputs/buttons: active card + marks unchanged', await activeId(host) === first && !(await markOf(host, first)) && await host.evaluate(() => !document.getElementById('ftViewer').classList.contains('rail-collapsed') || window.innerWidth < 1000), `active ${await activeId(host)}`);
 await host.focus(stripBtnSel);
 await host.keyboard.press('j');
 const second = await activeId(host);
@@ -252,6 +252,13 @@ const reloadAnswer = await host.evaluate(() => FTViewer.reload());
 check('7 reload() refused while marks are unsaved (and a save started)', reloadAnswer === 'refused');
 await host.waitForFunction(() => FTViewer.saveState() === 'saved', null, { timeout: 15000 });
 check('7 save-state event saved after the refusal-triggered save', await host.evaluate(() => window.__ev.some((e) => e.type === 'save-state' && e.detail.state === 'saved' && e.detail.pending === 0)));
+check('7 live-state events: canReload false while unsaved, true once saved; liveState() agrees', await host.evaluate(() => {
+  const ls = window.__ev.filter((e) => e.type === 'live-state');
+  const now = FTViewer.liveState();
+  return ls.some((e) => e.detail.canReload === false) && ls.length && ls[ls.length - 1].detail.canReload === true &&
+    now && now.canReload === true && typeof now.total === 'number' && 'generation' in now && 'live' in now;
+}));
+if (shellHosts) check('7 hosted: no viewer live chip (the shell chip owns live-index state)', await host.evaluate(() => !document.getElementById('ft-live-chip')));
 // a NEW unsaved mark, then destroy immediately — before the 2.5 s autosave
 const third = await activeId(host);
 await host.keyboard.press('3');

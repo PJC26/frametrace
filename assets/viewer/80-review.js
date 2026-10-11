@@ -1190,7 +1190,8 @@ const toolbarOverflow = (() => {
 // the case line and the actions) and loses its live semantics: the chip text
 // changes every poll. A NEW "reload available" button and a lost status poll
 // are announced once through ftAnnounce instead (controls.css restyles it;
-// the id is unchanged). Embedded (no header) it docks top-right via CSS.
+// the id is unchanged). Embedded (no header) it goes inline into the pager.
+// Hosted in the workstation there is no chip (the shell's chip owns it).
 if (typeof MutationObserver === "function") {
   const adoptChip = chip => {
     chip.removeAttribute("aria-live");
@@ -1198,8 +1199,13 @@ if (typeof MutationObserver === "function") {
     chip.setAttribute("aria-label", t("chip.live"));
     const header = ftRoot.querySelector(":scope > header");
     const actions = header && header.querySelector(".header-actions");
-    // Embedded pages hide the header; the chip then docks top-right (CSS).
+    // Embedded pages (legacy iframe) hide the header; the chip then sits
+    // inline in the pager row under the grid — never over a control.
     if (actions && getComputedStyle(header).display !== "none") header.insertBefore(chip, actions);
+    else {
+      const pager = ftRoot.querySelector(".pager");
+      if (pager) pager.insertBefore(chip, pager.querySelector(".pager-spacer"));
+    }
     let reloadShown = false;
     let lostShown = false;
     new MutationObserver(() => {

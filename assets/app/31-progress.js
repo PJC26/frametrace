@@ -27,6 +27,19 @@ function pipelineDismiss() {
 }
 function pipelineActive(S) { return pipelineView(S).active; }
 
+// Fresh index data the mounted viewer does not show yet. The viewer only
+// reports which generation it loaded (FTViewer "live-state"); the current
+// generation comes from the /api/status poll — the one source of truth for
+// indexing / enrichment state (the viewer shows no live chip when hosted).
+// -> { total, canReload } | null
+function liveReloadOffer(S) {
+  const v = (S && S.viewer) || {};
+  if (!v.mounted || !v.live || v.liveGeneration == null) return null;
+  const gen = Number(S.counts && S.counts.generation) || 0;
+  if (!gen || gen === Number(v.liveGeneration)) return null;
+  return { total: Number(S.counts.total) || 0, canReload: v.canReload !== false };
+}
+
 // state: idle | running | enriching | failed | cancelled | stopped | ready
 function pipelineView(S) {
   const p = (S.jobs && S.jobs.pipeline) || {};
@@ -41,7 +54,7 @@ function pipelineView(S) {
   if (raw === "running") state = "running";
   else if (raw === "review-partial") state = p.busy ? "enriching" : "stopped";
   else if (raw === "error") state = /중단|cancel/i.test(err) ? "cancelled" : "failed";
-  else if (pipeReloadWaits && ["review-ready", "done", "finalized"].includes(raw)) state = "ready";
+  else if ((pipeReloadWaits || liveReloadOffer(S)) && ["review-ready", "done", "finalized"].includes(raw)) state = "ready";
   const active = state === "running" || state === "enriching";
   const noticeKey = state === "idle" || active ? "" : `${state}|${err}`;
   const notice = !!noticeKey && noticeKey !== pipeDismissed;

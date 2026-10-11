@@ -331,7 +331,10 @@ async function loadViewerData(mount) {
     try {
       const data = await loadViewerDataOnce(ui);
       ui.remove();
-      if (data && data.liveIndex) setTimeout(() => { if (!signal || !signal.aborted) startLiveIndexChip(data.liveIndex, root, signal); }, 0);
+      // Hosted: the shell's top-strip chip and jobs sheet show the live
+      // index (FTViewer "live-state"); only standalone pages get the chip.
+      const hostedMount = !!(window.FTViewer && window.FTViewer._hosted);
+      if (data && data.liveIndex && !hostedMount) setTimeout(() => { if (!signal || !signal.aborted) startLiveIndexChip(data.liveIndex, root, signal); }, 0);
       return data;
     } catch (err) {
       const error = err && err.ftViewerLoad
@@ -449,7 +452,9 @@ function startLiveIndexChip(live, root, signal) {
     }
     if (signal && signal.aborted) return;
     render();
-    const active = !latest || latest.phase === "running" || (latest.phase === "review-partial" && latest.busy);
+    // review-partial is polled fast even when not busy: "stopped" is only
+    // shown for as long as the server really reports it.
+    const active = !latest || latest.phase === "running" || latest.phase === "review-partial";
     // Keep polling while work continues; afterwards slow down but keep the
     // chip honest (a later re-analysis can move the index again).
     timer = setTimeout(tick, active ? 3000 : 15000);

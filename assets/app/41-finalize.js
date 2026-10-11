@@ -273,7 +273,13 @@ function finBuild() {
     `</div>`;
   FIN.built = true;
   mount.addEventListener("click", finOnClick);
-  mount.addEventListener("change", e => { if (e.target && e.target.id === "marksFile") finImportMarks(); });
+  mount.addEventListener("change", e => {
+    if (e.target && e.target.id === "marksFile") finImportMarks();
+    // The hosted selection bar has no 검토자 field: a committed name here is
+    // the examiner for new marks too (FTViewer.setExaminer), not only for
+    // the report.
+    if (e.target && e.target.id === "finalExaminer" && e.target.value.trim()) propagateExaminerName(e.target.value.trim(), FIN.caseId);
+  });
   mount.addEventListener("input", e => {
     if (e.target && e.target.id === "finalExaminer") { FIN.examinerTouched = true; finPaint(); }
   });

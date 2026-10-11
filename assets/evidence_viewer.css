@@ -77,8 +77,7 @@ html:root .ft-viewer .count-pills { display: flex; align-items: center; gap: 4px
 :where(.ft-viewer) .topbar .menu-list button { height: 32px; font-size: 13px; }
 
 /* ---- work area: rail | grid + media ---- */
-:where(.ft-viewer) .workarea { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); min-height: 0; min-width: 0; --rail-w: 200px; }
-@media (min-width: 1600px) { :where(.ft-viewer) .workarea { --rail-w: 240px; } }
+:where(.ft-viewer) .workarea { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); min-height: 0; min-width: 0; }
 :where(.ft-viewer).rail-collapsed .workarea, :where(.ft-viewer).theater .workarea { grid-template-columns: minmax(0, 1fr); }
 :where(.ft-viewer).rail-collapsed .rail, :where(.ft-viewer).theater .rail { display: none; }
 :where(.ft-viewer) .rail { min-height: 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; background: var(--surface); border-right: 1px solid var(--line); padding: 8px 6px 16px; display: flex; flex-direction: column; gap: 6px; }
@@ -126,10 +125,13 @@ html:root .ft-viewer .count-pills { display: flex; align-items: center; gap: 4px
 :where(.ft-viewer) .period { margin: 0; padding: 2px 4px; line-height: 1.45; }
 :where(.ft-viewer) .cal-year { height: 28px; font-size: var(--fs-xs); padding: 0 2px; width: auto; flex: 0 0 auto; }
 
-:where(.ft-viewer) .main { display: grid; grid-template-columns: minmax(0, 1fr) 10px minmax(min(420px, 55%), 40%); padding: 8px; min-height: 0; min-width: 0; }
-/* 24px hit area (WCAG 2.5.8) inside the 10px layout track: the negative
+/* Grid | 6px splitter | media column at the --media-w token (480 / 640 px
+   from 1600px, docs/ui-rebuild-contract.md §6.1); never more than half of
+   the work area on narrow frames. A dragged split overrides this inline. */
+:where(.ft-viewer) .main { display: grid; grid-template-columns: minmax(0, 1fr) 6px min(var(--media-w), 50%); padding: 8px; min-height: 0; min-width: 0; }
+/* 24px hit area (WCAG 2.5.8) inside the 6px layout track: the negative
    margins keep the layout unchanged while the visible line stays thin. */
-:where(.ft-viewer) .vsplitter { cursor: col-resize; display: grid; place-items: center; width: 24px; margin-inline: -7px; position: relative; z-index: 2; border-radius: 4px; }
+:where(.ft-viewer) .vsplitter { cursor: col-resize; display: grid; place-items: center; width: 24px; margin-inline: -9px; position: relative; z-index: 2; border-radius: 4px; }
 :where(.ft-viewer) .vsplitter::before { content: ""; width: 3px; height: 44px; border-radius: 2px; background: var(--border-strong); }
 :where(.ft-viewer) .vsplitter:hover::before, :where(.ft-viewer) .vsplitter.dragging::before, :where(.ft-viewer) .vsplitter:focus-visible::before { background: var(--accent); }
 :where(.ft-viewer).theater .vsplitter { display: none; }
@@ -149,12 +151,14 @@ html:root .ft-viewer .count-pills { display: flex; align-items: center; gap: 4px
 :where(.ft-viewer) .hsplitter { flex: 0 0 auto; height: 24px; margin-block: -7px; position: relative; z-index: 2; cursor: row-resize; display: grid; place-items: center; border-radius: 4px; }
 :where(.ft-viewer) .hsplitter::before { content: ""; width: 44px; height: 3px; border-radius: 2px; background: var(--border-strong); }
 :where(.ft-viewer) .hsplitter:hover::before, :where(.ft-viewer) .hsplitter.dragging::before, :where(.ft-viewer) .hsplitter:focus-visible::before { background: var(--accent); }
-/* Title / stage / toolbar: the toolbar row sizes to its content (it may wrap),
-   so it is never clipped by a fixed row height. */
-:where(.ft-viewer) .player { background: var(--dark); border-radius: 8px; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; flex: 0 0 auto; height: 56%; min-height: 240px; }
+/* Title / stage / toolbar: the stage is 16:9 of the media column (270px at
+   480, 360px at 640 — §6.1) unless the examiner dragged #hsplitter (inline
+   height on #mediaStage); the toolbar row sizes to its content, so it is
+   never clipped by a fixed row height. The details tabs take the rest. */
+:where(.ft-viewer) .player { background: var(--dark); border-radius: 8px; display: grid; grid-template-rows: auto auto auto; overflow: hidden; flex: 0 0 auto; }
 :where(.ft-viewer) .media-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 32px; padding: 0 12px; color: #eaf3ef; background: #16231f; font-size: 13px; min-width: 0; }
 :where(.ft-viewer) .media-title h2 { font-size: 13px; font-weight: 700; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-:where(.ft-viewer) .media-stage { overflow: auto; display: grid; place-items: center; min-height: 0; }
+:where(.ft-viewer) .media-stage { overflow: auto; display: grid; place-items: center; min-height: 0; aspect-ratio: 16 / 9; }
 :where(.ft-viewer) .media-stage:focus-visible { outline-offset: -3px; }
 :where(.ft-viewer) .media-stage video { background: #0b0f0d; max-width: 100%; }
 :where(.ft-viewer) .media-stage .fallback { color: #c8d5d0; font-size: 13px; padding: 12px; text-align: center; }
@@ -209,6 +213,7 @@ html:root .ft-viewer .count-pills { display: flex; align-items: center; gap: 4px
 :where(.ft-viewer).theater .browse { display: none; }
 :where(.ft-viewer).theater .mini-info, :where(.ft-viewer).theater .hsplitter { display: none; }
 :where(.ft-viewer).theater .player { height: auto !important; flex: 1 1 auto; }
+:where(.ft-viewer).theater .media-stage { aspect-ratio: auto; height: auto !important; }
 
 /* ---- thumbnail grid ----
    Fixed row height per density (--card-h) keeps the virtual grid's row math

@@ -61,7 +61,7 @@ assets/
     viewer.body.html           T5  NEW       조각: <div id="ftViewer" class="ft-viewer" data-ft-viewer="2">…</div> (현 evidence_viewer.html body 23~322행 전부)
     00-host.js                 T5  NEW       window.FTViewer (§3)
     10-boot.js … 95-init.js    T5  edit      IIFE → async function ftViewerBoot(opts); body.* 상태 클래스 → root; AbortSignal 리스너; 이벤트 dispatch
-    99-loader.js               T5  edit      standalone 자동 init; 오버레이·live chip을 root 내부에 absolute
+    99-loader.js               T5  edit      standalone 자동 init; 오버레이를 root 내부에 absolute; live chip은 standalone 전용(호스트는 `live-state` 이벤트)
     controls.css               T1  rewrite   kit.css 클래스로 통일, 중복 버튼 규칙 삭제 (embed 규칙 추가 금지 — T5)
     20-i18n.js, 21-i18n-layout.js  T5 edit   글리프(▾ ◐ ⧉ ⤓ ✓ ✕ ☰ ⚠) 제거, 신규 키 추가
   legacy/                      T5  NEW       465e7db 스냅샷: examiner_app.html, tokens.css, app/*.css, app/*.js (롤백 §9.3)
@@ -221,6 +221,8 @@ window.FTViewer = {
   summary() → { total, byKind, byStatus, warned, marked, noted, pending },   // = __frametraceSummary() + pending(미저장 건수)
   saveState() → "saved"|"pending"|"saving"|"failed"|"queued"|"local"|null,
   save() → Promise<boolean>,         // syncMarksNow()
+  setExaminer(name), getExaminer() → string|null,   // 검토자(마크 귀속). 호스트 선택 바에는 입력란이 없고 41-finalize `#finalExaminer`가 호출
+  liveState() → { live, generation, total, canReload }|null,   // = 마지막 `live-state` detail
   popout() → Window|null,            // 70-player.js openPopupPlayer(): 영상+판독 창
   closePopout(), isPoppedOut() → boolean,
   toast(message, kind = "info") → void,     // §6.5 단일 토스트 호스트
@@ -247,6 +249,7 @@ window.FTViewer = {
 | `records` | `{ total, byKind, byStatus, generation }` | 데이터 적재/재적재 후 | 31-progress(T3: 칩 "n/m") |
 | `save-state` | `{ state, pending, queued }` | `renderSaveState()` 마다 | 01-store, 40-finalize(T4), 23-popout(T2) |
 | `dirty` | `{ count }` | `markReviewDirty()/clearReviewDirty()` | 01-store, 40-finalize |
+| `live-state` | `{ live, generation, total, canReload }` | 마운트 데이터의 색인 세대(`live`=부분 색인으로 적재) · 지금 `reload()`가 받아들여질지(미저장 없음). 값이 바뀔 때만 | 22-viewer-host → `viewer.live/liveGeneration/canReload`; 31-progress·32-jobs가 `/api/status`의 `index_generation`과 비교해 칩 "보강 완료"·`btnJobReload` "새 데이터 반영 (n건)" 표시. **호스트에서 색인·보강 상태의 단일 출처는 셸의 `/api/status` 폴링**이며 뷰어는 `#ft-live-chip`을 만들지 않고 상태를 폴링하지 않는다 |
 | `selection` | `{ ids: string[], count }` | 선택 변경 | 01-store |
 | `active-record` | `{ id, kind, status, mark }` | 활성 카드 변경 | 01-store, 23-popout |
 | `locale` | `{ locale }` | 언어 변경(버튼·API) | 15-theme(T2: 라벨 동기) |
@@ -280,7 +283,7 @@ const FTStore = {
     counts:   { indexed: 0, total: 0, generation: 0 },   // indexed = FTViewer records.total, total = /api/records live total
     panels:   { jobs: false, finalize: false, project: false, tools: false, help: false },
     popout:   { open: false, writer: "main" },           // writer는 항상 "main"(팝아웃은 writer가 아님)
-    viewer:   { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, locale: "ko", theme: "light" },
+    viewer:   { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, locale: "ko", theme: "light", live: false, liveGeneration: null, canReload: true },
     server:   { instance: "", lost: false, failures: 0 },
     env:      null,                                      // /api/env 응답
   },
@@ -413,7 +416,7 @@ const FTStore = {
 | 뷰어 상단 바 | 35 | `.ft-viewer .topbar` |
 | 뷰어 메뉴/필터 패널 | 40 | `.menu-list`, `.filters-extra` |
 | 뷰어 모달(단축키·클립·팔레트) | 50 | `#shortcutsModal`, `.modal.dlg` |
-| live 칩(호스트: 루트 내부 absolute) | 55 | `#ft-live-chip` |
+| live 칩(standalone 전용: 헤더 인라인, embed는 페이저 행 인라인 — 층 없음) | — | `#ft-live-chip` |
 | 토스트 | 60 | `#toastHost`(단일) |
 | 상단 띠 | 65 | `#hTopStrip` |
 | 셸 팝오버·뷰어 고정 메뉴 | 70 | `.h-pop`, `.menu-fixed` |
@@ -447,13 +450,13 @@ const FTStore = {
 | 빈 상태 `#inputCard` | 열 760px 중앙, 블록 간 12px, 수직 중앙(`min-height:100%`, `padding 20px 0`) | 동일 | 블록 2개 `#blkEvidence`(입력 40px·`btnStart` primary lg), `#blkRecent`(목록 `max-height: max(110px, 100vh − 420px)`, 상단 행 `[이어서 검토]` primary lg 36px) |
 | 뷰어 `.topbar` | 40px | 40px | 불변 |
 | 뷰어 `.workarea` | 724−40−44 = **640px** | 1036−40−44 = **952px** | `grid-template-columns: var(--rail-w) minmax(0,1fr)` |
-| 좌 레일 `#leftRail` | **240px** | **280px** (≥1600) | Ctrl+B 접힘 → 0 |
+| 좌 레일 `#leftRail` | **240px** | **280px** (≥1600) | 기본 열림(`--rail-w` 토큰), Ctrl+B 접힘 → 0; ≥1000/＜1000 두 폭별로 열림 상태 기억(`ft.viewer.rail.v2`) |
 | 중앙 그리드 열 | 1366−240−480−6 = **640px** (≥600) | 1920−280−640−6 = **994px** (≥960) | `vsplitter` 6px; 드래그 범위 유지(`aria-valuemin 28`…) — 기본값은 px 토큰에서 계산 |
 | 우 미디어 열 `section.media` | **480px** | **640px** (≥1600) | `--media-w` |
-| 영상 스테이지 `#mediaStage` | **270px**(16:9) | **360px** | `hsplitter` 드래그 가능, 더블클릭 기본값 |
-| 툴바 `#mediaToolbar` | 1행 44px(transport); 2행은 `tbMore` 팝오버 | 2행 88px (≥1600 인라인) | 현행 로직 |
+| 영상 스테이지 `#mediaStage` | **270px**(16:9) | **360px** | 최소값이 아니라 미디어 열 폭의 16:9(`aspect-ratio`) — 더 키우면 레터박스만 늘어난다. `hsplitter` 드래그(120…100vh−320, `#mediaStage` 인라인 height, 저장 키 `layout.stageH`), 더블클릭/Enter 기본값 |
+| 툴바 `#mediaToolbar` | 1행 44px(transport: −10초/+10초·프레임 이동은 아이콘 버튼 — 라벨은 접근 이름, 키는 툴팁) + `tbMore` 팝오버 | 1행 44px (미디어 열 <1000px이면 팝오버 — 640px에서도 팝오버) | 현행 로직 |
 | 상세 탭 `.mini-info` | 640−270−44−6 = **320px** (탭 32 + 288 스크롤) | 952−360−88−6 = **498px** | 스크롤 영역 |
-| `#selectionBar` | 44px 전폭, sticky bottom | 동일 | `btnApplyMarks` = 영역 유일 primary. **판독 블록을 우측 열로 옮기지 않는다**(§10 Q1) |
+| `#selectionBar` | 44px 전폭(실측 49 = 36px primary + 패딩, ≤52), **1행**, sticky bottom | 동일 | `btnApplyMarks` = 영역 유일 primary. **판독 블록을 우측 열로 옮기지 않는다**(§10 Q1). 1366에서 1행 유지: `#reviewProgress`는 <1600px에서 숨김(페이저 `#triageStatus`가 같은 수치), 호스트에서는 `#examinerName` 숨김(검토자는 결과물 시트 `#finalExaminer` → `FTViewer.setExaminer`; 마운트 시 셸 prefs의 이름으로 시드) — DOM과 동작은 유지 |
 | 시트 `.h-sheet` | 폭 **480px**, top 44, height 724, right 0 | 폭 **560px**, height 1036 | §6.3 |
 | 팝오버 `.h-pop` | min 240 / max min(380, 100vw−32) | 동일 | opener 아래 6px, 우측 정렬 |
 | 대화상자 `.h-modal` | min(560px, 92vw), max-height 80vh | 동일 | |
@@ -481,7 +484,7 @@ const FTStore = {
 - **단일 호스트 규칙**: 뷰어가 마운트되면 `#toastHost`(뷰어)만 쓰고 셸 `toast()`는 `FTViewer.toast()`로 위임; 뷰어가 없으면(빈 상태·레거시) 셸 `#hToastBox`를 쓴다. 두 호스트가 동시에 보이지 않는다.
 - 위치(`position:fixed`): 빈 상태 `top: 52px; right: 16px`; 호스트 모드 `top: 44+40+8 = 92px; right: 16px`; 시트 열림 시 `right: calc(var(--sheet-w) + 16px)`(`html[data-sheet]` 속성으로 CSS 전환); 폭 `min(400px, 100vw − 32px)`; 최대 3개; `pointer-events:none`(버튼만 auto); 6 s, 오류는 수동 닫기; Esc는 최신 토스트.
 - standalone 뷰어: `top: 100px`(헤더 36+탭 40+8)·우측 14px — 현행과 동일.
-- `#ft-live-chip`: 호스트/standalone 공통으로 그리드 열 **좌하단**(`position:absolute; left:12px; bottom:12px` — `.browse` 기준) → 페이저 위, 선택 바 위로 올라가지 않는다. 시트와 겹치지 않는다(그리드 열 내부).
+- `#ft-live-chip`: **standalone 전용**. 헤더가 보이면 헤더 안 인라인, embed(레거시 iframe)면 그리드 아래 페이저 행 인라인 — 어떤 컨트롤도 덮지 않는다. 호스트에서는 만들지 않는다: 색인·보강 상태는 상단 띠 칩(`#jobPanel`), "새 데이터 반영"은 작업 시트 `btnJobReload`(§3.2 `live-state`).
 
 ### 6.6 프로젝트 팝오버 `#hProjectPop` (T2)
 

@@ -218,6 +218,35 @@ await test('5. enrichment finishing waits for the examiner (no reload behind the
   assert.match(env.$('jobPanel').className, /\bidle\b/);
 });
 
+await test('5c. live index moved under the mounted viewer (FTViewer live-state): one source of truth, reload offered in the sheet', async () => {
+  const env = makeEnv({ status: partial({ index_generation: 2 }) });
+  env.recordsTotal = 30;
+  await env.advance(1200);
+  // the viewer loaded generation 2 (live) and holds no unsaved marks
+  env.store().set({ viewer: { ...env.state().viewer, mounted: true, live: true, liveGeneration: 2, canReload: true } });
+  await env.advance(1200);
+  assert.equal(env.$('btnJobReload').hidden, true, 'same generation: nothing to offer');
+  assert.equal(env.$('jobTitle').textContent, '보강 중', 'the chip reads the status poll, not the viewer');
+  env.status = partial({ index_generation: 3 });
+  await env.advance(3200);
+  assert.equal(env.$('jobTitle').textContent, '보강 중');
+  assert.equal(env.$('btnJobReload').hidden, false, 'newer generation: offered while enrichment runs');
+  assert.equal(env.$('btnJobReload').textContent, '새 데이터 반영 (30건)');
+  env.store().set({ viewer: { ...env.state().viewer, canReload: false } });
+  await env.advance(1100);
+  assert.match(env.$('btnJobReload').title, /저장되지 않은/, 'unsaved marks: the tooltip says why it will refuse');
+  env.status = ready({ index_generation: 3 });
+  await env.advance(1200);
+  assert.equal(env.$('jobTitle').textContent, '보강 완료');
+  assert.equal(env.viewer.reloadCalls.length, 0, 'never reloaded behind the examiner');
+  // the examiner reloads: the new mount reports generation 3, non-live
+  env.store().set({ viewer: { ...env.state().viewer, live: false, liveGeneration: null, canReload: true } });
+  env.$('btnJobReload').click();
+  await env.advance(50);
+  assert.equal(env.viewer.reloadCalls.length, 1);
+  assert.equal(env.$('btnJobReload').hidden, true);
+});
+
 await test('5b. a finished recover job: FTViewer.reload() exactly once; refused -> deferred + btnJobReload', async () => {
   const sj = (over = {}) => ({ kind: 'recover-deleted', state: 'running', started_unix: 1_700_000_100, elapsed_secs: 5, stage: 1, stages: 2, stage_label: '복구', error: null, ...over });
   for (const refuse of [false, true]) {

@@ -652,8 +652,11 @@ function renderJobsSheet() {
   const mounted = !!(S.viewer && S.viewer.mounted);
   const reloadBtn = $("btnJobReload");
   if (reloadBtn) {
-    reloadBtn.hidden = !((cj && cj.outcome === "deferred") || (pipelineReloadPending() && mounted));
-    reloadBtn.textContent = cj && cj.outcome === "deferred" ? "뷰어 새로 고침" : "새 데이터 반영";
+    const offer = liveReloadOffer(S);
+    reloadBtn.hidden = !((cj && cj.outcome === "deferred") || ((pipelineReloadPending() || offer) && mounted));
+    reloadBtn.textContent = cj && cj.outcome === "deferred" ? "뷰어 새로 고침"
+      : offer && offer.total ? `새 데이터 반영 (${fmtCount(offer.total)}건)` : "새 데이터 반영";
+    reloadBtn.title = offer && !offer.canReload ? "저장되지 않은 판독 내용이 있습니다 — 저장된 뒤 반영됩니다" : "";
   }
   const closeBtn = $("btnJobClose");
   if (closeBtn) {

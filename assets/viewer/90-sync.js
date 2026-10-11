@@ -149,8 +149,32 @@ function renderSaveState() {
     lastSaveSignature = signature;
     FTViewer._emit("save-state", { state: kind, pending: n, queued: queuedOnServer });
   }
+  emitLiveState();
 }
 var lastSaveSignature = "";
+
+// Host notification (FTViewer "live-state", contract §3.2): which index
+// generation this mount loaded and whether a reload would be accepted now.
+// In the workstation the shell owns the live-index / enrichment status (its
+// /api/status poll is the single source of truth) and offers '새 데이터
+// 반영' in its jobs sheet; the viewer never polls or shows a chip there.
+var lastLiveSignature = "";
+function liveStateDetail() {
+  const live = DATA.liveIndex || null;
+  return {
+    live: !!live,
+    generation: live && live.generation != null ? live.generation : null,
+    total: records.length,
+    canReload: !(pendingReviewSync || saveInFlight || state.deletedIds.length || queuedOnServer > 0),
+  };
+}
+function emitLiveState() {
+  const detail = liveStateDetail();
+  const signature = JSON.stringify(detail);
+  if (signature === lastLiveSignature) return;
+  lastLiveSignature = signature;
+  FTViewer._emit("live-state", detail);
+}
 function emitDirty() {
   FTViewer._emit("dirty", { count: pendingSaveCount() });
 }
