@@ -102,13 +102,19 @@ function hOpenSheet(which, opener) {
   hSetOpenerState(which, true);
   if (which === "finalize") { $("main").inert = true; $("hTopStrip").inert = true; }
   FTStore.set({ panels: { [which]: true } });
-  setTimeout(() => {
-    if (sheet.hidden) return;
+  // The sheet's contents are rendered by its owner (32-jobs / 41-finalize)
+  // and may land a moment later; retry briefly until focus is inside.
+  let tries = 0;
+  const focusFirst = () => {
+    if (sheet.hidden || !FTStore.state.panels[which]) return;
+    if (typeof sheet.contains === "function" && sheet.contains(document.activeElement)) return;
     const first = which === "finalize"
       ? ((sheet.querySelector && sheet.querySelector("#finalExaminer")) || hFocusables(sheet).find(el => el.id !== "hFinalizeClose") || $("hFinalizeClose"))
       : ($("hJobsClose") || hFocusables(sheet)[0]);
     try { if (first) first.focus(); } catch (e) {}
-  }, 0);
+    if (++tries < 10 && typeof sheet.contains === "function" && !sheet.contains(document.activeElement)) setTimeout(focusFirst, 50);
+  };
+  setTimeout(focusFirst, 0);
 }
 function hCloseSheet(which, refocus) {
   const sheet = $(H_SHEETS[which]);

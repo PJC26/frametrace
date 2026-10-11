@@ -365,6 +365,7 @@ if (shellHasMount) {
     await page.click('#hBtnFinalize');
     await page.waitForSelector('#hFinalizeSheet #btnFinalize');
     assert.equal(await page.$eval('#main', (m) => m.inert), true, '#main inert while the sheet is open');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.id === 'finalExaminer', null, { timeout: 3000 }).catch(() => {});
     assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.id), 'finalExaminer');
     await page.keyboard.press('Escape');
     await page.waitForFunction(() => document.getElementById('hFinalizeSheet').hidden);
