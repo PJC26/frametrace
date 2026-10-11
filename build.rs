@@ -88,15 +88,44 @@ fn tokens_path() -> PathBuf {
     path
 }
 
+/// Shared UI kit (assets/kit.css: buttons, inputs, kbd, icon glyphs) is the
+/// SECOND part of both CSS bundles, right after the tokens, so one
+/// definition styles every control on every page
+/// (docs/ui-rebuild-contract.md §5.4).
+fn kit_path() -> PathBuf {
+    let path = PathBuf::from("assets/kit.css");
+    println!("cargo:rerun-if-changed={}", path.display());
+    path
+}
+
+/// Offline inline SVG icon sprite (assets/icons.svg). A page template may
+/// carry at most one `<!-- @bundle:icons.svg -->` marker; when present it
+/// is replaced by the sprite so icons work under file:// as well
+/// (docs/ui-rebuild-contract.md §5.5).
+fn inline_icons(page: String, template_name: &str) -> String {
+    const MARKER: &str = "<!-- @bundle:icons.svg -->";
+    let sprite_path = PathBuf::from("assets/icons.svg");
+    println!("cargo:rerun-if-changed={}", sprite_path.display());
+    match page.matches(MARKER).count() {
+        0 => page,
+        1 => {
+            let sprite = fs::read_to_string(&sprite_path).expect("assets/icons.svg unreadable");
+            page.replacen(MARKER, sprite.trim_end(), 1)
+        }
+        n => panic!("{template_name} must contain at most one {MARKER} (found {n})"),
+    }
+}
+
 fn viewer_css_bundle(out_dir: &Path) {
-    // Order matters: tokens, the page stylesheet, then the control styles
-    // (action bar, player toolbar, menus, toasts) which refine it.
+    // Order matters: tokens, the shared kit, the page stylesheet, then the
+    // control styles (action bar, player toolbar, menus, toasts) which
+    // refine it.
     let viewer_css = PathBuf::from("assets/evidence_viewer.css");
     let controls_css = PathBuf::from("assets/viewer/controls.css");
     println!("cargo:rerun-if-changed={}", viewer_css.display());
     println!("cargo:rerun-if-changed={}", controls_css.display());
     let css = concat(
-        &[tokens_path(), viewer_css, controls_css],
+        &[tokens_path(), kit_path(), viewer_css, controls_css],
         "assets/viewer/bundle.css",
         "css",
     );
@@ -114,7 +143,7 @@ fn app_bundle(out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", app_dir.display());
     println!("cargo:rerun-if-changed={}", template_path.display());
     let template = fs::read_to_string(template_path).expect("assets/examiner_app.html missing");
-    let mut css_parts = vec![tokens_path()];
+    let mut css_parts = vec![tokens_path(), kit_path()];
     css_parts.extend(sorted_parts(app_dir, "css"));
     let css = concat(&css_parts, "assets/app/bundle.css", "css");
     let js = concat(&sorted_parts(app_dir, "js"), "assets/app/bundle.js", "js");
@@ -144,6 +173,7 @@ fn app_bundle(out_dir: &Path) {
         );
         page = page.replacen(marker, &block, 1);
     }
+    let page = inline_icons(page, "examiner_app.html");
     fs::write(out_dir.join("examiner_app.html"), page).expect("failed to write app bundle");
 }
 

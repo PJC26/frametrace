@@ -1,0 +1,6 @@
+/* FrameTrace UI kit — shared controls (buttons: default/secondary, .primary,
+   .quiet, .destructive; size .lg/.icon; inputs; kbd; .ic icon glyphs).
+   Bundled SECOND (after assets/tokens.css) into BOTH the workstation shell
+   and the evidence viewer by build.rs / scripts/lib/app-bundle.mjs, so one
+   definition styles every control on every page. Owned by track T1
+   (docs/ui-rebuild-contract.md §5.4). Intentionally empty until T1 lands. */
