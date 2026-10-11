@@ -15,6 +15,9 @@
 //!   old and new values, and are returned to the caller to print.
 //! * A computed digest is never replaced by a different operator-supplied
 //!   value.
+//! * Tool-generated default notes ("Auto-registered by …", written on
+//!   every scan-folder / inspect-e01 / … run) only fill an empty notes
+//!   field; they never overwrite what the operator wrote.
 
 use super::*;
 use crate::util::now_unix;
@@ -125,6 +128,15 @@ pub struct EvidenceSourceChange {
 }
 
 /// Relative path of the chained log recording evidence source changes.
+/// Prefix of the default notes FrameTrace's own commands attach when they
+/// register a source implicitly.
+pub const AUTO_NOTES_PREFIX: &str = "Auto-registered by ";
+
+/// True for a tool-generated default note (see [`AUTO_NOTES_PREFIX`]).
+pub fn is_auto_note(notes: &str) -> bool {
+    notes.starts_with(AUTO_NOTES_PREFIX)
+}
+
 pub const EVIDENCE_SOURCE_LOG_REL_PATH: &str = "evidence/logs/evidence-source-log.jsonl";
 
 #[derive(Debug, Clone)]
@@ -268,6 +280,15 @@ pub fn register_evidence_source_with_origin(
     };
 
     // Existing source: work out which custody fields actually change.
+    // An implicit re-registration's default note never replaces notes
+    // already on the source (the operator's, or an earlier tool's).
+    let notes = input.notes.clone().filter(|new| {
+        !(is_auto_note(new)
+            && existing
+                .notes
+                .as_deref()
+                .is_some_and(|old| !old.trim().is_empty()))
+    });
     let mut changes = Vec::new();
     let mut note_change = |field: &'static str, old: &Option<String>, new: &Option<String>| {
         if new.is_some() && new != old {
@@ -288,7 +309,7 @@ pub fn register_evidence_source_with_origin(
         &existing.acquisition_tool,
         &input.acquisition_tool,
     );
-    note_change("notes", &existing.notes, &input.notes);
+    note_change("notes", &existing.notes, &notes);
 
     let mut stored_hash = (
         existing.evidence_hash.clone(),
@@ -381,7 +402,7 @@ pub fn register_evidence_source_with_origin(
             stored_hash.0,
             stored_hash.1,
             stored_hash.2,
-            input.notes,
+            notes,
             metadata_json,
         ],
     )
@@ -428,6 +449,49 @@ mod tests {
             notes: None,
             metadata_json: None,
         }
+    }
+
+    #[test]
+    fn auto_registration_note_never_overwrites_operator_notes() {
+        let dir = case("autonotes");
+        let auto = |path: &str| EvidenceSourceInput {
+            notes: Some("Auto-registered by scan-folder".into()),
+            ..input(None, "folder", path, None)
+        };
+        // First implicit registration fills the empty field.
+        register_evidence_source(&dir, &auto("/e/sd")).unwrap();
+        let notes = |dir: &Path| -> Option<String> {
+            let conn = open_case_db(dir).unwrap();
+            conn.query_row(
+                "SELECT notes FROM evidence_sources WHERE path = '/e/sd'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            notes(&dir).as_deref(),
+            Some("Auto-registered by scan-folder")
+        );
+        // The operator writes a real note (audited change).
+        let operator = EvidenceSourceInput {
+            notes: Some("SD card from vehicle 12가3456, sealed bag #7".into()),
+            ..input(None, "folder", "/e/sd", None)
+        };
+        let row = register_evidence_source(&dir, &operator).unwrap();
+        assert!(row.changes.iter().any(|c| c.field == "notes"));
+        // Re-scanning must keep it, and logs no notes change.
+        let row = register_evidence_source(&dir, &auto("/e/sd")).unwrap();
+        assert!(
+            row.changes.iter().all(|c| c.field != "notes"),
+            "{:?}",
+            row.changes.iter().map(|c| c.field).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            notes(&dir).as_deref(),
+            Some("SD card from vehicle 12가3456, sealed bag #7")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
