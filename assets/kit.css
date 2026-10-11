@@ -1,6 +1,165 @@
-/* FrameTrace UI kit — shared controls (buttons: default/secondary, .primary,
-   .quiet, .destructive; size .lg/.icon; inputs; kbd; .ic icon glyphs).
-   Bundled SECOND (after assets/tokens.css) into BOTH the workstation shell
-   and the evidence viewer by build.rs / scripts/lib/app-bundle.mjs, so one
-   definition styles every control on every page. Owned by track T1
-   (docs/ui-rebuild-contract.md §5.4). Intentionally empty until T1 lands. */
+/* FrameTrace UI kit — shared controls: buttons (4 kinds x 5 states), inputs,
+   kbd, .ic icon glyphs, small text utilities.
+   Bundled SECOND (right after assets/tokens.css) into BOTH the workstation
+   shell and the evidence viewer by build.rs / scripts/lib/app-bundle.mjs, so
+   one definition styles every control on every page. Driven only by the
+   tokens in assets/tokens.css; both themes follow. Owned by track T1
+   (docs/ui-rebuild-contract.md section 5.4). Page stylesheets load AFTER this
+   file and win on equal specificity, so kit selectors stay shallow.
+
+   Button language
+     kinds    secondary (plain <button>: 1px --border-strong outline on
+              --surface) · .primary (filled --accent; exactly ONE per
+              [data-region]) · .quiet (transparent; toolbars, menus, chips) ·
+              .destructive (--danger outline + text; .primary.destructive is
+              filled and only ever sits behind a confirm dialog)
+     sizes    32px default · .lg 36px (.primary is 36px by default) ·
+              .icon 28x28 (icon only, aria-label required) · never below 24px
+     states   default · :hover · :active · :focus-visible (2px ring, 2px
+              offset; menu items -2px) · :disabled (--disabled-*, tooltip
+              carries the reason) · [aria-busy="true"] (spinner)
+     Every state differs from default in background, outline or text colour
+     and holds >= 4.5:1 text contrast (disabled >= 3:1) in both themes. */
+
+/* ---- buttons: secondary (default) ---- */
+button {
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  line-height: var(--lh-ctl);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  box-sizing: border-box;
+  min-height: var(--ctl-h);
+  min-width: var(--ctl-h);
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+button:hover:not(:disabled) { background: var(--surface-2); border-color: var(--accent); }
+button:active:not(:disabled) { background: var(--accent-soft); border-color: var(--accent); transform: translateY(1px); }
+button:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
+button[role="menuitem"]:focus-visible { outline-offset: -2px; }
+button:disabled { background: var(--disabled-bg); border-color: var(--border); color: var(--disabled-fg); cursor: not-allowed; transform: none; }
+
+/* ---- primary ---- */
+button.primary { min-height: var(--ctl-h-lg); background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+button.primary:hover:not(:disabled) { background: var(--accent-ink); border-color: var(--accent-ink); color: var(--on-accent); }
+button.primary:active:not(:disabled) { background: var(--accent-ink); border-color: var(--on-accent); color: var(--on-accent); }
+button.primary:disabled { background: var(--disabled-bg); border-color: var(--border); color: var(--disabled-fg); }
+
+/* ---- quiet ---- */
+button.quiet { background: transparent; border-color: transparent; color: var(--text); }
+button.quiet:hover:not(:disabled) { background: var(--surface-2); border-color: transparent; }
+button.quiet:active:not(:disabled) { background: var(--accent-soft); border-color: transparent; }
+button.quiet:disabled { background: transparent; border-color: transparent; color: var(--disabled-fg); }
+
+/* ---- destructive ---- */
+button.destructive { background: var(--surface); border-color: var(--danger); color: var(--danger); }
+button.destructive:hover:not(:disabled) { background: var(--failed-bg); border-color: var(--danger); }
+button.destructive:active:not(:disabled) { background: var(--failed-bg); border-color: var(--danger); }
+button.destructive.quiet { background: transparent; border-color: transparent; }
+button.destructive.quiet:hover:not(:disabled), button.destructive.quiet:active:not(:disabled) { background: var(--failed-bg); border-color: transparent; }
+button.primary.destructive { background: var(--danger); border-color: var(--danger); color: var(--on-accent); }
+button.primary.destructive:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 82%, #000); border-color: color-mix(in srgb, var(--danger) 82%, #000); color: var(--on-accent); }
+button.primary.destructive:active:not(:disabled) { background: color-mix(in srgb, var(--danger) 82%, #000); border-color: var(--on-accent); color: var(--on-accent); }
+button.destructive:disabled, button.primary.destructive:disabled { background: var(--disabled-bg); border-color: var(--border); color: var(--disabled-fg); }
+button.destructive.quiet:disabled { background: transparent; border-color: transparent; }
+
+/* ---- size modifiers ---- */
+button.lg { min-height: var(--ctl-h-lg); padding: 0 16px; }
+button.icon { width: var(--ctl-h-icon); height: var(--ctl-h-icon); min-width: var(--ctl-h-icon); min-height: var(--ctl-h-icon); padding: 0; flex: none; }
+button.icon.lg { width: var(--ctl-h-lg); height: var(--ctl-h-lg); min-width: var(--ctl-h-lg); min-height: var(--ctl-h-lg); }
+
+/* ---- toggle (filter chips, view switches): pressed state is visible ---- */
+button.toggle[aria-pressed="true"],
+button.toggle[aria-expanded="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); }
+button.toggle[aria-pressed="true"]:hover:not(:disabled) { background: var(--accent-soft); border-color: var(--accent-ink); }
+button.toggle[aria-pressed="true"]:disabled, button.toggle[aria-expanded="true"]:disabled { background: var(--disabled-bg); border-color: var(--border); color: var(--disabled-fg); }
+
+/* ---- busy: spinner, no pointer-events trap (the caller sets disabled/aria-busy) ---- */
+button[aria-busy="true"] { cursor: progress; }
+button[aria-busy="true"]::before {
+  content: "";
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: ft-kit-spin .8s linear infinite;
+}
+@keyframes ft-kit-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button[aria-busy="true"]::before { animation: none; border-right-color: currentColor; border-style: dotted; }
+  button:active:not(:disabled) { transform: none; }
+}
+
+/* ---- inputs ---- */
+input[type="text"], input[type="search"], input[type="date"], input[type="number"], select, textarea {
+  font: inherit;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ctl);
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  max-width: 100%;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+textarea { height: auto; min-height: var(--ctl-h); padding: 6px 8px; }
+input[type="text"]:hover:not(:disabled), input[type="search"]:hover:not(:disabled), input[type="date"]:hover:not(:disabled), input[type="number"]:hover:not(:disabled), select:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--accent); }
+input[type="text"]:focus-visible, input[type="search"]:focus-visible, input[type="date"]:focus-visible, input[type="number"]:focus-visible, select:focus-visible, textarea:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); border-color: var(--accent); }
+input:disabled, select:disabled, textarea:disabled { background: var(--disabled-bg); border-color: var(--border); color: var(--disabled-fg); cursor: not-allowed; }
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+
+/* ---- key caps ---- */
+kbd {
+  display: inline-grid;
+  place-items: center;
+  box-sizing: border-box;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--muted);
+  font: 600 var(--fs-xs)/16px var(--font-mono);
+}
+
+/* ---- icons: <svg class="ic" aria-hidden="true"><use href="#i-check"/></svg> ---- */
+svg.ic {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  vertical-align: -3px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+/* ---- text utilities ---- */
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--font-mono); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* Windows high-contrast: keep control edges and the focus ring visible. */
+@media (forced-colors: active) {
+  button, input, select, textarea, kbd { border-color: ButtonText; }
+  button:disabled { border-color: GrayText; color: GrayText; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline-color: Highlight; }
+}

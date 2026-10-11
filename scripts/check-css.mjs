@@ -4,16 +4,28 @@
 // validates the shared design tokens (assets/tokens.css): they must parse,
 // be bundled first into BOTH pages, and meet the contrast contract in both
 // themes.
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { appBundleCss, viewerBundleCss } from "./lib/app-bundle.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const files = ["assets/evidence_viewer.css", "assets/app/app.css"];
-// controls.css has no token block of its own (it is bundled after tokens.css +
-// evidence_viewer.css): only brace balance is checked here.
-for (const extra of ["assets/viewer/controls.css"]) {
+// The shell layout stylesheet is assets/app/00-layout.css after T2 renames
+// app.css (docs/ui-rebuild-contract.md section 1.2); accept either so the gate
+// works on both sides of that rename.
+const layoutCss = existsSync(join(root, "assets/app/00-layout.css")) ? "assets/app/00-layout.css" : "assets/app/app.css";
+const files = ["assets/evidence_viewer.css", layoutCss];
+// These have no token block of their own (kit.css is bundled right after
+// tokens.css, the rest after the page stylesheet): only brace balance is
+// checked. Optional ones are skipped until their track lands.
+for (const extra of ["assets/kit.css", "assets/viewer/controls.css", "assets/app/30-jobs.css", "assets/app/40-finalize.css"]) {
+  if (!existsSync(join(root, extra))) {
+    if (extra === "assets/kit.css" || extra === "assets/viewer/controls.css") {
+      console.error(`${extra}: missing`);
+      process.exitCode = 1;
+    }
+    continue;
+  }
   const css = readFileSync(join(root, extra), "utf8");
   const open = (css.match(/{/g) ?? []).length;
   const close = (css.match(/}/g) ?? []).length;
@@ -59,6 +71,7 @@ const tokensCss = readFileSync(join(root, "assets/tokens.css"), "utf8");
   if (!tokensCss.includes('html[data-theme="dark"]')) bad("dark theme block missing");
   if (/@import|url\(\s*["']?https?:/i.test(tokensCss)) bad("must not load remote resources (offline tool)");
 }
+const nthBanner = (css, n) => css.split("\n").filter((l) => l.startsWith("/* ==== "))[n] ?? "";
 const firstBanner = (css) => css.split("\n").find((l) => l.startsWith("/* ==== ")) ?? "";
 for (const [name, css] of [
   ["shell", appBundleCss(root)],
@@ -67,9 +80,18 @@ for (const [name, css] of [
   if (!firstBanner(css).includes("assets/tokens.css")) {
     bad(`${name} CSS bundle does not start with assets/tokens.css (node mirror)`);
   }
+  if (!nthBanner(css, 1).includes("assets/kit.css")) {
+    bad(`${name} CSS bundle must carry assets/kit.css second (node mirror)`);
+  }
+  if ((css.match(/\/\* ==== assets\/kit\.css/g) ?? []).length !== 1) {
+    bad(`${name} CSS bundle must include assets/kit.css exactly once`);
+  }
 }
 {
   const build = readFileSync(join(root, "build.rs"), "utf8");
+  if ((build.match(/kit_path\(\)/g) ?? []).length < 3) {
+    bad("build.rs must bundle kit_path() into both the shell and the viewer");
+  }
   if ((build.match(/tokens_path\(\)/g) ?? []).length < 3) {
     bad("build.rs must bundle tokens_path() into both the shell and the viewer");
   }
@@ -116,6 +138,13 @@ for (const st of statuses) {
   for (const s of surfaces) pairs.push([`--${st}-fg`, s, 4.5]);
 }
 for (const m of marks) pairs.push([`--mark-${m}-fg`, `--mark-${m}-bg`, 4.5]);
+// Section 5.2 additions: video stage text, non-text contrast (WCAG 1.4.11) for
+// control outlines / accent, and single-colour mark glyphs.
+pairs.push(["--media-muted", "--media-bg", 4.5]);
+for (const s of surfaces) {
+  pairs.push(["--border-strong", s, 3], ["--accent", s, 3]);
+  for (const m of marks) pairs.push([`--mark-${m}-ink`, s, 3]);
+}
 for (const [theme, map] of [
   ["light", light],
   ["dark", dark],
@@ -129,6 +158,13 @@ for (const [theme, map] of [
     if (r + 1e-9 < min) bad(`${theme}: ${fg} ${map[fg]} on ${bg} ${map[bg]} = ${r.toFixed(2)}:1 < ${min}:1`);
   }
 }
-if (!/--fs-xs:\s*12px/.test(tokensCss)) bad("--fs-xs must be 12px (minimum text size)");
+if (!/--fs-xs:\s*13px/.test(tokensCss)) bad("--fs-xs must be 13px (minimum text size)");
+if (!/--fs-sm:\s*14px/.test(tokensCss)) bad("--fs-sm must be 14px (body size)");
+if (!/--radius:\s*3px/.test(tokensCss)) bad("--radius must be 3px");
+for (const [theme, map] of [["light", light], ["dark", dark]]) {
+  for (const [k, v] of Object.entries({ "--ctl-h": "32px", "--ctl-h-lg": "36px", "--ctl-h-icon": "28px", "--hit-min": "24px" })) {
+    if (map[k] !== v) bad(`${theme}: ${k} must be ${v}`);
+  }
+}
 if (tokenErrors) process.exitCode = 1;
 else console.log(`assets/tokens.css: ok (${pairs.length} contrast pairs x 2 themes, bundled first into shell + viewer)`);

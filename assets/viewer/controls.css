@@ -3,6 +3,12 @@
    viewer_css_bundle, scripts/lib/app-bundle.mjs viewerBundleCss) and driven
    only by the shared tokens in assets/tokens.css, so both themes follow.
 
+   The generic control language (buttons, inputs, kbd, .sr-only, .ic) now
+   lives in assets/kit.css, bundled before this file. What remains here is
+   viewer-specific layout plus the selector-scoped button skins for the legacy
+   markup classes (mini / btn-sm / icon-btn / chip ...); those collapse into
+   kit classes when T5 re-marks the fragment (contract section 1.2).
+
    Button language (the acceptance contract for this file)
      primary    filled accent   exactly one per region (케이스에 반영)
      secondary  outlined        default for every control
@@ -16,11 +22,6 @@
    facet tree) stretched it past the viewport and pushed the right end of
    the action bar and the media toolbar off-screen. Pin it to the viewport. */
 body { grid-template-columns: minmax(0, 1fr); }
-
-.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
-
-/* ---- key caps ---- */
-kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--muted); font: 600 var(--fs-xs)/16px var(--font-mono); }
 
 /* ======================================================================
    Action bar — 44px, three zones, one row from 1366px, wraps below
