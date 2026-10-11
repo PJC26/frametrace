@@ -491,17 +491,28 @@ pub(crate) fn run_folder_enrichment(
     // Publishes the step and reports whether the run may proceed (false
     // once a cancel arrived between steps).
     let begin = |key: &'static str| -> bool {
-        let mut guard = state_lock(state);
-        if guard.cancel_requested {
-            return false;
+        // The step flips under the marks gate so an import never sees a
+        // stale step; entering a short-transaction step applies the marks
+        // queued during the previous (long) one.
+        let _gate = marks_gate();
+        {
+            let mut guard = state_lock(state);
+            if guard.cancel_requested {
+                return false;
+            }
+            if let Some(position) = plan.iter().position(|(step, _)| *step == key) {
+                guard.enrichment = Some(Enrichment {
+                    step: key,
+                    label: plan[position].1,
+                    stage: position + 1,
+                    stages,
+                });
+            }
         }
-        if let Some(position) = plan.iter().position(|(step, _)| *step == key) {
-            guard.enrichment = Some(Enrichment {
-                step: key,
-                label: plan[position].1,
-                stage: position + 1,
-                stages,
-            });
+        if matches!(key, "validate" | "anomalies")
+            && let Err(err) = drain_pending_marks(state, case_dir)
+        {
+            warn_step(state, 3, err);
         }
         true
     };
@@ -576,10 +587,32 @@ pub(crate) fn run_folder_enrichment(
     if !begin("make-review") {
         return stop_enrichment(state, 4, None);
     }
-    match runner(&["make-review".into(), case_text.clone()]) {
-        Ok(output) => {
-            log(output);
-            let mut guard = state_lock(state);
+    // Marks saved during phase 2 must be in the review: queued ones are
+    // applied under the gate, and make-review re-runs until no marks landed
+    // since it last started. The flip to review-ready happens under the
+    // same gate, so a late import either gets in before it or sees
+    // review-ready and takes the normal path.
+    let mut seen_epoch = {
+        let _gate = marks_gate();
+        if let Err(err) = drain_pending_marks(state, case_dir) {
+            drop(_gate);
+            return stop_enrichment(state, 4, Some(&err));
+        }
+        state_lock(state).marks_epoch
+    };
+    for _ in 0..8 {
+        match runner(&["make-review".into(), case_text.clone()]) {
+            Ok(output) => log(output),
+            Err(_) if cancelled() => return stop_enrichment(state, 4, None),
+            Err(err) => return stop_enrichment(state, 4, Some(&err)),
+        }
+        let _gate = marks_gate();
+        if let Err(err) = drain_pending_marks(state, case_dir) {
+            drop(_gate);
+            return stop_enrichment(state, 4, Some(&err));
+        }
+        let mut guard = state_lock(state);
+        if guard.marks_epoch == seen_epoch {
             guard.steps[4] = StepStatus::Done;
             guard.phase = "review-ready";
             guard.busy = false;
@@ -588,10 +621,18 @@ pub(crate) fn run_folder_enrichment(
             guard
                 .logs
                 .push("검토 화면이 준비되었습니다. 뷰어에서 증거를 확인하십시오.".into());
+            return;
         }
-        Err(_) if cancelled() => stop_enrichment(state, 4, None),
-        Err(err) => stop_enrichment(state, 4, Some(&err)),
+        seen_epoch = guard.marks_epoch;
+        guard
+            .logs
+            .push("리뷰 생성 중 저장된 판독 마크를 포함하도록 리뷰를 다시 생성합니다.".into());
     }
+    stop_enrichment(
+        state,
+        4,
+        Some("리뷰 생성 중 판독 마크가 계속 바뀌어 안정화하지 못했습니다 — 다시 분석하십시오."),
+    );
 }
 
 /// Ends phase 2 early without losing phase 1 (UX-02): the phase stays
@@ -599,7 +640,16 @@ pub(crate) fn run_folder_enrichment(
 /// examiner cancelled — recorded as a warning so the run never reads as a
 /// clean pass; `Some(err)` is a real failure surfaced as `error`.
 pub(crate) fn stop_enrichment(state: &SharedState, step: usize, failure: Option<&str>) {
+    // Marks queued behind a long step are applied now so they are never
+    // stranded; the gate keeps a racing import from queueing after this.
+    let _gate = marks_gate();
+    let case_dir = state_lock(state).case_dir.clone();
+    let drain_failure = case_dir.and_then(|dir| drain_pending_marks(state, &dir).err());
     let mut guard = state_lock(state);
+    if let Some(err) = drain_failure {
+        guard.logs.push(format!("오류: {err}"));
+        guard.warnings.push((step, err));
+    }
     guard.phase = "review-partial";
     guard.busy = false;
     guard.byte_progress = None;
@@ -772,6 +822,117 @@ pub(crate) fn build_selection_file(case_dir: &Path, output: &Path) -> Result<usi
     Ok(ids.len())
 }
 
+/// Serializes marks applies against the phase-2 steps that hold long case-DB
+/// transactions (scan-folder hashing) or read the marks (make-review).
+static MARKS_GATE: Mutex<()> = Mutex::new(());
+
+fn marks_gate() -> MutexGuard<'static, ()> {
+    MARKS_GATE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+const PENDING_MARKS_DIR: &str = "marks-pending";
+
+fn pending_marks_files(case_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(case_dir.join(PENDING_MARKS_DIR)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Number of queued (accepted but not yet applied) marks imports.
+pub(crate) fn pending_marks_count(case_dir: &Path) -> usize {
+    pending_marks_files(case_dir).len()
+}
+
+/// Applies every queued marks import in arrival order. A file is removed
+/// only after its import committed, so a failure leaves it queued. The
+/// caller holds `MARKS_GATE`. Returns how many were applied.
+fn drain_pending_marks(state: &SharedState, case_dir: &Path) -> Result<usize, String> {
+    let mut applied = 0;
+    for path in pending_marks_files(case_dir) {
+        crate::cli::handlers::import_marks_quiet(case_dir, &path)
+            .map_err(|err| format!("대기 중이던 마크 반영 실패 ({}): {err}", path.display()))?;
+        let _ = std::fs::remove_file(&path);
+        applied += 1;
+        state_lock(state).marks_epoch += 1;
+    }
+    if applied > 0 {
+        state_lock(state).logs.push(format!(
+            "저장 대기 중이던 판독 마크 {applied}건을 반영했습니다."
+        ));
+    }
+    Ok(applied)
+}
+
+/// Marks import while phase-2 enrichment is running (`review-partial` +
+/// busy). Validate/anomaly steps only take short case-DB transactions, so
+/// the marks are applied at once (SQLite's busy timeout covers the
+/// overlap). During `hash` (one long scan transaction) and `make-review`
+/// (reads the marks) the body is queued durably on disk and applied right
+/// after that step, so nothing is lost and make-review always sees them.
+fn import_marks_during_enrichment(
+    state: &SharedState,
+    case_dir: &Path,
+    marks_body: &str,
+) -> String {
+    let _gate = marks_gate();
+    // Re-checked under the gate: enrichment may have just finished.
+    let (partial, step) = {
+        let guard = state_lock(state);
+        (
+            guard.busy && guard.phase == "review-partial",
+            guard.enrichment.map(|e| e.step),
+        )
+    };
+    if !partial {
+        return api_err("보강 작업이 방금 끝났습니다 — 잠시 후 다시 저장하십시오.");
+    }
+    let direct =
+        matches!(step, Some("validate") | Some("anomalies")) && pending_marks_count(case_dir) == 0;
+    if !direct {
+        let dir = case_dir.join(PENDING_MARKS_DIR);
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            return api_err(&format!("대기열 폴더를 만들 수 없습니다: {err}"));
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!("{nanos:032}.json"));
+        if let Err(err) = crate::util::write_text_atomic(&path, marks_body) {
+            return api_err(&format!("대기열 저장 실패: {err}"));
+        }
+        state_lock(state)
+            .logs
+            .push("보강 중이라 판독 마크를 대기열에 저장했습니다 (해당 단계 직후 반영).".into());
+        return serde_json::json!({
+            "ok": true,
+            "deferred": true,
+            "pending": pending_marks_count(case_dir),
+        })
+        .to_string();
+    }
+    let marks_path = case_dir.join("marks-imported.json");
+    if let Err(err) = crate::util::write_text_atomic(&marks_path, marks_body) {
+        return api_err(&err.to_string());
+    }
+    match crate::cli::handlers::import_marks_quiet(case_dir, &marks_path) {
+        Ok(stored) => {
+            state_lock(state).marks_epoch += 1;
+            serde_json::json!({"ok": true, "applied": true, "stored": stored}).to_string()
+        }
+        Err(err) => api_err(&err),
+    }
+}
+
 /// Accepts the viewer's downloaded marks JSON, stores it in the case, and
 /// refreshes the report so examiner marks land in the deliverable.
 pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String {
@@ -785,10 +946,6 @@ pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
     };
-    let _busy = match try_acquire_busy(state) {
-        Ok(guard) => guard,
-        Err(err) => return api_err(&err),
-    };
     let marks_path = case_dir.join("marks-imported.json");
     let preflight =
         crate::selection::parse_marks_text(&marks_body, &marks_path).and_then(|marks| {
@@ -801,6 +958,24 @@ pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String
         });
     if let Err(err) = preflight {
         return serde_json::json!({"ok": false, "error": err}).to_string();
+    }
+    let enriching = {
+        let guard = state_lock(state);
+        guard.busy && guard.phase == "review-partial"
+    };
+    if enriching {
+        return import_marks_during_enrichment(state, &case_dir, &marks_body);
+    }
+    let _busy = match try_acquire_busy(state) {
+        Ok(guard) => guard,
+        Err(err) => return api_err(&err),
+    };
+    // Anything queued during phase 2 is applied before this import.
+    {
+        let _gate = marks_gate();
+        if let Err(err) = drain_pending_marks(state, &case_dir) {
+            return api_err(&err);
+        }
     }
     if let Err(err) = std::fs::write(&marks_path, &marks_body) {
         return format!(

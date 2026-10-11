@@ -787,6 +787,14 @@ let jobSeen = false, reviewReady = false, autoProgress = false, autoReviewed = f
 // True while the last status was review-partial (UX-02) — detects the
 // enrichment → review-ready transition under an open viewer.
 let reviewPartialSeen = false;
+// Last phase reported by /api/status. While it is review-partial the
+// review/ folder (evidence-viewer.html) is not written yet, so popup and
+// fullscreen-fallback open the server's built-in /viewer/ instead (same
+// origin: the ft_token cookie planted by ?token= keeps authenticating).
+let lastPhase = "";
+function standaloneViewerUrl() {
+  return lastPhase === "review-partial" ? "/viewer/" : "/review/evidence-viewer.html";
+}
 // A session-restored case pauses the auto-jump to review until the
 // examiner picks "이어서 검토" or "새 분석" on the stage-1 notice.
 let restoreHandled = false;
@@ -1009,6 +1017,7 @@ $("btnServerRetry").addEventListener("click", () => { pollFailures = Math.min(po
 
 function applyStatus(st) {
     if (!st.has_job) return;
+    lastPhase = st.phase;
     if (!jobSeen) { jobSeen = true; $("s2").disabled = false; }
     renderTrack(st.steps || [], st.step_names, st.progress, st.warnings);
     appendLogLines(st.logs || []);
@@ -1304,7 +1313,7 @@ reviewFrame.addEventListener("load", () => setTimeout(refreshCaseStats, 400));
 setInterval(() => { if (reviewFrameLoaded && $("resultCard").classList.contains("on")) refreshCaseStats(); }, 2500);
 
 $("btnViewerFull").addEventListener("click", () => {
-  reviewFrame.requestFullscreen ? reviewFrame.requestFullscreen() : window.open("/review/evidence-viewer.html", "_blank");
+  reviewFrame.requestFullscreen ? reviewFrame.requestFullscreen() : window.open(standaloneViewerUrl(), "_blank");
 });
 // Fullscreen restores the viewer's full chrome; inline stays compact.
 document.addEventListener("fullscreenchange", () => {
@@ -1330,12 +1339,12 @@ async function ensureReportFrame() {
 
 $("btnViewerWindow").addEventListener("click", () => {
   const win = window.open(
-    "/review/evidence-viewer.html",
+    standaloneViewerUrl(),
     "frametrace-viewer",
     "popup=yes,width=1500,height=950"
   );
   if (win) win.focus();
-  else window.open("/review/evidence-viewer.html", "_blank"); // popup blocked: fall back to a tab
+  else window.open(standaloneViewerUrl(), "_blank"); // popup blocked: fall back to a tab
 });
 
 $("btnRecoverDeleted").addEventListener("click", async () => {

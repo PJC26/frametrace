@@ -84,6 +84,7 @@ var manualQueued = false;   // "Apply to case" was pressed while one was in flig
 var saveRevision = 0;       // bumps on every change; detects edits mid-flight
 var saveFailures = 0;
 var saveError = "";
+var queuedOnServer = 0;     // marks the server holds in its phase-2 queue (durable, not yet in the DB)
 var saveRetryAt = 0;
 var viewerIsServed = location.protocol === "http:" || location.protocol === "https:";
 var saveStateEl = document.getElementById("saveState");
@@ -124,6 +125,11 @@ function renderSaveState() {
     cls = "candidate";
     label = tf("save.pending", { n });
     title = tf("save.title.pending", { n });
+  } else if (queuedOnServer > 0) {
+    kind = "queued";
+    cls = "candidate";
+    label = t("save.queuedServer");
+    title = tf("save.title.queuedServer", { n: queuedOnServer });
   } else {
     kind = "saved";
     cls = "ok";
@@ -136,6 +142,25 @@ function renderSaveState() {
   saveStateEl.textContent = label;
   saveStateEl.title = title;
   saveStateEl.setAttribute("aria-label", `${label} — ${title}`);
+}
+
+// While the server holds queued marks, poll until its queue is empty so the
+// indicator turns "saved" only once they really reached the case DB.
+var queueWatchTimer = null;
+function watchServerQueue() {
+  if (queueWatchTimer || !viewerIsServed) return;
+  queueWatchTimer = setInterval(async () => {
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      const st = res.ok ? await res.json() : null;
+      if (st && Number(st.pending_marks) === 0) {
+        queuedOnServer = 0;
+        clearInterval(queueWatchTimer);
+        queueWatchTimer = null;
+        renderSaveState();
+      }
+    } catch (e) { /* keep waiting; the indicator stays "queued" */ }
+  }, 3000);
 }
 
 function scheduleAutosave(delay) {
@@ -204,6 +229,10 @@ async function syncMarksNow() {
   }
   saveInFlight = false;
   if (result.ok) {
+    // queued: durably on the server but not in the case DB until the
+    // enrichment step ends — shown as "저장 대기(보강 중)", never a failure.
+    queuedOnServer = result.deferred ? Math.max(1, Number(result.pending) || 1) : 0;
+    if (queuedOnServer) watchServerQueue();
     saveFailures = 0;
     saveError = "";
     saveRetryAt = 0;
@@ -286,6 +315,7 @@ async function runManualApply() {
   pendingReviewSync = true;
   const result = await syncMarksNow();
   if (result.queued) { manualQueued = true; toast(t("save.queued")); }
+  else if (result.ok && result.deferred) toast(t("save.queuedServer"));
   else if (result.ok) toast(t("toast.applyDone"));
   else if (result.offline) toast(t("toast.applyOffline"));
   else toast(tf("toast.applyFail", { err: result.error || "?" }));
@@ -642,7 +672,7 @@ state.pageSize = Number(els.pageSize.value) || 100;
 function rangeText(range) {
   const r = normRange(range);
   const p = v => Number.isFinite(v) ? `${v.toFixed(1)}s` : "—";
-  return r ? `${p(r.in)} ~ ${p(r.out)}` : (state.locale === "en" ? "none" : "없음");
+  return r ? `${p(r.in)} ~ ${p(r.out)}` : t("range.none");
 }
 
 function serverRanges() {
@@ -683,7 +713,6 @@ function resolveRangeDivergence(ids, side) {
 }
 
 function showRangeDivergenceBanner(ids) {
-  const en = state.locale === "en";
   const server = serverRanges();
   const bar = document.createElement("div");
   bar.id = "rangeDivergenceBanner";
@@ -691,8 +720,8 @@ function showRangeDivergenceBanner(ids) {
   bar.style.cssText = "position:sticky;top:0;z-index:50;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;background:#fff3cd;color:#4a3500;border-bottom:2px solid #d9a400;font-size:13px";
   const msg = document.createElement("span");
   msg.style.fontWeight = "700";
-  msg.textContent = en ? `${ids.length} range(s) differ from the server` : `서버와 다른 ${ids.length}건`;
-  msg.title = ids.slice(0, 20).map(id => `${id}: ${en ? "server" : "서버"} ${rangeText(server[id])} / ${en ? "browser" : "브라우저"} ${rangeText(state.ranges[id])}`).join("\n");
+  msg.textContent = tf("range.divergeMsg", { n: ids.length });
+  msg.title = ids.slice(0, 20).map(id => `${id}: ${t("range.server")} ${rangeText(server[id])} / ${t("range.browser")} ${rangeText(state.ranges[id])}`).join("\n");
   bar.appendChild(msg);
   const mk = (id, label, side) => {
     const b = document.createElement("button");
@@ -703,8 +732,8 @@ function showRangeDivergenceBanner(ids) {
     b.addEventListener("click", () => { resolveRangeDivergence(ids, side); bar.remove(); });
     bar.appendChild(b);
   };
-  mk("rangeUseServer", en ? "Use server" : "서버 기준", "server");
-  mk("rangeUseBrowser", en ? "Use browser" : "브라우저 기준", "browser");
+  mk("rangeUseServer", t("range.useServer"), "server");
+  mk("rangeUseBrowser", t("range.useBrowser"), "browser");
   document.body.insertBefore(bar, document.body.firstChild);
 }
 

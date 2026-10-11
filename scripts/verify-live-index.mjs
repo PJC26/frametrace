@@ -10,7 +10,7 @@
 // Uses a throwaway XDG_CONFIG_HOME so the real workstation session file is
 // never touched, and synthesizes 30 × 20 MiB files so hashing is slow
 // enough to observe phase 2.
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -67,6 +67,7 @@ if (!start.ok) fail('start: ' + start.error);
 
 const phases = [];
 let partialChecked = false;
+let markSavedDuringPartial = false;
 const deadline = Date.now() + 300000;
 let st;
 while (Date.now() < deadline) {
@@ -80,6 +81,18 @@ while (Date.now() < deadline) {
     const viewer = await fetch(base + '/viewer/?embed=1', { headers: authHeaders });
     console.log('viewer status:', viewer.status, 'review/index.html exists:', existsSync(join(caseDir, 'review/index.html')));
     if (viewer.status !== 200) fail('/viewer/ not served');
+    // Marks saved during review-partial must be accepted (applied or queued
+    // behind the hash/make-review step) and persisted by review-ready.
+    const caseId = JSON.parse(readFileSync(join(caseDir, 'case.json'), 'utf8')).case_id;
+    const markBody = { schema_version: 1, case_id: caseId, marks: [{ id: 'vid_000001', status: 'important', note: 'saved during review-partial' }] };
+    const imp = await (await fetch(base + '/api/import-marks', {
+      method: 'POST',
+      headers: { ...authHeaders, ...nonceHeaders, 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ marks_json: JSON.stringify(markBody) }),
+    })).json();
+    console.log('import-marks during review-partial:', JSON.stringify(imp));
+    if (!imp.ok || !(imp.applied || imp.deferred)) fail('import-marks refused during review-partial: ' + JSON.stringify(imp));
+    markSavedDuringPartial = true;
     if (chromium) {
       const browser = await chromium.launch();
       const page = await browser.newPage({ viewport: { width: 1400, height: 860 } });
@@ -107,6 +120,12 @@ console.log(`final: phase=${st.phase} hashed=${finalRec.videos.filter((v) => v.s
 if (st.phase !== 'review-ready') fail('did not reach review-ready: ' + (st.error || st.phase));
 if (!phases.includes('review-partial')) fail('review-partial never observed');
 if (finalRec.videos.some((v) => !v.sha256)) fail('phase 2 did not hash every record');
+if (!markSavedDuringPartial) fail('never saved a mark during review-partial');
+const meta = await getJson('/api/records-meta');
+const persisted = (meta.annotations?.marks || []).find((m) => m.record_id === 'vid_000001' || m.id === 'vid_000001');
+console.log('mark after review-ready:', JSON.stringify(persisted || null), 'pending_marks=' + st.pending_marks);
+if (!persisted || persisted.status !== 'important') fail('mark saved during review-partial missing after review-ready');
+if (st.pending_marks) fail('marks still queued after review-ready');
 console.log('OK');
 cleanup();
 process.exit(0);

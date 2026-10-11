@@ -330,6 +330,9 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         "progress": progress,
         "enrichment": enrichment,
         "index_generation": index_generation,
+        // Marks accepted while a hash/make-review step held the case DB;
+        // applied automatically right after that step.
+        "pending_marks": case_dir.as_deref().map(pending_marks_count).unwrap_or(0),
     })
     .to_string()
 }

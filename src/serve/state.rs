@@ -129,6 +129,9 @@ pub(crate) struct JobState {
     pub(crate) index_generation: u64,
     /// File fingerprint the current `index_generation` was taken from.
     pub(crate) index_fingerprint: Option<IndexFingerprint>,
+    /// Bumped (under `MARKS_GATE`) whenever marks reach the case DB while
+    /// phase 2 runs; make-review re-runs until it has seen the latest.
+    pub(crate) marks_epoch: u64,
 }
 
 /// One phase-2 enrichment step (UX-02).
@@ -175,6 +178,7 @@ impl JobState {
             enrichment: None,
             index_generation: 0,
             index_fingerprint: None,
+            marks_epoch: 0,
         }
     }
 }
