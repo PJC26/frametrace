@@ -99,7 +99,7 @@ $("btnStart").addEventListener("click", async () => {
 function resetCaseUi() {
   jobSeen = false; reviewReady = false; autoReviewed = false; autoProgress = false;
   auditVerified = false;
-  $("btnFinalize").disabled = false;
+  $("btnFinalize").disabled = true;
   $("btnFinalize").textContent = "보고서 생성·패키징";
   $("finalLinks").innerHTML = "";
   $("finalHint").textContent = "";

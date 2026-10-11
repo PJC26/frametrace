@@ -26,6 +26,11 @@ function hRender() {
   if (mode === "project" && !s.viewer.mounted) hViewer.mount(s.phase === "review-partial");
   if (mode !== "project" && s.panels.finalize) hCloseSheet("finalize", false);
   if (mode === "empty" && hPrevMode && hPrevMode !== "empty" && typeof onHomeShown === "function") onHomeShown();
+  // First paint of the empty state: the evidence field takes focus (the
+  // markup's autofocus cannot, the section starts hidden).
+  if (mode === "empty" && !hPrevMode && (!document.activeElement || document.activeElement === document.body)) {
+    try { $("sourcePath").focus(); } catch (e) {}
+  }
   hPrevMode = mode;
   hRenderStrip(mode);
 }

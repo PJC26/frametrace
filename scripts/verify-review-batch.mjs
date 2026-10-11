@@ -319,7 +319,9 @@ async function unitTests() {
     ex.document.getElementById('caseDir').value = '/tmp/nope';
     await ex.openCase('/tmp/nope');
     assert.equal(dom.startErr.textContent.includes('서버에 연결할 수 없습니다'), true);
-    assert.equal(dom.s2.disabled, true);
+    // One integrated screen: no step rail any more — the reset shows in the
+    // shell's workflow latches (docs/ui-rebuild-contract.md §2.2).
+    assert.equal(runInNewContext('reviewReady || jobSeen', ex), false);
     assert.equal(dom.btnFinalize.disabled, true);
   };
   await openFail();
@@ -334,17 +336,15 @@ async function unitTests() {
   dom.btnFinalize.textContent = '보고서 재생성';
   dom.auditBadge.className = 'badge ok';
   dom.auditBadge.textContent = '감사 로그 구조 검증됨';
-  dom.s3.disabled = false;
-  dom.s4.disabled = false;
+  runInNewContext('reviewReady = true; jobSeen = true;', ex);
   ex.fetch = async () => ({ ok: true, has_review: true });
   await ex.openCase('/tmp/other-case');
   assert.equal(dom.finalLinks.innerHTML, '');
   assert.equal(dom.pkgPath.textContent, '');
   assert.equal(dom.btnFinalize.disabled, true);
-  assert.equal(dom.btnFinalize.textContent, '결과 보고서 생성 및 패키징');
+  assert.equal(dom.btnFinalize.textContent, '보고서 생성·패키징');
   assert.equal(dom.auditBadge.textContent, '감사 로그 대기');
-  assert.equal(dom.s3.disabled, true);
-  assert.equal(dom.s4.disabled, true);
+  assert.equal(runInNewContext('reviewReady || jobSeen', ex), false);
   console.log('PASS VM examiner open-case success clears stale results');
   // SHOULD-FIX 4: "모두 일치" only when files were compared and none were
   // left uncompared.

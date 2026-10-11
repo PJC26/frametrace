@@ -294,6 +294,13 @@ function applyStatus(st) {
     const running = st.phase === "running" || enriching;
     setInputsDisabled(running);
     $("btnStart").disabled = running || finalizing;
+    // @interim(T2): the deliverables sheet's one primary follows the case
+    // (contract §10.1 Q2: open while enrichment runs, but blocked).
+    if (!finalizing) {
+      const canSeal = ["review-ready", "finalizing", "done"].includes(st.phase) && !st.busy;
+      $("btnFinalize").disabled = !canSeal;
+      $("btnFinalize").title = canSeal ? "" : partial ? "분석 보강(해시·검증)이 끝나면 생성할 수 있습니다" : "진행 중인 작업이 끝나면 생성할 수 있습니다";
+    }
     $("btnStart").title = running ? "분석이 진행 중입니다 — 상단 작업 표시에서 상황을 보거나 중단할 수 있습니다"
       : finalizing ? "보고서 생성이 진행 중입니다" : "";
     $("btnCancel").style.display = running ? "" : "none";
