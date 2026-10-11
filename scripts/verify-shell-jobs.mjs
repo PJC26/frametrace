@@ -479,6 +479,8 @@ await test('preflight: render (estimate, inside-source, escaping) and 404 degrad
 await test('preflight: shown before Start; server-reported case_inside_source asks first', async () => {
   const env = makeEnv({ routes: {
     'POST /api/preflight': () => ({ json: { ok: true, sampled_bytes: 2 * 1024 ** 3, est_files: 40, free_bytes: 900 * 1024 ** 3, case_inside_source: true, warnings: [] } }),
+    // Start auto-detects the evidence kind first: D:\BLACKBOX is a folder.
+    'GET /api/browse': () => ({ json: { ok: true, exists: true, is_dir: true, kind: 'folder', entries: [] } }),
   } });
   env.status = { ok: true, has_job: false, phase: 'idle', busy: false };
   await env.advance(1500);

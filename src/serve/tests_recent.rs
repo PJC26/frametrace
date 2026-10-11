@@ -320,5 +320,18 @@ fn evidence_kind_is_auto_detected() {
     let dir: serde_json::Value =
         serde_json::from_str(&browse_json(&root.display().to_string(), true)).unwrap();
     assert_eq!(dir["kind"], "folder");
+    assert!(
+        dir.get("canonical").is_none(),
+        "only case folders report it"
+    );
+    // A case folder reports its canonical path (dedupe against the list).
+    let case = root.join("case");
+    make_case(&case);
+    std::fs::write(case.join("db/case.db"), b"").unwrap();
+    let alias = root.join("case/../case");
+    let listed: serde_json::Value =
+        serde_json::from_str(&browse_json(&alias.display().to_string(), false)).unwrap();
+    assert_eq!(listed["is_case"], true);
+    assert_eq!(listed["canonical"], canonical_case_dir(&case).as_str());
     let _ = std::fs::remove_dir_all(&root);
 }

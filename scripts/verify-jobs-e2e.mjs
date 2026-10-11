@@ -118,6 +118,8 @@ try {
   // ---- 1. analysis to review ------------------------------------------------
   await page.goto(`${base}/?token=${token}`);
   await page.fill('#sourcePath', srcDir);
+  // The case folder lives under the start screen's collapsed '옵션'.
+  if (!(await page.locator('#caseDir').isVisible())) await page.click('#startOptions > summary');
   await page.fill('#caseDir', caseDir);
   await page.click('#btnStart');
   // A preflight / resume dialog may ask for confirmation.
