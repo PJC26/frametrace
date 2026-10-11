@@ -45,7 +45,8 @@ try { ({ chromium } = require('playwright')); } catch {
 let axeSource = '';
 try { axeSource = readFileSync(require.resolve('axe-core/axe.min.js'), 'utf8'); } catch { /* axe optional */ }
 
-const ENFORCED = { contrast: true, name: true, 'name-baseline': false, 'name-custom': false, 'min-font': true, target: false, focus: false, axe: false };
+// All rules reached zero after the UX overhaul; enforce them so regressions fail.
+const ENFORCED = { contrast: true, name: true, 'name-baseline': true, 'name-custom': true, 'min-font': true, target: true, focus: true, axe: true };
 
 // ---------------------------------------------------------------- in-page
 // Runs inside every frame. Returns { contrast, name, minFont, target } findings.

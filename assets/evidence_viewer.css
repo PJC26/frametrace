@@ -142,7 +142,9 @@ button.cal-cell:hover { border-color: var(--accent); }
 .cal-year { height: 28px; font-size: var(--fs-xs); padding: 0 2px; width: auto; flex: 0 0 auto; }
 
 .main { display: grid; grid-template-columns: minmax(0, 1fr) 10px minmax(min(420px, 55%), 40%); padding: 8px; min-height: 0; min-width: 0; }
-.vsplitter { cursor: col-resize; display: grid; place-items: center; width: 10px; border-radius: 4px; }
+/* 24px hit area (WCAG 2.5.8) inside the 10px layout track: the negative
+   margins keep the layout unchanged while the visible line stays thin. */
+.vsplitter { cursor: col-resize; display: grid; place-items: center; width: 24px; margin-inline: -7px; position: relative; z-index: 2; border-radius: 4px; }
 .vsplitter::before { content: ""; width: 3px; height: 44px; border-radius: 2px; background: var(--border-strong); }
 .vsplitter:hover::before, .vsplitter.dragging::before, .vsplitter:focus-visible::before { background: var(--accent); }
 body.theater .vsplitter { display: none; }
@@ -159,7 +161,7 @@ body.rail-collapsed .active-filters:not([hidden]) { display: flex; }
 .pager-spacer { flex: 1 1 auto; }
 
 .media { display: flex; flex-direction: column; gap: 0; min-height: 0; min-width: 0; }
-.hsplitter { flex: 0 0 auto; height: 10px; cursor: row-resize; display: grid; place-items: center; border-radius: 4px; }
+.hsplitter { flex: 0 0 auto; height: 24px; margin-block: -7px; position: relative; z-index: 2; cursor: row-resize; display: grid; place-items: center; border-radius: 4px; }
 .hsplitter::before { content: ""; width: 44px; height: 3px; border-radius: 2px; background: var(--border-strong); }
 .hsplitter:hover::before, .hsplitter.dragging::before, .hsplitter:focus-visible::before { background: var(--accent); }
 /* Title / stage / toolbar: the toolbar row sizes to its content (it may wrap),

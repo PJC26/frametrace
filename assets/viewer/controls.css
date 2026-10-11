@@ -133,13 +133,18 @@ body.theater .player { grid-template-rows: 34px minmax(0, 1fr) auto; }
 /* ======================================================================
    Toasts — top-right (below the header), max 3, never over the action bar
    ====================================================================== */
-#toastHost { position: fixed; top: 54px; right: 14px; bottom: auto; z-index: 60; display: grid; gap: 8px; width: min(420px, calc(100vw - 28px)); pointer-events: none; }
-body.embed #toastHost { top: 48px; }
-#toastHost > .toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 8px; max-width: none; padding: 8px 6px 8px 14px; border-radius: var(--radius); border-left: 4px solid var(--accent); background: #1f2724; color: #f2f7f5; font-size: var(--fs-sm); line-height: var(--lh-ctl); box-shadow: 0 6px 18px rgba(0,0,0,.28); }
+#toastHost { position: fixed; top: 100px; right: 14px; bottom: auto; z-index: 60; display: grid; gap: 8px; width: min(420px, calc(100vw - 28px)); pointer-events: none; }
+/* Below the top bar (title row hidden in embed) so toasts never cover the
+   search/filter/count-pill buttons. */
+body.embed #toastHost { top: 56px; }
+/* Clicks pass through a toast's text to whatever is underneath; only its
+   own buttons (close / action) take the pointer. A transient message must
+   never block a control. */
+#toastHost > .toast { pointer-events: none; display: flex; align-items: flex-start; gap: 8px; max-width: none; padding: 8px 6px 8px 14px; border-radius: var(--radius); border-left: 4px solid var(--accent); background: #1f2724; color: #f2f7f5; font-size: var(--fs-sm); line-height: var(--lh-ctl); box-shadow: 0 6px 18px rgba(0,0,0,.28); }
 #toastHost .toast-text { flex: 1 1 auto; min-width: 0; padding-top: 3px; overflow-wrap: anywhere; }
 #toastHost .toast-error { border-left-color: #ff8a80; }
 #toastHost .toast-error::before { content: "!"; flex: none; display: grid; place-items: center; width: 20px; height: 20px; margin-top: 2px; border-radius: 50%; background: #ff8a80; color: #1f2724; font-weight: 800; font-size: var(--fs-xs); }
-#toastHost .toast button { flex: none; min-width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: #d8e4df; font: inherit; font-size: var(--fs-xs); cursor: pointer; padding: 0 8px; }
+#toastHost .toast button { pointer-events: auto; flex: none; min-width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: #d8e4df; font: inherit; font-size: var(--fs-xs); cursor: pointer; padding: 0 8px; }
 #toastHost .toast button:hover { background: rgba(255,255,255,.14); }
 #toastHost .toast button:focus-visible { outline: 2px solid #7fd6c7; outline-offset: 1px; }
 #toastHost .toast button.toast-action { border-color: #8ea39b; color: #f2f7f5; }
@@ -150,7 +155,9 @@ body.embed #toastHost { top: 48px; }
    or docked top-right when the page is embedded) — never over the bar */
 #ft-live-chip { position: static !important; right: auto !important; bottom: auto !important; z-index: auto !important; flex: 0 0 auto; max-width: min(460px, 42vw) !important; white-space: nowrap; box-shadow: none !important; }
 #ft-live-chip button { min-height: 24px; min-width: 24px; }
-body.embed #ft-live-chip { position: fixed !important; top: 8px; right: 8px !important; z-index: 55 !important; }
+/* Embed has no title row; park the live-index chip bottom-left just above
+   the action bar instead of over the top bar's buttons. */
+body.embed #ft-live-chip { position: fixed !important; top: auto !important; bottom: 56px !important; left: 12px !important; right: auto !important; z-index: 55 !important; box-shadow: var(--shadow, 0 4px 12px rgba(0,0,0,.2)) !important; }
 
 /* ======================================================================
    Command palette (Ctrl+K) — shortcuts-modal styling

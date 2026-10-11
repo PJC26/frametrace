@@ -309,11 +309,16 @@ details.adv summary { cursor: pointer; font-size: var(--fs-xs); font-weight: 600
    bar), at most 3, 6 s, hover/focus pauses, Esc dismisses the newest;
    errors stay until dismissed. */
 .toastbox { position: fixed; top: calc(var(--bar-h) + 8px); right: var(--gutter); z-index: 60; display: grid; gap: 6px; width: min(400px, calc(100vw - 32px)); pointer-events: none; }
-.toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 8px; padding: 8px 6px 8px 12px; border-radius: var(--radius); border: 1px solid var(--line-strong); border-left: 4px solid var(--info); background: var(--panel); color: var(--text); font-size: var(--fs-sm); box-shadow: var(--shadow); animation: fadein var(--dur) var(--ease); }
+/* Stage 3: the embedded viewer's own top bar (search, filters, count pills,
+   보기, ?) sits right under the stage bar — keep shell toasts below it so
+   they never cover those buttons. */
+body.stage3 .toastbox { top: calc(var(--bar-h) + 56px); }
+.toast { pointer-events: none; /* text is click-through; only its buttons take the pointer */ display: flex; align-items: flex-start; gap: 8px; padding: 8px 6px 8px 12px; border-radius: var(--radius); border: 1px solid var(--line-strong); border-left: 4px solid var(--info); background: var(--panel); color: var(--text); font-size: var(--fs-sm); box-shadow: var(--shadow); animation: fadein var(--dur) var(--ease); }
 .toast .toast-msg { flex: 1; min-width: 0; padding-top: 4px; overflow-wrap: anywhere; }
 .toast.ok { border-left-color: var(--ok); }
 .toast.warn { border-left-color: var(--warn); background: var(--warn-bg); color: var(--warn-fg); }
 .toast.err { border-left-color: var(--danger); background: var(--failed-bg); color: var(--failed-fg); }
+.toast button, .toast a { pointer-events: auto; }
 .toast .toast-x { min-height: 28px; min-width: 28px; padding: 0; border-color: transparent; background: transparent; color: inherit; font-size: var(--fs-lg); line-height: 1; }
 .toast .toast-x:hover:not(:disabled) { background: var(--surface-2); border-color: var(--line); }
 

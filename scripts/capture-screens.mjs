@@ -12,7 +12,7 @@
 //   --repo        source tree to build+serve (default: this checkout). Point it
 //                 at a `git worktree` of an older commit to capture "before".
 //   --out         PNG output dir (default <repo-of-this-script>/docs/screens/current)
-//   --target-dir  CARGO_TARGET_DIR (default /tmp/ft-target-F, or ft-target-F-<hash> for --repo)
+//   --target-dir  CARGO_TARGET_DIR (default: $CARGO_TARGET_DIR or <repo>/target)
 //
 // Needs: node 18+, ffmpeg, Playwright (npm i -D playwright, or a global
 // install found via NODE_PATH / /opt/*-tools) and a Chromium. Set
@@ -39,7 +39,9 @@ const sizes = opt('sizes', '1366x768,1920x1080').split(',').map((z) => {
 });
 const themes = opt('themes', opt('theme', 'light,dark')).split(',').map((x) => x.trim());
 if (themes.some((x) => x !== 'light' && x !== 'dark')) { console.error('--themes must be light and/or dark'); process.exit(2); }
-const targetDir = resolve(opt('target-dir', repo === selfRepo ? '/tmp/ft-target-F' : '/tmp/ft-target-F-' + Buffer.from(repo).toString('hex').slice(-8)));
+// Default to the repo's own target dir: a shared /tmp dir let parallel
+// worktrees (and --no-build) capture another checkout's binary.
+const targetDir = resolve(opt('target-dir', process.env.CARGO_TARGET_DIR || join(repo, 'target')));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Playwright + Chromium -------------------------------------------------

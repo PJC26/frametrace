@@ -19,6 +19,7 @@ harnesses=(
   "verify-jobs-e2e --no-build"
   "verify-review-batch --unit"
   "bench-viewer"
+  "check-a11y"
 )
 
 failed=()
