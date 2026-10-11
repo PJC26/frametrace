@@ -41,6 +41,16 @@ function finViewerSaveState() {
   const v = finViewer();
   try { return v && typeof v.saveState === "function" ? (v.saveState() || null) : null; } catch (e) { return null; }
 }
+// Bridge helpers other shell files call (project-switch guard, quit guard).
+// Hosted viewer only — the shell never reads viewer DOM (contract 3).
+function viewerWindow() { return null; }
+function viewerSaveState() { return finViewerSaveState(); }
+// Starts a save (or retry) now; true when a viewer accepted it.
+function retryViewerSave() {
+  const v = finViewer();
+  if (v && typeof v.save === "function") { Promise.resolve(v.save()).catch(() => {}); return true; }
+  return false;
+}
 function finViewerSummary() {
   const v = finViewer();
   try { return v && typeof v.summary === "function" ? v.summary() : null; } catch (e) { return null; }
