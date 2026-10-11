@@ -25,9 +25,11 @@ function buildViewer() {
     js += readFileSync(join(dir, part), 'utf8');
     if (!js.endsWith('\n')) js += '\n';
   }
-  const videos = ['a', 'b', 'c'].map((n) => ({
+  const videos = ['a', 'b', 'c', 'd', 'e'].map((n) => ({
     id: `vid_${n}`, relative_path: `DCIM/${n}.mp4`, source_path: `/case/DCIM/${n}.mp4`,
     ffprobe_ok: true, size_bytes: 1000, extension: 'mp4',
+    ...(n === 'e' ? { ffprobe: { streams: [{ codec_type: 'video', avg_frame_rate: '0/0', r_frame_rate: '30000/1001' }] } } : {}),
+    ...(n === 'd' ? { ffprobe: { streams: [{ codec_type: 'audio' }, { codec_type: 'video', avg_frame_rate: '25/1', r_frame_rate: '25/1' }] } } : {}),
   }));
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
     manifest: { case_id: 'FT-UNDO', title: 'undo' }, caseDir: '/case', scan: { videos },
@@ -103,7 +105,7 @@ try {
     const v = document.createElement('video');
     v.muted = true; v.loop = true;
     v.src = URL.createObjectURL(new Blob(chunks, { type: 'video/webm' }));
-    document.getElementById('mediaStage').replaceChildren(v);
+    window.__tv = v; document.getElementById('mediaStage').replaceChildren(v);
     await new Promise((r) => (v.onloadeddata = r));
     v.currentTime = 0.5;
     await new Promise((r) => setTimeout(r, 200));
@@ -146,6 +148,27 @@ try {
     await page.keyboard.type(',.LJK');
     check('keys in a text input do nothing', Math.abs((await time()) - g0) < 0.001
       && (await page.evaluate(() => document.querySelector('#mediaStage video').paused)) && (await page.locator('#query').inputValue()) === ',.LJK');
+  }
+  // 25 fps record (fps parsed from the raw ffprobe stream): step is 0.04 s.
+  {
+    await page.locator('#query').fill('');
+    await page.locator('.card[data-id="vid_d"]').click();
+    await page.evaluate(() => { document.activeElement?.blur(); document.getElementById('mediaStage').replaceChildren(window.__tv); window.__tv.pause(); window.__tv.currentTime = 0.5; });
+    await settle();
+    const f0 = await time();
+    await page.keyboard.press('.'); await settle();
+    const f1 = await time();
+    check('25 fps record steps 0.04 s', Math.abs(f1 - f0 - 0.04) < 0.005, `${f0} -> ${f1}`);
+    // 30000/1001 via r_frame_rate (avg is 0/0) and a record with no probe data.
+    for (const [id, want, label] of [['vid_e', 1001 / 30000, 'NTSC 30000/1001 (avg 0/0)'], ['vid_a', 1 / 30, 'no ffprobe data -> 1/30 fallback']]) {
+      await page.locator(`.card[data-id="${id}"]`).click();
+      await page.evaluate(() => { document.activeElement?.blur(); document.getElementById('mediaStage').replaceChildren(window.__tv); window.__tv.pause(); window.__tv.currentTime = 0.5; });
+      await settle();
+      const g0 = await time();
+      await page.keyboard.press('.'); await settle();
+      const g1 = await time();
+      check(`${label} steps ${want.toFixed(4)} s`, Math.abs(g1 - g0 - want) < 0.005, `${g0} -> ${g1}`);
+    }
   }
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

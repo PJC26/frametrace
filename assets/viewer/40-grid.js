@@ -92,36 +92,65 @@ function filteredRecords() {
   return list;
 }
 
+// Per-dimension predicates. Facet counts reuse them to count a record
+// against every filter EXCEPT the dimension being counted, so picking a
+// day does not collapse the calendar to that one day (UX-22).
+function passesKind(record) { return !state.kind || record.kind === state.kind; }
+function passesRecType(record) { return !state.recType || (record.recType || "unclassified") === state.recType; }
+function passesDate(record) {
+  if (!state.dateFrom && !state.dateTo) return true;
+  if (!record.recDay) return false;
+  if (state.dateFrom && record.recDay < state.dateFrom) return false;
+  if (state.dateTo && record.recDay > state.dateTo) return false;
+  return true;
+}
+function passesRest(record, chip, query) {
+  if (state.status && record.status !== state.status) return false;
+  if (chip === "anomaly" && !record.hasAnomaly) return false;
+  if (chip === "warning" && !(record.warnings || []).length) return false;
+  if (chip === "kind:recovery" && record.kind !== "candidate" && record.kind !== "filesystem") return false;
+  if (chip === "marked:any" && !state.marks[record.id] && !(state.tags[record.id] || []).length && !(state.notes[record.id] || "").trim()) return false;
+  if (chip.startsWith("tag:")) {
+    const tags = state.tags[record.id] || [];
+    if (!tags.includes(chip.slice(4))) return false;
+  }
+  if (chip.startsWith("mark:")) {
+    const wanted = chip.slice(5);
+    const mark = state.marks[record.id];
+    if (wanted === "none") { if (mark) return false; }
+    else if (!mark || mark.status !== wanted) return false;
+  }
+  return !query || searchHaystack(record).includes(query);
+}
+
+// Counts for the calendar and the facet tree, each excluding its own
+// dimension's filter. One pass; memoised on the filter key minus sort,
+// and fetched once per render() and passed to both renderers.
+let facetMemo = { key: null, value: null };
+function facetCounts() {
+  const base = filterMemoKey();
+  const key = base === null ? null : base.split("\u0001").slice(0, 7).join("\u0001") + "\u0001" + records.length;
+  if (key !== null && facetMemo.key === key) return facetMemo.value;
+  const chip = state.chip || "";
+  const query = state.query || "";
+  const typeCounts = new Map(), kindCounts = new Map(), dayCounts = new Map();
+  records.forEach(record => {
+    if (!passesRest(record, chip, query)) return;
+    const k = passesKind(record), ty = passesRecType(record), d = passesDate(record);
+    if (k && d) { const tk = record.recType || "unclassified"; typeCounts.set(tk, (typeCounts.get(tk) || 0) + 1); }
+    if (ty && d) kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
+    if (k && ty && record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
+  });
+  const value = { typeCounts, kindCounts, dayCounts };
+  facetMemo = { key, value };
+  return value;
+}
+
 function computeFilteredRecords() {
   const chip = state.chip || "";
   const query = state.query || "";
-  const list = records.filter(record => {
-    if (state.kind && record.kind !== state.kind) return false;
-    if (state.recType && (record.recType || "unclassified") !== state.recType) return false;
-    if (state.status && record.status !== state.status) return false;
-    if (chip === "anomaly" && !record.hasAnomaly) return false;
-    if (chip === "warning" && !(record.warnings || []).length) return false;
-    if (chip === "kind:recovery" && record.kind !== "candidate" && record.kind !== "filesystem") return false;
-    if (chip === "marked:any" && !state.marks[record.id] && !(state.tags[record.id] || []).length && !(state.notes[record.id] || "").trim()) return false;
-    if (state.dateFrom || state.dateTo) {
-      if (!record.recDay) return false;
-      if (state.dateFrom && record.recDay < state.dateFrom) return false;
-      if (state.dateTo && record.recDay > state.dateTo) return false;
-    }
-    if (chip.startsWith("tag:")) {
-      const wanted = chip.slice(4);
-      const tags = state.tags[record.id] || [];
-      if (!tags.includes(wanted)) return false;
-    }
-    if (chip.startsWith("mark:")) {
-      const wanted = chip.slice(5);
-      const mark = state.marks[record.id];
-      if (wanted === "none") { if (mark) return false; }
-      else if (!mark || mark.status !== wanted) return false;
-    }
-    if (!query) return true;
-    return searchHaystack(record).includes(query);
-  });
+  const list = records.filter(record =>
+    passesKind(record) && passesRecType(record) && passesDate(record) && passesRest(record, chip, query));
   const byId = (a, b) => idCollator.compare(String(a.id), String(b.id));
   switch (state.sortBy) {
     case "time-desc":
@@ -616,12 +645,17 @@ function audioFlag(record) {
   return "";
 }
 
+// Thumbnail URLs that already failed (see the capture-phase error handler
+// in 65-actions.js): render the placeholder straight away.
+const thumbRetried = new Set();
+const thumbDead = new Set();
+
 function renderCard(record) {
   const mark = markOf(record);
   const markChip = mark ? `<span class="mark-chip ${escapeHtml(mark.status)}">${escapeHtml(markLabel(mark.status))}</span>` : "";
   const staleTag = record.indexStatus === "stale" ? '<span class="muted">(stale)</span>' : "";
-  const thumb = record.thumb
-    ? `<img src="${escapeHtml(record.thumb)}" loading="lazy" decoding="async" fetchpriority="low">`
+  const thumb = record.thumb && !thumbDead.has(record.thumb)
+    ?`<img src="${escapeHtml(record.thumb)}" loading="lazy" decoding="async" fetchpriority="low">`
     : `<div class="ph">${record.status === "validation-failed" ? t("thumb.damaged") : t("thumb.missing")}</div>`;
   const recTypeTag = record.recType ? `<span class="rec-type">${escapeHtml(recTypeLabel(record.recType))}</span>` : "";
   const channel = record.channel ? `<span class="channel-badge">${escapeHtml(record.channel)}</span>` : "";
@@ -663,11 +697,7 @@ function renderCard(record) {
 // number and a count chip; intensity follows the count relative to the
 // month's max. Click selects the day as a date filter; clicking the
 // selected day clears it. Month nav steps through the recorded span.
-function renderHistogram(filtered) {
-  const days = new Map();
-  filtered.forEach(record => {
-    if (record.recDay) days.set(record.recDay, (days.get(record.recDay) || 0) + 1);
-  });
+function renderHistogram(days) {
   const allDays = [...days.keys()].sort();
   const months = [...new Set(allDays.map(d => d.slice(0, 7)))];
   if (!months.length) {
@@ -703,8 +733,12 @@ function renderHistogram(filtered) {
   }
   const monthLabel = new Date(cy, cm - 1, 1).toLocaleDateString(loc, { year: "numeric", month: "long" });
   const mi = months.indexOf(state.calMonth);
+  const years = [...new Set(months.map(m => m.slice(0, 4)))];
+  const yearSel = years.length > 1
+    ? `<select id="calYear" class="cal-year" aria-label="${escapeHtml(t("cal.year"))}">${years.map(y => `<option value="${y}"${y === String(cy) ? " selected" : ""}>${y}</option>`).join("")}</select>`
+    : "";
   const nav = months.length > 1
-    ? `<div class="cal-nav">
+    ? `<div class="cal-nav">${yearSel}
         <button type="button" class="cal-btn" id="calPrev" ${mi <= 0 ? "disabled" : ""} title="${escapeHtml(t("cal.prev"))}">‹</button>
         <span class="cal-month">${escapeHtml(monthLabel)}</span>
         <button type="button" class="cal-btn" id="calNext" ${mi >= months.length - 1 ? "disabled" : ""} title="${escapeHtml(t("cal.next"))}">›</button>
@@ -721,6 +755,10 @@ function renderHistogram(filtered) {
       state.currentPage = 1;
       render();
     });
+  });
+  document.getElementById("calYear")?.addEventListener("change", e => {
+    const inYear = months.filter(m => m.startsWith(e.target.value));
+    if (inYear.length) { state.calMonth = inYear[inYear.length - 1]; render(); }
   });
   document.getElementById("calPrev")?.addEventListener("click", () => { state.calMonth = months[mi - 1]; render(); });
   document.getElementById("calNext")?.addEventListener("click", () => { state.calMonth = months[mi + 1]; render(); });
