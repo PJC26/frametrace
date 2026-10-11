@@ -115,6 +115,8 @@ pub(crate) fn api_export_clip(request: &Request, state: &SharedState) -> String 
     }
 }
 
+const CLIP_BUSY_ERROR: &str = "분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.";
+
 /// Upper bound on concurrently running clip exports (each is an ffmpeg).
 pub(crate) const MAX_RUNNING_CLIP_JOBS: usize = 4;
 /// Finished clip jobs kept for dedupe/status before the oldest is dropped.
@@ -126,6 +128,8 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         let guard = state_lock(state);
         (guard.case_dir.clone(), guard.busy)
     };
+    // `busy` here is only a fast-path snapshot; the authoritative check is
+    // repeated under the registration lock below (finding 4).
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
             .to_string();
@@ -196,7 +200,7 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         return clip_response(&existing, true);
     }
     if busy {
-        return api_err("분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.");
+        return api_err(CLIP_BUSY_ERROR);
     }
     let dir = case_dir.join("artifacts/clips");
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -219,6 +223,12 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
             .find(|job| job.key == key && job.state == "running" && !job.cancel_requested)
         {
             return clip_response(existing, true);
+        }
+        // finalize/recover/carve take `busy` first and then count running
+        // clips; re-checking `busy` in the same lock as the registration
+        // closes the window where both could proceed (finding 4).
+        if guard.busy {
+            return api_err(CLIP_BUSY_ERROR);
         }
         if guard
             .clip_jobs
