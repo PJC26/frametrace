@@ -216,7 +216,7 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         if let Some(existing) = guard
             .clip_jobs
             .iter()
-            .find(|job| job.key == key && job.state == "running")
+            .find(|job| job.key == key && job.state == "running" && !job.cancel_requested)
         {
             return clip_response(existing, true);
         }
@@ -315,7 +315,7 @@ pub(crate) fn exhibit_arg(exhibit: &str) -> String {
     format!("--exhibit={exhibit}")
 }
 
-/// A running job with `key`, or a finished one whose clip is still on disk
+/// A running (not cancel-pending) job with `key`, or a finished one whose clip is still on disk
 /// with the recorded size (so a deleted/replaced clip is exported anew).
 fn find_reusable_clip_job(state: &SharedState, key: &str) -> Option<ClipJob> {
     let guard = state_lock(state);
@@ -326,7 +326,9 @@ fn find_reusable_clip_job(state: &SharedState, key: &str) -> Option<ClipJob> {
         .find(|job| {
             job.key == key
                 && match job.state {
-                    "running" => true,
+                    // A cancel-pending job is about to die: joining it would
+                    // hand the caller a job that ends "cancelled" (finding 3).
+                    "running" => !job.cancel_requested,
                     "done" => std::fs::metadata(&job.output)
                         .is_ok_and(|meta| Some(meta.len()) == job.size_bytes),
                     _ => false,

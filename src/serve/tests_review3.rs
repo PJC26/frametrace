@@ -219,3 +219,130 @@ fn signoff_refused_when_marks_cannot_be_read() {
     assert!(!case.join(crate::report::SIGNOFF_REL_PATH).exists());
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn running_clip(id: &str, key: &str, output: PathBuf) -> ClipJob {
+    ClipJob {
+        id: id.into(),
+        key: key.into(),
+        record_id: "vid_0001".into(),
+        rel_path: output.to_string_lossy().to_string(),
+        output,
+        started_unix: 1,
+        finished_unix: None,
+        state: "running",
+        sha256: None,
+        size_bytes: None,
+        error: None,
+        cancel_requested: false,
+    }
+}
+
+/// Finding 2: cancelling the job that holds `busy` (a re-hash) must not
+/// kill an unrelated clip export; with nothing busy, cancel stops clips.
+#[test]
+fn cancel_targets_the_busy_job_not_clip_exports() {
+    let root = scratch("cancel-scope");
+    let state = bound(&root, "review-ready");
+    {
+        let mut guard = state_lock(&state);
+        guard
+            .clip_jobs
+            .push(running_clip("clip-1", "k", root.join("c.mp4")));
+        guard.busy = true;
+    }
+    let response = parse(&api_cancel(&state));
+    assert_eq!(response["ok"], true, "{response}");
+    {
+        let guard = state_lock(&state);
+        assert!(guard.cancel_requested);
+        assert!(
+            !guard.clip_jobs[0].cancel_requested,
+            "a busy-job cancel must leave the clip export running"
+        );
+    }
+    assert_eq!(response["cancelled"], "job", "{response}");
+    assert_eq!(response["clips_cancelled"], 0, "{response}");
+    state_lock(&state).busy = false;
+    let response = parse(&api_cancel(&state));
+    assert_eq!(response["cancelled"], "clips", "{response}");
+    assert_eq!(response["clips_cancelled"], 1, "{response}");
+    assert!(state_lock(&state).clip_jobs[0].cancel_requested);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Writes an executable `/bin/sh` script standing in for the CLI.
+#[cfg(unix)]
+fn fake_cli(dir: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-frametrace.sh");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+const SLOW_EXPORT: &str = r#"out=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "--output" ]; then out="$a"; fi
+  prev="$a"
+done
+case "$1" in
+  export-video) sleep 3; printf 'clip' > "$out"; echo exported ;;
+  *) exit 0 ;;
+esac"#;
+
+#[cfg(unix)]
+fn temp_case(label: &str) -> PathBuf {
+    let dir = scratch(label);
+    std::fs::create_dir_all(dir.join("db")).unwrap();
+    std::fs::write(dir.join("case.json"), br#"{"case_id":"FT-rev3"}"#).unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !check() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Finding 3: an identical export request must not join a job whose
+/// cancel is already pending (it would end "cancelled" under the caller).
+#[cfg(unix)]
+#[test]
+fn export_dedupe_skips_cancel_pending_jobs() {
+    let case = temp_case("clip-cancel-dedupe");
+    let exe = fake_cli(&case, SLOW_EXPORT);
+    let state = bound(&case, "review-ready");
+    let body = r#"{"id":"vid_0001","start":"1","duration":"2"}"#;
+    let req = request("POST", "/api/export-clip", "", body);
+    let first = parse(&export_clip_with_exe(&req, &state, &exe));
+    let first_id = first["job"]["id"].as_str().unwrap().to_string();
+    let cancel = parse(&api_export_clip_cancel(
+        &request(
+            "POST",
+            "/api/export-clip-cancel",
+            "",
+            &format!(r#"{{"job":"{first_id}"}}"#),
+        ),
+        &state,
+    ));
+    assert_eq!(cancel["ok"], true, "{cancel}");
+    let second = parse(&export_clip_with_exe(&req, &state, &exe));
+    assert_eq!(second["ok"], true, "{second}");
+    assert_ne!(
+        second["job"]["id"], first_id,
+        "a cancel-pending job must not be reused: {second}"
+    );
+    assert_eq!(second["deduped"], false);
+    let second_id = second["job"]["id"].as_str().unwrap().to_string();
+    wait_for("second clip done", || {
+        state_lock(&state)
+            .clip_jobs
+            .iter()
+            .any(|job| job.id == second_id && job.state == "done")
+    });
+    let _ = std::fs::remove_dir_all(case);
+}
