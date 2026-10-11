@@ -739,10 +739,10 @@ function announceResultCount(n) {
 function audioFlag(record) {
   const codec = String(record.audioCodec || "").toLowerCase();
   if (codec && codec !== "none" && codec !== "-") {
-    return `<span class="audio-flag has" title="${escapeHtml(record.audioCodec)}">🔊</span>`;
+    return `<span class="audio-flag has" title="${escapeHtml(record.audioCodec)}">${ftIcon("audio")}</span>`;
   }
   if (record.probeOk === true) {
-    return `<span class="audio-flag none" title="${escapeHtml(t("audio.absent"))}">🔇</span>`;
+    return `<span class="audio-flag none" title="${escapeHtml(t("audio.absent"))}">${ftIcon("mute")}</span>`;
   }
   return "";
 }
@@ -754,13 +754,13 @@ const thumbDead = new Set();
 
 // Status is never colour alone: every status badge carries an icon + text.
 function statusIcon(status) {
-  if (status === "ffprobe-video-stream-confirmed" || status === "ffprobe-confirmed") return "✓";
-  if (status === "validation-failed") return "✕";
-  if (status === "duplicate-candidate") return "⧉";
-  return "?";
+  if (status === "ffprobe-video-stream-confirmed" || status === "ffprobe-confirmed") return "check";
+  if (status === "validation-failed") return "x";
+  if (status === "duplicate-candidate") return "copy";
+  return "question";
 }
 function statusBadgeHtml(status) {
-  return `<span class="badge ${statusClass(status)}" title="${escapeHtml(status)}"><span class="st-ic" aria-hidden="true">${statusIcon(status)}</span>${escapeHtml(statusLabel(status))}</span>`;
+  return `<span class="badge ${statusClass(status)}" title="${escapeHtml(status)}">${ftIcon(statusIcon(status))}${escapeHtml(statusLabel(status))}</span>`;
 }
 
 // While the workstation is still scanning/enriching (live index), a record
@@ -784,14 +784,14 @@ function thumbHtml(record, displayName) {
   // A URL that failed (twice) can be retried; a record that never had a
   // thumbnail has nothing to retry.
   const retry = record.thumb
-    ? `<button type="button" class="thumb-retry" data-thumb-retry="${escapeHtml(record.thumb)}" title="${escapeHtml(t("thumb.retryTip"))}">${escapeHtml(t("thumb.retry"))}</button>`
+    ? `<button type="button" class="quiet" data-thumb-retry="${escapeHtml(record.thumb)}" title="${escapeHtml(t("thumb.retryTip"))}">${escapeHtml(t("thumb.retry"))}</button>`
     : "";
   return `<div class="ph"><span>${t("thumb.missing")}</span>${retry}</div>`;
 }
 
 function renderCard(record) {
   const mark = markOf(record);
-  const markChip = mark ? `<span class="mark-chip ${escapeHtml(mark.status)}">${escapeHtml(markLabel(mark.status))}</span>` : "";
+  const markChip = mark ? markChipHtml(mark.status) : "";
   const staleTag = record.indexStatus === "stale" ? '<span class="muted">(stale)</span>' : "";
   const displayName = record.originalName && record.originalName !== record.name
     ? record.originalName
@@ -807,11 +807,11 @@ function renderCard(record) {
     ? `<div class="tag-row">${tagListFor(record).map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("")}</div>`
     : "";
   const anomalyChip = record.hasAnomaly
-    ? `<span class="badge anomaly" title="${escapeHtml(record.anomalies.map(item => item.kind).join(", "))}"><span class="st-ic" aria-hidden="true">⚠</span>${escapeHtml(t("header.anomaly"))}</span>`
+    ? `<span class="badge anomaly" title="${escapeHtml(record.anomalies.map(item => item.kind).join(", "))}">${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}</span>`
     : "";
   const kindChip = `<span class="kind-badge kind-${escapeHtml(record.kind || "video")}" title="${t("tree.kind")}">${escapeHtml(KIND_SHORT[record.kind] || record.kind || "?")}</span>`;
   const warnChip = (record.warnings || []).length
-    ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}"><span class="st-ic" aria-hidden="true">!</span>${tf("warn.count", { n: record.warnings.length })}</span>`
+    ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}">${ftIcon("info")}${tf("warn.count", { n: record.warnings.length })}</span>`
     : "";
   const dflChip = record.dfl && record.dfl.band
     ? `<span class="badge dfl dfl-${escapeHtml(record.dfl.band)}" title="${escapeHtml(tf("dfl.title", { score: record.dfl.score ?? "" }))}">${escapeHtml(tf("dfl.badge", { band: record.dfl.band_label || record.dfl.band }))}</span>`
@@ -860,15 +860,15 @@ function renderHistogram(days) {
   const weekdayNames = Array.from({ length: 7 }, (_, i) =>
     new Date(2024, 0, 1 + i).toLocaleDateString(loc, { weekday: "narrow" })); // 2024-01-01 = Monday
   const cells = weekdayNames.map(w => `<span class="cal-wd">${escapeHtml(w)}</span>`);
-  for (let i = 0; i < startWeekday; i++) cells.push(`<span class="cal-cell empty"></span>`);
+  for (let i = 0; i < startWeekday; i++) cells.push(`<span class="cal-day empty"></span>`);
   for (let d = 1; d <= dim; d++) {
     const day = `${state.calMonth}-${String(d).padStart(2, "0")}`;
     const count = days.get(day) || 0;
     const selected = state.dateFrom === day && state.dateTo === day;
     const level = count ? Math.min(4, 1 + Math.floor((count * 3) / max)) : 0;
     cells.push(count
-      ? `<button type="button" class="cal-cell l${level}${selected ? " selected" : ""}" data-day="${day}" aria-pressed="${selected}" title="${escapeHtml(tf("hist.item", { day, count }))}"><span class="cal-d">${d}</span><span class="sr-only"> · </span><span class="cal-n">${count > 99 ? "99+" : count}</span><span class="sr-only">${escapeHtml(t("unit.count"))}</span></button>`
-      : `<span class="cal-cell l0${selected ? " selected" : ""}" data-day="${day}"><span class="cal-d">${d}</span></span>`);
+      ? `<button type="button" class="quiet toggle cal-day l${level}${selected ? " selected" : ""}" data-day="${day}" aria-pressed="${selected}" title="${escapeHtml(tf("hist.item", { day, count }))}"><span class="cal-d">${d}</span><span class="sr-only"> · </span><span class="cal-n">${count > 99 ? "99+" : count}</span><span class="sr-only">${escapeHtml(t("unit.count"))}</span></button>`
+      : `<span class="cal-day l0${selected ? " selected" : ""}" data-day="${day}"><span class="cal-d">${d}</span></span>`);
   }
   const monthLabel = new Date(cy, cm - 1, 1).toLocaleDateString(loc, { year: "numeric", month: "long" });
   const mi = months.indexOf(state.calMonth);
@@ -883,9 +883,9 @@ function renderHistogram(days) {
   const nextTip = mi >= months.length - 1 ? t("layout.calNextNone") : t("cal.next");
   const nav = months.length > 1
     ? `<div class="cal-nav">
-        <button type="button" class="cal-btn" id="calPrev" ${mi <= 0 ? "disabled" : ""} title="${escapeHtml(prevTip)}" aria-label="${escapeHtml(prevTip)}">‹</button>
+        <button type="button" class="quiet icon cal-nav-btn cal-prev" id="calPrev" ${mi <= 0 ? "disabled" : ""} title="${escapeHtml(prevTip)}" aria-label="${escapeHtml(prevTip)}">${ftIcon("chevron-right")}</button>
         ${yearSel}<span class="cal-month">${escapeHtml(shortMonth)}</span>
-        <button type="button" class="cal-btn" id="calNext" ${mi >= months.length - 1 ? "disabled" : ""} title="${escapeHtml(nextTip)}" aria-label="${escapeHtml(nextTip)}">›</button>
+        <button type="button" class="quiet icon cal-nav-btn" id="calNext" ${mi >= months.length - 1 ? "disabled" : ""} title="${escapeHtml(nextTip)}" aria-label="${escapeHtml(nextTip)}">${ftIcon("chevron-right")}</button>
       </div>`
     : `<div class="cal-nav"><span class="cal-month">${escapeHtml(monthLabel)}</span></div>`;
   els.dayHistogram.innerHTML = `<div class="cal">${nav}<div class="cal-grid">${cells.join("")}</div></div>`;

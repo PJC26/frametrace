@@ -136,10 +136,11 @@ function renderSaveState() {
     label = t("save.saved");
     title = t("save.title.saved");
   }
-  saveStateEl.className = `badge save-state ${cls}`;
+  saveStateEl.className = `quiet save-ind ${cls}`;
   saveStateEl.style.fontWeight = kind === "failed" || kind === "pending" ? "700" : "";
   saveStateEl.dataset.state = kind;
-  saveStateEl.textContent = label;
+  saveStateEl.innerHTML = `${ftIcon(kind === "failed" ? "warning" : kind === "saved" ? "check" : kind === "saving" ? "spinner" : "save")}<span class="save-label"></span>`;
+  saveStateEl.lastElementChild.textContent = label;
   saveStateEl.title = title;
   saveStateEl.setAttribute("aria-label", `${label} — ${title}`);
   // Host notification (FTViewer "save-state"): only on an actual change.
@@ -733,7 +734,7 @@ function showRangeDivergenceBanner(ids) {
   const mk = (id, label, side) => {
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "mini";
+    b.className = "quiet";
     b.id = id;
     b.textContent = label;
     b.addEventListener("click", () => { resolveRangeDivergence(ids, side); bar.remove(); });

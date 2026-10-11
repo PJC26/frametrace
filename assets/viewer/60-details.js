@@ -144,11 +144,11 @@ function renderDetails() {
     }
   }
   document.getElementById("detailBadges").innerHTML = [
-    `<span class="badge ${statusClass(record.status)}">${escapeHtml(statusLabel(record.status))}</span>`,
+    `<span class="badge ${statusClass(record.status)}">${ftIcon(statusIcon(record.status))}${escapeHtml(statusLabel(record.status))}</span>`,
     (record.warnings || []).length ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}">${tf("warn.count", { n: record.warnings.length })}</span>` : "",
-    record.hasAnomaly ? `<span class="badge anomaly">${escapeHtml(t("header.anomaly"))}</span>` : "",
+    record.hasAnomaly ? `<span class="badge anomaly">${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}</span>` : "",
     record.dfl && record.dfl.band ? `<span class="badge dfl dfl-${escapeHtml(record.dfl.band)}">${escapeHtml(tf("dfl.badge", { band: record.dfl.band_label || record.dfl.band }))}</span>` : "",
-    mark ? `<span class="mark-chip ${escapeHtml(mark.status)}">${escapeHtml(markLabel(mark.status))}</span>` : "",
+    mark ? markChipHtml(mark.status) : "",
     ...recordTags.map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`),
     record.indexStatus === "stale" ? '<span class="muted">stale</span>' : ""
   ].join(" ");
@@ -176,10 +176,10 @@ function renderDetails() {
   ].map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${v}</dd>`).join("");
   // tag editor for the selected evidence
   const tagEditorHtml = `<div class="tag-editor">
-    ${tagPresets().map(preset => `<button type="button" class="tag-btn ${recordTags.includes(preset) ? "on" : ""}" data-preset-tag="${escapeHtml(preset)}">${escapeHtml(preset)}</button>`).join("")}
+    ${tagPresets().map(preset => `<button type="button" class="quiet toggle tag-btn ${recordTags.includes(preset) ? "on" : ""}" aria-pressed="${recordTags.includes(preset)}" data-preset-tag="${escapeHtml(preset)}">${escapeHtml(preset)}</button>`).join("")}
     <input type="text" class="tag-input" id="customTagInput" placeholder="${t("tag.input")}" aria-label="${escapeHtml(t("tag.input"))}" style="width:104px;height:28px;font-size:12px;">
-    <button type="button" class="mini" id="btnAddCustomTag">${t("tag.apply")}</button>
-    <button type="button" class="mini" id="btnSaveCustomTag" title="${t("tag.presetSave.title")}">${t("tag.presetSave")}</button>
+    <button type="button" class="quiet" id="btnAddCustomTag">${t("tag.apply")}</button>
+    <button type="button" class="quiet" id="btnSaveCustomTag" title="${t("tag.presetSave.title")}">${t("tag.presetSave")}</button>
   </div>`;
   // replace existing tag editor if any
   const oldEditor = ftRoot.querySelector(".tag-editor-wrap");
@@ -405,10 +405,10 @@ function renderChips() {
     if (secondary && !state.chipsExpanded && state.chip !== value) { hidden += 1; continue; }
     const tip = t(`chip.tip.${label.slice(5)}`);
     const on = state.chip === value;
-    parts.push(`<button type="button" class="chip ${on ? "active" : ""}" data-chip="${escapeHtml(value)}" aria-pressed="${on}" title="${escapeHtml(tip)}">${escapeHtml(t(label))}</button>`);
+    parts.push(`<button type="button" class="quiet toggle rail-chip ${on ? "active" : ""}" data-chip="${escapeHtml(value)}" aria-pressed="${on}" title="${escapeHtml(tip)}">${escapeHtml(t(label))}</button>`);
   }
   if (hidden || state.chipsExpanded) {
-    parts.push(`<button type="button" class="chip chip-more" id="chipMore" aria-expanded="${!!state.chipsExpanded}">${escapeHtml(t(state.chipsExpanded ? "chip.less" : "chip.more"))}</button>`);
+    parts.push(`<button type="button" class="quiet rail-chip chip-more" id="chipMore" aria-expanded="${!!state.chipsExpanded}">${escapeHtml(t(state.chipsExpanded ? "chip.less" : "chip.more"))}</button>`);
   }
   els.presetChips.innerHTML = parts.join("");
   document.getElementById("chipMore")?.addEventListener("click", () => {
@@ -416,14 +416,14 @@ function renderChips() {
     renderChips();
     document.getElementById("chipMore")?.focus();
   });
-  els.presetChips.querySelectorAll(".chip[data-chip]").forEach(chip => {
+  els.presetChips.querySelectorAll("[data-chip]").forEach(chip => {
     chip.addEventListener("click", () => {
       const value = chip.dataset.chip;
       const hadFocus = document.activeElement === chip;
       applyPresetChip(value);
       if (!hadFocus) return;
       render();
-      els.presetChips.querySelector(`.chip[data-chip="${CSS.escape(value)}"]`)?.focus();
+      els.presetChips.querySelector(`[data-chip="${CSS.escape(value)}"]`)?.focus();
     });
   });
   // Count pills mirror the status select / anomaly chip.
@@ -471,8 +471,8 @@ function renderActiveFilters() {
   host.hidden = !list.length;
   if (!list.length) { host.innerHTML = ""; return; }
   const chips = list.map(([key, label]) =>
-    `<button type="button" class="af-chip" data-af="${key}" aria-label="${escapeHtml(tf("layout.clearFilter", { label }))}" title="${escapeHtml(tf("layout.clearFilter", { label }))}"><span>${escapeHtml(label)}</span><span class="af-x" aria-hidden="true">✕</span></button>`);
-  if (list.length > 1) chips.push(`<button type="button" class="btn-sm" data-af="all">${escapeHtml(t("layout.clearAll"))}</button>`);
+    `<button type="button" class="quiet af-chip" data-af="${key}" aria-label="${escapeHtml(tf("layout.clearFilter", { label }))}" title="${escapeHtml(tf("layout.clearFilter", { label }))}"><span>${escapeHtml(label)}</span><span class="af-x" aria-hidden="true">${ftIcon("x")}</span></button>`);
+  if (list.length > 1) chips.push(`<button type="button" class="quiet" data-af="all">${escapeHtml(t("layout.clearAll"))}</button>`);
   host.innerHTML = chips.join("");
 }
 
