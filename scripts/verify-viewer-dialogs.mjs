@@ -14,6 +14,14 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+
+// The secondary player tools (clip export, size ...) live in the "더보기"
+// popover when the media column is narrow: open it first.
+const openTools = (p) => p.evaluate(() => {
+  const b = document.getElementById('btnMoreTools');
+  const l = document.getElementById('moreToolsList');
+  if (b && b.offsetParent && l && l.hidden) b.click();
+});
 import { viewerBundleCss } from './lib/app-bundle.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -116,6 +124,7 @@ try {
     const body = url.searchParams.get('job') === 'clip-1' ? { ok: true, job } : { ok: false, error: 'unknown job' };
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
   });
+  await openTools(page);
   await page.locator('#btnExportClip').click();
   check('export asks IN/OUT in a dialog', await page.locator('.modal.dlg input').count() === 2);
   check('IN/OUT prefilled from the marked range', (await page.locator('.modal.dlg input').nth(0).inputValue()) === '5.000' && (await page.locator('.modal.dlg input').nth(1).inputValue()) === '15.000');
@@ -149,6 +158,7 @@ try {
       : { id: 'clip-1', state: 'running', elapsed_secs: 1, bytes_written: 1000 };
     route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, job }) });
   });
+  await openTools(page);
   await page.locator('#btnExportClip').click();
   await page.locator('.modal.dlg button.primary').click();
   await page.waitForSelector('.clip-progress button', { timeout: 4000 });
@@ -167,6 +177,7 @@ try {
   // legacy synchronous response still works
   await page.unroute('**/api/export-clip');
   await page.route('**/api/export-clip', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, path: '/case/exports/old.mp4' }) }));
+  await openTools(page);
   await page.locator('#btnExportClip').click();
   await page.locator('.modal.dlg button.primary').click();
   await page.waitForSelector('.modal.dlg .dlg-msg');
@@ -176,6 +187,7 @@ try {
   // server error: toast + button recovers
   await page.unroute('**/api/export-clip');
   await page.route('**/api/export-clip', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'ffmpeg missing' }) }));
+  await openTools(page);
   await page.locator('#btnExportClip').click();
   await page.locator('.modal.dlg button.primary').click();
   await page.waitForFunction(() => /ffmpeg missing/.test(document.getElementById('toastHost').textContent), null, { timeout: 3000 }).catch(() => {});
@@ -183,6 +195,7 @@ try {
   check('button usable again after an error', await page.evaluate(() => !document.querySelector('#btnExportClip').disabled));
 
   // bad range is rejected without a request
+  await openTools(page);
   await page.locator('#btnExportClip').click();
   await page.locator('.modal.dlg input').nth(1).fill('1');
   await page.locator('.modal.dlg button.primary').click();
@@ -192,6 +205,7 @@ try {
   await page.evaluate(() => { const z = document.getElementById('videoZoom'); z.value = '150'; z.dispatchEvent(new Event('input', { bubbles: true })); });
   const zoomState = await page.evaluate(() => [document.getElementById('videoMode').value, document.getElementById('mediaStage').classList.contains('mode-zoom')]);
   check('zoom slider leaves fit mode', zoomState[0] === 'custom' && zoomState[1] === true, zoomState.join(','));
+  await openTools(page);
   await page.selectOption('#videoMode', '50');
   check('preset size drives the slider', (await page.locator('#videoZoom').inputValue()) === '50');
 

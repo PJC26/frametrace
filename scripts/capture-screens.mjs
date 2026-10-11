@@ -255,6 +255,8 @@ async function runCombo({ w, h, theme }, sub) {
     await cpage.click('#btnSetIn').catch(() => {});
     await cpage.evaluate(() => window.__ftCt && window.__ftCt(4));
     await cpage.click('#btnSetOut').catch(() => {});
+    // Narrow media column: the clip export lives in the 더보기 popover.
+    await cpage.evaluate(() => { const b = document.getElementById('btnMoreTools'); const l = document.getElementById('moreToolsList'); if (b && b.offsetParent && l && l.hidden) b.click(); });
     await cpage.click('#btnExportClip').catch(() => {});
     const clipOpen = await cpage.waitForSelector('.modal.dlg', { timeout: 2500 }).catch(() => null);
     // Focusing the dialog input scrolls the overflowing page sideways by a

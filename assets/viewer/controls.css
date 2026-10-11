@@ -1,0 +1,176 @@
+/* FrameTrace viewer — controls: bottom action bar, player toolbar, menus,
+   toasts, command palette.  Bundled AFTER evidence_viewer.css (build.rs
+   viewer_css_bundle, scripts/lib/app-bundle.mjs viewerBundleCss) and driven
+   only by the shared tokens in assets/tokens.css, so both themes follow.
+
+   Button language (the acceptance contract for this file)
+     primary    filled accent   exactly one per region (케이스에 반영)
+     secondary  outlined        default for every control
+     tertiary   ghost           low-emphasis (전체 선택 / 해제)
+     states     default / hover / pressed / focus-visible (--focus-ring) /
+                disabled (>=3:1, tooltip carries the reason) / busy
+                (spinner + aria-busy, from withBusy)
+     size       32px tall, never below 24x24 */
+
+/* The body grid had an implicit auto column: wide page content (calendar,
+   facet tree) stretched it past the viewport and pushed the right end of
+   the action bar and the media toolbar off-screen. Pin it to the viewport. */
+body { grid-template-columns: minmax(0, 1fr); }
+
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+
+/* ---- key caps ---- */
+kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--muted); font: 600 var(--fs-xs)/16px var(--font-mono); }
+
+/* ======================================================================
+   Action bar — 44px, three zones, one row from 1366px, wraps below
+   ====================================================================== */
+.selection-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; min-height: 44px; padding: 6px 12px; background: var(--surface); border-top: 1px solid var(--border); }
+.bar-zone { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
+.bar-progress { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; }
+.bar-progress progress { width: 56px; height: 6px; accent-color: var(--accent); }
+
+/* shared geometry + secondary (outlined) look */
+#selectionBar button:where(:not(.save-state):not(.menu-list *)), #mediaToolbar .tb-row button:where(:not(.menu-list *)) {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 32px; min-width: 32px; padding: 0 12px; border-radius: var(--radius);
+  background: var(--surface); color: var(--text); border: 1px solid var(--border-strong);
+  font: inherit; font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+#selectionBar button:where(:not(.save-state):not(.menu-list *)):hover, #mediaToolbar .tb-row button:where(:not(.menu-list *)):hover { background: var(--surface-2); border-color: var(--accent); }
+#selectionBar button:where(:not(.save-state):not(.menu-list *)):active, #mediaToolbar .tb-row button:where(:not(.menu-list *)):active { background: var(--accent-soft); border-color: var(--accent-ink); box-shadow: inset 0 1px 2px rgba(0,0,0,.16); }
+#selectionBar button:where(:not(.menu-list *)):focus-visible, #selectionBar input:focus-visible, #mediaToolbar button:where(:not(.menu-list *)):focus-visible, #mediaToolbar select:focus-visible, #mediaToolbar input:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); position: relative; z-index: 3; }
+#selectionBar button:where(:not(.save-state):not(.menu-list *)):disabled, #mediaToolbar .tb-row button:where(:not(.menu-list *)):disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--border); box-shadow: none; cursor: not-allowed; }
+/* tertiary (ghost) */
+#selectionBar #btnSelectFiltered, #selectionBar #btnClearSelection { background: transparent; border-color: transparent; }
+#selectionBar #btnSelectFiltered:hover, #selectionBar #btnClearSelection:hover { background: var(--surface-2); border-color: var(--border-strong); }
+/* primary (filled) — one per region */
+#selectionBar button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+#selectionBar button.primary:hover { background: var(--accent-ink); border-color: var(--accent-ink); }
+#selectionBar button.primary:active { background: var(--accent-ink); filter: brightness(.92); }
+#selectionBar button.primary:disabled { background: var(--disabled-bg); border-color: var(--border); color: var(--disabled-fg); }
+/* busy: spinner (from evidence_viewer.css ::before) + full-contrast label */
+#selectionBar button.busy, #mediaToolbar button.busy, html:root .menu-list button.busy { opacity: 1; cursor: progress; }
+#selectionBar button.busy:disabled, #mediaToolbar .tb-row button:where(:not(.menu-list *)).busy:disabled { background: var(--surface-2); color: var(--text); border-color: var(--accent); }
+#selectionBar button.primary.busy:disabled { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+button.busy::before { margin-right: 0; }
+
+/* segmented groups */
+.seg, .scope-seg, .tb-group { display: inline-flex; align-items: stretch; }
+#selectionBar .seg button, #selectionBar .scope-seg button, #mediaToolbar .tb-group button { border-radius: 0; margin-left: -1px; }
+#selectionBar .seg button:first-child, #selectionBar .scope-seg button:first-child, #mediaToolbar .tb-group button:first-child { border-radius: var(--radius) 0 0 var(--radius); margin-left: 0; }
+#selectionBar .seg button:last-child, #selectionBar .scope-seg button:last-child, #mediaToolbar .tb-group button:last-child { border-radius: 0 var(--radius) var(--radius) 0; }
+#selectionBar .seg button:hover, #selectionBar .scope-seg button:hover, #mediaToolbar .tb-group button:hover { position: relative; z-index: 1; }
+#selectionBar .seg button { padding: 0 10px; }
+#selectionBar .scope-seg button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; position: relative; z-index: 1; }
+#selectionBar .scope-seg button[aria-pressed="true"]:hover { background: var(--accent-soft); }
+
+/* reviewer field + save state */
+#selectionBar #examinerName { width: 96px; height: 32px; padding: 0 10px; border-radius: var(--radius); border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); font: inherit; font-size: var(--fs-sm); }
+#selectionBar #examinerName::placeholder { color: var(--muted); opacity: 1; }
+#selectionBar button.save-state { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: var(--radius); font: inherit; font-size: var(--fs-sm); cursor: pointer; white-space: nowrap; }
+#selectionBar button.save-state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+#selectionBar button.save-state:hover { border-color: var(--accent); }
+
+/* ======================================================================
+   Menus (action bar, header 보기, player 더보기)
+   ====================================================================== */
+html:root .menu-list { min-width: 208px; padding: 6px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius); box-shadow: 0 8px 24px rgba(0,0,0,.18); z-index: 40; }
+html:root .menu-list button { display: flex; align-items: center; width: 100%; height: 32px; min-width: 32px; padding: 0 10px; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--text); font: inherit; font-size: var(--fs-sm); text-align: left; white-space: nowrap; cursor: pointer; }
+html:root .menu-list button:hover { background: var(--surface-2); border-color: transparent; }
+html:root .menu-list button:active { background: var(--accent-soft); }
+html:root .menu-list button:focus-visible { outline: var(--focus-ring); outline-offset: -2px; position: relative; z-index: 1; }
+html:root .menu-list button:disabled { background: transparent; color: var(--disabled-fg); border-color: transparent; cursor: not-allowed; }
+html:root .menu-list button.busy:disabled { color: var(--text); }
+html:root .menu-list button.busy::before { margin-right: 6px; }
+html:root .menu-list .menu-sec { color: var(--muted); font-size: var(--fs-xs); }
+.menu-list.tag-menu { min-width: 232px; }
+.tag-menu-row { gap: 2px; }
+html:root .tag-menu-row > button:first-child { width: auto; flex: 1 1 0; min-width: 0; }
+html:root .tag-menu-row .tag-del { width: 32px; flex: none; padding: 0; justify-content: center; text-align: center; }
+.tag-add { gap: 6px; padding: 6px 4px 2px; }
+.tag-add input { height: 32px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); padding: 0 8px; font-size: var(--fs-sm); }
+html:root .tag-add button { width: auto; justify-content: center; border: 1px solid var(--border-strong); }
+.bar-save .menu-list { left: auto; right: 0; }
+.menu-list.menu-fixed { position: fixed; min-width: 248px; max-width: calc(100vw - 16px); overflow-y: auto; z-index: 70; }
+
+/* ======================================================================
+   Player toolbar — transport row always inline; the rest inline (row 2)
+   when the media column is wide, else in the 더보기 popover
+   ====================================================================== */
+.player { grid-template-rows: 32px minmax(0, 1fr) auto; }
+body.theater .player { grid-template-rows: 34px minmax(0, 1fr) auto; }
+#mediaToolbar { --tb-bg: #16231f; --tb-fg: #eaf3ef; --tb-line: #4b625a; --tb-hover: #22352f; --tb-ring: #7fd6c7;
+  display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 0; padding: 0; background: var(--tb-bg); color: var(--tb-fg); }
+.tb-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px; min-width: 0; }
+.tb-row + .tb-row { border-top: 1px solid #2c3a34; }
+.tb-spacer { flex: 1 1 8px; }
+.tb-range { white-space: nowrap; }
+.tb-range:empty { display: none; }
+.tb-size { display: inline-flex; align-items: center; gap: 8px; }
+#mediaToolbar .muted { color: var(--media-muted); font-size: var(--fs-xs); }
+#mediaToolbar .tb-row button:where(:not(.menu-list *)) { background: var(--tb-bg); color: var(--tb-fg); border-color: var(--tb-line); padding: 0 8px; font-size: var(--fs-xs); }
+#mediaToolbar .tb-row button:where(:not(.menu-list *)):hover { background: var(--tb-hover); border-color: var(--tb-ring); }
+#mediaToolbar .tb-row button:where(:not(.menu-list *)):active { background: #2c443c; border-color: var(--tb-ring); }
+#mediaToolbar .tb-row button:where(:not(.menu-list *)).on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 700; }
+#mediaToolbar .tb-row button:where(:not(.menu-list *)):disabled { background: var(--tb-bg); color: #8ea39b; border-color: #34463f; }
+#mediaToolbar .tb-row button:where(:not(.menu-list *)).busy:disabled { background: var(--tb-hover); color: var(--tb-fg); border-color: var(--tb-ring); }
+#mediaToolbar button:where(:not(.menu-list *)):focus-visible, #mediaToolbar select:focus-visible, #mediaToolbar input:focus-visible { outline-color: var(--tb-ring); }
+#mediaToolbar kbd { background: rgba(255,255,255,.1); border-color: var(--tb-line); color: var(--media-muted); }
+#mediaToolbar .tb-row select { height: 32px; padding: 0 8px; border-radius: var(--radius); background: var(--tb-bg); color: var(--tb-fg); border: 1px solid var(--tb-line); font-size: var(--fs-xs); }
+#mediaToolbar .tb-row input[type="range"] { width: 120px; height: 24px; padding: 0; background: transparent; border: 0; accent-color: var(--accent); }
+/* the same elements, once moved into the popover, follow the page theme */
+#mediaToolbar .menu-list { color: var(--text); }
+#mediaToolbar .menu-list .muted { color: var(--muted); }
+#mediaToolbar .menu-list .tb-size { padding: 4px 10px; width: 100%; flex-wrap: wrap; }
+#mediaToolbar .menu-list select { height: 32px; background: var(--surface); color: var(--text); border-color: var(--border-strong); }
+#mediaToolbar .menu-list input[type="range"] { width: 100%; height: 24px; padding: 0; background: transparent; border: 0; accent-color: var(--accent); }
+#mediaToolbar .menu-list #metricVideos { padding: 4px 10px; }
+#mediaToolbar .menu-list button.on { background: var(--accent-soft); color: var(--accent-ink); font-weight: 700; }
+#mediaToolbar .menu-list button { font-size: var(--fs-sm); }
+
+/* ======================================================================
+   Toasts — top-right (below the header), max 3, never over the action bar
+   ====================================================================== */
+#toastHost { position: fixed; top: 54px; right: 14px; bottom: auto; z-index: 60; display: grid; gap: 8px; width: min(420px, calc(100vw - 28px)); pointer-events: none; }
+body.embed #toastHost { top: 48px; }
+#toastHost > .toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 8px; max-width: none; padding: 8px 6px 8px 14px; border-radius: var(--radius); border-left: 4px solid var(--accent); background: #1f2724; color: #f2f7f5; font-size: var(--fs-sm); line-height: var(--lh-ctl); box-shadow: 0 6px 18px rgba(0,0,0,.28); }
+#toastHost .toast-text { flex: 1 1 auto; min-width: 0; padding-top: 3px; overflow-wrap: anywhere; }
+#toastHost .toast-error { border-left-color: #ff8a80; }
+#toastHost .toast-error::before { content: "!"; flex: none; display: grid; place-items: center; width: 20px; height: 20px; margin-top: 2px; border-radius: 50%; background: #ff8a80; color: #1f2724; font-weight: 800; font-size: var(--fs-xs); }
+#toastHost .toast button { flex: none; min-width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: #d8e4df; font: inherit; font-size: var(--fs-xs); cursor: pointer; padding: 0 8px; }
+#toastHost .toast button:hover { background: rgba(255,255,255,.14); }
+#toastHost .toast button:focus-visible { outline: 2px solid #7fd6c7; outline-offset: 1px; }
+#toastHost .toast button.toast-action { border-color: #8ea39b; color: #f2f7f5; }
+#toastHost .toast button:disabled { color: #9db0a8; cursor: not-allowed; }
+#toastHost .toast .toast-close { padding: 0; }
+
+/* live index chip (99-loader.js keeps the id; it is moved into the header,
+   or docked top-right when the page is embedded) — never over the bar */
+#ft-live-chip { position: static !important; right: auto !important; bottom: auto !important; z-index: auto !important; flex: 0 0 auto; max-width: min(460px, 42vw) !important; white-space: nowrap; box-shadow: none !important; }
+#ft-live-chip button { min-height: 24px; min-width: 24px; }
+body.embed #ft-live-chip { position: fixed !important; top: 8px; right: 8px !important; z-index: 55 !important; }
+
+/* ======================================================================
+   Command palette (Ctrl+K) — shortcuts-modal styling
+   ====================================================================== */
+.modal.palette { display: flex; flex-direction: column; gap: 6px; width: min(560px, calc(100vw - 32px)); max-width: none; padding: 8px; }
+.palette-input { height: 36px; padding: 0 10px; border-radius: var(--radius); border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); font-size: var(--fs-md); }
+.palette-list { list-style: none; margin: 0; padding: 0; overflow: auto; }
+.cmd-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; padding: 0 10px; border-radius: var(--radius-sm); cursor: pointer; color: var(--text); font-size: var(--fs-sm); }
+.cmd-item:hover { background: var(--surface-2); }
+.cmd-item.on { background: var(--accent-soft); color: var(--accent-ink); }
+.cmd-item.off .cmd-label { color: var(--disabled-fg); }
+.cmd-tip { max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: var(--fs-xs); }
+.cmd-empty { padding: 8px 10px; color: var(--muted); font-size: var(--fs-sm); }
+
+/* ======================================================================
+   In-page dialogs (askDialog): one primary (OK), cancel is secondary
+   ====================================================================== */
+.dlg .dlg-actions button { height: 32px; min-width: 72px; padding: 0 14px; border-radius: var(--radius); background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); font: inherit; font-size: var(--fs-sm); cursor: pointer; }
+.dlg .dlg-actions button:hover { background: var(--surface-2); border-color: var(--accent); }
+.dlg .dlg-actions button:active { background: var(--accent-soft); }
+.dlg .dlg-actions button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.dlg .dlg-actions button.primary:hover { background: var(--accent-ink); border-color: var(--accent-ink); }
+.dlg .dlg-actions button:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--border); cursor: not-allowed; }

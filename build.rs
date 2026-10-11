@@ -89,10 +89,14 @@ fn tokens_path() -> PathBuf {
 }
 
 fn viewer_css_bundle(out_dir: &Path) {
+    // Order matters: tokens, the page stylesheet, then the control styles
+    // (action bar, player toolbar, menus, toasts) which refine it.
     let viewer_css = PathBuf::from("assets/evidence_viewer.css");
+    let controls_css = PathBuf::from("assets/viewer/controls.css");
     println!("cargo:rerun-if-changed={}", viewer_css.display());
+    println!("cargo:rerun-if-changed={}", controls_css.display());
     let css = concat(
-        &[tokens_path(), viewer_css],
+        &[tokens_path(), viewer_css, controls_css],
         "assets/viewer/bundle.css",
         "css",
     );

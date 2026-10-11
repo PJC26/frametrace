@@ -11,6 +11,17 @@ import { appBundleCss, viewerBundleCss } from "./lib/app-bundle.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const files = ["assets/evidence_viewer.css", "assets/app/app.css"];
+// controls.css has no token block of its own (it is bundled after tokens.css +
+// evidence_viewer.css): only brace balance is checked here.
+for (const extra of ["assets/viewer/controls.css"]) {
+  const css = readFileSync(join(root, extra), "utf8");
+  const open = (css.match(/{/g) ?? []).length;
+  const close = (css.match(/}/g) ?? []).length;
+  if (open !== close) {
+    console.error(`${extra}: unbalanced braces (${open} open / ${close} close)`);
+    process.exitCode = 1;
+  } else console.log(`${extra}: ok`);
+}
 
 for (const file of files) {
   const css = readFileSync(join(root, file), "utf8");
