@@ -74,6 +74,11 @@ struct SourceRow {
     write_protect: Option<String>,
     acquisition_tool: Option<String>,
     evidence_hash: Option<String>,
+    /// `evidence_hash_algorithm` (schema v6; `None` on older databases).
+    hash_algorithm: Option<String>,
+    /// `evidence_hash_origin`: "computed" / "operator-supplied" (schema
+    /// v6; `None` = not recorded).
+    hash_origin: Option<String>,
     /// What a re-stat of `path` observed at statement generation time.
     observed: String,
 }
@@ -129,12 +134,27 @@ fn observe_path(path: &str) -> String {
 
 fn load_evidence_sources(case_dir: &Path) -> Result<Vec<SourceRow>, String> {
     let conn = open_case_db_for_statement(case_dir)?;
+    // Read-only connections skip init_schema: a pre-v6 database has no
+    // algorithm/origin columns — read NULLs (shown as "origin not
+    // recorded") instead of failing the statement.
+    let has = |col: &str| case_db::table_has_column(&conn, "evidence_sources", col);
+    let algo_col = if has("evidence_hash_algorithm")? {
+        "evidence_hash_algorithm"
+    } else {
+        "NULL"
+    };
+    let origin_col = if has("evidence_hash_origin")? {
+        "evidence_hash_origin"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT source_id, kind, path, registered_unix, write_protect,
+                acquisition_tool, evidence_hash, {algo_col}, {origin_col}
+         FROM evidence_sources ORDER BY registered_unix ASC"
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT source_id, kind, path, registered_unix, write_protect,
-                acquisition_tool, evidence_hash
-         FROM evidence_sources ORDER BY registered_unix ASC",
-        )
+        .prepare(&sql)
         .map_err(|err| format!("failed to query evidence sources: {err}"))?;
     let rows = stmt
         .query_map([], |row| {
@@ -148,11 +168,36 @@ fn load_evidence_sources(case_dir: &Path) -> Result<Vec<SourceRow>, String> {
                 write_protect: row.get(4)?,
                 acquisition_tool: row.get(5)?,
                 evidence_hash: row.get(6)?,
+                hash_algorithm: row.get(7)?,
+                hash_origin: row.get(8)?,
             })
         })
         .map_err(|err| format!("failed to query evidence sources: {err}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("failed to read evidence source row: {err}"))
+}
+
+/// The evidence-hash cell: the value plus where it came from (FOR-04), so
+/// an operator-typed hash never reads as one FrameTrace computed.
+fn evidence_hash_cell(s: &SourceRow) -> String {
+    let Some(hash) = s.evidence_hash.as_deref().filter(|h| !h.is_empty()) else {
+        return "—".to_string();
+    };
+    let class = if s.hash_origin.as_deref() == Some("computed") {
+        "ok"
+    } else {
+        "warn"
+    };
+    let algo = s
+        .hash_algorithm
+        .as_deref()
+        .map(|a| format!("{}:", esc(a)))
+        .unwrap_or_default();
+    format!(
+        "{algo}{}<br><span class={class}>{}</span>",
+        esc(hash),
+        esc(case_db::describe_hash_origin(s.hash_origin.as_deref()))
+    )
 }
 
 fn load_jobs(case_dir: &Path) -> Result<Vec<JobRow>, String> {
@@ -392,7 +437,7 @@ fn render(
                     ts(s.registered_unix),
                     opt(&s.write_protect),
                     opt(&s.acquisition_tool),
-                    opt(&s.evidence_hash),
+                    evidence_hash_cell(s),
                     esc(&s.observed),
                 ));
             }
@@ -559,9 +604,9 @@ th {{ background: #eef4f8; }}
 td.path {{ font-family: Consolas, monospace; font-size: 11px; word-break: break-all; }}
 td.hash {{ font-family: Consolas, monospace; font-size: 11px; }}
 td.empty {{ color: #888; font-style: italic; }}
-td.ok {{ color: #1d7a38; }}
+td.ok, span.ok {{ color: #1d7a38; }}
 td.bad, p.banner.bad {{ color: #b3261e; }}
-td.warn, p.note.warn {{ color: #8a5a00; }}
+td.warn, span.warn, p.note.warn {{ color: #8a5a00; }}
 p.note.bad {{ color: #b3261e; font-weight: 600; }}
 p.note.ok {{ color: #1d7a38; }}
 p.banner {{ padding: 10px 14px; border-radius: 6px; font-weight: 600; }}
@@ -587,7 +632,7 @@ p.banner:not(.ok):not(.bad):not(.warn) {{ background: #f1f3f4; color: #444; }}
 <tr><td>Case directory</td><td class=path>{case_dir_disp}</td></tr>
 </table>
 <h2>2. Evidence Sources</h2>
-<table><tr><th>Source ID</th><th>Kind</th><th>Path</th><th>Registered (UTC)</th><th>Write-protect</th><th>Acquisition tool</th><th>Evidence hash (as recorded, not re-verified)</th><th>Observed at generation</th></tr>
+<table><tr><th>Source ID</th><th>Kind</th><th>Path</th><th>Registered (UTC)</th><th>Write-protect</th><th>Acquisition tool</th><th>Evidence hash and origin (as recorded, not re-verified by this statement)</th><th>Observed at generation</th></tr>
 {src_rows}</table>
 {coverage_line}
 <h2>3. Processing Ledger</h2>
@@ -678,6 +723,81 @@ mod tests {
         assert!(html.contains("3 of 4"));
         assert!(html.contains("1 hash error"));
         assert!(html.contains("No evidence sources registered."));
+    }
+
+    #[test]
+    fn evidence_hash_shows_whether_frametrace_computed_it() {
+        let source = |id: &str, origin: Option<&str>| SourceRow {
+            source_id: id.into(),
+            kind: "e01".into(),
+            path: format!("/e/{id}.E01"),
+            registered_unix: 1_704_110_400,
+            write_protect: None,
+            acquisition_tool: None,
+            evidence_hash: Some("ab".repeat(32)),
+            hash_algorithm: Some("sha256".into()),
+            hash_origin: origin.map(str::to_string),
+            observed: "present".into(),
+        };
+        let html = render(
+            Path::new("/case"),
+            &serde_json::Value::Null,
+            &Ok(vec![
+                source("COMP", Some("computed")),
+                source("TYPED", Some("operator-supplied")),
+                source("OLD", None),
+            ]),
+            &Ok(Vec::new()),
+            &Err("n/a".to_string()),
+            &[],
+            "",
+            1_704_110_400,
+        );
+        assert!(
+            html.contains("<span class=ok>computed by FrameTrace</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=warn>operator-supplied, NOT verified by FrameTrace</span>")
+        );
+        assert!(html.contains("origin not recorded"));
+        assert!(html.contains(&format!("sha256:{}", "ab".repeat(32))));
+    }
+
+    #[test]
+    fn statement_reads_origin_from_case_db() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-custody-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let input = |path: &str| case_db::EvidenceSourceInput {
+            kind: "e01".into(),
+            path: path.into(),
+            source_id: None,
+            write_protect: None,
+            acquisition_tool: None,
+            evidence_hash: Some("cd".repeat(32)),
+            notes: None,
+            metadata_json: None,
+        };
+        case_db::register_evidence_source(&dir, &input("/e/typed.E01")).unwrap();
+        case_db::register_evidence_source_with_origin(
+            &dir,
+            &input("/e/hashed.E01"),
+            case_db::HashOrigin::Computed,
+        )
+        .unwrap();
+        let rows = load_evidence_sources(&dir).unwrap();
+        let origin = |p: &str| {
+            rows.iter()
+                .find(|r| r.path == p)
+                .unwrap()
+                .hash_origin
+                .clone()
+        };
+        assert_eq!(origin("/e/typed.E01").as_deref(), Some("operator-supplied"));
+        assert_eq!(origin("/e/hashed.E01").as_deref(), Some("computed"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
