@@ -39,10 +39,12 @@ fn parse(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid JSON {err}: {text}"))
 }
 
+#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn status(state: &SharedState) -> serde_json::Value {
     parse(&api_status(state))
 }
 
+#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + timeout;
     while !check() {
@@ -62,6 +64,7 @@ fn fake_cli(dir: &Path, body: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn write_inspection(case_dir: &Path) {
     let dir = case_dir.join("db/filesystem");
     std::fs::create_dir_all(&dir).unwrap();
@@ -72,6 +75,7 @@ fn write_inspection(case_dir: &Path) {
     .unwrap();
 }
 
+#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn marks_request(id: &str) -> Request {
     let marks = serde_json::json!({
         "schema_version": 1,
