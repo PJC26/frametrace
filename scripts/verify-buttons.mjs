@@ -21,7 +21,7 @@
 //     button text, icon-only buttons carry aria-label, per-state checks on a
 //     sample of buttons, top strip / selection bar / sheet buttons inside the
 //     viewport and not covered. These findings FAIL the run on the rebuilt UI
-//     (detected by <html data-ft-host> or #ftViewer[data-ft-viewer="2"], or
+//     (detected by <html data-ft-host>, or
 //     FT_BUTTONS_STRICT=1). On the pre-rebuild UI they are printed as
 //     warnings so the transition does not break CI.
 //  C. BUNDLES. assets/kit.css is the second CSS part of both bundles and the
@@ -301,7 +301,10 @@ if (!noLive) {
       return cls.length ? s + '.' + cls.join('.') : s;
     };
     const name = (e) => (e.parentElement ? one(e.parentElement) + ' > ' : '') + one(e);
-    out.strict = document.documentElement.hasAttribute('data-ft-host') || !!document.querySelector('#ftViewer[data-ft-viewer="2"]');
+    // Strict once the rebuilt integrated page (T2) is live. The viewer
+    // fragment alone (T5, data-ft-viewer="2") appears before its glyph →
+    // icon migration lands, so it must not flip the whole page to strict.
+    out.strict = document.documentElement.hasAttribute('data-ft-host');
     for (const b of document.querySelectorAll('button')) {
       if (!visible(b)) continue;
       const cls = [...b.classList];
