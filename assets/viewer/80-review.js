@@ -203,9 +203,12 @@ function redoJournal() {
 
 // Bulk actions over more than BULK_CONFIRM_MIN items ask first; the
 // journal still makes them undoable afterwards.
-function confirmBulk(ids, action) {
-  if (ids.length <= BULK_CONFIRM_MIN) return true;
-  return window.confirm(tf("confirm.bulk", { n: ids.length, action }));
+// Runs `run` now for small batches; above the threshold it first asks via
+// the in-page dialog (Esc/Cancel = do nothing). Small batches stay
+// synchronous so single-key flows never gain a microtask delay.
+function confirmThen(ids, action, run) {
+  if (ids.length <= BULK_CONFIRM_MIN) { run(); return; }
+  askDialog({ message: tf("confirm.bulk", { n: ids.length, action }) }).then(res => { if (res) run(); });
 }
 
 function markStatusLabel(status) {
@@ -218,29 +221,30 @@ function applyMarkJournaled(status) {
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   const label = markStatusLabel(status);
-  if (!confirmBulk(ids, label)) return;
-  journaled(label, ids, () => {
-    const stamped = Math.floor(Date.now() / 1000);
-    ids.forEach(id => {
-      if (status === null) delete state.marks[id];
-      else state.marks[id] = { status, marked_unix: stamped };
-      touchAnnotation(id);
-    });
-    storageSet(MARKS_KEY, state.marks);
-  }, tf("toast.markApplied", { n: ids.length, status: label }));
-  render();
+  confirmThen(ids, label, () => {
+    journaled(label, ids, () => {
+      const stamped = Math.floor(Date.now() / 1000);
+      ids.forEach(id => {
+        if (status === null) delete state.marks[id];
+        else state.marks[id] = { status, marked_unix: stamped };
+        touchAnnotation(id);
+      });
+      storageSet(MARKS_KEY, state.marks);
+    }, tf("toast.markApplied", { n: ids.length, status: label }));
+    render();
+  });
 }
 
 function applyTagJournaled(tag) {
   const ids = targetIds();
-  if (ids.length && !confirmBulk(ids, tf("journal.tag", { tag }))) return;
-  journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag));
+  if (!ids.length) { journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag)); return; }
+  confirmThen(ids, tf("journal.tag", { tag }), () => journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag)));
 }
 
 function clearTagsJournaled() {
   const ids = targetIds();
-  if (ids.length && !confirmBulk(ids, t("journal.tagClear"))) return;
-  journaled(t("journal.tagClear"), ids, () => clearTags());
+  if (!ids.length) { journaled(t("journal.tagClear"), ids, () => clearTags()); return; }
+  confirmThen(ids, t("journal.tagClear"), () => journaled(t("journal.tagClear"), ids, () => clearTags()));
 }
 
 // Single-key triage: mark the active record and advance so an examiner
@@ -447,12 +451,24 @@ document.getElementById("btnClearDates").addEventListener("click", () => {
   state.currentPage = 1;
   render();
 });
-els.videoMode.addEventListener("change", () => { state.layout.videoMode = els.videoMode.value; saveLayout(); applyVideoScale(); });
+els.videoMode.addEventListener("change", () => {
+  state.layout.videoMode = els.videoMode.value;
+  // A preset size (50/100/200%) drives the zoom value so the slider and
+  // the rendered size always agree.
+  const preset = Number(els.videoMode.value);
+  if (Number.isFinite(preset) && preset > 0) {
+    state.layout.videoZoom = preset;
+    els.videoZoom.value = String(preset);
+  }
+  saveLayout();
+  applyVideoScale();
+});
 els.videoZoom.addEventListener("input", () => {
-  state.layout.videoMode = els.videoMode.value === "fit" ? "fit" : els.videoMode.value;
-  if (els.videoMode.value !== "fit") state.layout.videoMode = els.videoMode.value;
+  // Dragging the slider leaves "fit" for a custom zoom (it used to do
+  // nothing in fit mode).
+  state.layout.videoMode = "custom";
+  els.videoMode.value = "custom";
   state.layout.videoZoom = Number(els.videoZoom.value);
-  if (els.videoMode.value === "fit") { els.videoMode.value = "fit"; }
   saveLayoutSoon();
   applyVideoScale();
 });
@@ -477,9 +493,7 @@ document.getElementById("btnDual").addEventListener("click", () => {
 document.getElementById("btnTelemetry").addEventListener("click", async (ev) => {
   const record = selectedRecord();
   if (!record) return;
-  const btn = ev.currentTarget;
-  btn.disabled = true;
-  try {
+  await withBusy(ev.currentTarget, async () => {
     const res = await fetch("/api/telemetry", {
       method: "POST",
       headers: { "Content-Type": "text/plain" },
@@ -494,16 +508,12 @@ document.getElementById("btnTelemetry").addEventListener("click", async (ev) => 
     } else {
       toast(tf("toast.telemetryFail", { err: data.error || "" }));
     }
-  } catch {
-    toast(t("toast.telemetryOffline"));
-  } finally {
-    btn.disabled = false;
-  }
+  }, { fail: () => t("toast.telemetryOffline") });
 });
 
 // Grab the decoded frame straight off the <video> element — no ffmpeg round
 // trip — and store it as a hashed case artifact (artifacts/captures/).
-async function captureCurrentFrame(videoEl, recordId) {
+async function captureCurrentFrame(videoEl, recordId, btn) {
   if (!videoEl || !videoEl.videoWidth) { toast(t("toast.noVideo")); return; }
   const canvas = document.createElement("canvas");
   canvas.width = videoEl.videoWidth;
@@ -511,21 +521,20 @@ async function captureCurrentFrame(videoEl, recordId) {
   canvas.getContext("2d").drawImage(videoEl, 0, 0);
   const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
   const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
-  try {
+  await withBusy(btn, async () => {
     const res = await fetch("/api/capture-frame", {
       method: "POST",
       headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({ id: recordId, image: b64, time: videoEl.currentTime.toFixed(2) })
     });
     const data = await res.json();
-    toast(data.ok ? tf("toast.captureSaved", { path: data.path }) : tf("toast.captureFail", { err: data.error || "" }));
-  } catch {
-    toast(t("toast.captureOffline"));
-  }
+    if (!data.ok) throw new Error(data.error || "");
+    toast(tf("toast.captureSaved", { path: data.path }));
+  }, { fail: err => (err instanceof TypeError || err instanceof SyntaxError) ? t("toast.captureOffline") : tf("toast.captureFail", { err: err?.message || "" }) });
 }
-document.getElementById("btnCaptureFrame").addEventListener("click", () => {
+document.getElementById("btnCaptureFrame").addEventListener("click", ev => {
   const record = selectedRecord();
-  captureCurrentFrame(currentVideo(), record ? record.id : "unknown");
+  captureCurrentFrame(currentVideo(), record ? record.id : "unknown", ev.currentTarget);
 });
 
 // --- 구간(인/아웃) 마킹 + 클립보내기: 기록별로 localStorage에 유지됨 ---
@@ -613,56 +622,97 @@ document.getElementById("btnProxy").addEventListener("click", async () => {
     toast(t("toast.playOriginal"));
     return;
   }
-  btn.disabled = true;
-  toast(t("toast.proxyBuilding"));
-  try {
+  await withBusy(btn, async () => {
     await requestReviewProxy(record);
     toast(t("toast.proxyPlaying"));
-  } catch (err) {
-    toast(tf("toast.proxyFail", { err: err?.message || "" }));
-  } finally {
-    btn.disabled = false;
-  }
+  }, { start: "toast.proxyBuilding", fail: err => tf("toast.proxyFail", { err: err?.message || "" }) });
 });
-document.getElementById("btnExportClip").addEventListener("click", async () => {
+// "12.5", "1:02.250" or "0:01:02" -> seconds, NaN when unparseable.
+function parseClipTime(text) {
+  const parts = String(text || "").trim().split(":");
+  if (!parts.length || parts.length > 3 || parts.some(p => p.trim() === "")) return NaN;
+  let total = 0;
+  for (const p of parts) {
+    const n = Number(p);
+    if (!Number.isFinite(n) || n < 0) return NaN;
+    total = total * 60 + n;
+  }
+  return total;
+}
+
+// Poll /api/status for a background export job (server returns {ok, job}).
+// Tolerates several result shapes; resolves with the final result object
+// ({ path, sha256 }) or throws with the server's error text.
+async function pollExportJob(job, btn) {
+  const id = typeof job === "string" ? job : (job && (job.id || job.job_id)) || "";
+  const base = btn.dataset.label || btn.textContent;
+  btn.dataset.label = base;
+  const started = Date.now();
+  let quiet = 0;
+  while (Date.now() - started < 30 * 60 * 1000) {
+    await new Promise(r => setTimeout(r, 1000));
+    let st;
+    try { st = await (await fetch("/api/status", { cache: "no-store" })).json(); }
+    catch { quiet = 0; btn.textContent = base + " …"; continue; }
+    const rec = (st.jobs && id && st.jobs[id]) || (st.job && (!id || st.job.id === id || st.job.job_id === id) ? st.job : null)
+      || (st.last_job && (!id || st.last_job.id === id || st.last_job.job_id === id) ? st.last_job : null) || st.job_result || null;
+    const state = rec && String(rec.state || rec.status || "").toLowerCase();
+    if (rec && ["failed", "error"].includes(state)) throw new Error(rec.error || "export failed");
+    if (rec && (["done", "completed", "ok", "success"].includes(state) || rec.sha256 || rec.path)) return rec.result || rec;
+    const pr = st.progress;
+    if (pr && pr.total > 0) btn.textContent = `${base} ${Math.min(100, Math.round((pr.done / pr.total) * 100))}%`;
+    else btn.textContent = base + " …";
+    if (!pr && !st.busy) {
+      quiet += 1;
+      if (quiet >= 3) return { path: "", sha256: "", unknown: true };
+    } else quiet = 0;
+  }
+  throw new Error("timeout");
+}
+
+async function exportClip(btn, burn) {
   const record = selectedRecord();
   const range = rangeOf(record);
   if (!record || !range || !Number.isFinite(range.in) || !Number.isFinite(range.out) || range.out <= range.in) {
     toast(t("toast.noRange"));
     return;
   }
-  try {
-    const res = await fetch("/api/export-clip", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ id: record.id, path: record.path || "", start: range.in.toFixed(3), duration: (range.out - range.in).toFixed(3) })
-    });
+  const fields = [
+    { name: "in", label: t("clip.in"), value: range.in.toFixed(3) },
+    { name: "out", label: t("clip.out"), value: range.out.toFixed(3) }
+  ];
+  if (burn) fields.push({ name: "exhibit", label: t("clip.exhibitPrompt"), value: t("clip.exhibitDefault") });
+  const ans = await askDialog({ title: t(burn ? "toolbar.clipBurn" : "toolbar.clip"), message: t("clip.dlgMsg"), fields, ok: t("clip.go") });
+  if (!ans) return;
+  const tin = parseClipTime(ans.in), tout = parseClipTime(ans.out);
+  if (!Number.isFinite(tin) || !Number.isFinite(tout) || tout <= tin) { toast(t("clip.badRange")); return; }
+  const body = { id: record.id, path: record.path || "", start: tin.toFixed(3), duration: (tout - tin).toFixed(3) };
+  if (burn) { body.burn_in = "true"; body.exhibit = (ans.exhibit || "").trim(); }
+  await withBusy(btn, async () => {
+    const res = await fetch("/api/export-clip", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(body) });
     const data = await res.json();
-    toast(data.ok ? tf("toast.clipDone", { path: data.path }) : tf("toast.clipFail", { err: data.error || "" }));
-  } catch {
-    toast(t("toast.clipOffline"));
-  }
-});
-document.getElementById("btnExportClipBurn").addEventListener("click", async () => {
-  const record = selectedRecord();
-  const range = rangeOf(record);
-  if (!record || !range || !Number.isFinite(range.in) || !Number.isFinite(range.out) || range.out <= range.in) {
-    toast(t("toast.noRange"));
-    return;
-  }
-  const exhibit = window.prompt(t("clip.exhibitPrompt"), t("clip.exhibitDefault")) ?? "";
-  try {
-    const res = await fetch("/api/export-clip", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ id: record.id, path: record.path || "", start: range.in.toFixed(3), duration: (range.out - range.in).toFixed(3), burn_in: "true", exhibit })
+    if (!data.ok) throw new Error(data.error || "");
+    let result = data;
+    if (data.job && !data.path) result = await pollExportJob(data.job, btn);
+    const path = result.path || data.path || "";
+    const sha = result.sha256 || data.sha256 || "";
+    toast(path ? tf("toast.clipDone", { path }) : t("clip.doneNoPath"));
+    // Exhibit summary: what was cut, from what, and its hash.
+    await askDialog({
+      title: t("clip.summaryTitle"),
+      message: [
+        `${t("clip.src")}: ${record.name || record.id}`,
+        `${t("clip.range")}: ${tin.toFixed(3)}s – ${tout.toFixed(3)}s (${(tout - tin).toFixed(3)}s)`,
+        `${t("clip.out.path")}: ${path || "-"}`,
+        `SHA-256: ${sha || t("clip.noSha")}`,
+        burn && body.exhibit ? `${t("clip.exhibit")}: ${body.exhibit}` : ""
+      ].filter(Boolean).join("\n"),
+      single: true
     });
-    const data = await res.json();
-    toast(data.ok ? tf("toast.clipDone", { path: data.path }) : tf("toast.clipFail", { err: data.error || "" }));
-  } catch {
-    toast(t("toast.clipOffline"));
-  }
-});
+  }, { fail: err => tf("toast.clipFail", { err: err?.message || "" }) });
+}
+document.getElementById("btnExportClip").addEventListener("click", ev => exportClip(ev.currentTarget, false));
+document.getElementById("btnExportClipBurn").addEventListener("click", ev => exportClip(ev.currentTarget, true));
 document.getElementById("btnShortcuts").addEventListener("click", () => toggleShortcuts(true));
 document.getElementById("btnShortcutsClose").addEventListener("click", () => toggleShortcuts(false));
 document.getElementById("btnSelectFiltered").addEventListener("click", selectAllFiltered);

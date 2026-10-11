@@ -381,6 +381,29 @@ function storageSet(key, value) {
   }
 }
 
+// Frame rate for frame-stepping: the server's `fps` field when present,
+// else avg_frame_rate / r_frame_rate ("30000/1001") of the first video
+// stream in the raw ffprobe JSON; undefined when unknown (the player then
+// falls back to 1/30 s).
+function parseRate(value) {
+  if (typeof value === "number") return Number.isFinite(value) && value > 0 ? value : undefined;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(?:\/\s*(\d+(?:\.\d+)?))?\s*$/.exec(String(value ?? ""));
+  if (!m) return undefined;
+  const den = m[2] === undefined ? 1 : Number(m[2]);
+  if (!den) return undefined;
+  const fps = Number(m[1]) / den;
+  return Number.isFinite(fps) && fps > 0 ? fps : undefined;
+}
+function videoFps(video) {
+  const direct = parseRate(video.fps);
+  if (direct) return direct;
+  let probe = video.ffprobe;
+  if (typeof probe === "string") { try { probe = JSON.parse(probe); } catch { probe = null; } }
+  const stream = (probe && Array.isArray(probe.streams) ? probe.streams : []).find(st => st && st.codec_type === "video");
+  if (!stream) return undefined;
+  return parseRate(stream.avg_frame_rate) || parseRate(stream.r_frame_rate);
+}
+
 const validationsByPath = new Map(validationLog.map(item => [normalizePath(item.target_path), item]));
 const recoveredFilesystemLog = filesystemLog.filter(item => item.event === "recover-inode" && item.output_path);
 // Case-level warnings recorded on inspection events (e.g. a truncated
@@ -414,6 +437,7 @@ const records = [
       indexStatus: video.index_status || "active",
       modifiedUnix: video.modified_unix,
       inode: video.inode,
+      fps: videoFps(video),
       validation
     };
   }),

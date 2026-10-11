@@ -320,3 +320,18 @@ html[data-theme="dark"] .cal-cell.l1 { background: #16261f; border-color: #2a4a4
 html[data-theme="dark"] .cal-cell.l2 { background: #1d332c; border-color: #35615a; }
 html[data-theme="dark"] .cal-cell.l3 { background: #265047; border-color: #4a8579; }
 html[data-theme="dark"] .cal-cell.selected { outline-color: #e8f0ec; }
+
+/* ---- v1.0 UX: busy buttons, in-page dialog, export menu groups, calendar year ---- */
+button.busy { position: relative; opacity: .75; cursor: progress; }
+button.busy::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: ft-spin .7s linear infinite; }
+@keyframes ft-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { button.busy::before { animation-duration: 2s; } }
+.modal.dlg { padding: 14px 16px; min-width: 360px; }
+.dlg .dlg-msg { margin: 8px 0 10px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+.dlg .dlg-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.dlg .dlg-field input { height: 30px; font-size: 13px; padding: 0 8px; }
+.dlg .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.menu-list .menu-sec { font-size: 10px; letter-spacing: .04em; color: var(--muted); padding: 6px 10px 2px; border-top: 1px solid var(--line); margin-top: 3px; }
+.menu-list .menu-sec:first-child { border-top: none; margin-top: 0; }
+.cal-year { height: 20px; font-size: 11px; padding: 0 2px; }
+html[data-theme="dark"] .modal.dlg { background: #232c28; }

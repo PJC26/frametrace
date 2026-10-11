@@ -413,8 +413,7 @@ document.getElementById("btnExportSelected").addEventListener("click", async () 
   const selected = selectedRecords();
   if (!selected.length) { toast(t("toast.selectFirst")); return; }
   const btn = document.getElementById("btnExportSelected");
-  btn.disabled = true;
-  try {
+  await withBusy(btn, async () => {
     const res = await fetch("/api/export-selected", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -430,11 +429,7 @@ document.getElementById("btnExportSelected").addEventListener("click", async () 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: res.export_dir })
     }).catch(() => {});
-  } catch (err) {
-    toast(t("toast.offline"));
-  } finally {
-    btn.disabled = false;
-  }
+  }, { fail: () => t("toast.offline") });
 });
 
 // --- 원본 파일 다운로드: /media?path&download=1이 Content-Disposition으로
@@ -506,11 +501,12 @@ document.getElementById("btnDownloadFile").addEventListener("click", async () =>
     toast(t("toast.fileOnly"));
   }
 });
-document.getElementById("btnDownloadFiles").addEventListener("click", async () => {
+document.getElementById("btnDownloadFiles").addEventListener("click", async (ev) => {
   const selected = selectedRecords();
   if (!selected.length) { toast(t("toast.selectFirst")); return; }
   if (canFolderSave()) {
-    try {
+    await withBusy(ev.currentTarget, async () => {
+      if (typeof window.showDirectoryPicker !== "function") throw new Error(t("toast.noDirPicker"));
       const dir = await showDirectoryPicker({ mode: "readwrite" });
       let saved = 0, failed = 0;
       for (const record of selected) {
@@ -522,9 +518,7 @@ document.getElementById("btnDownloadFiles").addEventListener("click", async () =
         }
       }
       toast(failed ? tf("toast.folderPartial", { n: saved, f: failed }) : tf("toast.folderSaved", { n: saved }));
-    } catch (error) {
-      if (error.name !== "AbortError") toast(tf("toast.folderFail", { err: error.message }));
-    }
+    }, { fail: err => err?.name === "AbortError" ? "" : tf("toast.folderFail", { err: err?.message || "" }) });
     return;
   }
   let started = 0;
@@ -540,11 +534,8 @@ document.getElementById("btnDownloadFiles").addEventListener("click", async () =
   }
 });
 document.getElementById("btnTranscodeQueue").addEventListener("click", async (ev) => {
-  const btn = ev.currentTarget;
   const ids = selectedRecords().map(r => r.id).join(",");
-  btn.disabled = true;
-  toast(t("toast.queueRunning"));
-  try {
+  await withBusy(ev.currentTarget, async () => {
     const res = await fetch("/api/transcode-queue", {
       method: "POST",
       headers: { "Content-Type": "text/plain" },
@@ -556,11 +547,7 @@ document.getElementById("btnTranscodeQueue").addEventListener("click", async (ev
     } else {
       toast(tf("toast.queueFail", { err: data.error || "" }));
     }
-  } catch {
-    toast(t("toast.queueOffline"));
-  } finally {
-    btn.disabled = false;
-  }
+  }, { start: "toast.queueRunning", fail: () => t("toast.queueOffline") });
 });
 
 // --- 케이스 타임라인 패널: db/timeline.jsonl을 읽어 시간순 이벤트를 표시 ---

@@ -2,6 +2,27 @@ function setupGridDelegation() {
   if (els.recordGrid._delegated) return;
   els.recordGrid._delegated = true;
   let shiftRange = false;
+  // PERF-05: a thumbnail that fails to load is retried once (cache-busted),
+  // then replaced by the "no thumbnail" placeholder — never a broken-image
+  // icon. error events don't bubble, so listen in the capture phase.
+  els.recordGrid.addEventListener("error", event => {
+    const img = event.target;
+    if (!img || img.tagName !== "IMG" || !img.closest(".thumb")) return;
+    const src = img.getAttribute("src") || "";
+    // thumbRetried/thumbDead outlive grid re-renders (the virtual grid
+    // recreates <img> nodes), so a bad URL costs one retry in total.
+    const base = src.replace(/[?&]r=1$/, "");
+    if (!thumbRetried.has(base) && !/^data:/i.test(src)) {
+      thumbRetried.add(base);
+      setTimeout(() => { if (img.isConnected) img.src = base + (base.includes("?") ? "&" : "?") + "r=1"; }, 400);
+      return;
+    }
+    thumbDead.add(base);
+    const ph = document.createElement("div");
+    ph.className = "ph";
+    ph.textContent = t("thumb.missing");
+    img.replaceWith(ph);
+  }, true);
   els.recordGrid.addEventListener("click", event => {
     const header = event.target.closest(".group-header");
     if (header) {
@@ -222,4 +243,130 @@ async function togglePip() {
   } catch (error) {
     toast(tf("toast.pipFail", { err: error.message }));
   }
+}
+
+// --- UX-14: busy buttons + in-page dialogs -------------------------------
+
+// Runs fn() while `button` shows a busy state (disabled, aria-busy, spinner
+// via .busy). Optional toasts: opts.start (i18n key), opts.done(result)
+// -> string|null, opts.fail(err) -> string. Errors never stay silent: an
+// exception always ends in an error toast and the button is re-enabled.
+// A second click while busy is ignored.
+async function withBusy(button, fn, opts = {}) {
+  if (button) {
+    if (button.dataset.busy === "1") return undefined;
+    button.dataset.busy = "1";
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.classList.add("busy");
+  }
+  if (opts.start) toast(t(opts.start));
+  try {
+    const result = await fn();
+    const done = typeof opts.done === "function" ? opts.done(result) : opts.done;
+    if (done) toast(done);
+    return result;
+  } catch (err) {
+    const msg = typeof opts.fail === "function" ? opts.fail(err) : tf("toast.busyFail", { err: err?.message || String(err) });
+    if (msg) toast(msg);
+    return undefined;
+  } finally {
+    if (button) {
+      delete button.dataset.busy;
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      button.classList.remove("busy");
+    }
+  }
+}
+
+// Accessible in-page dialog replacing window.confirm / window.prompt.
+// spec: { title?, message, fields?: [{ name, label, value }], ok?, cancel? }
+// Resolves to null on cancel/Esc/backdrop click; otherwise to a values
+// object ({} when there are no fields). Enter confirms from an input,
+// Tab cycles inside the dialog, focus returns to the opener.
+function askDialog(spec) {
+  return new Promise(resolve => {
+    const opener = document.activeElement;
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const box = document.createElement("div");
+    box.className = "modal dlg";
+    box.setAttribute("role", "dialog");
+    box.setAttribute("aria-modal", "true");
+    const uid = "dlg" + Math.random().toString(36).slice(2, 8);
+    const msg = document.createElement("p");
+    msg.id = uid + "m";
+    msg.className = "dlg-msg";
+    msg.textContent = spec.message || "";
+    box.setAttribute("aria-labelledby", spec.title ? uid + "t" : msg.id);
+    if (spec.title) {
+      const h = document.createElement("div");
+      h.id = uid + "t";
+      h.className = "panel-title";
+      h.textContent = spec.title;
+      box.appendChild(h);
+    }
+    box.appendChild(msg);
+    const inputs = {};
+    (spec.fields || []).forEach((f, i) => {
+      const label = document.createElement("label");
+      label.className = "dlg-field";
+      label.textContent = f.label || "";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = f.value || "";
+      input.id = uid + "f" + i;
+      label.appendChild(input);
+      box.appendChild(label);
+      inputs[f.name] = input;
+    });
+    const row = document.createElement("div");
+    row.className = "dlg-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = spec.cancel || t("dlg.cancel");
+    const ok = document.createElement("button");
+    ok.type = "button";
+    ok.className = "primary";
+    ok.textContent = spec.ok || t("dlg.ok");
+    if (spec.single) row.append(ok); else row.append(cancel, ok);
+    box.appendChild(row);
+    back.appendChild(box);
+    let done = false;
+    const finish = value => {
+      if (done) return;
+      done = true;
+      back.removeEventListener("keydown", onKey, true);
+      back.remove();
+      try { if (opener && opener.focus) opener.focus(); } catch { /* opener gone */ }
+      resolve(value);
+    };
+    const accept = () => {
+      const out = {};
+      for (const k of Object.keys(inputs)) out[k] = inputs[k].value;
+      finish(out);
+    };
+    function onKey(e) {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(null); return; }
+      if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); e.stopPropagation(); accept(); return; }
+      if (e.key === "Tab") {
+        const f = [...box.querySelectorAll("input,button")];
+        const first = f[0], last = f[f.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        return;
+      }
+      // Keep app shortcuts (j/k/1/2/space ...) from firing under the dialog.
+      e.stopPropagation();
+    }
+    back.addEventListener("keydown", onKey, true);
+    back.addEventListener("click", e => { if (e.target === back) finish(null); });
+    cancel.addEventListener("click", () => finish(null));
+    ok.addEventListener("click", accept);
+    document.body.appendChild(back);
+    const firstInput = Object.values(inputs)[0];
+    (firstInput || ok).focus();
+    if (firstInput) firstInput.select();
+  });
 }

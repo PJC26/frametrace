@@ -246,25 +246,10 @@ function renderDetails() {
   ].join("") || `<div class="validation-item">${t("validation.none")}</div>`;
 }
 
-// Facet counts cover the whole (immutable) record set — count once.
-let treeCountsCache = null;
-function treeCounts() {
-  if (treeCountsCache) return treeCountsCache;
-  const typeCounts = new Map();
-  const kindCounts = new Map();
-  const dayCounts = new Map();
-  records.forEach(record => {
-    const typeKey = record.recType || "unclassified";
-    typeCounts.set(typeKey, (typeCounts.get(typeKey) || 0) + 1);
-    kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
-    if (record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
-  });
-  treeCountsCache = { typeCounts, kindCounts, dayCounts };
-  return treeCountsCache;
-}
-
-function renderTree() {
-  const { typeCounts, kindCounts, dayCounts } = treeCounts();
+// Facet counts come from facetCounts() (40-grid.js): each dimension is
+// counted with its own filter excluded, computed once per render.
+function renderTree(facets) {
+  const { typeCounts, kindCounts, dayCounts } = facets || facetCounts();
   const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate") };
   const items = [];
   const addItems = (title, entries, activeKey, onPick) => {
@@ -453,8 +438,9 @@ function render() {
   const filtered = filteredRecords();
   renderMetrics();
   renderChips();
-  renderHistogram(filtered);
-  renderTree();
+  const facets = facetCounts();
+  renderHistogram(facets.dayCounts);
+  renderTree(facets);
   renderGrid(filtered);
   renderDetails();
   renderSaveState();
