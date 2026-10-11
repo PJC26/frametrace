@@ -1,6 +1,7 @@
 //! Paged record APIs (/api/records, /api/records-meta) and filesystem-inspection lookup.
 
 use super::*;
+use std::collections::HashMap;
 
 /// `GET /api/records?offset=0&limit=500&q=foo` — paged slice of the case
 /// video index so the reviewer UI does not have to parse one giant inline
@@ -41,19 +42,161 @@ pub(crate) fn cached_index(
     Ok(value)
 }
 
+/// Path of the in-flight scan checkpoint (`scan_folder` appends one
+/// verbatim record line per processed file; deleted when the run ends).
+pub(crate) fn scan_progress_path(case_dir: &Path) -> PathBuf {
+    case_dir.join("db/scan-progress.jsonl")
+}
+
+/// Current index generation for `case_dir` (UX-02). Stats the index and
+/// the live checkpoint and bumps `JobState::index_generation` whenever
+/// either changed since the last call, so the counter only ever grows and
+/// any reader comparing two values sees "changed" exactly when the data
+/// a live page would return changed. The state lock is held only for the
+/// compare-and-bump, never across filesystem calls.
+pub(crate) fn index_generation(state: &SharedState, case_dir: &Path) -> u64 {
+    let stat = |path: PathBuf| {
+        path.metadata()
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| (meta.modified().unwrap_or(UNIX_EPOCH), meta.len()))
+    };
+    let fingerprint = IndexFingerprint {
+        case_dir: case_dir.to_path_buf(),
+        index: stat(case_dir.join("db/video_index.json")),
+        progress: stat(scan_progress_path(case_dir)),
+    };
+    let mut guard = state_lock(state);
+    if guard.index_fingerprint.as_ref() != Some(&fingerprint) {
+        guard.index_generation = guard.index_generation.wrapping_add(1);
+        guard.index_fingerprint = Some(fingerprint);
+    }
+    guard.index_generation
+}
+
+/// Records from a live scan checkpoint. The header line (it carries a
+/// `checkpoint` key) is skipped; a line that does not parse — normally
+/// only the torn last line of a write in progress — is counted, never
+/// silently dropped, so the caller can report it.
+pub(crate) fn read_live_checkpoint(case_dir: &Path) -> (Vec<serde_json::Value>, usize) {
+    let Ok(text) = crate::util::read_to_string(&scan_progress_path(case_dir)) else {
+        return (Vec::new(), 0);
+    };
+    let mut records = Vec::new();
+    let mut skipped = 0usize;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) if value.get("checkpoint").is_some() => {}
+            Ok(value) if value.is_object() && value.get("id").is_some() => records.push(value),
+            _ => skipped += 1,
+        }
+    }
+    (records, skipped)
+}
+
+/// Overlays live checkpoint records on the index list: a record whose id
+/// (or, failing that, source path) is already indexed replaces it in
+/// place — order and offsets stay stable for the pager — and unknown
+/// records (a first scan still running) are appended in checkpoint order.
+pub(crate) fn overlay_live_records(
+    base: &[serde_json::Value],
+    live: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let key_of = |video: &serde_json::Value, field: &str| {
+        video
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let mut merged: Vec<serde_json::Value> = base.to_vec();
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut by_path: HashMap<String, usize> = HashMap::new();
+    for (position, video) in merged.iter().enumerate() {
+        if let Some(id) = key_of(video, "id") {
+            by_id.insert(id, position);
+        }
+        if let Some(path) = key_of(video, "source_path") {
+            by_path.insert(path, position);
+        }
+    }
+    for record in live {
+        let position = key_of(&record, "id")
+            .and_then(|id| by_id.get(&id).copied())
+            .or_else(|| key_of(&record, "source_path").and_then(|p| by_path.get(&p).copied()));
+        match position {
+            Some(position) => merged[position] = record,
+            None => {
+                let position = merged.len();
+                if let Some(id) = key_of(&record, "id") {
+                    by_id.insert(id, position);
+                }
+                if let Some(path) = key_of(&record, "source_path") {
+                    by_path.insert(path, position);
+                }
+                merged.push(record);
+            }
+        }
+    }
+    merged
+}
+
 pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
-    let Some(case_dir) = state_lock(state).case_dir.clone() else {
+    let (case_dir, phase) = {
+        let guard = state_lock(state);
+        (guard.case_dir.clone(), guard.phase)
+    };
+    let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"no case open\"}".to_string();
     };
+    // UX-02: `live=1` while the pipeline is still producing data overlays
+    // the scan checkpoint on the (possibly hash-less) index so the viewer
+    // sees enriched records as they land. Outside those phases the
+    // checkpoint is a leftover of an interrupted run and is ignored.
+    let live_phase = matches!(phase, "running" | "review-partial");
+    let live = live_phase && query_value(&request.query, "live").as_deref() == Some("1");
+    let generation = index_generation(state, &case_dir);
+    // Index-only version for the strict (non-live) pager: a restart is
+    // warranted when the index file itself changed, not merely because a
+    // checkpoint line was appended.
+    let etag = case_dir
+        .join("db/video_index.json")
+        .metadata()
+        .ok()
+        .map(|meta| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{mtime}-{}", meta.len())
+        });
     let index = match cached_index(state, &case_dir) {
-        Ok(index) => index,
+        Ok(index) => Some(index),
+        // A first scan still running has no index yet — the checkpoint
+        // alone is the live list.
+        Err(_) if live && scan_progress_path(&case_dir).is_file() => None,
         Err(err) => return api_err(err),
     };
     let empty = Vec::new();
-    let videos = index
-        .get("videos")
+    let base = index
+        .as_ref()
+        .and_then(|index| index.get("videos"))
         .and_then(|v| v.as_array())
         .unwrap_or(&empty);
+    let (live_records, live_skipped) = if live {
+        read_live_checkpoint(&case_dir)
+    } else {
+        (Vec::new(), 0)
+    };
+    let live_count = live_records.len();
+    let overlaid;
+    let videos: &Vec<serde_json::Value> = if live && live_count > 0 {
+        overlaid = overlay_live_records(base, live_records);
+        &overlaid
+    } else {
+        base
+    };
     let query = query_value(&request.query, "q").map(|q| q.to_lowercase());
     // FTS5 trigram index accelerates the same substring contract for
     // DB-indexed records; `None` (no db, short query, or any error)
@@ -108,7 +251,19 @@ pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
         .take(limit)
         .cloned()
         .collect();
-    serde_json::json!({"ok": true, "total": total, "offset": offset, "videos": page}).to_string()
+    serde_json::json!({
+        "ok": true,
+        "total": total,
+        "offset": offset,
+        "videos": page,
+        "generation": generation,
+        "etag": etag,
+        "live": live,
+        "phase": phase,
+        "live_records": live_count,
+        "live_skipped": live_skipped,
+    })
+    .to_string()
 }
 
 /// `GET /api/records-meta` — the non-record half of the viewer data

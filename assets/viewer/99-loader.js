@@ -16,6 +16,15 @@
  * mismatch can be accepted explicitly; the viewer then flags the list as
  * incomplete for the whole session (DATA.loadWarning).
  *
+ * UX-02 live index: while the workstation is still scanning or enriching
+ * (phase running / review-partial) the first page answers `live:true`.
+ * The list then legitimately changes under the pager (checkpoint records
+ * replace hash-less ones), so a version change or count drift is NOT an
+ * error: the partial list opens, DATA.liveIndex records what was loaded,
+ * and a chip polls /api/status — "색인 중 N건 / 보강 중" — offering to
+ * reload once index_generation moves. The reload is refused while review
+ * marks are unsaved, so annotations are never dropped by a refresh.
+ *
  * This file sits outside the viewer IIFE and runs before i18n is set
  * up, so its few strings are bilingual inline. */
 //
@@ -140,7 +149,8 @@ async function loaderFetchJson(url) {
 // short page, failed page or count mismatch is an error, never a silent
 // truncation. Duplicate ids (an unstable order across pages) are dropped
 // and surface as a count mismatch.
-async function loadAllRecordPages(first, ui) {
+async function loadAllRecordPages(first, ui, live) {
+  const liveParam = live ? "&live=1" : "";
   const versionOf = page => page && (page.etag ?? page.generation ?? null);
   let restarts = 0;
   let head = first;
@@ -162,7 +172,7 @@ async function loadAllRecordPages(first, ui) {
     let restarted = false;
     while (offset < total) {
       ui.progress(offset, total);
-      const page = await loaderFetchJson(`/api/records?offset=${offset}&limit=${loaderLimits().pageSize}`);
+      const page = await loaderFetchJson(`/api/records?offset=${offset}&limit=${loaderLimits().pageSize}${liveParam}`);
       if (!page || !page.ok || !Array.isArray(page.videos)) {
         throw ViewerLoadError(
           `증거 목록 일부를 불러오지 못했습니다 (${offset}/${total}). / Failed to load part of the evidence list.`,
@@ -170,7 +180,7 @@ async function loadAllRecordPages(first, ui) {
         );
       }
       const pageVersion = versionOf(page);
-      if (version !== null && pageVersion !== null && pageVersion !== version) {
+      if (!live && version !== null && pageVersion !== null && pageVersion !== version) {
         if (restarts >= loaderLimits().maxRestarts) {
           throw ViewerLoadError(
             "불러오는 동안 케이스 색인이 계속 바뀌고 있습니다. 분석이 끝난 뒤 다시 시도하십시오. / The case index kept changing while loading — retry after the analysis finishes.",
@@ -192,12 +202,13 @@ async function loadAllRecordPages(first, ui) {
     }
     if (restarted) continue;
     ui.progress(Math.min(offset, total), total);
-    return { videos: [...byId.values()], total, received: offset };
+    return { videos: [...byId.values()], total, received: offset, generation: head.generation ?? null };
   }
 }
 
 async function loadViewerDataFromApi(first, ui) {
-  const paged = await loadAllRecordPages(first, ui);
+  const live = !!(first && first.live);
+  const paged = await loadAllRecordPages(first, ui, live);
   ui.status("케이스 정보를 불러오는 중… / Loading case metadata…");
   const meta = await loaderFetchJson("/api/records-meta");
   if (!meta || meta.ok === false || typeof meta !== "object") {
@@ -223,6 +234,17 @@ async function loadViewerDataFromApi(first, ui) {
     telemetry: meta.telemetry,
     proxies: meta.proxies,
   };
+  if (live) {
+    // The index is still growing/enriching: whatever arrived is the
+    // current snapshot, not a truncation. The chip tells the examiner.
+    data.liveIndex = {
+      generation: paged.generation,
+      loaded: paged.videos.length,
+      total: paged.total,
+      phase: first.phase || "",
+    };
+    return data;
+  }
   if (paged.videos.length !== paged.total) {
     data.loadWarning = { loaded: paged.videos.length, total: paged.total };
     throw ViewerLoadError(
@@ -254,7 +276,7 @@ async function loadViewerDataOnce(ui) {
   if (served) {
     let first = null;
     try {
-      first = await loaderFetchJson(`/api/records?offset=0&limit=${loaderLimits().pageSize}`);
+      first = await loaderFetchJson(`/api/records?offset=0&limit=${loaderLimits().pageSize}&live=1`);
     } catch (err) {
       // 404 = a plain static server without the API: the bundle is the
       // expected source. Anything else is a real failure to report if the
@@ -288,6 +310,7 @@ async function loadViewerData() {
     try {
       const data = await loadViewerDataOnce(ui);
       ui.remove();
+      if (data && data.liveIndex) setTimeout(() => startLiveIndexChip(data.liveIndex), 0);
       return data;
     } catch (err) {
       const error = err && err.ftViewerLoad
@@ -301,4 +324,111 @@ async function loadViewerData() {
       ui.reset();
     }
   }
+}
+
+// ---- UX-02 live index chip ----------------------------------------------
+// Polls /api/status while the case index is still being built or enriched
+// and shows where it stands. New data is applied by reloading the page
+// (the viewer derives its record model once at boot), and only when the
+// save indicator reports nothing pending — a refresh must never be the
+// thing that loses review marks.
+function liveChipText(st, live, newTotal) {
+  const n = newTotal != null ? newTotal : live.total;
+  const phase = st ? st.phase : live.phase;
+  if (phase === "running") return `색인 중 ${n}건 / Indexing ${n}`;
+  if (phase === "review-partial") {
+    const e = st && st.enrichment;
+    if (st && st.busy && e) {
+      const prog = e.total > 0 ? ` ${e.done}/${e.total}` : "";
+      return `색인 ${n}건 · 보강 중: ${e.label}${prog} / Enriching`;
+    }
+    if (st && st.busy) return `색인 ${n}건 · 보강 중 / Enriching`;
+    return `색인 ${n}건 · 보강 중단됨 — 해시·검증 미완료 / Enrichment stopped`;
+  }
+  if (phase === "review-ready" || phase === "done" || phase === "finalized") {
+    return `보강 완료 (${n}건) / Enrichment complete`;
+  }
+  return `색인 ${n}건 / Indexed ${n}`;
+}
+
+function liveSaveIsClean() {
+  const el = document.getElementById("saveState");
+  const kind = el && el.dataset ? el.dataset.state : "";
+  return !kind || kind === "saved";
+}
+
+function startLiveIndexChip(live) {
+  if (document.getElementById("ft-live-chip")) return;
+  const chip = document.createElement("div");
+  chip.id = "ft-live-chip";
+  chip.setAttribute("role", "status");
+  chip.setAttribute("aria-live", "polite");
+  chip.style.cssText = "position:fixed;right:12px;bottom:60px;z-index:9000;display:flex;gap:8px;align-items:center;max-width:min(560px,calc(100vw - 24px));padding:6px 10px;border-radius:999px;background:#12302b;color:#d7ece6;border:1px solid #2f6b60;font:12px/1.4 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25)";
+  const text = document.createElement("span");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.hidden = true;
+  button.style.cssText = "padding:2px 10px;border-radius:999px;border:1px solid #6cc3b2;background:#0f7c71;color:#fff;font:inherit;cursor:pointer";
+  const note = document.createElement("span");
+  note.style.cssText = "color:#f2c8a0";
+  chip.append(text, button, note);
+  document.body.appendChild(chip);
+
+  let latest = null;
+  let newTotal = null;
+  let failures = 0;
+  let timer = 0;
+  const render = () => {
+    text.textContent = liveChipText(latest, live, newTotal);
+    const changed = latest && latest.index_generation != null && live.generation != null &&
+      latest.index_generation !== live.generation;
+    button.hidden = !changed;
+    if (changed) {
+      button.textContent = newTotal != null
+        ? `새 데이터 반영 (${newTotal}건) / Reload`
+        : "새 데이터 반영 / Reload";
+    }
+    const stopped = latest && latest.phase === "review-partial" && !latest.busy;
+    chip.style.borderColor = stopped ? "#b2560f" : "#2f6b60";
+  };
+  button.addEventListener("click", () => {
+    if (!liveSaveIsClean()) {
+      note.textContent = "저장되지 않은 판독 내용이 있어 새로 고치지 않았습니다 — 저장 상태가 '저장됨'이 된 뒤 다시 누르십시오. / Unsaved review marks — reload refused.";
+      const save = document.getElementById("saveState");
+      if (save) save.click(); // ask the viewer to save (or retry) now
+      return;
+    }
+    note.textContent = "";
+    location.reload();
+  });
+  const tick = async () => {
+    timer = 0;
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const st = await res.json();
+      failures = 0;
+      const moved = latest && st.index_generation !== latest.index_generation;
+      latest = st;
+      if (moved || (newTotal == null && st.index_generation !== live.generation)) {
+        try {
+          const head = await fetch("/api/records?offset=0&limit=1&live=1", { cache: "no-store" });
+          const page = head.ok ? await head.json() : null;
+          if (page && page.ok && Number.isFinite(Number(page.total))) newTotal = Number(page.total);
+        } catch (e) { /* the count is a hint; the status line still updates */ }
+      }
+      if (note.textContent.startsWith("상태 확인 실패")) note.textContent = "";
+    } catch (err) {
+      failures += 1;
+      note.textContent = `상태 확인 실패 (${failures}회) — 재시도 중 / Status check failed, retrying`;
+    }
+    render();
+    const active = !latest || latest.phase === "running" || (latest.phase === "review-partial" && latest.busy);
+    // Keep polling while work continues; afterwards slow down but keep the
+    // chip honest (a later re-analysis can move the index again).
+    timer = setTimeout(tick, active ? 3000 : 15000);
+  };
+  render();
+  tick();
+  return () => { if (timer) clearTimeout(timer); };
 }

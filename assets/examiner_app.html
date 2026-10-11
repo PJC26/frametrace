@@ -783,15 +783,21 @@ document.querySelectorAll(".navstep").forEach(b => b.addEventListener("click", (
 // auto-navigation happens once per state so it never yanks the examiner
 // away from a screen they deliberately opened
 let jobSeen = false, reviewReady = false, autoProgress = false, autoReviewed = false;
+// True while the last status was review-partial (UX-02) — detects the
+// enrichment → review-ready transition under an open viewer.
+let reviewPartialSeen = false;
 // A session-restored case pauses the auto-jump to review until the
 // examiner picks "이어서 검토" or "새 분석" on the stage-1 notice.
 let restoreHandled = false;
 
-function enableReviewStage() {
+// partial = UX-02 phase "review-partial": the hash-less index is
+// reviewable while enrichment runs, but finalizing (stage 4) waits for
+// review-ready so a report never claims hashes that do not exist yet.
+function enableReviewStage(partial) {
   reviewReady = true;
   $("s3").disabled = false;
-  $("s4").disabled = false;
-  ensureReviewFrame();
+  if (!partial) $("s4").disabled = false;
+  ensureReviewFrame(partial);
 }
 
 $("btnRestoreReview").addEventListener("click", () => {
@@ -1005,7 +1011,12 @@ function applyStatus(st) {
     if (!jobSeen) { jobSeen = true; $("s2").disabled = false; }
     renderTrack(st.steps || [], st.step_names, st.progress, st.warnings);
     appendLogLines(st.logs || []);
-    const running = st.phase === "running";
+    // UX-02: phase 2 (enrichment) runs under review-partial with busy set —
+    // the job is still active (cancel visible, inputs locked) although the
+    // review stage is already open.
+    const partial = st.phase === "review-partial";
+    const enriching = partial && !!st.busy;
+    const running = st.phase === "running" || enriching;
     setInputsDisabled(running);
     $("btnStart").disabled = running || finalizing;
     $("btnCancel").style.display = running ? "" : "none";
@@ -1021,8 +1032,30 @@ function applyStatus(st) {
     const rn = $("restoreNotice");
     rn.hidden = !restorePending || wantNew;
     if (restorePending) $("restoreCase").textContent = st.case_dir || "";
-    if (st.phase === "review-ready" || st.phase === "done" || st.phase === "finalized") {
+    if (partial) {
+      if (!reviewReady) enableReviewStage(true);
+      if (!autoReviewed && !restorePending && !wantNew) {
+        autoReviewed = true;
+        showView(3);
+        toast("1단계 색인 완료 — 해시·검증이 끝나기 전에도 검토를 시작할 수 있습니다.");
+      }
+      setStep(3, enriching ? 1 : 2);
+      const fh = $("finalHint");
+      if (!finalizing) {
+        const e = st.enrichment;
+        fh.textContent = enriching
+          ? `보강 진행 중${e ? ` (${e.label} ${e.stage}/${e.stages})` : ""} — 끝나면 결과 보고서를 생성할 수 있습니다.`
+          : "보강이 완료되지 않았습니다 (해시·검증·리뷰 생성 미완료) — 같은 소스로 다시 분석하면 이어서 진행합니다.";
+      }
+    } else if (st.phase === "review-ready" || st.phase === "done" || st.phase === "finalized") {
       if (!auditVerified) { auditVerified = true; verifyAudit(); }
+      if (reviewPartialSeen) {
+        // Enrichment finished under an open review: keep the viewer (and
+        // any unsaved marks in it); its chip offers the reload.
+        reviewPartialSeen = false;
+        $("s4").disabled = false;
+        toast("보강 완료 — 뷰어 오른쪽 아래 '새 데이터 반영'으로 해시·검증 결과를 불러오십시오.");
+      }
       if (!reviewReady) { reviewReady = true; $("s3").disabled = false; $("s4").disabled = false; ensureReviewFrame(); }
       if (!autoReviewed && !restorePending && !wantNew) { autoReviewed = true; showView(3); }
       setStep(st.phase === "running" ? 4 : 4, 3);
@@ -1046,6 +1079,7 @@ function applyStatus(st) {
     } else if (running) {
       setStep(3, 2);
     }
+    if (partial) reviewPartialSeen = true;
     const errEl = $("startErr");
     if (st.error) {
       // Re-render only when something else replaced the box, so an
@@ -1229,10 +1263,14 @@ $("withFfprobe").addEventListener("change", syncScanMode);
 // target re-focuses an already-open viewer instead of stacking copies.
 const reviewFrame = $("reviewFrame");
 let reviewFrameLoaded = false;
-function ensureReviewFrame() {
+// UX-02: before make-review has written review/ the server's built-in
+// /viewer/ page (same viewer, data via /api/records?live=1) is the frame.
+// Once loaded, the frame is never swapped behind the examiner's back —
+// a navigation could drop marks that are still being saved.
+function ensureReviewFrame(partial) {
   if (!reviewFrameLoaded) {
     reviewFrameLoaded = true;
-    reviewFrame.src = "/review/evidence-viewer.html?embed=1";
+    reviewFrame.src = partial ? "/viewer/?embed=1" : "/review/evidence-viewer.html?embed=1";
   }
 }
 function refreshCaseStats() {

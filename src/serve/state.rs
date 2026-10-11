@@ -71,7 +71,12 @@ impl StepStatus {
 }
 
 pub(crate) struct JobState {
-    pub(crate) phase: &'static str, // idle | running | review-ready | finalizing | done | error
+    /// idle | running | review-partial | review-ready | finalizing | done | error.
+    /// `review-partial` (UX-02): the fast hash-less index exists and the
+    /// viewer is usable while phase 2 (hash / validate / anomalies /
+    /// make-review) enriches it in the background — `busy` stays true
+    /// while that enrichment runs, false once it stopped (cancel/failure).
+    pub(crate) phase: &'static str,
     pub(crate) steps: [StepStatus; 5],
     pub(crate) step_names: Vec<&'static str>,
     pub(crate) logs: Vec<String>,
@@ -115,6 +120,36 @@ pub(crate) struct JobState {
     /// inside a previous case. Cleared by open-case and by a new
     /// analysis start.
     pub(crate) restored: bool,
+    /// Phase-2 enrichment step currently running (UX-02); `None` outside
+    /// phase 2. Surfaced as `enrichment` in /api/status.
+    pub(crate) enrichment: Option<Enrichment>,
+    /// Monotonic counter bumped whenever the case index (or the live scan
+    /// checkpoint overlaid on it) changes on disk; the viewer polls it to
+    /// learn that a refetch would show newer data.
+    pub(crate) index_generation: u64,
+    /// File fingerprint the current `index_generation` was taken from.
+    pub(crate) index_fingerprint: Option<IndexFingerprint>,
+}
+
+/// One phase-2 enrichment step (UX-02).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Enrichment {
+    /// Stable machine key: hash | validate | anomalies | make-review.
+    pub(crate) step: &'static str,
+    /// Korean label for the UI chip.
+    pub(crate) label: &'static str,
+    /// 1-based position within the enrichment plan.
+    pub(crate) stage: usize,
+    pub(crate) stages: usize,
+}
+
+/// `(path, mtime, len)` of the index plus the live checkpoint; any change
+/// bumps `JobState::index_generation`.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct IndexFingerprint {
+    pub(crate) case_dir: PathBuf,
+    pub(crate) index: Option<(SystemTime, u64)>,
+    pub(crate) progress: Option<(SystemTime, u64)>,
 }
 
 impl JobState {
@@ -137,6 +172,9 @@ impl JobState {
             index_cache: None,
             warnings: Vec::new(),
             restored: false,
+            enrichment: None,
+            index_generation: 0,
+            index_fingerprint: None,
         }
     }
 }

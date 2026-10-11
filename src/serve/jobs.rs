@@ -57,6 +57,7 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         guard.restored = false;
         guard.cancel_requested = false;
         guard.warnings = Vec::new();
+        guard.enrichment = None;
         guard.steps = [StepStatus::Pending; 5];
         guard.step_names = job.kind.step_names().to_vec();
         guard.logs = Vec::new();
@@ -334,12 +335,17 @@ pub(crate) fn run_e01_pipeline_tail(state: SharedState, job: PipelineJob) {
     }
 }
 
+/// Folder pipeline, split in two stages (UX-02):
+///
+/// * Phase 1 — init-case → register-source → a fast `scan-folder` without
+///   hashing, ffprobe or deepfake screening. As soon as it writes the
+///   index the phase flips to `review-partial` and the examiner can start
+///   reviewing.
+/// * Phase 2 — [`run_folder_enrichment`]: an incremental `scan-folder`
+///   that adds the requested hashes/probes (record_is_unchanged reprocesses
+///   only records missing them), validate-batch, the anomaly pass and
+///   make-review, ending in `review-ready`.
 pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
-    let case_dir = job.case_dir;
-    let source_path = job.source_path;
-    let with_hash = job.with_hash;
-    let with_ffprobe = job.with_ffprobe;
-    let with_deepfake = job.with_deepfake;
     let log = |state: &SharedState, line: String| state_lock(state).logs.push(line);
     let set_step = |state: &SharedState, index: usize, status: StepStatus| {
         state_lock(state).steps[index] = status;
@@ -354,8 +360,9 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
             return;
         }
     };
+    let case_dir = job.case_dir.clone();
     let case_text = case_dir.to_string_lossy().to_string();
-    let source_text = source_path.to_string_lossy().to_string();
+    let source_text = job.source_path.to_string_lossy().to_string();
 
     set_step(&state, 0, StepStatus::Running);
     if case_dir.join("case.json").exists() {
@@ -411,17 +418,15 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
         }
     }
 
+    // Phase 1 scan: listing + container metadata only. Hashing and
+    // ffprobe are the slow per-file passes; they move to phase 2.
     set_step(&state, 2, StepStatus::Running);
-    let mut scan_args: Vec<String> = vec!["scan-folder".into(), case_text.clone(), source_text];
-    if with_hash {
-        scan_args.push("--hash".into());
-    }
-    if !with_ffprobe {
-        scan_args.push("--no-ffprobe".into());
-    }
-    if with_deepfake {
-        scan_args.push("--deepfake".into());
-    }
+    let scan_args: Vec<String> = vec![
+        "scan-folder".into(),
+        case_text.clone(),
+        source_text,
+        "--no-ffprobe".into(),
+    ];
     match run_step(&exe, &scan_args, &state) {
         Ok(output) => {
             log(&state, output);
@@ -434,70 +439,187 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
         }
     }
 
-    set_step(&state, 3, StepStatus::Running);
-    if with_ffprobe {
+    enter_review_partial(&state);
+    run_folder_enrichment(&state, &job, |args| run_step(&exe, args, &state));
+}
+
+/// Phase 1 is done: the hash-less index is on disk and reviewable while
+/// phase 2 keeps the job busy (UX-02).
+pub(crate) fn enter_review_partial(state: &SharedState) {
+    let mut guard = state_lock(state);
+    guard.phase = "review-partial";
+    guard.logs.push(
+        "1단계 색인이 끝났습니다 — 지금부터 검토할 수 있습니다. 해시·검증·리뷰 생성은 백그라운드에서 이어서 진행됩니다."
+            .into(),
+    );
+}
+
+/// Ordered phase-2 steps for `job` as `(key, label)`.
+pub(crate) fn enrichment_plan(job: &PipelineJob) -> Vec<(&'static str, &'static str)> {
+    let mut plan = Vec::new();
+    if job.with_hash || job.with_ffprobe || job.with_deepfake {
+        plan.push(("hash", "해시 · 메타데이터 보강"));
+    }
+    if job.with_ffprobe {
+        plan.push(("validate", "재생성 검증"));
+    }
+    plan.push(("anomalies", "이상 징후 스캔"));
+    plan.push(("make-review", "리뷰 생성"));
+    plan
+}
+
+/// Phase 2 of the folder pipeline. `runner` executes one CLI step (the
+/// real pipeline passes `run_step`; tests inject a fake) and must honor
+/// the cancel flag like `run_step` does.
+///
+/// A cancel or a fatal failure here never throws the examiner out of the
+/// review that phase 1 already opened: the phase stays `review-partial`
+/// (see [`stop_enrichment`]), with the reason visible in warnings/error.
+pub(crate) fn run_folder_enrichment(
+    state: &SharedState,
+    job: &PipelineJob,
+    mut runner: impl FnMut(&[String]) -> Result<String, String>,
+) {
+    let log = |line: String| state_lock(state).logs.push(line);
+    let set_step = |index: usize, status: StepStatus| {
+        state_lock(state).steps[index] = status;
+    };
+    let case_dir = &job.case_dir;
+    let case_text = case_dir.to_string_lossy().to_string();
+    let plan = enrichment_plan(job);
+    let stages = plan.len();
+    // Publishes the step and reports whether the run may proceed (false
+    // once a cancel arrived between steps).
+    let begin = |key: &'static str| -> bool {
+        let mut guard = state_lock(state);
+        if guard.cancel_requested {
+            return false;
+        }
+        if let Some(position) = plan.iter().position(|(step, _)| *step == key) {
+            guard.enrichment = Some(Enrichment {
+                step: key,
+                label: plan[position].1,
+                stage: position + 1,
+                stages,
+            });
+        }
+        true
+    };
+    let cancelled = || state_lock(state).cancel_requested;
+
+    set_step(3, StepStatus::Running);
+    if plan.iter().any(|(step, _)| *step == "hash") {
+        if !begin("hash") {
+            return stop_enrichment(state, 3, None);
+        }
+        let mut args: Vec<String> = vec![
+            "scan-folder".into(),
+            case_text.clone(),
+            job.source_path.to_string_lossy().to_string(),
+            "--incremental".into(),
+        ];
+        if job.with_hash {
+            args.push("--hash".into());
+        }
+        if !job.with_ffprobe {
+            args.push("--no-ffprobe".into());
+        }
+        if job.with_deepfake {
+            args.push("--deepfake".into());
+        }
+        match runner(&args) {
+            Ok(output) => log(output),
+            Err(_) if cancelled() => return stop_enrichment(state, 3, None),
+            Err(err) => warn_step(
+                state,
+                3,
+                format!("해시·메타데이터 보강 실패 — 1단계 색인(해시 없음)을 유지합니다: {err}"),
+            ),
+        }
+    }
+
+    if job.with_ffprobe {
+        if !begin("validate") {
+            return stop_enrichment(state, 3, None);
+        }
         let selection_path = case_dir.join("selection-all.json");
-        match build_selection_file(&case_dir, &selection_path) {
+        match build_selection_file(case_dir, &selection_path) {
             Ok(count) => {
-                log(&state, format!("검증 대상 {count}건"));
-                match run_step(
-                    &exe,
-                    &[
-                        "validate-batch".into(),
-                        case_text.clone(),
-                        selection_path.to_string_lossy().to_string(),
-                    ],
-                    &state,
-                ) {
-                    Ok(output) => {
-                        log(&state, output);
-                        set_step(&state, 3, StepStatus::Done);
-                    }
-                    Err(err) => {
-                        warn_step(&state, 3, format!("일괄 검증 실패, 건너뜀: {err}"));
-                        set_step(&state, 3, StepStatus::Done);
-                    }
+                log(format!("검증 대상 {count}건"));
+                match runner(&[
+                    "validate-batch".into(),
+                    case_text.clone(),
+                    selection_path.to_string_lossy().to_string(),
+                ]) {
+                    Ok(output) => log(output),
+                    Err(_) if cancelled() => return stop_enrichment(state, 3, None),
+                    Err(err) => warn_step(state, 3, format!("일괄 검증 실패, 건너뜀: {err}")),
                 }
             }
-            Err(err) => {
-                warn_step(
-                    &state,
-                    3,
-                    format!("선택 목록 생성 실패, 검증 건너뜀: {err}"),
-                );
-                set_step(&state, 3, StepStatus::Done);
-            }
+            Err(err) => warn_step(state, 3, format!("선택 목록 생성 실패, 검증 건너뜀: {err}")),
         }
     } else {
-        log(&state, "ffprobe 검증이 꺼져 있어 건너뜁니다.".to_string());
-        set_step(&state, 3, StepStatus::Done);
+        log("ffprobe 검증이 꺼져 있어 건너뜁니다.".to_string());
+    }
+    set_step(3, StepStatus::Done);
+
+    set_step(4, StepStatus::Running);
+    if !begin("anomalies") {
+        return stop_enrichment(state, 4, None);
+    }
+    match runner(&["qa".into(), "anomalies".into(), case_text.clone()]) {
+        Ok(output) => log(output),
+        Err(_) if cancelled() => return stop_enrichment(state, 4, None),
+        Err(err) => warn_step(state, 4, format!("이상 징후 스캔 건너뜀: {err}")),
     }
 
-    match run_step(
-        &exe,
-        &["qa".into(), "anomalies".into(), case_text.clone()],
-        &state,
-    ) {
-        Ok(output) => log(&state, output),
-        Err(err) => warn_step(&state, 4, format!("이상 징후 스캔 건너뜀: {err}")),
+    if !begin("make-review") {
+        return stop_enrichment(state, 4, None);
     }
-
-    set_step(&state, 4, StepStatus::Running);
-    match run_step(&exe, &["make-review".into(), case_text.clone()], &state) {
+    match runner(&["make-review".into(), case_text.clone()]) {
         Ok(output) => {
-            log(&state, output);
-            set_step(&state, 4, StepStatus::Done);
-            let mut guard = state_lock(&state);
+            log(output);
+            let mut guard = state_lock(state);
+            guard.steps[4] = StepStatus::Done;
             guard.phase = "review-ready";
             guard.busy = false;
             guard.byte_progress = None;
+            guard.enrichment = None;
             guard
                 .logs
                 .push("검토 화면이 준비되었습니다. 뷰어에서 증거를 확인하십시오.".into());
         }
-        Err(err) => {
-            set_step(&state, 4, StepStatus::Failed);
-            fail(&state, &err);
+        Err(_) if cancelled() => stop_enrichment(state, 4, None),
+        Err(err) => stop_enrichment(state, 4, Some(&err)),
+    }
+}
+
+/// Ends phase 2 early without losing phase 1 (UX-02): the phase stays
+/// `review-partial` and the job is released. `failure = None` means the
+/// examiner cancelled — recorded as a warning so the run never reads as a
+/// clean pass; `Some(err)` is a real failure surfaced as `error`.
+pub(crate) fn stop_enrichment(state: &SharedState, step: usize, failure: Option<&str>) {
+    let mut guard = state_lock(state);
+    guard.phase = "review-partial";
+    guard.busy = false;
+    guard.byte_progress = None;
+    let interrupted = guard.enrichment.take();
+    let what = interrupted.map(|e| e.label).unwrap_or("보강");
+    match failure {
+        None => {
+            guard.steps[step] = StepStatus::Pending;
+            let message = format!(
+                "{what} 단계에서 보강을 중단했습니다 — 해시·검증·리뷰 생성이 완료되지 않았습니다. 1단계 색인으로 검토는 계속할 수 있으며, 같은 소스로 다시 분석하면 이어서 진행합니다."
+            );
+            guard.logs.push(format!("경고: {message}"));
+            guard.warnings.push((step, message));
+        }
+        Some(err) => {
+            guard.steps[step] = StepStatus::Failed;
+            guard.error = Some(err.to_string());
+            guard.logs.push(format!(
+                "오류: {what} 실패 — 1단계 색인으로 검토는 계속할 수 있습니다: {err}"
+            ));
         }
     }
 }
