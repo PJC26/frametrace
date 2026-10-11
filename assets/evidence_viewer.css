@@ -93,6 +93,7 @@ html:root .ft-viewer .count-pills { display: flex; align-items: center; gap: 4px
 :where(.ft-viewer) .rail .rail-chip { width: 100%; height: 32px; border-radius: 6px; text-align: left; background: transparent; border-color: transparent; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
 :where(.ft-viewer) .rail .rail-chip:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border); }
 :where(.ft-viewer) .rail .rail-chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); font-weight: 800; box-shadow: inset 3px 0 0 var(--accent); }
+:where(.ft-viewer) .rail .rail-chip.active:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 16%, var(--accent-soft)); box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px var(--accent); }
 :where(.ft-viewer) .rail .rail-chip-more { border: 1px dashed var(--border-strong); color: var(--muted); text-align: center; }
 :where(.ft-viewer) .tree { min-width: 0; }
 :where(.ft-viewer) .tree-sec { padding: 8px 6px 2px; font-size: var(--fs-xs); font-weight: 800; color: var(--accent-ink); border-top: 1px solid var(--line); margin-top: 2px; }

@@ -195,6 +195,9 @@ const playerChannel = ("BroadcastChannel" in window)
 if (playerChannel) {
   playerChannel.addEventListener("message", (ev) => {
     const m = ev.data || {};
+    // Single writer: only the window that opened the pop-out (its token is
+    // baked into the popup) answers; other tabs on the case stay silent.
+    if (m.token !== FTViewer.writerToken) return;
     const reply = (payload) => playerChannel.postMessage({ seq: m.seq, payload });
     if (m.type === "descriptor") reply(playerDescriptor());
     else if (m.type === "focus") reply(viewerBridge.focus(m.arg));
@@ -289,14 +292,14 @@ var RATES=[${RATES.join(",")}];
 var rate=document.getElementById("rate");
 var cur=null;
 v.playbackRate=${rate};
-var seqN=0,pend={},chan=("BroadcastChannel" in window)?new BroadcastChannel(${jsLit(`ft-player:${manifest.case_id || "case"}`)}):null;
+var TOKEN=${jsLit(FTViewer.writerToken)};var seqN=0,pend={},chan=("BroadcastChannel" in window)?new BroadcastChannel(${jsLit(`ft-player:${manifest.case_id || "case"}`)}):null;
 if(chan){chan.onmessage=function(ev){var m=ev.data||{},f=m.seq&&pend[m.seq];if(f){delete pend[m.seq];f(m.payload);}};}
 function call(op,arg,cb){
 var b=(window.opener&&!window.opener.closed&&window.opener.__ftBridge)||null;
 if(b){try{cb(b[op](arg));}catch(e){cb(undefined);}return;}
 if(!chan){cb(undefined);return;}
 var s=++seqN;pend[s]=cb;
-chan.postMessage({type:op,seq:s,arg:arg});
+chan.postMessage({type:op,seq:s,arg:arg,token:TOKEN});
 setTimeout(function(){if(pend[s]){delete pend[s];cb(undefined);}},3000);
 }
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]});}

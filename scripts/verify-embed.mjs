@@ -40,6 +40,7 @@ import {
 } from './lib/app-bundle.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+let axeSource = '';
 const require = createRequire(import.meta.url);
 let chromium;
 try { ({ chromium } = require('playwright')); } catch {
@@ -47,6 +48,7 @@ try { ({ chromium } = require('playwright')); } catch {
   process.exit(2);
 }
 
+try { axeSource = readFileSync(createRequire(import.meta.url).resolve('axe-core/axe.min.js'), 'utf8'); } catch { /* axe optional */ }
 let failures = 0;
 const check = (name, ok, detail = '') => {
   if (!ok) failures++;
@@ -140,13 +142,13 @@ ${css}
 html,body{margin:0;height:100%}body{display:grid;grid-template-rows:44px auto minmax(0,1fr);background:var(--bg)}
 #tTop{display:flex;gap:8px;align-items:center;padding:0 12px}
 #tSheet{display:flex;gap:8px;padding:4px 12px}
-#hViewerHost{min-height:0}
+#tMain{min-height:0}#hViewerHost{min-height:0;height:100%}
 </style></head>
 <body>
 <!-- @bundle:icons.svg -->
 <header id="tTop"><button id="tStripBtn" type="button">strip</button></header>
 <section id="tSheet" data-keys="off"><input id="sourcePath" type="text" aria-label="source"><input id="finalExaminer" type="text" aria-label="examiner"><button id="tSheetBtn" type="button">sheet</button></section>
-<div id="hViewerHost">${VIEWER_INCLUDE}</div>
+<main id="tMain" tabindex="-1"><div id="hViewerHost">${VIEWER_INCLUDE}</div></main>
 <script>
 ${viewerBundleJs(root)}</script>
 </body></html>`;
@@ -195,6 +197,12 @@ check('1 #ftViewer[data-ft-viewer="2"].hosted.embed', await host.evaluate(() => 
   const r = document.querySelector('#ftViewer[data-ft-viewer="2"]');
   return !!r && r.classList.contains('hosted') && r.classList.contains('embed');
 }));
+// 1 landmarks: the shell's <main> is the page's only main landmark; the
+// fragment's #mainArea (role="main" standalone) is a labelled region when hosted.
+check('9 hosted page has exactly one main landmark (the shell\'s) and #mainArea is a labelled region', await host.evaluate(() => {
+  const a = document.getElementById('mainArea');
+  return document.querySelectorAll('main, [role="main"]').length === 1 && a.getAttribute('role') === 'region' && !!a.getAttribute('aria-label');
+}), await host.evaluate(() => String(document.querySelectorAll('main, [role="main"]').length)));
 check('1 no iframe on the hosted page', await host.evaluate(() => document.querySelectorAll('iframe').length === 0));
 check('1 standalone title row hidden when hosted', await host.evaluate(() => getComputedStyle(document.querySelector('#ftViewer > header')).display === 'none'));
 check('7 ready + records events fired', await host.evaluate(() => ['ready', 'records'].every((t) => window.__ev.some((e) => e.type === t && e.detail.total > 0))));
@@ -279,6 +287,13 @@ const dbMarks = (meta.annotations && meta.annotations.marks) || [];
 const byId = (id) => dbMarks.find((m) => (m.record_id || m.id) === id);
 check('7 both marks reached the case DB with the examiner', byId(second)?.status === 'important' && byId(third)?.status === 'needs_verification' && byId(third)?.examiner === 'T5 Examiner', JSON.stringify(dbMarks));
 check('7 reload() after save: reloaded in place (no page load)', await host.evaluate(async () => { window.__stay = 1; return (await FTViewer.reload()) === 'reloaded' && window.__stay === 1; }));
+check('2 reload() keeps the host-controlled .popped class (and the region role)', await host.evaluate(async () => {
+  const r = document.getElementById('ftViewer');
+  r.classList.add('popped');
+  const ok = (await FTViewer.reload()) === 'reloaded' && r.classList.contains('popped') && r.classList.contains('hosted');
+  r.classList.remove('popped');
+  return ok && document.getElementById('mainArea').getAttribute('role') === 'region';
+}));
 await host.waitForSelector('#recordGrid .card', { timeout: 30000 });
 // a destroyed mount's listeners are gone: one j press moves exactly one card
 await host.evaluate(() => FTViewer.focus());
@@ -288,6 +303,31 @@ await host.keyboard.press('j');
 check('7 after destroy/init cycles one j moves exactly one card', await activeId(host) === ids[ids.indexOf(a0) + 1], `${a0} → ${await activeId(host)}`);
 await host.keyboard.press('x');
 check('7 selection event on x', await host.evaluate(() => window.__ev.some((e) => e.type === 'selection' && e.detail.count === 1)));
+
+// 3 single writer: only the window that opened the pop-out (token) answers on ft-player:<case>
+const chanProbe = await host.evaluate(async () => {
+  const key = Object.keys(localStorage).find((k) => /^ft\.viewer\..*\.examiner$/.test(k));
+  const caseId = key.slice('ft.viewer.'.length, -'.examiner'.length);
+  const ch = new BroadcastChannel(FTViewer.channels.player(caseId));
+  const got = [];
+  ch.onmessage = (e) => got.push(e.data);
+  const ask = async (seq, token) => { ch.postMessage(token === undefined ? { type: 'list', seq } : { type: 'list', seq, token }); await new Promise((r) => setTimeout(r, 300)); return got.filter((m) => m.seq === seq).length; };
+  const out = { none: await ask(1), wrong: await ask(2, 'other-tab-token'), mine: await ask(3, FTViewer.writerToken) };
+  ch.close();
+  return out;
+});
+check('3 ft-player channel: tokenless / foreign-token requests get no answer; the owner token does', chanProbe.none === 0 && chanProbe.wrong === 0 && chanProbe.mine === 1, JSON.stringify(chanProbe));
+
+// 5 examiner attribution: marks saved without an examiner get one later
+const lateId = await host.evaluate(() => { FTViewer.setExaminer(''); FTViewer.focus(); return document.querySelector('#recordGrid .card.active').dataset.id; });
+await host.keyboard.press('1');
+const lateEx = await host.evaluate(() => FTViewer.attributeUnassignedMarks('Late Examiner'));
+check('5 attributeUnassignedMarks(): re-pushes the unassigned mark, sets the examiner', lateEx >= 1 && await host.evaluate(() => FTViewer.getExaminer()) === 'Late Examiner', String(lateEx));
+await host.waitForFunction(() => FTViewer.saveState() === 'saved', null, { timeout: 15000 });
+const meta2 = await server.getJson('/api/records-meta');
+const lateRow = ((meta2.annotations && meta2.annotations.marks) || []).find((m) => (m.record_id || m.id) === lateId);
+check('5 the case DB holds the late examiner on that mark', lateRow && lateRow.examiner === 'Late Examiner', JSON.stringify(lateRow));
+check('5 attributeUnassignedMarks() is a no-op once everything is attributed', await host.evaluate(() => FTViewer.attributeUnassignedMarks('Late Examiner')) === 0);
 
 // locale / theme / toast
 await host.evaluate(() => FTViewer.setLocale('en'));
@@ -342,6 +382,19 @@ for (let i = 0; i < SPOTS.length; i++) {
   if (h === null && s === null) { note(`6 ${sel} not rendered on either page`); continue; }
   check(`6 ${sel} computed style hosted == standalone`, h === s, h === s ? '' : `hosted ${h} / standalone ${s}`);
 }
+check('9 standalone page has exactly one main landmark (#mainArea role=main, not nested)', await standalone.evaluate(() => {
+  const m = document.querySelectorAll('main, [role="main"]');
+  return m.length === 1 && m[0].id === 'mainArea';
+}));
+if (axeSource) {
+  await standalone.evaluate(axeSource);
+  const axeRes = async (page) => page.evaluate(async () => (await window.axe.run(document, { runOnly: { type: 'rule', values: ['landmark-no-duplicate-main', 'landmark-main-is-top-level', 'landmark-one-main', 'region'] } })).violations.map((v) => v.id + ':' + v.nodes.length));
+  const sv = (await axeRes(standalone)).filter((v) => !v.startsWith('region'));
+  check('9 axe landmark rules clean on standalone', sv.length === 0, sv.join(','));
+  await host.evaluate(axeSource);
+  const hv = (await axeRes(host)).filter((v) => !v.startsWith('region'));
+  check('9 axe landmark rules clean on hosted', hv.length === 0, hv.join(','));
+} else note('9 axe-core not resolvable: DOM landmark counts only');
 check('2 standalone page is not hosted, embed off at top level', await standalone.evaluate(() => !document.getElementById('ftViewer').classList.contains('hosted') && !document.getElementById('ftViewer').classList.contains('embed')));
 await standalone.close();
 await host.close();
