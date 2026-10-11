@@ -73,7 +73,12 @@ function showView(n) {
   document.querySelectorAll(".navstep").forEach(b => b.classList.toggle("sel", b.dataset.view === key));
   const prev = viewShown;
   viewShown = key;
-  if (document.body && document.body.classList) document.body.classList.toggle("stage3", key === "3");
+  if (document.body && document.body.classList) {
+    document.body.classList.toggle("stage3", key === "3");
+    // Stage 1 is the calm start screen: no step rail, crumbs or tagline.
+    document.body.classList.toggle("stage1", key === "1");
+  }
+  if (key === "1" && prev !== key && typeof onHomeShown === "function") onHomeShown();
   const menu = $("caseMenuWrap");
   if (menu) menu.hidden = key !== "3";
   if (key !== "3" && typeof closeAllPopovers === "function") closeAllPopovers(false);
@@ -113,24 +118,26 @@ function enableReviewStage(partial) {
   ensureReviewFrame(partial);
 }
 
-$("btnRestoreReview").addEventListener("click", () => {
+// The bound case's viewer (stage-1 '뷰어 보기'; also ends the
+// restored-session pause on the auto-jump).
+function openBoundViewer() {
   restoreHandled = true;
-  $("restoreNotice").hidden = true;
+  homeRestored = "";
   if (!autoReviewed) autoReviewed = true;
-  if (!reviewReady) enableReviewStage();
+  if (!reviewReady) enableReviewStage(lastPhase === "review-partial");
   showView(3);
-});
-$("btnRestoreNew").addEventListener("click", () => {
-  restoreHandled = true;
-  $("restoreNotice").hidden = true;
-  showView(1);
-});
+}
+// Case dir of a restored session still awaiting the examiner's choice
+// ("" = none); shown in the stage-1 '뷰어 보기' block.
+let homeRestored = "";
 
 // Controls that loadEnv() disabled for a missing tool carry
 // data-env-off and must stay disabled when a finished run re-enables the
 // form (otherwise the E01 radio comes back without libewf installed).
 function setInputsDisabled(disabled) {
-  document.querySelectorAll("#inputCard input, #inputCard select, #inputCard button").forEach(el => {
+  // The evidence form and the recent-project buttons lock while a job
+  // runs; '뷰어 보기' does not (the viewer is usable during enrichment).
+  document.querySelectorAll("#blkEvidence input, #blkEvidence select, #blkEvidence button, #blkRecent button").forEach(el => {
     el.disabled = disabled || (el.dataset && el.dataset.envOff === "1");
   });
   if (!disabled && $("directE01").checked) $("skipE01Verify").disabled = true;
@@ -293,6 +300,7 @@ function schedulePoll(ms) {
   pollTimer = setTimeout(poll, delay);
 }
 let lastStatus = null;
+let lastHomeKey = null;
 async function poll() {
   if (shuttingDown) return;
   let st;
@@ -320,6 +328,18 @@ async function poll() {
     applyStatus(st);
   } catch (err) {
     console.error("status render failed:", err);
+  }
+  try {
+    // A phase change (analysis finished, case opened) refreshes the
+    // stage-1 project list so it is current before the examiner returns.
+    const homeKey = `${st.case_dir || ""}|${st.phase || ""}|${!!st.busy}`;
+    if (homeKey !== lastHomeKey) {
+      if (lastHomeKey !== null) renderRecentCases();
+      lastHomeKey = homeKey;
+    }
+    syncViewerBlock();
+  } catch (err) {
+    console.error("viewer block update failed:", err);
   }
   schedulePoll(st.has_job ? 1200 : 1500);
 }
@@ -351,9 +371,7 @@ function applyStatus(st) {
       wantNew = sessionStorage.getItem("ft_want_new") === "1";
       if (wantNew) sessionStorage.removeItem("ft_want_new");
     } catch (e) { /* storage blocked */ }
-    const rn = $("restoreNotice");
-    rn.hidden = !restorePending || wantNew;
-    if (restorePending) $("restoreCase").textContent = st.case_dir || "";
+    homeRestored = restorePending && !wantNew ? (st.case_dir || "") : "";
     if (partial) {
       if (!reviewReady) enableReviewStage(true);
       if (!autoReviewed && !restorePending && !wantNew) {

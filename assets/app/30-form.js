@@ -23,12 +23,9 @@ async function loadEnv() {
     syncToolsBtn();
     ffprobeMissing = !t.ffprobe;
     if (!t.ffprobe) { $("withFfprobe").checked = false; syncScanMode(); }
-    const e01Radio = document.querySelector("input[name='inputKind'][value='e01']");
-    if (e01Radio) {
-      setEnvOff(e01Radio, !wf.e01);
-      $("e01Need").hidden = wf.e01;
-      if (!wf.e01) e01Radio.closest("label")?.setAttribute("title", esc(hints.e01 || "libewf 도구가 필요합니다"));
-    }
+    // E01 is auto-detected from the path; a missing libewf is explained
+    // next to the detected-kind chip instead of greying a radio.
+    syncE01Need();
     // deepfake-lens is optional — grey the controls rather than letting a
     // first-time user click into a per-file "tool not found" storm.
     const dfOk = env.deepfake === true;
@@ -63,6 +60,9 @@ function syncToolsBtn() {
 
 // ---- UX-11: analysis mode presets + size/placement hints ----
 let ffprobeMissing = false;
+// Auto-detected evidence kind of the source path (55-home.js): "" (unknown),
+// folder | e01 | other | missing.
+let detectedKind = "";
 const SCAN_MODES = {
   quick: { hash: false, ffprobe: false },
   standard: { hash: false, ffprobe: true },
@@ -139,6 +139,7 @@ function updateModeInfo() {
   }
   el.className = "modeinfo" + (warn ? " warn" : "");
   el.textContent = text;
+  updateOptSummary();
   // The preflight's hash-cost line depends on the SHA-256 checkbox.
   renderPreflightBox();
 }
@@ -147,14 +148,26 @@ function inputKind() {
   return document.querySelector("input[name='inputKind']:checked")?.value || "folder";
 }
 
-function syncInputKind() {
+// Sets the (hidden) evidence-kind radios from auto-detection.
+function setInputKind(kind) {
+  const radio = document.querySelector(`input[name='inputKind'][value='${kind === "e01" ? "e01" : "folder"}']`);
+  if (radio && !radio.checked) { radio.checked = true; syncInputKindView(); }
+}
+function syncInputKindView() {
   const e01 = inputKind() === "e01";
-  $("sourcePath").placeholder = e01
-    ? "예: D:\\Images\\blackbox.E01 (또는 Ex01/S01/L01)"
-    : "예: E:\\ 또는 D:\\BLACKBOX 또는 C:\\Users\\me\\Desktop\\입수자료";
   $("verifyRow").style.display = e01 ? "flex" : "none";
+  syncE01Need();
   updateModeInfo();
+}
+function syncInputKind() {
+  syncInputKindView();
   validatePaths();
+}
+// "libewf 미설치" shows only when the detected input is an E01 image.
+function syncE01Need() {
+  const el = $("e01Need");
+  if (!el) return;
+  el.hidden = !(envState && !envState.e01 && detectedKind === "e01");
 }
 
 function syncDirectE01() {

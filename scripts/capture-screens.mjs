@@ -177,14 +177,21 @@ async function runCombo({ w, h, theme }, sub) {
     await page.goto(base + '/?token=' + token, { waitUntil: 'load' });
     await page.waitForSelector('#sourcePath');
     await sleep(600);
-    await shot('00-onboarding', '첫 실행 안내 카드가 보이는 입력 화면 (First-run onboarding on the input stage)');
+    await shot('00-onboarding', '시작 화면 첫 실행 — 증거 넣기 · 이전 프로젝트(빈 상태) · 뷰어 보기 (First run: start screen, empty)');
     if (await page.locator('#btnOnboardOk').isVisible()) await page.click('#btnOnboardOk');
     await sleep(300);
-    await shot('01-start', '입력 단계 — 소스/케이스 경로가 비어 있는 초기 화면 (Input stage, empty)');
+    if (await page.locator('#startOptions > summary').isVisible().catch(() => false)) await page.click('#startOptions > summary');
+    await shot('01-start', '시작 화면 — 옵션(케이스 폴더 · 분석 모드) 펼침 (Start screen with options expanded)');
+    if (await page.locator('#startOptions > summary').isVisible().catch(() => false)) await page.click('#startOptions > summary');
     await page.fill('#sourcePath', srcDir);
+    // The case folder lives under the start screen's collapsed '옵션':
+    // open it to fill, close it again so the shot shows the default view.
+    const optsOpen = await page.locator('#caseDir').isVisible();
+    if (!optsOpen) await page.click('#startOptions > summary');
     await page.fill('#caseDir', caseDir);
     await page.dispatchEvent('#sourcePath', 'input');
     await page.dispatchEvent('#caseDir', 'input');
+    if (!optsOpen) await page.click('#startOptions > summary');
     await sleep(400);
     // UX-11 preflight panel: let it settle so the shot shows the result.
     await page.waitForFunction(() => { const p = document.getElementById('preflight'); return !p || p.hidden || !/사전 점검 중/.test(p.textContent || ''); }, null, { timeout: 6000 }).catch(() => {});

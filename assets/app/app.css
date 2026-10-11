@@ -166,12 +166,71 @@ body.stage3 .framewrap { height: calc(100vh - var(--bar-h)); }
 body.quit .rail, body.quit .hdrmenu, body.quit #jobPanel, body.quit .barcase { display: none !important; }
 
 /* ============================================================== stage 1 */
-#inputCard { max-width: 1320px; }
-.startgrid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px 24px; align-items: start; }
-@media (min-width: 1280px) { .startgrid { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); } .startgrid > .startcol + .startcol { border-left: 1px solid var(--line); padding-left: 24px; } }
-.startcol { min-width: 0; }
-.startfoot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
-p.hint.opencase { margin: 2px 0 0; line-height: 1.7; }
+/* Start screen: ONE centered column (max 760px) with exactly three blocks
+   — 증거 넣기 · 이전 프로젝트 · 뷰어 보기 — vertically balanced in the
+   viewport. No step rail, crumbs, footer or tagline on this stage; they
+   return on stages 2/4 (and the compact bar on 3). */
+body.stage1 .rail, body.stage1 .crumbs, body.stage1 .pagefoot, body.stage1 header .sub { display: none; }
+body.stage1 .shell { padding: 0 var(--gutter); }
+.view.start.on { display: flex; justify-content: center; align-items: center; min-height: calc(100vh - var(--bar-h)); padding: 20px 0; }
+.startcol { width: 100%; max-width: 760px; min-width: 0; display: grid; gap: 12px; }
+.sblock { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 16px 20px; }
+.sbhead { margin-bottom: 12px; }
+.sbhead h3 { margin: 0; font-size: var(--fs-lg); font-weight: 700; letter-spacing: -.01em; }
+.sbdesc { margin: 2px 0 0; color: var(--muted); font-size: var(--fs-sm); }
+#blkEvidence > .pathrow input { height: 40px; font-size: var(--fs-md); }
+#blkEvidence > .pathrow button { min-height: 40px; }
+.srcline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.srcline:not(:has(:not([hidden]):not(:empty))) { display: none; }
+.srcline .pathstatus { margin: 0; min-height: 0; }
+.kindchip { display: inline-flex; align-items: center; gap: 5px; min-height: 24px; padding: 0 10px; border-radius: 999px; background: var(--original-bg); color: var(--original-fg); font-size: var(--fs-xs); font-weight: 600; }
+.kindchip::before { content: "✓"; }
+.kindchip.e01 { background: var(--info-bg); color: var(--info-fg); }
+.starthint { font-size: var(--fs-xs); }
+.need { margin: 6px 0 0; }
+.preflight { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin: 6px 0 0; padding: 6px 10px; border-radius: 6px; background: var(--surface-2); font-size: var(--fs-xs); line-height: 1.5; }
+.preflight .pf-k { font-weight: 700; color: var(--muted); }
+.preflight .pf-sep { color: var(--muted); }
+.preflight .pf-i.warn { color: var(--warn-fg); font-weight: 600; }
+.preflight .pf-i.err { flex-basis: 100%; color: var(--danger); font-weight: 600; }
+.resumebox { margin-top: 8px; }
+details.opts { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+details.opts > summary { display: flex; align-items: center; gap: 8px; width: fit-content; max-width: 100%; min-height: 32px; margin: 0 -8px; padding: 0 8px; border-radius: 6px; cursor: pointer; list-style: none; }
+details.opts > summary::-webkit-details-marker { display: none; }
+details.opts > summary::before { content: "▸"; color: var(--muted); font-size: var(--fs-xs); transition: transform var(--dur-fast) var(--ease); }
+details.opts[open] > summary::before { transform: rotate(90deg); }
+details.opts > summary:hover { background: var(--surface-2); }
+.opts-t { font-size: var(--fs-sm); font-weight: 600; }
+.opts-sum { min-width: 0; color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.opts-body { padding-top: 10px; }
+/* Closed: really gone (Chromium otherwise still lays out skipped details
+   content for geometry queries). */
+details.opts:not([open]) > .opts-body { display: none; }
+p.hint.opencase { margin: 2px 0 0; }
+/* 이전 프로젝트: most recent first; the list scrolls inside the block so
+   the column keeps fitting 1366x768. */
+.recentlist { list-style: none; margin: 0; padding: 0; overflow: auto; max-height: max(110px, calc(100vh - 580px)); border: 1px solid var(--line); border-radius: var(--radius); }
+.rc-row { display: flex; align-items: center; gap: 12px; min-height: 52px; padding: 6px 8px 6px 12px; }
+.rc-row + .rc-row { border-top: 1px solid var(--line); }
+.rc-main { flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); column-gap: 10px; align-items: baseline; }
+.rc-name { font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-meta { color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-path { grid-column: 1 / -1; color: var(--muted); font-family: var(--mono); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-act { flex: none; min-width: 76px; min-height: 36px; }
+.rc-row.missing .rc-name { color: var(--muted); text-decoration: line-through; }
+.recentempty { margin: 0; padding: 12px; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); font-size: var(--fs-sm); text-align: center; }
+.sbfoot { display: flex; gap: 8px; margin-top: 10px; }
+#btnOpenOther { min-height: 36px; }
+.sbrow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; }
+.viewerreason { flex: 1 1 260px; min-width: 0; color: var(--muted); font-size: var(--fs-sm); }
+.startfoot { margin: 0; text-align: center; color: var(--muted); font-size: var(--fs-xs); }
+.startcol > .onboard { margin: 0; }
+.picker-item .pk-tag { color: var(--muted); font-size: var(--fs-xs); }
+@media (max-width: 600px) {
+  #blkEvidence > .pathrow { flex-wrap: wrap; }
+  #blkEvidence > .pathrow input { flex: 1 1 100%; }
+  .sblock { padding: 14px; }
+}
 .field { margin-bottom: 8px; }
 .fieldlabel { display: block; font-size: var(--fs-xs); font-weight: 600; margin-bottom: 4px; color: var(--text); }
 .fieldlabel .opt { color: var(--muted); font-weight: 400; }
@@ -202,20 +261,11 @@ input[type="text"]:disabled { background: var(--disabled-bg); color: var(--disab
 .resumebox { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; padding: 7px 10px; border: 1px solid var(--warn); border-radius: 7px; background: var(--warn-bg); font-size: var(--fs-xs); }
 .resumebox #resumeText { flex: 1; min-width: 200px; }
 .resumebox button { min-height: 28px; font-size: var(--fs-xs); }
-.preflight { margin: 4px 0 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); font-size: var(--fs-xs); line-height: 1.55; }
-.preflight .pf-head { font-weight: 600; margin-bottom: 2px; }
-.preflight ul { margin: 2px 0 0; padding-left: 16px; }
-.preflight li.warn { color: var(--warn); }
-.preflight li.err { color: var(--danger); font-weight: 600; }
-.preflight .pf-note { color: var(--muted); font-size: var(--fs-xs); }
 .onboard { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); padding: 10px 14px 10px; margin: 0 0 12px; font-size: var(--fs-xs); line-height: 1.5; }
 .onboard b.ob-title { display: block; font-size: var(--fs-sm); margin-bottom: 6px; }
 .onboard ul { margin: 0 0 8px; padding-left: 16px; display: grid; gap: 2px; color: var(--ink); }
 .onboard .ob-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .onboard .ob-foot .muted { font-size: var(--fs-xs); }
-.caselist { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
-.casechip { min-height: 28px; padding: 0 11px; font-size: var(--fs-xs); font-weight: 500; background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; }
-.casechip:hover:not(:disabled) { background: var(--accent-soft); }
 .err { display: none; background: var(--failed-bg); color: var(--failed-fg); border-radius: 7px; padding: 9px 12px; font-size: var(--fs-sm); margin-top: 10px; }
 .err.show { display: block; }
 .err .hintline { margin-top: 5px; font-size: var(--fs-xs); }

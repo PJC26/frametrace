@@ -24,30 +24,33 @@ function renderPreflight(res, opts) {
     rows.push({ cls: "err", text: "케이스 폴더가 증거 소스 안에 있습니다 — 원본 매체에 산출물이 기록되고 다음 스캔에서 다시 색인될 수 있습니다. 다른 드라이브를 지정하십시오." });
   }
   if (bytes !== null) {
-    rows.push({ cls: "", text: `확인된 소스 크기: ${fmtBytes(bytes)}` + (files !== null ? ` · 예상 파일 수 약 ${files.toLocaleString()}개` : "") });
-  } else if (files !== null) {
-    rows.push({ cls: "", text: `예상 파일 수 약 ${files.toLocaleString()}개` });
+    rows.push({ cls: "", text: `확인된 소스 크기: ${fmtBytes(bytes)}`, title: "서버가 표본 조사한 값 — 정확한 총량이 아닐 수 있습니다" });
+  }
+  if (files !== null) {
+    rows.push({ cls: "", text: `파일 약 ${files.toLocaleString()}개`, title: "표본 조사로 추정한 파일 수" });
   }
   if (bytes !== null && bytes > 0) {
     if (o.hash) {
       const fast = Math.max(1, Math.round(bytes / (HASH_MBPS_FAST * 1024 * 1024)));
       const slow = Math.max(1, Math.round(bytes / (HASH_MBPS_SLOW * 1024 * 1024)));
-      rows.push({ cls: slow >= 3600 ? "warn" : "", text: `SHA-256 해시 예상 소요: ${fmtEta(fast)} – ${fmtEta(slow)} (디스크 ${HASH_MBPS_SLOW}–${HASH_MBPS_FAST} MB/s 가정, 추정치)` });
+      rows.push({ cls: slow >= 3600 ? "warn" : "", text: `SHA-256 해시 예상 소요: ${fmtEta(fast)} – ${fmtEta(slow)}`,
+        title: `디스크 ${HASH_MBPS_SLOW}–${HASH_MBPS_FAST} MB/s 가정, 추정치` });
     } else {
-      rows.push({ cls: "", text: "SHA-256 해시 생략 — 원본 바이트 전체를 읽지 않습니다 (증거 대조용 해시는 기록되지 않음)." });
+      rows.push({ cls: "", text: "SHA-256 해시 생략", title: "원본 바이트 전체를 읽지 않습니다 (증거 대조용 해시는 기록되지 않음)" });
     }
   }
   if (free !== null) {
     const low = free < 2 * 1024 * 1024 * 1024;
-    rows.push({ cls: low ? "warn" : "", text: `케이스 폴더 드라이브 여유 공간: ${fmtBytes(free)}` + (low ? " — 부족할 수 있습니다" : "") });
+    rows.push({ cls: low ? "warn" : "", text: `케이스 드라이브 여유 ${fmtBytes(free)}` + (low ? " — 부족할 수 있습니다" : "") });
   }
   for (const w of Array.isArray(res.warnings) ? res.warnings : []) {
     if (w !== null && w !== undefined && String(w).trim()) rows.push({ cls: "warn", text: String(w) });
   }
   if (!rows.length) rows.push({ cls: "", text: "서버가 사전 점검 정보를 제공하지 않았습니다." });
-  return `<div class="pf-head">사전 점검</div><ul>` +
-    rows.map(r => `<li${r.cls ? ` class="${r.cls}"` : ""}>${esc(r.text)}</li>`).join("") +
-    `</ul><div class="pf-note">크기·파일 수는 서버가 표본 조사한 값이며 정확한 총량이 아닐 수 있습니다.</div>`;
+  // One compact line: "사전 점검  a · b · c" (wraps only when it must).
+  return `<span class="pf-k">사전 점검</span>` +
+    rows.map(r => `<span class="pf-i${r.cls ? " " + r.cls : ""}"${r.title ? ` title="${esc(r.title)}"` : ""}>${esc(r.text)}</span>`)
+      .join(`<span class="pf-sep" aria-hidden="true">·</span>`);
 }
 function renderPreflightBox() {
   const box = $("preflight");
@@ -67,7 +70,9 @@ function runPreflight() {
   const src = $("sourcePath").value.trim(), dir = $("caseDir").value.trim();
   const box = $("preflight");
   const key = preflightKey(src, dir);
-  if (preflightUnsupported || !src) {
+  // A path already known to be missing / unsupported gets the inline
+  // error instead of a preflight line.
+  if (preflightUnsupported || !src || detectedKind === "missing" || detectedKind === "other") {
     if (box) box.hidden = true;
     preflightData = null;
     return Promise.resolve(null);

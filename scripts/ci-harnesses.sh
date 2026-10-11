@@ -17,6 +17,7 @@ harnesses=(
   "verify-player-popup-escape"
   "verify-viewer-dialogs"
   "verify-jobs-e2e --no-build"
+  "verify-start-screen"
   "verify-review-batch --unit"
   "bench-viewer"
   "check-a11y"

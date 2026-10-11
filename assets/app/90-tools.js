@@ -45,28 +45,31 @@ $("btnLogBottom").addEventListener("click", () => {
 // Restore last-used paths/options, then validate what was restored.
 (function restorePrefs() {
   const prefs = loadPrefs();
-  if (prefs.inputKind) {
-    const radio = document.querySelector(`input[name='inputKind'][value='${prefs.inputKind}']`);
-    if (radio && !radio.disabled) radio.checked = true;
-  }
+  // The evidence kind is not restored: it is detected from each path.
   for (const [id, key] of [["withHash", "withHash"], ["withFfprobe", "withFfprobe"], ["withDeepfake", "withDeepfake"], ["skipE01Verify", "skipE01Verify"], ["directE01", "directE01"]]) {
     if (typeof prefs[key] === "boolean") $(id).checked = prefs[key];
   }
-  if (prefs.lastSource) $("sourcePath").value = prefs.lastSource;
-  if (prefs.lastCase) $("caseDir").value = prefs.lastCase;
+  // The start screen opens empty: the last source/case stay one click away
+  // (path suggestions, '이전 프로젝트') instead of being pre-filled — a
+  // pre-filled case folder hidden under '옵션' would silently send new
+  // evidence into the previous case.
   syncScanMode();
   renderRecent();
 })();
 
-// First-run onboarding: shown once until dismissed, reopenable via
-// '안내 다시 보기'. Persisted in the same prefs bucket as recent paths.
-if (!loadPrefs().onboarded) $("onboard").hidden = false;
+// Usage notes: never shown by default (the three start blocks explain
+// themselves); '사용 안내' in the start-screen footer toggles them.
 $("btnOnboardOk").addEventListener("click", () => {
   savePrefs({ onboarded: true });
   $("onboard").hidden = true;
+  try { $("btnOnboardShow").focus(); } catch (e) {}
 });
 $("btnOnboardShow").addEventListener("click", () => {
-  $("onboard").hidden = false;
-  $("onboard").scrollIntoView({ block: "nearest" });
+  const show = $("onboard").hidden;
+  $("onboard").hidden = !show;
+  if (show) {
+    try { $("onboard").scrollIntoView({ block: "nearest" }); } catch (e) {}
+    try { $("btnOnboardOk").focus(); } catch (e) {}
+  }
 });
 
