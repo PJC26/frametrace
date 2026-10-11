@@ -6,21 +6,20 @@ function showQuitPage() {
   shuttingDown = true;
   clearTimeout(pollTimer);
   setServerLost(false);
-  document.querySelector(".shell").style.display = "none";
-  document.body.classList.add("quit");
-  closeAllPopovers(false);
-  $("env").innerHTML = "";
-  $("btnQuit").style.display = "none";
+  hClosePopovers(false);
+  hCloseSheet("jobs", false);
+  hCloseSheet("finalize", false);
+  $("main").hidden = true;
+  $("hTopStrip").inert = true;
+  $("hEnv").innerHTML = "";
+  $("hBtnQuit").hidden = true;
   $("quitPage").hidden = false;
 }
 // Unsynced viewer changes (same signal as the finalize checklist).
-async function pendingViewerChanges() {
-  try {
-    const w = viewerWindow();
-    const sm = w && typeof w.__frametraceSummary === "function" ? w.__frametraceSummary() : null;
-    if (sm && Number.isFinite(sm.pending)) return sm.pending;
-    if (sm && Number.isFinite(sm.unsynced)) return sm.unsynced;
-  } catch (e) { /* fall through */ }
+async function hPendingChanges() {
+  const sm = hViewer.summary();
+  if (sm && Number.isFinite(sm.pending)) return sm.pending;
+  if (sm && Number.isFinite(sm.unsynced)) return sm.unsynced;
   if (!reviewReady) return 0;
   try {
     const meta = await jget("/api/records-meta");
@@ -29,8 +28,8 @@ async function pendingViewerChanges() {
     return drafts && typeof drafts === "object" ? Object.keys(drafts).length : 0;
   } catch (e) { return 0; }
 }
-$("btnQuit").addEventListener("click", async () => {
-  const btn = $("btnQuit");
+$("hBtnQuit").addEventListener("click", async () => {
+  const btn = $("hBtnQuit");
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   try {
@@ -40,7 +39,7 @@ $("btnQuit").addEventListener("click", async () => {
       await alertDialog("서버 종료", "서버에 연결할 수 없습니다 — 이미 종료되었을 수 있습니다.");
       return;
     }
-    const pending = await pendingViewerChanges();
+    const pending = await hPendingChanges();
     const pendingHtml = pending > 0
       ? `<p><b>케이스에 아직 반영되지 않은 마크·메모 변경 ${pending}건</b>이 있습니다. 서버를 종료하면 이 브라우저의 임시 저장본에만 남습니다 — 취소하고 몇 초 기다려 자동 반영된 뒤 종료하는 것을 권장합니다.</p>`
       : "";

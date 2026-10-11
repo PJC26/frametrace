@@ -2,7 +2,7 @@
 // background Recover/Carve jobs (async contract + old synchronous
 // responses), viewer refresh without `src = src`, review-frame load
 // timeout/retry, preflight panel, checkpoint resume info, guarded
-// "새 케이스 시작" reload, theme/locale propagation and the breadcrumb.
+// "새 케이스 시작" reload, theme/locale propagation and the top strip.
 //
 //   node scripts/verify-shell-jobs.mjs
 //
@@ -201,7 +201,7 @@ async function openReview(env, docOpts) {
   return v;
 }
 
-await test('Recover/Carve hidden until a case is open; breadcrumb shows case + step', async () => {
+await test('Recover/Carve hidden until a case is open; top strip names the case', async () => {
   const env = makeEnv();
   assert.equal(env.$('btnRecoverDeleted').hidden, true);
   assert.equal(env.$('btnCarve').hidden, true);
@@ -209,8 +209,9 @@ await test('Recover/Carve hidden until a case is open; breadcrumb shows case + s
   await env.advance(2000);
   assert.equal(env.$('btnRecoverDeleted').hidden, false);
   assert.equal(env.$('btnCarve').hidden, false);
-  assert.match(env.$('crumbs').innerHTML, /케이스: c1/);
-  assert.match(env.$('crumbs').innerHTML, /단계 4\/4/);
+  assert.equal(env.$('hProjectName').textContent, 'c1');
+  assert.equal(env.$('hProjectBtn').disabled, false);
+  assert.match(env.$('hProjectBtn').title, /\/cases\/c1/);
   env.ev('resetCaseUi()');
   assert.equal(env.$('btnRecoverDeleted').hidden, true);
 });
@@ -428,11 +429,15 @@ await test('old synchronous server failure → visible error, retry possible', a
   await env.advance(10);
   assert.match(env.$('jobTitle').textContent, /실패/);
   assert.match(env.$('jobDetail').textContent, /파일시스템 조사 결과가 없습니다/);
-  assert.match(env.$('recoverHint').textContent, /다시 시도/);
+  assert.match(env.$('jobsNote').textContent, /다시 시도/);
   assert.equal(env.$('btnRecoverDeleted').disabled, false);
   assert.equal(env.$('btnJobClose').hidden, false);
   env.$('btnJobClose').click();
-  assert.equal(env.$('jobPanel').hidden, true);
+  // The failed job is cleared from the chip; with a case open the chip
+  // stays as the idle jobs-sheet opener (docs/ui-rebuild-contract.md §2.2).
+  assert.ok(env.$('jobPanel').hidden || /\bok\b/.test(env.$('jobPanel').className), env.$('jobPanel').className);
+  assert.doesNotMatch(env.$('jobTitle').textContent, /실패/);
+  assert.equal(env.$('btnJobClose').hidden, true);
 });
 
 await test('review frame: load timeout shows retry; retry reloads with a fresh URL', async () => {
@@ -552,14 +557,14 @@ await test('새 케이스 시작 never reloads over unsaved marks', async () => 
 await test('theme + viewer language live in the shell and propagate to the frame', async () => {
   const env = makeEnv();
   const v = await openReview(env);
-  env.$('btnTheme').click();
+  env.$('hBtnTheme').click();
   assert.ok(env.frameWin.posted.some((m) => m.type === 'ft-theme' && m.theme === 'dark'));
   assert.equal(v.doc.documentElement.dataset.theme, 'dark');
-  env.$('btnViewerLang').click();
+  env.$('hBtnLang').click();
   assert.ok(env.frameWin.posted.some((m) => m.type === 'ft-locale' && m.locale === 'en'));
   assert.equal(v.langBtn.clicks, 1);
   assert.equal(v.doc.documentElement.lang, 'en');
-  assert.match(env.$('btnViewerLang').textContent, /English/);
+  assert.match(env.$('hBtnLang').textContent, /English/);
   // A reloaded frame comes back in the shell's language/theme.
   const v2 = env.loadFrame({ lang: 'ko' });
   assert.equal(v2.doc.documentElement.lang, 'en');
@@ -588,7 +593,7 @@ await test('job finishing while the viewer frame is loading: wait for load, then
 await test('viewer locale is re-posted until acked; a reloaded frame restarts the sequence', async () => {
   const env = makeEnv();
   await openReview(env);
-  env.$('btnViewerLang').click(); // → en
+  env.$('hBtnLang').click(); // → en
   env.frameWin.posted.length = 0;
   await env.advance(3000);
   const n = () => env.frameWin.posted.filter((m) => m.type === 'ft-locale' && m.locale === 'en').length;

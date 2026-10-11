@@ -139,7 +139,7 @@ try {
   check('recover-deleted refuses without filesystem results (real endpoint, no stub)',
     rec && rec.ok === false && typeof rec.error === 'string' && rec.error.length > 0 && !rec.job, JSON.stringify(rec).slice(0, 200));
   check('refused recover-deleted left no job behind', !((await getJson('/api/status')).job_kind));
-  await page.waitForSelector('.view[data-view="3"].on', { timeout: 15000 });
+  await page.waitForSelector('#hViewerHost:not([hidden])', { timeout: 15000 });
   const frameOf = () => page.frames().find((f) => /evidence-viewer\.html|\/viewer\//.test(f.url()));
   const viewerReady = await until(async () => {
     const f = frameOf();
@@ -150,10 +150,9 @@ try {
   if (!viewerReady) { await page.screenshot({ path: join(work, 'noviewer.png') }); throw new Error('no viewer; screenshot ' + join(work, 'noviewer.png')); }
   const before = await viewerReady.evaluate(() => window.__frametraceSummary());
   console.log('viewer before carve:', JSON.stringify(before));
-  // Stage-3 review tools live in the stage bar's '케이스 작업' menu.
+  // Recover / carve live in the jobs sheet, opened from the top-strip chip.
   const openCaseMenu = async () => {
-    if (await page.locator('#btnCaseMenu').isVisible().catch(() => false) &&
-        (await page.getAttribute('#btnCaseMenu', 'aria-expanded')) !== 'true') await page.click('#btnCaseMenu');
+    if (await page.locator('#hJobsSheet').isHidden()) await page.click('#hBtnJobs');
   };
   await openCaseMenu();
   await page.waitForSelector('#btnCarve:not([hidden])', { timeout: 10000 });

@@ -4,33 +4,17 @@
 // applied), the embedded viewer's __frametraceSummary() and the viewer's
 // per-case localStorage drafts (= mark/note changes not yet synced to the
 // case DB). Blocking items disable "proceed"; warnings only inform.
-function viewerWindow() {
-  try { return reviewFrameLoaded ? reviewFrame.contentWindow : null; } catch (e) { return null; }
-}
-function viewerExaminerInput() {
-  try { return reviewFrameLoaded && reviewFrame.contentDocument ? reviewFrame.contentDocument.getElementById("examinerName") : null; } catch (e) { return null; }
-}
+// @interim(T2): the viewer is reached through hViewer (01-store.js) —
+// hosted FTViewer or the legacy frame — never through its DOM.
+function viewerExaminerInput() { return hViewer.examinerInput(); }
 function readLs(key) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
 }
-// Save-state badge of the embedded viewer ("saved", "pending", "saving",
-// "failed", "queued", "local"), or null when the viewer is not loaded.
-function viewerSaveState() {
-  try {
-    const doc = reviewFrameLoaded && reviewFrame.contentDocument;
-    const el = doc ? doc.getElementById("saveState") : null;
-    return el && el.dataset ? (el.dataset.state || null) : null;
-  } catch (e) { return null; }
-}
-// Clicking the viewer's save badge saves (or retries) immediately.
-function retryViewerSave() {
-  try {
-    const doc = reviewFrameLoaded && reviewFrame.contentDocument;
-    const el = doc ? doc.getElementById("saveState") : null;
-    if (el) { el.click(); return true; }
-  } catch (e) {}
-  return false;
-}
+// Save state of the viewer ("saved", "pending", "saving", "failed",
+// "queued", "local"), or null when no viewer is mounted.
+function viewerSaveState() { return hViewer.saveState(); }
+// Saves (or retries) immediately; false when no viewer is mounted.
+function retryViewerSave() { return hViewer.save(); }
 // Pure: finalize checklist rows for unsaved marks. `retry: true` rows get
 // the dialog's "저장 다시 시도" button.
 function unsavedMarksChecks({ pendingMarks, saveState, drafts }) {
@@ -60,9 +44,7 @@ async function gatherFinalizeChecks() {
   let meta = null;
   try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
   const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
-  let summary = null;
-  const w = viewerWindow();
-  try { if (w && typeof w.__frametraceSummary === "function") summary = w.__frametraceSummary(); } catch (e) { summary = null; }
+  const summary = hViewer.summary();
 
   // Unsaved / queued marks block the finalize (SHOULD-FIX 5): sealing a
   // package without the examiner's latest marks is a silent loss.
@@ -204,8 +186,6 @@ $("btnFinalize").addEventListener("click", async () => {
       $("pkgPath").classList.add("show");
       $("pkgPath").textContent = "패키지: " + res.package_dir;
     }
-    setStep(4, 4);
-    ensureReportFrame();
   } finally {
     finalizing = false;
     btn.removeAttribute("aria-busy");

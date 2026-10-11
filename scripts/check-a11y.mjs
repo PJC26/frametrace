@@ -3,17 +3,22 @@
 //   cargo build --locked
 //   NODE_PATH=<repo>/node_modules node scripts/check-a11y.mjs [--out report.json] [--shots DIR] [--quick]
 //
-// Loads the shell (stage 1, and stage 3 with the embedded viewer) and the
-// standalone viewer against an isolated server holding a synthetic demo case
-// (scripts/make-demo-case.mjs), in light and dark, at 1366x768 and
-// 1920x1080, and checks:
+// Loads the integrated shell (empty state; project with the hosted viewer;
+// project with each sheet open) and the standalone viewer against an
+// isolated server holding a synthetic demo case (scripts/make-demo-case.mjs),
+// in light and dark, at 1366x768 and 1920x1080, and checks
+// (docs/ui-rebuild-contract.md §8.1):
 //
 //   contrast   ENFORCED  every visible text node vs its effective background
 //                        >= 4.5:1 (>= 3:1 for large/bold, and for disabled)
 //   name       ENFORCED  every visible button / link / input / select has an
 //                        accessible name (NAME_BASELINE lists known-unlabelled
 //                        controls awaiting markup fixes; reported as warnings)
-//   min-font   ENFORCED  no visible text under 12px
+//   min-font   ENFORCED  no visible text under the --fs-xs token (13px, §5.3;
+//                        the token itself is pinned by check-css.mjs)
+//   glyph      ENFORCED  no Unicode icon glyph in a button label (icons come
+//                        from the sprite); the pre-rebuild viewer (no
+//                        data-ft-viewer="2" root) is reported as a warning
 //   target     warning   interactive targets >= 24x24 CSS px or spaced (WCAG 2.5.8)
 //   focus      warning   a focus-visible ring is present when Tabbing
 //   axe        warning   serious/critical axe-core violations (only when
@@ -46,11 +51,16 @@ let axeSource = '';
 try { axeSource = readFileSync(require.resolve('axe-core/axe.min.js'), 'utf8'); } catch { /* axe optional */ }
 
 // All rules reached zero after the UX overhaul; enforce them so regressions fail.
-const ENFORCED = { contrast: true, name: true, 'name-baseline': true, 'name-custom': true, 'min-font': true, target: true, focus: true, axe: true };
+const ENFORCED = { contrast: true, name: true, 'name-baseline': true, 'name-custom': true, 'min-font': true, glyph: true, 'glyph-legacy': false, target: true, focus: true, axe: true };
+// Minimum text size = the --fs-xs token (contract §5.3: 13px). Read from
+// assets/tokens.css so this gate and the token can never disagree; never
+// below 12px.
+const MIN_FONT = Math.max(12, Number((/--fs-xs:\s*(\d+(?:\.\d+)?)px/.exec(readFileSync(join(root, 'assets/tokens.css'), 'utf8')) || [])[1]) || 12);
+const GLYPHS = '◐☀⏻⤢⧉▾↗✓✕☰⚠⤓▸';
 
 // ---------------------------------------------------------------- in-page
-// Runs inside every frame. Returns { contrast, name, minFont, target } findings.
-function collect() {
+// Runs inside every frame. Returns { contrast, name, minFont, target, glyph } findings.
+function collect({ minFont: MIN_FONT, glyphs: GLYPHS }) {
   const parseColor = (s) => {
     let m = /^rgba?\(([^)]+)\)$/.exec(s);
     if (m) {
@@ -135,7 +145,7 @@ function collect() {
   };
   const isDisabled = (el) => !!el.closest('[disabled], [aria-disabled="true"], fieldset:disabled');
 
-  const out = { contrast: [], name: [], nameCustom: [], minFont: [], target: [], scanned: { text: 0, interactive: 0 } };
+  const out = { contrast: [], name: [], nameCustom: [], minFont: [], target: [], glyph: [], glyphLegacy: [], newViewer: !!document.querySelector('[data-ft-viewer="2"]'), scanned: { text: 0, interactive: 0 } };
   const seen = new Set();
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
@@ -151,7 +161,7 @@ function collect() {
     const fs = parseFloat(cs.fontSize);
     if (fs === 0) continue; // glyph drawn via ::after (e.g. done-step check); no text is shown
     const key = sel(el);
-    if (fs < 12) {
+    if (fs < MIN_FONT) {
       const k = 'f|' + key + '|' + fs;
       if (!seen.has(k)) { seen.add(k); out.minFont.push({ selector: key, detail: `${fs}px "${text.slice(0, 24)}"` }); }
     }
@@ -211,6 +221,18 @@ function collect() {
     if (ph && ph.trim()) return ph.trim();
     return '';
   };
+  // Icon glyphs in button labels: the sprite (<svg class="ic">) replaces
+  // them. Inside a pre-rebuild viewer (no data-ft-viewer="2" root) they
+  // are reported separately until that viewer is replaced.
+  const glyphRe = new RegExp('[' + GLYPHS + ']');
+  const newViewer = out.newViewer;
+  for (const e of all) {
+    if (e.tagName !== 'BUTTON' && e.getAttribute('role') !== 'button') continue;
+    const t = textOf(e);
+    if (!glyphRe.test(t)) continue;
+    const legacyViewer = !newViewer && !e.closest('.h-top, .h-main > .h-empty, .h-sheet, .h-pop, .h-modal, .h-toastbox, .h-popnote, .h-host-wait');
+    (legacyViewer ? out.glyphLegacy : out.glyph).push({ selector: sel(e), detail: `glyph in label "${t.slice(0, 24)}"` });
+  }
   const rects = [];
   for (const e of all) {
     out.scanned.interactive++;
@@ -311,15 +333,28 @@ for (const deadline = Date.now() + 240000; ; await new Promise((r) => setTimeout
 let browser;
 try { browser = await chromium.launch(); } catch { browser = await chromium.launch({ channel: 'chrome' }); }
 
+// The project view: the hosted viewer's grid in #hViewerHost (or, until
+// the fragment is hosted, the legacy viewer frame in the same mount).
+const waitProject = async (page) => {
+  await page.waitForSelector('#hViewerHost:not([hidden])', { timeout: 20000 });
+  await page.waitForFunction(() => {
+    const host = document.getElementById('hViewerHost');
+    if (host.querySelectorAll('#recordGrid .card').length) return true;
+    const fr = host.querySelector('iframe');
+    try { return !!(fr && fr.contentDocument && fr.contentDocument.querySelectorAll('#recordGrid .card').length); } catch { return false; }
+  }, null, { timeout: 30000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+};
 const PAGES = [
-  { id: 'shell-stage1', path: '/', prep: async (page) => { await page.waitForSelector('.navstep[data-view="1"]'); await page.click('.navstep[data-view="1"]'); await page.waitForTimeout(500); } },
-  { id: 'shell-stage3-embedded-viewer', path: '/', prep: async (page) => {
-    await page.waitForSelector('.navstep[data-view="3"]:not([disabled])', { timeout: 20000 });
-    await page.click('.navstep[data-view="3"]');
-    await page.waitForSelector('iframe', { state: 'attached' });
-    await page.waitForFunction(() => [...document.querySelectorAll('iframe')].some((f) => f.contentDocument && f.contentDocument.querySelectorAll('#recordGrid .card').length > 0), null, { timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(1200);
+  { id: 'shell-empty', path: '/', prep: async (page) => {
+    await page.waitForSelector('#hViewerHost:not([hidden]), #inputCard:not([hidden])', { timeout: 20000 });
+    if (await page.locator('#hViewerHost').isVisible()) { await page.click('#hProjectBtn'); await page.click('#hProjectNew'); }
+    await page.waitForSelector('#inputCard:not([hidden])');
+    await page.waitForTimeout(500);
   } },
+  { id: 'shell-project', path: '/', prep: waitProject },
+  { id: 'shell-project-sheets-finalize', path: '/', prep: async (page) => { await waitProject(page); await page.click('#hBtnFinalize'); await page.waitForSelector('#hFinalizeSheet:not([hidden])'); await page.waitForTimeout(300); } },
+  { id: 'shell-project-sheets-jobs', path: '/', prep: async (page) => { await waitProject(page); await page.click('#hBtnJobs'); await page.waitForSelector('#hJobsSheet:not([hidden])'); await page.waitForTimeout(300); } },
   { id: 'viewer-standalone', path: '/viewer/', prep: async (page) => {
     await page.waitForSelector('#recordGrid .card', { timeout: 30000 }).catch(() => {});
     await page.waitForTimeout(1200);
@@ -331,9 +366,12 @@ const TABS = 45;
 // Unlabelled native controls that exist today and need markup (HTML/JS)
 // changes owned by tracks T1-T3. They are reported as warnings; delete the
 // entry once the control is labelled so the 'name' gate covers it again.
+// Contract §8.1 empties this list once T5 labels the three viewer
+// controls: it now applies only to the pre-rebuild viewer (a frame without
+// a data-ft-viewer="2" root), so the rebuilt viewer is held to the full gate.
 const NAME_BASELINE = [/^select#videoMode$/, /^input#customTagInput$/, /^textarea#evidenceNote$/];
 
-const findings = { contrast: [], name: [], 'name-baseline': [], 'name-custom': [], 'min-font': [], target: [], focus: [], axe: [] };
+const findings = { contrast: [], name: [], 'name-baseline': [], 'name-custom': [], 'min-font': [], glyph: [], 'glyph-legacy': [], target: [], focus: [], axe: [] };
 const push = (rule, ctx, item) => findings[rule].push({ ...ctx, ...item });
 const scanned = [];
 
@@ -362,14 +400,16 @@ for (const theme of THEMES) {
         const label = frame === page.mainFrame() ? 'top' : 'iframe';
         if (frame !== page.mainFrame() && frame.url() === 'about:blank') continue;
         let res;
-        try { res = await frame.evaluate(collect); } catch (e) { console.error('collect failed', label, e.message); continue; }
+        try { res = await frame.evaluate(collect, { minFont: MIN_FONT, glyphs: GLYPHS }); } catch (e) { console.error('collect failed', label, e.message); continue; }
         const ctx = { ...ctx0, frame: label };
         scanned.push({ ...ctx, ...res.scanned });
         for (const it of res.contrast) push('contrast', ctx, it);
-        for (const it of res.name) push(NAME_BASELINE.some((re) => re.test(it.selector)) ? 'name-baseline' : 'name', ctx, it);
+        for (const it of res.name) push(!res.newViewer && NAME_BASELINE.some((re) => re.test(it.selector)) ? 'name-baseline' : 'name', ctx, it);
         for (const it of res.nameCustom) push('name-custom', ctx, it);
         for (const it of res.minFont) push('min-font', ctx, it);
         for (const it of res.target) push('target', ctx, it);
+        for (const it of res.glyph) push('glyph', ctx, it);
+        for (const it of res.glyphLegacy) push('glyph-legacy', ctx, it);
         if (axeSource) {
           try {
             await frame.evaluate(axeSource);
