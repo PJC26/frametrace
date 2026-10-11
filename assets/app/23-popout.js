@@ -45,8 +45,7 @@ function hPopoutOpen() {
   if (FTStore.state.popout.open) { hViewer.focusPopout(); return; }
   const win = hViewer.popout();
   if (!win) {
-    // The legacy adapter explains its own refusals (unsaved marks).
-    if (hViewer.hosted()) toast("팝업이 차단되었습니다 — 브라우저에서 이 사이트의 팝업을 허용하십시오.", "warn");
+    toast("팝업이 차단되었습니다 — 브라우저에서 이 사이트의 팝업을 허용하십시오.", "warn");
     return;
   }
   hSetPopped(true);
@@ -57,7 +56,7 @@ function hSetPopped(on) {
   FTStore.set({ popout: { open, writer: "main" } });
   $("hPopoutNote").hidden = !open;
   const host = $("hViewerHost");
-  const root = hViewer.hosted() && host && host.querySelector ? host.querySelector(".ft-viewer") : null;
+  const root = host && host.querySelector ? host.querySelector(".ft-viewer") : null;
   if (root && root.classList) root.classList.toggle("popped", open);
   if (was !== open) {
     hBroadcast(open ? "popout-open" : "popout-closed");
@@ -68,11 +67,9 @@ function hSetPopped(on) {
 $("hBtnPopout").addEventListener("click", hPopoutOpen);
 $("hBtnPopoutReturn").addEventListener("click", () => {
   hViewer.closePopout();
-  // The legacy adapter calls hSetPopped itself once it may return (it
-  // refuses while the pop-out still holds unsaved marks).
-  if (hViewer.hosted()) hSetPopped(false);
+  hSetPopped(false);
 });
 $("hBtnPopoutFocus").addEventListener("click", () => {
-  if (!hViewer.focusPopout() && hViewer.hosted() && !hViewer.isPoppedOut()) hSetPopped(false);
+  if (!hViewer.focusPopout() && !hViewer.isPoppedOut()) hSetPopped(false);
 });
 hChannel();

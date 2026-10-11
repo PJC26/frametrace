@@ -168,7 +168,8 @@ export function makeEnv(opts = {}) {
     createElement: (tag) => makeEl('', tag),
     createTextNode: (t) => ({ text: t }),
     addEventListener(t, fn) { (docListeners[t] ||= []).push(fn); },
-    documentElement: { dataset: { theme: 'light' } },
+    // The integrated page: <html data-ft-host="shell"> (the viewer is hosted).
+    documentElement: { dataset: { theme: 'light' }, hasAttribute: (n) => n === 'data-ft-host' },
     activeElement: null,
     body: makeEl('body'),
   };

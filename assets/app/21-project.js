@@ -68,33 +68,55 @@ async function hConfirmLeave(title) {
   });
   return !!go && !unsaved();
 }
-// Takes the viewer down after the unsaved check. ui.home goes up first so
-// the renderer does not remount the old case in between.
+function hFoldPopout() {
+  if (!FTStore.state.popout.open) return;
+  hViewer.closePopout();
+  hSetPopped(false);
+}
+// Takes the viewer down after the unsaved check (→ empty state). ui.home
+// goes up first so the renderer does not remount the old case in between.
 async function hLeaveViewer(title) {
   if (!(await hConfirmLeave(title))) return false;
-  if (FTStore.state.popout.open) {
-    hViewer.closePopout();
-    if (!hViewer.hosted() && hViewer.isPoppedOut()) return false;
-    hSetPopped(false);
-  }
+  hFoldPopout();
   hCloseSheet("finalize", false);
   FTStore.set({ ui: { home: true } });
   hViewer.unmount();
   return true;
 }
+// True while a project switch runs: the renderer keeps the project screen
+// but must not remount the old case between destroy and init.
+let hSwitching = false;
 async function hSwitchProject(dir) {
   hClosePopovers(false);
   if (!dir) return false;
-  if (!(await hLeaveViewer("프로젝트 전환"))) return false;
-  const ok = await openCase(dir);
-  if (!ok) {
-    toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err");
+  if (!(await hConfirmLeave("프로젝트 전환"))) return false;
+  hFoldPopout();
+  hCloseSheet("finalize", false);
+  hViewer.retry();
+  let opened = false;
+  let switched = false;
+  hSwitching = true;
+  try {
+    // save → destroy → POST /api/open-case → one poll → init; no page reload
+    // (22-viewer-host.js). Refused (false) when unsaved marks would not save.
+    switched = await hostViewerSwitch(async () => {
+      FTStore.set({ viewer: { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null } });
+      opened = await openCase(dir);
+      if (!opened) return false;
+      try { await poll(); } catch (e) { /* the poll loop retries */ }
+      FTStore.set({ ui: { home: false } });
+      return true;
+    });
+  } finally {
+    hSwitching = false;
+  }
+  if (!switched) {
+    toast("저장되지 않은 판독 내용이 있어 프로젝트를 바꾸지 않았습니다 — 뷰어의 저장 상태를 확인하십시오.", "warn");
     return false;
   }
-  // One poll so the store describes the new case before the mount.
-  try { await poll(); } catch (e) { /* the poll loop retries */ }
-  FTStore.set({ ui: { home: false } });
-  return true;
+  if (!opened) toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err");
+  hRender();
+  return opened;
 }
 async function hGoHome() {
   hClosePopovers(false);

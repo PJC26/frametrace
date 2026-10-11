@@ -89,12 +89,10 @@ const shellHosts = appMarkup(root).includes(VIEWER_INCLUDE) && /<html[^>]*data-f
     if (re.test(appJs)) hits.push(id);
   }
   const bridge = /postToViewer|contentWindow/.test(appJs);
-  if (shellHosts) {
-    check('3 shell bundle has no viewer id lookups', hits.length === 0, hits.join(', '));
-    check('3 shell bundle has no postToViewer/contentWindow', !bridge);
-  } else {
-    note(`3 shell still embeds by iframe (no ${VIEWER_INCLUDE} yet): ${hits.length} viewer id lookups${bridge ? ' + contentWindow bridge' : ''} — enforced once the host page switches`);
-  }
+  // Enforced: the integrated shell hosts the viewer in its own document.
+  check('3 shell template hosts the fragment (<html data-ft-host> + include marker)', shellHosts);
+  check('3 shell bundle has no viewer id lookups', hits.length === 0, hits.join(', '));
+  check('3 shell bundle has no postToViewer/contentWindow', !bridge);
 }
 
 // ---------------------------------------------------------------- server

@@ -100,51 +100,45 @@ function hBaseName(dir) {
   return String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
 }
 
+
 // ---- the one door to the review viewer ----
-// Hosted (the viewer fragment lives in this document, T5): window.FTViewer
-// (§3). Until that lands the review page runs in an iframe behind the same
-// mount point (60-review.js registers hLegacyViewer). Shell code talks to
-// the viewer only through hViewer — never through viewer DOM ids.
+// The viewer fragment lives in this document (#hViewerHost) and the viewer
+// bundle exposes window.FTViewer (docs/ui-rebuild-contract.md §3). Mounting
+// goes through 22-viewer-host.js (hostViewerMount / hostViewerUnmount /
+// hostViewerSwitch), which only mounts while FTStore.hasProject(). Shell
+// code talks to the viewer only through hViewer — never through viewer ids.
 function hViewerApi() {
   const v = typeof window !== "undefined" ? window.FTViewer : null;
-  if (v && typeof v.init === "function") return v;
-  return hLegacyViewer || null;
+  return v && typeof v.init === "function" ? v : null;
 }
 let hHostedWired = false;
-// @interim: the legacy iframe adapter, assigned by 60-review.js.
-let hLegacyViewer = null;
+// A mount that failed is not retried for the same case on every render
+// (that would spin); opening another case — or this one again — retries.
+let hMountFailedFor = null;
 const hViewer = {
-  hosted() { const v = typeof window !== "undefined" ? window.FTViewer : null; return !!(v && typeof v.init === "function"); },
+  hosted() { return !!hViewerApi(); },
   mounted() { return !!FTStore.state.viewer.mounted; },
-  mount(partial) {
-    if (FTStore.state.viewer.mounted) return;
-    const v = hViewerApi();
-    if (!v) return;
-    if (!this.hosted()) {
-      v.mount(!!partial);
-      FTStore.set({ viewer: { mounted: true } });
-      return;
-    }
-    hWireHostedViewer(v);
+  mount() {
+    if (FTStore.state.viewer.mounted || !hViewerApi()) return;
+    const caseDir = FTStore.state.project.caseDir;
+    if (hMountFailedFor !== null && hMountFailedFor === caseDir) return;
+    hWireHostedViewer(hViewerApi());
+    // Optimistic: the renderer must not ask twice while init runs; the
+    // viewer's ready/destroyed events keep the flag honest afterwards.
     FTStore.set({ viewer: { mounted: true } });
-    // A host component (22-viewer-host.js) may have mounted it already:
-    // init() then refuses with "already mounted", which is fine.
-    const refused = e => /already mounted/i.test(String((e && e.message) || e));
-    const failed = e => {
-      if (refused(e)) return;
+    Promise.resolve(hostViewerMount()).then(ok => {
+      if (ok) { hMountFailedFor = null; return; }
       FTStore.set({ viewer: { mounted: false } });
-      console.error("viewer init failed:", e);
-      toast("검토 화면을 열지 못했습니다: " + ((e && e.message) || e), "err");
-    };
-    try {
-      const p = v.init({ embed: true, host: $("hViewerHost"), theme: hThemeNow(), locale: hLocalePref() || null });
-      if (p && typeof p.catch === "function") p.catch(failed);
-    } catch (e) { failed(e); }
+      if (!FTStore.hasProject()) return;
+      hMountFailedFor = caseDir;
+      toast("검토 화면을 열지 못했습니다 — 페이지를 새로 고치거나 케이스를 다시 여십시오.", "err");
+    });
   },
+  // The examiner asked for a case again (switch / reopen): try anew.
+  retry() { hMountFailedFor = null; },
   unmount() {
     if (!FTStore.state.viewer.mounted) return;
-    const v = hViewerApi();
-    try { if (v) { if (this.hosted()) v.destroy(); else v.unmount(); } } catch (e) { console.error("viewer unmount failed:", e); }
+    try { hostViewerUnmount(); } catch (e) { console.error("viewer unmount failed:", e); }
     FTStore.set({ viewer: { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null }, popout: { open: false } });
   },
   // "saved"|"pending"|"saving"|"failed"|"queued"|"local"|null (null = no viewer).
@@ -161,55 +155,38 @@ const hViewer = {
   save() {
     const v = hViewerApi();
     if (!v || !FTStore.state.viewer.mounted) return false;
-    try {
-      const r = v.save();
-      if (r && typeof r.catch === "function") { r.catch(() => {}); return true; }
-      return !!r;
-    } catch (e) { return false; }
+    try { Promise.resolve(v.save()).catch(() => {}); return true; } catch (e) { return false; }
   },
   summary() {
     const v = hViewerApi();
     if (!v || !FTStore.state.viewer.mounted) return null;
     try { return v.summary() || null; } catch (e) { return null; }
   },
-  // Resolves "reloaded" | "refused" | "none" (nothing mounted).
-  async reload(opts) {
-    const v = hViewerApi();
-    if (!v || !FTStore.state.viewer.mounted) return "none";
-    try { return (await v.reload(Object.assign({ keepUnsaved: true }, opts || {}))) || "reloaded"; } catch (e) { return "refused"; }
-  },
-  setTheme(t) { const v = hViewerApi(); try { if (v && v.setTheme) v.setTheme(t); } catch (e) {} },
-  setLocale(l) { const v = hViewerApi(); try { if (v && v.setLocale) v.setLocale(l); } catch (e) {} },
-  getLocale() { const v = hViewerApi(); try { return (v && v.getLocale && v.getLocale()) || ""; } catch (e) { return ""; } },
+  setTheme(t) { const v = hViewerApi(); try { if (v) v.setTheme(t); } catch (e) {} },
+  setLocale(l) { const v = hViewerApi(); try { if (v) v.setLocale(l); } catch (e) {} },
+  getLocale() { const v = hViewerApi(); try { return (v && v.getLocale()) || ""; } catch (e) { return ""; } },
   popout() { const v = hViewerApi(); try { return v && FTStore.state.viewer.mounted ? v.popout() : null; } catch (e) { return null; } },
   closePopout() { const v = hViewerApi(); try { if (v) v.closePopout(); } catch (e) {} },
   isPoppedOut() { const v = hViewerApi(); try { return !!(v && v.isPoppedOut()); } catch (e) { return false; } },
-  focusPopout() { const v = hViewerApi(); try { if (v && v.focusPopout) return v.focusPopout(); } catch (e) {} return false; },
+  // popout() on an open pop-out brings that window to the front.
+  focusPopout() { return this.isPoppedOut() && !!this.popout(); },
   focus() { const v = hViewerApi(); try { return !!(v && FTStore.state.viewer.mounted && v.focus()); } catch (e) { return false; } },
   // Shell toasts go to the viewer's single toast host while it is mounted
   // (§6.5); false = show it in the shell's own box.
   toast(msg, kind) {
-    if (!this.hosted() || !FTStore.state.viewer.mounted) return false;
-    try { window.FTViewer.toast(msg, kind === "err" ? "error" : kind || "info"); return true; } catch (e) { return false; }
+    const v = hViewerApi();
+    if (!v || !FTStore.state.viewer.mounted) return false;
+    try { v.toast(msg, kind === "err" ? "error" : kind || "info"); return true; } catch (e) { return false; }
   },
-  // Legacy-only: the iframe viewer's examiner field (hosted: the viewer
-  // owns that field; the finalize code asks the viewer, not its DOM).
-  examinerInput() { const v = hViewerApi(); try { return v && v.examinerInput ? v.examinerInput() : null; } catch (e) { return null; } },
 };
-// Viewer events → store (§3.2). Registered once; FTViewer's EventTarget
-// outlives destroy()/init().
+// Viewer events → store (§3.2) that 22-viewer-host.js does not mirror
+// already. Registered once; FTViewer's EventTarget outlives destroy()/init().
 function hWireHostedViewer(v) {
   if (hHostedWired || !v || typeof v.on !== "function") return;
   hHostedWired = true;
   const d = e => (e && e.detail) || {};
-  v.on("save-state", e => FTStore.set({ viewer: { saveState: d(e).state || null } }));
-  v.on("dirty", e => FTStore.set({ viewer: { dirty: Number(d(e).count) || 0 } }));
-  v.on("selection", e => FTStore.set({ viewer: { selection: Number(d(e).count) || 0 } }));
-  v.on("active-record", e => FTStore.set({ viewer: { activeId: d(e).id || null } }));
-  v.on("records", e => FTStore.set({ counts: { indexed: Number(d(e).total) || 0, generation: Number(d(e).generation) || 0 } }));
   v.on("ready", e => FTStore.set({ counts: { indexed: Number(d(e).total) || 0 } }));
-  v.on("locale", e => { FTStore.set({ viewer: { locale: d(e).locale || "ko" } }); syncLangBtn(); });
-  v.on("theme", e => FTStore.set({ viewer: { theme: d(e).theme || "light" } }));
+  v.on("locale", () => syncLangBtn());
   v.on("popout", e => hSetPopped(!!d(e).open));
   v.on("request-popout", () => hPopoutOpen());
   v.on("error", e => { if (d(e).stage === "load") toast("검토 데이터를 불러오지 못했습니다: " + (d(e).message || ""), "err"); });

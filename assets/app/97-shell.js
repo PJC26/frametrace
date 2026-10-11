@@ -23,7 +23,7 @@ function hRender() {
   $("inputCard").hidden = mode !== "empty";
   $("hViewerHost").hidden = mode === "empty";
   $("hHostWait").hidden = mode !== "wait";
-  if (mode === "project" && !s.viewer.mounted) hViewer.mount(s.phase === "review-partial");
+  if (mode === "project" && !s.viewer.mounted && !hSwitching) hViewer.mount();
   if (mode !== "project" && s.panels.finalize) hCloseSheet("finalize", false);
   if (mode === "empty" && hPrevMode && hPrevMode !== "empty" && typeof onHomeShown === "function") onHomeShown();
   // First paint of the empty state: the evidence field takes focus (the
