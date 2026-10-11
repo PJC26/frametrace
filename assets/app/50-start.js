@@ -74,7 +74,6 @@ $("btnStart").addEventListener("click", async () => {
     pushRecent("recentCases", caseDir);
     started = true;
     resetLogView();
-    jobSeen = true; autoProgress = true; autoReviewed = false;
     // Straight into the host: the chip shows progress, the jobs sheet
     // opens once on the first start, the viewer mounts at review-partial.
     FTStore.set({ ui: { home: false } });
@@ -89,23 +88,11 @@ $("btnStart").addEventListener("click", async () => {
   }
 });
 
-// Switching cases must not leak the previous case's state into the UI —
-// badges, links and package paths describe whatever the server last
-// reported, so clear them before the poll repopulates from the new case.
+// Switching cases must not leak the previous case's state into the UI.
+// The deliverables sheet (41-finalize.js) and the jobs sheet (32-jobs.js)
+// reset themselves on a project change; this clears what the shell owns.
 function resetCaseUi() {
-  jobSeen = false; reviewReady = false; autoReviewed = false; autoProgress = false;
   auditVerified = false;
-  $("btnFinalize").disabled = true;
-  $("btnFinalize").textContent = "보고서 생성·패키징";
-  $("finalLinks").innerHTML = "";
-  $("finalHint").textContent = "";
-  $("jobsNote").textContent = "조사된 이미지가 있을 때 삭제 영상 후보 복구와 카빙을 실행할 수 있습니다.";
-  $("pkgPath").classList.remove("show");
-  $("pkgPath").textContent = "";
-  $("advOut").hidden = true;
-  $("advOut").textContent = "";
-  $("advLink").innerHTML = "";
-  $("track").innerHTML = "";
   setCaseToolsVisible(false);
   resetLogView();
   shownStatusError = null;

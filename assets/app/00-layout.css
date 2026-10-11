@@ -262,28 +262,7 @@ details.opts:not([open]) > .opts-body { display: none; }
 .h-sheet-foot:not(:has(> :not([hidden]):not([style*="display:none"]):not([style*="display: none"]))) { display: none; }
 .h-note { margin: 0; color: var(--muted); font-size: var(--fs-sm); }
 .h-sheet h3 { margin: 0 0 6px; font-size: var(--fs-sm); font-weight: 600; }
-.h-check { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; font-size: var(--fs-sm); cursor: pointer; }
-.h-check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
 
-/* @interim (T3/T4): styles for the pre-rebuild job / finalize markup that
-   still lives inside the sheet mounts. 30-jobs.css / 40-finalize.css
-   replace them; delete with that markup. */
-#hFinalizeSheet #finalHint { margin: 0; font-size: var(--fs-xs); }
-#hFinalizeSheet #finalHint:empty { display: none; }
-#hFinalizeSheet .linklist { display: grid; gap: 6px; }
-#hFinalizeSheet .linklist:empty { display: none; }
-#hFinalizeSheet .linklist a { display: block; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); color: var(--text); font-size: var(--fs-sm); text-decoration: none; }
-#hFinalizeSheet .linklist a:hover { border-color: var(--accent); }
-#hFinalizeSheet .linklist a b { color: var(--accent-ink); }
-#hFinalizeSheet .linklist a span { display: block; margin-top: 2px; color: var(--muted); font-size: var(--fs-xs); }
-#hFinalizeSheet .pkg { display: none; padding: 8px 10px; border: 1px dashed var(--border-strong); border-radius: var(--radius); background: var(--surface-2); font-family: var(--font-mono); font-size: var(--fs-xs); word-break: break-all; }
-#hFinalizeSheet .pkg.show { display: block; }
-.h-adv { border-top: 1px solid var(--border); padding-top: 8px; }
-.h-adv > summary { display: flex; align-items: center; gap: 6px; width: fit-content; min-height: var(--h-ctl); padding: 0 8px; margin: 0 -8px; border-radius: var(--radius); color: var(--muted); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; list-style: none; }
-.h-adv > summary:hover { background: var(--surface-2); }
-.h-adv-body { display: grid; gap: 4px; padding-top: 8px; }
-.h-adv-body > button { justify-content: flex-start; }
-#hFinalizeSheet .adv-out { max-height: 160px; margin: 4px 0 0; padding: 8px 10px; overflow: auto; border-radius: var(--radius); background: var(--surface-2); font-family: var(--font-mono); font-size: var(--fs-xs); white-space: pre-wrap; word-break: break-all; }
 
 /* ================================================================ toasts
    One host at a time (§6.5): the viewer's #toastHost once it is mounted,

@@ -20,7 +20,7 @@ async function hPendingChanges() {
   const sm = hViewer.summary();
   if (sm && Number.isFinite(sm.pending)) return sm.pending;
   if (sm && Number.isFinite(sm.unsynced)) return sm.unsynced;
-  if (!reviewReady) return 0;
+  if (!FTStore.hasProject()) return 0;
   try {
     const meta = await jget("/api/records-meta");
     const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;

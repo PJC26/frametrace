@@ -185,45 +185,9 @@
      its head/body/foot. -->
 <div class="h-sheet" id="hJobsSheet" role="complementary" aria-labelledby="hJobsTitle" data-region="hJobsSheet" data-keys="off" hidden></div>
 
-<!-- Deliverables sheet (modal). Mount owned by T2; the content below is
-     the pre-rebuild markup kept until the finalize code (T4) renders it. -->
-<div class="h-sheet" id="hFinalizeSheet" role="dialog" aria-modal="true" aria-label="결과물 — 보고서 · 패키지" data-region="hFinalizeSheet" data-keys="off" hidden>
-  <div class="h-sheet-head">
-    <h2>결과물</h2>
-    <button type="button" class="quiet icon" id="hFinalizeClose" aria-label="결과물 시트 닫기" title="닫기 (Esc)"><svg class="ic" aria-hidden="true"><use href="#i-close"/></svg></button>
-  </div>
-  <div class="h-sheet-body">
-    <p class="h-note">보고서에는 발견 영상·메타데이터·SHA-256·처리 체인이 정리됩니다. 패키징 때 원본 해시를 다시 계산해 기록값과 대조합니다.</p>
-    <p class="muted" id="finalHint"></p>
-    <div class="linklist" id="finalLinks"></div>
-    <div class="pkg" id="pkgPath"></div>
-    <div class="h-row">
-      <button type="button" id="btnVerifySources" title="색인된 모든 원본을 지금 다시 해시해 기록된 SHA-256과 비교합니다 (evidence/logs/hash-verify.jsonl)">원본 재검증</button>
-    </div>
-    <details class="h-adv" id="finalAdvanced">
-      <summary><svg class="ic h-caret" aria-hidden="true"><use href="#i-chevron-right"/></svg>고급</summary>
-      <div class="h-adv-body">
-        <input type="file" id="marksFile" accept=".json" hidden>
-        <button type="button" class="quiet" id="btnImportMarks" title="다른 PC·오프라인 뷰어에서 내보낸 마크 JSON을 가져올 때만 사용합니다">외부 마크 파일 가져오기</button>
-        <button type="button" class="quiet" data-adv="dfxml">DFXML 보내기</button>
-        <button type="button" class="quiet" data-adv="timeline">타임라인 JSONL</button>
-        <button type="button" class="quiet" data-adv="qa-consistency">색인 일관성 QA</button>
-        <button type="button" class="quiet" data-adv="qa-defense">보고 방어 체크</button>
-        <button type="button" class="quiet" data-adv="deepfake" title="케이스의 모든 파일을 deepfake-lens로 스크리닝 — 판정이 아니라 검토 우선순위입니다">딥페이크 스크리닝</button>
-        <label class="sr-only" for="advPath">다른 케이스 폴더 또는 해시 목록 파일 경로</label>
-        <input type="text" id="advPath" placeholder="다른 케이스 폴더 또는 해시 목록 파일 경로">
-        <button type="button" class="quiet" data-adv="compare">케이스 비교</button>
-        <button type="button" class="quiet" data-adv="merge">케이스 병합</button>
-        <button type="button" class="quiet" data-adv="known-hash">기지 해시 필터</button>
-        <pre class="adv-out muted" id="advOut" hidden></pre>
-        <div id="advLink"></div>
-      </div>
-    </details>
-  </div>
-  <div class="h-sheet-foot">
-    <button type="button" class="primary lg" id="btnFinalize">보고서 생성·패키징</button>
-  </div>
-</div>
+<!-- Deliverables sheet (modal). Mount owned by T2; 41-finalize.js (T4)
+     renders its head/body/foot. -->
+<div class="h-sheet" id="hFinalizeSheet" role="dialog" aria-modal="true" aria-label="결과물 — 보고서 · 패키지" data-region="hFinalizeSheet" data-keys="off" hidden></div>
 
 <!-- Toasts are visual only; announcements go through the two live
      regions below (polite for everything, assertive for errors). -->
