@@ -715,10 +715,13 @@ function downloadHref(path) {{
     return "/media?path=" + encodeURIComponent(absPath(path)) + "&download=1";
   return fileUrl(absPath(path));
 }}
-// Mirrors video_export::sanitize_filename — every non-alphanumeric char
+// Mirrors util::sanitize_filename — every non-alphanumeric char
 // (including '.') becomes '_' one-for-one, so ft-951sd\...\carve_1.avi maps to
-// ft-951sd_..._carve_1_avi_proxy_*.
-const sanitizeSelector = s => String(s || "").replace(/[^A-Za-z0-9_-]/g, "_");
+// ft-951sd_..._carve_1_avi_proxy_*; Windows device names get a leading '_'.
+const sanitizeSelector = s => {{
+  const out = String(s || "").replace(/[^A-Za-z0-9_-]/g, "_") || "clip";
+  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(out) ? "_" + out : out;
+}};
 function proxyFor(a) {{
   // Proxy filenames embed sanitize(selector) where the selector was the
   // carve-log path at build time (often case-relative), while output_path

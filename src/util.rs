@@ -401,15 +401,17 @@ pub fn html_escape(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Longest sanitized file-name stem, so `{stem}_proxy_*.mp4` style names stay
-/// well inside the 255-byte filesystem limit.
-const MAX_SANITIZED_FILENAME_CHARS: usize = 100;
-
 /// The single file-name sanitizer. Keeps ASCII alphanumerics, `-` and `_`;
 /// everything else (separators, dots, control characters, spaces, non-ASCII)
 /// becomes `_` one-for-one. Windows reserved device names (CON, PRN, AUX, NUL,
-/// COM1-9, LPT1-9) get a leading `_`, trailing dots/spaces are impossible by
-/// construction, the stem is capped, and an empty result becomes `clip`.
+/// COM1-9, LPT1-9) get a leading `_` (such names could never be created on
+/// Windows, so no existing file changes name), trailing dots/spaces are
+/// impossible by construction, and an empty result becomes `clip`.
+///
+/// The output is NOT length-capped on purpose: proxies, clips and telemetry
+/// are found again by re-sanitizing the selector (often a full source path),
+/// and the HTML report mirrors this rule in JS (`sanitizeSelector`). Changing
+/// the mapping would orphan artifacts in existing cases.
 pub fn sanitize_filename(input: &str) -> String {
     let mut out: String = input
         .chars()
@@ -420,7 +422,6 @@ pub fn sanitize_filename(input: &str) -> String {
                 '_'
             }
         })
-        .take(MAX_SANITIZED_FILENAME_CHARS)
         .collect();
     if out.is_empty() {
         return "clip".to_string();
@@ -545,7 +546,8 @@ mod tests {
         assert_eq!(sanitize_filename("COM0"), "COM0");
         assert_eq!(sanitize_filename("console"), "console");
         assert_eq!(sanitize_filename("한글.avi"), "___avi");
-        assert_eq!(sanitize_filename(&"x".repeat(500)).len(), 100);
+        // Not capped: existing artifacts are located by re-sanitizing.
+        assert_eq!(sanitize_filename(&"x".repeat(500)).len(), 500);
     }
 
     #[test]
