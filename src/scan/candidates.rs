@@ -255,6 +255,85 @@ pub(super) fn record_is_unchanged(
     true
 }
 
+/// Decodes the data lines of a checkpoint discarded for a fingerprint
+/// mismatch. Best effort: an undecodable line is skipped (it only costs a
+/// re-hash), never an error.
+pub(super) fn salvage_checkpoint_records(
+    checkpoint: &RunCheckpoint,
+) -> HashMap<String, VideoRecord> {
+    checkpoint
+        .stale_data_lines()
+        .iter()
+        .filter_map(|line| serde_json::from_str::<VideoRecord>(line).ok())
+        .map(|record| {
+            (
+                normalize_source_key(&record.source_path.to_string_lossy()),
+                record,
+            )
+        })
+        .collect()
+}
+
+/// Same size and mtime as the file on disk — the oracle incremental scans
+/// and checkpoint replay already use to trust a stored per-file record.
+pub(super) fn same_file_state(
+    record: &VideoRecord,
+    size_bytes: u64,
+    modified_unix: Option<u64>,
+) -> bool {
+    record.size_bytes == size_bytes && record.modified_unix == modified_unix
+}
+
+fn has_hash(record: &VideoRecord) -> bool {
+    record.sha256.is_some()
+}
+
+fn has_probe(record: &VideoRecord) -> bool {
+    record.probe.error.as_deref() != Some("ffprobe skipped")
+}
+
+/// True when `donor` knows something `existing` does not (a hash or a
+/// probe result), so skipping the file would drop that fact.
+pub(super) fn adds_facts(donor: &VideoRecord, existing: &VideoRecord) -> bool {
+    (has_hash(donor) && !has_hash(existing)) || (has_probe(donor) && !has_probe(existing))
+}
+
+/// Which per-file facts a scan reuses instead of computing.
+pub(super) struct CarriedFacts<'a> {
+    pub(super) hash: Option<&'a VideoRecord>,
+    pub(super) probe: Option<&'a VideoRecord>,
+}
+
+/// Merge rule for per-file facts (Blocker: a lighter pass must never drop
+/// recorded hashes/metadata). Both donors already match the file's current
+/// size+mtime.
+///
+/// * `salvaged` (a discarded checkpoint of an interrupted run) always
+///   donates: those facts were computed for this exact file state and
+///   redoing them is the work resume exists to avoid.
+/// * `indexed` (the current index record) donates a fact the pass does
+///   not compute itself (no `--hash` / `--no-ffprobe`), and — in
+///   incremental mode — any fact it already has. Only an explicit
+///   non-incremental `--hash` / ffprobe pass recomputes what it was asked
+///   to compute.
+pub(super) fn carried_facts<'a>(
+    salvaged: Option<&'a VideoRecord>,
+    indexed: Option<&'a VideoRecord>,
+    options: &ScanOptions,
+) -> CarriedFacts<'a> {
+    let hash = salvaged.filter(|r| has_hash(r)).or_else(|| {
+        indexed
+            .filter(|_| options.incremental || !options.hash_files)
+            .filter(|r| has_hash(r))
+    });
+    let probe = salvaged.filter(|r| has_probe(r)).or_else(|| {
+        indexed
+            .filter(|_| options.incremental || !options.use_ffprobe)
+            .filter(|r| has_probe(r))
+    });
+    CarriedFacts { hash, probe }
+}
+
 pub(super) fn classify_confidence(extension: &str, probe: &ProbeSummary) -> String {
     if probe.ok {
         "ffprobe-confirmed".to_string()

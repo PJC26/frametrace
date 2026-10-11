@@ -127,6 +127,14 @@ pub(super) fn load_existing_video_ids(case_dir: &Path) -> Result<IdRegistry, Str
     })
 }
 
+/// Fresh records replace indexed ones wholesale. That is safe because a
+/// fresh record already carries every per-file fact the pass did not
+/// compute itself (scan_folder's `carried_facts` rule): a rescan without
+/// `--hash` keeps the recorded SHA-256/hash_status and one with
+/// `--no-ffprobe` keeps the recorded probe, as long as size+mtime still
+/// match. A lighter pass therefore never downgrades evidence facts; only
+/// a changed file (or an explicit non-incremental `--hash`/ffprobe pass,
+/// which recomputes) replaces them.
 pub(super) fn merge_existing_with_scan(
     case_dir: &Path,
     result: &ScanResult,

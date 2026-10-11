@@ -157,6 +157,7 @@ Open `case-001/review/evidence-viewer.html` to review actual indexed/candidate m
 Open `case-001/reports/case-report.html` after `make-report`.
 
 By default, `scan-folder` skips full SHA-256 hashing because terabyte-scale evidence can take hours. Use `--hash` when the evidence workflow requires per-file hashes.
+A rescan never drops facts it did not compute: running `scan-folder` without `--hash` (or with `--no-ffprobe`) over an existing index keeps each file's recorded SHA-256 (and ffprobe metadata) as long as its size and mtime are unchanged. Hashes computed by an interrupted run (its `db/scan-progress.jsonl` checkpoint) are likewise reused by the next scan of the same files, even with different options.
 
 Exported clips are written to `case-001/artifacts/clips/` unless `--output` is provided.
 Proxy files are written to `case-001/artifacts/proxies/`, thumbnails to `case-001/artifacts/thumbnails/`, and carved recovery candidates to `case-001/artifacts/carved/`.

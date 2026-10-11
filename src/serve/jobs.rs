@@ -421,12 +421,7 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
     // Phase 1 scan: listing + container metadata only. Hashing and
     // ffprobe are the slow per-file passes; they move to phase 2.
     set_step(&state, 2, StepStatus::Running);
-    let scan_args: Vec<String> = vec![
-        "scan-folder".into(),
-        case_text.clone(),
-        source_text,
-        "--no-ffprobe".into(),
-    ];
+    let scan_args = phase1_scan_args(&case_text, &source_text);
     match run_step(&exe, &scan_args, &state) {
         Ok(output) => {
             log(&state, output);
@@ -441,6 +436,22 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
 
     enter_review_partial(&state);
     run_folder_enrichment(&state, &job, |args| run_step(&exe, args, &state));
+}
+
+/// Phase-1 `scan-folder` arguments. `--incremental` makes a rerun on an
+/// existing case reuse every unchanged record verbatim (hashes and ffprobe
+/// metadata included) instead of rebuilding it hash-less; together with
+/// scan-folder's carry rule (a pass never drops facts it did not compute)
+/// and its salvage of a cancelled phase-2 checkpoint, re-analysing after a
+/// cancel resumes hashing where it stopped (Blockers 1/2).
+pub(crate) fn phase1_scan_args(case_text: &str, source_text: &str) -> Vec<String> {
+    vec![
+        "scan-folder".into(),
+        case_text.into(),
+        source_text.into(),
+        "--no-ffprobe".into(),
+        "--incremental".into(),
+    ]
 }
 
 /// Phase 1 is done: the hash-less index is on disk and reviewable while
@@ -659,7 +670,7 @@ pub(crate) fn stop_enrichment(state: &SharedState, step: usize, failure: Option<
         None => {
             guard.steps[step] = StepStatus::Pending;
             let message = format!(
-                "{what} 단계에서 보강을 중단했습니다 — 해시·검증·리뷰 생성이 완료되지 않았습니다. 1단계 색인으로 검토는 계속할 수 있으며, 같은 소스로 다시 분석하면 이어서 진행합니다."
+                "{what} 단계에서 보강을 중단했습니다 — 해시·검증·리뷰 생성이 완료되지 않았습니다. 1단계 색인으로 검토는 계속할 수 있으며, 같은 소스로 다시 분석하면 이미 계산한 해시는 다시 계산하지 않고 남은 파일부터 이어서 진행합니다."
             );
             guard.logs.push(format!("경고: {message}"));
             guard.warnings.push((step, message));

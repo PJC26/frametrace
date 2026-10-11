@@ -1055,7 +1055,7 @@ function applyStatus(st) {
         const e = st.enrichment;
         fh.textContent = enriching
           ? `보강 진행 중${e ? ` (${e.label} ${e.stage}/${e.stages})` : ""} — 끝나면 결과 보고서를 생성할 수 있습니다.`
-          : "보강이 완료되지 않았습니다 (해시·검증·리뷰 생성 미완료) — 같은 소스로 다시 분석하면 이어서 진행합니다.";
+          : "보강이 완료되지 않았습니다 (해시·검증·리뷰 생성 미완료) — 같은 소스로 다시 분석하면 이미 계산된 해시는 재사용하고 남은 파일만 처리합니다.";
       }
     } else if (st.phase === "review-ready" || st.phase === "done" || st.phase === "finalized") {
       if (!auditVerified) { auditVerified = true; verifyAudit(); }
@@ -1242,7 +1242,7 @@ let cancelRequested = false;
 $("btnCancel").addEventListener("click", async () => {
   const go = await askDialog({
     title: "분석 중단",
-    html: "<p>분석을 중단하시겠습니까?</p><p>중단 후 같은 소스·옵션으로 '분석 시작'을 다시 누르면 같은 케이스를 체크포인트에서 이어서 분석합니다.</p>",
+    html: "<p>분석을 중단하시겠습니까?</p><p>중단 후 같은 소스로 '분석 시작'을 다시 누르면 같은 케이스에서 이어서 분석합니다 — 이미 계산된 해시·메타데이터는 다시 계산하지 않고 남은 파일만 처리합니다.</p>",
     okLabel: "분석 중단", cancelLabel: "계속 분석", danger: true, focus: "dlgCancel",
   });
   if (!go) return;

@@ -61,6 +61,12 @@ pub struct RunCheckpoint {
     resumed: bool,
     reset_stale: bool,
     lines: Vec<String>,
+    /// Data lines of a prior checkpoint discarded for a fingerprint
+    /// mismatch. Never replayed as "done" work, but a caller may salvage
+    /// per-item facts from them (scan-folder reuses hashes of files whose
+    /// size+mtime still match) so a cancelled heavy run is not redone from
+    /// zero just because a lighter pass ran in between.
+    stale_lines: Vec<String>,
     file: File,
 }
 
@@ -101,6 +107,7 @@ impl RunCheckpoint {
         let mut reset_stale = false;
         let mut run_id = new_run_id(kind)?;
         let mut lines = Vec::new();
+        let mut stale_lines = Vec::new();
 
         if mode != ResumeMode::Disabled && !text.trim().is_empty() {
             match parse_checkpoint(&text, path, kind) {
@@ -117,6 +124,7 @@ impl RunCheckpoint {
                         ));
                     } else {
                         reset_stale = true;
+                        stale_lines = prior_lines;
                     }
                 }
                 Ok(None) => {
@@ -166,6 +174,7 @@ impl RunCheckpoint {
             resumed,
             reset_stale,
             lines,
+            stale_lines,
             file,
         })
     }
@@ -221,6 +230,12 @@ impl RunCheckpoint {
     /// Data lines (everything after the header) loaded from the prior run.
     pub fn data_lines(&self) -> &[String] {
         &self.lines
+    }
+
+    /// Data lines of the prior checkpoint discarded by [`Self::reset_stale`]
+    /// (empty otherwise). Salvage only — never treat them as completed work.
+    pub fn stale_data_lines(&self) -> &[String] {
+        &self.stale_lines
     }
 }
 
