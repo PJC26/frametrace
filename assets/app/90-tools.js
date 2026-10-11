@@ -14,34 +14,7 @@ function legacyCopy(text) {
   ta.remove();
   return ok;
 }
-// @interim: the log tools move to the jobs code (T3, 30-jobs.js).
-$("btnCopyLog").addEventListener("click", async () => {
-  const text = $("log").textContent;
-  let ok = false;
-  try { await navigator.clipboard.writeText(text); ok = true; }
-  catch (e) { ok = legacyCopy(text); }
-  if (ok) flashLabel($("btnCopyLog"), "복사됨", "로그 복사");
-  else toast("클립보드에 복사하지 못했습니다 — '로그 저장'으로 파일로 저장하십시오.", "err");
-});
-$("btnSaveLog").addEventListener("click", () => {
-  const p2 = n => String(n).padStart(2, "0");
-  const d = new Date();
-  const name = `frametrace-log-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}.txt`;
-  const blob = new Blob([$("log").textContent], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-});
-$("log").addEventListener("scroll", () => {
-  if (logAtBottom($("log"))) $("btnLogBottom").hidden = true;
-});
-$("btnLogBottom").addEventListener("click", () => {
-  const el = $("log");
-  el.scrollTop = el.scrollHeight;
-  $("btnLogBottom").hidden = true;
-});
+// Log copy / save / jump-to-latest live with the log in 32-jobs.js.
 
 // Restore last-used paths/options, then validate what was restored.
 (function restorePrefs() {

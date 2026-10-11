@@ -42,10 +42,6 @@ $("btnStart").addEventListener("click", async () => {
   const prevHint = hint.textContent;
   hint.textContent = "분석 시작 요청 중…";
   $("btnStart").setAttribute("aria-busy", "true");
-  cancelRequested = false;
-  $("btnCancel").disabled = false;
-  $("btnCancel").removeAttribute("aria-busy");
-  $("btnCancel").textContent = "분석 중단";
   let started = false;
   try {
     const res = await jpost("/api/start", {
@@ -154,29 +150,7 @@ async function openCase(dir) {
   return true;
 }
 
-let cancelRequested = false;
-$("btnCancel").addEventListener("click", async () => {
-  const go = await askDialog({
-    title: "분석 중단",
-    html: "<p>분석을 중단하시겠습니까?</p><p>중단 후 같은 소스로 '분석 시작'을 다시 누르면 같은 케이스에서 이어서 분석합니다 — 이미 계산된 해시·메타데이터는 다시 계산하지 않고 남은 파일만 처리합니다.</p>",
-    okLabel: "분석 중단", cancelLabel: "계속 분석", danger: true, focus: "dlgCancel",
-  });
-  if (!go) return;
-  cancelRequested = true;
-  $("btnCancel").disabled = true;
-  $("btnCancel").setAttribute("aria-busy", "true");
-  $("btnCancel").textContent = "중단 요청 중…";
-  const res = await jpost("/api/cancel", {});
-  if (!res.ok) {
-    cancelRequested = false;
-    $("btnCancel").disabled = false;
-    $("btnCancel").removeAttribute("aria-busy");
-    $("btnCancel").textContent = "분석 중단";
-    toast("중단 요청 실패: " + (res.error || "알 수 없는 오류"), "err");
-  }
-});
-// "새 분석" reloads the page onto the empty state (ft_want_new, read once
-// by 97-shell.js). @interim: T3 moves this handler into 30-jobs.js.
+// btnCancel / btnNew (work sheet) are wired in 32-jobs.js.
 // UX-18: a page reload also reloads the viewer, so it is guarded exactly
 // like the viewer's own refresh: never while marks/memos are not yet in
 // the case DB — offer to save instead.
@@ -202,18 +176,6 @@ async function guardedPageReload(reason) {
   location.reload();
   return true;
 }
-$("btnNew").addEventListener("click", async () => {
-  const btn = $("btnNew");
-  btn.disabled = true;
-  try {
-    try { sessionStorage.setItem("ft_want_new", "1"); } catch (e) { /* storage blocked: the bound case reopens */ }
-    const reloaded = await guardedPageReload("새 케이스 시작");
-    if (!reloaded) { try { sessionStorage.removeItem("ft_want_new"); } catch (e) {} }
-  } finally {
-    btn.disabled = false;
-  }
-});
-
 $("directE01").addEventListener("change", syncDirectE01);
 document.querySelectorAll("input[name='scanMode']").forEach(r => r.addEventListener("change", () => applyScanMode(r.value)));
 $("withHash").addEventListener("change", syncScanMode);

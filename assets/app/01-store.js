@@ -3,7 +3,7 @@
 // renderer listens to the single "change" event, which carries the set of
 // changed keys ("phase", "project", "project.caseDir", …).
 //
-// Writers: the status poll (/api/status → set via hStoreFromStatus), the
+// Writers: the status poll (/api/status, 40-status.js), the
 // viewer bridge (viewer.*), and 97-shell.js — the only writer of panels.*.
 //
 // T2 addition (additive to §4): ui.home — the examiner asked for the empty
@@ -98,47 +98,6 @@ const FTStore = (() => {
 
 function hBaseName(dir) {
   return String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
-}
-
-// Pure: one /api/status reply → an FTStore patch. Server phases are
-// idle|running|review-partial|review-ready|finalizing|done|error; the store
-// speaks the contract's vocabulary (idle → empty, finalizing → review-ready
-// while busy, done + package → finalized).
-function hStoreFromStatus(st) {
-  const s = st && typeof st === "object" ? st : {};
-  const raw = String(s.phase || "idle");
-  let phase = raw === "idle" ? "empty" : raw === "finalizing" ? "review-ready" : raw;
-  if (raw === "done" && s.package_dir) phase = "finalized";
-  if (!s.has_job && !s.case_dir) phase = "empty";
-  return {
-    phase,
-    project: {
-      caseDir: s.case_dir || "",
-      name: hBaseName(s.case_dir),
-      packageDir: s.package_dir || "",
-      restored: !!s.restored,
-    },
-    jobs: {
-      pipeline: {
-        steps: Array.isArray(s.steps) ? s.steps : [],
-        stepNames: Array.isArray(s.step_names) ? s.step_names : [],
-        current: s.current || "",
-        progress: s.progress || null,
-        enrichment: s.enrichment || null,
-        warnings: Array.isArray(s.warnings) ? s.warnings : [],
-        logs: Array.isArray(s.logs) ? s.logs : [],
-        busy: !!s.busy,
-        error: s.error || "",
-      },
-      caseJob: s.job || null,
-      clipJobs: Array.isArray(s.clip_jobs) ? s.clip_jobs : [],
-      clipsRunning: Number(s.clips_running) || 0,
-      pendingMarks: Number(s.pending_marks) || 0,
-      jobKind: s.job_kind || null,
-    },
-    counts: { generation: Number(s.index_generation) || 0 },
-    server: { instance: s.instance || "", lost: false, failures: 0 },
-  };
 }
 
 // ---- the one door to the review viewer ----

@@ -40,13 +40,7 @@
   </div>
   <!-- Progress chip: one place for the analysis and every background job.
        Mount owned by T2; its contents are rendered by the jobs code (T3). -->
-  <div class="h-chip" id="jobPanel" hidden>
-    <button type="button" class="quiet h-chip-btn" id="hBtnJobs" aria-controls="hJobsSheet" aria-expanded="false" title="작업 진행 상황 (Alt+J)">
-      <span class="h-chip-dot" id="jobDot" aria-hidden="true"></span>
-      <span class="h-chip-text"><b id="jobTitle"></b> <span id="jobDetail"></span></span>
-      <span class="h-chip-time mono num" id="jobElapsed"></span>
-    </button>
-  </div>
+  <div class="h-chip" id="jobPanel" hidden></div>
   <span class="h-spacer" aria-hidden="true"></span>
   <button type="button" id="hBtnPopout" aria-label="새 창 — 보조 모니터로 영상·판독 분리" title="열린 프로젝트가 없습니다" disabled><svg class="ic" aria-hidden="true"><use href="#i-popout"/></svg><span class="h-lbl h-lbl-pop">새 창</span></button>
   <button type="button" id="hBtnFinalize" aria-controls="hFinalizeSheet" aria-expanded="false" aria-label="결과물 — 보고서·패키지 (Alt+R)" title="열린 프로젝트가 없습니다" disabled><svg class="ic" aria-hidden="true"><use href="#i-report"/></svg><span class="h-lbl h-lbl-fin">결과물</span></button>
@@ -187,42 +181,9 @@
   </div>
 </main>
 
-<!-- Jobs sheet (non-modal). Mount owned by T2; the analysis/job content
-     below is the pre-rebuild markup kept until the jobs code (T3) renders
-     this sheet itself. -->
-<div class="h-sheet" id="hJobsSheet" role="complementary" aria-labelledby="hJobsTitle" data-region="hJobsSheet" data-keys="off" hidden>
-  <div class="h-sheet-head">
-    <h2 id="hJobsTitle">작업</h2>
-    <button type="button" class="quiet icon" id="hJobsClose" aria-label="작업 시트 닫기" title="닫기 (Esc)"><svg class="ic" aria-hidden="true"><use href="#i-close"/></svg></button>
-  </div>
-  <div class="h-sheet-body">
-    <ol class="steptrack" id="track"></ol>
-    <pre class="log" id="log" tabindex="0" aria-label="분석 로그 (스크롤 가능)"></pre>
-    <div class="h-row h-logtools">
-      <button type="button" class="quiet" id="btnCopyLog"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>로그 복사</button>
-      <button type="button" class="quiet" id="btnSaveLog" title="현재까지의 로그를 텍스트 파일로 저장합니다"><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg>로그 저장</button>
-      <button type="button" class="quiet" id="btnLogBottom" title="로그 맨 아래로 이동하고 자동 스크롤을 다시 켭니다" hidden>최신 로그로</button>
-    </div>
-    <section class="h-jobs-start" id="jobsStart" aria-labelledby="jobsStartTitle">
-      <h3 id="jobsStartTitle">삭제 영상 · 카빙</h3>
-      <p class="h-note" id="jobsNote">조사된 이미지가 있을 때 삭제 영상 후보 복구와 카빙을 실행할 수 있습니다.</p>
-      <div class="h-row">
-        <button type="button" id="btnRecoverDeleted" hidden>삭제 영상 후보 복구</button>
-        <button type="button" id="btnCarve" hidden title="export된 raw 이미지에서 영상 시그니처를 카빙합니다 (E01 전체 export 분석 필요)">이미지 카빙</button>
-        <label class="h-check" id="reassembleWrap" hidden title="조각난 영상을 이어붙인 후보를 추가로 만듭니다. 결과는 검증 전 '후보'로만 표시됩니다"><input type="checkbox" id="chkReassemble"> 조각 재조립 시도</label>
-      </div>
-      <div class="h-row h-jobctl">
-        <button type="button" class="destructive" id="btnJobCancel" hidden>작업 중단</button>
-        <button type="button" class="primary" id="btnJobReload" hidden>뷰어 새로 고침</button>
-        <button type="button" class="quiet" id="btnJobClose" hidden>작업 표시 지우기</button>
-      </div>
-    </section>
-  </div>
-  <div class="h-sheet-foot">
-    <button type="button" class="destructive" id="btnCancel" style="display:none">분석 중단</button>
-    <button type="button" id="btnNew" style="display:none">새 분석</button>
-  </div>
-</div>
+<!-- Jobs sheet (non-modal). Mount owned by T2; 32-jobs.js (T3) renders
+     its head/body/foot. -->
+<div class="h-sheet" id="hJobsSheet" role="complementary" aria-labelledby="hJobsTitle" data-region="hJobsSheet" data-keys="off" hidden></div>
 
 <!-- Deliverables sheet (modal). Mount owned by T2; the content below is
      the pre-rebuild markup kept until the finalize code (T4) renders it. -->
