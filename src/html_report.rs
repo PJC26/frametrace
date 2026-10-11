@@ -682,9 +682,9 @@ function downloadHref(path) {{
   return fileUrl(absPath(path));
 }}
 // Mirrors video_export::sanitize_filename — every non-alphanumeric char
-// (including '.') becomes '_', so ft-951sd\...\carve_1.avi maps to
+// (including '.') becomes '_' one-for-one, so ft-951sd\...\carve_1.avi maps to
 // ft-951sd_..._carve_1_avi_proxy_*.
-const sanitizeSelector = s => String(s || "").replace(/[^A-Za-z0-9_-]+/g, "_");
+const sanitizeSelector = s => String(s || "").replace(/[^A-Za-z0-9_-]/g, "_");
 function proxyFor(a) {{
   // Proxy filenames embed sanitize(selector) where the selector was the
   // carve-log path at build time (often case-relative), while output_path

@@ -401,6 +401,41 @@ pub fn html_escape(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Longest sanitized file-name stem, so `{stem}_proxy_*.mp4` style names stay
+/// well inside the 255-byte filesystem limit.
+const MAX_SANITIZED_FILENAME_CHARS: usize = 100;
+
+/// The single file-name sanitizer. Keeps ASCII alphanumerics, `-` and `_`;
+/// everything else (separators, dots, control characters, spaces, non-ASCII)
+/// becomes `_` one-for-one. Windows reserved device names (CON, PRN, AUX, NUL,
+/// COM1-9, LPT1-9) get a leading `_`, trailing dots/spaces are impossible by
+/// construction, the stem is capped, and an empty result becomes `clip`.
+pub fn sanitize_filename(input: &str) -> String {
+    let mut out: String = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(MAX_SANITIZED_FILENAME_CHARS)
+        .collect();
+    if out.is_empty() {
+        return "clip".to_string();
+    }
+    let upper = out.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        out.insert(0, '_');
+    }
+    out
+}
+
 pub fn json_for_script(input: &str) -> String {
     input
         .replace('<', "\\u003c")
@@ -490,7 +525,28 @@ fn percent_encode_path(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{csv_safe_cell, run_with_timeout, unique_dir, unique_path, write_text_atomic};
+    use super::{
+        csv_safe_cell, run_with_timeout, sanitize_filename, unique_dir, unique_path,
+        write_text_atomic,
+    };
+
+    #[test]
+    fn sanitize_filename_blocks_hostile_names() {
+        assert_eq!(sanitize_filename("vid_000001"), "vid_000001");
+        assert_eq!(sanitize_filename("a/b:c.mp4"), "a_b_c_mp4");
+        assert_eq!(sanitize_filename("../../etc"), "______etc");
+        assert_eq!(sanitize_filename("name. "), "name__");
+        assert_eq!(sanitize_filename("a\u{0}b\n\u{7f}"), "a_b__");
+        assert_eq!(sanitize_filename(""), "clip");
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("nul"), "_nul");
+        assert_eq!(sanitize_filename("Com1"), "_Com1");
+        assert_eq!(sanitize_filename("lpt9"), "_lpt9");
+        assert_eq!(sanitize_filename("COM0"), "COM0");
+        assert_eq!(sanitize_filename("console"), "console");
+        assert_eq!(sanitize_filename("한글.avi"), "___avi");
+        assert_eq!(sanitize_filename(&"x".repeat(500)).len(), 100);
+    }
 
     #[test]
     fn csv_safe_cell_neutralizes_formula_prefixes() {
