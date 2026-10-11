@@ -6,6 +6,23 @@ use super::*;
 // carry one small JSON record per selected item.
 pub(crate) const MAX_BODY: usize = 4 * 1024 * 1024;
 
+/// SEC-06: `/api/capture-frame` carries a base64 canvas JPEG (quality
+/// 0.92). A 4K frame is 3-5 MB of JPEG, i.e. up to ~7 MB of base64 — more
+/// than [`MAX_BODY`] — so that one route gets a larger request cap.
+pub(crate) const MAX_CAPTURE_FRAME_BODY: usize = 16 * 1024 * 1024;
+
+/// Request-body cap for a route (decided from the request line, before any
+/// body byte is read).
+pub(crate) fn http_body_limit_for(path: &str) -> usize {
+    if path == "/api/capture-frame" {
+        MAX_CAPTURE_FRAME_BODY
+    } else {
+        MAX_BODY
+    }
+}
+
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -25,56 +42,149 @@ pub(crate) struct Request {
     pub(crate) nonce_header: Option<String>,
 }
 
-pub(crate) fn handle_connection(mut stream: TcpStream, state: SharedState) -> Result<(), String> {
+/// Headers only the static-file path needs; kept out of [`Request`] so the
+/// many `Request { .. }` literals in tests stay valid.
+#[derive(Default, Clone)]
+pub(crate) struct RequestExtras {
+    pub(crate) if_none_match: Option<String>,
+}
+
+/// A request that could not be read; `status == 0` means "close silently".
+#[derive(Debug)]
+pub(crate) struct HttpReadError {
+    pub(crate) status: u16,
+    pub(crate) message: String,
+}
+
+fn read_error(status: u16, message: impl Into<String>) -> HttpReadError {
+    HttpReadError {
+        status,
+        message: message.into(),
+    }
+}
+
+fn io_read_error(err: &std::io::Error) -> HttpReadError {
+    let timed_out = matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    );
+    read_error(
+        if timed_out { 408 } else { 0 },
+        format!("read failed: {err}"),
+    )
+}
+
+/// How a request must prove itself (SEC-01/SEC-04 gate classes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpAuthClass {
+    /// No proof needed (no token configured, read-only GET/HEAD).
+    Public,
+    /// FRAMETRACE_TOKEN configured: every request carries it.
+    Token,
+    /// No token configured, state-changing request: instance nonce.
+    Nonce,
+}
+
+pub(crate) fn http_auth_class(method: &str, token_configured: bool) -> HttpAuthClass {
+    if token_configured {
+        HttpAuthClass::Token
+    } else if matches!(method, "GET" | "HEAD") {
+        HttpAuthClass::Public
+    } else {
+        HttpAuthClass::Nonce
+    }
+}
+
+/// Gate for one request. `Ok(plant_cookie)` lets it through (a successful
+/// `?token=` asks for the ft_token cookie so follow-up viewer fetches,
+/// which cannot add headers, stay authorized); `Err(status)` is the
+/// refusal code (403 cross-origin/rebinding, 401 missing proof).
+///
+/// Without a configured token, mutating requests must present the
+/// per-instance nonce — planted as a SameSite=Strict ft_nonce cookie on
+/// page loads, so same-origin fetches carry it while cross-site forms and
+/// clients that never learned it are refused. Scripts read the nonce from
+/// the ft_nonce cookie a GET / plants or from the user-private instance
+/// file and send X-FrameTrace-Nonce (/api/status's "instance" is only a
+/// fingerprint, not the nonce).
+pub(crate) fn authorize(
+    request: &Request,
+    token: Option<&str>,
+    instance: &str,
+) -> Result<bool, u16> {
+    if !request_is_localhost_trusted(request) {
+        return Err(403);
+    }
+    match http_auth_class(&request.method, token.is_some()) {
+        HttpAuthClass::Public => Ok(false),
+        HttpAuthClass::Token => match request_authorized(request, token.unwrap_or_default()) {
+            AuthProof::Denied => Err(401),
+            AuthProof::Query => Ok(true),
+            AuthProof::Header | AuthProof::Cookie => Ok(false),
+        },
+        HttpAuthClass::Nonce => {
+            if request_nonce_authorized(request, instance) {
+                Ok(false)
+            } else {
+                Err(401)
+            }
+        }
+    }
+}
+
+/// Writes the final response and half-closes so simple clients see EOF
+/// instead of waiting on the read timeout; connections are never reused.
+pub(crate) fn finish(stream: &mut TcpStream, response: &[u8]) -> Result<(), String> {
+    let written = stream
+        .write_all(response)
+        .map_err(|err| format!("write failed: {err}"));
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    written
+}
+
+pub(crate) fn handle_connection(stream: TcpStream, state: SharedState) -> Result<(), String> {
+    handle_connection_timed(stream, state, HEADER_READ_TIMEOUT)
+}
+
+pub(crate) fn handle_connection_timed(
+    mut stream: TcpStream,
+    state: SharedState,
+    read_timeout: Duration,
+) -> Result<(), String> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|err| format!("read timeout: {err}"))?;
     // A peer that stops reading must not pin a worker thread forever.
     stream
         .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|err| format!("write timeout: {err}"))?;
-    let request = read_request(&mut stream)?;
-    if !request_is_localhost_trusted(&request) {
-        let response = plain(403, b"cross-origin request rejected".to_vec());
-        let _ = stream.write_all(&response);
-        let _ = stream.flush();
-        // Half-close so simple clients see EOF instead of waiting on the
-        // read timeout; we never reuse connections.
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-        return Ok(());
-    }
-    let token = state_lock(&state).token.clone();
-    let mut plant_cookie = false;
-    if let Some(token) = token.as_deref() {
-        match request_authorized(&request, token) {
-            AuthProof::Denied => {
-                let _ = stream.write_all(&plain(401, b"unauthorized".to_vec()));
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                return Ok(());
+    let (request, extras) = match read_request_ext(&mut stream, read_timeout) {
+        Ok(read) => read,
+        Err(err) => {
+            if err.status != 0 {
+                let _ = finish(
+                    &mut stream,
+                    &plain(err.status, err.message.clone().into_bytes()),
+                );
             }
-            // A successful ?token= request plants the cookie so follow-up
-            // viewer fetches (which cannot add headers) stay authorized.
-            AuthProof::Query => plant_cookie = true,
-            AuthProof::Header | AuthProof::Cookie => {}
+            return Err(err.message);
         }
-    }
-    // Without a configured FRAMETRACE_TOKEN, mutating requests still prove
-    // they came from the workstation UI: every non-GET/HEAD request must
-    // present the per-instance nonce — planted as a SameSite=Strict
-    // ft_nonce cookie on page loads, so same-origin fetches carry it
-    // automatically while cross-site forms (which browsers strip it from)
-    // and non-browser clients that never learned it are refused. Scripts
-    // read the nonce from the ft_nonce cookie a GET / plants or from the
-    // user-private instance file and send X-FrameTrace-Nonce
-    // (/api/status's "instance" is only a fingerprint, not the nonce).
-    if token.is_none() && !matches!(request.method.as_str(), "GET" | "HEAD") {
-        let instance = state_lock(&state).instance.clone();
-        if !request_nonce_authorized(&request, &instance) {
-            let _ = stream.write_all(&plain(401, b"unauthorized".to_vec()));
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            return Ok(());
+    };
+    let (token, instance) = {
+        let guard = state_lock(&state);
+        (guard.token.clone(), guard.instance.clone())
+    };
+    let plant_cookie = match authorize(&request, token.as_deref(), &instance) {
+        Ok(plant) => plant,
+        Err(403) => {
+            return finish(
+                &mut stream,
+                &plain(403, b"cross-origin request rejected".to_vec()),
+            );
         }
-    }
+        Err(code) => return finish(&mut stream, &plain(code, b"unauthorized".to_vec())),
+    };
     if request.method == "GET" && request.path == "/media" {
         let result = serve_media(&mut stream, &request, &state);
         let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -90,7 +200,7 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: SharedState) -> Re
             || request.path.starts_with("/case/")
             || viewer_subresource)
     {
-        let result = serve_case_file(&mut stream, &request, &state);
+        let result = serve_case_file_with(&mut stream, &request, &extras, &state);
         let _ = stream.shutdown(std::net::Shutdown::Write);
         return result;
     }
@@ -100,51 +210,38 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: SharedState) -> Re
     }
     // GETs under the no-token model also plant the instance nonce so the
     // just-served page can satisfy the mutating-request gate.
-    if token.is_none() && request.method == "GET" {
-        let instance = state_lock(&state).instance.clone();
-        if !instance.is_empty() {
-            set_nonce_cookie(&mut response, &instance);
-        }
+    if token.is_none() && request.method == "GET" && !instance.is_empty() {
+        set_nonce_cookie(&mut response, &instance);
     }
-    stream
-        .write_all(&response)
-        .map_err(|err| format!("write failed: {err}"))?;
-    let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    Ok(())
+    finish(&mut stream, &response)
 }
 
-pub(crate) fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
-    let mut buffer: Vec<u8> = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 2048];
-    let header_end = loop {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|err| format!("read failed: {err}"))?;
-        if read == 0 {
-            return Err("connection closed before request header ended".into());
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            break position;
-        }
-        if buffer.len() > 64 * 1024 {
-            return Err("request header too large".into());
-        }
-    };
-    let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+/// Parsed request line + headers (everything before the body).
+pub(crate) struct ParsedHead {
+    pub(crate) request: Request,
+    pub(crate) extras: RequestExtras,
+    pub(crate) content_length: usize,
+}
+
+/// Parses the header block. Refuses `Transfer-Encoding` bodies (SEC-06:
+/// this server only understands Content-Length framing, and honouring a
+/// chunked body as empty would desync/smuggle), conflicting duplicate
+/// Content-Length values, and bodies over the per-route cap.
+pub(crate) fn parse_request_head(head: &str) -> Result<ParsedHead, HttpReadError> {
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_uppercase();
     let target = parts.next().unwrap_or("/").to_string();
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
+    let mut transfer_encoding = false;
     let mut range = None;
     let mut origin = None;
     let mut host = None;
     let mut cookie = None;
     let mut token_header = None;
     let mut nonce_header = None;
+    let mut extras = RequestExtras::default();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -152,9 +249,15 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
         let name = name.trim();
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value
+            let parsed = value
                 .parse::<usize>()
-                .map_err(|_| "invalid content-length")?;
+                .map_err(|_| read_error(400, "invalid content-length"))?;
+            if content_length.is_some_and(|previous| previous != parsed) {
+                return Err(read_error(400, "conflicting content-length"));
+            }
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = true;
         } else if name.eq_ignore_ascii_case("range") {
             range = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("origin") {
@@ -167,38 +270,91 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
             token_header = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("x-frametrace-nonce") {
             nonce_header = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("if-none-match") {
+            extras.if_none_match = Some(value.to_string());
         }
     }
-    if content_length > MAX_BODY {
-        return Err("request body too large".into());
+    if transfer_encoding {
+        return Err(read_error(
+            411,
+            "Transfer-Encoding request bodies are not supported; send Content-Length",
+        ));
     }
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (percent_decode_component(path, false), query.to_string()),
+        None => (percent_decode_component(&target, false), String::new()),
+    };
+    let content_length = content_length.unwrap_or(0);
+    if content_length > http_body_limit_for(&path) {
+        return Err(read_error(413, "request body too large"));
+    }
+    Ok(ParsedHead {
+        request: Request {
+            method,
+            path,
+            query,
+            body: String::new(),
+            range,
+            origin,
+            host,
+            cookie,
+            token_header,
+            nonce_header,
+        },
+        extras,
+        content_length,
+    })
+}
+
+/// Reads one request. `header_deadline` bounds the whole header phase (a
+/// slowloris client dripping a byte at a time resets the per-read socket
+/// timeout forever, so a wall-clock deadline is also enforced); the body
+/// gets 4x that budget.
+pub(crate) fn read_request_ext(
+    stream: &mut TcpStream,
+    header_deadline: Duration,
+) -> Result<(Request, RequestExtras), HttpReadError> {
+    let started = std::time::Instant::now();
+    let mut buffer: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    let header_end = loop {
+        if started.elapsed() > header_deadline {
+            return Err(read_error(408, "request header timed out"));
+        }
+        let read = stream.read(&mut chunk).map_err(|err| io_read_error(&err))?;
+        if read == 0 {
+            return Err(read_error(
+                0,
+                "connection closed before request header ended",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break position;
+        }
+        if buffer.len() > 64 * 1024 {
+            return Err(read_error(431, "request header too large"));
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let parsed = parse_request_head(&head)?;
+    let content_length = parsed.content_length;
     let mut body = buffer[header_end + 4..].to_vec();
+    let body_deadline = header_deadline * 4;
     while body.len() < content_length {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|err| format!("read failed: {err}"))?;
+        if started.elapsed() > body_deadline {
+            return Err(read_error(408, "request body timed out"));
+        }
+        let read = stream.read(&mut chunk).map_err(|err| io_read_error(&err))?;
         if read == 0 {
             break;
         }
         body.extend_from_slice(&chunk[..read]);
     }
     body.truncate(content_length);
-    let (path, query) = match target.split_once('?') {
-        Some((path, query)) => (percent_decode_component(path, false), query.to_string()),
-        None => (percent_decode_component(&target, false), String::new()),
-    };
-    Ok(Request {
-        method,
-        path,
-        query,
-        body: String::from_utf8_lossy(&body).to_string(),
-        range,
-        origin,
-        host,
-        cookie,
-        token_header,
-        nonce_header,
-    })
+    let mut request = parsed.request;
+    request.body = String::from_utf8_lossy(&body).to_string();
+    Ok((request, parsed.extras))
 }
 
 /// Percent-decodes a URL component. `plus_as_space` selects query-string
@@ -479,31 +635,101 @@ pub(crate) fn plain(code: u16, body: Vec<u8>) -> Vec<u8> {
     respond(code, "text/plain; charset=utf-8", body, "no-store", None)
 }
 
+/// True when `relative` (already percent-decoded) is a plain relative path
+/// that cannot climb out of its base: non-empty, no NUL, no absolute/drive
+/// component and no `..` *component*. A `..` inside a file name
+/// (`a..b.mp4`) is fine; both `/` and `\\` count as separators so a
+/// Windows-style traversal is refused on every platform.
+pub(crate) fn relative_path_is_safe(relative: &str) -> bool {
+    if relative.is_empty() || relative.contains('\0') {
+        return false;
+    }
+    let mut saw_component = false;
+    for part in relative.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return false,
+            // `C:` / `C:foo` would re-root a join on Windows.
+            part if part.len() >= 2
+                && part.as_bytes()[1] == b':'
+                && part.as_bytes()[0].is_ascii_alphabetic() =>
+            {
+                return false;
+            }
+            _ => saw_component = true,
+        }
+    }
+    // A leading separator would make `join` replace the base entirely.
+    saw_component && !relative.starts_with(['/', '\\'])
+}
+
+/// Strong validator for a thumbnail (size + mtime nanoseconds).
+pub(crate) fn thumb_etag(meta: &std::fs::Metadata) -> String {
+    let nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("\"{:x}-{:x}\"", meta.len(), nanos)
+}
+
+/// True when an `If-None-Match` header value matches `etag` (list, `*` and
+/// weak-prefixed forms; weak comparison is what RFC 9110 prescribes here).
+pub(crate) fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let strip = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let ours = strip(etag);
+    if_none_match
+        .split(',')
+        .map(strip)
+        .any(|candidate| candidate == "*" || candidate == ours)
+}
+
+/// Thumbnails are `review/thumbs/<img>`; they are small, numerous and
+/// fetched on every grid scroll (PERF-05).
+fn is_thumbnail_path(case_dir: &Path, path: &Path) -> bool {
+    let Ok(case_canonical) = case_dir.canonicalize() else {
+        return false;
+    };
+    path.strip_prefix(case_canonical.join("review").join("thumbs"))
+        .is_ok()
+        && matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("jpg" | "jpeg" | "png" | "webp")
+        )
+}
+
 /// Serves a file under the case directory. Responses are streamed in 64 KiB
 /// chunks rather than read fully into memory — case artifacts (reports,
 /// exported bundles) can be large, and the buffered version multiplied
-/// memory use by the concurrent-request count.
-pub(crate) fn serve_case_file(
+/// memory use by the concurrent-request count. Thumbnails carry a strong
+/// ETag (304 on a matching `If-None-Match`); a `?v=` content-addressed URL
+/// is additionally cacheable as immutable.
+pub(crate) fn serve_case_file_with(
     stream: &mut TcpStream,
     request: &Request,
+    extras: &RequestExtras,
     state: &SharedState,
 ) -> Result<(), String> {
     let case_dir = state_lock(state).case_dir.clone();
     let Some(case_dir) = case_dir else {
         return write_simple(stream, 404, b"no case loaded");
     };
-    let prefix = if request.path.starts_with("/review/") {
-        "/review/"
+    let (prefix, under_review) = if request.path.starts_with("/review/") {
+        ("/review/", true)
     } else if request.path.starts_with("/viewer/") {
-        "/viewer/"
+        ("/viewer/", true)
     } else {
-        "/case/"
+        ("/case/", false)
     };
-    let relative = request.path.trim_start_matches(prefix);
-    if relative.is_empty() || relative.contains("..") {
+    let relative = request.path.strip_prefix(prefix).unwrap_or_default();
+    if !relative_path_is_safe(relative) {
         return write_simple(stream, 403, b"invalid path");
     }
-    let full = if prefix == "/review/" || prefix == "/viewer/" {
+    let full = if under_review {
         case_dir.join("review").join(relative)
     } else {
         case_dir.join(relative)
@@ -515,19 +741,44 @@ pub(crate) fn serve_case_file(
     };
     // Directories must not reach the streaming path: File::open succeeds
     // on them and the read would fail mid-response.
-    let total = match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => meta.len(),
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => meta,
         _ => return write_simple(stream, 404, b"file not found"),
     };
+    let total = meta.len();
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(_) => return write_simple(stream, 404, b"file not found"),
     };
     let trusted = is_generated_page(&case_dir, &path);
+    let safety = content_safety_headers(&path, trusted, false);
+    let (cache, etag_header) = if is_thumbnail_path(&case_dir, &path) {
+        let etag = thumb_etag(&meta);
+        let immutable = query_value(&request.query, "v").is_some_and(|v| !v.is_empty());
+        let cache = if immutable {
+            "private, max-age=31536000, immutable"
+        } else {
+            "private, max-age=60"
+        };
+        if extras
+            .if_none_match
+            .as_deref()
+            .is_some_and(|value| etag_matches(value, &etag))
+        {
+            let head = format!(
+                "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+            );
+            return stream
+                .write_all(head.as_bytes())
+                .map_err(|err| format!("write failed: {err}"));
+        }
+        (cache, format!("ETag: {etag}\r\n"))
+    } else {
+        ("private, max-age=60", String::new())
+    };
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {total}\r\nCache-Control: private, max-age=60\r\nX-Content-Type-Options: nosniff\r\n{}Connection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {total}\r\nCache-Control: {cache}\r\n{etag_header}X-Content-Type-Options: nosniff\r\n{safety}Connection: close\r\n\r\n",
         mime_for(&path),
-        content_safety_headers(&path, trusted, false)
     );
     stream
         .write_all(head.as_bytes())
@@ -838,11 +1089,16 @@ pub(crate) fn respond(
     let status_text = match code {
         200 => "OK",
         206 => "Partial Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
+        411 => "Length Required",
+        413 => "Payload Too Large",
         416 => "Range Not Satisfiable",
+        431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "OK",
     };

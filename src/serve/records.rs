@@ -1,7 +1,206 @@
 //! Paged record APIs (/api/records, /api/records-meta) and filesystem-inspection lookup.
 
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+/// PERF-07: one pre-lowercased record, so a search does no per-request
+/// `to_lowercase` over every field of every record.
+pub(crate) struct SearchRow {
+    id: Option<String>,
+    fields: Vec<String>,
+}
+
+struct SearchIndexEntry {
+    case_dir: PathBuf,
+    generation: u64,
+    overlaid: bool,
+    rows: Arc<Vec<SearchRow>>,
+}
+
+static SEARCH_INDEX_CACHE: Mutex<Option<SearchIndexEntry>> = Mutex::new(None);
+
+const SEARCH_FIELDS: [&str; 5] = [
+    "id",
+    "relative_path",
+    "source_path",
+    "name",
+    "original_name",
+];
+
+fn build_search_rows(videos: &[serde_json::Value]) -> Vec<SearchRow> {
+    videos
+        .iter()
+        .map(|video| SearchRow {
+            id: video.get("id").and_then(|v| v.as_str()).map(str::to_string),
+            fields: SEARCH_FIELDS
+                .iter()
+                .filter_map(|key| video.get(*key).and_then(|v| v.as_str()))
+                .map(str::to_lowercase)
+                .collect(),
+        })
+        .collect()
+}
+
+/// Lowercased search rows for `videos`, reused while the index generation
+/// (index file or live checkpoint changed) is unchanged. Holds one entry —
+/// the current case — so memory is bounded by a single index.
+pub(crate) fn cached_search_rows(
+    case_dir: &Path,
+    generation: u64,
+    overlaid: bool,
+    videos: &[serde_json::Value],
+) -> Arc<Vec<SearchRow>> {
+    let mut guard = SEARCH_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = guard.as_ref()
+        && entry.case_dir == case_dir
+        && entry.generation == generation
+        && entry.overlaid == overlaid
+        && entry.rows.len() == videos.len()
+    {
+        return Arc::clone(&entry.rows);
+    }
+    let rows = Arc::new(build_search_rows(videos));
+    *guard = Some(SearchIndexEntry {
+        case_dir: case_dir.to_path_buf(),
+        generation,
+        overlaid,
+        rows: Arc::clone(&rows),
+    });
+    rows
+}
+
+type FileStamp = Option<(SystemTime, u64)>;
+
+struct FtsCacheEntry {
+    case_dir: PathBuf,
+    query: String,
+    stamp: (FileStamp, FileStamp),
+    hit: Option<Arc<crate::case_db::FtsSearchHit>>,
+}
+
+/// Each entry holds the full indexed-id set, so keep only a few queries.
+pub(crate) const FTS_CACHE_CAPACITY: usize = 8;
+static FTS_CACHE: Mutex<VecDeque<FtsCacheEntry>> = Mutex::new(VecDeque::new());
+
+#[cfg(test)]
+pub(crate) fn records_fts_cache_len() -> usize {
+    FTS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+fn file_stamp(path: &Path) -> FileStamp {
+    path.metadata()
+        .ok()
+        .map(|meta| (meta.modified().unwrap_or(UNIX_EPOCH), meta.len()))
+}
+
+/// The case DB changes through the main file or (WAL mode) its `-wal`
+/// sidecar, so both feed the cache key.
+fn case_db_stamp(case_dir: &Path) -> (FileStamp, FileStamp) {
+    let db = crate::case_db::case_db_path(case_dir);
+    let mut wal = db.clone().into_os_string();
+    wal.push("-wal");
+    (file_stamp(&db), file_stamp(Path::new(&wal)))
+}
+
+/// [`crate::case_db::fts_search_video_ids`] memoized by (case, query, DB
+/// stamp), LRU-bounded. Errors are not cached.
+pub(crate) fn cached_fts_search(
+    case_dir: &Path,
+    query: &str,
+) -> Option<Arc<crate::case_db::FtsSearchHit>> {
+    let stamp = case_db_stamp(case_dir);
+    {
+        let mut cache = FTS_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache
+            .iter()
+            .position(|e| e.case_dir == case_dir && e.query == query && e.stamp == stamp)
+        {
+            let entry = cache.remove(position)?;
+            let hit = entry.hit.clone();
+            cache.push_back(entry);
+            return hit;
+        }
+    }
+    let hit = crate::case_db::fts_search_video_ids(case_dir, query)
+        .ok()?
+        .map(Arc::new);
+    let mut cache = FTS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|e| !(e.case_dir == case_dir && e.query == query));
+    cache.push_back(FtsCacheEntry {
+        case_dir: case_dir.to_path_buf(),
+        query: query.to_string(),
+        stamp,
+        hit: hit.clone(),
+    });
+    while cache.len() > FTS_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    hit
+}
+
+struct ThumbListing {
+    case_dir: PathBuf,
+    dir_mtime: SystemTime,
+    stems: Arc<Vec<String>>,
+}
+
+static THUMB_LISTING_CACHE: Mutex<Option<ThumbListing>> = Mutex::new(None);
+
+/// Sorted `review/thumbs/*.jpg` stems, cached by the directory's mtime
+/// (PERF-05). A listing taken within 2 s of the directory's last change is
+/// not cached: filesystems with coarse mtime could otherwise hide a file
+/// added in the same tick.
+pub(crate) fn cached_thumb_stems(case_dir: &Path) -> Arc<Vec<String>> {
+    let dir = case_dir.join("review/thumbs");
+    let mtime = dir.metadata().ok().and_then(|m| m.modified().ok());
+    if let Some(mtime) = mtime
+        && let Some(entry) = THUMB_LISTING_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        && entry.case_dir == case_dir
+        && entry.dir_mtime == mtime
+    {
+        return Arc::clone(&entry.stems);
+    }
+    let mut stems: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jpg")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                stems.push(stem.to_string());
+            }
+        }
+    }
+    stems.sort();
+    let stems = Arc::new(stems);
+    let settled = mtime.is_some_and(|m| {
+        SystemTime::now()
+            .duration_since(m)
+            .is_ok_and(|age| age > Duration::from_secs(2))
+    });
+    if let (Some(mtime), true) = (mtime, settled) {
+        *THUMB_LISTING_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ThumbListing {
+            case_dir: case_dir.to_path_buf(),
+            dir_mtime: mtime,
+            stems: Arc::clone(&stems),
+        });
+    }
+    stems
+}
 
 /// `GET /api/records?offset=0&limit=500&q=foo` — paged slice of the case
 /// video index so the reviewer UI does not have to parse one giant inline
@@ -236,40 +435,32 @@ pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
     // FTS5 trigram index accelerates the same substring contract for
     // DB-indexed records; `None` (no db, short query, or any error)
     // falls back to the full substring scan rather than returning an
-    // honest-but-wrong empty set.
-    let fts = query.as_deref().and_then(|q| {
-        crate::case_db::fts_search_video_ids(&case_dir, q)
-            .ok()
-            .flatten()
-    });
-    let substring_match = |video: &&serde_json::Value, q: &str| -> bool {
-        [
-            "id",
-            "relative_path",
-            "source_path",
-            "name",
-            "original_name",
-        ]
-        .iter()
-        .filter_map(|key| video.get(*key).and_then(|v| v.as_str()))
-        .any(|text| text.to_lowercase().contains(q))
-    };
-    let matches = |video: &&serde_json::Value| -> bool {
-        let Some(q) = query.as_deref() else {
+    // honest-but-wrong empty set. Results are cached per (query, DB
+    // stamp) so paging through a result set does not reopen the DB.
+    let fts = query
+        .as_deref()
+        .and_then(|q| cached_fts_search(&case_dir, q));
+    let rows = query
+        .as_ref()
+        .map(|_| cached_search_rows(&case_dir, generation, live && live_count > 0, videos));
+    let matched_index = |position: usize| -> bool {
+        let (Some(q), Some(rows)) = (query.as_deref(), rows.as_ref()) else {
             return true;
         };
-        if let Some((hits, indexed)) = &fts {
-            let id = video.get("id").and_then(|v| v.as_str());
-            return match id {
+        let row = &rows[position];
+        let substring_match = || row.fields.iter().any(|text| text.contains(q));
+        if let Some(hit) = &fts {
+            let (hits, indexed) = &**hit;
+            return match row.id.as_deref() {
                 Some(id) if hits.contains(id) => true,
                 // Indexed in the db but not in FTS results = no match;
                 // anything else (carved/filesystem records outside the
                 // videos table) still gets the substring contract.
                 Some(id) if indexed.contains(id) => false,
-                _ => substring_match(video, q),
+                _ => substring_match(),
             };
         }
-        substring_match(video, q)
+        substring_match()
     };
     let offset = query_value(&request.query, "offset")
         .and_then(|v| v.parse::<usize>().ok())
@@ -278,7 +469,12 @@ pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(500)
         .clamp(1, 5000);
-    let filtered: Vec<&serde_json::Value> = videos.iter().filter(matches).collect();
+    let filtered: Vec<&serde_json::Value> = videos
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| matched_index(*position))
+        .map(|(_, video)| video)
+        .collect();
     let total = filtered.len();
     let page: Vec<serde_json::Value> = filtered
         .into_iter()
@@ -361,18 +557,11 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // Same thumb mapping the bundle generator emits: review/thumbs/<id>.jpg
     // relative to the served viewer page.
     let mut thumbs = serde_json::Map::new();
-    if let Ok(entries) = std::fs::read_dir(case_dir.join("review/thumbs")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jpg")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            {
-                thumbs.insert(
-                    stem.to_string(),
-                    serde_json::Value::String(format!("thumbs/{stem}.jpg")),
-                );
-            }
-        }
+    for stem in cached_thumb_stems(&case_dir).iter() {
+        thumbs.insert(
+            stem.clone(),
+            serde_json::Value::String(format!("thumbs/{stem}.jpg")),
+        );
     }
     // Proxies already on disk so the viewer can prefer them for
     // browser-unplayable containers without a redundant generate pass.
