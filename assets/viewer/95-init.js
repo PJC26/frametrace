@@ -20,6 +20,49 @@ window.addEventListener("message", event => {
   // Framed + embed off = the host fullscreened us: show a way back.
   if (exitFsBtn) exitFsBtn.hidden = event.data.embed || window.self === window.top;
 });
+// UX-06: the workstation shell posts {type:"ft-reload"} after a
+// Recover/Carve job rewrote the case. The record model is derived once at
+// boot, so new data means re-loading the page — which pages /api/records
+// and /api/records-meta afresh (layout/selection live in localStorage).
+// That is only done when every review change has reached the case DB:
+// otherwise the reload is refused (and a save started), so annotations are
+// never lost to a refresh. The shell always gets an answer:
+// {type:"ft-reload-ack", reloaded:true|false, reason}.
+async function viewerReloadBlocker() {
+  if (pendingReviewSync || saveInFlight || state.deletedIds.length) return "unsaved";
+  if (queuedOnServer > 0) {
+    // Marks durably queued on the server are applied before the job frees
+    // the case; confirm the queue is empty before reloading over them.
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      const st = res.ok ? await res.json() : null;
+      if (st && Number(st.pending_marks) === 0) {
+        queuedOnServer = 0;
+        renderSaveState();
+        return "";
+      }
+    } catch (e) { /* unknown → treat as still queued */ }
+    return "queued";
+  }
+  return "";
+}
+window.addEventListener("message", async event => {
+  if (!event.data || event.data.type !== "ft-reload") return;
+  if (event.source && window.parent !== window && event.source !== window.parent) return;
+  const target = event.source || window.parent;
+  const answer = (reloaded, reason) => {
+    try { target.postMessage({ type: "ft-reload-ack", reloaded, reason: reason || "" }, "*"); } catch (e) { /* host gone */ }
+  };
+  const blocker = await viewerReloadBlocker();
+  if (blocker) {
+    if (blocker === "unsaved" && viewerIsServed && !saveInFlight) syncMarksNow();
+    toast(t("reload.refused"));
+    answer(false, blocker);
+    return;
+  }
+  answer(true, "");
+  location.reload();
+});
 if (exitFsBtn) {
   exitFsBtn.addEventListener("click", () => {
     try { window.parent.postMessage({ type: "ft-exit-fullscreen" }, "*"); } catch (e) {}

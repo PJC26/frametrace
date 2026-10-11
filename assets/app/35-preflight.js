@@ -109,7 +109,7 @@ function ensurePreflight(src, dir) {
 }
 
 // ---- UX-10: checkpoint resume choice ----
-// GET /api/case-info?case_dir=… → {checkpoint:{done,total}} when the case
+// GET /api/case-info?case_dir=… → {checkpoint:{done,total|null}} when the case
 // holds an interrupted scan. 404 → caseResumeInfo() falls back to probing
 // db/scan-progress.jsonl through /api/browse (no N/M then).
 let caseInfoUnsupported = false;
@@ -126,6 +126,11 @@ function resumeText(info) {
   const d = Number(info.done), t = Number(info.total);
   if (Number.isFinite(d) && Number.isFinite(t) && t > 0) {
     return `이전 분석 ${d.toLocaleString()}/${t.toLocaleString()} 진행됨 (${Math.min(100, Math.round(d * 100 / t))}%) — 이어서 하거나 새 케이스 폴더에서 처음부터 시작할 수 있습니다.`;
+  }
+  // checkpoint.total is null until a completed index exists: show the
+  // count alone, never a made-up total.
+  if (Number.isFinite(d) && d > 0) {
+    return `이전 분석 ${d.toLocaleString()}건 진행됨 (전체 건수는 아직 모름) — 이어서 하거나 새 케이스 폴더에서 처음부터 시작할 수 있습니다.`;
   }
   return "중단된 이전 분석의 체크포인트가 있습니다 — 이어서 하거나 새 케이스 폴더에서 처음부터 시작할 수 있습니다.";
 }

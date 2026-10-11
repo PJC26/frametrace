@@ -1209,6 +1209,32 @@ fn capture_frame_fails_when_audit_append_fails() {
     let _ = std::fs::remove_dir_all(&case_dir);
 }
 
+/// A capture whose base64 exceeds the generic 4 MiB MAX_BODY (a 4K
+/// frame) is accepted: the route allows MAX_CAPTURE_FRAME_BODY. Above
+/// that cap it is still refused.
+#[test]
+fn capture_frame_accepts_payload_above_generic_body_cap() {
+    let case_dir = scratch_dir("capture-large");
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case_dir.clone());
+    // "/9j/" = FF D8 FF (JPEG magic); each "AAAA" = three zero bytes.
+    let groups = 1_200_000; // ~4.8 MB of base64, ~3.6 MB decoded
+    let image = format!("/9j/{}", "AAAA".repeat(groups));
+    let decoded_len = 3 + 3 * groups as u64;
+    assert!(image.len() > MAX_BODY && image.len() < MAX_CAPTURE_FRAME_BODY);
+    let body = serde_json::json!({"id": "vid_1", "image": image, "time": "2"}).to_string();
+    let reply = api_capture_frame(&post_request("/api/capture-frame", &body), &state);
+    assert!(reply.contains("\"ok\":true"), "{reply}");
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let saved = case_dir.join(reply["path"].as_str().unwrap());
+    assert_eq!(std::fs::metadata(&saved).unwrap().len(), decoded_len);
+    let too_big = "A".repeat(MAX_CAPTURE_FRAME_BODY + 4);
+    let body = serde_json::json!({"id": "vid_1", "image": too_big}).to_string();
+    let reply = api_capture_frame(&post_request("/api/capture-frame", &body), &state);
+    assert!(reply.contains("\"ok\":false"), "{reply}");
+    let _ = std::fs::remove_dir_all(&case_dir);
+}
+
 /// FOR-06: selection export reports failure when its audit entry fails.
 #[test]
 fn export_selected_surfaces_audit_failure() {

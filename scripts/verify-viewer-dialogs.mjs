@@ -99,15 +99,20 @@ try {
   await page.evaluate(() => document.activeElement?.blur());
   let exportBody = null;
   let statusCalls = 0;
+  // Real contract (src/serve/media.rs): the POST answers with a running
+  // job; progress via /api/export-clip-status?job=ID; the finished job
+  // carries the case-relative path and the clip's SHA-256.
   await page.route('**/api/export-clip', (route) => {
     exportBody = JSON.parse(route.request().postData());
-    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, job: 'job-1' }) });
+    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, deduped: false, job: { id: 'clip-1', kind: 'export-clip', state: 'running', elapsed_secs: 0, bytes_written: 0, path: 'artifacts/clips/clip.mp4', sha256: null } }) });
   });
-  await page.route('**/api/status', (route) => {
+  await page.route('**/api/export-clip-status*', (route) => {
     statusCalls += 1;
-    const body = statusCalls < 2
-      ? { busy: true, progress: { job_type: 'export-clip', done: 50, total: 100 } }
-      : { busy: false, progress: null, jobs: { 'job-1': { state: 'done', path: '/case/exports/clip.mp4', sha256: 'ab'.repeat(32) } } };
+    const url = new URL(route.request().url());
+    const job = statusCalls < 3
+      ? { id: 'clip-1', state: 'running', elapsed_secs: statusCalls, bytes_written: 524288 * statusCalls, path: 'artifacts/clips/clip.mp4', sha256: null }
+      : { id: 'clip-1', state: 'done', elapsed_secs: 3, bytes_written: 1500000, size_bytes: 1500000, path: 'artifacts/clips/clip.mp4', sha256: 'ab'.repeat(32) };
+    const body = url.searchParams.get('job') === 'clip-1' ? { ok: true, job } : { ok: false, error: 'unknown job' };
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
   });
   await page.locator('#btnExportClip').click();
@@ -117,12 +122,46 @@ try {
   await page.keyboard.press('Enter');
   await page.waitForFunction(() => document.querySelector('#btnExportClip')?.classList.contains('busy'), null, { timeout: 3000 }).catch(() => {});
   check('button shows busy state while the job runs', await page.evaluate(() => document.querySelector('#btnExportClip').disabled && document.querySelector('#btnExportClip').getAttribute('aria-busy') === 'true'));
+  await page.waitForFunction(() => /KB|MB/.test(document.querySelector('.clip-progress')?.textContent || ''), null, { timeout: 4000 }).catch(() => {});
+  check('progress row shows elapsed + bytes written, with a cancel button', await page.evaluate(() => {
+    const row = document.querySelector('.clip-progress');
+    return !!row && /KB|MB/.test(row.textContent) && !!row.querySelector('button');
+  }));
   await page.waitForSelector('.modal.dlg .dlg-msg', { timeout: 8000 });
   const summary = await page.locator('.modal.dlg .dlg-msg').innerText();
   check('request used the edited IN and the right duration', exportBody && exportBody.start === '6.500' && exportBody.duration === '8.500', JSON.stringify(exportBody));
-  check('exhibit summary shows the clip SHA-256', summary.includes('ab'.repeat(32)) && summary.includes('/case/exports/clip.mp4'), summary);
+  check('exhibit summary shows the clip path and SHA-256', summary.includes('ab'.repeat(32)) && summary.includes('artifacts/clips/clip.mp4'), summary);
+  check('progress row removed when the job ends', await page.locator('.clip-progress').count() === 0);
   await page.locator('.modal.dlg button.primary').click();
   check('button re-enabled after the job', await page.evaluate(() => !document.querySelector('#btnExportClip').disabled && !document.querySelector('#btnExportClip').classList.contains('busy')));
+
+  // cancel: POST /api/export-clip-cancel {job}, the job ends "cancelled"
+  let cancelBody = null;
+  await page.unroute('**/api/export-clip-status*');
+  await page.route('**/api/export-clip-cancel', (route) => {
+    cancelBody = JSON.parse(route.request().postData());
+    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  await page.route('**/api/export-clip-status*', (route) => {
+    const job = cancelBody
+      ? { id: 'clip-1', state: 'cancelled', elapsed_secs: 2, error: '사용자가 클립 내보내기를 중단했습니다.' }
+      : { id: 'clip-1', state: 'running', elapsed_secs: 1, bytes_written: 1000 };
+    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, job }) });
+  });
+  await page.locator('#btnExportClip').click();
+  await page.locator('.modal.dlg button.primary').click();
+  await page.waitForSelector('.clip-progress button', { timeout: 4000 });
+  await page.locator('.clip-progress button').click();
+  await page.waitForFunction(() => !document.querySelector('#btnExportClip').disabled, null, { timeout: 6000 }).catch(() => {});
+  check('cancel posts the job id', cancelBody && cancelBody.job === 'clip-1', JSON.stringify(cancelBody));
+  const cancelState = await page.evaluate(() => ({
+    toasts: document.getElementById('toastHost').textContent,
+    summary: !!document.querySelector('.modal.dlg .dlg-msg'),
+  }));
+  check('cancelled export says so (no summary, no failure)',
+    /클립 내보내기를 중단/.test(cancelState.toasts) && !/내보내기 실패/.test(cancelState.toasts) && !cancelState.summary, JSON.stringify(cancelState));
+  await page.unroute('**/api/export-clip-status*');
+  await page.unroute('**/api/export-clip-cancel');
 
   // legacy synchronous response still works
   await page.unroute('**/api/export-clip');
@@ -154,6 +193,21 @@ try {
   check('zoom slider leaves fit mode', zoomState[0] === 'custom' && zoomState[1] === true, zoomState.join(','));
   await page.selectOption('#videoMode', '50');
   check('preset size drives the slider', (await page.locator('#videoZoom').inputValue()) === '50');
+
+  // --- ft-reload with unsaved marks: refused + acked, page not reloaded ----
+  // (this fixture's /api/import-marks never succeeds, so marks stay pending)
+  const reloadAck = await page.evaluate(() => new Promise((resolve) => {
+    window.__noReload = 1;
+    const onMsg = (e) => { if (e.data && e.data.type === 'ft-reload-ack') { window.removeEventListener('message', onMsg); resolve(e.data); } };
+    window.addEventListener('message', onMsg);
+    window.postMessage({ type: 'ft-reload', reason: 'carve' }, '*');
+    setTimeout(() => resolve(null), 4000);
+  }));
+  await page.waitForTimeout(500);
+  const stillHere = await page.evaluate(() => window.__noReload === 1 && document.getElementById('saveState')?.dataset.state);
+  check('ft-reload with unsaved marks is refused and acked (reloaded:false)', reloadAck && reloadAck.reloaded === false && reloadAck.reason === 'unsaved', JSON.stringify(reloadAck));
+  check('page kept (no reload), save state still not clean', stillHere && stillHere !== 'saved', String(stillHere));
+  check('refusal is reported to the examiner', /저장되지 않은 판독 내용/.test(await page.evaluate(() => document.getElementById('toastHost').textContent)));
 
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

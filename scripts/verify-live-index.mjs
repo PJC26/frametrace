@@ -7,21 +7,19 @@
 //
 //   cargo build && node scripts/verify-live-index.mjs [shots-dir]
 //
-// Uses a throwaway XDG_CONFIG_HOME so the real workstation session file is
-// never touched, and synthesizes 30 × 20 MiB files so hashing is slow
+// Runs its own isolated server (scripts/lib/isolated-server.mjs) so it can
+// never attach to another workstation, and synthesizes 30 × 20 MiB files so hashing is slow
 // enough to observe phase 2.
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { startIsolatedServer } from './lib/isolated-server.mjs';
 import { createRequire } from 'node:module';
 import { randomFillSync } from 'node:crypto';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const shots = process.argv[2] || '';
-const exe = join(root, 'target/debug/frametrace' + (process.platform === 'win32' ? '.exe' : ''));
-if (!existsSync(exe)) { console.error('build first: cargo build'); process.exit(2); }
 
 let chromium = null;
 try { ({ chromium } = createRequire(import.meta.url)('playwright')); } catch { /* HTTP-only */ }
@@ -35,29 +33,23 @@ for (let i = 10; i < 40; i++) {
   writeFileSync(join(src, `20260916-13h41m${i}s_F.mp4`), chunk);
 }
 const caseDir = join(work, 'case');
-// SEC-04: the server requires a token by default; pin a known one for the harness.
-const token = 'live-' + Math.random().toString(36).slice(2, 12);
-const authHeaders = { 'X-FrameTrace-Token': token };
-const server = spawn(exe, [], {
-  env: { ...process.env, XDG_CONFIG_HOME: join(work, 'xdg'), APPDATA: join(work, 'xdg'), FRAMETRACE_NO_BROWSER: '1', FRAMETRACE_TOKEN: token },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+// Isolated dedicated server (explicit port skips the reuse-a-running-
+// workstation discovery; throwaway HOME/XDG/APPDATA/instance file; pinned
+// token) — see scripts/lib/isolated-server.mjs.
 const fail = (msg) => { console.error('FAIL:', msg); cleanup(); process.exit(1); };
-function cleanup() { try { server.kill(); } catch {} try { rmSync(work, { recursive: true, force: true }); } catch {} }
-
-const base = await new Promise((resolve, reject) => {
-  let out = '';
-  server.stdout.on('data', (d) => { out += d; const m = out.match(/http:\/\/127\.0\.0\.1:\d+/); if (m) resolve(m[0]); });
-  server.on('exit', (code) => reject(new Error(`server exited ${code}`)));
-  setTimeout(() => reject(new Error('server did not start')), 15000);
-}).catch((e) => fail(e.message));
-
-const home = await fetch(base + '/', { headers: authHeaders });
-const nonce = (home.headers.get('set-cookie') || '').match(/ft_nonce=([^;]+)/)?.[1];
+let server = null;
+function cleanup() { try { server && server.stop(); } catch {} try { rmSync(work, { recursive: true, force: true }); } catch {} }
+try {
+  server = await startIsolatedServer({ root, work });
+} catch (e) {
+  fail(e.message);
+}
+const { base, token } = server;
+const authHeaders = server.headers;
 // With a token configured the server authenticates by token and does not
-// require (or plant) the per-instance nonce.
-const nonceHeaders = nonce ? { 'X-FrameTrace-Nonce': nonce, Cookie: `ft_nonce=${nonce}` } : {};
-const getJson = async (path) => (await fetch(base + path, { cache: 'no-store', headers: authHeaders })).json();
+// require the per-instance nonce.
+const nonceHeaders = {};
+const getJson = server.getJson;
 const start = await (await fetch(base + '/api/start', {
   method: 'POST',
   headers: { ...authHeaders, ...nonceHeaders, 'Content-Type': 'application/json' },

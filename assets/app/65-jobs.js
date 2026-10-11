@@ -1,19 +1,27 @@
 // ---- UX-06: Recover / Carve as background case jobs ----
-// Contract (server side lands separately): POST /api/recover-deleted and
-// POST /api/carve answer {ok:true, job:...} immediately; progress and
-// cancel go through the existing /api/status (busy/phase/logs/progress,
-// optional elapsed_secs) and /api/cancel. An older server answers only
-// when the work is finished ({ok:true} / {ok:false,error}) — then the
-// regular status poll still drives the panel (elapsed, cancel) while the
-// request is outstanding. Either way completion refreshes the viewer via
-// refreshViewerData() (postMessage / guarded reload), never `src = src`.
+// Server contract (src/serve/jobs.rs): POST /api/recover-deleted and
+// POST /api/carve answer {ok:true, job:{kind, started_unix}} at once (or
+// {ok:false, error} when the job cannot start). /api/status then carries
+// `job_kind` (what holds busy) and `job` = the current/last case job:
+// {kind: "recover-deleted"|"carve", state: running|done|failed|cancelled,
+//  stage, stages, stage_label, started_unix, finished_unix, elapsed_secs,
+//  error}. The outcome is read from job.state, never guessed from words in
+// an error string. /api/cancel kills the job's process tree; the job then
+// ends "cancelled". A shell reloaded mid-job adopts the running job from
+// /api/status so progress and cancel stay reachable.
+// Older servers (no `job` in /api/status) still work: a synchronous
+// response means finished; an async one falls back to busy/error.
+// Completion refreshes the viewer via refreshViewerData() (postMessage /
+// guarded reload), never `src = src`.
 const CASE_JOBS = {
   recover: {
+    serverKind: "recover-deleted",
     title: "삭제 영상 후보 복구",
     url: () => "/api/recover-deleted",
     confirm: null,
   },
   carve: {
+    serverKind: "carve",
     title: "이미지 카빙",
     url: () => ($("chkReassemble") && $("chkReassemble").checked ? "/api/carve?reassemble=1" : "/api/carve"),
     confirm: {
@@ -51,13 +59,32 @@ function caseJobElapsed(job) {
   // Server-reported elapsed wins (it survives a page reload); the client
   // clock fills in between polls and on older servers.
   if (Number.isFinite(job.serverElapsed) && job.serverElapsedAt) {
-    return job.serverElapsed + Math.max(0, (Date.now() - job.serverElapsedAt) / 1000);
+    return job.serverElapsed + Math.max(0, ((job.endedAt || Date.now()) - job.serverElapsedAt) / 1000);
   }
   return Math.max(0, ((job.endedAt || Date.now()) - job.startedAt) / 1000);
 }
+// The server's record of THIS job in /api/status (null on older servers
+// or when st.job describes a different/earlier job).
+function serverCaseJob(st, job) {
+  const sj = st && st.job;
+  if (!sj || typeof sj !== "object" || !sj.state) return null;
+  const info = job.jobInfo && typeof job.jobInfo === "object" ? job.jobInfo : null;
+  if (sj.kind !== (info && info.kind ? info.kind : job.spec.serverKind)) return null;
+  if (info && info.started_unix != null) return Number(sj.started_unix) === Number(info.started_unix) ? sj : null;
+  // No start stamp from the POST: accept a job that started with ours.
+  return Number(sj.started_unix) >= Math.floor(job.startedAt / 1000) - 5 ? sj : null;
+}
 // One line describing where the job stands, from /api/status.
-function caseJobDetail(st) {
+function caseJobDetail(st, sj) {
   if (!st) return "";
+  const logs = Array.isArray(st.logs) ? st.logs : [];
+  const lastLog = logs.length ? String(logs[logs.length - 1]) : "";
+  if (sj && sj.stages > 0) {
+    const stage = `단계 ${Number(sj.stage) || 1}/${sj.stages}: ${sj.stage_label || ""}`;
+    const tail = lastLog && lastLog !== sj.stage_label ? " · " + lastLog : "";
+    const line = stage + tail;
+    return line.length > 180 ? line.slice(0, 179) + "…" : line;
+  }
   const p = st.progress;
   if (p && p.total > 0) {
     const pct = Math.min(100, Math.round(p.done * 100 / p.total));
@@ -65,9 +92,7 @@ function caseJobDetail(st) {
       (p.eta_secs > 0 ? ` · 남은 시간 ${fmtEta(p.eta_secs)}` : "");
   }
   if (p && p.done > 0) return `${fmtBytes(p.done)} 처리됨`;
-  const logs = Array.isArray(st.logs) ? st.logs : [];
-  const last = logs.length ? String(logs[logs.length - 1]) : "";
-  return last.length > 140 ? last.slice(0, 139) + "…" : last;
+  return lastLog.length > 140 ? lastLog.slice(0, 139) + "…" : lastLog;
 }
 function renderCaseJob() {
   const job = caseJob;
@@ -142,23 +167,63 @@ async function runCaseJob(kind) {
 
 // Called for every /api/status reply (poll loop).
 function caseJobOnStatus(st) {
+  if (!st) return;
+  if (!caseJob || (caseJob.outcome && caseJob.outcome !== "deferred")) {
+    adoptRunningCaseJob(st);
+    return;
+  }
   const job = caseJob;
-  if (!job || job.outcome || !st) return;
+  if (job.outcome) return;
+  const sj = job.async && !job.posting ? serverCaseJob(st, job) : null;
+  if (sj) {
+    job.sawServerJob = true;
+    const el = Number(sj.elapsed_secs);
+    if (Number.isFinite(el) && el >= 0) { job.serverElapsed = el; job.serverElapsedAt = Date.now(); }
+    if (sj.state === "running") {
+      job.detail = caseJobDetail(st, sj);
+      renderCaseJob();
+      return;
+    }
+    if (sj.state === "done") finishCaseJob(job, "ok");
+    else if (sj.state === "cancelled") finishCaseJob(job, "cancelled", sj.error);
+    else finishCaseJob(job, "failed", sj.error || st.error || "알 수 없는 오류");
+    return;
+  }
+  // Older server (no `job` in /api/status): busy / error only.
   if (st.busy) job.sawBusy = true;
   const el = Number(st.elapsed_secs);
   if (Number.isFinite(el) && el >= 0 && st.busy) { job.serverElapsed = el; job.serverElapsedAt = Date.now(); }
-  if (st.busy) job.detail = caseJobDetail(st);
+  if (st.busy) job.detail = caseJobDetail(st, null);
   renderCaseJob();
-  if (!job.async || job.posting) return;
+  if (!job.async || job.posting || job.sawServerJob) return;
   const graceOver = Date.now() - job.startedAt > CASE_JOB_GRACE_MS;
   if (!st.busy && (job.sawBusy || graceOver)) {
-    if (st.error) {
-      const cancelled = job.cancel || /중단|cancel/i.test(String(st.error));
-      finishCaseJob(job, cancelled ? "cancelled" : "failed", st.error);
-    } else {
-      finishCaseJob(job, "ok");
-    }
+    if (st.error) finishCaseJob(job, job.cancel ? "cancelled" : "failed", st.error);
+    else finishCaseJob(job, "ok");
   }
+}
+
+// A shell (re)loaded while the server runs a case job (or a job started
+// from another window): show it, with elapsed time and cancel, instead of
+// hiding running work.
+function adoptRunningCaseJob(st) {
+  const sj = st.job;
+  if (!sj || sj.state !== "running") return;
+  const kind = Object.keys(CASE_JOBS).find(k => CASE_JOBS[k].serverKind === sj.kind);
+  if (!kind) return;
+  const prev = caseJob;
+  if (prev && prev.jobInfo && Number(prev.jobInfo.started_unix) === Number(sj.started_unix) && prev.jobInfo.kind === sj.kind) return;
+  const spec = CASE_JOBS[kind];
+  const el = Number(sj.elapsed_secs) || 0;
+  const job = { kind, spec, startedAt: Date.now() - el * 1000, endedAt: 0, async: true, posting: false, sawBusy: true,
+    cancel: false, outcome: "", detail: caseJobDetail(st, sj), message: "", serverElapsed: el, serverElapsedAt: Date.now(),
+    jobInfo: { kind: sj.kind, started_unix: sj.started_unix }, adopted: true, sawServerJob: true };
+  caseJob = job;
+  setCaseJobButtons(true);
+  $("recoverHint").textContent = `${spec.title} 실행 중… 진행 상황은 위 작업 표시줄에 나타납니다.`;
+  renderCaseJob();
+  stopCaseJobTicker();
+  caseJobTicker = setInterval(() => { if (caseJob === job && !job.outcome) renderCaseJob(); }, 1000);
 }
 
 async function finishCaseJob(job, outcome, error) {
@@ -176,7 +241,8 @@ async function finishCaseJob(job, outcome, error) {
   }
   if (outcome === "cancelled") {
     job.outcome = "cancelled";
-    job.message = "작업이 중단되었습니다 — 다시 실행할 수 있습니다.";
+    const why = String(error || "").split(/\r?\n/)[0].slice(0, 240);
+    job.message = (why || "작업이 중단되었습니다.") + " 다시 실행할 수 있습니다.";
     $("recoverHint").textContent = `${title}이(가) 중단되었습니다.`;
     renderCaseJob();
     return;
