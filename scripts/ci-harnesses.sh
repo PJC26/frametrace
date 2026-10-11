@@ -23,7 +23,7 @@ harnesses=(
   "check-a11y"
   # UI rebuild (docs/ui-rebuild-contract.md §8.2): each track replaces ONLY
   # its own anchor line below with the real entry — never reorder or append.
-  # @T1 verify-buttons
+  "verify-buttons"
   # @T5 verify-embed
   # @T2 verify-layout
   # @T3 verify-progress

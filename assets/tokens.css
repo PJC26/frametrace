@@ -5,20 +5,24 @@
    "light|dark"> (ft-theme in localStorage), set by an inline script before
    first paint.
 
+   Design language: paper document + video stage. Warm grey paper, ink-blue
+   accent, 3px radius, shadows only on popovers/sheets, 14px body (13px
+   minimum), tabular mono numerals. Amber flag = important mark; red is
+   reserved for failed / deleted-candidate / destructive.
    Contrast contract (checked by scripts/check-css.mjs, both themes):
    every text token on every surface token >= 4.5:1, every status fg on its
-   own bg and on the plain surfaces >= 4.5:1, disabled >= 3:1. */
+   own bg and on the plain surfaces >= 4.5:1, disabled >= 3:1, control
+   borders / mark ink >= 3:1 (docs/ui-rebuild-contract.md section 5). */
 :root {
   color-scheme: light;
 
   /* ---- type ---- */
   --font-sans: "Pretendard Variable", Pretendard, "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
   --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --fs-xs: 12px;   /* minimum text size anywhere */
-  --fs-sm: 13px;   /* body */
-  --fs-md: 14px;
-  --fs-lg: 16px;
-  --fs-xl: 20px;
+  --fs-xs: 13px;   /* minimum text size anywhere (captions, kbd, meta) */
+  --fs-sm: 14px;   /* body and controls */
+  --fs-md: 16px;   /* headings (weight 600) */
+  --fs-lg: 20px;   /* empty-state and dialog titles */
   --lh-body: 1.5;
   --lh-ctl: 1.35;
 
@@ -29,10 +33,28 @@
   --sp-4: 16px;
   --sp-5: 24px;
   --sp-6: 32px;
-  --radius-sm: 4px;
-  --radius: 8px;
-  --radius-lg: 12px;
-  --shadow: 0 1px 3px rgba(0,0,0,.05), 0 4px 14px rgba(0,0,0,.05);
+  --radius: 3px;
+  --radius-pill: 999px;
+  /* transition aliases (one release): the old scale collapses to --radius;
+     cards carry no shadow any more. */
+  --radius-sm: var(--radius);
+  --radius-lg: var(--radius);
+  --fs-xl: var(--fs-lg);
+  --shadow: none;
+  --shadow-pop: 0 4px 16px rgba(0,0,0,.14);
+  --shadow-sheet: -8px 0 24px rgba(0,0,0,.12);
+
+  /* ---- control sizes ---- */
+  --ctl-h: 32px;
+  --ctl-h-lg: 36px;
+  --ctl-h-icon: 28px;
+  --hit-min: 24px;
+
+  /* ---- layout (docs/ui-rebuild-contract.md section 6; 1600px switch below) ---- */
+  --top-h: 44px;
+  --rail-w: 240px;
+  --media-w: 480px;
+  --sheet-w: 480px;
 
   /* ---- focus ring: 2px accent, 2px offset ---- */
   --focus-ring-width: 2px;
@@ -45,84 +67,93 @@
   --dur: 150ms;
   --dur-slow: 180ms;
 
-  /* ---- surfaces & text ---- */
-  --bg: #f1f3f2;
-  --surface: #ffffff;
-  --surface-2: #f6f8f7;
-  --text: #1f2724;
-  --muted: #5a6560;
-  --border: #d3d9d6;
-  --border-strong: #aab3af;
-  --accent: #0d7569;
+  /* ---- surfaces & text (warm grey paper, ink-blue accent) ---- */
+  --bg: #ecebe7;
+  --surface: #fbfaf7;
+  --surface-2: #f3f2ee;
+  --text: #1a1c1e;
+  --muted: #55595e;
+  --border: #d6d3cc;
+  --border-strong: #858177;
+  --accent: #234e8c;
   --on-accent: #ffffff;
-  --accent-ink: #0b5f57;
-  --accent-soft: #e2f0ee;
-  --disabled-fg: #6f7a75;
-  --disabled-bg: #e6eae8;
-  --media-bg: #101815;   /* video stage: dark in both themes */
-  --media-muted: #a9bdb5; /* secondary text on the dark media bars */
+  --accent-ink: #1c3f73;
+  --accent-soft: #e4ebf5;
+  --disabled-fg: #6f7276;
+  --disabled-bg: #e6e4df;
+  --media-bg: #141618;    /* video stage: dark in both themes */
+  --media-muted: #b4b9be; /* secondary text on the dark media bars */
 
-  /* ---- semantic ---- */
-  --ok: #1b6e34;
+  /* ---- semantic (status text only) ---- */
+  --ok: #2a6b3a;
   --danger: #b3261e;
   --warn: #7a5200;
-  --info: #1d5fae;
+  --info: #234e8c;
 
   /* ---- status: fg/bg pairs ---- */
-  --verified-fg: #1b6e34;        --verified-bg: #e3f4ec;
-  --failed-fg: #b3261e;          --failed-bg: #fdeceb;
-  --candidate-fg: #5e4f91;       --candidate-bg: #efecf7;
-  --original-fg: #0b5f57;        --original-bg: #e2f0ee;
+  --verified-fg: #2a6b3a;        --verified-bg: #e4f1e7;
+  --failed-fg: #b3261e;          --failed-bg: #fbeae8;
+  --candidate-fg: #5e4f91;       --candidate-bg: #eeecf6;
+  --original-fg: #1c3f73;        --original-bg: #e4ebf5;
   --carved-fg: #96470a;          --carved-bg: #fbeadd;
   --fs-recovered-fg: #1f4fb0;    --fs-recovered-bg: #e5ecfa;
   --deleted-candidate-fg: #9b1c1c; --deleted-candidate-bg: #fbe6e6;
   --anomaly-fg: #7a5200;         --anomaly-bg: #f8efd9;
-  --warn-fg: #7a5200;            --warn-bg: #fdf3e3;
-  --info-fg: #1d5fae;            --info-bg: #e6eef8;
+  --warn-fg: #7a5200;            --warn-bg: #fbf1dc;
+  --info-fg: #234e8c;            --info-bg: #e4ebf5;
 
-  /* ---- review marks (chips: solid bg + fg) ---- */
-  --mark-reviewed-bg: #1d5fae;   --mark-reviewed-fg: #ffffff;
-  --mark-important-bg: #b3261e;  --mark-important-fg: #ffffff;
-  --mark-needs-verification-bg: #8a5d14; --mark-needs-verification-fg: #ffffff;
+  /* ---- review marks: reviewed = grey check, important = amber flag,
+          needs-verification = violet question mark. -ink = single-colour
+          glyph on a plain surface (non-text, >= 3:1). ---- */
+  --mark-reviewed-fg: #3d4146;   --mark-reviewed-bg: #e2e1dc;   --mark-reviewed-ink: #55595e;
+  --mark-important-fg: #5c3a00;  --mark-important-bg: #f6dfb3;  --mark-important-ink: #8a5a00;
+  --mark-needs-verification-fg: #4a3b7f; --mark-needs-verification-bg: #e7e2f5; --mark-needs-verification-ink: #5e4f91;
 }
 
 html[data-theme="dark"] {
   color-scheme: dark;
-  --shadow: 0 1px 3px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.35);
+  --shadow-pop: 0 6px 20px rgba(0,0,0,.45);
+  --shadow-sheet: -8px 0 28px rgba(0,0,0,.5);
 
-  --bg: #101514;
-  --surface: #1a211e;
-  --surface-2: #232c28;
-  --text: #e1e9e5;
-  --muted: #9bb1a8;
-  --border: #2e3b36;
-  --border-strong: #4a5f57;
-  --accent: #3fa08e;
-  --on-accent: #0b1512;          /* dark ink: white on #3fa08e is only 3.17:1 */
-  --accent-ink: #57b8a6;
-  --accent-soft: #1d332d;
-  --disabled-fg: #7d908a;
-  --disabled-bg: #1a211e;
+  --bg: #121416;
+  --surface: #1b1e21;
+  --surface-2: #24282c;
+  --text: #e6e4df;
+  --muted: #a7acb2;
+  --border: #33383d;
+  --border-strong: #767d84;
+  --accent: #8db4ea;
+  --on-accent: #0f1a2b;          /* dark ink on the light dark-theme accent */
+  --accent-ink: #a9c7f2;
+  --accent-soft: #22304a;
+  --disabled-fg: #848a90;
+  --disabled-bg: #1b1e21;
+  --media-bg: #0e1012;
+  --media-muted: #b4b9be;
 
-  --ok: #6cc688;
+  --ok: #7fcb95;
   --danger: #ff8a80;
   --warn: #e8b45a;
-  --info: #8ab4f0;
+  --info: #8db4ea;
 
-  --verified-fg: #6cc688;        --verified-bg: #16382c;
+  --verified-fg: #7fcb95;        --verified-bg: #17352a;
   --failed-fg: #ff8a80;          --failed-bg: #3d2422;
   --candidate-fg: #b8a9ec;       --candidate-bg: #2a2640;
-  --original-fg: #57b8a6;        --original-bg: #1d332d;
+  --original-fg: #a9c7f2;        --original-bg: #22304a;
   --carved-fg: #f0a060;          --carved-bg: #3a2616;
   --fs-recovered-fg: #8fb0f5;    --fs-recovered-bg: #1c2a4a;
   --deleted-candidate-fg: #ff8f8f; --deleted-candidate-bg: #3d2222;
   --anomaly-fg: #e8b45a;         --anomaly-bg: #3a2e1a;
   --warn-fg: #e8b45a;            --warn-bg: #3a2e1a;
-  --info-fg: #8ab4f0;            --info-bg: #1c2b42;
+  --info-fg: #8db4ea;            --info-bg: #22304a;
 
-  --mark-reviewed-bg: #8ab4f0;   --mark-reviewed-fg: #0b1512;
-  --mark-important-bg: #ff8a80;  --mark-important-fg: #0b1512;
-  --mark-needs-verification-bg: #e8b45a; --mark-needs-verification-fg: #0b1512;
+  --mark-reviewed-fg: #d6d9dd;   --mark-reviewed-bg: #3a3f45;   --mark-reviewed-ink: #a7acb2;
+  --mark-important-fg: #1f1500;  --mark-important-bg: #e0a94a;  --mark-important-ink: #e0a94a;
+  --mark-needs-verification-fg: #15102a; --mark-needs-verification-bg: #b8a9ec; --mark-needs-verification-ink: #b8a9ec;
+}
+
+@media (min-width: 1600px) {
+  :root { --rail-w: 280px; --media-w: 640px; --sheet-w: 560px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
