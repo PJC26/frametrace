@@ -53,7 +53,9 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch();
 try {
-  const page = await browser.newPage();
+  // The facet rail (calendar + tree) auto-collapses below 1500px wide;
+  // use a wide viewport so the calendar is on screen.
+  const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
   await page.goto(base);
