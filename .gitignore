@@ -47,3 +47,7 @@
 /chrome-test-profile
 /tmp/
 /shots-*/
+
+# Large local screenshot sets for UX before/after comparison (not versioned)
+docs/screens/before-ux/
+docs/screens/after-ux/
