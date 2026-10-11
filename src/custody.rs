@@ -276,20 +276,36 @@ fn render_hash_verify(case_dir: &Path) -> String {
             dash(get("observed_sha256")),
         ));
     }
-    let banner = if mismatched > 0 {
-        format!(
-            "<p class=\"banner bad\">{mismatched} indexed file(s) have a live SHA-256 that differs from the recorded one. This is an observation of a difference, not a finding of who or what changed the file.</p>"
-        )
-    } else {
-        format!(
-            "<p class=\"banner ok\">{matched} indexed file(s) re-hashed live and equal to the recorded SHA-256 ({other} not comparable).</p>"
-        )
-    };
+    let banner = hash_verify_banner(matched, mismatched, other);
     format!(
         "<p class=note>Live re-hash run at {} (newest run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
         ts(latest),
         crate::anomaly::HASH_VERIFY_REL_PATH,
     )
+}
+
+/// Section-5 banner. Green ("ok") only when at least one file was actually
+/// compared and every file was comparable (SHOULD-FIX 4): a run where
+/// nothing matched — or some files could not be compared — must never read
+/// as a clean re-verification.
+fn hash_verify_banner(matched: usize, mismatched: usize, other: usize) -> String {
+    if mismatched > 0 {
+        format!(
+            "<p class=\"banner bad\">{mismatched} indexed file(s) have a live SHA-256 that differs from the recorded one. This is an observation of a difference, not a finding of who or what changed the file.</p>"
+        )
+    } else if matched == 0 {
+        format!(
+            "<p class=\"banner warn\">No indexed file was re-verified: 0 files were compared against a recorded SHA-256 ({other} not comparable — not reachable, unreadable, or no recorded hash). This run does not confirm that any source is unchanged.</p>"
+        )
+    } else if other > 0 {
+        format!(
+            "<p class=\"banner warn\">{matched} indexed file(s) re-hashed live and equal to the recorded SHA-256, but {other} file(s) could not be compared (not reachable, unreadable, or no recorded hash) and are NOT re-verified.</p>"
+        )
+    } else {
+        format!(
+            "<p class=\"banner ok\">All {matched} indexed file(s) re-hashed live and equal to the recorded SHA-256.</p>"
+        )
+    }
 }
 
 fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
@@ -742,6 +758,21 @@ mod tests {
         assert_eq!(coverage.hashed, 1);
         assert_eq!(coverage.errors, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SHOULD-FIX 4: nothing compared (or some not comparable) is never green.
+    #[test]
+    fn hash_verify_banner_is_ok_only_when_everything_was_compared() {
+        let none = hash_verify_banner(0, 0, 5);
+        assert!(none.contains("banner warn"), "{none}");
+        assert!(none.contains("No indexed file was re-verified"), "{none}");
+        let empty = hash_verify_banner(0, 0, 0);
+        assert!(empty.contains("banner warn"), "{empty}");
+        let partial = hash_verify_banner(3, 0, 2);
+        assert!(partial.contains("banner warn"), "{partial}");
+        assert!(partial.contains("NOT re-verified"), "{partial}");
+        assert!(hash_verify_banner(3, 0, 0).contains("banner ok"));
+        assert!(hash_verify_banner(3, 1, 0).contains("banner bad"));
     }
 
     #[test]

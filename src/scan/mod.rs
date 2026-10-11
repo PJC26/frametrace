@@ -73,14 +73,22 @@ pub fn scan_folder(
     // reused verbatim (never re-hashed or re-probed) when its stored
     // size+mtime still match the file on disk; merge_existing_with_scan then
     // carries the untouched record forward and marks missing paths stale.
-    let incremental_index: HashMap<String, IndexedRecordLine> = if options.incremental {
-        load_existing_record_lines(case_dir)?
-            .into_iter()
-            .map(|line| (normalize_source_key(&line.source_path), line))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    //
+    // The existing index is also loaded outside incremental mode: per-file
+    // facts a pass does not compute itself (a SHA-256 when run without
+    // --hash, ffprobe metadata when run with --no-ffprobe) are carried from
+    // the indexed record whose size+mtime still match, so a lighter rescan
+    // never downgrades a hashed record to `hash_status=skipped` (see
+    // `carried_facts`).
+    let existing_index: HashMap<String, IndexedRecordLine> = load_existing_record_lines(case_dir)?
+        .into_iter()
+        .map(|line| (normalize_source_key(&line.source_path), line))
+        .collect();
+    // A prior checkpoint discarded for different inputs (e.g. a cancelled
+    // `--incremental --hash` enrichment followed by a lighter phase-1 scan)
+    // still holds hashes/probes computed moments ago; salvage them per file
+    // instead of re-hashing gigabytes of evidence.
+    let salvaged_records = salvage_checkpoint_records(&checkpoint);
     let total_files = collection.files.len() as u64;
     let mut records = Vec::with_capacity(collection.files.len());
     let mut unchanged_files = 0usize;
@@ -141,12 +149,23 @@ pub fn scan_folder(
             records.push(existing.clone());
             continue;
         }
-        if let Some(existing) = incremental_index.get(&source_key)
+        let salvaged = salvaged_records
+            .get(&source_key)
+            .filter(|record| same_file_state(record, metadata.len(), modified_unix));
+        let indexed = existing_index
+            .get(&source_key)
+            .filter(|line| !line.json_line.contains("\"index_status\""))
+            .map(|line| &line.record)
+            .filter(|record| same_file_state(record, metadata.len(), modified_unix));
+        if options.incremental
+            && let Some(existing) = existing_index.get(&source_key)
             && record_is_unchanged(existing, metadata.len(), modified_unix, options)
+            && !salvaged.is_some_and(|donor| adds_facts(donor, &existing.record))
         {
             unchanged_files += 1;
             continue;
         }
+        let carried = carried_facts(salvaged, indexed, options);
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -158,7 +177,9 @@ pub fn scan_folder(
             .to_string_lossy()
             .to_string();
 
-        let (sha256, hash_status) = if options.hash_files {
+        let (sha256, hash_status) = if let Some(donor) = carried.hash {
+            (donor.sha256.clone(), donor.hash_status.clone())
+        } else if options.hash_files {
             let (sha256, status, warning) = hash_with_restat(&path, &metadata);
             if let Some(warning) = warning {
                 warnings.push(warning);
@@ -168,7 +189,9 @@ pub fn scan_folder(
             (None, "skipped".to_string())
         };
 
-        let probe = if options.use_ffprobe {
+        let probe = if let Some(donor) = carried.probe {
+            donor.probe.clone()
+        } else if options.use_ffprobe {
             ffprobe::probe(&path)
         } else {
             ProbeSummary::skipped()

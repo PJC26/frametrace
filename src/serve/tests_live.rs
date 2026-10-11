@@ -109,6 +109,8 @@ fn live_records_overlay_a_synthetic_checkpoint() {
     );
     std::fs::write(case_dir.join("db/scan-progress.jsonl"), checkpoint).unwrap();
     let state = shared(&case_dir, "review-partial");
+    // Phase 2 is actually running: only then is the checkpoint live.
+    state_lock(&state).busy = true;
 
     let live: serde_json::Value =
         serde_json::from_str(&api_records(&get("/api/records", "live=1"), &state)).unwrap();
@@ -160,6 +162,7 @@ fn live_records_serve_checkpoint_before_first_index() {
     );
     std::fs::write(case_dir.join("db/scan-progress.jsonl"), checkpoint).unwrap();
     let state = shared(&case_dir, "running");
+    state_lock(&state).busy = true;
     let live: serde_json::Value =
         serde_json::from_str(&api_records(&get("/api/records", "live=1"), &state)).unwrap();
     assert_eq!(live["ok"], true);
@@ -303,6 +306,73 @@ fn enrichment_success_reaches_review_ready() {
     assert_eq!(st["steps"][3], "done");
     assert_eq!(st["steps"][4], "done");
     let _ = std::fs::remove_dir_all(&case_dir);
+}
+
+/// NICE: an index-only case opened via /api/open-case lands in
+/// `review-partial` with no job running. A `db/scan-progress.jsonl` left
+/// by a dead run must not be overlaid as "live" data then.
+#[test]
+fn stale_checkpoint_is_ignored_without_an_active_run() {
+    let case_dir = temp_case("stalelive");
+    write_index(&case_dir, &[video("vid_000001", None)]);
+    let checkpoint = format!(
+        "{}\n{}\n{}\n",
+        r#"{"schema_version":1,"checkpoint":"scan-folder","run_id":"r","fingerprint":"f"}"#,
+        video("vid_000001", Some("dead")),
+        video("vid_000009", Some("beef")),
+    );
+    std::fs::write(case_dir.join("db/scan-progress.jsonl"), checkpoint).unwrap();
+    let state = shared(&case_dir, "review-partial");
+    assert!(!state_lock(&state).busy);
+    let records: serde_json::Value =
+        serde_json::from_str(&api_records(&get("/api/records", "live=1"), &state)).unwrap();
+    assert_eq!(records["live"], false);
+    assert_eq!(records["total"], 1);
+    assert!(records["videos"][0]["sha256"].is_null());
+    let _ = std::fs::remove_dir_all(&case_dir);
+}
+
+/// The live checkpoint is parsed once per (mtime, len), not on every poll.
+#[test]
+fn live_checkpoint_parse_is_cached_by_mtime_and_len() {
+    let case_dir = temp_case("livecache");
+    let header =
+        r#"{"schema_version":1,"checkpoint":"scan-folder","run_id":"r","fingerprint":"f"}"#;
+    let path = case_dir.join("db/scan-progress.jsonl");
+    std::fs::write(&path, format!("{header}\n{}\n", video("vid_000001", None))).unwrap();
+    let state = shared(&case_dir, "running");
+    state_lock(&state).busy = true;
+    let (first, _) = cached_live_checkpoint(&state, &case_dir);
+    let (again, _) = cached_live_checkpoint(&state, &case_dir);
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "unchanged checkpoint re-parsed"
+    );
+    std::fs::write(
+        &path,
+        format!(
+            "{header}\n{}\n{}\n",
+            video("vid_000001", None),
+            video("vid_000002", None)
+        ),
+    )
+    .unwrap();
+    let (grown, _) = cached_live_checkpoint(&state, &case_dir);
+    assert_eq!(grown.len(), 2, "appended line must invalidate the cache");
+    let _ = std::fs::remove_dir_all(&case_dir);
+}
+
+/// Blocker 1/2: phase 1 is an incremental, hash-less scan, so re-analysing
+/// an existing case reuses recorded hashes (scan::tests::
+/// rerun_after_cancelled_hash_pass_reuses_computed_hashes runs these exact
+/// options end to end).
+#[test]
+fn phase_one_scan_is_incremental() {
+    let args = phase1_scan_args("/case", "/ev");
+    assert_eq!(args[0], "scan-folder");
+    assert!(args.iter().any(|a| a == "--incremental"), "{args:?}");
+    assert!(args.iter().any(|a| a == "--no-ffprobe"), "{args:?}");
+    assert!(!args.iter().any(|a| a == "--hash"), "{args:?}");
 }
 
 #[test]

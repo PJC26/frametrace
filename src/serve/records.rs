@@ -94,6 +94,38 @@ pub(crate) fn read_live_checkpoint(case_dir: &Path) -> (Vec<serde_json::Value>, 
     (records, skipped)
 }
 
+/// [`read_live_checkpoint`] memoized by path+mtime+len (NICE): a poll
+/// against an unchanged checkpoint costs one `stat` and an `Arc` clone.
+/// Like [`cached_index`], the state lock is never held while reading.
+pub(crate) fn cached_live_checkpoint(
+    state: &SharedState,
+    case_dir: &Path,
+) -> (Arc<Vec<serde_json::Value>>, usize) {
+    let path = scan_progress_path(case_dir);
+    let Ok(meta) = path.metadata() else {
+        return (Arc::new(Vec::new()), 0);
+    };
+    let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+    let len = meta.len();
+    if let Some(cache) = &state_lock(state).live_cache
+        && cache.path == path
+        && cache.mtime == mtime
+        && cache.len == len
+    {
+        return (Arc::clone(&cache.records), cache.skipped);
+    }
+    let (records, skipped) = read_live_checkpoint(case_dir);
+    let records = Arc::new(records);
+    state_lock(state).live_cache = Some(LiveCache {
+        path,
+        mtime,
+        len,
+        records: Arc::clone(&records),
+        skipped,
+    });
+    (records, skipped)
+}
+
 /// Overlays live checkpoint records on the index list: a record whose id
 /// (or, failing that, source path) is already indexed replaces it in
 /// place — order and offsets stay stable for the pager — and unknown
@@ -141,9 +173,9 @@ pub(crate) fn overlay_live_records(
 }
 
 pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
-    let (case_dir, phase) = {
+    let (case_dir, phase, busy) = {
         let guard = state_lock(state);
-        (guard.case_dir.clone(), guard.phase)
+        (guard.case_dir.clone(), guard.phase, guard.busy)
     };
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"no case open\"}".to_string();
@@ -151,8 +183,11 @@ pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
     // UX-02: `live=1` while the pipeline is still producing data overlays
     // the scan checkpoint on the (possibly hash-less) index so the viewer
     // sees enriched records as they land. Outside those phases the
-    // checkpoint is a leftover of an interrupted run and is ignored.
-    let live_phase = matches!(phase, "running" | "review-partial");
+    // checkpoint is a leftover of an interrupted run and is ignored —
+    // including in `review-partial` without an active job (an index-only
+    // case opened via /api/open-case, or phase 2 cancelled/failed): a
+    // dead run's checkpoint must not be presented as live data.
+    let live_phase = busy && matches!(phase, "running" | "review-partial");
     let live = live_phase && query_value(&request.query, "live").as_deref() == Some("1");
     let generation = index_generation(state, &case_dir);
     // Index-only version for the strict (non-live) pager: a restart is
@@ -185,14 +220,14 @@ pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
         .and_then(|v| v.as_array())
         .unwrap_or(&empty);
     let (live_records, live_skipped) = if live {
-        read_live_checkpoint(&case_dir)
+        cached_live_checkpoint(state, &case_dir)
     } else {
-        (Vec::new(), 0)
+        (Arc::new(Vec::new()), 0)
     };
     let live_count = live_records.len();
     let overlaid;
     let videos: &Vec<serde_json::Value> = if live && live_count > 0 {
-        overlaid = overlay_live_records(base, live_records);
+        overlaid = overlay_live_records(base, live_records.iter().cloned().collect());
         &overlaid
     } else {
         base

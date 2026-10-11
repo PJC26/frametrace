@@ -421,12 +421,7 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
     // Phase 1 scan: listing + container metadata only. Hashing and
     // ffprobe are the slow per-file passes; they move to phase 2.
     set_step(&state, 2, StepStatus::Running);
-    let scan_args: Vec<String> = vec![
-        "scan-folder".into(),
-        case_text.clone(),
-        source_text,
-        "--no-ffprobe".into(),
-    ];
+    let scan_args = phase1_scan_args(&case_text, &source_text);
     match run_step(&exe, &scan_args, &state) {
         Ok(output) => {
             log(&state, output);
@@ -441,6 +436,22 @@ pub(crate) fn run_folder_pipeline(state: SharedState, job: PipelineJob) {
 
     enter_review_partial(&state);
     run_folder_enrichment(&state, &job, |args| run_step(&exe, args, &state));
+}
+
+/// Phase-1 `scan-folder` arguments. `--incremental` makes a rerun on an
+/// existing case reuse every unchanged record verbatim (hashes and ffprobe
+/// metadata included) instead of rebuilding it hash-less; together with
+/// scan-folder's carry rule (a pass never drops facts it did not compute)
+/// and its salvage of a cancelled phase-2 checkpoint, re-analysing after a
+/// cancel resumes hashing where it stopped (Blockers 1/2).
+pub(crate) fn phase1_scan_args(case_text: &str, source_text: &str) -> Vec<String> {
+    vec![
+        "scan-folder".into(),
+        case_text.into(),
+        source_text.into(),
+        "--no-ffprobe".into(),
+        "--incremental".into(),
+    ]
 }
 
 /// Phase 1 is done: the hash-less index is on disk and reviewable while
@@ -659,7 +670,7 @@ pub(crate) fn stop_enrichment(state: &SharedState, step: usize, failure: Option<
         None => {
             guard.steps[step] = StepStatus::Pending;
             let message = format!(
-                "{what} 단계에서 보강을 중단했습니다 — 해시·검증·리뷰 생성이 완료되지 않았습니다. 1단계 색인으로 검토는 계속할 수 있으며, 같은 소스로 다시 분석하면 이어서 진행합니다."
+                "{what} 단계에서 보강을 중단했습니다 — 해시·검증·리뷰 생성이 완료되지 않았습니다. 1단계 색인으로 검토는 계속할 수 있으며, 같은 소스로 다시 분석하면 이미 계산한 해시는 다시 계산하지 않고 남은 파일부터 이어서 진행합니다."
             );
             guard.logs.push(format!("경고: {message}"));
             guard.warnings.push((step, message));
@@ -1028,14 +1039,29 @@ pub(crate) fn sanitize_examiner(raw: &str) -> String {
         .collect()
 }
 
-/// Writes `review/signoff.json` atomically. Returns the signed unix time.
-pub(crate) fn write_signoff(case_dir: &Path, examiner: &str) -> Result<i64, String> {
+/// Where an in-progress finalize keeps its sign-off until report and
+/// package both succeeded; only then is it promoted to
+/// `review/signoff.json` (SHOULD-FIX 6).
+pub(crate) const SIGNOFF_PENDING_REL_PATH: &str = "review/signoff.pending.json";
+
+/// Writes a sign-off record atomically to `rel_path`. It binds the examiner
+/// to the current review marks (`content_sha256`, see
+/// `report::signoff_content_sha256`) so a later make-report can say whether
+/// the marks changed after the sign-off. Returns the signed unix time.
+pub(crate) fn write_signoff(
+    case_dir: &Path,
+    rel_path: &str,
+    examiner: &str,
+) -> Result<i64, String> {
     let signed_unix = crate::util::now_unix()? as i64;
+    let content_sha256 =
+        crate::report::signoff_content_sha256(&crate::cli::handlers::review_marks_json(case_dir));
     let body = format!(
-        "{{\"schema_version\":1,\"examiner\":{},\"signed_unix\":{signed_unix},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
-        json_string(examiner)
+        "{{\"schema_version\":2,\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks\",\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+        json_string(examiner),
+        json_string(&content_sha256)
     );
-    let path = case_dir.join(crate::report::SIGNOFF_REL_PATH);
+    let path = case_dir.join(rel_path);
     crate::util::write_text_atomic(&path, &body)
         .map_err(|err| format!("검토자 기록 저장 실패 {}: {err}", path.display()))?;
     Ok(signed_unix)
@@ -1081,8 +1107,23 @@ pub(crate) fn finalize_with_exe(
     examiner: &str,
     state: &SharedState,
 ) -> String {
-    // The sign-off must exist before make-report so the report names the reviewer.
-    if let Err(err) = write_signoff(case_dir, examiner) {
+    // Never seal without the latest marks (SHOULD-FIX 5): marks queued on
+    // disk by an earlier enrichment run are applied first, and a failure
+    // blocks the finalize instead of packaging a stale review.
+    {
+        let _gate = marks_gate();
+        if let Err(err) = drain_pending_marks(state, case_dir) {
+            return api_err(&format!(
+                "최종화 차단: 저장 대기 중인 판독 마크를 케이스에 반영하지 못했습니다 — {err}"
+            ));
+        }
+    }
+    // The sign-off is written to a pending file that make-report reads
+    // (--signoff) so the report names the reviewer, and is promoted to
+    // review/signoff.json only after report AND package succeeded: a failed
+    // finalize never leaves a sign-off behind (SHOULD-FIX 6).
+    let pending_signoff = case_dir.join(SIGNOFF_PENDING_REL_PATH);
+    if let Err(err) = write_signoff(case_dir, SIGNOFF_PENDING_REL_PATH, examiner) {
         return api_err(&err);
     }
     {
@@ -1098,13 +1139,40 @@ pub(crate) fn finalize_with_exe(
     // finalized package should rest on live digests, not stored scan hashes.
     let report = run_step(
         exe,
-        &["make-report".into(), case_text.clone(), "--rehash".into()],
+        &[
+            "make-report".into(),
+            case_text.clone(),
+            "--rehash".into(),
+            "--signoff".into(),
+            pending_signoff.to_string_lossy().to_string(),
+        ],
         state,
     );
     let packaging = if report.is_ok() {
         run_step(exe, &["package-case".into(), case_text.clone()], state)
     } else {
         report.clone()
+    };
+    let promoted = match (&report, &packaging) {
+        (Ok(_), Ok(_)) => std::fs::rename(
+            &pending_signoff,
+            case_dir.join(crate::report::SIGNOFF_REL_PATH),
+        )
+        .map_err(|err| format!("검토자 기록 확정 실패: {err}")),
+        _ => {
+            let _ = std::fs::remove_file(&pending_signoff);
+            // The report on disk was rendered with the abandoned sign-off;
+            // re-render it from the promoted state (best effort) so it does
+            // not name a reviewer for a finalize that never completed.
+            if report.is_ok() {
+                let _ = run_step(exe, &["make-report".into(), case_text.clone()], state);
+            }
+            Ok(())
+        }
+    };
+    let packaging = match (packaging, promoted) {
+        (Ok(out), Ok(())) => Ok(out),
+        (Ok(_), Err(err)) | (Err(err), _) => Err(err),
     };
     let mut guard = state_lock(state);
     match (report, packaging) {

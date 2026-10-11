@@ -321,3 +321,94 @@ fn custody_table_flags_tampered_source_and_confirms_untouched_one() {
     assert_eq!((summary.matched, summary.mismatched), (0, 1));
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// SHOULD-FIX 6: a finalize whose package step fails must not leave a
+/// sign-off behind (it used to write review/signoff.json before
+/// make-report, so every later report named a reviewer for a finalize that
+/// never completed).
+#[cfg(unix)]
+#[test]
+fn failed_finalize_leaves_no_signoff() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, case, _source) = case_fixture("finalize-fail");
+    let fake = root.join("fake-frametrace.sh");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncase \"$1\" in package-case) echo 'disk full' >&2; exit 1;; *) exit 0;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case.clone());
+    let response = finalize_with_exe(&fake, &case, "홍길동", &state);
+    assert!(response.contains("\"ok\":false"), "{response}");
+    assert!(
+        !case.join(crate::report::SIGNOFF_REL_PATH).exists(),
+        "failed finalize must not record a sign-off"
+    );
+    assert!(!case.join(SIGNOFF_PENDING_REL_PATH).exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// SHOULD-FIX 6: after a sign-off, changing the review marks makes the
+/// next report say the sign-off is not for the current content.
+#[test]
+fn report_flags_marks_changed_after_signoff() {
+    let (root, case, _source) = case_fixture("signoff-stale");
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case.clone());
+    let response = finalize_with_exe(&cli_bin(), &case, "홍길동", &state);
+    assert!(response.contains("\"ok\":true"), "{response}");
+    let report = std::fs::read_to_string(case.join("reports/case-report.html")).unwrap();
+    assert!(
+        report.contains("판독 마크는 변경되지 않았습니다"),
+        "fresh sign-off is current"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(case.join("case.json")).unwrap()).unwrap();
+    let marks = serde_json::json!({
+        "schema_version": 1,
+        "case_id": manifest["case_id"],
+        "marks": [{"id": "vid_000001", "status": "important", "note": "after sign-off"}],
+    });
+    let marks_path = root.join("marks.json");
+    std::fs::write(&marks_path, marks.to_string()).unwrap();
+    crate::cli::handlers::import_marks_quiet(&case, &marks_path).unwrap();
+    crate::cli::handlers::make_report(&case, false, false, None).unwrap();
+    let report = std::fs::read_to_string(case.join("reports/case-report.html")).unwrap();
+    assert!(
+        report.contains("이 기록 이후 판독 마크가 변경되었습니다"),
+        "an old sign-off must not read as current"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// SHOULD-FIX 5: marks still queued on disk are applied before sealing, so
+/// the packaged review always carries the latest marks.
+#[test]
+fn finalize_applies_queued_marks_before_sealing() {
+    let (root, case, _source) = case_fixture("finalize-queued");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(case.join("case.json")).unwrap()).unwrap();
+    let queued = case.join("marks-pending");
+    std::fs::create_dir_all(&queued).unwrap();
+    std::fs::write(
+        queued.join("0001.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "case_id": manifest["case_id"],
+            "marks": [{"id": "vid_000001", "status": "important", "note": "queued"}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case.clone());
+    let response = finalize_with_exe(&cli_bin(), &case, "홍길동", &state);
+    assert!(response.contains("\"ok\":true"), "{response}");
+    assert_eq!(pending_marks_count(&case), 0);
+    let marks = crate::case_db::load_review_marks(&case).unwrap();
+    assert!(marks.iter().any(|m| m.note.as_deref() == Some("queued")));
+    let _ = std::fs::remove_dir_all(root);
+}

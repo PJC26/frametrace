@@ -795,3 +795,160 @@ fn resume_tolerates_torn_checkpoint_tail() {
     assert_eq!(second.video_count, 2);
     let _ = fs::remove_dir_all(case_dir.parent().unwrap());
 }
+
+fn hashes_of_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> std::collections::HashMap<String, (Option<String>, String)> {
+    lines
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            (
+                value["relative_path"].as_str().unwrap().to_string(),
+                (
+                    value["sha256"].as_str().map(str::to_string),
+                    value["hash_status"].as_str().unwrap().to_string(),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn jsonl_hashes(case_dir: &Path) -> std::collections::HashMap<String, (Option<String>, String)> {
+    let text = fs::read_to_string(case_dir.join("db/videos.jsonl")).unwrap();
+    hashes_of_lines(text.lines())
+}
+
+/// Blocker 1: a lighter rescan (no --hash, with or without --incremental —
+/// the workstation's phase 1 on an existing case) must never downgrade a
+/// recorded SHA-256 to `hash_status=skipped`, in the JSONL index, the
+/// index JSON or case.db.
+#[test]
+fn lighter_rescan_keeps_recorded_hashes() {
+    let (case_dir, source_dir) = incremental_fixture("keephash");
+    fs::write(source_dir.join("a.mp4"), b"\0\0\0\x18ftypmp42one").unwrap();
+    fs::write(source_dir.join("b.mp4"), b"\0\0\0\x18ftypmp42two").unwrap();
+    let hashed = ScanOptions {
+        hash_files: true,
+        use_ffprobe: false,
+        ..ScanOptions::default()
+    };
+    super::scan_folder(&case_dir, &source_dir, &hashed, ResumeMode::Auto, None).unwrap();
+    let before = jsonl_hashes(&case_dir);
+    assert_eq!(before.len(), 2);
+    assert!(
+        before
+            .values()
+            .all(|(sha, status)| sha.is_some() && status == "complete")
+    );
+
+    for incremental in [false, true] {
+        super::scan_folder(
+            &case_dir,
+            &source_dir,
+            &ScanOptions {
+                hash_files: false,
+                use_ffprobe: false,
+                incremental,
+                ..ScanOptions::default()
+            },
+            ResumeMode::Auto,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            jsonl_hashes(&case_dir),
+            before,
+            "incremental={incremental}: lighter pass dropped hashes"
+        );
+        let index = fs::read_to_string(case_dir.join("db/video_index.json")).unwrap();
+        assert!(!index.contains("\"hash_status\":\"skipped\""), "{index}");
+        let db_lines = crate::case_db::load_video_record_lines(&case_dir).unwrap();
+        assert_eq!(
+            hashes_of_lines(db_lines.iter().map(String::as_str)),
+            before,
+            "incremental={incremental}: case.db lost hashes"
+        );
+    }
+
+    // A changed file is never credited with its old hash.
+    fs::write(source_dir.join("a.mp4"), b"\0\0\0\x18ftypmp42one-changed").unwrap();
+    super::scan_folder(
+        &case_dir,
+        &source_dir,
+        &ScanOptions {
+            hash_files: false,
+            use_ffprobe: false,
+            ..ScanOptions::default()
+        },
+        ResumeMode::Auto,
+        None,
+    )
+    .unwrap();
+    let after = jsonl_hashes(&case_dir);
+    assert_eq!(after["a.mp4"], (None, "skipped".to_string()));
+    assert_eq!(after["b.mp4"], before["b.mp4"]);
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}
+
+/// Blocker 2: cancel the phase-2 `--incremental --hash` pass mid-way,
+/// re-run the analysis (phase 1 = `--incremental --no-ffprobe`, a
+/// different checkpoint fingerprint), then phase 2 again. The files the
+/// cancelled pass already hashed must not be hashed again. The crafted
+/// checkpoint carries a sentinel digest no real hash of these files
+/// produces, so its survival proves no re-hash happened.
+#[test]
+fn rerun_after_cancelled_hash_pass_reuses_computed_hashes() {
+    let (case_dir, source_dir) = incremental_fixture("resumehash");
+    fs::write(source_dir.join("a.mp4"), b"\0\0\0\x18ftypmp42one").unwrap();
+    fs::write(source_dir.join("b.mp4"), b"\0\0\0\x18ftypmp42two").unwrap();
+    fs::write(source_dir.join("c.mp4"), b"\0\0\0\x18ftypmp42three").unwrap();
+    // Exactly the options the workstation passes (phase1_scan_args and
+    // run_folder_enrichment with hashing on, ffprobe off).
+    let phase1 = ScanOptions {
+        hash_files: false,
+        use_ffprobe: false,
+        incremental: true,
+        ..ScanOptions::default()
+    };
+    let phase2 = ScanOptions {
+        hash_files: true,
+        ..phase1.clone()
+    };
+    super::scan_folder(&case_dir, &source_dir, &phase1, ResumeMode::Auto, None).unwrap();
+
+    // The cancelled phase 2 checkpointed a.mp4 and b.mp4 before the kill.
+    let sentinel = "f".repeat(64);
+    let lines: Vec<String> = fs::read_to_string(case_dir.join("db/videos.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("a.mp4") || line.contains("b.mp4"))
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value["sha256"] = serde_json::Value::String(sentinel.clone());
+            value["hash_status"] = serde_json::Value::String("complete".into());
+            value.to_string()
+        })
+        .collect();
+    assert_eq!(lines.len(), 2);
+    leave_checkpoint(&case_dir, &source_dir, &phase2, &lines);
+
+    // Re-analysis: phase 1 first (its fingerprint resets the checkpoint)...
+    super::scan_folder(&case_dir, &source_dir, &phase1, ResumeMode::Auto, None).unwrap();
+    let mid = jsonl_hashes(&case_dir);
+    assert_eq!(mid["a.mp4"].0.as_deref(), Some(sentinel.as_str()));
+    assert_eq!(mid["b.mp4"].0.as_deref(), Some(sentinel.as_str()));
+    assert_eq!(mid["c.mp4"].0, None);
+
+    // ...then phase 2 hashes only the file the cancelled run never reached.
+    let rerun =
+        super::scan_folder(&case_dir, &source_dir, &phase2, ResumeMode::Auto, None).unwrap();
+    assert_eq!(rerun.unchanged_files, 2, "a/b reused, not re-hashed");
+    assert_eq!(rerun.video_count, 1, "only c.mp4 processed");
+    let done = jsonl_hashes(&case_dir);
+    assert_eq!(done["a.mp4"].0.as_deref(), Some(sentinel.as_str()));
+    assert_eq!(done["b.mp4"].0.as_deref(), Some(sentinel.as_str()));
+    let c_sha = done["c.mp4"].0.clone().expect("c.mp4 hashed");
+    assert_ne!(c_sha, sentinel);
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}

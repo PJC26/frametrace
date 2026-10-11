@@ -593,20 +593,88 @@ pub fn parse_signoff(text: &str) -> Option<(String, i64)> {
     Some((examiner, signed))
 }
 
+/// Digest of the content a finalize sign-off covers: the review marks as
+/// make-report embeds them (`review_marks_json`).
+pub fn signoff_content_sha256(marks_json: &str) -> String {
+    crate::sha256::digest_bytes(marks_json.as_bytes())
+}
+
+/// Whether the content a sign-off was given for is still what the report
+/// shows (SHOULD-FIX 6): an old sign-off must never read as current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignoffCurrency {
+    /// The review marks are unchanged since the sign-off.
+    Current,
+    /// The review marks changed after the sign-off.
+    Changed,
+    /// The record predates content binding; currency cannot be checked.
+    Unbound,
+}
+
+impl SignoffCurrency {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "sign-off 이후 판독 마크 변경 없음",
+            Self::Changed => "sign-off 이후 판독 마크가 변경됨 — 현재 내용에 대한 sign-off가 아님",
+            Self::Unbound => "sign-off 대상 내용 해시 없음 — 이후 변경 여부 확인 불가",
+        }
+    }
+}
+
+/// Compares the sign-off's recorded `content_sha256` with the current one.
+pub fn signoff_currency(signoff_text: &str, current_content_sha256: &str) -> SignoffCurrency {
+    let recorded = serde_json::from_str::<serde_json::Value>(signoff_text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("content_sha256")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    match recorded {
+        Some(hash) if hash == current_content_sha256 => SignoffCurrency::Current,
+        Some(_) => SignoffCurrency::Changed,
+        None => SignoffCurrency::Unbound,
+    }
+}
+
 /// Banner naming the reviewer recorded at finalize time. The wording is
 /// deliberately "recorded as entered": the workstation has no login, so the
 /// name is the examiner's own typed statement, not an authenticated identity.
-pub fn signoff_banner_html(examiner: &str, signed_unix: i64) -> String {
+/// It also states whether the review marks changed after that sign-off.
+pub fn signoff_banner_html(examiner: &str, signed_unix: i64, currency: SignoffCurrency) -> String {
+    let (background, border, tail) = match currency {
+        SignoffCurrency::Current => (
+            "#eef4f8",
+            "#b9d0e0",
+            " — 이 기록 이후 판독 마크는 변경되지 않았습니다.".to_string(),
+        ),
+        SignoffCurrency::Changed => (
+            "#fce8e6",
+            "#e6a49c",
+            " — <strong>주의: 이 기록 이후 판독 마크가 변경되었습니다. 아래 내용은 검토자가 최종화한 시점과 다르며, 이 기록은 현재 내용에 대한 sign-off가 아닙니다. 다시 최종화하십시오.</strong>".to_string(),
+        ),
+        SignoffCurrency::Unbound => (
+            "#fff4e0",
+            "#f4c790",
+            " — 이 기록에는 대상 내용의 해시가 없어 이후 판독 마크 변경 여부를 확인할 수 없습니다.".to_string(),
+        ),
+    };
     format!(
-        "<div style=\"padding:8px 16px;background:#eef4f8;border-bottom:1px solid #b9d0e0;font-size:13px\">검토자: <strong>{}</strong> (최종화 시 입력·기록된 이름이며 신원 인증은 아닙니다; 기록 시각 unix {})</div>",
+        "<div style=\"padding:8px 16px;background:{background};border-bottom:1px solid {border};font-size:13px\">검토자: <strong>{}</strong> (최종화 시 입력·기록된 이름이며 신원 인증은 아닙니다; 기록 시각 unix {}){tail}</div>",
         crate::util::html_escape(examiner),
         signed_unix
     )
 }
 
 /// Inserts the sign-off banner right after `<body>`.
-pub fn inject_signoff_banner(html: String, examiner: &str, signed_unix: i64) -> String {
-    let banner = signoff_banner_html(examiner, signed_unix);
+pub fn inject_signoff_banner(
+    html: String,
+    examiner: &str,
+    signed_unix: i64,
+    currency: SignoffCurrency,
+) -> String {
+    let banner = signoff_banner_html(examiner, signed_unix, currency);
     match html.find("<body>") {
         Some(index) => format!(
             "{}{}{}",
@@ -644,6 +712,7 @@ mod tests {
             "<html><body><p>x</p></body></html>".to_string(),
             "홍길동 <b>",
             1700000000,
+            super::SignoffCurrency::Current,
         );
         assert!(html.contains("검토자: <strong>홍길동 &lt;b&gt;</strong>"));
         assert!(html.contains("신원 인증은 아닙니다"));
@@ -653,6 +722,28 @@ mod tests {
             Some(("A".to_string(), 5))
         );
         assert_eq!(super::parse_signoff(r#"{"examiner":"  "}"#), None);
+    }
+
+    /// SHOULD-FIX 6: a sign-off given for other marks never reads as current.
+    #[test]
+    fn signoff_currency_detects_marks_changed_after_signoff() {
+        use super::{SignoffCurrency, signoff_banner_html, signoff_currency};
+        let digest = super::signoff_content_sha256("[]");
+        let record = format!(r#"{{"examiner":"A","signed_unix":5,"content_sha256":"{digest}"}}"#);
+        assert_eq!(signoff_currency(&record, &digest), SignoffCurrency::Current);
+        let changed = super::signoff_content_sha256(r#"[{"id":"v","status":"important"}]"#);
+        assert_eq!(
+            signoff_currency(&record, &changed),
+            SignoffCurrency::Changed
+        );
+        assert_eq!(
+            signoff_currency(r#"{"examiner":"A","signed_unix":5}"#, &digest),
+            SignoffCurrency::Unbound
+        );
+        let banner = signoff_banner_html("A", 5, SignoffCurrency::Changed);
+        assert!(banner.contains("변경되었습니다"), "{banner}");
+        assert!(banner.contains("현재 내용에 대한 sign-off가 아닙니다"));
+        assert!(!signoff_banner_html("A", 5, SignoffCurrency::Current).contains("주의"));
     }
 
     fn render(inputs: &[(&str, &str)]) -> String {

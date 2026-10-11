@@ -109,6 +109,9 @@ pub(crate) struct JobState {
     /// actually changes; handlers clone the `Arc` (not the document) and
     /// release the state lock before filtering (PERF-01).
     pub(crate) index_cache: Option<IndexCache>,
+    /// Parsed live scan checkpoint, keyed by path+mtime+len so polling
+    /// `/api/records?live=1` does not re-parse an unchanged checkpoint.
+    pub(crate) live_cache: Option<LiveCache>,
     /// Non-fatal step failures from the last pipeline run (FOR-08):
     /// `(step index, message)`. Surfaced as `warnings` in /api/status so a
     /// skipped validation/anomaly pass is never mistaken for a clean run.
@@ -173,6 +176,7 @@ impl JobState {
             shutdown_requested: false,
             instance: new_instance_id(),
             index_cache: None,
+            live_cache: None,
             warnings: Vec::new(),
             restored: false,
             enrichment: None,
@@ -235,6 +239,14 @@ pub(crate) struct IndexCache {
     pub(crate) mtime: SystemTime,
     pub(crate) len: u64,
     pub(crate) value: Arc<serde_json::Value>,
+}
+
+pub(crate) struct LiveCache {
+    pub(crate) path: PathBuf,
+    pub(crate) mtime: SystemTime,
+    pub(crate) len: u64,
+    pub(crate) records: Arc<Vec<serde_json::Value>>,
+    pub(crate) skipped: usize,
 }
 
 pub(crate) type SharedState = Arc<Mutex<JobState>>;
