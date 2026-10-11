@@ -19,6 +19,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isolatedEnv } from './lib/isolated-server.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const selfRepo = resolve(here, '..');
@@ -80,7 +81,9 @@ const base = `http://127.0.0.1:${port}`;
 const token = 'capture-' + Math.random().toString(36).slice(2, 12);
 const authHeaders = { 'X-FrameTrace-Token': token };
 const server = spawn(exe, [String(port)], {
-  env: { ...process.env, FRAMETRACE_NO_BROWSER: '1', FRAMETRACE_TOKEN: token, XDG_CONFIG_HOME: join(work, 'cfg'), APPDATA: join(work, 'cfg'), HOME: process.env.HOME },
+  // Explicit port (no reuse-discovery) + throwaway HOME/XDG/APPDATA and
+  // instance file: never reads or overwrites ~/.frametrace/server.json.
+  env: isolatedEnv(work, { FRAMETRACE_TOKEN: token }),
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let serverLog = '';
