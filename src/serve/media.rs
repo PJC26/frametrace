@@ -230,6 +230,10 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         if guard.busy {
             return api_err(CLIP_BUSY_ERROR);
         }
+        // The case may have been switched since the snapshot above.
+        if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
+            return api_err("케이스가 바뀌었습니다 — 다시 시도하십시오.");
+        }
         if guard
             .clip_jobs
             .iter()

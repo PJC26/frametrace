@@ -390,3 +390,85 @@ esac"#,
     assert_eq!(parse(&api_status(&state))["phase"], "review-ready");
     let _ = std::fs::remove_dir_all(case);
 }
+
+/// NICE: opening another case while a clip export runs is refused — the
+/// export would otherwise block the new case's finalize.
+#[test]
+fn open_case_refused_while_clip_exports_run() {
+    let old = scratch("open-old");
+    let new = scratch("open-new");
+    std::fs::write(new.join("case.json"), br#"{"case_id":"FT-new"}"#).unwrap();
+    let state = bound(&old, "review-ready");
+    state_lock(&state)
+        .clip_jobs
+        .push(running_clip("clip-1", "k", old.join("c.mp4")));
+    let body = serde_json::json!({"case_dir": new.to_string_lossy()}).to_string();
+    let response = parse(&api_open_case(
+        &request("POST", "/api/open-case", "", &body),
+        &state,
+    ));
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("클립 내보내기"),
+        "{response}"
+    );
+    assert_eq!(state_lock(&state).case_dir.as_deref(), Some(old.as_path()));
+    let _ = std::fs::remove_dir_all(old);
+    let _ = std::fs::remove_dir_all(new);
+}
+
+/// NICE: finalize_with_exe must not release `busy` while the caller's
+/// BusyGuard is still alive (another job could start in that window).
+#[cfg(unix)]
+#[test]
+fn finalize_leaves_busy_to_the_callers_guard() {
+    let case = temp_case("finalize-busy");
+    let exe = fake_cli(&case, "exit 1");
+    let state = bound(&case, "review-ready");
+    let guard = try_acquire_busy(&state).unwrap();
+    let response = finalize_with_exe(&exe, &case, "홍길동", &state);
+    assert!(response.contains("\"ok\":false"), "{response}");
+    assert!(
+        state_lock(&state).busy,
+        "busy must stay held until the caller's guard drops"
+    );
+    drop(guard);
+    assert!(!state_lock(&state).busy);
+    let _ = std::fs::remove_dir_all(case);
+}
+
+/// NICE: a cancel between `qa anomalies` and `make-custody` is reported as
+/// cancelled, not as a completed verification.
+#[cfg(unix)]
+#[test]
+fn verify_sources_cancelled_before_custody_is_not_ok() {
+    let (root, case) = case_fixture("verify-cancel");
+    // A completed hash-verify run so the summary exists.
+    crate::anomaly::scan_case(&case, true).unwrap();
+    let marker = root.join("custody-started");
+    let exe = fake_cli(
+        &root,
+        &format!(
+            r#"case "$1" in
+  qa) exit 0 ;;
+  make-custody) touch "{}"; sleep 10 ;;
+  *) exit 0 ;;
+esac"#,
+            marker.display()
+        ),
+    );
+    let state = bound(&case, "review-ready");
+    let worker_state = Arc::clone(&state);
+    let worker_exe = exe.clone();
+    let worker =
+        thread::spawn(move || super::jobs::verify_sources_with_exe(&worker_state, &worker_exe));
+    wait_for("make-custody started", || marker.exists());
+    assert_eq!(parse(&api_cancel(&state))["cancelled"], "job");
+    let response = parse(&worker.join().unwrap());
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["cancelled"], true, "{response}");
+    let _ = std::fs::remove_dir_all(root);
+}

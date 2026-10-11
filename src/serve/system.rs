@@ -514,6 +514,24 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     if guard.busy {
         return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
     }
+    // Clip exports write into the bound case and block its finalize; a
+    // switch while one runs would leave the new case's finalize refused for
+    // the old case's export (and the export landing under a case no longer
+    // shown).
+    let clips_running = guard
+        .clip_jobs
+        .iter()
+        .filter(|job| job.state == "running")
+        .count();
+    if clips_running > 0 {
+        return api_err(&format!(
+            "클립 내보내기 {clips_running}건이 진행 중입니다 — 끝나거나 중단한 뒤 케이스를 여십시오."
+        ));
+    }
+    if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
+        // Finished clip jobs belong to the previous binding.
+        guard.clip_jobs.clear();
+    }
     guard.case_dir = Some(case_dir.clone());
     // Reopening the same case must keep extra media roots the earlier
     // session recorded (e.g. a carving workspace linked into the case) —
