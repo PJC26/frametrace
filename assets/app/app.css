@@ -203,6 +203,9 @@ details.opts > summary:hover { background: var(--surface-2); }
 .opts-t { font-size: var(--fs-sm); font-weight: 600; }
 .opts-sum { min-width: 0; color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .opts-body { padding-top: 10px; }
+/* Closed: really gone (Chromium otherwise still lays out skipped details
+   content for geometry queries). */
+details.opts:not([open]) > .opts-body { display: none; }
 p.hint.opencase { margin: 2px 0 0; }
 /* 이전 프로젝트: most recent first; the list scrolls inside the block so
    the column keeps fitting 1366x768. */

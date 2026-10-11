@@ -72,6 +72,8 @@ function scheduleValidate() {
 // drive letter fails before the analysis does, not three steps in.
 async function validatePaths() {
   const src = $("sourcePath").value.trim();
+  // Case folder may have been filled programmatically (자동 제안, 처음부터).
+  updateOptSummary();
   if (!src) {
     applyDetection("", { kind: "" });
     schedulePreflight();
