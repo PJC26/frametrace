@@ -470,14 +470,94 @@ fn inject_redaction_banner(html: String, redact_paths: bool) -> String {
 }
 
 /// The review marks exactly as make-report embeds them (before path
-/// redaction). The finalize sign-off binds to its digest
-/// ([`report::signoff_content_sha256`]) so a later report can say whether
-/// the marks changed after the sign-off.
-pub(crate) fn review_marks_json(case_dir: &Path) -> String {
-    match crate::case_db::load_review_marks(case_dir) {
-        Ok(rows) => review_marks_json_from_rows(&rows),
-        Err(_) => "[]".to_string(),
+/// redaction). A DB read failure is an error, never an empty list: a
+/// sign-off bound to "no marks" because of a transient read failure would
+/// misstate what the examiner signed (finding 8).
+pub(crate) fn review_marks_json(case_dir: &Path) -> Result<String, String> {
+    crate::case_db::load_review_marks(case_dir)
+        .map(|rows| review_marks_json_from_rows(&rows))
+        .map_err(|err| format!("판독 마크를 읽지 못했습니다: {err}"))
+}
+
+/// Version of the content a finalize sign-off binds to. v3 adds each
+/// mark's IN-OUT range and the tag map to v2's id/status/time/examiner/
+/// note; a sign-off with an older `schema_version` cannot say whether
+/// ranges or tags changed after it.
+pub const SIGNOFF_CONTENT_SCHEMA: u64 = 3;
+
+/// The content a finalize sign-off binds to ([`report::signoff_content_sha256`]):
+/// every review mark with its range, plus the tag map, in a stable order.
+pub(crate) fn signoff_content_json(case_dir: &Path) -> Result<String, String> {
+    let rows = crate::case_db::load_review_marks(case_dir)
+        .map_err(|err| format!("판독 마크를 읽지 못했습니다: {err}"))?;
+    let tags = crate::case_db::load_review_tags(case_dir)
+        .map_err(|err| format!("판독 태그를 읽지 못했습니다: {err}"))?;
+    Ok(signoff_content_json_from(&rows, &tags))
+}
+
+/// [`signoff_content_json`] over already-loaded rows (verify-package reads
+/// them from the packaged database). Marks are ordered by id, the tag map
+/// by id with each tag list sorted and de-duplicated, so the digest only
+/// changes when the content does.
+pub(crate) fn signoff_content_json_from(
+    rows: &[case_db::ReviewMarkRow],
+    tags: &[crate::selection::TagEntry],
+) -> String {
+    let number = |value: Option<f64>| {
+        value
+            .and_then(|v| serde_json::Number::from_f64(v).map(|n| n.to_string()))
+            .unwrap_or_else(|| "null".to_string())
+    };
+    let mut sorted: Vec<&case_db::ReviewMarkRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| a.record_id.cmp(&b.record_id));
+    let marks = sorted
+        .iter()
+        .map(|mark| {
+            let (range_in, range_out) = mark.range.map_or((None, None), |r| (r.start, r.end));
+            format!(
+                "{{\"id\":\"{}\",\"status\":\"{}\",\"marked_unix\":{},\"examiner\":{},\"note\":{},\"range_in\":{},\"range_out\":{}}}",
+                crate::util::json_escape(&mark.record_id),
+                crate::util::json_escape(&mark.status),
+                mark.marked_unix,
+                mark.examiner
+                    .as_deref()
+                    .map(|v| format!("\"{}\"", crate::util::json_escape(v)))
+                    .unwrap_or_else(|| "null".to_string()),
+                mark.note
+                    .as_deref()
+                    .map(|v| format!("\"{}\"", crate::util::json_escape(v)))
+                    .unwrap_or_else(|| "null".to_string()),
+                number(range_in),
+                number(range_out),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut tag_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for entry in tags {
+        tag_map
+            .entry(entry.id.as_str())
+            .or_default()
+            .extend(entry.tags.iter().map(String::as_str));
     }
+    let tags = tag_map
+        .iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(id, values)| {
+            format!(
+                "\"{}\":[{}]",
+                crate::util::json_escape(id),
+                values
+                    .iter()
+                    .map(|v| format!("\"{}\"", crate::util::json_escape(v)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"schema\":{SIGNOFF_CONTENT_SCHEMA},\"marks\":[{marks}],\"tags\":{{{tags}}}}}")
 }
 
 /// [`review_marks_json`] over already-loaded rows, so verify-package can
@@ -554,8 +634,11 @@ pub fn make_report(
     let batch_log =
         read_to_string(&case_dir.join("artifacts/logs/batch-log.jsonl")).unwrap_or_default();
     let scan_runs_json = read_scan_runs_json(case_dir);
-    let marks_json = review_marks_json(case_dir);
-    let signoff_content = report::signoff_content_sha256(&marks_json);
+    let marks_json = review_marks_json(case_dir)?;
+    let signoff_digests = report::SignoffDigests {
+        content: report::signoff_content_sha256(&signoff_content_json(case_dir)?),
+        legacy: report::signoff_content_sha256(&marks_json),
+    };
     let redact = |text: String| -> String {
         if redact_paths {
             crate::redact::redact_json_text(&text, case_dir)
@@ -602,7 +685,7 @@ pub fn make_report(
         Some((examiner, signed_unix)) => {
             let currency = report::signoff_currency(
                 signoff_text.as_deref().unwrap_or_default(),
-                &signoff_content,
+                &signoff_digests,
             );
             println!(
                 "검토자: {examiner} (최종화 시 입력된 이름, 신원 미인증) — {}",

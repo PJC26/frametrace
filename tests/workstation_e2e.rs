@@ -174,6 +174,9 @@ fn workstation_full_pipeline_over_http() {
         .env("FRAMETRACE_NO_BROWSER", "1")
         // Never read or overwrite the user's ~/.frametrace/server.json.
         .env("FRAMETRACE_INSTANCE_FILE", work.join("server.json"))
+        // ...nor the user's workstation-session.json / audit key config dir.
+        .env("XDG_CONFIG_HOME", work.join("config"))
+        .env("APPDATA", work.join("config"))
         // SEC-04: the e2e exercises the nonce gate, so opt out of the default token.
         .env("FRAMETRACE_NO_TOKEN", "1")
         .stdout(Stdio::null())

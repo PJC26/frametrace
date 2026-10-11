@@ -1091,7 +1091,8 @@ pub(crate) fn sanitize_examiner(raw: &str) -> String {
 pub(crate) const SIGNOFF_PENDING_REL_PATH: &str = "review/signoff.pending.json";
 
 /// Writes a sign-off record atomically to `rel_path`. It binds the examiner
-/// to the current review marks (`content_sha256`, see
+/// to the current review marks, their IN-OUT ranges and the tag map
+/// (`content_sha256`, see
 /// `report::signoff_content_sha256`) so a later make-report can say whether
 /// the marks changed after the sign-off. Returns the signed unix time.
 pub(crate) fn write_signoff(
@@ -1100,10 +1101,15 @@ pub(crate) fn write_signoff(
     examiner: &str,
 ) -> Result<i64, String> {
     let signed_unix = crate::util::now_unix()? as i64;
-    let content_sha256 =
-        crate::report::signoff_content_sha256(&crate::cli::handlers::review_marks_json(case_dir));
+    // A read failure refuses the sign-off (finding 8): binding it to an
+    // empty mark list would misstate what the examiner signed.
+    let content = crate::cli::handlers::signoff_content_json(case_dir).map_err(|err| {
+        format!("최종화 차단: 검토자 기록에 묶을 판독 내용을 읽지 못했습니다 — {err}")
+    })?;
+    let content_sha256 = crate::report::signoff_content_sha256(&content);
     let body = format!(
-        "{{\"schema_version\":2,\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks\",\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+        "{{\"schema_version\":{},\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks (status, note, IN-OUT range) and tags\",\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+        crate::report::SIGNOFF_SCHEMA_VERSION,
         json_string(examiner),
         json_string(&content_sha256)
     );
@@ -1178,9 +1184,10 @@ pub(crate) fn finalize_with_exe(
         return api_err(&err);
     }
     {
+        // `busy` belongs to the caller's guard: setting or clearing it here
+        // would release it while that guard is still alive.
         let mut guard = state_lock(state);
         guard.phase = "finalizing";
-        guard.busy = true;
         guard.error = None;
         guard.logs.push("결과 보고서 생성 중…".into());
     }
@@ -1235,7 +1242,6 @@ pub(crate) fn finalize_with_exe(
                 .map(|relative| relative.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
             guard.phase = "done";
-            guard.busy = false;
             guard.byte_progress = None;
             guard.package_dir = package_dir.clone();
             let manifest_sha256 = package_dir.as_deref().and_then(package_manifest_sha256);
@@ -1260,7 +1266,6 @@ pub(crate) fn finalize_with_exe(
         (report, packaging) => {
             let error = report.err().or_else(|| packaging.err()).unwrap_or_default();
             guard.phase = "review-ready";
-            guard.busy = false;
             guard.error = Some(error.clone());
             serde_json::json!({"ok": false, "error": error}).to_string()
         }
@@ -1273,6 +1278,14 @@ pub(crate) fn finalize_with_exe(
 /// so its recorded-vs-observed table reflects this run. Cancellable like any
 /// other step.
 pub(crate) fn api_verify_sources(state: &SharedState) -> String {
+    match std::env::current_exe() {
+        Ok(exe) => verify_sources_with_exe(state, &exe),
+        Err(err) => api_err(&err.to_string()),
+    }
+}
+
+/// [`api_verify_sources`] parameterised on the CLI executable (tests).
+pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String {
     let case_dir = state_lock(state).case_dir.clone();
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
@@ -1281,23 +1294,32 @@ pub(crate) fn api_verify_sources(state: &SharedState) -> String {
         Ok(guard) => guard,
         Err(err) => return api_err(&err),
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => return api_err(&err.to_string()),
-    };
     state_lock(state)
         .logs
         .push("원본 재검증: 색인된 모든 원본을 다시 해시하는 중…".into());
     let case_text = case_dir.to_string_lossy().to_string();
     if let Err(err) = run_step(
-        &exe,
+        exe,
         &["qa".into(), "anomalies".into(), case_text.clone()],
         state,
     ) {
         return api_err(&err);
     }
     // Best effort: the custody statement is regenerated at package time too.
-    if let Err(err) = run_step(&exe, &["make-custody".into(), case_text], state) {
+    // A cancel is not "best effort": the user stopped the run, so it is
+    // reported as cancelled, never as a completed verification.
+    if let Err(err) = run_step(exe, &["make-custody".into(), case_text], state) {
+        if state_lock(state).cancel_requested {
+            state_lock(state).logs.push(
+                "경고: 원본 재검증을 중단했습니다 — 보관 이력서는 갱신되지 않았습니다.".into(),
+            );
+            return serde_json::json!({
+                "ok": false,
+                "cancelled": true,
+                "error": "원본 재검증을 중단했습니다 — 보관 이력서가 갱신되지 않았습니다.",
+            })
+            .to_string();
+        }
         warn_step(state, 4, format!("보관 이력서 갱신 건너뜀: {err}"));
     }
     match crate::anomaly::latest_hash_verify_summary(&case_dir) {
@@ -1456,8 +1478,11 @@ pub(crate) fn start_case_job(state: &SharedState, exe: &Path, spec: CaseJobSpec)
     let started_unix = crate::util::now_unix().unwrap_or(0);
     let prior_phase = {
         let mut guard = state_lock(state);
+        // The phase stays what it was (finding 9): marks queue during a
+        // case job, so a shell reloaded mid-job must still open the review
+        // stage. The job itself is reported via `job` / `job_kind`, and
+        // `busy` (held by the lease) still blocks finalize and other jobs.
         let prior = guard.phase;
-        guard.phase = "finalizing";
         guard.error = None;
         guard.case_job = Some(CaseJob {
             kind: spec.kind,

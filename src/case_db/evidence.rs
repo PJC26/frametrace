@@ -52,7 +52,15 @@ pub fn load_review_tags(case_dir: &Path) -> Result<Vec<crate::selection::TagEntr
         return Ok(Vec::new());
     }
     let conn = open_readonly_case_db(&path)?;
-    if !table_exists(&conn, "schema_meta")? {
+    load_review_tags_from(&conn)
+}
+
+/// [`load_review_tags`] over an already-open connection (verify-package
+/// reads a packaged database copy this way).
+pub(crate) fn load_review_tags_from(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<crate::selection::TagEntry>, String> {
+    if !table_exists(conn, "schema_meta")? {
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare("SELECT key, value FROM schema_meta WHERE substr(key, 1, 15) = 'review_tags.v1:' ORDER BY key")

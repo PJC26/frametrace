@@ -44,9 +44,11 @@ export function isolatedEnv(work, extra = {}) {
 }
 
 export async function startIsolatedServer({ root, work, token, port, release = false } = {}) {
-  const dir = join(root, 'target', release ? 'release' : 'debug');
-  const exe = join(dir, 'frametrace-app' + (process.platform === 'win32' ? '.exe' : ''));
-  if (!existsSync(exe)) throw new Error(`build first (cargo build): ${exe} missing`);
+  // FRAMETRACE_BIN pins an exact binary (CI builds once); otherwise
+  // $CARGO_TARGET_DIR (or ./target) / debug|release / frametrace-app.
+  const dir = join(process.env.CARGO_TARGET_DIR || join(root, 'target'), release ? 'release' : 'debug');
+  const exe = process.env.FRAMETRACE_BIN || join(dir, 'frametrace-app' + (process.platform === 'win32' ? '.exe' : ''));
+  if (!existsSync(exe)) throw new Error(`build first (cargo build --locked) or set FRAMETRACE_BIN: ${exe} missing`);
   const pinned = token || 'iso-' + Math.random().toString(36).slice(2, 12);
   const usePort = port || await freePort();
   const base = `http://127.0.0.1:${usePort}`;

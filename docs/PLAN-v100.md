@@ -51,3 +51,35 @@
 적대적 리뷰에서 확인된 회귀(Undo가 메모/태그 삭제, 카드 Space 충돌, shell nonce 폴백, 수동 적용 누락 등)는 모두 수정 + 회귀 테스트.
 **미완료(다음 라운드 필수)**: UX-02 2단계 파이프라인, PERF-02 서버사이드 쿼리/가상 스크롤, STR-01/02/04 파일 분할, FOR-03 원본 재해시, FOR-01 IN/OUT 서버 저장·divergence 경고, SEC-04 기본 랜덤 토큰, 최종화 응답 체크섬/검토자명 보고서 기록, 플레이어 프레임 이동/J-K-L, 자식 프로세스 트리 종료.
 검증은 stable 1.97 기준(핀 1.94 미설치); Windows 전용 shell.rs는 이 환경에서 컴파일하지 못함.
+
+## 7. v1.1 결과 (2026-10-11)
+근거: `git log --oneline 1bacf67^..HEAD`, `docs/review-backlog-2026-10.json`. 아래 매핑은 커밋 메시지에 적힌 내용만 반영.
+
+**완료 (커밋)**
+- UX-02 2단계 폴더 파이프라인(검토 우선, 보강 백그라운드) — 1d0a52a, 1d7a87f(보강 중 마크 저장), 12345bc(재분석 시 해시 보존/재개)
+- PERF-02 1부 가상 그리드(100k+ 레코드에서 DOM 일정, 페이징은 폴백) — ad3ff50
+- FOR-01 IN/OUT 범위 케이스 DB 저장(스키마 v5) + divergence 배너 — 60d8af5, 22f5911
+- SEC-04 기본 랜덤 토큰(`FRAMETRACE_NO_TOKEN=1`로 해제), FOR-03 원본 재해시(`/api/verify-sources`, 기록값 대 관측값), 최종화 검토자명·체크섬·sign-off, 프로세스 트리 종료(프로세스 그룹/Job 객체) — 1f69ddc; SIGINT/SIGTERM 정리 — ee85876
+- 최종화 sign-off: 미저장 마크 차단, 보고서·패키지 성공 후에만 승격, 마크 변경 후 sign-off 경고 — 4d1c3aa; 재해시 배너 오표시 수정 — 50b150f
+- STR-01 셸 `assets/app` 분할 — 158f858; STR-03 serde_json 기반 인덱스 편집 — 0a5d531; STR-06 sanitize/escape 단일화 — e402e4b, 082d8aa; STR-07 단일 패스 템플릿 치환 — df31e78
+- FOR-12 carve `scan_complete`/MP4 문구/복사 검증 — bb4f3ac
+- FOR-04, FOR-07, FOR-13(+`verify-package`): 검증된 증거 해시와 출처, 마크 이력(스키마 v6), 엄격한 감사 꼬리 — a87257d; custody 해시 출처 표기 — 718b8e7; 증거 메모 보존 — 0eb3a42
+- UX-06/09/10/11, SEC-06: Recover/Carve/클립 내보내기 백그라운드 잡, case-info, preflight — 3505df7, f61b9a0, 736558d, efcf72d, e2e3043
+- UX-12, UX-18(부분: iframe 워치독·재시도, 미저장 시 새 케이스 거부), 셸 ft-reload — f61b9a0, 378f540, e4c40fc
+- 뷰어: SEC-03 팝업 스크립트 이스케이프, UX-14, UX-17, UX-21(줌 슬라이더·내보내기 메뉴 그룹화, 커밋 메시지에는 누락), UX-22, PERF-05 썸네일 재시도, fps — 848a2f3, 666523b
+- PERF-07 검색/FTS/썸네일 목록 캐시, 썸네일 ETag/304, 경로 컴포넌트 검사 — d555c2f
+- STR-02 번들 파일별 배너·sourceURL, 접두 중복 검사, check-js 오류→파일 매핑, rerun-if-changed 확인
+- STR-08 `serve/mod.rs` 글롭 재노출을 명시 목록으로 교체, 문서 주석 위치 수정
+- 하네스: verify-jobs-e2e(실제 워크스테이션), 격리 서버 — 97f62be; capture-frame 한도 — 319c925
+
+**의도적 비목표 (사유)**
+- PERF-02 서버사이드 쿼리 엔진: 가상 그리드가 100k까지 유지됨. 그 이상에서 재검토.
+- STR-04 잔여 분할(tsk/telemetry/html_report): 순수 구조 변경 대비 회귀 위험이 이점보다 큼.
+- STR-05 서브프로세스 완전 통합: 호출부별 정책 차이가 커서 별도 라운드 필요.
+- STR-09 CLI/파이프라인 통합: `phase1_scan_args` 테스트로 드리프트를 감시하는 선에서 유지.
+- UX-18 다중 창 완전 동기화: 단일 작성자 + 경고 유지.
+- 범위 외 기능 아이디어: 백로그에 기록만.
+
+**미검증**
+- Windows 런타임 동작(Job 객체, 콘솔 핸들러, shell.rs 컴파일 포함)은 이 환경에서 실행/빌드하지 못함.
+- Recover e2e는 디스크 이미지가 필요해 합성 이미지 범위까지만 확인.

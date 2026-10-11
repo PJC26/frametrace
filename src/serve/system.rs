@@ -438,23 +438,47 @@ pub(crate) fn byte_progress_json(
 /// overall integrity (keyed vs structural-only vs failed).
 pub(crate) fn api_cancel(state: &SharedState) -> String {
     let mut guard = state_lock(state);
-    // Clip exports (UX-09) run without `busy`; the global cancel stops
-    // them too so "중단 후 종료" never leaves an ffmpeg behind.
-    let clips = cancel_all_clip_jobs(&mut guard);
-    if !guard.busy {
-        if clips > 0 {
-            guard
-                .logs
-                .push(format!("클립 내보내기 {clips}건 중단 요청을 받았습니다."));
-            return "{\"ok\":true}".to_string();
-        }
-        return "{\"ok\":false,\"error\":\"진행 중인 작업이 없습니다.\"}".to_string();
+    if guard.busy {
+        // Cancel only the job that holds `busy` (finding 2): a clip export
+        // runs beside it and is unrelated — stopping a re-hash must not
+        // kill it. Clips are cancelled per job (export-clip-cancel) or by a
+        // cancel issued while nothing else runs.
+        guard.cancel_requested = true;
+        let job_kind = status_job_kind(&guard);
+        let clips_running = guard
+            .clip_jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .count();
+        guard
+            .logs
+            .push("중단 요청을 받았습니다. 현재 단계를 멈추는 중입니다.".to_string());
+        return serde_json::json!({
+            "ok": true,
+            "cancelled": "job",
+            "job_kind": job_kind,
+            "clips_cancelled": 0,
+            "clips_running": clips_running,
+        })
+        .to_string();
     }
-    guard.cancel_requested = true;
-    guard
-        .logs
-        .push("중단 요청을 받았습니다. 현재 단계를 멈추는 중입니다.".to_string());
-    "{\"ok\":true}".to_string()
+    // Nothing holds `busy`: the global cancel stops running clip exports
+    // (UX-09) so "중단 후 종료" never leaves an ffmpeg behind.
+    let clips = cancel_all_clip_jobs(&mut guard);
+    if clips > 0 {
+        guard
+            .logs
+            .push(format!("클립 내보내기 {clips}건 중단 요청을 받았습니다."));
+        return serde_json::json!({
+            "ok": true,
+            "cancelled": "clips",
+            "job_kind": null,
+            "clips_cancelled": clips,
+            "clips_running": clips,
+        })
+        .to_string();
+    }
+    "{\"ok\":false,\"error\":\"진행 중인 작업이 없습니다.\"}".to_string()
 }
 
 /// POST /api/shutdown — the only clean way to stop the windowed
@@ -489,6 +513,24 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     let mut guard = state_lock(state);
     if guard.busy {
         return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
+    }
+    // Clip exports write into the bound case and block its finalize; a
+    // switch while one runs would leave the new case's finalize refused for
+    // the old case's export (and the export landing under a case no longer
+    // shown).
+    let clips_running = guard
+        .clip_jobs
+        .iter()
+        .filter(|job| job.state == "running")
+        .count();
+    if clips_running > 0 {
+        return api_err(&format!(
+            "클립 내보내기 {clips_running}건이 진행 중입니다 — 끝나거나 중단한 뒤 케이스를 여십시오."
+        ));
+    }
+    if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
+        // Finished clip jobs belong to the previous binding.
+        guard.clip_jobs.clear();
     }
     guard.case_dir = Some(case_dir.clone());
     // Reopening the same case must keep extra media roots the earlier

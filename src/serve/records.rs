@@ -372,9 +372,20 @@ pub(crate) fn overlay_live_records(
 }
 
 pub(crate) fn api_records(request: &Request, state: &SharedState) -> String {
+    // A recover/carve job keeps the review phase (it may be
+    // `review-partial`) but is not the scan pipeline: its busy never makes
+    // a leftover checkpoint live.
     let (case_dir, phase, busy) = {
         let guard = state_lock(state);
-        (guard.case_dir.clone(), guard.phase, guard.busy)
+        let case_job_running = guard
+            .case_job
+            .as_ref()
+            .is_some_and(|job| job.state == "running");
+        (
+            guard.case_dir.clone(),
+            guard.phase,
+            guard.busy && !case_job_running,
+        )
     };
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"no case open\"}".to_string();

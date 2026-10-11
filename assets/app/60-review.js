@@ -75,10 +75,9 @@ function onReviewFrameLoad() {
   frameTimer = 0;
   frameState = "ok";
   showFrameFail(null);
+  // Theme/locale are pushed until the viewer acks (see 15-theme.js), so no
+  // fixed-delay retries are needed for a viewer that wires up late.
   syncViewerChrome();
-  // The viewer wires its language button after its data loads.
-  setTimeout(syncViewerChrome, 1500);
-  setTimeout(syncViewerChrome, 5000);
 }
 reviewFrame.addEventListener("load", onReviewFrameLoad);
 $("btnFrameRetry").addEventListener("click", () => {
@@ -123,14 +122,31 @@ function waitForViewerAck(ms) {
     setTimeout(() => finish(null), ms);
   });
 }
+function waitForFrameSettled(ms) {
+  return new Promise(resolve => {
+    let t = 0, poll = 0;
+    const done = () => { clearTimeout(t); clearInterval(poll); reviewFrame.removeEventListener("load", done); resolve(); };
+    // onReviewFrameLoad (registered first) has already set frameState.
+    poll = setInterval(() => { if (frameState !== "loading") done(); }, 250);
+    reviewFrame.addEventListener("load", done);
+    t = setTimeout(done, ms);
+  });
+}
 // "none" (no frame yet — the next open loads fresh data), "posted"
 // (the viewer took it), "reloaded", "deferred" (unsaved marks).
 async function refreshViewerData(reason) {
   if (!reviewFrameLoaded) return "none";
-  if (frameState === "failed" || frameState === "loading") {
+  if (frameState === "failed") {
     // Nothing reviewable is on screen: (re)load is safe.
-    if (frameState === "failed") loadReviewFrame(frameUrl);
+    loadReviewFrame(frameUrl);
     return "reloaded";
+  }
+  if (frameState === "loading") {
+    // The viewer is still coming up: it may hold marks by the time it is
+    // live, so wait for it and use the normal ft-reload handshake below.
+    await waitForFrameSettled(FRAME_TIMEOUT_MS + 1000);
+    if (frameState === "failed") { loadReviewFrame(frameUrl); return "reloaded"; }
+    if (frameState !== "ok") return "deferred";
   }
   const ack = waitForViewerAck(VIEWER_RELOAD_ACK_MS);
   postToViewer({ type: "ft-reload", reason: reason || "" });

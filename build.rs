@@ -20,17 +20,45 @@ fn sorted_parts(dir: &Path, ext: &str) -> Vec<PathBuf> {
     parts
 }
 
-/// Plain newline-terminated concatenation (scripts/check-js.mjs mirrors
-/// this exactly when it syntax-checks the bundles).
-fn concat(parts: &[PathBuf]) -> String {
+/// Repo-relative display name with `/` separators on every platform
+/// (Windows `read_dir` paths use `\\`), used for banners and sourceURL.
+fn display_name(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Each part is preceded by a `/* ==== path ==== */` banner so a line in a
+/// browser error can be traced to its source file, and the bundle ends
+/// with a `//# sourceURL=` naming the bundle. Numeric `NN-` prefixes must
+/// be unique so the load order is never decided by an accidental tie.
+/// scripts/lib/app-bundle.mjs and scripts/check-js.mjs mirror this format.
+fn concat(parts: &[PathBuf], bundle_name: &str, ext: &str) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    for path in parts {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if let Some((prefix, _)) = name.split_once('-')
+            && prefix.chars().all(|c| c.is_ascii_digit())
+        {
+            assert!(
+                seen.insert(prefix.to_string()),
+                "duplicate numeric prefix {prefix} among {bundle_name} parts (at {name})"
+            );
+        }
+    }
     let mut bundle = String::new();
     for path in parts {
+        bundle.push_str(&format!("/* ==== {} ==== */\n", display_name(path)));
         bundle.push_str(
             &fs::read_to_string(path).unwrap_or_else(|_| panic!("{} unreadable", path.display())),
         );
         if !bundle.ends_with('\n') {
             bundle.push('\n');
         }
+    }
+    if ext == "js" {
+        bundle.push_str(&format!("//# sourceURL={bundle_name}\n"));
     }
     bundle
 }
@@ -42,7 +70,11 @@ fn concat(parts: &[PathBuf]) -> String {
 fn viewer_bundle(out_dir: &Path) {
     let viewer_dir = Path::new("assets/viewer");
     println!("cargo:rerun-if-changed={}", viewer_dir.display());
-    let bundle = concat(&sorted_parts(viewer_dir, "js"));
+    let bundle = concat(
+        &sorted_parts(viewer_dir, "js"),
+        "assets/viewer/bundle.js",
+        "js",
+    );
     fs::write(out_dir.join("evidence_viewer.js"), bundle).expect("failed to write viewer bundle");
 }
 
@@ -57,8 +89,12 @@ fn app_bundle(out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", app_dir.display());
     println!("cargo:rerun-if-changed={}", template_path.display());
     let template = fs::read_to_string(template_path).expect("assets/examiner_app.html missing");
-    let css = concat(&sorted_parts(app_dir, "css"));
-    let js = concat(&sorted_parts(app_dir, "js"));
+    let css = concat(
+        &sorted_parts(app_dir, "css"),
+        "assets/app/bundle.css",
+        "css",
+    );
+    let js = concat(&sorted_parts(app_dir, "js"), "assets/app/bundle.js", "js");
     assert!(
         !js.to_ascii_lowercase().contains("</script"),
         "assets/app/*.js must not contain a literal </script"

@@ -143,6 +143,24 @@ pub(crate) fn finish(stream: &mut TcpStream, response: &[u8]) -> Result<(), Stri
     written
 }
 
+/// After refusing a request whose body is still in flight (411/413/431),
+/// read and discard what the client keeps sending (bounded in bytes and
+/// time) so closing the socket does not RST the connection and swallow the
+/// status line the client has not read yet.
+pub(crate) fn drain_unread(stream: &mut TcpStream) {
+    const DRAIN_CAP: usize = 16 * 1024 * 1024;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let started = std::time::Instant::now();
+    let mut sink = [0u8; 16 * 1024];
+    let mut total = 0usize;
+    while total < DRAIN_CAP && started.elapsed() < Duration::from_secs(5) {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n,
+        }
+    }
+}
+
 pub(crate) fn handle_connection(stream: TcpStream, state: SharedState) -> Result<(), String> {
     handle_connection_timed(stream, state, HEADER_READ_TIMEOUT)
 }
@@ -159,7 +177,8 @@ pub(crate) fn handle_connection_timed(
     stream
         .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|err| format!("write timeout: {err}"))?;
-    let (request, extras) = match read_request_ext(&mut stream, read_timeout) {
+    HEAD_ONLY.with(|flag| flag.set(false));
+    let (mut request, extras) = match read_request_ext(&mut stream, read_timeout) {
         Ok(read) => read,
         Err(err) => {
             if err.status != 0 {
@@ -167,10 +186,19 @@ pub(crate) fn handle_connection_timed(
                     &mut stream,
                     &plain(err.status, err.message.clone().into_bytes()),
                 );
+                if matches!(err.status, 400 | 411 | 413 | 431) {
+                    drain_unread(&mut stream);
+                }
             }
             return Err(err.message);
         }
     };
+    // HEAD is answered exactly like GET minus the body.
+    let is_head = request.method == "HEAD";
+    if is_head {
+        request.method = "GET".into();
+        HEAD_ONLY.with(|flag| flag.set(true));
+    }
     let (token, instance) = {
         let guard = state_lock(&state);
         (guard.token.clone(), guard.instance.clone())
@@ -212,6 +240,9 @@ pub(crate) fn handle_connection_timed(
     // just-served page can satisfy the mutating-request gate.
     if token.is_none() && request.method == "GET" && !instance.is_empty() {
         set_nonce_cookie(&mut response, &instance);
+    }
+    if is_head && let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+        response.truncate(end + 4);
     }
     finish(&mut stream, &response)
 }
@@ -812,6 +843,12 @@ pub(crate) fn viewer_page() -> Vec<u8> {
     )
 }
 
+thread_local! {
+    // Set on a connection thread answering HEAD: headers go out as for GET,
+    // body bytes do not.
+    static HEAD_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Writes exactly `remaining` bytes from `reader` to `stream` in bounded
 /// chunks — the shared transfer loop for media ranges and case files.
 pub(crate) fn stream_body(
@@ -819,6 +856,9 @@ pub(crate) fn stream_body(
     reader: &mut impl Read,
     mut remaining: u64,
 ) -> Result<(), String> {
+    if HEAD_ONLY.with(std::cell::Cell::get) {
+        return Ok(());
+    }
     let mut chunk = [0u8; 64 * 1024];
     while remaining > 0 {
         let want = remaining.min(chunk.len() as u64) as usize;
@@ -980,8 +1020,8 @@ pub(crate) fn serve_media(
         return write_simple(stream, 403, b"path outside approved roots");
     }
     let total = match std::fs::metadata(&canonical) {
-        Ok(meta) => meta.len(),
-        Err(_) => return write_simple(stream, 404, b"media not found"),
+        Ok(meta) if meta.is_file() => meta.len(),
+        _ => return write_simple(stream, 404, b"media not found"),
     };
     let (start, end, code) = match request
         .range

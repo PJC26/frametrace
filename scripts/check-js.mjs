@@ -2,7 +2,8 @@
 //  - assets/viewer/*.js  -> concatenated exactly like build.rs (sorted by
 //    filename, newline-terminated) and checked as ONE classic script, because
 //    the viewer is a single IIFE split across files.
-//    (parts are not checked individually: the IIFE spans files).
+//    (parts are not checked individually: the IIFE spans files; a syntax
+//    error is mapped back to its part via the per-file banner).
 //  - assets/app/*.js -> the workstation shell, bundled the same way
 //    (build.rs app_bundle) and checked as ONE classic script; plus an id
 //    check: every literal $("id") / document.getElementById("id") must
@@ -25,11 +26,24 @@ const tmp = mkdtempSync(join(tmpdir(), 'ft-checkjs-'));
 let failed = false;
 const fail = (msg) => { console.error('FAIL ' + msg); failed = true; };
 
+// A syntax error is reported against the bundle's line; map it back to the
+// part whose `/* ==== path ==== */` banner precedes that line.
+function locate(source, stderr) {
+  const m = stderr.match(/:(\d+)\n/);
+  if (!m) return '';
+  const lines = source.split('\n');
+  for (let i = Number(m[1]) - 1; i >= 0; i--) {
+    const b = lines[i] && lines[i].match(/^\/\* ==== (.+) ==== \*\/$/);
+    if (b) return `  [source part: ${b[1]}, line ${Number(m[1]) - i - 1}]\n`;
+  }
+  return '';
+}
+
 function nodeCheck(label, source, ext = 'js') {
   const file = join(tmp, label.replace(/[^A-Za-z0-9._-]/g, '_') + '.' + ext);
   writeFileSync(file, source);
   const r = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
-  if (r.status !== 0) fail(`${label}\n${r.stderr.replace(new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&'), 'g'), label)}`);
+  if (r.status !== 0) fail(`${label}\n${locate(source, r.stderr)}${r.stderr.replace(new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&'), 'g'), label)}`);
   else console.log('ok   ' + label);
 }
 
@@ -39,11 +53,9 @@ if (!existsSync(viewerDir)) fail('assets/viewer missing');
 else {
   const parts = readdirSync(viewerDir).filter((f) => f.endsWith('.js')).sort();
   if (parts.length === 0) fail('assets/viewer has no .js parts');
-  let bundle = '';
-  for (const p of parts) {
-    bundle += readFileSync(join(viewerDir, p), 'utf8');
-    if (!bundle.endsWith('\n')) bundle += '\n';
-  }
+  const prefixes = parts.map((p) => p.split('-')[0]);
+  if (new Set(prefixes).size !== prefixes.length) fail('assets/viewer has duplicate numeric prefixes');
+  const bundle = concatParts(parts.map((p) => join(viewerDir, p)), 'assets/viewer/bundle.js', root);
   nodeCheck(`assets/viewer/*.js (${parts.length} parts bundled)`, bundle);
 }
 
@@ -53,13 +65,13 @@ if (!existsSync(appDir)) fail('assets/app missing');
 else {
   const jsParts = appParts('js', root);
   if (jsParts.length === 0) fail('assets/app has no .js parts');
-  const appJs = concatParts(jsParts);
+  const appJs = concatParts(jsParts, 'assets/app/bundle.js', root);
   nodeCheck(`assets/app/*.js (${jsParts.length} parts bundled)`, appJs);
   if (/<\/script/i.test(appJs)) fail('assets/app/*.js contains a literal </script');
   const css = appBundleCss(root);
   const open = (css.match(/{/g) || []).length, close = (css.match(/}/g) || []).length;
   if (open !== close) fail(`assets/app/*.css unbalanced braces (${open} open / ${close} close)`);
-  else if (!css.trimStart().startsWith(':root')) fail('assets/app/*.css must start with the :root token block');
+  else if (!/^(\/\*[^]*?\*\/\s*)*:root/.test(css.trimStart())) fail('assets/app/*.css must start with the :root token block');
   else console.log('ok   assets/app/*.css');
   const markup = appMarkup(root);
   for (const marker of ['<!-- @bundle:app.css -->', '<!-- @bundle:app.js -->']) {

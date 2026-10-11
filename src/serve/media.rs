@@ -115,6 +115,8 @@ pub(crate) fn api_export_clip(request: &Request, state: &SharedState) -> String 
     }
 }
 
+const CLIP_BUSY_ERROR: &str = "분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.";
+
 /// Upper bound on concurrently running clip exports (each is an ffmpeg).
 pub(crate) const MAX_RUNNING_CLIP_JOBS: usize = 4;
 /// Finished clip jobs kept for dedupe/status before the oldest is dropped.
@@ -126,6 +128,8 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         let guard = state_lock(state);
         (guard.case_dir.clone(), guard.busy)
     };
+    // `busy` here is only a fast-path snapshot; the authoritative check is
+    // repeated under the registration lock below (finding 4).
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
             .to_string();
@@ -196,7 +200,7 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         return clip_response(&existing, true);
     }
     if busy {
-        return api_err("분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.");
+        return api_err(CLIP_BUSY_ERROR);
     }
     let dir = case_dir.join("artifacts/clips");
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -216,9 +220,19 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         if let Some(existing) = guard
             .clip_jobs
             .iter()
-            .find(|job| job.key == key && job.state == "running")
+            .find(|job| job.key == key && job.state == "running" && !job.cancel_requested)
         {
             return clip_response(existing, true);
+        }
+        // finalize/recover/carve take `busy` first and then count running
+        // clips; re-checking `busy` in the same lock as the registration
+        // closes the window where both could proceed (finding 4).
+        if guard.busy {
+            return api_err(CLIP_BUSY_ERROR);
+        }
+        // The case may have been switched since the snapshot above.
+        if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
+            return api_err("케이스가 바뀌었습니다 — 다시 시도하십시오.");
         }
         if guard
             .clip_jobs
@@ -315,7 +329,7 @@ pub(crate) fn exhibit_arg(exhibit: &str) -> String {
     format!("--exhibit={exhibit}")
 }
 
-/// A running job with `key`, or a finished one whose clip is still on disk
+/// A running (not cancel-pending) job with `key`, or a finished one whose clip is still on disk
 /// with the recorded size (so a deleted/replaced clip is exported anew).
 fn find_reusable_clip_job(state: &SharedState, key: &str) -> Option<ClipJob> {
     let guard = state_lock(state);
@@ -326,7 +340,9 @@ fn find_reusable_clip_job(state: &SharedState, key: &str) -> Option<ClipJob> {
         .find(|job| {
             job.key == key
                 && match job.state {
-                    "running" => true,
+                    // A cancel-pending job is about to die: joining it would
+                    // hand the caller a job that ends "cancelled" (finding 3).
+                    "running" => !job.cancel_requested,
                     "done" => std::fs::metadata(&job.output)
                         .is_ok_and(|meta| Some(meta.len()) == job.size_bytes),
                     _ => false,
