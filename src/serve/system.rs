@@ -125,11 +125,15 @@ pub(crate) fn browse_json(raw: &str, want_files: bool) -> String {
     let path = PathBuf::from(raw);
     let display = path.display().to_string();
     let Ok(meta) = std::fs::metadata(&path) else {
-        return serde_json::json!({"ok": true, "exists": false, "path": display}).to_string();
+        return serde_json::json!({"ok": true, "exists": false, "kind": "missing", "path": display})
+            .to_string();
     };
     if meta.is_file() {
+        let magic = has_ewf_signature_file(&path);
         return serde_json::json!({
             "ok": true, "exists": true, "is_file": true, "is_dir": false,
+            "kind": source_kind(true, &display, magic),
+            "e01_magic": magic,
             "path": display,
             "name": path
                 .file_name()
@@ -192,7 +196,7 @@ pub(crate) fn browse_json(raw: &str, want_files: bool) -> String {
         )
         .collect();
     let mut body = serde_json::json!({
-        "ok": true, "exists": true, "is_dir": true,
+        "ok": true, "exists": true, "is_dir": true, "kind": "folder",
         "is_case": crate::case_db::case_db_path(&path).is_file(),
         "path": display,
         "entries": entries,
@@ -218,6 +222,41 @@ pub(crate) fn browse_entry_json(
     is_case: bool,
 ) -> serde_json::Value {
     serde_json::json!({"name": name, "path": path, "dir": dir, "is_case": is_case})
+}
+
+/// Stage-1 auto-detection of the evidence kind for an existing path:
+/// a directory is `folder`; a file is `e01` when its name is a first
+/// E01-family segment or its header carries an EWF signature, otherwise
+/// `other` (not accepted as evidence input).
+pub(crate) fn source_kind(is_file: bool, name: &str, ewf_magic: bool) -> &'static str {
+    if !is_file {
+        "folder"
+    } else if ewf_magic || is_e01_first_segment(name) {
+        "e01"
+    } else {
+        "other"
+    }
+}
+
+/// EWF file signatures: EWF1 `EVF\t\r\n\xff\0` (E01) / `LVF…` (L01) and
+/// EWF2 `EVF2\r\n\x81\0` (Ex01) / `LEF2\r\n\x81\0` (Lx01).
+pub(crate) fn has_ewf_signature(head: &[u8]) -> bool {
+    const SIGS: [&[u8; 8]; 4] = [
+        b"EVF\x09\x0d\x0a\xff\x00",
+        b"LVF\x09\x0d\x0a\xff\x00",
+        b"EVF2\x0d\x0a\x81\x00",
+        b"LEF2\x0d\x0a\x81\x00",
+    ];
+    head.len() >= 8 && SIGS.iter().any(|sig| &head[..8] == sig.as_slice())
+}
+
+/// Reads at most the first 8 bytes of `path` (read-only).
+fn has_ewf_signature_file(path: &Path) -> bool {
+    let mut head = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .map(|_| has_ewf_signature(&head))
+        .unwrap_or(false)
 }
 
 /// `true` for the first segment of a split forensic image family. The
@@ -583,10 +622,8 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     }
     drop(guard);
     save_session(&case_dir, extra_root.as_deref());
-    format!(
-        "{{\"ok\":true,\"has_review\":{}}}",
-        if has_review { "true" } else { "false" }
-    )
+    record_recent_case(&case_dir, None);
+    serde_json::json!({"ok": true, "has_review": has_review, "has_index": has_index}).to_string()
 }
 
 pub(crate) fn api_verify_audit(state: &SharedState) -> String {

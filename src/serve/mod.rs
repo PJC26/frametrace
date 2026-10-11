@@ -22,6 +22,7 @@ mod http;
 mod jobs;
 mod media;
 mod proc;
+mod recent;
 mod records;
 mod state;
 mod system;
@@ -37,6 +38,8 @@ mod tests_jobs;
 mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
+#[cfg(test)]
+mod tests_recent;
 #[cfg(test)]
 mod tests_review3;
 
@@ -57,6 +60,7 @@ pub(crate) use media::{
     api_export_clip_status, api_export_selected, api_proxy, api_telemetry, api_transcode_queue,
     cancel_all_clip_jobs, clip_job_json, newest_package_dir, opt_path, running_clip_job_count,
 };
+pub(crate) use recent::{api_recent_cases, api_recent_cases_forget, record_recent_case};
 pub(crate) use records::{
     api_records, api_records_meta, cached_index, index_generation, newest_tsk_inspection,
     scan_progress_path,
@@ -100,12 +104,19 @@ pub(crate) use jobs::SIGNOFF_PENDING_REL_PATH;
 #[cfg(all(test, unix))]
 pub(crate) use media::exhibit_arg;
 #[cfg(test)]
+pub(crate) use recent::{
+    RECENT_CAP, RecentCase, canonical_case_dir, forget_recent_in, load_recent, recent_case_json,
+    recent_cases_file, recent_cases_json_from, record_recent_in, upsert_recent,
+};
+#[cfg(test)]
 pub(crate) use records::{
     FTS_CACHE_CAPACITY, cached_fts_search, cached_live_checkpoint, cached_thumb_stems,
     records_fts_cache_len,
 };
 #[cfg(test)]
-pub(crate) use system::{browse_json, byte_progress_json, preflight_json, progress_json};
+pub(crate) use system::{
+    browse_json, byte_progress_json, has_ewf_signature, preflight_json, progress_json, source_kind,
+};
 
 const EXAMINER_PAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/examiner_app.html"));
 
@@ -136,6 +147,9 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
             .and_then(|(dir, roots)| (dir == *case_dir).then_some(roots))
             .unwrap_or_else(|| vec![case_dir.clone()]);
     } else if let Some((case_dir, roots)) = restore_session() {
+        // Upgrading from a build without the recent list: the restored
+        // case is at least the first entry.
+        record_recent_case(&case_dir, None);
         let mut guard = state_lock(&state);
         guard.case_dir = Some(case_dir.clone());
         guard.media_roots = roots;
@@ -440,6 +454,8 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/preflight") => json(api_preflight(request)),
         ("GET", "/api/export-clip-status") => json(api_export_clip_status(request, state)),
         ("POST", "/api/export-clip-cancel") => json(api_export_clip_cancel(request, state)),
+        ("GET", "/api/recent-cases") => json(api_recent_cases()),
+        ("POST", "/api/recent-cases/forget") => json(api_recent_cases_forget(request)),
         _ => plain(404, b"not found".to_vec()),
     }
 }

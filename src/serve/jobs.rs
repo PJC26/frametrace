@@ -82,6 +82,7 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         &case_dir,
         (input_kind == InputKind::Folder).then_some(source_path.as_path()),
     );
+    record_recent_case(&case_dir, Some(source_path.as_path()));
     let worker_state = Arc::clone(state);
     let spawned = thread::Builder::new()
         .name("ft-pipeline".into())
@@ -126,10 +127,14 @@ pub(crate) fn default_case_dir() -> PathBuf {
 }
 
 pub(crate) fn run_pipeline(state: SharedState, job: PipelineJob) {
+    let (case_dir, source_path) = (job.case_dir.clone(), job.source_path.clone());
     match job.kind {
         InputKind::Folder => run_folder_pipeline(state, job),
         InputKind::E01 | InputKind::E01Direct => run_e01_pipeline(state, job),
     }
+    // Finished (or failed/cancelled): bump the stage-1 recent list so the
+    // case's new state shows at the top.
+    record_recent_case(&case_dir, Some(source_path.as_path()));
 }
 
 pub(crate) fn run_e01_pipeline(state: SharedState, job: PipelineJob) {
