@@ -333,8 +333,32 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         // Marks accepted while a hash/make-review step held the case DB;
         // applied automatically right after that step.
         "pending_marks": case_dir.as_deref().map(pending_marks_count).unwrap_or(0),
+        // UX-06: which kind of job holds `busy` (null when idle), and the
+        // current/last background case job with its stage and outcome.
+        "job_kind": status_job_kind(&guard),
+        "job": guard.case_job.as_ref().map(case_job_json),
+        // UX-09: clip exports run beside `busy`; running + recent ones.
+        "clip_jobs": guard.clip_jobs.iter().rev().take(8).map(clip_job_json).collect::<Vec<_>>(),
+        "clips_running": guard.clip_jobs.iter().filter(|job| job.state == "running").count(),
     })
     .to_string()
+}
+
+/// `job_kind` for /api/status: the background case job when one runs,
+/// else the pipeline / finalize / short busy job, else `null`.
+pub(crate) fn status_job_kind(guard: &JobState) -> Option<&'static str> {
+    if !guard.busy {
+        return None;
+    }
+    if let Some(job) = guard.case_job.as_ref().filter(|job| job.state == "running") {
+        return Some(job.kind);
+    }
+    Some(match guard.phase {
+        "running" => "pipeline",
+        "review-partial" => "enrichment",
+        "finalizing" => "finalize",
+        _ => "task",
+    })
 }
 
 /// Reads the newest running job's progress from the case DB so the UI can
@@ -414,7 +438,16 @@ pub(crate) fn byte_progress_json(
 /// overall integrity (keyed vs structural-only vs failed).
 pub(crate) fn api_cancel(state: &SharedState) -> String {
     let mut guard = state_lock(state);
+    // Clip exports (UX-09) run without `busy`; the global cancel stops
+    // them too so "중단 후 종료" never leaves an ffmpeg behind.
+    let clips = cancel_all_clip_jobs(&mut guard);
     if !guard.busy {
+        if clips > 0 {
+            guard
+                .logs
+                .push(format!("클립 내보내기 {clips}건 중단 요청을 받았습니다."));
+            return "{\"ok\":true}".to_string();
+        }
         return "{\"ok\":false,\"error\":\"진행 중인 작업이 없습니다.\"}".to_string();
     }
     guard.cancel_requested = true;
@@ -430,7 +463,8 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
 /// cancel-then-shutdown flow for that case.
 pub(crate) fn api_shutdown(state: &SharedState) -> String {
     let mut guard = state_lock(state);
-    if guard.busy {
+    let clips_running = guard.clip_jobs.iter().any(|job| job.state == "running");
+    if guard.busy || clips_running {
         return "{\"ok\":false,\"running\":true,\"error\":\"작업이 진행 중입니다 — 중단 후 종료하십시오.\"}"
             .to_string();
     }
@@ -471,6 +505,8 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     guard.restored = false;
     guard.warnings = Vec::new();
     guard.enrichment = None;
+    // The last recover/carve outcome belonged to the previous binding.
+    guard.case_job = None;
     if has_review {
         guard.phase = "review-ready";
         guard.steps = [StepStatus::Done; 5];
@@ -590,4 +626,415 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
         "logs": logs_json,
     })
     .to_string()
+}
+
+/// Stat budget for `checkpoint.fingerprint_matches` (one `stat` per line).
+const CASE_INFO_STAT_CAP: usize = 20_000;
+
+/// `GET /api/case-info[?case_dir=...]` (UX-10): what a case already holds,
+/// derived read-only from `db/scan-progress.jsonl` and the index — no DB
+/// open, no writes. Defaults to the bound case; `case_dir` inspects another
+/// case folder (it must hold case.json) before opening it.
+pub(crate) fn api_case_info(request: &Request, state: &SharedState) -> String {
+    let (bound, phase) = {
+        let guard = state_lock(state);
+        (guard.case_dir.clone(), guard.phase)
+    };
+    let requested = query_value(&request.query, "case_dir")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let Some(case_dir) = requested.or_else(|| bound.clone()) else {
+        return api_err("열린 케이스가 없습니다.");
+    };
+    if !case_dir.join("case.json").is_file() {
+        return api_err("해당 폴더에 case.json이 없습니다 — 케이스 폴더가 아닙니다.");
+    }
+    let is_bound = bound.as_deref() == Some(case_dir.as_path());
+    let video_count = if is_bound {
+        cached_index(state, &case_dir)
+            .ok()
+            .and_then(|index| index_video_count(&index))
+    } else {
+        crate::util::read_to_string(&case_dir.join("db/video_index.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|index| index_video_count(&index))
+    };
+    let mut info = case_info_json(&case_dir, video_count);
+    if let Some(map) = info.as_object_mut() {
+        map.insert("ok".into(), serde_json::Value::Bool(true));
+        map.insert(
+            "case_dir".into(),
+            serde_json::json!(case_dir.to_string_lossy()),
+        );
+        // The live phase only describes the bound case; another folder
+        // keeps the phase derived from its files.
+        if is_bound {
+            map.insert("phase".into(), serde_json::json!(phase));
+        }
+        map.insert("bound".into(), serde_json::Value::Bool(is_bound));
+    }
+    info.to_string()
+}
+
+fn index_video_count(index: &serde_json::Value) -> Option<u64> {
+    index
+        .get("videos")
+        .and_then(|videos| videos.as_array())
+        .map(|videos| videos.len() as u64)
+}
+
+/// Pure part of [`api_case_info`]. `checkpoint` is `null` without a
+/// checkpoint file; otherwise `done` = completed record lines, `total` =
+/// files in the last completed index (`null` before any index exists —
+/// the checkpoint itself never records a total), `fingerprint_matches` =
+/// records whose file still has the recorded size+mtime (the oracle a
+/// rerun uses to reuse them instead of re-hashing).
+pub(crate) fn case_info_json(case_dir: &Path, video_count: Option<u64>) -> serde_json::Value {
+    let has_index = case_dir.join("db/video_index.json").is_file();
+    let has_review = case_dir.join("review/index.html").is_file();
+    let checkpoint = crate::util::read_to_string(&scan_progress_path(case_dir))
+        .ok()
+        .map(|text| checkpoint_summary_json(&text, video_count));
+    let phase = if has_review {
+        "review-ready"
+    } else if has_index {
+        "review-partial"
+    } else {
+        "idle"
+    };
+    serde_json::json!({
+        "checkpoint": checkpoint,
+        "has_index": has_index,
+        "has_review": has_review,
+        "video_count": video_count,
+        "phase": phase,
+    })
+}
+
+fn checkpoint_summary_json(text: &str, video_count: Option<u64>) -> serde_json::Value {
+    let mut kind = serde_json::Value::Null;
+    let mut run_id = serde_json::Value::Null;
+    let mut done = 0u64;
+    let mut unreadable = 0u64;
+    let mut matches = 0u64;
+    let mut checked = 0usize;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            unreadable += 1;
+            continue;
+        };
+        if let Some(header) = value.get("checkpoint") {
+            kind = header.clone();
+            run_id = value.get("run_id").cloned().unwrap_or_default();
+            continue;
+        }
+        if !value.is_object() || value.get("id").is_none() {
+            unreadable += 1;
+            continue;
+        }
+        done += 1;
+        if checked >= CASE_INFO_STAT_CAP {
+            continue;
+        }
+        checked += 1;
+        let path = value.get("source_path").and_then(|v| v.as_str());
+        let size = value.get("size_bytes").and_then(|v| v.as_u64());
+        let mtime = value.get("modified_unix").and_then(|v| v.as_u64());
+        if let (Some(path), Some(size)) = (path, size)
+            && let Ok(meta) = std::fs::metadata(path)
+        {
+            let disk_mtime = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            if meta.is_file() && meta.len() == size && disk_mtime == mtime {
+                matches += 1;
+            }
+        }
+    }
+    serde_json::json!({
+        "kind": kind,
+        "run_id": run_id,
+        "done": done,
+        "total": video_count,
+        "fingerprint_matches": matches,
+        "fingerprint_checked": checked,
+        "unreadable_lines": unreadable,
+    })
+}
+
+/// Bounds for the preflight walk: it must answer in about a second even on
+/// a multi-terabyte source.
+const PREFLIGHT_MAX_ENTRIES: usize = 20_000;
+const PREFLIGHT_MAX_MILLIS: u64 = 1_500;
+/// Below this much free space on the case volume the preflight warns.
+const PREFLIGHT_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+const PREFLIGHT_VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "m4v", "avi", "mkv", "wmv", "asf", "mpg", "mpeg", "mts", "m2ts", "ts", "3gp",
+    "webm", "flv", "dav", "dav_", "nov", "ave", "g64", "g64x", "glv", "blk", "264", "265", "h264",
+    "h265", "hevc",
+];
+
+/// `POST /api/preflight {source_path, case_dir}` (UX-11): a bounded look at
+/// the source before an analysis starts. Read-only: nothing is created.
+pub(crate) fn api_preflight(request: &Request) -> String {
+    let source = body_value(&request.body, "source_path")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    if source.is_empty() {
+        return api_err("증거 소스 경로를 입력하십시오.");
+    }
+    let case_dir = body_value(&request.body, "case_dir")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_case_dir);
+    preflight_json(
+        Path::new(&source),
+        &case_dir,
+        PREFLIGHT_MAX_ENTRIES,
+        Duration::from_millis(PREFLIGHT_MAX_MILLIS),
+    )
+    .to_string()
+}
+
+/// `path` resolved through its nearest existing ancestor, so a case folder
+/// that does not exist yet still compares against the canonical source.
+fn canonical_via_ancestor(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(canonical, |acc: PathBuf, part| acc.join(part));
+        }
+        match (
+            cursor.file_name().map(|n| n.to_os_string()),
+            cursor.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                missing.push(name);
+                cursor = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Pure body of [`api_preflight`] with explicit bounds (tests).
+pub(crate) fn preflight_json(
+    source: &Path,
+    case_dir: &Path,
+    max_entries: usize,
+    max_time: Duration,
+) -> serde_json::Value {
+    let mut warnings: Vec<String> = Vec::new();
+    let Ok(source_meta) = std::fs::metadata(source) else {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("소스 경로가 존재하지 않습니다: {}", source.display()),
+        });
+    };
+    let source_canonical = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    let case_canonical = canonical_via_ancestor(case_dir);
+    let case_inside_source = source_meta.is_dir() && case_canonical.starts_with(&source_canonical);
+    if case_inside_source {
+        warnings.push(if case_canonical == source_canonical {
+            "케이스 폴더가 증거 소스 폴더 자체입니다 — 다른 위치를 지정하십시오.".to_string()
+        } else {
+            "케이스 폴더가 증거 소스 안에 있습니다 — 분석 결과가 증거 매체에 기록됩니다. 증거 밖의 위치를 지정하십시오.".to_string()
+        });
+    }
+    if source_meta.is_dir()
+        && source_canonical != case_canonical
+        && source_canonical.starts_with(&case_canonical)
+    {
+        warnings.push("증거 소스가 케이스 폴더 안에 있습니다.".to_string());
+    }
+    if source_meta.is_dir() && source_canonical.parent().is_none() {
+        warnings.push(format!(
+            "소스가 볼륨 루트입니다 ({}) — 볼륨 전체가 검토 범위로 열립니다. 증거 폴더만 지정하는 것을 권장합니다.",
+            source_canonical.display()
+        ));
+    }
+    let started = std::time::Instant::now();
+    let sample = if source_meta.is_file() {
+        sample_image_family(source, source_meta.len())
+    } else {
+        sample_source_tree(
+            &source_canonical,
+            case_inside_source.then_some(case_canonical.as_path()),
+            max_entries,
+            started + max_time,
+        )
+    };
+    // A truncated walk extrapolates from the directories it fully saw over
+    // the ones still queued — an estimate, flagged as such.
+    let scale = if sample.complete || sample.visited_dirs == 0 {
+        1.0
+    } else {
+        (sample.visited_dirs + sample.pending_dirs) as f64 / sample.visited_dirs as f64
+    };
+    let estimate = |value: u64| (value as f64 * scale) as u64;
+    let est_total_bytes = estimate(sample.bytes);
+    if !sample.complete {
+        warnings.push(format!(
+            "소스가 커서 일부({}개 폴더)만 표본 조사했습니다 — 파일 수·용량은 추정치입니다.",
+            sample.visited_dirs
+        ));
+    }
+    if sample.unreadable_dirs > 0 {
+        warnings.push(format!(
+            "읽을 수 없는 폴더 {}개가 있습니다.",
+            sample.unreadable_dirs
+        ));
+    }
+    if source_meta.is_dir() && sample.complete && sample.video_files == 0 {
+        warnings.push(
+            "영상 확장자 파일을 찾지 못했습니다 (확장자 없는 영상은 분석 때 시그니처로 찾습니다)."
+                .to_string(),
+        );
+    }
+    let free_bytes = match crate::diskspace::available_bytes(case_dir) {
+        Ok(free) => Some(free),
+        Err(err) => {
+            warnings.push(format!(
+                "케이스 위치의 여유 공간을 확인하지 못했습니다: {err}"
+            ));
+            None
+        }
+    };
+    if let Some(free) = free_bytes {
+        if free < PREFLIGHT_MIN_FREE_BYTES {
+            warnings.push(format!(
+                "케이스 위치의 여유 공간이 부족합니다 ({}).",
+                crate::diskspace::human_bytes(free)
+            ));
+        }
+        // A full E01 export writes at least the (compressed) image size.
+        if source_meta.is_file() && free < est_total_bytes {
+            warnings.push(format!(
+                "E01 전체 export에는 최소 {} 이상이 필요하지만 여유 공간은 {}입니다 — '빠른 검토'를 고려하십시오.",
+                crate::diskspace::human_bytes(est_total_bytes),
+                crate::diskspace::human_bytes(free)
+            ));
+        }
+    }
+    serde_json::json!({
+        "ok": true,
+        "source_kind": if source_meta.is_file() { "file" } else { "folder" },
+        "sampled_bytes": sample.bytes,
+        "sampled_files": sample.files,
+        "sampled_dirs": sample.visited_dirs,
+        "complete": sample.complete,
+        "est_files": estimate(sample.files),
+        "est_video_files": estimate(sample.video_files),
+        "est_total_bytes": est_total_bytes,
+        "free_bytes": free_bytes,
+        "case_inside_source": case_inside_source,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "warnings": warnings,
+    })
+}
+
+#[derive(Default)]
+struct PreflightSample {
+    files: u64,
+    video_files: u64,
+    bytes: u64,
+    visited_dirs: u64,
+    pending_dirs: u64,
+    unreadable_dirs: u64,
+    complete: bool,
+}
+
+/// An image file (E01 family): the segment set next to it, same stem.
+fn sample_image_family(source: &Path, own_len: u64) -> PreflightSample {
+    let mut sample = PreflightSample {
+        complete: true,
+        ..PreflightSample::default()
+    };
+    let stem = source.file_stem().map(|s| s.to_os_string());
+    let siblings = source
+        .parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok());
+    for entry in siblings.into_iter().flatten().flatten() {
+        if entry.path().file_stem().map(|s| s.to_os_string()) == stem
+            && let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            sample.files += 1;
+            sample.bytes += meta.len();
+        }
+    }
+    if sample.files == 0 {
+        sample.files = 1;
+        sample.bytes = own_len;
+    }
+    sample
+}
+
+/// Breadth-first walk bounded by an entry count and a deadline. The case
+/// folder (when inside the source) is skipped, as scan-folder does.
+fn sample_source_tree(
+    root: &Path,
+    skip: Option<&Path>,
+    max_entries: usize,
+    deadline: std::time::Instant,
+) -> PreflightSample {
+    let mut sample = PreflightSample {
+        complete: true,
+        ..PreflightSample::default()
+    };
+    let mut pending = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut entries = 0usize;
+    'walk: while let Some(dir) = pending.pop_front() {
+        if skip.is_some_and(|skip| dir.starts_with(skip)) {
+            continue;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            sample.unreadable_dirs += 1;
+            continue;
+        };
+        for entry in read.flatten() {
+            entries += 1;
+            if entries > max_entries || std::time::Instant::now() > deadline {
+                // This directory was only partly read: it counts as pending.
+                sample.complete = false;
+                pending.push_front(dir);
+                break 'walk;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push_back(path);
+            } else if kind.is_file() {
+                sample.files += 1;
+                let video = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        PREFLIGHT_VIDEO_EXTENSIONS
+                            .iter()
+                            .any(|known| ext.eq_ignore_ascii_case(known))
+                    });
+                if video {
+                    sample.video_files += 1;
+                }
+                sample.bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        sample.visited_dirs += 1;
+    }
+    sample.pending_dirs = pending.len() as u64;
+    sample
 }

@@ -97,15 +97,36 @@ pub(crate) fn api_capture_frame(request: &Request, state: &SharedState) -> Strin
 /// `POST /api/export-clip`: export the viewer's in/out range of one record
 /// through `export-video`, producing a deliverable clip under
 /// artifacts/clips/ with its own chained export-log entry.
+///
+/// UX-09: the export is a background job that does NOT hold the global
+/// busy lock, so marks autosave keeps working while ffmpeg runs. The
+/// response is immediate: `{ok:true, job:{id, kind:"export-clip", state,
+/// started_unix, ...}, deduped}`; an identical in-flight (or finished, with
+/// its clip still on disk) request returns the same job. A finished job
+/// carries `path` and the clip's `sha256` (also mirrored at the top level).
+/// Poll `GET /api/export-clip-status?job=ID` (or `clip_jobs` in
+/// /api/status); cancel with `POST /api/export-clip-cancel {job}`.
 pub(crate) fn api_export_clip(request: &Request, state: &SharedState) -> String {
-    let case_dir = state_lock(state).case_dir.clone();
+    match std::env::current_exe() {
+        Ok(exe) => export_clip_with_exe(request, state, &exe),
+        Err(err) => api_err(&err.to_string()),
+    }
+}
+
+/// Upper bound on concurrently running clip exports (each is an ffmpeg).
+pub(crate) const MAX_RUNNING_CLIP_JOBS: usize = 4;
+/// Finished clip jobs kept for dedupe/status before the oldest is dropped.
+const KEPT_FINISHED_CLIP_JOBS: usize = 32;
+
+/// [`api_export_clip`] parameterised on the CLI executable (tests).
+pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: &Path) -> String {
+    let (case_dir, busy) = {
+        let guard = state_lock(state);
+        (guard.case_dir.clone(), guard.busy)
+    };
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
             .to_string();
-    };
-    let _busy = match try_acquire_busy(state) {
-        Ok(guard) => guard,
-        Err(err) => return api_err(&err),
     };
     let id = body_value(&request.body, "id").unwrap_or_default();
     let start = body_value(&request.body, "start")
@@ -116,6 +137,8 @@ pub(crate) fn api_export_clip(request: &Request, state: &SharedState) -> String 
         .unwrap_or(-1.0);
     // NaN/negative/parse failures are all rejected here.
     if id.trim().is_empty()
+        || id.len() > 512
+        || id.chars().any(char::is_control)
         || !start.is_finite()
         || start < 0.0
         || !duration.is_finite()
@@ -127,54 +150,121 @@ pub(crate) fn api_export_clip(request: &Request, state: &SharedState) -> String 
     // export-video resolves vid_* ids and indexed source paths. Carved /
     // filesystem records carry non-indexed ids (carve_*, fls_*) — for
     // those the viewer also sends the record's file path, which we only
-    // honor when it sits inside the approved media roots.
+    // honor when it sits inside the approved media roots. The canonical
+    // (absolute) path is what reaches argv, so it can never read as a flag.
     let selector = if id.starts_with("vid_") {
         id.clone()
     } else {
         let alt = body_value(&request.body, "path").unwrap_or_default();
-        let candidate = PathBuf::from(alt.trim());
         let roots = state_lock(state).media_roots.clone();
-        let allowed = candidate
+        let canonical = PathBuf::from(alt.trim())
             .canonicalize()
-            .map(|canonical| {
+            .ok()
+            .filter(|canonical| {
                 roots
                     .iter()
                     .filter_map(|root| root.canonicalize().ok())
-                    .any(|root| path_is_under(&root, &canonical))
-            })
-            .unwrap_or(false);
-        if !allowed {
-            return "{\"ok\":false,\"error\":\"색인된 영상 또는 허용된 경로의 파일만 클립으로보낼 수 있습니다.\"}"
+                    .any(|root| path_is_under(&root, canonical))
+            });
+        let Some(canonical) = canonical else {
+            return "{\"ok\":false,\"error\":\"색인된 영상 또는 허용된 경로의 파일만 클립으로 보낼 수 있습니다.\"}"
                 .to_string();
-        }
-        candidate.to_string_lossy().to_string()
+        };
+        canonical.to_string_lossy().to_string()
     };
+    let burn_in = body_value(&request.body, "burn_in").as_deref() == Some("true");
+    let exhibit = body_value(&request.body, "exhibit")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && burn_in);
+    if exhibit
+        .as_deref()
+        .is_some_and(|v| v.len() > 200 || v.chars().any(char::is_control))
+    {
+        return api_err("증거번호(exhibit) 값이 올바르지 않습니다.");
+    }
+    let hash_source = body_value(&request.body, "hash_source").as_deref() == Some("true");
+    let key = format!(
+        "{}\u{1f}{selector}\u{1f}{start:.3}\u{1f}{duration:.3}\u{1f}{burn_in}\u{1f}{}\u{1f}{hash_source}",
+        case_dir.display(),
+        exhibit.as_deref().unwrap_or_default()
+    );
+    // Dedupe first: an identical request joins the existing job even while
+    // another job holds `busy` (it is the same, already-approved export).
+    if let Some(existing) = find_reusable_clip_job(state, &key) {
+        return clip_response(&existing, true);
+    }
+    if busy {
+        return api_err("분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.");
+    }
     let dir = case_dir.join("artifacts/clips");
     if let Err(err) = std::fs::create_dir_all(&dir) {
-        return format!(
-            "{{\"ok\":false,\"error\":{}}}",
-            json_string(&err.to_string())
-        );
+        return api_err(&err.to_string());
     }
-    let output = crate::util::unique_available_path(&dir.join(format!(
-        "{}__{}s+{}s.mp4",
+    let base_name = format!(
+        "{}__{}s+{}s",
         export_safe_name(&id),
         start as u64,
         duration as u64
-    )));
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            return format!(
-                "{{\"ok\":false,\"error\":{}}}",
-                json_string(&err.to_string())
+    );
+    // Registered under the state lock (re-checking dedupe and the running
+    // cap), so two racing identical POSTs still yield exactly one job and
+    // two different jobs never get the same not-yet-created output path.
+    let job = {
+        let mut guard = state_lock(state);
+        if let Some(existing) = guard
+            .clip_jobs
+            .iter()
+            .find(|job| job.key == key && job.state == "running")
+        {
+            return clip_response(existing, true);
+        }
+        if guard
+            .clip_jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .count()
+            >= MAX_RUNNING_CLIP_JOBS
+        {
+            return api_err(
+                "동시에 진행 중인 클립 내보내기가 너무 많습니다 — 하나가 끝난 뒤 다시 시도하십시오.",
             );
         }
+        guard.clip_seq += 1;
+        let job_id = format!("clip-{}", guard.clip_seq);
+        let mut output = crate::util::unique_available_path(&dir.join(format!("{base_name}.mp4")));
+        if guard
+            .clip_jobs
+            .iter()
+            .any(|job| job.state == "running" && job.output == output)
+        {
+            output =
+                crate::util::unique_available_path(&dir.join(format!("{base_name}__{job_id}.mp4")));
+        }
+        let rel_path = output
+            .strip_prefix(&case_dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| output.to_string_lossy().to_string());
+        let job = ClipJob {
+            id: job_id,
+            key,
+            record_id: id.clone(),
+            output,
+            rel_path,
+            started_unix: crate::util::now_unix().unwrap_or(0),
+            finished_unix: None,
+            state: "running",
+            sha256: None,
+            size_bytes: None,
+            error: None,
+            cancel_requested: false,
+        };
+        guard.clip_jobs.push(job.clone());
+        prune_finished_clip_jobs(&mut guard.clip_jobs);
+        job
     };
-    let case_text = case_dir.to_string_lossy().to_string();
     let mut args = vec![
         "export-video".into(),
-        case_text,
+        case_dir.to_string_lossy().to_string(),
         selector,
         "--format".into(),
         "mp4".into(),
@@ -183,32 +273,245 @@ pub(crate) fn api_export_clip(request: &Request, state: &SharedState) -> String 
         "--duration".into(),
         format!("{duration:.3}"),
         "--output".into(),
-        output.to_string_lossy().to_string(),
+        job.output.to_string_lossy().to_string(),
     ];
     // Court-submission burn-in: exhibit label optional — case id, hash
-    // prefix, and ms timecode are always stamped when requested.
-    if body_value(&request.body, "burn_in").as_deref() == Some("true") {
+    // prefix, and ms timecode are always stamped when requested. SEC-06:
+    // the label travels as ONE `--exhibit=<value>` token, so a value
+    // starting with `-` can never be parsed as a separate flag.
+    if burn_in {
         args.push("--burn-in".into());
-        if let Some(exhibit) = body_value(&request.body, "exhibit")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            args.push("--exhibit".into());
-            args.push(exhibit);
+        if let Some(exhibit) = exhibit {
+            args.push(exhibit_arg(&exhibit));
         }
     }
-    if body_value(&request.body, "hash_source").as_deref() == Some("true") {
+    if hash_source {
         args.push("--hash-source".into());
     }
-    match run_step(&exe, &args, state) {
-        Ok(_) => {
-            let rel = output
-                .strip_prefix(&case_dir)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| output.to_string_lossy().to_string());
-            serde_json::json!({"ok": true, "path": rel}).to_string()
+    let worker_state = Arc::clone(state);
+    let worker_exe = exe.to_path_buf();
+    let job_id = job.id.clone();
+    let spawned = thread::Builder::new()
+        .name("ft-clip".into())
+        .spawn(move || run_clip_job(&worker_state, &worker_exe, &job_id, &args));
+    if spawned.is_err() {
+        update_clip_job(state, &job.id, |job| {
+            job.state = "failed";
+            job.error = Some("작업 스레드 시작 실패".into());
+            job.finished_unix = crate::util::now_unix().ok();
+        });
+        return api_err("작업 스레드 시작 실패");
+    }
+    state_lock(state)
+        .logs
+        .push(format!("클립 내보내기 시작: {} ({})", job.rel_path, job.id));
+    clip_response(&job, false)
+}
+
+/// The single argv token carrying the burn-in exhibit label (SEC-06).
+pub(crate) fn exhibit_arg(exhibit: &str) -> String {
+    format!("--exhibit={exhibit}")
+}
+
+/// A running job with `key`, or a finished one whose clip is still on disk
+/// with the recorded size (so a deleted/replaced clip is exported anew).
+fn find_reusable_clip_job(state: &SharedState, key: &str) -> Option<ClipJob> {
+    let guard = state_lock(state);
+    guard
+        .clip_jobs
+        .iter()
+        .rev()
+        .find(|job| {
+            job.key == key
+                && match job.state {
+                    "running" => true,
+                    "done" => std::fs::metadata(&job.output)
+                        .is_ok_and(|meta| Some(meta.len()) == job.size_bytes),
+                    _ => false,
+                }
+        })
+        .cloned()
+}
+
+fn prune_finished_clip_jobs(jobs: &mut Vec<ClipJob>) {
+    while jobs.iter().filter(|job| job.state != "running").count() > KEPT_FINISHED_CLIP_JOBS {
+        match jobs.iter().position(|job| job.state != "running") {
+            Some(index) => {
+                jobs.remove(index);
+            }
+            None => break,
         }
-        Err(err) => serde_json::json!({"ok": false, "error": err}).to_string(),
+    }
+}
+
+fn update_clip_job(state: &SharedState, id: &str, update: impl FnOnce(&mut ClipJob)) {
+    if let Some(job) = state_lock(state)
+        .clip_jobs
+        .iter_mut()
+        .find(|job| job.id == id)
+    {
+        update(job);
+    }
+}
+
+/// Worker: runs export-video (killed as a tree on a per-job cancel), then
+/// hashes the finished clip. A failed/cancelled export never leaves a
+/// partial file posing as a deliverable.
+fn run_clip_job(state: &SharedState, exe: &Path, id: &str, args: &[String]) {
+    let cancelled = || {
+        state_lock(state)
+            .clip_jobs
+            .iter()
+            .find(|job| job.id == id)
+            .is_none_or(|job| job.cancel_requested)
+    };
+    let output = state_lock(state)
+        .clip_jobs
+        .iter()
+        .find(|job| job.id == id)
+        .map(|job| job.output.clone());
+    let Some(output) = output else { return };
+    let result = run_step_cancellable(exe, args, &cancelled);
+    let finished = crate::util::now_unix().ok();
+    let outcome = match result {
+        Ok(_) => match crate::audit::digest_file(&output) {
+            Ok(digest) => Ok((
+                digest,
+                std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0),
+            )),
+            Err(err) => Err(format!("클립은 만들어졌지만 SHA-256 계산 실패: {err}")),
+        },
+        Err(err) => Err(err),
+    };
+    let was_cancelled = cancelled();
+    if outcome.is_err() {
+        // A torn or unverified clip must not linger as a deliverable.
+        let _ = std::fs::remove_file(&output);
+    }
+    let mut guard = state_lock(state);
+    let mut log = None;
+    if let Some(job) = guard.clip_jobs.iter_mut().find(|job| job.id == id) {
+        job.finished_unix = finished;
+        match outcome {
+            Ok((digest, size)) => {
+                log = Some(format!(
+                    "클립 내보내기 완료: {} · SHA-256 {digest}",
+                    job.rel_path
+                ));
+                job.state = "done";
+                job.sha256 = Some(digest);
+                job.size_bytes = Some(size);
+            }
+            Err(_) if was_cancelled => {
+                job.state = "cancelled";
+                job.error = Some("사용자가 클립 내보내기를 중단했습니다.".into());
+                log = Some(format!("클립 내보내기 중단: {}", job.rel_path));
+            }
+            Err(err) => {
+                log = Some(format!(
+                    "오류: 클립 내보내기 실패 ({}): {err}",
+                    job.rel_path
+                ));
+                job.state = "failed";
+                job.error = Some(err);
+            }
+        }
+    }
+    if let Some(line) = log {
+        guard.logs.push(line);
+    }
+}
+
+/// Number of clip exports still running (finalize/recover/carve/shutdown
+/// wait for them).
+pub(crate) fn running_clip_job_count(state: &SharedState) -> usize {
+    state_lock(state)
+        .clip_jobs
+        .iter()
+        .filter(|job| job.state == "running")
+        .count()
+}
+
+/// Requests cancel of every running clip export; returns how many.
+pub(crate) fn cancel_all_clip_jobs(guard: &mut JobState) -> usize {
+    let mut count = 0;
+    for job in guard
+        .clip_jobs
+        .iter_mut()
+        .filter(|job| job.state == "running")
+    {
+        job.cancel_requested = true;
+        count += 1;
+    }
+    count
+}
+
+/// Public view of one clip job.
+pub(crate) fn clip_job_json(job: &ClipJob) -> serde_json::Value {
+    let end = job
+        .finished_unix
+        .or_else(|| crate::util::now_unix().ok())
+        .unwrap_or(job.started_unix);
+    // ffmpeg writes the clip progressively: its size is the honest
+    // progress signal (no total is known up front).
+    let bytes_written = if job.state == "running" {
+        std::fs::metadata(&job.output).map(|m| m.len()).unwrap_or(0)
+    } else {
+        job.size_bytes.unwrap_or(0)
+    };
+    serde_json::json!({
+        "id": job.id,
+        "kind": "export-clip",
+        "record_id": job.record_id,
+        "state": job.state,
+        "started_unix": job.started_unix,
+        "finished_unix": job.finished_unix,
+        "elapsed_secs": end.saturating_sub(job.started_unix),
+        "path": job.rel_path,
+        "bytes_written": bytes_written,
+        "sha256": job.sha256,
+        "size_bytes": job.size_bytes,
+        "error": job.error,
+        "cancel_requested": job.cancel_requested,
+    })
+}
+
+fn clip_response(job: &ClipJob, deduped: bool) -> String {
+    let mut body = serde_json::json!({
+        "ok": true,
+        "job": clip_job_json(job),
+        "deduped": deduped,
+    });
+    if job.state == "done"
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert("path".into(), serde_json::json!(job.rel_path));
+        map.insert("sha256".into(), serde_json::json!(job.sha256));
+    }
+    body.to_string()
+}
+
+/// `GET /api/export-clip-status?job=ID`.
+pub(crate) fn api_export_clip_status(request: &Request, state: &SharedState) -> String {
+    let id = query_value(&request.query, "job").unwrap_or_default();
+    let guard = state_lock(state);
+    match guard.clip_jobs.iter().find(|job| job.id == id) {
+        Some(job) => clip_response(job, false),
+        None => api_err("해당 클립 내보내기 작업을 찾을 수 없습니다."),
+    }
+}
+
+/// `POST /api/export-clip-cancel {job}`: kills that export's process tree.
+pub(crate) fn api_export_clip_cancel(request: &Request, state: &SharedState) -> String {
+    let id = body_value(&request.body, "job").unwrap_or_default();
+    let mut guard = state_lock(state);
+    match guard.clip_jobs.iter_mut().find(|job| job.id == id) {
+        Some(job) if job.state == "running" => {
+            job.cancel_requested = true;
+            "{\"ok\":true}".to_string()
+        }
+        Some(_) => api_err("이미 끝난 클립 내보내기입니다."),
+        None => api_err("해당 클립 내보내기 작업을 찾을 수 없습니다."),
     }
 }
 
