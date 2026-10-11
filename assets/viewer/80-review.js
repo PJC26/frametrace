@@ -640,34 +640,71 @@ function parseClipTime(text) {
   return total;
 }
 
-// Poll /api/status for a background export job (server returns {ok, job}).
-// Tolerates several result shapes; resolves with the final result object
-// ({ path, sha256 }) or throws with the server's error text.
-async function pollExportJob(job, btn) {
-  const id = typeof job === "string" ? job : (job && (job.id || job.job_id)) || "";
+// Clip export runs as its own server job (UX-09, src/serve/media.rs):
+// POST /api/export-clip → {ok, job:{id, state, path, bytes_written,
+// elapsed_secs, sha256, error}, deduped}; an identical request joins the
+// same job. Progress: GET /api/export-clip-status?job=ID; cancel: POST
+// /api/export-clip-cancel {job}. A finished job carries the clip's case-
+// relative `path` and `sha256`; a failed/cancelled one never leaves a clip.
+function fmtClipBytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1048576) return (v / 1048576).toFixed(1) + " MB";
+  if (v >= 1024) return Math.round(v / 1024) + " KB";
+  return v + " B";
+}
+// Persistent progress row (in the toast host) with a cancel button.
+function clipProgressUi(onCancel) {
+  const host = document.getElementById("toastHost");
+  const item = document.createElement("div");
+  item.className = "toast clip-progress";
+  item.setAttribute("role", "status");
+  const text = document.createElement("span");
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "mini";
+  cancel.style.marginLeft = "10px";
+  cancel.textContent = t("clip.cancel");
+  cancel.addEventListener("click", () => {
+    cancel.disabled = true;
+    cancel.textContent = t("clip.cancelling");
+    onCancel();
+  });
+  item.append(text, " ", cancel);
+  if (host) host.appendChild(item);
+  return {
+    set(job) {
+      text.textContent = tf("clip.progress", { sec: Number(job.elapsed_secs) || 0, size: fmtClipBytes(job.bytes_written) });
+    },
+    remove() { item.remove(); }
+  };
+}
+// Polls one export job until it leaves "running"; resolves with the final
+// job record (state done|failed|cancelled). Network blips are retried.
+async function pollExportJob(job, btn, ui) {
+  const id = job.id;
   const base = btn.dataset.label || btn.textContent;
   btn.dataset.label = base;
-  const started = Date.now();
-  let quiet = 0;
-  while (Date.now() - started < 30 * 60 * 1000) {
+  let current = job;
+  let misses = 0;
+  while (current.state === "running") {
+    ui.set(current);
+    btn.textContent = `${base} ${Number(current.elapsed_secs) || 0}s`;
     await new Promise(r => setTimeout(r, 1000));
-    let st;
-    try { st = await (await fetch("/api/status", { cache: "no-store" })).json(); }
-    catch { quiet = 0; btn.textContent = base + " …"; continue; }
-    const rec = (st.jobs && id && st.jobs[id]) || (st.job && (!id || st.job.id === id || st.job.job_id === id) ? st.job : null)
-      || (st.last_job && (!id || st.last_job.id === id || st.last_job.job_id === id) ? st.last_job : null) || st.job_result || null;
-    const state = rec && String(rec.state || rec.status || "").toLowerCase();
-    if (rec && ["failed", "error"].includes(state)) throw new Error(rec.error || "export failed");
-    if (rec && (["done", "completed", "ok", "success"].includes(state) || rec.sha256 || rec.path)) return rec.result || rec;
-    const pr = st.progress;
-    if (pr && pr.total > 0) btn.textContent = `${base} ${Math.min(100, Math.round((pr.done / pr.total) * 100))}%`;
-    else btn.textContent = base + " …";
-    if (!pr && !st.busy) {
-      quiet += 1;
-      if (quiet >= 3) return { path: "", sha256: "", unknown: true };
-    } else quiet = 0;
+    let data = null;
+    try {
+      const res = await fetch(`/api/export-clip-status?job=${encodeURIComponent(id)}`, { cache: "no-store" });
+      data = await res.json();
+    } catch {
+      misses += 1;
+      if (misses >= 30) throw new Error(t("toast.clipOffline"));
+      continue;
+    }
+    misses = 0;
+    if (!data || !data.ok || !data.job) throw new Error((data && data.error) || "export-clip-status");
+    current = data.job;
   }
-  throw new Error("timeout");
+  btn.textContent = base;
+  return current;
 }
 
 async function exportClip(btn, burn) {
@@ -689,21 +726,43 @@ async function exportClip(btn, burn) {
   const body = { id: record.id, path: record.path || "", start: tin.toFixed(3), duration: (tout - tin).toFixed(3) };
   if (burn) { body.burn_in = "true"; body.exhibit = (ans.exhibit || "").trim(); }
   await withBusy(btn, async () => {
-    const res = await fetch("/api/export-clip", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(body) });
+    let res;
+    try {
+      res = await fetch("/api/export-clip", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(body) });
+    } catch {
+      throw new Error(t("toast.clipOffline"));
+    }
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || "");
-    let result = data;
-    if (data.job && !data.path) result = await pollExportJob(data.job, btn);
-    const path = result.path || data.path || "";
-    const sha = result.sha256 || data.sha256 || "";
+    let job = data.job || null;
+    if (job && job.state === "running") {
+      if (data.deduped) toast(t("clip.joined"));
+      const ui = clipProgressUi(async () => {
+        try {
+          const r = await fetch("/api/export-clip-cancel", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ job: job.id }) });
+          const d = await r.json();
+          if (!d.ok) toast(tf("toast.clipFail", { err: d.error || "" }));
+        } catch { toast(t("toast.clipOffline")); }
+      });
+      try { job = await pollExportJob(job, btn, ui); } finally { ui.remove(); }
+    }
+    if (job && job.state === "cancelled") { toast(t("toast.clipCancelled")); return; }
+    if (job && job.state === "failed") throw new Error(job.error || "export failed");
+    const path = (job && job.path) || data.path || "";
+    const sha = (job && job.sha256) || data.sha256 || "";
+    const caseDir = String(DATA.caseDir || "");
+    const sep = caseDir.includes("\\") && !caseDir.includes("/") ? "\\" : "/";
+    const full = path && caseDir && !/^([a-zA-Z]:|[\\/])/.test(path)
+      ? caseDir.replace(/[\\/]+$/, "") + sep + path.split("/").join(sep) : path;
     toast(path ? tf("toast.clipDone", { path }) : t("clip.doneNoPath"));
-    // Exhibit summary: what was cut, from what, and its hash.
+    // Exhibit summary: what was cut, from what, where it is, and its hash.
     await askDialog({
       title: t("clip.summaryTitle"),
       message: [
         `${t("clip.src")}: ${record.name || record.id}`,
         `${t("clip.range")}: ${tin.toFixed(3)}s – ${tout.toFixed(3)}s (${(tout - tin).toFixed(3)}s)`,
-        `${t("clip.out.path")}: ${path || "-"}`,
+        `${t("clip.out.path")}: ${full || "-"}`,
+        job && job.size_bytes ? `${t("clip.size")}: ${fmtClipBytes(job.size_bytes)} (${Number(job.size_bytes).toLocaleString()} B)` : "",
         `SHA-256: ${sha || t("clip.noSha")}`,
         burn && body.exhibit ? `${t("clip.exhibit")}: ${body.exhibit}` : ""
       ].filter(Boolean).join("\n"),
