@@ -144,3 +144,95 @@ pub(crate) fn find_running_server() -> Option<u16> {
     }
     None
 }
+
+/// Port and token of the server running in THIS process, published by `run`
+/// right after bind and before any instance-file write. The WebView2 shell
+/// reads it instead of racing the instance file (which may be unwritable,
+/// HOME-less, or not yet written when the TCP connect succeeds).
+static LOCAL_SERVER: Mutex<Option<(u16, Option<String>)>> = Mutex::new(None);
+
+pub(crate) fn publish_local_server(port: u16, token: Option<&str>) {
+    *LOCAL_SERVER.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((port, token.map(str::to_string)));
+}
+
+/// `Some(token_or_none)` once the in-process server for `port` has published.
+pub(crate) fn local_server_token(port: u16) -> Option<Option<String>> {
+    LOCAL_SERVER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .filter(|(published, _)| *published == port)
+        .map(|(_, token)| token.clone())
+}
+
+/// Token for the shell: the in-process value wins; the instance file is a
+/// fallback for a separately launched shell attaching to another server.
+pub(crate) fn resolve_shell_token(
+    port: u16,
+    file_lookup: impl Fn(u16) -> Option<String>,
+) -> Option<String> {
+    match local_server_token(port) {
+        Some(token) => token,
+        None => file_lookup(port),
+    }
+}
+
+pub(crate) fn build_workstation_url(port: u16, token: Option<&str>) -> String {
+    match token {
+        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
+        None => format!("http://127.0.0.1:{port}/"),
+    }
+}
+
+/// What the shell should show: the workstation URL, or an explicit error
+/// (instead of silently navigating into a blank 401).
+/// `owned`: the server runs in this process, so wait briefly for it to
+/// publish its token.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn shell_target(port: u16, owned: bool, wait: Duration) -> Result<String, String> {
+    if owned {
+        let deadline = std::time::Instant::now() + wait;
+        while local_server_token(port).is_none() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if local_server_token(port).is_none() {
+            return Err(format!(
+                "워크스테이션 서버가 시작되지 않았습니다 (127.0.0.1:{port}). / The workstation server did not start."
+            ));
+        }
+    }
+    let token = resolve_shell_token(port, token_for_port);
+    if token.is_none() {
+        let denied = probe_status_body(port, None)
+            .map(|body| body.starts_with(b"HTTP/1.1 401") || body.starts_with(b"HTTP/1.0 401"))
+            .unwrap_or(false);
+        if denied {
+            return Err(format!(
+                "서버(127.0.0.1:{port})가 접근 토큰을 요구하지만 찾을 수 없습니다. 앱을 다시 시작하거나 FRAMETRACE_TOKEN을 설정하세요. / The server requires an access token that could not be found; restart the app or set FRAMETRACE_TOKEN."
+            ));
+        }
+    }
+    Ok(build_workstation_url(port, token.as_deref()))
+}
+
+#[cfg(test)]
+mod tests_shell_token {
+    use super::*;
+
+    #[test]
+    fn in_process_token_wins_even_without_instance_file() {
+        publish_local_server(1, Some("tok12345"));
+        let token = resolve_shell_token(1, |_| None);
+        assert_eq!(token.as_deref(), Some("tok12345"));
+        assert_eq!(
+            build_workstation_url(1, token.as_deref()),
+            "http://127.0.0.1:1/?token=tok12345"
+        );
+        // A different port falls back to the file lookup.
+        assert_eq!(
+            resolve_shell_token(2, |_| Some("fromfile".into())).as_deref(),
+            Some("fromfile")
+        );
+    }
+}

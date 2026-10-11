@@ -55,8 +55,10 @@ pub fn run_hosted() -> Result<(), String> {
     // An already-running workstation wins: attach a window to it instead
     // of stacking a second server. We don't own it, so closing the window
     // leaves it running — same contract as the browser flow.
-    let (url, owned_port) = if let Some(port) = serve::find_running_server() {
-        (workstation_url(port), None)
+    let (target, owned_port) = if let Some(port) = serve::find_running_server() {
+        // Attaching to a separately launched server: the instance file is
+        // the only token source.
+        (serve::shell_target(port, false, Duration::ZERO), None)
     } else {
         let port = reserve_port()?;
         let server = std::thread::Builder::new()
@@ -87,14 +89,21 @@ pub fn run_hosted() -> Result<(), String> {
                 }
             }
         });
-        (workstation_url(port), Some((port, watcher)))
+        // The server publishes its token in-process right after bind; wait
+        // for that rather than re-reading the instance file.
+        (
+            serve::shell_target(port, true, Duration::from_secs(10)),
+            Some((port, watcher)),
+        )
     };
 
-    let hosted = match host_window(&url) {
+    let hosted = match host_window(&target) {
         Ok(()) => true,
         Err(err) => {
             eprintln!("webview2 shell unavailable, falling back to browser: {err}");
-            serve::open_in_browser(&url);
+            if let Ok(url) = &target {
+                serve::open_in_browser(url);
+            }
             false
         }
     };
@@ -126,15 +135,6 @@ fn reserve_port() -> Result<u16, String> {
     Ok(port)
 }
 
-fn workstation_url(port: u16) -> String {
-    // SEC-04: the token is random by default; the server records it in the
-    // user-private instance file (FRAMETRACE_TOKEN, when set, wins).
-    match crate::serve::token_for_port(port) {
-        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
-        None => format!("http://127.0.0.1:{port}/"),
-    }
-}
-
 fn wait_for_server(port: u16, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -152,7 +152,7 @@ fn wait_for_server(port: u16, timeout: Duration) -> Result<(), String> {
 /// Reads briefly so the server thread can flush, then returns; the
 /// accept loop exits on its own poll even if the read races.
 fn request_shutdown(port: u16) {
-    let query = match crate::serve::token_for_port(port) {
+    let query = match crate::serve::resolve_shell_token(port, crate::serve::token_for_port) {
         Some(token) => format!("?token={token}"),
         None => String::new(),
     };
@@ -214,7 +214,7 @@ fn nonce_from_response(response: &str) -> Option<String> {
     })
 }
 
-fn host_window(url: &str) -> Result<(), String> {
+fn host_window(target: &Result<String, String>) -> Result<(), String> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED)
             .ok()
@@ -250,7 +250,7 @@ fn host_window(url: &str) -> Result<(), String> {
         // The watcher needs our thread id so it can end the pump with a
         // thread message if the server dies while the window is open.
         FRAME_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
-        let result = host_webview(hwnd, url);
+        let result = host_webview(hwnd, target);
         FRAME_THREAD.store(0, Ordering::SeqCst);
         if let Err(err) = result {
             // Browser fallback happens at the caller — the dead frame must
@@ -262,7 +262,7 @@ fn host_window(url: &str) -> Result<(), String> {
     }
 }
 
-unsafe fn host_webview(hwnd: HWND, url: &str) -> Result<(), String> {
+unsafe fn host_webview(hwnd: HWND, target: &Result<String, String>) -> Result<(), String> {
     unsafe {
         // WebView2 user data lives under LOCALAPPDATA — the default
         // "<exe>.WebView2" beside the binary is not writable when the app
@@ -338,10 +338,28 @@ unsafe fn host_webview(hwnd: HWND, url: &str) -> Result<(), String> {
             .CoreWebView2()
             .map_err(|err| format!("WebView2 CoreWebView2 failed: {err}"))?;
 
-        let url_wide = HSTRING::from(url);
-        webview
-            .Navigate(PCWSTR::from_raw(url_wide.as_ptr()))
-            .map_err(|err| format!("WebView2 navigate to {url} failed: {err}"))?;
+        match target {
+            Ok(url) => {
+                let url_wide = HSTRING::from(url.as_str());
+                webview
+                    .Navigate(PCWSTR::from_raw(url_wide.as_ptr()))
+                    .map_err(|err| format!("WebView2 navigate to {url} failed: {err}"))?;
+            }
+            Err(message) => {
+                // Explicit error page instead of a blank 401 / dead frame.
+                let escaped = message
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                let html = HSTRING::from(format!(
+                    "<!doctype html><meta charset=\"utf-8\"><title>FrameTrace</title>\
+                     <body style=\"font:16px sans-serif;margin:3em\"><h2>FrameTrace</h2><p>{escaped}</p></body>"
+                ));
+                webview
+                    .NavigateToString(PCWSTR::from_raw(html.as_ptr()))
+                    .map_err(|err| format!("WebView2 NavigateToString failed: {err}"))?;
+            }
+        }
 
         CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller));
         let _ = ShowWindow(hwnd, SW_SHOW);
