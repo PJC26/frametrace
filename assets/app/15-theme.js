@@ -56,11 +56,29 @@ function syncViewerLangBtn() {
   btn.textContent = cur === "en" ? "뷰어 언어: English" : "뷰어 언어: 한국어";
   btn.setAttribute("aria-label", (cur === "en" ? "검토 뷰어 언어 English — 한국어로 전환" : "검토 뷰어 언어 한국어 — English로 전환"));
 }
+// The viewer answers {type:"ft-locale-ack", locale}; until then (or until
+// the frame reloads, which restarts the sequence) the shell re-posts, so a
+// viewer that wires its message handler late still gets the language.
+let localeSeq = 0, localeAcked = "";
+const LOCALE_RETRY_MS = 500, LOCALE_RETRY_MAX = 24;
+window.addEventListener("message", e => {
+  if (!e.data || e.data.type !== "ft-locale-ack") return;
+  try { const fr = viewerFrameEl(); if (e.source && fr && e.source !== fr.contentWindow) return; } catch (err) {}
+  localeAcked = e.data.locale || "";
+});
 function pushLocaleToViewer(locale) {
   if (!locale) return;
-  postToViewer({ type: "ft-locale", locale });
-  // Same-origin fallback: the viewer's language button is in its hidden
-  // header but still clickable; it toggles and persists per case.
+  const seq = ++localeSeq;
+  localeAcked = "";
+  let tries = 0;
+  const tick = () => {
+    if (seq !== localeSeq || localeAcked === locale) return;
+    postToViewer({ type: "ft-locale", locale });
+    if (++tries < LOCALE_RETRY_MAX) setTimeout(tick, LOCALE_RETRY_MS);
+  };
+  tick();
+  // Same-origin fallback (idempotent with the message): the viewer's
+  // language button toggles and persists per case.
   try {
     const fr = viewerFrameEl();
     const doc = fr && fr.contentDocument;

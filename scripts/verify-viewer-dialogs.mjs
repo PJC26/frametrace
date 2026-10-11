@@ -209,6 +209,21 @@ try {
   check('page kept (no reload), save state still not clean', stillHere && stillHere !== 'saved', String(stillHere));
   check('refusal is reported to the examiner', /저장되지 않은 판독 내용/.test(await page.evaluate(() => document.getElementById('toastHost').textContent)));
 
+  // --- shell → viewer theme/locale handshake (findings 11) ---------------
+  const acks = await page.evaluate(async () => {
+    const got = [];
+    window.addEventListener('message', (e) => { if (e.data && /-ack$/.test(e.data.type)) got.push(e.data); });
+    const before = document.documentElement.lang;
+    window.postMessage({ type: 'ft-locale', locale: before === 'en' ? 'ko' : 'en' }, '*');
+    window.postMessage({ type: 'ft-locale', locale: 'xx' }, '*');
+    window.postMessage({ type: 'ft-theme', theme: 'dark' }, '*');
+    window.postMessage({ type: 'ft-theme', theme: 'purple' }, '*');
+    await new Promise((r) => setTimeout(r, 300));
+    return { got, before, after: document.documentElement.lang, theme: document.documentElement.dataset.theme };
+  });
+  check('ft-locale switches the viewer language and is acked', acks.after !== acks.before && acks.got.some((m) => m.type === 'ft-locale-ack' && m.locale === acks.after), JSON.stringify(acks));
+  check('ft-theme applies and is acked; invalid values are ignored and not acked',
+    acks.theme === 'dark' && acks.got.some((m) => m.type === 'ft-theme-ack' && m.theme === 'dark') && acks.got.length === 2, JSON.stringify(acks));
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {
   await browser.close();

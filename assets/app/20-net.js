@@ -110,14 +110,19 @@ $("dlgOk").addEventListener("click", async () => {
   closeDialog(true);
 });
 $("dlgCancel").addEventListener("click", () => closeDialog(false));
-$("dlgBackdrop").addEventListener("keydown", e => {
+// Document-level so Escape / Tab still work after a click on the backdrop
+// or any non-focusable part of the dialog moved focus to <body>.
+document.addEventListener("keydown", e => {
+  if ($("dlgBackdrop").hidden) return;
   if (e.key === "Escape") { e.preventDefault(); closeDialog(false); return; }
   if (e.key !== "Tab") return;
   const focusables = [...$("dlgBackdrop").querySelectorAll("button, input, a[href], [tabindex='0']")]
     .filter(el => !el.disabled && !el.hidden && el.offsetParent !== null);
   if (!focusables.length) return;
   const first = focusables[0], last = focusables[focusables.length - 1];
-  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  const inside = $("dlgBackdrop").contains(document.activeElement);
+  if (!inside) { e.preventDefault(); (e.shiftKey ? last : first).focus(); }
+  else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 

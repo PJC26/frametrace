@@ -1,0 +1,40 @@
+name: Harnesses
+
+# Viewer / shell / end-to-end harnesses (scripts/verify-*.mjs, bench-viewer)
+# on Linux. The binary is built once and shared through FRAMETRACE_BIN.
+#
+# /api/recover-deleted: verify-jobs-e2e exercises the real endpoint without
+# stubs only for its refusal path (folder case, no filesystem results). A
+# positive recovery needs a disk image with deleted NTFS/FAT entries plus
+# The Sleuth Kit, which hosted runners do not provide; that path is covered
+# in-process by src/serve/tests_jobs.rs (fake recover exe).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  harnesses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install Playwright
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: Build once
+        run: cargo build --locked
+      - name: Run harnesses
+        env:
+          FRAMETRACE_BIN: ${{ github.workspace }}/target/debug/frametrace-app
+        run: bash scripts/ci-harnesses.sh
