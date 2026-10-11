@@ -50,6 +50,23 @@ function hPopoutOpen() {
   }
   hSetPopped(true);
 }
+// The note covers exactly the viewer's media column (same place, same
+// width — no layout shift); the column's width is the viewer's own, so it
+// is measured rather than assumed.
+function hPlacePopnote() {
+  const note = $("hPopoutNote"), host = $("hViewerHost");
+  if (!note || note.hidden || !host || typeof host.querySelector !== "function") return;
+  const media = host.querySelector(".ft-viewer .media");
+  if (!media || typeof media.getBoundingClientRect !== "function") return;
+  const m = media.getBoundingClientRect(), h = host.getBoundingClientRect();
+  if (!m.width) return;
+  note.style.left = Math.round(m.left - h.left) + "px";
+  note.style.width = Math.round(m.width) + "px";
+  note.style.top = Math.round(m.top - h.top) + "px";
+  note.style.bottom = Math.round(h.bottom - m.bottom) + "px";
+  note.style.right = "auto";
+}
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") window.addEventListener("resize", hPlacePopnote);
 function hSetPopped(on) {
   const open = !!on;
   const was = !!FTStore.state.popout.open;
@@ -57,6 +74,7 @@ function hSetPopped(on) {
   $("hPopoutNote").hidden = !open;
   const host = $("hViewerHost");
   const root = host && host.querySelector ? host.querySelector(".ft-viewer") : null;
+  if (open) hPlacePopnote();
   if (root && root.classList) root.classList.toggle("popped", open);
   if (was !== open) {
     hBroadcast(open ? "popout-open" : "popout-closed");

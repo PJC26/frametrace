@@ -206,18 +206,36 @@ check('7 saveState() saved', await host.evaluate(() => FTViewer.saveState()) ===
 // 4 keys: host regions with [data-keys="off"] never feed viewer shortcuts
 await host.evaluate(() => FTViewer.focus());
 const first = await activeId(host);
-await host.focus('#sourcePath');
-await host.keyboard.press('j');
-await host.keyboard.press('1');
-await host.keyboard.press('Control+z');
-await host.focus('#finalExaminer');
+// (#sourcePath lives in the empty state, hidden while a project is open.)
+if (!shellHosts) {
+  await host.focus('#sourcePath');
+  await host.keyboard.press('j');
+  await host.keyboard.press('1');
+  await host.keyboard.press('Control+z');
+}
+// The real shell: the deliverables sheet field and a button inside the jobs
+// sheet (both [data-keys="off"]); the T5 test host page has stand-ins.
+const finSel = '#finalExaminer';
+const sheetBtnSel = shellHosts ? '#btnCopyLog' : '#tSheetBtn';
+const stripBtnSel = shellHosts ? '#hBtnTheme' : '#tStripBtn';
+if (shellHosts) {
+  await host.evaluate(() => hOpenSheet('finalize', document.getElementById('hBtnFinalize')));
+  await host.waitForSelector('#finalExaminer', { state: 'visible', timeout: 10000 });
+}
+await host.focus(finSel);
 await host.keyboard.press('k');
-await host.focus('#tSheetBtn');
+if (shellHosts) {
+  await host.evaluate(() => hCloseSheet('finalize', false));
+  await host.evaluate(() => hOpenSheet('jobs', document.getElementById('hBtnJobs')));
+  await host.waitForSelector(sheetBtnSel, { state: 'visible', timeout: 10000 });
+}
+await host.focus(sheetBtnSel);
 await host.keyboard.press('j');
 await host.keyboard.press('1');
 await host.keyboard.press('Control+b');
+if (shellHosts) await host.evaluate(() => hCloseSheet('jobs', false));
 check('4 keys-off inputs/buttons: active card + marks unchanged', await activeId(host) === first && !(await markOf(host, first)) && await host.evaluate(() => !document.getElementById('ftViewer').classList.contains('rail-collapsed') || window.innerWidth < 1500), `active ${await activeId(host)}`);
-await host.focus('#tStripBtn');
+await host.focus(stripBtnSel);
 await host.keyboard.press('j');
 const second = await activeId(host);
 check('4 plain host button: j moves the active card', second && second !== first, `${first} → ${second}`);
@@ -240,7 +258,7 @@ await host.keyboard.press('3');
 check('7 key 3 marks the next card (hosted)', /needs_verification/.test(await markOf(host, third)) && await host.evaluate(() => FTViewer.saveState()) === 'pending');
 await host.evaluate(() => FTViewer.destroy());
 check('7 destroy(): markup kept, rendered state gone, destroyed event', await host.evaluate(() => !!document.getElementById('recordGrid') && document.querySelectorAll('#recordGrid .card').length === 0 && window.__ev.some((e) => e.type === 'destroyed') && FTViewer.saveState() === null));
-await host.focus('#tStripBtn');
+await host.focus(stripBtnSel);
 await host.keyboard.press('j');
 await host.keyboard.press('1');
 check('7 destroyed viewer ignores keys (no cards, no errors)', await host.evaluate(() => document.querySelectorAll('#recordGrid .card').length === 0));
@@ -276,10 +294,20 @@ check('7 toast(): one #toastHost inside the root + toast event', await host.eval
 
 // request-popout (hosted, a listener present) and popout()/closePopout()
 await host.evaluate(() => { window.__opened = 0; const o = window.open; window.open = (...a) => { window.__opened++; return o.apply(window, a); }; FTViewer.on('request-popout', () => {}); });
-await host.click('#btnPopPlayer').catch(async () => { await host.evaluate(() => document.getElementById('btnPopPlayer').click()); });
-check('7 hosted btnPopPlayer emits request-popout instead of opening', await host.evaluate(() => window.__opened === 0 && window.__ev.some((e) => e.type === 'request-popout')));
-const [popup] = await Promise.all([host.waitForEvent('popup', { timeout: 10000 }), host.evaluate(() => { FTViewer.popout(); })]);
-await popup.waitForLoadState().catch(() => {});
+const clickPop = () => host.click('#btnPopPlayer').catch(async () => { await host.evaluate(() => document.getElementById('btnPopPlayer').click()); });
+let popup;
+if (shellHosts) {
+  // The integrated shell answers request-popout itself (23-popout.js calls
+  // FTViewer.popout() once and folds the media column): exactly one window.
+  await clickPop();
+  await host.waitForFunction(() => window.__opened >= 1 && FTStore.state.popout.open === true, null, { timeout: 10000 }).catch(() => {});
+  check('7 hosted btnPopPlayer emits request-popout; the shell opens one pop-out', await host.evaluate(() => window.__opened === 1 && window.__ev.some((e) => e.type === 'request-popout') && FTStore.state.popout.open === true));
+} else {
+  await clickPop();
+  check('7 hosted btnPopPlayer emits request-popout instead of opening', await host.evaluate(() => window.__opened === 0 && window.__ev.some((e) => e.type === 'request-popout')));
+  [popup] = await Promise.all([host.waitForEvent('popup', { timeout: 10000 }), host.evaluate(() => { FTViewer.popout(); })]);
+}
+if (popup) await popup.waitForLoadState().catch(() => {});
 check('7 popout(): popup open, isPoppedOut + popout{open:true}', await host.evaluate(() => FTViewer.isPoppedOut() && window.__ev.some((e) => e.type === 'popout' && e.detail.open === true)));
 await host.evaluate(() => FTViewer.closePopout());
 await host.waitForTimeout(300);

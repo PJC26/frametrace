@@ -52,7 +52,7 @@
 :where(.ft-viewer) input, :where(.ft-viewer) select { font: inherit; height: 32px; border: 1px solid var(--border-strong); border-radius: 6px; padding: 0 8px; background: var(--surface); color: var(--ink); max-width: 100%; }
 :where(.ft-viewer) select:hover, :where(.ft-viewer) input:hover { border-color: var(--accent); }
 :where(.ft-viewer) code { font-family: var(--mono); font-size: var(--fs-xs); word-break: break-all; }
-:where(.ft-viewer) .muted { color: var(--muted); font-size: 12px; }
+:where(.ft-viewer) .muted { color: var(--muted); font-size: var(--fs-xs); }
 :where(.ft-viewer) mark { background: #ffe9a8; padding: 0 1px; }
 
 /* ---- filter bar: one 40px row (wraps only when the frame is too narrow) ---- */

@@ -306,9 +306,14 @@ async function loadViewerDataOnce(ui) {
       );
     }
   }
-  const loaded = await loadDataBundle();
-  const data = window.__FRAMETRACE_DATA__;
-  if (loaded && data && typeof data === "object") return data;
+  // Hosted in the workstation page (GET /), the API is the only source:
+  // there is no data-bundle.js next to "/" (host-integration hook).
+  const hostedPage = typeof FTViewer === "object" && FTViewer && FTViewer._hosted;
+  if (!hostedPage) {
+    const loaded = await loadDataBundle();
+    const data = window.__FRAMETRACE_DATA__;
+    if (loaded && data && typeof data === "object") return data;
+  }
   if (apiError) throw apiError;
   throw ViewerLoadError(
     "증거 데이터(data-bundle.js)를 찾을 수 없습니다. / Evidence data (data-bundle.js) not found.",

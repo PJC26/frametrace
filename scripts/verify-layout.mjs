@@ -98,7 +98,7 @@ const caseB = join(work, 'cases', 'case-b');
 const POPOUT_STUB = () => {
   window.__opened = [];
   window.open = (url, name, feat) => {
-    const w = { url, name, feat, closed: false, document: null, focus() {}, close() { this.closed = true; }, postMessage() {}, addEventListener() {}, removeEventListener() {} };
+    const w = { url, name, feat, closed: false, document: document.implementation.createHTMLDocument(''), focus() {}, close() { this.closed = true; }, postMessage() {}, addEventListener() {}, removeEventListener() {} };
     window.__opened.push(w);
     return w;
   };

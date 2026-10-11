@@ -2,9 +2,8 @@
 // against a synthetic dashcam folder and saves named PNGs of the integrated
 // screen (docs/ui-rebuild-contract.md §9.4): empty state, analysis chip and
 // jobs sheet, hosted viewer, project switcher, deliverables sheet, toasts,
-// pop-out — plus the standalone viewer. No frame APIs: everything is read
-// from the main document (a not-yet-hosted legacy viewer frame is reached
-// through its same-origin contentDocument).
+// pop-out — plus the standalone viewer. No frames: the viewer is hosted in
+// the shell document, so everything is read from the main document.
 //
 //   node scripts/capture-screens.mjs [--repo <dir>] [--out <dir>] [--target-dir <dir>]
 //                                     [--sizes 1366x768,1920x1080] [--themes light,dark]
@@ -127,7 +126,7 @@ async function runCombo({ w, h, theme }, sub) {
   await ctx.addInitScript((t) => { try { localStorage.setItem('ft-theme', t); } catch { /* ignore */ } }, theme);
   await ctx.addInitScript(STABLE_INIT, STABLE_CSS);
   // The pop-out shot stubs window.open: no real second window.
-  await ctx.addInitScript(() => { window.open = (url) => ({ url, closed: false, document: null, focus() {}, close() { this.closed = true; }, postMessage() {}, addEventListener() {}, removeEventListener() {} }); });
+  await ctx.addInitScript(() => { window.open = (url) => ({ url, closed: false, document: document.implementation.createHTMLDocument(''), focus() {}, close() { this.closed = true; }, postMessage() {}, addEventListener() {}, removeEventListener() {} }); });
   const page = await ctx.newPage();
   const consoleErrors = [];
   page.on('pageerror', (e) => consoleErrors.push('pageerror: ' + e.message));
@@ -148,7 +147,6 @@ async function runCombo({ w, h, theme }, sub) {
       }
     };
     walk(document.body);
-    for (const fr of document.querySelectorAll('iframe')) { try { if (fr.contentDocument && fr.contentDocument.body) walk(fr.contentDocument.body); } catch { /* cross-origin */ } }
   };
   async function shot(name, desc, target = page) {
     await settle(target);
@@ -164,14 +162,9 @@ async function runCombo({ w, h, theme }, sub) {
     while (Date.now() - t0 < ms) { const s = await status(); if (want.includes(s.phase)) return s; if (s.phase === 'error' || s.phase === 'failed') throw new Error('pipeline ' + s.phase); await sleep(250); }
     throw new Error('timeout waiting for ' + want);
   }
-  // Grid rows fully visible (distinct card tops inside the scroll container),
-  // in the hosted viewer or inside the legacy viewer frame.
+  // Grid rows fully visible (distinct card tops inside the scroll container).
   const visibleRows = (t) => t.evaluate(() => {
-    let doc = document, win = window;
-    if (!document.querySelector('.card[data-id]')) {
-      const fr = document.querySelector('#hViewerHost iframe');
-      try { if (fr && fr.contentDocument) { doc = fr.contentDocument; win = fr.contentWindow; } } catch { /* no access */ }
-    }
+    const doc = document, win = window;
     const cards = [...doc.querySelectorAll('.card[data-id]')];
     const tops = new Set();
     for (const c of cards) {
@@ -215,14 +208,8 @@ async function runCombo({ w, h, theme }, sub) {
     await shot('02b-running-chip', '작업 시트를 닫은 상태 — 진행은 상단 칩에만 표시 (Jobs sheet closed: progress in the chip)');
     await waitPhase(['review-ready', 'done'], 180000);
     await page.waitForSelector('#hViewerHost:not([hidden])', { timeout: 20000 });
-    // Grid cards: the hosted viewer, or (until it is hosted) the legacy
-    // viewer frame in the same mount — measured from the main frame.
-    await page.waitForFunction(() => {
-      const host = document.getElementById('hViewerHost');
-      if (host.querySelector('.card[data-id]')) return true;
-      const fr = host.querySelector('iframe');
-      try { return !!(fr && fr.contentDocument && fr.contentDocument.querySelector('.card[data-id]')); } catch { return false; }
-    }, null, { timeout: 30000 });
+    // Grid cards of the viewer hosted in this document.
+    await page.waitForSelector('#hViewerHost .card[data-id]', { timeout: 30000 });
     await sleep(1500);
     notes.rows = await visibleRows(page);
     const rowsTxt = notes.rows ? notes.rows.visible : '?';
@@ -241,7 +228,7 @@ async function runCombo({ w, h, theme }, sub) {
     await shot('03b-jobs-sheet', '작업 시트 — 삭제 영상 복구 실패 상태 (데모 케이스: 조사된 이미지 없음) (Jobs sheet: recover failed)');
     if (await page.locator('#btnJobClose').isVisible().catch(() => false)) await page.click('#btnJobClose');
     await page.click('#hJobsClose');
-    await page.evaluate(() => { while (typeof dismissNewestToast === 'function' && dismissNewestToast()) { /* clear */ } });
+    await page.evaluate(() => { while (typeof dismissNewestToast === 'function' && dismissNewestToast()) { /* shell box */ } document.querySelectorAll('#hViewerHost #toastHost .toast').forEach((t) => t.remove()); });
 
     // Standalone viewer (what examiners open from the package / a new tab).
     const vpage = await ctx.newPage();
@@ -323,35 +310,31 @@ async function runCombo({ w, h, theme }, sub) {
     await page.evaluate(() => { for (const [m, k] of [['검토 결과를 케이스에 저장했습니다.', 'ok'], ['보강이 끝나면 새 데이터 반영을 누르십시오.', 'warn'], ['캡처 확인용 오류 알림 — 직접 닫을 때까지 남습니다.', 'err']]) toast(m, k); });
     await sleep(200);
     await shot('06c-toast-hosted', '호스트 화면 — 알림 3개 + 작업 시트 열림 (알림은 시트 왼쪽, 상단 바 아래) (Three toasts with the jobs sheet open)');
-    await page.evaluate(() => { while (dismissNewestToast()) { /* clear */ } });
+    await page.evaluate(() => { while (typeof dismissNewestToast === 'function' && dismissNewestToast()) { /* shell box */ } document.querySelectorAll('#hViewerHost #toastHost .toast').forEach((t) => t.remove()); });
     await page.click('#hJobsClose');
 
     await page.click('#hBtnFinalize');
     await page.waitForSelector('#hFinalizeSheet:not([hidden])');
-    await sleep(400);
-    await shot('07-finalize-sheet', '결과물 시트 — 보고서 생성·패키징 (1차 버튼 1개) · 접힌 고급 (Deliverables sheet)');
+    const finSettled = () => page.waitForFunction(() => { const v = document.getElementById('finalVerdict'); return v && !/loading/.test(v.className) && document.querySelectorAll('#finalChecklist li').length > 0; }, null, { timeout: 15000 }).catch(() => {});
+    await finSettled();
+    if (await page.locator('#finalExaminer').isVisible().catch(() => false)) await page.fill('#finalExaminer', '데모 검토자');
+    await sleep(300);
+    await shot('07-finalize-sheet', '결과물 시트 — 점검표 · 보고서 생성·패키징 (1차 버튼 1개) · 접힌 고급 (Deliverables sheet)');
     // Blocked: unsaved marks in the viewer hold the package back (the save
     // state is forced for the shot only, then restored).
-    await page.evaluate(() => { window.__ssKeep = hViewer.saveState; hViewer.saveState = () => 'pending'; });
-    await page.click('#btnFinalize');
-    const dlg = await page.waitForSelector('#dlgBackdrop:not([hidden])', { timeout: 6000 }).catch(() => null);
-    await sleep(600);
+    await page.evaluate(() => { window.__ssKeep = window.FTViewer.saveState; window.FTViewer.saveState = () => 'pending'; });
+    await page.click('#btnFinalRecheck');
+    await finSettled();
+    await sleep(300);
     await shot('07b-finalize-blocked', '결과물 — 저장되지 않은 마크가 있어 차단된 상태 (Deliverables blocked by unsaved marks)');
-    await page.evaluate(() => { hViewer.saveState = window.__ssKeep; });
-    if (dlg) {
-      if (await page.locator('#dlgRecheck').isVisible().catch(() => false)) {
-        await page.click('#dlgRecheck');
-        await page.waitForFunction(() => !document.getElementById('dlgOk').disabled, null, { timeout: 15000 }).catch(() => {});
-      }
-      const examiner = page.locator('#dlgExaminer, #finalExaminer').first();
-      if (await examiner.isVisible().catch(() => false)) await examiner.fill('데모 검토자');
-      await page.click('#dlgOk');
-    } else if (await page.locator('#finalExaminer').isVisible().catch(() => false)) {
-      await page.fill('#finalExaminer', '데모 검토자');
-      await page.click('#btnFinalize');
-    }
+    await page.evaluate(() => { window.FTViewer.saveState = window.__ssKeep; });
+    await page.click('#btnFinalRecheck');
+    await finSettled();
+    await page.waitForFunction(() => !document.getElementById('btnFinalize').disabled, null, { timeout: 15000 }).catch(() => {});
+    await page.click('#btnFinalize');
     await waitPhase(['done'], 180000);
-    await sleep(2500);
+    await page.waitForSelector('#finalLinks a', { timeout: 20000 }).catch(() => {});
+    await sleep(800);
     await shot('08-finalized', '결과물 시트 — 생성된 보고서 링크와 패키지 경로 (Deliverables done: links + package path)');
     await page.keyboard.press('Escape');
     await sleep(200);

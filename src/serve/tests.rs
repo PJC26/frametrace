@@ -925,9 +925,9 @@ fn legacy_examiner_page_served_when_env_set() {
 
 #[test]
 fn examiner_page_hosts_the_shared_viewer_fragment_at_most_once() {
-    // While the shell still embeds the viewer by iframe it carries no
-    // fragment; once it hosts the viewer (<html data-ft-host>) it carries
-    // exactly one, plus the viewer bundle (window.FTViewer).
+    // The integrated shell hosts the viewer (<html data-ft-host>): exactly
+    // one expanded fragment plus the viewer bundle (window.FTViewer), and no
+    // marker text left over (build.rs refuses markers inside shell parts).
     assert!(
         !EXAMINER_PAGE.contains("<!-- @include:") && !EXAMINER_PAGE.contains("<!-- @bundle:app")
     );

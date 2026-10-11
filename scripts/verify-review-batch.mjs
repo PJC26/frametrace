@@ -321,32 +321,19 @@ async function unitTests() {
     ex.document.getElementById('caseDir').value = '/tmp/nope';
     await ex.openCase('/tmp/nope');
     assert.equal(dom.startErr.textContent.includes('서버에 연결할 수 없습니다'), true);
-    // One integrated screen: no step rail any more — the reset shows in the
-    // shell's workflow latches (docs/ui-rebuild-contract.md §2.2).
-    assert.equal(runInNewContext('reviewReady || jobSeen', ex), false);
-    assert.equal(dom.btnFinalize.disabled, true);
   };
   await openFail();
-  console.log('PASS VM examiner open-case failure resets workflow state');
-  // A successful switch must also clear the previous case's results —
-  // otherwise stale report links, package paths and the audit badge of
-  // case A stay visible while case B is being reviewed.
-  dom.finalLinks.innerHTML = '<a href="/case/reports/case-report.html">old</a>';
-  dom.pkgPath.textContent = 'old-package';
-  dom.pkgPath.classList.add('show');
-  dom.btnFinalize.disabled = false;
-  dom.btnFinalize.textContent = '보고서 재생성';
+  console.log('PASS VM examiner open-case failure is reported');
+  // A successful switch clears what the shell owns from the previous case
+  // (audit badge, audit latch). The deliverables sheet resets itself on the
+  // project change (41-finalize.js finResetSheet; verify-finalize-sheet 6).
   dom.auditBadge.className = 'badge ok';
   dom.auditBadge.textContent = '감사 로그 구조 검증됨';
-  runInNewContext('reviewReady = true; jobSeen = true;', ex);
+  runInNewContext('auditVerified = true;', ex);
   ex.fetch = async () => ({ ok: true, has_review: true });
   await ex.openCase('/tmp/other-case');
-  assert.equal(dom.finalLinks.innerHTML, '');
-  assert.equal(dom.pkgPath.textContent, '');
-  assert.equal(dom.btnFinalize.disabled, true);
-  assert.equal(dom.btnFinalize.textContent, '보고서 생성·패키징');
   assert.equal(dom.auditBadge.textContent, '감사 로그 대기');
-  assert.equal(runInNewContext('reviewReady || jobSeen', ex), false);
+  assert.equal(runInNewContext('auditVerified', ex), false);
   console.log('PASS VM examiner open-case success clears stale results');
   // SHOULD-FIX 4: "모두 일치" only when files were compared and none were
   // left uncompared.

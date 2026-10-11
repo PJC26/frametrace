@@ -51,6 +51,15 @@
 #hJobsSheet #jobsCounts { font-size: var(--fs-xs); color: var(--muted); }
 #hJobsSheet .h-job-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 #hJobsSheet .h-job-chk { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: var(--fs-sm); min-height: 24px; }
+/* 24px hit box (WCAG 2.5.8) around a 16px drawn box; the sheet floats over
+   the viewer, so a smaller native checkbox would sit on other targets. */
+#hJobsSheet .h-job-chk input { appearance: none; flex: none; display: grid; place-items: center; width: 24px; height: 24px; margin: 0; border-radius: var(--radius); cursor: pointer; }
+#hJobsSheet .h-job-chk input::before { content: ""; grid-area: 1 / 1; width: 16px; height: 16px; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--surface); }
+#hJobsSheet .h-job-chk input::after { content: ""; grid-area: 1 / 1; width: 4px; height: 8px; margin-top: -2px; border: solid var(--on-accent); border-width: 0 2px 2px 0; transform: rotate(45deg); visibility: hidden; }
+#hJobsSheet .h-job-chk input:checked::before { background: var(--accent); border-color: var(--accent); }
+#hJobsSheet .h-job-chk input:checked::after { visibility: visible; }
+#hJobsSheet .h-job-chk input:hover:not(:disabled)::before { border-color: var(--accent); }
+#hJobsSheet .h-job-chk input:disabled::before { background: var(--disabled-bg); border-color: var(--border); }
 #hJobsSheet .h-job-err { padding: 8px 12px; border: 1px solid var(--danger); border-radius: var(--radius); background: var(--failed-bg); color: var(--failed-fg); font-size: var(--fs-sm); }
 #hJobsSheet .h-job-err .hintline { margin-top: 4px; }
 #hJobsSheet .h-job-err pre { margin: 6px 0 0; max-height: 140px; overflow: auto; white-space: pre-wrap; font: var(--fs-xs) var(--font-mono); }

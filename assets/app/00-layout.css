@@ -228,6 +228,9 @@ html[data-mode="wait"] .h-host > .ft-viewer { display: none; }
    mode), left of an open sheet, never over a control. */
 .h-toastbox { position: fixed; z-index: 60; top: calc(var(--h-top) + 8px + var(--h-banner)); right: 16px; width: min(400px, calc(100vw - 32px)); display: grid; gap: 6px; pointer-events: none; }
 html[data-mode="project"] .h-toastbox, html[data-mode="wait"] .h-toastbox { top: calc(var(--h-top) + 48px + var(--h-banner)); }
+/* The hosted viewer's toast host (one host at a time, §6.5) moves left of an
+   open sheet too, so a toast is never hidden under it. */
+html[data-sheet] .h-host .ft-viewer.hosted #toastHost { right: calc(var(--h-sheet-w) + 16px); width: min(400px, calc(100vw - var(--h-sheet-w) - 32px)); }
 html[data-sheet] .h-toastbox { right: calc(var(--h-sheet-w) + 16px); width: min(400px, calc(100vw - var(--h-sheet-w) - 32px)); }
 .h-toast { display: flex; align-items: flex-start; gap: 8px; padding: 8px 6px 8px 12px; border: 1px solid var(--border-strong); border-left: 4px solid var(--info); border-radius: var(--radius); background: var(--surface); color: var(--text); font-size: var(--fs-sm); box-shadow: var(--h-pop-shadow); pointer-events: none; }
 .h-toast .h-toast-msg { flex: 1; min-width: 0; padding-top: 4px; overflow-wrap: anywhere; }
