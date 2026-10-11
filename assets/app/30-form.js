@@ -113,6 +113,8 @@ function updateModeInfo() {
   }
   el.className = "modeinfo" + (warn ? " warn" : "");
   el.textContent = text;
+  // The preflight's hash-cost line depends on the SHA-256 checkbox.
+  renderPreflightBox();
 }
 
 function inputKind() {

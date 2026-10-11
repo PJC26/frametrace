@@ -10,8 +10,146 @@ let reviewFrameLoaded = false;
 function ensureReviewFrame(partial) {
   if (!reviewFrameLoaded) {
     reviewFrameLoaded = true;
-    reviewFrame.src = partial ? "/viewer/?embed=1" : "/review/evidence-viewer.html?embed=1";
+    loadReviewFrame(partial ? "/viewer/?embed=1" : "/review/evidence-viewer.html?embed=1");
   }
+}
+
+// ---- UX-18: frame load watchdog + visible retry ----
+// "loading" until the frame's load event shows a real viewer document;
+// "failed" after FRAME_TIMEOUT_MS without one, or when it loaded an error
+// page (404 text has no <script>). Retrying a failed frame is safe — a
+// viewer that never came up holds no marks.
+const FRAME_TIMEOUT_MS = 20000;
+let frameState = "idle", frameUrl = "", frameAttempt = 0, frameTimer = 0;
+function loadReviewFrame(url) {
+  frameUrl = url;
+  frameAttempt += 1;
+  frameState = "loading";
+  showFrameFail(null);
+  clearTimeout(frameTimer);
+  frameTimer = setTimeout(frameWatchdog, FRAME_TIMEOUT_MS);
+  // A retry needs a distinct URL or a cached failure may be replayed.
+  reviewFrame.src = frameAttempt > 1 ? `${url}${url.includes("?") ? "&" : "?"}retry=${frameAttempt}` : url;
+}
+// Same-origin inspection: a viewer page carries scripts (and soon its
+// summary hook); a plain-text error body does not. Cross-origin or
+// uninspectable frames are trusted once they fire load.
+function frameDocState() {
+  try {
+    const doc = reviewFrame.contentDocument;
+    if (!doc) return "unknown";
+    const w = reviewFrame.contentWindow;
+    if (w && typeof w.__frametraceSummary === "function") return "alive";
+    if (doc.querySelector && doc.querySelector("script")) return "alive";
+    return doc.readyState === "loading" ? "loading" : "empty";
+  } catch (e) { return "unknown"; }
+}
+function frameWatchdog() {
+  frameTimer = 0;
+  if (frameState !== "loading") return;
+  // DOM is up and the viewer is running even though some subresource
+  // still holds the load event: not a failure.
+  if (frameDocState() === "alive") { frameState = "ok"; return; }
+  frameFailed(`${Math.round(FRAME_TIMEOUT_MS / 1000)}초 동안 뷰어가 응답하지 않았습니다 — 서버가 바쁘거나 연결이 끊겼을 수 있습니다.`);
+}
+function frameFailed(msg) {
+  frameState = "failed";
+  clearTimeout(frameTimer);
+  frameTimer = 0;
+  showFrameFail(msg);
+}
+function showFrameFail(msg) {
+  const box = $("frameFail");
+  if (!box) return;
+  box.hidden = !msg;
+  if (msg) $("frameFailMsg").textContent = msg;
+}
+function onReviewFrameLoad() {
+  if (!reviewFrameLoaded) return;
+  const st = frameDocState();
+  if (st === "empty") {
+    frameFailed("뷰어 페이지가 비어 있거나 오류 응답입니다 — 검토 데이터가 아직 만들어지지 않았거나 서버 오류일 수 있습니다.");
+    return;
+  }
+  clearTimeout(frameTimer);
+  frameTimer = 0;
+  frameState = "ok";
+  showFrameFail(null);
+  syncViewerChrome();
+  // The viewer wires its language button after its data loads.
+  setTimeout(syncViewerChrome, 1500);
+  setTimeout(syncViewerChrome, 5000);
+}
+reviewFrame.addEventListener("load", onReviewFrameLoad);
+$("btnFrameRetry").addEventListener("click", () => {
+  if (!frameUrl) return;
+  if (frameState !== "failed") { showFrameFail(null); return; }
+  loadReviewFrame(frameUrl);
+});
+$("btnFrameWindow").addEventListener("click", () => {
+  const win = window.open(standaloneViewerUrl(), "_blank");
+  if (!win) toast("팝업이 차단되었습니다 — 브라우저에서 이 사이트의 팝업을 허용하십시오.", "warn");
+});
+
+// ---- viewer data refresh after a background job (UX-06) ----
+// Never `src = src`: that navigation drops marks still being saved.
+// 1) ask the viewer over postMessage ({type:"ft-reload"}); a viewer that
+//    handles it answers {type:"ft-reload-ack"} (or reloads itself, which
+//    fires the frame's load event); 2) otherwise reload it only when its
+//    save indicator is clean; 3) else defer and let the examiner retry.
+const VIEWER_RELOAD_ACK_MS = 1500;
+function viewerHasUnsaved() {
+  const ss = viewerSaveState();
+  return ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued";
+}
+function waitForViewerAck(ms) {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = v => {
+      if (done) return;
+      done = true;
+      window.removeEventListener("message", onMsg);
+      reviewFrame.removeEventListener("load", onLoad);
+      resolve(v);
+    };
+    const onMsg = e => {
+      let fromFrame = true;
+      try { fromFrame = !e.source || e.source === reviewFrame.contentWindow; } catch (err) { fromFrame = true; }
+      if (fromFrame && e.data && e.data.type === "ft-reload-ack") finish(e.data.reloaded === false ? "refused" : "ack");
+    };
+    const onLoad = () => finish("ack");
+    window.addEventListener("message", onMsg);
+    reviewFrame.addEventListener("load", onLoad);
+    setTimeout(() => finish(null), ms);
+  });
+}
+// "none" (no frame yet — the next open loads fresh data), "posted"
+// (the viewer took it), "reloaded", "deferred" (unsaved marks).
+async function refreshViewerData(reason) {
+  if (!reviewFrameLoaded) return "none";
+  if (frameState === "failed" || frameState === "loading") {
+    // Nothing reviewable is on screen: (re)load is safe.
+    if (frameState === "failed") loadReviewFrame(frameUrl);
+    return "reloaded";
+  }
+  const ack = waitForViewerAck(VIEWER_RELOAD_ACK_MS);
+  postToViewer({ type: "ft-reload", reason: reason || "" });
+  const got = await ack;
+  if (got === "ack") return "posted";
+  if (got === "refused") return "deferred";
+  return guardedFrameReload();
+}
+function guardedFrameReload() {
+  if (viewerHasUnsaved()) {
+    retryViewerSave(); // start saving now; the examiner retries after
+    return "deferred";
+  }
+  try {
+    reviewFrame.contentWindow.location.reload();
+  } catch (e) {
+    loadReviewFrame(frameUrl);
+  }
+  return "reloaded";
 }
 function refreshCaseStats() {
   const el = $("caseStats");
@@ -77,23 +215,5 @@ $("btnViewerWindow").addEventListener("click", () => {
   else window.open(standaloneViewerUrl(), "_blank"); // popup blocked: fall back to a tab
 });
 
-$("btnRecoverDeleted").addEventListener("click", async () => {
-  const btn = $("btnRecoverDeleted");
-  btn.disabled = true;
-  $("recoverHint").textContent = "삭제 영상 후보 복구 중… (후보 수에 따라 시간이 걸릴 수 있습니다)";
-  let done = false;
-  try {
-    const res = await jpost("/api/recover-deleted", {});
-    if (!res.ok) {
-      $("recoverHint").textContent = "복구 실패: " + (res.error || "알 수 없는 오류");
-      return;
-    }
-    done = true;
-    $("recoverHint").textContent = "복구 완료 — 뷰어를 갱신합니다.";
-    if (reviewFrameLoaded) reviewFrame.src = reviewFrame.src;
-  } finally {
-    btn.disabled = false;
-    if (!done && /중…/.test($("recoverHint").textContent)) $("recoverHint").textContent = "복구가 완료되지 않았습니다 — 다시 시도할 수 있습니다.";
-  }
-});
+// Recover / Carve run as background case jobs: see 65-jobs.js.
 

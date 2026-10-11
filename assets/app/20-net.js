@@ -11,6 +11,9 @@ async function readJson(r) {
     const status = r && r.status ? `HTTP ${r.status}` : "응답 없음";
     return Object.assign({}, data && typeof data === "object" ? data : {}, {
       ok: false,
+      // HTTP status kept so callers can tell "endpoint not in this server
+      // build" (404/405 — degrade quietly) from a real failure.
+      status: (r && r.status) || 0,
       error: (data && data.error) || `서버 오류 (${status})`,
     });
   }
@@ -18,7 +21,7 @@ async function readJson(r) {
   return data;
 }
 function netError(err) {
-  return { ok: false, network: true, error: "서버에 연결할 수 없습니다: " + ((err && err.message) || err || "network") };
+  return { ok: false, network: true, status: 0, error: "서버에 연결할 수 없습니다: " + ((err && err.message) || err || "network") };
 }
 // jget throws on failure (existing callers wrap it and treat a throw as
 // "unknown"); jpost never throws — it always resolves to { ok, error }.
@@ -27,6 +30,20 @@ async function jget(url) {
   const data = await readJson(r);
   if (!(r && r.ok) || data.malformed) throw new Error(data.error);
   return data;
+}
+// Like jpost for GET: never throws, keeps the HTTP status on failure.
+async function jgetSoft(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    return await readJson(r);
+  } catch (err) {
+    return netError(err);
+  }
+}
+// True when a soft call failed because the server does not have the
+// endpoint (an older build) — callers then hide the feature, not error.
+function endpointMissing(res) {
+  return !!(res && !res.ok && (res.status === 404 || res.status === 405 || res.status === 501));
 }
 async function jpost(url, body) {
   try {

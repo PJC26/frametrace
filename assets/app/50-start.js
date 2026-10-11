@@ -6,7 +6,12 @@ $("btnStart").addEventListener("click", async () => {
   $("startErr").classList.remove("show");
   // Preflight: never write case output inside the evidence source.
   const caseDir = $("caseDir").value.trim();
-  if (caseDir && pathInside(caseDir, source)) {
+  // UX-11: the server-side preflight (when this server has it) also sees
+  // symlinks/junctions the string check cannot; give it a bounded moment.
+  starting = true;
+  let pf = null;
+  try { pf = await ensurePreflight(source, caseDir); } finally { starting = false; }
+  if ((caseDir && pathInside(caseDir, source)) || (pf && pf.case_inside_source === true)) {
     const go = await askDialog({
       title: "케이스 폴더가 증거 소스 안에 있습니다",
       html: `<p>케이스 폴더 <code>${esc(caseDir)}</code>가 증거 소스 <code>${esc(source)}</code> 안에 있습니다.</p>` +
@@ -85,6 +90,7 @@ function resetCaseUi() {
   $("advOut").textContent = "";
   $("advLink").innerHTML = "";
   $("track").innerHTML = "";
+  setCaseToolsVisible(false);
   resetLogView();
   shownStatusError = null;
   const audit = $("auditBadge");
@@ -143,9 +149,41 @@ $("btnCancel").addEventListener("click", async () => {
 });
 // Reload alone lands back on the review stage (the poll auto-jumps on a
 // completed case); the flag keeps stage 1 on this load only.
-$("btnNew").addEventListener("click", () => {
-  sessionStorage.setItem("ft_want_new", "1");
+// UX-18: a page reload also reloads the embedded viewer, so it is guarded
+// exactly like the viewer's own refresh: never while marks/memos are not
+// yet in the case DB — offer to save instead.
+async function viewerUnsavedCount() {
+  const ss = viewerSaveState();
+  let pending = 0;
+  try { pending = await pendingViewerChanges(); } catch (e) { pending = 0; }
+  const unsaved = ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued";
+  return { pending: Number(pending) || 0, unsaved, saveState: ss };
+}
+async function guardedPageReload(reason) {
+  const u = await viewerUnsavedCount();
+  if (u.pending > 0 || u.unsaved) {
+    const go = await askDialog({
+      title: reason || "화면 새로 고침",
+      html: `<p><b>케이스에 아직 반영되지 않은 마크·메모 변경${u.pending ? ` ${u.pending}건` : ""}</b>이 있어 화면을 새로 고치지 않았습니다.</p>` +
+        `<p>'저장 다시 시도'로 저장한 뒤 다시 누르십시오 — 저장 상태가 '저장됨'이 되면 진행할 수 있습니다.</p>`,
+      okLabel: "저장 다시 시도", cancelLabel: "닫기",
+    });
+    if (go && !retryViewerSave()) toast("뷰어가 열려 있지 않아 저장을 다시 시도하지 못했습니다 — 검토 화면에서 저장 상태를 확인하십시오.", "warn");
+    return false;
+  }
   location.reload();
+  return true;
+}
+$("btnNew").addEventListener("click", async () => {
+  const btn = $("btnNew");
+  btn.disabled = true;
+  try {
+    try { sessionStorage.setItem("ft_want_new", "1"); } catch (e) { /* storage blocked: stage 1 may auto-advance */ }
+    const reloaded = await guardedPageReload("새 케이스 시작");
+    if (!reloaded) { try { sessionStorage.removeItem("ft_want_new"); } catch (e) {} }
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 $("directE01").addEventListener("change", syncDirectE01);

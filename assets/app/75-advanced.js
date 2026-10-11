@@ -1,30 +1,3 @@
-$("btnCarve").addEventListener("click", async () => {
-  const go = await askDialog({
-    title: "이미지 카빙",
-    html: "<p>export된 raw 이미지에서 영상 시그니처 카빙을 실행합니다.</p><p>이미지 크기에 따라 시간이 걸릴 수 있습니다. 계속하시겠습니까?</p>",
-    okLabel: "카빙 실행",
-  });
-  if (!go) return;
-  const btn = $("btnCarve");
-  btn.disabled = true;
-  $("recoverHint").textContent = "시그니처 카빙 실행 중… (이미지 크기에 따라 시간이 걸릴 수 있습니다)";
-  let done = false;
-  try {
-    const reassemble = $("chkReassemble") && $("chkReassemble").checked;
-    const res = await jpost(reassemble ? "/api/carve?reassemble=1" : "/api/carve", {});
-    if (!res.ok) {
-      $("recoverHint").textContent = "카빙 실패: " + (res.error || "알 수 없는 오류");
-      return;
-    }
-    done = true;
-    $("recoverHint").textContent = "카빙 완료 — 뷰어를 갱신합니다.";
-    if (reviewFrameLoaded) reviewFrame.src = reviewFrame.src;
-  } finally {
-    btn.disabled = false;
-    if (!done && /중…/.test($("recoverHint").textContent)) $("recoverHint").textContent = "카빙이 완료되지 않았습니다 — 다시 시도할 수 있습니다.";
-  }
-});
-
 document.querySelectorAll("[data-adv]").forEach(btn => {
   btn.addEventListener("click", async () => {
     const tool = btn.dataset.adv;

@@ -6,6 +6,31 @@ function setStep(active, doneCount) {
     if (i === active) el.setAttribute("aria-current", "step");
     else el.removeAttribute("aria-current");
   }
+  stepActive = active; stepDone = doneCount || 0;
+  renderCrumbs();
+}
+
+// ---- UX-12: compact breadcrumb / step indicator ----
+// Mirrors the rail (workflow position + which stage is on screen) in one
+// line above the card, plus the bound case folder name.
+const CRUMB_NAMES = ["입력", "분석 진행", "검토", "결과물"];
+let stepActive = 1, stepDone = 0, viewShown = "1";
+function crumbsHtml(active, done, view, caseDir) {
+  const items = CRUMB_NAMES.map((name, i) => {
+    const n = i + 1;
+    const cls = ["cr", n <= done ? "done" : "", n === active ? "cur" : "", String(n) === String(view) ? "onview" : ""].filter(Boolean).join(" ");
+    const mark = n <= done ? "✓" : String(n);
+    return `<span class="${cls}"${n === active ? ' aria-current="step"' : ""}>${mark} ${esc(name)}</span>`;
+  });
+  const base = String(caseDir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  return items.join(`<span class="sep" aria-hidden="true">›</span>`) +
+    `<span class="sep">·</span><span>단계 ${active}/4</span>` +
+    (base ? `<span class="casename" title="${esc(caseDir)}">케이스: ${esc(base)}</span>` : "");
+}
+function renderCrumbs() {
+  const el = $("crumbs");
+  if (!el) return;
+  el.innerHTML = crumbsHtml(stepActive, stepDone, viewShown, lastStatus && lastStatus.case_dir);
 }
 
 // --- view switching: one screen per workflow stage ---
@@ -13,6 +38,8 @@ function showView(n) {
   const key = String(n);
   document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.dataset.view === key));
   document.querySelectorAll(".navstep").forEach(b => b.classList.toggle("sel", b.dataset.view === key));
+  viewShown = key;
+  renderCrumbs();
 }
 document.querySelectorAll(".navstep").forEach(b => b.addEventListener("click", () => {
   showView(b.dataset.view);
@@ -245,6 +272,11 @@ async function poll() {
   if (st.instance) lastInstance = st.instance;
   lastStatus = st;
   try {
+    caseJobOnStatus(st);
+  } catch (err) {
+    console.error("case job update failed:", err);
+  }
+  try {
     applyStatus(st);
   } catch (err) {
     console.error("status render failed:", err);
@@ -328,6 +360,9 @@ function applyStatus(st) {
       setStep(3, 2);
     }
     if (partial) reviewPartialSeen = true;
+    // UX-12: Recover/Carve only make sense once a case is open for review.
+    setCaseToolsVisible(reviewReady && !!st.case_dir);
+    renderCrumbs();
     const errEl = $("startErr");
     if (st.error) {
       // Re-render only when something else replaced the box, so an

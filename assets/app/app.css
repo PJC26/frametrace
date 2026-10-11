@@ -154,7 +154,44 @@ pre.log { background: #15181a; color: #c8e8e0; border-radius: 7px; padding: 10px
 .btnlink { display: inline-flex; align-items: center; height: 28px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--line); color: var(--ink); font-size: 12.5px; text-decoration: none; }
 .btnlink:hover { border-color: var(--accent); color: var(--accent); }
 .vsep { width: 1px; align-self: stretch; background: var(--line); margin: 2px 4px; }
-#reviewFrame { flex: 1; min-height: 420px; border: 1px solid var(--line); border-radius: 6px; margin-top: 10px; background: #fff; }
+.framewrap { position: relative; flex: 1; display: flex; flex-direction: column; min-height: 420px; margin-top: 10px; }
+#reviewFrame { flex: 1; min-height: 420px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+/* UX-18: a frame that never loads (or loads an error page) gets a
+   visible retry instead of staying an indefinitely blank rectangle. */
+.framefail { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 24px; text-align: center; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font-size: 13px; }
+.framefail b { font-size: 14px; color: var(--danger); }
+.framefail span { max-width: 560px; color: var(--muted); }
+.framefail .row { display: flex; gap: 8px; justify-content: center; }
+/* UX-06: background recover/carve job — progress, elapsed, cancel. */
+.jobpanel { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); font-size: 12.5px; }
+.jobpanel .jobtext { flex: 1; min-width: 200px; }
+.jobpanel #jobDetail { color: var(--muted); }
+.jobpanel .jobelapsed { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.jobpanel button { height: 26px; font-size: 12px; }
+.jobdot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); flex: none; }
+.jobpanel.running .jobdot { animation: pulse 1.2s ease-in-out infinite; }
+.jobpanel.ok .jobdot { background: var(--ok); }
+.jobpanel.failed { border-color: var(--danger); }
+.jobpanel.failed .jobdot { background: var(--danger); }
+.jobpanel.cancelled .jobdot, .jobpanel.deferred .jobdot { background: var(--warn); }
+/* UX-12: compact location / step indicator above the stage card. */
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin: 0 0 8px; font-size: 12px; color: var(--muted); min-height: 18px; }
+.crumbs .cr { white-space: nowrap; }
+.crumbs .cr.done { color: var(--ok); }
+.crumbs .cr.cur { color: var(--ink); font-weight: 600; }
+.crumbs .cr.onview { text-decoration: underline; text-underline-offset: 3px; }
+.crumbs .sep { opacity: .5; }
+.crumbs .casename { margin-left: 6px; padding-left: 8px; border-left: 1px solid var(--line); font-family: var(--mono); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* UX-10 / UX-11: checkpoint resume choice and preflight panel. */
+.resumebox { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; padding: 7px 10px; border: 1px solid var(--warn); border-radius: 7px; font-size: 12.5px; }
+.resumebox #resumeText { flex: 1; min-width: 200px; }
+.resumebox button { height: 26px; font-size: 12px; }
+.preflight { margin: 8px 0 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); font-size: 12.5px; line-height: 1.55; }
+.preflight .pf-head { font-weight: 600; margin-bottom: 2px; }
+.preflight ul { margin: 2px 0 0; padding-left: 16px; }
+.preflight li.warn { color: var(--warn); }
+.preflight li.err { color: var(--danger); font-weight: 600; }
+.preflight .pf-note { color: var(--muted); font-size: 11.5px; }
 .stack { display: grid; gap: 6px; }
 .stack button { width: 100%; text-align: left; justify-content: flex-start; }
 .stack button.ghost { border: 1px solid var(--line); background: var(--bg); color: var(--ink); padding: 0 12px; }

@@ -90,6 +90,7 @@ function scheduleValidate() {
 async function validatePaths() {
   const src = $("sourcePath").value.trim();
   const srcEl = $("sourceStatus");
+  schedulePreflight();
   if (!src) {
     setStatus(srcEl, "", "");
   } else {
@@ -108,10 +109,12 @@ async function validatePaths() {
   const caseEl = $("caseStatus");
   if (!dir) {
     setStatus(caseEl, "", "");
+    renderResumeBox(null);
   } else {
     try {
       const res = await jget("/api/browse?path=" + encodeURIComponent(dir));
       if ($("caseDir").value.trim() !== dir) return;
+      if (!res.is_case) renderResumeBox(null);
       const underSource = src && pathInside(dir, src);
       if (res.is_file) setStatus(caseEl, "err", "파일 경로입니다 — 폴더를 지정하십시오.");
       else if (underSource) setStatus(caseEl, "err", "케이스 폴더가 증거 소스 안에 있습니다 — 원본 매체에 산출물이 기록됩니다. 다른 드라이브의 폴더를 지정하십시오.");
@@ -120,6 +123,7 @@ async function validatePaths() {
         // UX-10: surface what the server will do with an existing case.
         const info = await caseResumeInfo(dir);
         if ($("caseDir").value.trim() !== dir) return;
+        renderResumeBox(info);
         if (info.checkpoint) setStatus(caseEl, "warn",
           "중단된 스캔 체크포인트가 있습니다 — 같은 소스·같은 옵션으로 '분석 시작'하면 완료된 파일은 건너뛰고 이어서 진행합니다 (모드: 이어서 분석). " +
           "옵션이나 소스가 다르면 처음부터 다시 스캔합니다. 완전히 새로 시작하려면 다른(빈) 케이스 폴더를 지정하십시오.");
@@ -127,15 +131,33 @@ async function validatePaths() {
         else setStatus(caseEl, "warn", "기존 케이스이지만 검토 결과가 없습니다 — 이전 분석이 끝나지 않았을 수 있습니다. '분석 시작'으로 이어서 진행하십시오.");
       }
       else setStatus(caseEl, "ok", "기존 폴더입니다 — 이 폴더 안에 케이스가 새로 만들어집니다.");
-    } catch { setStatus(caseEl, "", ""); }
+    } catch { setStatus(caseEl, "", ""); renderResumeBox(null); }
   }
 }
 
 // Probes the case folder through /api/browse (the only path API the
 // server has): db/scan-progress.jsonl exists only while a scan is
 // interrupted (finish() deletes it); review/index.html marks a completed
-// review build. The server does not expose the checkpoint's N-of-M count.
+// review build. UX-10: a server with GET /api/case-info also reports the
+// checkpoint's N-of-M ({checkpoint:{done,total}}); older ones fall back
+// to the probes (no count).
 async function caseResumeInfo(dir) {
+  const ci = await fetchCaseInfo(dir);
+  if (ci) {
+    const cp = ci.checkpoint && typeof ci.checkpoint === "object" ? ci.checkpoint : null;
+    const review = typeof ci.has_review === "boolean" ? ci.has_review : (typeof ci.review === "boolean" ? ci.review : null);
+    if (cp || review !== null) {
+      return {
+        checkpoint: !!cp,
+        done: cp ? Number(cp.done) : NaN,
+        total: cp ? Number(cp.total) : NaN,
+        review: review !== null ? review : (await caseResumeProbe(dir)).review,
+      };
+    }
+  }
+  return caseResumeProbe(dir);
+}
+async function caseResumeProbe(dir) {
   const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
   const base = dir.replace(/[\\/]+$/, "");
   const probe = async rel => {
