@@ -112,7 +112,8 @@ function chipModel(S, now) {
   if (clips.running.length) {
     const bytes = clips.running.reduce((n, c) => n + (Number(c.bytes_written) || 0), 0);
     const base = Math.max(...clips.running.map(c => Number(c.elapsed_secs) || 0));
-    const since = J.statusAt ? Math.max(0, (now - J.statusAt) / 1000) : 0;
+    const at = typeof pollStatusAt === "number" ? pollStatusAt : 0;
+    const since = at ? Math.max(0, (now - at) / 1000) : 0;
     return { mode: "clips", cls: "running", title: "클립 내보내기",
       detail: `${clips.running.length}건 진행 중` + (bytes > 0 ? JOIN + fmtBytes(bytes) : ""), elapsed: base + since, live: true };
   }

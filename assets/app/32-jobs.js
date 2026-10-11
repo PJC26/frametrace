@@ -446,7 +446,7 @@ $("btnNew").addEventListener("click", async () => {
   const go = document.getElementById(PROJECT_NEW_ID);
   if (go && typeof go.click === "function") { go.click(); return; }
   const ss = typeof FTViewer === "object" && FTViewer && typeof FTViewer.saveState === "function" ? FTViewer.saveState() : null;
-  if (ss && ss !== "saved" && ss !== "local") {
+  if (hViewerStateUnsaved(ss, () => { try { return Number((FTViewer.summary() || {}).pending) || 0; } catch (e) { return 1; } })) {
     if (typeof FTViewer.save === "function") { try { FTViewer.save(); } catch (e) { /* surfaced by the viewer */ } }
     toast("아직 저장되지 않은 마크·메모가 있습니다 — 저장 상태가 '저장됨'이 된 뒤 다시 누르십시오.", "warn");
     return;

@@ -49,7 +49,7 @@ function hProjectPopRender() {
 // Resolves true when the viewer has nothing unsaved (or the examiner saved
 // it from the dialog); false keeps the current project.
 async function hConfirmLeave(title) {
-  const unsaved = () => { const ss = hViewer.saveState(); return !!ss && ss !== "saved"; };
+  const unsaved = () => hViewer.hasUnsaved();
   if (!FTStore.state.viewer.mounted || !unsaved()) return true;
   const go = await askDialog({
     title,

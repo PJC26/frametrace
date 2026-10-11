@@ -111,6 +111,11 @@ function hViewerApi() {
   const v = typeof window !== "undefined" ? window.FTViewer : null;
   return v && typeof v.init === "function" ? v : null;
 }
+// saveState → unsaved? pendingCount() is only asked for "local".
+function hViewerStateUnsaved(ss, pendingCount) {
+  if (ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued") return true;
+  return ss === "local" && (typeof pendingCount === "function" ? pendingCount() : 0) > 0;
+}
 let hHostedWired = false;
 // A mount that failed is not retried for the same case on every render
 // (that would spin); opening another case — or this one again — retries.
@@ -147,9 +152,14 @@ const hViewer = {
     if (!v || !FTStore.state.viewer.mounted) return null;
     try { return v.saveState() || null; } catch (e) { return null; }
   },
+  // The one "unsaved" rule for every shell guard (project switch, leaving,
+  // quit): anything not yet in the case DB — including edits that so far
+  // live only in this browser ("local" with a pending count).
   hasUnsaved() {
-    const ss = this.saveState();
-    return ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued";
+    return hViewerStateUnsaved(this.saveState(), () => {
+      const s = this.summary();
+      return Math.max(Number(FTStore.state.viewer.dirty) || 0, Number(s && s.pending) || 0);
+    });
   },
   // Starts a save now; true when a viewer took the request.
   save() {
@@ -190,4 +200,12 @@ function hWireHostedViewer(v) {
   v.on("popout", e => hSetPopped(!!d(e).open));
   v.on("request-popout", () => hPopoutOpen());
   v.on("error", e => { if (d(e).stage === "load") toast("검토 데이터를 불러오지 못했습니다: " + (d(e).message || ""), "err"); });
+  // The viewer's own toasts (a failed save, …) would land in its host
+  // inside the inert #main while the modal deliverables sheet is open:
+  // take them over (cancelable event, §6.5) into the body-level box.
+  v.on("toast", e => {
+    if (!FTStore.state.panels.finalize || !e || typeof e.preventDefault !== "function") return;
+    e.preventDefault();
+    toast(String(d(e).message || ""), d(e).kind === "error" ? "err" : "info");
+  });
 }

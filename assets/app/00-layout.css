@@ -51,6 +51,16 @@ body { margin: 0; display: flex; flex-direction: column; overflow: hidden; backg
 #hProjectBtn:disabled { color: var(--muted); }
 .h-project-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .h-spacer { flex: 1 1 0; min-width: 0; }
+/* 검토자 — quiet strip button; the name ellipsizes, the popover holds the field. */
+.h-popwrap-examiner { flex: 0 1 auto; min-width: 0; }
+#hBtnExaminer { max-width: 200px; padding: 0 8px; }
+#hBtnExaminer.unset .h-examiner-name { color: var(--warn-fg); font-weight: 600; }
+.h-examiner-k { flex: none; color: var(--muted); }
+.h-examiner-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.h-examiner-pop { width: 320px; }
+.h-examiner-row { display: flex; gap: 6px; padding: 0 8px; }
+.h-examiner-row input { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 1439px) { #hBtnExaminer { max-width: 160px; } }
 .h-vsep { width: 1px; height: 20px; background: var(--border); }
 #hBtnTools.warn { color: var(--warn-fg); background: var(--warn-bg); border-color: var(--warn); }
 /* Warn state needs its own hover/pressed so the states stay distinguishable. */
@@ -102,9 +112,9 @@ a.h-mi:focus-visible, button.h-mi:focus-visible { outline-offset: -2px; }
 
 /* ---- server-lost banner (§6.2): under the strip, 36px ---- */
 .h-srvbanner { position: sticky; top: var(--h-top); z-index: 39; flex: none; display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 16px; background: var(--failed-bg); color: var(--failed-fg); border-bottom: 1px solid var(--danger); font-size: var(--fs-sm); }
-.h-srvbanner b { font-weight: 600; }
+.h-srvbanner b { flex: none; font-weight: 600; white-space: nowrap; }
 .h-grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.h-srvbanner button { min-height: 28px; }
+.h-srvbanner button { flex: none; min-height: 28px; }
 
 /* ================================================================= main */
 .h-main { position: relative; flex: 1 1 auto; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); }

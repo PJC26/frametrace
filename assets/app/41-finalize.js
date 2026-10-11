@@ -18,7 +18,7 @@ const FIN = {
   built: false, open: false, loading: false, busy: false, gen: 0,
   checks: [], caseId: null, status: null, env: null,
   result: null, verify: null, audit: null, examinerTouched: false,
-  bound: false, timer: 0, caseDir: null,
+  bound: false, timer: 0, caseDir: null, sig: "", attributing: false,
 };
 const FIN_LEVEL = { block: { icon: "i-x", word: "차단" }, warn: { icon: "i-warning", word: "주의" }, info: { icon: "i-info", word: "정보" }, ok: { icon: "i-check", word: "완료" } };
 const FIN_ADV = [
@@ -131,6 +131,75 @@ function propagateExaminerName(name, caseId) {
   if (caseId) { try { localStorage.setItem(`ft.viewer.${caseId}.examiner`, JSON.stringify(name)); } catch (e) {} }
   const v = finViewer();
   try { if (v && typeof v.setExaminer === "function") v.setExaminer(name); } catch (e) {}
+  if (typeof hExaminerRender === "function") hExaminerRender();
+}
+
+// "현재 이름으로 귀속": records the examiner name on the marks the case DB
+// holds without one. POST /api/import-marks upserts by record id and keeps
+// what is not sent: examiner = COALESCE(new, stored), note likewise, range
+// untouched when absent — so only the examiner changes (status and
+// marked_unix are re-sent as stored), and review_mark_history records the
+// update with this name as actor. Done only once the viewer has nothing
+// unsaved, so a pending viewer edit cannot be overtaken by stale values.
+async function finAttribute() {
+  if (FIN.attributing || FIN.busy) return;
+  const name = (finEl("finalExaminer").value || "").trim();
+  if (!name) { finHint("먼저 검토자 이름을 입력하십시오."); try { finEl("finalExaminer").focus(); } catch (e) {} return; }
+  FIN.attributing = true;
+  finPaint();
+  finHint("검토자 이름을 기록하는 중…");
+  let msg = "", ok = false;
+  try {
+    const v = finViewer();
+    if (v && typeof v.save === "function" && FIN_UNSAVED.includes(finViewerSaveState())) {
+      let saved = false;
+      try { saved = await v.save(); } catch (e) { saved = false; }
+      if (!saved) { msg = "뷰어의 미저장 변경을 먼저 저장하지 못했습니다 — ‘저장 다시 시도’ 후 다시 누르십시오."; return; }
+    }
+    propagateExaminerName(name, FIN.caseId);
+    // Preferred: the viewer owns the marks it shows — it stamps the name on
+    // its unattributed marks/notes and saves them (contract §3). The
+    // re-check below counts what the case DB really holds afterwards.
+    if (v && typeof v.attributeUnassignedMarks === "function") {
+      let n;
+      try { n = await v.attributeUnassignedMarks(name); } catch (e) { n = e; }
+      if (typeof n !== "number" || !Number.isFinite(n)) {
+        msg = "검토자 이름을 기록하지 못했습니다: " + ((n && n.message) || "뷰어 저장 실패") + " — ‘다시 확인’ 후 다시 누르십시오.";
+        return;
+      }
+      if (n > 0) { ok = true; msg = `마크 ${n}건에 검토자 ‘${name}’을(를) 기록했습니다.`; return; }
+      // 0 from the viewer while the DB still lists some (marks the viewer
+      // does not hold): fall through to the direct, DB-driven patch.
+    }
+    let meta = null;
+    try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
+    const marks = meta && meta.annotations && Array.isArray(meta.annotations.marks) ? meta.annotations.marks : null;
+    if (!marks) { msg = "케이스의 마크 정보를 읽지 못했습니다 — 연결을 확인한 뒤 다시 누르십시오."; return; }
+    const todo = marks.filter(m => m && !String(m.examiner || "").trim() && (m.record_id || m.id) && m.status);
+    if (!todo.length) { ok = true; msg = "검토자 이름이 없는 마크가 없습니다."; return; }
+    const payload = {
+      schema_version: 2, protocol: "patch-v1",
+      case_id: (meta.manifest && meta.manifest.case_id) || null,
+      examiner: name,
+      marks: todo.map(m => {
+        const e = { id: String(m.record_id || m.id), status: m.status, examiner: name };
+        if (Number.isFinite(Number(m.marked_unix))) e.marked_unix = Number(m.marked_unix);
+        return e;
+      }),
+      tags: [], deleted_ids: [],
+    };
+    const res = await jpost("/api/import-marks", { marks_json: JSON.stringify(payload) });
+    if (!res || !res.ok) { msg = "검토자 이름을 기록하지 못했습니다: " + ((res && res.error) || "알 수 없는 오류"); return; }
+    ok = true;
+    msg = res.deferred
+      ? `마크 ${todo.length}건의 검토자 기록을 저장 대기열에 넣었습니다 — 보강 작업이 끝나면 반영됩니다.`
+      : `마크 ${todo.length}건에 검토자 ‘${name}’을(를) 기록했습니다.`;
+  } finally {
+    FIN.attributing = false;
+    finHint(ok ? "" : msg);
+    if (msg) toast(msg, ok ? "ok" : "err");
+    finRefresh();
+  }
 }
 
 async function finRunAudit() {
@@ -185,8 +254,15 @@ async function gatherFinalizeChecks() {
     if (waiting) add("warn", `검증 대기 ${waiting}건`, "보고서에 '검증 대기'로 표시되며 확정 소견이 아닙니다.");
     const impNoNote = real.filter(m => m.status === "important" && !String(m.note || "").trim()).length;
     if (impNoNote) add("warn", `메모 없는 '중요' 마크 ${impNoNote}건`, "중요 판단의 근거를 메모로 남기는 것을 권장합니다.");
-    const noExaminer = marks.filter(m => !String(m.examiner || "").trim()).length;
-    if (noExaminer) add("warn", `검토자 이름 없이 기록된 마크 ${noExaminer}건`, "이름 입력 이후 수정된 마크부터 검토자가 기록됩니다.");
+    // Counted from the case DB (records-meta), never guessed. A report must
+    // not go out with marks nobody is answerable for: block, with a
+    // one-click fix that records the name typed above on exactly these.
+    const noExaminer = marks.filter(m => m && !String(m.examiner || "").trim());
+    if (noExaminer.length) {
+      checks.push({ level: "block", text: `검토자 이름 없이 기록된 마크 ${noExaminer.length}건`,
+        sub: "‘현재 이름으로 귀속’을 누르면 위의 검토자 이름을 이 마크들에 기록합니다 (변경 이력에 남습니다).",
+        attribute: noExaminer.length });
+    }
   }
   if (summary) {
     const total = summary.total || 0;
@@ -220,9 +296,26 @@ function finRows() {
 }
 function finRowHtml(c) {
   const lv = FIN_LEVEL[c.level] || FIN_LEVEL.info;
+  const fix = c.attribute
+    ? `<button type="button" id="btnFinalAttribute"${FIN.attributing ? ' disabled aria-busy="true"' : ""}>현재 이름으로 귀속</button>`
+    : "";
   return `<li class="h-check h-check-${esc(c.level)}" data-level="${esc(c.level)}">${finIcon(lv.icon)}` +
     `<span class="h-check-text"><span class="sr-only">${lv.word}: </span>${esc(c.text)}` +
-    (c.sub ? `<small>${esc(c.sub)}</small>` : "") + `</span></li>`;
+    (c.sub ? `<small>${esc(c.sub)}</small>` : "") + fix + `</span></li>`;
+}
+// Writes markup only when it changed: a background re-check that finds the
+// same result must not re-announce the verdict (role=status) or rebuild a
+// list under the examiner's focus.
+// (Compared with what was last written, not with innerHTML: the browser
+// re-serializes markup, so a read-back never matches the source string.)
+const finWritten = new Map();
+function finSetHtml(el, html) {
+  if (!el) return false;
+  const key = el.id || el;
+  if (finWritten.get(key) === html && el.innerHTML !== "") return false;
+  finWritten.set(key, html);
+  el.innerHTML = html;
+  return true;
 }
 function finResultHtml() {
   const r = FIN.result;
@@ -304,10 +397,22 @@ function finPaint() {
   const sum = finSummarize(rows, { loading: FIN.loading, name });
   const verdict = finEl("finalVerdict");
   const done = !!FIN.result && sum.state === "ready";
-  verdict.className = "h-fin-verdict " + (done ? "done" : sum.state);
-  verdict.innerHTML = finIcon(sum.state === "blocked" ? "i-warning" : sum.state === "loading" ? "i-spinner" : "i-check") +
-    `<span>${esc(done ? "보고서·패키지를 만들었습니다" : sum.text)}</span>`;
-  finEl("finalChecklist").innerHTML = rows.map(finRowHtml).join("");
+  const cls = "h-fin-verdict " + (done ? "done" : sum.state);
+  if (verdict.className !== cls) verdict.className = cls;
+  finSetHtml(verdict, finIcon(sum.state === "blocked" ? "i-warning" : sum.state === "loading" ? "i-spinner" : "i-check") +
+    `<span>${esc(done ? "보고서·패키지를 만들었습니다" : sum.text)}</span>`);
+  const list = finEl("finalChecklist");
+  const hadFocus = typeof list.contains === "function" && list.contains(document.activeElement) && document.activeElement && document.activeElement.id;
+  if (finSetHtml(list, rows.map(finRowHtml).join("")) && hadFocus) {
+    const back = finEl(hadFocus);
+    try { if (back && !back.disabled) back.focus(); else finEl("finalExaminer").focus(); } catch (e) {}
+  }
+  const attr = finEl("btnFinalAttribute");
+  if (attr && !FIN.attributing) {
+    const named = !!name.trim();
+    attr.disabled = !named;
+    attr.title = named ? `검토자 이름 없는 마크에 ‘${name.trim()}’을(를) 기록합니다` : "먼저 위에 검토자 이름을 입력하십시오";
+  }
   finEl("btnFinalRetrySave").hidden = !FIN.checks.some(c => c.retry);
   const btn = finEl("btnFinalize");
   btn.disabled = FIN.busy || sum.disabled;
@@ -315,17 +420,20 @@ function finPaint() {
   btn.setAttribute("aria-describedby", "finalVerdict");
   if (FIN.busy) btn.setAttribute("aria-busy", "true"); else btn.removeAttribute("aria-busy");
   finEl("btnFinalRecheck").disabled = FIN.busy || FIN.loading;
-  finEl("finalLinks").innerHTML = finResultHtml();
+  finSetHtml(finEl("finalLinks"), finResultHtml());
   const mount = finMount();
   if (FIN.busy) mount.setAttribute("aria-busy", "true"); else mount.removeAttribute("aria-busy");
 }
 function finHint(text) { const h = finEl("finalHint"); if (h) h.textContent = text || ""; }
 
-async function finRefresh() {
+// opts.background: a re-check the examiner did not ask for (something that
+// matters changed). It shows no "점검 중…" and repaints only what changed.
+async function finRefresh(opts) {
   if (!finBuild()) return;
+  const background = !!(opts && opts.background);
   const gen = ++FIN.gen;
-  FIN.loading = true;
-  finPaint();
+  FIN.sig = finSignature();
+  if (!background) { FIN.loading = true; finPaint(); }
   try {
     const state = await gatherFinalizeChecks();
     if (gen !== FIN.gen) return;
@@ -339,10 +447,28 @@ async function finRefresh() {
   if (gen === FIN.gen) { FIN.loading = false; finPaint(); }
   if (gen === FIN.gen) { try { const e = await jgetSoft("/api/env"); if (e && e.ok !== false) { FIN.env = e; finApplyEnv(); } } catch (x) {} }
 }
+// What the checklist depends on. Anything else the store or the viewer
+// reports (a status poll with the same content, selection, active card,
+// counts) leaves the checklist alone — re-checking costs three requests
+// and must not flicker the verdict.
+function finSignature() {
+  const S = typeof FTStore === "object" && FTStore && FTStore.state ? FTStore.state : null;
+  const j = S ? S.jobs || {} : {};
+  const v = finViewer();
+  let examiner = "";
+  try { examiner = v && typeof v.getExaminer === "function" ? String(v.getExaminer() || "") : ""; } catch (e) {}
+  return JSON.stringify([
+    S ? S.phase : "", S && typeof FTStore.isBusy === "function" ? FTStore.isBusy() : false,
+    Number(j.pendingMarks) || 0, !!(j.pipeline && j.pipeline.busy), j.jobKind || null,
+    S ? S.project.caseDir : "", S ? !!S.viewer.mounted : true, S ? Number(S.viewer.dirty) || 0 : 0,
+    finViewerSaveState(), examiner,
+  ]);
+}
 function finScheduleRefresh() {
   if (!FIN.open || FIN.busy) return;
+  if (finSignature() === FIN.sig) return;
   clearTimeout(FIN.timer);
-  FIN.timer = setTimeout(finRefresh, 300);
+  FIN.timer = setTimeout(() => finRefresh({ background: true }), 300);
 }
 function finBindViewer() {
   const v = finViewer();
@@ -379,6 +505,26 @@ function finSetFinalizing(on) {
 }
 
 // ---- actions ----
+// "local" (edits only in this browser) counts as unsaved once anything is
+// pending — the dirty count below, the same rule as hViewer.hasUnsaved().
+const FIN_UNSAVED = ["pending", "saving", "failed", "queued"];
+// "" = nothing new stands in the way; otherwise why the seal must wait.
+async function finLateBlocker() {
+  const viewerSays = () => {
+    const ss = finViewerSaveState();
+    if (FIN_UNSAVED.includes(ss)) return "뷰어에 아직 케이스에 반영되지 않은 마크·메모 변경이 있습니다.";
+    const S = typeof FTStore === "object" && FTStore && FTStore.state ? FTStore.state : null;
+    if (S && S.viewer && S.viewer.mounted && Number(S.viewer.dirty) > 0) return "뷰어에 아직 저장되지 않은 변경이 있습니다.";
+    return "";
+  };
+  const first = viewerSays();
+  if (first) return first;
+  const st = await jgetSoft("/api/status");
+  if (!st || st.ok === false || st.malformed) return "서버 상태를 확인할 수 없습니다.";
+  if (Number(st.pending_marks) > 0) return `저장 대기 마크 ${Number(st.pending_marks)}건이 아직 케이스에 반영되지 않았습니다.`;
+  if (st.busy) return "다른 작업이 진행 중입니다.";
+  return viewerSays();
+}
 async function finFinalize() {
   if (FIN.busy || !FIN.built) return;
   const nameEl = finEl("finalExaminer");
@@ -396,6 +542,16 @@ async function finFinalize() {
     return;
   }
   propagateExaminerName(name, state.caseId);
+  // The checklist took a few requests; a mark made meanwhile (or a save
+  // that failed) must still stop the seal. Last look, right before POST.
+  const late = await finLateBlocker();
+  if (late) {
+    finSetFinalizing(false);
+    finRefresh();
+    finHint("보고서를 만들지 않았습니다 — " + late);
+    toast("보고서를 만들지 않았습니다 — " + late, "warn");
+    return;
+  }
   finHint("보고서 생성 중… (원본 해시 재계산 포함 — 소스 크기에 따라 오래 걸릴 수 있습니다)");
   finPaint();
   let res;
@@ -510,6 +666,7 @@ async function finOnClick(e) {
     case "btnFinalize": return finFinalize();
     case "btnFinalRecheck": return finRefresh();
     case "btnFinalRetrySave": return finRetrySave();
+    case "btnFinalAttribute": return finAttribute();
     case "btnVerifySources": return finVerifySources();
     case "btnVerifyAudit": return finVerifyAudit();
     case "btnImportMarks": return finEl("marksFile").click();

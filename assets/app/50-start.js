@@ -145,7 +145,7 @@ async function hUnsavedCount() {
   const ss = hViewer.saveState();
   let pending = 0;
   try { pending = await hPendingChanges(); } catch (e) { pending = 0; }
-  const unsaved = ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued";
+  const unsaved = hViewerStateUnsaved(ss, () => Number(pending) || 0);
   return { pending: Number(pending) || 0, unsaved, saveState: ss };
 }
 async function guardedPageReload(reason) {

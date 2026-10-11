@@ -297,7 +297,9 @@ await test('6b. server unreachable: store flags it, backs off, recovers', async 
   env.routes['GET /api/status'] = () => { throw new Error('down'); };
   await env.advance(60000);
   assert.equal(env.state().server.lost, true);
-  assert.equal(env.state().phase, 'server-lost');
+  // A lost server is a connection state, not a phase: the last good phase
+  // stays so the review screen is not replaced (adversarial review B1).
+  assert.equal(env.state().phase, 'review-ready');
   assert.equal(env.$('serverBanner').hidden, false);
   delete env.routes['GET /api/status'];
   await env.advance(15000);

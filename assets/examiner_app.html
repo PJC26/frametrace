@@ -42,6 +42,19 @@
        Mount owned by T2; its contents are rendered by the jobs code (T3). -->
   <div class="h-chip" id="jobPanel" hidden></div>
   <span class="h-spacer" aria-hidden="true"></span>
+  <!-- 검토자: who new marks are attributed to — settable before the first
+       mark, without opening the deliverables sheet (project mode only). -->
+  <div class="h-popwrap h-popwrap-examiner" id="hExaminerWrap" hidden>
+    <button type="button" class="quiet h-examiner" id="hBtnExaminer" aria-haspopup="true" aria-expanded="false" aria-controls="hExaminerPop" title="새 마크에 기록될 검토자 이름"><span class="h-examiner-k">검토자:</span> <span class="h-examiner-name" id="hExaminerName">미설정</span></button>
+    <div class="h-pop h-examiner-pop" id="hExaminerPop" role="group" aria-label="검토자" data-keys="off" hidden>
+      <label class="h-pop-title" for="hExaminerInput">검토자 이름</label>
+      <div class="h-examiner-row">
+        <input type="text" id="hExaminerInput" autocomplete="name" spellcheck="false" placeholder="예: 홍길동 (소속)" aria-describedby="hExaminerNote">
+        <button type="button" id="hBtnExaminerSave" data-keep>저장</button>
+      </div>
+      <p class="h-pop-note" id="hExaminerNote">이후 판독 마크와 보고서에 입력한 그대로 기록됩니다.</p>
+    </div>
+  </div>
   <button type="button" id="hBtnPopout" aria-label="새 창 — 보조 모니터로 영상·판독 분리" title="열린 프로젝트가 없습니다" disabled><svg class="ic" aria-hidden="true"><use href="#i-popout"/></svg><span class="h-lbl h-lbl-pop">새 창</span></button>
   <button type="button" id="hBtnFinalize" aria-controls="hFinalizeSheet" aria-expanded="false" aria-label="결과물 — 보고서·패키지 (Alt+R)" title="열린 프로젝트가 없습니다" disabled><svg class="ic" aria-hidden="true"><use href="#i-report"/></svg><span class="h-lbl h-lbl-fin">결과물</span></button>
   <span class="h-vsep" aria-hidden="true"></span>
@@ -70,8 +83,8 @@
   <button type="button" class="quiet destructive icon" id="hBtnQuit" aria-label="서버 종료" title="워크스테이션 서버 종료 (확인 후) — 케이스 데이터와 감사 로그는 보존됩니다"><svg class="ic" aria-hidden="true"><use href="#i-power"/></svg></button>
 </header>
 <div class="h-srvbanner" id="serverBanner" role="alert" hidden>
-  <b>서버 연결이 끊겼습니다.</b>
-  <span class="h-grow" id="serverBannerMsg">frametrace-app이 실행 중인지 확인하십시오 — 자동으로 다시 연결을 시도합니다.</span>
+  <b>서버 연결 끊김 — 재연결 중</b>
+  <span class="h-grow" id="serverBannerMsg">frametrace-app이 실행 중인지 확인하십시오. 화면과 판독 내용은 그대로 유지되고, 연결되면 자동으로 이어집니다.</span>
   <button type="button" id="btnServerRetry">지금 다시 시도</button>
 </div>
 <main class="h-main" id="main" tabindex="-1">

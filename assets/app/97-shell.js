@@ -9,6 +9,10 @@ let hStatusSeen = false;
 function hMode() {
   const s = FTStore.state;
   if (s.ui.home) return "empty";
+  // While the server is unreachable nothing it said is newer than what the
+  // screen shows: keep the last mode (review screen, open sheet, mounted
+  // viewer) until a poll succeeds — the banner carries the state.
+  if (s.server.lost && hPrevMode) return hPrevMode;
   if (s.phase === "running") return "wait";
   if (FTStore.hasProject()) return "project";
   return "empty";
@@ -63,6 +67,12 @@ function hRenderStrip(mode) {
   fb.disabled = mode !== "project";
   fb.title = mode === "project" ? "결과물 — 보고서·패키지 (Alt+R)"
     : mode === "wait" ? "첫 색인이 끝나면 열 수 있습니다" : "열린 프로젝트가 없습니다";
+  const exWrap = $("hExaminerWrap");
+  if (exWrap) {
+    exWrap.hidden = mode !== "project";
+    if (exWrap.hidden && s.panels.examiner) hClosePopovers(false);
+    hExaminerRender();
+  }
   const pop = $("hBtnPopout");
   pop.disabled = mode !== "project" || !s.viewer.mounted || hPeerPopped;
   pop.title = hPeerPopped ? "다른 창에서 열림 — 보조 창은 한 번에 하나만 엽니다"
@@ -71,6 +81,54 @@ function hRenderStrip(mode) {
 }
 FTStore.on("change", ({ keys }) => {
   if (keys.has("phase") || keys.has("project") || keys.has("ui") || keys.has("viewer") || keys.has("popout")) hRender();
+});
+
+// ---- 검토자 (who new marks are attributed to) ----
+// The hosted selection bar has no examiner field, so the strip carries one
+// quiet button: "검토자: 미설정" until a name is set, then the name. It
+// opens a tiny popover with the field; saving sets FTViewer.setExaminer
+// (the viewer stamps it on every mark it writes from then on) and the
+// shell pref (seeds the next mount / the deliverables sheet).
+function hExaminerNow() {
+  let name = "";
+  try { const v = hViewerApi(); if (v && FTStore.state.viewer.mounted && typeof v.getExaminer === "function") name = String(v.getExaminer() || ""); } catch (e) {}
+  if (!name.trim()) { try { name = String((loadPrefs() || {}).examinerName || ""); } catch (e) {} }
+  return name.trim();
+}
+function hExaminerRender() {
+  const btn = $("hBtnExaminer");
+  if (!btn) return;
+  const name = hExaminerNow();
+  $("hExaminerName").textContent = name || "미설정";
+  btn.classList.toggle("unset", !name);
+  btn.title = name ? `검토자: ${name} — 새 마크에 이 이름이 기록됩니다 (바꾸려면 누르십시오)` : "검토자 이름이 없습니다 — 마크하기 전에 설정하십시오";
+  btn.setAttribute("aria-label", name ? `검토자: ${name} — 변경` : "검토자: 미설정 — 설정");
+}
+function hExaminerSave() {
+  const input = $("hExaminerInput");
+  const name = String(input.value || "").trim();
+  if (!name) {
+    $("hExaminerNote").textContent = "이름을 입력하십시오 — 이후 판독 마크와 보고서에 그대로 기록됩니다.";
+    try { input.focus(); } catch (e) {}
+    return false;
+  }
+  if (typeof propagateExaminerName === "function") propagateExaminerName(name, typeof FIN === "object" && FIN ? FIN.caseId : null);
+  else {
+    try { savePrefs({ examinerName: name }); } catch (e) {}
+    try { const v = hViewerApi(); if (v) v.setExaminer(name); } catch (e) {}
+  }
+  $("hExaminerNote").textContent = "이후 판독 마크와 보고서에 입력한 그대로 기록됩니다.";
+  // The deliverables sheet shows the same name unless it was typed there.
+  const fin = document.getElementById("finalExaminer");
+  if (fin && !(typeof FIN === "object" && FIN && FIN.examinerTouched)) fin.value = name;
+  hClosePopovers(true);
+  hExaminerRender();
+  announce(`검토자를 ‘${name}’(으)로 설정했습니다.`);
+  return true;
+}
+$("hBtnExaminerSave").addEventListener("click", () => { hExaminerSave(); });
+$("hExaminerInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); hExaminerSave(); }
 });
 
 // ---- sheets (§6.3) ----
@@ -96,6 +154,11 @@ function hOpenSheet(which, opener) {
   const other = which === "jobs" ? "finalize" : "jobs";
   if (FTStore.state.panels[other]) hCloseSheet(other, false);
   hClosePopovers(false);
+  // A viewer menu left open under the sheet would swallow the first Esc
+  // (its window-capture handler) although the sheet is the top layer. The
+  // viewer closes every menu on window "resize" — the one public signal
+  // the shell may send without touching viewer DOM.
+  try { if (typeof window.dispatchEvent === "function" && typeof Event === "function") window.dispatchEvent(new Event("resize")); } catch (e) {}
   hSheetReturn[which] = opener || document.activeElement || null;
   sheet.hidden = false;
   rootEl().dataset.sheet = which;
@@ -161,7 +224,7 @@ for (const [which, id] of Object.entries(H_SHEETS)) {
 // focuses the first item, arrows / Home / End move, Esc or Tab-out closes
 // (Esc returns focus to the opener). An action item closes the popover
 // first, so a dialog it opens restores focus to the opener.
-const POPOVERS = [["hProjectBtn", "hProjectPop", "project"], ["hBtnTools", "hToolsPop", "tools"], ["hBtnHelp", "hHelpPop", "help"]];
+const POPOVERS = [["hProjectBtn", "hProjectPop", "project"], ["hBtnTools", "hToolsPop", "tools"], ["hBtnHelp", "hHelpPop", "help"], ["hBtnExaminer", "hExaminerPop", "examiner"]];
 function popoverItems(pop) {
   return [...pop.querySelectorAll("button, a[href]")]
     .filter(el => !el.disabled && !el.hidden && !(el.closest && el.closest("[hidden]")));
@@ -186,6 +249,13 @@ function hOpenPopover(btnId, popId, key, focusFirst) {
   pop.hidden = false;
   btn.setAttribute("aria-expanded", "true");
   FTStore.set({ panels: { [key]: true } });
+  if (key === "examiner") {
+    // The field is the point of this popover: it takes focus, prefilled.
+    const input = $("hExaminerInput");
+    input.value = hExaminerNow();
+    try { input.focus(); input.select(); } catch (e) {}
+    return;
+  }
   if (focusFirst) {
     const items = popoverItems(pop);
     if (items[0]) items[0].focus();
@@ -209,6 +279,8 @@ for (const [btnId, popId, key] of POPOVERS) {
     if (e.key === "ArrowDown") { e.preventDefault(); hOpenPopover(btnId, popId, key, true); }
   });
   pop.addEventListener("keydown", e => {
+    // A text field keeps its own arrows / Home / End (caret keys).
+    if (isTextField(e.target) && e.key !== "Escape") return;
     const items = popoverItems(pop);
     const i = items.indexOf(document.activeElement);
     let next = -1;
@@ -221,7 +293,9 @@ for (const [btnId, popId, key] of POPOVERS) {
   });
   pop.addEventListener("click", e => {
     const item = e.target && e.target.closest ? e.target.closest("button, a[href]") : null;
-    if (item && !item.disabled) hClosePopovers(true);
+    // data-keep: the item decides itself (the examiner "저장" keeps the
+    // popover open when the name is empty).
+    if (item && !item.disabled && !(item.hasAttribute && item.hasAttribute("data-keep"))) hClosePopovers(true);
   }, true);
   pop.addEventListener("focusout", e => {
     const to = e.relatedTarget;
