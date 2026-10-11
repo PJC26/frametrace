@@ -297,6 +297,95 @@ await test('cancel: confirm → /api/cancel → cancelled outcome, buttons re-en
   assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 0, 'no refresh after cancel');
 });
 
+// ---- real server contract (src/serve/jobs.rs): /api/status `job` ----
+const sjob = (over = {}) => ({ kind: 'carve', state: 'running', started_unix: 1_700_000_100, finished_unix: null,
+  elapsed_secs: 75, stage: 1, stages: 2, stage_label: '시그니처 카빙', error: null, ...over });
+const carveRoutes = (extra = {}) => ({
+  'POST /api/carve': () => ({ json: { ok: true, job: { kind: 'carve', started_unix: 1_700_000_100 } } }),
+  'POST /api/cancel': () => ({ json: { ok: true } }),
+  ...extra,
+});
+
+await test('server job: stage + elapsed from st.job, done → viewer refresh', async () => {
+  const env = makeEnv({ routes: carveRoutes() });
+  await openReview(env);
+  // An earlier job of another kind in st.job must not be taken for ours.
+  env.status = { ...env.status, phase: 'finalizing', busy: true, job_kind: 'carve', logs: ['시그니처 카빙 실행 중… (raw)'],
+    job: sjob({ kind: 'recover-deleted', state: 'done', started_unix: 1_600_000_000 }) };
+  env.$('btnCarve').click();
+  await env.answerDialog(true);
+  await env.advance(1300);
+  assert.match(env.$('jobTitle').textContent, /이미지 카빙 진행 중/, 'stale job of another kind ignored');
+  env.status = { ...env.status, job: sjob() };
+  await env.advance(1300);
+  assert.match(env.$('jobDetail').textContent, /단계 1\/2: 시그니처 카빙 · 시그니처 카빙 실행 중/);
+  assert.match(env.$('jobElapsed').textContent, /^경과 1:1\d$/);
+  env.status = { ...env.status, job: sjob({ stage: 2, stage_label: '리뷰 생성', elapsed_secs: 80 }) };
+  await env.advance(1300);
+  assert.match(env.$('jobDetail').textContent, /단계 2\/2: 리뷰 생성/);
+  // busy already dropped but st.job still running: not finished yet.
+  env.status = { ...env.status, busy: false, phase: 'review-ready', job_kind: null };
+  await env.advance(1300);
+  assert.match(env.$('jobTitle').textContent, /진행 중/);
+  env.status = { ...env.status, job: sjob({ state: 'done', stage: 2, finished_unix: 1_700_000_190, elapsed_secs: 90 }) };
+  await env.advance(1300);
+  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 1);
+  env.winMessage({ type: 'ft-reload-ack', reloaded: true }, env.frameWin);
+  await env.advance(10);
+  assert.match(env.$('jobTitle').textContent, /이미지 카빙 완료/);
+  assert.match(env.$('jobElapsed').textContent, /^경과 1:3\d$/);
+});
+
+await test('server job: cancelled read from state (no keyword needed), not shown as failed', async () => {
+  const env = makeEnv({ routes: carveRoutes() });
+  await openReview(env);
+  env.status = { ...env.status, phase: 'finalizing', busy: true, job: sjob() };
+  env.$('btnCarve').click();
+  await env.answerDialog(true);
+  await env.advance(1300);
+  env.$('btnJobCancel').click();
+  await env.answerDialog(true);
+  assert.ok(env.calls.some((c) => c.method === 'POST' && c.url === '/api/cancel'));
+  env.status = { ...env.status, busy: false, phase: 'review-ready', error: null,
+    job: sjob({ state: 'cancelled', finished_unix: 1_700_000_180, error: '시그니처 카빙 작업을 멈췄습니다 — 결과가 리뷰에 반영되지 않았을 수 있습니다.' }) };
+  await env.advance(1300);
+  assert.match(env.$('jobTitle').textContent, /이미지 카빙 중단됨/);
+  assert.match(env.$('jobPanel').className, /cancelled/);
+  assert.match(env.$('jobDetail').textContent, /결과가 리뷰에 반영되지 않았을 수 있습니다/);
+  assert.equal(env.$('btnCarve').disabled, false);
+  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 0);
+});
+
+await test('server job: failure whose text says "cancel" is still a failure', async () => {
+  const env = makeEnv({ routes: carveRoutes() });
+  await openReview(env);
+  env.status = { ...env.status, phase: 'finalizing', busy: true, job: sjob() };
+  env.$('btnCarve').click();
+  await env.answerDialog(true);
+  await env.advance(1300);
+  env.status = { ...env.status, busy: false, phase: 'review-ready', error: 'carve-file: cancelled read (I/O error)',
+    job: sjob({ state: 'failed', error: 'carve-file: cancelled read (I/O error)' }) };
+  await env.advance(1300);
+  assert.match(env.$('jobTitle').textContent, /이미지 카빙 실패/);
+  assert.match(env.$('jobDetail').textContent, /I\/O error/);
+  assert.match(env.$('jobPanel').className, /failed/);
+});
+
+await test('shell reloaded mid-job adopts the running server job (progress + cancel)', async () => {
+  const env = makeEnv({ routes: carveRoutes() });
+  env.status = { ...env.status, phase: 'finalizing', busy: true, job_kind: 'recover-deleted',
+    job: sjob({ kind: 'recover-deleted', stage_label: '삭제 영상 후보 복구', elapsed_secs: 130 }) };
+  await env.advance(2000);
+  assert.equal(env.$('jobPanel').hidden, false);
+  assert.match(env.$('jobTitle').textContent, /삭제 영상 후보 복구 진행 중/);
+  assert.match(env.$('jobElapsed').textContent, /^경과 2:1\d$/);
+  assert.equal(env.$('btnJobCancel').hidden, false);
+  assert.equal(env.$('btnRecoverDeleted').disabled, true);
+  env.status = { ...env.status, busy: false, phase: 'review-ready', job: sjob({ kind: 'recover-deleted', state: 'done' }) };
+  await env.advance(1600);
+  assert.match(env.$('jobTitle').textContent, /완료/);
+});
+
 await test('carve sends ?reassemble=1 when the checkbox is on', async () => {
   const env = makeEnv({ routes: { 'POST /api/carve': () => ({ json: { ok: true, job: 1 } }) } });
   await openReview(env);
