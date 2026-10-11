@@ -529,8 +529,9 @@ fn is_lower_hex_sha256(text: &str) -> bool {
 /// 2. `package-manifest.json` agrees with `manifest.sha256` and on-disk sizes;
 /// 3. every packaged hash-chained `.jsonl` log verifies as a chain;
 /// 4. the packaged SQLite snapshot passes `integrity_check`;
-/// 5. a packaged sign-off's `content_sha256` matches the review marks in
-///    the packaged database, and the packaged report names that examiner.
+/// 5. a packaged sign-off's `content_sha256` matches the review marks
+///    (with their IN-OUT ranges) and tags in the packaged database, and the
+///    packaged report names that examiner.
 ///
 /// Returns `Err` only when the directory cannot be inspected at all; every
 /// finding (including failures) is a check in the result.
@@ -850,7 +851,11 @@ fn verify_package_db_and_signoff(
         now_unix().unwrap_or(0),
         SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let marks = (|| -> Result<Vec<crate::case_db::ReviewMarkRow>, String> {
+    type PackagedReview = (
+        Vec<crate::case_db::ReviewMarkRow>,
+        Vec<crate::selection::TagEntry>,
+    );
+    let marks = (|| -> Result<PackagedReview, String> {
         fs::create_dir_all(&scratch).map_err(|err| err.to_string())?;
         let copy = scratch.join("case.db");
         fs::copy(package_dir.join(db_rel), &copy).map_err(|err| err.to_string())?;
@@ -863,6 +868,7 @@ fn verify_package_db_and_signoff(
         }
         let history = crate::case_db::load_review_mark_history_from(&conn, None)?.len();
         let marks = crate::case_db::load_review_marks_from(&conn)?;
+        let tags = crate::case_db::load_review_tags_from(&conn)?;
         out.push(
             CheckStatus::Pass,
             db_rel,
@@ -872,11 +878,11 @@ fn verify_package_db_and_signoff(
                 history
             ),
         );
-        Ok(marks)
+        Ok((marks, tags))
     })();
     let _ = fs::remove_dir_all(&scratch);
-    let marks = match marks {
-        Ok(marks) => marks,
+    let (marks, tags) = match marks {
+        Ok(review) => review,
         Err(err) => {
             out.push(CheckStatus::Fail, db_rel, err);
             return;
@@ -909,23 +915,34 @@ fn verify_package_db_and_signoff(
         );
         return;
     };
-    let content = crate::report::signoff_content_sha256(
-        &crate::cli::handlers::review_marks_json_from_rows(&marks),
-    );
-    match crate::report::signoff_currency(&text, &content) {
+    let digests = crate::report::SignoffDigests {
+        content: crate::report::signoff_content_sha256(
+            &crate::cli::handlers::signoff_content_json_from(&marks, &tags),
+        ),
+        legacy: crate::report::signoff_content_sha256(
+            &crate::cli::handlers::review_marks_json_from_rows(&marks),
+        ),
+    };
+    match crate::report::signoff_currency(&text, &digests) {
         crate::report::SignoffCurrency::Current => out.push(
             CheckStatus::Pass,
             signoff_rel,
             format!(
-                "content_sha256 matches the review marks in the packaged db/case.db (examiner recorded as typed: {examiner}; not an authenticated identity)"
+                "content_sha256 matches the review marks (status, note, IN-OUT range) and tags in the packaged db/case.db (examiner recorded as typed: {examiner}; not an authenticated identity)"
             ),
         ),
         crate::report::SignoffCurrency::Changed => out.push(
             CheckStatus::Fail,
             signoff_rel,
             format!(
-                "content_sha256 does not match the review marks in the packaged db/case.db (now {content}): the sign-off does not cover this package's marks"
+                "content_sha256 does not match the review marks / tags in the packaged db/case.db (now {}): the sign-off does not cover this package's marks",
+                digests.content
             ),
+        ),
+        crate::report::SignoffCurrency::LegacyBinding => out.push(
+            CheckStatus::NotVerified,
+            signoff_rel,
+            "sign-off uses an older binding (schema_version < 3) that covers mark status and notes only; those still match, but whether IN-OUT ranges or tags changed after the sign-off cannot be checked — finalize again to bind them",
         ),
         crate::report::SignoffCurrency::Unbound => out.push(
             CheckStatus::NotVerified,
@@ -1101,13 +1118,13 @@ mod tests {
             )
             .unwrap();
             let content = crate::report::signoff_content_sha256(
-                &crate::cli::handlers::review_marks_json(&case_dir),
+                &crate::cli::handlers::signoff_content_json(&case_dir).unwrap(),
             );
             fs::create_dir_all(case_dir.join("review")).unwrap();
             fs::write(
                 case_dir.join("review/signoff.pending.json"),
                 format!(
-                    "{{\"schema_version\":2,\"examiner\":\"홍길동\",\"signed_unix\":5,\"content_sha256\":\"{content}\"}}\n"
+                    "{{\"schema_version\":3,\"examiner\":\"홍길동\",\"signed_unix\":5,\"content_sha256\":\"{content}\"}}\n"
                 ),
             )
             .unwrap();
