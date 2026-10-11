@@ -53,7 +53,7 @@ pub(super) fn scan_signatures(
     max_candidates: usize,
     checkpoint: &mut RunCheckpoint,
     progress: Option<&CarveProgress<'_>>,
-) -> Result<Vec<CarveHit>, String> {
+) -> Result<(Vec<CarveHit>, u64), String> {
     let scan_start = window.start;
     let resume_offset = window.resume;
     let scan_end = window.end;
@@ -63,7 +63,7 @@ pub(super) fn scan_signatures(
     if hits.len() >= max_candidates {
         // The interrupted run had already stopped scanning at the cap.
         hits.truncate(max_candidates);
-        return Ok(hits);
+        return Ok((hits, resume_offset));
     }
     let mut file =
         File::open(source_path).map_err(|err| format!("failed to open carve source: {err}"))?;
@@ -125,7 +125,9 @@ pub(super) fn scan_signatures(
     hits.retain(|hit| hit.offset >= scan_start);
     hits.sort_by_key(|hit| hit.offset);
     hits.dedup_by_key(|hit| hit.offset);
-    Ok(hits)
+    // `offset` is how far the walk actually read; the caller compares it with
+    // the requested end to detect a short read.
+    Ok((hits, offset))
 }
 
 /// EWF segment files begin with the libewf file signature

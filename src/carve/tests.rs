@@ -166,7 +166,9 @@ fn extents_follow_container_structure() {
     fs::write(&mp4_ok, &data).unwrap();
     let (extent, note) = super::mp4_extent(&mp4_ok, 0, data.len() as u64);
     assert_eq!(extent, data.len() as u64);
-    assert!(note.contains("box structure complete"), "{note}");
+    assert!(note.contains("box headers tile the span exactly"), "{note}");
+    assert!(note.contains("not verified"), "{note}");
+    assert!(note.contains("no moov box seen"), "{note}");
 
     // Fragmented MP4: ftyp(24) then foreign (non-box) bytes — gap at +24.
     let mp4_gap = root.join("gap.mp4");
@@ -910,7 +912,10 @@ fn scan_window_limits_hits_and_reports_coverage() {
     let result = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
     assert_eq!(result.scan_start_offset, 512);
     assert_eq!(result.scan_end_offset, 1536);
-    assert!(result.scan_complete);
+    assert!(
+        !result.scan_complete,
+        "a narrowed scan window must never claim a complete scan"
+    );
     assert_eq!(result.artifacts.len(), 1);
     assert_eq!(result.artifacts[0].offset, 640);
     assert!(
@@ -929,5 +934,26 @@ fn scan_window_limits_hits_and_reports_coverage() {
         ..Default::default()
     };
     assert!(carve_file(&case_dir, &source, &empty, ResumeMode::Auto, None).is_err());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn copy_ranges_checks_byte_counts_and_writes_full_output() {
+    let root = std::env::temp_dir().join(format!("ft-copy-ranges-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("src.bin");
+    fs::write(&source, (0u8..100).collect::<Vec<u8>>()).unwrap();
+
+    let ok = root.join("out/ok.bin");
+    super::output::copy_ranges(&source, &[(10, 5), (90, 10)], &ok).unwrap();
+    let bytes = fs::read(&ok).unwrap();
+    assert_eq!(bytes.len(), 15);
+    assert_eq!(&bytes[..5], &[10, 11, 12, 13, 14]);
+
+    // A range running past EOF is a short read, not a silently shorter file.
+    let short = root.join("out/short.bin");
+    let err = super::output::copy_ranges(&source, &[(95, 10)], &short).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
     let _ = fs::remove_dir_all(&root);
 }

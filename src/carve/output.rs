@@ -21,9 +21,19 @@ pub(super) fn copy_ranges(source: &Path, ranges: &[(u64, u64)], output: &Path) -
     for (offset, size_bytes) in ranges {
         input.seek(SeekFrom::Start(*offset))?;
         let mut reader = (&mut input).take(*size_bytes);
-        io::copy(&mut reader, &mut writer)?;
+        let copied = io::copy(&mut reader, &mut writer)?;
+        if copied != *size_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "short read carving {size_bytes} bytes at offset {offset}: copied {copied}"
+                ),
+            ));
+        }
     }
-    writer.flush()
+    writer.flush()?;
+    // Evidence copies must be durable before they are logged/hashed.
+    writer.get_ref().sync_all()
 }
 
 pub(super) fn write_carve_outputs(case_dir: &Path, result: &CarveResult) -> Result<(), String> {

@@ -50,11 +50,12 @@ pub(super) fn mp4_extent(source: &Path, start: u64, span: u64) -> (u64, String) 
             return (
                 span,
                 format!(
-                    "MP4 box structure complete ({} boxes{}{}{}) — structural end boundary.",
+                    "MP4 top-level box headers tile the span exactly ({} boxes{}{}{}); only box headers were checked — box payloads, sample tables and playback were not verified{}.",
                     boxes,
                     if saw_ftyp { ", ftyp" } else { "" },
                     if saw_moov { ", moov" } else { "" },
-                    if saw_mdat { ", mdat" } else { "" }
+                    if saw_mdat { ", mdat" } else { "" },
+                    if saw_moov { "" } else { "; no moov box seen" }
                 ),
             );
         }
