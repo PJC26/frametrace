@@ -29,11 +29,32 @@ function hBroadcast(type, value) {
   if (!c) return;
   try { c.postMessage({ type, caseDir: FTStore.state.project.caseDir || "", value: value === undefined ? null : value, from: hInstance }); } catch (e) {}
 }
+// A peer's "popout-open" is only believed while it keeps saying so: the
+// owner repeats it every H_PEER_BEAT_MS, and a peer that has not heard it
+// for H_PEER_STALE_MS (owner tab crashed / closed without pagehide) gives
+// its own button back. A new tab asks once ("popout-query").
+const H_PEER_BEAT_MS = 5000, H_PEER_STALE_MS = 15000;
+let hPeerFrom = "", hPeerStaleTimer = 0, hBeatTimer = 0;
+function hSetPeerPopped(on, from) {
+  clearTimeout(hPeerStaleTimer);
+  hPeerStaleTimer = 0;
+  if (on) {
+    hPeerFrom = from || "";
+    hPeerStaleTimer = setTimeout(() => hSetPeerPopped(false), H_PEER_STALE_MS);
+  } else hPeerFrom = "";
+  if (hPeerPopped === !!on) return;
+  hPeerPopped = !!on;
+  hRenderStrip(hMode());
+}
 function hOnPeer(m) {
   if (!m || typeof m !== "object" || m.from === hInstance) return;
-  if (m.type === "popout-open" || m.type === "popout-closed") {
-    hPeerPopped = m.type === "popout-open";
-    hRenderStrip(hMode());
+  if (m.type === "popout-open") {
+    hSetPeerPopped(true, m.from);
+  } else if (m.type === "popout-closed") {
+    // Only the tab that owns the peer pop-out can take it back.
+    if (!hPeerFrom || hPeerFrom === m.from) hSetPeerPopped(false);
+  } else if (m.type === "popout-query") {
+    if (FTStore.state.popout.open) hBroadcast("popout-open");
   } else if (m.type === "theme" && (m.value === "dark" || m.value === "light") && m.value !== hThemeNow()) {
     hSetTheme(m.value, true);
   } else if (m.type === "locale" && (m.value === "en" || m.value === "ko") && m.value !== hLocalePref()) {
@@ -80,7 +101,14 @@ function hSetPopped(on) {
     hBroadcast(open ? "popout-open" : "popout-closed");
     announce(open ? "영상·판독을 보조 창으로 옮겼습니다. 저장은 이 창에서 합니다." : "영상을 이 화면으로 되돌렸습니다.");
   }
+  clearInterval(hBeatTimer);
+  hBeatTimer = open ? setInterval(() => { if (FTStore.state.popout.open) hBroadcast("popout-open"); }, H_PEER_BEAT_MS) : 0;
   hRenderStrip(hMode());
+}
+// Closing this tab while it owns the pop-out frees the other tabs' buttons
+// at once (the heartbeat timeout covers a crash).
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("pagehide", () => { if (FTStore.state.popout.open) hBroadcast("popout-closed"); });
 }
 $("hBtnPopout").addEventListener("click", hPopoutOpen);
 $("hBtnPopoutReturn").addEventListener("click", () => {
@@ -91,3 +119,4 @@ $("hBtnPopoutFocus").addEventListener("click", () => {
   if (!hViewer.focusPopout() && !hViewer.isPoppedOut()) hSetPopped(false);
 });
 hChannel();
+hBroadcast("popout-query");

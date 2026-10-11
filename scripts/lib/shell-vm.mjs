@@ -94,6 +94,7 @@ function makeEl(id, tag = 'div') {
     click() { if (el.disabled) return; el.clicks += 1; el.dispatch('click'); },
     setAttribute(k, v) { el.attrs[k] = String(v); },
     getAttribute(k) { return el.attrs[k] ?? null; },
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(el.attrs, k); },
     removeAttribute(k) { delete el.attrs[k]; },
     appendChild(c) { el.children.push(c); if (c && typeof c.text === 'string') el.textContent += c.text; return c; },
     append(...c) { el.children.push(...c); },
@@ -194,7 +195,7 @@ export function makeEnv(opts = {}) {
     on(ev, fn) { (viewerEvents[ev] ||= []).push(fn); },
     off(ev, fn) { viewerEvents[ev] = (viewerEvents[ev] || []).filter((f) => f !== fn); },
   };
-  viewer.emit = (ev, detail) => { for (const fn of [...(viewerEvents[ev] || [])]) fn({ type: ev, detail }); };
+  viewer.emit = (ev, detail, extra = {}) => { const e = { type: ev, detail, ...extra }; for (const fn of [...(viewerEvents[ev] || [])]) fn(e); return e; };
 
   const ctx = {
     document, console: { log() {}, error: (...a) => env.consoleErrors.push(a.join(' ')), warn() {} },
@@ -204,10 +205,14 @@ export function makeEnv(opts = {}) {
     Event: class Event { constructor(type) { this.type = type; } },
     addEventListener(t, fn) { (winListeners[t] ||= []).push(fn); },
     removeEventListener(t, fn) { winListeners[t] = (winListeners[t] || []).filter((f) => f !== fn); },
+    dispatchEvent(e) { for (const fn of [...(winListeners[e && e.type] || [])]) fn(e); return true; },
     open: () => ({ focus() {} }),
     Blob: class Blob { constructor(p) { this.parts = p; } }, URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} },
     URLSearchParams, encodeURIComponent, JSON, Math, Number, String, Object, Array, Promise, Set, Map, RegExp, Error,
     FTViewer,
+    // Extra globals a harness needs before the bundle evaluates (e.g. a
+    // BroadcastChannel stand-in).
+    ...(opts.globals || {}),
   };
   ctx.window = ctx;
   env.consoleErrors = [];
@@ -223,6 +228,8 @@ export function makeEnv(opts = {}) {
     ev,
     store: () => ev('FTStore'),
     state: () => ev('FTStore').state,
+    winEvent: (type, extra = {}) => { const e = { type, ...extra }; for (const fn of [...(winListeners[type] || [])]) fn(e); return e; },
+    winListenerCount: (type) => (winListeners[type] || []).length,
     docKey: (key) => { const e = { type: 'keydown', key, prevented: false, preventDefault() { this.prevented = true; } }; for (const fn of [...(docListeners.keydown || [])]) fn(e); return e; },
     async answerDialog(ok) {
       await flush();

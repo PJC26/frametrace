@@ -79,7 +79,11 @@ const TOAST_MAX = 3, TOAST_MS = 6000;
 let toasts = [];
 function toast(msg, kind) {
   announce(msg, kind === "err");
-  if (typeof hViewer === "object" && hViewer.toast(msg, kind)) return null;
+  // The deliverables sheet is modal: #main (and the viewer's toast host in
+  // it) is inert, so a toast there could not be dismissed or clicked. While
+  // it is open, toasts go to the shell's body-level box instead.
+  const sheetModal = typeof FTStore === "object" && FTStore && FTStore.state && FTStore.state.panels && FTStore.state.panels.finalize;
+  if (!sheetModal && typeof hViewer === "object" && hViewer.toast(msg, kind)) return null;
   const box = $("hToastBox");
   if (!box || typeof document.createElement !== "function") return null;
   const el = document.createElement("div");

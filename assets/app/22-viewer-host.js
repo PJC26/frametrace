@@ -48,6 +48,13 @@ function hostViewerBridge() {
   api.on("ready", () => {
     hostViewerStore({ mounted: true, saveState: api.saveState() });
     hostViewerSeedExaminer(api);
+    // A reload() rebuilds the viewer root with its pristine classes: while
+    // the pop-out is open the media column must fold again under the note
+    // (if the window closed meanwhile, the viewer's "popout" event unfolds).
+    if (typeof hSetPopped === "function" && typeof FTStore === "object" && FTStore && FTStore.state.popout.open) {
+      hSetPopped(true);
+    }
+    if (typeof hExaminerRender === "function") hExaminerRender();
   });
   api.on("destroyed", () => hostViewerStore({ mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, live: false, liveGeneration: null, canReload: true }));
 }
@@ -104,8 +111,16 @@ function hostViewerUnmount() {
 // decides what to show.
 async function hostViewerSwitch(openFn) {
   if (hostViewerAvailable() && hostViewer.mounted) {
-    const state = window.FTViewer.saveState();
-    if (state && state !== "saved" && state !== "local") {
+    // Same rule as every other shell guard (hViewer.hasUnsaved): edits
+    // that live only in this browser ("local" with a pending count) are
+    // unsaved too, so they are saved before the viewer goes down.
+    const api = window.FTViewer;
+    const state = api.saveState();
+    const pending = () => { try { return Number((api.summary() || {}).pending) || 0; } catch (e) { return 1; } };
+    const unsaved = typeof hViewerStateUnsaved === "function"
+      ? hViewerStateUnsaved(state, pending)
+      : !!state && state !== "saved" && !(state === "local" && pending() === 0);
+    if (unsaved) {
       const saved = await window.FTViewer.save();
       if (!saved) return false;
     }

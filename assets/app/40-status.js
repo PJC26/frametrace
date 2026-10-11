@@ -112,25 +112,35 @@ function errorHtml(raw) {
 }
 
 // ---- server-lost banner (UX-05) ----
+// A lost server is a connection state, not a phase: the store keeps the
+// last good phase / project, so the review screen, an open sheet and the
+// mounted viewer stay exactly as they were, and only server.lost goes up.
+// The banner text is set once when the connection drops (not per failed
+// poll, so the role=alert region is not re-announced every few seconds);
+// the next good poll takes it down again.
 let pollFailures = 0;
 let lastInstance = null;
+// When the last good /api/status arrived (the clip chip's elapsed clock).
+// Deliberately NOT in the store: a per-poll timestamp would make "jobs"
+// change on every poll and wake every jobs listener for nothing. `var` so
+// 31-progress.js may read it before this line has run.
+var pollStatusAt = 0;
 function setServerLost(lost, detail) {
   const banner = $("serverBanner");
+  const was = !banner.hidden;
   banner.hidden = !lost;
-  if (lost && detail) $("serverBannerMsg").textContent = detail;
+  if (lost && !was && detail) { $("serverBannerMsg").textContent = detail; $("serverBannerMsg").title = detail; }
   const S = storeState();
-  if (S && (!!S.server.lost !== !!lost || S.server.failures !== pollFailures)) {
-    patchStore({ server: Object.assign({}, S.server, { lost: !!lost, failures: pollFailures }) });
+  if (S && !!S.server.lost !== !!lost) {
+    patchStore({ server: Object.assign({}, S.server, { lost: !!lost, failures: lost ? pollFailures : 0 }) });
   }
 }
 function pollFailed(err) {
   pollFailures += 1;
   if (pollFailures >= 3) {
     setServerLost(true,
-      `frametrace-app이 실행 중인지 확인하십시오 — ${pollFailures}회 연속 응답 없음, 자동으로 다시 연결을 시도합니다.` +
+      "frametrace-app이 실행 중인지 확인하십시오. 화면과 판독 내용은 그대로 유지되고, 연결되면 자동으로 이어집니다." +
       (err && err.message ? ` (${err.message})` : ""));
-    const S = storeState();
-    if (S && S.phase !== "server-lost") patchStore({ phase: "server-lost" });
   }
 }
 
@@ -301,8 +311,8 @@ function applyStatus(st) {
     clipsRunning: Number(st.clips_running) || 0,
     pendingMarks: Number(st.pending_marks) || 0,
     jobKind: st.job_kind || null,
-    statusAt: Date.now(),
   });
+  pollStatusAt = Date.now();
   if (S) {
     patchStore({
       phase,
