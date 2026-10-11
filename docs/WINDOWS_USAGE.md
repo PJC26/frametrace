@@ -114,6 +114,9 @@ the local review workstation on `127.0.0.1` and opens it in the browser.
   `POST /api/shutdown` or by killing the process.
 - **Auth** (optional): `FRAMETRACE_TOKEN` adds a shared-secret gate — see
   `docs/security-review.md`.
+- **Previous UI** (rollback, one release only): start with
+  `FRAMETRACE_UI=legacy` (PowerShell: `$env:FRAMETRACE_UI="legacy"`) to get
+  the pre-rebuild 4-step workstation screen with its embedded viewer frame.
 
 ## Recommended Field Workflow
 

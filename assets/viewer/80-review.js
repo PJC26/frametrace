@@ -167,6 +167,9 @@ function toast(message, opts) {
   const host = document.getElementById("toastHost");
   const text = String(message == null ? "" : message);
   const error = opts && opts.error != null ? !!opts.error : TOAST_ERROR_RE.test(text);
+  // Host notification; a host that renders the message itself cancels it
+  // (contract section 6.5: one toast host at a time, by default the viewer's).
+  if (FTViewer._emit("toast", { message: text, kind: error ? "error" : "info" }, true).defaultPrevented) return null;
   ftAnnounce(text);
   if (!host) return null;
   const item = document.createElement("div");
@@ -475,6 +478,9 @@ document.addEventListener("keydown", event => {
   if (event.defaultPrevented) return;
   const el = document.activeElement;
   const tag = el?.tagName;
+  // A host region that owns its keys (shell sheets, popovers, dialogs, the
+  // empty-state column — [data-keys="off"]) never feeds viewer shortcuts.
+  if (el && el.closest && el.closest('[data-keys="off"]')) return;
   if (isTypingTarget(el)) {
     if (event.key === "Escape") el.blur();
     return;
@@ -536,7 +542,7 @@ document.addEventListener("keydown", event => {
   }
   // A focused <select> would also type-ahead on the same key.
   if (handled && tag === "SELECT") event.preventDefault();
-});
+}, { signal: ftSignal });
 
 els.query.addEventListener("input", () => {
   clearTimeout(els.query._debounce);
@@ -603,7 +609,13 @@ document.getElementById("btnStepBack").addEventListener("click", () => stepFrame
 document.getElementById("btnStepFwd").addEventListener("click", () => stepFrame(1));
 document.getElementById("btnSkipFwd").addEventListener("click", () => skipVideo(10));
 document.getElementById("playRate").addEventListener("change", () => setRate(Number(els.playRate.value) || 1));
-document.getElementById("btnPopPlayer").addEventListener("click", openPlayerWindow);
+// Hosted: the shell owns the second-monitor layout (it calls
+// FTViewer.popout() and folds the main window's media column), so the
+// button only asks. Standalone, or a host without a listener, opens directly.
+document.getElementById("btnPopPlayer").addEventListener("click", () => {
+  if (ftHosted && FTViewer._listens("request-popout")) FTViewer._emit("request-popout", {});
+  else openPlayerWindow();
+});
 document.getElementById("btnDual").addEventListener("click", () => {
   state.layout.dual = !state.layout.dual;
   saveLayout();
@@ -971,9 +983,9 @@ function setMenuExpanded(listId, open) {
   const btn = menuAnchor(listId);
   if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
 }
-function openMenuLists() { return [...document.querySelectorAll(".menu-list")].filter(l => !l.hidden); }
+function openMenuLists() { return [...ftRoot.querySelectorAll(".menu-list")].filter(l => !l.hidden); }
 function closeAllMenus() {
-  document.querySelectorAll(".menu-list").forEach(l => { l.hidden = true; setMenuExpanded(l.id, false); });
+  ftRoot.querySelectorAll(".menu-list").forEach(l => { l.hidden = true; setMenuExpanded(l.id, false); });
 }
 // The toolbar popover lives inside the overflow:hidden player, so it is
 // positioned in viewport coordinates next to its anchor (open downwards when
@@ -1030,7 +1042,7 @@ function closeMenuAndFocusAnchor(list) {
     else { const items = menuItems(list); (e.key === "ArrowUp" ? items[items.length - 1] : items[0])?.focus(); }
   });
 });
-document.querySelectorAll(".menu-list").forEach(list => {
+ftRoot.querySelectorAll(".menu-list").forEach(list => {
   // Capture phase: a clicked action item closes its menu and hands focus
   // back to the anchor BEFORE the item's own handler runs, so dialogs it
   // opens (askDialog) restore focus to a visible control.
@@ -1070,8 +1082,8 @@ document.querySelectorAll(".menu-list").forEach(list => {
     if (e.relatedTarget && !list.parentElement.contains(e.relatedTarget)) { list.hidden = true; setMenuExpanded(list.id, false); }
   });
 });
-document.addEventListener("click", closeAllMenus);
-window.addEventListener("resize", closeAllMenus);
+document.addEventListener("click", closeAllMenus, { signal: ftSignal });
+window.addEventListener("resize", closeAllMenus, { signal: ftSignal });
 // Esc with a menu open closes only the menu (capture phase, so the global
 // handler below does not also leave theater mode / dismiss toasts).
 window.addEventListener("keydown", e => {
@@ -1082,7 +1094,7 @@ window.addEventListener("keydown", e => {
   e.stopPropagation();
   const inside = open.find(l => l.parentElement.contains(document.activeElement));
   if (inside) closeMenuAndFocusAnchor(inside); else closeAllMenus();
-}, true);
+}, { capture: true, signal: ftSignal });
 document.getElementById("btnMoreFilters").addEventListener("click", e => {
   const extra = document.getElementById("filtersExtra");
   extra.hidden = !extra.hidden;
@@ -1141,7 +1153,7 @@ const toolbarOverflow = (() => {
   const wrap = document.getElementById("tbMore");
   const list = document.getElementById("moreToolsList");
   const row = document.getElementById("toolsRow");
-  const media = document.querySelector("section.media");
+  const media = ftRoot.querySelector("section.media");
   const more = document.getElementById("btnMoreTools");
   if (!wrap || !list || !row || !media || !more) return null;
   const tools = [...row.children];
@@ -1168,7 +1180,7 @@ const toolbarOverflow = (() => {
   const measure = () => apply((media.clientWidth || 0) < TOOLBAR_INLINE_MIN_WIDTH);
   measure();
   if (typeof ResizeObserver === "function") new ResizeObserver(measure).observe(media);
-  else window.addEventListener("resize", measure);
+  else window.addEventListener("resize", measure, { signal: ftSignal });
   return { apply, measure };
 })();
 
@@ -1184,7 +1196,7 @@ if (typeof MutationObserver === "function") {
     chip.removeAttribute("aria-live");
     chip.setAttribute("role", "group");
     chip.setAttribute("aria-label", t("chip.live"));
-    const header = document.querySelector("body > header");
+    const header = ftRoot.querySelector(":scope > header");
     const actions = header && header.querySelector(".header-actions");
     // Embedded pages hide the header; the chip then docks top-right (CSS).
     if (actions && getComputedStyle(header).display !== "none") header.insertBefore(chip, actions);
@@ -1207,7 +1219,8 @@ if (typeof MutationObserver === "function") {
       const chip = document.getElementById("ft-live-chip");
       if (chip) { watch.disconnect(); adoptChip(chip); }
     });
-    watch.observe(document.body, { childList: true });
+    watch.observe(ftRoot, { childList: true });
+    ftSignal.addEventListener("abort", () => watch.disconnect(), { once: true });
   }
 }
 
@@ -1227,7 +1240,7 @@ const commandPalette = (() => {
   function collect() {
     const seen = new Set();
     entries = [];
-    document.querySelectorAll(SOURCES).forEach(btn => {
+    ftRoot.querySelectorAll(SOURCES).forEach(btn => {
       if (!btn.id || seen.has(btn.id) || btn.id === "btnMoreTools" || btn.closest("#tagMenuList") || btn.id === "btnShortcutsClose") return;
       seen.add(btn.id);
       entries.push({ btn, label: labelOf(btn), tip: btn.title || "" });
@@ -1264,7 +1277,7 @@ const commandPalette = (() => {
     back.innerHTML = `<div class="modal palette" role="dialog" aria-modal="true" aria-label="${escapeHtml(t("palette.title"))}">` +
       `<input type="text" class="palette-input" role="combobox" aria-expanded="true" aria-controls="cmdList" aria-autocomplete="list" aria-label="${escapeHtml(t("palette.title"))}" placeholder="${escapeHtml(t("palette.placeholder"))}" autocomplete="off">` +
       `<ul id="cmdList" class="palette-list" role="listbox" aria-label="${escapeHtml(t("palette.title"))}"></ul></div>`;
-    document.body.appendChild(back);
+    ftRoot.appendChild(back);
     input = back.querySelector("input");
     listEl = back.querySelector("ul");
     input.addEventListener("input", () => { cursor = 0; draw(); });
@@ -1285,7 +1298,7 @@ const commandPalette = (() => {
   function open() {
     if (!back) build();
     if (!back.hidden) return;
-    if (document.querySelector(".modal-backdrop:not([hidden]):not(#cmdPalette)")) return;
+    if (ftRoot.querySelector(".modal-backdrop:not([hidden]):not(#cmdPalette)")) return;
     closeAllMenus();
     opener = document.activeElement;
     collect();
@@ -1297,9 +1310,10 @@ const commandPalette = (() => {
   }
   window.addEventListener("keydown", e => {
     if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || String(e.key).toLowerCase() !== "k") return;
+    if (document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-keys="off"]')) return;
     e.preventDefault();
     e.stopPropagation();
     if (back && !back.hidden) close(); else open();
-  }, true);
+  }, { capture: true, signal: ftSignal });
   return { open, close };
 })();

@@ -1,4 +1,5 @@
-// Lint: every title= in assets/evidence_viewer.html needs data-i18n-title, and
+// Lint: every title= in the viewer markup (assets/evidence_viewer.html + the
+// shared fragment assets/viewer/viewer.body.html) needs data-i18n-title, and
 // every data-i18n* key used by the page must exist in both locales (ko, en).
 // Also reports keys present in only one locale.
 //
@@ -9,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const html = readFileSync(join(root, 'assets/evidence_viewer.html'), 'utf8');
+const html = readFileSync(join(root, 'assets/evidence_viewer.html'), 'utf8') + '\n' +
+  readFileSync(join(root, 'assets/viewer/viewer.body.html'), 'utf8');
 const src = readFileSync(join(root, 'assets/viewer/20-i18n.js'), 'utf8');
 
 const start = src.indexOf('const I18N = {');

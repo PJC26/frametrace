@@ -2,8 +2,22 @@
  * Data arrives via window.__FRAMETRACE_DATA__ (inlined by frametrace make-review).
  * Reviewer state (layout, marks, selection) persists in localStorage per case. */
 
-(async function () {
-const DATA = await loadViewerData();
+// One mount of the viewer. Called only through FTViewer.init()
+// (00-host.js); everything below 95-init.js runs inside this function, so a
+// destroy()/init() pair rebuilds the whole record model from scratch.
+//   opts.root      the fragment root (#ftViewer) — state classes live here
+//   opts.signal    AbortSignal of this mount: every document/window/channel
+//                  listener is registered with it, timers stop on abort
+//   opts.hosted    true inside the workstation shell (no iframe)
+//   opts.embed     hide the standalone title row
+//   opts.data      inline bundle (else loadViewerData() resolves it)
+async function ftViewerBoot(opts) {
+const ftRoot = opts.root;
+const ftSignal = opts.signal;
+const ftHosted = !!opts.hosted;
+const DATA = opts.data && opts.data.manifest ? opts.data : await loadViewerData({ root: ftRoot, signal: ftSignal, url: opts.url || "" });
+// destroy() while the list was still loading: this mount is void.
+if (!opts.isCurrent()) return;
 const manifest = DATA.manifest || {};
 const scan = DATA.scan || {};
 // The carve audit log is append-only across runs: a re-carve re-emits

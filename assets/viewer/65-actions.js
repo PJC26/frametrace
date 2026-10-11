@@ -371,7 +371,7 @@ function askDialog(spec) {
     back.addEventListener("click", e => { if (e.target === back) finish(null); });
     cancel.addEventListener("click", () => finish(null));
     ok.addEventListener("click", accept);
-    document.body.appendChild(back);
+    ftRoot.appendChild(back);
     const firstInput = Object.values(inputs)[0];
     (firstInput || ok).focus();
     if (firstInput) firstInput.select();

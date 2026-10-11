@@ -71,6 +71,9 @@ const I18N = {
     "sc.pip": "화면 속 화면",
     "sc.exit": "모드 종료",
     "sc.rangeSel": "범위 선택",
+    "sc.altProject": "프로젝트 전환 열기 / 닫기",
+    "sc.altJobs": "작업 시트 열기 / 닫기",
+    "sc.altFinalize": "결과물 시트 열기 / 닫기",
     "media.size": "크기",
     "media.fit": "맞춤",
     "panel.selected": "선택 증거",
@@ -574,6 +577,9 @@ const I18N = {
     "sc.pip": "Picture-in-picture",
     "sc.exit": "Exit mode",
     "sc.rangeSel": "Range select",
+    "sc.altProject": "Open / close the project switcher",
+    "sc.altJobs": "Open / close the jobs sheet",
+    "sc.altFinalize": "Open / close the deliverables sheet",
     "media.size": "Size",
     "media.fit": "Fit",
     "panel.selected": "Selected evidence",
@@ -1029,16 +1035,16 @@ function tf(key, subs) {
 
 function applyChromeI18n() {
   document.documentElement.lang = state.locale;
-  document.querySelectorAll("[data-i18n]").forEach(el => {
+  ftRoot.querySelectorAll("[data-i18n]").forEach(el => {
     el.textContent = t(el.dataset.i18n);
   });
-  document.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
+  ftRoot.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
     el.setAttribute("placeholder", t(el.dataset.i18nPlaceholder));
   });
-  document.querySelectorAll("[data-i18n-title]").forEach(el => {
+  ftRoot.querySelectorAll("[data-i18n-title]").forEach(el => {
     el.setAttribute("title", t(el.dataset.i18nTitle));
   });
-  document.querySelectorAll("[data-i18n-aria-label]").forEach(el => {
+  ftRoot.querySelectorAll("[data-i18n-aria-label]").forEach(el => {
     el.setAttribute("aria-label", t(el.dataset.i18nAriaLabel));
   });
   const langBtn = document.getElementById("btnLang");

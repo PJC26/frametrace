@@ -128,8 +128,12 @@ function playerDescriptor() {
 
 // Same-origin popup windows drive review through this bridge — marks and
 // tags flow through the same state/localStorage path as the main viewer,
-// so popup actions are identical to clicking the buttons there.
-window.__ftBridge = {
+// so popup actions are identical to clicking the buttons there. The popup
+// looks window.opener.__ftBridge up on every call, so after a hosted
+// destroy()/init() it talks to the new mount; a destroyed mount clears the
+// reference (00-host.js beforeDestroy) and never writes again — the main
+// window stays the single writer (docs/ui-rebuild-contract.md §3.3).
+const viewerBridge = {
   descriptor: () => playerDescriptor(),
   focus(id) {
     if (state.activeId !== id && records.some(record => record.id === id)) {
@@ -179,6 +183,7 @@ window.__ftBridge = {
     }));
   },
 };
+window.__ftBridge = viewerBridge;
 
 // BroadcastChannel mirror of __ftBridge: a popup bound to this case keeps
 // working even when window.opener was severed (browser popup policies,
@@ -192,14 +197,17 @@ if (playerChannel) {
     const m = ev.data || {};
     const reply = (payload) => playerChannel.postMessage({ seq: m.seq, payload });
     if (m.type === "descriptor") reply(playerDescriptor());
-    else if (m.type === "focus") reply(window.__ftBridge.focus(m.arg));
-    else if (m.type === "navigate") reply(window.__ftBridge.navigate(m.arg));
-    else if (m.type === "mark") reply(window.__ftBridge.mark(m.arg));
-    else if (m.type === "toggleTag") reply(window.__ftBridge.toggleTag(m.arg));
-    else if (m.type === "list") reply(window.__ftBridge.list());
-    else if (m.type === "undo") reply(window.__ftBridge.undo());
-    else if (m.type === "redo") reply(window.__ftBridge.redo());
-  });
+    else if (m.type === "focus") reply(viewerBridge.focus(m.arg));
+    else if (m.type === "navigate") reply(viewerBridge.navigate(m.arg));
+    else if (m.type === "mark") reply(viewerBridge.mark(m.arg));
+    else if (m.type === "toggleTag") reply(viewerBridge.toggleTag(m.arg));
+    else if (m.type === "list") reply(viewerBridge.list());
+    else if (m.type === "undo") reply(viewerBridge.undo());
+    else if (m.type === "redo") reply(viewerBridge.redo());
+  }, { signal: ftSignal });
+  // One channel per mount: closing it on destroy() means a stale mount can
+  // never answer (or write) for the popup.
+  ftSignal.addEventListener("abort", () => { try { playerChannel.close(); } catch (e) { /* closed */ } }, { once: true });
 }
 
 // A minimal dedicated player window — the examiner can park the clip on
@@ -217,9 +225,9 @@ function jsLit(value) {
 
 function openPlayerWindow() {
   const record = selectedRecord();
-  if (!record) { toast(t("toast.noRecord")); return; }
+  if (!record) { toast(t("toast.noRecord")); return null; }
   const win = window.open("", "frametrace-player", "popup=yes,width=1100,height=880");
-  if (!win) { toast(t("toast.popupBlocked")); return; }
+  if (!win) { toast(t("toast.popupBlocked")); return null; }
   const e = escapeHtml;
   const rate = state.layout.rate || 1;
   const rateOptions = RATES.map(r => `<option value="${r}"${r === rate ? " selected" : ""}>${r}×</option>`).join("");
@@ -367,6 +375,8 @@ call("descriptor",null,function(d){if(d===undefined){dead();}else{applyDesc(d,tr
 <\/script></body></html>`);
   win.document.close();
   win.focus();
+  FTViewer._trackPopup(win);
+  return win;
 }
 
 
@@ -379,6 +389,7 @@ window.addEventListener("keydown", event => {
   const key = String(event.key);
   if (!/^[jkl]$/i.test(key)) return;
   if (typeof isTypingTarget === "function" && isTypingTarget(document.activeElement)) return;
+  if (document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-keys="off"]')) return;
   if (!event.shiftKey) {
     if (key !== key.toUpperCase()) return; // plain j/k/l keep their normal meaning
     event.stopImmediatePropagation(); // CapsLock-only "J": not a shuttle key
@@ -391,4 +402,4 @@ window.addEventListener("keydown", event => {
     event.preventDefault();
     shuttleKey(key === "j" ? -1 : key === "k" ? 0 : 1);
   }
-}, true);
+}, { capture: true, signal: ftSignal });

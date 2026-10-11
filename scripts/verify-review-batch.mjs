@@ -236,6 +236,8 @@ async function unitTests() {
   const records = ['a', 'b', 'c'].map(id => ({ id }));
   const els = Object.fromEntries(['resultCount', 'pageStatus', 'prevPage', 'nextPage', 'recordGrid'].map(id => [id, {}]));
   els.recordGrid.classList = { add: () => {}, remove: () => {}, toggle: () => {} };
+  // State classes (vgrid, theater, ...) live on the fragment root #ftViewer.
+  els.root = { classList: { add: () => {}, remove: () => {}, toggle: () => {}, contains: () => false } };
   Object.assign(state, { marks: {}, selectedIds: new Set(), pageSize: 100, currentPage: 1, groupBy: 'none', collapsedGroups: new Set() });
   // Exercises the paged renderer; the virtual grid has its own Playwright check.
   const grid = { state, records, recordById: new Map(records.map(r => [r.id, r])), els, t: x => x, tf, escapeHtml: x => x, groupKeyFor: () => 'group', renderCard: r => `<card>${r.id}</card>`, groupHeaderHtml: key => `<hdr>${key}</hdr>`, announceResultCount: () => {}, virtualGridEnabled: () => false, document: { body: { classList: { toggle: () => {} } } } };

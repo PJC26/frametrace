@@ -901,6 +901,62 @@ fn examiner_page_auto_detects_image_extension() {
     assert!(EXAMINER_PAGE.contains("input[name='inputKind'][value='e01']"));
 }
 
+#[test]
+fn legacy_examiner_page_served_when_env_set() {
+    // FRAMETRACE_UI=legacy (docs/ui-rebuild-contract.md §9.3) serves the
+    // pre-rebuild shell with its iframe viewer; anything else, the current one.
+    assert!(legacy_ui_requested(Some("legacy")));
+    assert!(legacy_ui_requested(Some(" LEGACY ")));
+    for other in [None, Some(""), Some("new"), Some("0")] {
+        assert!(!legacy_ui_requested(other), "{other:?}");
+    }
+    assert_eq!(examiner_page(false), EXAMINER_PAGE);
+    let legacy = examiner_page(true);
+    assert_eq!(legacy, EXAMINER_PAGE_LEGACY);
+    assert!(legacy.contains(r#"id="stageNav""#));
+    assert!(legacy.contains(r#"<iframe id="reviewFrame""#));
+    assert!(legacy.contains("/review/evidence-viewer.html?embed=1"));
+    // A self-contained page: bundles inlined, no viewer fragment of its own.
+    assert!(!legacy.contains("<!-- @bundle:app") && !legacy.contains("<!-- @include:"));
+    assert!(!legacy.contains(r#"id="ftViewer""#));
+    // Same E01 auto-detect guard as the current shell.
+    assert!(legacy.contains("looksImage"));
+}
+
+#[test]
+fn examiner_page_hosts_the_shared_viewer_fragment_at_most_once() {
+    // While the shell still embeds the viewer by iframe it carries no
+    // fragment; once it hosts the viewer (<html data-ft-host>) it carries
+    // exactly one, plus the viewer bundle (window.FTViewer).
+    assert!(
+        !EXAMINER_PAGE.contains("<!-- @include:") && !EXAMINER_PAGE.contains("<!-- @bundle:app")
+    );
+    let roots = EXAMINER_PAGE.matches(r#"id="ftViewer""#).count();
+    let html_tag = EXAMINER_PAGE
+        .find("<html")
+        .map(|at| &EXAMINER_PAGE[at..at + EXAMINER_PAGE[at..].find('>').unwrap()])
+        .unwrap_or("");
+    if html_tag.contains("data-ft-host") {
+        assert_eq!(roots, 1);
+        assert!(EXAMINER_PAGE.contains(r#"data-ft-viewer="2""#));
+        assert_eq!(EXAMINER_PAGE.matches(r#"id="recordGrid""#).count(), 1);
+        assert_eq!(
+            EXAMINER_PAGE
+                .matches("/* ==== assets/viewer/00-host.js ==== */")
+                .count(),
+            1
+        );
+        assert_eq!(
+            EXAMINER_PAGE
+                .matches("/* ==== assets/kit.css ==== */")
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(roots, 0);
+    }
+}
+
 fn post_request(path: &str, body: &str) -> Request {
     Request {
         method: "POST".into(),

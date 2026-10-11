@@ -6,28 +6,20 @@ if (examinerInput) {
     storageSet(EXAMINER_KEY, state.examiner);
   });
 }
-// Embedded mode (inside the examiner workstation iframe): only the title
-// row goes (case title + the viewer's own theme/language buttons — the
-// shell's stage bar owns those). The filter bar with its count pills,
-// 보기 ▾, ?, the facet rail, grid and media all stay. The host flips it
-// off over postMessage when the iframe goes fullscreen.
-const setEmbed = on => document.body.classList.toggle("embed", on);
-setEmbed(new URLSearchParams(location.search).has("embed") || window.self !== window.top);
+// Embedded mode (hosted in the workstation shell, or the legacy iframe):
+// only the title row goes (case title + the viewer's own theme/language
+// buttons — the host owns those). The filter bar with its count pills,
+// 보기 ▾, ?, the facet rail, grid and media all stay. The state class sits
+// on the fragment root (#ftViewer), never on <body>, so a hosting page's
+// own body is untouched.
+const setEmbed = on => ftRoot.classList.toggle("embed", on);
+setEmbed(!!opts.embed || ftHosted);
 const exitFsBtn = document.getElementById("btnExitFs");
-window.addEventListener("message", event => {
-  if (!event.data || event.data.type !== "ft-embed") return;
-  setEmbed(!!event.data.embed);
-  // Framed + embed off = the host fullscreened us: show a way back.
-  if (exitFsBtn) exitFsBtn.hidden = event.data.embed || window.self === window.top;
-});
-// UX-06: the workstation shell posts {type:"ft-reload"} after a
-// Recover/Carve job rewrote the case. The record model is derived once at
-// boot, so new data means re-loading the page — which pages /api/records
-// and /api/records-meta afresh (layout/selection live in localStorage).
-// That is only done when every review change has reached the case DB:
-// otherwise the reload is refused (and a save started), so annotations are
-// never lost to a refresh. The shell always gets an answer:
-// {type:"ft-reload-ack", reloaded:true|false, reason}.
+// UX-06: new case data (a Recover/Carve job rewrote the case) means a fresh
+// record model. That is only done when every review change has reached the
+// case DB: otherwise the reload is refused (and a save started), so
+// annotations are never lost to a refresh. Shared by FTViewer.reload()
+// (hosted) and the legacy ft-reload postMessage (standalone iframe).
 async function viewerReloadBlocker() {
   if (pendingReviewSync || saveInFlight || state.deletedIds.length) return "unsaved";
   if (queuedOnServer > 0) {
@@ -46,81 +38,158 @@ async function viewerReloadBlocker() {
   }
   return "";
 }
-window.addEventListener("message", async event => {
-  if (!event.data || event.data.type !== "ft-reload") return;
-  if (event.source && window.parent !== window && event.source !== window.parent) return;
-  const target = event.source || window.parent;
-  const answer = (reloaded, reason) => {
-    try { target.postMessage({ type: "ft-reload-ack", reloaded, reason: reason || "" }, "*"); } catch (e) { /* host gone */ }
-  };
-  const blocker = await viewerReloadBlocker();
-  if (blocker) {
-    if (blocker === "unsaved" && viewerIsServed && !saveInFlight) syncMarksNow();
-    toast(t("reload.refused"));
-    answer(false, blocker);
-    return;
-  }
-  answer(true, "");
-  location.reload();
-});
-// The shell pushes theme / language into the embedded viewer. Same source
-// and origin checks as ft-reload; each is acked so the shell can stop
-// retrying (a viewer that loaded late simply misses the first posts).
-window.addEventListener("message", event => {
-  const d = event.data;
-  if (!d || (d.type !== "ft-locale" && d.type !== "ft-theme")) return;
-  if (event.source && window.parent !== window && event.source !== window.parent) return;
-  if (event.origin && event.origin !== "null" && location.origin !== "null" && event.origin !== location.origin) return;
-  const target = event.source || window.parent;
-  const ack = msg => { try { target.postMessage(msg, "*"); } catch (e) { /* host gone */ } };
-  if (d.type === "ft-locale") {
-    if (d.locale !== "ko" && d.locale !== "en") return;
-    if (state.locale !== d.locale) {
-      state.locale = d.locale;
-      storageSet(LOCALE_KEY, state.locale);
-      render();
+function viewerRefuseReload(blocker) {
+  if (blocker === "unsaved" && viewerIsServed && !saveInFlight) syncMarksNow();
+  toast(t("reload.refused"));
+}
+function viewerSetLocale(locale) {
+  if (locale !== "ko" && locale !== "en") return;
+  if (state.locale === locale) return;
+  state.locale = locale;
+  storageSet(LOCALE_KEY, state.locale);
+  render();
+  syncThemeBtn();
+  FTViewer._emit("locale", { locale });
+}
+// Legacy iframe protocol (docs/ui-rebuild-contract.md §3.1/§9.3): only a
+// standalone page listens — a hosted viewer is driven through FTViewer.
+if (!ftHosted) {
+  window.addEventListener("message", event => {
+    if (!event.data || event.data.type !== "ft-embed") return;
+    setEmbed(!!event.data.embed);
+    // Framed + embed off = the host fullscreened us: show a way back.
+    if (exitFsBtn) exitFsBtn.hidden = event.data.embed || window.self === window.top;
+  }, { signal: ftSignal });
+  // The legacy shell posts {type:"ft-reload"} and always gets an answer:
+  // {type:"ft-reload-ack", reloaded:true|false, reason}.
+  window.addEventListener("message", async event => {
+    if (!event.data || event.data.type !== "ft-reload") return;
+    if (event.source && window.parent !== window && event.source !== window.parent) return;
+    const target = event.source || window.parent;
+    const answer = (reloaded, reason) => {
+      try { target.postMessage({ type: "ft-reload-ack", reloaded, reason: reason || "" }, "*"); } catch (e) { /* host gone */ }
+    };
+    const blocker = await viewerReloadBlocker();
+    if (blocker) {
+      viewerRefuseReload(blocker);
+      answer(false, blocker);
+      return;
     }
-    ack({ type: "ft-locale-ack", locale: d.locale });
-  } else {
-    if (d.theme !== "dark" && d.theme !== "light") return;
-    document.documentElement.dataset.theme = d.theme;
-    try { localStorage.setItem("ft-theme", d.theme); } catch (e) {}
-    syncThemeBtn();
-    ack({ type: "ft-theme-ack", theme: d.theme });
+    answer(true, "");
+    location.reload();
+  }, { signal: ftSignal });
+  // The legacy shell pushes theme / language into the framed viewer. Same
+  // source and origin checks as ft-reload; each is acked so the shell can
+  // stop retrying (a viewer that loaded late simply misses the first posts).
+  window.addEventListener("message", event => {
+    const d = event.data;
+    if (!d || (d.type !== "ft-locale" && d.type !== "ft-theme")) return;
+    if (event.source && window.parent !== window && event.source !== window.parent) return;
+    if (event.origin && event.origin !== "null" && location.origin !== "null" && event.origin !== location.origin) return;
+    const target = event.source || window.parent;
+    const ack = msg => { try { target.postMessage(msg, "*"); } catch (e) { /* host gone */ } };
+    if (d.type === "ft-locale") {
+      if (d.locale !== "ko" && d.locale !== "en") return;
+      viewerSetLocale(d.locale);
+      ack({ type: "ft-locale-ack", locale: d.locale });
+    } else {
+      if (d.theme !== "dark" && d.theme !== "light") return;
+      FTViewer._applyTheme(d.theme);
+      ack({ type: "ft-theme-ack", theme: d.theme });
+    }
+  }, { signal: ftSignal });
+  if (exitFsBtn) {
+    exitFsBtn.addEventListener("click", () => {
+      try { window.parent.postMessage({ type: "ft-exit-fullscreen" }, "*"); } catch (e) {}
+    });
   }
-});
-if (exitFsBtn) {
-  exitFsBtn.addEventListener("click", () => {
-    try { window.parent.postMessage({ type: "ft-exit-fullscreen" }, "*"); } catch (e) {}
-  });
 }
 setupHeightSplitter();
 setupColumnSplitter();
 setupGridDelegation();
 setupLayoutChrome();
 document.getElementById("btnLang")?.addEventListener("click", () => {
-  state.locale = state.locale === "ko" ? "en" : "ko";
-  storageSet(LOCALE_KEY, state.locale);
-  render();
+  viewerSetLocale(state.locale === "ko" ? "en" : "ko");
 });
-// Shared ft-theme key — same choice as the workstation shell. When this
-// page is the embedded iframe the host also retags this document
-// directly, so both paths land on the same attribute.
+// Shared ft-theme key — same choice as the workstation shell (hosted: the
+// same document, so one attribute serves both).
 const themeBtn = document.getElementById("btnTheme");
-const syncThemeBtn = () => {
+function syncThemeBtn() {
   if (!themeBtn) return;
   const dark = document.documentElement.dataset.theme === "dark";
   themeBtn.textContent = dark ? "☀ " + t("theme.light") : "◐ " + t("theme.dark");
-};
+}
 themeBtn?.addEventListener("click", () => {
-  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  document.documentElement.dataset.theme = next;
-  try { localStorage.setItem("ft-theme", next); } catch (e) {}
-  syncThemeBtn();
+  FTViewer._applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 });
 syncThemeBtn();
+
+// ---- host API (docs/ui-rebuild-contract.md §3) ----------------------------
+function viewerSummary() {
+  const base = window.__frametraceSummary();
+  return { ...base, pending: pendingSaveCount() };
+}
+function viewerFocus() {
+  const card = state.activeId != null
+    ? els.recordGrid.querySelector(`.card[data-id="${CSS.escape(state.activeId)}"]`)
+    : null;
+  const el = card || els.recordGrid;
+  if (!el) return false;
+  if (!card && !el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+  el.focus();
+  return document.activeElement === el;
+}
+FTViewer._attach({
+  reloadBlocker: viewerReloadBlocker,
+  refuseReload: viewerRefuseReload,
+  setLocale: viewerSetLocale,
+  getLocale: () => state.locale,
+  syncTheme: syncThemeBtn,
+  focus: viewerFocus,
+  summary: viewerSummary,
+  saveState: () => (saveStateEl && saveStateEl.dataset.state) || null,
+  // Resolves true once nothing is pending (marks durably queued on the
+  // server count as saved: they reach the case DB when the job ends).
+  async save() {
+    if (!viewerIsServed) return false;
+    const idle = () => !pendingReviewSync && !state.deletedIds.length;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      while (saveInFlight) await new Promise(resolve => setTimeout(resolve, 100));
+      if (idle()) return true;
+      const result = await syncMarksNow();
+      if (!result.ok && !result.queued) return false;
+    }
+    while (saveInFlight) await new Promise(resolve => setTimeout(resolve, 100));
+    return idle();
+  },
+  // Same path as typing into the viewer's own 검토자 field (#examinerName).
+  setExaminer(name) {
+    const value = String(name == null ? "" : name);
+    if (examinerInput) {
+      examinerInput.value = value;
+      examinerInput.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      state.examiner = value;
+      storageSet(EXAMINER_KEY, state.examiner);
+    }
+  },
+  getExaminer: () => state.examiner || "",
+  popout: () => openPlayerWindow(),
+  toast: (message, kind) => (kind === "error" ? toastError(message) : toast(message)),
+  beforeDestroy() {
+    clearTimeout(autosaveTimer);
+    if (queueWatchTimer) clearInterval(queueWatchTimer);
+    queueWatchTimer = null;
+    stopShuttle();
+    if (window.__ftBridge === viewerBridge) window.__ftBridge = null;
+    if (window.__frametraceSummary === viewerSummaryHook) window.__frametraceSummary = undefined;
+  },
+});
+const viewerSummaryHook = window.__frametraceSummary;
 applyLayout();
 render();
-})();
+FTViewer._emit("records", { total: records.length, byKind: viewerSummary().byKind, byStatus: viewerSummary().byStatus, generation: DATA.liveIndex ? DATA.liveIndex.generation : null });
+FTViewer._emit("ready", { total: records.length, live: !!DATA.liveIndex, generation: DATA.liveIndex ? DATA.liveIndex.generation : null });
+}
 
-// Data loading lives in 99-loader.js (outside the IIFE; see its header).
+// Data loading lives in 99-loader.js (outside ftViewerBoot; see its header).

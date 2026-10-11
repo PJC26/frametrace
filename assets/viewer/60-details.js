@@ -47,6 +47,8 @@ function audioDetailText(record) {
 }
 
 function renderDetails() {
+  if (ftSignal.aborted) return; // a frame queued before destroy()
+  emitViewerChanges();
   const record = selectedRecord();
   const teleTitle = document.getElementById("telemetryTitle");
   const telePane = document.getElementById("telemetryPane");
@@ -180,7 +182,7 @@ function renderDetails() {
     <button type="button" class="mini" id="btnSaveCustomTag" title="${t("tag.presetSave.title")}">${t("tag.presetSave")}</button>
   </div>`;
   // replace existing tag editor if any
-  const oldEditor = document.querySelector(".tag-editor-wrap");
+  const oldEditor = ftRoot.querySelector(".tag-editor-wrap");
   if (oldEditor) oldEditor.remove();
   // The review annotation (tags + note) sits in the 요약 tab, the default
   // one, so marking/tagging never needs a tab switch.
@@ -195,7 +197,7 @@ function renderDetails() {
     touchAnnotation(record.id);
     storageSet(NOTES_KEY, state.notes);
   });
-  document.querySelectorAll(".tag-btn").forEach(btn => {
+  ftRoot.querySelectorAll(".tag-btn").forEach(btn => {
     btn.addEventListener("click", () => {
       toggleTag(record.id, btn.dataset.presetTag);
       requestRender();
@@ -310,7 +312,31 @@ function renderTree(facets) {
   });
 }
 
+// Host notifications (FTViewer "active-record" / "selection"): renderMetrics
+// runs after every active-card or selection change, so it emits on change.
+var ftLastActiveId;
+var ftLastSelection;
+function emitViewerChanges() {
+  if (state.activeId !== ftLastActiveId) {
+    ftLastActiveId = state.activeId;
+    const record = state.activeId == null ? null : recordById.get(state.activeId);
+    FTViewer._emit("active-record", {
+      id: state.activeId,
+      kind: record ? record.kind || "video" : null,
+      status: record ? record.status || null : null,
+      mark: (state.activeId != null && state.marks[state.activeId]?.status) || null,
+    });
+  }
+  const ids = [...state.selectedIds];
+  const signature = ids.join("\n");
+  if (signature !== ftLastSelection) {
+    ftLastSelection = signature;
+    FTViewer._emit("selection", { ids, count: ids.length });
+  }
+}
+
 function renderMetrics() {
+  emitViewerChanges();
   // Case ID only on the line; title and source path in the tooltip.
   els.caseLine.textContent = manifest.case_id || "case";
   els.caseLine.title = tf("layout.caseTip", { id: manifest.case_id || "case", title: manifest.title || "Untitled", path: scan.source_path || "-" });
@@ -401,7 +427,7 @@ function renderChips() {
     });
   });
   // Count pills mirror the status select / anomaly chip.
-  document.querySelectorAll(".count-pills [data-pill]").forEach(pill => {
+  ftRoot.querySelectorAll(".count-pills [data-pill]").forEach(pill => {
     const value = pill.dataset.pill;
     const on = value.startsWith("status:") ? state.status === value.slice(7) : state.chip === value;
     pill.setAttribute("aria-pressed", on ? "true" : "false");
@@ -462,7 +488,7 @@ function clearActiveFilter(key) {
   render();
   // Keep keyboard focus in the row (or move it to the grid when it empties).
   const next = document.querySelector("#activeFilters [data-af]");
-  if (next && document.body.classList.contains("rail-collapsed")) next.focus();
+  if (next && els.root.classList.contains("rail-collapsed")) next.focus();
   else els.query.focus();
 }
 
@@ -510,6 +536,9 @@ function setActiveCard(id) {
 }
 
 function render() {
+  // A render queued (rAF / timer) by a mount that has since been destroyed
+  // must not touch the fragment the next mount owns.
+  if (ftSignal.aborted) return;
   if (renderFrame) { cancelFrame(renderFrame); renderFrame = 0; }
   applyChromeI18n();
   // The zoom-mode select sits next to a visual "크기" label only; give it a

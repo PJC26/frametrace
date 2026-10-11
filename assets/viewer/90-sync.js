@@ -142,6 +142,16 @@ function renderSaveState() {
   saveStateEl.textContent = label;
   saveStateEl.title = title;
   saveStateEl.setAttribute("aria-label", `${label} — ${title}`);
+  // Host notification (FTViewer "save-state"): only on an actual change.
+  const signature = `${kind}|${n}|${queuedOnServer}`;
+  if (signature !== lastSaveSignature) {
+    lastSaveSignature = signature;
+    FTViewer._emit("save-state", { state: kind, pending: n, queued: queuedOnServer });
+  }
+}
+var lastSaveSignature = "";
+function emitDirty() {
+  FTViewer._emit("dirty", { count: pendingSaveCount() });
 }
 
 // While the server holds queued marks, poll until its queue is empty so the
@@ -150,6 +160,7 @@ var queueWatchTimer = null;
 function watchServerQueue() {
   if (queueWatchTimer || !viewerIsServed) return;
   queueWatchTimer = setInterval(async () => {
+    if (ftSignal.aborted) { clearInterval(queueWatchTimer); queueWatchTimer = null; return; }
     try {
       const res = await fetch("/api/status", { cache: "no-store" });
       const st = res.ok ? await res.json() : null;
@@ -165,6 +176,7 @@ function watchServerQueue() {
 
 function scheduleAutosave(delay) {
   clearTimeout(autosaveTimer);
+  if (ftSignal.aborted) return; // this mount was destroyed
   autosaveTimer = setTimeout(() => { autosaveTimer = null; syncMarksNow(); }, delay);
 }
 
@@ -177,6 +189,7 @@ function markReviewDirty() {
     if (!(saveFailures > 0 && autosaveTimer)) scheduleAutosave(AUTOSAVE_DEBOUNCE_MS);
   }
   renderSaveState();
+  emitDirty();
 }
 
 function clearReviewDirty() {
@@ -184,6 +197,7 @@ function clearReviewDirty() {
   state.deletedIds = [];
   state.drafts = {};
   storageSet(ANNOTATIONS_KEY, state.drafts);
+  emitDirty();
 }
 
 async function pushMarksToCase(payload) {
@@ -204,6 +218,8 @@ async function pushMarksToCase(payload) {
 // A call made while a save is in flight is queued behind it, not dropped.
 async function syncMarksNow() {
   if (!viewerIsServed) return { ok: false, offline: true, error: t("save.offlineErr") };
+  // A destroyed mount never writes: the next mount owns the drafts.
+  if (ftSignal.aborted) return { ok: false, error: "viewer destroyed" };
   if (saveInFlight) {
     saveQueued = true;
     return { ok: false, queued: true };
@@ -248,6 +264,7 @@ async function syncMarksNow() {
     saveRetryAt = Date.now() + delay;
     scheduleAutosave(delay);
     if (firstFailure) toast(tf("toast.saveFailed", { err: saveError }));
+    if (firstFailure) FTViewer._emit("error", { message: tf("toast.saveFailed", { err: saveError }), detail: saveError, stage: "save" });
   }
   if (manualQueued) {
     // A queued manual apply always pushes once more and reports, even if
@@ -277,7 +294,7 @@ window.addEventListener("beforeunload", (event) => {
   if (!pendingReviewSync && !state.deletedIds.length && !saveInFlight) return;
   event.preventDefault();
   event.returnValue = "";
-});
+}, { signal: ftSignal });
 
 if (saveStateEl) {
   // Clicking the indicator saves (or retries) right away.
@@ -289,10 +306,10 @@ if (saveStateEl) {
 }
 // Back online / tab visible again: retry a failed save now instead of
 // waiting out the backoff.
-window.addEventListener("online", () => { if (viewerIsServed && pendingReviewSync) scheduleAutosave(0); });
+window.addEventListener("online", () => { if (viewerIsServed && pendingReviewSync) scheduleAutosave(0); }, { signal: ftSignal });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && viewerIsServed && pendingReviewSync && saveFailures > 0) scheduleAutosave(0);
-});
+}, { signal: ftSignal });
 
 // Server-served viewers can push marks straight into the case DB instead of
 // the download → file-pick → import dance.
@@ -724,7 +741,7 @@ function showRangeDivergenceBanner(ids) {
   };
   mk("rangeUseServer", t("range.useServer"), "server");
   mk("rangeUseBrowser", t("range.useBrowser"), "browser");
-  document.body.insertBefore(bar, document.body.firstChild);
+  ftRoot.insertBefore(bar, ftRoot.firstChild);
 }
 
 // A fresh browser (new origin/port, cleared storage) has no local ranges:

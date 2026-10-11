@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    // Theme resolves before first paint so there is no flash: explicit
+    // choice (localStorage) beats the OS preference. The same ft-theme key
+    // is read by the evidence viewer and carve report — one toggle themes
+    // every surface, including the embedded review iframe.
+    try {
+      document.documentElement.dataset.theme =
+        localStorage.getItem("ft-theme") ||
+        (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    } catch (e) {}
+  </script>
+  <title>FrameTrace 검수 워크스테이션</title>
+  <!-- @bundle:app.css -->
+</head>
+<body class="stage1">
+<a class="skiplink" href="#main">본문으로 건너뛰기</a>
+<header class="stagebar" id="stageBar">
+  <div class="brand-mark" aria-hidden="true">FT</div>
+  <h1>FrameTrace 검수 워크스테이션</h1>
+  <!-- One step list for every stage: a left rail on stages 1/2/4, folded
+       into this 40px bar on stage 3 (full-bleed review). Alt+1…Alt+4. -->
+  <nav class="rail" id="stageNav" aria-label="작업 단계">
+    <button type="button" class="navstep sel current" id="s1" data-view="1"><span class="num" aria-hidden="true" data-n="1">1</span><span class="nt"><b>입력</b><small>증거 소스 · 케이스 폴더</small></span><span class="sr-only" id="s1State"></span></button>
+    <button type="button" class="navstep" id="s2" data-view="2" disabled><span class="num" aria-hidden="true" data-n="2">2</span><span class="nt"><b>분석 진행</b><small>단계 · 실시간 로그</small></span><span class="sr-only" id="s2State"></span></button>
+    <button type="button" class="navstep" id="s3" data-view="3" disabled><span class="num" aria-hidden="true" data-n="3">3</span><span class="nt"><b>검토</b><small>뷰어 · 삭제 영상 복구</small></span><span class="sr-only" id="s3State"></span></button>
+    <button type="button" class="navstep" id="s4" data-view="4" disabled><span class="num" aria-hidden="true" data-n="4">4</span><span class="nt"><b>결과물</b><small>보고서 · 패키지</small></span><span class="sr-only" id="s4State"></span></button>
+  </nav>
+  <span class="barcase" id="barCase" hidden></span>
+  <div class="sub">로컬 전용 · 원본 증거는 읽기 전용으로만 접근합니다</div>
+  <span class="barspacer" aria-hidden="true"></span>
+  <div class="jobpanel" id="jobPanel" hidden>
+    <span class="jobdot" id="jobDot" aria-hidden="true"></span>
+    <span class="jobtext"><b id="jobTitle"></b> <span id="jobDetail"></span></span>
+    <span class="jobelapsed" id="jobElapsed"></span>
+    <button type="button" class="danger" id="btnJobCancel">작업 중단</button>
+    <button type="button" class="primary" id="btnJobReload" hidden>뷰어 새로 고침</button>
+    <button type="button" class="ghost" id="btnJobClose" hidden>닫기</button>
+  </div>
+  <div class="hdrmenu" id="caseMenuWrap" hidden>
+    <button type="button" class="hbtn menubtn" id="btnCaseMenu" aria-expanded="false" aria-controls="caseMenu" title="검토 도구 — 전체화면, 새 창, 색인 대시보드, 삭제 영상 복구, 카빙">케이스 작업 <span class="caret" aria-hidden="true">▾</span></button>
+    <div class="popover" id="caseMenu" hidden>
+      <div class="pop-title">보기</div>
+      <button type="button" class="mi" id="btnViewerFull" title="뷰어를 전체화면으로 확대 — 헤더·보기 메뉴까지 모두 표시됩니다">⤢ 뷰어 전체화면</button>
+      <button type="button" class="mi" id="btnViewerWindow" title="별도 창으로 열기 — 듀얼 모니터에 적합. 저장은 한 창에서만 합니다">⧉ 새 창으로 열기 (보조 모니터)</button>
+      <a href="/review/index.html" target="_blank" rel="noopener" class="mi" id="lnkDashboard">색인 대시보드 <span aria-hidden="true">↗</span><span class="sr-only">(새 탭)</span></a>
+      <div class="pop-sep" role="separator"></div>
+      <div class="pop-title">삭제 영상 · 카빙</div>
+      <button type="button" class="mi" id="btnRecoverDeleted" hidden>삭제 영상 후보 복구</button>
+      <button type="button" class="mi" id="btnCarve" hidden title="export된 raw 이미지에서 영상 시그니처를 카빙합니다 (E01 전체 export 분석 필요)">이미지 카빙</button>
+      <label class="mi chk" id="reassembleWrap" hidden title="조각난 영상을 이어붙인 후보를 추가로 만듭니다. 시간이 더 걸리며, 결과는 검증 전 '후보'로만 표시됩니다 — 확정된 복구가 아닙니다"><input type="checkbox" id="chkReassemble"> 카빙 시 조각 재조립 시도</label>
+      <p class="pop-note" id="recoverHint">뷰어에서 항목을 마크·메모로 선별한 뒤, 4단계 '결과물'에서 보고서와 패키지를 생성합니다. 삭제 후보 복구·카빙은 조사된 이미지가 있을 때만 동작합니다.</p>
+    </div>
+  </div>
+  <div class="hdrmenu">
+    <button type="button" class="hbtn menubtn" id="btnTools" aria-expanded="false" aria-controls="toolsPop" title="외부 도구 · 감사 로그 상태">도구 <span id="toolsCount">…</span> <span class="caret" aria-hidden="true">▾</span></button>
+    <div class="popover" id="toolsPop" hidden>
+      <div class="pop-title">외부 도구 · 감사 로그</div>
+      <div class="env" id="env"></div>
+      <p class="pop-note">ffmpeg/ffprobe는 영상 검증, libewf는 E01 입력, Sleuth Kit은 삭제 파일 조사에 쓰입니다. 없는 도구가 있어도 기본 폴더 분석은 동작합니다.</p>
+    </div>
+  </div>
+  <button type="button" class="hbtn" id="btnTheme" title="테마 전환 (라이트/다크)" aria-label="테마 전환">◐ 테마</button>
+  <button type="button" class="hbtn" id="btnViewerLang" title="검토 뷰어의 표시 언어를 전환합니다 (워크스테이션 화면은 한국어 전용)">뷰어 언어: 한국어</button>
+  <span class="hdr-sep" aria-hidden="true"></span>
+  <button type="button" class="hbtn danger" id="btnQuit" title="워크스테이션 서버를 종료합니다 (확인 후) — 케이스 데이터와 감사 로그는 보존됩니다">⏻ 서버 종료</button>
+</header>
+<div class="srvbanner" id="serverBanner" role="alert" hidden>
+  <b>서버 연결이 끊겼습니다.</b>
+  <span class="grow" id="serverBannerMsg">frametrace-app이 실행 중인지 확인하십시오 — 자동으로 다시 연결을 시도합니다.</span>
+  <button type="button" id="btnServerRetry">지금 다시 시도</button>
+</div>
+<!-- Toasts are visual only; announcements go through the two live
+     regions below (polite for everything, assertive for errors). -->
+<div class="toastbox" id="toastBox" role="region" aria-label="알림"></div>
+<div class="sr-only" id="srStatus" role="status" aria-live="polite"></div>
+<div class="sr-only" id="srAlert" role="alert" aria-live="assertive"></div>
+<div class="quitpage" id="quitPage" hidden>
+  <div class="card">
+    <h2>워크스테이션이 종료되었습니다</h2>
+    <p>케이스 데이터와 감사 로그는 보존됩니다. 이 창을 닫아도 됩니다.<br>다시 시작하려면 frametrace-app을 실행하십시오.</p>
+  </div>
+</div>
+<div class="shell">
+<main id="main" tabindex="-1">
+  <nav class="crumbs" id="crumbs" aria-label="현재 위치"></nav>
+
+  <!-- Stage 1 (start screen): one centered column, exactly three blocks —
+       증거 넣기 · 이전 프로젝트 · 뷰어 보기. Everything else (case folder,
+       analysis mode, options) stays behind the collapsed '옵션' disclosure. -->
+  <section class="view on start" id="inputCard" data-view="1" aria-labelledby="inputTitle">
+    <h2 class="sr-only" id="inputTitle">시작 — 증거 넣기 · 이전 프로젝트 · 뷰어 보기</h2>
+    <div class="startcol">
+      <div class="onboard" id="onboard" hidden>
+        <b class="ob-title">FrameTrace 사용 안내</b>
+        <ul>
+          <li>원본 증거는 <b>읽기 전용</b>으로만 접근합니다 — 해시·메타데이터·감사 로그 등 모든 산출물은 케이스 폴더에만 기록됩니다.</li>
+          <li>순서: <b>증거 넣기 → 분석 → 검토(마크·선별) → 결과물(보고서·패키지)</b>. 분석한 케이스는 '이전 프로젝트'에서 다시 열 수 있습니다.</li>
+          <li>도구 상태는 헤더의 '도구' 버튼을 보십시오 — E01 입력에는 libewf, 삭제 파일 조사에는 Sleuth Kit이 필요합니다. 없는 도구가 있어도 폴더 분석은 동작합니다.</li>
+          <li>삭제 후보·카빙·재조립 결과는 검증을 통과하기 전까지 '<b>후보</b>'로만 표시됩니다.</li>
+        </ul>
+        <div class="ob-foot">
+          <button type="button" id="btnOnboardOk">안내 닫기</button>
+        </div>
+      </div>
+
+      <section class="sblock" id="blkEvidence" aria-labelledby="blkEvidenceTitle">
+        <div class="sbhead">
+          <h3 id="blkEvidenceTitle">증거 넣기</h3>
+          <p class="sbdesc" id="blkEvidenceDesc">E01 이미지 파일이나 블랙박스 폴더·드라이브를 넣으면 바로 분석합니다. 원본은 읽기 전용입니다.</p>
+        </div>
+        <label class="sr-only" for="sourcePath" id="sourceLabel">증거 경로 — E01 이미지 파일 또는 폴더·드라이브</label>
+        <div class="pathrow">
+          <input type="text" id="sourcePath" list="recentSources" autocomplete="off" spellcheck="false" placeholder="E:\BLACKBOX 또는 D:\증거\disk.E01" aria-describedby="blkEvidenceDesc sourceStatus" autofocus>
+          <button type="button" id="btnBrowseSource" title="폴더 또는 E01 이미지 파일을 고릅니다">찾아보기…</button>
+          <button type="button" class="primary big" id="btnStart">분석 시작</button>
+        </div>
+        <datalist id="recentSources"></datalist>
+        <div class="srcline">
+          <span class="kindchip" id="kindChip" hidden></span>
+          <span class="pathstatus" id="sourceStatus" aria-live="polite"></span>
+          <span class="muted starthint" id="startHint" aria-live="polite"></span>
+        </div>
+        <small id="e01Need" class="need" hidden>libewf 미설치 — E01을 분석하려면 tools/bin 또는 PATH에 ewf* 도구가 필요합니다 (헤더 '도구' 참고)</small>
+        <div class="preflight" id="preflight" aria-live="polite" hidden></div>
+        <div class="resumebox" id="resumeBox" hidden>
+          <span id="resumeText"></span>
+          <button type="button" id="btnResumeContinue" title="같은 소스·같은 옵션으로 분석을 시작합니다 — 완료된 파일은 건너뜁니다">이어서</button>
+          <button type="button" class="ghost" id="btnResumeFresh" title="빈 새 케이스 폴더를 제안합니다 — 기존 케이스와 체크포인트는 그대로 보존됩니다">처음부터 (새 케이스 폴더)</button>
+        </div>
+        <div class="err" id="startErr" role="alert"></div>
+        <details class="opts" id="startOptions">
+          <summary><span class="opts-t">옵션</span> <span class="opts-sum" id="optSummary">케이스 폴더 자동 · 전체 (증거용)</span></summary>
+          <div class="opts-body">
+            <!-- Evidence kind is auto-detected from the path; these radios
+                 only carry the detected value for the start request. -->
+            <div class="kindstore" hidden>
+              <input type="radio" name="inputKind" value="folder" checked aria-label="폴더">
+              <input type="radio" name="inputKind" value="e01" aria-label="E01 이미지">
+            </div>
+            <div class="field">
+              <label class="fieldlabel" for="caseDir"><span>케이스 폴더 <span class="opt">(비우면 자동 생성)</span></span></label>
+              <div class="pathrow">
+                <input type="text" id="caseDir" list="recentCases" autocomplete="off" spellcheck="false" placeholder="자동 — 예: C:\Cases\case-001">
+                <button type="button" id="btnBrowseCase">찾아보기…</button>
+                <button type="button" class="ghost" id="btnSuggestCase" title="소스 이름과 오늘 날짜로 케이스 폴더 경로를 채웁니다">자동 제안</button>
+              </div>
+              <datalist id="recentCases"></datalist>
+              <div class="pathstatus" id="caseStatus" aria-live="polite"></div>
+              <p class="hint opencase">이 폴더가 이미 만든 케이스라면 <button type="button" class="linkbtn" id="btnOpenCase">이 케이스 열기</button></p>
+            </div>
+            <div class="fieldlabel" id="scanModeLabel">분석 모드</div>
+            <div class="seg" role="radiogroup" aria-labelledby="scanModeLabel">
+              <label title="해시·ffprobe 생략 — 파일 목록과 기본 메타데이터만 색인합니다 (대용량 소스 1차 선별용)"><input type="radio" name="scanMode" value="quick"> 빠른 선별</label>
+              <label title="ffprobe 검증만 실행, SHA-256 해시는 생략합니다"><input type="radio" name="scanMode" value="standard"> 표준</label>
+              <label title="파일별 SHA-256 + ffprobe 검증 — 소스의 모든 바이트를 읽습니다 (최종 증거용)"><input type="radio" name="scanMode" value="full" checked> 전체 (증거용)</label>
+              <label title="아래 체크박스를 직접 조정한 상태"><input type="radio" name="scanMode" value="custom"> 사용자 지정</label>
+            </div>
+            <div class="modeinfo" id="modeInfo" aria-live="polite"></div>
+            <div class="checks">
+              <label><input type="checkbox" id="withHash" checked> 파일별 SHA-256 해시 계산 (증거 대조용)</label>
+              <label><input type="checkbox" id="withFfprobe" checked> ffprobe 재생성 검증 (코덱/길이 메타데이터)</label>
+              <label><input type="checkbox" id="withDeepfake"> 딥페이크 스크리닝 (deepfake-lens — 느릴 수 있음; 판정이 아니라 검토 우선순위)</label>
+            </div>
+            <div class="checks" id="verifyRow" style="display:none;">
+              <label><input type="checkbox" id="skipE01Verify"> E01 해시 검증 생략 (ewfverify는 이미지 크기에 비례해 오래 걸립니다 — 최종 증거용은 생략 비권장)</label>
+              <label><input type="checkbox" id="directE01"> 빠른 검토 — raw export 생략, E01에서 직접 파일시스템 조사 (대용량 이미지에 적합; 카빙은 별도 export 필요)</label>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="sblock" id="blkRecent" aria-labelledby="blkRecentTitle">
+        <div class="sbhead">
+          <h3 id="blkRecentTitle">이전 프로젝트</h3>
+          <p class="sbdesc">분석한 케이스는 케이스 폴더에 모두 저장되어 언제든 다시 열 수 있습니다.</p>
+        </div>
+        <ul class="recentlist" id="recentCaseRow" aria-labelledby="blkRecentTitle" hidden></ul>
+        <p class="recentempty" id="recentEmpty">아직 연 프로젝트가 없습니다.</p>
+        <div class="sbfoot">
+          <button type="button" class="primary" id="btnOpenOther" title="케이스 폴더를 골라 바로 엽니다">다른 케이스 폴더 열기…</button>
+        </div>
+      </section>
+
+      <section class="sblock" id="blkViewer" aria-labelledby="blkViewerTitle">
+        <div class="sbhead">
+          <h3 id="blkViewerTitle">뷰어 보기</h3>
+          <p class="sbdesc">마지막으로 연 케이스의 뷰어를 바로 엽니다.</p>
+        </div>
+        <div class="sbrow">
+          <button type="button" class="primary big" id="btnViewerOpen" aria-describedby="viewerReason" title="아직 연 케이스가 없습니다 — 먼저 증거를 넣어 분석하거나 이전 프로젝트를 여십시오." disabled>뷰어 보기</button>
+          <span class="viewerreason" id="viewerReason">아직 연 케이스가 없습니다 — 먼저 증거를 넣어 분석하거나 이전 프로젝트를 여십시오.</span>
+        </div>
+      </section>
+
+      <p class="startfoot">로컬 전용 도구 · 원본 증거는 읽기 전용으로만 접근합니다 · <button type="button" class="linkbtn" id="btnOnboardShow">사용 안내</button></p>
+    </div>
+  </section>
+
+  <section class="card view" id="progCard" data-view="2" aria-labelledby="progTitle">
+    <div class="cardhead">
+      <h2 id="progTitle">분석 진행</h2>
+      <p class="hint">각 단계는 감사 로그에 기록됩니다. 이 탭을 닫아도 분석은 계속되지만, 결과를 보려면 페이지를 다시 열어야 합니다.</p>
+    </div>
+    <div class="viewcols progcols">
+      <ol class="steptrack" id="track"></ol>
+      <pre class="log" id="log" tabindex="0" aria-label="분석 로그 (스크롤 가능)"></pre>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button type="button" class="danger" id="btnCancel" style="display:none">분석 중단</button>
+      <button type="button" class="primary" id="btnNew" style="display:none">새 케이스 시작</button>
+      <span class="logtools">
+        <button type="button" class="ghost" id="btnCopyLog">로그 복사</button>
+        <button type="button" class="ghost" id="btnSaveLog" title="현재까지의 로그를 텍스트 파일로 저장합니다">로그 저장</button>
+        <button type="button" class="ghost" id="btnLogBottom" title="로그 맨 아래로 이동하고 자동 스크롤을 다시 켭니다" hidden>↓ 최신 로그로</button>
+      </span>
+    </div>
+  </section>
+
+  <!-- Stage 3 is full-bleed: the viewer gets 100vh - 40px. Its tools live
+       in the stage bar's '케이스 작업' menu; the viewer shows its own counts. -->
+  <section class="view" id="resultCard" data-view="3" aria-labelledby="resultTitle">
+    <h2 class="sr-only" id="resultTitle">검토 — 분석된 데이터 확인</h2>
+    <div class="sr-only" id="caseStats">뷰어 로딩 중…</div>
+    <div class="framewrap">
+      <iframe id="reviewFrame" title="증거 뷰어" allow="fullscreen"></iframe>
+      <div class="framefail" id="frameFail" role="alert" hidden>
+        <b id="frameFailTitle">뷰어를 불러오지 못했습니다</b>
+        <span id="frameFailMsg"></span>
+        <span class="row">
+          <button type="button" class="primary" id="btnFrameRetry">다시 시도</button>
+          <button type="button" id="btnFrameWindow">새 창으로 열기</button>
+        </span>
+      </div>
+      <div class="framefail popout" id="framePopout" hidden>
+        <b>별도 창에서 검토 중</b>
+        <span>검토 뷰어가 다른 창(보조 모니터)에 열려 있습니다. 마크·메모가 한 창에서만 저장되도록 이 자리의 뷰어는 닫아 두었습니다.</span>
+        <span class="row">
+          <button type="button" class="primary" id="btnFrameReturn">여기로 되돌리기</button>
+          <button type="button" id="btnFrameFocusPopup">별도 창 보기</button>
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <section class="card view" id="finalCard" data-view="4" aria-labelledby="finalTitle">
+    <h2 id="finalTitle">결과물 정리 — 보고서 · 패키지</h2>
+    <p class="hint">검토가 끝나면 결과 보고서를 생성합니다. 보고서에는 발견된 원본 영상, 메타데이터, SHA-256 해시, 발견/분석 기법, 처리 체인이 정리됩니다. 최종 패키징은 색인된 원본 파일의 SHA-256을 다시 계산해 기록된 값과 비교하고, 일치/불일치를 보고서에 그대로 기록합니다 (불일치의 원인은 판단하지 않습니다).</p>
+    <div class="viewcols">
+      <div>
+        <div class="minihead">보고서 · 패키지</div>
+        <div class="stack">
+          <button type="button" class="primary big" id="btnFinalize">결과 보고서 생성 및 패키징</button>
+          <button id="btnVerifySources" title="색인된 모든 원본을 지금 다시 해시해 기록된 SHA-256과 비교합니다 (evidence/logs/hash-verify.jsonl, 보관 이력서 5절)">원본 재검증 (SHA-256 다시 계산)</button>
+          <input type="file" id="marksFile" accept=".json" style="display:none">
+          <button id="btnImportMarks" title="다른 PC·오프라인 뷰어에서 내보낸 마크 JSON을 가져올 때만 사용합니다 — 이 화면의 뷰어 마크는 자동으로 케이스에 반영됩니다">외부 마크 파일 가져오기 (보고서 갱신)</button>
+        </div>
+        <p class="muted" id="finalHint"></p>
+        <div class="linklist" id="finalLinks"></div>
+        <div class="pkg" id="pkgPath"></div>
+      </div>
+      <div>
+        <div class="minihead">고급 도구 — 상호교환·QA·케이스 비교</div>
+        <div class="stack">
+          <button class="ghost" data-adv="dfxml">DFXML보내기</button>
+          <button class="ghost" data-adv="timeline">타임라인 JSONL</button>
+          <button class="ghost" data-adv="qa-consistency">색인 일관성 QA</button>
+          <button class="ghost" data-adv="qa-defense">보고 방어 체크</button>
+          <button class="ghost" data-adv="deepfake" title="케이스의 모든 파일(색인·카빙·복구)을 deepfake-lens로 스크리닝 — 결과는 뷰어의 '합성의심' 배지로 표시. 판정이 아니라 검토 우선순위입니다">딥페이크 스크리닝</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="advPath" placeholder="다른 케이스 폴더 또는 해시 목록 파일 경로" style="flex:1;min-width:0">
+        </div>
+        <div class="stack" style="margin-top:8px">
+          <button class="ghost" data-adv="compare">케이스 비교</button>
+          <button class="ghost" data-adv="merge">케이스 병합</button>
+          <button class="ghost" data-adv="known-hash">기지원 해시 필터</button>
+        </div>
+        <pre class="adv-out muted" id="advOut" hidden></pre>
+        <div id="advLink"></div>
+      </div>
+    </div>
+    <div id="reportWrap" hidden>
+      <div class="minihead" style="margin:0 0 6px">보고서 미리보기</div>
+      <iframe id="reportFrame" title="결과 보고서"></iframe>
+    </div>
+  </section>
+</main>
+</div>
+<div class="modal-backdrop" id="pickerBackdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
+    <div class="modal-head">
+      <h3 id="pickerTitle">폴더 선택</h3>
+      <button type="button" id="pickerClose" aria-label="선택 창 닫기" title="닫기 (Esc)">×</button>
+    </div>
+    <div class="picker-pathrow">
+      <input type="text" id="pickerPath" aria-label="현재 경로 — 직접 입력 후 Enter로 이동" spellcheck="false">
+      <button id="pickerUp">상위</button>
+    </div>
+    <ul class="picker-list" id="pickerList" role="listbox" aria-label="폴더 목록 — 위/아래 화살표로 이동, Enter 또는 Space로 열기"></ul>
+    <div class="modal-foot">
+      <span class="muted" id="pickerStatus" role="status" aria-live="polite"></span>
+      <button class="primary" id="pickerSelect">이 폴더 선택</button>
+      <button id="pickerCancel">취소</button>
+    </div>
+  </div>
+</div>
+<div class="modal-backdrop" id="dlgBackdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dlgTitle">
+    <div class="modal-head">
+      <h3 id="dlgTitle"></h3>
+    </div>
+    <div class="dlg-body" id="dlgBody"></div>
+    <div class="modal-foot">
+      <span class="dlg-progress" id="dlgNote" aria-live="polite"></span>
+      <button class="primary" id="dlgOk">확인</button>
+      <button id="dlgCancel">취소</button>
+    </div>
+  </div>
+</div>
+<footer class="pagefoot">FrameTrace는 로컬 전용 도구입니다. 원본 증거 매체는 쓰기 보호 상태로 두고, 본 도구는 케이스 폴더에만 산출물을 작성합니다.</footer>
+<!-- @bundle:app.js -->
+</body>
+</html>

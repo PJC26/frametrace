@@ -9,7 +9,11 @@
 //    check: every literal $("id") / document.getElementById("id") must
 //    exist in assets/examiner_app.html or be created by the app's own
 //    markup strings (id="..."), so a renamed element cannot silently
-//    turn a handler into a TypeError at load.
+//    turn a handler into a TypeError at load. Ids of the shared viewer
+//    fragment (assets/viewer/viewer.body.html) count as markup too.
+//  - the two bundles share ONE document's global scope when the shell hosts
+//    the viewer: their top-level function/class/const/let/var names must
+//    not intersect (docs/ui-rebuild-contract.md §2.1).
 //  - inline <script> blocks of assets/examiner_app.html and
 //    assets/evidence_viewer.html.
 //  - every scripts/*.mjs (and scripts/lib/*.mjs) must parse.
@@ -19,7 +23,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { appParts, concatParts, appBundleCss, appMarkup } from './lib/app-bundle.mjs';
+import { appParts, concatParts, appBundleCss, appMarkup, viewerFragment, viewerBundleJs, topLevelBindings, VIEWER_INCLUDE } from './lib/app-bundle.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = mkdtempSync(join(tmpdir(), 'ft-checkjs-'));
@@ -80,6 +84,14 @@ else {
   // id check
   const known = new Set();
   for (const m of markup.matchAll(/\bid\s*=\s*"([^"]+)"/g)) known.add(m[1]);
+  for (const m of viewerFragment(root).matchAll(/\bid\s*=\s*"([^"]+)"/g)) known.add(m[1]);
+  if (markup.split(VIEWER_INCLUDE).length > 2) fail(`assets/examiner_app.html must contain at most one ${VIEWER_INCLUDE}`);
+  // shared global scope (hosted viewer)
+  const viewerTop = topLevelBindings(viewerBundleJs(root));
+  const appTop = topLevelBindings(appJs);
+  const clash = [...appTop].filter((name) => viewerTop.has(name));
+  if (clash.length) fail('assets/app and assets/viewer declare the same top-level names: ' + clash.join(', '));
+  else console.log(`ok   top-level bindings: viewer ${viewerTop.size} / shell ${appTop.size}, no overlap`);
   for (const m of appJs.matchAll(/\bid\s*=\s*\\?"([A-Za-z][\w-]*)\\?"/g)) known.add(m[1]);
   for (const m of appJs.matchAll(/\.id\s*=\s*"([^"]+)"/g)) known.add(m[1]);
   const missing = new Map();

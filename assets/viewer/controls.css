@@ -12,10 +12,10 @@
                 (spinner + aria-busy, from withBusy)
      size       32px tall, never below 24x24 */
 
-/* The body grid had an implicit auto column: wide page content (calendar,
+/* The root grid (#ftViewer) had an implicit auto column: wide page content (calendar,
    facet tree) stretched it past the viewport and pushed the right end of
    the action bar and the media toolbar off-screen. Pin it to the viewport. */
-body { grid-template-columns: minmax(0, 1fr); }
+.ft-viewer { grid-template-columns: minmax(0, 1fr); }
 
 .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
 
@@ -100,7 +100,7 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
    when the media column is wide, else in the 더보기 popover
    ====================================================================== */
 .player { grid-template-rows: 32px minmax(0, 1fr) auto; }
-body.theater .player { grid-template-rows: 34px minmax(0, 1fr) auto; }
+.ft-viewer.theater .player { grid-template-rows: 34px minmax(0, 1fr) auto; }
 #mediaToolbar { --tb-bg: #16231f; --tb-fg: #eaf3ef; --tb-line: #4b625a; --tb-hover: #22352f; --tb-ring: #7fd6c7;
   display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 0; padding: 0; background: var(--tb-bg); color: var(--tb-fg); }
 .tb-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px; min-width: 0; }
@@ -136,7 +136,7 @@ body.theater .player { grid-template-rows: 34px minmax(0, 1fr) auto; }
 #toastHost { position: fixed; top: 100px; right: 14px; bottom: auto; z-index: 60; display: grid; gap: 8px; width: min(420px, calc(100vw - 28px)); pointer-events: none; }
 /* Below the top bar (title row hidden in embed) so toasts never cover the
    search/filter/count-pill buttons. */
-body.embed #toastHost { top: 56px; }
+.ft-viewer.embed #toastHost { top: 56px; }
 /* Clicks pass through a toast's text to whatever is underneath; only its
    own buttons (close / action) take the pointer. A transient message must
    never block a control. */
@@ -157,7 +157,7 @@ body.embed #toastHost { top: 56px; }
 #ft-live-chip button { min-height: 24px; min-width: 24px; }
 /* Embed has no title row; park the live-index chip bottom-left just above
    the action bar instead of over the top bar's buttons. */
-body.embed #ft-live-chip { position: fixed !important; top: auto !important; bottom: 56px !important; left: 12px !important; right: auto !important; z-index: 55 !important; box-shadow: var(--shadow, 0 4px 12px rgba(0,0,0,.2)) !important; }
+.ft-viewer.embed #ft-live-chip { position: fixed !important; top: auto !important; bottom: 56px !important; left: 12px !important; right: auto !important; z-index: 55 !important; box-shadow: var(--shadow, 0 4px 12px rgba(0,0,0,.2)) !important; }
 
 /* ======================================================================
    Command palette (Ctrl+K) — shortcuts-modal styling

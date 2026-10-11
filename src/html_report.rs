@@ -1,6 +1,9 @@
 use crate::util::json_for_script;
 
-const VIEWER_TEMPLATE: &str = include_str!("../assets/evidence_viewer.html");
+// The standalone template with the shared viewer fragment
+// (assets/viewer/viewer.body.html) and the icon sprite already inlined by
+// build.rs (docs/ui-rebuild-contract.md §1.2).
+const VIEWER_TEMPLATE: &str = include_str!(concat!(env!("OUT_DIR"), "/evidence_viewer.html"));
 const VIEWER_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/evidence_viewer.css"));
 // build.rs concatenates assets/viewer/*.js into this bundle — the
 // deliverable stays a single serverless file while the source is split.
@@ -931,7 +934,10 @@ fn jsonl_to_array(jsonl: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill_template, render_carve_report_html, render_evidence_viewer_html};
+    use super::{
+        VIEWER_CSS, VIEWER_JS, VIEWER_TEMPLATE, fill_template, render_carve_report_html,
+        render_evidence_viewer_html, render_evidence_viewer_html_slim,
+    };
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -1160,5 +1166,161 @@ mod tests {
                 redaction_applied: false,
             }),
         );
+    }
+
+    // ---- shared viewer fragment / standalone parity (docs/ui-rebuild-contract.md §1.2, §8.1)
+
+    fn asset(rel: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn full_viewer_page() -> String {
+        render_evidence_viewer_html(
+            r#"{"case_id":"FT-PARITY","title":"parity"}"#,
+            r#"{"videos":[{"id":"vid_000001","relative_path":"a.mp4","size_bytes":1}]}"#,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "{}",
+            "{}",
+            "{}",
+            "{}",
+            "[]",
+            Path::new("/case"),
+        )
+    }
+
+    /// Every `id="…"` the fragment declares.
+    fn fragment_ids(fragment: &str) -> Vec<String> {
+        fragment
+            .match_indices(" id=\"")
+            .map(|(at, m)| {
+                let rest = &fragment[at + m.len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn viewer_fragment_present_in_slim_and_full_pages() {
+        let fragment = asset("assets/viewer/viewer.body.html");
+        let fragment = fragment.trim_end();
+        for (name, page) in [
+            ("slim", render_evidence_viewer_html_slim()),
+            ("full", full_viewer_page()),
+        ] {
+            assert_eq!(page.matches(r#"id="ftViewer""#).count(), 1, "{name}");
+            assert_eq!(page.matches(r#"data-ft-viewer="2""#).count(), 1, "{name}");
+            assert_eq!(page.matches(r#"id="recordGrid""#).count(), 1, "{name}");
+            assert!(
+                page.contains(fragment),
+                "{name}: fragment not inlined verbatim"
+            );
+            // (the icon sprite's own header comment names its marker, so only
+            // the include and the CSS/JS bundle markers are checked here)
+            assert!(
+                !page.contains("<!-- @include:") && !page.contains("<!-- @bundle:app"),
+                "{name}: unreplaced build marker"
+            );
+            for slot in ["__CSS__", "__DATA__", "__JS__"] {
+                assert!(
+                    !VIEWER_TEMPLATE.replacen(slot, "", 1).contains(slot),
+                    "template must carry {slot} once"
+                );
+            }
+            // Every viewer id stays unique on the page (harnesses and the
+            // shell's legacy iframe bridge address them by id).
+            let ids = fragment_ids(fragment);
+            assert!(ids.len() > 120, "fragment ids: {}", ids.len());
+            for id in ids {
+                assert_eq!(
+                    page.matches(&format!(" id=\"{id}\"")).count(),
+                    1,
+                    "{name}: id {id} must appear exactly once"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_viewer_template_is_assembled_from_the_shared_sources() {
+        // OUT_DIR template == assets/evidence_viewer.html with the fragment
+        // and the icon sprite substituted — nothing else may differ, so the
+        // exported court-evidence page and the hosted viewer share markup.
+        let expected = asset("assets/evidence_viewer.html")
+            .replacen(
+                "<!-- @include:viewer.body -->",
+                asset("assets/viewer/viewer.body.html").trim_end(),
+                1,
+            )
+            .replacen(
+                "<!-- @bundle:icons.svg -->",
+                asset("assets/icons.svg").trim_end(),
+                1,
+            );
+        assert_eq!(VIEWER_TEMPLATE, expected);
+        // The slim page is exactly the template with the three slots filled.
+        assert_eq!(
+            render_evidence_viewer_html_slim(),
+            VIEWER_TEMPLATE
+                .replacen("__CSS__", VIEWER_CSS, 1)
+                .replacen("__DATA__", "window.__FRAMETRACE_DATA__ = null;", 1)
+                .replacen("__JS__", VIEWER_JS, 1)
+        );
+    }
+
+    #[test]
+    fn standalone_viewer_bundles_tokens_kit_and_host_api_once() {
+        let page = render_evidence_viewer_html_slim();
+        for banner in [
+            "/* ==== assets/tokens.css ==== */",
+            "/* ==== assets/kit.css ==== */",
+            "/* ==== assets/evidence_viewer.css ==== */",
+            "/* ==== assets/viewer/controls.css ==== */",
+            "/* ==== assets/viewer/00-host.js ==== */",
+            "/* ==== assets/viewer/99-loader.js ==== */",
+        ] {
+            assert_eq!(page.matches(banner).count(), 1, "{banner}");
+        }
+        // Mark colours follow the shared tokens (contract §5.6): whatever
+        // assets/tokens.css defines for --mark-important-bg is in the page.
+        let tokens = asset("assets/tokens.css");
+        let line = tokens
+            .lines()
+            .find(|l| l.contains("--mark-important-bg:"))
+            .expect("tokens.css defines --mark-important-bg");
+        assert!(page.contains(line), "{line}");
+        assert!(tokens.len() > 100 && page.contains(tokens.trim_end()));
+        // The bundle exposes window.FTViewer and still self-mounts when no
+        // host page claims it (packaged file, /viewer/, legacy iframe).
+        assert!(VIEWER_JS.contains("window.FTViewer = FTViewer;"));
+        assert!(VIEWER_JS.contains(r#"hasAttribute("data-ft-host")"#));
+        assert!(VIEWER_JS.contains("async function ftViewerBoot(opts)"));
+    }
+
+    #[test]
+    fn standalone_viewer_keeps_the_legacy_iframe_contract() {
+        // FRAMETRACE_UI=legacy embeds this page in an iframe (?embed=1) and
+        // drives it by postMessage + same-origin DOM reads: keep all of it
+        // until the legacy shell is deleted (contract §9.3).
+        let page = render_evidence_viewer_html_slim();
+        for needle in [
+            "\"ft-reload\"",
+            "\"ft-reload-ack\"",
+            "\"ft-embed\"",
+            "\"ft-theme\"",
+            "\"ft-locale\"",
+            "window.__frametraceSummary",
+            "window.__ftBridge",
+            r#"id="saveState""#,
+            r#"id="examinerName""#,
+            r#"id="btnExitFs""#,
+            r#"has("embed")"#,
+        ] {
+            assert!(page.contains(needle), "{needle}");
+        }
     }
 }

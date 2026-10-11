@@ -1,0 +1,212 @@
+const STEP_NAMES = ["케이스 준비", "소스 등록", "스캔 · 색인", "재생성 검증", "리뷰 생성"];
+
+// Reads a fetch Response as JSON without ever throwing: HTTP errors,
+// non-JSON bodies (a proxy error page, a truncated reply) and network
+// failures all collapse to { ok:false, error } so callers have exactly one
+// failure shape to render.
+async function readJson(r) {
+  let data = null;
+  try { data = await r.json(); } catch (e) { data = null; }
+  if (!r || !r.ok) {
+    const status = r && r.status ? `HTTP ${r.status}` : "응답 없음";
+    return Object.assign({}, data && typeof data === "object" ? data : {}, {
+      ok: false,
+      // HTTP status kept so callers can tell "endpoint not in this server
+      // build" (404/405 — degrade quietly) from a real failure.
+      status: (r && r.status) || 0,
+      error: (data && data.error) || `서버 오류 (${status})`,
+    });
+  }
+  if (!data || typeof data !== "object") return { ok: false, malformed: true, error: "서버 응답을 해석할 수 없습니다 (JSON 아님)" };
+  return data;
+}
+function netError(err) {
+  return { ok: false, network: true, status: 0, error: "서버에 연결할 수 없습니다: " + ((err && err.message) || err || "network") };
+}
+// jget throws on failure (existing callers wrap it and treat a throw as
+// "unknown"); jpost never throws — it always resolves to { ok, error }.
+async function jget(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  const data = await readJson(r);
+  if (!(r && r.ok) || data.malformed) throw new Error(data.error);
+  return data;
+}
+// Like jpost for GET: never throws, keeps the HTTP status on failure.
+async function jgetSoft(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    return await readJson(r);
+  } catch (err) {
+    return netError(err);
+  }
+}
+// True when a soft call failed because the server does not have the
+// endpoint (an older build) — callers then hide the feature, not error.
+function endpointMissing(res) {
+  return !!(res && !res.ok && (res.status === 404 || res.status === 405 || res.status === 501));
+}
+async function jpost(url, body) {
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    return await readJson(r);
+  } catch (err) {
+    return netError(err);
+  }
+}
+
+// ---- screen-reader announcements: one polite + one assertive region ----
+// Toasts and job transitions are announced here (the toast stack itself
+// is not a live region, so nothing is read twice). Assertive is reserved
+// for errors; the server-lost banner is its own role=alert.
+let announceTimer = 0;
+function announce(msg, assertive) {
+  const el = $(assertive ? "srAlert" : "srStatus");
+  if (!el || !msg) return;
+  // Clearing first makes a repeated identical message announce again.
+  el.textContent = "";
+  clearTimeout(announceTimer);
+  announceTimer = setTimeout(() => { el.textContent = String(msg); }, 40);
+}
+
+// ---- toast: transient, non-blocking feedback ----
+// Top-right under the stage bar, at most TOAST_MAX stacked; info/warn
+// leave after TOAST_MS (hover or keyboard focus pauses the clock), errors
+// stay until dismissed (× or Esc). Esc dismisses the newest toast.
+const TOAST_MAX = 3, TOAST_MS = 6000;
+let toasts = [];
+function toast(msg, kind) {
+  const box = $("toastBox");
+  if (!box || typeof document.createElement !== "function") return;
+  announce(msg, kind === "err");
+  const el = document.createElement("div");
+  el.className = "toast" + (kind === "err" ? " err" : kind === "warn" ? " warn" : kind === "ok" ? " ok" : "");
+  const text = document.createElement("span");
+  text.className = "toast-msg";
+  text.textContent = msg;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "toast-x";
+  close.textContent = "×";
+  close.title = "알림 닫기 (Esc)";
+  close.setAttribute("aria-label", "알림 닫기");
+  if (typeof el.append === "function") el.append(text, close); else { el.appendChild(text); el.appendChild(close); }
+  const sticky = kind === "err";
+  const rec = { el, sticky, timer: 0, left: TOAST_MS, since: 0, hover: false, focus: false };
+  const arm = () => {
+    if (sticky || rec.timer || rec.hover || rec.focus) return;
+    rec.since = Date.now();
+    rec.timer = setTimeout(() => dismissToast(rec), Math.max(800, rec.left));
+  };
+  const pause = () => {
+    if (!rec.timer) return;
+    clearTimeout(rec.timer);
+    rec.timer = 0;
+    rec.left -= Date.now() - rec.since;
+  };
+  rec.dismiss = () => dismissToast(rec);
+  el.addEventListener("mouseenter", () => { rec.hover = true; pause(); });
+  el.addEventListener("mouseleave", () => { rec.hover = false; arm(); });
+  el.addEventListener("focusin", () => { rec.focus = true; pause(); });
+  el.addEventListener("focusout", () => { rec.focus = false; arm(); });
+  close.addEventListener("click", () => dismissToast(rec));
+  box.appendChild(el);
+  toasts.push(rec);
+  // Over the cap: drop the oldest non-error first, errors last.
+  while (toasts.length > TOAST_MAX) dismissToast(toasts.find(t => !t.sticky) || toasts[0]);
+  arm();
+  return rec;
+}
+function dismissToast(rec) {
+  if (!rec) return;
+  clearTimeout(rec.timer);
+  rec.timer = 0;
+  toasts = toasts.filter(t => t !== rec);
+  try { rec.el.remove(); } catch (e) {}
+}
+function dismissNewestToast() {
+  const rec = toasts[toasts.length - 1];
+  if (!rec) return false;
+  dismissToast(rec);
+  return true;
+}
+
+// Busy state for a button: spinner + label, aria-busy, disabled.
+function setBusy(btn, busy, label) {
+  if (!btn) return;
+  if (busy) {
+    if (btn.dataset && btn.dataset.idleLabel === undefined) btn.dataset.idleLabel = btn.textContent;
+    if (label) btn.textContent = label;
+    btn.setAttribute("aria-busy", "true");
+    btn.disabled = true;
+  } else {
+    btn.removeAttribute("aria-busy");
+    if (btn.dataset && btn.dataset.idleLabel !== undefined) {
+      if (label !== false) btn.textContent = btn.dataset.idleLabel;
+      delete btn.dataset.idleLabel;
+    }
+  }
+}
+
+// ---- in-app dialog (replaces blocking confirm/alert) ----
+// askDialog resolves true on OK, false on cancel/Escape. `onOk` may return
+// false (or a Promise of false) to keep the dialog open, e.g. when a
+// required field is still empty.
+let dlgResolve = null, dlgOnOk = null, dlgLastFocus = null;
+function askDialog({ title, html, okLabel, cancelLabel, danger, onOk, focus }) {
+  if (dlgResolve) closeDialog(false);
+  dlgLastFocus = document.activeElement;
+  $("dlgTitle").textContent = title || "";
+  $("dlgBody").innerHTML = html || "";
+  $("dlgNote").textContent = "";
+  $("dlgOk").textContent = okLabel || "확인";
+  $("dlgOk").disabled = false;
+  $("dlgOk").classList.toggle("danger-fill", !!danger);
+  $("dlgCancel").textContent = cancelLabel || "취소";
+  $("dlgCancel").hidden = cancelLabel === null;
+  $("dlgBackdrop").hidden = false;
+  dlgOnOk = onOk || null;
+  setTimeout(() => {
+    const target = (focus && $(focus)) || $("dlgOk");
+    if (target && target.focus) target.focus();
+  }, 0);
+  return new Promise(resolve => { dlgResolve = resolve; });
+}
+function closeDialog(result) {
+  $("dlgBackdrop").hidden = true;
+  const resolve = dlgResolve;
+  dlgResolve = null; dlgOnOk = null;
+  if (dlgLastFocus && dlgLastFocus.focus) { try { dlgLastFocus.focus(); } catch (e) {} }
+  if (resolve) resolve(result);
+}
+function alertDialog(title, msg) {
+  return askDialog({ title, html: `<p>${esc(msg)}</p>`, okLabel: "확인", cancelLabel: null });
+}
+$("dlgOk").addEventListener("click", async () => {
+  if (dlgOnOk) {
+    $("dlgOk").disabled = true;
+    $("dlgOk").setAttribute("aria-busy", "true");
+    let keep = false;
+    try { keep = (await dlgOnOk()) === false; } catch (e) { keep = true; $("dlgNote").textContent = "오류: " + (e.message || e); }
+    $("dlgOk").removeAttribute("aria-busy");
+    $("dlgOk").disabled = false;
+    if (keep) return;
+  }
+  closeDialog(true);
+});
+$("dlgCancel").addEventListener("click", () => closeDialog(false));
+// Document-level so Escape / Tab still work after a click on the backdrop
+// or any non-focusable part of the dialog moved focus to <body>.
+document.addEventListener("keydown", e => {
+  if ($("dlgBackdrop").hidden) return;
+  if (e.key === "Escape") { e.preventDefault(); closeDialog(false); return; }
+  if (e.key !== "Tab") return;
+  const focusables = [...$("dlgBackdrop").querySelectorAll("button, input, a[href], [tabindex='0']")]
+    .filter(el => !el.disabled && !el.hidden && el.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  const inside = $("dlgBackdrop").contains(document.activeElement);
+  if (!inside) { e.preventDefault(); (e.shiftKey ? last : first).focus(); }
+  else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
+

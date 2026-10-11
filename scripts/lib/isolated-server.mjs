@@ -8,6 +8,7 @@
 // read or overwritten, and a pinned FRAMETRACE_TOKEN.
 //
 //   const srv = await startIsolatedServer({ root, work });
+//   startIsolatedServer({ root, work, env: { FRAMETRACE_UI: 'legacy' } })  // extra env
 //   srv.base, srv.token, srv.headers, srv.getJson(path), srv.postJson(path, body), srv.stop()
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
@@ -43,7 +44,7 @@ export function isolatedEnv(work, extra = {}) {
   };
 }
 
-export async function startIsolatedServer({ root, work, token, port, release = false } = {}) {
+export async function startIsolatedServer({ root, work, token, port, release = false, env = {} } = {}) {
   // FRAMETRACE_BIN pins an exact binary (CI builds once); otherwise
   // $CARGO_TARGET_DIR (or ./target) / debug|release / frametrace-app.
   const dir = join(process.env.CARGO_TARGET_DIR || join(root, 'target'), release ? 'release' : 'debug');
@@ -53,7 +54,7 @@ export async function startIsolatedServer({ root, work, token, port, release = f
   const usePort = port || await freePort();
   const base = `http://127.0.0.1:${usePort}`;
   const child = spawn(exe, [String(usePort)], {
-    env: isolatedEnv(work, { FRAMETRACE_TOKEN: pinned }),
+    env: isolatedEnv(work, { ...env, FRAMETRACE_TOKEN: pinned }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let log = '';
