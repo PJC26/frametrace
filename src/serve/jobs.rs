@@ -1462,8 +1462,11 @@ pub(crate) fn start_case_job(state: &SharedState, exe: &Path, spec: CaseJobSpec)
     let started_unix = crate::util::now_unix().unwrap_or(0);
     let prior_phase = {
         let mut guard = state_lock(state);
+        // The phase stays what it was (finding 9): marks queue during a
+        // case job, so a shell reloaded mid-job must still open the review
+        // stage. The job itself is reported via `job` / `job_kind`, and
+        // `busy` (held by the lease) still blocks finalize and other jobs.
         let prior = guard.phase;
-        guard.phase = "finalizing";
         guard.error = None;
         guard.case_job = Some(CaseJob {
             kind: spec.kind,

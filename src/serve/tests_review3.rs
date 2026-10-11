@@ -346,3 +346,47 @@ fn export_dedupe_skips_cancel_pending_jobs() {
     });
     let _ = std::fs::remove_dir_all(case);
 }
+
+/// Finding 9: a recover/carve job keeps the case's review phase (marks
+/// queue during it, so a shell reloaded mid-job must be able to open the
+/// review stage); the job itself is reported via job/job_kind, and
+/// finalize is still refused while it holds busy.
+#[cfg(unix)]
+#[test]
+fn case_job_keeps_review_phase_and_still_blocks_finalize() {
+    let case = temp_case("job-phase");
+    let dir = case.join("db/filesystem");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("tsk-inspection-1.json"),
+        br#"{"image_path":"/nonexistent/evidence.raw","partition_offset":2048}"#,
+    )
+    .unwrap();
+    let exe = fake_cli(
+        &case,
+        r#"case "$1" in
+  recover-batch) sleep 2; echo ok ;;
+  *) echo ok ;;
+esac"#,
+    );
+    let state = bound(&case, "review-ready");
+    let started = parse(&recover_deleted_with_exe(&state, &exe));
+    assert_eq!(started["ok"], true, "{started}");
+    let status = parse(&api_status(&state));
+    assert_eq!(status["busy"], true, "{status}");
+    assert_eq!(status["job_kind"], "recover-deleted", "{status}");
+    assert_eq!(
+        status["phase"], "review-ready",
+        "the review stage must stay open during a case job: {status}"
+    );
+    let refused = api_finalize(
+        &request("POST", "/api/finalize", "", r#"{"examiner":"홍길동"}"#),
+        &state,
+    );
+    assert!(refused.contains("\"ok\":false"), "{refused}");
+    wait_for("recover done", || {
+        parse(&api_status(&state))["job"]["state"] == "done"
+    });
+    assert_eq!(parse(&api_status(&state))["phase"], "review-ready");
+    let _ = std::fs::remove_dir_all(case);
+}
