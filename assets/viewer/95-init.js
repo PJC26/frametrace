@@ -63,6 +63,32 @@ window.addEventListener("message", async event => {
   answer(true, "");
   location.reload();
 });
+// The shell pushes theme / language into the embedded viewer. Same source
+// and origin checks as ft-reload; each is acked so the shell can stop
+// retrying (a viewer that loaded late simply misses the first posts).
+window.addEventListener("message", event => {
+  const d = event.data;
+  if (!d || (d.type !== "ft-locale" && d.type !== "ft-theme")) return;
+  if (event.source && window.parent !== window && event.source !== window.parent) return;
+  if (event.origin && event.origin !== "null" && location.origin !== "null" && event.origin !== location.origin) return;
+  const target = event.source || window.parent;
+  const ack = msg => { try { target.postMessage(msg, "*"); } catch (e) { /* host gone */ } };
+  if (d.type === "ft-locale") {
+    if (d.locale !== "ko" && d.locale !== "en") return;
+    if (state.locale !== d.locale) {
+      state.locale = d.locale;
+      storageSet(LOCALE_KEY, state.locale);
+      render();
+    }
+    ack({ type: "ft-locale-ack", locale: d.locale });
+  } else {
+    if (d.theme !== "dark" && d.theme !== "light") return;
+    document.documentElement.dataset.theme = d.theme;
+    try { localStorage.setItem("ft-theme", d.theme); } catch (e) {}
+    syncThemeBtn();
+    ack({ type: "ft-theme-ack", theme: d.theme });
+  }
+});
 if (exitFsBtn) {
   exitFsBtn.addEventListener("click", () => {
     try { window.parent.postMessage({ type: "ft-exit-fullscreen" }, "*"); } catch (e) {}

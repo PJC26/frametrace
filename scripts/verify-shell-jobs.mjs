@@ -116,6 +116,7 @@ function makeEnv(opts = {}) {
 
   const els = {};
   const winListeners = {};
+  const docListeners = {};
   const store = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
   const document = {
     getElementById: (id) => (els[id] ||= makeEl(id, id === 'reviewFrame' ? 'iframe' : 'div')),
@@ -123,7 +124,7 @@ function makeEnv(opts = {}) {
     querySelector: () => null,
     createElement: (tag) => makeEl('', tag),
     createTextNode: (t) => ({ text: t }),
-    addEventListener() {},
+    addEventListener(t, fn) { (docListeners[t] ||= []).push(fn); },
     documentElement: { dataset: { theme: 'light' } },
     activeElement: null,
     body: makeEl('body'),
@@ -160,6 +161,7 @@ function makeEnv(opts = {}) {
     ctx, els, frame, frameWin, advance, flush, errors,
     $: (id) => document.getElementById(id),
     ev: (expr) => vm.runInContext(expr, ctx),
+    docKey: (key) => { const ev = { type: 'keydown', key, prevented: false, preventDefault() { this.prevented = true; } }; for (const fn of [...(docListeners.keydown || [])]) fn(ev); return ev; },
     winMessage: (data, source) => { for (const fn of [...(winListeners.message || [])]) fn({ data, source }); },
     async answerDialog(ok) {
       await flush();
@@ -560,6 +562,56 @@ await test('theme + viewer language live in the shell and propagate to the frame
   const v2 = env.loadFrame({ lang: 'ko' });
   assert.equal(v2.doc.documentElement.lang, 'en');
   assert.equal(v2.doc.documentElement.dataset.theme, 'dark');
+});
+
+await test('job finishing while the viewer frame is loading: wait for load, then ft-reload handshake', async () => {
+  const env = makeEnv();
+  await openReview(env);
+  env.ev('loadReviewFrame')(env.frame.src); // frame navigates again → "loading"
+  assert.equal(env.ev('frameState'), 'loading');
+  env.frameWin.posted.length = 0;
+  let result = null;
+  env.ev('refreshViewerData')('carve').then((r) => { result = r; });
+  await env.advance(500);
+  assert.equal(result, null, 'must not report success while the frame is still loading');
+  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 0);
+  env.loadFrame();
+  await env.advance(50);
+  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 1, 'ft-reload posted once the frame is live');
+  env.winMessage({ type: 'ft-reload-ack', reloaded: false }, env.frameWin);
+  await env.advance(50);
+  assert.equal(result, 'deferred', 'a refusal after the load is honoured');
+});
+
+await test('viewer locale is re-posted until acked; a reloaded frame restarts the sequence', async () => {
+  const env = makeEnv();
+  await openReview(env);
+  env.$('btnViewerLang').click(); // → en
+  env.frameWin.posted.length = 0;
+  await env.advance(3000);
+  const n = () => env.frameWin.posted.filter((m) => m.type === 'ft-locale' && m.locale === 'en').length;
+  assert.ok(n() >= 4, 'retried without ack: ' + n());
+  env.winMessage({ type: 'ft-locale-ack', locale: 'en' }, env.frameWin);
+  const after = n();
+  await env.advance(5000);
+  assert.equal(n(), after, 'stops after ack');
+  env.frameWin.posted.length = 0;
+  env.loadFrame({ lang: 'ko' });
+  await env.advance(1200);
+  assert.ok(n() >= 2, 'reloaded frame gets the locale again');
+});
+
+await test('shell dialog: Escape works at document level even after focus left the dialog', async () => {
+  const env = makeEnv();
+  const p = env.ev('askDialog')({ title: 't', html: '<p>x</p>' });
+  await env.flush();
+  assert.equal(env.$('dlgBackdrop').hidden, false);
+  env.ctx.document.activeElement = null; // backdrop click moved focus to <body>
+  const ev = env.docKey('Escape');
+  assert.equal(ev.prevented, true);
+  assert.equal(await p, false);
+  assert.equal(env.$('dlgBackdrop').hidden, true);
+  assert.equal(env.docKey('Escape').prevented, false, 'ignored while no dialog is open');
 });
 
 await test('no uncaught errors from timers', async () => {
