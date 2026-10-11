@@ -60,6 +60,7 @@ pub struct ServeOptions {
 }
 
 pub fn run(options: ServeOptions) -> Result<(), String> {
+    proc::install_process_guard();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     if let Some(case_dir) = &options.case_dir {
         let mut guard = state_lock(&state);
@@ -127,6 +128,8 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
         None => first_free_port().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?,
     };
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+    // In-process publish first: the shell must never depend on the file.
+    publish_local_server(port, token.as_deref());
     write_instance_file(port, &state_lock(&state).instance, token.as_deref());
     let url = match &token {
         Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
