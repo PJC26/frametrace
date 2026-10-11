@@ -31,6 +31,8 @@ mod tests;
 mod tests_hardening;
 #[cfg(test)]
 mod tests_live;
+#[cfg(test)]
+mod tests_marks_live;
 
 pub(crate) use discovery::*;
 pub(crate) use http::*;

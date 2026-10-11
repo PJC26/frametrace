@@ -545,6 +545,17 @@ pub fn validate_batch(
 }
 
 pub fn import_marks(case_dir: &Path, marks_path: &Path) -> Result<(), String> {
+    let stored = import_marks_quiet(case_dir, marks_path)?;
+    println!("marks imported");
+    println!("source: {}", marks_path.display());
+    println!("marks stored: {stored}");
+    println!("sqlite: {}", case_db::case_db_path(case_dir).display());
+    Ok(())
+}
+
+/// [`import_marks`] without the stdout report, so the workstation server
+/// can apply marks in-process (phase-2 enrichment) and return the count.
+pub fn import_marks_quiet(case_dir: &Path, marks_path: &Path) -> Result<usize, String> {
     ensure_case(case_dir)?;
     let marks_file = crate::selection::parse_marks_file(marks_path)?;
     crate::selection::enforce_case_binding(
@@ -583,11 +594,7 @@ pub fn import_marks(case_dir: &Path, marks_path: &Path) -> Result<(), String> {
         &marks_file.tags,
         &marks_file.deleted_ids,
     )?;
-    println!("marks imported");
-    println!("source: {}", marks_path.display());
-    println!("marks stored: {stored}");
-    println!("sqlite: {}", case_db::case_db_path(case_dir).display());
-    Ok(())
+    Ok(stored)
 }
 
 pub fn export_marks(case_dir: &Path, output: Option<&Path>) -> Result<(), String> {

@@ -260,7 +260,9 @@ fn deleted_video_selectors(
 #[cfg(test)]
 mod tests;
 
-pub(crate) use batch::{export_batch, export_marks, import_marks, validate_batch};
+pub(crate) use batch::{
+    export_batch, export_marks, import_marks, import_marks_quiet, validate_batch,
+};
 pub(crate) use case::{
     InitCaseOptions, PackageOptions, RegisterSourceOptions, init_case, inspect, make_custody,
     make_report, make_review, package_case, register_source, scan_folder,

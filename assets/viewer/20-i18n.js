@@ -394,7 +394,15 @@ const I18N = {
     "toast.shuttle": "셔틀 {dir} {speed}배속",
     "toast.shuttlePause": "셔틀 정지",
     "sc.step": "한 프레임 뒤로 / 앞으로 (일시정지 중)",
-    "sc.shuttle": "셔틀 역방향 / 정지 / 정방향 (반복 시 1×→2×→4×)"
+    "sc.shuttle": "셔틀 역방향 / 정지 / 정방향 (반복 시 1×→2×→4×)",
+    "save.queuedServer": "저장 대기(보강 중)",
+    "save.title.queuedServer": "{n}건이 서버 대기열에 안전하게 보관되었습니다 — 해시·리뷰 생성 단계가 끝나는 즉시 케이스 DB에 반영됩니다. 창을 닫아도 유실되지 않습니다.",
+    "range.divergeMsg": "서버와 다른 {n}건",
+    "range.server": "서버",
+    "range.browser": "브라우저",
+    "range.none": "없음",
+    "range.useServer": "서버 기준",
+    "range.useBrowser": "브라우저 기준"
   },
   en: {
     "unit.count": "",
@@ -791,7 +799,15 @@ const I18N = {
     "toast.shuttle": "Shuttle {dir} {speed}x",
     "toast.shuttlePause": "Shuttle stopped",
     "sc.step": "Step one frame back / forward (pauses)",
-    "sc.shuttle": "Shuttle reverse / pause / forward (repeat: 1x, 2x, 4x)"
+    "sc.shuttle": "Shuttle reverse / pause / forward (repeat: 1x, 2x, 4x)",
+    "save.queuedServer": "Queued (enrichment running)",
+    "save.title.queuedServer": "{n} change(s) are safely held in the server queue — they reach the case DB as soon as the hash / review-build step ends. Closing the window will not lose them.",
+    "range.divergeMsg": "{n} range(s) differ from the server",
+    "range.server": "server",
+    "range.browser": "browser",
+    "range.none": "none",
+    "range.useServer": "Use server",
+    "range.useBrowser": "Use browser"
   }
 };
 
