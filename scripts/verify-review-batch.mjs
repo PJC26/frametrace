@@ -238,7 +238,7 @@ async function unitTests() {
   els.recordGrid.classList = { add: () => {}, remove: () => {}, toggle: () => {} };
   Object.assign(state, { marks: {}, selectedIds: new Set(), pageSize: 100, currentPage: 1, groupBy: 'none', collapsedGroups: new Set() });
   // Exercises the paged renderer; the virtual grid has its own Playwright check.
-  const grid = { state, records, recordById: new Map(records.map(r => [r.id, r])), els, t: x => x, tf, escapeHtml: x => x, groupKeyFor: () => 'group', renderCard: r => `<card>${r.id}</card>`, virtualGridEnabled: () => false, document: { body: { classList: { toggle: () => {} } } } };
+  const grid = { state, records, recordById: new Map(records.map(r => [r.id, r])), els, t: x => x, tf, escapeHtml: x => x, groupKeyFor: () => 'group', renderCard: r => `<card>${r.id}</card>`, groupHeaderHtml: key => `<hdr>${key}</hdr>`, announceResultCount: () => {}, virtualGridEnabled: () => false, document: { body: { classList: { toggle: () => {} } } } };
   const selectedSource = source.match(/^function selectedRecord\(\).*$/m)[0];
   assert.equal(runInNewContext(selectedSource + '\nselectedRecord();', grid), records[0]);
   runInNewContext(fn('renderGrid') + '\nrenderGrid([]);', grid);
