@@ -175,6 +175,27 @@ FTViewer._attach({
     }
   },
   getExaminer: () => state.examiner || "",
+  // Host re-push after the examiner name becomes known late (finalize
+  // sheet): marks/notes saved without an examiner get this one and go
+  // through the normal draft + save path. The server upsert takes the new
+  // non-empty examiner over the stored one and logs it in review_mark_history.
+  attributeUnassignedMarks(name) {
+    FTViewer.setExaminer(name);
+    const who = (state.examiner || "").trim();
+    if (!who) return 0;
+    const ids = new Set([
+      ...Object.keys(state.marks),
+      ...Object.keys(state.notes).filter(id => (state.notes[id] || "").trim())
+    ]);
+    let count = 0;
+    for (const id of ids) {
+      if ((state.examiners[id] || "").trim()) continue;
+      touchAnnotation(id);
+      count += 1;
+    }
+    if (count) { try { void syncMarksNow(); } catch (e) { /* retried by autosave */ } }
+    return count;
+  },
   liveState: () => liveStateDetail(),
   popout: () => openPlayerWindow(),
   toast: (message, kind) => (kind === "error" ? toastError(message) : toast(message)),

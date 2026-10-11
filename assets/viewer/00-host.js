@@ -34,6 +34,19 @@ const FTViewer = (() => {
   let apiBase = "";
   let popup = null;
   let popupTimer = 0;
+  // Per-window writer identity (contract §3.3): the pop-out player opened
+  // by THIS window carries it in every ft-player channel message; windows
+  // holding another token (other shell tabs on the same case) stay silent.
+  const writerToken = (() => {
+    try {
+      const a = new Uint32Array(4);
+      crypto.getRandomValues(a);
+      return Array.from(a, n => n.toString(36)).join("");
+    } catch (e) { return String(Math.random()).slice(2) + Date.now().toString(36); }
+  })();
+  // Classes the HOST toggles on #ftViewer (not the viewer): they must
+  // survive reload()'s destroy()+init().
+  const HOST_CLASSES = ["popped"];
 
   const emit = (type, detail, cancelable = false) => {
     const ev = new CustomEvent(type, { detail: detail || {}, cancelable });
@@ -69,6 +82,7 @@ const FTViewer = (() => {
     version: 2,
     /** Channel names (contract §3.3). ft-review is the shell's (T2);
      *  ft-player:<case_id> is the popup-player bridge (70-player.js). */
+    writerToken,
     channels: Object.freeze({ review: "ft-review", player: caseId => `ft-player:${caseId || "case"}` }),
 
     async init({ data = null, url = "", embed: wantEmbed = false, host = document, theme = null, locale = null } = {}) {
@@ -82,6 +96,15 @@ const FTViewer = (() => {
       embed = !!wantEmbed || hosted;
       el.classList.toggle("hosted", hosted);
       el.classList.toggle("embed", embed);
+      // The fragment carries role="main" (standalone: its one main
+      // landmark). Inside the shell, whose <main id="main"> is the page's
+      // main landmark, it becomes a labelled region instead.
+      const area = hosted ? el.querySelector("#mainArea") : null;
+      if (area) {
+        area.setAttribute("role", "region");
+        area.setAttribute("aria-label", "증거 검토");
+        area.setAttribute("data-i18n-aria-label", "layout.review");
+      }
       if (theme) applyTheme(theme);
       state = "mounting";
       const mine = ++generation;
@@ -131,8 +154,13 @@ const FTViewer = (() => {
         return "reloaded";
       }
       const opts = { embed, host: root, theme: api.getTheme(), locale: api.getLocale() };
+      const kept = root ? HOST_CLASSES.filter(c => root.classList.contains(c)) : [];
+      const el = root;
       api.destroy();
+      const restoreHostClasses = () => { if (el) for (const c of kept) el.classList.add(c); };
+      restoreHostClasses(); // right away: the media column must not flash back
       await api.init(opts);
+      restoreHostClasses();
       void reason;
       return "reloaded";
     },
@@ -151,6 +179,9 @@ const FTViewer = (() => {
     /** Sets the viewer's examiner (검토자) used in marks payloads — the same
      *  flow as typing into #examinerName. No-op while unmounted. */
     setExaminer(name) { if (impl) impl.setExaminer(name); },
+    /** Sets `name` on marks/notes whose examiner is empty and saves them;
+     *  returns how many were re-pushed (0 when unmounted or name empty). */
+    attributeUnassignedMarks(name) { return impl && impl.attributeUnassignedMarks ? impl.attributeUnassignedMarks(name) : 0; },
     getExaminer() { return impl ? impl.getExaminer() : null; },
     /** { live, generation, total, canReload } of the mounted data (same
      *  detail as the "live-state" event); null while unmounted. */

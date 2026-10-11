@@ -435,7 +435,7 @@ if (!noLive) {
               const el = h.asElement();
               if (!el) continue;
               const label = await el.evaluate((e) => e.tagName.toLowerCase() + (e.id ? '#' + e.id : e.className ? '.' + String(e.className).split(' ').join('.') : '')).catch(() => 'button');
-              await probeStates(page, el, label, where, report, { toggleDisabled: false }).catch((e) => warn(where, `state probe skipped for ${label}: ${e.message.split('\n')[0]}`));
+              await probeStates(page, el, label, where, (m) => (/\.rail-chip\b/.test(label) ? fail(where, m) : report(m)), { toggleDisabled: false }).catch((e) => warn(where, `state probe skipped for ${label}: ${e.message.split('\n')[0]}`));
             }
           }
         }

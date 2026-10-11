@@ -222,6 +222,8 @@ window.FTViewer = {
   saveState() → "saved"|"pending"|"saving"|"failed"|"queued"|"local"|null,
   save() → Promise<boolean>,         // syncMarksNow()
   setExaminer(name), getExaminer() → string|null,   // 검토자(마크 귀속). 호스트 선택 바에는 입력란이 없고 41-finalize `#finalExaminer`가 호출
+  attributeUnassignedMarks(name) → number,   // setExaminer(name) 후, 검토자가 비어 있는 마크·메모를 같은 드래프트→저장 경로로 재전송하고 건수를 돌려줌(0이면 무동작). 서버 upsert는 `examiner = COALESCE(excluded.examiner, 기존)`이라 비어 있지 않은 새 값이 기존 값을 덮고 `review_mark_history`에 update로 남는다(src/case_db/marks.rs). setExaminer만으로는 이미 저장된 마크가 바뀌지 않는다
+  writerToken,                       // 이 창의 고유 토큰: 이 창이 연 팝아웃만 `ft-player:<case>` 메시지에 담아 보내고, 토큰이 다른 창(같은 케이스의 다른 셸 탭)은 응답하지 않는다(단일 writer)
   liveState() → { live, generation, total, canReload }|null,   // = 마지막 `live-state` detail
   popout() → Window|null,            // 70-player.js openPopupPlayer(): 영상+판독 창
   closePopout(), isPoppedOut() → boolean,
@@ -237,6 +239,8 @@ window.FTViewer = {
 | **standalone** (`/review/evidence-viewer.html`, `/viewer/`, 패키지 파일, 레거시 iframe `?embed=1`) | `99-loader.js` 끝: `if (!document.documentElement.hasAttribute("data-ft-host")) FTViewer.init({ embed: new URLSearchParams(location.search).has("embed") || window.self !== window.top })`. 데이터 소스 판별은 현 `loadViewerData()` 순서 그대로(인라인 → `/api/records` → `data-bundle.js`). |
 | **hosted** (`GET /`) | `examiner_app.html`은 `<html data-ft-host="shell">`. 자동 init 없음. `22-viewer-host.js`가 프로젝트 열림(`FTStore.state.phase ∈ {review-partial, review-ready, done, finalized}`)에 `FTViewer.init({ embed: true, host: $("hViewerHost"), theme, locale })`를 호출하고 `hViewerHost.hidden=false`, `inputCard.hidden=true`. 프로젝트 전환: `await FTViewer.save()` 성공(또는 저장 없음) 확인 → `FTViewer.destroy()` → `/api/open-case` → `init()`. `init()` 재호출은 `destroy()` 없이는 거부(`throw Error("FTViewer already mounted")`). |
 | 번들 평가 시점 | `10-boot.js`의 `(async function () {` → `async function ftViewerBoot(opts) {`, `95-init.js`의 `})();` → `}`. `00-host.js`는 `FTViewer.init = opts => ftViewerBoot(opts)` 호이스팅 함수에 의존(TDZ 없음). |
+| 랜드마크 | 조각의 `#mainArea`는 `role="main"`인 `<div>`(standalone: 페이지의 유일한 main). hosted `init()`은 이를 `role="region"` + `aria-label`("증거 검토", i18n `layout.review`)로 바꾼다 — 셸의 `<main id="main">`이 페이지의 유일한 main. `verify-embed` 9번이 양쪽 모두 main 정확히 1개를 확인(axe `landmark-*` 포함). |
+| 호스트 클래스 | `reload()`(destroy→init)는 호스트가 `#ftViewer`에 건 `.popped`를 보존한다(destroy 단독은 원본 className으로 복원). |
 | 리스너 | 뷰어가 `document`/`window`/`matchMedia`에 거는 모든 리스너는 `{ signal: FTViewer._ac.signal }`로 등록(T5가 grep 기준: `addEventListener(` 호출 전부). `destroy()`는 abort 후 새 AbortController를 만든다. |
 | 데이터 재적재 | `reload()`는 현 `ft-reload` 핸들러 로직(95-init.js:28-63)을 함수화: 미저장이면 `"refused"`(저장 시작 + `toast(t("reload.refused"))`), 아니면 **페이지 리로드 대신** `destroy()`→`init()`(호스트)·`location.reload()`(standalone). 호스트에서 `keepUnsaved=false`면 미저장 무시하고 재적재(사용 금지: 호출자는 T3가 아니라 사용자 확인 대화상자를 거친 T2만). |
 | postMessage 호환 | 레거시 iframe(§9.3)을 위해 `ft-theme/ft-locale/ft-reload/ft-embed` 메시지 핸들러는 standalone 모드에서 유지한다. 호스트 모드에서는 등록하지 않는다. |
@@ -263,7 +267,7 @@ window.FTViewer = {
 ### 3.3 BroadcastChannel
 
 - `ft-review` (T2 23-popout.js, 세션 단위, 이름 고정 `"ft-review"`): 메시지 `{ type: "popout-open"|"popout-closed"|"theme"|"locale"|"project-changed", caseDir, value, from: instanceId }`. 수신자: 같은 origin의 다른 셸 탭·팝아웃 창. 쓰기는 **본 창(셸)만**: 팝아웃은 마크를 직접 저장하지 않고 `ft-player:<case_id>`(기존 70-player.js 브리지, 불변)로 본 창에 위임한다 → "단일 writer"는 구조적으로 보장된다.
-- `ft-player:<case_id>` (T5, 불변): 팝업 플레이어 ↔ 본 창 브리지(`focus/navigate/mark/toggleTag/list/undo/redo`).
+- `ft-player:<case_id>` (T5, 불변): 팝업 플레이어 ↔ 본 창 브리지(`focus/navigate/mark/toggleTag/list/undo/redo`). 모든 요청은 `token`(= 팝업을 연 창의 `FTViewer.writerToken`)을 담아야 하며, 토큰이 일치하는 창만 응답한다.
 
 ---
 
