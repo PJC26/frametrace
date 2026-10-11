@@ -26,6 +26,8 @@ mod state;
 mod system;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_live;
 
 pub(crate) use discovery::*;
 pub(crate) use http::*;
@@ -327,6 +329,7 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/advanced") => json(api_advanced(request, state)),
         ("POST", "/api/carve") => json(api_carve(request, state)),
         ("POST", "/api/open-folder") => json(api_open_folder(request, state)),
+        ("GET", path) if is_viewer_page_path(path) => viewer_page(),
         _ => plain(404, b"not found".to_vec()),
     }
 }

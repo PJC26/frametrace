@@ -80,8 +80,15 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: SharedState) -> Re
         let _ = stream.shutdown(std::net::Shutdown::Write);
         return result;
     }
+    // `/viewer/` and `/viewer/index.html` are the embedded viewer page
+    // (routed below); everything else under `/viewer/` is a page-relative
+    // subresource (thumbs/, data-bundle.js) that lives in case/review/.
+    let viewer_subresource =
+        request.path.starts_with("/viewer/") && !is_viewer_page_path(&request.path);
     if request.method == "GET"
-        && (request.path.starts_with("/review/") || request.path.starts_with("/case/"))
+        && (request.path.starts_with("/review/")
+            || request.path.starts_with("/case/")
+            || viewer_subresource)
     {
         let result = serve_case_file(&mut stream, &request, &state);
         let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -487,6 +494,8 @@ pub(crate) fn serve_case_file(
     };
     let prefix = if request.path.starts_with("/review/") {
         "/review/"
+    } else if request.path.starts_with("/viewer/") {
+        "/viewer/"
     } else {
         "/case/"
     };
@@ -494,7 +503,7 @@ pub(crate) fn serve_case_file(
     if relative.is_empty() || relative.contains("..") {
         return write_simple(stream, 403, b"invalid path");
     }
-    let full = if prefix == "/review/" {
+    let full = if prefix == "/review/" || prefix == "/viewer/" {
         case_dir.join("review").join(relative)
     } else {
         case_dir.join(relative)
@@ -524,6 +533,32 @@ pub(crate) fn serve_case_file(
         .write_all(head.as_bytes())
         .map_err(|err| format!("write failed: {err}"))?;
     stream_body(stream, &mut file, total)
+}
+
+/// True for the two spellings of the embedded viewer page itself.
+pub(crate) fn is_viewer_page_path(path: &str) -> bool {
+    matches!(path, "/viewer/" | "/viewer/index.html")
+}
+
+/// `GET /viewer/` (UX-02): the evidence viewer compiled into this binary
+/// (same slim page make-review writes to review/evidence-viewer.html),
+/// served before make-review has run so the examiner can review the
+/// phase-1 index while enrichment continues. Data always comes from
+/// /api/records (`live=1`) + /api/records-meta. It is a FrameTrace page,
+/// so it gets the trusted generated-page headers (frameable by the
+/// workstation only), never the sandboxed evidence headers.
+pub(crate) fn viewer_page() -> Vec<u8> {
+    respond(
+        200,
+        "text/html; charset=utf-8",
+        crate::html_report::render_evidence_viewer_html_slim().into_bytes(),
+        "no-store",
+        Some(&content_safety_headers(
+            Path::new("index.html"),
+            true,
+            false,
+        )),
+    )
 }
 
 /// Writes exactly `remaining` bytes from `reader` to `stream` in bounded

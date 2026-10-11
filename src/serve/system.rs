@@ -248,6 +248,13 @@ pub(crate) fn drive_roots() -> Vec<String> {
 }
 
 pub(crate) fn api_status(state: &SharedState) -> String {
+    // Taken before the main lock: index_generation stats files and locks
+    // briefly on its own.
+    let bound_case = state_lock(state).case_dir.clone();
+    let index_generation = bound_case
+        .as_deref()
+        .map(|dir| index_generation(state, dir))
+        .unwrap_or(0);
     let guard = state_lock(state);
     let case_dir = guard.case_dir.clone();
     let byte_progress = guard.byte_progress.clone();
@@ -275,6 +282,32 @@ pub(crate) fn api_status(state: &SharedState) -> String {
             .as_ref()
             .map(|path| path.to_string_lossy().to_string())
     };
+    let progress = progress_json(case_dir.as_deref(), byte_progress.as_ref());
+    // UX-02: which phase-2 step is enriching the partial index. `done` /
+    // `total` are the running job's unit progress when the step reports
+    // one (files hashed), else the step position within the plan.
+    let enrichment = guard.enrichment.map(|step| {
+        let (done, total, unit) = match (
+            progress.get("done").and_then(|v| v.as_u64()),
+            progress.get("total").and_then(|v| v.as_u64()),
+        ) {
+            (Some(done), Some(total)) if total > 0 => (done, total, "units"),
+            _ => (
+                step.stage.saturating_sub(1) as u64,
+                step.stages as u64,
+                "steps",
+            ),
+        };
+        serde_json::json!({
+            "step": step.step,
+            "label": step.label,
+            "stage": step.stage,
+            "stages": step.stages,
+            "done": done,
+            "total": total,
+            "unit": unit,
+        })
+    });
     serde_json::json!({
         "ok": true,
         "app": "frametrace",
@@ -294,7 +327,9 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         "case_dir": opt(&guard.case_dir),
         "package_dir": opt(&guard.package_dir),
         "error": guard.error,
-        "progress": progress_json(case_dir.as_deref(), byte_progress.as_ref()),
+        "progress": progress,
+        "enrichment": enrichment,
+        "index_generation": index_generation,
     })
     .to_string()
 }
@@ -411,6 +446,9 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
             .to_string();
     }
     let has_review = case_dir.join("review/index.html").is_file();
+    // A case whose enrichment pass was cancelled (or failed) before
+    // make-review still has a reviewable index (UX-02).
+    let has_index = case_dir.join("db/video_index.json").is_file();
     let mut guard = state_lock(state);
     if guard.busy {
         return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
@@ -429,12 +467,27 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     // prompt must not reappear over it.
     guard.restored = false;
     guard.warnings = Vec::new();
+    guard.enrichment = None;
     if has_review {
         guard.phase = "review-ready";
         guard.steps = [StepStatus::Done; 5];
         guard
             .logs
             .push(format!("기존 케이스를 열었습니다: {}", case_dir.display()));
+    } else if has_index {
+        guard.phase = "review-partial";
+        guard.steps = [
+            StepStatus::Done,
+            StepStatus::Done,
+            StepStatus::Done,
+            StepStatus::Pending,
+            StepStatus::Pending,
+        ];
+        guard.package_dir = None;
+        guard.logs.push(format!(
+            "케이스를 열었습니다 (색인만 있음 — 보강·리뷰 생성 전): {}",
+            case_dir.display()
+        ));
     } else {
         // Without a review bundle the new binding has nothing to show —
         // leaving a previous case's "review-ready" phase would report a
