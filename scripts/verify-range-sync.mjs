@@ -163,15 +163,20 @@ try {
   check('"브라우저 기준" pushes browser range', pushed?.range?.in === 3 && pushed?.range?.out === 4, JSON.stringify(pushed));
   check('server now has browser range', serverMarks.get(id)?.range?.in === 3);
 
-  // (6) Browser has no range, server does, choose browser -> server cleared.
+  // (6) Fresh browser (no local ranges): server ranges are seeded, no banner,
+  // and a routine save never clears them.
   await open(page, null);
-  check('banner when browser lacks a server range', (await page.locator('#rangeDivergenceBanner').count()) === 1);
+  check('no banner when browser merely lacks a range', (await page.locator('#rangeDivergenceBanner').count()) === 0);
+  const seeded = await page.evaluate((key) => JSON.parse(localStorage.getItem(key) || '{}'), RANGES_KEY);
+  check('server range seeded into browser', seeded?.[id]?.in === 3 && seeded?.[id]?.out === 4, JSON.stringify(seeded));
   imports.length = 0;
-  await page.locator('#rangeUseBrowser').click();
+  await page.locator('.card').first().click();
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.keyboard.press('2');
   await page.locator('#saveState').click();
   await waitSaved(page);
-  const cleared = imports.at(-1)?.marks.find((m) => m.id === id);
-  check('browser choice clears the server range', !serverMarks.get(id)?.range, JSON.stringify({ cleared, deleted: imports.at(-1)?.deleted_ids }));
+  const kept = imports.at(-1)?.marks.find((m) => m.id === id);
+  check('save after seeding keeps server range', serverMarks.get(id)?.range?.in === 3 && kept?.range?.in === 3, JSON.stringify(kept));
 
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

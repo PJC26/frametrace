@@ -6,6 +6,15 @@ function currentVideo() {
   return els.mediaStage.querySelector("video");
 }
 
+// A <video> element can exist (selected record) with no loaded source or a
+// failed load; transport keys must treat that as "no video".
+function playableVideo() {
+  const video = currentVideo();
+  if (!video) return null;
+  if (video.error || !(video.currentSrc || video.getAttribute("src"))) return null;
+  return video;
+}
+
 function skipVideo(delta) {
   const video = currentVideo();
   if (!video) return;
@@ -14,8 +23,11 @@ function skipVideo(delta) {
 
 // Space in both the main viewer and the popup player (UX-08).
 function togglePlayback() {
-  const video = currentVideo();
+  const video = playableVideo();
   if (!video) { toast(t("toast.noVideo")); return; }
+  // Space always returns to the rate chip's speed: a forward shuttle's 2x/4x
+  // must not linger after pause (stopShuttle restores state.layout.rate).
+  if (shuttle.dir !== 0) stopShuttle();
   if (video.paused) video.play().catch(() => {});
   else video.pause();
 }
@@ -31,6 +43,9 @@ function frameDuration() {
 }
 
 function stopShuttle() {
+  // Forward shuttle borrowed playbackRate; give it back so the rate chip
+  // (state.layout.rate) and the real rate stay consistent.
+  if (shuttle.dir > 0 && shuttle.video) shuttle.video.playbackRate = Number(state.layout.rate) || 1;
   if (shuttle.timer) clearInterval(shuttle.timer);
   shuttle.timer = null;
   shuttle.dir = 0;
@@ -39,7 +54,7 @@ function stopShuttle() {
 }
 
 function stepFrame(dir) {
-  const video = currentVideo();
+  const video = playableVideo();
   if (!video) { toast(t("toast.noVideo")); return; }
   stopShuttle();
   if (!video.paused) video.pause();
@@ -48,7 +63,7 @@ function stepFrame(dir) {
 }
 
 function shuttleKey(dir) {
-  const video = currentVideo();
+  const video = playableVideo();
   if (!video) { toast(t("toast.noVideo")); return; }
   if (dir === 0) {
     stopShuttle();
@@ -343,3 +358,27 @@ call("descriptor",null,function(d){if(d===undefined){dead();}else{applyDesc(d,tr
   win.document.close();
   win.focus();
 }
+
+
+// CapsLock flips event.key's case: Caps+j arrives as "J" without Shift and
+// would trigger shuttle, while Shift+j with CapsLock arrives as "j" and would
+// navigate records. Normalise in the capture phase: shuttle only when Shift is
+// really held. (The J/K/L switch itself lives in 80-review.js.)
+window.addEventListener("keydown", event => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const key = String(event.key);
+  if (!/^[jkl]$/i.test(key)) return;
+  if (typeof isTypingTarget === "function" && isTypingTarget(document.activeElement)) return;
+  if (!event.shiftKey) {
+    if (key !== key.toUpperCase()) return; // plain j/k/l keep their normal meaning
+    event.stopImmediatePropagation(); // CapsLock-only "J": not a shuttle key
+    event.preventDefault();
+    if (key === "J") moveActive(1); else if (key === "K") moveActive(-1); // behave as plain j/k
+    return;
+  }
+  if (key === key.toLowerCase()) { // Shift+j while CapsLock is on
+    event.stopImmediatePropagation();
+    event.preventDefault();
+    shuttleKey(key === "j" ? -1 : key === "k" ? 0 : 1);
+  }
+}, true);

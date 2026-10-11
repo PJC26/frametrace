@@ -691,6 +691,9 @@ function detectRangeDivergence() {
   const diverged = [];
   for (const id of ids) {
     if (pending.has(id)) continue; // unsynced local edit: will be pushed, not a conflict
+    // Only a conflict when BOTH sides hold a range and they differ; a
+    // one-sided range is a seed (server only) or an unsynced edit (browser only).
+    if (!rangeValid(server[id]) || !rangeValid(state.ranges[id])) continue;
     if (!sameRange(server[id], state.ranges[id])) diverged.push(id);
   }
   return diverged;
@@ -737,7 +740,23 @@ function showRangeDivergenceBanner(ids) {
   document.body.insertBefore(bar, document.body.firstChild);
 }
 
+// A fresh browser (new origin/port, cleared storage) has no local ranges:
+// adopt the server's so they are visible and a later save can never send a
+// null range for an id the browser merely has no value for.
+function seedServerRanges() {
+  const server = serverRanges();
+  let changed = false;
+  for (const id of Object.keys(server)) {
+    if (rangeValid(state.ranges[id])) continue;
+    state.ranges[id] = { ...server[id] };
+    changed = true;
+  }
+  if (changed) storageSet(RANGES_KEY, state.ranges);
+  return changed;
+}
+
 (function initRangeDivergence() {
+  seedServerRanges();
   const ids = detectRangeDivergence();
   if (!ids.length) return;
   ids.forEach(id => rangeConflictIds.add(id));
