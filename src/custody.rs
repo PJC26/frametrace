@@ -20,7 +20,7 @@
 
 use crate::audit;
 use crate::case_db;
-use crate::util::{html_escape, now_unix, read_to_string, write_text_atomic};
+use crate::util::{html_escape as esc, now_unix, read_to_string, write_text_atomic};
 use std::path::{Path, PathBuf};
 
 pub const CUSTODY_REL_PATH: &str = "reports/custody-statement.html";
@@ -327,10 +327,6 @@ fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
             out.push(path);
         }
     }
-}
-
-fn esc(value: &str) -> String {
-    html_escape(value)
 }
 
 fn opt(value: &Option<String>) -> String {

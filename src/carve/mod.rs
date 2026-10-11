@@ -318,7 +318,7 @@ pub fn carve_file(
         "carve-file",
     )?;
 
-    let hits = scan_signatures(
+    let (hits, scanned_to) = scan_signatures(
         &source_path,
         ScanWindow {
             start: scan_start,
@@ -353,7 +353,17 @@ pub fn carve_file(
         );
     }
     let candidate_limit_reached = hits.len() >= options.max_candidates;
-    let scan_complete = !candidate_limit_reached;
+    // Complete only if the walk covered the whole source: no candidate cap,
+    // no narrowed window, and every requested byte was actually read (a short
+    // read — file shrank, I/O ended early — leaves `scanned_to < scan_end`).
+    let short_read = scanned_to < scan_end && !candidate_limit_reached;
+    let whole_source = scan_start == 0 && scan_end >= source_size;
+    let scan_complete = !candidate_limit_reached && !short_read && whole_source;
+    if short_read {
+        warnings.push(format!(
+            "short read: signature scan reached offset {scanned_to} but the requested window ended at {scan_end}; bytes beyond were not scanned"
+        ));
+    }
     if candidate_limit_reached {
         warnings.push(format!(
             "candidate limit reached at {}; scan completeness is not established (conservative even at EOF); additional candidates may exist; rerun with a higher --max-candidates",

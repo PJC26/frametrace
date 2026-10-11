@@ -459,10 +459,47 @@ pub fn render_evidence_viewer_html(
         proxies_json,
         case_dir,
     );
-    VIEWER_TEMPLATE
-        .replace("__CSS__", VIEWER_CSS)
-        .replace("__DATA__", &data)
-        .replace("__JS__", VIEWER_JS)
+    fill_viewer_template(&data)
+}
+
+/// Fills the viewer template's `__CSS__` / `__DATA__` / `__JS__` slots in a
+/// single left-to-right pass over the template, so substituted content is
+/// never rescanned: case data (or the bundled JS/CSS) that happens to contain
+/// one of the tokens is emitted verbatim instead of being rewritten.
+fn fill_viewer_template(data: &str) -> String {
+    fill_template(
+        VIEWER_TEMPLATE,
+        &[
+            ("__CSS__", VIEWER_CSS),
+            ("__DATA__", data),
+            ("__JS__", VIEWER_JS),
+        ],
+    )
+}
+
+fn fill_template(template: &str, slots: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(
+        template.len() + slots.iter().map(|(_, value)| value.len()).sum::<usize>(),
+    );
+    let mut rest = template;
+    while !rest.is_empty() {
+        let next = slots
+            .iter()
+            .filter_map(|(token, value)| rest.find(token).map(|at| (at, *token, *value)))
+            .min_by_key(|(at, _, _)| *at);
+        match next {
+            Some((at, token, value)) => {
+                out.push_str(&rest[..at]);
+                out.push_str(value);
+                rest = &rest[at + token.len()..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// External data bundle written next to the slim viewer page
@@ -507,10 +544,7 @@ pub fn render_data_bundle_js(
 /// sibling data-bundle.js (standalone), so a huge index never lands
 /// inside the HTML itself.
 pub fn render_evidence_viewer_html_slim() -> String {
-    VIEWER_TEMPLATE
-        .replace("__CSS__", VIEWER_CSS)
-        .replace("__DATA__", "window.__FRAMETRACE_DATA__ = null;")
-        .replace("__JS__", VIEWER_JS)
+    fill_viewer_template("window.__FRAMETRACE_DATA__ = null;")
 }
 
 /// Standalone carve-results page (`review/carve-report.html`): a raw
@@ -681,10 +715,13 @@ function downloadHref(path) {{
     return "/media?path=" + encodeURIComponent(absPath(path)) + "&download=1";
   return fileUrl(absPath(path));
 }}
-// Mirrors video_export::sanitize_filename — every non-alphanumeric char
-// (including '.') becomes '_', so ft-951sd\...\carve_1.avi maps to
-// ft-951sd_..._carve_1_avi_proxy_*.
-const sanitizeSelector = s => String(s || "").replace(/[^A-Za-z0-9_-]+/g, "_");
+// Mirrors util::sanitize_filename — every non-alphanumeric char
+// (including '.') becomes '_' one-for-one, so ft-951sd\...\carve_1.avi maps to
+// ft-951sd_..._carve_1_avi_proxy_*; Windows device names get a leading '_'.
+const sanitizeSelector = s => {{
+  const out = String(s || "").replace(/[^A-Za-z0-9_-]/g, "_") || "clip";
+  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(out) ? "_" + out : out;
+}};
 function proxyFor(a) {{
   // Proxy filenames embed sanitize(selector) where the selector was the
   // carve-log path at build time (often case-relative), while output_path
@@ -894,9 +931,26 @@ fn jsonl_to_array(jsonl: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_carve_report_html, render_evidence_viewer_html};
+    use super::{fill_template, render_carve_report_html, render_evidence_viewer_html};
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn template_fill_does_not_rewrite_tokens_inside_substituted_data() {
+        let out = fill_template(
+            "a __CSS__ b __DATA__ c __JS__ d",
+            &[
+                ("__CSS__", "css __JS__ __DATA__"),
+                ("__DATA__", "{\"x\":\"__JS__ __CSS__ __DATA__\"}"),
+                ("__JS__", "js __DATA__"),
+            ],
+        );
+        assert_eq!(
+            out,
+            "a css __JS__ __DATA__ b {\"x\":\"__JS__ __CSS__ __DATA__\"} c js __DATA__ d"
+        );
+        assert_eq!(fill_template("no slots", &[("__JS__", "x")]), "no slots");
+    }
 
     #[test]
     fn carve_report_renders_summary_and_absolutizes_relative_paths() {

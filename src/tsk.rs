@@ -1,6 +1,8 @@
 use crate::audit;
 use crate::tool_policy::{command_version, require_case_output_path, resolve_tool_binary};
-use crate::util::{canonicalize_display, json_escape, now_unix, unique_path, write_text};
+use crate::util::{
+    canonicalize_display, json_escape, now_unix, sanitize_filename, unique_path, write_text,
+};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -898,22 +900,6 @@ fn icat_args(image_path: &Path, options: &TskRecoverOptions) -> Vec<String> {
 fn tsk_path_string(path: &Path) -> String {
     let raw = audit::path_string(path);
     raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
-}
-
-fn sanitize_filename(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unknown".to_string()
-    } else {
-        out
-    }
 }
 
 #[cfg(test)]

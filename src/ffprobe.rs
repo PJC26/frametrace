@@ -23,6 +23,7 @@ pub fn probe_with_binary(binary: &str, path: &Path) -> ProbeSummary {
                 audio_codec: None,
                 width: None,
                 height: None,
+                fps: None,
             };
         }
     };
@@ -51,6 +52,7 @@ pub fn probe_with_binary(binary: &str, path: &Path) -> ProbeSummary {
                 audio_codec: None,
                 width: None,
                 height: None,
+                fps: None,
             };
         }
     };
@@ -68,6 +70,7 @@ pub fn probe_with_binary(binary: &str, path: &Path) -> ProbeSummary {
             audio_codec: None,
             width: None,
             height: None,
+            fps: None,
         };
     }
 
@@ -83,6 +86,7 @@ pub fn probe_with_binary(binary: &str, path: &Path) -> ProbeSummary {
             audio_codec: None,
             width: None,
             height: None,
+            fps: None,
         };
     }
     parse_probe_summary(raw)
@@ -135,6 +139,8 @@ struct FfprobeStream {
     width: Option<u32>,
     height: Option<u32>,
     duration: Option<String>,
+    avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +154,24 @@ struct FfprobeFormat {
 struct FfprobeOutput {
     streams: Option<Vec<FfprobeStream>>,
     format: Option<FfprobeFormat>,
+}
+
+/// Parses ffprobe rational frame rates ("30000/1001", "25/1", "30"). `0/0`,
+/// zero, negative or non-finite values mean "unknown" and yield `None`.
+pub(crate) fn parse_frame_rate(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let value = match text.split_once('/') {
+        Some((num, den)) => {
+            let num: f64 = num.trim().parse().ok()?;
+            let den: f64 = den.trim().parse().ok()?;
+            if den == 0.0 {
+                return None;
+            }
+            num / den
+        }
+        None => text.parse().ok()?,
+    };
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 fn first_duration(value: &Option<String>) -> Option<f64> {
@@ -172,6 +196,7 @@ fn parse_probe_summary(raw: String) -> ProbeSummary {
                 audio_codec: None,
                 width: None,
                 height: None,
+                fps: None,
             };
         }
     };
@@ -208,6 +233,12 @@ fn parse_probe_summary(raw: String) -> ProbeSummary {
         audio_codec: audio.and_then(|stream| stream.codec_name.clone()),
         width: video.and_then(|stream| stream.width),
         height: video.and_then(|stream| stream.height),
+        fps: video.and_then(|stream| {
+            [&stream.avg_frame_rate, &stream.r_frame_rate]
+                .into_iter()
+                .filter_map(|rate| rate.as_deref().and_then(parse_frame_rate))
+                .next()
+        }),
         raw_json: Some(raw),
         error: None,
     }
@@ -215,6 +246,33 @@ fn parse_probe_summary(raw: String) -> ProbeSummary {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_frame_rates_and_ignores_unknown() {
+        assert!((super::parse_frame_rate("30000/1001").unwrap() - 29.97).abs() < 0.001);
+        assert_eq!(super::parse_frame_rate("25/1"), Some(25.0));
+        assert_eq!(super::parse_frame_rate("30"), Some(30.0));
+        assert_eq!(super::parse_frame_rate("0/0"), None);
+        assert_eq!(super::parse_frame_rate("0/1"), None);
+        assert_eq!(super::parse_frame_rate("abc"), None);
+        assert_eq!(super::parse_frame_rate(""), None);
+    }
+
+    #[test]
+    fn probe_summary_takes_fps_from_avg_then_r_frame_rate() {
+        let avg = r#"{"streams":[{"codec_type":"video","codec_name":"h264","width":1,"height":1,"avg_frame_rate":"30000/1001","r_frame_rate":"60/1"}],"format":{}}"#;
+        let fps = super::parse_probe_summary(avg.to_string()).fps.unwrap();
+        assert!((fps - 29.97).abs() < 0.001);
+        let fallback =
+            r#"{"streams":[{"codec_type":"video","avg_frame_rate":"0/0","r_frame_rate":"25/1"}]}"#;
+        assert_eq!(
+            super::parse_probe_summary(fallback.to_string()).fps,
+            Some(25.0)
+        );
+        let none =
+            r#"{"streams":[{"codec_type":"video","avg_frame_rate":"0/0","r_frame_rate":"0/0"}]}"#;
+        assert_eq!(super::parse_probe_summary(none.to_string()).fps, None);
+    }
+
     #[test]
     fn sanitizes_run_specific_probe_prefixes() {
         let raw = concat!(

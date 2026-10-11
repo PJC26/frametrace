@@ -523,21 +523,7 @@ fn tsv_unescape(value: &str) -> String {
     out
 }
 
-pub fn sanitize_filename(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "clip".to_string()
-    } else {
-        out
-    }
-}
+pub use crate::util::sanitize_filename;
 
 #[cfg(test)]
 mod tests {
