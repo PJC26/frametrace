@@ -78,6 +78,27 @@ fn viewer_bundle(out_dir: &Path) {
     fs::write(out_dir.join("evidence_viewer.js"), bundle).expect("failed to write viewer bundle");
 }
 
+/// Shared design tokens (assets/tokens.css) are the FIRST part of both CSS
+/// bundles, so the shell and the viewer resolve one palette/type/spacing
+/// source. The viewer export is a single file, so its stylesheet is
+/// materialised here (tokens + assets/evidence_viewer.css) for include_str.
+fn tokens_path() -> PathBuf {
+    let path = PathBuf::from("assets/tokens.css");
+    println!("cargo:rerun-if-changed={}", path.display());
+    path
+}
+
+fn viewer_css_bundle(out_dir: &Path) {
+    let viewer_css = PathBuf::from("assets/evidence_viewer.css");
+    println!("cargo:rerun-if-changed={}", viewer_css.display());
+    let css = concat(
+        &[tokens_path(), viewer_css],
+        "assets/viewer/bundle.css",
+        "css",
+    );
+    fs::write(out_dir.join("evidence_viewer.css"), css).expect("failed to write viewer css");
+}
+
 /// STR-01: the workstation shell (`GET /`) is authored as markup in
 /// `assets/examiner_app.html` plus `assets/app/*.css` / `assets/app/*.js`,
 /// and served as ONE self-contained page: the `<!-- @bundle:app.css -->`
@@ -89,11 +110,9 @@ fn app_bundle(out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", app_dir.display());
     println!("cargo:rerun-if-changed={}", template_path.display());
     let template = fs::read_to_string(template_path).expect("assets/examiner_app.html missing");
-    let css = concat(
-        &sorted_parts(app_dir, "css"),
-        "assets/app/bundle.css",
-        "css",
-    );
+    let mut css_parts = vec![tokens_path()];
+    css_parts.extend(sorted_parts(app_dir, "css"));
+    let css = concat(&css_parts, "assets/app/bundle.css", "css");
     let js = concat(&sorted_parts(app_dir, "js"), "assets/app/bundle.js", "js");
     assert!(
         !js.to_ascii_lowercase().contains("</script"),
@@ -127,5 +146,6 @@ fn app_bundle(out_dir: &Path) {
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     viewer_bundle(&out_dir);
+    viewer_css_bundle(&out_dir);
     app_bundle(&out_dir);
 }
