@@ -175,16 +175,18 @@ function renderDetails() {
   // tag editor for the selected evidence
   const tagEditorHtml = `<div class="tag-editor">
     ${tagPresets().map(preset => `<button type="button" class="tag-btn ${recordTags.includes(preset) ? "on" : ""}" data-preset-tag="${escapeHtml(preset)}">${escapeHtml(preset)}</button>`).join("")}
-    <input type="text" class="tag-input" id="customTagInput" placeholder="${t("tag.input")}" style="width:80px;height:24px;font-size:11px;">
+    <input type="text" class="tag-input" id="customTagInput" placeholder="${t("tag.input")}" aria-label="${escapeHtml(t("tag.input"))}" style="width:104px;height:28px;font-size:12px;">
     <button type="button" class="mini" id="btnAddCustomTag">${t("tag.apply")}</button>
     <button type="button" class="mini" id="btnSaveCustomTag" title="${t("tag.presetSave.title")}">${t("tag.presetSave")}</button>
   </div>`;
   // replace existing tag editor if any
   const oldEditor = document.querySelector(".tag-editor-wrap");
   if (oldEditor) oldEditor.remove();
-  const metaEl = els.metaList;
+  // The review annotation (tags + note) sits in the 요약 tab, the default
+  // one, so marking/tagging never needs a tab switch.
+  const metaEl = els.summaryList;
   metaEl.insertAdjacentHTML("afterend", `<div class="tag-editor-wrap">${tagEditorHtml}
-    <textarea id="evidenceNote" class="note-input" rows="2" placeholder="${t("note.placeholder")}">${escapeHtml(state.notes[record.id] || "")}</textarea>
+    <textarea id="evidenceNote" class="note-input" rows="2" placeholder="${t("note.placeholder")}" aria-label="${escapeHtml(t("note.placeholder"))}">${escapeHtml(state.notes[record.id] || "")}</textarea>
   </div>`);
   document.getElementById("evidenceNote").addEventListener("input", e => {
     const value = e.target.value;
@@ -283,24 +285,35 @@ function renderTree(facets) {
   });
   els.facetTree.innerHTML = items.map(item => item.header !== undefined
     ? `<div class="tree-sec">${escapeHtml(item.header)}</div>`
-    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}" tabindex="0" role="button"><span>${escapeHtml(item.label)}</span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
+    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}" tabindex="0" role="button" aria-pressed="${!!item.active}"><span>${escapeHtml(item.label)}</span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
   ).join("");
   const pickers = items.filter(item => item.pick);
   const nodes = els.facetTree.querySelectorAll(".tree-item");
   let idx = 0;
+  // Picking re-renders the tree; keep keyboard focus on the same position.
+  const pickAndKeepFocus = (entry, node, at) => {
+    const hadFocus = document.activeElement === node;
+    entry.pick(node.dataset.pick);
+    if (!hadFocus) return;
+    render();
+    els.facetTree.querySelectorAll(".tree-item")[at]?.focus();
+  };
   nodes.forEach(node => {
     const entry = pickers[idx];
     if (!entry) return;
+    const at = idx;
     idx += 1;
-    node.addEventListener("click", () => entry.pick(node.dataset.pick));
+    node.addEventListener("click", () => pickAndKeepFocus(entry, node, at));
     node.addEventListener("keydown", e => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); entry.pick(node.dataset.pick); }
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickAndKeepFocus(entry, node, at); }
     });
   });
 }
 
 function renderMetrics() {
-  els.caseLine.textContent = `${manifest.case_id || "case"} · ${manifest.title || "Untitled"} · ${scan.source_path || "-"}`;
+  // Case ID only on the line; title and source path in the tooltip.
+  els.caseLine.textContent = manifest.case_id || "case";
+  els.caseLine.title = tf("layout.caseTip", { id: manifest.case_id || "case", title: manifest.title || "Untitled", path: scan.source_path || "-" });
   els.metricVideos.textContent = tf("metric.indexed", { n: videos.length });
   els.metricCarved.textContent = carveLog.length + recoveredFilesystemLog.length;
   const carveLink = document.getElementById("linkCarveReport");
@@ -342,39 +355,56 @@ function staticMetricCounts() {
   return staticMetricCountsCache;
 }
 
+// One entry point for preset filters: rail chips and the count pills.
+function applyPresetChip(value) {
+  state.chip = value;
+  if (value.startsWith("status:")) {
+    state.status = value.slice(7);
+    els.status.value = state.status;
+  } else {
+    state.status = "";
+    els.status.value = "";
+  }
+  state.currentPage = 1;
+  requestRender();
+}
+
 function renderChips() {
-  // Status/mark chips stay inline; tag filters live in the 정렬·표시
-  // panel's tag select so the chip row stays a single group.
-  const parts = [`<span class="chip-label">${t("filter.label")}</span>`];
+  // Status/mark chips stay in the rail list; tag filters live in the
+  // 정렬·표시 panel's tag select so the list stays a single group.
+  const parts = [];
   let hidden = 0;
   for (const [value, label, secondary] of PRESET_CHIPS) {
     if (value.startsWith("tag:")) continue;
     if (secondary && !state.chipsExpanded && state.chip !== value) { hidden += 1; continue; }
     const tip = t(`chip.tip.${label.slice(5)}`);
-    parts.push(`<button type="button" class="chip ${state.chip === value ? "active" : ""}" data-chip="${escapeHtml(value)}" title="${escapeHtml(tip)}">${escapeHtml(t(label))}</button>`);
+    const on = state.chip === value;
+    parts.push(`<button type="button" class="chip ${on ? "active" : ""}" data-chip="${escapeHtml(value)}" aria-pressed="${on}" title="${escapeHtml(tip)}">${escapeHtml(t(label))}</button>`);
   }
   if (hidden || state.chipsExpanded) {
-    parts.push(`<button type="button" class="chip chip-more" id="chipMore">${escapeHtml(t(state.chipsExpanded ? "chip.less" : "chip.more"))}</button>`);
+    parts.push(`<button type="button" class="chip chip-more" id="chipMore" aria-expanded="${!!state.chipsExpanded}">${escapeHtml(t(state.chipsExpanded ? "chip.less" : "chip.more"))}</button>`);
   }
   els.presetChips.innerHTML = parts.join("");
   document.getElementById("chipMore")?.addEventListener("click", () => {
     state.chipsExpanded = !state.chipsExpanded;
     renderChips();
+    document.getElementById("chipMore")?.focus();
   });
   els.presetChips.querySelectorAll(".chip[data-chip]").forEach(chip => {
     chip.addEventListener("click", () => {
       const value = chip.dataset.chip;
-      state.chip = value;
-      if (value.startsWith("status:")) {
-        state.status = value.slice(7);
-        els.status.value = state.status;
-      } else {
-        state.status = "";
-        els.status.value = "";
-      }
-      state.currentPage = 1;
-      requestRender();
+      const hadFocus = document.activeElement === chip;
+      applyPresetChip(value);
+      if (!hadFocus) return;
+      render();
+      els.presetChips.querySelector(`.chip[data-chip="${CSS.escape(value)}"]`)?.focus();
     });
+  });
+  // Count pills mirror the status select / anomaly chip.
+  document.querySelectorAll(".count-pills [data-pill]").forEach(pill => {
+    const value = pill.dataset.pill;
+    const on = value.startsWith("status:") ? state.status === value.slice(7) : state.chip === value;
+    pill.setAttribute("aria-pressed", on ? "true" : "false");
   });
   // Tag filter options follow the editable preset list plus any tags
   // already applied in this case that aren't presets (custom tags).
@@ -384,6 +414,56 @@ function renderChips() {
   els.tagFilter.innerHTML = `<option value="">${t("filter.tag.all")}</option>`
     + filterTags.map(tag => `<option value="tag:${escapeHtml(tag)}">${escapeHtml(tf("filter.tag.named", { tag }))}</option>`).join("");
   els.tagFilter.value = state.chip.startsWith("tag:") ? state.chip : "";
+  renderActiveFilters();
+}
+
+// Active filters as removable chips above the grid — visible only while the
+// rail (which shows the same state) is collapsed.
+function activeFilterList() {
+  const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate") };
+  const list = [];
+  const chip = state.chip || "";
+  if (chip && !chip.startsWith("status:")) {
+    const preset = PRESET_CHIPS.find(([value]) => value === chip);
+    list.push(["chip", preset ? t(preset[1]) : chip.startsWith("tag:") ? tf("filter.tag.named", { tag: chip.slice(4) }) : chip]);
+  }
+  if (state.status) list.push(["status", tf("layout.afStatus", { v: statusLabel(state.status) })]);
+  if (state.kind) list.push(["kind", tf("layout.afKind", { v: kindLabels[state.kind] || state.kind })]);
+  if (state.recType) list.push(["recType", tf("layout.afType", { v: recTypeLabel(state.recType) })]);
+  if (state.dateFrom || state.dateTo) {
+    const v = state.dateFrom === state.dateTo ? state.dateFrom : `${state.dateFrom || "…"} ~ ${state.dateTo || "…"}`;
+    list.push(["date", tf("layout.afDate", { v })]);
+  }
+  if (state.query) list.push(["query", tf("layout.afQuery", { v: state.query })]);
+  return list;
+}
+
+function renderActiveFilters() {
+  const host = document.getElementById("activeFilters");
+  if (!host) return;
+  const list = activeFilterList();
+  host.hidden = !list.length;
+  if (!list.length) { host.innerHTML = ""; return; }
+  const chips = list.map(([key, label]) =>
+    `<button type="button" class="af-chip" data-af="${key}" aria-label="${escapeHtml(tf("layout.clearFilter", { label }))}" title="${escapeHtml(tf("layout.clearFilter", { label }))}"><span>${escapeHtml(label)}</span><span class="af-x" aria-hidden="true">✕</span></button>`);
+  if (list.length > 1) chips.push(`<button type="button" class="btn-sm" data-af="all">${escapeHtml(t("layout.clearAll"))}</button>`);
+  host.innerHTML = chips.join("");
+}
+
+function clearActiveFilter(key) {
+  const all = key === "all";
+  if (all || key === "chip" || (key === "status" && state.chip.startsWith("status:"))) state.chip = "";
+  if (all || key === "status") { state.status = ""; els.status.value = ""; }
+  if (all || key === "kind") { state.kind = ""; els.kind.value = ""; }
+  if (all || key === "recType") state.recType = "";
+  if (all || key === "date") { state.dateFrom = ""; state.dateTo = ""; els.dateFrom.value = ""; els.dateTo.value = ""; }
+  if (all || key === "query") { state.query = ""; els.query.value = ""; }
+  state.currentPage = 1;
+  render();
+  // Keep keyboard focus in the row (or move it to the grid when it empties).
+  const next = document.querySelector("#activeFilters [data-af]");
+  if (next && document.body.classList.contains("rail-collapsed")) next.focus();
+  else els.query.focus();
 }
 
 // PERF-03: requestRender() coalesces any number of state changes in one
@@ -424,9 +504,7 @@ function setActiveCard(id) {
   const card = els.recordGrid.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
   state.activeId = id;
   if (!card) { requestRender(); return; }
-  els.recordGrid.querySelectorAll(".card.active").forEach(el => { el.classList.remove("active"); el.tabIndex = -1; });
-  card.classList.add("active");
-  card.tabIndex = 0;
+  syncActiveCard();
   renderDetails();
   renderMetrics();
 }
@@ -434,6 +512,9 @@ function setActiveCard(id) {
 function render() {
   if (renderFrame) { cancelFrame(renderFrame); renderFrame = 0; }
   applyChromeI18n();
+  // The zoom-mode select sits next to a visual "크기" label only; give it a
+  // programmatic name unless its markup already carries one.
+  if (els.videoMode && !els.videoMode.hasAttribute("data-i18n-aria-label")) els.videoMode.setAttribute("aria-label", t("media.size"));
   // Filter+sort once per render — grid and histogram share the result.
   const filtered = filteredRecords();
   renderMetrics();
@@ -444,4 +525,5 @@ function render() {
   renderGrid(filtered);
   renderDetails();
   renderSaveState();
+  syncSplitterAria();
 }

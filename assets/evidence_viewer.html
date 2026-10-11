@@ -21,115 +21,142 @@ __CSS__
 </head>
 <body>
   <button id="btnExitFs" class="fs-exit" hidden data-i18n-title="tip.fsExit" title="Esc 키로도 닫을 수 있습니다" data-i18n="fs.exit">✕ 닫기 — 워크스테이션으로</button>
-  <header>
+  <!-- Title row: standalone only (body.embed hides it — the shell's stage bar
+       owns the case title, theme and language there). -->
+  <header class="app-header">
     <h1>FrameTrace Evidence Viewer</h1>
     <div class="case-line" id="caseLine"></div>
     <div class="header-actions">
-      <span class="badge ok" data-i18n-title="tip.badgeOk" title="ffprobe로 검증됨"><span data-i18n="header.verified">검증됨</span> <span id="metricVerified">0</span></span>
-      <span class="badge candidate" data-i18n-title="tip.badgeCand" title="아직 검증하지 않은 후보"><span data-i18n="header.candidate">후보</span> <span id="metricCarved">0</span></span>
-      <span class="badge failed" data-i18n-title="tip.badgeFail" title="검증 실패"><span data-i18n="header.failed">실패</span> <span id="metricFailed">0</span></span>
-      <span class="badge anomaly" data-i18n-title="tip.badgeAnom" title="이상 후보 소견"><span data-i18n="header.anomaly">이상 후보</span> <span id="metricAnomaly">0</span></span>
       <a id="linkCarveReport" href="carve-report.html" hidden data-i18n="link.carve">카빙 결과</a>
-      <button id="btnTheme" type="button" data-i18n-title="theme.toggle" title="테마 전환">◐</button>
-      <button id="btnLang" type="button" title="Switch language" data-i18n-title="lang.switch">EN</button>
-      <div class="menu menu-down">
-        <button id="btnViewMenu" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="viewMenuList" data-i18n="menu.view">보기 ▾</button>
-        <div class="menu-list" id="viewMenuList" hidden>
-          <button id="btnTheater" type="button" data-i18n-title="tip.theater" title="시어터 모드 (t)" data-i18n="btn.theater">시어터</button>
-          <button id="btnFullscreen" type="button" data-i18n-title="tip.fullscreen" title="전체화면 (f)" data-i18n="btn.fullscreen">전체화면</button>
-          <button id="btnPip" type="button" data-i18n-title="tip.pip" title="화면 속 화면 (p)" data-i18n="btn.pip">PiP</button>
-          <hr>
-          <button id="btnTimeline" type="button" data-i18n-title="tip.timeline" title="케이스 이벤트를 시간순으로 봅니다" data-i18n="menu.timeline">타임라인</button>
-        </div>
-      </div>
-      <button id="btnShortcuts" type="button" data-i18n-title="tip.shortcuts" title="단축키 (?)">?</button>
+      <button id="btnTheme" type="button" class="btn-sm" data-i18n-title="theme.toggle" title="테마 전환">◐</button>
+      <button id="btnLang" type="button" class="btn-sm" title="Switch language" data-i18n-title="lang.switch">EN</button>
     </div>
   </header>
-  <div class="main">
-    <section class="browse">
-      <div class="warn-banner" id="caseWarnings" hidden></div>
-      <div class="timeline-panel" id="timelinePanel" hidden>
-        <div class="timeline-head">
-          <b data-i18n="timeline.title">케이스 타임라인</b>
-          <span class="muted" id="timelineMeta"></span>
-          <button id="btnTimelineGen" type="button" class="mini" data-i18n="timeline.gen">타임라인 생성/갱신</button>
-          <button id="btnTimelineClose" type="button" class="mini" data-i18n="btn.close">닫기</button>
+  <div class="topbar" role="search" aria-label="증거 검색과 필터" data-i18n-aria-label="layout.searchLabel">
+    <button id="btnRail" type="button" class="icon-btn" aria-expanded="true" aria-controls="leftRail" aria-label="필터 패널 접기/펼치기 (Ctrl+B)" data-i18n-aria-label="layout.railToggle" title="필터 패널 접기/펼치기 (Ctrl+B)" data-i18n-title="layout.railToggle"><span aria-hidden="true">☰</span></button>
+    <input id="query" type="search" placeholder="경로, ID, 파서, 해시 검색" data-i18n-placeholder="search.placeholder" aria-label="검색" data-i18n-aria-label="layout.search">
+    <select id="kind" title="출처" data-i18n-title="filter.kind" aria-label="출처" data-i18n-aria-label="filter.kind">
+      <option value="" data-i18n="filter.kind.all">전체 출처</option>
+      <option value="video" data-i18n="filter.kind.video">원본 (논리 파일)</option>
+      <option value="carved" data-i18n="filter.kind.carved">카빙 후보</option>
+      <option value="filesystem" data-i18n="filter.kind.filesystem">파일시스템 복구</option>
+      <option value="candidate" data-i18n="filter.kind.candidate">삭제 영상 후보 (복구 전)</option>
+    </select>
+    <select id="status" title="검증 상태" data-i18n-title="filter.status" aria-label="검증 상태" data-i18n-aria-label="filter.status">
+      <option value="" data-i18n="filter.status.all">전체 검증 상태</option>
+      <option value="ffprobe-video-stream-confirmed" data-i18n="status.verified">검증됨</option>
+      <option value="validation-failed" data-i18n="status.failed">검증 실패</option>
+      <option value="candidate-unvalidated" data-i18n="status.candidate">미검증 후보</option>
+      <option value="duplicate-candidate" data-i18n="status.duplicate">중복 후보</option>
+    </select>
+    <div class="menu menu-down menu-filters">
+      <button id="btnMoreFilters" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="filtersExtra" data-i18n-title="tip.moreFilters" title="정렬, 그룹화, 페이지 크기, 기간 필터" data-i18n="menu.filters">정렬·표시 ▾</button>
+      <div class="filters filters-extra" id="filtersExtra" hidden role="group" aria-label="정렬·표시" data-i18n-aria-label="layout.sortDisplay">
+        <div class="fx-row">
+          <span class="fx-label" data-i18n="layout.density">카드 밀도</span>
+          <div class="seg density-seg" role="group" aria-label="카드 밀도" data-i18n-aria-label="layout.density">
+            <button id="btnDensityComfortable" type="button" data-density="comfortable" aria-pressed="true" data-i18n="layout.comfortable">넉넉</button>
+            <button id="btnDensityCompact" type="button" data-density="compact" aria-pressed="false" data-i18n="layout.compact">촘촘</button>
+          </div>
         </div>
-        <div class="timeline-list" id="timelineList"></div>
-      </div>
-      <div class="filters">
-        <input id="query" type="search" placeholder="경로, ID, 파서, 해시 검색" data-i18n-placeholder="search.placeholder">
-        <select id="kind" title="출처" data-i18n-title="filter.kind">
-          <option value="" data-i18n="filter.kind.all">전체 출처</option>
-          <option value="video" data-i18n="filter.kind.video">원본 (논리 파일)</option>
-          <option value="carved" data-i18n="filter.kind.carved">카빙 후보</option>
-          <option value="filesystem" data-i18n="filter.kind.filesystem">파일시스템 복구</option>
-          <option value="candidate" data-i18n="filter.kind.candidate">삭제 영상 후보 (복구 전)</option>
-        </select>
-        <select id="status" title="검증 상태" data-i18n-title="filter.status">
-          <option value="" data-i18n="filter.status.all">전체 검증 상태</option>
-          <option value="ffprobe-video-stream-confirmed" data-i18n="status.verified">검증됨</option>
-          <option value="validation-failed" data-i18n="status.failed">검증 실패</option>
-          <option value="candidate-unvalidated" data-i18n="status.candidate">미검증 후보</option>
-          <option value="duplicate-candidate" data-i18n="status.duplicate">중복 후보</option>
-        </select>
-        <button id="btnMoreFilters" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="filtersExtra" data-i18n-title="tip.moreFilters" title="정렬, 그룹화, 페이지 크기, 기간 필터" data-i18n="menu.filters">정렬·표시 ▾</button>
-      </div>
-      <div class="filters filters-extra" id="filtersExtra" hidden>
-        <select id="sortBy" title="정렬" data-i18n-title="filter.sort">
-          <option value="id" data-i18n="filter.sort.id">기본 (ID순)</option>
-          <option value="time-desc" data-i18n="filter.sort.timeDesc">시간 최신순</option>
-          <option value="time-asc" data-i18n="filter.sort.timeAsc">시간 오래된순</option>
-          <option value="name" data-i18n="filter.sort.name">이름순</option>
-          <option value="size-desc" data-i18n="filter.sort.sizeDesc">크기순</option>
-        </select>
-        <select id="groupBy" title="분류/그룹화" data-i18n-title="filter.group">
-          <option value="none" data-i18n="filter.group.none">그룹화 없음</option>
-          <option value="day" data-i18n="filter.group.day">녹화 일자별</option>
-          <option value="kind" data-i18n="filter.group.kind">출처별</option>
-          <option value="recType" data-i18n="filter.group.recType">녹화 유형별 (주행/충격/주차)</option>
-          <option value="status" data-i18n="filter.group.status">검증 상태별</option>
-          <option value="mark" data-i18n="filter.group.mark">판독 마크별</option>
-          <option value="prefix" data-i18n="filter.group.prefix">이름 접두사별</option>
-          <option value="channel" data-i18n="filter.group.channel">채널별 (전/후방)</option>
-        </select>
-        <button id="btnGroupKind" class="chip chip-toggle" type="button" data-i18n-title="tip.groupKind" title="출처(원본/카빙/복구/후보)별로 목록을 묶어 봅니다" data-i18n="chip.groupKind">출처별 묶기</button>
-        <select id="tagFilter" title="태그로 필터" data-i18n-title="filter.tag">
-          <option value="" data-i18n="filter.tag.all">태그: 전체</option>
-        </select>
-        <select id="pageSize">
-          <option value="100" data-i18n="filter.page.100">100개씩</option>
-          <option value="250" data-i18n="filter.page.250">250개씩</option>
-          <option value="500" data-i18n="filter.page.500">500개씩</option>
-          <option value="1000" data-i18n="filter.page.1000">1000개씩</option>
-        </select>
-        <div class="date-row">
-          <input id="dateFrom" type="date" title="기간 시작" data-i18n-title="filter.dateFrom">
-          <span class="muted">~</span>
-          <input id="dateTo" type="date" title="기간 끝" data-i18n-title="filter.dateTo">
+        <div class="fx-row">
+          <select id="sortBy" title="정렬" data-i18n-title="filter.sort" aria-label="정렬" data-i18n-aria-label="filter.sort">
+            <option value="id" data-i18n="filter.sort.id">기본 (ID순)</option>
+            <option value="time-desc" data-i18n="filter.sort.timeDesc">시간 최신순</option>
+            <option value="time-asc" data-i18n="filter.sort.timeAsc">시간 오래된순</option>
+            <option value="name" data-i18n="filter.sort.name">이름순</option>
+            <option value="size-desc" data-i18n="filter.sort.sizeDesc">크기순</option>
+          </select>
+          <select id="groupBy" title="분류/그룹화" data-i18n-title="filter.group" aria-label="분류/그룹화" data-i18n-aria-label="filter.group">
+            <option value="none" data-i18n="filter.group.none">그룹화 없음</option>
+            <option value="day" data-i18n="filter.group.day">녹화 일자별</option>
+            <option value="kind" data-i18n="filter.group.kind">출처별</option>
+            <option value="recType" data-i18n="filter.group.recType">녹화 유형별 (주행/충격/주차)</option>
+            <option value="status" data-i18n="filter.group.status">검증 상태별</option>
+            <option value="mark" data-i18n="filter.group.mark">판독 마크별</option>
+            <option value="prefix" data-i18n="filter.group.prefix">이름 접두사별</option>
+            <option value="channel" data-i18n="filter.group.channel">채널별 (전/후방)</option>
+          </select>
+        </div>
+        <div class="fx-row">
+          <button id="btnGroupKind" class="chip chip-toggle" type="button" data-i18n-title="tip.groupKind" title="출처(원본/카빙/복구/후보)별로 목록을 묶어 봅니다" data-i18n="chip.groupKind">출처별 묶기</button>
+          <select id="tagFilter" title="태그로 필터" data-i18n-title="filter.tag" aria-label="태그로 필터" data-i18n-aria-label="filter.tag">
+            <option value="" data-i18n="filter.tag.all">태그: 전체</option>
+          </select>
+          <select id="pageSize" aria-label="페이지 크기" data-i18n-aria-label="layout.pageSize">
+            <option value="100" data-i18n="filter.page.100">100개씩</option>
+            <option value="250" data-i18n="filter.page.250">250개씩</option>
+            <option value="500" data-i18n="filter.page.500">500개씩</option>
+            <option value="1000" data-i18n="filter.page.1000">1000개씩</option>
+          </select>
+        </div>
+        <div class="date-row fx-row">
+          <input id="dateFrom" type="date" title="기간 시작" data-i18n-title="filter.dateFrom" aria-label="기간 시작" data-i18n-aria-label="filter.dateFrom">
+          <span class="muted" aria-hidden="true">~</span>
+          <input id="dateTo" type="date" title="기간 끝" data-i18n-title="filter.dateTo" aria-label="기간 끝" data-i18n-aria-label="filter.dateTo">
           <button id="btnClearDates" class="mini" type="button" data-i18n="btn.clearDates">기간 해제</button>
         </div>
       </div>
-      <div class="chip-row"><span id="presetChips" class="chip-row-inner"></span></div>
-      <div class="histline"><span class="muted period" id="periodLabel"></span><div class="hist" id="dayHistogram" title="일자별 건수 — 클릭하면 그날로 필터" data-i18n-title="hist.title"></div></div>
-      <div class="histline"><span class="muted" id="dflSummary" aria-live="polite"></span></div>
-      <div class="midrow">
-        <aside class="tree" id="facetTree"></aside>
-        <div class="grid" id="recordGrid" role="listbox" aria-label="증거 목록" data-i18n-aria-label="grid.label" aria-multiselectable="true"></div>
+    </div>
+    <div class="count-pills" role="group" aria-label="상태별 건수 — 누르면 필터" data-i18n-aria-label="layout.pills">
+      <button id="pillVerified" type="button" class="pill ok" data-pill="status:ffprobe-video-stream-confirmed" aria-pressed="false" data-i18n-title="tip.badgeOk" title="ffprobe로 검증됨"><span class="pill-ic" aria-hidden="true">✓</span><span data-i18n="header.verified">검증됨</span> <span id="metricVerified" class="pill-n">0</span></button>
+      <button id="pillFailed" type="button" class="pill failed" data-pill="status:validation-failed" aria-pressed="false" data-i18n-title="tip.badgeFail" title="검증 실패"><span class="pill-ic" aria-hidden="true">✕</span><span data-i18n="header.failed">실패</span> <span id="metricFailed" class="pill-n">0</span></button>
+      <button id="pillCandidate" type="button" class="pill candidate" data-pill="status:candidate-unvalidated" aria-pressed="false" data-i18n-title="tip.badgeCand" title="아직 검증하지 않은 후보"><span class="pill-ic" aria-hidden="true">?</span><span data-i18n="header.candidate">후보</span> <span id="metricCarved" class="pill-n">0</span></button>
+      <button id="pillAnomaly" type="button" class="pill anomaly" data-pill="anomaly" aria-pressed="false" data-i18n-title="tip.badgeAnom" title="이상 후보 소견"><span class="pill-ic" aria-hidden="true">⚠</span><span data-i18n="layout.pillAnomaly">이상</span> <span id="metricAnomaly" class="pill-n">0</span></button>
+    </div>
+    <div class="menu menu-down">
+      <button id="btnViewMenu" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="viewMenuList" data-i18n="menu.view">보기 ▾</button>
+      <div class="menu-list" id="viewMenuList" hidden>
+        <button id="btnTheater" type="button" data-i18n-title="tip.theater" title="시어터 모드 (t)" data-i18n="btn.theater">시어터</button>
+        <button id="btnFullscreen" type="button" data-i18n-title="tip.fullscreen" title="전체화면 (f)" data-i18n="btn.fullscreen">전체화면</button>
+        <button id="btnPip" type="button" data-i18n-title="tip.pip" title="화면 속 화면 (p)" data-i18n="btn.pip">PiP</button>
+        <hr>
+        <button id="btnTimeline" type="button" data-i18n-title="tip.timeline" title="케이스 이벤트를 시간순으로 봅니다" data-i18n="menu.timeline">타임라인</button>
       </div>
-      <div class="pager">
-        <span class="muted" id="resultCount"></span>
-        <span class="muted" id="triageStatus" aria-live="polite"></span>
-        <button id="prevPage" data-i18n="page.prev">이전</button>
-        <span class="muted" id="pageStatus" aria-live="polite"></span>
-        <button id="nextPage" data-i18n="page.next">다음</button>
-      </div>
-    </section>
-    <div class="vsplitter" id="vsplitter" title="드래그: 목록/뷰어 폭 조절 / 더블클릭: 기본값" data-i18n-title="split.v"></div>
-    <section class="media">
+    </div>
+    <button id="btnShortcuts" type="button" class="icon-btn" data-i18n-title="tip.shortcuts" title="단축키 (?)" aria-label="단축키 (?)" data-i18n-aria-label="tip.shortcuts"><span aria-hidden="true">?</span></button>
+  </div>
+  <div class="workarea">
+    <aside class="rail" id="leftRail" aria-labelledby="railTitle">
+      <h2 class="rail-title" id="railTitle" data-i18n="filter.label">필터</h2>
+      <div class="chip-row rail-chips"><span id="presetChips" class="chip-row-inner" role="group" aria-labelledby="railTitle"></span></div>
+      <div class="tree" id="facetTree" role="group" aria-label="분류" data-i18n-aria-label="layout.facets"></div>
+      <section class="rail-cal" aria-labelledby="calTitle">
+        <h2 class="rail-title" id="calTitle" data-i18n="layout.calendar">녹화 달력</h2>
+        <div class="hist" id="dayHistogram" title="일자별 건수 — 클릭하면 그날로 필터" data-i18n-title="hist.title"></div>
+        <p class="muted period" id="periodLabel"></p>
+      </section>
+    </aside>
+    <main class="main" id="mainArea">
+      <section class="browse" aria-label="증거 목록" data-i18n-aria-label="grid.label">
+        <div class="warn-banner" id="caseWarnings" hidden></div>
+        <div class="timeline-panel" id="timelinePanel" hidden>
+          <div class="timeline-head">
+            <h2 class="timeline-title" data-i18n="timeline.title">케이스 타임라인</h2>
+            <span class="muted" id="timelineMeta"></span>
+            <button id="btnTimelineGen" type="button" class="mini" data-i18n="timeline.gen">타임라인 생성/갱신</button>
+            <button id="btnTimelineClose" type="button" class="mini" data-i18n="btn.close">닫기</button>
+          </div>
+          <div class="timeline-list" id="timelineList"></div>
+        </div>
+        <div class="active-filters" id="activeFilters" hidden role="group" aria-label="적용 중인 필터" data-i18n-aria-label="layout.activeFilters"></div>
+        <div class="grid" id="recordGrid" role="grid" aria-label="증거 목록" data-i18n-aria-label="grid.label" aria-multiselectable="true"></div>
+        <div class="pager">
+          <span class="muted" id="dflSummary"></span>
+          <span class="muted" id="triageStatus"></span>
+          <span class="pager-spacer"></span>
+          <span class="muted"><span data-i18n="layout.results">결과</span> <span id="resultCount"></span></span>
+          <button id="prevPage" type="button" class="btn-sm" data-i18n="page.prev">이전</button>
+          <span class="muted" id="pageStatus"></span>
+          <button id="nextPage" type="button" class="btn-sm" data-i18n="page.next">다음</button>
+          <span id="gridLive" class="sr-only" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+      <div class="vsplitter" id="vsplitter" role="separator" tabindex="0" aria-orientation="vertical" aria-controls="mainArea" aria-valuemin="28" aria-valuemax="72" aria-valuenow="60" aria-label="목록/뷰어 폭 조절 (←/→)" data-i18n-aria-label="layout.splitV" title="드래그: 목록/뷰어 폭 조절 / 더블클릭: 기본값" data-i18n-title="split.v"></div>
+      <section class="media" aria-label="미리보기" data-i18n-aria-label="layout.preview">
       <div class="player">
-        <div class="media-title"><strong id="mediaTitle">-</strong><span id="mediaStatus" class="badge">-</span></div>
-        <div class="media-stage" id="mediaStage"></div>
+        <div class="media-title"><h2 id="mediaTitle">-</h2><span id="mediaStatus" class="badge">-</span></div>
+        <div class="media-stage" id="mediaStage" tabindex="0" role="region" aria-label="영상" data-i18n-aria-label="layout.stage"></div>
         <div class="media-toolbar">
           <button id="btnSkipBack" type="button" data-i18n-title="tip.skipBack" title="10초 뒤로 (←)" data-i18n="toolbar.skipBack">« -10초</button>
           <button id="btnSkipFwd" type="button" data-i18n-title="tip.skipFwd" title="10초 앞으로 (→)" data-i18n="toolbar.skipFwd">+10초 »</button>
@@ -166,23 +193,40 @@ __CSS__
           <span class="muted" id="metricVideos"></span>
         </div>
       </div>
-      <div class="hsplitter" id="hsplitter" title="드래그: 영상 높이 조절 / 더블클릭: 기본값" data-i18n-title="split.h"></div>
-      <aside class="mini-info">
-        <div class="panel-title" data-i18n="panel.selected">선택 증거</div>
-        <div id="detailBadges"></div>
-        <dl id="summaryList"></dl>
-        <div class="panel-title telemetry-title" id="telemetryTitle" hidden><span data-i18n="panel.telemetry">주행 궤적</span><button id="btnTelemetry" type="button" data-i18n="btn.telemetry">추출</button></div>
-        <div id="telemetryPane" hidden><canvas id="telemetryCanvas" width="236" height="130"></canvas><div class="telemetry-note" id="telemetryNote"></div></div>
-        <div class="panel-title" data-i18n="panel.inspector">포렌식 인스펙터</div>
-        <dl id="metaList"></dl>
-        <div class="panel-title" data-i18n="panel.validation">검증 로그</div>
-        <div class="validation-list" id="validationList"></div>
-        <dl>
-          <dt data-i18n="panel.source">원본</dt><dd data-i18n="panel.source.desc">수정하지 않음</dd>
-          <dt data-i18n="panel.recovered">복구물</dt><dd data-i18n="panel.recovered.desc">검증 전까지 후보</dd>
-        </dl>
-      </aside>
-    </section>
+      <div class="hsplitter" id="hsplitter" role="separator" tabindex="0" aria-orientation="horizontal" aria-valuemin="160" aria-valuemax="1200" aria-valuenow="360" aria-label="영상 높이 조절 (↑/↓)" data-i18n-aria-label="layout.splitH" title="드래그: 영상 높이 조절 / 더블클릭: 기본값" data-i18n-title="split.h"></div>
+      <section class="mini-info" aria-labelledby="detailsTitle">
+        <div class="details-head">
+          <h2 class="panel-title" id="detailsTitle" data-i18n="panel.selected">선택 증거</h2>
+          <div id="detailBadges"></div>
+        </div>
+        <div class="tabs" role="tablist" id="detailTabs" aria-label="상세 정보" data-i18n-aria-label="layout.detailTabs">
+          <button type="button" role="tab" id="tabSummary" aria-controls="tpSummary" aria-selected="true" tabindex="0" data-i18n="layout.tabSummary">요약</button>
+          <button type="button" role="tab" id="tabInspector" aria-controls="tpInspector" aria-selected="false" tabindex="-1" data-i18n="layout.tabInspector">인스펙터</button>
+          <button type="button" role="tab" id="tabValidation" aria-controls="tpValidation" aria-selected="false" tabindex="-1" data-i18n="panel.validation">검증 로그</button>
+          <button type="button" role="tab" id="tabTelemetry" aria-controls="tpTelemetry" aria-selected="false" tabindex="-1" data-i18n="layout.tabTelemetry">궤적</button>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpSummary" aria-labelledby="tabSummary" tabindex="0">
+          <dl id="summaryList"></dl>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpInspector" aria-labelledby="tabInspector" tabindex="0" hidden>
+          <h3 class="panel-title sub-title" data-i18n="panel.inspector">포렌식 인스펙터</h3>
+          <dl id="metaList"></dl>
+          <dl class="legend-list">
+            <dt data-i18n="panel.source">원본</dt><dd data-i18n="panel.source.desc">수정하지 않음</dd>
+            <dt data-i18n="panel.recovered">복구물</dt><dd data-i18n="panel.recovered.desc">검증 전까지 후보</dd>
+          </dl>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpValidation" aria-labelledby="tabValidation" tabindex="0" hidden>
+          <div class="validation-list" id="validationList"></div>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpTelemetry" aria-labelledby="tabTelemetry" tabindex="0" hidden>
+          <div class="telemetry-title" id="telemetryTitle" hidden><h3 class="panel-title sub-title" data-i18n="panel.telemetry">주행 궤적</h3><button id="btnTelemetry" type="button" class="btn-sm" data-i18n="btn.telemetry">추출</button></div>
+          <div id="telemetryPane" hidden><canvas id="telemetryCanvas" width="236" height="130" role="img" aria-label="주행 궤적" data-i18n-aria-label="panel.telemetry"></canvas><div class="telemetry-note" id="telemetryNote"></div></div>
+          <p class="muted tab-empty" id="telemetryEmpty" data-i18n="layout.telemetryEmpty">이 영상에는 추출할 궤적이 없습니다.</p>
+        </div>
+      </section>
+      </section>
+    </main>
   </div>
   <div class="selection-bar" id="selectionBar">
     <strong id="selectionCount" aria-live="polite">0개 선택</strong>

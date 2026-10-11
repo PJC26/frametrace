@@ -16,6 +16,16 @@ const start = src.indexOf('const I18N = {');
 const end = src.indexOf('\n};', start);
 if (start < 0 || end < 0) { console.error('cannot locate the I18N table in 20-i18n.js'); process.exit(1); }
 const I18N = vm.runInNewContext('(' + src.slice(start + 'const I18N = '.length, end + 2) + ')');
+// Layout strings live in 21-i18n-layout.js and are merged into I18N at load.
+try {
+  const lsrc = readFileSync(join(root, 'assets/viewer/21-i18n-layout.js'), 'utf8');
+  const ls = lsrc.indexOf('const I18N_LAYOUT = {');
+  const le = lsrc.indexOf('\n};', ls);
+  if (ls >= 0 && le >= 0) {
+    const extra = vm.runInNewContext('(' + lsrc.slice(ls + 'const I18N_LAYOUT = '.length, le + 2) + ')');
+    for (const loc of ['ko', 'en']) Object.assign(I18N[loc], extra[loc] || {});
+  }
+} catch { /* optional part */ }
 
 const problems = [];
 const tags = html.match(/<[a-zA-Z][^<>]*>/g) || [];

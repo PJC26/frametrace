@@ -214,14 +214,34 @@ function applyLayout() {
 }
 
 // Column split between the browse pane and the media pane. The default lives
-// in CSS (55%/45%); a dragged value is stored as the left pane percentage.
+// in CSS (grid fills, media 40% / min 420px); a dragged or keyed value is
+// stored as the browse pane percentage of .main (28–72).
+const COL_MIN = 28, COL_MAX = 72;
 function applyColumnSplit() {
   const main = document.querySelector(".main");
   const pct = Number(state.layout.colSplit) || 0;
-  if (pct >= 28 && pct <= 72) {
-    main.style.gridTemplateColumns = `minmax(0, ${pct}%) 10px minmax(0, 1fr)`;
+  if (pct >= COL_MIN && pct <= COL_MAX) {
+    main.style.gridTemplateColumns = `minmax(0, 1fr) 10px minmax(min(420px, 55%), ${(100 - pct).toFixed(2)}%)`;
   } else {
     main.style.gridTemplateColumns = "";
+  }
+  syncSplitterAria();
+}
+
+// aria-valuenow follows the rendered split (browse % of .main).
+function syncSplitterAria() {
+  const splitter = document.getElementById("vsplitter");
+  const main = document.querySelector(".main");
+  const browse = document.querySelector(".browse");
+  if (!splitter || !main || !browse) return;
+  const w = main.clientWidth;
+  const pct = w > 0 ? Math.round((browse.getBoundingClientRect().width / w) * 100) : Math.round(Number(state.layout.colSplit) || 60);
+  splitter.setAttribute("aria-valuenow", String(Math.max(COL_MIN, Math.min(COL_MAX, pct || 60))));
+  const hs = document.getElementById("hsplitter");
+  const player = document.querySelector(".player");
+  if (hs && player) {
+    hs.setAttribute("aria-valuenow", String(Math.round(player.offsetHeight || 0)));
+    hs.setAttribute("aria-valuemax", String(Math.max(200, window.innerHeight - 200)));
   }
 }
 
@@ -239,7 +259,7 @@ function setupColumnSplitter() {
     if (!dragging) return;
     const rect = main.getBoundingClientRect();
     const pct = ((event.clientX - rect.left) / rect.width) * 100;
-    state.layout.colSplit = Math.max(28, Math.min(72, pct));
+    state.layout.colSplit = Math.max(COL_MIN, Math.min(COL_MAX, pct));
     applyColumnSplit();
   });
   const end = () => {
@@ -253,6 +273,24 @@ function setupColumnSplitter() {
     state.layout.colSplit = 0;
     saveLayout();
     applyLayout();
+  });
+  // Keyboard: ←/→ 2%, Shift ×5, Home/End to the limits, Enter resets.
+  // preventDefault keeps the global ←/→ video seek from also firing.
+  splitter.addEventListener("keydown", event => {
+    const now = Number(splitter.getAttribute("aria-valuenow")) || 60;
+    const step = event.shiftKey ? 10 : 2;
+    let next = null;
+    if (event.key === "ArrowLeft") next = now - step;
+    else if (event.key === "ArrowRight") next = now + step;
+    else if (event.key === "Home") next = COL_MIN;
+    else if (event.key === "End") next = COL_MAX;
+    else if (event.key === "Enter") { event.preventDefault(); state.layout.colSplit = 0; saveLayout(); applyLayout(); return; }
+    if (next === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.layout.colSplit = Math.max(COL_MIN, Math.min(COL_MAX, next));
+    applyColumnSplit();
+    saveLayoutSoon();
   });
 }
 
@@ -286,6 +324,20 @@ function setupHeightSplitter() {
     state.layout.playerH = 0;
     saveLayout();
     applyLayout();
+  });
+  splitter.addEventListener("keydown", event => {
+    const step = event.shiftKey ? 80 : 20;
+    const cur = player.offsetHeight;
+    let next = null;
+    if (event.key === "ArrowUp") next = cur - step;
+    else if (event.key === "ArrowDown") next = cur + step;
+    else if (event.key === "Enter") { event.preventDefault(); state.layout.playerH = 0; saveLayout(); applyLayout(); return; }
+    if (next === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.layout.playerH = Math.max(160, Math.min(window.innerHeight - 260, next));
+    applyLayout();
+    saveLayoutSoon();
   });
 }
 
@@ -341,7 +393,9 @@ let lastGridActive = null;
 let gridRenderedOnce = false;
 
 // Intl formatters are expensive to construct; build once, reuse per card.
-const cardTimeFormat = new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+// Compact, locale-neutral card time (YYYY-MM-DD HH:mm, 24h) so it fits a
+// 140px card; the detail panel keeps the full localized timestamp.
+const cardTimeFormat = { format: date => { const p = n => String(n).padStart(2, "0"); return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`; } };
 
 const gridForcedPaging = (() => {
   try { return new URLSearchParams(location.search).get("grid") === "paged"; } catch { return false; }
@@ -355,8 +409,11 @@ function gridMetrics() {
   const grid = els.recordGrid;
   const cs = getComputedStyle(grid);
   const inner = grid.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
-  const cols = Math.max(1, Math.floor((inner + VG_GAP) / (VG_MIN_CARD_W + VG_GAP)));
-  const rowH = parseFloat(cs.getPropertyValue("--card-h")) || 240;
+  // Card min width and row height come from CSS so each density keeps the
+  // row math exact (--card-min-w / --card-h on .grid).
+  const minW = parseFloat(cs.getPropertyValue("--card-min-w")) || VG_MIN_CARD_W;
+  const cols = Math.max(1, Math.floor((inner + VG_GAP) / (minW + VG_GAP)));
+  const rowH = parseFloat(cs.getPropertyValue("--card-h")) || 188;
   return { cols, rowH };
 }
 
@@ -423,9 +480,8 @@ function groupedModel(filtered, cols, rowH) {
 
 function vgRowElement(row) {
   if (row.type === "h") {
-    const kindAttr = state.groupBy === "kind" ? ` data-gkind="${escapeHtml(row.kind)}"` : "";
     const holder = document.createElement("div");
-    holder.innerHTML = `<div class="group-header"${kindAttr} data-group="${escapeHtml(row.key)}" tabindex="0" role="button"><span>${escapeHtml(row.key)}</span><span class="muted">${row.count}${t("unit.count")}${row.collapsed ? ` · ${t("group.collapsed")}` : ""}</span></div>`;
+    holder.innerHTML = groupHeaderHtml(row.key, row.kind, row.count, row.collapsed);
     const el = holder.firstElementChild;
     el.style.top = row.top + "px";
     el.style.height = row.h + "px";
@@ -435,7 +491,7 @@ function vgRowElement(row) {
   for (let i = row.s; i < row.e; i++) html.push(renderCard(vg.filtered[i]));
   const el = document.createElement("div");
   el.className = "vrow";
-  el.setAttribute("role", "presentation");
+  el.setAttribute("role", "row");
   el.style.top = row.top + "px";
   el.style.height = row.h + "px";
   el.innerHTML = html.join("");
@@ -477,13 +533,25 @@ function paintVirtual(full) {
   syncActiveCard();
 }
 
+// The current card carries .active (ring + marker), aria-current and the
+// grid's single tab stop. Several modules swap .active directly; this
+// re-derives the ARIA side from state.activeId.
 function syncActiveCard() {
-  els.recordGrid.querySelectorAll(".card.active").forEach(el => {
-    if (el.dataset.id !== state.activeId) { el.classList.remove("active"); el.tabIndex = -1; }
+  els.recordGrid.querySelectorAll(".card.active, .card[aria-current]").forEach(el => {
+    if (el.dataset.id !== state.activeId) { el.classList.remove("active"); el.removeAttribute("aria-current"); el.tabIndex = -1; }
   });
   if (state.activeId == null) return;
   const card = els.recordGrid.querySelector(`.card[data-id="${CSS.escape(state.activeId)}"]`);
-  if (card && !card.classList.contains("active")) { card.classList.add("active"); card.tabIndex = 0; }
+  if (card) {
+    if (!card.classList.contains("active")) card.classList.add("active");
+    card.setAttribute("aria-current", "true");
+    card.tabIndex = 0;
+  }
+}
+
+function groupHeaderHtml(key, kind, count, collapsed) {
+  const kindAttr = state.groupBy === "kind" ? ` data-gkind="${escapeHtml(kind || "")}"` : "";
+  return `<div class="group-header"${kindAttr} data-group="${escapeHtml(key)}" role="row"><div class="gh-cell" role="gridcell" tabindex="0" aria-expanded="${collapsed ? "false" : "true"}"><span>${escapeHtml(key)}</span><span class="muted">${count}${t("unit.count")}${collapsed ? ` · ${t("group.collapsed")}` : ""}</span></div></div>`;
 }
 
 // Scroll the active record's row into view (nearest edge), then paint it.
@@ -535,6 +603,7 @@ if (typeof ResizeObserver === "function") {
     }
     moveActiveByPage(step);
     gridEnsureActiveVisible();
+    syncActiveCard();
   };
 }
 
@@ -585,17 +654,25 @@ function renderGrid(filtered) {
     else if (status === "important") important += 1;
     else if (status === "needs_verification") pending += 1;
   }
+  // Status texts are plain (non-live) — one polite region (#gridLive)
+  // announces the result count, and only when the filter result changes,
+  // never on j/k or a mark.
   if (els.triageStatus) {
     els.triageStatus.textContent = tf("triage.line", { done: reviewed, total: records.length, imp: important, pend: pending });
+    els.triageStatus.title = els.triageStatus.textContent;
   }
   if (els.dflSummary) {
     const { dist, screened } = dflDistribution();
     els.dflSummary.textContent = screened
       ? tf("dfl.dist", { n: screened, total: records.length, high: dist.high, medium: dist.medium, low: dist.low, unknown: dist.unknown, failed: dist.failed, none: records.length - screened })
       : "";
+    els.dflSummary.title = els.dflSummary.textContent;
   }
+  announceResultCount(filtered.length);
   els.prevPage.disabled = state.currentPage <= 1;
   els.nextPage.disabled = state.currentPage >= pageCount;
+  els.prevPage.title = els.prevPage.disabled ? t("layout.pageFirst") : t("page.prev");
+  els.nextPage.title = els.nextPage.disabled ? t("layout.pageLast") : t("page.next");
 
   if (virtual && filtered.length) {
     renderVirtualGrid(filtered);
@@ -612,7 +689,14 @@ function renderGrid(filtered) {
     });
   }
 
+  // Paged path: cards stay direct CSS-grid items, but each run of cards is
+  // wrapped in a display:contents role=row so the ARIA grid is well formed.
   const cardsHtml = [];
+  let run = [];
+  const flushRun = () => {
+    if (run.length) cardsHtml.push(`<div class="prow" role="row">${run.join("")}</div>`);
+    run = [];
+  };
   let lastGroup = null;
   pageRows.forEach(record => {
     if (state.groupBy !== "none") {
@@ -620,15 +704,32 @@ function renderGrid(filtered) {
       if (key !== lastGroup) {
         lastGroup = key;
         const collapsed = state.collapsedGroups.has(key);
-        const kindAttr = state.groupBy === "kind" ? ` data-gkind="${escapeHtml(record.kind || "")}"` : "";
-        cardsHtml.push(`<div class="group-header"${kindAttr} data-group="${escapeHtml(key)}" tabindex="0" role="button"><span>${escapeHtml(key)}</span><span class="muted">${groupCounts.get(key) || 0}${t("unit.count")}${collapsed ? ` · ${t("group.collapsed")}` : ""}</span></div>`);
+        flushRun();
+        cardsHtml.push(groupHeaderHtml(key, record.kind, groupCounts.get(key) || 0, collapsed));
         if (collapsed) return;
       }
       if (state.collapsedGroups.has(key)) return;
     }
-    cardsHtml.push(renderCard(record));
+    run.push(renderCard(record));
   });
-  els.recordGrid.innerHTML = cardsHtml.join("") || `<div class="fallback">${t("grid.empty")}</div>`;
+  flushRun();
+  els.recordGrid.innerHTML = cardsHtml.join("") || `<div class="prow" role="row"><div class="fallback" role="gridcell">${t("grid.empty")}</div></div>`;
+}
+
+let lastAnnounced = null;
+let announceTimer = 0;
+function announceResultCount(n) {
+  const live = document.getElementById("gridLive");
+  if (!live) return;
+  const key = `${n}|${filterMemoKey()}|${state.locale}`;
+  if (key === lastAnnounced) return;
+  const first = lastAnnounced === null;
+  lastAnnounced = key;
+  clearTimeout(announceTimer);
+  // Debounced so typing in the search box yields one announcement; the
+  // initial load is not announced at all.
+  if (first) return;
+  announceTimer = setTimeout(() => { live.textContent = tf("layout.live", { n }); }, 600);
 }
 
 // Tri-state audio flag: probed codec present → speaker, probed with no
@@ -650,18 +751,52 @@ function audioFlag(record) {
 const thumbRetried = new Set();
 const thumbDead = new Set();
 
+// Status is never colour alone: every status badge carries an icon + text.
+function statusIcon(status) {
+  if (status === "ffprobe-video-stream-confirmed" || status === "ffprobe-confirmed") return "✓";
+  if (status === "validation-failed") return "✕";
+  if (status === "duplicate-candidate") return "⧉";
+  return "?";
+}
+function statusBadgeHtml(status) {
+  return `<span class="badge ${statusClass(status)}" title="${escapeHtml(status)}"><span class="st-ic" aria-hidden="true">${statusIcon(status)}</span>${escapeHtml(statusLabel(status))}</span>`;
+}
+
+// While the workstation is still scanning/enriching (live index), a record
+// without a thumbnail is most likely waiting for the enrichment step —
+// show a "generating" skeleton instead of a final "no thumbnail".
+function thumbPending(record) {
+  const live = DATA.liveIndex;
+  if (!live) return false;
+  const phase = String(live.phase || "");
+  return (phase === "running" || phase === "review-partial") && record.kind !== "candidate" && record.status !== "validation-failed";
+}
+
+function thumbHtml(record, displayName) {
+  if (record.thumb && !thumbDead.has(record.thumb)) {
+    return `<img src="${escapeHtml(record.thumb)}" alt="${escapeHtml(tf("thumb.alt", { name: displayName }))}" loading="lazy" decoding="async" fetchpriority="low">`;
+  }
+  if (record.status === "validation-failed") return `<div class="ph">${t("thumb.damaged")}</div>`;
+  if (!record.thumb && thumbPending(record)) {
+    return `<div class="ph pending" title="${escapeHtml(t("thumb.pendingTip"))}">${escapeHtml(t("thumb.pending"))}</div>`;
+  }
+  // A URL that failed (twice) can be retried; a record that never had a
+  // thumbnail has nothing to retry.
+  const retry = record.thumb
+    ? `<button type="button" class="thumb-retry" data-thumb-retry="${escapeHtml(record.thumb)}" title="${escapeHtml(t("thumb.retryTip"))}">${escapeHtml(t("thumb.retry"))}</button>`
+    : "";
+  return `<div class="ph"><span>${t("thumb.missing")}</span>${retry}</div>`;
+}
+
 function renderCard(record) {
   const mark = markOf(record);
   const markChip = mark ? `<span class="mark-chip ${escapeHtml(mark.status)}">${escapeHtml(markLabel(mark.status))}</span>` : "";
   const staleTag = record.indexStatus === "stale" ? '<span class="muted">(stale)</span>' : "";
-  const thumb = record.thumb && !thumbDead.has(record.thumb)
-    ?`<img src="${escapeHtml(record.thumb)}" loading="lazy" decoding="async" fetchpriority="low">`
-    : `<div class="ph">${record.status === "validation-failed" ? t("thumb.damaged") : t("thumb.missing")}</div>`;
-  const recTypeTag = record.recType ? `<span class="rec-type">${escapeHtml(recTypeLabel(record.recType))}</span>` : "";
-  const channel = record.channel ? `<span class="channel-badge">${escapeHtml(record.channel)}</span>` : "";
   const displayName = record.originalName && record.originalName !== record.name
     ? record.originalName
     : record.name;
+  const thumb = thumbHtml(record, displayName);
+  const recTypeTag = record.recType ? `<span class="rec-type">${escapeHtml(recTypeLabel(record.recType))}</span>` : "";
   const recTime = record.recTime
     ? record.recSource === "name-date"
       ? record.recDay
@@ -671,24 +806,27 @@ function renderCard(record) {
     ? `<div class="tag-row">${tagListFor(record).map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("")}</div>`
     : "";
   const anomalyChip = record.hasAnomaly
-    ? `<span class="badge anomaly" title="${escapeHtml(record.anomalies.map(item => item.kind).join(", "))}">${escapeHtml(t("header.anomaly"))}</span>`
+    ? `<span class="badge anomaly" title="${escapeHtml(record.anomalies.map(item => item.kind).join(", "))}"><span class="st-ic" aria-hidden="true">⚠</span>${escapeHtml(t("header.anomaly"))}</span>`
     : "";
   const kindChip = `<span class="kind-badge kind-${escapeHtml(record.kind || "video")}" title="${t("tree.kind")}">${escapeHtml(KIND_SHORT[record.kind] || record.kind || "?")}</span>`;
   const warnChip = (record.warnings || []).length
-    ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}">${tf("warn.count", { n: record.warnings.length })}</span>`
+    ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}"><span class="st-ic" aria-hidden="true">!</span>${tf("warn.count", { n: record.warnings.length })}</span>`
     : "";
   const dflChip = record.dfl && record.dfl.band
     ? `<span class="badge dfl dfl-${escapeHtml(record.dfl.band)}" title="${escapeHtml(tf("dfl.title", { score: record.dfl.score ?? "" }))}">${escapeHtml(tf("dfl.badge", { band: record.dfl.band_label || record.dfl.band }))}</span>`
     : (record.dfl && record.dfl.error
       ? `<span class="badge dfl dfl-low" title="${escapeHtml(tf("dfl.failTitle", { error: record.dfl.error }))}">${escapeHtml(t("dfl.fail"))}</span>`
       : "");
-  return `<div class="card ${record.id === state.activeId ? "active" : ""}" data-id="${escapeHtml(record.id)}" tabindex="${record.id === state.activeId ? 0 : -1}" role="option" aria-selected="${state.selectedIds.has(record.id)}">
-    <div class="thumb">${thumb}<input type="checkbox" aria-label="${escapeHtml(t("aria.select"))}" ${state.selectedIds.has(record.id) ? "checked" : ""} data-check="${escapeHtml(record.id)}">${recTypeTag}${kindChip}<span class="dur">${fmtDuration(record.duration)}</span></div>
+  const active = record.id === state.activeId;
+  // role=gridcell (inside a role=row) may contain the selection checkbox and
+  // the retry button — no nested-interactive inside an option.
+  return `<div class="card ${active ? "active" : ""}" data-id="${escapeHtml(record.id)}" tabindex="${active ? 0 : -1}" role="gridcell" title="${escapeHtml(displayName)}" aria-selected="${state.selectedIds.has(record.id)}"${active ? ' aria-current="true"' : ""}>
+    <div class="thumb">${thumb}<input type="checkbox" aria-label="${escapeHtml(t("aria.select"))}: ${escapeHtml(displayName)}" ${state.selectedIds.has(record.id) ? "checked" : ""} data-check="${escapeHtml(record.id)}">${recTypeTag}${kindChip}<span class="dur">${fmtDuration(record.duration)}</span></div>
     <div class="meta">
-      <div class="name-row"><span class="name" title="${escapeHtml(displayName)}">${highlightEscape(displayName, state.query)}</span>${channel ? `<span class="channel-badge">${escapeHtml(record.channel)}</span>` : ""}</div>
-      <div class="time-row"><span class="time-text">${recTime ? escapeHtml(recTime) : t("time.unknown")}</span><span class="badge ${statusClass(record.status)}" title="${escapeHtml(record.status)}">${escapeHtml(statusLabel(record.status))}</span>${anomalyChip}${warnChip}${dflChip}</div>
+      <div class="name-row"><span class="name" title="${escapeHtml(displayName)}">${highlightEscape(displayName, state.query)}</span>${record.channel ? `<span class="channel-badge">${escapeHtml(record.channel)}</span>` : ""}</div>
+      <div class="time-row"><span class="time-text">${recTime ? escapeHtml(recTime) : t("time.unknown")}</span><span class="sub">${fmtBytes(record.size)}${audioFlag(record)}${staleTag}</span></div>
+      <div class="badge-row">${statusBadgeHtml(record.status)}${markChip}${anomalyChip}${warnChip}${dflChip}</div>
       ${tagsHtml}
-      <div class="sub-row"><span class="sub">${fmtBytes(record.size)}${audioFlag(record)}${markChip}${staleTag}</span></div>
     </div>
   </div>`;
 }
@@ -728,7 +866,7 @@ function renderHistogram(days) {
     const selected = state.dateFrom === day && state.dateTo === day;
     const level = count ? Math.min(4, 1 + Math.floor((count * 3) / max)) : 0;
     cells.push(count
-      ? `<button type="button" class="cal-cell l${level}${selected ? " selected" : ""}" data-day="${day}" title="${escapeHtml(tf("hist.item", { day, count }))}"><span class="cal-d">${d}</span><span class="cal-n">${count > 99 ? "99+" : count}</span></button>`
+      ? `<button type="button" class="cal-cell l${level}${selected ? " selected" : ""}" data-day="${day}" aria-pressed="${selected}" title="${escapeHtml(tf("hist.item", { day, count }))}"><span class="cal-d">${d}</span><span class="sr-only"> · </span><span class="cal-n">${count > 99 ? "99+" : count}</span><span class="sr-only">${escapeHtml(t("unit.count"))}</span></button>`
       : `<span class="cal-cell l0${selected ? " selected" : ""}" data-day="${day}"><span class="cal-d">${d}</span></span>`);
   }
   const monthLabel = new Date(cy, cm - 1, 1).toLocaleDateString(loc, { year: "numeric", month: "long" });
@@ -737,11 +875,16 @@ function renderHistogram(days) {
   const yearSel = years.length > 1
     ? `<select id="calYear" class="cal-year" aria-label="${escapeHtml(t("cal.year"))}">${years.map(y => `<option value="${y}"${y === String(cy) ? " selected" : ""}>${y}</option>`).join("")}</select>`
     : "";
+  // Fits the 200px rail: ‹ [year] month ›. With a year select the label
+  // shows the month only. Disabled arrows say why in their tooltip.
+  const shortMonth = yearSel ? new Date(cy, cm - 1, 1).toLocaleDateString(loc, { month: "long" }) : monthLabel;
+  const prevTip = mi <= 0 ? t("layout.calPrevNone") : t("cal.prev");
+  const nextTip = mi >= months.length - 1 ? t("layout.calNextNone") : t("cal.next");
   const nav = months.length > 1
-    ? `<div class="cal-nav">${yearSel}
-        <button type="button" class="cal-btn" id="calPrev" ${mi <= 0 ? "disabled" : ""} title="${escapeHtml(t("cal.prev"))}">‹</button>
-        <span class="cal-month">${escapeHtml(monthLabel)}</span>
-        <button type="button" class="cal-btn" id="calNext" ${mi >= months.length - 1 ? "disabled" : ""} title="${escapeHtml(t("cal.next"))}">›</button>
+    ? `<div class="cal-nav">
+        <button type="button" class="cal-btn" id="calPrev" ${mi <= 0 ? "disabled" : ""} title="${escapeHtml(prevTip)}" aria-label="${escapeHtml(prevTip)}">‹</button>
+        ${yearSel}<span class="cal-month">${escapeHtml(shortMonth)}</span>
+        <button type="button" class="cal-btn" id="calNext" ${mi >= months.length - 1 ? "disabled" : ""} title="${escapeHtml(nextTip)}" aria-label="${escapeHtml(nextTip)}">›</button>
       </div>`
     : `<div class="cal-nav"><span class="cal-month">${escapeHtml(monthLabel)}</span></div>`;
   els.dayHistogram.innerHTML = `<div class="cal">${nav}<div class="cal-grid">${cells.join("")}</div></div>`;
@@ -782,4 +925,198 @@ function knownDaySpan() {
   });
   knownDaySpanCache = { from, to, count };
   return knownDaySpanCache;
+}
+
+// ---- layout chrome --------------------------------------------------------
+// Rail (Ctrl+B), card density, the 정렬·표시 panel, 보기 ▾ keyboard support,
+// count pills, detail tabs and the thumbnail retry button. Wired once from
+// 95-init.js. Preferences are per-browser conveniences: every storage access
+// is guarded and the page works without it.
+const RAIL_KEY = "ft.viewer.rail.v1";
+const DENSITY_KEY = "ft.viewer.density.v1";
+const DETAIL_TAB_KEY = "ft.viewer.detailTab.v1";
+const RAIL_AUTO_BELOW = 1500;
+function prefGet(key, fallback) {
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch { return fallback; }
+}
+function prefSet(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* storage blocked: keep the in-memory value */ }
+}
+
+// The rail remembers open/closed separately for wide (>=1500px) and narrow
+// frames; narrow frames start collapsed so the grid keeps its columns.
+let railPrefs = Object.assign({ wide: true, narrow: false }, prefGet(RAIL_KEY, {}) || {});
+let railWidthClass = null;
+const railClassNow = () => (window.innerWidth >= RAIL_AUTO_BELOW ? "wide" : "narrow");
+function applyRail() {
+  railWidthClass = railClassNow();
+  const open = !!railPrefs[railWidthClass];
+  document.body.classList.toggle("rail-collapsed", !open);
+  document.getElementById("btnRail")?.setAttribute("aria-expanded", open ? "true" : "false");
+}
+function toggleRail() {
+  const key = railClassNow();
+  railPrefs[key] = !railPrefs[key];
+  prefSet(RAIL_KEY, railPrefs);
+  applyRail();
+  syncSplitterAria();
+}
+
+let gridDensity = prefGet(DENSITY_KEY, "comfortable") === "compact" ? "compact" : "comfortable";
+function applyDensity() {
+  document.body.classList.toggle("density-compact", gridDensity === "compact");
+  document.querySelectorAll("[data-density]").forEach(btn => btn.setAttribute("aria-pressed", btn.dataset.density === gridDensity ? "true" : "false"));
+}
+
+function menuItems(list) {
+  return [...list.querySelectorAll("button:not([disabled]), select:not([disabled]), input:not([disabled])")].filter(el => el.offsetParent !== null);
+}
+
+function setupLayoutChrome() {
+  applyRail();
+  applyDensity();
+  window.addEventListener("resize", () => {
+    if (railClassNow() !== railWidthClass) applyRail();
+    syncSplitterAria();
+  });
+  document.getElementById("btnRail")?.addEventListener("click", toggleRail);
+  document.addEventListener("keydown", event => {
+    if (event.defaultPrevented || event.altKey || event.shiftKey) return;
+    if (!(event.ctrlKey || event.metaKey) || String(event.key).toLowerCase() !== "b") return;
+    const el = document.activeElement;
+    if (el && (el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+    event.preventDefault();
+    toggleRail();
+  });
+
+  document.querySelectorAll("[data-density]").forEach(btn => btn.addEventListener("click", () => {
+    if (gridDensity === btn.dataset.density) return;
+    gridDensity = btn.dataset.density;
+    prefSet(DENSITY_KEY, gridDensity);
+    applyDensity();
+    requestRender();
+  }));
+
+  // 정렬·표시 panel (its toggle lives in 80-review.js): outside click and
+  // Esc close it, Esc returns focus to the button, a keyboard open moves
+  // focus into the panel.
+  const moreBtn = document.getElementById("btnMoreFilters");
+  const extra = document.getElementById("filtersExtra");
+  if (moreBtn && extra) {
+    const closeExtra = focusBtn => {
+      if (extra.hidden) return;
+      extra.hidden = true;
+      moreBtn.setAttribute("aria-expanded", "false");
+      if (focusBtn) moreBtn.focus();
+    };
+    moreBtn.addEventListener("click", event => {
+      const viaKeyboard = event.detail === 0;
+      setTimeout(() => { if (!extra.hidden && viaKeyboard) menuItems(extra)[0]?.focus(); }, 0);
+    });
+    moreBtn.addEventListener("keydown", event => {
+      if (event.key !== "ArrowDown" || event.defaultPrevented) return;
+      event.preventDefault();
+      if (extra.hidden) moreBtn.click();
+      setTimeout(() => menuItems(extra)[0]?.focus(), 0);
+    });
+    extra.addEventListener("keydown", event => {
+      if (event.key === "Escape") { event.preventDefault(); closeExtra(true); }
+    });
+    document.addEventListener("click", event => {
+      if (!extra.hidden && event.target instanceof Element && !event.target.closest(".menu-filters")) closeExtra(false);
+    });
+  }
+
+  // 보기 ▾: Enter/Space/ArrowDown open and focus the first item, arrows move,
+  // Esc closes and returns focus, Tab closes.
+  const viewBtn = document.getElementById("btnViewMenu");
+  const viewList = document.getElementById("viewMenuList");
+  if (viewBtn && viewList) {
+    const focusItem = idx => {
+      const items = menuItems(viewList);
+      if (items.length) items[(idx + items.length) % items.length].focus();
+    };
+    viewBtn.addEventListener("click", event => {
+      const viaKeyboard = event.detail === 0;
+      setTimeout(() => { if (!viewList.hidden && viaKeyboard) focusItem(0); }, 0);
+    });
+    viewBtn.addEventListener("keydown", event => {
+      if (event.defaultPrevented || (event.key !== "ArrowDown" && event.key !== "ArrowUp")) return;
+      event.preventDefault();
+      if (viewList.hidden) viewBtn.click();
+      setTimeout(() => focusItem(event.key === "ArrowUp" ? -1 : 0), 0);
+    });
+    viewList.addEventListener("keydown", event => {
+      if (event.defaultPrevented) return;
+      const items = menuItems(viewList);
+      const at = items.indexOf(document.activeElement);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        focusItem(at + (event.key === "ArrowDown" ? 1 : -1));
+      } else if (event.key === "Home" || event.key === "End") {
+        event.preventDefault();
+        focusItem(event.key === "Home" ? 0 : -1);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        viewList.hidden = true;
+        viewBtn.setAttribute("aria-expanded", "false");
+        viewBtn.focus();
+      } else if (event.key === "Tab") {
+        viewList.hidden = true;
+        viewBtn.setAttribute("aria-expanded", "false");
+      }
+    });
+  }
+
+  // Count pills filter by status / anomaly; pressing the active one clears.
+  document.querySelectorAll(".count-pills [data-pill]").forEach(pill => pill.addEventListener("click", () => {
+    applyPresetChip(pill.getAttribute("aria-pressed") === "true" ? "" : pill.dataset.pill);
+  }));
+
+  // Active-filter chip row (shown while the rail is collapsed).
+  document.getElementById("activeFilters")?.addEventListener("click", event => {
+    const chip = event.target.closest("[data-af]");
+    if (chip) clearActiveFilter(chip.dataset.af);
+  });
+
+  // Thumbnail retry: forget the failed URL and repaint.
+  els.recordGrid.addEventListener("click", event => {
+    const btn = event.target.closest("[data-thumb-retry]");
+    if (!btn) return;
+    const url = btn.dataset.thumbRetry;
+    thumbDead.delete(url);
+    thumbRetried.delete(url);
+    requestRender();
+  });
+
+  // Detail tabs: roving tabindex, ←/→/Home/End, selection remembered.
+  const tabs = [...document.querySelectorAll("#detailTabs [role='tab']")];
+  const selectTab = (tab, focus) => {
+    tabs.forEach(item => {
+      const on = item === tab;
+      item.setAttribute("aria-selected", on ? "true" : "false");
+      item.tabIndex = on ? 0 : -1;
+      const panel = document.getElementById(item.getAttribute("aria-controls"));
+      if (panel) panel.hidden = !on;
+    });
+    if (focus) tab.focus();
+    prefSet(DETAIL_TAB_KEY, tab.id);
+  };
+  tabs.forEach(tab => tab.addEventListener("click", () => selectTab(tab, false)));
+  document.getElementById("detailTabs")?.addEventListener("keydown", event => {
+    const at = tabs.indexOf(document.activeElement);
+    if (at < 0) return;
+    let next = null;
+    if (event.key === "ArrowRight") next = at + 1;
+    else if (event.key === "ArrowLeft") next = at - 1;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    if (next === null) return;
+    // preventDefault: the global ←/→ seek must not also fire.
+    event.preventDefault();
+    event.stopPropagation();
+    selectTab(tabs[(next + tabs.length) % tabs.length], true);
+  });
+  const savedTab = tabs.find(tab => tab.id === prefGet(DETAIL_TAB_KEY, ""));
+  if (savedTab) selectTab(savedTab, false);
 }

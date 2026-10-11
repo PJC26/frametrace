@@ -6,11 +6,11 @@ if (examinerInput) {
     storageSet(EXAMINER_KEY, state.examiner);
   });
 }
-// Embedded mode (inside the examiner workstation iframe): drop the
-// viewer's own chrome — case title, stat badges, locale toggle, view
-// menu — because the host already shows them. Grid/media keep full
-// functionality. The host flips it off over postMessage when the
-// iframe goes fullscreen, so the full UI returns there.
+// Embedded mode (inside the examiner workstation iframe): only the title
+// row goes (case title + the viewer's own theme/language buttons — the
+// shell's stage bar owns those). The filter bar with its count pills,
+// 보기 ▾, ?, the facet rail, grid and media all stay. The host flips it
+// off over postMessage when the iframe goes fullscreen.
 const setEmbed = on => document.body.classList.toggle("embed", on);
 setEmbed(new URLSearchParams(location.search).has("embed") || window.self !== window.top);
 const exitFsBtn = document.getElementById("btnExitFs");
@@ -97,6 +97,7 @@ if (exitFsBtn) {
 setupHeightSplitter();
 setupColumnSplitter();
 setupGridDelegation();
+setupLayoutChrome();
 document.getElementById("btnLang")?.addEventListener("click", () => {
   state.locale = state.locale === "ko" ? "en" : "ko";
   storageSet(LOCALE_KEY, state.locale);
