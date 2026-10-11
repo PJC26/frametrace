@@ -13,6 +13,14 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
+// The secondary player tools (pop-out, clip export, size ...) live in the
+// "더보기" popover when the media column is narrow: open it first.
+const openTools = (p) => p.evaluate(() => {
+  const b = document.getElementById('btnMoreTools');
+  const l = document.getElementById('moreToolsList');
+  if (b && b.offsetParent && l && l.hidden) b.click();
+});
+
 const HOSTILE = '</script><img src=x onerror="window.__pwned=1;alert(1)">\u2028\u2029';
 
 function buildViewer() {
@@ -61,6 +69,7 @@ try {
   await page.waitForSelector('.card');
   await page.locator('.card').first().click();
   await page.evaluate(() => document.activeElement?.blur());
+  await openTools(page);
   const [popup] = await Promise.all([ctx.waitForEvent('page'), page.locator('#btnPopPlayer').click()]);
   await popup.waitForSelector('#list .li', { timeout: 5000 }).catch(() => {});
   check('popup player script ran (list rendered)', await popup.locator('#list .li').count() === 2);

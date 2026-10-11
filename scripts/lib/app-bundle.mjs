@@ -30,8 +30,9 @@ export const appBundleJs = (root = repoRoot) => concatParts(appParts('js', root)
 // Shared tokens (assets/tokens.css) are the first CSS part of both pages.
 export const tokensPath = (root = repoRoot) => join(root, 'assets/tokens.css');
 export const appBundleCss = (root = repoRoot) => concatParts([tokensPath(root), ...appParts('css', root)], 'assets/app/bundle.css', root);
-// The standalone/exported viewer stylesheet: tokens + evidence_viewer.css.
-export const viewerBundleCss = (root = repoRoot) => concatParts([tokensPath(root), join(root, 'assets/evidence_viewer.css')], 'assets/viewer/bundle.css', root);
+// The standalone/exported viewer stylesheet: tokens + evidence_viewer.css +
+// viewer/controls.css (action bar, player toolbar, menus, toasts).
+export const viewerBundleCss = (root = repoRoot) => concatParts([tokensPath(root), join(root, 'assets/evidence_viewer.css'), join(root, 'assets/viewer/controls.css')], 'assets/viewer/bundle.css', root);
 export const appMarkup = (root = repoRoot) => readFileSync(join(root, 'assets/examiner_app.html'), 'utf8');
 
 // The page exactly as GET / serves it.

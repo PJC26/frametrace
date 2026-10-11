@@ -253,8 +253,10 @@ async function togglePip() {
 // exception always ends in an error toast and the button is re-enabled.
 // A second click while busy is ignored.
 async function withBusy(button, fn, opts = {}) {
+  let hadFocus = false;
   if (button) {
     if (button.dataset.busy === "1") return undefined;
+    hadFocus = document.activeElement === button;
     button.dataset.busy = "1";
     button.disabled = true;
     button.setAttribute("aria-busy", "true");
@@ -268,7 +270,7 @@ async function withBusy(button, fn, opts = {}) {
     return result;
   } catch (err) {
     const msg = typeof opts.fail === "function" ? opts.fail(err) : tf("toast.busyFail", { err: err?.message || String(err) });
-    if (msg) toast(msg);
+    if (msg) toastError(msg); // failures persist until dismissed
     return undefined;
   } finally {
     if (button) {
@@ -276,6 +278,11 @@ async function withBusy(button, fn, opts = {}) {
       button.disabled = false;
       button.removeAttribute("aria-busy");
       button.classList.remove("busy");
+      // A disabled button drops keyboard focus; hand it back so the
+      // examiner is not thrown to <body> after a long export.
+      if (hadFocus && (!document.activeElement || document.activeElement === document.body)) {
+        try { button.focus({ preventScroll: true }); } catch { /* detached */ }
+      }
     }
   }
 }

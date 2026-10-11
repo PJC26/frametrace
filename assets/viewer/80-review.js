@@ -117,30 +117,100 @@ function applyJournalSide(changes, side) {
   storageSet(RANGES_KEY, state.ranges);
 }
 
+// --- toasts ------------------------------------------------------------
+// Top-right stack (never over the bottom action bar), at most 3 at once,
+// 6 s auto-dismiss that pauses while the pointer or keyboard focus is on a
+// toast, Esc dismisses, and error toasts stay until dismissed. This
+// definition replaces the plain stub in 30-records.js (a later function
+// declaration of the same name wins inside the viewer closure). Each toast
+// is also announced through the single polite status line (15-announce.js)
+// instead of making #toastHost a live region of its own.
+const TOAST_MAX = 3;
+const TOAST_MS = 6000;
+const TOAST_ERROR_RE = /실패|오류|failed|failure|error|연결할 수 없|오프라인|offline|unreachable/i;
+
+function dismissToast(item) {
+  if (!item) return;
+  clearTimeout(item._ftTimer);
+  if (item.isConnected) item.remove();
+}
+function dismissToasts() {
+  const host = document.getElementById("toastHost");
+  if (!host) return false;
+  const items = [...host.querySelectorAll(".toast:not(.clip-progress)")];
+  items.forEach(dismissToast);
+  return items.length > 0;
+}
+// Auto-dismiss timer with hover/focus pause: leaving restarts the
+// remaining time (never less than 1.5 s so the text stays readable).
+function armToast(item, ms) {
+  item._ftLeft = ms;
+  const start = () => {
+    clearTimeout(item._ftTimer);
+    item._ftPaused = false;
+    item._ftStarted = Date.now();
+    item._ftTimer = setTimeout(() => dismissToast(item), item._ftLeft);
+  };
+  const pause = () => {
+    if (item._ftPaused) return;
+    item._ftPaused = true;
+    clearTimeout(item._ftTimer);
+    item._ftLeft = Math.max(1500, item._ftLeft - (Date.now() - item._ftStarted));
+  };
+  item.addEventListener("mouseenter", pause);
+  item.addEventListener("focusin", pause);
+  item.addEventListener("mouseleave", () => { if (!item.contains(document.activeElement)) start(); });
+  item.addEventListener("focusout", () => { if (!item.matches(":hover")) start(); });
+  start();
+}
+function toast(message, opts) {
+  const host = document.getElementById("toastHost");
+  const text = String(message == null ? "" : message);
+  const error = opts && opts.error != null ? !!opts.error : TOAST_ERROR_RE.test(text);
+  ftAnnounce(text);
+  if (!host) return null;
+  const item = document.createElement("div");
+  item.className = error ? "toast toast-error" : "toast";
+  const body = document.createElement("span");
+  body.className = "toast-text";
+  body.textContent = text;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "toast-close";
+  close.textContent = "\u2715";
+  close.title = t("toast.close");
+  close.setAttribute("aria-label", t("toast.close"));
+  close.addEventListener("click", () => dismissToast(item));
+  item.append(body, close);
+  host.appendChild(item);
+  const stack = [...host.querySelectorAll(".toast:not(.clip-progress)")];
+  while (stack.length > TOAST_MAX) {
+    const drop = stack.find(el => !el.classList.contains("toast-error")) || stack[0];
+    stack.splice(stack.indexOf(drop), 1);
+    dismissToast(drop);
+  }
+  if (!error) armToast(item, (opts && opts.ms) || TOAST_MS);
+  return item;
+}
+function toastError(message) { return toast(message, { error: true }); }
+
 // Toast with an inline Undo button. Only the newest undo toast is kept so
 // rapid 1/2/3 triage does not stack a column of stale buttons.
 function attachUndoButton(item) {
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = "mini";
-  btn.style.marginLeft = "10px";
+  btn.className = "mini toast-action";
   btn.textContent = t("undo.btn");
-  btn.addEventListener("click", () => { item.remove(); undoJournal(); });
+  btn.addEventListener("click", () => { dismissToast(item); undoJournal(); });
   item.classList.add("toast-undo");
-  item.appendChild(btn);
+  item.insertBefore(btn, item.querySelector(".toast-close"));
 }
 function toastUndo(message) {
   const host = document.getElementById("toastHost");
   if (!host) return;
-  host.querySelectorAll(".toast-undo").forEach(el => el.remove());
-  const item = document.createElement("div");
-  item.className = "toast";
-  const text = document.createElement("span");
-  text.textContent = message;
-  item.appendChild(text);
-  attachUndoButton(item);
-  host.appendChild(item);
-  setTimeout(() => item.remove(), 6000);
+  host.querySelectorAll(".toast-undo").forEach(el => dismissToast(el));
+  const item = toast(message);
+  if (item) attachUndoButton(item);
 }
 
 // Runs mutate(), journals the before/after state of `ids` when anything
@@ -162,7 +232,7 @@ function journaled(label, ids, mutate, message) {
   redoStack.length = 0;
   const raised = host && host.lastElementChild !== lastToastBefore ? host.lastElementChild : null;
   if (message == null && raised && raised.classList.contains("toast")) {
-    host.querySelectorAll(".toast-undo").forEach(el => el.remove());
+    host.querySelectorAll(".toast-undo").forEach(el => dismissToast(el));
     attachUndoButton(raised);
   } else {
     toastUndo(message == null ? label : message);
@@ -296,25 +366,32 @@ function moveToUnreviewed(step) {
 const reviewMeta = (() => {
   const bar = document.getElementById("selectionBar");
   const count = document.getElementById("selectionCount");
-  if (!bar || !count) return null;
+  const clearBtn = document.getElementById("btnClearSelection");
+  if (!bar || !count || !clearBtn) return null;
+  // Review progress sits right after the scope controls: "검토 12/340" + meter.
   const progress = document.createElement("span");
   progress.id = "reviewProgress";
-  progress.className = "grp-label";
-  progress.style.cssText = "display:inline-flex;align-items:center;gap:6px;white-space:nowrap";
-  const meter = document.createElement("progress");
-  meter.style.cssText = "width:64px;height:8px";
+  progress.className = "bar-progress";
   const progressText = document.createElement("span");
+  const meter = document.createElement("progress");
+  meter.setAttribute("aria-hidden", "true");
   progress.append(progressText, meter);
-  count.insertAdjacentElement("afterend", progress);
-  const scope = document.createElement("span");
-  scope.id = "markScope";
-  scope.className = "grp-label";
-  scope.style.whiteSpace = "nowrap";
-  const seg = bar.querySelector(".seg");
-  if (seg) seg.insertAdjacentElement("beforebegin", scope);
-  else bar.appendChild(scope);
-  return { count, progress, progressText, meter, scope };
+  clearBtn.insertAdjacentElement("afterend", progress);
+  return {
+    count, progress, progressText, meter,
+    scopeActive: document.getElementById("btnScopeActive"),
+    scopeSelected: document.getElementById("btnScopeSelected"),
+    scopeLabel: document.getElementById("scopeSelLabel")
+  };
 })();
+
+// Sets a button's tooltip through data-i18n-title so applyChromeI18n()
+// (which re-runs on every render) keeps the same, localised text.
+function setI18nTitle(el, key) {
+  if (!el) return;
+  el.dataset.i18nTitle = key;
+  el.title = t(key);
+}
 
 function updateReviewMeta() {
   if (!reviewMeta) return;
@@ -324,17 +401,62 @@ function updateReviewMeta() {
   reviewMeta.meter.max = Math.max(1, total);
   reviewMeta.meter.value = reviewed;
   reviewMeta.progress.title = t("progress.title");
+  // Scope segment: shows what the verdict buttons / tag menu act on. The
+  // rule is unchanged (selection wins, otherwise the active item).
   const selected = state.selectedIds.size;
-  reviewMeta.scope.textContent = selected
-    ? tf("scope.selected", { n: selected })
-    : state.activeId ? t("scope.active") : t("scope.none");
+  const { scopeActive, scopeSelected, scopeLabel } = reviewMeta;
+  scopeLabel.textContent = tf("scope.btnSel", { n: selected });
+  scopeSelected.disabled = selected === 0;
+  scopeSelected.setAttribute("aria-pressed", selected ? "true" : "false");
+  setI18nTitle(scopeSelected, selected ? "scope.tipSelected" : "scope.tipNone");
+  const noTarget = !selected && !state.activeId;
+  scopeActive.disabled = noTarget;
+  scopeActive.setAttribute("aria-pressed", selected || noTarget ? "false" : "true");
+  setI18nTitle(scopeActive, noTarget ? "scope.none" : selected ? "scope.tipActive" : "scope.tipActiveOnly");
+}
+if (reviewMeta) {
+  reviewMeta.scopeActive.addEventListener("click", () => { if (state.selectedIds.size) clearSelection(); });
+}
+
+// --- consolidated status line (count · selection · save state) ----------
+// One debounced polite message replaces the aria-live attributes that used
+// to sit on #selectionCount, #saveState, the toast host and the index chip.
+// Only a CHANGED sentence is announced, so j/k navigation stays silent.
+let lastStatusLine = null;
+function composeStatusLine() {
+  if (!reviewMeta) return "";
+  const saveEl = document.getElementById("saveState");
+  return [reviewMeta.count.textContent, reviewMeta.progressText.textContent, saveEl ? saveEl.textContent : ""]
+    .map(part => String(part || "").trim()).filter(Boolean).join(" · ");
+}
+function refreshStatusLine() {
+  const line = composeStatusLine();
+  if (lastStatusLine === null) { lastStatusLine = line; return; }
+  if (line === lastStatusLine) return;
+  lastStatusLine = line;
+  ftAnnounce(line);
 }
 // renderMetrics() rewrites #selectionCount on every render — piggyback on
 // that instead of patching render() in a file this module doesn't own.
 if (reviewMeta && typeof MutationObserver === "function") {
-  new MutationObserver(updateReviewMeta).observe(reviewMeta.count, { childList: true, characterData: true, subtree: true });
+  new MutationObserver(() => { updateReviewMeta(); refreshStatusLine(); })
+    .observe(reviewMeta.count, { childList: true, characterData: true, subtree: true });
+  const saveEl = document.getElementById("saveState");
+  if (saveEl) {
+    let lastSaveKind = saveEl.dataset.state || "";
+    new MutationObserver(() => {
+      const kind = saveEl.dataset.state || "";
+      refreshStatusLine();
+      // Assertive only when saving newly FAILS — never for routine states.
+      if (kind === "failed" && lastSaveKind !== "failed") {
+        ftAnnounce(`${saveEl.textContent}. ${saveEl.title || ""}`, { assertive: true });
+      }
+      lastSaveKind = kind;
+    }).observe(saveEl, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ["data-state"] });
+  }
 }
 updateReviewMeta();
+lastStatusLine = composeStatusLine();
 
 // --- Global keyboard (UX-03 / UX-08 / UX-15) ---
 // Only real text entry captures keys. A focused <select>, checkbox, range
@@ -407,6 +529,7 @@ document.addEventListener("keydown", event => {
     case "Escape":
       if (tag === "SELECT" || tag === "INPUT") el.blur();
       toggleShortcuts(false);
+      dismissToasts();
       if (state.layout.theater) toggleTheater();
       break;
     default: handled = false; break;
@@ -476,6 +599,8 @@ document.getElementById("btnTheater").addEventListener("click", toggleTheater);
 document.getElementById("btnFullscreen").addEventListener("click", toggleFullscreen);
 document.getElementById("btnPip").addEventListener("click", togglePip);
 document.getElementById("btnSkipBack").addEventListener("click", () => skipVideo(-10));
+document.getElementById("btnStepBack").addEventListener("click", () => stepFrame(-1));
+document.getElementById("btnStepFwd").addEventListener("click", () => stepFrame(1));
 document.getElementById("btnSkipFwd").addEventListener("click", () => skipVideo(10));
 document.getElementById("playRate").addEventListener("change", () => setRate(Number(els.playRate.value) || 1));
 document.getElementById("btnPopPlayer").addEventListener("click", openPlayerWindow);
@@ -657,12 +782,11 @@ function clipProgressUi(onCancel) {
   const host = document.getElementById("toastHost");
   const item = document.createElement("div");
   item.className = "toast clip-progress";
-  item.setAttribute("role", "status");
   const text = document.createElement("span");
+  text.className = "toast-text";
   const cancel = document.createElement("button");
   cancel.type = "button";
-  cancel.className = "mini";
-  cancel.style.marginLeft = "10px";
+  cancel.className = "mini toast-action";
   cancel.textContent = t("clip.cancel");
   cancel.addEventListener("click", () => {
     cancel.disabled = true;
@@ -798,7 +922,7 @@ document.getElementById("btnCopyPaths").addEventListener("click", () => {
 const tagMenuList = document.getElementById("tagMenuList");
 function rebuildTagMenu() {
   tagMenuList.innerHTML = state.tagPresets.map(tag =>
-    `<div class="tag-menu-row"><button type="button" data-keep data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button><button type="button" class="tag-del" data-keep data-del-preset="${escapeHtml(tag)}" title="${t("tagmenu.delPreset")}">×</button></div>`
+    `<div class="tag-menu-row"><button type="button" data-keep data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button><button type="button" class="tag-del" data-keep data-del-preset="${escapeHtml(tag)}" title="${t("tagmenu.delPreset")}" aria-label="${escapeHtml(tf("tagmenu.delOne", { tag }))}">×</button></div>`
   ).join("")
     + `<button type="button" data-tag-clear>${t("tagmenu.clear")}</button><hr>`
     + `<div class="tag-add"><input type="text" id="tagPresetInput" placeholder="${t("tagmenu.new")}" maxlength="24">`
@@ -817,7 +941,7 @@ function addTagPresetFromMenu() {
 }
 tagMenuList.addEventListener("click", e => {
   const del = e.target.closest("[data-del-preset]");
-  if (del) { removeTagPreset(del.dataset.delPreset); rebuildTagMenu(); return; }
+  if (del) { removeTagPreset(del.dataset.delPreset); rebuildTagMenu(); tagMenuList.querySelector("button")?.focus(); return; }
   if (e.target.closest("[data-tag-add]")) { addTagPresetFromMenu(); return; }
   if (e.target.closest("[data-tag-clear]")) { clearTagsJournaled(); return; }
   const apply = e.target.closest("[data-tag]");
@@ -830,37 +954,135 @@ tagMenuList.addEventListener("keydown", e => {
   }
 });
 
-// Selection-bar menus: toggle on the anchor button, close on outside
-// click / Escape / a menu item without data-keep (tag items stay open so
-// several tags can be applied to one selection).
-const MENU_BUTTONS = { tagMenuList: "btnTagMenu", exportMenuList: "btnExportMenu", viewMenuList: "btnViewMenu" };
+// Menus (action bar, header "보기", toolbar "더보기"): toggle on the anchor
+// button, close on outside click / Escape / focus leaving / a menu item
+// without data-keep (tag items stay open so several tags can be applied to
+// one selection). Keyboard: Enter / Space / ArrowDown opens and focuses the
+// first item (ArrowUp the last), arrows / Home / End move, Esc closes and
+// returns focus to the anchor. <select> and range inputs inside a menu keep
+// their own arrow keys.
+const MENU_BUTTONS = { tagMenuList: "btnTagMenu", exportMenuList: "btnExportMenu", viewMenuList: "btnViewMenu", moreToolsList: "btnMoreTools" };
+const MENU_ITEM_SELECTOR = "button:not(:disabled), input:not(:disabled), select:not(:disabled)";
+function menuAnchor(listId) { return document.getElementById(MENU_BUTTONS[listId]); }
+function menuItems(list) {
+  return [...list.querySelectorAll(MENU_ITEM_SELECTOR)].filter(el => el.offsetParent !== null || el.getClientRects().length);
+}
 function setMenuExpanded(listId, open) {
-  const btn = document.getElementById(MENU_BUTTONS[listId]);
+  const btn = menuAnchor(listId);
   if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
 }
+function openMenuLists() { return [...document.querySelectorAll(".menu-list")].filter(l => !l.hidden); }
 function closeAllMenus() {
   document.querySelectorAll(".menu-list").forEach(l => { l.hidden = true; setMenuExpanded(l.id, false); });
 }
-function toggleMenu(listId) {
+// The toolbar popover lives inside the overflow:hidden player, so it is
+// positioned in viewport coordinates next to its anchor (open downwards when
+// there is room, otherwise upwards) and never clipped.
+function positionFixedMenu(list) {
+  const anchor = menuAnchor(list.id);
+  if (!anchor || !list.classList.contains("menu-fixed")) return;
+  const r = anchor.getBoundingClientRect();
+  // Never open over the action bar: the space below ends at the bar's top edge.
+  const bar = document.getElementById("selectionBar");
+  const floor = bar ? bar.getBoundingClientRect().top : window.innerHeight;
+  const below = floor - r.bottom - 8;
+  const above = r.top - 56; // keep clear of the 46px header
+  const down = below >= Math.min(list.scrollHeight, 320) || below >= above;
+  list.style.maxHeight = Math.max(140, down ? below : above) + "px";
+  list.style.left = "auto";
+  list.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+  list.style.top = down ? r.bottom + 6 + "px" : "auto";
+  list.style.bottom = down ? "auto" : window.innerHeight - r.top + 6 + "px";
+}
+function toggleMenu(listId, focus) {
   const list = document.getElementById(listId);
   const willOpen = list.hidden;
   closeAllMenus();
   list.hidden = !willOpen;
-  setMenuExpanded(listId, !willOpen);
+  setMenuExpanded(listId, willOpen);
+  if (willOpen) {
+    positionFixedMenu(list);
+    if (focus) { const items = menuItems(list); (focus === "last" ? items[items.length - 1] : items[0])?.focus(); }
+  }
 }
-document.getElementById("btnTagMenu").addEventListener("click", e => {
-  e.stopPropagation();
-  rebuildTagMenu();
-  toggleMenu("tagMenuList");
+function closeMenuAndFocusAnchor(list) {
+  list.hidden = true;
+  setMenuExpanded(list.id, false);
+  const anchor = menuAnchor(list.id);
+  if (anchor && anchor.offsetParent !== null) anchor.focus({ preventScroll: true });
+}
+[["btnTagMenu", "tagMenuList"], ["btnExportMenu", "exportMenuList"], ["btnViewMenu", "viewMenuList"], ["btnMoreTools", "moreToolsList"]].forEach(([btnId, listId]) => {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  btn.addEventListener("click", e => {
+    e.stopPropagation();
+    if (listId === "tagMenuList") rebuildTagMenu();
+    // detail === 0: activated from the keyboard (Enter/Space) -> move into the menu.
+    toggleMenu(listId, e.detail === 0 ? "first" : null);
+  });
+  btn.addEventListener("keydown", e => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (listId === "tagMenuList") rebuildTagMenu();
+    const list = document.getElementById(listId);
+    if (list.hidden) toggleMenu(listId, e.key === "ArrowUp" ? "last" : "first");
+    else { const items = menuItems(list); (e.key === "ArrowUp" ? items[items.length - 1] : items[0])?.focus(); }
+  });
 });
-document.getElementById("btnExportMenu").addEventListener("click", e => {
-  e.stopPropagation();
-  toggleMenu("exportMenuList");
+document.querySelectorAll(".menu-list").forEach(list => {
+  // Capture phase: a clicked action item closes its menu and hands focus
+  // back to the anchor BEFORE the item's own handler runs, so dialogs it
+  // opens (askDialog) restore focus to a visible control.
+  list.addEventListener("click", e => {
+    const item = e.target.closest("button");
+    if (item && !item.hasAttribute("data-keep") && list.contains(item)) closeMenuAndFocusAnchor(list);
+  }, true);
+  list.addEventListener("click", e => {
+    // Keep the document-level closer from seeing in-menu clicks.
+    e.stopPropagation();
+  });
+  list.addEventListener("keydown", e => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      closeMenuAndFocusAnchor(list);
+      return;
+    }
+    if (e.key === "Tab") { closeMenuAndFocusAnchor(list); return; }
+    const tag = e.target.tagName;
+    const own = tag === "SELECT" || (tag === "INPUT" && e.target.type === "range");
+    if (own && (e.key.startsWith("Arrow") || e.key === "Home" || e.key === "End")) return;
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    if (tag === "INPUT" && (e.key === "Home" || e.key === "End")) return; // caret keys in the tag text field
+    const items = menuItems(list);
+    if (!items.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const i = items.indexOf(e.target);
+    const next = e.key === "Home" ? 0 : e.key === "End" ? items.length - 1
+      : e.key === "ArrowDown" ? (i + 1) % items.length : (i - 1 + items.length) % items.length;
+    items[next].focus();
+  });
+  // Keyboard focus leaving the menu entirely (e.g. Shift+Tab off the anchor)
+  // closes it; a null relatedTarget (mouse click in Safari) does not.
+  list.parentElement.addEventListener("focusout", e => {
+    if (e.relatedTarget && !list.parentElement.contains(e.relatedTarget)) { list.hidden = true; setMenuExpanded(list.id, false); }
+  });
 });
-document.getElementById("btnViewMenu").addEventListener("click", e => {
+document.addEventListener("click", closeAllMenus);
+window.addEventListener("resize", closeAllMenus);
+// Esc with a menu open closes only the menu (capture phase, so the global
+// handler below does not also leave theater mode / dismiss toasts).
+window.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  const open = openMenuLists();
+  if (!open.length) return;
+  e.preventDefault();
   e.stopPropagation();
-  toggleMenu("viewMenuList");
-});
+  const inside = open.find(l => l.parentElement.contains(document.activeElement));
+  if (inside) closeMenuAndFocusAnchor(inside); else closeAllMenus();
+}, true);
 document.getElementById("btnMoreFilters").addEventListener("click", e => {
   const extra = document.getElementById("filtersExtra");
   extra.hidden = !extra.hidden;
@@ -875,21 +1097,6 @@ btnGroupKind.addEventListener("click", () => {
 });
 const syncGroupKindChip = () => btnGroupKind.classList.toggle("active", state.groupBy === "kind");
 els.groupBy.addEventListener("change", syncGroupKindChip);
-document.querySelectorAll(".menu-list").forEach(list => {
-  list.addEventListener("click", e => {
-    // Keep the document-level closer from seeing in-menu clicks; an
-    // action item without data-keep closes its own menu explicitly.
-    e.stopPropagation();
-    if (e.target.closest("button") && !e.target.closest("button").hasAttribute("data-keep")) {
-      list.hidden = true;
-      setMenuExpanded(list.id, false);
-    }
-  });
-});
-document.addEventListener("click", closeAllMenus);
-document.addEventListener("keydown", e => {
-  if (e.key === "Escape") closeAllMenus();
-});
 document.getElementById("btnDownloadSelection").addEventListener("click", () => {
   const selected = selectedRecords();
   if (!selected.length) { toast(t("toast.selectFirst")); return; }
@@ -906,3 +1113,193 @@ document.getElementById("btnDownloadSelection").addEventListener("click", () => 
     }))
   });
 });
+
+// --- accessible names for icon-only chrome --------------------------------
+// "?" lives in the header markup; its name is attached here and goes through
+// data-i18n-aria-label so the language switch keeps it localised. ◐ and EN
+// keep their visible text as the name (a different aria-label would break
+// "label in name"); their title carries the explanation.
+[["btnShortcuts", "tip.shortcuts"]].forEach(([id, key]) => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.dataset.i18nAriaLabel = key;
+  el.setAttribute("aria-label", t(key));
+});
+[["btnMarkReviewed", "1"], ["btnMarkImportant", "2"], ["btnMarkVerify", "3"], ["btnMarkClear", "0"],
+  ["btnSetIn", "i"], ["btnSetOut", "o"], ["btnStepBack", ","], ["btnStepFwd", "."]].forEach(([id, keys]) => {
+  document.getElementById(id)?.setAttribute("aria-keyshortcuts", keys);
+});
+
+// --- player toolbar: transport row + "더보기" overflow ----------------------
+// Row 1 (transport) is always inline. The secondary tools (pop-out, dual,
+// save, capture, clip exports, proxy, size/zoom) are the SAME elements moved
+// — never cloned, so ids stay unique and every handler stays bound — into a
+// popover when the media column is narrower than 1000 px, and back into row 2
+// when it is wider. A ResizeObserver drives it; nothing is ever clipped.
+const TOOLBAR_INLINE_MIN_WIDTH = 1000;
+const toolbarOverflow = (() => {
+  const wrap = document.getElementById("tbMore");
+  const list = document.getElementById("moreToolsList");
+  const row = document.getElementById("toolsRow");
+  const media = document.querySelector("section.media");
+  const more = document.getElementById("btnMoreTools");
+  if (!wrap || !list || !row || !media || !more) return null;
+  const tools = [...row.children];
+  let compact = null;
+  const syncBusy = () => {
+    const busy = tools.some(el => el.getAttribute && el.getAttribute("aria-busy") === "true");
+    more.classList.toggle("busy", busy);
+    if (busy) more.setAttribute("aria-busy", "true"); else more.removeAttribute("aria-busy");
+  };
+  function apply(narrow) {
+    if (narrow === compact) return;
+    compact = narrow;
+    list.hidden = true;
+    setMenuExpanded(list.id, false);
+    if (narrow) tools.forEach(el => list.appendChild(el));
+    else tools.forEach(el => row.appendChild(el));
+    row.hidden = narrow;
+    wrap.hidden = !narrow;
+  }
+  if (typeof MutationObserver === "function") {
+    const mo = new MutationObserver(syncBusy);
+    tools.forEach(el => { if (el.nodeType === 1) mo.observe(el, { attributes: true, attributeFilter: ["aria-busy"] }); });
+  }
+  const measure = () => apply((media.clientWidth || 0) < TOOLBAR_INLINE_MIN_WIDTH);
+  measure();
+  if (typeof ResizeObserver === "function") new ResizeObserver(measure).observe(media);
+  else window.addEventListener("resize", measure);
+  return { apply, measure };
+})();
+
+// --- live index chip (created by 99-loader.js) -----------------------------
+// 99-loader appends a fixed bottom-right chip with its own aria-live, which
+// sat on top of the action bar. It is moved into the header (inline, between
+// the case line and the actions) and loses its live semantics: the chip text
+// changes every poll. A NEW "reload available" button and a lost status poll
+// are announced once through ftAnnounce instead (controls.css restyles it;
+// the id is unchanged). Embedded (no header) it docks top-right via CSS.
+if (typeof MutationObserver === "function") {
+  const adoptChip = chip => {
+    chip.removeAttribute("aria-live");
+    chip.setAttribute("role", "group");
+    chip.setAttribute("aria-label", t("chip.live"));
+    const header = document.querySelector("body > header");
+    const actions = header && header.querySelector(".header-actions");
+    // Embedded pages hide the header; the chip then docks top-right (CSS).
+    if (actions && getComputedStyle(header).display !== "none") header.insertBefore(chip, actions);
+    let reloadShown = false;
+    let lostShown = false;
+    new MutationObserver(() => {
+      const button = chip.querySelector("button");
+      const reload = !!button && !button.hidden;
+      if (reload && !reloadShown) ftAnnounce(button.textContent);
+      reloadShown = reload;
+      const lost = chip.textContent.includes("상태 확인 실패");
+      if (lost && !lostShown) ftAnnounce(t("chip.lost"), { assertive: true });
+      lostShown = lost;
+    }).observe(chip, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["hidden"] });
+  };
+  const existing = document.getElementById("ft-live-chip");
+  if (existing) adoptChip(existing);
+  else {
+    const watch = new MutationObserver(() => {
+      const chip = document.getElementById("ft-live-chip");
+      if (chip) { watch.disconnect(); adoptChip(chip); }
+    });
+    watch.observe(document.body, { childList: true });
+  }
+}
+
+// --- Ctrl+K command palette -------------------------------------------------
+// A filtered list over the visible button labels already on the page (action
+// bar, player toolbar incl. the 더보기 popover, header, export menu). Entries
+// call the real button's click(), so behaviour, busy and offline states are
+// the buttons' own. Reuses the modal styling of the shortcuts sheet.
+const commandPalette = (() => {
+  let back = null, input = null, listEl = null, entries = [], shown = [], cursor = 0, opener = null;
+  const SOURCES = "#selectionBar button, #mediaToolbar button, header button, #exportMenuList button, #viewMenuList button";
+  const labelOf = btn => {
+    const own = [...btn.childNodes].filter(n => n.nodeName !== "KBD" && !(n.nodeType === 1 && n.getAttribute("aria-hidden") === "true"))
+      .map(n => n.textContent).join("").replace(/\s+/g, " ").trim();
+    return own || btn.getAttribute("aria-label") || btn.title || btn.id;
+  };
+  function collect() {
+    const seen = new Set();
+    entries = [];
+    document.querySelectorAll(SOURCES).forEach(btn => {
+      if (!btn.id || seen.has(btn.id) || btn.id === "btnMoreTools" || btn.closest("#tagMenuList") || btn.id === "btnShortcutsClose") return;
+      seen.add(btn.id);
+      entries.push({ btn, label: labelOf(btn), tip: btn.title || "" });
+    });
+  }
+  function draw() {
+    const q = input.value.trim().toLowerCase();
+    shown = entries.filter(e => !q || e.label.toLowerCase().includes(q) || e.btn.id.toLowerCase().includes(q.replace(/\s/g, "")) || e.tip.toLowerCase().includes(q));
+    cursor = Math.min(cursor, Math.max(0, shown.length - 1));
+    listEl.innerHTML = shown.length ? shown.map((e, i) =>
+      `<li id="cmdOpt${i}" role="option" aria-selected="${i === cursor}" aria-disabled="${e.btn.disabled}" class="cmd-item${i === cursor ? " on" : ""}${e.btn.disabled ? " off" : ""}" data-i="${i}"><span class="cmd-label">${escapeHtml(e.label)}</span>` +
+      `<span class="cmd-tip">${escapeHtml(e.btn.disabled ? t("palette.disabled") + (e.tip ? " — " + e.tip : "") : e.tip)}</span></li>`
+    ).join("") : `<li class="cmd-empty" role="presentation">${escapeHtml(t("palette.empty"))}</li>`;
+    input.setAttribute("aria-activedescendant", shown.length ? "cmdOpt" + cursor : "");
+    listEl.querySelector(".on")?.scrollIntoView({ block: "nearest" });
+  }
+  function close() {
+    if (!back || back.hidden) return;
+    back.hidden = true;
+    try { opener && opener.focus && opener.focus(); } catch { /* opener gone */ }
+  }
+  function run(index) {
+    const entry = shown[index];
+    if (!entry) return;
+    close();
+    if (entry.btn.disabled) { toast(entry.tip || t("palette.disabled")); return; }
+    entry.btn.click();
+  }
+  function build() {
+    back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.id = "cmdPalette";
+    back.hidden = true;
+    back.innerHTML = `<div class="modal palette" role="dialog" aria-modal="true" aria-label="${escapeHtml(t("palette.title"))}">` +
+      `<input type="text" class="palette-input" role="combobox" aria-expanded="true" aria-controls="cmdList" aria-autocomplete="list" aria-label="${escapeHtml(t("palette.title"))}" placeholder="${escapeHtml(t("palette.placeholder"))}" autocomplete="off">` +
+      `<ul id="cmdList" class="palette-list" role="listbox" aria-label="${escapeHtml(t("palette.title"))}"></ul></div>`;
+    document.body.appendChild(back);
+    input = back.querySelector("input");
+    listEl = back.querySelector("ul");
+    input.addEventListener("input", () => { cursor = 0; draw(); });
+    listEl.addEventListener("mousedown", e => e.preventDefault());
+    listEl.addEventListener("click", e => { const li = e.target.closest("[data-i]"); if (li) run(Number(li.dataset.i)); });
+    back.addEventListener("click", e => { if (e.target === back) close(); });
+    back.addEventListener("keydown", e => {
+      if (e.key === "Escape") { e.preventDefault(); close(); }
+      else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (shown.length) cursor = (cursor + (e.key === "ArrowDown" ? 1 : -1) + shown.length) % shown.length;
+        draw();
+      } else if (e.key === "Enter") { e.preventDefault(); run(cursor); }
+      else if (e.key === "Tab") e.preventDefault();
+      e.stopPropagation(); // app shortcuts (j/k/1/2/space ...) must not fire under the palette
+    });
+  }
+  function open() {
+    if (!back) build();
+    if (!back.hidden) return;
+    if (document.querySelector(".modal-backdrop:not([hidden]):not(#cmdPalette)")) return;
+    closeAllMenus();
+    opener = document.activeElement;
+    collect();
+    input.value = "";
+    cursor = 0;
+    back.hidden = false;
+    draw();
+    input.focus();
+  }
+  window.addEventListener("keydown", e => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || String(e.key).toLowerCase() !== "k") return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (back && !back.hidden) close(); else open();
+  }, true);
+  return { open, close };
+})();
