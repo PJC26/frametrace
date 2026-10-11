@@ -324,7 +324,7 @@ $("btnBrowseCase").addEventListener("click", () => openPicker("caseDir", "dir"))
 $("pickerCancel").addEventListener("click", closePicker);
 $("pickerClose").addEventListener("click", closePicker);
 $("pickerBackdrop").addEventListener("click", e => { if (e.target === $("pickerBackdrop")) closePicker(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("pickerBackdrop").hidden) closePicker(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("pickerBackdrop").hidden) { e.preventDefault(); closePicker(); } });
 $("pickerBackdrop").addEventListener("keydown", e => {
   if (e.key !== "Tab") return;
   const focusables = [...$("pickerBackdrop").querySelectorAll("button, input, .picker-item[tabindex='0']")]

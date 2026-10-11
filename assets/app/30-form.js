@@ -4,14 +4,23 @@ async function loadEnv() {
     const t = env.tools || {};
     const wf = env.workflows || {};
     const hints = env.hints || {};
-    const badge = (label, ok, hint) =>
-      `<span class="badge ${ok ? "ok" : "bad"}" title="${esc(hint || "")}">${esc(label)} ${ok ? "준비됨" : "없음"}</span>`;
+    // Rows of the '도구 N/5' popover; a missing tool also shows its hint
+    // inline (a tooltip alone is unreachable by keyboard).
+    const badge = (label, ok, hint, id) =>
+      `<span class="badge ${ok ? "ok" : "bad"}"${id ? ` id="${id}"` : ""} title="${esc(hint || "")}">${esc(label)} ${ok ? "준비됨" : "없음"}` +
+      (!ok && hint ? ` — ${esc(hint)}` : "") + `</span>`;
+    const prevAudit = $("auditBadge");
+    const auditHtml = prevAudit && prevAudit.className && prevAudit.className !== "badge"
+      ? `<span class="${esc(prevAudit.className)}" id="auditBadge" title="${esc(prevAudit.title || "")}">${esc(prevAudit.textContent)}</span>`
+      : `<span class="badge" id="auditBadge" title="감사 로그 무결성은 분석 완료 후 자동 검증됩니다">감사 로그 대기</span>`;
     $("env").innerHTML =
       badge("ffmpeg", t.ffmpeg, hints.media) +
       badge("ffprobe", t.ffprobe, hints.media) +
-      `<span class="badge ${wf.e01 ? "ok" : "bad"}" id="ewfBadge" title="${esc(hints.e01 || "")}">libewf(E01) ${wf.e01 ? "준비됨" : "없음"}</span>` +
+      badge("libewf(E01)", wf.e01, hints.e01, "ewfBadge") +
       badge("TSK(파일시스템)", wf.filesystem, hints.filesystem) +
-      `<span class="badge" id="auditBadge" title="감사 로그 무결성은 분석 완료 후 자동 검증됩니다">감사 로그 대기</span>`;
+      auditHtml;
+    envState = { ffmpeg: !!t.ffmpeg, ffprobe: !!t.ffprobe, e01: !!wf.e01, filesystem: !!wf.filesystem };
+    syncToolsBtn();
     ffprobeMissing = !t.ffprobe;
     if (!t.ffprobe) { $("withFfprobe").checked = false; syncScanMode(); }
     const e01Radio = document.querySelector("input[name='inputKind'][value='e01']");
@@ -33,6 +42,23 @@ async function loadEnv() {
         dfOk ? "케이스의 모든 파일을 deepfake-lens로 스크리닝 — 결과는 '합성의심' 배지로 표시" : "deepfake-lens 미설치 — pip install deepfake-lens 또는 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
     }
   } catch (e) { console.error("loadEnv failed:", e); }
+}
+
+// '도구 N/5 ▾' in the stage bar: ffmpeg, ffprobe, libewf, TSK and the
+// audit log. A missing tool (or a failed audit check) turns it amber with
+// the count; a pending audit check is not a failure.
+let envState = null;
+function syncToolsBtn() {
+  const btn = $("btnTools"), count = $("toolsCount");
+  if (!btn || !count) return;
+  if (!envState) { count.textContent = "확인 중"; return; }
+  const audit = $("auditBadge");
+  const auditBad = !!(audit && /\bbad\b/.test(audit.className || ""));
+  const missing = ["ffmpeg", "ffprobe", "e01", "filesystem"].filter(k => !envState[k]).length + (auditBad ? 1 : 0);
+  count.textContent = `${5 - missing}/5`;
+  btn.classList.toggle("warn", missing > 0);
+  btn.setAttribute("aria-label", `도구 ${5 - missing}/5 — ` + (missing > 0 ? `${missing}개 준비 안 됨` : "모두 준비됨"));
+  btn.title = missing > 0 ? `외부 도구 · 감사 로그: ${missing}개 준비 안 됨 — 눌러서 확인` : "외부 도구 · 감사 로그 상태 — 모두 준비됨";
 }
 
 // ---- UX-11: analysis mode presets + size/placement hints ----

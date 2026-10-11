@@ -148,6 +148,12 @@ try {
   if (!viewerReady) { await page.screenshot({ path: join(work, 'noviewer.png') }); throw new Error('no viewer; screenshot ' + join(work, 'noviewer.png')); }
   const before = await viewerReady.evaluate(() => window.__frametraceSummary());
   console.log('viewer before carve:', JSON.stringify(before));
+  // Stage-3 review tools live in the stage bar's '케이스 작업' menu.
+  const openCaseMenu = async () => {
+    if (await page.locator('#btnCaseMenu').isVisible().catch(() => false) &&
+        (await page.getAttribute('#btnCaseMenu', 'aria-expanded')) !== 'true') await page.click('#btnCaseMenu');
+  };
+  await openCaseMenu();
   await page.waitForSelector('#btnCarve:not([hidden])', { timeout: 10000 });
 
   // ---- 2. carve → cancel ----------------------------------------------------
@@ -192,6 +198,7 @@ try {
   const srcBefore = await page.$eval('#reviewFrame', (f) => f.getAttribute('src'));
   const markId = await viewerReady.evaluate(() => document.querySelector('#recordGrid .card[data-id^="vid_"]')?.dataset.id);
   const marksBefore = importMarks.length;
+  await openCaseMenu();
   await page.click('#btnCarve');
   await page.waitForSelector('#dlgBackdrop:not([hidden]) #dlgOk');
   await page.click('#dlgOk');

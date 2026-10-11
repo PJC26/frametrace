@@ -54,15 +54,97 @@ async function jpost(url, body) {
   }
 }
 
+// ---- screen-reader announcements: one polite + one assertive region ----
+// Toasts and job transitions are announced here (the toast stack itself
+// is not a live region, so nothing is read twice). Assertive is reserved
+// for errors; the server-lost banner is its own role=alert.
+let announceTimer = 0;
+function announce(msg, assertive) {
+  const el = $(assertive ? "srAlert" : "srStatus");
+  if (!el || !msg) return;
+  // Clearing first makes a repeated identical message announce again.
+  el.textContent = "";
+  clearTimeout(announceTimer);
+  announceTimer = setTimeout(() => { el.textContent = String(msg); }, 40);
+}
+
 // ---- toast: transient, non-blocking feedback ----
+// Top-right under the stage bar, at most TOAST_MAX stacked; info/warn
+// leave after TOAST_MS (hover or keyboard focus pauses the clock), errors
+// stay until dismissed (× or Esc). Esc dismisses the newest toast.
+const TOAST_MAX = 3, TOAST_MS = 6000;
+let toasts = [];
 function toast(msg, kind) {
   const box = $("toastBox");
   if (!box || typeof document.createElement !== "function") return;
+  announce(msg, kind === "err");
   const el = document.createElement("div");
-  el.className = "toast" + (kind === "err" ? " err" : kind === "warn" ? " warn" : "");
-  el.textContent = msg;
+  el.className = "toast" + (kind === "err" ? " err" : kind === "warn" ? " warn" : kind === "ok" ? " ok" : "");
+  const text = document.createElement("span");
+  text.className = "toast-msg";
+  text.textContent = msg;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "toast-x";
+  close.textContent = "×";
+  close.title = "알림 닫기 (Esc)";
+  close.setAttribute("aria-label", "알림 닫기");
+  if (typeof el.append === "function") el.append(text, close); else { el.appendChild(text); el.appendChild(close); }
+  const sticky = kind === "err";
+  const rec = { el, sticky, timer: 0, left: TOAST_MS, since: 0, hover: false, focus: false };
+  const arm = () => {
+    if (sticky || rec.timer || rec.hover || rec.focus) return;
+    rec.since = Date.now();
+    rec.timer = setTimeout(() => dismissToast(rec), Math.max(800, rec.left));
+  };
+  const pause = () => {
+    if (!rec.timer) return;
+    clearTimeout(rec.timer);
+    rec.timer = 0;
+    rec.left -= Date.now() - rec.since;
+  };
+  rec.dismiss = () => dismissToast(rec);
+  el.addEventListener("mouseenter", () => { rec.hover = true; pause(); });
+  el.addEventListener("mouseleave", () => { rec.hover = false; arm(); });
+  el.addEventListener("focusin", () => { rec.focus = true; pause(); });
+  el.addEventListener("focusout", () => { rec.focus = false; arm(); });
+  close.addEventListener("click", () => dismissToast(rec));
   box.appendChild(el);
-  setTimeout(() => el.remove(), kind === "err" ? 7000 : 3500);
+  toasts.push(rec);
+  // Over the cap: drop the oldest non-error first, errors last.
+  while (toasts.length > TOAST_MAX) dismissToast(toasts.find(t => !t.sticky) || toasts[0]);
+  arm();
+  return rec;
+}
+function dismissToast(rec) {
+  if (!rec) return;
+  clearTimeout(rec.timer);
+  rec.timer = 0;
+  toasts = toasts.filter(t => t !== rec);
+  try { rec.el.remove(); } catch (e) {}
+}
+function dismissNewestToast() {
+  const rec = toasts[toasts.length - 1];
+  if (!rec) return false;
+  dismissToast(rec);
+  return true;
+}
+
+// Busy state for a button: spinner + label, aria-busy, disabled.
+function setBusy(btn, busy, label) {
+  if (!btn) return;
+  if (busy) {
+    if (btn.dataset && btn.dataset.idleLabel === undefined) btn.dataset.idleLabel = btn.textContent;
+    if (label) btn.textContent = label;
+    btn.setAttribute("aria-busy", "true");
+    btn.disabled = true;
+  } else {
+    btn.removeAttribute("aria-busy");
+    if (btn.dataset && btn.dataset.idleLabel !== undefined) {
+      if (label !== false) btn.textContent = btn.dataset.idleLabel;
+      delete btn.dataset.idleLabel;
+    }
+  }
 }
 
 // ---- in-app dialog (replaces blocking confirm/alert) ----
@@ -78,7 +160,7 @@ function askDialog({ title, html, okLabel, cancelLabel, danger, onOk, focus }) {
   $("dlgNote").textContent = "";
   $("dlgOk").textContent = okLabel || "확인";
   $("dlgOk").disabled = false;
-  $("dlgOk").style.background = danger ? "var(--danger)" : "";
+  $("dlgOk").classList.toggle("danger-fill", !!danger);
   $("dlgCancel").textContent = cancelLabel || "취소";
   $("dlgCancel").hidden = cancelLabel === null;
   $("dlgBackdrop").hidden = false;
@@ -102,8 +184,10 @@ function alertDialog(title, msg) {
 $("dlgOk").addEventListener("click", async () => {
   if (dlgOnOk) {
     $("dlgOk").disabled = true;
+    $("dlgOk").setAttribute("aria-busy", "true");
     let keep = false;
     try { keep = (await dlgOnOk()) === false; } catch (e) { keep = true; $("dlgNote").textContent = "오류: " + (e.message || e); }
+    $("dlgOk").removeAttribute("aria-busy");
     $("dlgOk").disabled = false;
     if (keep) return;
   }

@@ -7,6 +7,8 @@ function showQuitPage() {
   clearTimeout(pollTimer);
   setServerLost(false);
   document.querySelector(".shell").style.display = "none";
+  document.body.classList.add("quit");
+  closeAllPopovers(false);
   $("env").innerHTML = "";
   $("btnQuit").style.display = "none";
   $("quitPage").hidden = false;
@@ -30,6 +32,7 @@ async function pendingViewerChanges() {
 $("btnQuit").addEventListener("click", async () => {
   const btn = $("btnQuit");
   btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
   try {
     let st = null;
     try { st = await jget("/api/status"); } catch (e) { st = null; }
@@ -83,6 +86,7 @@ $("btnQuit").addEventListener("click", async () => {
     });
     if (go) showQuitPage();
   } finally {
+    btn.removeAttribute("aria-busy");
     btn.disabled = false;
   }
 });
