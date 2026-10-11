@@ -38,20 +38,75 @@ mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
 
-pub(crate) use discovery::*;
-pub(crate) use http::*;
-pub(crate) use jobs::*;
-pub(crate) use media::*;
-pub(crate) use records::*;
-pub(crate) use state::*;
-pub(crate) use system::*;
+pub(crate) use discovery::{
+    find_running_server, publish_local_server, token_for_port, write_instance_file,
+};
+pub(crate) use http::{
+    MAX_CAPTURE_FRAME_BODY, Request, body_value, handle_connection, instance_fingerprint,
+    is_viewer_page_path, json, json_string, page, path_is_under, plain, query_value,
+    request_is_localhost_trusted, valid_token, viewer_page, write_simple,
+};
+pub(crate) use jobs::{
+    api_carve, api_finalize, api_import_marks, api_recover_deleted, api_start, api_verify_sources,
+    case_job_json, default_case_dir, pending_marks_count, run_step, run_step_cancellable,
+};
+pub(crate) use media::{
+    api_advanced, api_capture_frame, api_export_clip, api_export_clip_cancel,
+    api_export_clip_status, api_export_selected, api_proxy, api_telemetry, api_transcode_queue,
+    cancel_all_clip_jobs, clip_job_json, newest_package_dir, opt_path, running_clip_job_count,
+};
+pub(crate) use records::{
+    api_records, api_records_meta, cached_index, index_generation, newest_tsk_inspection,
+    scan_progress_path,
+};
+pub(crate) use state::{
+    BusyLease, CaseJob, ClipJob, Enrichment, IndexCache, IndexFingerprint, InputKind, JobState,
+    LiveCache, PipelineJob, SharedState, StepStatus, api_err, restore_session, save_session,
+    state_lock, try_acquire_busy, try_lease_busy,
+};
+pub(crate) use system::{
+    api_browse, api_cancel, api_case_info, api_env, api_open_case, api_preflight, api_shutdown,
+    api_status, api_verify_audit, tool_available,
+};
+
+// ---- test-only re-exports (names only the unit tests reach through `super::*`)
+#[cfg(test)]
+pub(crate) use discovery::probe_status_body;
+// The WebView2 shell (windows only, src/shell.rs) reaches these.
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) use discovery::read_instance_record;
+#[cfg(target_os = "windows")]
+pub(crate) use discovery::{resolve_shell_token, shell_target};
+#[cfg(test)]
+pub(crate) use http::{
+    AuthProof, HttpAuthClass, MAX_BODY, authorize, etag_matches, handle_connection_timed,
+    http_auth_class, http_body_limit_for, is_generated_page, mime_for, parse_range,
+    parse_request_head, percent_decode_component, percent_encode_header_value,
+    relative_path_is_safe, request_authorized, secret_eq,
+};
+#[cfg(test)]
+pub(crate) use jobs::{
+    SIGNOFF_PENDING_REL_PATH, STEP_OUTPUT_TAIL_BYTES, build_selection_file, carve_with_exe,
+    drain_capped, enter_review_partial, finalize_with_exe, phase1_scan_args,
+    recover_deleted_with_exe, run_folder_enrichment, source_is_volume_root, start_media_roots,
+    warn_step,
+};
+#[cfg(test)]
+pub(crate) use media::{copy_unique, exhibit_arg, export_clip_with_exe, export_safe_name};
+#[cfg(test)]
+pub(crate) use records::{
+    FTS_CACHE_CAPACITY, cached_fts_search, cached_live_checkpoint, cached_thumb_stems,
+    records_fts_cache_len,
+};
+#[cfg(test)]
+pub(crate) use system::{browse_json, byte_progress_json, preflight_json, progress_json};
+
+const EXAMINER_PAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/examiner_app.html"));
 
 /// In-flight connection bound: the accept loop spawns one thread per
 /// connection, so an unbounded accept would let any local process exhaust
 /// memory/handles by opening thousands of idle sockets. Overflow
 /// connections get an immediate 503 instead of a thread.
-const EXAMINER_PAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/examiner_app.html"));
-
 pub(crate) const MAX_CONNECTIONS: usize = 64;
 
 pub struct ServeOptions {
