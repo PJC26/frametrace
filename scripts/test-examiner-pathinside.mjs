@@ -1,9 +1,7 @@
 // Regression: pathInside treats "/" as a root containing every absolute path.
-import { readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
-const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../assets/examiner_app.html'), 'utf8');
+import { appBundleJs } from './lib/app-bundle.mjs';
+const html = appBundleJs();
 const m = html.match(/function normPath[\s\S]*?\nfunction pathInside[\s\S]*?\n}\n/);
 if (!m) { console.error('FAIL cannot extract pathInside'); process.exit(1); }
 const ctx = vm.createContext({});

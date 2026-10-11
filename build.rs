@@ -1,35 +1,95 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Sorted `dir/*.<ext>` files, each registered for rebuild. Numeric
+/// filename prefixes define the concatenation order — both bundles are
+/// one classic script, so declaration order is load-bearing.
+fn sorted_parts(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut parts: Vec<_> = fs::read_dir(dir)
+        .unwrap_or_else(|_| panic!("{} missing", dir.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension().is_some_and(|e| e == ext)).then_some(path)
+        })
+        .collect();
+    parts.sort();
+    for path in &parts {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    parts
+}
+
+/// Plain newline-terminated concatenation (scripts/check-js.mjs mirrors
+/// this exactly when it syntax-checks the bundles).
+fn concat(parts: &[PathBuf]) -> String {
+    let mut bundle = String::new();
+    for path in parts {
+        bundle.push_str(
+            &fs::read_to_string(path).unwrap_or_else(|_| panic!("{} unreadable", path.display())),
+        );
+        if !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+    }
+    bundle
+}
 
 /// Bundles `assets/viewer/*.js` into one classic script for the
 /// single-file evidence viewer. Source lives split per concern, but the
 /// deliverable must stay a plain concatenation — ES module imports do
 /// not resolve under file:// where the exported review page is opened.
-fn main() {
+fn viewer_bundle(out_dir: &Path) {
     let viewer_dir = Path::new("assets/viewer");
     println!("cargo:rerun-if-changed={}", viewer_dir.display());
+    let bundle = concat(&sorted_parts(viewer_dir, "js"));
+    fs::write(out_dir.join("evidence_viewer.js"), bundle).expect("failed to write viewer bundle");
+}
 
-    let mut parts: Vec<_> = fs::read_dir(viewer_dir)
-        .expect("assets/viewer missing")
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().is_some_and(|ext| ext == "js")).then_some(path)
-        })
-        .collect();
-    // Numeric filename prefixes define the concatenation order — the
-    // viewer is one IIFE, so declaration order is load-bearing.
-    parts.sort();
-
-    let mut bundle = String::new();
-    for path in &parts {
-        println!("cargo:rerun-if-changed={}", path.display());
-        bundle.push_str(&fs::read_to_string(path).expect("viewer part unreadable"));
-        if !bundle.ends_with('\n') {
-            bundle.push('\n');
-        }
+/// STR-01: the workstation shell (`GET /`) is authored as markup in
+/// `assets/examiner_app.html` plus `assets/app/*.css` / `assets/app/*.js`,
+/// and served as ONE self-contained page: the `<!-- @bundle:app.css -->`
+/// and `<!-- @bundle:app.js -->` markers are replaced by inline
+/// `<style>` / `<script>` blocks (no extra routes, works offline).
+fn app_bundle(out_dir: &Path) {
+    let app_dir = Path::new("assets/app");
+    let template_path = Path::new("assets/examiner_app.html");
+    println!("cargo:rerun-if-changed={}", app_dir.display());
+    println!("cargo:rerun-if-changed={}", template_path.display());
+    let template = fs::read_to_string(template_path).expect("assets/examiner_app.html missing");
+    let css = concat(&sorted_parts(app_dir, "css"));
+    let js = concat(&sorted_parts(app_dir, "js"));
+    assert!(
+        !js.to_ascii_lowercase().contains("</script"),
+        "assets/app/*.js must not contain a literal </script"
+    );
+    assert!(
+        !css.to_ascii_lowercase().contains("</style"),
+        "assets/app/*.css must not contain a literal </style"
+    );
+    let mut page = template;
+    for (marker, block) in [
+        (
+            "<!-- @bundle:app.css -->",
+            format!("<style>\n{css}</style>"),
+        ),
+        (
+            "<!-- @bundle:app.js -->",
+            format!("<script>\n{js}</script>"),
+        ),
+    ] {
+        assert_eq!(
+            page.matches(marker).count(),
+            1,
+            "examiner_app.html must contain exactly one {marker}"
+        );
+        page = page.replacen(marker, &block, 1);
     }
+    fs::write(out_dir.join("examiner_app.html"), page).expect("failed to write app bundle");
+}
 
-    let out = Path::new(&env::var("OUT_DIR").unwrap()).join("evidence_viewer.js");
-    fs::write(&out, bundle).expect("failed to write viewer bundle");
+fn main() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    viewer_bundle(&out_dir);
+    app_bundle(&out_dir);
 }
