@@ -295,9 +295,9 @@ async function unitTests() {
   runInNewContext(ops + '\nclearTags();', grid);
   assert.equal(JSON.stringify(state.drafts.a.tags), '[]');
   console.log('PASS VM annotation drafts capture post-mutation state');
-  const exSource = readFileSync(new URL('../assets/examiner_app.html', import.meta.url), 'utf8');
-  const scripts = [...exSource.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
-  const exScript = scripts[scripts.length - 1];
+  // STR-01: the shell script is bundled from assets/app/*.js (build.rs).
+  const { appBundleJs } = await import('./lib/app-bundle.mjs');
+  const exScript = appBundleJs();
   const { document: exDoc } = { document: {} };
   void exDoc;
   const el = id => ({ id, value: '', textContent: '', innerHTML: '', disabled: false, checked: false, classList: { add() {}, remove() {}, toggle() {} }, style: {}, dataset: {}, addEventListener() {}, setAttribute() {}, removeAttribute() {}, closest: () => null, querySelectorAll: () => [] });

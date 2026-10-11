@@ -1,0 +1,137 @@
+async function loadEnv() {
+  try {
+    const env = await jget("/api/env");
+    const t = env.tools || {};
+    const wf = env.workflows || {};
+    const hints = env.hints || {};
+    const badge = (label, ok, hint) =>
+      `<span class="badge ${ok ? "ok" : "bad"}" title="${esc(hint || "")}">${esc(label)} ${ok ? "준비됨" : "없음"}</span>`;
+    $("env").innerHTML =
+      badge("ffmpeg", t.ffmpeg, hints.media) +
+      badge("ffprobe", t.ffprobe, hints.media) +
+      `<span class="badge ${wf.e01 ? "ok" : "bad"}" id="ewfBadge" title="${esc(hints.e01 || "")}">libewf(E01) ${wf.e01 ? "준비됨" : "없음"}</span>` +
+      badge("TSK(파일시스템)", wf.filesystem, hints.filesystem) +
+      `<span class="badge" id="auditBadge" title="감사 로그 무결성은 분석 완료 후 자동 검증됩니다">감사 로그 대기</span>`;
+    ffprobeMissing = !t.ffprobe;
+    if (!t.ffprobe) { $("withFfprobe").checked = false; syncScanMode(); }
+    const e01Radio = document.querySelector("input[name='inputKind'][value='e01']");
+    if (e01Radio) {
+      setEnvOff(e01Radio, !wf.e01);
+      $("e01Need").hidden = wf.e01;
+      if (!wf.e01) e01Radio.closest("label")?.setAttribute("title", esc(hints.e01 || "libewf 도구가 필요합니다"));
+    }
+    // deepfake-lens is optional — grey the controls rather than letting a
+    // first-time user click into a per-file "tool not found" storm.
+    const dfOk = env.deepfake === true;
+    setEnvOff($("withDeepfake"), !dfOk);
+    $("withDeepfake").closest("label")?.setAttribute("title",
+      dfOk ? "" : "deepfake-lens 미설치 — pip install deepfake-lens 또는 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
+    const dfBtn = document.querySelector("button[data-adv='deepfake']");
+    if (dfBtn) {
+      setEnvOff(dfBtn, !dfOk);
+      dfBtn.setAttribute("title",
+        dfOk ? "케이스의 모든 파일을 deepfake-lens로 스크리닝 — 결과는 '합성의심' 배지로 표시" : "deepfake-lens 미설치 — pip install deepfake-lens 또는 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
+    }
+  } catch (e) { console.error("loadEnv failed:", e); }
+}
+
+// ---- UX-11: analysis mode presets + size/placement hints ----
+let ffprobeMissing = false;
+const SCAN_MODES = {
+  quick: { hash: false, ffprobe: false },
+  standard: { hash: false, ffprobe: true },
+  full: { hash: true, ffprobe: true },
+};
+function scanMode() {
+  return document.querySelector("input[name='scanMode']:checked")?.value || "custom";
+}
+function setScanModeRadio(mode) {
+  const radio = document.querySelector(`input[name='scanMode'][value='${mode}']`);
+  if (radio) radio.checked = true;
+}
+function applyScanMode(mode) {
+  const m = SCAN_MODES[mode];
+  if (m) {
+    $("withHash").checked = m.hash;
+    // ffprobe stays off when the tool is missing, whatever the preset says.
+    $("withFfprobe").checked = m.ffprobe && !ffprobeMissing;
+  }
+  syncScanMode();
+}
+// Checkbox state is the source of truth; the radio reflects it.
+function syncScanMode() {
+  const h = $("withHash").checked, f = $("withFfprobe").checked;
+  let mode = "custom";
+  for (const [k, m] of Object.entries(SCAN_MODES)) if (m.hash === h && m.ffprobe === f) mode = k;
+  setScanModeRadio(mode);
+  updateModeInfo();
+}
+// Whole drives, device roots and forensic images are routinely hundreds of
+// GB to several TB. The server reports no source size, so this is a
+// path-shape heuristic, worded as such.
+function looksLargeSource(src) {
+  const v = String(src || "").trim();
+  if (!v) return false;
+  if (inputKind() === "e01") return true;
+  return /^[A-Za-z]:[\\/]?$/.test(v) || /^\\\\[?.]\\/.test(v) || v === "/" ||
+    /^\/(dev|media|mnt|Volumes|run\/media\/[^/]+)\/[^/]+\/?$/.test(v);
+}
+function normPath(p) {
+  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+// True when `child` is `parent` or lies beneath it (case-insensitive,
+// separator-agnostic — the workstation is primarily Windows).
+function pathInside(child, parent) {
+  const c = normPath(child), p = normPath(parent);
+  // Trailing-slash stripping turns the root "/" into "": treat it as the
+  // filesystem root, which contains every absolute path (including itself).
+  if (!p && /^\s*[\\/]+\s*$/.test(String(parent || ""))) {
+    return /^\s*[\\/]/.test(String(child || ""));
+  }
+  if (!c || !p) return false;
+  if (c === p) return true;
+  return c.startsWith(p + "/");
+}
+function updateModeInfo() {
+  const el = $("modeInfo");
+  if (!el) return;
+  const mode = scanMode();
+  const hash = $("withHash").checked;
+  const big = looksLargeSource($("sourcePath").value);
+  const lines = {
+    quick: "빠른 선별: 해시·ffprobe를 생략하고 파일 목록과 기본 메타데이터만 색인합니다 — 대용량 소스의 1차 선별용. 증거 대조용 SHA-256은 색인에 기록되지 않습니다.",
+    standard: "표준: ffprobe로 코덱·길이를 검증하고 SHA-256 해시는 생략합니다.",
+    full: "전체 (증거용): 모든 파일의 SHA-256을 계산하므로 소스의 모든 바이트를 읽습니다 — 소요 시간은 소스 크기에 비례합니다 (1 TB 기준 대략 1.5–3시간, 디스크 속도에 따라 다름).",
+    custom: "사용자 지정: 아래 체크박스 설정 그대로 실행합니다.",
+  };
+  let text = lines[mode] || lines.custom;
+  let warn = false;
+  if (big && hash) {
+    warn = true;
+    text = "⚠ 드라이브 전체 또는 디스크 이미지로 보입니다 — 수백 GB~수 TB일 수 있고, SHA-256 해시 계산이 켜져 있어 수 시간이 걸릴 수 있습니다. " +
+      "소스 크기는 서버가 제공하지 않아 정확한 예상 시간은 표시할 수 없습니다. 먼저 '빠른 선별'로 훑어본 뒤 필요한 범위만 '전체'로 분석하는 것을 권장합니다. · " + text;
+  }
+  el.className = "modeinfo" + (warn ? " warn" : "");
+  el.textContent = text;
+}
+
+function inputKind() {
+  return document.querySelector("input[name='inputKind']:checked")?.value || "folder";
+}
+
+function syncInputKind() {
+  const e01 = inputKind() === "e01";
+  $("sourcePath").placeholder = e01
+    ? "예: D:\\Images\\blackbox.E01 (또는 Ex01/S01/L01)"
+    : "예: E:\\ 또는 D:\\BLACKBOX 또는 C:\\Users\\me\\Desktop\\입수자료";
+  $("verifyRow").style.display = e01 ? "flex" : "none";
+  updateModeInfo();
+  validatePaths();
+}
+
+function syncDirectE01() {
+  const direct = $("directE01").checked;
+  $("skipE01Verify").disabled = direct;
+  if (direct) $("skipE01Verify").checked = false;
+}
+

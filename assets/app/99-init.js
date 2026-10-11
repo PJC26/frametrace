@@ -1,0 +1,2 @@
+syncInputKind();
+poll();

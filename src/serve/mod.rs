@@ -46,7 +46,7 @@ pub(crate) use system::*;
 /// connection, so an unbounded accept would let any local process exhaust
 /// memory/handles by opening thousands of idle sockets. Overflow
 /// connections get an immediate 503 instead of a thread.
-const EXAMINER_PAGE: &str = include_str!("../../assets/examiner_app.html");
+const EXAMINER_PAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/examiner_app.html"));
 
 pub(crate) const MAX_CONNECTIONS: usize = 64;
 
