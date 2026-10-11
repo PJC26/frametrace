@@ -117,7 +117,8 @@ const themeBtn = document.getElementById("btnTheme");
 function syncThemeBtn() {
   if (!themeBtn) return;
   const dark = document.documentElement.dataset.theme === "dark";
-  themeBtn.textContent = dark ? "☀ " + t("theme.light") : "◐ " + t("theme.dark");
+  const lbl = document.getElementById("btnThemeLabel");
+  if (lbl) lbl.textContent = dark ? t("theme.light") : t("theme.dark");
 }
 themeBtn?.addEventListener("click", () => {
   FTViewer._applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");

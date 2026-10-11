@@ -25,8 +25,8 @@ const results = [];
 const check = (n, ok, d = '') => { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${d ? '  — ' + d : ''}`); };
 
 const top = await ev(ws, sid, `(() => ({
-  chipCount: document.querySelectorAll('#presetChips .chip').length,
-  tagChips: document.querySelectorAll('#presetChips .chip[data-chip^="tag:"]').length,
+  chipCount: document.querySelectorAll('#presetChips [data-chip]').length,
+  tagChips: document.querySelectorAll('#presetChips [data-chip^="tag:"]').length,
   groupKindInExtra: document.getElementById('filtersExtra').contains(document.getElementById('btnGroupKind')),
   tagSelExists: !!document.getElementById('tagFilter'),
   filterRows: (() => { const f = document.querySelector('.browse .filters'); return f.getBoundingClientRect().height; })(),

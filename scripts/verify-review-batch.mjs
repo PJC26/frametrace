@@ -89,7 +89,7 @@ async function main() {
   // warning chip filters records with warnings — add a synthetic warning
   // state check: chip exists and applies the predicate
   const warn = await evalIn(browserWs, main.sessionId,
-    `(() => { const chip = [...document.querySelectorAll('.chip')].find(c => c.dataset.chip === 'warning');
+    `(() => { const chip = [...document.querySelectorAll('[data-chip]')].find(c => c.dataset.chip === 'warning');
         if (!chip) return { exists: false };
         chip.click();
         const n = filteredRecords().length;
@@ -99,7 +99,7 @@ async function main() {
 
   // reset chip to all (data-chip="")
   await evalIn(browserWs, main.sessionId,
-    `[...document.querySelectorAll('.chip')].find(c => c.dataset.chip === '')?.click()`);
+    `[...document.querySelectorAll('[data-chip]')].find(c => c.dataset.chip === '')?.click()`);
 
   // note editor: pick a record, type a note, verify persistence
   const note = await evalIn(browserWs, main.sessionId,

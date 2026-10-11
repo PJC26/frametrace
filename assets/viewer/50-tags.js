@@ -40,6 +40,12 @@ function toggleTag(id, tag) {
   else addTag(id, tag);
 }
 
+const MARK_ICON = { reviewed: "check", important: "flag", needs_verification: "question" };
+// Mark chip: shape + colour + text (reviewed = grey check, important = amber
+// flag, needs verification = purple question mark).
+function markChipHtml(status) {
+  return `<span class="mark-chip ${escapeHtml(status)}">${ftIcon(MARK_ICON[status] || "check")}${escapeHtml(markLabel(status))}</span>`;
+}
 function markLabel(status) {
   if (status === "reviewed") return t("mark.reviewed");
   if (status === "important") return t("mark.important");

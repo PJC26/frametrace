@@ -232,6 +232,11 @@ function fileUrl(path) {
   return encoded;
 }
 
+// Offline sprite icon (assets/icons.svg, inlined into every viewer page).
+function ftIcon(name) {
+  return `<svg class="ic" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+}
+
 function escapeHtml(value) {
   return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }

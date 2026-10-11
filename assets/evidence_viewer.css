@@ -48,9 +48,7 @@
 :where(.ft-viewer) button:hover:not(:disabled) { border-color: var(--accent); background: var(--surface-2); }
 :where(.ft-viewer) button:active:not(:disabled) { background: var(--accent-soft); border-color: var(--accent-ink); }
 :where(.ft-viewer) button:disabled { color: var(--disabled-fg); background: var(--disabled-bg); cursor: not-allowed; border-color: var(--border); }
-:where(.ft-viewer) button.mini, :where(.ft-viewer) button.btn-sm { height: 28px; min-width: 28px; font-size: var(--fs-xs); padding: 0 8px; }
 :where(.ft-viewer) .topbar button[aria-pressed="true"], :where(.ft-viewer) .topbar button[aria-expanded="true"], :where(.ft-viewer) .seg button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); font-weight: 700; }
-:where(.ft-viewer) .icon-btn { width: 32px; padding: 0; display: inline-grid; place-items: center; font-size: 15px; line-height: 1; flex: 0 0 auto; }
 :where(.ft-viewer) input, :where(.ft-viewer) select { font: inherit; height: 32px; border: 1px solid var(--border-strong); border-radius: 6px; padding: 0 8px; background: var(--surface); color: var(--ink); max-width: 100%; }
 :where(.ft-viewer) select:hover, :where(.ft-viewer) input:hover { border-color: var(--accent); }
 :where(.ft-viewer) code { font-family: var(--mono); font-size: var(--fs-xs); word-break: break-all; }
@@ -61,21 +59,8 @@
 :where(.ft-viewer) .topbar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; min-height: 40px; background: var(--surface); border-bottom: 1px solid var(--line); flex-wrap: wrap; min-width: 0; position: relative; z-index: 35; }
 :where(.ft-viewer) .topbar input[type="search"] { flex: 1 1 220px; min-width: 220px; }
 :where(.ft-viewer) .topbar > select { flex: 0 1 auto; width: auto; max-width: 150px; min-width: 104px; text-overflow: ellipsis; }
-:where(.ft-viewer) .count-pills { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
-:where(.ft-viewer) .pill { display: inline-flex; align-items: center; gap: 4px; height: 32px; padding: 0 10px; border-radius: 999px; font-size: var(--fs-xs); font-weight: 600; border: 1px solid; }
-:where(.ft-viewer) .pill .pill-ic { font-size: 12px; line-height: 1; }
-:where(.ft-viewer) .pill .pill-n { font-variant-numeric: tabular-nums; font-weight: 800; }
-:where(.ft-viewer) .pill.ok { color: var(--verified-fg); background: var(--verified-bg); border-color: currentColor; }
-:where(.ft-viewer) .pill.failed { color: var(--failed-fg); background: var(--failed-bg); border-color: currentColor; }
-:where(.ft-viewer) .pill.candidate { color: var(--candidate-fg); background: var(--candidate-bg); border-color: currentColor; }
-:where(.ft-viewer) .pill.anomaly { color: var(--anomaly-fg); background: var(--anomaly-bg); border-color: currentColor; }
-:where(.ft-viewer) .topbar .pill:hover:not(:disabled) { background: var(--surface); border-color: currentColor; }
+html:root .ft-viewer .count-pills { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 /* Pressed = filter on: inverted fill + thicker ring (not colour alone). */
-:where(.ft-viewer) .topbar .pill[aria-pressed="true"] { color: var(--surface); border-width: 2px; font-weight: 800; }
-:where(.ft-viewer) .topbar .pill.ok[aria-pressed="true"] { background: var(--verified-fg); border-color: var(--verified-fg); }
-:where(.ft-viewer) .topbar .pill.failed[aria-pressed="true"] { background: var(--failed-fg); border-color: var(--failed-fg); }
-:where(.ft-viewer) .topbar .pill.candidate[aria-pressed="true"] { background: var(--candidate-fg); border-color: var(--candidate-fg); }
-:where(.ft-viewer) .topbar .pill.anomaly[aria-pressed="true"] { background: var(--anomaly-fg); border-color: var(--anomaly-fg); }
 /* 정렬·표시 drop-down panel */
 :where(.ft-viewer) .menu-filters { flex: 0 0 auto; }
 :where(.ft-viewer) .topbar .filters-extra { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; width: max-content; max-width: min(560px, calc(100vw - 24px)); display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
@@ -101,15 +86,15 @@
 :where(.ft-viewer) .chip-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 :where(.ft-viewer) .chip-label { font-size: var(--fs-xs); font-weight: 700; color: var(--muted); letter-spacing: .04em; margin: 0 2px 0 6px; }
 :where(.ft-viewer) .chip-label:first-child { margin-left: 0; }
-:where(.ft-viewer) .chip { height: 28px; border-radius: 999px; padding: 0 10px; font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); }
-:where(.ft-viewer) .chip.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+:where(.ft-viewer) .rail-chip, :where(.ft-viewer) .chip-toggle { height: 28px; border-radius: 999px; padding: 0 10px; font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); }
+:where(.ft-viewer) .rail-chip.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 :where(.ft-viewer) .chip-more { border-style: dashed; color: var(--muted); }
 /* Preset filters as a vertical list in the rail. */
 :where(.ft-viewer) .rail-chips .chip-row-inner { flex-direction: column; align-items: stretch; gap: 2px; }
-:where(.ft-viewer) .rail .chip { width: 100%; height: 32px; border-radius: 6px; text-align: left; background: transparent; border-color: transparent; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
-:where(.ft-viewer) .rail .chip:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border); }
-:where(.ft-viewer) .rail .chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); font-weight: 800; box-shadow: inset 3px 0 0 var(--accent); }
-:where(.ft-viewer) .rail .chip-more { border: 1px dashed var(--border-strong); color: var(--muted); text-align: center; }
+:where(.ft-viewer) .rail .rail-chip { width: 100%; height: 32px; border-radius: 6px; text-align: left; background: transparent; border-color: transparent; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+:where(.ft-viewer) .rail .rail-chip:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border); }
+:where(.ft-viewer) .rail .rail-chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); font-weight: 800; box-shadow: inset 3px 0 0 var(--accent); }
+:where(.ft-viewer) .rail .rail-chip-more { border: 1px dashed var(--border-strong); color: var(--muted); text-align: center; }
 :where(.ft-viewer) .tree { min-width: 0; }
 :where(.ft-viewer) .tree-sec { padding: 8px 6px 2px; font-size: var(--fs-xs); font-weight: 800; color: var(--accent-ink); border-top: 1px solid var(--line); margin-top: 2px; }
 :where(.ft-viewer) .tree-item { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-height: 32px; padding: 4px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
@@ -121,23 +106,23 @@
 :where(.ft-viewer) .cal { display: flex; flex-direction: column; gap: 4px; padding: 0 2px; }
 :where(.ft-viewer) .cal-nav { display: flex; align-items: center; gap: 4px; }
 :where(.ft-viewer) .cal-month { flex: 1 1 auto; text-align: center; font-size: 13px; font-weight: 700; color: var(--ink); white-space: nowrap; }
-:where(.ft-viewer) .cal-btn { height: 28px; width: 28px; min-width: 28px; padding: 0; font-size: 15px; line-height: 1; border-radius: 6px; flex: 0 0 auto; }
+:where(.ft-viewer) .cal-nav-btn { height: 28px; width: 28px; min-width: 28px; padding: 0; font-size: 15px; line-height: 1; border-radius: 6px; flex: 0 0 auto; }
 :where(.ft-viewer) .cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; }
 :where(.ft-viewer) .cal-wd { font-size: var(--fs-xs); color: var(--muted); text-align: center; line-height: 18px; }
-:where(.ft-viewer) .cal-cell { min-width: 0; height: 34px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--ink); font: inherit; font-size: var(--fs-xs); padding: 0; cursor: default; }
-:where(.ft-viewer) button.cal-cell { cursor: pointer; position: relative; }
-:where(.ft-viewer) button.cal-cell:hover { border-color: var(--accent); }
-:where(.ft-viewer) .cal-cell .cal-d { font-size: var(--fs-xs); font-weight: 700; line-height: 1.1; }
-:where(.ft-viewer) .cal-cell .cal-n { font-size: var(--fs-xs); line-height: 1.1; color: var(--muted); }
-:where(.ft-viewer) .cal-cell.l1 { background: #eef6f3; border-color: #c4dcd6; }
-:where(.ft-viewer) .cal-cell.l2 { background: #d6ebe4; border-color: #9ec9be; }
-:where(.ft-viewer) .cal-cell.l3 { background: #b4dcd0; border-color: #6fb0a1; }
-:where(.ft-viewer) .cal-cell.l3 .cal-n, :where(.ft-viewer) .cal-cell.l2 .cal-n { color: var(--ink); }
-:where(.ft-viewer) .cal-cell.l4 { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-:where(.ft-viewer) .cal-cell.l4 .cal-n { color: var(--on-accent); }
-:where(.ft-viewer) .cal-cell.selected { outline: 2px solid var(--ink); outline-offset: -1px; }
-:where(.ft-viewer) .cal-cell.empty { border: none; background: transparent; }
-:where(.ft-viewer) .cal-cell:not(button) .cal-d { color: var(--muted); font-weight: 400; }
+:where(.ft-viewer) .cal-day { min-width: 0; height: 34px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--ink); font: inherit; font-size: var(--fs-xs); padding: 0; cursor: default; }
+:where(.ft-viewer) button.cal-day { cursor: pointer; position: relative; }
+:where(.ft-viewer) button.cal-day:hover { border-color: var(--accent); }
+:where(.ft-viewer) .cal-day .cal-d { font-size: var(--fs-xs); font-weight: 700; line-height: 1.1; }
+:where(.ft-viewer) .cal-day .cal-n { font-size: var(--fs-xs); line-height: 1.1; color: var(--muted); }
+:where(.ft-viewer) .cal-day.l1 { background: #eef6f3; border-color: #c4dcd6; }
+:where(.ft-viewer) .cal-day.l2 { background: #d6ebe4; border-color: #9ec9be; }
+:where(.ft-viewer) .cal-day.l3 { background: #b4dcd0; border-color: #6fb0a1; }
+:where(.ft-viewer) .cal-day.l3 .cal-n, :where(.ft-viewer) .cal-day.l2 .cal-n { color: var(--ink); }
+:where(.ft-viewer) .cal-day.l4 { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+:where(.ft-viewer) .cal-day.l4 .cal-n { color: var(--on-accent); }
+:where(.ft-viewer) .cal-day.selected { outline: 2px solid var(--ink); outline-offset: -1px; }
+:where(.ft-viewer) .cal-day.empty { border: none; background: transparent; }
+:where(.ft-viewer) .cal-day:not(button) .cal-d { color: var(--muted); font-weight: 400; }
 :where(.ft-viewer) .period { margin: 0; padding: 2px 4px; line-height: 1.45; }
 :where(.ft-viewer) .cal-year { height: 28px; font-size: var(--fs-xs); padding: 0 2px; width: auto; flex: 0 0 auto; }
 
@@ -254,8 +239,8 @@
 :where(.ft-viewer) .thumb .ph.pending { background: linear-gradient(100deg, #18211e 30%, #26332f 50%, #18211e 70%) 0 0 / 300% 100%; animation: ft-skeleton 1.4s linear infinite; }
 @keyframes ft-skeleton { from { background-position: 100% 0; } to { background-position: 0 0; } }
 @media (prefers-reduced-motion: reduce) { :where(.ft-viewer) .thumb .ph.pending { animation: none; } }
-:where(.ft-viewer) .thumb .ph .thumb-retry { height: 26px; min-width: 26px; font-size: var(--fs-xs); padding: 0 8px; background: #16231f; color: #eaf3ef; border-color: #4a5f57; }
-:where(.ft-viewer) .thumb .ph .thumb-retry:hover { border-color: #8fd3c4; background: #1f2f2a; }
+:where(.ft-viewer) .thumb .ph [data-thumb-retry] { height: 26px; min-width: 26px; font-size: var(--fs-xs); padding: 0 8px; background: #16231f; color: #eaf3ef; border-color: #4a5f57; }
+:where(.ft-viewer) .thumb .ph [data-thumb-retry]:hover { border-color: #8fd3c4; background: #1f2f2a; }
 :where(.ft-viewer) .thumb .dur { position: absolute; right: 6px; bottom: 6px; background: rgba(0, 0, 0, .75); color: #fff; font-size: var(--fs-xs); padding: 1px 6px; border-radius: 4px; }
 /* 24px selection box with clear space around it (WCAG 2.5.8). */
 :where(.ft-viewer) .thumb .checkbox, :where(.ft-viewer) .thumb input[data-check] { position: absolute; left: 6px; top: 6px; width: 24px; height: 24px; margin: 0; accent-color: var(--accent); cursor: pointer; z-index: 1; }
@@ -264,9 +249,9 @@
 :where(.ft-viewer) .name { font-size: var(--fs-xs); font-weight: 800; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 :where(.ft-viewer) .sub { font-size: var(--fs-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; }
 :where(.ft-viewer) .badge-row { display: flex; flex-wrap: nowrap; gap: 4px; overflow: hidden; min-width: 0; }
-:where(.ft-viewer) .badge .st-ic { font-size: 12px; line-height: 1; }
+:where(.ft-viewer) .badge .ic { width: 13px; height: 13px; vertical-align: -2px; flex: none; }
 :where(.ft-viewer).density-compact .card .time-row, :where(.ft-viewer).density-compact .card .sub-row, :where(.ft-viewer).density-compact .card .tag-row { display: none; }
-:where(.ft-viewer) .mark-chip { display: inline-block; border-radius: 4px; padding: 1px 5px; font-size: var(--fs-xs); font-weight: 800; color: var(--mark-reviewed-fg); background: var(--mark-reviewed-bg); margin-left: 4px; }
+:where(.ft-viewer) .mark-chip { display: inline-flex; align-items: center; gap: 4px; border-radius: 4px; padding: 1px 5px; font-size: var(--fs-xs); font-weight: 800; color: var(--mark-reviewed-fg); background: var(--mark-reviewed-bg); margin-left: 4px; }
 :where(.ft-viewer) .mark-chip.important { background: var(--mark-important-bg); color: var(--mark-important-fg); }
 :where(.ft-viewer) .mark-chip.needs_verification { background: var(--mark-needs-verification-bg); color: var(--mark-needs-verification-fg); }
 :where(.ft-viewer) .group-header { grid-column: 1 / -1; display: flex; align-items: stretch; min-height: 30px; padding: 0; background: #e3ebe8; color: #29433c; font-size: var(--fs-xs); font-weight: 800; cursor: pointer; border-radius: 6px; border-left: 4px solid #546e66; }
@@ -302,8 +287,8 @@
 :where(.ft-viewer) .menu-list.tag-menu { max-height: 340px; overflow-y: auto; min-width: 200px; }
 :where(.ft-viewer) .tag-menu-row { display: flex; gap: 2px; }
 :where(.ft-viewer) .tag-menu-row > button:first-child { flex: 1; min-width: 0; }
-:where(.ft-viewer) .tag-menu-row .tag-del { flex: none; width: 26px; padding: 0; text-align: center; color: var(--muted); }
-:where(.ft-viewer) .tag-menu-row .tag-del:hover { color: var(--danger); }
+:where(.ft-viewer) .tag-menu-row .tag-x { flex: none; width: 26px; padding: 0; text-align: center; color: var(--muted); }
+:where(.ft-viewer) .tag-menu-row .tag-x:hover { color: var(--danger); }
 :where(.ft-viewer) .tag-add { display: flex; gap: 4px; padding: 4px 6px; }
 :where(.ft-viewer) .tag-add input { flex: 1; min-width: 0; height: 26px; font-size: 12px; border: 1px solid var(--line); border-radius: 5px; padding: 0 8px; }
 :where(.ft-viewer) .tag-add button { flex: none; height: 26px; font-size: 12px; }
@@ -353,7 +338,8 @@
 :where(.ft-viewer) .grid .fallback { grid-column: 1 / -1; padding: 16px; color: var(--muted); }
 :where(.ft-viewer) .time-text { font-size: var(--fs-xs); color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 :where(.ft-viewer) .sub-row { display: flex; align-items: center; gap: 4px; }
-:where(.ft-viewer) .audio-flag { font-size: var(--fs-xs); line-height: 1; margin-left: 2px; }
+:where(.ft-viewer) .audio-flag { line-height: 1; margin-left: 2px; display: inline-flex; vertical-align: middle; }
+:where(.ft-viewer) .audio-flag .ic { width: 14px; height: 14px; vertical-align: 0; }
 :where(.ft-viewer) .audio-flag.none { opacity: .55; }
 
 @media (prefers-reduced-motion: reduce) {
@@ -373,7 +359,7 @@ html[data-theme="dark"] :where(.ft-viewer) button { background: #232c28; border-
 html[data-theme="dark"] :where(.ft-viewer) button:disabled { color: var(--disabled-fg); background: #1a211e; border-color: #2c3a34; }
 html[data-theme="dark"] :where(.ft-viewer) input, html[data-theme="dark"] :where(.ft-viewer) select { background: #161d1a; border-color: #3a4f48; }
 html[data-theme="dark"] :where(.ft-viewer) mark { background: #6b5a1e; color: #ffe9a8; }
-html[data-theme="dark"] :where(.ft-viewer) .chip { background: #232c28; border-color: #3a4f48; }
+html[data-theme="dark"] :where(.ft-viewer) .rail-chip, :where(.ft-viewer) .chip-toggle { background: #232c28; border-color: #3a4f48; }
 html[data-theme="dark"] :where(.ft-viewer) .vsplitter::before, html[data-theme="dark"] :where(.ft-viewer) .hsplitter::before { background: #3a4f48; }
 html[data-theme="dark"] :where(.ft-viewer) .tree-item:hover { background: #222b27; }
 html[data-theme="dark"] :where(.ft-viewer) .tree-item.active { background: #1d332d; }
@@ -391,11 +377,11 @@ html[data-theme="dark"] :where(.ft-viewer) .timeline-panel { background: var(--p
 html[data-theme="dark"] :where(.ft-viewer) .timeline-row:hover { background: #222b27; }
 html[data-theme="dark"] :where(.ft-viewer) .channel-badge { background: #26344a; color: #a8c4e0; }
 html[data-theme="dark"] :where(.ft-viewer) .note-input { background: #161d1a; color: var(--ink); }
-html[data-theme="dark"] :where(.ft-viewer) .cal-cell { background: #1a211e; border-color: #2c3a34; }
-html[data-theme="dark"] :where(.ft-viewer) .cal-cell.l1 { background: #16261f; border-color: #2a4a40; }
-html[data-theme="dark"] :where(.ft-viewer) .cal-cell.l2 { background: #1d332c; border-color: #35615a; }
-html[data-theme="dark"] :where(.ft-viewer) .cal-cell.l3 { background: #265047; border-color: #4a8579; }
-html[data-theme="dark"] :where(.ft-viewer) .cal-cell.selected { outline-color: #e8f0ec; }
+html[data-theme="dark"] :where(.ft-viewer) .cal-day { background: #1a211e; border-color: #2c3a34; }
+html[data-theme="dark"] :where(.ft-viewer) .cal-day.l1 { background: #16261f; border-color: #2a4a40; }
+html[data-theme="dark"] :where(.ft-viewer) .cal-day.l2 { background: #1d332c; border-color: #35615a; }
+html[data-theme="dark"] :where(.ft-viewer) .cal-day.l3 { background: #265047; border-color: #4a8579; }
+html[data-theme="dark"] :where(.ft-viewer) .cal-day.selected { outline-color: #e8f0ec; }
 
 /* ---- v1.0 UX: busy buttons, in-page dialog, export menu groups, calendar year ---- */
 :where(.ft-viewer) button.busy { position: relative; opacity: .75; cursor: progress; }
@@ -411,19 +397,19 @@ html[data-theme="dark"] :where(.ft-viewer) .cal-cell.selected { outline-color: #
 :where(.ft-viewer) .menu-list .menu-sec:first-child { border-top: none; margin-top: 0; }
 html[data-theme="dark"] :where(.ft-viewer) .modal.dlg { background: #232c28; }
 /* Accent-filled states must beat the dark-theme surface overrides above. */
-html[data-theme="dark"] :where(.ft-viewer) .chip.active, html[data-theme="dark"] :where(.ft-viewer) .tag-btn.on, html[data-theme="dark"] :where(.ft-viewer) .cal-cell.l4 { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+html[data-theme="dark"] :where(.ft-viewer) .rail-chip.active, html[data-theme="dark"] :where(.ft-viewer) .tag-btn.on, html[data-theme="dark"] :where(.ft-viewer) .cal-day.l4 { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 /* Rail list items stay flat in dark too; the current one keeps the soft fill
    + left bar used in light (beats the generic dark .chip/.chip.active). */
-html[data-theme="dark"] :where(.ft-viewer) .rail .chip:not(.active) { background: transparent; border-color: transparent; }
-html[data-theme="dark"] :where(.ft-viewer) .rail .chip:not(.active):hover { background: var(--surface-2); border-color: var(--border); }
-html[data-theme="dark"] :where(.ft-viewer) .rail .chip.chip-more { border: 1px dashed var(--border-strong); }
-html[data-theme="dark"] :where(.ft-viewer) .rail .chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); }
+html[data-theme="dark"] :where(.ft-viewer) .rail .rail-chip:not(.active) { background: transparent; border-color: transparent; }
+html[data-theme="dark"] :where(.ft-viewer) .rail .rail-chip:not(.active):hover { background: var(--surface-2); border-color: var(--border); }
+html[data-theme="dark"] :where(.ft-viewer) .rail .rail-chip.chip-more { border: 1px dashed var(--border-strong); }
+html[data-theme="dark"] :where(.ft-viewer) .rail .rail-chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); }
 html[data-theme="dark"] :where(.ft-viewer) .active-filters .af-chip { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); }
 html[data-theme="dark"] :where(.ft-viewer) .tabs [role="tab"] { background: transparent; border-color: transparent; }
 html[data-theme="dark"] :where(.ft-viewer) .tabs [role="tab"]:hover:not(:disabled) { background: var(--surface-2); }
 html[data-theme="dark"] :where(.ft-viewer) .tabs [role="tab"][aria-selected="true"] { border-bottom-color: var(--accent); }
 html[data-theme="dark"] :where(.ft-viewer) .tabs [role="tab"]:not([aria-selected="true"]):hover { border-bottom-color: var(--border-strong); }
-html[data-theme="dark"] :where(.ft-viewer) .cal-cell.l2 .cal-n, html[data-theme="dark"] :where(.ft-viewer) .cal-cell.l3 .cal-n { color: var(--ink); }
+html[data-theme="dark"] :where(.ft-viewer) .cal-day.l2 .cal-n, html[data-theme="dark"] :where(.ft-viewer) .cal-day.l3 .cal-n { color: var(--ink); }
 
 /* ---- hosted in the workstation shell (docs/ui-rebuild-contract.md §2.3/§6) ----
    The shell mounts the same fragment in its own document: the root fills
@@ -436,3 +422,28 @@ html[data-theme="dark"] :where(.ft-viewer) .cal-cell.l2 .cal-n, html[data-theme=
 :where(.ft-viewer) .sc-host { display: none; }
 :where(.ft-viewer).hosted .sc-host { display: table-row; }
 html .ft-viewer.hosted #toastHost { top: 92px; }
+
+/* Count pills = kit toggle buttons carrying the status tokens (T5 migration).
+   Status is icon + text + colour; red is only the failed pill. */
+html:root .ft-viewer .count-pills button.toggle { height: 32px; padding: 0 10px; border-radius: var(--radius-pill); font-size: var(--fs-xs); font-weight: 600; border: 1px solid currentColor; gap: 4px; }
+html:root .ft-viewer .count-pills .pill-n { font-variant-numeric: tabular-nums; font-weight: 800; }
+html:root .ft-viewer .count-pills button.st-ok { color: var(--verified-fg); background: var(--verified-bg); }
+html:root .ft-viewer .count-pills button.st-failed { color: var(--failed-fg); background: var(--failed-bg); }
+html:root .ft-viewer .count-pills button.st-candidate { color: var(--candidate-fg); background: var(--candidate-bg); }
+html:root .ft-viewer .count-pills button.st-anomaly { color: var(--anomaly-fg); background: var(--anomaly-bg); }
+html:root .ft-viewer .count-pills button.toggle:hover:not(:disabled) { background: var(--surface); border-color: currentColor; }
+html:root .ft-viewer .count-pills button.toggle[aria-pressed="true"] { color: var(--surface); border-width: 2px; font-weight: 800; }
+html:root .ft-viewer .count-pills button.st-ok[aria-pressed="true"] { background: var(--verified-fg); border-color: var(--verified-fg); }
+html:root .ft-viewer .count-pills button.st-failed[aria-pressed="true"] { background: var(--failed-fg); border-color: var(--failed-fg); }
+html:root .ft-viewer .count-pills button.st-candidate[aria-pressed="true"] { background: var(--candidate-fg); border-color: var(--candidate-fg); }
+html:root .ft-viewer .count-pills button.st-anomaly[aria-pressed="true"] { background: var(--anomaly-fg); border-color: var(--anomaly-fg); }
+/* Calendar month arrows: one chevron, mirrored for "previous" */
+:where(.ft-viewer) .cal-prev .ic { transform: scaleX(-1); }
+/* Menu carets, exit button, labelled icon buttons */
+:where(.ft-viewer) button .ic + .ic { margin-left: -2px; }
+:where(.ft-viewer) .fs-exit { display: inline-flex; align-items: center; gap: 6px; }
+:where(.ft-viewer) .af-chip .af-x .ic { width: 12px; height: 12px; vertical-align: 0; }
+/* Mark buttons carry the same icon colours as the grid / detail chips */
+#selectionBar #btnMarkReviewed .ic { color: var(--mark-reviewed-ink); }
+#selectionBar #btnMarkImportant .ic { color: var(--mark-important-ink); }
+#selectionBar #btnMarkVerify .ic { color: var(--mark-needs-verification-ink); }

@@ -179,8 +179,8 @@ function toast(message, opts) {
   body.textContent = text;
   const close = document.createElement("button");
   close.type = "button";
-  close.className = "toast-close";
-  close.textContent = "\u2715";
+  close.className = "quiet icon toast-close";
+  close.innerHTML = ftIcon("x");
   close.title = t("toast.close");
   close.setAttribute("aria-label", t("toast.close"));
   close.addEventListener("click", () => dismissToast(item));
@@ -202,7 +202,7 @@ function toastError(message) { return toast(message, { error: true }); }
 function attachUndoButton(item) {
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = "mini toast-action";
+  btn.className = "quiet toast-action";
   btn.textContent = t("undo.btn");
   btn.addEventListener("click", () => { dismissToast(item); undoJournal(); });
   item.classList.add("toast-undo");
@@ -798,7 +798,7 @@ function clipProgressUi(onCancel) {
   text.className = "toast-text";
   const cancel = document.createElement("button");
   cancel.type = "button";
-  cancel.className = "mini toast-action";
+  cancel.className = "quiet toast-action";
   cancel.textContent = t("clip.cancel");
   cancel.addEventListener("click", () => {
     cancel.disabled = true;
@@ -934,7 +934,7 @@ document.getElementById("btnCopyPaths").addEventListener("click", () => {
 const tagMenuList = document.getElementById("tagMenuList");
 function rebuildTagMenu() {
   tagMenuList.innerHTML = state.tagPresets.map(tag =>
-    `<div class="tag-menu-row"><button type="button" data-keep data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button><button type="button" class="tag-del" data-keep data-del-preset="${escapeHtml(tag)}" title="${t("tagmenu.delPreset")}" aria-label="${escapeHtml(tf("tagmenu.delOne", { tag }))}">×</button></div>`
+    `<div class="tag-menu-row"><button type="button" data-keep data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button><button type="button" class="quiet icon tag-x" data-keep data-del-preset="${escapeHtml(tag)}" title="${t("tagmenu.delPreset")}" aria-label="${escapeHtml(tf("tagmenu.delOne", { tag }))}">${ftIcon("x")}</button></div>`
   ).join("")
     + `<button type="button" data-tag-clear>${t("tagmenu.clear")}</button><hr>`
     + `<div class="tag-add"><input type="text" id="tagPresetInput" placeholder="${t("tagmenu.new")}" maxlength="24">`
