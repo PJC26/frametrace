@@ -26,7 +26,7 @@
 /* ======================================================================
    Action bar — 44px, three zones, one row from 1366px, wraps below
    ====================================================================== */
-.selection-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; min-height: 44px; padding: 6px 12px; background: var(--surface); border-top: 1px solid var(--border); }
+.selection-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; min-height: 44px; padding: 3px 12px; /* 44px with the 36px primary (§6.1) */ background: var(--surface); border-top: 1px solid var(--border); }
 .bar-zone { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
 .bar-progress { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; }
 .bar-progress progress { width: 56px; height: 6px; accent-color: var(--accent); }

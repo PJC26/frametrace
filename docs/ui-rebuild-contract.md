@@ -456,7 +456,7 @@ const FTStore = {
 | 영상 스테이지 `#mediaStage` | **270px**(16:9) | **360px** | 최소값이 아니라 미디어 열 폭의 16:9(`aspect-ratio`) — 더 키우면 레터박스만 늘어난다. `hsplitter` 드래그(120…100vh−320, `#mediaStage` 인라인 height, 저장 키 `layout.stageH`), 더블클릭/Enter 기본값 |
 | 툴바 `#mediaToolbar` | 1행 44px(transport: −10초/+10초·프레임 이동은 아이콘 버튼 — 라벨은 접근 이름, 키는 툴팁) + `tbMore` 팝오버 | 1행 44px (미디어 열 <1000px이면 팝오버 — 640px에서도 팝오버) | 현행 로직 |
 | 상세 탭 `.mini-info` | 640−270−44−6 = **320px** (탭 32 + 288 스크롤) | 952−360−88−6 = **498px** | 스크롤 영역 |
-| `#selectionBar` | 44px 전폭(실측 49 = 36px primary + 패딩, ≤52), **1행**, sticky bottom | 동일 | `btnApplyMarks` = 영역 유일 primary. **판독 블록을 우측 열로 옮기지 않는다**(§10 Q1). 1366에서 1행 유지: `#reviewProgress`는 <1600px에서 숨김(페이저 `#triageStatus`가 같은 수치), 호스트에서는 `#examinerName` 숨김(검토자는 결과물 시트 `#finalExaminer` → `FTViewer.setExaminer`; 마운트 시 셸 prefs의 이름으로 시드) — DOM과 동작은 유지 |
+| `#selectionBar` | 44px 전폭(36px primary + 3px 패딩 + 1px 경계, ≤52), **1행**, sticky bottom | 동일 | `btnApplyMarks` = 영역 유일 primary. **판독 블록을 우측 열로 옮기지 않는다**(§10 Q1). 1366에서 1행 유지: `#reviewProgress`는 <1600px에서 숨김(페이저 `#triageStatus`가 같은 수치), 호스트에서는 `#examinerName` 숨김(검토자는 결과물 시트 `#finalExaminer` → `FTViewer.setExaminer`; 마운트 시 셸 prefs의 이름으로 시드) — DOM과 동작은 유지 |
 | 시트 `.h-sheet` | 폭 **480px**, top 44, height 724, right 0 | 폭 **560px**, height 1036 | §6.3 |
 | 팝오버 `.h-pop` | min 240 / max min(380, 100vw−32) | 동일 | opener 아래 6px, 우측 정렬 |
 | 대화상자 `.h-modal` | min(560px, 92vw), max-height 80vh | 동일 | |
