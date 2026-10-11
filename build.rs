@@ -276,6 +276,16 @@ fn shell_page(spec: &ShellPage) -> String {
         "{}/*.css must not contain a literal </style",
         spec.bundle_dir
     );
+    // Build markers are expanded in the template only. A literal marker in
+    // a part (even inside a comment) would survive into the served page and
+    // look like an unexpanded include, or be miscounted by inline_icons.
+    for marker in ["<!-- @include:", "<!-- @bundle:"] {
+        assert!(
+            !js.contains(marker) && !css.contains(marker),
+            "{}/* parts must not contain a literal {marker} (write the marker name without the comment syntax)",
+            spec.bundle_dir
+        );
+    }
     let script = if hosted {
         format!(
             "<script>\n{}</script>\n<script>\n{js}</script>",

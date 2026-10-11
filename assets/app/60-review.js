@@ -1,5 +1,5 @@
 // @interim (legacy viewer frame) — until the viewer fragment is hosted in
-// this document (T5: <!-- @include:viewer.body --> + window.FTViewer), the
+// this document (T5: the "@include:viewer.body" marker + window.FTViewer), the
 // review page runs in an <iframe> inside #hViewerHost. Everything that
 // touches that frame lives in this file, behind hLegacyViewer (the same
 // surface as FTViewer, docs/ui-rebuild-contract.md §3), and is inert once
