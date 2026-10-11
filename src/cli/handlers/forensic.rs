@@ -84,7 +84,9 @@ pub fn import_e01(case_dir: &Path, e01_file: &Path, options: E01Options) -> Resu
             return Err(err);
         }
     };
-    case_db::register_evidence_source(
+    // FrameTrace digested the exported raw image itself, so its hash is
+    // recorded as computed, not operator-supplied.
+    let raw_source = case_db::register_evidence_source_with_origin(
         case_dir,
         &case_db::EvidenceSourceInput {
             kind: "raw-image".to_string(),
@@ -96,7 +98,12 @@ pub fn import_e01(case_dir: &Path, e01_file: &Path, options: E01Options) -> Resu
             notes: Some(format!("Exported from source {}", source.source_id)),
             metadata_json: None,
         },
-    )?;
+        case_db::HashOrigin::Computed,
+    )
+    .inspect_err(|err| {
+        let _ = case_db::fail_job(case_dir, &job.job_id, err);
+    })?;
+    super::case::print_source_changes(case_dir, &raw_source);
     case_db::complete_job(case_dir, &job.job_id, 1, "import-e01 completed")?;
     println!("E01 imported");
     println!("source registered: {} ({})", source.source_id, source.kind);

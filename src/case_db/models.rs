@@ -50,10 +50,21 @@ pub struct EvidenceSourceInput {
     pub metadata_json: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct EvidenceSourceRow {
     pub source_id: String,
     pub kind: String,
     pub path: String,
+    /// Stored hash (lowercase hex) after this registration, if any.
+    pub evidence_hash: Option<String>,
+    pub hash_algorithm: Option<String>,
+    /// `computed` / `operator-supplied`; `None` for legacy rows.
+    pub hash_origin: Option<String>,
+    /// True when this call created the source.
+    pub newly_registered: bool,
+    /// Custody fields this call changed (each one chained into
+    /// `evidence/logs/evidence-source-log.jsonl`).
+    pub changes: Vec<crate::case_db::EvidenceSourceChange>,
 }
 
 pub struct JobRecord {

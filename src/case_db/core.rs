@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) const SCHEMA_VERSION: &str = "5";
+pub(crate) const SCHEMA_VERSION: &str = "6";
 
 pub fn case_db_path(case_dir: &Path) -> PathBuf {
     case_dir.join("db/case.db")
@@ -178,6 +178,7 @@ fn init_schema_locked(conn: &Connection) -> Result<(), String> {
             apply_schema_v3_tables(conn)?;
             apply_schema_v4_columns(conn)?;
             apply_schema_v5_columns(conn)?;
+            apply_schema_v6_history(conn)?;
             conn.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
                 [SCHEMA_VERSION],
@@ -189,22 +190,30 @@ fn init_schema_locked(conn: &Connection) -> Result<(), String> {
             migrate_v2_to_v3(conn)?;
             migrate_v3_to_v4(conn)?;
             migrate_v4_to_v5(conn)?;
+            migrate_v5_to_v6(conn)?;
         }
         Some("2") => {
             migrate_v2_to_v3(conn)?;
             migrate_v3_to_v4(conn)?;
             migrate_v4_to_v5(conn)?;
+            migrate_v5_to_v6(conn)?;
         }
         Some("3") => {
             migrate_v3_to_v4(conn)?;
             migrate_v4_to_v5(conn)?;
+            migrate_v5_to_v6(conn)?;
         }
-        Some("4") => migrate_v4_to_v5(conn)?,
+        Some("4") => {
+            migrate_v4_to_v5(conn)?;
+            migrate_v5_to_v6(conn)?;
+        }
+        Some("5") => migrate_v5_to_v6(conn)?,
         Some(SCHEMA_VERSION) => {
             apply_schema_v2_indexes(conn)?;
             apply_schema_v3_tables(conn)?;
             apply_schema_v4_columns(conn)?;
             apply_schema_v5_columns(conn)?;
+            apply_schema_v6_history(conn)?;
         }
         Some(version) => {
             return Err(format!("unsupported SQLite schema version: {version}"));
@@ -302,6 +311,102 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<(), String> {
         [SCHEMA_VERSION],
     )
     .map_err(|err| format!("failed to update SQLite schema version: {err}"))?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(conn: &Connection) -> Result<(), String> {
+    backup_database(conn, "5", "6")?;
+    // Older chains (e.g. a v4 file that never had review_marks) reach v6
+    // with every earlier additive step re-applied; all are idempotent.
+    apply_schema_v3_tables(conn)?;
+    apply_schema_v4_columns(conn)?;
+    apply_schema_v5_columns(conn)?;
+    apply_schema_v6_history(conn)?;
+    // Marks that existed before history was kept get one `baseline` row so
+    // the history states where its knowledge starts instead of implying
+    // the mark was created at its first post-migration edit.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system time before UNIX epoch: {err}"))?
+        .as_secs();
+    conn.execute(
+        r#"
+        INSERT INTO review_mark_history (
+            record_id, action, changed_unix, actor,
+            new_status, new_marked_unix, new_record_path, new_examiner, new_note,
+            new_range_in, new_range_out, detail
+        )
+        SELECT record_id, 'baseline', ?1, NULL,
+            status, marked_unix, record_path, examiner, note, range_in, range_out,
+            'state at schema v6 migration; no earlier history was recorded'
+        FROM review_marks
+        "#,
+        [i64::try_from(now).unwrap_or(i64::MAX)],
+    )
+    .map_err(|err| format!("failed to record v6 review mark baseline: {err}"))?;
+    conn.execute(
+        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+        [SCHEMA_VERSION],
+    )
+    .map_err(|err| format!("failed to update SQLite schema version: {err}"))?;
+    Ok(())
+}
+
+/// v6: append-only review mark history (FOR-07) and hash provenance for
+/// evidence sources (FOR-04).
+fn apply_schema_v6_history(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS review_mark_history (
+            history_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            changed_unix INTEGER NOT NULL,
+            actor TEXT,
+            old_status TEXT,
+            new_status TEXT,
+            old_marked_unix INTEGER,
+            new_marked_unix INTEGER,
+            old_record_path TEXT,
+            new_record_path TEXT,
+            old_examiner TEXT,
+            new_examiner TEXT,
+            old_note TEXT,
+            new_note TEXT,
+            old_range_in REAL,
+            new_range_in REAL,
+            old_range_out REAL,
+            new_range_out REAL,
+            old_tags_json TEXT,
+            new_tags_json TEXT,
+            detail TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS review_mark_history_record_idx
+            ON review_mark_history (record_id, history_pk);
+
+        CREATE TRIGGER IF NOT EXISTS review_mark_history_no_update
+            BEFORE UPDATE ON review_mark_history
+        BEGIN
+            SELECT RAISE(ABORT, 'review_mark_history is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS review_mark_history_no_delete
+            BEFORE DELETE ON review_mark_history
+        BEGIN
+            SELECT RAISE(ABORT, 'review_mark_history is append-only');
+        END;
+        "#,
+    )
+    .map_err(|err| format!("failed to apply SQLite v6 review mark history: {err}"))?;
+    for column in ["evidence_hash_algorithm", "evidence_hash_origin"] {
+        if !table_has_column(conn, "evidence_sources", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE evidence_sources ADD COLUMN {column} TEXT"
+            ))
+            .map_err(|err| format!("failed to apply SQLite v6 {column} column: {err}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -666,7 +771,7 @@ mod tests {
 
         let conn = open_case_db(&case_dir).unwrap();
         init_schema(&conn).unwrap();
-        assert_eq!(read_schema_version(&conn).as_deref(), Some("5"));
+        assert_eq!(read_schema_version(&conn).as_deref(), Some(SCHEMA_VERSION));
         assert!(table_has_column(&conn, "review_marks", "range_in").unwrap());
         assert!(table_has_column(&conn, "review_marks", "range_out").unwrap());
         let note: String = conn

@@ -2,17 +2,21 @@ pub mod core;
 pub mod evidence;
 pub mod helpers;
 pub mod jobs;
+pub mod marks;
 pub mod metrics;
 pub mod models;
 pub mod scan;
+pub mod sources;
 
 pub use core::*;
 pub use evidence::*;
 pub(crate) use helpers::*;
 pub use jobs::*;
+pub use marks::*;
 pub use metrics::*;
 pub use models::*;
 pub use scan::*;
+pub use sources::*;
 
 #[cfg(test)]
 mod tests {

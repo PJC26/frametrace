@@ -166,6 +166,10 @@ pub enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Verify a package written by package-case: manifest.sha256 entries vs
+    /// files, package-manifest.json, audit chains, database snapshot and
+    /// sign-off consistency; reports what is verified vs not verified
+    VerifyPackage { package_dir: PathBuf },
     /// Export an indexed video or selected range as a client-deliverable MP4/AVI
     ExportVideo {
         case_dir: PathBuf,
@@ -679,6 +683,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             let options = PackageOptions { output_dir: output };
             package_case(&case_dir, options)
         }
+        Commands::VerifyPackage { package_dir } => verify_package(&package_dir),
         Commands::ExportVideo {
             case_dir,
             selector,

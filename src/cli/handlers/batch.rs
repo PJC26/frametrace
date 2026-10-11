@@ -588,11 +588,14 @@ pub fn import_marks_quiet(case_dir: &Path, marks_path: &Path) -> Result<usize, S
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let stored = case_db::patch_review_annotations(
+    // The file-level examiner is the only "who" deletions and tag edits
+    // carry into review_mark_history (FOR-07).
+    let stored = case_db::patch_review_annotations_by(
         case_dir,
         &rows,
         &marks_file.tags,
         &marks_file.deleted_ids,
+        marks_file.examiner.as_deref(),
     )?;
     Ok(stored)
 }
