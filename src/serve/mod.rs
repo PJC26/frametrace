@@ -32,6 +32,8 @@ mod tests_hardening;
 #[cfg(test)]
 mod tests_http;
 #[cfg(test)]
+mod tests_jobs;
+#[cfg(test)]
 mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
@@ -369,6 +371,10 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/open-folder") => json(api_open_folder(request, state)),
         ("GET", path) if is_viewer_page_path(path) => viewer_page(),
         ("POST", "/api/verify-sources") => json(api_verify_sources(state)),
+        ("GET", "/api/case-info") => json(api_case_info(request, state)),
+        ("POST", "/api/preflight") => json(api_preflight(request)),
+        ("GET", "/api/export-clip-status") => json(api_export_clip_status(request, state)),
+        ("POST", "/api/export-clip-cancel") => json(api_export_clip_cancel(request, state)),
         _ => plain(404, b"not found".to_vec()),
     }
 }

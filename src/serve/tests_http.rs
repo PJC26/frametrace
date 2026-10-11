@@ -71,6 +71,10 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/carve"),
     ("POST", "/api/open-folder"),
     ("POST", "/api/verify-sources"),
+    ("GET", "/api/case-info"),
+    ("POST", "/api/preflight"),
+    ("GET", "/api/export-clip-status"),
+    ("POST", "/api/export-clip-cancel"),
 ];
 
 #[test]

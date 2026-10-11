@@ -135,6 +135,51 @@ pub(crate) struct JobState {
     /// Bumped (under `MARKS_GATE`) whenever marks reach the case DB while
     /// phase 2 runs; make-review re-runs until it has seen the latest.
     pub(crate) marks_epoch: u64,
+    /// Current or last background case job (UX-06: recover-deleted /
+    /// carve). Kept after it ends so /api/status can report `done` /
+    /// `failed` / `cancelled` to a client that polls after the fact.
+    pub(crate) case_job: Option<CaseJob>,
+    /// Clip-export jobs (UX-09), running and recently finished. They do
+    /// NOT hold `busy`, so marks autosave keeps working during an export.
+    pub(crate) clip_jobs: Vec<ClipJob>,
+    /// Monotonic id source for `clip_jobs`.
+    pub(crate) clip_seq: u64,
+}
+
+/// A background case job (UX-06) run under the busy lease.
+#[derive(Clone, Debug)]
+pub(crate) struct CaseJob {
+    /// Stable machine key: `recover-deleted` | `carve`.
+    pub(crate) kind: &'static str,
+    pub(crate) started_unix: u64,
+    pub(crate) finished_unix: Option<u64>,
+    /// 1-based stage within `stages` (main step, then make-review).
+    pub(crate) stage: usize,
+    pub(crate) stages: usize,
+    pub(crate) stage_label: &'static str,
+    /// running | done | failed | cancelled.
+    pub(crate) state: &'static str,
+    pub(crate) error: Option<String>,
+}
+
+/// One clip export (UX-09). Identical requests share one job (`key`).
+#[derive(Clone, Debug)]
+pub(crate) struct ClipJob {
+    pub(crate) id: String,
+    /// Dedupe key: case + selector + range + burn-in options.
+    pub(crate) key: String,
+    pub(crate) record_id: String,
+    pub(crate) output: PathBuf,
+    /// Output path relative to the case directory (what the UI shows).
+    pub(crate) rel_path: String,
+    pub(crate) started_unix: u64,
+    pub(crate) finished_unix: Option<u64>,
+    /// running | done | failed | cancelled.
+    pub(crate) state: &'static str,
+    pub(crate) sha256: Option<String>,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) error: Option<String>,
+    pub(crate) cancel_requested: bool,
 }
 
 /// One phase-2 enrichment step (UX-02).
@@ -183,6 +228,9 @@ impl JobState {
             index_generation: 0,
             index_fingerprint: None,
             marks_epoch: 0,
+            case_job: None,
+            clip_jobs: Vec::new(),
+            clip_seq: 0,
         }
     }
 }
@@ -213,6 +261,42 @@ pub(crate) fn try_acquire_busy(state: &SharedState) -> Result<BusyGuard<'_>, Str
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
         state_lock(self.state).busy = false;
+    }
+}
+
+/// Owned busy lease for a job that outlives its HTTP handler (UX-06): the
+/// worker thread holds it and releases `busy` in the same lock as its
+/// final state update, so no window exists where another job could take
+/// `busy` and then have it cleared under it. Dropping an unreleased lease
+/// (a panicking worker) still frees `busy`.
+pub(crate) struct BusyLease {
+    state: Option<SharedState>,
+}
+
+/// Atomically takes `busy` for a background job, like [`try_acquire_busy`].
+pub(crate) fn try_lease_busy(state: &SharedState) -> Result<BusyLease, String> {
+    std::mem::forget(try_acquire_busy(state)?);
+    Ok(BusyLease {
+        state: Some(Arc::clone(state)),
+    })
+}
+
+impl BusyLease {
+    /// Clears `busy` after applying `finish` under the same state lock.
+    pub(crate) fn release_with(mut self, finish: impl FnOnce(&mut JobState)) {
+        if let Some(state) = self.state.take() {
+            let mut guard = state_lock(&state);
+            finish(&mut guard);
+            guard.busy = false;
+        }
+    }
+}
+
+impl Drop for BusyLease {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            state_lock(&state).busy = false;
+        }
     }
 }
 

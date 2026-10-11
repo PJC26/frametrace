@@ -64,10 +64,19 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         guard.error = None;
         guard.package_dir = None;
         guard.case_dir = Some(case_dir.clone());
-        guard.media_roots = match input_kind {
-            InputKind::Folder => vec![case_dir.clone(), source_path.clone()],
-            InputKind::E01 | InputKind::E01Direct => vec![case_dir.clone()],
-        };
+        guard.case_job = None;
+        guard.media_roots = start_media_roots(input_kind, &case_dir, &source_path);
+        // SEC-06: /media serves anything under a media root. A folder
+        // source at a volume root (E:\ of a dashcam card) is legitimate,
+        // but then the whole volume is reviewable — say so, never silently.
+        if input_kind == InputKind::Folder && source_is_volume_root(&source_path) {
+            let message = format!(
+                "소스가 볼륨 루트입니다 ({}) — 이 볼륨 전체가 검토 범위(/media)로 열립니다. 증거 폴더만 지정하는 것을 권장합니다.",
+                source_path.display()
+            );
+            guard.logs.push(format!("경고: {message}"));
+            guard.warnings.push((1, message));
+        }
     }
     save_session(
         &case_dir,
@@ -84,6 +93,25 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         return "{\"ok\":false,\"error\":\"작업 스레드 시작 실패\"}".to_string();
     }
     "{\"ok\":true}".to_string()
+}
+
+/// Media roots a new analysis approves for `/media`: the case plus, for
+/// folder input, exactly the registered source — nothing above it.
+pub(crate) fn start_media_roots(
+    kind: InputKind,
+    case_dir: &Path,
+    source_path: &Path,
+) -> Vec<PathBuf> {
+    match kind {
+        InputKind::Folder => vec![case_dir.to_path_buf(), source_path.to_path_buf()],
+        InputKind::E01 | InputKind::E01Direct => vec![case_dir.to_path_buf()],
+    }
+}
+
+/// True when `path` is a filesystem/volume root (`/`, `E:\`, `\\srv\share\`).
+pub(crate) fn source_is_volume_root(path: &Path) -> bool {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    resolved.parent().is_none()
 }
 
 pub(crate) fn default_case_dir() -> PathBuf {
@@ -709,6 +737,17 @@ pub(crate) fn fail(state: &SharedState, message: &str) {
 pub(crate) const STEP_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 
 pub(crate) fn run_step(exe: &Path, args: &[String], state: &SharedState) -> Result<String, String> {
+    run_step_cancellable(exe, args, &|| state_lock(state).cancel_requested)
+}
+
+/// [`run_step`] with an explicit cancel predicate, for jobs that do not use
+/// the global cancel flag (clip exports cancel per job, UX-09). A `true`
+/// from `cancelled` kills the whole process tree.
+pub(crate) fn run_step_cancellable(
+    exe: &Path,
+    args: &[String],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String, String> {
     // Spawned as a process tree (own group / Job object) so cancel reaches
     // the ffmpeg/ffprobe grandchildren, not just the direct child.
     let mut tracked = super::proc::spawn_tracked(
@@ -729,7 +768,7 @@ pub(crate) fn run_step(exe: &Path, args: &[String], state: &SharedState) -> Resu
     let stderr_reader = thread::spawn(move || drain_capped(&mut stderr_pipe));
     let mut killed = false;
     let status = loop {
-        if !killed && state_lock(state).cancel_requested {
+        if !killed && cancelled() {
             killed = true;
             tracked.kill_tree();
         }
@@ -743,7 +782,7 @@ pub(crate) fn run_step(exe: &Path, args: &[String], state: &SharedState) -> Resu
     // return immediately with whatever tail was retained.
     let stdout_tail = stdout_reader.join().unwrap_or_default();
     let stderr_tail = stderr_reader.join().unwrap_or_default();
-    if state_lock(state).cancel_requested {
+    if killed || cancelled() {
         return Err("사용자가 분석을 중단했습니다.".to_string());
     }
     let mut text = String::from_utf8_lossy(&stdout_tail).to_string();
@@ -883,6 +922,19 @@ fn drain_pending_marks(state: &SharedState, case_dir: &Path) -> Result<usize, St
     Ok(applied)
 }
 
+/// True while a job that holds `busy` accepts marks through the durable
+/// queue instead of refusing them: phase-2 enrichment (UX-02) and a
+/// background recover/carve job (UX-06), whose make-review re-runs until
+/// it has seen every queued mark.
+pub(crate) fn marks_must_queue(guard: &JobState) -> bool {
+    guard.busy
+        && (guard.phase == "review-partial"
+            || guard
+                .case_job
+                .as_ref()
+                .is_some_and(|job| job.state == "running"))
+}
+
 /// Marks import while phase-2 enrichment is running (`review-partial` +
 /// busy). Validate/anomaly steps only take short case-DB transactions, so
 /// the marks are applied at once (SQLite's busy timeout covers the
@@ -898,13 +950,10 @@ fn import_marks_during_enrichment(
     // Re-checked under the gate: enrichment may have just finished.
     let (partial, step) = {
         let guard = state_lock(state);
-        (
-            guard.busy && guard.phase == "review-partial",
-            guard.enrichment.map(|e| e.step),
-        )
+        (marks_must_queue(&guard), guard.enrichment.map(|e| e.step))
     };
     if !partial {
-        return api_err("보강 작업이 방금 끝났습니다 — 잠시 후 다시 저장하십시오.");
+        return api_err("진행 중이던 작업이 방금 끝났습니다 — 잠시 후 다시 저장하십시오.");
     }
     let direct =
         matches!(step, Some("validate") | Some("anomalies")) && pending_marks_count(case_dir) == 0;
@@ -921,9 +970,9 @@ fn import_marks_during_enrichment(
         if let Err(err) = crate::util::write_text_atomic(&path, marks_body) {
             return api_err(&format!("대기열 저장 실패: {err}"));
         }
-        state_lock(state)
-            .logs
-            .push("보강 중이라 판독 마크를 대기열에 저장했습니다 (해당 단계 직후 반영).".into());
+        state_lock(state).logs.push(
+            "작업 진행 중이라 판독 마크를 대기열에 저장했습니다 (해당 단계 직후 반영).".into(),
+        );
         return serde_json::json!({
             "ok": true,
             "deferred": true,
@@ -970,10 +1019,7 @@ pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String
     if let Err(err) = preflight {
         return serde_json::json!({"ok": false, "error": err}).to_string();
     }
-    let enriching = {
-        let guard = state_lock(state);
-        guard.busy && guard.phase == "review-partial"
-    };
+    let enriching = marks_must_queue(&state_lock(state));
     if enriching {
         return import_marks_during_enrichment(state, &case_dir, &marks_body);
     }
@@ -1086,6 +1132,11 @@ pub(crate) fn api_finalize(request: &Request, state: &SharedState) -> String {
         Ok(guard) => guard,
         Err(err) => return api_err(&err),
     };
+    // UX-09: clip exports run without `busy`; sealing while one is still
+    // writing into artifacts/clips would package a torn or missing clip.
+    if running_clip_job_count(state) > 0 {
+        return api_err("최종화 차단: 클립 내보내기가 진행 중입니다 — 끝난 뒤 다시 시도하십시오.");
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
@@ -1273,116 +1324,81 @@ pub(crate) fn api_verify_sources(state: &SharedState) -> String {
 /// `POST /api/recover-deleted`: run recover-batch --deleted-videos on the
 /// image from the latest filesystem inspection, then regenerate the
 /// review bundle so the recovered items appear in the viewer.
+///
+/// UX-06: runs as a background job. The response is immediate —
+/// `{ok:true, job:{kind, started_unix}}` — and progress, cancel and the
+/// final outcome travel through `/api/status` (`job_kind`, `job`).
 pub(crate) fn api_recover_deleted(state: &SharedState) -> String {
+    match std::env::current_exe() {
+        Ok(exe) => recover_deleted_with_exe(state, &exe),
+        Err(err) => api_err(&err.to_string()),
+    }
+}
+
+/// [`api_recover_deleted`] parameterised on the CLI executable (tests run
+/// a fake step binary).
+pub(crate) fn recover_deleted_with_exe(state: &SharedState, exe: &Path) -> String {
     let case_dir = state_lock(state).case_dir.clone();
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
-    };
-    let _busy = match try_acquire_busy(state) {
-        Ok(guard) => guard,
-        Err(err) => return api_err(&err),
     };
     let Some((image_path, partition_offset)) = newest_tsk_inspection(&case_dir) else {
         return "{\"ok\":false,\"error\":\"파일시스템 조사 결과가 없습니다 — 먼저 E01/이미지 분석을 실행하십시오.\"}"
             .to_string();
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            return format!(
-                "{{\"ok\":false,\"error\":{}}}",
-                json_string(&err.to_string())
-            );
-        }
-    };
-    {
-        let mut guard = state_lock(state);
-        guard.phase = "finalizing";
-        guard.busy = true;
-        guard.error = None;
-        guard.logs.push(format!(
-            "삭제 영상 후보 복구 중… ({} @ 오프셋 {partition_offset})",
-            image_path.display()
-        ));
-    }
     let case_text = case_dir.to_string_lossy().to_string();
-    let recover = run_step(
-        &exe,
-        &[
-            "recover-batch".into(),
-            case_text.clone(),
-            image_path.to_string_lossy().to_string(),
-            "--deleted-videos".into(),
-            "--partition-offset".into(),
-            partition_offset.to_string(),
-        ],
+    let args = vec![
+        "recover-batch".into(),
+        case_text,
+        image_path.to_string_lossy().to_string(),
+        "--deleted-videos".into(),
+        "--partition-offset".into(),
+        partition_offset.to_string(),
+    ];
+    start_case_job(
         state,
-    );
-    let review = if recover.is_ok() {
-        run_step(&exe, &["make-review".into(), case_text.clone()], state)
-    } else {
-        recover.clone()
-    };
-    let mut guard = state_lock(state);
-    match (recover, review) {
-        (Ok(recover_out), Ok(_)) => {
-            guard.phase = "review-ready";
-            guard.busy = false;
-            guard.logs.push(recover_out.clone());
-            guard
-                .logs
-                .push("복구 완료 — 뷰어를 새로 열면 복구된 항목이 보입니다.".into());
-            "{\"ok\":true}".to_string()
-        }
-        (recover, review) => {
-            let error = recover.err().or_else(|| review.err()).unwrap_or_default();
-            guard.phase = "review-ready";
-            guard.busy = false;
-            guard.error = Some(error.clone());
-            serde_json::json!({"ok": false, "error": error}).to_string()
-        }
-    }
+        exe,
+        CaseJobSpec {
+            kind: "recover-deleted",
+            stage_label: "삭제 영상 후보 복구",
+            case_dir,
+            main_args: args,
+            start_log: format!(
+                "삭제 영상 후보 복구 중… ({} @ 오프셋 {partition_offset})",
+                image_path.display()
+            ),
+            done_log: "복구 완료 — 뷰어를 새로 열면 복구된 항목이 보입니다.",
+        },
+    )
 }
 
 /// `POST /api/carve`: run bounded signature carving over the case's
 /// exported raw image (evidence/images/evidence.raw), then regenerate the
 /// review bundle so carved candidates show up in the viewer. Requires the
 /// full E01 pipeline (direct triage never exports a raw image).
+///
+/// UX-06: a background job with the same contract as recover-deleted.
 pub(crate) fn api_carve(request: &Request, state: &SharedState) -> String {
+    match std::env::current_exe() {
+        Ok(exe) => carve_with_exe(request, state, &exe),
+        Err(err) => api_err(&err.to_string()),
+    }
+}
+
+/// [`api_carve`] parameterised on the CLI executable.
+pub(crate) fn carve_with_exe(request: &Request, state: &SharedState, exe: &Path) -> String {
     let case_dir = state_lock(state).case_dir.clone();
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
-    };
-    let _busy = match try_acquire_busy(state) {
-        Ok(guard) => guard,
-        Err(err) => return api_err(&err),
     };
     let raw = case_dir.join("evidence/images/evidence.raw");
     if !raw.is_file() {
         return "{\"ok\":false,\"error\":\"카빙할 raw 이미지가 없습니다 — E01을 '빠른 검토' 없이 분석(전체 export)하면 사용할 수 있습니다.\"}".to_string();
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            return format!(
-                "{{\"ok\":false,\"error\":{}}}",
-                json_string(&err.to_string())
-            );
-        }
-    };
-    {
-        let mut guard = state_lock(state);
-        guard.phase = "finalizing";
-        guard.busy = true;
-        guard.error = None;
-        guard
-            .logs
-            .push(format!("시그니처 카빙 실행 중… ({})", raw.display()));
-    }
     let case_text = case_dir.to_string_lossy().to_string();
     let mut args = vec![
         "carve-file".into(),
-        case_text.clone(),
+        case_text,
         raw.to_string_lossy().to_string(),
     ];
     if query_value(&request.query, "reassemble").as_deref() == Some("1") {
@@ -1401,29 +1417,229 @@ pub(crate) fn api_carve(request: &Request, state: &SharedState) -> String {
             args.push(value);
         }
     }
-    let carve = run_step(&exe, &args, state);
-    let review = if carve.is_ok() {
-        run_step(&exe, &["make-review".into(), case_text.clone()], state)
-    } else {
-        carve.clone()
+    start_case_job(
+        state,
+        exe,
+        CaseJobSpec {
+            kind: "carve",
+            stage_label: "시그니처 카빙",
+            case_dir,
+            main_args: args,
+            start_log: format!("시그니처 카빙 실행 중… ({})", raw.display()),
+            done_log: "카빙 완료 — 뷰어를 새로 열면 카빙 후보가 보입니다.",
+        },
+    )
+}
+
+/// What a background case job runs: one main CLI step, then make-review.
+pub(crate) struct CaseJobSpec {
+    pub(crate) kind: &'static str,
+    pub(crate) stage_label: &'static str,
+    pub(crate) case_dir: PathBuf,
+    pub(crate) main_args: Vec<String>,
+    pub(crate) start_log: String,
+    pub(crate) done_log: &'static str,
+}
+
+/// Takes the busy lease, publishes the job in [`JobState::case_job`] and
+/// runs it on a worker thread. Returns the immediate API response.
+pub(crate) fn start_case_job(state: &SharedState, exe: &Path, spec: CaseJobSpec) -> String {
+    let lease = match try_lease_busy(state) {
+        Ok(lease) => lease,
+        Err(err) => return api_err(&err),
     };
-    let mut guard = state_lock(state);
-    match (carve, review) {
-        (Ok(carve_out), Ok(_)) => {
-            guard.phase = "review-ready";
-            guard.busy = false;
-            guard.logs.push(carve_out.clone());
-            guard
-                .logs
-                .push("카빙 완료 — 뷰어를 새로 열면 카빙 후보가 보입니다.".into());
-            "{\"ok\":true}".to_string()
-        }
-        (carve, review) => {
-            let error = carve.err().or_else(|| review.err()).unwrap_or_default();
-            guard.phase = "review-ready";
-            guard.busy = false;
-            guard.error = Some(error.clone());
-            serde_json::json!({"ok": false, "error": error}).to_string()
-        }
+    // A clip export writes into the case while make-review/recovery would
+    // rewrite it; recover/carve wait for exports like finalize does.
+    if running_clip_job_count(state) > 0 {
+        return api_err("클립 내보내기가 진행 중입니다 — 내보내기가 끝난 뒤 다시 시도하십시오.");
     }
+    let started_unix = crate::util::now_unix().unwrap_or(0);
+    let prior_phase = {
+        let mut guard = state_lock(state);
+        let prior = guard.phase;
+        guard.phase = "finalizing";
+        guard.error = None;
+        guard.case_job = Some(CaseJob {
+            kind: spec.kind,
+            started_unix,
+            finished_unix: None,
+            stage: 1,
+            stages: 2,
+            stage_label: spec.stage_label,
+            state: "running",
+            error: None,
+        });
+        guard.logs.push(spec.start_log.clone());
+        prior
+    };
+    let kind = spec.kind;
+    let worker_state = Arc::clone(state);
+    let exe = exe.to_path_buf();
+    let spawned = thread::Builder::new()
+        .name(format!("ft-{kind}"))
+        .spawn(move || run_case_job(&worker_state, lease, &exe, spec, prior_phase));
+    if spawned.is_err() {
+        // The closure (and with it the lease) was dropped: busy is free.
+        let mut guard = state_lock(state);
+        guard.phase = prior_phase;
+        guard.case_job = None;
+        return api_err("작업 스레드 시작 실패");
+    }
+    serde_json::json!({
+        "ok": true,
+        "job": {"kind": kind, "started_unix": started_unix},
+    })
+    .to_string()
+}
+
+/// How a case job ended.
+enum CaseJobEnd {
+    Done,
+    Cancelled,
+    Failed(String),
+}
+
+/// Worker body: main step → make-review (re-run until it has seen every
+/// mark queued meanwhile, like phase 2) → final state, released together
+/// with `busy` under the marks gate.
+fn run_case_job(
+    state: &SharedState,
+    lease: BusyLease,
+    exe: &Path,
+    spec: CaseJobSpec,
+    prior_phase: &'static str,
+) {
+    let cancelled = || state_lock(state).cancel_requested;
+    let end_with = |lease: BusyLease, end: CaseJobEnd| {
+        let _gate = marks_gate();
+        finish_case_job(state, lease, &spec, end, prior_phase);
+    };
+    match run_step(exe, &spec.main_args, state) {
+        Ok(output) => state_lock(state).logs.push(output),
+        Err(_) if cancelled() => return end_with(lease, CaseJobEnd::Cancelled),
+        Err(err) => return end_with(lease, CaseJobEnd::Failed(err)),
+    }
+    if cancelled() {
+        return end_with(lease, CaseJobEnd::Cancelled);
+    }
+    let mut seen_epoch = {
+        let _gate = marks_gate();
+        let drained = drain_pending_marks(state, &spec.case_dir);
+        let mut guard = state_lock(state);
+        if let Some(job) = guard.case_job.as_mut() {
+            job.stage = 2;
+            job.stage_label = "리뷰 생성";
+        }
+        if let Err(err) = drained {
+            drop(guard);
+            finish_case_job(state, lease, &spec, CaseJobEnd::Failed(err), prior_phase);
+            return;
+        }
+        guard.marks_epoch
+    };
+    let case_text = spec.case_dir.to_string_lossy().to_string();
+    for _ in 0..8 {
+        match run_step(exe, &["make-review".into(), case_text.clone()], state) {
+            Ok(output) => state_lock(state).logs.push(output),
+            Err(_) if cancelled() => return end_with(lease, CaseJobEnd::Cancelled),
+            Err(err) => return end_with(lease, CaseJobEnd::Failed(err)),
+        }
+        let _gate = marks_gate();
+        if let Err(err) = drain_pending_marks(state, &spec.case_dir) {
+            finish_case_job(state, lease, &spec, CaseJobEnd::Failed(err), prior_phase);
+            return;
+        }
+        let epoch = state_lock(state).marks_epoch;
+        if epoch == seen_epoch {
+            finish_case_job(state, lease, &spec, CaseJobEnd::Done, prior_phase);
+            return;
+        }
+        seen_epoch = epoch;
+        state_lock(state)
+            .logs
+            .push("리뷰 생성 중 저장된 판독 마크를 포함하도록 리뷰를 다시 생성합니다.".into());
+    }
+    end_with(
+        lease,
+        CaseJobEnd::Failed(
+            "리뷰 생성 중 판독 마크가 계속 바뀌어 안정화하지 못했습니다 — 다시 시도하십시오."
+                .into(),
+        ),
+    );
+}
+
+/// Publishes the outcome and frees `busy` atomically. The caller holds the
+/// marks gate; queued marks are applied first so none is stranded behind
+/// a cancelled/failed job (a failure to apply them is a visible warning
+/// and they stay queued — the finalize checklist then blocks on them).
+fn finish_case_job(
+    state: &SharedState,
+    lease: BusyLease,
+    spec: &CaseJobSpec,
+    end: CaseJobEnd,
+    prior_phase: &'static str,
+) {
+    let drain_failure = match end {
+        CaseJobEnd::Done => None,
+        _ => drain_pending_marks(state, &spec.case_dir).err(),
+    };
+    let finished = crate::util::now_unix().ok();
+    lease.release_with(|guard| {
+        if let Some(err) = drain_failure {
+            guard.logs.push(format!("오류: {err}"));
+            guard.warnings.push((4, err));
+        }
+        // make-review ran only on success; otherwise the phase the case
+        // had before stays (an index-only case is not "review-ready").
+        guard.phase = match (&end, prior_phase) {
+            (CaseJobEnd::Done, _) => "review-ready",
+            (_, "review-partial") => "review-partial",
+            (_, "idle") => "idle",
+            _ => "review-ready",
+        };
+        guard.byte_progress = None;
+        let (job_state, error) = match &end {
+            CaseJobEnd::Done => {
+                guard.logs.push(spec.done_log.to_string());
+                ("done", None)
+            }
+            CaseJobEnd::Cancelled => {
+                let message = format!(
+                    "{} 작업을 중단했습니다 — 결과가 리뷰에 반영되지 않았을 수 있습니다.",
+                    spec.stage_label
+                );
+                guard.logs.push(format!("경고: {message}"));
+                ("cancelled", Some(message))
+            }
+            CaseJobEnd::Failed(err) => {
+                guard.logs.push(format!("오류: {err}"));
+                guard.error = Some(err.clone());
+                ("failed", Some(err.clone()))
+            }
+        };
+        if let Some(job) = guard.case_job.as_mut() {
+            job.state = job_state;
+            job.error = error;
+            job.finished_unix = finished;
+        }
+    });
+}
+
+/// `/api/status` view of the current/last case job (UX-06).
+pub(crate) fn case_job_json(job: &CaseJob) -> serde_json::Value {
+    let end = job
+        .finished_unix
+        .or_else(|| crate::util::now_unix().ok())
+        .unwrap_or(job.started_unix);
+    serde_json::json!({
+        "kind": job.kind,
+        "state": job.state,
+        "started_unix": job.started_unix,
+        "finished_unix": job.finished_unix,
+        "elapsed_secs": end.saturating_sub(job.started_unix),
+        "stage": job.stage,
+        "stages": job.stages,
+        "stage_label": job.stage_label,
+        "error": job.error,
+    })
 }
