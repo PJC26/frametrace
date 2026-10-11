@@ -101,8 +101,9 @@ function jobsSheetHtml() {
 function mountJobsSheet() {
   const host = document.getElementById(JOBS_SHEET_ID);
   if (!host) return false;
-  if (!host.getAttribute("role")) host.setAttribute("role", "complementary");
-  if (!host.getAttribute("aria-labelledby")) host.setAttribute("aria-labelledby", "hJobsTitle");
+  const has = k => typeof host.getAttribute === "function" && host.getAttribute(k);
+  if (!has("role")) host.setAttribute("role", "complementary");
+  if (!has("aria-labelledby")) host.setAttribute("aria-labelledby", "hJobsTitle");
   host.setAttribute("data-region", "hJobsSheet");
   host.setAttribute("data-keys", "off");
   host.innerHTML = jobsSheetHtml();
