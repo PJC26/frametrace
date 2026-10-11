@@ -24,7 +24,7 @@ use candidates::*;
 use index_merge::*;
 pub(crate) use json_line::tsv_escape;
 use json_line::*;
-pub use json_line::{json_record_lines, set_json_field};
+pub use json_line::{json_record_lines, set_json_field, try_set_json_field};
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mov", "m4v", "avi", "mkv", "wmv", "asf", "mpg", "mpeg", "mts", "m2ts", "ts", "3gp",

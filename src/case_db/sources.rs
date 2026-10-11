@@ -150,6 +150,7 @@ struct StoredSource {
     hash_algorithm: Option<String>,
     hash_origin: Option<String>,
     notes: Option<String>,
+    metadata_json: Option<String>,
 }
 
 fn read_source(
@@ -159,7 +160,7 @@ fn read_source(
 ) -> Result<Option<StoredSource>, String> {
     tx.query_row(
         &format!(
-            "SELECT source_id, kind, path, write_protect, acquisition_tool, evidence_hash, evidence_hash_algorithm, evidence_hash_origin, notes FROM evidence_sources WHERE {clause}"
+            "SELECT source_id, kind, path, write_protect, acquisition_tool, evidence_hash, evidence_hash_algorithm, evidence_hash_origin, notes, metadata_json FROM evidence_sources WHERE {clause}"
         ),
         args,
         |row| {
@@ -173,6 +174,7 @@ fn read_source(
                 hash_algorithm: row.get(6)?,
                 hash_origin: row.get(7)?,
                 notes: row.get(8)?,
+                metadata_json: row.get(9)?,
             })
         },
     )
@@ -310,6 +312,13 @@ pub fn register_evidence_source_with_origin(
         &input.acquisition_tool,
     );
     note_change("notes", &existing.notes, &notes);
+    // Absent metadata keeps what is stored; supplied metadata replaces it
+    // and is logged like any other custody-field change.
+    note_change(
+        "metadata_json",
+        &existing.metadata_json,
+        &input.metadata_json,
+    );
 
     let mut stored_hash = (
         existing.evidence_hash.clone(),
@@ -391,7 +400,7 @@ pub fn register_evidence_source_with_origin(
             evidence_hash_algorithm = ?6,
             evidence_hash_origin = ?7,
             notes = COALESCE(?8, notes),
-            metadata_json = ?9
+            metadata_json = COALESCE(?9, metadata_json)
         WHERE source_id = ?1
         "#,
         params![
@@ -403,7 +412,7 @@ pub fn register_evidence_source_with_origin(
             stored_hash.1,
             stored_hash.2,
             notes,
-            metadata_json,
+            input.metadata_json.as_deref(),
         ],
     )
     .map_err(|err| format!("failed to update evidence source: {err}"))?;
@@ -491,6 +500,40 @@ mod tests {
             notes(&dir).as_deref(),
             Some("SD card from vehicle 12가3456, sealed bag #7")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn re_registration_without_metadata_keeps_it_and_changes_are_logged() {
+        let dir = case("metakeep");
+        let with_meta = EvidenceSourceInput {
+            metadata_json: Some("{\"camera\":\"dashcam\"}".into()),
+            ..input(None, "folder", "/e/meta", None)
+        };
+        register_evidence_source(&dir, &with_meta).unwrap();
+        let stored = |dir: &Path| -> String {
+            open_case_db(dir)
+                .unwrap()
+                .query_row(
+                    "SELECT metadata_json FROM evidence_sources WHERE path = '/e/meta'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let notes_only = EvidenceSourceInput {
+            notes: Some("sealed bag #7".into()),
+            ..input(None, "folder", "/e/meta", None)
+        };
+        register_evidence_source(&dir, &notes_only).unwrap();
+        assert_eq!(stored(&dir), "{\"camera\":\"dashcam\"}");
+        let replaced = EvidenceSourceInput {
+            metadata_json: Some("{\"camera\":\"bodycam\"}".into()),
+            ..input(None, "folder", "/e/meta", None)
+        };
+        let row = register_evidence_source(&dir, &replaced).unwrap();
+        assert!(row.changes.iter().any(|c| c.field == "metadata_json"));
+        assert_eq!(stored(&dir), "{\"camera\":\"bodycam\"}");
         let _ = fs::remove_dir_all(&dir);
     }
 

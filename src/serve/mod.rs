@@ -267,12 +267,16 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
-                let _ = thread::Builder::new()
+                let worker_count = Arc::clone(&in_flight);
+                let spawned = thread::Builder::new()
                     .name("ft-http".into())
                     .spawn(move || {
                         let _ = handle_connection(stream, state);
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        worker_count.fetch_sub(1, Ordering::SeqCst);
                     });
+                if spawned.is_err() {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));

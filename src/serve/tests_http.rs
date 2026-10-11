@@ -573,3 +573,60 @@ fn thumb_listing_cache_sees_added_and_removed_thumbs() {
     assert_eq!(meta["thumbs"]["c"], "thumbs/c.jpg");
     assert!(meta["thumbs"].get("a").is_none());
 }
+
+#[test]
+fn refused_head_with_unread_body_still_delivers_the_status() {
+    let (addr, _state) = start_server(None, None);
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let five_mib = 5 * 1024 * 1024;
+    stream
+        .write_all(
+            format!(
+                "POST /api/start HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {five_mib}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    // The client keeps sending its body while the server has already refused.
+    let block = vec![b'x'; 64 * 1024];
+    for _ in 0..(five_mib / block.len()) {
+        stream.write_all(&block).expect("body write must not reset");
+    }
+    let mut buffer = Vec::new();
+    let _ = stream.read_to_end(&mut buffer);
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+}
+
+#[test]
+fn head_matches_get_without_a_body_and_media_directories_are_refused() {
+    let case_dir = scratch("head");
+    std::fs::create_dir_all(case_dir.join("review")).unwrap();
+    std::fs::write(case_dir.join("review/a.mp4"), b"video-bytes").unwrap();
+    let (addr, state) = start_server(Some(&case_dir), None);
+    state_lock(&state).media_roots = vec![case_dir.clone()];
+    let head = |target: &str| {
+        raw(
+            addr,
+            &format!("HEAD {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
+        )
+    };
+    let status = head("/api/status");
+    assert!(status_line(&status).contains("200"), "{status}");
+    assert!(status.ends_with("\r\n\r\n"), "{status}");
+    let file = head("/review/a.mp4");
+    assert!(status_line(&file).contains("200"), "{file}");
+    assert!(file.contains("Content-Length: 11"), "{file}");
+    assert!(!file.contains("video-bytes"), "{file}");
+    let dir = raw(
+        addr,
+        &format!(
+            "GET /media?path={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            case_dir.join("review").display()
+        ),
+    );
+    assert!(status_line(&dir).contains("404"), "{dir}");
+}

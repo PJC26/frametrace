@@ -49,6 +49,14 @@ fn parse_range_field(
         )
     };
     let obj = raw.as_object().ok_or_else(|| bad("expected an object"))?;
+    // Only an explicit {in, out} object may touch the stored range: an
+    // object with other keys (e.g. start/end) must not silently clear it.
+    if let Some(unknown) = obj.keys().find(|key| !matches!(key.as_str(), "in" | "out")) {
+        return Err(bad(&format!("unknown key {unknown:?} (expected in/out)")));
+    }
+    if !obj.contains_key("in") && !obj.contains_key("out") {
+        return Err(bad("expected explicit in and/or out keys"));
+    }
     let point = |key: &str| -> Result<Option<f64>, String> {
         match obj.get(key) {
             None | Some(serde_json::Value::Null) => Ok(None),
@@ -449,6 +457,17 @@ mod tests {
             "frametrace-selection-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn range_object_with_unknown_keys_is_rejected_not_cleared() {
+        for range in [r#"{"start":1.5,"end":4}"#, r#"{}"#, r#"{"in":1,"end":4}"#] {
+            let text = format!(
+                r#"{{"schema_version":2,"marks":[{{"id":"a","status":"important","range":{range}}}]}}"#
+            );
+            let err = parse_marks_text(&text, std::path::Path::new("m.json")).unwrap_err();
+            assert!(err.contains("invalid range"), "{range}: {err}");
+        }
     }
 
     #[test]
