@@ -35,8 +35,11 @@ for (let i = 10; i < 40; i++) {
   writeFileSync(join(src, `20260916-13h41m${i}s_F.mp4`), chunk);
 }
 const caseDir = join(work, 'case');
+// SEC-04: the server requires a token by default; pin a known one for the harness.
+const token = 'live-' + Math.random().toString(36).slice(2, 12);
+const authHeaders = { 'X-FrameTrace-Token': token };
 const server = spawn(exe, [], {
-  env: { ...process.env, XDG_CONFIG_HOME: join(work, 'xdg'), APPDATA: join(work, 'xdg'), FRAMETRACE_NO_BROWSER: '1' },
+  env: { ...process.env, XDG_CONFIG_HOME: join(work, 'xdg'), APPDATA: join(work, 'xdg'), FRAMETRACE_NO_BROWSER: '1', FRAMETRACE_TOKEN: token },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const fail = (msg) => { console.error('FAIL:', msg); cleanup(); process.exit(1); };
@@ -49,13 +52,15 @@ const base = await new Promise((resolve, reject) => {
   setTimeout(() => reject(new Error('server did not start')), 15000);
 }).catch((e) => fail(e.message));
 
-const home = await fetch(base + '/');
+const home = await fetch(base + '/', { headers: authHeaders });
 const nonce = (home.headers.get('set-cookie') || '').match(/ft_nonce=([^;]+)/)?.[1];
-if (!nonce) fail('no nonce cookie');
-const getJson = async (path) => (await fetch(base + path, { cache: 'no-store' })).json();
+// With a token configured the server authenticates by token and does not
+// require (or plant) the per-instance nonce.
+const nonceHeaders = nonce ? { 'X-FrameTrace-Nonce': nonce, Cookie: `ft_nonce=${nonce}` } : {};
+const getJson = async (path) => (await fetch(base + path, { cache: 'no-store', headers: authHeaders })).json();
 const start = await (await fetch(base + '/api/start', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', 'X-FrameTrace-Nonce': nonce, Cookie: `ft_nonce=${nonce}` },
+  headers: { ...authHeaders, ...nonceHeaders, 'Content-Type': 'application/json' },
   body: JSON.stringify({ input_kind: 'folder', source_path: src, case_dir: caseDir, with_hash: true, with_ffprobe: false }),
 })).json();
 if (!start.ok) fail('start: ' + start.error);
@@ -72,7 +77,7 @@ while (Date.now() < deadline) {
     const rec = await getJson('/api/records?offset=0&limit=500&live=1');
     console.log(`live records: ok=${rec.ok} live=${rec.live} total=${rec.total} generation=${rec.generation} hashed=${rec.videos.filter((v) => v.sha256).length}`);
     if (!rec.ok || !rec.live || rec.total !== 30) fail('live records during review-partial');
-    const viewer = await fetch(base + '/viewer/?embed=1');
+    const viewer = await fetch(base + '/viewer/?embed=1', { headers: authHeaders });
     console.log('viewer status:', viewer.status, 'review/index.html exists:', existsSync(join(caseDir, 'review/index.html')));
     if (viewer.status !== 200) fail('/viewer/ not served');
     if (chromium) {
@@ -80,7 +85,7 @@ while (Date.now() < deadline) {
       const page = await browser.newPage({ viewport: { width: 1400, height: 860 } });
       const errors = [];
       page.on('pageerror', (e) => errors.push(String(e)));
-      await page.goto(base + '/viewer/');
+      await page.goto(base + '/viewer/?token=' + token);
       await page.waitForSelector('#ft-live-chip', { timeout: 20000 });
       await page.waitForTimeout(1500);
       const chip = await page.textContent('#ft-live-chip');

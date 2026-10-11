@@ -516,6 +516,18 @@ pub fn make_report(case_dir: &Path, rehash: bool, redact_paths: bool) -> Result<
         marks_json: &marks_json,
         redaction_applied: redact_paths,
     });
+    // Finalize sign-off: the reviewer name recorded by the workstation (as
+    // typed - not an authenticated identity) is printed and shown in the report.
+    let html = match read_to_string(&case_dir.join(report::SIGNOFF_REL_PATH))
+        .ok()
+        .and_then(|text| report::parse_signoff(&text))
+    {
+        Some((examiner, signed_unix)) => {
+            println!("검토자: {examiner} (최종화 시 입력된 이름, 신원 미인증)");
+            report::inject_signoff_banner(html, &examiner, signed_unix)
+        }
+        None => html,
+    };
     let report_path = case_dir.join("reports/case-report.html");
     write_text(&report_path, &html).map_err(|err| format!("failed to write report html: {err}"))?;
     println!("report written: {}", report_path.display());

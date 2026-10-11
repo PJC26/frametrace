@@ -21,11 +21,14 @@ mod discovery;
 mod http;
 mod jobs;
 mod media;
+mod proc;
 mod records;
 mod state;
 mod system;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_hardening;
 #[cfg(test)]
 mod tests_live;
 
@@ -78,20 +81,17 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
             ));
         }
     }
-    // FRAMETRACE_TOKEN opts into shared-secret auth on top of the loopback
-    // trust model — useful when untrusted processes share the exam machine.
-    // The token must be cookie-safe because a successful ?token= request
-    // plants it as the ft_token cookie for subsequent fetches.
-    let token = std::env::var("FRAMETRACE_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    // SEC-04: shared-secret auth is ON by default on top of the loopback
+    // trust model - any local process (or a browser tab on another origin
+    // that guessed the port) can otherwise read evidence over GET.
+    // FRAMETRACE_TOKEN pins a specific token; FRAMETRACE_NO_TOKEN=1 opts
+    // out (E2E harnesses). The token must be cookie-safe because a
+    // successful ?token= request plants it as the ft_token cookie.
+    let token = resolve_token(
+        std::env::var("FRAMETRACE_TOKEN").ok().as_deref(),
+        std::env::var("FRAMETRACE_NO_TOKEN").ok().as_deref(),
+    )?;
     if let Some(token) = &token {
-        if !valid_token(token) {
-            return Err(
-                "FRAMETRACE_TOKEN must be 8+ chars of A-Z a-z 0-9 . _ - ~ (cookie-safe)".into(),
-            );
-        }
         state_lock(&state).token = Some(token.clone());
     }
     // Relaunching the app (e.g. after closing the browser tab) must reuse
@@ -102,7 +102,9 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
         && options.case_dir.is_none()
         && let Some(existing_port) = find_running_server()
     {
-        let url = match &token {
+        // The running instance's token lives in the user-private instance
+        // file (or FRAMETRACE_TOKEN pinned it for both processes).
+        let url = match token_for_port(existing_port).or_else(|| token.clone()) {
             Some(token) => format!("http://127.0.0.1:{existing_port}/?token={token}"),
             None => format!("http://127.0.0.1:{existing_port}/"),
         };
@@ -123,7 +125,7 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
         None => first_free_port().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?,
     };
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
-    write_instance_file(port, &state_lock(&state).instance);
+    write_instance_file(port, &state_lock(&state).instance, token.as_deref());
     let url = match &token {
         Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
         None => format!("http://127.0.0.1:{port}/"),
@@ -139,7 +141,36 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
         open_in_browser(&url);
     }
     serve_on(listener, state);
+    // Shutdown path (/api/shutdown ends the accept loop; it is refused while a
+    // step runs, so this only reaps stragglers): never leave pipeline process
+    // trees (ffmpeg grandchildren) running after the workstation exits. Kept
+    // out of serve_on so in-process test servers cannot kill each other's steps.
+    proc::kill_all_tracked();
     Ok(())
+}
+
+/// Decides the auth token for a server process. Pure so it can be tested
+/// without touching the environment. Explicit `FRAMETRACE_TOKEN` wins, then
+/// `FRAMETRACE_NO_TOKEN=1` disables, otherwise a random 128-bit token.
+pub(crate) fn resolve_token(
+    env_token: Option<&str>,
+    no_token: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(value) = env_token.map(str::trim).filter(|v| !v.is_empty()) {
+        if !valid_token(value) {
+            return Err(
+                "FRAMETRACE_TOKEN must be 8+ chars of A-Z a-z 0-9 . _ - ~ (cookie-safe)".into(),
+            );
+        }
+        return Ok(Some(value.to_string()));
+    }
+    if no_token.map(str::trim) == Some("1") {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| format!("could not generate an access token (entropy): {err}"))?;
+    Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
 /// Accept loop shared by `run` and the integration tests (no browser side
@@ -313,7 +344,7 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("GET", "/api/records-meta") => json(api_records_meta(state)),
         ("GET", "/api/status") => json(api_status(state)),
         ("POST", "/api/start") => json(api_start(request, state)),
-        ("POST", "/api/finalize") => json(api_finalize(state)),
+        ("POST", "/api/finalize") => json(api_finalize(request, state)),
         ("POST", "/api/recover-deleted") => json(api_recover_deleted(state)),
         ("POST", "/api/export-selected") => json(api_export_selected(request, state)),
         ("POST", "/api/verify-audit") => json(api_verify_audit(state)),
@@ -330,6 +361,7 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/carve") => json(api_carve(request, state)),
         ("POST", "/api/open-folder") => json(api_open_folder(request, state)),
         ("GET", path) if is_viewer_page_path(path) => viewer_page(),
+        ("POST", "/api/verify-sources") => json(api_verify_sources(state)),
         _ => plain(404, b"not found".to_vec()),
     }
 }

@@ -127,11 +127,11 @@ fn reserve_port() -> Result<u16, String> {
 }
 
 fn workstation_url(port: u16) -> String {
-    match std::env::var("FRAMETRACE_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => {
-            format!("http://127.0.0.1:{port}/?token={token}")
-        }
-        _ => format!("http://127.0.0.1:{port}/"),
+    // SEC-04: the token is random by default; the server records it in the
+    // user-private instance file (FRAMETRACE_TOKEN, when set, wins).
+    match crate::serve::token_for_port(port) {
+        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
+        None => format!("http://127.0.0.1:{port}/"),
     }
 }
 
@@ -152,9 +152,9 @@ fn wait_for_server(port: u16, timeout: Duration) -> Result<(), String> {
 /// Reads briefly so the server thread can flush, then returns; the
 /// accept loop exits on its own poll even if the read races.
 fn request_shutdown(port: u16) {
-    let query = match std::env::var("FRAMETRACE_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => format!("?token={token}"),
-        _ => String::new(),
+    let query = match crate::serve::token_for_port(port) {
+        Some(token) => format!("?token={token}"),
+        None => String::new(),
     };
     // No configured token means the mutating-request gate wants the
     // instance nonce — the shell shares the user's trust domain, so the
@@ -182,7 +182,7 @@ fn request_shutdown(port: u16) {
 /// cookie that `GET /` plants — `/api/status`'s "instance" field is only
 /// a SHA-256 fingerprint of the nonce and would be refused with 401.
 fn instance_nonce(port: u16) -> Option<String> {
-    if let Some((instance_port, instance)) = crate::serve::read_instance_file()
+    if let Some((instance_port, instance, _)) = crate::serve::read_instance_record()
         && instance_port == port
         && !instance.is_empty()
     {
