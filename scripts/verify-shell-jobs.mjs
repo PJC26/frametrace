@@ -259,9 +259,9 @@ await test('preflight: render (estimate, inside-source, escaping) and 404 degrad
   const env = makeEnv();
   const html = env.ev('renderPreflight')({ sampled_bytes: 500 * 1024 ** 3, est_files: 12345, free_bytes: 1024 ** 3, case_inside_source: true, warnings: ['<b>x</b>'] }, { hash: true });
   assert.match(html, /케이스 폴더가 증거 소스 안에/);
-  assert.match(html, /확인된 소스 크기: 500\.0 GB/);
+  assert.match(html, /크기 500\.0 GB/);
   assert.match(html, /12,345/);
-  assert.match(html, /SHA-256 해시 예상 소요: 약 \d+분 – 약 1시간 \d+분/);
+  assert.match(html, /해시 약 \d+분 – 약 1시간 \d+분/);
   assert.match(html, /부족할 수 있습니다/);
   assert.match(html, /&lt;b&gt;x&lt;\/b&gt;/);
   assert.doesNotMatch(html, /<b>x<\/b>/);
@@ -286,7 +286,7 @@ await test('preflight: shown before Start; server-reported case_inside_source as
   env.ev('schedulePreflight()');
   await env.advance(700);
   assert.equal(env.$('preflight').hidden, false);
-  assert.match(env.$('preflight').innerHTML, /확인된 소스 크기: 2\.0 GB/);
+  assert.match(env.$('preflight').innerHTML, /크기 2\.0 GB/);
   env.$('btnStart').click();
   await env.flush();
   assert.equal(env.$('dlgBackdrop').hidden, false);

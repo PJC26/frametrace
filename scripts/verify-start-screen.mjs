@@ -255,7 +255,7 @@ try {
   await page.click('#startOptions > summary');
   const pf = await until(async () => {
     const t = (await page.locator('#preflight').textContent()) || '';
-    return (await page.locator('#preflight').isVisible()) && /확인된 소스 크기/.test(t) && t;
+    return (await page.locator('#preflight').isVisible()) && /사전 점검/.test(t) && /크기 [0-9]/.test(t) && t;
   }, 8000);
   const pfHeight = await page.locator('#preflight').evaluate((el) => el.getBoundingClientRect().height);
   check('b. preflight summary appears in one compact line', !!pf && pfHeight <= 40, `${Math.round(pfHeight)}px: ${pf || ''}`);

@@ -24,7 +24,7 @@ function renderPreflight(res, opts) {
     rows.push({ cls: "err", text: "케이스 폴더가 증거 소스 안에 있습니다 — 원본 매체에 산출물이 기록되고 다음 스캔에서 다시 색인될 수 있습니다. 다른 드라이브를 지정하십시오." });
   }
   if (bytes !== null) {
-    rows.push({ cls: "", text: `확인된 소스 크기: ${fmtBytes(bytes)}`, title: "서버가 표본 조사한 값 — 정확한 총량이 아닐 수 있습니다" });
+    rows.push({ cls: "", text: `크기 ${fmtBytes(bytes)}`, title: "서버가 표본 조사한 값 — 정확한 총량이 아닐 수 있습니다" });
   }
   if (files !== null) {
     rows.push({ cls: "", text: `파일 약 ${files.toLocaleString()}개`, title: "표본 조사로 추정한 파일 수" });
@@ -33,21 +33,23 @@ function renderPreflight(res, opts) {
     if (o.hash) {
       const fast = Math.max(1, Math.round(bytes / (HASH_MBPS_FAST * 1024 * 1024)));
       const slow = Math.max(1, Math.round(bytes / (HASH_MBPS_SLOW * 1024 * 1024)));
-      rows.push({ cls: slow >= 3600 ? "warn" : "", text: `SHA-256 해시 예상 소요: ${fmtEta(fast)} – ${fmtEta(slow)}`,
+      rows.push({ cls: slow >= 3600 ? "warn" : "", text: fast === slow ? `해시 약 ${fmtEta(fast).replace(/^약\s*/, "")}` : `해시 ${fmtEta(fast)} – ${fmtEta(slow)}`,
         title: `디스크 ${HASH_MBPS_SLOW}–${HASH_MBPS_FAST} MB/s 가정, 추정치` });
     } else {
-      rows.push({ cls: "", text: "SHA-256 해시 생략", title: "원본 바이트 전체를 읽지 않습니다 (증거 대조용 해시는 기록되지 않음)" });
+      rows.push({ cls: "", text: "해시 생략", title: "원본 바이트 전체를 읽지 않습니다 (증거 대조용 해시는 기록되지 않음)" });
     }
   }
   if (free !== null) {
     const low = free < 2 * 1024 * 1024 * 1024;
-    rows.push({ cls: low ? "warn" : "", text: `케이스 드라이브 여유 ${fmtBytes(free)}` + (low ? " — 부족할 수 있습니다" : "") });
+    rows.push({ cls: low ? "warn" : "", text: `여유 ${fmtBytes(free)}` + (low ? " — 부족할 수 있습니다" : ""), title: "케이스 폴더 드라이브의 남은 공간" });
   }
   for (const w of Array.isArray(res.warnings) ? res.warnings : []) {
     if (w !== null && w !== undefined && String(w).trim()) rows.push({ cls: "warn", text: String(w) });
   }
   if (!rows.length) rows.push({ cls: "", text: "서버가 사전 점검 정보를 제공하지 않았습니다." });
-  // One compact line: "사전 점검  a · b · c" (wraps only when it must).
+  // One compact line: "사전 점검  a · b · c". Plain info never wraps
+  // (CSS ellipsis, full text in the box title); warnings/errors may wrap
+  // so they are never cut off.
   return `<span class="pf-k">사전 점검</span>` +
     rows.map(r => `<span class="pf-i${r.cls ? " " + r.cls : ""}"${r.title ? ` title="${esc(r.title)}"` : ""}>${esc(r.text)}</span>`)
       .join(`<span class="pf-sep" aria-hidden="true">·</span>`);
@@ -58,6 +60,7 @@ function renderPreflightBox() {
   if (preflightData.key !== preflightKey($("sourcePath").value, $("caseDir").value)) return;
   box.hidden = false;
   box.innerHTML = renderPreflight(preflightData.res, { hash: $("withHash").checked });
+  box.title = box.textContent.replace(/\s*·\s*/g, " · ").trim();
 }
 function schedulePreflight() {
   clearTimeout(preflightTimer);
