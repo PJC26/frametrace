@@ -3,8 +3,6 @@ function setStep(active, doneCount) {
     const el = $("s" + i);
     el.classList.toggle("current", i === active);
     el.classList.toggle("done", i <= (doneCount || 0));
-    if (i === active) el.setAttribute("aria-current", "step");
-    else el.removeAttribute("aria-current");
   }
   stepActive = active; stepDone = doneCount || 0;
   renderCrumbs();
@@ -22,23 +20,64 @@ function crumbsHtml(active, done, view, caseDir) {
     const mark = n <= done ? "✓" : String(n);
     return `<span class="${cls}"${n === active ? ' aria-current="step"' : ""}>${mark} ${esc(name)}</span>`;
   });
-  const base = String(caseDir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  const base = caseBaseName(caseDir);
   return items.join(`<span class="sep" aria-hidden="true">›</span>`) +
     `<span class="sep">·</span><span>단계 ${active}/4</span>` +
     (base ? `<span class="casename" title="${esc(caseDir)}">케이스: ${esc(base)}</span>` : "");
 }
+function caseBaseName(caseDir) {
+  return String(caseDir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+}
+// Why a step button is disabled (shown as its tooltip).
+const STEP_WHY = {
+  2: "분석을 시작하면 열립니다",
+  3: "분석 결과(색인)가 준비되면 열립니다",
+  4: "해시·검증까지 끝나면 열립니다",
+};
+// Step buttons: a visually hidden suffix carries the pipeline state (the ✓ is CSS),
+// aria-current="step" marks the stage on screen, tooltip explains a
+// disabled step or names the Alt shortcut.
+function syncNavSteps() {
+  for (let i = 1; i <= 4; i++) {
+    const el = $("s" + i);
+    if (!el) continue;
+    const state = i <= stepDone ? " — 완료" : i === stepActive ? " — 진행 위치" : "";
+    const sr = $("s" + i + "State");
+    if (sr) sr.textContent = state;
+    el.title = el.disabled ? `${CRUMB_NAMES[i - 1]} — ${STEP_WHY[i] || ""}` : `${CRUMB_NAMES[i - 1]} (Alt+${i})`;
+    if (String(i) === String(viewShown)) el.setAttribute("aria-current", "step");
+    else el.removeAttribute("aria-current");
+  }
+}
 function renderCrumbs() {
   const el = $("crumbs");
   if (!el) return;
-  el.innerHTML = crumbsHtml(stepActive, stepDone, viewShown, lastStatus && lastStatus.case_dir);
+  const caseDir = lastStatus && lastStatus.case_dir;
+  el.innerHTML = crumbsHtml(stepActive, stepDone, viewShown, caseDir);
+  const bc = $("barCase");
+  if (bc) {
+    const base = caseBaseName(caseDir);
+    bc.hidden = !base;
+    bc.textContent = base;
+    bc.title = caseDir ? "케이스 폴더: " + caseDir : "";
+  }
+  syncNavSteps();
 }
 
 // --- view switching: one screen per workflow stage ---
+// Stage 3 is full-bleed: body.stage3 folds the rail into the 40px stage
+// bar and shows the '케이스 작업' menu there (see app.css / 97-shell.js).
 function showView(n) {
   const key = String(n);
   document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.dataset.view === key));
   document.querySelectorAll(".navstep").forEach(b => b.classList.toggle("sel", b.dataset.view === key));
+  const prev = viewShown;
   viewShown = key;
+  if (document.body && document.body.classList) document.body.classList.toggle("stage3", key === "3");
+  const menu = $("caseMenuWrap");
+  if (menu) menu.hidden = key !== "3";
+  if (key !== "3" && typeof closeAllPopovers === "function") closeAllPopovers(false);
+  if (prev !== key && typeof window.scrollTo === "function") { try { window.scrollTo(0, 0); } catch (e) {} }
   renderCrumbs();
 }
 document.querySelectorAll(".navstep").forEach(b => b.addEventListener("click", () => {
@@ -147,12 +186,13 @@ async function verifyAudit() {
   if (!badge) return;
   try {
     const res = await jpost("/api/verify-audit", {});
-    if (!res.ok) { badge.className = "badge bad"; badge.textContent = "감사 로그 검증 실패"; return; }
+    if (!res.ok) { badge.className = "badge bad"; badge.textContent = "감사 로그 검증 실패"; syncToolsBtn(); return; }
     const keyed = res.integrity === "integrity-keyed";
     badge.className = "badge ok";
     badge.textContent = `감사 로그 ${keyed ? "키 서명 검증됨" : "구조 검증됨"} (${res.verified}개 로그, ${res.entries}항목)`;
     badge.title = (res.logs || []).map(l => `${l.name}: ${l.integrity}, ${l.entries}항목`).join("\n");
   } catch (e) { badge.className = "badge bad"; badge.textContent = "감사 로그 검증 불가"; }
+  syncToolsBtn();
 }
 // Maps raw pipeline errors to a first-run action hint — the log keeps the
 // exact CLI output, this answers "what do I do now?".
@@ -299,8 +339,10 @@ function applyStatus(st) {
     const running = st.phase === "running" || enriching;
     setInputsDisabled(running);
     $("btnStart").disabled = running || finalizing;
+    $("btnStart").title = running ? "분석이 진행 중입니다 — 2단계 '분석 진행'에서 상황을 보거나 중단할 수 있습니다"
+      : finalizing ? "보고서 생성이 진행 중입니다" : "";
     $("btnCancel").style.display = running ? "" : "none";
-    if (!running && !cancelRequested) { $("btnCancel").disabled = false; $("btnCancel").textContent = "분석 중단"; }
+    if (!running && !cancelRequested) { $("btnCancel").disabled = false; $("btnCancel").removeAttribute("aria-busy"); $("btnCancel").textContent = "분석 중단"; }
     $("btnNew").style.display = (!running && (st.error || st.phase !== "running")) ? "" : "none";
     if (running && !autoProgress) { autoProgress = true; showView(2); }
     const restorePending = st.restored && !restoreHandled;

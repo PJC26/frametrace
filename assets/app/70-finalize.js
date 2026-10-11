@@ -189,6 +189,7 @@ $("btnFinalize").addEventListener("click", async () => {
   catch (err) { toast("점검 정보를 불러오지 못했습니다: " + (err.message || err), "err"); }
   if (!go) { btn.disabled = false; return; }
   finalizing = true;
+  btn.setAttribute("aria-busy", "true");
   $("finalHint").textContent = "보고서 생성 중… (원본 해시 재계산 포함 — 소스 크기에 따라 오래 걸릴 수 있습니다)";
   try {
     const res = await jpost("/api/finalize", { examiner: finalizeExaminer });
@@ -207,6 +208,7 @@ $("btnFinalize").addEventListener("click", async () => {
     ensureReportFrame();
   } finally {
     finalizing = false;
+    btn.removeAttribute("aria-busy");
     btn.disabled = false;
     if (/중…/.test($("finalHint").textContent)) $("finalHint").textContent = "보고서 생성이 완료되지 않았습니다 — 다시 시도할 수 있습니다.";
   }
@@ -240,6 +242,7 @@ $("btnVerifySources").addEventListener("click", async () => {
   const btn = $("btnVerifySources");
   if (btn.disabled) return;
   btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
   $("finalHint").textContent = "원본 재검증 중… (색인된 모든 원본을 다시 해시합니다 — 소스 크기에 따라 오래 걸릴 수 있습니다)";
   try {
     const res = await jpost("/api/verify-sources", {});
@@ -250,6 +253,7 @@ $("btnVerifySources").addEventListener("click", async () => {
   } catch (err) {
     $("finalHint").textContent = "원본 재검증 실패: " + (err.message || err);
   } finally {
+    btn.removeAttribute("aria-busy");
     btn.disabled = false;
   }
 });

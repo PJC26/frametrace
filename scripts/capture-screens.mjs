@@ -202,7 +202,13 @@ async function runCombo({ w, h, theme }, sub) {
     notes.rows = rf ? await visibleRows(rf) : null;
     const rowsTxt = notes.rows ? notes.rows.visible : '?';
     await shot('03-review-embedded', `검토 단계 — 셸 안에 임베드된 증거 뷰어; 완전히 보이는 그리드 행 ${rowsTxt}개 (Review stage, viewer embedded in the shell; fully visible grid rows: ${rowsTxt})`);
-    // UX-06: Recover runs as a background job with a visible panel.
+    // UX-06: Recover runs as a background job with a visible panel. Newer
+    // shells keep it in the stage bar's '케이스 작업' menu.
+    if (await page.locator('#btnCaseMenu').isVisible().catch(() => false)) {
+      await page.click('#btnCaseMenu');
+      await sleep(200);
+      await shot('03a-review-case-menu', '검토 단계 — 단계 바의 케이스 작업 메뉴 (Stage-bar case tools menu)');
+    }
     if (await page.locator('#btnRecoverDeleted').isVisible().catch(() => false)) {
       await page.click('#btnRecoverDeleted');
       await page.waitForFunction(() => /\b(ok|failed|cancelled|deferred)\b/.test(document.getElementById('jobPanel')?.className || ''), null, { timeout: 20000 }).catch(() => {});

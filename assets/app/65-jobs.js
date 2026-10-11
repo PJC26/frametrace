@@ -43,10 +43,17 @@ function setCaseToolsVisible(on) {
     if (el) el.hidden = !on;
   }
 }
+const CASE_JOB_TITLES = {
+  btnRecoverDeleted: "조사된 이미지에서 삭제된 영상 후보를 복구한 뒤 뷰어를 갱신합니다",
+  btnCarve: "export된 raw 이미지에서 영상 시그니처를 카빙합니다 (E01 전체 export 분석 필요)",
+};
 function setCaseJobButtons(busy) {
   for (const id of ["btnRecoverDeleted", "btnCarve"]) {
     const el = $(id);
-    if (el) el.disabled = busy;
+    if (!el) continue;
+    el.disabled = busy;
+    // A disabled control says why.
+    el.title = busy ? "다른 작업이 진행 중입니다 — 단계 바의 작업 표시에서 진행 상황을 확인하거나 중단할 수 있습니다" : CASE_JOB_TITLES[id];
   }
 }
 function fmtClock(secs) {
@@ -110,11 +117,19 @@ function renderCaseJob() {
   }[job.outcome] || (job.cancel ? `${title} 중단 요청 중…` : `${title} 진행 중…`);
   $("jobTitle").textContent = label;
   $("jobDetail").textContent = job.message || job.detail || (job.async ? "" : "서버 응답 대기 중");
+  // The pill truncates; the full line is in its tooltip. Only state
+  // changes are announced (elapsed ticks every second and must not be).
+  panel.title = label + ($("jobDetail").textContent ? " — " + $("jobDetail").textContent : "");
+  if (job.announced !== label) {
+    job.announced = label;
+    announce(label + (job.outcome && job.message ? " — " + job.message : ""), job.outcome === "failed");
+  }
   $("jobElapsed").textContent = "경과 " + fmtClock(caseJobElapsed(job));
   const cancel = $("btnJobCancel");
   cancel.hidden = !!job.outcome;
   cancel.disabled = !!job.cancel;
   cancel.textContent = job.cancel ? "중단 요청 중…" : "작업 중단";
+  if (job.cancel) cancel.setAttribute("aria-busy", "true"); else cancel.removeAttribute("aria-busy");
   $("btnJobReload").hidden = job.outcome !== "deferred";
   $("btnJobClose").hidden = !job.outcome || job.outcome === "deferred";
 }
@@ -138,7 +153,7 @@ async function runCaseJob(kind) {
     cancel: false, outcome: "", detail: "", message: "", serverElapsed: NaN, serverElapsedAt: 0 };
   caseJob = job;
   setCaseJobButtons(true);
-  $("recoverHint").textContent = `${spec.title} 실행 중… 진행 상황은 위 작업 표시줄에 나타납니다.`;
+  $("recoverHint").textContent = `${spec.title} 실행 중… 진행 상황은 단계 바의 작업 표시에 나타납니다.`;
   renderCaseJob();
   stopCaseJobTicker();
   caseJobTicker = setInterval(() => { if (caseJob === job && !job.outcome) renderCaseJob(); }, 1000);
@@ -220,7 +235,7 @@ function adoptRunningCaseJob(st) {
     jobInfo: { kind: sj.kind, started_unix: sj.started_unix }, adopted: true, sawServerJob: true };
   caseJob = job;
   setCaseJobButtons(true);
-  $("recoverHint").textContent = `${spec.title} 실행 중… 진행 상황은 위 작업 표시줄에 나타납니다.`;
+  $("recoverHint").textContent = `${spec.title} 실행 중… 진행 상황은 단계 바의 작업 표시에 나타납니다.`;
   renderCaseJob();
   stopCaseJobTicker();
   caseJobTicker = setInterval(() => { if (caseJob === job && !job.outcome) renderCaseJob(); }, 1000);
@@ -237,6 +252,7 @@ async function finishCaseJob(job, outcome, error) {
     job.message = String(error || "알 수 없는 오류").split(/\r?\n/)[0].slice(0, 240);
     $("recoverHint").textContent = `${title} 실패: ${job.message} — 원인을 확인한 뒤 다시 시도할 수 있습니다.`;
     renderCaseJob();
+    toast(`${title} 실패: ${job.message}`, "err");
     return;
   }
   if (outcome === "cancelled") {
@@ -255,6 +271,7 @@ async function finishCaseJob(job, outcome, error) {
   if (how === "deferred") {
     job.outcome = "deferred";
     job.message = "저장되지 않은 판독 내용이 있어 뷰어를 새로 고치지 않았습니다 — 저장이 끝난 뒤 '뷰어 새로 고침'을 누르십시오.";
+    toast(`${title} 완료 — ${job.message}`, "warn");
   } else {
     job.message = how === "none" ? "완료 — 검토 화면을 열면 결과가 표시됩니다." : "완료 — 뷰어에 결과를 반영했습니다.";
   }

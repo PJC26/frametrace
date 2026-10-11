@@ -46,7 +46,7 @@ function frameDocState() {
 }
 function frameWatchdog() {
   frameTimer = 0;
-  if (frameState !== "loading") return;
+  if (frameState !== "loading" || framePopped) return;
   // DOM is up and the viewer is running even though some subresource
   // still holds the load event: not a failure.
   if (frameDocState() === "alive") { frameState = "ok"; return; }
@@ -65,7 +65,7 @@ function showFrameFail(msg) {
   if (msg) $("frameFailMsg").textContent = msg;
 }
 function onReviewFrameLoad() {
-  if (!reviewFrameLoaded) return;
+  if (!reviewFrameLoaded || framePopped) return;
   const st = frameDocState();
   if (st === "empty") {
     frameFailed("뷰어 페이지가 비어 있거나 오류 응답입니다 — 검토 데이터가 아직 만들어지지 않았거나 서버 오류일 수 있습니다.");
@@ -78,6 +78,7 @@ function onReviewFrameLoad() {
   // Theme/locale are pushed until the viewer acks (see 15-theme.js), so no
   // fixed-delay retries are needed for a viewer that wires up late.
   syncViewerChrome();
+  bridgeFrameKeys();
 }
 reviewFrame.addEventListener("load", onReviewFrameLoad);
 $("btnFrameRetry").addEventListener("click", () => {
@@ -136,6 +137,11 @@ function waitForFrameSettled(ms) {
 // (the viewer took it), "reloaded", "deferred" (unsaved marks).
 async function refreshViewerData(reason) {
   if (!reviewFrameLoaded) return "none";
+  // Popped out: the separate window owns the data; ask it to refresh.
+  if (framePopped) {
+    try { if (popoutWin && !popoutWin.closed) popoutWin.postMessage({ type: "ft-reload", reason: reason || "" }, "*"); } catch (e) {}
+    return "none";
+  }
   if (frameState === "failed") {
     // Nothing reviewable is on screen: (re)load is safe.
     loadReviewFrame(frameUrl);
@@ -221,14 +227,89 @@ async function ensureReportFrame() {
   else frame.contentWindow && frame.contentWindow.location.reload();
 }
 
-$("btnViewerWindow").addEventListener("click", () => {
-  const win = window.open(
-    standaloneViewerUrl(),
-    "frametrace-viewer",
-    "popup=yes,width=1500,height=950"
-  );
-  if (win) win.focus();
-  else window.open(standaloneViewerUrl(), "_blank"); // popup blocked: fall back to a tab
+// ---- second monitor: one writer at a time ----
+// Opening the standalone viewer in its own window parks the embedded one
+// (about:blank) behind a "별도 창에서 검토 중" placeholder so marks are
+// never written from two viewers at once. Parking is refused while the
+// embedded viewer still has unsaved marks (same guard as the reload path);
+// returning is refused while the pop-out has unsaved marks. Closing the
+// pop-out window brings the embedded viewer back automatically.
+let popoutWin = null, popoutTimer = 0, framePopped = false;
+// The pop-out viewer's save badge (same element the embedded one uses).
+function popoutSaveBadge() {
+  try {
+    const pdoc = popoutWin && !popoutWin.closed ? popoutWin.document : null;
+    return pdoc ? pdoc.getElementById("saveState") : null;
+  } catch (e) { return null; }
+}
+function popoutSaveState() {
+  const el = popoutSaveBadge();
+  return el && el.dataset ? (el.dataset.state || null) : null;
+}
+function setPopoutUi(on) {
+  framePopped = on;
+  const ph = $("framePopout");
+  if (ph) ph.hidden = !on;
+  reviewFrame.hidden = on;
+  const full = $("btnViewerFull");
+  if (full) {
+    full.disabled = on;
+    full.title = on ? "뷰어가 별도 창에 열려 있습니다 — 먼저 '여기로 되돌리기'를 누르십시오"
+      : "뷰어를 전체화면으로 확대 — 헤더·보기 메뉴까지 모두 표시됩니다";
+  }
+  const win = $("btnViewerWindow");
+  if (win) win.textContent = on ? "⧉ 별도 창 보기" : "⧉ 새 창으로 열기 (보조 모니터)";
+}
+function openViewerPopout() {
+  if (framePopped && popoutWin && !popoutWin.closed) { try { popoutWin.focus(); } catch (e) {} return; }
+  if (reviewFrameLoaded && frameState === "ok" && viewerHasUnsaved()) {
+    retryViewerSave();
+    toast("아직 케이스에 저장되지 않은 마크·메모가 있습니다 — 저장 상태가 '저장됨'이 된 뒤 다시 새 창으로 여십시오.", "warn");
+    return;
+  }
+  let win = window.open(standaloneViewerUrl(), "frametrace-viewer", "popup=yes,width=1500,height=950");
+  if (!win) win = window.open(standaloneViewerUrl(), "_blank"); // popup blocked: fall back to a tab
+  if (!win) { toast("팝업이 차단되었습니다 — 브라우저에서 이 사이트의 팝업을 허용하십시오.", "warn"); return; }
+  try { win.focus(); } catch (e) {}
+  popoutWin = win;
+  if (reviewFrameLoaded) {
+    clearTimeout(frameTimer);
+    frameTimer = 0;
+    showFrameFail(null);
+    setPopoutUi(true);
+    try { reviewFrame.src = "about:blank"; } catch (e) {}
+    announce("검토 뷰어를 별도 창으로 옮겼습니다.");
+  }
+  clearInterval(popoutTimer);
+  popoutTimer = setInterval(() => {
+    let closed = true;
+    try { closed = !popoutWin || popoutWin.closed; } catch (e) { closed = true; }
+    if (closed) returnViewerHere(true);
+  }, 1000);
+}
+function returnViewerHere(windowClosed) {
+  if (!windowClosed) {
+    const ss = popoutSaveState();
+    if (ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued") {
+      try { popoutSaveBadge().click(); } catch (e) {}
+      toast("별도 창에 아직 저장되지 않은 마크·메모가 있습니다 — 그 창에서 '저장됨'을 확인한 뒤 다시 누르십시오.", "warn");
+      return;
+    }
+    try { if (popoutWin && !popoutWin.closed) popoutWin.close(); } catch (e) {}
+  }
+  clearInterval(popoutTimer);
+  popoutTimer = 0;
+  popoutWin = null;
+  if (!framePopped) return;
+  setPopoutUi(false);
+  if (frameUrl) loadReviewFrame(frameUrl);
+  announce("검토 뷰어를 이 화면으로 되돌렸습니다.");
+}
+$("btnViewerWindow").addEventListener("click", openViewerPopout);
+$("btnFrameReturn").addEventListener("click", () => returnViewerHere(false));
+$("btnFrameFocusPopup").addEventListener("click", () => {
+  try { if (popoutWin && !popoutWin.closed) { popoutWin.focus(); return; } } catch (e) {}
+  returnViewerHere(true);
 });
 
 // Recover / Carve run as background case jobs: see 65-jobs.js.

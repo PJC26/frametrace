@@ -25,7 +25,11 @@ $("btnStart").addEventListener("click", async () => {
   const hint = $("startHint");
   const prevHint = hint.textContent;
   hint.textContent = "분석 시작 요청 중…";
+  $("btnStart").setAttribute("aria-busy", "true");
   cancelRequested = false;
+  $("btnCancel").disabled = false;
+  $("btnCancel").removeAttribute("aria-busy");
+  $("btnCancel").textContent = "분석 중단";
   let started = false;
   try {
     const res = await jpost("/api/start", {
@@ -65,6 +69,7 @@ $("btnStart").addEventListener("click", async () => {
   } finally {
     starting = false;
     hint.textContent = prevHint;
+    $("btnStart").removeAttribute("aria-busy");
     // The poll owns the steady-state enable/disable; this only undoes the
     // optimistic disable so a failed request never strands the button.
     $("btnStart").disabled = started || finalizing || !!(lastStatus && lastStatus.phase === "running");
@@ -95,6 +100,7 @@ function resetCaseUi() {
   shownStatusError = null;
   const audit = $("auditBadge");
   if (audit) { audit.className = "badge"; audit.textContent = "감사 로그 대기"; audit.removeAttribute("title"); }
+  syncToolsBtn();
 }
 
 $("btnOpenCase").addEventListener("click", () => openCase($("caseDir").value.trim()));
@@ -138,11 +144,13 @@ $("btnCancel").addEventListener("click", async () => {
   if (!go) return;
   cancelRequested = true;
   $("btnCancel").disabled = true;
+  $("btnCancel").setAttribute("aria-busy", "true");
   $("btnCancel").textContent = "중단 요청 중…";
   const res = await jpost("/api/cancel", {});
   if (!res.ok) {
     cancelRequested = false;
     $("btnCancel").disabled = false;
+    $("btnCancel").removeAttribute("aria-busy");
     $("btnCancel").textContent = "분석 중단";
     toast("중단 요청 실패: " + (res.error || "알 수 없는 오류"), "err");
   }
