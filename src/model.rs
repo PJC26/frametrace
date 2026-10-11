@@ -82,6 +82,11 @@ pub struct ProbeSummary {
     pub audio_codec: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Frames per second of the first video stream (`avg_frame_rate`, falling
+    /// back to `r_frame_rate`); `None` for legacy records or when ffprobe
+    /// reported none / `0/0`.
+    #[serde(default)]
+    pub fps: Option<f64>,
 }
 
 impl ProbeSummary {
@@ -96,6 +101,7 @@ impl ProbeSummary {
             audio_codec: None,
             width: None,
             height: None,
+            fps: None,
         }
     }
 }
@@ -172,6 +178,16 @@ impl VideoRecord {
         let duration = optional_f64_json(self.probe.duration_seconds);
         let width = optional_u32_json(self.probe.width);
         let height = optional_u32_json(self.probe.height);
+        // Emitted only when known, so records without fps stay byte-identical
+        // to what older binaries wrote.
+        let fps = match self
+            .probe
+            .fps
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            Some(value) => format!(",\"fps\":{value:.3}"),
+            None => String::new(),
+        };
         let ffprobe_json = match &self.probe.raw_json {
             Some(raw) => {
                 compact_json_value_if_well_formed(raw).unwrap_or_else(|| "null".to_string())
@@ -179,7 +195,7 @@ impl VideoRecord {
             None => "null".to_string(),
         };
         format!(
-            "{{\"id\":\"{}\",\"source_path\":\"{}\",\"file_url\":\"{}\",\"relative_path\":\"{}\",\"extension\":\"{}\",\"size_bytes\":{},\"modified_unix\":{},\"sha256\":{},\"hash_status\":\"{}\",\"confidence\":\"{}\",\"source_profile\":{},\"duration_seconds\":{},\"format_name\":{},\"video_codec\":{},\"audio_codec\":{},\"width\":{},\"height\":{},\"ffprobe_ok\":{},\"ffprobe_error\":{},\"ffprobe\":{}}}",
+            "{{\"id\":\"{}\",\"source_path\":\"{}\",\"file_url\":\"{}\",\"relative_path\":\"{}\",\"extension\":\"{}\",\"size_bytes\":{},\"modified_unix\":{},\"sha256\":{},\"hash_status\":\"{}\",\"confidence\":\"{}\",\"source_profile\":{},\"duration_seconds\":{},\"format_name\":{},\"video_codec\":{},\"audio_codec\":{},\"width\":{},\"height\":{}{},\"ffprobe_ok\":{},\"ffprobe_error\":{},\"ffprobe\":{}}}",
             json_escape(&self.id),
             json_escape(&source_path),
             json_escape(&file_url),
@@ -197,6 +213,7 @@ impl VideoRecord {
             optional_string_json(self.probe.audio_codec.as_deref()),
             width,
             height,
+            fps,
             self.probe.ok,
             optional_string_json(self.probe.error.as_deref()),
             ffprobe_json
@@ -356,6 +373,8 @@ mod probe_summary_flat {
         audio_codec: Option<String>,
         width: Option<u32>,
         height: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fps: Option<f64>,
         ffprobe_ok: bool,
         ffprobe_error: Option<String>,
         /// The published contract inlines the raw ffprobe JSON object here,
@@ -387,6 +406,7 @@ mod probe_summary_flat {
             audio_codec: probe.audio_codec.clone(),
             width: probe.width,
             height: probe.height,
+            fps: probe.fps,
             ffprobe_ok: probe.ok,
             ffprobe_error: probe.error.clone(),
             ffprobe: probe.raw_json.clone(),
@@ -408,6 +428,7 @@ mod probe_summary_flat {
             audio_codec: flat.audio_codec,
             width: flat.width,
             height: flat.height,
+            fps: flat.fps,
         })
     }
 }
@@ -437,6 +458,7 @@ mod tests {
                 audio_codec: None,
                 width: Some(1920),
                 height: Some(1080),
+                fps: None,
             },
             confidence: "ffprobe-confirmed".to_string(),
             source_profile: SourceProfile::generic_media("extension"),
@@ -458,6 +480,31 @@ mod tests {
             serde_json::from_str(&record.to_json()).expect("to_json output parses");
         assert_eq!(reparsed.id, record.id);
         assert_eq!(reparsed.probe.ok, record.probe.ok);
+    }
+
+    /// `fps` is a flat record key when known and absent (not null) otherwise;
+    /// both shapes parse back.
+    #[test]
+    fn fps_is_flat_key_and_round_trips() {
+        let mut record = sample_record();
+        assert!(!record.to_json().contains("\"fps\""));
+        record.probe.fps = Some(29.97);
+        let json = record.to_json();
+        assert!(
+            json.contains(r#""height":1080,"fps":29.970,"ffprobe_ok""#),
+            "{json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["fps"], serde_json::json!(29.97));
+        let parsed: VideoRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.probe.fps, Some(29.97));
+        // serde path (used by case_db/serve) is flat too.
+        let via_serde: serde_json::Value = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(via_serde["fps"], serde_json::json!(29.97));
+        assert!(via_serde.get("probe").is_none());
+        let legacy: VideoRecord =
+            serde_json::from_str(&record.to_json().replace(",\"fps\":29.970", "")).unwrap();
+        assert_eq!(legacy.probe.fps, None);
     }
 
     /// ffprobe_ok must survive `#[serde(flatten)]` without duplicate keys in

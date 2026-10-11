@@ -363,6 +363,7 @@ mod tests {
             audio_codec: None,
             width: Some(1920),
             height: Some(1080),
+            fps: None,
         };
         assert_eq!(
             validation_status(&probe).0,
@@ -386,6 +387,7 @@ mod tests {
             audio_codec: None,
             width: None,
             height: None,
+            fps: None,
         };
         assert_eq!(validation_status(&probe).0, "validation-failed");
     }
@@ -402,6 +404,7 @@ mod tests {
             audio_codec: Some("mp3".to_string()),
             width: None,
             height: None,
+            fps: None,
         };
         assert_eq!(validation_status(&probe).0, "validation-failed");
     }
