@@ -58,6 +58,13 @@ pub fn init_case(case_dir: &Path, options: &InitCaseOptions) -> Result<(), Strin
     {
         return Err("case directory already exists and is not empty".to_string());
     }
+    // FOR-04: an evidence hash must be well-formed hex for its algorithm;
+    // it is stored lowercase and reported as operator-supplied.
+    let evidence_hash = options
+        .evidence_hash
+        .as_deref()
+        .map(case_db::parse_evidence_hash)
+        .transpose()?;
     let created_unix = now_unix()?;
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|err| format!("failed to generate case id: {err}"))?;
@@ -79,7 +86,7 @@ pub fn init_case(case_dir: &Path, options: &InitCaseOptions) -> Result<(), Strin
         device_serial: options.device_serial.clone(),
         write_protect: options.write_protect.clone(),
         acquisition_tool: options.acquisition_tool.clone(),
-        evidence_hash: options.evidence_hash.clone(),
+        evidence_hash: evidence_hash.as_ref().map(|hash| hash.hex.clone()),
         notes: options.notes.clone(),
     };
 
@@ -93,6 +100,14 @@ pub fn init_case(case_dir: &Path, options: &InitCaseOptions) -> Result<(), Strin
 
     println!("case created: {}", case_dir.display());
     println!("case id: {}", manifest.case_id);
+    if let Some(hash) = &evidence_hash {
+        println!(
+            "evidence hash: {}:{} ({})",
+            hash.algorithm,
+            hash.hex,
+            case_db::describe_hash_origin(Some(case_db::HashOrigin::OperatorSupplied.label()))
+        );
+    }
     Ok(())
 }
 
@@ -250,11 +265,55 @@ pub fn register_source(
             metadata_json: None,
         },
     )?;
-    println!("source registered: {}", row.source_id);
+    println!(
+        "source registered: {} ({})",
+        row.source_id,
+        if row.newly_registered {
+            "new"
+        } else {
+            "existing"
+        }
+    );
     println!("kind: {}", row.kind);
     println!("path: {}", row.path);
+    match (&row.evidence_hash, &row.hash_algorithm) {
+        (Some(hash), algorithm) => println!(
+            "evidence hash: {}:{hash} ({})",
+            algorithm.as_deref().unwrap_or("unknown-algorithm"),
+            case_db::describe_hash_origin(row.hash_origin.as_deref())
+        ),
+        (None, _) => println!("evidence hash: none recorded"),
+    }
+    print_source_changes(case_dir, &row);
     println!("sqlite: {}", case_db::case_db_path(case_dir).display());
     Ok(())
+}
+
+/// Prints the custody fields a re-registration changed (each one already
+/// chained into the evidence source log) — never a silent overwrite.
+pub(crate) fn print_source_changes(case_dir: &Path, row: &case_db::EvidenceSourceRow) {
+    if row.changes.is_empty() {
+        return;
+    }
+    println!(
+        "source {} changed ({} field(s)):",
+        row.source_id,
+        row.changes.len()
+    );
+    for change in &row.changes {
+        println!(
+            "  {}: {} -> {}",
+            change.field,
+            change.old.as_deref().unwrap_or("(none)"),
+            change.new.as_deref().unwrap_or("(none)")
+        );
+    }
+    println!(
+        "change audit log: {}",
+        case_dir
+            .join(case_db::EVIDENCE_SOURCE_LOG_REL_PATH)
+            .display()
+    );
 }
 
 pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> Result<(), String> {
@@ -416,34 +475,35 @@ fn inject_redaction_banner(html: String, redact_paths: bool) -> String {
 /// the marks changed after the sign-off.
 pub(crate) fn review_marks_json(case_dir: &Path) -> String {
     match crate::case_db::load_review_marks(case_dir) {
-        Ok(rows) => {
-            let entries = rows
-                .iter()
-                .map(|mark| {
-                    format!(
-                        "{{\"id\":\"{}\",\"status\":\"{}\",\"marked_unix\":{}{}{}}}",
-                        crate::util::json_escape(&mark.record_id),
-                        crate::util::json_escape(&mark.status),
-                        mark.marked_unix,
-                        mark.examiner
-                            .as_deref()
-                            .map(|name| format!(
-                                ",\"examiner\":\"{}\"",
-                                crate::util::json_escape(name)
-                            ))
-                            .unwrap_or_default(),
-                        mark.note
-                            .as_deref()
-                            .map(|note| format!(",\"note\":\"{}\"", crate::util::json_escape(note)))
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{entries}]")
-        }
+        Ok(rows) => review_marks_json_from_rows(&rows),
         Err(_) => "[]".to_string(),
     }
+}
+
+/// [`review_marks_json`] over already-loaded rows, so verify-package can
+/// recompute the sign-off content digest from a packaged database.
+pub(crate) fn review_marks_json_from_rows(rows: &[case_db::ReviewMarkRow]) -> String {
+    let entries = rows
+        .iter()
+        .map(|mark| {
+            format!(
+                "{{\"id\":\"{}\",\"status\":\"{}\",\"marked_unix\":{}{}{}}}",
+                crate::util::json_escape(&mark.record_id),
+                crate::util::json_escape(&mark.status),
+                mark.marked_unix,
+                mark.examiner
+                    .as_deref()
+                    .map(|name| format!(",\"examiner\":\"{}\"", crate::util::json_escape(name)))
+                    .unwrap_or_default(),
+                mark.note
+                    .as_deref()
+                    .map(|note| format!(",\"note\":\"{}\"", crate::util::json_escape(note)))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{entries}]")
 }
 
 pub fn make_report(
@@ -608,6 +668,45 @@ pub fn package_case(case_dir: &Path, options: PackageOptions) -> Result<(), Stri
     println!("files: {}", result.file_count);
     println!("manifest: {}", result.manifest_path.display());
     Ok(())
+}
+
+/// `verify-package`: checks a package directory written by package-case
+/// and prints every check with its status — PASS, FAIL (naming the file)
+/// or NOT VERIFIED (what the package alone cannot prove). Exits non-zero
+/// when any check fails.
+pub fn verify_package(package_dir: &Path) -> Result<(), String> {
+    let result = package::verify_package(package_dir)?;
+    println!("package: {}", package_dir.display());
+    if let Some(hash) = &result.manifest_sha256 {
+        println!("manifest.sha256 SHA-256: {hash}");
+    }
+    for check in &result.checks {
+        println!(
+            "[{}] {}: {}",
+            check.status.label(),
+            check.subject,
+            check.detail
+        );
+    }
+    let failures: Vec<&str> = result
+        .failures()
+        .map(|check| check.subject.as_str())
+        .collect();
+    if failures.is_empty() {
+        println!(
+            "package verified: {} file(s) match manifest.sha256 (see NOT VERIFIED lines for what this does not establish)",
+            result.files_verified
+        );
+        Ok(())
+    } else {
+        let mut names = failures.clone();
+        names.dedup();
+        Err(format!(
+            "package verification FAILED: {} check(s) failed ({})",
+            failures.len(),
+            names.join(", ")
+        ))
+    }
 }
 
 pub fn inspect(case_dir: &Path) -> Result<(), String> {

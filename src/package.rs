@@ -80,6 +80,7 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     for rel_dir in recursive_package_dirs() {
         copy_package_dir(case_dir, &output_dir, Path::new(rel_dir), &mut files)?;
     }
+    let signoff_source = copy_signoff(case_dir, &output_dir, &mut files)?;
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
     let checksum_text = files
@@ -102,6 +103,7 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
         &missing_optional_files,
         &running_jobs,
         quiescent,
+        signoff_source,
     );
     let manifest_path = output_dir.join("package-manifest.json");
     write_text(&manifest_path, &manifest_json)
@@ -118,7 +120,7 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     write_text(
         &output_dir.join("README.txt"),
         &format!(
-            "FrameTrace case package\n\n{report_note} Verify package contents with manifest.sha256 before transfer.\n\nSnapshot scope: see snapshot_scope in package-manifest.json. For Amped FIVE or Magnet DVR Examiner handoff steps, see docs/COMMERCIAL_HANDOFF.md in the FrameTrace repository.\n"
+            "FrameTrace case package\n\n{report_note} Verify package contents with manifest.sha256 before transfer (`frametrace verify-package <package-dir>` checks the manifest, audit chains and sign-off and reports what it could not verify).\n\nSnapshot scope: see snapshot_scope in package-manifest.json. For Amped FIVE or Magnet DVR Examiner handoff steps, see docs/COMMERCIAL_HANDOFF.md in the FrameTrace repository.\n"
         ),
     )
     .map_err(|err| format!("failed to write package README: {err}"))?;
@@ -389,6 +391,576 @@ fn copy_package_file(
     Ok(())
 }
 
+/// The workstation's not-yet-promoted finalize sign-off (mirrors
+/// `serve::jobs::SIGNOFF_PENDING_REL_PATH`).
+const SIGNOFF_PENDING_REL_PATH: &str = "review/signoff.pending.json";
+
+/// Packages the sign-off the packaged report was rendered with, as
+/// `review/signoff.json`: during finalize that is the pending record
+/// (make-report ran with `--signoff <pending>`, and promotion happens only
+/// after this package succeeds); otherwise the promoted record. Returns the
+/// case-relative source, which the manifest records as `signoff_source`.
+fn copy_signoff(
+    case_dir: &Path,
+    output_dir: &Path,
+    files: &mut Vec<PackageFile>,
+) -> Result<Option<&'static str>, String> {
+    let promoted = crate::report::SIGNOFF_REL_PATH;
+    for source_rel in [SIGNOFF_PENDING_REL_PATH, promoted] {
+        let source = case_dir.join(source_rel);
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "package source cannot be a symlink: {}",
+                source.display()
+            ));
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let target = output_dir.join(promoted);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create package directory: {err}"))?;
+        }
+        fs::copy(&source, &target).map_err(|err| {
+            format!(
+                "failed to copy sign-off {} into the package: {err}",
+                source.display()
+            )
+        })?;
+        files.push(PackageFile {
+            relative_path: PathBuf::from(promoted),
+            sha256: audit::digest_file(&target)?,
+            size_bytes: fs::metadata(&target)
+                .map_err(|err| format!("failed to stat packaged sign-off: {err}"))?
+                .len(),
+        });
+        return Ok(Some(source_rel));
+    }
+    Ok(None)
+}
+
+/// Outcome of one `verify-package` check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    /// Verified and consistent.
+    Pass,
+    /// Verified and inconsistent: the package is not what it claims.
+    Fail,
+    /// Could not be verified from the package alone; stated, not implied.
+    NotVerified,
+}
+
+impl CheckStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::NotVerified => "NOT VERIFIED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageCheck {
+    pub status: CheckStatus,
+    /// Package-relative file (or area) the check is about.
+    pub subject: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PackageVerification {
+    pub checks: Vec<PackageCheck>,
+    /// SHA-256 of `manifest.sha256` — compare with the value recorded at
+    /// finalize; nothing inside the package can authenticate itself.
+    pub manifest_sha256: Option<String>,
+    pub files_verified: usize,
+}
+
+impl PackageVerification {
+    pub fn failures(&self) -> impl Iterator<Item = &PackageCheck> {
+        self.checks
+            .iter()
+            .filter(|check| check.status == CheckStatus::Fail)
+    }
+
+    pub fn passed(&self) -> bool {
+        self.failures().next().is_none()
+    }
+
+    fn push(&mut self, status: CheckStatus, subject: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(PackageCheck {
+            status,
+            subject: subject.into(),
+            detail: detail.into(),
+        });
+    }
+}
+
+/// Files `package_case` writes after (or outside) `manifest.sha256`.
+const UNLISTED_PACKAGE_FILES: &[&str] = &["manifest.sha256", "package-manifest.json", "README.txt"];
+
+/// Rejects manifest paths that could escape the package or are not the
+/// portable '/'-separated relative form `package_case` writes.
+fn safe_manifest_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('/')
+        && !rel.contains('\\')
+        && !rel.contains(':')
+        && rel
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn is_lower_hex_sha256(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Verifies a package written by [`package_case`] using only its own
+/// contents (FOR-13). Checks, each reported with what it covers:
+/// 1. every `manifest.sha256` entry names a regular file whose SHA-256
+///    matches, and no other file is present (besides the manifest files
+///    and README);
+/// 2. `package-manifest.json` agrees with `manifest.sha256` and on-disk sizes;
+/// 3. every packaged hash-chained `.jsonl` log verifies as a chain;
+/// 4. the packaged SQLite snapshot passes `integrity_check`;
+/// 5. a packaged sign-off's `content_sha256` matches the review marks in
+///    the packaged database, and the packaged report names that examiner.
+///
+/// Returns `Err` only when the directory cannot be inspected at all; every
+/// finding (including failures) is a check in the result.
+pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String> {
+    if !package_dir.is_dir() {
+        return Err(format!(
+            "package directory not found: {}",
+            package_dir.display()
+        ));
+    }
+    let mut out = PackageVerification::default();
+    let manifest_path = package_dir.join("manifest.sha256");
+    let manifest_text = match fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(err) => {
+            out.push(
+                CheckStatus::Fail,
+                "manifest.sha256",
+                format!("cannot read the checksum manifest: {err}"),
+            );
+            return Ok(out);
+        }
+    };
+    out.manifest_sha256 = audit::digest_file(&manifest_path).ok();
+
+    // 1. manifest.sha256 entries vs files.
+    let mut listed: std::collections::BTreeMap<String, String> = Default::default();
+    let mut manifest_ok = true;
+    let body = manifest_text.strip_suffix('\n').unwrap_or(&manifest_text);
+    if !manifest_text.is_empty() && !manifest_text.ends_with('\n') {
+        manifest_ok = false;
+        out.push(
+            CheckStatus::Fail,
+            "manifest.sha256",
+            "last line is not newline-terminated (truncated or appended)",
+        );
+    }
+    for (index, line) in body.split('\n').enumerate() {
+        if manifest_text.is_empty() {
+            break;
+        }
+        let parsed = line
+            .split_once("  ")
+            .filter(|(hash, rel)| is_lower_hex_sha256(hash) && safe_manifest_path(rel));
+        let Some((hash, rel)) = parsed else {
+            manifest_ok = false;
+            out.push(
+                CheckStatus::Fail,
+                "manifest.sha256",
+                format!(
+                    "line {} is not `<sha256>  <relative path>` with a safe relative path: {line:?}",
+                    index + 1
+                ),
+            );
+            continue;
+        };
+        if listed.insert(rel.to_string(), hash.to_string()).is_some() {
+            manifest_ok = false;
+            out.push(
+                CheckStatus::Fail,
+                rel,
+                "listed more than once in manifest.sha256",
+            );
+        }
+    }
+    for (rel, expected) in &listed {
+        let path = package_dir.join(rel);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => {
+                out.push(
+                    CheckStatus::Fail,
+                    rel,
+                    "listed in manifest.sha256 but is not a regular file (symlink or directory)",
+                );
+                continue;
+            }
+            Err(_) => {
+                out.push(
+                    CheckStatus::Fail,
+                    rel,
+                    "listed in manifest.sha256 but missing from the package",
+                );
+                continue;
+            }
+        }
+        match audit::digest_file(&path) {
+            Ok(actual) if &actual == expected => out.files_verified += 1,
+            Ok(actual) => out.push(
+                CheckStatus::Fail,
+                rel,
+                format!("SHA-256 mismatch: manifest.sha256 records {expected}, file is {actual}"),
+            ),
+            Err(err) => out.push(CheckStatus::Fail, rel, err),
+        }
+    }
+    let mut present = Vec::new();
+    collect_package_files(package_dir, Path::new(""), &mut present, &mut out);
+    for rel in present {
+        if !listed.contains_key(&rel) && !UNLISTED_PACKAGE_FILES.contains(&rel.as_str()) {
+            out.push(
+                CheckStatus::Fail,
+                &rel,
+                "present in the package but not listed in manifest.sha256 (added after packaging)",
+            );
+        }
+    }
+    if manifest_ok && out.files_verified == listed.len() {
+        out.push(
+            CheckStatus::Pass,
+            "manifest.sha256",
+            format!(
+                "{} listed file(s) present with matching SHA-256; no unlisted files",
+                listed.len()
+            ),
+        );
+    }
+
+    // 2. package-manifest.json vs manifest.sha256 and sizes.
+    verify_package_manifest_json(package_dir, &listed, &mut out);
+
+    // 3. Hash-chained logs.
+    for rel in listed.keys().filter(|rel| rel.ends_with(".jsonl")) {
+        let path = package_dir.join(rel);
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let chained = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .is_some_and(|value| {
+                value.get("previous_entry_sha256").is_some() || value.get("entry_sha256").is_some()
+            });
+        if !chained {
+            out.push(
+                CheckStatus::NotVerified,
+                rel,
+                "not a hash-chained log; covered by manifest.sha256 only",
+            );
+            continue;
+        }
+        match audit::verify_chained_jsonl(&path) {
+            Ok(result) => {
+                let mut detail = format!(
+                    "audit chain verified: {} entr{}, {}",
+                    result.entries,
+                    if result.entries == 1 { "y" } else { "ies" },
+                    result.integrity.label()
+                );
+                for warning in &result.warnings {
+                    detail.push_str(&format!("; warning: {warning}"));
+                }
+                out.push(CheckStatus::Pass, rel, detail);
+            }
+            Err(err) => out.push(CheckStatus::Fail, rel, format!("audit chain broken: {err}")),
+        }
+    }
+
+    // 4 + 5. Database snapshot and sign-off.
+    verify_package_db_and_signoff(package_dir, &listed, &mut out);
+
+    out.push(
+        CheckStatus::NotVerified,
+        "authenticity",
+        format!(
+            "manifest.sha256 is not signed: these checks show the package is internally consistent, not who produced it. Compare its SHA-256 ({}) with the value recorded at finalize.",
+            out.manifest_sha256.as_deref().unwrap_or("unavailable")
+        ),
+    );
+    out.push(
+        CheckStatus::NotVerified,
+        "source evidence",
+        "original evidence media are not in the package and were not re-hashed (see the packaged custody/report re-hash results)",
+    );
+    Ok(out)
+}
+
+fn collect_package_files(
+    root: &Path,
+    rel: &Path,
+    present: &mut Vec<String>,
+    out: &mut PackageVerification,
+) {
+    let Ok(entries) = fs::read_dir(root.join(rel)) else {
+        out.push(
+            CheckStatus::Fail,
+            rel_manifest_path(rel),
+            "directory could not be listed",
+        );
+        return;
+    };
+    for entry in entries.flatten() {
+        let child = rel.join(entry.file_name());
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_package_files(root, &child, present, out);
+        } else if file_type.is_file() {
+            present.push(rel_manifest_path(&child));
+        } else {
+            out.push(
+                CheckStatus::Fail,
+                rel_manifest_path(&child),
+                "symlink or special file inside the package",
+            );
+        }
+    }
+}
+
+fn verify_package_manifest_json(
+    package_dir: &Path,
+    listed: &std::collections::BTreeMap<String, String>,
+    out: &mut PackageVerification,
+) {
+    let subject = "package-manifest.json";
+    let value = match fs::read_to_string(package_dir.join(subject))
+        .map_err(|err| err.to_string())
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&text).map_err(|err| err.to_string())
+        }) {
+        Ok(value) => value,
+        Err(err) => {
+            out.push(CheckStatus::Fail, subject, format!("unreadable: {err}"));
+            return;
+        }
+    };
+    let Some(files) = value.get("files").and_then(|files| files.as_array()) else {
+        out.push(CheckStatus::Fail, subject, "has no files array");
+        return;
+    };
+    let mut ok = true;
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files {
+        let rel = file
+            .get("relative_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let sha = file.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+        seen.insert(rel.to_string());
+        match listed.get(rel) {
+            None => {
+                ok = false;
+                out.push(
+                    CheckStatus::Fail,
+                    subject,
+                    format!("lists {rel:?}, which manifest.sha256 does not"),
+                );
+            }
+            Some(expected) if expected != sha => {
+                ok = false;
+                out.push(
+                    CheckStatus::Fail,
+                    subject,
+                    format!("{rel}: sha256 {sha} disagrees with manifest.sha256 {expected}"),
+                );
+            }
+            Some(_) => {
+                let size = file.get("size_bytes").and_then(|v| v.as_u64());
+                let actual = fs::metadata(package_dir.join(rel)).ok().map(|m| m.len());
+                if size != actual {
+                    ok = false;
+                    out.push(
+                        CheckStatus::Fail,
+                        subject,
+                        format!("{rel}: size_bytes {size:?} disagrees with the file ({actual:?})"),
+                    );
+                }
+            }
+        }
+    }
+    for rel in listed.keys().filter(|rel| !seen.contains(*rel)) {
+        ok = false;
+        out.push(
+            CheckStatus::Fail,
+            subject,
+            format!("omits {rel}, which manifest.sha256 lists"),
+        );
+    }
+    if value.get("file_count").and_then(|v| v.as_u64()) != Some(files.len() as u64) {
+        ok = false;
+        out.push(
+            CheckStatus::Fail,
+            subject,
+            "file_count disagrees with the files array",
+        );
+    }
+    if ok {
+        out.push(
+            CheckStatus::Pass,
+            subject,
+            "file list, digests and sizes agree with manifest.sha256 (the JSON itself is not covered by manifest.sha256)",
+        );
+    }
+}
+
+fn verify_package_db_and_signoff(
+    package_dir: &Path,
+    listed: &std::collections::BTreeMap<String, String>,
+    out: &mut PackageVerification,
+) {
+    let db_rel = "db/case.db";
+    let signoff_rel = crate::report::SIGNOFF_REL_PATH;
+    if !listed.contains_key(db_rel) {
+        out.push(
+            CheckStatus::Fail,
+            db_rel,
+            "required case database is not in manifest.sha256",
+        );
+        return;
+    }
+    // Work on a private copy so verification never creates -wal/-shm
+    // files (or anything else) inside the package being verified.
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "frametrace-verify-package-{}-{}-{}",
+        std::process::id(),
+        now_unix().unwrap_or(0),
+        SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let marks = (|| -> Result<Vec<crate::case_db::ReviewMarkRow>, String> {
+        fs::create_dir_all(&scratch).map_err(|err| err.to_string())?;
+        let copy = scratch.join("case.db");
+        fs::copy(package_dir.join(db_rel), &copy).map_err(|err| err.to_string())?;
+        let conn = crate::case_db::open_readonly_case_db(&copy)?;
+        let check: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|err| format!("integrity_check failed to run: {err}"))?;
+        if check != "ok" {
+            return Err(format!("SQLite integrity_check: {check}"));
+        }
+        let history = crate::case_db::load_review_mark_history_from(&conn, None)?.len();
+        let marks = crate::case_db::load_review_marks_from(&conn)?;
+        out.push(
+            CheckStatus::Pass,
+            db_rel,
+            format!(
+                "SQLite integrity_check ok; {} review mark(s), {} review mark history row(s)",
+                marks.len(),
+                history
+            ),
+        );
+        Ok(marks)
+    })();
+    let _ = fs::remove_dir_all(&scratch);
+    let marks = match marks {
+        Ok(marks) => marks,
+        Err(err) => {
+            out.push(CheckStatus::Fail, db_rel, err);
+            return;
+        }
+    };
+
+    let report_rel = "reports/case-report.html";
+    let report = listed
+        .contains_key(report_rel)
+        .then(|| fs::read_to_string(package_dir.join(report_rel)).ok())
+        .flatten();
+    if !listed.contains_key(signoff_rel) {
+        let detail = if report
+            .as_deref()
+            .is_some_and(|html| html.contains("검토자: <strong>"))
+        {
+            "no sign-off record in the package, although the packaged report names a reviewer; the sign-off cannot be checked"
+        } else {
+            "no sign-off record in the package (not finalized, or packaged before sign-off records were included)"
+        };
+        out.push(CheckStatus::NotVerified, signoff_rel, detail);
+        return;
+    }
+    let text = fs::read_to_string(package_dir.join(signoff_rel)).unwrap_or_default();
+    let Some((examiner, _)) = crate::report::parse_signoff(&text) else {
+        out.push(
+            CheckStatus::Fail,
+            signoff_rel,
+            "sign-off record is not valid (no examiner)",
+        );
+        return;
+    };
+    let content = crate::report::signoff_content_sha256(
+        &crate::cli::handlers::review_marks_json_from_rows(&marks),
+    );
+    match crate::report::signoff_currency(&text, &content) {
+        crate::report::SignoffCurrency::Current => out.push(
+            CheckStatus::Pass,
+            signoff_rel,
+            format!(
+                "content_sha256 matches the review marks in the packaged db/case.db (examiner recorded as typed: {examiner}; not an authenticated identity)"
+            ),
+        ),
+        crate::report::SignoffCurrency::Changed => out.push(
+            CheckStatus::Fail,
+            signoff_rel,
+            format!(
+                "content_sha256 does not match the review marks in the packaged db/case.db (now {content}): the sign-off does not cover this package's marks"
+            ),
+        ),
+        crate::report::SignoffCurrency::Unbound => out.push(
+            CheckStatus::NotVerified,
+            signoff_rel,
+            "sign-off predates content binding (no content_sha256); which marks it covers cannot be checked",
+        ),
+    }
+    match report {
+        Some(html) => {
+            let banner = format!(
+                "검토자: <strong>{}</strong>",
+                crate::util::html_escape(&examiner)
+            );
+            if html.contains(&banner) {
+                out.push(
+                    CheckStatus::Pass,
+                    report_rel,
+                    "report names the same examiner as the sign-off record",
+                );
+            } else {
+                out.push(
+                    CheckStatus::Fail,
+                    report_rel,
+                    "report does not name the examiner recorded in review/signoff.json",
+                );
+            }
+        }
+        None => out.push(
+            CheckStatus::NotVerified,
+            report_rel,
+            "no packaged report to compare with the sign-off",
+        ),
+    }
+}
+
 fn copy_optional_package_file(
     case_dir: &Path,
     output_dir: &Path,
@@ -409,6 +981,7 @@ fn package_manifest_json(
     missing_optional_files: &[PathBuf],
     running_jobs: &[crate::case_db::RunningJob],
     quiescent: bool,
+    signoff_source: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str("{\n");
@@ -466,6 +1039,12 @@ fn package_manifest_json(
         "  \"snapshot_scope\": \"{}\",\n",
         json_escape(snapshot_scope)
     ));
+    out.push_str(&format!(
+        "  \"signoff_source\": {},\n",
+        signoff_source
+            .map(|rel| format!("\"{}\"", json_escape(rel)))
+            .unwrap_or_else(|| "null".to_string())
+    ));
     let pdf_note = if files
         .iter()
         .any(|file| file.relative_path == Path::new("reports/case-report.html"))
@@ -482,6 +1061,216 @@ fn package_manifest_json(
 #[cfg(test)]
 mod tests {
     use super::package_case;
+
+    mod verify {
+        use super::super::{CheckStatus, PackageVerification, package_case, verify_package};
+        use super::fixture;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        fn failing_subjects(result: &PackageVerification) -> Vec<String> {
+            result.failures().map(|c| c.subject.clone()).collect()
+        }
+
+        /// A case with a chained audit log, marks, a sign-off bound to
+        /// those marks and a report naming the examiner — then packaged.
+        fn signed_package(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+            let root = fixture(name);
+            let case_dir = root.join("case");
+            crate::audit::append_chained_jsonl_keyed(
+                &case_dir.join("evidence/logs/scan-log.jsonl"),
+                r#"{"kind":"one"}"#,
+                None,
+            )
+            .unwrap();
+            crate::audit::append_chained_jsonl_keyed(
+                &case_dir.join("evidence/logs/scan-log.jsonl"),
+                r#"{"kind":"two"}"#,
+                None,
+            )
+            .unwrap();
+            crate::case_db::upsert_review_marks(
+                &case_dir,
+                &[crate::case_db::ReviewMarkRow {
+                    record_id: "vid_1".into(),
+                    status: "important".into(),
+                    marked_unix: 9,
+                    examiner: Some("kim".into()),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            let content = crate::report::signoff_content_sha256(
+                &crate::cli::handlers::review_marks_json(&case_dir),
+            );
+            fs::create_dir_all(case_dir.join("review")).unwrap();
+            fs::write(
+                case_dir.join("review/signoff.pending.json"),
+                format!(
+                    "{{\"schema_version\":2,\"examiner\":\"홍길동\",\"signed_unix\":5,\"content_sha256\":\"{content}\"}}\n"
+                ),
+            )
+            .unwrap();
+            fs::create_dir_all(case_dir.join("reports")).unwrap();
+            fs::write(
+                case_dir.join("reports/case-report.html"),
+                "<html><body><div>검토자: <strong>홍길동</strong></div></body></html>",
+            )
+            .unwrap();
+            let output = root.join("package");
+            package_case(&case_dir, Some(&output)).unwrap();
+            (root, case_dir, output)
+        }
+
+        fn check<'a>(
+            result: &'a PackageVerification,
+            subject: &str,
+        ) -> Option<&'a super::super::PackageCheck> {
+            result.checks.iter().find(|c| c.subject == subject)
+        }
+
+        #[test]
+        fn fresh_package_passes_and_states_what_is_not_verified() {
+            let (root, _case, output) = signed_package("verify-fresh");
+            let result = verify_package(&output).unwrap();
+            assert!(result.passed(), "{:?}", result.checks);
+            assert_eq!(
+                check(&result, "evidence/logs/scan-log.jsonl")
+                    .unwrap()
+                    .status,
+                CheckStatus::Pass
+            );
+            let signoff = check(&result, "review/signoff.json").unwrap();
+            assert_eq!(signoff.status, CheckStatus::Pass, "{signoff:?}");
+            assert_eq!(
+                check(&result, "reports/case-report.html").unwrap().status,
+                CheckStatus::Pass
+            );
+            assert_eq!(
+                check(&result, "authenticity").unwrap().status,
+                CheckStatus::NotVerified
+            );
+            // Unchained jsonl is reported as not verified, never as a pass.
+            assert_eq!(
+                check(&result, "db/videos.jsonl").unwrap().status,
+                CheckStatus::NotVerified
+            );
+            let manifest: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(output.join("package-manifest.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["signoff_source"], "review/signoff.pending.json");
+            // Verification wrote nothing into the package.
+            assert!(!output.join("db/case.db-shm").exists());
+            assert!(!output.join("db/case.db-wal").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        fn rewrite(path: &Path, from: &str, to: &str) {
+            let text = fs::read_to_string(path).unwrap();
+            assert!(text.contains(from), "{from} not in {}", path.display());
+            fs::write(path, text.replacen(from, to, 1)).unwrap();
+        }
+
+        #[test]
+        fn tampered_file_manifest_and_audit_line_fail_naming_the_file() {
+            // Tampered packaged file.
+            let (root, _case, output) = signed_package("verify-file");
+            fs::write(output.join("case.json"), b"{\"forged\":true}").unwrap();
+            let result = verify_package(&output).unwrap();
+            assert!(failing_subjects(&result).contains(&"case.json".to_string()));
+            assert!(
+                result
+                    .failures()
+                    .any(|c| c.detail.contains("SHA-256 mismatch"))
+            );
+            fs::remove_dir_all(root).unwrap();
+
+            // Tampered manifest.sha256 (digest edited for one entry).
+            let (root, _case, output) = signed_package("verify-manifest");
+            let manifest = output.join("manifest.sha256");
+            let text = fs::read_to_string(&manifest).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.ends_with("  db/video_paths.tsv"))
+                .unwrap();
+            rewrite(&manifest, &line[..64], &"0".repeat(64));
+            let result = verify_package(&output).unwrap();
+            let failing = failing_subjects(&result);
+            assert!(
+                failing.contains(&"db/video_paths.tsv".to_string()),
+                "{failing:?}"
+            );
+            // package-manifest.json now disagrees with manifest.sha256 too.
+            assert!(failing.contains(&"package-manifest.json".to_string()));
+            fs::remove_dir_all(root).unwrap();
+
+            // Tampered audit line, with manifest.sha256 "fixed up" to match:
+            // the chain check still names the log.
+            let (root, _case, output) = signed_package("verify-audit");
+            let log = output.join("evidence/logs/scan-log.jsonl");
+            let before = crate::audit::digest_file(&log).unwrap();
+            rewrite(&log, "\"kind\":\"one\"", "\"kind\":\"forged\"");
+            let after = crate::audit::digest_file(&log).unwrap();
+            rewrite(&output.join("manifest.sha256"), &before, &after);
+            let result = verify_package(&output).unwrap();
+            let failure = result
+                .failures()
+                .find(|c| c.subject == "evidence/logs/scan-log.jsonl")
+                .expect("audit log named");
+            assert!(failure.detail.contains("audit chain broken"), "{failure:?}");
+            fs::remove_dir_all(root).unwrap();
+
+            // Junk appended after the last audit entry.
+            let (root, _case, output) = signed_package("verify-junk");
+            let log = output.join("evidence/logs/scan-log.jsonl");
+            let mut text = fs::read_to_string(&log).unwrap();
+            text.push_str("{\"kind\":\"appended\"}\n");
+            fs::write(&log, text).unwrap();
+            let result = verify_package(&output).unwrap();
+            assert!(
+                failing_subjects(&result).contains(&"evidence/logs/scan-log.jsonl".to_string())
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn added_files_and_stale_signoff_fail() {
+            let (root, case_dir, _output) = signed_package("verify-extra");
+            let output = root.join("package");
+            fs::write(output.join("reports/extra.html"), b"added later").unwrap();
+            let result = verify_package(&output).unwrap();
+            assert!(failing_subjects(&result).contains(&"reports/extra.html".to_string()));
+
+            // Marks changed after the sign-off: a new package carrying the
+            // old sign-off must not verify as signed for its content.
+            fs::remove_file(case_dir.join("review/signoff.pending.json")).ok();
+            crate::case_db::upsert_review_marks(
+                &case_dir,
+                &[crate::case_db::ReviewMarkRow {
+                    record_id: "vid_2".into(),
+                    status: "relevant".into(),
+                    marked_unix: 10,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            fs::write(
+                case_dir.join("review/signoff.json"),
+                fs::read_to_string(output.join("review/signoff.json")).unwrap(),
+            )
+            .unwrap();
+            let second = root.join("package2");
+            package_case(&case_dir, Some(&second)).unwrap();
+            let result = verify_package(&second).unwrap();
+            let failure = result
+                .failures()
+                .find(|c| c.subject == "review/signoff.json")
+                .expect("stale sign-off fails");
+            assert!(failure.detail.contains("does not cover"), "{failure:?}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
     use std::fs;
 
     fn fixture(name: &str) -> std::path::PathBuf {

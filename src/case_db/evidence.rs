@@ -1,79 +1,5 @@
 use super::*;
-use crate::util::now_unix;
-use rusqlite::params;
 use std::path::Path;
-
-pub fn register_evidence_source(
-    case_dir: &Path,
-    input: &EvidenceSourceInput,
-) -> Result<EvidenceSourceRow, String> {
-    let conn = open_case_db(case_dir)?;
-    init_schema(&conn)?;
-    let now = now_unix()?;
-    let path = input.path.to_string_lossy().to_string();
-    let source_id = input
-        .source_id
-        .clone()
-        .unwrap_or_else(|| stable_source_id(&input.kind, &path));
-    conn.execute(
-        r#"
-        INSERT INTO evidence_sources (
-            source_id,
-            kind,
-            path,
-            registered_unix,
-            last_seen_unix,
-            write_protect,
-            acquisition_tool,
-            evidence_hash,
-            notes,
-            metadata_json
-        )
-        VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)
-        ON CONFLICT(source_id) DO UPDATE SET
-            kind = excluded.kind,
-            path = excluded.path,
-            last_seen_unix = excluded.last_seen_unix,
-            write_protect = COALESCE(excluded.write_protect, evidence_sources.write_protect),
-            acquisition_tool = COALESCE(excluded.acquisition_tool, evidence_sources.acquisition_tool),
-            evidence_hash = COALESCE(excluded.evidence_hash, evidence_sources.evidence_hash),
-            notes = COALESCE(excluded.notes, evidence_sources.notes),
-            metadata_json = excluded.metadata_json
-        ON CONFLICT(kind, path) DO UPDATE SET
-            last_seen_unix = excluded.last_seen_unix,
-            write_protect = COALESCE(excluded.write_protect, evidence_sources.write_protect),
-            acquisition_tool = COALESCE(excluded.acquisition_tool, evidence_sources.acquisition_tool),
-            evidence_hash = COALESCE(excluded.evidence_hash, evidence_sources.evidence_hash),
-            notes = COALESCE(excluded.notes, evidence_sources.notes),
-            metadata_json = excluded.metadata_json
-        "#,
-        params![
-            source_id.as_str(),
-            input.kind.as_str(),
-            path.as_str(),
-            u64_to_i64(now),
-            input.write_protect.as_deref(),
-            input.acquisition_tool.as_deref(),
-            input.evidence_hash.as_deref(),
-            input.notes.as_deref(),
-            input.metadata_json.as_deref().unwrap_or("{}"),
-        ],
-    )
-    .map_err(|err| format!("failed to register evidence source: {err}"))?;
-
-    conn.query_row(
-        "SELECT source_id, kind, path FROM evidence_sources WHERE kind = ?1 AND path = ?2",
-        params![input.kind.as_str(), path.as_str()],
-        |row| {
-            Ok(EvidenceSourceRow {
-                source_id: row.get(0)?,
-                kind: row.get(1)?,
-                path: row.get(2)?,
-            })
-        },
-    )
-    .map_err(|err| format!("failed to read registered evidence source: {err}"))
-}
 
 pub(crate) fn stable_source_id(kind: &str, path: &str) -> String {
     let digest = crate::sha256::digest_bytes(format!("{kind}\n{path}").as_bytes());
@@ -115,57 +41,9 @@ pub fn patch_review_annotations(
     tags: &[crate::selection::TagEntry],
     deleted_ids: &[String],
 ) -> Result<usize, String> {
-    let mut conn = open_case_db(case_dir)?;
-    init_schema(&conn)?;
-    let tx = conn
-        .transaction()
-        .map_err(|err| format!("failed to start SQLite marks transaction: {err}"))?;
-    for id in deleted_ids {
-        tx.execute("DELETE FROM review_marks WHERE record_id = ?1", [id])
-            .map_err(|err| format!("failed to remove review mark: {err}"))?;
-    }
-    for entry in tags {
-        let key = format!("review_tags.v1:{}", entry.id);
-        if entry.tags.is_empty() {
-            tx.execute("DELETE FROM schema_meta WHERE key = ?1", [&key])
-                .map_err(|err| format!("failed to remove review tags: {err}"))?;
-        } else {
-            let value = serde_json::to_string(&entry.tags).map_err(|err| err.to_string())?;
-            tx.execute("INSERT INTO schema_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])
-                .map_err(|err| format!("failed to store review tags: {err}"))?;
-        }
-    }
-    for mark in marks {
-        tx.execute(
-            r#"
-            INSERT INTO review_marks (record_id, status, marked_unix, record_path, examiner, note, range_in, range_out)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(record_id) DO UPDATE SET
-                status = excluded.status,
-                marked_unix = excluded.marked_unix,
-                record_path = COALESCE(excluded.record_path, review_marks.record_path),
-                examiner = COALESCE(excluded.examiner, review_marks.examiner),
-                note = COALESCE(excluded.note, review_marks.note),
-                range_in = CASE WHEN ?9 THEN excluded.range_in ELSE review_marks.range_in END,
-                range_out = CASE WHEN ?9 THEN excluded.range_out ELSE review_marks.range_out END
-            "#,
-            params![
-                mark.record_id.as_str(),
-                mark.status.as_str(),
-                u64_to_i64(mark.marked_unix),
-                mark.record_path.as_deref(),
-                mark.examiner.as_deref(),
-                mark.note.as_deref(),
-                mark.range.and_then(|range| range.start),
-                mark.range.and_then(|range| range.end),
-                mark.range.is_some(),
-            ],
-        )
-        .map_err(|err| format!("failed to upsert review mark {}: {err}", mark.record_id))?;
-    }
-    tx.commit()
-        .map_err(|err| format!("failed to commit review marks: {err}"))?;
-    Ok(marks.len())
+    // Every effective change is appended to review_mark_history in the
+    // same transaction (FOR-07); see `patch_review_annotations_by`.
+    super::marks::patch_review_annotations_by(case_dir, marks, tags, deleted_ids, None)
 }
 
 pub fn load_review_tags(case_dir: &Path) -> Result<Vec<crate::selection::TagEntry>, String> {
@@ -201,17 +79,25 @@ pub fn load_review_marks(case_dir: &Path) -> Result<Vec<ReviewMarkRow>, String> 
         return Ok(Vec::new());
     }
     let conn = open_readonly_case_db(&path)?;
-    if !table_exists(&conn, "review_marks")? {
+    load_review_marks_from(&conn)
+}
+
+/// [`load_review_marks`] over an already-open connection (verify-package
+/// reads a packaged database copy this way).
+pub(crate) fn load_review_marks_from(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<ReviewMarkRow>, String> {
+    if !table_exists(conn, "review_marks")? {
         return Ok(Vec::new());
     }
     // Read-only connections skip init_schema, so a pre-v4 case db may not
     // have the note column yet — fall back to NULLs instead of failing.
-    let note_col = if table_has_column(&conn, "review_marks", "note")? {
+    let note_col = if table_has_column(conn, "review_marks", "note")? {
         "note"
     } else {
         "NULL"
     };
-    let (in_col, out_col) = if table_has_column(&conn, "review_marks", "range_in")? {
+    let (in_col, out_col) = if table_has_column(conn, "review_marks", "range_in")? {
         ("range_in", "range_out")
     } else {
         ("NULL", "NULL")

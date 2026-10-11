@@ -263,10 +263,17 @@ pub fn verify_chained_jsonl_text(
     keys: &[AuditKey],
 ) -> Result<AuditChainVerification, String> {
     let complete_tail = text.is_empty() || text.ends_with('\n');
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
+    // Split on '\n' only: `str::lines` would also swallow a trailing '\r',
+    // letting CR bytes be inserted without any hash noticing. Every line,
+    // including the last, must be a complete chained entry — blank or
+    // whitespace-only lines are content no hash covers, so they fail
+    // verification instead of being skipped.
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let lines: Vec<&str> = if text.is_empty() {
+        Vec::new()
+    } else {
+        body.split('\n').collect()
+    };
     let mut previous_entry_sha256 = "GENESIS".to_string();
     let mut last_entry_sha256 = previous_entry_sha256.clone();
     let mut entries = 0usize;
@@ -283,6 +290,11 @@ pub fn verify_chained_jsonl_text(
             Unauthenticated,
         }
         let verify_line = || -> Result<Keyed, String> {
+            if line.trim().is_empty() {
+                return Err(format!(
+                    "audit line {line_number} is blank: content outside any chained entry (no hash covers it)"
+                ));
+            }
             let recorded_previous =
                 extract_json_string(line, "previous_entry_sha256").ok_or_else(|| {
                     format!("audit line {line_number} is missing previous_entry_sha256")
@@ -304,10 +316,43 @@ pub fn verify_chained_jsonl_text(
                     "audit line {line_number} entry hash mismatch: expected {computed_entry}, found {recorded_entry}"
                 ));
             }
+            // The chained field must be the one the appender wrote last
+            // before entry_sha256 — a duplicate key elsewhere in the body
+            // must not be what the chain check read.
+            if !signed_entry.ends_with(&format!(
+                ",\"previous_entry_sha256\":\"{}\"}}",
+                json_escape(&recorded_previous)
+            )) {
+                return Err(format!(
+                    "audit line {line_number} has previous_entry_sha256 outside its chained position"
+                ));
+            }
 
             // Keyed layer — purely additive over the same signed bytes.
             let recorded_hmac = extract_json_string(line, "entry_hmac_sha256");
             let recorded_key_id = extract_json_string(line, "entry_hmac_key_id");
+            // Everything after the signed bytes is the documented trailer
+            // only, byte for byte: entry_sha256, then (keyed) the HMAC and
+            // key id. Any other field or trailing junk there is content
+            // entry_sha256 does not cover, so the line fails.
+            let mut canonical = format!(
+                "{},\"entry_sha256\":\"{}\"",
+                &signed_entry[..signed_entry.len() - 1],
+                json_escape(&recorded_entry)
+            );
+            if let (Some(hmac), Some(key_id)) = (&recorded_hmac, &recorded_key_id) {
+                canonical.push_str(&format!(
+                    ",\"entry_hmac_sha256\":\"{}\",\"entry_hmac_key_id\":\"{}\"",
+                    json_escape(hmac),
+                    json_escape(key_id)
+                ));
+            }
+            canonical.push('}');
+            if canonical != *line && recorded_hmac.is_some() == recorded_key_id.is_some() {
+                return Err(format!(
+                    "audit line {line_number} has content after entry_sha256 that the entry hash does not cover (only entry_hmac_sha256/entry_hmac_key_id may follow it)"
+                ));
+            }
             match (recorded_hmac, recorded_key_id) {
                 (None, None) => Ok(Keyed::Unkeyed),
                 (Some(_), None) | (None, Some(_)) => Err(format!(
@@ -753,6 +798,54 @@ mod tests {
         let verification = verify_chained_jsonl(&path).unwrap();
         assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
         assert_eq!(verification.keyed_entries, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FOR-13: nothing outside the hashed bytes may ride along — not an
+    /// extra field after entry_sha256 on the LAST line (which no later
+    /// previous_entry_sha256 covers), not junk/blank lines after the last
+    /// entry, not CR bytes, not a duplicate chain key.
+    #[test]
+    fn content_not_covered_by_entry_hash_fails_verification() {
+        use super::verify_chained_jsonl_text;
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-junk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        append_chained_jsonl_keyed(&path, r#"{"kind":"one"}"#, None).unwrap();
+        append_chained_jsonl_keyed(&path, r#"{"kind":"two"}"#, None).unwrap();
+        let good = read_to_string(&path).unwrap();
+        assert_eq!(
+            verify_chained_jsonl_text(&good, "t", &[]).unwrap().entries,
+            2
+        );
+
+        let last_with_extra_field = format!(
+            "{},\"examiner\":\"forged\"}}\n",
+            good.trim_end().strip_suffix('}').unwrap()
+        );
+        let tampered = [
+            ("extra field after entry_sha256", last_with_extra_field),
+            ("junk line", format!("{good}garbage\n")),
+            ("blank line", format!("{good}\n")),
+            ("whitespace line", format!("{good}   \n")),
+            ("trailing json object", format!("{good}{{}}\n")),
+            ("CR before newline", good.replace('\n', "\r\n")),
+        ];
+        for (label, text) in tampered {
+            let err = verify_chained_jsonl_text(&text, "t", &[]).unwrap_err();
+            assert!(err.contains("audit line"), "{label}: {err}");
+        }
+
+        // Keyed trailer: same rule, the key id must be the canonical form.
+        let key = test_key("k1", 0x33);
+        let keyed_path = dir.join("keyed.jsonl");
+        append_chained_jsonl_keyed(&keyed_path, r#"{"kind":"one"}"#, Some(&key)).unwrap();
+        let keyed = read_to_string(&keyed_path).unwrap();
+        assert!(verify_chained_jsonl_text(&keyed, "t", std::slice::from_ref(&key)).is_ok());
+        let keyed_extra = keyed.replace("\"}\n", "\",\"x\":1}\n");
+        assert!(verify_chained_jsonl_text(&keyed_extra, "t", std::slice::from_ref(&key)).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }
