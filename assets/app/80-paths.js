@@ -149,8 +149,9 @@ async function caseResumeInfo(dir) {
     if (cp || review !== null) {
       return {
         checkpoint: !!cp,
-        done: cp ? Number(cp.done) : NaN,
-        total: cp ? Number(cp.total) : NaN,
+        // Number(null) is 0: a null total (no index yet) must stay unknown.
+        done: cp && cp.done != null ? Number(cp.done) : NaN,
+        total: cp && cp.total != null ? Number(cp.total) : NaN,
         review: review !== null ? review : (await caseResumeProbe(dir)).review,
       };
     }

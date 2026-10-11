@@ -414,6 +414,17 @@ await test('case-info: N/M resume text; 404 falls back to the checkpoint probe',
   assert.match(env.ev('resumeText')(info), /이전 분석 40\/100 진행됨 \(40%\)/);
   assert.ok(env.calls.some((c) => c.url === '/api/case-info?case_dir=%2Fcases%2Fc1'));
 
+  // No index yet: the server reports checkpoint.total = null → "N건 진행됨"
+  // without inventing a total (Number(null) would read as 0).
+  const noTotal = makeEnv({ routes: { 'GET /api/case-info': () => ({ json: { ok: true, checkpoint: { done: 37, total: null }, has_review: false } }) } });
+  const info3 = await noTotal.ev('caseResumeInfo("/cases/c1")');
+  assert.equal(info3.checkpoint, true);
+  assert.equal(info3.done, 37);
+  assert.ok(Number.isNaN(info3.total));
+  const text3 = noTotal.ev('resumeText')(info3);
+  assert.match(text3, /이전 분석 37건 진행됨/);
+  assert.doesNotMatch(text3, /\/|%/);
+
   const old = makeEnv({ routes: { 'GET /api/browse': (_b, url) => ({ json: { ok: true, is_file: url.includes('scan-progress'), is_case: url.endsWith('c1') } }) } });
   const info2 = await old.ev('caseResumeInfo("/cases/c1")');
   assert.equal(info2.checkpoint, true);
