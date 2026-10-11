@@ -1,4 +1,5 @@
 const els = {
+  root: ftRoot,
   caseLine: document.getElementById("caseLine"),
   resultCount: document.getElementById("resultCount"),
   triageStatus: document.getElementById("triageStatus"),
@@ -199,8 +200,8 @@ function saveLayoutSoon() {
 }
 
 function applyLayout() {
-  document.body.classList.toggle("theater", !!state.layout.theater);
-  const player = document.querySelector(".player");
+  els.root.classList.toggle("theater", !!state.layout.theater);
+  const player = ftRoot.querySelector(".player");
   const h = Number(state.layout.playerH) || 0;
   player.style.height = h >= 160 ? h + "px" : "";
   applyColumnSplit();
@@ -218,7 +219,7 @@ function applyLayout() {
 // stored as the browse pane percentage of .main (28–72).
 const COL_MIN = 28, COL_MAX = 72;
 function applyColumnSplit() {
-  const main = document.querySelector(".main");
+  const main = ftRoot.querySelector(".main");
   const pct = Number(state.layout.colSplit) || 0;
   if (pct >= COL_MIN && pct <= COL_MAX) {
     main.style.gridTemplateColumns = `minmax(0, 1fr) 10px minmax(min(420px, 55%), ${(100 - pct).toFixed(2)}%)`;
@@ -231,14 +232,14 @@ function applyColumnSplit() {
 // aria-valuenow follows the rendered split (browse % of .main).
 function syncSplitterAria() {
   const splitter = document.getElementById("vsplitter");
-  const main = document.querySelector(".main");
-  const browse = document.querySelector(".browse");
+  const main = ftRoot.querySelector(".main");
+  const browse = ftRoot.querySelector(".browse");
   if (!splitter || !main || !browse) return;
   const w = main.clientWidth;
   const pct = w > 0 ? Math.round((browse.getBoundingClientRect().width / w) * 100) : Math.round(Number(state.layout.colSplit) || 60);
   splitter.setAttribute("aria-valuenow", String(Math.max(COL_MIN, Math.min(COL_MAX, pct || 60))));
   const hs = document.getElementById("hsplitter");
-  const player = document.querySelector(".player");
+  const player = ftRoot.querySelector(".player");
   if (hs && player) {
     hs.setAttribute("aria-valuenow", String(Math.round(player.offsetHeight || 0)));
     hs.setAttribute("aria-valuemax", String(Math.max(200, window.innerHeight - 200)));
@@ -247,7 +248,7 @@ function syncSplitterAria() {
 
 function setupColumnSplitter() {
   const splitter = document.getElementById("vsplitter");
-  const main = document.querySelector(".main");
+  const main = ftRoot.querySelector(".main");
   let dragging = false;
   splitter.addEventListener("pointerdown", event => {
     dragging = true;
@@ -296,7 +297,7 @@ function setupColumnSplitter() {
 
 function setupHeightSplitter() {
   const splitter = document.getElementById("hsplitter");
-  const player = document.querySelector(".player");
+  const player = ftRoot.querySelector(".player");
   let startY = 0;
   let startH = 0;
   let dragging = false;
@@ -635,7 +636,7 @@ function renderGrid(filtered) {
   }
   gridRenderedOnce = true;
   const virtual = virtualGridEnabled();
-  document.body.classList.toggle("vgrid", virtual);
+  els.root.classList.toggle("vgrid", virtual);
   const pageCount = virtual ? 1 : Math.max(1, Math.ceil(filtered.length / state.pageSize));
   state.currentPage = virtual ? 1 : Math.min(Math.max(1, state.currentPage), pageCount);
   const start = virtual ? 0 : (state.currentPage - 1) * state.pageSize;
@@ -951,7 +952,7 @@ const railClassNow = () => (window.innerWidth >= RAIL_AUTO_BELOW ? "wide" : "nar
 function applyRail() {
   railWidthClass = railClassNow();
   const open = !!railPrefs[railWidthClass];
-  document.body.classList.toggle("rail-collapsed", !open);
+  els.root.classList.toggle("rail-collapsed", !open);
   document.getElementById("btnRail")?.setAttribute("aria-expanded", open ? "true" : "false");
 }
 function toggleRail() {
@@ -964,8 +965,8 @@ function toggleRail() {
 
 let gridDensity = prefGet(DENSITY_KEY, "comfortable") === "compact" ? "compact" : "comfortable";
 function applyDensity() {
-  document.body.classList.toggle("density-compact", gridDensity === "compact");
-  document.querySelectorAll("[data-density]").forEach(btn => btn.setAttribute("aria-pressed", btn.dataset.density === gridDensity ? "true" : "false"));
+  els.root.classList.toggle("density-compact", gridDensity === "compact");
+  ftRoot.querySelectorAll("[data-density]").forEach(btn => btn.setAttribute("aria-pressed", btn.dataset.density === gridDensity ? "true" : "false"));
 }
 
 function menuItems(list) {
@@ -978,18 +979,19 @@ function setupLayoutChrome() {
   window.addEventListener("resize", () => {
     if (railClassNow() !== railWidthClass) applyRail();
     syncSplitterAria();
-  });
+  }, { signal: ftSignal });
   document.getElementById("btnRail")?.addEventListener("click", toggleRail);
   document.addEventListener("keydown", event => {
     if (event.defaultPrevented || event.altKey || event.shiftKey) return;
     if (!(event.ctrlKey || event.metaKey) || String(event.key).toLowerCase() !== "b") return;
     const el = document.activeElement;
     if (el && (el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+    if (el && el.closest && el.closest('[data-keys="off"]')) return;
     event.preventDefault();
     toggleRail();
-  });
+  }, { signal: ftSignal });
 
-  document.querySelectorAll("[data-density]").forEach(btn => btn.addEventListener("click", () => {
+  ftRoot.querySelectorAll("[data-density]").forEach(btn => btn.addEventListener("click", () => {
     if (gridDensity === btn.dataset.density) return;
     gridDensity = btn.dataset.density;
     prefSet(DENSITY_KEY, gridDensity);
@@ -1024,7 +1026,7 @@ function setupLayoutChrome() {
     });
     document.addEventListener("click", event => {
       if (!extra.hidden && event.target instanceof Element && !event.target.closest(".menu-filters")) closeExtra(false);
-    });
+    }, { signal: ftSignal });
   }
 
   // 보기 ▾: Enter/Space/ArrowDown open and focus the first item, arrows move,
@@ -1069,7 +1071,7 @@ function setupLayoutChrome() {
   }
 
   // Count pills filter by status / anomaly; pressing the active one clears.
-  document.querySelectorAll(".count-pills [data-pill]").forEach(pill => pill.addEventListener("click", () => {
+  ftRoot.querySelectorAll(".count-pills [data-pill]").forEach(pill => pill.addEventListener("click", () => {
     applyPresetChip(pill.getAttribute("aria-pressed") === "true" ? "" : pill.dataset.pill);
   }));
 

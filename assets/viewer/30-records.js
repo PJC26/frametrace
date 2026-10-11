@@ -620,7 +620,8 @@ const state = {
   examiner: storageGet(EXAMINER_KEY, ""),
   tags: storageGet(TAGS_KEY, {}),
   tagPresets: storageGet(TAG_PRESETS_KEY, null),
-  locale: storageGet(LOCALE_KEY, "ko") === "en" ? "en" : "ko",
+  // A host-supplied locale (FTViewer.init({ locale })) wins and is remembered.
+  locale: opts.locale || (storageGet(LOCALE_KEY, "ko") === "en" ? "en" : "ko"),
   layout: Object.assign({ videoMode: "fit", videoZoom: 100, theater: false, dual: false, playerH: 0, colSplit: 0, rate: 1 }, storageGet(LAYOUT_KEY, {})),
   currentPage: 1,
   pageSize: 100,
@@ -676,6 +677,7 @@ hydrateAnnotations(DATA.annotations || { marks: [], tags: [] });
 // null = never customized → seed from defaults; an empty array is a
 // deliberate "no presets" choice and must not reseed.
 if (!Array.isArray(state.tagPresets)) state.tagPresets = [...DEFAULT_TAG_PRESETS];
+if (opts.locale) storageSet(LOCALE_KEY, state.locale);
 
 // Same-origin hosts (e.g. the examiner workstation iframe) read live case
 // stats through this getter instead of re-parsing the embedded data.

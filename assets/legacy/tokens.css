@@ -1,0 +1,138 @@
+/* FrameTrace shared design tokens — bundled FIRST into both the workstation
+   shell (assets/examiner_app.html) and the evidence viewer
+   (assets/evidence_viewer.html) by build.rs. Offline tool: system fonts only,
+   nothing is downloaded. Theme switching is unchanged: <html data-theme=
+   "light|dark"> (ft-theme in localStorage), set by an inline script before
+   first paint.
+
+   Contrast contract (checked by scripts/check-css.mjs, both themes):
+   every text token on every surface token >= 4.5:1, every status fg on its
+   own bg and on the plain surfaces >= 4.5:1, disabled >= 3:1. */
+:root {
+  color-scheme: light;
+
+  /* ---- type ---- */
+  --font-sans: "Pretendard Variable", Pretendard, "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --fs-xs: 12px;   /* minimum text size anywhere */
+  --fs-sm: 13px;   /* body */
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --lh-body: 1.5;
+  --lh-ctl: 1.35;
+
+  /* ---- spacing / shape ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --radius-sm: 4px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow: 0 1px 3px rgba(0,0,0,.05), 0 4px 14px rgba(0,0,0,.05);
+
+  /* ---- focus ring: 2px accent, 2px offset ---- */
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+  --focus-ring: var(--focus-ring-width) solid var(--accent);
+
+  /* ---- motion (120-180ms ease-out; 0 under reduced motion) ---- */
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --dur-fast: 120ms;
+  --dur: 150ms;
+  --dur-slow: 180ms;
+
+  /* ---- surfaces & text ---- */
+  --bg: #f1f3f2;
+  --surface: #ffffff;
+  --surface-2: #f6f8f7;
+  --text: #1f2724;
+  --muted: #5a6560;
+  --border: #d3d9d6;
+  --border-strong: #aab3af;
+  --accent: #0d7569;
+  --on-accent: #ffffff;
+  --accent-ink: #0b5f57;
+  --accent-soft: #e2f0ee;
+  --disabled-fg: #6f7a75;
+  --disabled-bg: #e6eae8;
+  --media-bg: #101815;   /* video stage: dark in both themes */
+  --media-muted: #a9bdb5; /* secondary text on the dark media bars */
+
+  /* ---- semantic ---- */
+  --ok: #1b6e34;
+  --danger: #b3261e;
+  --warn: #7a5200;
+  --info: #1d5fae;
+
+  /* ---- status: fg/bg pairs ---- */
+  --verified-fg: #1b6e34;        --verified-bg: #e3f4ec;
+  --failed-fg: #b3261e;          --failed-bg: #fdeceb;
+  --candidate-fg: #5e4f91;       --candidate-bg: #efecf7;
+  --original-fg: #0b5f57;        --original-bg: #e2f0ee;
+  --carved-fg: #96470a;          --carved-bg: #fbeadd;
+  --fs-recovered-fg: #1f4fb0;    --fs-recovered-bg: #e5ecfa;
+  --deleted-candidate-fg: #9b1c1c; --deleted-candidate-bg: #fbe6e6;
+  --anomaly-fg: #7a5200;         --anomaly-bg: #f8efd9;
+  --warn-fg: #7a5200;            --warn-bg: #fdf3e3;
+  --info-fg: #1d5fae;            --info-bg: #e6eef8;
+
+  /* ---- review marks (chips: solid bg + fg) ---- */
+  --mark-reviewed-bg: #1d5fae;   --mark-reviewed-fg: #ffffff;
+  --mark-important-bg: #b3261e;  --mark-important-fg: #ffffff;
+  --mark-needs-verification-bg: #8a5d14; --mark-needs-verification-fg: #ffffff;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --shadow: 0 1px 3px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.35);
+
+  --bg: #101514;
+  --surface: #1a211e;
+  --surface-2: #232c28;
+  --text: #e1e9e5;
+  --muted: #9bb1a8;
+  --border: #2e3b36;
+  --border-strong: #4a5f57;
+  --accent: #3fa08e;
+  --on-accent: #0b1512;          /* dark ink: white on #3fa08e is only 3.17:1 */
+  --accent-ink: #57b8a6;
+  --accent-soft: #1d332d;
+  --disabled-fg: #7d908a;
+  --disabled-bg: #1a211e;
+
+  --ok: #6cc688;
+  --danger: #ff8a80;
+  --warn: #e8b45a;
+  --info: #8ab4f0;
+
+  --verified-fg: #6cc688;        --verified-bg: #16382c;
+  --failed-fg: #ff8a80;          --failed-bg: #3d2422;
+  --candidate-fg: #b8a9ec;       --candidate-bg: #2a2640;
+  --original-fg: #57b8a6;        --original-bg: #1d332d;
+  --carved-fg: #f0a060;          --carved-bg: #3a2616;
+  --fs-recovered-fg: #8fb0f5;    --fs-recovered-bg: #1c2a4a;
+  --deleted-candidate-fg: #ff8f8f; --deleted-candidate-bg: #3d2222;
+  --anomaly-fg: #e8b45a;         --anomaly-bg: #3a2e1a;
+  --warn-fg: #e8b45a;            --warn-bg: #3a2e1a;
+  --info-fg: #8ab4f0;            --info-bg: #1c2b42;
+
+  --mark-reviewed-bg: #8ab4f0;   --mark-reviewed-fg: #0b1512;
+  --mark-important-bg: #ff8a80;  --mark-important-fg: #0b1512;
+  --mark-needs-verification-bg: #e8b45a; --mark-needs-verification-fg: #0b1512;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-fast: 0ms; --dur: 0ms; --dur-slow: 0ms; }
+}
+
+/* Base rhythm shared by both pages. Component stylesheets load after this
+   and may refine, but never go below --fs-xs. */
+body { font-size: var(--fs-sm); line-height: var(--lh-body); }
+button, input, select, textarea { line-height: var(--lh-ctl); }
+
+/* Keyboard focus ring (2px accent, 2px offset). Mouse clicks do not show it. */
+:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }

@@ -67,7 +67,9 @@ fn concat(parts: &[PathBuf], bundle_name: &str, ext: &str) -> String {
 /// single-file evidence viewer. Source lives split per concern, but the
 /// deliverable must stay a plain concatenation — ES module imports do
 /// not resolve under file:// where the exported review page is opened.
-fn viewer_bundle(out_dir: &Path) {
+/// `00-host.js` (window.FTViewer) sorts first; the hosted workstation page
+/// inlines the very same bundle (docs/ui-rebuild-contract.md §3).
+fn viewer_js() -> String {
     let viewer_dir = Path::new("assets/viewer");
     println!("cargo:rerun-if-changed={}", viewer_dir.display());
     let bundle = concat(
@@ -75,7 +77,66 @@ fn viewer_bundle(out_dir: &Path) {
         "assets/viewer/bundle.js",
         "js",
     );
-    fs::write(out_dir.join("evidence_viewer.js"), bundle).expect("failed to write viewer bundle");
+    assert!(
+        !bundle.to_ascii_lowercase().contains("</script"),
+        "assets/viewer/*.js must not contain a literal </script"
+    );
+    bundle
+}
+
+/// The shared viewer markup (docs/ui-rebuild-contract.md §1.2): ONE
+/// fragment, `assets/viewer/viewer.body.html`, rooted at
+/// `<div id="ftViewer" class="ft-viewer" data-ft-viewer="2">`. Every page
+/// that shows the viewer carries a single include marker that is replaced
+/// by it, so the standalone/exported viewer and the viewer hosted inside
+/// the workstation shell can never drift apart.
+const VIEWER_INCLUDE: &str = "<!-- @include:viewer.body -->";
+
+fn viewer_fragment() -> String {
+    let path = PathBuf::from("assets/viewer/viewer.body.html");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let fragment = fs::read_to_string(&path).expect("assets/viewer/viewer.body.html missing");
+    assert!(
+        fragment.starts_with(r#"<div id="ftViewer" class="ft-viewer" data-ft-viewer="2">"#),
+        "viewer.body.html must start with the #ftViewer root"
+    );
+    assert_eq!(
+        fragment.matches(r#"id="ftViewer""#).count(),
+        1,
+        "viewer.body.html must contain exactly one #ftViewer root"
+    );
+    // The standalone template is filled by html_report::fill_template; the
+    // fragment must never carry one of its slot tokens or another marker.
+    for token in [
+        "__CSS__",
+        "__DATA__",
+        "__JS__",
+        "<!-- @include:",
+        "<!-- @bundle:",
+    ] {
+        assert!(
+            !fragment.contains(token),
+            "viewer.body.html must not contain {token}"
+        );
+    }
+    fragment.trim_end().to_string()
+}
+
+/// Replaces the include marker. `required` pages must carry exactly one;
+/// optional pages at most one. Returns whether the fragment went in.
+fn include_viewer_body(page: String, template_name: &str, required: bool) -> (String, bool) {
+    match page.matches(VIEWER_INCLUDE).count() {
+        0 if !required => (page, false),
+        1 => (page.replacen(VIEWER_INCLUDE, &viewer_fragment(), 1), true),
+        n => panic!(
+            "{template_name} must contain {} {VIEWER_INCLUDE} (found {n})",
+            if required {
+                "exactly one"
+            } else {
+                "at most one"
+            }
+        ),
+    }
 }
 
 /// Shared design tokens (assets/tokens.css) are the FIRST part of both CSS
@@ -116,20 +177,58 @@ fn inline_icons(page: String, template_name: &str) -> String {
     }
 }
 
-fn viewer_css_bundle(out_dir: &Path) {
-    // Order matters: tokens, the shared kit, the page stylesheet, then the
-    // control styles (action bar, player toolbar, menus, toasts) which
-    // refine it.
+/// The viewer's own stylesheets (scoped under `.ft-viewer`): the page
+/// stylesheet, then the control styles (action bar, player toolbar, menus,
+/// toasts) which refine it.
+fn viewer_own_css() -> Vec<PathBuf> {
     let viewer_css = PathBuf::from("assets/evidence_viewer.css");
     let controls_css = PathBuf::from("assets/viewer/controls.css");
     println!("cargo:rerun-if-changed={}", viewer_css.display());
     println!("cargo:rerun-if-changed={}", controls_css.display());
-    let css = concat(
-        &[tokens_path(), kit_path(), viewer_css, controls_css],
-        "assets/viewer/bundle.css",
-        "css",
-    );
+    vec![viewer_css, controls_css]
+}
+
+fn viewer_css_bundle(out_dir: &Path) {
+    // Order matters: tokens, the shared kit, then the viewer's own sheets.
+    let mut parts = vec![tokens_path(), kit_path()];
+    parts.extend(viewer_own_css());
+    let css = concat(&parts, "assets/viewer/bundle.css", "css");
     fs::write(out_dir.join("evidence_viewer.css"), css).expect("failed to write viewer css");
+}
+
+/// The standalone/exported viewer template, materialised in OUT_DIR with
+/// the fragment and the icon sprite inlined; html_report.rs include_str!s
+/// it and fills the `__CSS__` / `__DATA__` / `__JS__` slots per case.
+fn viewer_template(out_dir: &Path) {
+    let template_path = Path::new("assets/evidence_viewer.html");
+    println!("cargo:rerun-if-changed={}", template_path.display());
+    let template = fs::read_to_string(template_path).expect("assets/evidence_viewer.html missing");
+    for slot in ["__CSS__", "__DATA__", "__JS__"] {
+        assert_eq!(
+            template.matches(slot).count(),
+            1,
+            "evidence_viewer.html must contain exactly one {slot}"
+        );
+    }
+    let (page, _) = include_viewer_body(template, "evidence_viewer.html", true);
+    let page = inline_icons(page, "evidence_viewer.html");
+    for slot in ["__CSS__", "__DATA__", "__JS__"] {
+        assert_eq!(
+            page.matches(slot).count(),
+            1,
+            "the icon sprite must not contain {slot}"
+        );
+    }
+    fs::write(out_dir.join("evidence_viewer.html"), page).expect("failed to write viewer template");
+}
+
+/// One shell page flavour: template + token sheet (+ kit) + `app/` parts.
+struct ShellPage<'a> {
+    template: &'a Path,
+    tokens: PathBuf,
+    kit: Option<PathBuf>,
+    app_dir: &'a Path,
+    bundle_dir: &'a str,
 }
 
 /// STR-01: the workstation shell (`GET /`) is authored as markup in
@@ -137,49 +236,108 @@ fn viewer_css_bundle(out_dir: &Path) {
 /// and served as ONE self-contained page: the `<!-- @bundle:app.css -->`
 /// and `<!-- @bundle:app.js -->` markers are replaced by inline
 /// `<style>` / `<script>` blocks (no extra routes, works offline).
-fn app_bundle(out_dir: &Path) {
-    let app_dir = Path::new("assets/app");
-    let template_path = Path::new("assets/examiner_app.html");
-    println!("cargo:rerun-if-changed={}", app_dir.display());
-    println!("cargo:rerun-if-changed={}", template_path.display());
-    let template = fs::read_to_string(template_path).expect("assets/examiner_app.html missing");
-    let mut css_parts = vec![tokens_path(), kit_path()];
-    css_parts.extend(sorted_parts(app_dir, "css"));
-    let css = concat(&css_parts, "assets/app/bundle.css", "css");
-    let js = concat(&sorted_parts(app_dir, "js"), "assets/app/bundle.js", "js");
+///
+/// Hosted viewer (docs/ui-rebuild-contract.md §3): when the template carries
+/// the viewer include marker, the viewer fragment goes there, the viewer's
+/// own stylesheets join the shell CSS block (tokens + kit stay bundled
+/// once), and the viewer bundle is inlined as its own `<script>` right
+/// before the shell script, so `window.FTViewer` exists when the shell
+/// boots. Without the marker the page is exactly the shell bundle.
+fn shell_page(spec: &ShellPage) -> String {
+    println!("cargo:rerun-if-changed={}", spec.app_dir.display());
+    println!("cargo:rerun-if-changed={}", spec.template.display());
+    let template = fs::read_to_string(spec.template)
+        .unwrap_or_else(|_| panic!("{} missing", spec.template.display()));
+    let name = display_name(spec.template);
+    let (template, hosted) = include_viewer_body(template, &name, false);
+    let mut css_parts = vec![spec.tokens.clone()];
+    css_parts.extend(spec.kit.clone());
+    css_parts.extend(sorted_parts(spec.app_dir, "css"));
+    if hosted {
+        css_parts.extend(viewer_own_css());
+    }
+    let css = concat(
+        &css_parts,
+        &format!("{}/bundle.css", spec.bundle_dir),
+        "css",
+    );
+    let js = concat(
+        &sorted_parts(spec.app_dir, "js"),
+        &format!("{}/bundle.js", spec.bundle_dir),
+        "js",
+    );
     assert!(
         !js.to_ascii_lowercase().contains("</script"),
-        "assets/app/*.js must not contain a literal </script"
+        "{}/*.js must not contain a literal </script",
+        spec.bundle_dir
     );
     assert!(
         !css.to_ascii_lowercase().contains("</style"),
-        "assets/app/*.css must not contain a literal </style"
+        "{}/*.css must not contain a literal </style",
+        spec.bundle_dir
     );
+    let script = if hosted {
+        format!(
+            "<script>\n{}</script>\n<script>\n{js}</script>",
+            viewer_js()
+        )
+    } else {
+        format!("<script>\n{js}</script>")
+    };
     let mut page = template;
     for (marker, block) in [
         (
             "<!-- @bundle:app.css -->",
             format!("<style>\n{css}</style>"),
         ),
-        (
-            "<!-- @bundle:app.js -->",
-            format!("<script>\n{js}</script>"),
-        ),
+        ("<!-- @bundle:app.js -->", script),
     ] {
         assert_eq!(
             page.matches(marker).count(),
             1,
-            "examiner_app.html must contain exactly one {marker}"
+            "{name} must contain exactly one {marker}"
         );
         page = page.replacen(marker, &block, 1);
     }
-    let page = inline_icons(page, "examiner_app.html");
+    inline_icons(page, &name)
+}
+
+fn app_bundle(out_dir: &Path) {
+    let page = shell_page(&ShellPage {
+        template: Path::new("assets/examiner_app.html"),
+        tokens: tokens_path(),
+        kit: Some(kit_path()),
+        app_dir: Path::new("assets/app"),
+        bundle_dir: "assets/app",
+    });
     fs::write(out_dir.join("examiner_app.html"), page).expect("failed to write app bundle");
+}
+
+/// FRAMETRACE_UI=legacy rollback (docs/ui-rebuild-contract.md §9.3): the
+/// pre-rebuild shell (465e7db snapshot under assets/legacy/, never edited)
+/// bundled with the same rules. It embeds the viewer through its iframe
+/// (`/review/evidence-viewer.html?embed=1`), which the standalone viewer
+/// still honours. Remove together with assets/legacy/ one release later.
+fn legacy_bundle(out_dir: &Path) {
+    let tokens = PathBuf::from("assets/legacy/tokens.css");
+    println!("cargo:rerun-if-changed={}", tokens.display());
+    let page = shell_page(&ShellPage {
+        template: Path::new("assets/legacy/examiner_app.html"),
+        tokens,
+        kit: None,
+        app_dir: Path::new("assets/legacy/app"),
+        bundle_dir: "assets/legacy/app",
+    });
+    fs::write(out_dir.join("examiner_app_legacy.html"), page)
+        .expect("failed to write legacy app bundle");
 }
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    viewer_bundle(&out_dir);
+    fs::write(out_dir.join("evidence_viewer.js"), viewer_js())
+        .expect("failed to write viewer bundle");
     viewer_css_bundle(&out_dir);
+    viewer_template(&out_dir);
     app_bundle(&out_dir);
+    legacy_bundle(&out_dir);
 }

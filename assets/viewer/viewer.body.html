@@ -1,0 +1,305 @@
+<div id="ftViewer" class="ft-viewer" data-ft-viewer="2">
+  <button id="btnExitFs" class="fs-exit" hidden data-i18n-title="tip.fsExit" title="Esc 키로도 닫을 수 있습니다" data-i18n="fs.exit">✕ 닫기 — 워크스테이션으로</button>
+  <!-- Title row: standalone only (.ft-viewer.embed / .hosted hide it — the shell's stage bar
+       owns the case title, theme and language there). -->
+  <header class="app-header">
+    <h1>FrameTrace Evidence Viewer</h1>
+    <div class="case-line" id="caseLine"></div>
+    <div class="header-actions">
+      <a id="linkCarveReport" href="carve-report.html" hidden data-i18n="link.carve">카빙 결과</a>
+      <button id="btnTheme" type="button" class="btn-sm" data-i18n-title="theme.toggle" title="테마 전환">◐</button>
+      <button id="btnLang" type="button" class="btn-sm" title="Switch language" data-i18n-title="lang.switch">EN</button>
+    </div>
+  </header>
+  <div class="topbar" role="search" aria-label="증거 검색과 필터" data-i18n-aria-label="layout.searchLabel">
+    <button id="btnRail" type="button" class="icon-btn" aria-expanded="true" aria-controls="leftRail" aria-label="필터 패널 접기/펼치기 (Ctrl+B)" data-i18n-aria-label="layout.railToggle" title="필터 패널 접기/펼치기 (Ctrl+B)" data-i18n-title="layout.railToggle"><span aria-hidden="true">☰</span></button>
+    <input id="query" type="search" placeholder="경로, ID, 파서, 해시 검색" data-i18n-placeholder="search.placeholder" aria-label="검색" data-i18n-aria-label="layout.search">
+    <select id="kind" title="출처" data-i18n-title="filter.kind" aria-label="출처" data-i18n-aria-label="filter.kind">
+      <option value="" data-i18n="filter.kind.all">전체 출처</option>
+      <option value="video" data-i18n="filter.kind.video">원본 (논리 파일)</option>
+      <option value="carved" data-i18n="filter.kind.carved">카빙 후보</option>
+      <option value="filesystem" data-i18n="filter.kind.filesystem">파일시스템 복구</option>
+      <option value="candidate" data-i18n="filter.kind.candidate">삭제 영상 후보 (복구 전)</option>
+    </select>
+    <select id="status" title="검증 상태" data-i18n-title="filter.status" aria-label="검증 상태" data-i18n-aria-label="filter.status">
+      <option value="" data-i18n="filter.status.all">전체 검증 상태</option>
+      <option value="ffprobe-video-stream-confirmed" data-i18n="status.verified">검증됨</option>
+      <option value="validation-failed" data-i18n="status.failed">검증 실패</option>
+      <option value="candidate-unvalidated" data-i18n="status.candidate">미검증 후보</option>
+      <option value="duplicate-candidate" data-i18n="status.duplicate">중복 후보</option>
+    </select>
+    <div class="menu menu-down menu-filters">
+      <button id="btnMoreFilters" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="filtersExtra" data-i18n-title="tip.moreFilters" title="정렬, 그룹화, 페이지 크기, 기간 필터" data-i18n="menu.filters">정렬·표시 ▾</button>
+      <div class="filters filters-extra" id="filtersExtra" hidden role="group" aria-label="정렬·표시" data-i18n-aria-label="layout.sortDisplay">
+        <div class="fx-row">
+          <span class="fx-label" data-i18n="layout.density">카드 밀도</span>
+          <div class="seg density-seg" role="group" aria-label="카드 밀도" data-i18n-aria-label="layout.density">
+            <button id="btnDensityComfortable" type="button" data-density="comfortable" aria-pressed="true" data-i18n="layout.comfortable">넉넉</button>
+            <button id="btnDensityCompact" type="button" data-density="compact" aria-pressed="false" data-i18n="layout.compact">촘촘</button>
+          </div>
+        </div>
+        <div class="fx-row">
+          <select id="sortBy" title="정렬" data-i18n-title="filter.sort" aria-label="정렬" data-i18n-aria-label="filter.sort">
+            <option value="id" data-i18n="filter.sort.id">기본 (ID순)</option>
+            <option value="time-desc" data-i18n="filter.sort.timeDesc">시간 최신순</option>
+            <option value="time-asc" data-i18n="filter.sort.timeAsc">시간 오래된순</option>
+            <option value="name" data-i18n="filter.sort.name">이름순</option>
+            <option value="size-desc" data-i18n="filter.sort.sizeDesc">크기순</option>
+          </select>
+          <select id="groupBy" title="분류/그룹화" data-i18n-title="filter.group" aria-label="분류/그룹화" data-i18n-aria-label="filter.group">
+            <option value="none" data-i18n="filter.group.none">그룹화 없음</option>
+            <option value="day" data-i18n="filter.group.day">녹화 일자별</option>
+            <option value="kind" data-i18n="filter.group.kind">출처별</option>
+            <option value="recType" data-i18n="filter.group.recType">녹화 유형별 (주행/충격/주차)</option>
+            <option value="status" data-i18n="filter.group.status">검증 상태별</option>
+            <option value="mark" data-i18n="filter.group.mark">판독 마크별</option>
+            <option value="prefix" data-i18n="filter.group.prefix">이름 접두사별</option>
+            <option value="channel" data-i18n="filter.group.channel">채널별 (전/후방)</option>
+          </select>
+        </div>
+        <div class="fx-row">
+          <button id="btnGroupKind" class="chip chip-toggle" type="button" data-i18n-title="tip.groupKind" title="출처(원본/카빙/복구/후보)별로 목록을 묶어 봅니다" data-i18n="chip.groupKind">출처별 묶기</button>
+          <select id="tagFilter" title="태그로 필터" data-i18n-title="filter.tag" aria-label="태그로 필터" data-i18n-aria-label="filter.tag">
+            <option value="" data-i18n="filter.tag.all">태그: 전체</option>
+          </select>
+          <select id="pageSize" aria-label="페이지 크기" data-i18n-aria-label="layout.pageSize">
+            <option value="100" data-i18n="filter.page.100">100개씩</option>
+            <option value="250" data-i18n="filter.page.250">250개씩</option>
+            <option value="500" data-i18n="filter.page.500">500개씩</option>
+            <option value="1000" data-i18n="filter.page.1000">1000개씩</option>
+          </select>
+        </div>
+        <div class="date-row fx-row">
+          <input id="dateFrom" type="date" title="기간 시작" data-i18n-title="filter.dateFrom" aria-label="기간 시작" data-i18n-aria-label="filter.dateFrom">
+          <span class="muted" aria-hidden="true">~</span>
+          <input id="dateTo" type="date" title="기간 끝" data-i18n-title="filter.dateTo" aria-label="기간 끝" data-i18n-aria-label="filter.dateTo">
+          <button id="btnClearDates" class="mini" type="button" data-i18n="btn.clearDates">기간 해제</button>
+        </div>
+      </div>
+    </div>
+    <div class="count-pills" role="group" aria-label="상태별 건수 — 누르면 필터" data-i18n-aria-label="layout.pills">
+      <button id="pillVerified" type="button" class="pill ok" data-pill="status:ffprobe-video-stream-confirmed" aria-pressed="false" data-i18n-title="tip.badgeOk" title="ffprobe로 검증됨"><span class="pill-ic" aria-hidden="true">✓</span><span data-i18n="header.verified">검증됨</span> <span id="metricVerified" class="pill-n">0</span></button>
+      <button id="pillFailed" type="button" class="pill failed" data-pill="status:validation-failed" aria-pressed="false" data-i18n-title="tip.badgeFail" title="검증 실패"><span class="pill-ic" aria-hidden="true">✕</span><span data-i18n="header.failed">실패</span> <span id="metricFailed" class="pill-n">0</span></button>
+      <button id="pillCandidate" type="button" class="pill candidate" data-pill="status:candidate-unvalidated" aria-pressed="false" data-i18n-title="tip.badgeCand" title="아직 검증하지 않은 후보"><span class="pill-ic" aria-hidden="true">?</span><span data-i18n="header.candidate">후보</span> <span id="metricCarved" class="pill-n">0</span></button>
+      <button id="pillAnomaly" type="button" class="pill anomaly" data-pill="anomaly" aria-pressed="false" data-i18n-title="tip.badgeAnom" title="이상 후보 소견"><span class="pill-ic" aria-hidden="true">⚠</span><span data-i18n="layout.pillAnomaly">이상</span> <span id="metricAnomaly" class="pill-n">0</span></button>
+    </div>
+    <div class="menu menu-down">
+      <button id="btnViewMenu" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="viewMenuList" data-i18n="menu.view">보기 ▾</button>
+      <div class="menu-list" id="viewMenuList" hidden>
+        <button id="btnTheater" type="button" data-i18n-title="tip.theater" title="시어터 모드 (t)" data-i18n="btn.theater">시어터</button>
+        <button id="btnFullscreen" type="button" data-i18n-title="tip.fullscreen" title="전체화면 (f)" data-i18n="btn.fullscreen">전체화면</button>
+        <button id="btnPip" type="button" data-i18n-title="tip.pip" title="화면 속 화면 (p)" data-i18n="btn.pip">PiP</button>
+        <hr>
+        <button id="btnTimeline" type="button" data-i18n-title="tip.timeline" title="케이스 이벤트를 시간순으로 봅니다" data-i18n="menu.timeline">타임라인</button>
+      </div>
+    </div>
+    <button id="btnShortcuts" type="button" class="icon-btn" data-i18n-title="tip.shortcuts" title="단축키 (?)" aria-label="단축키 (?)" data-i18n-aria-label="tip.shortcuts"><span aria-hidden="true">?</span></button>
+  </div>
+  <div class="workarea">
+    <aside class="rail" id="leftRail" aria-labelledby="railTitle">
+      <h2 class="rail-title" id="railTitle" data-i18n="filter.label">필터</h2>
+      <div class="chip-row rail-chips"><span id="presetChips" class="chip-row-inner" role="group" aria-labelledby="railTitle"></span></div>
+      <div class="tree" id="facetTree" role="group" aria-label="분류" data-i18n-aria-label="layout.facets"></div>
+      <section class="rail-cal" aria-labelledby="calTitle">
+        <h2 class="rail-title" id="calTitle" data-i18n="layout.calendar">녹화 달력</h2>
+        <div class="hist" id="dayHistogram" title="일자별 건수 — 클릭하면 그날로 필터" data-i18n-title="hist.title"></div>
+        <p class="muted period" id="periodLabel"></p>
+      </section>
+    </aside>
+    <main class="main" id="mainArea">
+      <section class="browse" aria-label="증거 목록" data-i18n-aria-label="grid.label">
+        <div class="warn-banner" id="caseWarnings" hidden></div>
+        <div class="timeline-panel" id="timelinePanel" hidden>
+          <div class="timeline-head">
+            <h2 class="timeline-title" data-i18n="timeline.title">케이스 타임라인</h2>
+            <span class="muted" id="timelineMeta"></span>
+            <button id="btnTimelineGen" type="button" class="mini" data-i18n="timeline.gen">타임라인 생성/갱신</button>
+            <button id="btnTimelineClose" type="button" class="mini" data-i18n="btn.close">닫기</button>
+          </div>
+          <div class="timeline-list" id="timelineList"></div>
+        </div>
+        <div class="active-filters" id="activeFilters" hidden role="group" aria-label="적용 중인 필터" data-i18n-aria-label="layout.activeFilters"></div>
+        <div class="grid" id="recordGrid" role="grid" aria-label="증거 목록" data-i18n-aria-label="grid.label" aria-multiselectable="true"></div>
+        <div class="pager">
+          <span class="muted" id="dflSummary"></span>
+          <span class="muted" id="triageStatus"></span>
+          <span class="pager-spacer"></span>
+          <span class="muted"><span data-i18n="layout.results">결과</span> <span id="resultCount"></span></span>
+          <button id="prevPage" type="button" class="btn-sm" data-i18n="page.prev">이전</button>
+          <span class="muted" id="pageStatus"></span>
+          <button id="nextPage" type="button" class="btn-sm" data-i18n="page.next">다음</button>
+          <span id="gridLive" class="sr-only" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+      <div class="vsplitter" id="vsplitter" role="separator" tabindex="0" aria-orientation="vertical" aria-controls="mainArea" aria-valuemin="28" aria-valuemax="72" aria-valuenow="60" aria-label="목록/뷰어 폭 조절 (←/→)" data-i18n-aria-label="layout.splitV" title="드래그: 목록/뷰어 폭 조절 / 더블클릭: 기본값" data-i18n-title="split.v"></div>
+      <section class="media" aria-label="미리보기" data-i18n-aria-label="layout.preview">
+      <div class="player">
+        <div class="media-title"><h2 id="mediaTitle">-</h2><span id="mediaStatus" class="badge">-</span></div>
+        <div class="media-stage" id="mediaStage" tabindex="0" role="region" aria-label="영상" data-i18n-aria-label="layout.stage"></div>
+        <div class="media-toolbar" id="mediaToolbar" role="toolbar" aria-label="영상 도구" data-i18n-aria-label="tb.label">
+          <div class="tb-row tb-transport">
+            <button id="btnSkipBack" type="button" data-i18n-title="tip.skipBack" title="10초 뒤로 (←)"><span data-i18n="toolbar.skipBack">−10초</span></button>
+            <button id="btnSkipFwd" type="button" data-i18n-title="tip.skipFwd" title="10초 앞으로 (→)"><span data-i18n="toolbar.skipFwd">+10초</span></button>
+            <select id="playRate" title="재생 속도 ([ / ])" aria-label="재생 속도 ([ / ])" data-i18n-title="media.rate" data-i18n-aria-label="media.rate">
+              <option value="0.25">0.25×</option>
+              <option value="0.5">0.5×</option>
+              <option value="0.75">0.75×</option>
+              <option value="1" selected>1×</option>
+              <option value="1.25">1.25×</option>
+              <option value="1.5">1.5×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+            </select>
+            <span class="tb-group" role="group" aria-label="프레임 이동" data-i18n-aria-label="tb.step">
+              <button id="btnStepBack" type="button" data-i18n-title="tip.stepBack" title="한 프레임 뒤로 — 일시정지됩니다 (,)"><kbd aria-hidden="true">,</kbd><span data-i18n="toolbar.stepBack">−1f</span></button>
+              <button id="btnStepFwd" type="button" data-i18n-title="tip.stepFwd" title="한 프레임 앞으로 — 일시정지됩니다 (.)"><kbd aria-hidden="true">.</kbd><span data-i18n="toolbar.stepFwd">+1f</span></button>
+            </span>
+            <span class="tb-group" role="group" aria-label="구간 지정" data-i18n-aria-label="tb.range">
+              <button id="btnSetIn" type="button" data-i18n-title="tip.setIn" title="현재 위치를 구간 시작으로 (i)"><kbd aria-hidden="true">i</kbd><span data-i18n="toolbar.in">IN</span></button>
+              <button id="btnSetOut" type="button" data-i18n-title="tip.setOut" title="현재 위치를 구간 끝으로 (o)"><kbd aria-hidden="true">o</kbd><span data-i18n="toolbar.out">OUT</span></button>
+            </span>
+            <span class="muted tb-range" id="rangeLabel" data-i18n-title="tb.rangeTip" title="표시한 구간 (IN ~ OUT)"></span>
+            <span class="tb-spacer"></span>
+            <div class="menu tb-more" id="tbMore" hidden>
+              <button id="btnMoreTools" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="moreToolsList" data-i18n-title="tb.moreTip" title="영상 새 창, 듀얼 재생, 저장, 캡처, 내보내기, 프록시, 크기 설정" data-i18n="tb.more">더보기 ▾</button>
+              <div class="menu-list menu-fixed" id="moreToolsList" role="dialog" aria-label="영상 도구 더보기" data-i18n-aria-label="tb.moreLabel" hidden></div>
+            </div>
+          </div>
+          <div class="tb-row tb-tools" id="toolsRow">
+            <button id="btnPopPlayer" type="button" data-i18n-title="tip.popPlayer" title="현재 영상을 별도 창으로 엽니다 — 마크·태그·자동 넘김 지원" data-i18n="toolbar.popPlayer">⧉ 영상 새 창</button>
+            <button id="btnDual" type="button" data-i18n-title="tip.dual" title="같은 이름의 다른 채널 영상(_F/_R, 전방/후방)을 나란히 동기 재생합니다" data-i18n="toolbar.dual">듀얼 재생</button>
+            <button id="btnDownloadFile" type="button" data-i18n-title="tip.downloadFile" title="현재 영상의 원본 파일을 그대로 내려받습니다 — 워크스테이션 서버 필요" data-i18n="toolbar.download">⤓ 저장</button>
+            <button id="btnCaptureFrame" type="button" data-i18n-title="tip.captureFrame" title="현재 재생 위치의 프레임을 케이스 artifacts/captures에 JPEG로 저장합니다 — 워크스테이션 서버 필요" data-i18n="toolbar.capture">프레임 캡처</button>
+            <button id="btnExportClip" type="button" data-i18n-title="tip.exportClip" title="IN~OUT 구간을 MP4 클립으로 내보냅니다 — 워크스테이션 서버 필요" data-i18n="toolbar.clip">구간 내보내기</button>
+            <button id="btnExportClipBurn" type="button" data-i18n-title="tip.exportClipBurn" title="타임코드·케이스ID·해시·호증표를 화면에 새긴 법원 제출용 클립입니다 — 서버 필요" data-i18n="toolbar.clipBurn">법원용 내보내기</button>
+            <button id="btnProxy" type="button" data-i18n-title="tip.proxy" title="원본이 무거우면 검토용 저용량 프록시로 재생합니다 (없으면 생성 — 서버 필요)" data-i18n="toolbar.proxy">프록시 재생</button>
+            <span class="tb-size" role="group" aria-labelledby="videoSizeLabel">
+              <span class="muted" id="videoSizeLabel" data-i18n="media.size">크기</span>
+              <select id="videoMode" aria-labelledby="videoSizeLabel">
+                <option value="fit" data-i18n="media.fit">맞춤</option>
+                <option value="50">50%</option>
+                <option value="100">100%</option>
+                <option value="200">200%</option>
+                <option value="custom" data-i18n="media.custom">사용자 지정</option>
+              </select>
+              <input id="videoZoom" type="range" min="30" max="300" value="100" step="5" title="확대/축소" aria-label="확대/축소" data-i18n-title="media.zoom" data-i18n-aria-label="media.zoom">
+            </span>
+            <span class="muted" id="metricVideos"></span>
+          </div>
+        </div>
+      </div>
+      <div class="hsplitter" id="hsplitter" role="separator" tabindex="0" aria-orientation="horizontal" aria-valuemin="160" aria-valuemax="1200" aria-valuenow="360" aria-label="영상 높이 조절 (↑/↓)" data-i18n-aria-label="layout.splitH" title="드래그: 영상 높이 조절 / 더블클릭: 기본값" data-i18n-title="split.h"></div>
+      <section class="mini-info" aria-labelledby="detailsTitle">
+        <div class="details-head">
+          <h2 class="panel-title" id="detailsTitle" data-i18n="panel.selected">선택 증거</h2>
+          <div id="detailBadges"></div>
+        </div>
+        <div class="tabs" role="tablist" id="detailTabs" aria-label="상세 정보" data-i18n-aria-label="layout.detailTabs">
+          <button type="button" role="tab" id="tabSummary" aria-controls="tpSummary" aria-selected="true" tabindex="0" data-i18n="layout.tabSummary">요약</button>
+          <button type="button" role="tab" id="tabInspector" aria-controls="tpInspector" aria-selected="false" tabindex="-1" data-i18n="layout.tabInspector">인스펙터</button>
+          <button type="button" role="tab" id="tabValidation" aria-controls="tpValidation" aria-selected="false" tabindex="-1" data-i18n="panel.validation">검증 로그</button>
+          <button type="button" role="tab" id="tabTelemetry" aria-controls="tpTelemetry" aria-selected="false" tabindex="-1" data-i18n="layout.tabTelemetry">궤적</button>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpSummary" aria-labelledby="tabSummary" tabindex="0">
+          <dl id="summaryList"></dl>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpInspector" aria-labelledby="tabInspector" tabindex="0" hidden>
+          <h3 class="panel-title sub-title" data-i18n="panel.inspector">포렌식 인스펙터</h3>
+          <dl id="metaList"></dl>
+          <dl class="legend-list">
+            <dt data-i18n="panel.source">원본</dt><dd data-i18n="panel.source.desc">수정하지 않음</dd>
+            <dt data-i18n="panel.recovered">복구물</dt><dd data-i18n="panel.recovered.desc">검증 전까지 후보</dd>
+          </dl>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpValidation" aria-labelledby="tabValidation" tabindex="0" hidden>
+          <div class="validation-list" id="validationList"></div>
+        </div>
+        <div class="tabpanel" role="tabpanel" id="tpTelemetry" aria-labelledby="tabTelemetry" tabindex="0" hidden>
+          <div class="telemetry-title" id="telemetryTitle" hidden><h3 class="panel-title sub-title" data-i18n="panel.telemetry">주행 궤적</h3><button id="btnTelemetry" type="button" class="btn-sm" data-i18n="btn.telemetry">추출</button></div>
+          <div id="telemetryPane" hidden><canvas id="telemetryCanvas" width="236" height="130" role="img" aria-label="주행 궤적" data-i18n-aria-label="panel.telemetry"></canvas><div class="telemetry-note" id="telemetryNote"></div></div>
+          <p class="muted tab-empty" id="telemetryEmpty" data-i18n="layout.telemetryEmpty">이 영상에는 추출할 궤적이 없습니다.</p>
+        </div>
+      </section>
+      </section>
+    </main>
+  </div>
+  <div class="selection-bar" id="selectionBar" role="toolbar" aria-label="판독 작업" data-i18n-aria-label="bar.label">
+    <div class="bar-zone bar-scope">
+      <span class="scope-seg" id="scopeToggle" role="group" aria-label="적용 범위" data-i18n-aria-label="bar.scope">
+        <button id="btnScopeActive" type="button" aria-pressed="true" data-i18n-title="scope.tipActiveOnly" title="마크·태그가 현재 항목에 적용됩니다"><span data-i18n="scope.btnActive">현재 항목</span></button>
+        <button id="btnScopeSelected" type="button" aria-pressed="false" disabled data-i18n-title="scope.tipNone" title="선택한 항목이 없습니다. x 키나 카드의 체크박스로 선택하세요"><span id="scopeSelLabel">선택 0개</span></button>
+      </span>
+      <button id="btnSelectFiltered" type="button" data-i18n-title="tip.selectAll" title="필터 결과 전체 선택 (Ctrl+A)" data-i18n="sel.selectAll">전체 선택</button>
+      <button id="btnClearSelection" type="button" data-i18n-title="tip.clearSel" title="선택 해제 (Ctrl+D)" data-i18n="sel.clear">해제</button>
+      <span class="sr-only" id="selectionCount">0개 선택</span>
+    </div>
+    <div class="bar-zone bar-verdict">
+      <div class="seg" role="group" aria-label="판독 마크" data-i18n-aria-label="bar.verdict">
+        <button id="btnMarkReviewed" type="button" data-i18n-title="tip.markReviewed" title="판독 완료로 표시 (1)"><kbd aria-hidden="true">1</kbd><span data-i18n="mark.reviewed">판독 완료</span></button>
+        <button id="btnMarkImportant" type="button" data-i18n-title="tip.markImportant" title="중요로 표시 (2)"><kbd aria-hidden="true">2</kbd><span data-i18n="mark.important">중요</span></button>
+        <button id="btnMarkVerify" type="button" data-i18n-title="tip.markVerify" title="검증 대기로 표시 (3)"><kbd aria-hidden="true">3</kbd><span data-i18n="mark.verify">검증 대기</span></button>
+        <button id="btnMarkClear" type="button" data-i18n-title="tip.markClear" title="마크 해제 — 메모는 유지됩니다 (0)"><kbd aria-hidden="true">0</kbd><span data-i18n="mark.clear">해제</span></button>
+      </div>
+      <div class="menu">
+        <button id="btnTagMenu" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="tagMenuList" data-i18n="menu.tag">태그 ▾</button>
+        <div class="menu-list tag-menu" id="tagMenuList" role="group" aria-label="태그" data-i18n-aria-label="menu.tagLabel" hidden></div>
+      </div>
+    </div>
+    <div class="bar-zone bar-save">
+      <input id="examinerName" type="text" placeholder="검토자" data-i18n-placeholder="sel.examiner" data-i18n-title="tip.examiner" title="케이스에 반영될 검토자 이름" data-i18n-aria-label="tip.examiner" aria-label="케이스에 반영될 검토자 이름">
+      <button id="saveState" type="button" class="badge save-state ok" data-state="saved">저장 상태</button>
+      <button id="btnApplyMarks" type="button" class="primary" data-i18n-title="tip.apply" title="판독 마크·태그·메모를 케이스 DB에 반영하고 보고서를 갱신합니다 — 워크스테이션 서버 필요" data-i18n="sel.apply">케이스에 반영</button>
+      <div class="menu">
+        <button id="btnExportMenu" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="exportMenuList" data-i18n="menu.export">보내기·복사 ▾</button>
+        <div class="menu-list" id="exportMenuList" role="menu" aria-label="보내기·복사" data-i18n-aria-label="menu.exportLabel" hidden>
+          <div class="menu-sec" role="presentation" data-i18n="export.grpFiles">원본 파일</div>
+          <button id="btnDownloadFiles" type="button" role="menuitem" data-i18n-title="tip.dlFiles" title="선택한 원본 파일을 그대로 내려받습니다 — 브라우저가 다중 다운로드 허용을 물을 수 있습니다. 워크스테이션 서버 필요" data-i18n="export.files">선택 파일 다운로드</button>
+          <button id="btnExportSelected" type="button" role="menuitem" data-i18n-title="tip.pkgSel" title="선택 항목을 케이스 exports 폴더에 해시 매니페스트와 함께 복사합니다 — 워크스테이션 서버 필요" data-i18n="export.selected">선별 자료 묶기</button>
+          <button id="btnTranscodeQueue" type="button" role="menuitem" data-i18n-title="tip.transcode" title="브라우저에서 재생되지 않는 독점 포맷(DAV/NOV/AVE 등)을 H.264 프록시로 일괄 변환합니다 — 선택 없으면 전체 후보, 서버 필요" data-i18n="export.transcode">미재생 포맷 프록시 큐</button>
+          <div class="menu-sec" role="presentation" data-i18n="export.grpReports">목록 · 리포트</div>
+          <button id="btnDownloadCsv" type="button" role="menuitem" data-i18n-title="tip.csv" title="선택 항목의 메타데이터를 Excel용 CSV로 내려받습니다" data-i18n="export.csv">선별 CSV</button>
+          <button id="btnSummary" type="button" role="menuitem" data-i18n-title="tip.summary" title="선택/마크된 항목을 인쇄 가능한 요약 리포트(HTML)로 내려받습니다" data-i18n="export.summary">요약 리포트</button>
+          <div class="menu-sec" role="presentation" data-i18n="export.grpMarks">판독 결과</div>
+          <button id="btnDownloadMarks" type="button" role="menuitem" data-i18n="export.marks">마크 내려받기</button>
+          <button id="btnDownloadSelection" type="button" role="menuitem" data-i18n="export.list">선택 목록 다운로드</button>
+          <div class="menu-sec" role="presentation" data-i18n="export.grpCopy">클립보드</div>
+          <button id="btnCopyIds" type="button" role="menuitem" data-i18n="export.copyIds">ID 복사</button>
+          <button id="btnCopyPaths" type="button" role="menuitem" data-i18n="export.copyPaths">경로 복사</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="toastHost"></div>
+  <div id="shortcutsModal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle">
+      <div class="panel-title"><span id="shortcutsTitle" data-i18n="shortcuts.title">단축키</span> <button id="btnShortcutsClose" class="mini" type="button" data-i18n="btn.close">닫기</button></div>
+      <table>
+        <tbody>
+          <tr><td><code>j</code> / <code>k</code></td><td data-i18n="sc.next">다음 / 이전 증거</td></tr>
+          <tr><td><code>n</code> / <code>shift+n</code></td><td data-i18n="sc.nextUnreviewed">다음 / 이전 미검토 증거</td></tr>
+          <tr><td><code>space</code></td><td data-i18n="sc.play">영상 재생 / 일시정지</td></tr>
+          <tr><td><code>x</code></td><td data-i18n="sc.toggle">현재 증거 선택 토글</td></tr>
+          <tr><td><code>enter</code></td><td data-i18n="sc.preview">현재 증거 미리보기</td></tr>
+          <tr><td><code>1</code> / <code>2</code> / <code>3</code></td><td data-i18n="sc.mark">현재 증거 판독 완료 / 중요 / 검증 대기 (다음으로 이동)</td></tr>
+          <tr><td><code>0</code></td><td data-i18n="sc.unmarkKeep">현재 증거 마크 해제 (메모는 유지)</td></tr>
+          <tr><td><code>ctrl+z</code> / <code>ctrl+y</code></td><td data-i18n="sc.undo">실행 취소 / 다시 실행 (마크·태그·구간)</td></tr>
+          <tr><td><code>ctrl+a</code></td><td data-i18n="sc.selAll">필터 결과 전체 선택</td></tr>
+          <tr><td><code>ctrl+d</code></td><td data-i18n="sc.clear">선택 해제</td></tr>
+          <tr><td><code>←</code> / <code>→</code></td><td data-i18n="sc.seek">영상 10초 뒤로 / 앞으로</td></tr>
+          <tr><td><code>[</code> / <code>]</code></td><td data-i18n="sc.rate">재생 속도 낮추기 / 높이기</td></tr>
+          <tr><td><code>,</code> / <code>.</code></td><td data-i18n="sc.step">한 프레임 뒤로 / 앞으로 (일시정지 중)</td></tr>
+          <tr><td><code>shift+j</code> / <code>shift+k</code> / <code>shift+l</code></td><td data-i18n="sc.shuttle">셔틀 역방향 / 정지 / 정방향 (반복 시 1×→2×→4×)</td></tr>
+          <tr><td><code>i</code> / <code>o</code></td><td data-i18n="sc.range">구간 IN / OUT 지정</td></tr>
+          <tr><td><code>f</code></td><td data-i18n="sc.fs">영상 전체화면</td></tr>
+          <tr><td><code>t</code></td><td data-i18n="sc.theater">시어터 모드</td></tr>
+          <tr><td><code>p</code></td><td data-i18n="sc.pip">화면 속 화면</td></tr>
+          <tr><td><code>esc</code></td><td data-i18n="sc.exit">모드 종료</td></tr>
+          <tr><td><code>shift+클릭</code></td><td data-i18n="sc.rangeSel">범위 선택</td></tr>
+          <tr class="sc-host"><td><code>alt+p</code></td><td data-i18n="sc.altProject">프로젝트 전환 열기 / 닫기</td></tr>
+          <tr class="sc-host"><td><code>alt+j</code></td><td data-i18n="sc.altJobs">작업 시트 열기 / 닫기</td></tr>
+          <tr class="sc-host"><td><code>alt+r</code></td><td data-i18n="sc.altFinalize">결과물 시트 열기 / 닫기</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>

@@ -14,7 +14,7 @@ function makeAnnouncerRegion(id, role, live) {
   el.setAttribute("role", role);
   el.setAttribute("aria-live", live);
   el.setAttribute("aria-atomic", "true");
-  document.body.appendChild(el);
+  ftRoot.appendChild(el); // inside #ftViewer: a destroy() removes it
   return el;
 }
 const ftPoliteRegion = makeAnnouncerRegion("ftStatusLine", "status", "polite");

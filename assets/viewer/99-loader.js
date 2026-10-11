@@ -25,13 +25,18 @@
  * reload once index_generation moves. The reload is refused while review
  * marks are unsaved, so annotations are never dropped by a refresh.
  *
- * This file sits outside the viewer IIFE and runs before i18n is set
- * up, so its few strings are bilingual inline. */
+ * This file sits outside ftViewerBoot() and runs before i18n is set up,
+ * so its few strings are bilingual inline.
+ *
+ * The overlay and the live chip are created INSIDE the fragment root
+ * (#ftViewer): the viewer stylesheet is scoped to .ft-viewer, a hosted page
+ * keeps them out of the shell's layout, and FTViewer.destroy() removes them
+ * with the rest of the mount. Their colours are the shared tokens.
+ */
 //
-// Only function declarations live at this file's top level: the viewer
-// IIFE (10-boot.js) calls loadViewerData() while the bundle is still being
-// evaluated, before any top-level const/class further down would leave
-// its temporal dead zone.
+// Only function declarations live at this file's top level (plus the
+// standalone auto-init call at the very end): the shell bundle shares the
+// global scope when the viewer is hosted (docs/ui-rebuild-contract.md §2.1).
 function loaderLimits() {
   return { pageSize: 500, maxRestarts: 3 };
 }
@@ -44,12 +49,17 @@ function ViewerLoadError(message, detail, partial) {
   return error;
 }
 
-function loaderOverlay() {
+// Record API base (FTViewer.init({ url })): "" = this origin.
+function loaderApiBase() {
+  return (window.FTViewer && window.FTViewer._apiBase) || "";
+}
+
+function loaderOverlay(root) {
   const note = document.createElement("div");
   note.id = "ft-load-note";
   note.setAttribute("role", "status");
   note.setAttribute("aria-live", "polite");
-  note.style.cssText = "position:fixed;inset:0;display:grid;place-items:center;background:rgba(14,21,19,.92);color:#c9d6d1;font:14px/1.5 system-ui,sans-serif;z-index:9999";
+  note.style.cssText = "position:absolute;inset:0;display:grid;place-items:center;background:var(--media-bg);color:var(--media-muted);font:var(--fs-sm)/1.5 var(--font-sans);z-index:90";
   const box = document.createElement("div");
   box.style.cssText = "max-width:560px;padding:20px 24px;text-align:center";
   const msg = document.createElement("div");
@@ -58,18 +68,18 @@ function loaderOverlay() {
   bar.style.cssText = "width:320px;max-width:100%;margin-top:10px";
   bar.removeAttribute("value"); // indeterminate until the total is known
   const detail = document.createElement("div");
-  detail.style.cssText = "margin-top:8px;font-size:12px;color:#8fa79e;white-space:pre-wrap;word-break:break-word";
+  detail.style.cssText = "margin-top:8px;font-size:var(--fs-xs);color:var(--media-muted);white-space:pre-wrap;word-break:break-word";
   const actions = document.createElement("div");
   actions.style.cssText = "margin-top:14px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap";
   box.append(msg, bar, detail, actions);
   note.appendChild(box);
-  (document.body || document.documentElement).appendChild(note);
+  (root || document.getElementById("ftViewer") || document.body).appendChild(note);
   const button = (label, primary) => {
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = label;
-    b.style.cssText = "padding:6px 14px;border-radius:6px;font:inherit;cursor:pointer;" +
-      (primary ? "background:#0f7c71;color:#fff;border:1px solid #0f7c71" : "background:transparent;color:#c9d6d1;border:1px solid #5d746c");
+    b.style.cssText = "min-height:32px;padding:6px 14px;border-radius:var(--radius);font:inherit;cursor:pointer;" +
+      (primary ? "background:var(--accent);color:var(--on-accent);border:1px solid var(--accent)" : "background:transparent;color:var(--media-muted);border:1px solid var(--media-muted)");
     return b;
   };
   return {
@@ -87,7 +97,10 @@ function loaderOverlay() {
     fail(error) {
       note.setAttribute("role", "alert");
       bar.hidden = true;
-      msg.style.color = "#f2b8ad";
+      msg.style.color = "var(--failed-fg)";
+      msg.style.background = "var(--failed-bg)";
+      msg.style.padding = "4px 8px";
+      msg.style.borderRadius = "var(--radius)";
       msg.style.fontWeight = "700";
       msg.textContent = error.message || "증거 목록을 불러오지 못했습니다. / Failed to load the evidence list.";
       detail.textContent = error.detail || "";
@@ -108,6 +121,8 @@ function loaderOverlay() {
     reset() {
       note.setAttribute("role", "status");
       msg.style.color = "";
+      msg.style.background = "";
+      msg.style.padding = "";
       msg.style.fontWeight = "";
       msg.textContent = "증거 목록을 불러오는 중… / Loading evidence list…";
       detail.textContent = "";
@@ -172,7 +187,7 @@ async function loadAllRecordPages(first, ui, live) {
     let restarted = false;
     while (offset < total) {
       ui.progress(offset, total);
-      const page = await loaderFetchJson(`/api/records?offset=${offset}&limit=${loaderLimits().pageSize}${liveParam}`);
+      const page = await loaderFetchJson(`${loaderApiBase()}/api/records?offset=${offset}&limit=${loaderLimits().pageSize}${liveParam}`);
       if (!page || !page.ok || !Array.isArray(page.videos)) {
         throw ViewerLoadError(
           `증거 목록 일부를 불러오지 못했습니다 (${offset}/${total}). / Failed to load part of the evidence list.`,
@@ -189,7 +204,7 @@ async function loadAllRecordPages(first, ui, live) {
         }
         restarts += 1;
         ui.status("케이스 색인이 바뀌어 처음부터 다시 불러옵니다… / Case index changed — reloading from the start…");
-        head = await loaderFetchJson(`/api/records?offset=0&limit=${loaderLimits().pageSize}`);
+        head = await loaderFetchJson(`${loaderApiBase()}/api/records?offset=0&limit=${loaderLimits().pageSize}`);
         if (!head || !head.ok) {
           throw ViewerLoadError("증거 목록을 불러오지 못했습니다. / Failed to load the evidence list.", (head && head.error) || "/api/records");
         }
@@ -210,7 +225,7 @@ async function loadViewerDataFromApi(first, ui) {
   const live = !!(first && first.live);
   const paged = await loadAllRecordPages(first, ui, live);
   ui.status("케이스 정보를 불러오는 중… / Loading case metadata…");
-  const meta = await loaderFetchJson("/api/records-meta");
+  const meta = await loaderFetchJson(`${loaderApiBase()}/api/records-meta`);
   if (!meta || meta.ok === false || typeof meta !== "object") {
     throw ViewerLoadError(
       "케이스 정보(/api/records-meta)를 불러오지 못했습니다 — 기존 판독 마크가 표시되지 않을 수 있어 중단합니다. / Failed to load case metadata; stopping so existing review marks are not hidden.",
@@ -276,7 +291,7 @@ async function loadViewerDataOnce(ui) {
   if (served) {
     let first = null;
     try {
-      first = await loaderFetchJson(`/api/records?offset=0&limit=${loaderLimits().pageSize}&live=1`);
+      first = await loaderFetchJson(`${loaderApiBase()}/api/records?offset=0&limit=${loaderLimits().pageSize}&live=1`);
     } catch (err) {
       // 404 = a plain static server without the API: the bundle is the
       // expected source. Anything else is a real failure to report if the
@@ -301,21 +316,23 @@ async function loadViewerDataOnce(ui) {
   );
 }
 
-async function loadViewerData() {
+async function loadViewerData(mount) {
+  const { root = null, signal = null } = mount || {};
   if (window.__FRAMETRACE_DATA__ && window.__FRAMETRACE_DATA__.manifest) {
     return window.__FRAMETRACE_DATA__;
   }
-  const ui = loaderOverlay();
+  const ui = loaderOverlay(root);
   for (;;) {
     try {
       const data = await loadViewerDataOnce(ui);
       ui.remove();
-      if (data && data.liveIndex) setTimeout(() => startLiveIndexChip(data.liveIndex), 0);
+      if (data && data.liveIndex) setTimeout(() => { if (!signal || !signal.aborted) startLiveIndexChip(data.liveIndex, root, signal); }, 0);
       return data;
     } catch (err) {
       const error = err && err.ftViewerLoad
         ? err
         : ViewerLoadError("증거 목록을 불러오지 못했습니다. / Failed to load the evidence list.", String(err && err.message || err));
+      if (window.FTViewer) window.FTViewer._emit("error", { message: error.message, detail: error.detail || "", stage: "load" });
       const action = await ui.fail(error);
       if (action === "continue" && error.partial) {
         ui.remove();
@@ -357,22 +374,22 @@ function liveSaveIsClean() {
   return !kind || kind === "saved";
 }
 
-function startLiveIndexChip(live) {
+function startLiveIndexChip(live, root, signal) {
   if (document.getElementById("ft-live-chip")) return;
   const chip = document.createElement("div");
   chip.id = "ft-live-chip";
   chip.setAttribute("role", "status");
   chip.setAttribute("aria-live", "polite");
-  chip.style.cssText = "position:fixed;right:12px;bottom:60px;z-index:9000;display:flex;gap:8px;align-items:center;max-width:min(560px,calc(100vw - 24px));padding:6px 10px;border-radius:999px;background:#12302b;color:#d7ece6;border:1px solid #2f6b60;font:12px/1.4 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25)";
+  chip.style.cssText = "position:fixed;right:12px;bottom:60px;z-index:55;display:flex;gap:8px;align-items:center;max-width:min(560px,calc(100vw - 24px));padding:6px 10px;border-radius:999px;background:var(--surface);color:var(--text);border:1px solid var(--border-strong);font:var(--fs-xs)/1.4 var(--font-sans)";
   const text = document.createElement("span");
   const button = document.createElement("button");
   button.type = "button";
   button.hidden = true;
-  button.style.cssText = "padding:2px 10px;border-radius:999px;border:1px solid #6cc3b2;background:#0f7c71;color:#fff;font:inherit;cursor:pointer";
+  button.style.cssText = "padding:2px 10px;border-radius:999px;border:1px solid var(--accent);background:var(--accent);color:var(--on-accent);font:inherit;cursor:pointer";
   const note = document.createElement("span");
-  note.style.cssText = "color:#f2c8a0";
+  note.style.cssText = "color:var(--warn)";
   chip.append(text, button, note);
-  document.body.appendChild(chip);
+  (root || document.getElementById("ftViewer") || document.body).appendChild(chip);
 
   let latest = null;
   let newTotal = null;
@@ -389,7 +406,7 @@ function startLiveIndexChip(live) {
         : "새 데이터 반영 / Reload";
     }
     const stopped = latest && latest.phase === "review-partial" && !latest.busy;
-    chip.style.borderColor = stopped ? "#b2560f" : "#2f6b60";
+    chip.style.borderColor = stopped ? "var(--warn)" : "var(--border-strong)";
   };
   button.addEventListener("click", () => {
     if (!liveSaveIsClean()) {
@@ -399,10 +416,13 @@ function startLiveIndexChip(live) {
       return;
     }
     note.textContent = "";
-    location.reload();
+    // Standalone: a page reload; hosted: destroy() + init() in place.
+    if (window.FTViewer) window.FTViewer.reload({ reason: "live-index" });
+    else location.reload();
   });
   const tick = async () => {
     timer = 0;
+    if (signal && signal.aborted) return; // the mount is gone
     try {
       const res = await fetch("/api/status", { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -412,7 +432,7 @@ function startLiveIndexChip(live) {
       latest = st;
       if (moved || (newTotal == null && st.index_generation !== live.generation)) {
         try {
-          const head = await fetch("/api/records?offset=0&limit=1&live=1", { cache: "no-store" });
+          const head = await fetch(`${loaderApiBase()}/api/records?offset=0&limit=1&live=1`, { cache: "no-store" });
           const page = head.ok ? await head.json() : null;
           if (page && page.ok && Number.isFinite(Number(page.total))) newTotal = Number(page.total);
         } catch (e) { /* the count is a hint; the status line still updates */ }
@@ -422,6 +442,7 @@ function startLiveIndexChip(live) {
       failures += 1;
       note.textContent = `상태 확인 실패 (${failures}회) — 재시도 중 / Status check failed, retrying`;
     }
+    if (signal && signal.aborted) return;
     render();
     const active = !latest || latest.phase === "running" || (latest.phase === "review-partial" && latest.busy);
     // Keep polling while work continues; afterwards slow down but keep the
@@ -431,4 +452,13 @@ function startLiveIndexChip(live) {
   render();
   tick();
   return () => { if (timer) clearTimeout(timer); };
+}
+
+// ---- standalone auto-init (docs/ui-rebuild-contract.md §3.1) --------------
+// /review/evidence-viewer.html, /viewer/, the packaged file and the legacy
+// iframe mount themselves; a hosting page (<html data-ft-host>) calls
+// FTViewer.init() when a project opens.
+if (!document.documentElement.hasAttribute("data-ft-host")) {
+  FTViewer.init({ embed: new URLSearchParams(location.search).has("embed") || window.self !== window.top })
+    .catch(err => { console.error("FrameTrace viewer failed to start", err); });
 }

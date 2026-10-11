@@ -119,6 +119,32 @@ pub(crate) use system::{
 };
 
 const EXAMINER_PAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/examiner_app.html"));
+/// `FRAMETRACE_UI=legacy` rollback page (docs/ui-rebuild-contract.md §9.3):
+/// the pre-rebuild shell, which embeds the viewer through its iframe.
+/// Kept for one release after the UI rebuild, then removed with
+/// assets/legacy/.
+const EXAMINER_PAGE_LEGACY: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/examiner_app_legacy.html"));
+
+/// Whether `FRAMETRACE_UI=legacy` asked for the pre-rebuild shell. Read
+/// once per process: the served UI never flips mid-session.
+fn legacy_ui() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| legacy_ui_requested(std::env::var("FRAMETRACE_UI").ok().as_deref()))
+}
+
+fn legacy_ui_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("legacy"))
+}
+
+/// The page `GET /` serves.
+fn examiner_page(legacy: bool) -> &'static str {
+    if legacy {
+        EXAMINER_PAGE_LEGACY
+    } else {
+        EXAMINER_PAGE
+    }
+}
 
 /// In-flight connection bound: the accept loop spawns one thread per
 /// connection, so an unbounded accept would let any local process exhaust
@@ -425,7 +451,7 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         return plain(403, b"cross-origin request rejected".to_vec());
     }
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => page(EXAMINER_PAGE.as_bytes().to_vec()),
+        ("GET", "/") => page(examiner_page(legacy_ui()).as_bytes().to_vec()),
         ("GET", "/api/env") => json(api_env(request)),
         ("GET", "/api/browse") => json(api_browse(request)),
         ("GET", "/api/records") => json(api_records(request, state)),
