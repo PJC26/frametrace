@@ -67,7 +67,20 @@ try {
   await page.keyboard.press('.');
   await page.keyboard.press('Shift+L');
   const noVideoToast = await page.evaluate(() => document.getElementById('toastHost').textContent);
-  check('key without playable media shows a toast', noVideoToast.length > 0, noVideoToast);
+  check('key without playable media shows the no-video toast', /재생 중인 영상이 없습니다|No video is playing/.test(noVideoToast) && !/셔틀|Shuttle/.test(noVideoToast), noVideoToast);
+
+  // CapsLock alone (key "J"/"K", no Shift) must not shuttle; acts as j/k.
+  {
+    const c0 = await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
+    await page.evaluate(() => { document.getElementById('toastHost').textContent = ''; });
+    await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'L', bubbles: true })));
+    const capsToast = await page.evaluate(() => document.getElementById('toastHost').textContent);
+    check('CapsLock-only "L" does not shuttle', !/셔틀|Shuttle|재생 중인|No video/.test(capsToast), capsToast);
+    await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'J', bubbles: true })));
+    const c1 = await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
+    check('CapsLock-only "J" navigates like j', c1 !== c0, `${c0} -> ${c1}`);
+    await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'K', bubbles: true })));
+  }
 
   // j/k stay record navigation.
   const before = await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
@@ -113,6 +126,10 @@ try {
   await page.waitForTimeout(100);
   const rate = await page.evaluate(() => document.querySelector('#mediaStage video').playbackRate);
   check('Shift+L twice -> playbackRate 2', rate === 2, String(rate));
+  await page.keyboard.press('Space'); await settle();
+  const rateAfterSpace = await page.evaluate(() => [document.querySelector('#mediaStage video').playbackRate, document.querySelector('#mediaStage video').paused, document.getElementById('playRate').value]);
+  check('Space after forward shuttle pauses and restores chip rate', rateAfterSpace[1] && rateAfterSpace[0] === (Number(rateAfterSpace[2]) || 1), rateAfterSpace.join(','));
+  await page.keyboard.press('Shift+L'); await page.keyboard.press('Shift+L');
   await page.keyboard.press('Shift+K'); await settle();
   check('Shift+K pauses', await page.evaluate(() => document.querySelector('#mediaStage video').paused));
 
