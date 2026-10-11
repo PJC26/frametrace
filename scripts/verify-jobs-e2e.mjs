@@ -155,9 +155,15 @@ try {
   check('carve job panel shows stage from /api/status job', running, running || await page.textContent('#jobDetail'));
   const st1 = await getJson('/api/status');
   check('server reports job_kind=carve, job.state=running', st1.job_kind === 'carve' && st1.job && st1.job.state === 'running', JSON.stringify(st1.job));
-  await sleep(2200);
-  const elapsedText = await page.textContent('#jobElapsed');
-  check('elapsed time ticks', /경과 0:0[2-9]|경과 0:[1-9]\d/.test(elapsedText), elapsedText);
+  // Elapsed comes from whole-second server polls, so compare two readings
+  // instead of expecting an exact value after a fixed sleep.
+  const secs = (text) => { const m = /경과 (\d+):(\d{2})/.exec(text || ''); return m ? (+m[1]) * 60 + (+m[2]) : -1; };
+  const firstElapsed = await page.textContent('#jobElapsed');
+  const elapsedText = await until(async () => {
+    const text = await page.textContent('#jobElapsed');
+    return secs(text) > secs(firstElapsed) ? text : null;
+  }, 6000);
+  check('elapsed time ticks', !!elapsedText && secs(firstElapsed) >= 0, `${firstElapsed} → ${elapsedText || await page.textContent('#jobElapsed')}`);
   if (shots) { mkdirSync(shots, { recursive: true }); await page.screenshot({ path: join(shots, 'jobs-carve-running.png') }); }
   await page.click('#btnJobCancel');
   await page.waitForSelector('#dlgBackdrop:not([hidden]) #dlgOk');
