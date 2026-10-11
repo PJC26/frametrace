@@ -194,6 +194,21 @@ try {
   await page.selectOption('#videoMode', '50');
   check('preset size drives the slider', (await page.locator('#videoZoom').inputValue()) === '50');
 
+  // --- ft-reload with unsaved marks: refused + acked, page not reloaded ----
+  // (this fixture's /api/import-marks never succeeds, so marks stay pending)
+  const reloadAck = await page.evaluate(() => new Promise((resolve) => {
+    window.__noReload = 1;
+    const onMsg = (e) => { if (e.data && e.data.type === 'ft-reload-ack') { window.removeEventListener('message', onMsg); resolve(e.data); } };
+    window.addEventListener('message', onMsg);
+    window.postMessage({ type: 'ft-reload', reason: 'carve' }, '*');
+    setTimeout(() => resolve(null), 4000);
+  }));
+  await page.waitForTimeout(500);
+  const stillHere = await page.evaluate(() => window.__noReload === 1 && document.getElementById('saveState')?.dataset.state);
+  check('ft-reload with unsaved marks is refused and acked (reloaded:false)', reloadAck && reloadAck.reloaded === false && reloadAck.reason === 'unsaved', JSON.stringify(reloadAck));
+  check('page kept (no reload), save state still not clean', stillHere && stillHere !== 'saved', String(stillHere));
+  check('refusal is reported to the examiner', /저장되지 않은 판독 내용/.test(await page.evaluate(() => document.getElementById('toastHost').textContent)));
+
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {
   await browser.close();
