@@ -79,9 +79,10 @@ $("btnStart").addEventListener("click", async () => {
     started = true;
     resetLogView();
     jobSeen = true; autoProgress = true; autoReviewed = false;
-    $("s2").disabled = false;
-    showView(2);
-    setStep(3, 2);
+    // Straight into the host: the chip shows progress, the jobs sheet
+    // opens once on the first start, the viewer mounts at review-partial.
+    FTStore.set({ ui: { home: false } });
+    hAutoOpenJobs();
   } finally {
     starting = false;
     hint.textContent = prevHint;
@@ -98,13 +99,11 @@ $("btnStart").addEventListener("click", async () => {
 function resetCaseUi() {
   jobSeen = false; reviewReady = false; autoReviewed = false; autoProgress = false;
   auditVerified = false;
-  $("s2").disabled = true; $("s3").disabled = true; $("s4").disabled = true;
-  setStep(1, 0);
-  $("btnFinalize").disabled = true;
-  $("btnFinalize").textContent = "결과 보고서 생성 및 패키징";
+  $("btnFinalize").disabled = false;
+  $("btnFinalize").textContent = "보고서 생성·패키징";
   $("finalLinks").innerHTML = "";
   $("finalHint").textContent = "";
-  $("recoverHint").textContent = "조사된 이미지에서 삭제된 영상 후보를 자동 복구한 뒤 뷰어를 갱신합니다.";
+  $("jobsNote").textContent = "조사된 이미지가 있을 때 삭제 영상 후보 복구와 카빙을 실행할 수 있습니다.";
   $("pkgPath").classList.remove("show");
   $("pkgPath").textContent = "";
   $("advOut").hidden = true;
@@ -150,8 +149,8 @@ async function openCase(dir) {
   if (!res.has_review) toast("색인만 있는 케이스입니다 — 해시·검증 보강 전 상태로 엽니다.", "warn");
   pushRecent("recentCases", dir);
   savePrefs({ lastCase: dir });
-  // Flags were already reset above — the next poll re-enables the rail
-  // and jumps to the review screen when the new case reports its state.
+  // Flags were already reset above — the next poll mounts the viewer once
+  // the new case reports a reviewable phase.
   return true;
 }
 
@@ -176,20 +175,20 @@ $("btnCancel").addEventListener("click", async () => {
     toast("중단 요청 실패: " + (res.error || "알 수 없는 오류"), "err");
   }
 });
-// Reload alone lands back on the review stage (the poll auto-jumps on a
-// completed case); the flag keeps stage 1 on this load only.
-// UX-18: a page reload also reloads the embedded viewer, so it is guarded
-// exactly like the viewer's own refresh: never while marks/memos are not
-// yet in the case DB — offer to save instead.
-async function viewerUnsavedCount() {
-  const ss = viewerSaveState();
+// "새 분석" reloads the page onto the empty state (ft_want_new, read once
+// by 97-shell.js). @interim: T3 moves this handler into 30-jobs.js.
+// UX-18: a page reload also reloads the viewer, so it is guarded exactly
+// like the viewer's own refresh: never while marks/memos are not yet in
+// the case DB — offer to save instead.
+async function hUnsavedCount() {
+  const ss = hViewer.saveState();
   let pending = 0;
-  try { pending = await pendingViewerChanges(); } catch (e) { pending = 0; }
+  try { pending = await hPendingChanges(); } catch (e) { pending = 0; }
   const unsaved = ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued";
   return { pending: Number(pending) || 0, unsaved, saveState: ss };
 }
 async function guardedPageReload(reason) {
-  const u = await viewerUnsavedCount();
+  const u = await hUnsavedCount();
   if (u.pending > 0 || u.unsaved) {
     const go = await askDialog({
       title: reason || "화면 새로 고침",
@@ -197,7 +196,7 @@ async function guardedPageReload(reason) {
         `<p>'저장 다시 시도'로 저장한 뒤 다시 누르십시오 — 저장 상태가 '저장됨'이 되면 진행할 수 있습니다.</p>`,
       okLabel: "저장 다시 시도", cancelLabel: "닫기",
     });
-    if (go && !retryViewerSave()) toast("뷰어가 열려 있지 않아 저장을 다시 시도하지 못했습니다 — 검토 화면에서 저장 상태를 확인하십시오.", "warn");
+    if (go && !hViewer.save()) toast("뷰어가 열려 있지 않아 저장을 다시 시도하지 못했습니다 — 검토 화면에서 저장 상태를 확인하십시오.", "warn");
     return false;
   }
   location.reload();
@@ -207,7 +206,7 @@ $("btnNew").addEventListener("click", async () => {
   const btn = $("btnNew");
   btn.disabled = true;
   try {
-    try { sessionStorage.setItem("ft_want_new", "1"); } catch (e) { /* storage blocked: stage 1 may auto-advance */ }
+    try { sessionStorage.setItem("ft_want_new", "1"); } catch (e) { /* storage blocked: the bound case reopens */ }
     const reloaded = await guardedPageReload("새 케이스 시작");
     if (!reloaded) { try { sessionStorage.removeItem("ft_want_new"); } catch (e) {} }
   } finally {

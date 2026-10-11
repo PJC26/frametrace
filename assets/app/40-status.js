@@ -1,142 +1,30 @@
-function setStep(active, doneCount) {
-  for (let i = 1; i <= 4; i++) {
-    const el = $("s" + i);
-    el.classList.toggle("current", i === active);
-    el.classList.toggle("done", i <= (doneCount || 0));
-  }
-  stepActive = active; stepDone = doneCount || 0;
-  renderCrumbs();
-}
-
-// ---- UX-12: compact breadcrumb / step indicator ----
-// Mirrors the rail (workflow position + which stage is on screen) in one
-// line above the card, plus the bound case folder name.
-const CRUMB_NAMES = ["입력", "분석 진행", "검토", "결과물"];
-let stepActive = 1, stepDone = 0, viewShown = "1";
-function crumbsHtml(active, done, view, caseDir) {
-  const items = CRUMB_NAMES.map((name, i) => {
-    const n = i + 1;
-    const cls = ["cr", n <= done ? "done" : "", n === active ? "cur" : "", String(n) === String(view) ? "onview" : ""].filter(Boolean).join(" ");
-    const mark = n <= done ? "✓" : String(n);
-    return `<span class="${cls}"${n === active ? ' aria-current="step"' : ""}>${mark} ${esc(name)}</span>`;
-  });
-  const base = caseBaseName(caseDir);
-  return items.join(`<span class="sep" aria-hidden="true">›</span>`) +
-    `<span class="sep">·</span><span>단계 ${active}/4</span>` +
-    (base ? `<span class="casename" title="${esc(caseDir)}">케이스: ${esc(base)}</span>` : "");
-}
+// @interim(T2): the stage rail, breadcrumb and per-stage views are gone —
+// one integrated screen renders from FTStore (97-shell.js). T3 rewrites
+// this file (status polling -> FTStore.set); until then the poll below
+// maps each /api/status reply with hStoreFromStatus() (01-store.js).
+function setStep() { /* compat no-op: no step rail any more */ }
 function caseBaseName(caseDir) {
   return String(caseDir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
 }
-// Why a step button is disabled (shown as its tooltip).
-const STEP_WHY = {
-  2: "분석을 시작하면 열립니다",
-  3: "분석 결과(색인)가 준비되면 열립니다",
-  4: "해시·검증까지 끝나면 열립니다",
-};
-// Step buttons: a visually hidden suffix carries the pipeline state (the ✓ is CSS),
-// aria-current="step" marks the stage on screen, tooltip explains a
-// disabled step or names the Alt shortcut.
-function syncNavSteps() {
-  for (let i = 1; i <= 4; i++) {
-    const el = $("s" + i);
-    if (!el) continue;
-    const state = i <= stepDone ? " — 완료" : i === stepActive ? " — 진행 위치" : "";
-    const sr = $("s" + i + "State");
-    if (sr) sr.textContent = state;
-    el.title = el.disabled ? `${CRUMB_NAMES[i - 1]} — ${STEP_WHY[i] || ""}` : `${CRUMB_NAMES[i - 1]} (Alt+${i})`;
-    if (String(i) === String(viewShown)) el.setAttribute("aria-current", "step");
-    else el.removeAttribute("aria-current");
-  }
-}
-function renderCrumbs() {
-  const el = $("crumbs");
-  if (!el) return;
-  const caseDir = lastStatus && lastStatus.case_dir;
-  el.innerHTML = crumbsHtml(stepActive, stepDone, viewShown, caseDir);
-  const bc = $("barCase");
-  if (bc) {
-    const base = caseBaseName(caseDir);
-    bc.hidden = !base;
-    bc.textContent = base;
-    bc.title = caseDir ? "케이스 폴더: " + caseDir : "";
-  }
-  syncNavSteps();
-}
-
-// --- view switching: one screen per workflow stage ---
-// Stage 3 is full-bleed: body.stage3 folds the rail into the 40px stage
-// bar and shows the '케이스 작업' menu there (see app.css / 97-shell.js).
-function showView(n) {
-  const key = String(n);
-  document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.dataset.view === key));
-  document.querySelectorAll(".navstep").forEach(b => b.classList.toggle("sel", b.dataset.view === key));
-  const prev = viewShown;
-  viewShown = key;
-  if (document.body && document.body.classList) {
-    document.body.classList.toggle("stage3", key === "3");
-    // Stage 1 is the calm start screen: no step rail, crumbs or tagline.
-    document.body.classList.toggle("stage1", key === "1");
-  }
-  if (key === "1" && prev !== key && typeof onHomeShown === "function") onHomeShown();
-  const menu = $("caseMenuWrap");
-  if (menu) menu.hidden = key !== "3";
-  if (key !== "3" && typeof closeAllPopovers === "function") closeAllPopovers(false);
-  if (prev !== key && typeof window.scrollTo === "function") { try { window.scrollTo(0, 0); } catch (e) {} }
-  renderCrumbs();
-}
-document.querySelectorAll(".navstep").forEach(b => b.addEventListener("click", () => {
-  showView(b.dataset.view);
-  if (b.dataset.view === "4") ensureReportFrame();
-  if (b.dataset.view === "3" && reviewReady) ensureReviewFrame();
-}));
-// auto-navigation happens once per state so it never yanks the examiner
-// away from a screen they deliberately opened
+// One-shot latches so an automatic action happens once per state.
 let jobSeen = false, reviewReady = false, autoProgress = false, autoReviewed = false;
 // True while the last status was review-partial (UX-02) — detects the
-// enrichment → review-ready transition under an open viewer.
+// enrichment -> review-ready transition under an open viewer.
 let reviewPartialSeen = false;
 // Last phase reported by /api/status. While it is review-partial the
-// review/ folder (evidence-viewer.html) is not written yet, so popup and
-// fullscreen-fallback open the server's built-in /viewer/ instead (same
-// origin: the ft_token cookie planted by ?token= keeps authenticating).
+// review/ folder (evidence-viewer.html) is not written yet, so the legacy
+// viewer frame opens the server's built-in /viewer/ instead.
 let lastPhase = "";
 function standaloneViewerUrl() {
   return lastPhase === "review-partial" ? "/viewer/" : "/review/evidence-viewer.html";
 }
-// A session-restored case pauses the auto-jump to review until the
-// examiner picks "이어서 검토" or "새 분석" on the stage-1 notice.
-let restoreHandled = false;
-
-// partial = UX-02 phase "review-partial": the hash-less index is
-// reviewable while enrichment runs, but finalizing (stage 4) waits for
-// review-ready so a report never claims hashes that do not exist yet.
-function enableReviewStage(partial) {
-  reviewReady = true;
-  $("s3").disabled = false;
-  if (!partial) $("s4").disabled = false;
-  ensureReviewFrame(partial);
-}
-
-// The bound case's viewer (stage-1 '뷰어 보기'; also ends the
-// restored-session pause on the auto-jump).
-function openBoundViewer() {
-  restoreHandled = true;
-  homeRestored = "";
-  if (!autoReviewed) autoReviewed = true;
-  if (!reviewReady) enableReviewStage(lastPhase === "review-partial");
-  showView(3);
-}
-// Case dir of a restored session still awaiting the examiner's choice
-// ("" = none); shown in the stage-1 '뷰어 보기' block.
-let homeRestored = "";
 
 // Controls that loadEnv() disabled for a missing tool carry
 // data-env-off and must stay disabled when a finished run re-enables the
 // form (otherwise the E01 radio comes back without libewf installed).
 function setInputsDisabled(disabled) {
   // The evidence form and the recent-project buttons lock while a job
-  // runs; '뷰어 보기' does not (the viewer is usable during enrichment).
+  // runs.
   document.querySelectorAll("#blkEvidence input, #blkEvidence select, #blkEvidence button, #blkRecent button").forEach(el => {
     el.disabled = disabled || (el.dataset && el.dataset.envOff === "1");
   });
@@ -184,6 +72,46 @@ function renderTrack(steps, names, progress, warnings) {
     }
     return `<li class="${cls}${s === "done" && ws.length ? " warned" : ""}"><span class="dot"></span><span class="lbl">${esc(name)}</span>${extra}</li>`;
   }).join("");
+}
+
+// @interim(T2): the analysis shows in the same top-strip chip as the
+// background case jobs (65-jobs.js renderCaseJob falls back here when no
+// case job is on display). T3's progress chip replaces both.
+function renderPipelineChip() {
+  const panel = $("jobPanel");
+  if (!panel) return false;
+  const st = lastStatus;
+  const partial = !!st && st.phase === "review-partial";
+  const running = !!st && (st.phase === "running" || (partial && !!st.busy));
+  const failed = !!st && st.phase === "error";
+  // With a project open the chip stays as the jobs sheet opener (복구 ·
+  // 카빙 start there); the empty state hides it (00-layout.css).
+  const idle = !running && !failed && !!st && !!st.case_dir && H_REVIEW_PHASES.includes(st.phase === "finalizing" ? "review-ready" : st.phase);
+  if (!running && !failed && !idle) { panel.hidden = true; return false; }
+  panel.hidden = false;
+  panel.className = "h-chip " + (failed ? "failed" : running ? "running" : "ok");
+  if (idle) {
+    $("jobTitle").textContent = partial ? "보강 미완료" : "분석 완료";
+    $("jobDetail").textContent = "";
+    $("jobElapsed").textContent = "";
+    panel.title = "작업 — 진행 기록 · 삭제 영상 복구 · 카빙 (Alt+J)";
+    return true;
+  }
+  const steps = st.steps || [];
+  const names = (st.step_names && st.step_names.length === 5) ? st.step_names : STEP_NAMES;
+  const idx = steps.findIndex(x => x === "running");
+  let title = "분석 중", detail = "";
+  if (failed) { title = "분석 실패"; detail = String(st.error || "").split(/\r?\n/)[0].slice(0, 160); }
+  else if (partial) { const e = st.enrichment; title = "보강 중"; detail = e ? `${e.label} ${e.stage}/${e.stages}` : ""; }
+  else if (idx >= 0) detail = `단계 ${idx + 1}/${names.length} · ${names[idx]}`;
+  const p = st.progress;
+  if (!failed && p && p.total > 0) detail += `${detail ? " · " : ""}${Number(p.done).toLocaleString()}/${Number(p.total).toLocaleString()}`;
+  $("jobTitle").textContent = title;
+  $("jobDetail").textContent = detail;
+  const el = p && Number.isFinite(Number(p.elapsed_secs)) ? Number(p.elapsed_secs) : null;
+  $("jobElapsed").textContent = el !== null && !failed ? "경과 " + fmtClock(el) : "";
+  panel.title = title + (detail ? " — " + detail : "");
+  return true;
 }
 
 let finalizing = false;
@@ -279,6 +207,7 @@ let lastInstance = null;
 function setServerLost(lost, detail) {
   const banner = $("serverBanner");
   banner.hidden = !lost;
+  FTStore.set({ server: { lost: !!lost, failures: pollFailures } });
   if (lost && detail) $("serverBannerMsg").textContent = detail;
 }
 function pollFailed(err) {
@@ -308,6 +237,7 @@ async function poll() {
     st = await jget("/api/status");
   } catch (err) {
     pollFailed(err);
+    hOnStatus(null);
     schedulePoll(1200);
     return;
   }
@@ -330,16 +260,21 @@ async function poll() {
     console.error("status render failed:", err);
   }
   try {
+    FTStore.set(hStoreFromStatus(st));
+    hOnStatus(st);
+  } catch (err) {
+    console.error("shell render failed:", err);
+  }
+  try {
     // A phase change (analysis finished, case opened) refreshes the
-    // stage-1 project list so it is current before the examiner returns.
+    // 이전 프로젝트 list so it is current before the examiner returns.
     const homeKey = `${st.case_dir || ""}|${st.phase || ""}|${!!st.busy}`;
     if (homeKey !== lastHomeKey) {
       if (lastHomeKey !== null) renderRecentCases();
       lastHomeKey = homeKey;
     }
-    syncViewerBlock();
   } catch (err) {
-    console.error("viewer block update failed:", err);
+    console.error("project list update failed:", err);
   }
   schedulePoll(st.has_job ? 1200 : 1500);
 }
@@ -348,7 +283,7 @@ $("btnServerRetry").addEventListener("click", () => { pollFailures = Math.min(po
 function applyStatus(st) {
     if (!st.has_job) return;
     lastPhase = st.phase;
-    if (!jobSeen) { jobSeen = true; $("s2").disabled = false; }
+    jobSeen = true;
     renderTrack(st.steps || [], st.step_names, st.progress, st.warnings);
     appendLogLines(st.logs || []);
     // UX-02: phase 2 (enrichment) runs under review-partial with busy set —
@@ -359,24 +294,16 @@ function applyStatus(st) {
     const running = st.phase === "running" || enriching;
     setInputsDisabled(running);
     $("btnStart").disabled = running || finalizing;
-    $("btnStart").title = running ? "분석이 진행 중입니다 — 2단계 '분석 진행'에서 상황을 보거나 중단할 수 있습니다"
+    $("btnStart").title = running ? "분석이 진행 중입니다 — 상단 작업 표시에서 상황을 보거나 중단할 수 있습니다"
       : finalizing ? "보고서 생성이 진행 중입니다" : "";
     $("btnCancel").style.display = running ? "" : "none";
     if (!running && !cancelRequested) { $("btnCancel").disabled = false; $("btnCancel").removeAttribute("aria-busy"); $("btnCancel").textContent = "분석 중단"; }
     $("btnNew").style.display = (!running && (st.error || st.phase !== "running")) ? "" : "none";
-    if (running && !autoProgress) { autoProgress = true; showView(2); }
-    const restorePending = st.restored && !restoreHandled;
-    let wantNew = false;
-    try {
-      wantNew = sessionStorage.getItem("ft_want_new") === "1";
-      if (wantNew) sessionStorage.removeItem("ft_want_new");
-    } catch (e) { /* storage blocked */ }
-    homeRestored = restorePending && !wantNew ? (st.case_dir || "") : "";
+    if (running) autoProgress = true;
     if (partial) {
-      if (!reviewReady) enableReviewStage(true);
-      if (!autoReviewed && !restorePending && !wantNew) {
+      reviewReady = true;
+      if (!autoReviewed && enriching) {
         autoReviewed = true;
-        showView(3);
         toast("1단계 색인 완료 — 해시·검증이 끝나기 전에도 검토를 시작할 수 있습니다.");
       }
       setStep(3, enriching ? 1 : 2);
@@ -393,15 +320,14 @@ function applyStatus(st) {
         // Enrichment finished under an open review: keep the viewer (and
         // any unsaved marks in it); its chip offers the reload.
         reviewPartialSeen = false;
-        $("s4").disabled = false;
         toast("보강 완료 — 뷰어 오른쪽 아래 '새 데이터 반영'으로 해시·검증 결과를 불러오십시오.");
       }
-      if (!reviewReady) { reviewReady = true; $("s3").disabled = false; $("s4").disabled = false; ensureReviewFrame(); }
-      if (!autoReviewed && !restorePending && !wantNew) { autoReviewed = true; showView(3); }
+      reviewReady = true;
+      autoReviewed = true;
       setStep(st.phase === "running" ? 4 : 4, 3);
       // Only fill an idle hint — never overwrite a progress/failure message.
       const fh = $("finalHint");
-      if (!finalizing && (!fh.textContent || fh.textContent.startsWith("케이스: "))) {
+      if (!finalizing && (!fh.textContent || fh.textContent.startsWith("케이스: ") || fh.textContent.startsWith("보강"))) {
         fh.textContent = st.case_dir ? ("케이스: " + st.case_dir) : "";
       }
       if ((st.phase === "done" || st.phase === "finalized") && st.package_dir) {
@@ -414,7 +340,6 @@ function applyStatus(st) {
             `<a href="/case/reports/case-report.html" target="_blank"><b>최종 결과 보고서 열기</b><span>발견 원본 영상 · 메타데이터 · SHA-256 · 발견/분석 기법 · 처리 체인</span></a>` +
             pkgExplorerLink(st.package_dir);
         }
-        ensureReportFrame();
       }
     } else if (running) {
       setStep(3, 2);
@@ -422,7 +347,7 @@ function applyStatus(st) {
     if (partial) reviewPartialSeen = true;
     // UX-12: Recover/Carve only make sense once a case is open for review.
     setCaseToolsVisible(reviewReady && !!st.case_dir);
-    renderCrumbs();
+    renderCaseJob();
     const errEl = $("startErr");
     if (st.error) {
       // Re-render only when something else replaced the box, so an

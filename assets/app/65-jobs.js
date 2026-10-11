@@ -53,7 +53,7 @@ function setCaseJobButtons(busy) {
     if (!el) continue;
     el.disabled = busy;
     // A disabled control says why.
-    el.title = busy ? "다른 작업이 진행 중입니다 — 단계 바의 작업 표시에서 진행 상황을 확인하거나 중단할 수 있습니다" : CASE_JOB_TITLES[id];
+    el.title = busy ? "다른 작업이 진행 중입니다 — 상단 작업 표시에서 진행 상황을 확인하거나 중단할 수 있습니다" : CASE_JOB_TITLES[id];
   }
 }
 function fmtClock(secs) {
@@ -105,9 +105,14 @@ function renderCaseJob() {
   const job = caseJob;
   const panel = $("jobPanel");
   if (!panel) return;
-  if (!job) { panel.hidden = true; return; }
+  if (!job) {
+    // The job controls live in the jobs sheet now, not inside the chip.
+    for (const id of ["btnJobCancel", "btnJobReload", "btnJobClose"]) { const b = $(id); if (b) b.hidden = true; }
+    renderPipelineChip();
+    return;
+  }
   panel.hidden = false;
-  panel.className = "jobpanel " + (job.outcome || "running");
+  panel.className = "h-chip " + (job.outcome || "running");
   const title = job.spec.title;
   const label = {
     ok: `${title} 완료`,
@@ -153,7 +158,7 @@ async function runCaseJob(kind) {
     cancel: false, outcome: "", detail: "", message: "", serverElapsed: NaN, serverElapsedAt: 0 };
   caseJob = job;
   setCaseJobButtons(true);
-  $("recoverHint").textContent = `${spec.title} 실행 중… 진행 상황은 단계 바의 작업 표시에 나타납니다.`;
+  $("jobsNote").textContent = `${spec.title} 실행 중… 진행 상황은 상단 작업 표시에 나타납니다.`;
   renderCaseJob();
   stopCaseJobTicker();
   caseJobTicker = setInterval(() => { if (caseJob === job && !job.outcome) renderCaseJob(); }, 1000);
@@ -235,7 +240,7 @@ function adoptRunningCaseJob(st) {
     jobInfo: { kind: sj.kind, started_unix: sj.started_unix }, adopted: true, sawServerJob: true };
   caseJob = job;
   setCaseJobButtons(true);
-  $("recoverHint").textContent = `${spec.title} 실행 중… 진행 상황은 단계 바의 작업 표시에 나타납니다.`;
+  $("jobsNote").textContent = `${spec.title} 실행 중… 진행 상황은 상단 작업 표시에 나타납니다.`;
   renderCaseJob();
   stopCaseJobTicker();
   caseJobTicker = setInterval(() => { if (caseJob === job && !job.outcome) renderCaseJob(); }, 1000);
@@ -250,7 +255,7 @@ async function finishCaseJob(job, outcome, error) {
   if (outcome === "failed") {
     job.outcome = "failed";
     job.message = String(error || "알 수 없는 오류").split(/\r?\n/)[0].slice(0, 240);
-    $("recoverHint").textContent = `${title} 실패: ${job.message} — 원인을 확인한 뒤 다시 시도할 수 있습니다.`;
+    $("jobsNote").textContent = `${title} 실패: ${job.message} — 원인을 확인한 뒤 다시 시도할 수 있습니다.`;
     renderCaseJob();
     toast(`${title} 실패: ${job.message}`, "err");
     return;
@@ -259,7 +264,7 @@ async function finishCaseJob(job, outcome, error) {
     job.outcome = "cancelled";
     const why = String(error || "").split(/\r?\n/)[0].slice(0, 240);
     job.message = (why || "작업이 중단되었습니다.") + " 다시 실행할 수 있습니다.";
-    $("recoverHint").textContent = `${title}이(가) 중단되었습니다.`;
+    $("jobsNote").textContent = `${title}이(가) 중단되었습니다.`;
     renderCaseJob();
     return;
   }
@@ -275,7 +280,7 @@ async function finishCaseJob(job, outcome, error) {
   } else {
     job.message = how === "none" ? "완료 — 검토 화면을 열면 결과가 표시됩니다." : "완료 — 뷰어에 결과를 반영했습니다.";
   }
-  $("recoverHint").textContent = `${title} ${job.message}`;
+  $("jobsNote").textContent = `${title} ${job.message}`;
   renderCaseJob();
 }
 

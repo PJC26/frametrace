@@ -14,6 +14,7 @@ function legacyCopy(text) {
   ta.remove();
   return ok;
 }
+// @interim: the log tools move to the jobs code (T3, 30-jobs.js).
 $("btnCopyLog").addEventListener("click", async () => {
   const text = $("log").textContent;
   let ok = false;
@@ -49,27 +50,10 @@ $("btnLogBottom").addEventListener("click", () => {
   for (const [id, key] of [["withHash", "withHash"], ["withFfprobe", "withFfprobe"], ["withDeepfake", "withDeepfake"], ["skipE01Verify", "skipE01Verify"], ["directE01", "directE01"]]) {
     if (typeof prefs[key] === "boolean") $(id).checked = prefs[key];
   }
-  // The start screen opens empty: the last source/case stay one click away
+  // The empty state opens empty: the last source/case stay one click away
   // (path suggestions, '이전 프로젝트') instead of being pre-filled — a
   // pre-filled case folder hidden under '옵션' would silently send new
   // evidence into the previous case.
   syncScanMode();
   renderRecent();
 })();
-
-// Usage notes: never shown by default (the three start blocks explain
-// themselves); '사용 안내' in the start-screen footer toggles them.
-$("btnOnboardOk").addEventListener("click", () => {
-  savePrefs({ onboarded: true });
-  $("onboard").hidden = true;
-  try { $("btnOnboardShow").focus(); } catch (e) {}
-});
-$("btnOnboardShow").addEventListener("click", () => {
-  const show = $("onboard").hidden;
-  $("onboard").hidden = !show;
-  if (show) {
-    try { $("onboard").scrollIntoView({ block: "nearest" }); } catch (e) {}
-    try { $("btnOnboardOk").focus(); } catch (e) {}
-  }
-});
-

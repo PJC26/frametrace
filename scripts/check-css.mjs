@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { appBundleCss, viewerBundleCss } from "./lib/app-bundle.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const files = ["assets/evidence_viewer.css", "assets/app/app.css"];
+const files = ["assets/evidence_viewer.css", "assets/app/00-layout.css"];
 // controls.css has no token block of its own (it is bundled after tokens.css +
 // evidence_viewer.css): only brace balance is checked here.
 for (const extra of ["assets/viewer/controls.css"]) {

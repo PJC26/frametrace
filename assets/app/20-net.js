@@ -69,24 +69,28 @@ function announce(msg, assertive) {
 }
 
 // ---- toast: transient, non-blocking feedback ----
-// Top-right under the stage bar, at most TOAST_MAX stacked; info/warn
-// leave after TOAST_MS (hover or keyboard focus pauses the clock), errors
-// stay until dismissed (× or Esc). Esc dismisses the newest toast.
+// One toast host at a time (docs/ui-rebuild-contract.md §6.5): while the
+// hosted viewer is mounted its own #toastHost shows everything (shell
+// toasts are handed to FTViewer.toast); otherwise #hToastBox under the top
+// strip, left of an open sheet. At most TOAST_MAX stacked; info/warn leave
+// after TOAST_MS (hover or keyboard focus pauses the clock), errors stay
+// until dismissed (close button or Esc). Esc dismisses the newest toast.
 const TOAST_MAX = 3, TOAST_MS = 6000;
 let toasts = [];
 function toast(msg, kind) {
-  const box = $("toastBox");
-  if (!box || typeof document.createElement !== "function") return;
   announce(msg, kind === "err");
+  if (typeof hViewer === "object" && hViewer.toast(msg, kind)) return null;
+  const box = $("hToastBox");
+  if (!box || typeof document.createElement !== "function") return null;
   const el = document.createElement("div");
-  el.className = "toast" + (kind === "err" ? " err" : kind === "warn" ? " warn" : kind === "ok" ? " ok" : "");
+  el.className = "h-toast" + (kind === "err" ? " err" : kind === "warn" ? " warn" : kind === "ok" ? " ok" : "");
   const text = document.createElement("span");
-  text.className = "toast-msg";
+  text.className = "h-toast-msg";
   text.textContent = msg;
   const close = document.createElement("button");
   close.type = "button";
-  close.className = "toast-x";
-  close.textContent = "×";
+  close.className = "quiet icon h-toast-x";
+  close.innerHTML = '<svg class="ic" aria-hidden="true"><use href="#i-close"/></svg>';
   close.title = "알림 닫기 (Esc)";
   close.setAttribute("aria-label", "알림 닫기");
   if (typeof el.append === "function") el.append(text, close); else { el.appendChild(text); el.appendChild(close); }
@@ -160,7 +164,7 @@ function askDialog({ title, html, okLabel, cancelLabel, danger, onOk, focus }) {
   $("dlgNote").textContent = "";
   $("dlgOk").textContent = okLabel || "확인";
   $("dlgOk").disabled = false;
-  $("dlgOk").classList.toggle("danger-fill", !!danger);
+  $("dlgOk").classList.toggle("destructive", !!danger);
   $("dlgCancel").textContent = cancelLabel || "취소";
   $("dlgCancel").hidden = cancelLabel === null;
   $("dlgBackdrop").hidden = false;

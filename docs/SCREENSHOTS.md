@@ -49,13 +49,27 @@ Generate just the demo source folder:
 node scripts/make-demo-case.mjs /tmp/demo-source --clean
 ```
 
-Screens (names are stable): `00-onboarding`, `01-start`, `01b-start-filled`,
-`02-scan-running`, `03-review-embedded` (its description records how many grid
-rows are fully visible), `03b-review-job`, `04-viewer-grid`, `05-viewer-detail`,
+Screens (names are stable; docs/ui-rebuild-contract.md §9.4): `00-empty`
+(two blocks), `01-empty-options`, `01b-empty-filled` (detected-kind chip +
+preflight line), `02-running` (progress chip + jobs sheet opened once on the
+first start), `02b-running-chip` (sheet closed, chip only), `03-project` (viewer
+hosted in the shell; its description records how many grid rows are fully
+visible), `03a-project-menu` (project switcher), `03b-jobs-sheet` (recover job
+failed on the demo case), `04-viewer-grid`, `05-viewer-detail`,
 `05b-viewer-inspector` (details panel scrolled to 포렌식 인스펙터), `05c-shortcuts`,
 `05d-clip-dialog` (falls back to the "no range" toast if the dialog cannot open),
-`06-viewer-multiselect`, `06b-toast-actionbar`, `07-finalize`,
-`07b-finalize-precheck`, `08-report`, `09-alt-theme`.
+`06-viewer-multiselect`, `06b-toast-actionbar` (standalone viewer toast),
+`06c-toast-hosted` (three toasts with a sheet open), `07-finalize-sheet`,
+`07b-finalize-blocked` (unsaved marks block the package), `08-finalized`
+(report links + package path), `09-alt-theme`, `10-popout` (main window while
+video + verdict are in the second window; `window.open` is stubbed).
+
+The capture never uses frame APIs (`page.frames()` / `frameLocator`): the
+viewer is hosted in the shell document. Until the viewer fragment is hosted,
+the legacy viewer frame inside `#hViewerHost` is read through its same-origin
+`contentDocument`. `visual-diff.mjs` matches by name, so comparisons against
+`before-ux` need a manual name map (00-onboarding → 00-empty, 03-review-embedded
+→ 03-project, 07-finalize → 07-finalize-sheet, 08-report → 08-finalized).
 
 ## Compare before / after (visual-diff)
 

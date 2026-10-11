@@ -1,0 +1,109 @@
+// ---- project switcher (docs/ui-rebuild-contract.md §6.6) ----
+// #hProjectBtn (the case name in the strip) opens #hProjectPop: the open
+// project, up to 8 previous projects, "다른 케이스 폴더 열기…", "새 증거
+// 넣기" and the index dashboard. Switching never reloads the page: unsaved
+// check → viewer unmount → POST /api/open-case → one status poll → mount.
+const H_PHASE_LABEL = {
+  running: "분석 중", "review-partial": "색인 완료 · 보강 전", "review-ready": "검토 가능",
+  done: "검토 가능", finalized: "결과물 생성됨", error: "분석 실패",
+};
+function hProjectPopRender() {
+  const s = FTStore.state;
+  const cur = $("hProjectCur");
+  if (cur) {
+    const label = H_PHASE_LABEL[s.phase] || "";
+    const cls = s.phase === "finalized" ? " ok" : s.phase === "review-partial" ? " warn" : "";
+    cur.innerHTML = s.project.caseDir
+      ? `<b title="${esc(s.project.caseDir)}">${esc(s.project.name || s.project.caseDir)}</b>` +
+        `<span class="mono">${esc(s.project.caseDir)}</span>` +
+        (label ? `<span class="h-badge${cls}">${esc(label)}</span>` : "")
+      : "";
+  }
+  const list = $("hProjectRecent");
+  if (!list || typeof document.createElement !== "function") return;
+  const others = (typeof recentItems !== "undefined" ? recentItems : [])
+    .filter(it => !samePathish(it.case_dir, s.project.caseDir)).slice(0, 8);
+  list.innerHTML = "";
+  if (!others.length) {
+    const li = document.createElement("li");
+    li.className = "h-empty-row";
+    li.textContent = "다른 프로젝트가 없습니다.";
+    list.appendChild(li);
+    return;
+  }
+  for (const it of others) {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "quiet h-mi";
+    const name = it.name || hBaseName(it.case_dir) || it.case_dir;
+    const st = recentState(it, lastStatus);
+    btn.innerHTML = `<span title="${esc(it.case_dir)}">${esc(name)}</span><small>${esc([fmtWhen(it.last_opened_unix), st.state].filter(Boolean).join(" · "))}</small>`;
+    if (it.exists === false) { btn.disabled = true; btn.title = "폴더를 찾을 수 없습니다"; }
+    btn.addEventListener("click", () => hSwitchProject(it.case_dir));
+    li.appendChild(btn);
+    list.appendChild(li);
+  }
+}
+
+// Resolves true when the viewer has nothing unsaved (or the examiner saved
+// it from the dialog); false keeps the current project.
+async function hConfirmLeave(title) {
+  const unsaved = () => { const ss = hViewer.saveState(); return !!ss && ss !== "saved"; };
+  if (!FTStore.state.viewer.mounted || !unsaved()) return true;
+  const go = await askDialog({
+    title,
+    html: "<p><b>케이스에 아직 반영되지 않은 마크·메모 변경</b>이 있습니다.</p><p>‘저장 다시 시도’로 저장한 뒤 진행합니다.</p>",
+    okLabel: "저장 다시 시도", cancelLabel: "취소",
+    onOk: async () => {
+      hViewer.save();
+      $("dlgNote").textContent = "저장 중…";
+      for (let i = 0; i < 24; i++) {
+        await new Promise(r => setTimeout(r, 250));
+        if (!unsaved()) return true;
+      }
+      $("dlgNote").textContent = "아직 저장되지 않았습니다 — 뷰어의 저장 상태를 확인한 뒤 다시 시도하십시오.";
+      return false;
+    },
+  });
+  return !!go && !unsaved();
+}
+// Takes the viewer down after the unsaved check. ui.home goes up first so
+// the renderer does not remount the old case in between.
+async function hLeaveViewer(title) {
+  if (!(await hConfirmLeave(title))) return false;
+  if (FTStore.state.popout.open) {
+    hViewer.closePopout();
+    if (!hViewer.hosted() && hViewer.isPoppedOut()) return false;
+    hSetPopped(false);
+  }
+  hCloseSheet("finalize", false);
+  FTStore.set({ ui: { home: true } });
+  hViewer.unmount();
+  return true;
+}
+async function hSwitchProject(dir) {
+  hClosePopovers(false);
+  if (!dir) return false;
+  if (!(await hLeaveViewer("프로젝트 전환"))) return false;
+  const ok = await openCase(dir);
+  if (!ok) {
+    toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err");
+    return false;
+  }
+  // One poll so the store describes the new case before the mount.
+  try { await poll(); } catch (e) { /* the poll loop retries */ }
+  FTStore.set({ ui: { home: false } });
+  return true;
+}
+async function hGoHome() {
+  hClosePopovers(false);
+  if (!(await hLeaveViewer("새 증거 넣기"))) return false;
+  hCloseSheet("jobs", false);
+  setTimeout(() => { try { $("sourcePath").focus(); } catch (e) {} }, 0);
+  return true;
+}
+$("hProjectNew").addEventListener("click", () => { hGoHome(); });
+$("hProjectOpenOther").addEventListener("click", () => {
+  openPicker("caseDir", "case", dir => { hSwitchProject(dir); });
+});

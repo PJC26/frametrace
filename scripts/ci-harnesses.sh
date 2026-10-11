@@ -25,7 +25,7 @@ harnesses=(
   # its own anchor line below with the real entry — never reorder or append.
   # @T1 verify-buttons
   # @T5 verify-embed
-  # @T2 verify-layout
+  "verify-layout"
   # @T3 verify-progress
   # @T4 verify-finalize-sheet
 )

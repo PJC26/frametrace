@@ -1,10 +1,11 @@
-// Start screen (stage 1) end-to-end against the REAL server, in a real
-// browser, with an isolated config dir (never the examiner's
-// ~/.config/frametrace):
+// Empty state of the integrated screen end-to-end against the REAL
+// server, in a real browser, with an isolated config dir (never the
+// examiner's ~/.config/frametrace) — docs/ui-rebuild-contract.md §6.4/§8.1:
 //
-//   a. empty state: exactly three blocks (증거 넣기 · 이전 프로젝트 · 뷰어
-//      보기), "아직 연 프로젝트가 없습니다", 뷰어 보기 disabled with a reason,
-//      no step rail, 옵션 collapsed;
+//   a. empty state: exactly two blocks (증거 넣기 · 이전 프로젝트),
+//      "아직 연 프로젝트가 없습니다", no step rail / breadcrumb / onboarding /
+//      뷰어 보기 block in the page at all, 옵션 collapsed, 사용 안내 reachable
+//      from the top strip (#hBtnHelp);
 //   f. 옵션 disclosure exposes case folder + analysis modes with today's
 //      defaults (case folder auto, 전체 (증거용), hash/ffprobe on);
 //   e. a nonsense path and a non-evidence file show the inline error and
@@ -12,10 +13,11 @@
 //   d. a small fake .E01 (EVF signature) and a renamed image with the EVF
 //      header are detected as "E01 이미지";
 //   b. a folder path → chip "폴더", one-line preflight, Enter starts the
-//      analysis and reaches the review stage;
-//   c. back on stage 1 the case is listed in 이전 프로젝트, 열기 reopens it,
-//      뷰어 보기 opens the viewer;
-//   g. layout: the three primary buttons sit inside the viewport, >= 36px
+//      analysis and the host shows the viewer grid (#hViewerHost);
+//   c. back on the empty state (#hProjectBtn → 새 증거 넣기) the case is
+//      listed in 이전 프로젝트 with the block's one primary, [이어서 검토],
+//      which reopens it into the viewer without a page reload;
+//   g. layout: both primary buttons sit inside the viewport, >= 36px
 //      tall, labels unclipped, no horizontal scroll, blocks do not overlap —
 //      at 1366x768 and 1920x1080, light and dark; keyboard Tab order;
 //   d2. starting the fake E01 sends input_kind=e01 and the failure (libewf
@@ -106,14 +108,14 @@ const shot = async (page, name) => {
 const layoutProbe = () => {
   const vis = (el) => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const box = (el) => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, h: r.height, w: r.width }; };
-  const recentPrimary = document.querySelector('#blkRecent button.primary');
-  const primaries = [document.getElementById('btnStart'), recentPrimary, document.getElementById('btnViewerOpen')];
+  const recentPrimary = document.querySelector('#blkRecent #recentCaseRow button.primary');
+  const primaries = [document.getElementById('btnStart'), recentPrimary];
   const out = { vw: innerWidth, vh: innerHeight, hscroll: document.documentElement.scrollWidth > innerWidth + 1, primaries: [], blocks: [], small: [] };
   for (const el of primaries) {
     if (!el) { out.primaries.push(null); continue; }
     out.primaries.push({ id: el.id || el.textContent.trim(), visible: vis(el), ...box(el), clipped: el.scrollWidth > el.clientWidth + 1 });
   }
-  for (const id of ['blkEvidence', 'blkRecent', 'blkViewer']) {
+  for (const id of ['blkEvidence', 'blkRecent']) {
     const el = document.getElementById(id);
     out.blocks.push({ id, visible: vis(el), ...box(el) });
   }
@@ -124,22 +126,40 @@ const layoutProbe = () => {
     if (r.height < 24 || r.width < 24) out.small.push(`${el.id || el.textContent.trim()} ${Math.round(r.width)}x${Math.round(r.height)}`);
   }
   // Exactly one primary per block.
-  out.primaryPerBlock = ['blkEvidence', 'blkRecent', 'blkViewer'].map((id) =>
+  out.primaryPerBlock = ['blkEvidence', 'blkRecent'].map((id) =>
     [...document.querySelectorAll(`#${id} button.primary`)].filter(vis).length);
   return out;
 };
 function checkLayout(label, g, expectRecentPrimary) {
   const inside = (b) => b && b.visible && b.top >= 0 && b.left >= 0 && b.bottom <= g.vh + 0.5 && b.right <= g.vw + 0.5;
-  const [start, recent, viewer] = g.primaries;
+  const [start, recent] = g.primaries;
   check(`${label}: 분석 시작 inside the viewport, >=36px, label unclipped`, inside(start) && start.h >= 36 && !start.clipped, JSON.stringify(start));
-  if (expectRecentPrimary) check(`${label}: 이전 프로젝트 primary inside the viewport, >=36px`, inside(recent) && recent.h >= 36 && !recent.clipped, JSON.stringify(recent));
-  check(`${label}: 뷰어 보기 inside the viewport, >=36px, label unclipped`, inside(viewer) && viewer.h >= 36 && !viewer.clipped, JSON.stringify(viewer));
+  if (expectRecentPrimary) check(`${label}: [이어서 검토] inside the viewport, >=36px, label unclipped`, inside(recent) && recent.h >= 36 && !recent.clipped && recent.id === '이어서 검토', JSON.stringify(recent));
   check(`${label}: no horizontal scroll`, !g.hscroll);
-  const [b1, b2, b3] = g.blocks;
-  check(`${label}: three blocks stacked without overlap`, b1.visible && b2.visible && b3.visible && b1.bottom <= b2.top && b2.bottom <= b3.top, JSON.stringify(g.blocks.map((b) => [Math.round(b.top), Math.round(b.bottom)])));
+  const [b1, b2] = g.blocks;
+  check(`${label}: two blocks stacked without overlap`, b1.visible && b2.visible && b1.bottom <= b2.top, JSON.stringify(g.blocks.map((b) => [Math.round(b.top), Math.round(b.bottom)])));
   check(`${label}: centered column <= 760px`, Math.abs((b1.left + b1.right) / 2 - g.vw / 2) < 2 && b1.w <= 761, `${Math.round(b1.left)}..${Math.round(b1.right)} of ${g.vw}`);
   check(`${label}: every visible control >= 24px`, g.small.length === 0, g.small.join(', '));
   check(`${label}: exactly one primary per block`, g.primaryPerBlock.every((n) => n === 1), JSON.stringify(g.primaryPerBlock));
+}
+
+// Cards of the review grid in the host — the hosted viewer fragment, or
+// (until it lands) the legacy viewer frame inside the same mount point.
+const viewerCards = (page) => page.evaluate(() => {
+  const host = document.getElementById('hViewerHost');
+  if (!host || host.hidden) return 0;
+  let n = host.querySelectorAll('#recordGrid .card').length;
+  const fr = host.querySelector('iframe');
+  try { if (!n && fr && !fr.hidden && fr.contentDocument) n = fr.contentDocument.querySelectorAll('#recordGrid .card').length; } catch { /* cross-origin */ }
+  return n;
+});
+// Back to the empty state the way an examiner does: project switcher →
+// 새 증거 넣기 (no page reload).
+async function goHome(page) {
+  if (await page.locator('#inputCard').isVisible()) return;
+  await page.click('#hProjectBtn');
+  await page.click('#hProjectNew');
+  await page.waitForSelector('#inputCard:not([hidden])', { timeout: 10000 });
 }
 
 try {
@@ -157,15 +177,18 @@ try {
   await page.waitForSelector('#blkEvidence');
   await until(() => page.locator('#recentEmpty').isVisible(), 5000);
   const titles = await page.locator('#inputCard .sblock h3').allTextContents();
-  check('a. exactly three blocks: 증거 넣기 · 이전 프로젝트 · 뷰어 보기', JSON.stringify(titles) === JSON.stringify(['증거 넣기', '이전 프로젝트', '뷰어 보기']), JSON.stringify(titles));
-  check('a. each block has a one-line explanation', (await page.locator('#inputCard .sblock .sbdesc').count()) === 3);
+  check('a. exactly two blocks: 증거 넣기 · 이전 프로젝트', JSON.stringify(titles) === JSON.stringify(['증거 넣기', '이전 프로젝트']), JSON.stringify(titles));
+  check('a. each block has a one-line explanation', (await page.locator('#inputCard .sblock .sbdesc').count()) === 2);
   check('a. empty state says "아직 연 프로젝트가 없습니다"', (await page.locator('#recentEmpty').textContent()).includes('아직 연 프로젝트가 없습니다') && await page.locator('#recentCaseRow').isHidden());
-  const viewerBtn = page.locator('#btnViewerOpen');
-  const reason = (await page.locator('#viewerReason').textContent()).trim();
-  check('a. 뷰어 보기 disabled with a visible reason + tooltip', await viewerBtn.isDisabled() && reason.length > 10 && ((await viewerBtn.getAttribute('title')) || '').length > 10, reason);
-  check('a. no step rail, crumbs or onboarding on stage 1', await page.locator('#stageNav').isHidden() && await page.locator('#crumbs').isHidden() && await page.locator('#onboard').isHidden());
+  const removed = await page.evaluate(() => ['stageNav', 'crumbs', 'onboard', 'blkViewer', 'btnViewerOpen', 's1', 'resultCard', 'reviewFrame'].filter((id) => document.getElementById(id)));
+  check('a. no step rail, breadcrumb, onboarding or 뷰어 보기 block in the page', removed.length === 0, removed.join(','));
+  check('a. empty state: review host hidden, project switcher disabled', await page.locator('#hViewerHost').isHidden() && await page.locator('#hProjectBtn').isDisabled() && (await page.locator('#hProjectName').textContent()).trim() === '프로젝트 없음');
   check('a. 옵션 collapsed by default (case folder hidden)', !(await page.locator('#startOptions').evaluate((d) => d.open)) && await page.locator('#caseDir').isHidden());
-  check('a. 사용 안내 still reachable', await page.locator('#btnOnboardShow').isVisible());
+  check('a. 사용 안내 still reachable', await page.locator('#hBtnHelp').isVisible());
+  await page.click('#hBtnHelp');
+  check('a. 사용 안내 opens as a popover from the top strip', await page.locator('#hHelpPop').isVisible() && (await page.getAttribute('#hBtnHelp', 'aria-expanded')) === 'true');
+  await page.keyboard.press('Escape');
+  check('a. Esc closes it and returns focus to the opener', await page.locator('#hHelpPop').isHidden() && await page.evaluate(() => document.activeElement && document.activeElement.id === 'hBtnHelp'));
   await shot(page, 'start-empty-1366');
   checkLayout('g. empty 1366x768', await page.evaluate(layoutProbe), false);
   // Keyboard: the evidence field has focus; Tab walks block 1 in order.
@@ -247,12 +270,11 @@ try {
     return st.phase === 'review-ready' && !st.busy ? st : null;
   }, 240000, 500);
   check('b. analysis reaches review-ready', !!reviewing);
-  const onReview = await until(() => page.locator('#resultCard.on').isVisible(), 20000);
-  check('b. the shell lands on the review stage (viewer)', !!onReview);
+  const onReview = await until(() => viewerCards(page), 30000);
+  check('b. the shell shows the viewer grid in the host (same screen)', !!onReview && await page.locator('#inputCard').isHidden(), `${onReview || 0} cards`);
 
-  // ---- c. 이전 프로젝트 + 뷰어 보기 -----------------------------------------
-  await page.click('#s1');
-  await page.waitForSelector('#inputCard.on');
+  // ---- c. 이전 프로젝트 + [이어서 검토] -------------------------------------
+  await goHome(page);
   const listed = await until(async () => {
     if (!(await page.locator('#recentCaseRow li').count())) return null;
     const t = await page.locator('#recentCaseRow li').first().textContent();
@@ -264,9 +286,7 @@ try {
   // list (canonical spelling) must not show the same case twice.
   const caseRows = await page.locator('#recentCaseRow li', { hasText: 'case-a' }).count();
   check('c. the case is listed once (no duplicate from the browser history)', caseRows === 1, `${caseRows} rows`);
-  check('c. stage rail hidden again on stage 1', await page.locator('#stageNav').isHidden());
-  const reasonNow = (await page.locator('#viewerReason').textContent()).trim();
-  check('c. 뷰어 보기 enabled and names the case', await viewerBtn.isEnabled() && reasonNow.includes('case-a'), reasonNow);
+  check('c. empty state again: host hidden, chip hidden', await page.locator('#hViewerHost').isHidden() && await page.locator('#jobPanel').isHidden());
   await shot(page, 'start-with-recent-1366');
   checkLayout('g. with recent 1366x768 light', await page.evaluate(layoutProbe), true);
   for (const [w, h] of [[1920, 1080], [1366, 768]]) {
@@ -279,25 +299,22 @@ try {
     }
   }
   const rowBtn = page.locator('#recentCaseRow li').first().locator('button');
-  check('c. row action is 열기 (primary)', (await rowBtn.textContent()).trim() === '열기' && /\bprimary\b/.test(await rowBtn.getAttribute('class')));
+  check('c. top row action is [이어서 검토] (primary lg)', (await rowBtn.textContent()).trim() === '이어서 검토' && /\bprimary\b/.test(await rowBtn.getAttribute('class')) && !/\bprimary\b/.test(await page.getAttribute('#btnOpenOther', 'class')));
+  let loads = 0;
+  page.on('load', () => { loads += 1; });
   const openReq = page.waitForRequest((r) => r.url().endsWith('/api/open-case'), { timeout: 10000 });
   await rowBtn.click();
   const openBody = JSON.parse((await openReq).postData() || '{}');
-  const reopened = await until(() => page.locator('#resultCard.on').isVisible(), 20000);
-  check('c. 열기 reopens the case into the viewer', !!reopened && String(openBody.case_dir || '').endsWith('case-a'), JSON.stringify(openBody));
-  await page.click('#s1');
-  await page.waitForSelector('#inputCard.on');
-  await until(() => page.locator('#btnViewerOpen').isEnabled(), 5000);
-  await page.click('#btnViewerOpen');
-  const viewerOpen = await until(() => page.locator('#resultCard.on').isVisible(), 20000);
-  check('c. 뷰어 보기 opens the viewer', !!viewerOpen && (await page.locator('#reviewFrame').getAttribute('src') || '').includes('embed=1'));
+  const reopened = await until(() => viewerCards(page), 30000);
+  check('c. [이어서 검토] reopens the case into the viewer', !!reopened && String(openBody.case_dir || '').endsWith('case-a'), JSON.stringify(openBody));
+  check('c. reopening did not reload the page', loads === 0, `${loads} load events`);
+  check('c. the top strip names the open project', (await page.locator('#hProjectName').textContent()).includes('case-a') && await page.locator('#hProjectBtn').isEnabled());
   const recentApi = await getJson('/api/recent-cases');
   check('c. GET /api/recent-cases lists the case (isolated config)', Array.isArray(recentApi) && recentApi.some((r) => r.case_dir.endsWith('case-a') && r.exists === true && r.source_path === srcDir) &&
     existsSync(join(work, 'cfg', 'frametrace', 'recent-cases.json')), JSON.stringify(recentApi).slice(0, 240));
 
   // ---- d2. E01 start: flow chosen, failure shown clearly --------------------
-  await page.click('#s1');
-  await page.waitForSelector('#inputCard.on');
+  await goHome(page);
   await page.fill('#sourcePath', fakeE01);
   await until(async () => (await page.locator('#kindChip').textContent()).trim() === 'E01 이미지', 5000);
   await page.click('#startOptions > summary');
@@ -332,7 +349,8 @@ try {
   rmSync(gone, { recursive: true, force: true });
   await page.goto(`${base}/?token=${token}`);
   await page.waitForSelector('#blkRecent');
-  if (!(await page.locator('#inputCard.on').isVisible())) await page.click('#s1');
+  await until(async () => (await page.locator('#inputCard').isVisible()) || (await page.locator('#hViewerHost').isVisible()), 8000);
+  await goHome(page);
   const missingRow = page.locator('#recentCaseRow li.missing');
   await until(async () => (await missingRow.count()) > 0, 8000);
   check('h. a vanished case is listed greyed with 목록에서 지우기', opened.ok && (await missingRow.count()) === 1 && (await missingRow.locator('button').textContent()).trim() === '목록에서 지우기');

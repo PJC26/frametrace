@@ -1,104 +1,50 @@
-// Theme toggle — shared ft-theme key, mirrored into the embedded review
-// iframe so its chrome follows without a reload.
-//
-// UX-12: the embedded viewer hides its own header (theme + language
-// toggles) in embed mode, so the shell owns both controls and pushes them
-// into the frame: a postMessage ({type:"ft-theme"} / {type:"ft-locale"})
-// for a viewer that listens, plus a same-origin fallback that retags the
-// document / drives the viewer's own (hidden) language button.
-const themeBtn = $("btnTheme");
+// Theme + viewer language live in the top strip (the shell owns both; the
+// hosted viewer hides its own header). Theme: shared ft-theme key, so one
+// toggle themes every surface. Language: the review viewer's display
+// language (the shell itself is Korean only), remembered per browser.
+const hThemeBtn = $("hBtnTheme");
 const rootEl = () => document.documentElement || { dataset: {} };
+function hThemeNow() { return rootEl().dataset.theme === "dark" ? "dark" : "light"; }
 function syncThemeBtn() {
-  const dark = rootEl().dataset.theme === "dark";
-  // Never empty: the label always names the target theme.
-  themeBtn.textContent = dark ? "☀ 라이트" : "◐ 다크";
-  themeBtn.title = dark ? "라이트 테마로 전환" : "다크 테마로 전환";
-  themeBtn.setAttribute("aria-label", themeBtn.title);
+  const dark = hThemeNow() === "dark";
+  const label = dark ? "라이트 테마로 전환" : "다크 테마로 전환";
+  hThemeBtn.title = label;
+  hThemeBtn.setAttribute("aria-label", label);
 }
-function viewerFrameEl() { return $("reviewFrame"); }
-function postToViewer(msg) {
-  const fr = viewerFrameEl();
-  try { if (fr && fr.contentWindow) { fr.contentWindow.postMessage(msg, "*"); return true; } } catch (e) {}
-  return false;
-}
-function pushThemeToViewer(theme) {
-  postToViewer({ type: "ft-theme", theme });
-  const fr = viewerFrameEl();
-  try { if (fr && fr.contentDocument && fr.contentDocument.documentElement) fr.contentDocument.documentElement.dataset.theme = theme; } catch (e) {}
-}
-themeBtn.addEventListener("click", () => {
-  const next = rootEl().dataset.theme === "dark" ? "light" : "dark";
-  rootEl().dataset.theme = next;
-  try { localStorage.setItem("ft-theme", next); } catch (e) {}
-  pushThemeToViewer(next);
+// fromPeer: the change came from another shell tab (ft-review channel).
+function hSetTheme(next, fromPeer) {
+  const theme = next === "dark" ? "dark" : "light";
+  rootEl().dataset.theme = theme;
+  try { localStorage.setItem("ft-theme", theme); } catch (e) {}
+  hViewer.setTheme(theme);
+  FTStore.set({ viewer: { theme } });
   syncThemeBtn();
-});
+  if (!fromPeer) hBroadcast("theme", theme);
+}
+hThemeBtn.addEventListener("click", () => hSetTheme(hThemeNow() === "dark" ? "light" : "dark"));
 syncThemeBtn();
 
-// Viewer language: remembered by the shell, re-applied on every frame
-// load. "" = never chosen here (the viewer keeps its own per-case choice).
-const VIEWER_LOCALE_KEY = "ft.examiner.viewerLocale";
-function viewerLocalePref() {
-  try { const v = localStorage.getItem(VIEWER_LOCALE_KEY); return v === "en" || v === "ko" ? v : ""; } catch (e) { return ""; }
+// "" = never chosen here (the viewer keeps its own per-case choice).
+const H_LOCALE_KEY = "ft.examiner.viewerLocale";
+function hLocalePref() {
+  try { const v = localStorage.getItem(H_LOCALE_KEY); return v === "en" || v === "ko" ? v : ""; } catch (e) { return ""; }
 }
-// The viewer sets <html lang> from its locale (applyChromeI18n).
-function viewerCurrentLocale() {
-  try {
-    const fr = viewerFrameEl();
-    const lang = fr && fr.contentDocument && fr.contentDocument.documentElement ? fr.contentDocument.documentElement.lang : "";
-    return lang === "en" || lang === "ko" ? lang : "";
-  } catch (e) { return ""; }
-}
-function syncViewerLangBtn() {
-  const btn = $("btnViewerLang");
+function syncLangBtn() {
+  const btn = $("hBtnLang");
   if (!btn) return;
-  const cur = viewerLocalePref() || viewerCurrentLocale() || "ko";
-  btn.textContent = cur === "en" ? "뷰어 언어: English" : "뷰어 언어: 한국어";
-  btn.setAttribute("aria-label", (cur === "en" ? "검토 뷰어 언어 English — 한국어로 전환" : "검토 뷰어 언어 한국어 — English로 전환"));
+  const cur = hLocalePref() || hViewer.getLocale() || "ko";
+  btn.textContent = cur === "en" ? "English" : "한국어";
+  btn.setAttribute("aria-label", cur === "en" ? "검토 뷰어 언어 English — 한국어로 전환" : "검토 뷰어 언어 한국어 — English로 전환");
 }
-// The viewer answers {type:"ft-locale-ack", locale}; until then (or until
-// the frame reloads, which restarts the sequence) the shell re-posts, so a
-// viewer that wires its message handler late still gets the language.
-let localeSeq = 0, localeAcked = "";
-const LOCALE_RETRY_MS = 500, LOCALE_RETRY_MAX = 24;
-window.addEventListener("message", e => {
-  if (!e.data || e.data.type !== "ft-locale-ack") return;
-  try { const fr = viewerFrameEl(); if (e.source && fr && e.source !== fr.contentWindow) return; } catch (err) {}
-  localeAcked = e.data.locale || "";
+function hSetLocale(next, fromPeer) {
+  const locale = next === "en" ? "en" : "ko";
+  try { localStorage.setItem(H_LOCALE_KEY, locale); } catch (e) {}
+  hViewer.setLocale(locale);
+  FTStore.set({ viewer: { locale } });
+  syncLangBtn();
+  if (!fromPeer) hBroadcast("locale", locale);
+}
+$("hBtnLang").addEventListener("click", () => {
+  hSetLocale((hLocalePref() || hViewer.getLocale() || "ko") === "en" ? "ko" : "en");
 });
-function pushLocaleToViewer(locale) {
-  if (!locale) return;
-  const seq = ++localeSeq;
-  localeAcked = "";
-  let tries = 0;
-  const tick = () => {
-    if (seq !== localeSeq || localeAcked === locale) return;
-    postToViewer({ type: "ft-locale", locale });
-    if (++tries < LOCALE_RETRY_MAX) setTimeout(tick, LOCALE_RETRY_MS);
-  };
-  tick();
-  // Same-origin fallback (idempotent with the message): the viewer's
-  // language button toggles and persists per case.
-  try {
-    const fr = viewerFrameEl();
-    const doc = fr && fr.contentDocument;
-    const cur = viewerCurrentLocale();
-    const btn = doc ? doc.getElementById("btnLang") : null;
-    if (btn && cur && cur !== locale) btn.click();
-  } catch (e) {}
-}
-$("btnViewerLang").addEventListener("click", () => {
-  const next = (viewerLocalePref() || viewerCurrentLocale() || "ko") === "en" ? "ko" : "en";
-  try { localStorage.setItem(VIEWER_LOCALE_KEY, next); } catch (e) {}
-  pushLocaleToViewer(next);
-  syncViewerLangBtn();
-});
-// Called whenever the review frame (re)loads: theme + language follow the
-// shell even if they changed while the frame was loading.
-function syncViewerChrome() {
-  pushThemeToViewer(rootEl().dataset.theme === "dark" ? "dark" : "light");
-  pushLocaleToViewer(viewerLocalePref());
-  syncViewerLangBtn();
-}
-syncViewerLangBtn();
-
+syncLangBtn();

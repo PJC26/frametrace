@@ -1,8 +1,9 @@
-// ---- stage 1 start screen: 증거 넣기 · 이전 프로젝트 · 뷰어 보기 ----
-// One centered column, three blocks. The evidence kind is auto-detected
-// from the path (folder → folder pipeline, E01-family image → E01
-// pipeline), recent projects come from GET /api/recent-cases, and
-// '뷰어 보기' opens the bound or most recent reviewable case.
+// ---- empty state: 증거 넣기 · 이전 프로젝트 ----
+// One centred column, exactly two blocks. The evidence kind is
+// auto-detected from the path (folder → folder pipeline, E01-family image
+// → E01 pipeline); previous projects come from GET /api/recent-cases and
+// the newest openable one carries the block's single primary,
+// [이어서 검토].
 
 function showStartErr(msg) {
   const el = $("startErr");
@@ -73,7 +74,7 @@ function updateOptSummary() {
   const el = $("optSummary");
   if (!el) return;
   const dir = ($("caseDir").value || "").trim();
-  const base = dir ? caseBaseName(dir) : "";
+  const base = dir ? hBaseName(dir) : "";
   const modeNames = { quick: "빠른 선별", standard: "표준", full: "전체 (증거용)", custom: "사용자 지정" };
   const extras = [];
   if ($("withDeepfake").checked) extras.push("딥페이크");
@@ -150,13 +151,13 @@ async function renderRecentCases() {
     for (const c of checks.filter(Boolean)) {
       if (known.has(c.key)) continue;
       known.add(c.key);
-      items.push({ case_dir: c.p, name: caseBaseName(c.p) || c.p, exists: true, phase_hint: "", legacy: true });
+      items.push({ case_dir: c.p, name: hBaseName(c.p) || c.p, exists: true, phase_hint: "", legacy: true });
     }
   }
   if (seq !== recentSeq) return;
   recentItems = items.slice(0, RECENT_SHOWN);
   drawRecentList();
-  syncViewerBlock();
+  if (FTStore.state.panels.project) hProjectPopRender();
 }
 function drawRecentList() {
   const list = $("recentCaseRow"), empty = $("recentEmpty");
@@ -167,14 +168,15 @@ function drawRecentList() {
   if (empty) empty.hidden = !!recentItems.length;
   if (typeof document.createElement !== "function" || typeof list.appendChild !== "function") return;
   list.innerHTML = "";
-  // Exactly one primary in the block: the first openable row, else
-  // '다른 케이스 폴더 열기…'.
+  // Exactly one primary in the block: the first openable row (labelled
+  // "이어서 검토", or "이어서" for an interrupted analysis), else
+  // '다른 케이스 폴더 열기…'. Every other row action is quiet.
   let primaryGiven = false;
   recentItems.forEach((it, i) => {
     const s = recentState(it, st);
     const li = document.createElement("li");
     li.className = "rc-row" + (it.exists === false ? " missing" : "");
-    const name = it.name || caseBaseName(it.case_dir) || it.case_dir;
+    const name = it.name || hBaseName(it.case_dir) || it.case_dir;
     const when = fmtWhen(it.last_opened_unix);
     li.innerHTML =
       `<div class="rc-main"><span class="rc-name" title="${esc(it.case_dir)}">${esc(name)}</span>` +
@@ -182,17 +184,22 @@ function drawRecentList() {
       `<span class="rc-path" title="${esc(it.case_dir)}">${esc(it.case_dir)}</span></div>`;
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "rc-act casechip";
+    btn.className = "rc-act";
     btn.dataset.i = String(i);
-    btn.textContent = s.label;
-    btn.setAttribute("aria-label", `${s.label} — ${name}`);
+    let label = s.label;
     if (s.action === "forget") {
-      btn.classList.add("ghost");
+      btn.classList.add("quiet");
       btn.title = "목록에서만 지웁니다 — 폴더나 파일은 건드리지 않습니다";
-    } else if (!primaryGiven && s.action !== "progress") {
-      btn.classList.add("primary");
+    } else if (!primaryGiven && s.action !== "progress" && !running) {
+      if (s.action === "open") label = "이어서 검토";
+      btn.classList.add("primary", "lg");
+      li.classList.add("rc-top");
       primaryGiven = true;
+    } else {
+      btn.classList.add("quiet");
     }
+    btn.textContent = label;
+    btn.setAttribute("aria-label", `${label} — ${name}`);
     if (running && s.action !== "progress") {
       btn.disabled = true;
       btn.title = "분석이 진행 중입니다 — 끝나거나 중단한 뒤 열 수 있습니다";
@@ -208,7 +215,7 @@ async function recentAction(i, btn) {
   const it = recentItems[i];
   if (!it) return;
   const s = recentState(it, lastStatus);
-  if (s.action === "progress") { showView(2); return; }
+  if (s.action === "progress") { FTStore.set({ ui: { home: false } }); hOpenSheet("jobs", btn); return; }
   if (s.action === "forget") {
     setBusy(btn, true, "지우는 중…");
     const res = await jpost("/api/recent-cases/forget", { case_dir: it.case_dir });
@@ -234,68 +241,17 @@ async function recentAction(i, btn) {
     $("btnStart").click();
     return;
   }
-  $("caseDir").value = it.case_dir;
-  updateOptSummary();
   setBusy(btn, true, "여는 중…");
-  let ok = false;
-  try { ok = await openCase(it.case_dir); } finally { setBusy(btn, false); }
-  if (!ok) toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err");
+  try { await hSwitchProject(it.case_dir); } finally { setBusy(btn, false); }
 }
 
-// ---- 뷰어 보기 ----
-const VIEWABLE_PHASES = ["review-ready", "review-partial", "done", "finalized"];
-// Pure: what '뷰어 보기' would open → { kind: bound|recent|none, dir, reason }.
-function viewerTarget(st, items) {
-  if (st && st.case_dir && VIEWABLE_PHASES.includes(st.phase)) return { kind: "bound", dir: st.case_dir };
-  const running = !!(st && st.phase === "running");
-  const hit = (items || []).find(it => it.exists !== false && ["review", "finalized", "partial"].includes(it.phase_hint));
-  if (hit && !running) return { kind: "recent", dir: hit.case_dir };
-  if (running) return { kind: "none", reason: "분석이 진행 중입니다 — 첫 색인이 끝나면 뷰어를 열 수 있습니다." };
-  if ((items || []).some(it => it.exists !== false)) {
-    return { kind: "none", reason: "검토할 수 있는 케이스가 아직 없습니다 — 이전 프로젝트를 이어서 분석하거나 새 증거를 넣으십시오." };
-  }
-  return { kind: "none", reason: "아직 연 케이스가 없습니다 — 먼저 증거를 넣어 분석하거나 이전 프로젝트를 여십시오." };
-}
-let viewerTargetNow = { kind: "none" };
-function syncViewerBlock() {
-  const btn = $("btnViewerOpen"), why = $("viewerReason");
-  if (!btn || !why) return;
-  if (btn.getAttribute && btn.getAttribute("aria-busy") === "true") return;
-  const t = viewerTarget(lastStatus, recentItems);
-  viewerTargetNow = t;
-  btn.disabled = t.kind === "none";
-  if (t.kind === "none") {
-    why.textContent = t.reason;
-    btn.title = t.reason;
-    return;
-  }
-  const base = caseBaseName(t.dir);
-  why.textContent = (homeRestored && t.kind === "bound" ? "이전 세션에서 복원된 케이스: " : "케이스: ") + base;
-  btn.title = `${t.dir} — 검토 뷰어를 엽니다`;
-}
-$("btnViewerOpen").addEventListener("click", async () => {
-  const t = viewerTargetNow;
-  if (t.kind === "bound") { openBoundViewer(); return; }
-  if (t.kind !== "recent") return;
-  const btn = $("btnViewerOpen");
-  setBusy(btn, true, "여는 중…");
-  let ok = false;
-  try { ok = await openCase(t.dir); } finally { setBusy(btn, false); }
-  if (!ok) { toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err"); syncViewerBlock(); }
-  // On success the next status poll (open case → review-ready) jumps to
-  // the review stage, exactly like opening it from the list.
-});
 $("btnOpenOther").addEventListener("click", () => {
-  openPicker("caseDir", "case", async dir => {
-    const ok = await openCase(dir);
-    if (!ok) toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err");
-  });
+  openPicker("caseDir", "case", dir => { hSwitchProject(dir); });
 });
 $("caseDir").addEventListener("input", updateOptSummary);
 $("withDeepfake").addEventListener("change", updateOptSummary);
 
-// Called whenever stage 1 comes back on screen.
+// Called whenever the empty state comes back on screen.
 function onHomeShown() {
   renderRecentCases();
-  syncViewerBlock();
 }

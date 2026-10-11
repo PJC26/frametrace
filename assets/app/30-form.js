@@ -13,7 +13,7 @@ async function loadEnv() {
     const auditHtml = prevAudit && prevAudit.className && prevAudit.className !== "badge"
       ? `<span class="${esc(prevAudit.className)}" id="auditBadge" title="${esc(prevAudit.title || "")}">${esc(prevAudit.textContent)}</span>`
       : `<span class="badge" id="auditBadge" title="감사 로그 무결성은 분석 완료 후 자동 검증됩니다">감사 로그 대기</span>`;
-    $("env").innerHTML =
+    $("hEnv").innerHTML =
       badge("ffmpeg", t.ffmpeg, hints.media) +
       badge("ffprobe", t.ffprobe, hints.media) +
       badge("libewf(E01)", wf.e01, hints.e01, "ewfBadge") +
@@ -41,12 +41,12 @@ async function loadEnv() {
   } catch (e) { console.error("loadEnv failed:", e); }
 }
 
-// '도구 N/5 ▾' in the stage bar: ffmpeg, ffprobe, libewf, TSK and the
+// '도구 N/5' in the top strip: ffmpeg, ffprobe, libewf, TSK and the
 // audit log. A missing tool (or a failed audit check) turns it amber with
 // the count; a pending audit check is not a failure.
 let envState = null;
 function syncToolsBtn() {
-  const btn = $("btnTools"), count = $("toolsCount");
+  const btn = $("hBtnTools"), count = $("hToolsCount");
   if (!btn || !count) return;
   if (!envState) { count.textContent = "확인 중"; return; }
   const audit = $("auditBadge");
