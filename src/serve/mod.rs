@@ -37,6 +37,8 @@ mod tests_jobs;
 mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
+#[cfg(test)]
+mod tests_review3;
 
 pub(crate) use discovery::{
     find_running_server, publish_local_server, token_for_port, write_instance_file,

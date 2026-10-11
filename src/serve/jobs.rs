@@ -1091,7 +1091,8 @@ pub(crate) fn sanitize_examiner(raw: &str) -> String {
 pub(crate) const SIGNOFF_PENDING_REL_PATH: &str = "review/signoff.pending.json";
 
 /// Writes a sign-off record atomically to `rel_path`. It binds the examiner
-/// to the current review marks (`content_sha256`, see
+/// to the current review marks, their IN-OUT ranges and the tag map
+/// (`content_sha256`, see
 /// `report::signoff_content_sha256`) so a later make-report can say whether
 /// the marks changed after the sign-off. Returns the signed unix time.
 pub(crate) fn write_signoff(
@@ -1100,10 +1101,15 @@ pub(crate) fn write_signoff(
     examiner: &str,
 ) -> Result<i64, String> {
     let signed_unix = crate::util::now_unix()? as i64;
-    let content_sha256 =
-        crate::report::signoff_content_sha256(&crate::cli::handlers::review_marks_json(case_dir));
+    // A read failure refuses the sign-off (finding 8): binding it to an
+    // empty mark list would misstate what the examiner signed.
+    let content = crate::cli::handlers::signoff_content_json(case_dir).map_err(|err| {
+        format!("최종화 차단: 검토자 기록에 묶을 판독 내용을 읽지 못했습니다 — {err}")
+    })?;
+    let content_sha256 = crate::report::signoff_content_sha256(&content);
     let body = format!(
-        "{{\"schema_version\":2,\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks\",\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+        "{{\"schema_version\":{},\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks (status, note, IN-OUT range) and tags\",\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+        crate::report::SIGNOFF_SCHEMA_VERSION,
         json_string(examiner),
         json_string(&content_sha256)
     );

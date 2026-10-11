@@ -593,20 +593,38 @@ pub fn parse_signoff(text: &str) -> Option<(String, i64)> {
     Some((examiner, signed))
 }
 
-/// Digest of the content a finalize sign-off covers: the review marks as
-/// make-report embeds them (`review_marks_json`).
-pub fn signoff_content_sha256(marks_json: &str) -> String {
-    crate::sha256::digest_bytes(marks_json.as_bytes())
+/// Digest of the content a finalize sign-off covers: since sign-off
+/// schema v3 the review marks with their IN-OUT ranges plus the tag map
+/// (`signoff_content_json`); v2 records digested the report's marks JSON
+/// (`review_marks_json`: status / time / examiner / note only).
+pub fn signoff_content_sha256(content_json: &str) -> String {
+    crate::sha256::digest_bytes(content_json.as_bytes())
+}
+
+/// Sign-off schema version whose `content_sha256` covers ranges and tags.
+pub const SIGNOFF_SCHEMA_VERSION: u64 = 3;
+
+/// The current content digests a sign-off record is compared with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignoffDigests {
+    /// v3 binding: marks (with IN-OUT ranges) and tags.
+    pub content: String,
+    /// v2 binding: the report's marks JSON (status / time / examiner / note).
+    pub legacy: String,
 }
 
 /// Whether the content a sign-off was given for is still what the report
 /// shows (SHOULD-FIX 6): an old sign-off must never read as current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignoffCurrency {
-    /// The review marks are unchanged since the sign-off.
+    /// Marks (incl. ranges) and tags are unchanged since the sign-off.
     Current,
     /// The review marks changed after the sign-off.
     Changed,
+    /// An older (schema < 3) record whose status/note binding still
+    /// matches, but which never covered ranges or tags: whether those
+    /// changed cannot be checked.
+    LegacyBinding,
     /// The record predates content binding; currency cannot be checked.
     Unbound,
 }
@@ -614,27 +632,41 @@ pub enum SignoffCurrency {
 impl SignoffCurrency {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Current => "sign-off 이후 판독 마크 변경 없음",
+            Self::Current => "sign-off 이후 판독 마크(구간·태그 포함) 변경 없음",
             Self::Changed => "sign-off 이후 판독 마크가 변경됨 — 현재 내용에 대한 sign-off가 아님",
+            Self::LegacyBinding => {
+                "이전 형식 sign-off — 마크 상태·메모는 일치하나 IN-OUT 구간·태그 변경 여부는 확인 불가"
+            }
             Self::Unbound => "sign-off 대상 내용 해시 없음 — 이후 변경 여부 확인 불가",
         }
     }
 }
 
-/// Compares the sign-off's recorded `content_sha256` with the current one.
-pub fn signoff_currency(signoff_text: &str, current_content_sha256: &str) -> SignoffCurrency {
-    let recorded = serde_json::from_str::<serde_json::Value>(signoff_text)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("content_sha256")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
-    match recorded {
-        Some(hash) if hash == current_content_sha256 => SignoffCurrency::Current,
-        Some(_) => SignoffCurrency::Changed,
-        None => SignoffCurrency::Unbound,
+/// Compares the sign-off's recorded `content_sha256` with the current
+/// content. A record below [`SIGNOFF_SCHEMA_VERSION`] is compared with the
+/// legacy digest: a mismatch is a real change, a match only says status and
+/// notes are unchanged (ranges/tags were never bound).
+pub fn signoff_currency(signoff_text: &str, current: &SignoffDigests) -> SignoffCurrency {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(signoff_text) else {
+        return SignoffCurrency::Unbound;
+    };
+    let Some(recorded) = value.get("content_sha256").and_then(|v| v.as_str()) else {
+        return SignoffCurrency::Unbound;
+    };
+    let schema = value
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if schema >= SIGNOFF_SCHEMA_VERSION {
+        if recorded == current.content {
+            SignoffCurrency::Current
+        } else {
+            SignoffCurrency::Changed
+        }
+    } else if recorded == current.legacy {
+        SignoffCurrency::LegacyBinding
+    } else {
+        SignoffCurrency::Changed
     }
 }
 
@@ -647,12 +679,17 @@ pub fn signoff_banner_html(examiner: &str, signed_unix: i64, currency: SignoffCu
         SignoffCurrency::Current => (
             "#eef4f8",
             "#b9d0e0",
-            " — 이 기록 이후 판독 마크는 변경되지 않았습니다.".to_string(),
+            " — 이 기록 이후 판독 마크는 변경되지 않았습니다 (상태·메모·IN-OUT 구간·태그 모두 일치).".to_string(),
         ),
         SignoffCurrency::Changed => (
             "#fce8e6",
             "#e6a49c",
             " — <strong>주의: 이 기록 이후 판독 마크가 변경되었습니다. 아래 내용은 검토자가 최종화한 시점과 다르며, 이 기록은 현재 내용에 대한 sign-off가 아닙니다. 다시 최종화하십시오.</strong>".to_string(),
+        ),
+        SignoffCurrency::LegacyBinding => (
+            "#fff4e0",
+            "#f4c790",
+            " — 이 기록은 이전 형식이라 판독 마크의 상태·메모만 대상으로 합니다(이후 변경 없음). IN-OUT 구간·태그가 이후 바뀌었는지는 확인할 수 없습니다 — 다시 최종화하면 함께 기록됩니다.".to_string(),
         ),
         SignoffCurrency::Unbound => (
             "#fff4e0",
@@ -727,19 +764,45 @@ mod tests {
     /// SHOULD-FIX 6: a sign-off given for other marks never reads as current.
     #[test]
     fn signoff_currency_detects_marks_changed_after_signoff() {
-        use super::{SignoffCurrency, signoff_banner_html, signoff_currency};
-        let digest = super::signoff_content_sha256("[]");
-        let record = format!(r#"{{"examiner":"A","signed_unix":5,"content_sha256":"{digest}"}}"#);
-        assert_eq!(signoff_currency(&record, &digest), SignoffCurrency::Current);
-        let changed = super::signoff_content_sha256(r#"[{"id":"v","status":"important"}]"#);
+        use super::{SignoffCurrency, SignoffDigests, signoff_banner_html, signoff_currency};
+        let digests = |content: &str, legacy: &str| SignoffDigests {
+            content: super::signoff_content_sha256(content),
+            legacy: super::signoff_content_sha256(legacy),
+        };
+        let now = digests(r#"{"marks":[]}"#, "[]");
+        let record = format!(
+            r#"{{"schema_version":3,"examiner":"A","signed_unix":5,"content_sha256":"{}"}}"#,
+            now.content
+        );
+        assert_eq!(signoff_currency(&record, &now), SignoffCurrency::Current);
+        // A range/tag edit changes only the v3 digest: still detected.
+        let range_moved = digests(r#"{"marks":[],"tags":{"v":["x"]}}"#, "[]");
         assert_eq!(
-            signoff_currency(&record, &changed),
+            signoff_currency(&record, &range_moved),
             SignoffCurrency::Changed
         );
         assert_eq!(
-            signoff_currency(r#"{"examiner":"A","signed_unix":5}"#, &digest),
+            signoff_currency(r#"{"examiner":"A","signed_unix":5}"#, &now),
             SignoffCurrency::Unbound
         );
+        // A v2 record bound the legacy marks JSON: a match there is NOT
+        // "unchanged" (ranges/tags were never covered), a mismatch is.
+        let legacy = format!(
+            r#"{{"schema_version":2,"examiner":"A","signed_unix":5,"content_sha256":"{}"}}"#,
+            now.legacy
+        );
+        assert_eq!(
+            signoff_currency(&legacy, &range_moved),
+            SignoffCurrency::LegacyBinding
+        );
+        let status_changed = digests(r#"{"marks":[1]}"#, r#"[{"id":"v"}]"#);
+        assert_eq!(
+            signoff_currency(&legacy, &status_changed),
+            SignoffCurrency::Changed
+        );
+        let banner = signoff_banner_html("A", 5, SignoffCurrency::LegacyBinding);
+        assert!(banner.contains("확인할 수 없습니다"), "{banner}");
+        assert!(!banner.contains("변경되지 않았습니다"), "{banner}");
         let banner = signoff_banner_html("A", 5, SignoffCurrency::Changed);
         assert!(banner.contains("변경되었습니다"), "{banner}");
         assert!(banner.contains("현재 내용에 대한 sign-off가 아닙니다"));

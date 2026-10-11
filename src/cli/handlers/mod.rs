@@ -265,8 +265,8 @@ pub(crate) use batch::{
 };
 pub(crate) use case::{
     InitCaseOptions, PackageOptions, RegisterSourceOptions, init_case, inspect, make_custody,
-    make_report, make_review, package_case, register_source, review_marks_json,
-    review_marks_json_from_rows, scan_folder, verify_package,
+    make_report, make_review, package_case, register_source, review_marks_json_from_rows,
+    scan_folder, signoff_content_json, signoff_content_json_from, verify_package,
 };
 pub(crate) use doctor::{
     BenchmarkOptions, benchmark_db, deepfake_scan, deepfake_screen, doctor, rotate_audit_key,
