@@ -86,13 +86,17 @@ pub(crate) use http::{
 };
 #[cfg(test)]
 pub(crate) use jobs::{
-    SIGNOFF_PENDING_REL_PATH, STEP_OUTPUT_TAIL_BYTES, build_selection_file, carve_with_exe,
-    drain_capped, enter_review_partial, finalize_with_exe, phase1_scan_args,
-    recover_deleted_with_exe, run_folder_enrichment, source_is_volume_root, start_media_roots,
-    warn_step,
+    STEP_OUTPUT_TAIL_BYTES, build_selection_file, carve_with_exe, drain_capped,
+    enter_review_partial, finalize_with_exe, phase1_scan_args, recover_deleted_with_exe,
+    run_folder_enrichment, source_is_volume_root, start_media_roots, warn_step,
 };
 #[cfg(test)]
-pub(crate) use media::{copy_unique, exhibit_arg, export_clip_with_exe, export_safe_name};
+pub(crate) use media::{copy_unique, export_clip_with_exe, export_safe_name};
+// Only the fake-CLI tests (unix-only) use these.
+#[cfg(all(test, unix))]
+pub(crate) use jobs::SIGNOFF_PENDING_REL_PATH;
+#[cfg(all(test, unix))]
+pub(crate) use media::exhibit_arg;
 #[cfg(test)]
 pub(crate) use records::{
     FTS_CACHE_CAPACITY, cached_fts_search, cached_live_checkpoint, cached_thumb_stems,
