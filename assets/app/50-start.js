@@ -2,15 +2,31 @@ let starting = false;
 $("btnStart").addEventListener("click", async () => {
   if (starting) return;
   const source = $("sourcePath").value.trim();
-  if (!source) { $("startErr").classList.add("show"); $("startErr").textContent = "증거 소스 경로를 입력하십시오."; return; }
+  if (!source) {
+    showStartErr("증거 경로를 입력하십시오 — E01 이미지 파일이나 폴더·드라이브 경로입니다.");
+    try { $("sourcePath").focus(); } catch (e) {}
+    return;
+  }
   $("startErr").classList.remove("show");
   // Preflight: never write case output inside the evidence source.
   const caseDir = $("caseDir").value.trim();
   // UX-11: the server-side preflight (when this server has it) also sees
   // symlinks/junctions the string check cannot; give it a bounded moment.
   starting = true;
-  let pf = null;
-  try { pf = await ensurePreflight(source, caseDir); } finally { starting = false; }
+  let pf = null, det = null;
+  try {
+    // The evidence kind is auto-detected (folder vs E01 image); a missing
+    // or unsupported path stops here with an inline error.
+    det = await detectSourceKind(source);
+    if (det.kind === "missing" || det.kind === "other") {
+      applyDetection(source, det);
+      showStartErr(det.message);
+      try { $("sourcePath").focus(); } catch (e) {}
+      return;
+    }
+    applyDetection(source, det);
+    pf = await ensurePreflight(source, caseDir);
+  } finally { starting = false; }
   if ((caseDir && pathInside(caseDir, source)) || (pf && pf.case_inside_source === true)) {
     const go = await askDialog({
       title: "케이스 폴더가 증거 소스 안에 있습니다",
@@ -108,7 +124,7 @@ async function openCase(dir) {
   if (!dir) {
     $("startErr").classList.add("show");
     $("startErr").textContent = "열 기존 케이스 폴더 경로를 입력하십시오.";
-    return;
+    return false;
   }
   $("startErr").classList.remove("show");
   let res;
@@ -121,17 +137,22 @@ async function openCase(dir) {
   if (!res.ok) {
     $("startErr").classList.add("show");
     $("startErr").textContent = "오류: " + (res.error || "케이스 열기 실패");
-    return;
+    return false;
   }
-  if (!res.has_review) {
+  if (!res.has_review && !res.has_index) {
     $("startErr").classList.add("show");
     $("startErr").textContent = "케이스를 열었으나 검토 결과가 아직 없습니다 — 이전 분석이 중단되었을 수 있습니다. 같은 증거 소스를 지정하고 '분석 시작'을 누르면 체크포인트에서 이어서 진행합니다.";
-    return;
+    renderRecentCases();
+    return false;
   }
+  // UX-02: an index without the review bundle (enrichment cancelled) is
+  // still reviewable — the server opened it as review-partial.
+  if (!res.has_review) toast("색인만 있는 케이스입니다 — 해시·검증 보강 전 상태로 엽니다.", "warn");
   pushRecent("recentCases", dir);
   savePrefs({ lastCase: dir });
   // Flags were already reset above — the next poll re-enables the rail
   // and jumps to the review screen when the new case reports its state.
+  return true;
 }
 
 let cancelRequested = false;

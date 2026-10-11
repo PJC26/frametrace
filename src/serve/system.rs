@@ -202,6 +202,17 @@ pub(crate) fn browse_json(raw: &str, want_files: bool) -> String {
         "entries": entries,
         "truncated": truncated,
     });
+    // A case folder also reports its canonical form so the start screen
+    // can match it against the recent-projects list (which stores
+    // canonical paths) without listing the same case twice.
+    if crate::case_db::case_db_path(&path).is_file()
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert(
+            "canonical".to_string(),
+            serde_json::Value::String(super::recent::canonical_case_dir(&path)),
+        );
+    }
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

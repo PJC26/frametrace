@@ -4,15 +4,19 @@ document.querySelectorAll("input[name='inputKind']").forEach(radio => radio.addE
 // Auto-detect forensic image extensions in the source path: pasting an
 // E01/Ex01/L01/S01 path while "증거 폴더" is selected would otherwise send the
 // file to the folder pipeline and fail at the scan step.
+// The server's /api/browse "kind" (folder / e01 by extension or EWF
+// header / other / missing) settles it in validatePaths; the extension
+// check here only makes the chip react instantly while typing.
 $("sourcePath").addEventListener("input", () => {
   const v = $("sourcePath").value.trim().toLowerCase();
   const looksImage = /\.(e01|ex01|l01|s01|e02|ex02|l02|s02)$/.test(v);
   const e01Radio = document.querySelector("input[name='inputKind'][value='e01']");
-  if (looksImage && inputKind() !== "e01") {
+  if (looksImage && e01Radio && inputKind() !== "e01") {
     e01Radio.checked = true;
-    syncInputKind();
-    $("startErr").classList.remove("show");
+    syncInputKindView();
   }
+  detectedKind = "";
+  $("startErr").classList.remove("show");
   updateModeInfo();
   scheduleValidate();
 });
@@ -53,27 +57,6 @@ function renderRecent() {
   renderRecentCases();
 }
 
-// One-click reopen: remembered paths that still hold a case DB become chips.
-async function renderRecentCases() {
-  const row = $("recentCaseRow");
-  const paths = (loadPrefs().recentCases || []).slice(0, 6);
-  const checks = await Promise.all(paths.map(async p => {
-    try {
-      const res = await jget("/api/browse?path=" + encodeURIComponent(p));
-      return res.is_case ? p : null;
-    } catch { return null; }
-  }));
-  const valid = checks.filter(Boolean);
-  if (!valid.length) { row.hidden = true; row.innerHTML = ""; return; }
-  row.hidden = false;
-  row.innerHTML = `<span class="muted" style="font-size:13px">최근 케이스:</span>` +
-    valid.map(p => `<button type="button" class="casechip" data-path="${esc(p)}" title="${esc(p)}">${esc(p.split(/[\\/]/).filter(Boolean).pop() || p)}</button>`).join("");
-  row.querySelectorAll(".casechip").forEach(b => b.addEventListener("click", () => {
-    $("caseDir").value = b.dataset.path;
-    openCase(b.dataset.path);
-  }));
-}
-
 function setStatus(el, cls, msg) {
   el.className = "pathstatus" + (cls ? " " + cls : "");
   el.textContent = msg;
@@ -89,21 +72,16 @@ function scheduleValidate() {
 // drive letter fails before the analysis does, not three steps in.
 async function validatePaths() {
   const src = $("sourcePath").value.trim();
-  const srcEl = $("sourceStatus");
-  schedulePreflight();
   if (!src) {
-    setStatus(srcEl, "", "");
+    applyDetection("", { kind: "" });
+    schedulePreflight();
   } else {
-    try {
-      const res = await jget("/api/browse?path=" + encodeURIComponent(src));
-      if ($("sourcePath").value.trim() !== src) return; // stale reply
-      if (res.exists === false) setStatus(srcEl, "err", "경로를 찾을 수 없습니다 — 드라이브 문자와 경로를 확인하십시오.");
-      else if (res.is_file) {
-        if (inputKind() === "e01") setStatus(srcEl, "ok", "이미지 파일이 확인되었습니다.");
-        else setStatus(srcEl, "warn", "파일 경로입니다 — E01 계열 이미지면 'E01 디스크 이미지'를 선택하고, 아니면 폴더를 지정하십시오.");
-      } else if (inputKind() === "e01") setStatus(srcEl, "warn", "폴더입니다 — E01 이미지 파일을 선택하십시오.");
-      else setStatus(srcEl, "ok", "폴더가 확인되었습니다.");
-    } catch { setStatus(srcEl, "", ""); }
+    // Auto-detect the evidence kind (chip + inline error), then preflight
+    // only a usable path.
+    const det = await detectSourceKind(src);
+    if ($("sourcePath").value.trim() !== src) return; // stale reply
+    applyDetection(src, det);
+    schedulePreflight();
   }
   const dir = $("caseDir").value.trim();
   const caseEl = $("caseStatus");
@@ -176,12 +154,25 @@ let pickerCurrent = "";
 let pickerParent = "";
 let pickerLastFocus = null;
 
-function openPicker(targetId, mode) {
+// Modes: "dir" (any folder), "source" (evidence: a folder OR an
+// E01-family image file), "case" (a case folder to open; picking one
+// runs `onChoose`), "e01" (image files only).
+const PICKER_MODES = {
+  dir: { title: "폴더 선택", select: "이 폴더 선택", files: false },
+  source: { title: "증거 선택 — 폴더 또는 E01 이미지", select: "이 폴더 선택", files: true },
+  case: { title: "케이스 폴더 열기", select: "이 케이스 열기", files: false },
+  e01: { title: "E01 이미지 선택", select: "", files: true },
+};
+let pickerOnChoose = null;
+function openPicker(targetId, mode, onChoose) {
+  const m = PICKER_MODES[mode] || PICKER_MODES.dir;
   pickerTarget = targetId;
   pickerMode = mode;
+  pickerOnChoose = onChoose || null;
   pickerLastFocus = document.activeElement;
-  $("pickerTitle").textContent = mode === "e01" ? "E01 이미지 선택" : "폴더 선택";
-  $("pickerSelect").style.display = mode === "e01" ? "none" : "";
+  $("pickerTitle").textContent = m.title;
+  $("pickerSelect").textContent = m.select || "선택";
+  $("pickerSelect").style.display = m.select ? "" : "none";
   $("pickerBackdrop").hidden = false;
   // Focus lands in the list (first entry) once it loads, not the path box.
   browseTo($(targetId).value.trim(), true);
@@ -189,13 +180,16 @@ function openPicker(targetId, mode) {
 function closePicker() {
   $("pickerBackdrop").hidden = true;
   pickerTarget = null;
+  pickerOnChoose = null;
   if (pickerLastFocus) pickerLastFocus.focus();
 }
 function choose(path) {
   const input = $(pickerTarget);
+  const after = pickerOnChoose;
   input.value = path;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   closePicker();
+  if (after) after(path);
 }
 // Picker rows are listbox options with a roving tabindex: one Tab stop
 // for the list, Up/Down/Home/End move, Enter/Space activate (open a
@@ -248,7 +242,7 @@ async function browseTo(path, focusList) {
   const list = $("pickerList");
   const keepFocus = focusList !== false && (focusList === true || list.contains(document.activeElement));
   $("pickerStatus").textContent = "읽는 중…";
-  const files = pickerMode === "e01" ? "&files=e01" : "";
+  const files = (PICKER_MODES[pickerMode] || {}).files ? "&files=e01" : "";
   let res;
   try {
     res = await jget("/api/browse?path=" + encodeURIComponent(path) + files);
@@ -277,7 +271,7 @@ async function browseTo(path, focusList) {
   pickerCurrent = res.path || "";
   pickerParent = res.parent || "";
   $("pickerPath").value = pickerCurrent;
-  $("pickerSelect").disabled = pickerMode === "dir" && !pickerCurrent;
+  $("pickerSelect").disabled = !pickerCurrent;
   list.innerHTML = "";
   if (!res.ok || res.exists === false) {
     const li = document.createElement("li");
@@ -299,15 +293,18 @@ async function browseTo(path, focusList) {
   }
   list.appendChild(pickerRow(`<span class="dir">.. (상위 / 드라이브 목록)</span>`, () => browseTo(pickerParent, true)));
   for (const e of res.entries || []) {
+    // In "case" mode a case folder is the answer itself (one Enter opens it).
+    const pickCase = pickerMode === "case" && e.is_case;
     const html = `<span class="${e.dir ? "dir" : ""}">${esc(e.name)}${e.dir ? "/" : ""}</span>` +
-      (e.is_case ? `<span class="muted" style="font-size:12px"> · 케이스</span>` : "");
-    list.appendChild(pickerRow(html, () => { if (e.dir) browseTo(e.path, true); else choose(e.path); },
-      e.dir ? "Enter: 폴더 열기" : "Enter: 이 이미지 선택"));
+      (e.is_case ? `<span class="pk-tag"> · 케이스</span>` : "") +
+      (!e.dir ? `<span class="pk-tag"> · E01 이미지</span>` : "");
+    list.appendChild(pickerRow(html, () => { if (e.dir && !pickCase) browseTo(e.path, true); else choose(e.path); },
+      pickCase ? "Enter: 이 케이스 열기" : e.dir ? "Enter: 폴더 열기" : "Enter: 이 이미지 선택"));
   }
   if (!(res.entries || []).length) {
     const li = document.createElement("li");
     li.className = "picker-item muted";
-    li.textContent = pickerMode === "e01" ? "(하위 폴더나 E01 이미지가 없습니다)" : "(하위 폴더가 없습니다)";
+    li.textContent = (PICKER_MODES[pickerMode] || {}).files ? "(하위 폴더나 E01 이미지가 없습니다)" : "(하위 폴더가 없습니다)";
     list.appendChild(li);
   }
   const opts = pickerOptions();
@@ -319,7 +316,7 @@ async function browseTo(path, focusList) {
     : `${pickerCurrent || "드라이브 목록"} — ${count}개 항목`;
 }
 
-$("btnBrowseSource").addEventListener("click", () => openPicker("sourcePath", inputKind() === "e01" ? "e01" : "dir"));
+$("btnBrowseSource").addEventListener("click", () => openPicker("sourcePath", "source"));
 $("btnBrowseCase").addEventListener("click", () => openPicker("caseDir", "dir"));
 $("pickerCancel").addEventListener("click", closePicker);
 $("pickerClose").addEventListener("click", closePicker);

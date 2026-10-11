@@ -17,7 +17,7 @@
   <title>FrameTrace 검수 워크스테이션</title>
   <!-- @bundle:app.css -->
 </head>
-<body>
+<body class="stage1">
 <a class="skiplink" href="#main">본문으로 건너뛰기</a>
 <header class="stagebar" id="stageBar">
   <div class="brand-mark" aria-hidden="true">FT</div>
@@ -89,97 +89,116 @@
 <main id="main" tabindex="-1">
   <nav class="crumbs" id="crumbs" aria-label="현재 위치"></nav>
 
-  <section class="card view on" id="inputCard" data-view="1" aria-labelledby="inputTitle">
-    <div class="cardhead">
-      <h2 id="inputTitle">새 분석 — 증거 입력</h2>
-      <p class="hint">원본은 읽기 전용으로만 접근되며 모든 산출물은 케이스 폴더에 생성됩니다.</p>
-    </div>
-    <div class="onboard" id="onboard" hidden>
-      <b class="ob-title">FrameTrace 첫 실행 안내</b>
-      <ul>
-        <li>원본 증거는 <b>읽기 전용</b>으로만 접근합니다 — 해시·메타데이터·감사 로그 등 모든 산출물은 아래 '케이스 폴더'에만 기록됩니다.</li>
-        <li>진행은 4단계를 따릅니다 (Alt+1…Alt+4로 이동): <b>① 입력 → ② 분석 → ③ 검토(마크·선별) → ④ 결과물(보고서·패키지)</b></li>
-        <li>도구 상태는 헤더의 '도구' 버튼을 보십시오 — ffmpeg/ffprobe는 영상 검증에 쓰이고, E01 입력에는 libewf, 삭제 파일 조사에는 Sleuth Kit이 필요합니다. 없는 도구가 있어도 기본 폴더 분석은 동작합니다.</li>
-        <li>삭제 후보·카빙·재조립 결과는 검증을 통과하기 전까지 '<b>후보</b>'로만 표시됩니다.</li>
-        <li><b>첫 행동:</b> 증거 소스 경로를 입력하고 '분석 시작'을 누르십시오.</li>
-      </ul>
-      <div class="ob-foot">
-        <button type="button" class="primary" id="btnOnboardOk">알겠습니다</button>
-        <span class="muted">이 안내는 한 번만 표시됩니다 — 아래 '안내 다시 보기'로 언제든 다시 열 수 있습니다.</span>
+  <!-- Stage 1 (start screen): one centered column, exactly three blocks —
+       증거 넣기 · 이전 프로젝트 · 뷰어 보기. Everything else (case folder,
+       analysis mode, options) stays behind the collapsed '옵션' disclosure. -->
+  <section class="view on start" id="inputCard" data-view="1" aria-labelledby="inputTitle">
+    <h2 class="sr-only" id="inputTitle">시작 — 증거 넣기 · 이전 프로젝트 · 뷰어 보기</h2>
+    <div class="startcol">
+      <div class="onboard" id="onboard" hidden>
+        <b class="ob-title">FrameTrace 사용 안내</b>
+        <ul>
+          <li>원본 증거는 <b>읽기 전용</b>으로만 접근합니다 — 해시·메타데이터·감사 로그 등 모든 산출물은 케이스 폴더에만 기록됩니다.</li>
+          <li>순서: <b>증거 넣기 → 분석 → 검토(마크·선별) → 결과물(보고서·패키지)</b>. 분석한 케이스는 '이전 프로젝트'에서 다시 열 수 있습니다.</li>
+          <li>도구 상태는 헤더의 '도구' 버튼을 보십시오 — E01 입력에는 libewf, 삭제 파일 조사에는 Sleuth Kit이 필요합니다. 없는 도구가 있어도 폴더 분석은 동작합니다.</li>
+          <li>삭제 후보·카빙·재조립 결과는 검증을 통과하기 전까지 '<b>후보</b>'로만 표시됩니다.</li>
+        </ul>
+        <div class="ob-foot">
+          <button type="button" id="btnOnboardOk">안내 닫기</button>
+        </div>
       </div>
-    </div>
-    <div class="onboard" id="restoreNotice" hidden>
-      <b class="ob-title">이전 세션의 케이스가 복원되었습니다</b>
-      <ul>
-        <li>케이스: <code id="restoreCase"></code></li>
-        <li>마지막 검토 상태가 그대로 남아 있습니다 — 이어서 검토하거나 새 분석을 시작할 수 있습니다.</li>
-      </ul>
-      <div class="ob-foot">
-        <button type="button" class="primary" id="btnRestoreReview">이어서 검토</button>
-        <button type="button" id="btnRestoreNew">새 분석 시작</button>
-      </div>
-    </div>
-    <div class="startgrid">
-      <div class="startcol">
-        <div class="fieldlabel" id="inputKindLabel">증거 종류</div>
-        <div class="seg" role="radiogroup" aria-labelledby="inputKindLabel">
-          <label><input type="radio" name="inputKind" value="folder" checked> 증거 폴더 / 드라이브</label>
-          <label><input type="radio" name="inputKind" value="e01"> E01 디스크 이미지</label>
+
+      <section class="sblock" id="blkEvidence" aria-labelledby="blkEvidenceTitle">
+        <div class="sbhead">
+          <h3 id="blkEvidenceTitle">증거 넣기</h3>
+          <p class="sbdesc" id="blkEvidenceDesc">E01 이미지 파일이나 블랙박스 폴더·드라이브를 넣으면 바로 분석합니다. 원본은 읽기 전용입니다.</p>
         </div>
-        <small id="e01Need" class="need" hidden>libewf 미설치 — E01을 쓰려면 tools/bin 또는 PATH에 ewf*.exe가 필요합니다</small>
-        <div class="field">
-          <label class="fieldlabel" for="sourcePath"><span id="sourceLabel">증거 소스 경로 (필수)</span></label>
-          <div class="pathrow">
-            <input type="text" id="sourcePath" list="recentSources" autocomplete="off" spellcheck="false" placeholder="예: E:\ 또는 D:\BLACKBOX 또는 C:\Users\me\Desktop\입수자료" autofocus>
-            <button type="button" id="btnBrowseSource">찾아보기…</button>
-          </div>
-          <datalist id="recentSources"></datalist>
-          <div class="pathstatus" id="sourceStatus" aria-live="polite"></div>
+        <label class="sr-only" for="sourcePath" id="sourceLabel">증거 경로 — E01 이미지 파일 또는 폴더·드라이브</label>
+        <div class="pathrow">
+          <input type="text" id="sourcePath" list="recentSources" autocomplete="off" spellcheck="false" placeholder="E:\BLACKBOX 또는 D:\증거\disk.E01" aria-describedby="blkEvidenceDesc sourceStatus" autofocus>
+          <button type="button" id="btnBrowseSource" title="폴더 또는 E01 이미지 파일을 고릅니다">찾아보기…</button>
+          <button type="button" class="primary big" id="btnStart">분석 시작</button>
         </div>
-        <div class="field">
-          <label class="fieldlabel" for="caseDir"><span>케이스 폴더 <span class="opt">(비우면 오늘 날짜로 자동 생성)</span></span></label>
-          <div class="pathrow">
-            <input type="text" id="caseDir" list="recentCases" autocomplete="off" spellcheck="false" placeholder="예: C:\Cases\case-001">
-            <button type="button" id="btnBrowseCase">찾아보기…</button>
-            <button type="button" class="ghost" id="btnSuggestCase" title="소스 이름과 오늘 날짜로 케이스 폴더 경로를 채웁니다">자동 제안</button>
-          </div>
-          <datalist id="recentCases"></datalist>
-          <div class="pathstatus" id="caseStatus" aria-live="polite"></div>
-          <div class="resumebox" id="resumeBox" hidden>
-            <span id="resumeText"></span>
-            <button type="button" id="btnResumeContinue" title="같은 소스·같은 옵션으로 분석을 시작합니다 — 완료된 파일은 건너뜁니다">이어서</button>
-            <button type="button" class="ghost" id="btnResumeFresh" title="빈 새 케이스 폴더를 제안합니다 — 기존 케이스와 체크포인트는 그대로 보존됩니다">처음부터 (새 케이스 폴더)</button>
-          </div>
+        <datalist id="recentSources"></datalist>
+        <div class="srcline">
+          <span class="kindchip" id="kindChip" hidden></span>
+          <span class="pathstatus" id="sourceStatus" aria-live="polite"></span>
+          <span class="muted starthint" id="startHint" aria-live="polite"></span>
         </div>
-        <p class="hint opencase">이미 만들어진 케이스가 있으면 케이스 폴더를 지정한 뒤 <button type="button" class="linkbtn" id="btnOpenCase">기존 케이스 열기</button>로 검토 화면을 바로 열 수 있습니다. 브라우저를 닫았다면 frametrace-app을 다시 실행하면 이 화면으로 돌아옵니다. <button type="button" class="linkbtn" id="btnOnboardShow">안내 다시 보기</button></p>
-        <div id="recentCaseRow" class="caselist" hidden></div>
-      </div>
-      <div class="startcol">
-        <div class="fieldlabel" id="scanModeLabel">분석 모드</div>
-        <div class="seg" role="radiogroup" aria-labelledby="scanModeLabel">
-          <label title="해시·ffprobe 생략 — 파일 목록과 기본 메타데이터만 색인합니다 (대용량 소스 1차 선별용)"><input type="radio" name="scanMode" value="quick"> 빠른 선별</label>
-          <label title="ffprobe 검증만 실행, SHA-256 해시는 생략합니다"><input type="radio" name="scanMode" value="standard"> 표준</label>
-          <label title="파일별 SHA-256 + ffprobe 검증 — 소스의 모든 바이트를 읽습니다 (최종 증거용)"><input type="radio" name="scanMode" value="full" checked> 전체 (증거용)</label>
-          <label title="아래 체크박스를 직접 조정한 상태"><input type="radio" name="scanMode" value="custom"> 사용자 지정</label>
-        </div>
-        <div class="modeinfo" id="modeInfo" aria-live="polite"></div>
-        <div class="checks">
-          <label><input type="checkbox" id="withHash" checked> 파일별 SHA-256 해시 계산 (증거 대조용)</label>
-          <label><input type="checkbox" id="withFfprobe" checked> ffprobe 재생성 검증 (코덱/길이 메타데이터)</label>
-          <label><input type="checkbox" id="withDeepfake"> 딥페이크 스크리닝 (deepfake-lens — 느릴 수 있음; 판정이 아니라 검토 우선순위)</label>
-        </div>
-        <div class="checks" id="verifyRow" style="display:none;">
-          <label><input type="checkbox" id="skipE01Verify"> E01 해시 검증 생략 (ewfverify는 이미지 크기에 비례해 오래 걸립니다 — 최종 증거용은 생략 비권장)</label>
-          <label><input type="checkbox" id="directE01"> 빠른 검토 — raw export 생략, E01에서 직접 파일시스템 조사 (대용량 이미지에 적합; 카빙은 별도 export 필요)</label>
-        </div>
+        <small id="e01Need" class="need" hidden>libewf 미설치 — E01을 분석하려면 tools/bin 또는 PATH에 ewf* 도구가 필요합니다 (헤더 '도구' 참고)</small>
         <div class="preflight" id="preflight" aria-live="polite" hidden></div>
-      </div>
+        <div class="resumebox" id="resumeBox" hidden>
+          <span id="resumeText"></span>
+          <button type="button" id="btnResumeContinue" title="같은 소스·같은 옵션으로 분석을 시작합니다 — 완료된 파일은 건너뜁니다">이어서</button>
+          <button type="button" class="ghost" id="btnResumeFresh" title="빈 새 케이스 폴더를 제안합니다 — 기존 케이스와 체크포인트는 그대로 보존됩니다">처음부터 (새 케이스 폴더)</button>
+        </div>
+        <div class="err" id="startErr" role="alert"></div>
+        <details class="opts" id="startOptions">
+          <summary><span class="opts-t">옵션</span> <span class="opts-sum" id="optSummary">케이스 폴더 자동 · 전체 (증거용)</span></summary>
+          <div class="opts-body">
+            <!-- Evidence kind is auto-detected from the path; these radios
+                 only carry the detected value for the start request. -->
+            <div class="kindstore" hidden>
+              <input type="radio" name="inputKind" value="folder" checked aria-label="폴더">
+              <input type="radio" name="inputKind" value="e01" aria-label="E01 이미지">
+            </div>
+            <div class="field">
+              <label class="fieldlabel" for="caseDir"><span>케이스 폴더 <span class="opt">(비우면 자동 생성)</span></span></label>
+              <div class="pathrow">
+                <input type="text" id="caseDir" list="recentCases" autocomplete="off" spellcheck="false" placeholder="자동 — 예: C:\Cases\case-001">
+                <button type="button" id="btnBrowseCase">찾아보기…</button>
+                <button type="button" class="ghost" id="btnSuggestCase" title="소스 이름과 오늘 날짜로 케이스 폴더 경로를 채웁니다">자동 제안</button>
+              </div>
+              <datalist id="recentCases"></datalist>
+              <div class="pathstatus" id="caseStatus" aria-live="polite"></div>
+              <p class="hint opencase">이 폴더가 이미 만든 케이스라면 <button type="button" class="linkbtn" id="btnOpenCase">이 케이스 열기</button></p>
+            </div>
+            <div class="fieldlabel" id="scanModeLabel">분석 모드</div>
+            <div class="seg" role="radiogroup" aria-labelledby="scanModeLabel">
+              <label title="해시·ffprobe 생략 — 파일 목록과 기본 메타데이터만 색인합니다 (대용량 소스 1차 선별용)"><input type="radio" name="scanMode" value="quick"> 빠른 선별</label>
+              <label title="ffprobe 검증만 실행, SHA-256 해시는 생략합니다"><input type="radio" name="scanMode" value="standard"> 표준</label>
+              <label title="파일별 SHA-256 + ffprobe 검증 — 소스의 모든 바이트를 읽습니다 (최종 증거용)"><input type="radio" name="scanMode" value="full" checked> 전체 (증거용)</label>
+              <label title="아래 체크박스를 직접 조정한 상태"><input type="radio" name="scanMode" value="custom"> 사용자 지정</label>
+            </div>
+            <div class="modeinfo" id="modeInfo" aria-live="polite"></div>
+            <div class="checks">
+              <label><input type="checkbox" id="withHash" checked> 파일별 SHA-256 해시 계산 (증거 대조용)</label>
+              <label><input type="checkbox" id="withFfprobe" checked> ffprobe 재생성 검증 (코덱/길이 메타데이터)</label>
+              <label><input type="checkbox" id="withDeepfake"> 딥페이크 스크리닝 (deepfake-lens — 느릴 수 있음; 판정이 아니라 검토 우선순위)</label>
+            </div>
+            <div class="checks" id="verifyRow" style="display:none;">
+              <label><input type="checkbox" id="skipE01Verify"> E01 해시 검증 생략 (ewfverify는 이미지 크기에 비례해 오래 걸립니다 — 최종 증거용은 생략 비권장)</label>
+              <label><input type="checkbox" id="directE01"> 빠른 검토 — raw export 생략, E01에서 직접 파일시스템 조사 (대용량 이미지에 적합; 카빙은 별도 export 필요)</label>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="sblock" id="blkRecent" aria-labelledby="blkRecentTitle">
+        <div class="sbhead">
+          <h3 id="blkRecentTitle">이전 프로젝트</h3>
+          <p class="sbdesc">분석한 케이스는 케이스 폴더에 모두 저장되어 언제든 다시 열 수 있습니다.</p>
+        </div>
+        <ul class="recentlist" id="recentCaseRow" aria-labelledby="blkRecentTitle" hidden></ul>
+        <p class="recentempty" id="recentEmpty">아직 연 프로젝트가 없습니다.</p>
+        <div class="sbfoot">
+          <button type="button" class="primary" id="btnOpenOther" title="케이스 폴더를 골라 바로 엽니다">다른 케이스 폴더 열기…</button>
+        </div>
+      </section>
+
+      <section class="sblock" id="blkViewer" aria-labelledby="blkViewerTitle">
+        <div class="sbhead">
+          <h3 id="blkViewerTitle">뷰어 보기</h3>
+          <p class="sbdesc">마지막으로 연 케이스의 뷰어를 바로 엽니다.</p>
+        </div>
+        <div class="sbrow">
+          <button type="button" class="primary big" id="btnViewerOpen" aria-describedby="viewerReason" title="아직 연 케이스가 없습니다 — 먼저 증거를 넣어 분석하거나 이전 프로젝트를 여십시오." disabled>뷰어 보기</button>
+          <span class="viewerreason" id="viewerReason">아직 연 케이스가 없습니다 — 먼저 증거를 넣어 분석하거나 이전 프로젝트를 여십시오.</span>
+        </div>
+      </section>
+
+      <p class="startfoot">로컬 전용 도구 · 원본 증거는 읽기 전용으로만 접근합니다 · <button type="button" class="linkbtn" id="btnOnboardShow">사용 안내</button></p>
     </div>
-    <div class="startfoot">
-      <button type="button" class="primary big" id="btnStart">분석 시작</button>
-      <span class="muted" id="startHint">분석에는 소스 크기에 따라 수 분이 걸릴 수 있습니다.</span>
-    </div>
-    <div class="err" id="startErr" role="alert"></div>
   </section>
 
   <section class="card view" id="progCard" data-view="2" aria-labelledby="progTitle">
