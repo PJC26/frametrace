@@ -1,0 +1,53 @@
+/* 결과물 시트 (T4) — layout and state colours only. Button looks (primary /
+   quiet / icon / lg, focus ring, disabled) come from assets/kit.css; the
+   sheet frame (position, width, shadow, z-index) from the host layout (T2).
+   Tokens: docs/ui-rebuild-contract.md 5.1 names only. */
+.h-fin { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--surface); color: var(--text); font-size: var(--fs-sm); line-height: var(--lh-body); }
+.h-fin-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--border); }
+.h-fin-head h2 { margin: 0; font-size: var(--fs-md); font-weight: 600; }
+.h-fin-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: var(--sp-4); display: grid; gap: var(--sp-4); align-content: start; }
+.h-fin-foot { flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border-top: 1px solid var(--border); background: var(--surface); }
+.h-fin-hint { flex: 1 1 auto; min-width: 0; font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.h-fin-foot > button { flex: none; }
+.h-fin .muted { color: var(--muted); }
+
+/* "may a report be produced right now?" — the first thing in the sheet */
+.h-fin-verdict { margin: 0; padding: var(--sp-3); border: 1px solid var(--border-strong); border-radius: var(--radius); display: flex; gap: var(--sp-2); align-items: flex-start; font-weight: 600; background: var(--surface-2); color: var(--text); }
+.h-fin-verdict.ready, .h-fin-verdict.done { background: var(--verified-bg); color: var(--verified-fg); border-color: var(--verified-fg); }
+.h-fin-verdict.blocked { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
+.h-fin-verdict .ic { flex: none; margin-top: 2px; }
+
+.h-fin-field { display: grid; gap: var(--sp-1); }
+.h-fin-field label { font-weight: 600; }
+.h-fin-field small { font-size: var(--fs-xs); }
+.h-fin-field input { width: 100%; box-sizing: border-box; }
+
+.h-checklist { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-1); }
+.h-check { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-2) var(--sp-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); }
+.h-check .ic { flex: none; margin-top: 2px; }
+.h-check-text { min-width: 0; overflow-wrap: anywhere; }
+.h-check small { display: block; color: var(--muted); font-size: var(--fs-xs); line-height: var(--lh-ctl); margin-top: 2px; }
+.h-check-block { border-color: var(--warn-fg); background: var(--warn-bg); color: var(--warn-fg); font-weight: 600; }
+.h-check-block small { color: var(--warn-fg); font-weight: 400; }
+.h-check-warn .ic { color: var(--warn); }
+.h-check-ok .ic { color: var(--ok); }
+.h-check-info .ic { color: var(--info); }
+
+.h-fin-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.h-fin-actions [hidden] { display: none; }
+
+.h-fin-h { margin: 0 0 var(--sp-1); font-size: var(--fs-xs); font-weight: 600; color: var(--muted); }
+.h-fin-links { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
+.h-fin-links li { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); align-items: center; overflow-wrap: anywhere; }
+.h-fin-links a { color: var(--accent-ink); text-underline-offset: 2px; }
+.h-fin-links code { font-family: var(--font-mono); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+
+.h-fin-adv { border: 1px solid var(--border); border-radius: var(--radius); }
+.h-fin-adv > summary { cursor: pointer; padding: var(--sp-2) var(--sp-3); min-height: 28px; box-sizing: border-box; display: flex; align-items: center; font-weight: 600; }
+.h-fin-adv > summary:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+.h-fin-adv-body { display: grid; gap: var(--sp-2); padding: 0 var(--sp-3) var(--sp-3); }
+.h-fin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--sp-2); }
+.h-fin-grid > button, .h-fin-adv-body > button { justify-content: flex-start; text-align: left; }
+.h-fin-adv-body input[type="text"] { width: 100%; box-sizing: border-box; }
+.h-fin-out { margin: 0; padding: var(--sp-2); background: var(--surface-2); border-radius: var(--radius); font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow: auto; }
+.h-fin-adv-body a { color: var(--accent-ink); }

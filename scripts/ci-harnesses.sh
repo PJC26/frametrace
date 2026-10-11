@@ -27,7 +27,7 @@ harnesses=(
   # @T5 verify-embed
   # @T2 verify-layout
   # @T3 verify-progress
-  # @T4 verify-finalize-sheet
+  "verify-finalize-sheet"
 )
 
 failed=()

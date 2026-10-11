@@ -182,6 +182,7 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
   <h2>발견 및 분석 기법 (증거별 명세)</h2>
   <div id="techniques"></div>
   <div class="note">각 증거가 어떤 기법으로 발견되었고 어떤 검증을 통과했는지 정리합니다. 이상 징후 후보는 아래 전용 섹션과 <code>qa anomalies</code> 로그를 참고하십시오. 재생성 검증을 통과한 증거도 최종 보고 전 판독자 재생 확인이 필요합니다. 판독 마크는 뷰어에서 내려받아 <code>import-marks</code>로 반영한 뒤 보고서를 재생성하면 함께 정리됩니다.</div>
+  <div class="note" id="mark-legend">판독 마크 범례: 판독완료 = 회색 체크 · 중요 = 호박색 깃발 · 검증대기 = 보라 물음표</div>
 
   <h2>영상 색인</h2>
   <div id="videos"></div>
@@ -742,6 +743,26 @@ fn jsonl_to_array(jsonl: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::render_case_report;
+
+    /// Owner decision (docs/ui-rebuild-contract.md 10.1-3): the court report
+    /// carries a one-line textual legend of the viewer's mark shapes/colours,
+    /// placed right after the header note that mentions the marks.
+    #[test]
+    fn report_carries_mark_legend_line_after_marks_note() {
+        let html = render(&[
+            ("manifest", "{}"),
+            ("index", "[]"),
+            ("scan_runs", "[]"),
+            ("marks", "[]"),
+        ]);
+        let legend =
+            "판독 마크 범례: 판독완료 = 회색 체크 · 중요 = 호박색 깃발 · 검증대기 = 보라 물음표";
+        assert_eq!(html.matches(legend).count(), 1);
+        assert!(
+            html.find("import-marks").unwrap() < html.find(legend).unwrap(),
+            "legend sits next to the marks note"
+        );
+    }
 
     #[test]
     fn signoff_banner_escapes_and_is_injected_after_body() {
