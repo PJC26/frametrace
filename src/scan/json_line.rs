@@ -3,21 +3,28 @@
 /// serde_json (`preserve_order`), so existing key order is kept, a nested key
 /// with the same name is never touched, and an existing top-level key is
 /// replaced in place. Input that is not a JSON object, or a `value` that is
-/// not valid JSON, is returned unchanged.
+/// not valid JSON, is returned unchanged by this wrapper; use
+/// [`try_set_json_field`] to get the error.
 ///
 /// `#[doc(hidden)]`: exposed so the fuzz harness can hit this editor with
 /// arbitrary input; not part of the supported API.
 #[doc(hidden)]
 pub fn set_json_field(line: &str, key: &str, value: &str) -> String {
+    try_set_json_field(line, key, value).unwrap_or_else(|_| line.to_string())
+}
+
+/// Like [`set_json_field`] but reports why nothing was edited: `line` is not
+/// a JSON object or `value` is not valid JSON.
+#[doc(hidden)]
+pub fn try_set_json_field(line: &str, key: &str, value: &str) -> Result<String, String> {
     let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(line)
     else {
-        return line.to_string();
+        return Err("record is not a JSON object".into());
     };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else {
-        return line.to_string();
-    };
+    let parsed = serde_json::from_str::<serde_json::Value>(value)
+        .map_err(|err| format!("value for {key:?} is not valid JSON: {err}"))?;
     map.insert(key.to_string(), parsed);
-    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| line.to_string())
+    serde_json::to_string(&serde_json::Value::Object(map)).map_err(|err| err.to_string())
 }
 
 /// Splits index text into top-level JSON object records. The splitter is
@@ -253,5 +260,21 @@ mod tests {
     fn replaces_non_scalar_top_level_value_without_duplicating_key() {
         let out = set_json_field(r#"{"k":{"x":1},"a":2}"#, "k", "3");
         assert_eq!(out, r#"{"k":3,"a":2}"#);
+    }
+}
+
+#[cfg(test)]
+mod try_set_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_value_is_an_error_not_a_silent_noop() {
+        let line = r#"{"id":"a"}"#;
+        assert!(try_set_json_field(line, "k", "not json").is_err());
+        assert!(try_set_json_field("[1]", "k", "1").is_err());
+        assert_eq!(
+            try_set_json_field(line, "k", "7").unwrap(),
+            r#"{"id":"a","k":7}"#
+        );
     }
 }
