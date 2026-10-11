@@ -346,6 +346,29 @@ async function unitTests() {
   assert.equal(dom.s3.disabled, true);
   assert.equal(dom.s4.disabled, true);
   console.log('PASS VM examiner open-case success clears stale results');
+  // SHOULD-FIX 4: "모두 일치" only when files were compared and none were
+  // left uncompared.
+  const verdict = res => ex.verifySourcesVerdict(res);
+  assert.equal(verdict({ matched: 0, mismatched: 0, not_comparable: 3 }).level, 'warn');
+  assert.ok(!verdict({ matched: 0, mismatched: 0, not_comparable: 3 }).toast.includes('모두 일치'));
+  assert.ok(verdict({ matched: 0, mismatched: 0, not_comparable: 3 }).hint.includes('재검증되지 않았습니다'));
+  assert.equal(verdict({ matched: 0, mismatched: 0, not_comparable: 0 }).level, 'warn');
+  assert.equal(verdict({ matched: 2, mismatched: 0, not_comparable: 1 }).level, 'warn');
+  assert.equal(verdict({ matched: 2, mismatched: 1, not_comparable: 0 }).level, 'err');
+  assert.equal(verdict({ matched: 2, mismatched: 0, not_comparable: 0 }).level, 'ok');
+  console.log('PASS VM verify-sources never reports all-match when nothing was compared');
+  // SHOULD-FIX 5: unsaved or queued marks block the finalize, with a retry.
+  const levels = input => ex.unsavedMarksChecks(input).map(c => c.level);
+  const blockRetry = input => ex.unsavedMarksChecks(input).some(c => c.level === 'block' && c.retry);
+  assert.equal(JSON.stringify(levels({ pendingMarks: 0, saveState: 'saved', drafts: 0 })), '["ok"]');
+  assert.ok(levels({ pendingMarks: 2, saveState: 'saved', drafts: 0 }).includes('block'), 'server queue blocks');
+  assert.ok(blockRetry({ pendingMarks: 0, saveState: 'failed', drafts: 1 }), 'failed save blocks with retry');
+  assert.ok(blockRetry({ pendingMarks: 0, saveState: 'pending', drafts: 1 }), 'unsaved edits block with retry');
+  assert.ok(levels({ pendingMarks: 0, saveState: 'queued', drafts: 0 }).includes('block'), 'queued marks block');
+  assert.ok(blockRetry({ pendingMarks: 0, saveState: null, drafts: 3 }), 'browser-only drafts block');
+  assert.ok(levels({ pendingMarks: null, saveState: 'saved', drafts: 0 }).includes('block'), 'unknown server queue blocks');
+  assert.ok(!levels({ pendingMarks: 0, saveState: null, drafts: null }).includes('block'));
+  console.log('PASS VM finalize precheck blocks on unsaved marks');
   // Browser-playability gate: AVI/bin/proprietary records must prefer a
   // proxy and never reach a dead <video>; playable mp4 keeps the original.
   const consts = [...source.matchAll(/^const (BROWSER_CODECS|BROWSER_CONTAINERS|PROPRIETARY_EXTS|PLAYABLE_EXTS) = .*$/gm)].map(m => m[0]).join('\n');

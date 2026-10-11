@@ -410,7 +410,48 @@ fn inject_redaction_banner(html: String, redact_paths: bool) -> String {
     }
 }
 
-pub fn make_report(case_dir: &Path, rehash: bool, redact_paths: bool) -> Result<(), String> {
+/// The review marks exactly as make-report embeds them (before path
+/// redaction). The finalize sign-off binds to its digest
+/// ([`report::signoff_content_sha256`]) so a later report can say whether
+/// the marks changed after the sign-off.
+pub(crate) fn review_marks_json(case_dir: &Path) -> String {
+    match crate::case_db::load_review_marks(case_dir) {
+        Ok(rows) => {
+            let entries = rows
+                .iter()
+                .map(|mark| {
+                    format!(
+                        "{{\"id\":\"{}\",\"status\":\"{}\",\"marked_unix\":{}{}{}}}",
+                        crate::util::json_escape(&mark.record_id),
+                        crate::util::json_escape(&mark.status),
+                        mark.marked_unix,
+                        mark.examiner
+                            .as_deref()
+                            .map(|name| format!(
+                                ",\"examiner\":\"{}\"",
+                                crate::util::json_escape(name)
+                            ))
+                            .unwrap_or_default(),
+                        mark.note
+                            .as_deref()
+                            .map(|note| format!(",\"note\":\"{}\"", crate::util::json_escape(note)))
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{entries}]")
+        }
+        Err(_) => "[]".to_string(),
+    }
+}
+
+pub fn make_report(
+    case_dir: &Path,
+    rehash: bool,
+    redact_paths: bool,
+    signoff_path: Option<&Path>,
+) -> Result<(), String> {
     ensure_case(case_dir)?;
     let index_path = case_dir.join("db/video_index.json");
     let index_json = read_to_string(&index_path).map_err(|err| {
@@ -453,35 +494,8 @@ pub fn make_report(case_dir: &Path, rehash: bool, redact_paths: bool) -> Result<
     let batch_log =
         read_to_string(&case_dir.join("artifacts/logs/batch-log.jsonl")).unwrap_or_default();
     let scan_runs_json = read_scan_runs_json(case_dir);
-    let marks_json = match crate::case_db::load_review_marks(case_dir) {
-        Ok(rows) => {
-            let entries = rows
-                .iter()
-                .map(|mark| {
-                    format!(
-                        "{{\"id\":\"{}\",\"status\":\"{}\",\"marked_unix\":{}{}{}}}",
-                        crate::util::json_escape(&mark.record_id),
-                        crate::util::json_escape(&mark.status),
-                        mark.marked_unix,
-                        mark.examiner
-                            .as_deref()
-                            .map(|name| format!(
-                                ",\"examiner\":\"{}\"",
-                                crate::util::json_escape(name)
-                            ))
-                            .unwrap_or_default(),
-                        mark.note
-                            .as_deref()
-                            .map(|note| format!(",\"note\":\"{}\"", crate::util::json_escape(note)))
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{entries}]")
-        }
-        Err(_) => "[]".to_string(),
-    };
+    let marks_json = review_marks_json(case_dir);
+    let signoff_content = report::signoff_content_sha256(&marks_json);
     let redact = |text: String| -> String {
         if redact_paths {
             crate::redact::redact_json_text(&text, case_dir)
@@ -518,13 +532,23 @@ pub fn make_report(case_dir: &Path, rehash: bool, redact_paths: bool) -> Result<
     });
     // Finalize sign-off: the reviewer name recorded by the workstation (as
     // typed - not an authenticated identity) is printed and shown in the report.
-    let html = match read_to_string(&case_dir.join(report::SIGNOFF_REL_PATH))
-        .ok()
-        .and_then(|text| report::parse_signoff(&text))
-    {
+    // `signoff_path` is the workstation's not-yet-promoted record of an
+    // in-progress finalize; otherwise the promoted review/signoff.json.
+    let signoff_file = signoff_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| case_dir.join(report::SIGNOFF_REL_PATH));
+    let signoff_text = read_to_string(&signoff_file).ok();
+    let html = match signoff_text.as_deref().and_then(report::parse_signoff) {
         Some((examiner, signed_unix)) => {
-            println!("검토자: {examiner} (최종화 시 입력된 이름, 신원 미인증)");
-            report::inject_signoff_banner(html, &examiner, signed_unix)
+            let currency = report::signoff_currency(
+                signoff_text.as_deref().unwrap_or_default(),
+                &signoff_content,
+            );
+            println!(
+                "검토자: {examiner} (최종화 시 입력된 이름, 신원 미인증) — {}",
+                currency.label()
+            );
+            report::inject_signoff_banner(html, &examiner, signed_unix, currency)
         }
         None => html,
     };

@@ -151,6 +151,11 @@ pub enum Commands {
         /// before the report is generated (distributable-report privacy mode)
         #[arg(long)]
         redact_paths: bool,
+        /// Read the finalize sign-off from this file instead of
+        /// review/signoff.json (the workstation passes the not-yet-promoted
+        /// record of a finalize in progress)
+        #[arg(long)]
+        signoff: Option<PathBuf>,
     },
     /// Generate reports/custody-statement.html — a printable chain-of-custody
     /// document (sources, job ledger, live audit-chain verification)
@@ -667,7 +672,8 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             case_dir,
             rehash,
             redact_paths,
-        } => make_report(&case_dir, rehash, redact_paths),
+            signoff,
+        } => make_report(&case_dir, rehash, redact_paths, signoff.as_deref()),
         Commands::MakeCustody { case_dir } => make_custody(&case_dir),
         Commands::PackageCase { case_dir, output } => {
             let options = PackageOptions { output_dir: output };

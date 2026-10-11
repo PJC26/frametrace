@@ -250,6 +250,7 @@
     .toastbox { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 60; display: grid; gap: 6px; pointer-events: none; }
     .toast { pointer-events: auto; background: #20242a; color: #fff; border-radius: 7px; padding: 9px 14px; font-size: 13px; box-shadow: var(--shadow); max-width: min(560px, 92vw); }
     .toast.err { background: #8f1d14; }
+    .toast.warn { background: #8a5a00; }
     .dlg-body { padding: 0 14px 4px; overflow: auto; font-size: 13px; line-height: 1.5; }
     .dlg-body p { margin: 0 0 8px; }
     .checklist { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 5px; }
@@ -561,7 +562,7 @@ function toast(msg, kind) {
   const box = $("toastBox");
   if (!box || typeof document.createElement !== "function") return;
   const el = document.createElement("div");
-  el.className = "toast" + (kind === "err" ? " err" : "");
+  el.className = "toast" + (kind === "err" ? " err" : kind === "warn" ? " warn" : "");
   el.textContent = msg;
   box.appendChild(el);
   setTimeout(() => el.remove(), kind === "err" ? 7000 : 3500);
@@ -1382,6 +1383,43 @@ function viewerExaminerInput() {
 function readLs(key) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
 }
+// Save-state badge of the embedded viewer ("saved", "pending", "saving",
+// "failed", "queued", "local"), or null when the viewer is not loaded.
+function viewerSaveState() {
+  try {
+    const doc = reviewFrameLoaded && reviewFrame.contentDocument;
+    const el = doc ? doc.getElementById("saveState") : null;
+    return el && el.dataset ? (el.dataset.state || null) : null;
+  } catch (e) { return null; }
+}
+// Clicking the viewer's save badge saves (or retries) immediately.
+function retryViewerSave() {
+  try {
+    const doc = reviewFrameLoaded && reviewFrame.contentDocument;
+    const el = doc ? doc.getElementById("saveState") : null;
+    if (el) { el.click(); return true; }
+  } catch (e) {}
+  return false;
+}
+// Pure: finalize checklist rows for unsaved marks. `retry: true` rows get
+// the dialog's "저장 다시 시도" button.
+function unsavedMarksChecks({ pendingMarks, saveState, drafts }) {
+  const out = [];
+  const add = (level, text, sub, retry) => out.push({ level, text, sub: sub || "", retry: !!retry });
+  if (pendingMarks === null) add("block", "서버의 마크 저장 대기열을 확인할 수 없습니다", "연결이 복구된 뒤 '다시 확인'을 누르십시오.");
+  else if (pendingMarks > 0) add("block", `케이스 DB에 아직 반영되지 않은 저장 대기 마크 ${pendingMarks}건`,
+    "보강 작업이 끝나면 자동 반영됩니다 — 잠시 뒤 '다시 확인'을 누르십시오.");
+  if (saveState === "failed") add("block", "뷰어의 마크·메모 저장이 실패했습니다",
+    "최신 판독 내용 없이 보고서를 봉인할 수 없습니다 — '저장 다시 시도'를 누르거나 뷰어의 저장 상태 표시를 확인하십시오.", true);
+  else if (saveState === "pending" || saveState === "saving") add("block", "뷰어에 아직 저장되지 않은 마크·메모 변경이 있습니다",
+    "'저장 다시 시도'로 지금 저장한 뒤 '다시 확인'을 누르십시오.", true);
+  else if (saveState === "queued") add("block", "마크가 서버 대기열에 있습니다 (보강 작업 중)", "보강 작업이 끝난 뒤 다시 확인하십시오.");
+  if (drafts > 0 && !out.some(c => c.retry)) add("block", `브라우저에만 남아 있는 마크·메모 변경 ${drafts}건`,
+    "뷰어를 열어 저장을 완료하십시오 ('저장 다시 시도').", true);
+  if (drafts === null && saveState === null) add("warn", "뷰어의 미저장 변경을 확인할 수 없습니다", "뷰어가 아직 열리지 않았거나 케이스 정보를 읽지 못했습니다.");
+  if (!out.length) add("ok", "뷰어의 마크·메모가 모두 케이스에 반영되었습니다");
+  return out;
+}
 async function gatherFinalizeChecks() {
   const checks = [];
   const add = (level, text, sub) => checks.push({ level, text, sub: sub || "" });
@@ -1396,18 +1434,18 @@ async function gatherFinalizeChecks() {
   const w = viewerWindow();
   try { if (w && typeof w.__frametraceSummary === "function") summary = w.__frametraceSummary(); } catch (e) { summary = null; }
 
-  // Unsynced viewer changes.
-  let pending = null;
-  if (summary && Number.isFinite(summary.pending)) pending = summary.pending;
-  else if (summary && Number.isFinite(summary.unsynced)) pending = summary.unsynced;
-  else if (caseId) {
-    const drafts = readLs(`ft.viewer.${caseId}.annotations.v1`);
-    pending = drafts && typeof drafts === "object" ? Object.keys(drafts).length : 0;
+  // Unsaved / queued marks block the finalize (SHOULD-FIX 5): sealing a
+  // package without the examiner's latest marks is a silent loss.
+  let drafts = null;
+  if (caseId) {
+    const stored = readLs(`ft.viewer.${caseId}.annotations.v1`);
+    drafts = stored && typeof stored === "object" ? Object.keys(stored).length : 0;
   }
-  if (pending === null) add("warn", "뷰어의 미반영 마크 수를 확인할 수 없습니다", "뷰어가 아직 열리지 않았거나 케이스 정보를 읽지 못했습니다.");
-  else if (pending > 0) add("warn", `케이스에 아직 반영되지 않은 마크·메모 변경 ${pending}건`,
-    "뷰어는 변경 후 몇 초 안에 자동 반영합니다 — 잠시 뒤 '다시 확인'을 누르십시오. 계속 남아 있으면 뷰어의 저장 상태를 확인하십시오.");
-  else add("ok", "뷰어의 마크·메모가 모두 케이스에 반영되었습니다");
+  unsavedMarksChecks({
+    pendingMarks: st ? Number(st.pending_marks) || 0 : null,
+    saveState: viewerSaveState(),
+    drafts,
+  }).forEach(c => checks.push(c));
 
   const marks = meta && meta.annotations && Array.isArray(meta.annotations.marks) ? meta.annotations.marks : null;
   if (marks) {
@@ -1463,10 +1501,23 @@ async function preFinalizeDialog() {
       `<div class="field"><label class="fieldlabel" for="dlgExaminer">검토자 이름 (필수 — 입력한 그대로 sign-off·보고서·이후 판독 마크에 기록되며, 신원 인증은 아닙니다)</label>` +
       `<input type="text" id="dlgExaminer" autocomplete="name" value="${esc(currentExaminerName(state.caseId))}" placeholder="예: 홍길동 (소속)"></div>` +
       renderChecklist(state.checks) +
+      (state.checks.some(c => c.retry) ? `<button type="button" class="ghost" id="dlgRetrySave">저장 다시 시도</button> ` : "") +
       `<button type="button" class="ghost" id="dlgRecheck">다시 확인</button>`;
   };
   const wire = () => {
     const rc = $("dlgRecheck");
+    const rs = $("dlgRetrySave");
+    if (rs) rs.addEventListener("click", async () => {
+      rs.disabled = true;
+      if (!retryViewerSave()) {
+        $("dlgNote").textContent = "뷰어가 열려 있지 않습니다 — 검토 화면에서 뷰어를 연 뒤 저장하십시오.";
+        rs.disabled = false;
+        return;
+      }
+      $("dlgNote").textContent = "저장 중…";
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      if (rc) rc.click();
+    });
     if (rc) rc.addEventListener("click", async () => {
       const typed = $("dlgExaminer") ? $("dlgExaminer").value : "";
       rc.disabled = true;
@@ -1531,6 +1582,30 @@ $("btnFinalize").addEventListener("click", async () => {
   }
 });
 
+// SHOULD-FIX 4: "all match" only when something was actually compared and
+// nothing was left uncompared — 0 matched / N not comparable is a warning,
+// never a green pass.
+function verifySourcesVerdict(res) {
+  const matched = Number(res.matched) || 0;
+  const mismatched = Number(res.mismatched) || 0;
+  const notComparable = Number(res.not_comparable) || 0;
+  const counts = `일치 ${matched} · 불일치 ${mismatched} · 비교 불가 ${notComparable}`;
+  if (mismatched > 0) {
+    return { level: "err", toast: `원본 재검증: 불일치 ${mismatched}건`,
+      hint: `원본 재검증 완료 — ${counts} (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)` };
+  }
+  if (matched === 0) {
+    return { level: "warn", toast: "원본 재검증: 비교된 파일 없음 — 재검증되지 않았습니다",
+      hint: `원본 재검증 완료 — ${counts}. 기록된 해시와 비교할 수 있는 파일이 없어 아무것도 재검증되지 않았습니다` +
+        (notComparable ? " (원본에 접근할 수 없거나, 읽을 수 없거나, 해시 없이 색인됨 — 해시 포함으로 다시 분석하십시오)." : ".") };
+  }
+  if (notComparable > 0) {
+    return { level: "warn", toast: `원본 재검증: 일치 ${matched}건, 비교 불가 ${notComparable}건`,
+      hint: `원본 재검증 완료 — ${counts}. 비교 불가 ${notComparable}건은 재검증되지 않았습니다 (접근 불가·읽기 실패·기록된 해시 없음 — 보관 이력서 5절 참조).` };
+  }
+  return { level: "ok", toast: `원본 재검증: ${matched}건 모두 일치`, hint: `원본 재검증 완료 — ${counts}` };
+}
+
 $("btnVerifySources").addEventListener("click", async () => {
   const btn = $("btnVerifySources");
   if (btn.disabled) return;
@@ -1539,10 +1614,9 @@ $("btnVerifySources").addEventListener("click", async () => {
   try {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { $("finalHint").textContent = "원본 재검증 실패: " + (res.error || "알 수 없는 오류"); return; }
-    const bad = res.mismatched > 0;
-    $("finalHint").textContent = `원본 재검증 완료 — 일치 ${res.matched} · 불일치 ${res.mismatched} · 비교 불가 ${res.not_comparable}` +
-      (bad ? " (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)" : "");
-    toast(bad ? `원본 재검증: 불일치 ${res.mismatched}건` : "원본 재검증: 모두 일치", bad ? "err" : "ok");
+    const verdict = verifySourcesVerdict(res);
+    $("finalHint").textContent = verdict.hint;
+    toast(verdict.toast, verdict.level);
   } catch (err) {
     $("finalHint").textContent = "원본 재검증 실패: " + (err.message || err);
   } finally {
