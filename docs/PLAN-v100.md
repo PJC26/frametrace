@@ -66,7 +66,7 @@
 - FOR-04, FOR-07, FOR-13(+`verify-package`): 검증된 증거 해시와 출처, 마크 이력(스키마 v6), 엄격한 감사 꼬리 — a87257d; custody 해시 출처 표기 — 718b8e7; 증거 메모 보존 — 0eb3a42
 - UX-06/09/10/11, SEC-06: Recover/Carve/클립 내보내기 백그라운드 잡, case-info, preflight — 3505df7, f61b9a0, 736558d, efcf72d, e2e3043
 - UX-12, UX-18(부분: iframe 워치독·재시도, 미저장 시 새 케이스 거부), 셸 ft-reload — f61b9a0, 378f540, e4c40fc
-- 뷰어: SEC-03 팝업 스크립트 이스케이프, UX-14, UX-17, UX-22, PERF-05 썸네일 재시도, fps — 848a2f3, 666523b. UX-21은 커밋 메시지에 명시 없음(백로그와 대조 필요)
+- 뷰어: SEC-03 팝업 스크립트 이스케이프, UX-14, UX-17, UX-21(줌 슬라이더·내보내기 메뉴 그룹화, 커밋 메시지에는 누락), UX-22, PERF-05 썸네일 재시도, fps — 848a2f3, 666523b
 - PERF-07 검색/FTS/썸네일 목록 캐시, 썸네일 ETag/304, 경로 컴포넌트 검사 — d555c2f
 - STR-02 번들 파일별 배너·sourceURL, 접두 중복 검사, check-js 오류→파일 매핑, rerun-if-changed 확인
 - STR-08 `serve/mod.rs` 글롭 재노출을 명시 목록으로 교체, 문서 주석 위치 수정
