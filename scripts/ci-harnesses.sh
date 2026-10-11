@@ -26,7 +26,7 @@ harnesses=(
   # @T1 verify-buttons
   # @T5 verify-embed
   # @T2 verify-layout
-  # @T3 verify-progress
+  "verify-progress"
   # @T4 verify-finalize-sheet
 )
 

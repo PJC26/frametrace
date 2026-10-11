@@ -1,207 +1,27 @@
-// VM harness for the workstation shell (assets/app, bundled like build.rs):
-// background Recover/Carve jobs (async contract + old synchronous
-// responses), viewer refresh without `src = src`, review-frame load
-// timeout/retry, preflight panel, checkpoint resume info, guarded
-// "새 케이스 시작" reload, theme/locale propagation and the breadcrumb.
+// VM harness for the workstation shell's job UI (assets/app, bundled like
+// build.rs): background Recover/Carve jobs (async contract + old synchronous
+// responses) rendered into the chip (#jobPanel) and the work sheet
+// (#hJobsSheet), hosted-viewer refresh via FTViewer.reload() (never a page
+// reload), reload refusal -> 'deferred', cancel, failure visibility, plus the
+// preflight panel, checkpoint resume info and shell dialog Escape.
 //
 //   node scripts/verify-shell-jobs.mjs
 //
-// No server or browser: a fake DOM, a scripted fetch and virtual timers.
-import vm from 'node:vm';
-import assert from 'node:assert/strict';
-import { appBundleJs, appMarkup } from './lib/app-bundle.mjs';
+// No server or browser: a fake DOM, a scripted fetch and virtual timers
+// (scripts/lib/shell-vm.mjs). The viewer is an FTViewer mock; there is no
+// review iframe and no stage rail any more (docs/ui-rebuild-contract.md §8.1).
+import { makeEnv, test, passedCount, assert, markupHas } from './lib/shell-vm.mjs';
 
-const BUNDLE = appBundleJs();
-const MARKUP = appMarkup();
-
-// Initial `hidden` state of every id'd element, straight from the markup.
-const MARKUP_HIDDEN = new Map();
-for (const m of MARKUP.matchAll(/<(\w+)([^>]*?)\bid="([^"]+)"([^>]*)>/g)) {
-  const attrs = m[2] + ' ' + m[4];
-  MARKUP_HIDDEN.set(m[3], /(^|\s)hidden(\s|=|$)/.test(attrs));
-}
-
-function makeEl(id, tag = 'div') {
-  const listeners = {};
-  const set = new Set();
-  const el = {
-    id, tagName: tag.toUpperCase(), value: '', textContent: '', innerHTML: '', title: '', placeholder: '',
-    hidden: MARKUP_HIDDEN.get(id) === true, disabled: false, checked: false, className: '',
-    style: {}, dataset: {}, attrs: {}, children: [], clicks: 0, files: [],
-    classList: {
-      add: (...c) => c.forEach((x) => set.add(x)),
-      remove: (...c) => c.forEach((x) => set.delete(x)),
-      toggle: (c, on) => { const v = on === undefined ? !set.has(c) : !!on; if (v) set.add(c); else set.delete(c); return v; },
-      contains: (c) => set.has(c),
-    },
-    addEventListener(t, fn) { (listeners[t] ||= []).push(fn); },
-    removeEventListener(t, fn) { listeners[t] = (listeners[t] || []).filter((f) => f !== fn); },
-    dispatch(t, ev = {}) { for (const fn of [...(listeners[t] || [])]) fn({ type: t, target: el, preventDefault() {}, ...ev }); },
-    click() { el.clicks += 1; el.dispatch('click'); },
-    setAttribute(k, v) { el.attrs[k] = String(v); },
-    getAttribute(k) { return el.attrs[k] ?? null; },
-    removeAttribute(k) { delete el.attrs[k]; },
-    appendChild(c) { el.children.push(c); return c; },
-    append(...c) { el.children.push(...c); },
-    remove() {}, focus() {}, select() {}, scrollIntoView() {},
-    closest: () => null, querySelectorAll: () => [], querySelector: () => null, contains: () => false,
-  };
-  return el;
-}
-
-function fakeViewerDoc({ scripts = true, saveState = 'saved', lang = 'ko', readyState = 'complete' } = {}) {
-  const saveEl = makeEl('saveState');
-  saveEl.dataset.state = saveState;
-  const langBtn = makeEl('btnLang');
-  const doc = {
-    readyState,
-    documentElement: { dataset: {}, lang },
-    querySelector: (sel) => (sel === 'script' && scripts ? {} : null),
-    getElementById: (id) => (id === 'saveState' ? saveEl : id === 'btnLang' ? langBtn : null),
-  };
-  langBtn.addEventListener('click', () => { doc.documentElement.lang = doc.documentElement.lang === 'ko' ? 'en' : 'ko'; });
-  return { doc, saveEl, langBtn };
-}
-
-function makeEnv(opts = {}) {
-  let clock = 1_700_000_000_000;
-  const timers = new Map();
-  let timerSeq = 1;
-  const errors = [];
-  const sT = (fn, ms = 0) => { const id = timerSeq++; timers.set(id, { fn, due: clock + Math.max(0, Number(ms) || 0), every: 0 }); return id; };
-  const cT = (id) => { timers.delete(id); };
-  const sI = (fn, ms) => { const id = timerSeq++; timers.set(id, { fn, due: clock + ms, every: Math.max(1, ms) }); return id; };
-  const flush = async () => { for (let i = 0; i < 30; i++) await new Promise((r) => setImmediate(r)); };
-  async function advance(ms) {
-    const target = clock + ms;
-    for (;;) {
-      await flush();
-      let next = null;
-      for (const [id, t] of timers) if (t.due <= target && (!next || t.due < next[1].due)) next = [id, t];
-      if (!next) break;
-      const [id, t] = next;
-      clock = Math.max(clock, t.due);
-      if (t.every) t.due += t.every; else timers.delete(id);
-      try { t.fn(); } catch (e) { errors.push(e); }
-    }
-    clock = target;
-    await flush();
-  }
-  class FakeDate extends Date {
-    constructor(...a) { if (a.length) super(...a); else super(clock); }
-    static now() { return clock; }
-  }
-
-  const env = {
-    status: { ok: true, has_job: true, phase: 'review-ready', busy: false, case_dir: '/cases/c1', steps: ['done', 'done', 'done', 'done', 'done'], logs: [], error: null },
-    routes: opts.routes || {},
-    calls: [],
-  };
-  const respond = (status, json) => ({ ok: status < 400, status, json: async () => { if (json === undefined) throw new Error('not json'); return json; } });
-  async function fetchImpl(url, init = {}) {
-    const method = (init.method || 'GET').toUpperCase();
-    const body = init.body ? JSON.parse(init.body) : null;
-    env.calls.push({ method, url, body });
-    const path = url.split('?')[0];
-    const route = env.routes[`${method} ${url}`] || env.routes[`${method} ${path}`];
-    if (route) {
-      const r = await route(body, url);
-      return respond(r.status ?? 200, r.json);
-    }
-    if (path === '/api/status') return respond(200, JSON.parse(JSON.stringify(env.status)));
-    if (path === '/api/env') return respond(200, { ok: true, tools: { ffmpeg: true, ffprobe: true }, workflows: {}, hints: {} });
-    if (path === '/api/browse') return respond(200, { ok: true, exists: false });
-    return respond(404, undefined);
-  }
-
-  const els = {};
-  const winListeners = {};
-  const docListeners = {};
-  const store = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
-  const document = {
-    getElementById: (id) => (els[id] ||= makeEl(id, id === 'reviewFrame' ? 'iframe' : 'div')),
-    querySelectorAll: () => [],
-    querySelector: () => null,
-    createElement: (tag) => makeEl('', tag),
-    createTextNode: (t) => ({ text: t }),
-    addEventListener(t, fn) { (docListeners[t] ||= []).push(fn); },
-    documentElement: { dataset: { theme: 'light' } },
-    activeElement: null,
-    body: makeEl('body'),
-  };
-  const frame = document.getElementById('reviewFrame');
-  const frameWin = {
-    posted: [],
-    postMessage(m) { this.posted.push(m); },
-    location: { reloads: 0, reload() { this.reloads += 1; } },
-  };
-  frame.contentWindow = frameWin;
-  frame.contentDocument = null;
-  // Count every src assignment: `src = src` keeps the string but navigates.
-  let frameSrc = "";
-  frame.srcSets = 0;
-  Object.defineProperty(frame, "src", { get: () => frameSrc, set: (v) => { frame.srcSets += 1; frameSrc = String(v); } });
-
-  const ctx = {
-    document, console: { log() {}, error: (...a) => env.consoleErrors.push(a.join(' ')), warn() {} },
-    fetch: fetchImpl, setTimeout: sT, clearTimeout: cT, setInterval: sI, clearInterval: cT,
-    Date: FakeDate, localStorage: store(), sessionStorage: store(), navigator: {},
-    location: { protocol: 'http:', origin: 'http://127.0.0.1', reloads: 0, reload() { this.reloads += 1; } },
-    Event: class Event { constructor(type) { this.type = type; } },
-    addEventListener(t, fn) { (winListeners[t] ||= []).push(fn); },
-    removeEventListener(t, fn) { winListeners[t] = (winListeners[t] || []).filter((f) => f !== fn); },
-    open: () => ({ focus() {} }),
-    URLSearchParams, encodeURIComponent, JSON, Math, Number, String, Object, Array, Promise, Set, Map, RegExp, Error,
-  };
-  ctx.window = ctx;
-  env.consoleErrors = [];
-  vm.createContext(ctx);
-  vm.runInContext(BUNDLE, ctx);
-  Object.assign(env, {
-    ctx, els, frame, frameWin, advance, flush, errors,
-    $: (id) => document.getElementById(id),
-    ev: (expr) => vm.runInContext(expr, ctx),
-    docKey: (key) => { const ev = { type: 'keydown', key, prevented: false, preventDefault() { this.prevented = true; } }; for (const fn of [...(docListeners.keydown || [])]) fn(ev); return ev; },
-    winMessage: (data, source) => { for (const fn of [...(winListeners.message || [])]) fn({ data, source }); },
-    async answerDialog(ok) {
-      await flush();
-      assert.equal(env.$('dlgBackdrop').hidden, false, 'dialog expected to be open');
-      env.$(ok ? 'dlgOk' : 'dlgCancel').click();
-      await flush();
-    },
-    // Puts a live viewer document into the frame and fires load.
-    loadFrame(docOpts) {
-      const v = fakeViewerDoc(docOpts);
-      frame.contentDocument = v.doc;
-      frame.dispatch('load');
-      return v;
-    },
-  });
-  return env;
-}
-
-let passed = 0;
-async function test(name, fn) {
-  try {
-    await fn();
-    passed += 1;
-    console.log('PASS ' + name);
-  } catch (err) {
-    console.error('FAIL ' + name + '\n' + (err && err.stack || err));
-    process.exitCode = 1;
-  }
-}
-
-// Brings an env to "case open, review frame loaded".
-async function openReview(env, docOpts) {
-  await env.advance(2000); // first status poll → review stage + frame src
-  assert.match(env.frame.src || '', /evidence-viewer\.html\?embed=1/);
-  const v = env.loadFrame(docOpts);
+// Brings an env to "case open, viewer mounted".
+async function openReview(env) {
+  await env.advance(2000); // first status poll
+  env.store().set({ viewer: { ...env.state().viewer, mounted: true } });
   await env.advance(10);
-  return v;
 }
+const reloads = (env) => env.viewer.reloadCalls.length;
+const toastTexts = (env) => env.$('toastBox').children.map((c) => (c.children && c.children[0] ? c.children[0].textContent : ''));
 
-await test('Recover/Carve hidden until a case is open; breadcrumb shows case + step', async () => {
+await test('Recover/Carve hidden until a case is open; chip is the entry to the sheet', async () => {
   const env = makeEnv();
   assert.equal(env.$('btnRecoverDeleted').hidden, true);
   assert.equal(env.$('btnCarve').hidden, true);
@@ -209,20 +29,24 @@ await test('Recover/Carve hidden until a case is open; breadcrumb shows case + s
   await env.advance(2000);
   assert.equal(env.$('btnRecoverDeleted').hidden, false);
   assert.equal(env.$('btnCarve').hidden, false);
-  assert.match(env.$('crumbs').innerHTML, /케이스: c1/);
-  assert.match(env.$('crumbs').innerHTML, /단계 4\/4/);
-  env.ev('resetCaseUi()');
-  assert.equal(env.$('btnRecoverDeleted').hidden, true);
+  assert.equal(env.$('jobPanel').hidden, false, 'idle chip stays reachable while a case is open');
+  assert.match(env.$('jobPanel').className, /\bidle\b/);
+  assert.match(env.$('jobPanel').innerHTML, /id="hBtnJobs"[^>]*aria-controls="hJobsSheet"/);
+  assert.equal(env.state().project.name, 'c1');
+  env.status = { ok: true, has_job: false, phase: 'idle', busy: false };
+  await env.advance(5100);
+  assert.equal(env.$('btnRecoverDeleted').hidden, true, 'no case -> tools hidden again');
+  assert.equal(env.$('jobPanel').hidden, true, 'no project -> no chip');
 });
 
-await test('async job: progress, elapsed, completion via postMessage reload (never src=src)', async () => {
+await test('async job: progress, elapsed, completion via FTViewer.reload (never a page reload)', async () => {
   const env = makeEnv({ routes: { 'POST /api/recover-deleted': () => ({ json: { ok: true, job: { kind: 'recover' } } }) } });
   await openReview(env);
-  const srcBefore = env.frame.src, setsBefore = env.frame.srcSets;
   env.status = { ...env.status, phase: 'finalizing', busy: true, logs: ['삭제 영상 후보 복구 중… (img @ 오프셋 2048)'] };
   env.$('btnRecoverDeleted').click();
   await env.advance(1500);
   assert.equal(env.$('jobPanel').hidden, false);
+  assert.match(env.$('jobPanel').className, /\brunning\b/);
   assert.match(env.$('jobTitle').textContent, /삭제 영상 후보 복구 진행 중/);
   assert.match(env.$('jobDetail').textContent, /오프셋 2048/);
   assert.equal(env.$('btnJobCancel').hidden, false);
@@ -230,57 +54,44 @@ await test('async job: progress, elapsed, completion via postMessage reload (nev
   assert.equal(env.$('btnCarve').disabled, true);
   await env.advance(64000);
   assert.match(env.$('jobElapsed').textContent, /^경과 1:0\d$/);
+  assert.equal(reloads(env), 0, 'no refresh while running');
   env.status = { ...env.status, phase: 'review-ready', busy: false, logs: ['복구 완료'] };
-  await env.advance(1300);
-  assert.deepEqual(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 1);
-  env.winMessage({ type: 'ft-reload-ack' }, env.frameWin);
-  await env.advance(10);
+  await env.advance(1300 + 5100);
+  assert.equal(reloads(env), 1);
+  assert.equal(env.viewer.reloadCalls[0].keepUnsaved, true);
   assert.match(env.$('jobTitle').textContent, /완료/);
   assert.match(env.$('jobDetail').textContent, /뷰어에 결과를 반영/);
-  assert.equal(env.frame.src, srcBefore);
-  assert.equal(env.frame.srcSets, setsBefore, 'frame src must not be re-assigned');
-  assert.equal(env.frameWin.location.reloads, 0);
+  assert.equal(env.ctx.location.reloads, 0, 'the page itself is never reloaded');
   assert.equal(env.$('btnRecoverDeleted').disabled, false);
   assert.equal(env.$('btnJobCancel').hidden, true);
 });
 
-await test('no viewer ack + clean save → guarded in-frame reload', async () => {
+await test('viewer refuses the reload (unsaved marks) -> deferred, retry via btnJobReload', async () => {
   const env = makeEnv({ routes: { 'POST /api/recover-deleted': () => ({ json: { ok: true, job: 'j1' } }) } });
   await openReview(env);
-  const srcBefore = env.frame.src, setsBefore = env.frame.srcSets;
+  env.viewer.reloadResult = 'refused';
   env.status = { ...env.status, busy: true, phase: 'finalizing' };
   env.$('btnRecoverDeleted').click();
   await env.advance(1300);
   env.status = { ...env.status, busy: false, phase: 'review-ready' };
-  await env.advance(1300 + 1600);
-  assert.equal(env.frameWin.location.reloads, 1);
-  assert.equal(env.frame.src, srcBefore);
-  assert.equal(env.frame.srcSets, setsBefore);
-});
-
-await test('no viewer ack + unsaved marks → reload deferred, save retried, manual reload later', async () => {
-  const env = makeEnv({ routes: { 'POST /api/recover-deleted': () => ({ json: { ok: true, job: 'j1' } }) } });
-  const v = await openReview(env, { saveState: 'pending' });
-  env.status = { ...env.status, busy: true, phase: 'finalizing' };
-  env.$('btnRecoverDeleted').click();
-  await env.advance(1300);
-  env.status = { ...env.status, busy: false, phase: 'review-ready' };
-  await env.advance(1300 + 1600);
-  assert.equal(env.frameWin.location.reloads, 0, 'must not reload over unsaved marks');
-  assert.ok(v.saveEl.clicks >= 1, 'viewer save retried');
-  assert.equal(env.$('btnJobReload').hidden, false);
+  await env.advance(1300 + 5100);
+  assert.equal(reloads(env), 1);
   assert.match(env.$('jobPanel').className, /deferred/);
-  env.$('btnJobReload').click(); // still pending → refused
+  assert.equal(env.$('btnJobReload').hidden, false);
+  env.$('btnJobReload').click(); // still refused
   await env.flush();
-  assert.equal(env.frameWin.location.reloads, 0);
-  v.saveEl.dataset.state = 'saved';
+  assert.equal(reloads(env), 2);
+  assert.equal(env.$('btnJobReload').hidden, false, 'stays until the viewer takes the data');
+  env.viewer.reloadResult = 'reloaded';
   env.$('btnJobReload').click();
-  await env.flush();
-  assert.equal(env.frameWin.location.reloads, 1);
+  await env.advance(50);
+  assert.equal(reloads(env), 3);
   assert.equal(env.$('btnJobReload').hidden, true);
+  assert.match(env.$('jobPanel').className, /\bok\b/);
+  assert.equal(env.ctx.location.reloads, 0);
 });
 
-await test('cancel: confirm → /api/cancel → cancelled outcome, buttons re-enabled', async () => {
+await test('cancel: confirm -> /api/cancel -> cancelled outcome, buttons re-enabled', async () => {
   const env = makeEnv({ routes: { 'POST /api/carve': () => ({ json: { ok: true, job: { kind: 'carve' } } }), 'POST /api/cancel': () => ({ json: { ok: true } }) } });
   await openReview(env);
   env.status = { ...env.status, busy: true, phase: 'finalizing', logs: ['시그니처 카빙 실행 중…'] };
@@ -291,12 +102,13 @@ await test('cancel: confirm → /api/cancel → cancelled outcome, buttons re-en
   await env.answerDialog(true);
   assert.ok(env.calls.some((c) => c.method === 'POST' && c.url === '/api/cancel'));
   assert.match(env.$('jobTitle').textContent, /중단 요청 중/);
+  assert.equal(env.$('btnJobCancel').disabled, true);
   env.status = { ...env.status, busy: false, phase: 'review-ready', error: '사용자 요청으로 중단되었습니다' };
-  await env.advance(1300);
+  await env.advance(1300 + 5100);
   assert.match(env.$('jobTitle').textContent, /이미지 카빙 중단됨/);
   assert.match(env.$('jobPanel').className, /cancelled/);
   assert.equal(env.$('btnCarve').disabled, false);
-  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 0, 'no refresh after cancel');
+  assert.equal(reloads(env), 0, 'no refresh after cancel');
 });
 
 // ---- real server contract (src/serve/jobs.rs): /api/status `job` ----
@@ -308,7 +120,7 @@ const carveRoutes = (extra = {}) => ({
   ...extra,
 });
 
-await test('server job: stage + elapsed from st.job, done → viewer refresh', async () => {
+await test('server job: stage + elapsed from st.job, done -> viewer refresh', async () => {
   const env = makeEnv({ routes: carveRoutes() });
   await openReview(env);
   // An earlier job of another kind in st.job must not be taken for ours.
@@ -327,13 +139,11 @@ await test('server job: stage + elapsed from st.job, done → viewer refresh', a
   assert.match(env.$('jobDetail').textContent, /단계 2\/2: 리뷰 생성/);
   // busy already dropped but st.job still running: not finished yet.
   env.status = { ...env.status, busy: false, phase: 'review-ready', job_kind: null };
-  await env.advance(1300);
+  await env.advance(1300 + 5100);
   assert.match(env.$('jobTitle').textContent, /진행 중/);
   env.status = { ...env.status, job: sjob({ state: 'done', stage: 2, finished_unix: 1_700_000_190, elapsed_secs: 90 }) };
-  await env.advance(1300);
-  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 1);
-  env.winMessage({ type: 'ft-reload-ack', reloaded: true }, env.frameWin);
-  await env.advance(10);
+  await env.advance(1300 + 5100);
+  assert.equal(reloads(env), 1);
   assert.match(env.$('jobTitle').textContent, /이미지 카빙 완료/);
   assert.match(env.$('jobElapsed').textContent, /^경과 1:3\d$/);
 });
@@ -350,15 +160,15 @@ await test('server job: cancelled read from state (no keyword needed), not shown
   assert.ok(env.calls.some((c) => c.method === 'POST' && c.url === '/api/cancel'));
   env.status = { ...env.status, busy: false, phase: 'review-ready', error: null,
     job: sjob({ state: 'cancelled', finished_unix: 1_700_000_180, error: '시그니처 카빙 작업을 멈췄습니다 — 결과가 리뷰에 반영되지 않았을 수 있습니다.' }) };
-  await env.advance(1300);
+  await env.advance(1300 + 5100);
   assert.match(env.$('jobTitle').textContent, /이미지 카빙 중단됨/);
   assert.match(env.$('jobPanel').className, /cancelled/);
   assert.match(env.$('jobDetail').textContent, /결과가 리뷰에 반영되지 않았을 수 있습니다/);
   assert.equal(env.$('btnCarve').disabled, false);
-  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 0);
+  assert.equal(reloads(env), 0);
 });
 
-await test('server job: failure whose text says "cancel" is still a failure', async () => {
+await test('server job: failure whose text says "cancel" is still a failure, shown in chip, sheet and toast', async () => {
   const env = makeEnv({ routes: carveRoutes() });
   await openReview(env);
   env.status = { ...env.status, phase: 'finalizing', busy: true, job: sjob() };
@@ -367,16 +177,18 @@ await test('server job: failure whose text says "cancel" is still a failure', as
   await env.advance(1300);
   env.status = { ...env.status, busy: false, phase: 'review-ready', error: 'carve-file: cancelled read (I/O error)',
     job: sjob({ state: 'failed', error: 'carve-file: cancelled read (I/O error)' }) };
-  await env.advance(1300);
+  await env.advance(1300 + 5100);
   assert.match(env.$('jobTitle').textContent, /이미지 카빙 실패/);
   assert.match(env.$('jobDetail').textContent, /I\/O error/);
   assert.match(env.$('jobPanel').className, /failed/);
+  assert.equal(env.$('jobsErr').hidden, false, 'sheet shows the failure');
+  assert.match(env.$('jobsErr').innerHTML, /I\/O error/);
+  assert.ok(toastTexts(env).some((t) => /이미지 카빙 실패/.test(t)), 'sticky error toast: ' + toastTexts(env));
 });
 
 await test('shell reloaded mid-job adopts the running server job (progress + cancel)', async () => {
-  const env = makeEnv({ routes: carveRoutes() });
-  env.status = { ...env.status, phase: 'finalizing', busy: true, job_kind: 'recover-deleted',
-    job: sjob({ kind: 'recover-deleted', stage_label: '삭제 영상 후보 복구', elapsed_secs: 130 }) };
+  const env = makeEnv({ routes: carveRoutes(), status: { phase: 'finalizing', busy: true, job_kind: 'recover-deleted',
+    job: sjob({ kind: 'recover-deleted', stage_label: '삭제 영상 후보 복구', elapsed_secs: 130 }) } });
   await env.advance(2000);
   assert.equal(env.$('jobPanel').hidden, false);
   assert.match(env.$('jobTitle').textContent, /삭제 영상 후보 복구 진행 중/);
@@ -384,7 +196,7 @@ await test('shell reloaded mid-job adopts the running server job (progress + can
   assert.equal(env.$('btnJobCancel').hidden, false);
   assert.equal(env.$('btnRecoverDeleted').disabled, true);
   env.status = { ...env.status, busy: false, phase: 'review-ready', job: sjob({ kind: 'recover-deleted', state: 'done' }) };
-  await env.advance(1600);
+  await env.advance(1600 + 5100);
   assert.match(env.$('jobTitle').textContent, /완료/);
 });
 
@@ -415,47 +227,32 @@ await test('old synchronous server: elapsed + cancel while outstanding, refresh 
   assert.match(env.$('jobTitle').textContent, /진행 중/);
   resolveSync({ json: { ok: true } });
   await env.advance(10);
-  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 1);
-  env.winMessage({ type: 'ft-reload-ack' }, env.frameWin);
-  await env.advance(10);
+  assert.equal(reloads(env), 1);
   assert.match(env.$('jobTitle').textContent, /완료/);
 });
 
-await test('old synchronous server failure → visible error, retry possible', async () => {
+await test('old synchronous server failure -> visible error, retry possible, dismissible', async () => {
   const env = makeEnv({ routes: { 'POST /api/recover-deleted': () => ({ json: { ok: false, error: '파일시스템 조사 결과가 없습니다 — 먼저 E01/이미지 분석을 실행하십시오.' } }) } });
   await openReview(env);
   env.$('btnRecoverDeleted').click();
   await env.advance(10);
   assert.match(env.$('jobTitle').textContent, /실패/);
   assert.match(env.$('jobDetail').textContent, /파일시스템 조사 결과가 없습니다/);
-  assert.match(env.$('recoverHint').textContent, /다시 시도/);
+  assert.match(env.$('jobsNote').textContent, /다시 시도/);
   assert.equal(env.$('btnRecoverDeleted').disabled, false);
   assert.equal(env.$('btnJobClose').hidden, false);
   env.$('btnJobClose').click();
-  assert.equal(env.$('jobPanel').hidden, true);
+  assert.match(env.$('jobPanel').className, /\bidle\b/, 'dismissed -> back to the idle entry');
 });
 
-await test('review frame: load timeout shows retry; retry reloads with a fresh URL', async () => {
+await test('btnNew hands over to the project popover action (one guarded flow)', async () => {
   const env = makeEnv();
-  await env.advance(2000);
-  assert.equal(env.$('frameFail').hidden, true);
-  await env.advance(20000);
-  assert.equal(env.$('frameFail').hidden, false);
-  assert.match(env.$('frameFailMsg').textContent, /20초/);
-  env.$('btnFrameRetry').click();
-  assert.match(env.frame.src, /retry=2/);
-  assert.equal(env.$('frameFail').hidden, true);
-  env.loadFrame();
-  await env.advance(25000);
-  assert.equal(env.$('frameFail').hidden, true, 'loaded frame must not time out');
-});
-
-await test('review frame: error page (no script) is reported, not left blank', async () => {
-  const env = makeEnv();
-  await env.advance(2000);
-  env.loadFrame({ scripts: false });
-  assert.equal(env.$('frameFail').hidden, false);
-  assert.match(env.$('frameFailMsg').textContent, /비어 있거나 오류/);
+  await openReview(env);
+  assert.equal(env.$('btnNew').hidden, false);
+  env.$('btnNew').click();
+  await env.flush();
+  assert.equal(env.$('hProjectNew').clicks, 1);
+  assert.equal(env.ctx.location.reloads, 0);
 });
 
 await test('preflight: render (estimate, inside-source, escaping) and 404 degrade', async () => {
@@ -532,76 +329,6 @@ await test('case-info: N/M resume text; 404 falls back to the checkpoint probe',
   assert.match(old.$('resumeText').textContent, /체크포인트/);
 });
 
-await test('새 케이스 시작 never reloads over unsaved marks', async () => {
-  const env = makeEnv();
-  const v = await openReview(env, { saveState: 'pending' });
-  env.frameWin.__frametraceSummary = () => ({ total: 1, pending: 0, byKind: {}, byStatus: {} });
-  env.$('btnNew').click();
-  await env.flush();
-  assert.equal(env.$('dlgBackdrop').hidden, false);
-  await env.answerDialog(true); // "저장 다시 시도"
-  assert.equal(env.ctx.location.reloads, 0);
-  assert.ok(v.saveEl.clicks >= 1);
-  v.saveEl.dataset.state = 'saved';
-  env.$('btnNew').click();
-  await env.flush();
-  assert.equal(env.ctx.location.reloads, 1);
-  assert.equal(env.ctx.sessionStorage.getItem('ft_want_new'), '1');
-});
-
-await test('theme + viewer language live in the shell and propagate to the frame', async () => {
-  const env = makeEnv();
-  const v = await openReview(env);
-  env.$('btnTheme').click();
-  assert.ok(env.frameWin.posted.some((m) => m.type === 'ft-theme' && m.theme === 'dark'));
-  assert.equal(v.doc.documentElement.dataset.theme, 'dark');
-  env.$('btnViewerLang').click();
-  assert.ok(env.frameWin.posted.some((m) => m.type === 'ft-locale' && m.locale === 'en'));
-  assert.equal(v.langBtn.clicks, 1);
-  assert.equal(v.doc.documentElement.lang, 'en');
-  assert.match(env.$('btnViewerLang').textContent, /English/);
-  // A reloaded frame comes back in the shell's language/theme.
-  const v2 = env.loadFrame({ lang: 'ko' });
-  assert.equal(v2.doc.documentElement.lang, 'en');
-  assert.equal(v2.doc.documentElement.dataset.theme, 'dark');
-});
-
-await test('job finishing while the viewer frame is loading: wait for load, then ft-reload handshake', async () => {
-  const env = makeEnv();
-  await openReview(env);
-  env.ev('loadReviewFrame')(env.frame.src); // frame navigates again → "loading"
-  assert.equal(env.ev('frameState'), 'loading');
-  env.frameWin.posted.length = 0;
-  let result = null;
-  env.ev('refreshViewerData')('carve').then((r) => { result = r; });
-  await env.advance(500);
-  assert.equal(result, null, 'must not report success while the frame is still loading');
-  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 0);
-  env.loadFrame();
-  await env.advance(50);
-  assert.equal(env.frameWin.posted.filter((m) => m.type === 'ft-reload').length, 1, 'ft-reload posted once the frame is live');
-  env.winMessage({ type: 'ft-reload-ack', reloaded: false }, env.frameWin);
-  await env.advance(50);
-  assert.equal(result, 'deferred', 'a refusal after the load is honoured');
-});
-
-await test('viewer locale is re-posted until acked; a reloaded frame restarts the sequence', async () => {
-  const env = makeEnv();
-  await openReview(env);
-  env.$('btnViewerLang').click(); // → en
-  env.frameWin.posted.length = 0;
-  await env.advance(3000);
-  const n = () => env.frameWin.posted.filter((m) => m.type === 'ft-locale' && m.locale === 'en').length;
-  assert.ok(n() >= 4, 'retried without ack: ' + n());
-  env.winMessage({ type: 'ft-locale-ack', locale: 'en' }, env.frameWin);
-  const after = n();
-  await env.advance(5000);
-  assert.equal(n(), after, 'stops after ack');
-  env.frameWin.posted.length = 0;
-  env.loadFrame({ lang: 'ko' });
-  await env.advance(1200);
-  assert.ok(n() >= 2, 'reloaded frame gets the locale again');
-});
 
 await test('shell dialog: Escape works at document level even after focus left the dialog', async () => {
   const env = makeEnv();
@@ -616,10 +343,36 @@ await test('shell dialog: Escape works at document level even after focus left t
   assert.equal(env.docKey('Escape').prevented, false, 'ignored while no dialog is open');
 });
 
+
+// ---- T2-dependent (shell chrome rebuilt by T2): enabled once its markup lands ----
+if (markupHas('hProjectBtn')) {
+  await test('project button shows the open case name', async () => {
+    const env = makeEnv();
+    await env.advance(2000);
+    assert.match(env.$('hProjectBtn').textContent, /c1/);
+  });
+} else console.log('SKIP project button text (needs T2 markup: hProjectBtn)');
+if (markupHas('hBtnTheme') && markupHas('hBtnLang')) {
+  await test('theme + language buttons drive FTViewer', async () => {
+    const env = makeEnv();
+    const calls = [];
+    env.ctx.FTViewer.setTheme = (t) => calls.push(['theme', t]);
+    env.ctx.FTViewer.setLocale = (l) => calls.push(['locale', l]);
+    env.ctx.FTViewer.getTheme = () => 'light';
+    env.ctx.FTViewer.getLocale = () => 'ko';
+    await env.advance(2000);
+    env.$('hBtnTheme').click();
+    env.$('hBtnLang').click();
+    assert.ok(calls.some((c) => c[0] === 'theme' && c[1] === 'dark'), JSON.stringify(calls));
+    assert.ok(calls.some((c) => c[0] === 'locale' && c[1] === 'en'), JSON.stringify(calls));
+  });
+} else console.log('SKIP theme/language buttons (needs T2 markup: hBtnTheme/hBtnLang)');
+
 await test('no uncaught errors from timers', async () => {
   const env = makeEnv();
   await env.advance(30000);
   assert.deepEqual(env.errors.map(String), []);
+  assert.deepEqual(env.consoleErrors, []);
 });
 
-console.log(process.exitCode ? 'verify-shell-jobs: FAILED' : `verify-shell-jobs: ${passed} passed`);
+console.log(process.exitCode ? 'verify-shell-jobs: FAILED' : `verify-shell-jobs: ${passedCount()} passed`);

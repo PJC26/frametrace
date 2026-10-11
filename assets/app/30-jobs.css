@@ -1,0 +1,93 @@
+/* Analysis chip (top strip) + work sheet content (T3).
+   Layout of the mount nodes (.h-chip, .h-sheet frame, position, z-index) is
+   T2's 00-layout.css; buttons are kit.css (primary / quiet / destructive /
+   .icon). Only token names from docs/ui-rebuild-contract.md §5 are used.
+   Never relies on colour alone: every state also changes the title text. */
+
+/* ---- chip ---- */
+#jobPanel.h-chip { min-width: 0; }
+#jobPanel .h-chip-btn {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; max-width: 100%;
+  height: 32px; padding: 0 12px 0 10px; text-align: left; font-size: var(--fs-xs);
+  border: 1px solid var(--border); border-radius: var(--radius-pill, 999px); background: var(--surface-2); color: var(--text);
+}
+#jobPanel .h-chip-btn:hover { background: var(--accent-soft); }
+#jobPanel .h-chip-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#jobPanel .h-chip-text b { font-weight: 600; }
+#jobPanel #jobDetail { color: var(--muted); }
+#jobPanel .h-chip-elapsed { flex: none; color: var(--muted); }
+#jobPanel .h-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--border-strong); }
+#jobPanel.running .h-dot { background: var(--accent); animation: h-job-pulse 1.2s ease-in-out infinite; }
+#jobPanel.ok .h-dot { background: var(--ok); }
+#jobPanel.cancelled .h-dot, #jobPanel.deferred .h-dot { background: var(--warn); }
+#jobPanel.failed .h-chip-btn { border-color: var(--danger); background: var(--failed-bg); color: var(--failed-fg); }
+#jobPanel.failed .h-dot { background: var(--danger); }
+#jobPanel.failed #jobDetail, #jobPanel.failed .h-chip-elapsed { color: var(--failed-fg); }
+#jobPanel.cancelled .h-chip-btn, #jobPanel.deferred .h-chip-btn { border-color: var(--warn); background: var(--warn-bg); }
+#jobPanel.cancelled #jobDetail, #jobPanel.deferred #jobDetail { color: var(--warn-fg); }
+/* idle: just the entry to the sheet — no dot, no detail, no elapsed */
+#jobPanel.failed .h-chip-btn:hover { box-shadow: inset 0 0 0 1px var(--danger); }
+#jobPanel.cancelled .h-chip-btn:hover, #jobPanel.deferred .h-chip-btn:hover { box-shadow: inset 0 0 0 1px var(--warn); }
+#jobPanel.idle .h-chip-btn { width: auto; background: transparent; border-color: transparent; padding: 0 10px; }
+#jobPanel.idle .h-chip-btn:hover { background: var(--surface-2); }
+#jobPanel.idle .h-dot, #jobPanel.idle #jobDetail, #jobPanel.idle .h-chip-elapsed { display: none; }
+#jobPanel.idle .h-chip-text b { font-weight: 400; }
+@keyframes h-job-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { #jobPanel.running .h-dot { animation: none; } }
+
+/* ---- work sheet content (frame provided by .h-sheet) ---- */
+#hJobsSheet { display: flex; flex-direction: column; }
+#hJobsSheet[hidden] { display: none; }
+#hJobsSheet .h-job-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 44px; padding: 0 8px 0 16px; border-bottom: 1px solid var(--border); }
+#hJobsSheet .h-job-title { margin: 0; font-size: var(--fs-md); font-weight: 600; }
+#hJobsSheet .h-job-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 12px; padding: 12px 16px; overflow: auto; }
+#hJobsSheet .h-job-foot { flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--surface); }
+#hJobsSheet .h-job-spacer { flex: 1 1 auto; }
+#hJobsSheet .h-job-note { margin: 0; font-size: var(--fs-sm); color: var(--muted); }
+#hJobsSheet .h-job-note:empty { display: none; }
+#hJobsSheet .h-job-sec h3 { margin: 0; font-size: var(--fs-sm); font-weight: 600; }
+#hJobsSheet .h-job-secrow { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; min-height: 28px; }
+#hJobsSheet #jobsCounts { font-size: var(--fs-xs); color: var(--muted); }
+#hJobsSheet .h-job-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+#hJobsSheet .h-job-chk { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: var(--fs-sm); min-height: 24px; }
+#hJobsSheet .h-job-err { padding: 8px 12px; border: 1px solid var(--danger); border-radius: var(--radius); background: var(--failed-bg); color: var(--failed-fg); font-size: var(--fs-sm); }
+#hJobsSheet .h-job-err .hintline { margin-top: 4px; }
+#hJobsSheet .h-job-err pre { margin: 6px 0 0; max-height: 140px; overflow: auto; white-space: pre-wrap; font: var(--fs-xs) var(--font-mono); }
+#hJobsSheet .h-job-err summary { cursor: pointer; min-height: 24px; }
+
+/* step track */
+#hJobsSheet .h-track { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+#hJobsSheet .h-track li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--surface-2); font-size: var(--fs-sm); color: var(--muted); }
+#hJobsSheet .h-track li.running { background: var(--accent-soft); color: var(--text); }
+#hJobsSheet .h-track li.done { color: var(--text); }
+#hJobsSheet .h-track li.failed { color: var(--failed-fg); background: var(--failed-bg); }
+#hJobsSheet .h-trk-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--border-strong); }
+#hJobsSheet .h-track li.running .h-trk-dot { background: var(--accent); animation: h-job-pulse 1s infinite; }
+#hJobsSheet .h-track li.done .h-trk-dot { background: var(--ok); }
+#hJobsSheet .h-track li.warned .h-trk-dot { background: var(--warn); }
+#hJobsSheet .h-track li.failed .h-trk-dot { background: var(--danger); }
+#hJobsSheet .h-prog { flex: 1 1 100%; display: flex; align-items: center; gap: 8px; padding-left: 16px; min-width: 0; }
+#hJobsSheet .h-bar { flex: 1 1 auto; min-width: 40px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+#hJobsSheet .h-bar i { display: block; height: 100%; background: var(--accent); }
+#hJobsSheet .h-bar.indet i { width: 35%; animation: h-job-slide 1.4s ease-in-out infinite; }
+#hJobsSheet .h-ptext { flex: none; font-size: var(--fs-xs); color: var(--muted); }
+#hJobsSheet .h-trk-warn { padding: 1px 8px; border-radius: var(--radius-pill, 999px); background: var(--warn-bg); color: var(--warn-fg); font-size: var(--fs-xs); }
+#hJobsSheet .h-wlist { flex: 1 1 100%; display: grid; gap: 2px; padding-left: 16px; font-size: var(--fs-xs); color: var(--warn-fg); }
+@keyframes h-job-slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  #hJobsSheet .h-track li.running .h-trk-dot, #hJobsSheet .h-bar.indet i { animation: none; }
+}
+
+/* clip exports */
+#hJobsSheet .h-clips { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+#hJobsSheet .h-clips li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--surface-2); font-size: var(--fs-sm); }
+#hJobsSheet .h-clips li.failed { background: var(--failed-bg); color: var(--failed-fg); }
+#hJobsSheet .h-clip-name { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#hJobsSheet .h-clip-state { flex: none; font-weight: 600; }
+#hJobsSheet .h-clip-tail { flex: 1 1 100%; font-size: var(--fs-xs); color: var(--muted); }
+#hJobsSheet .h-clips li.failed .h-clip-tail { color: var(--failed-fg); }
+
+/* log: takes what is left of the sheet height */
+#hJobsSheet .h-job-logsec { flex: 1 1 160px; min-height: 120px; display: flex; flex-direction: column; }
+#hJobsSheet .h-job-logtools { display: flex; align-items: center; gap: 4px; }
+#hJobsSheet .h-job-log { flex: 1 1 auto; min-height: 0; margin: 0; padding: 8px 10px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); color: var(--text); font: var(--fs-xs)/1.5 var(--font-mono); white-space: pre-wrap; word-break: break-word; }

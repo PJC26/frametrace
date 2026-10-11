@@ -3,17 +3,20 @@
 //
 //   1. analysis of a synthetic dashcam folder runs to the review stage;
 //   2. Carve (UX-06) on a synthetic raw image with an embedded MP4: the job
-//      panel shows stage + elapsed, one run is cancelled from the UI and
-//      the panel says 중단됨 (server job.state = cancelled);
+//      chip shows stage + elapsed, one run is cancelled from the work sheet
+//      and the chip says 중단됨 (server job.state = cancelled);
 //   3. a second Carve runs to done while a review mark is saved from the
 //      viewer (accepted into the durable queue during the job); the shell
-//      posts ft-reload, the viewer acks and reloads, the carved candidates
-//      appear and the mark is still there (case DB + viewer);
+//      calls FTViewer.reload() (same document, no navigation), the carved
+//      candidates appear and the mark is still there (case DB + viewer);
 //   4. a clip export (UX-09) from the viewer: progress, then the exhibit
 //      summary shows the clip path + SHA-256 — checked against the file;
 //   5. /api/capture-frame accepts a > 4 MiB frame payload over HTTP.
 //
 //   node scripts/verify-jobs-e2e.mjs [--no-build] [--keep] [--shots DIR]
+//
+// The viewer is hosted in the same document (no iframe; docs/ui-rebuild-
+// contract.md §3): its DOM is queried on `page`, its API is window.FTViewer.
 //
 // Needs ffmpeg (demo clips) and Playwright (NODE_PATH). Uses Google Chrome
 // when installed (H.264 playback for IN/OUT), else Playwright's Chromium.
@@ -106,7 +109,9 @@ try {
   try { browser = await chromium.launch({ channel: 'chrome' }); } catch { browser = await chromium.launch(); }
   const page = await browser.newPage({ viewport: { width: 1500, height: 950 } });
   page.on('pageerror', (e) => pageErrors.push('shell: ' + e));
-  page.on('frameattached', () => {});
+  // The hosted viewer is re-initialised in place: the document must never navigate.
+  let navigations = 0;
+  page.on('framenavigated', (f) => { if (f === page.mainFrame()) navigations += 1; });
   page.on('console', (m) => { if (m.type() === 'error' && !/favicon|Failed to load resource/.test(m.text())) pageErrors.push('console: ' + m.text()); });
   const importMarks = [];
   page.on('response', async (res) => {
@@ -139,23 +144,19 @@ try {
   check('recover-deleted refuses without filesystem results (real endpoint, no stub)',
     rec && rec.ok === false && typeof rec.error === 'string' && rec.error.length > 0 && !rec.job, JSON.stringify(rec).slice(0, 200));
   check('refused recover-deleted left no job behind', !((await getJson('/api/status')).job_kind));
-  await page.waitForSelector('.view[data-view="3"].on', { timeout: 15000 });
-  const frameOf = () => page.frames().find((f) => /evidence-viewer\.html|\/viewer\//.test(f.url()));
-  const viewerReady = await until(async () => {
-    const f = frameOf();
-    if (!f) return null;
-    return (await f.evaluate(() => typeof window.__frametraceSummary === 'function' && document.querySelectorAll('#recordGrid .card').length)) ? f : null;
-  }, 30000);
-  check('review viewer loaded in the workstation', viewerReady, viewerReady ? '' : page.frames().map((f) => f.url()).join(' , '));
+  await page.waitForSelector('#hViewerHost:not([hidden])', { timeout: 15000 });
+  const viewerReady = await until(async () => (await page.evaluate(() => !!window.FTViewer && document.querySelectorAll('#hViewerHost #recordGrid .card').length)) ? page : null, 30000);
+  check('review viewer hosted in the workstation (same document)', viewerReady, viewerReady ? '' : page.url());
   if (!viewerReady) { await page.screenshot({ path: join(work, 'noviewer.png') }); throw new Error('no viewer; screenshot ' + join(work, 'noviewer.png')); }
-  const before = await viewerReady.evaluate(() => window.__frametraceSummary());
+  const before = await page.evaluate(() => window.FTViewer.summary());
   console.log('viewer before carve:', JSON.stringify(before));
-  // Stage-3 review tools live in the stage bar's '케이스 작업' menu.
-  const openCaseMenu = async () => {
-    if (await page.locator('#btnCaseMenu').isVisible().catch(() => false) &&
-        (await page.getAttribute('#btnCaseMenu', 'aria-expanded')) !== 'true') await page.click('#btnCaseMenu');
+  const navsBefore = navigations;
+  // Recover / Carve live in the work sheet ('작업 시작'); the chip opens it.
+  const openJobsSheet = async () => {
+    if (await page.locator('#hJobsSheet').isHidden().catch(() => true)) await page.click('#hBtnJobs');
+    await page.waitForSelector('#hJobsSheet:not([hidden])', { timeout: 5000 });
   };
-  await openCaseMenu();
+  await openJobsSheet();
   await page.waitForSelector('#btnCarve:not([hidden])', { timeout: 10000 });
 
   // ---- 2. carve → cancel ----------------------------------------------------
@@ -169,7 +170,7 @@ try {
     const detail = await page.textContent('#jobDetail');
     return /이미지 카빙 진행 중/.test(title) && /단계 1\/2: 시그니처 카빙/.test(detail) ? detail : null;
   }, 15000);
-  check('carve job panel shows stage from /api/status job', running, running || await page.textContent('#jobDetail'));
+  check('carve chip shows stage from /api/status job', running, running || await page.textContent('#jobDetail'));
   const st1 = await getJson('/api/status');
   check('server reports job_kind=carve, job.state=running', st1.job_kind === 'carve' && st1.job && st1.job.state === 'running', JSON.stringify(st1.job));
   // Elapsed comes from whole-second server polls, so compare two readings
@@ -182,6 +183,7 @@ try {
   }, 6000);
   check('elapsed time ticks', !!elapsedText && secs(firstElapsed) >= 0, `${firstElapsed} → ${elapsedText || await page.textContent('#jobElapsed')}`);
   if (shots) { mkdirSync(shots, { recursive: true }); await page.screenshot({ path: join(shots, 'jobs-carve-running.png') }); }
+  await openJobsSheet(); // cancel lives in the sheet
   await page.click('#btnJobCancel');
   await page.waitForSelector('#dlgBackdrop:not([hidden]) #dlgOk');
   await page.click('#dlgOk'); // confirm cancel
@@ -190,23 +192,24 @@ try {
   check('panel styled as cancelled, not failed', /\bcancelled\b/.test(await page.getAttribute('#jobPanel', 'class')));
   const st2 = await getJson('/api/status');
   check('server job.state = cancelled; busy released', st2.job && st2.job.state === 'cancelled' && !st2.busy && st2.phase === 'review-ready', JSON.stringify({ job: st2.job, busy: st2.busy, phase: st2.phase }));
-  check('cancelled run did not refresh the viewer', frameOf() === viewerReady && await viewerReady.evaluate(() => !!window.__frametraceSummary));
+  check('cancelled run did not refresh the viewer', navigations === navsBefore && await page.evaluate(() => !!window.FTViewer.summary().total));
   if (shots) await page.screenshot({ path: join(shots, 'jobs-carve-cancelled.png') });
+  await openJobsSheet();
   await page.click('#btnJobClose');
 
   // ---- 3. carve → done, with a mark saved during the job -------------------
   writeRaw(raw, 40);
-  await viewerReady.evaluate(() => { window.__e2eBeforeReload = 1; });
-  const srcBefore = await page.$eval('#reviewFrame', (f) => f.getAttribute('src'));
-  const markId = await viewerReady.evaluate(() => document.querySelector('#recordGrid .card[data-id^="vid_"]')?.dataset.id);
+  // FTViewer 'records' events carry the index generation the viewer loaded.
+  await page.evaluate(() => { window.__e2eRecords = []; window.FTViewer.on('records', (e) => window.__e2eRecords.push(e.detail)); });
+  const markId = await page.evaluate(() => document.querySelector('#recordGrid .card[data-id^="vid_"]')?.dataset.id);
   const marksBefore = importMarks.length;
-  await openCaseMenu();
+  await openJobsSheet();
   await page.click('#btnCarve');
   await page.waitForSelector('#dlgBackdrop:not([hidden]) #dlgOk');
   await page.click('#dlgOk');
   await until(async () => /진행 중/.test(await page.textContent('#jobTitle')), 10000);
   // Mark one record important from the viewer while the job holds busy.
-  await viewerReady.evaluate((id) => {
+  await page.evaluate((id) => {
     document.querySelector(`#recordGrid .card[data-id="${id}"]`).click();
     document.getElementById('btnMarkImportant').click();
   }, markId);
@@ -219,28 +222,24 @@ try {
   check('UI says carve done and the viewer took the new data', done, `${await page.textContent('#jobTitle')} | ${await page.textContent('#jobDetail')}`);
   const st3 = await getJson('/api/status');
   check('server job.state = done; no queued marks left', st3.job && st3.job.state === 'done' && st3.pending_marks === 0, JSON.stringify({ job: st3.job, pending: st3.pending_marks }));
-  const reloaded = await until(async () => {
-    const f = frameOf();
-    if (!f) return null;
-    return (await f.evaluate(() => !window.__e2eBeforeReload && typeof window.__frametraceSummary === 'function' && document.querySelectorAll('#recordGrid .card').length > 0)) ? f : null;
-  }, 30000);
-  const srcAfter = await page.$eval('#reviewFrame', (f) => f.getAttribute('src'));
-  check('viewer reloaded itself (ft-reload acked) without replacing the frame src', reloaded && srcAfter === srcBefore, `${srcBefore} → ${srcAfter}`);
-  const after = reloaded ? await reloaded.evaluate(() => window.__frametraceSummary()) : null;
+  const reloaded = await until(async () => (await page.evaluate(() => window.FTViewer.summary().byKind.carved > 0 && document.querySelectorAll('#hViewerHost #recordGrid .card').length > 0)) ? page : null, 30000);
+  const gens = await page.evaluate(() => (window.__e2eRecords || []).map((d) => d.generation));
+  check('viewer re-initialised in place (FTViewer.reload): new records generation, no page navigation', reloaded && gens.length > 0 && navigations === navsBefore, `generations ${JSON.stringify(gens)}, navigations ${navigations - navsBefore}`);
+  const after = reloaded ? await page.evaluate(() => window.FTViewer.summary()) : null;
   console.log('viewer after carve:', JSON.stringify(after));
   check('carved candidates appear in the refreshed viewer', after && (after.byKind.carved || 0) > 0 && after.total > before.total, `before ${before.total} → after ${after && after.total}`);
   const meta = await getJson('/api/records-meta');
   const stored = (meta.annotations?.marks || []).find((m) => (m.record_id || m.id) === markId);
   check('mark saved during the job persisted in the case DB', stored && stored.status === 'important', JSON.stringify(stored || null));
-  const shown = reloaded && await reloaded.evaluate((id) => {
+  const shown = reloaded && await page.evaluate((id) => {
     const card = document.querySelector(`#recordGrid .card[data-id="${id}"]`);
-    return { marked: window.__frametraceSummary().marked, cls: card ? card.className : '', save: document.getElementById('saveState')?.dataset.state };
+    return { marked: window.FTViewer.summary().marked, cls: card ? card.className : '', save: document.getElementById('saveState')?.dataset.state };
   }, markId);
   check('mark still shown after the viewer reload; save state clean', shown && shown.marked >= 1 && shown.save === 'saved', JSON.stringify(shown));
   if (shots) await page.screenshot({ path: join(shots, 'jobs-carve-done.png') });
 
   // ---- 4. clip export from the viewer ---------------------------------------
-  const v = reloaded || frameOf();
+  const v = page; // hosted viewer: same document
   const clipId = await v.evaluate(() => {
     const card = [...document.querySelectorAll('#recordGrid .card[data-id^="vid_"]')]
       .find((c) => /FRONT_20260908_010000|FRONT_20260908_010400/.test(c.textContent)) || document.querySelector('#recordGrid .card[data-id^="vid_"]');

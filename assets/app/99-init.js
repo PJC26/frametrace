@@ -1,3 +1,2 @@
 syncInputKind();
-renderCrumbs();
 poll();
