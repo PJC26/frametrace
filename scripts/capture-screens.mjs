@@ -53,6 +53,19 @@ if (!flag('no-build')) {
 }
 const exe = join(targetDir, 'debug', process.platform === 'win32' ? 'frametrace-app.exe' : 'frametrace-app');
 if (!existsSync(exe)) { console.error('missing binary ' + exe); process.exit(1); }
+// STR-01: the shell page is bundled at build time from assets/examiner_app.html
+// + assets/app/* (and the viewer from assets/viewer/*). With --no-build a
+// binary older than those sources would screenshot stale UI.
+if (flag('no-build')) {
+  const exeTime = statSync(exe).mtimeMs;
+  const sources = [join(repo, 'assets/examiner_app.html')];
+  for (const dir of ['assets/app', 'assets/viewer']) {
+    const abs = join(repo, dir);
+    if (existsSync(abs)) for (const f of readdirSync(abs)) sources.push(join(abs, f));
+  }
+  const stale = sources.filter((f) => existsSync(f) && statSync(f).mtimeMs > exeTime);
+  if (stale.length) console.warn(`[warn] --no-build: ${stale.length} UI source file(s) are newer than ${exe} — screenshots may show stale UI (e.g. ${stale[0]})`);
+}
 
 // ---- demo source + isolated state ------------------------------------------
 const work = mkdtempSync(join(tmpdir(), 'ft-shots-'));
@@ -120,6 +133,10 @@ try {
   await page.dispatchEvent('#sourcePath', 'input');
   await page.dispatchEvent('#caseDir', 'input');
   await sleep(400);
+  // UX-11 preflight panel (assets/app/35-preflight.js): let it settle so
+  // the shot shows the result, not "사전 점검 중…" (hidden on servers
+  // without /api/preflight).
+  await page.waitForFunction(() => { const p = document.getElementById('preflight'); return !p || p.hidden || !/사전 점검 중/.test(p.textContent || ''); }, null, { timeout: 6000 }).catch(() => {});
   await shot('01b-start-filled', '입력 단계 — 데모 소스와 케이스 폴더를 채운 상태 (Input stage, filled)');
   await page.click('#btnStart');
   await page.waitForSelector('#progCard.on', { timeout: 15000 }).catch(() => {});
@@ -134,6 +151,15 @@ try {
   await frame.locator('.card[data-id]').first().waitFor({ timeout: 30000 });
   await sleep(1200);
   await shot('03-review-embedded', '검토 단계 — 셸 안에 임베드된 증거 뷰어 (Review stage, viewer embedded in the shell)');
+  // UX-06: Recover runs as a background job with a visible panel. The demo
+  // folder case has no filesystem inspection, so this shows the honest
+  // failure state (and leaves the case untouched).
+  if (await page.locator('#btnRecoverDeleted').isVisible().catch(() => false)) {
+    await page.click('#btnRecoverDeleted');
+    await page.waitForFunction(() => /\b(ok|failed|cancelled|deferred)\b/.test(document.getElementById('jobPanel')?.className || ''), null, { timeout: 20000 }).catch(() => {});
+    await shot('03b-review-job', '검토 단계 — 삭제 영상 복구 작업 표시줄 (데모 케이스: 조사된 이미지 없음 → 실패 표시) (Background recover job panel)');
+    if (await page.locator('#btnJobClose').isVisible().catch(() => false)) await page.click('#btnJobClose');
+  }
 
   // Standalone viewer (what examiners open full-screen / in a new window).
   const vpage = await ctx.newPage();
