@@ -346,6 +346,14 @@ pub(crate) fn state_lock(state: &SharedState) -> MutexGuard<'_, JobState> {
 /// opened case so restarting the workstation returns to it instead of
 /// resetting to an empty stage 1 (and 404ing /review/*).
 pub(crate) fn session_file() -> Option<PathBuf> {
+    // Unit tests drive open-case/start in-process; never let them overwrite
+    // the examiner's real session file.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!(
+            "frametrace-test-session-{}.json",
+            std::process::id()
+        )));
+    }
     crate::audit_key::config_dir().map(|dir| dir.join("workstation-session.json"))
 }
 
