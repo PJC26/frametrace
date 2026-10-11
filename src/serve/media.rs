@@ -27,7 +27,9 @@ pub(crate) fn api_capture_frame(request: &Request, state: &SharedState) -> Strin
         return api_err("재생 시각 값이 올바르지 않습니다.");
     }
     let image_b64 = body_value(&request.body, "image").unwrap_or_default();
-    if image_b64.is_empty() || image_b64.len() > MAX_BODY {
+    // The route's request cap is MAX_CAPTURE_FRAME_BODY (http.rs): a 4K
+    // JPEG's base64 easily exceeds the generic 4 MiB MAX_BODY.
+    if image_b64.is_empty() || image_b64.len() > MAX_CAPTURE_FRAME_BODY {
         return "{\"ok\":false,\"error\":\"프레임 이미지가 비었거나 너무 큽니다.\"}".to_string();
     }
     let Some(bytes) = crate::audit_key::base64_decode(&image_b64) else {
