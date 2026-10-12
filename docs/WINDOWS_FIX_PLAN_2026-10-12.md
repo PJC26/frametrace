@@ -26,7 +26,7 @@
 | 10 explorer/msedge 이름 실행 | **고침** | ★ `mod.rs:360-381` `Command::new("msedge.exe")`, `"explorer.exe"` | `%SystemRoot%\explorer.exe`, Edge는 절대 경로 목록→App Paths 레지스트리→ShellExecuteW 폴백 |
 | 11 토큰 URL 노출 | **고침** | 미확인(워커가 `replaceState`·`Referrer-Policy` 존재 여부 먼저 grep) | 헤더 + 쿠키 심은 뒤 `history.replaceState` |
 | 12 지연 트랜잭션 | **고침** | ★ `marks.rs:108`, `scan.rs:16,40` `conn.transaction()` | `TransactionBehavior::Immediate` 공용 헬퍼 |
-| 13 HMAC 제거 무경고 | **고침(리뷰 정정)** | ★ `audit.rs:420` "mixed keyed/unkeyed" 경고 **이미 있음**. 빈틈은 (a) 전부 unkeyed로 재체인하면 경고 0, (b) keyed→unkeyed 전환이 "mixed"로만 뭉뚱그려짐 | 키 설정됨+keyed 0 → 경고; keyed→unkeyed 전환 → 키 설정 시 오류/미설정 시 줄번호 경고 |
+| 13 HMAC 제거 무경고 | **고침(리뷰 정정)** | ★ `audit.rs:420` "mixed keyed/unkeyed" 경고 **이미 있음**. 빈틈은 (a) 전부 unkeyed로 재체인하면 경고 0, (b) keyed→unkeyed 전환이 "mixed"로만 뭉뚱그려짐 | 키 설정됨+keyed 0 → 경고; keyed→unkeyed 전환 → 키 설정 시 오류/미설정 시 줄번호 경고 | — **적대적 리뷰 후 변경:** keyed→unkeyed 전환은 키 유무와 관계없이 줄번호 경고 + StructuralOnly 등급(인수인계 시 정상 체인을 FAILED로 표기하지 않도록)
 | 14 잘림/빈 로그 탐지 | **비목표** | — | 매니페스트에 앵커(엔트리 수·마지막 해시) 기록하는 스키마 변경 필요. 별도 설계(PLAN-v100 추가 항목)로 분리 |
 | 15 e01/tsk-audit 검증 누락 | **고침** | ★ `custody.rs:356` `ends_with("log.jsonl")`만 수집 | `-audit.jsonl` 포함 |
 | 16 DAV 파싱 실패 조용히 제외 | **고침** | ★ `anomaly.rs:518` `let Ok(frames) = … else { continue }`, `dav.rs:123` 첫 불량 프레임에서 Err | `dav-parse-limitation` finding (기존 `dav-date-coverage-limitation` 패턴) |
