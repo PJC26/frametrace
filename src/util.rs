@@ -607,6 +607,112 @@ mod tests {
         assert_eq!(csv_safe_cell("a,b"), "\"a,b\"");
         assert_eq!(csv_safe_cell("a\"b"), "\"a\"\"b\"");
     }
+
+    /// Guards the assumption that std's Windows spawn path does not leak one
+    /// child's inheritable stdio pipe ends into a sibling spawned concurrently
+    /// from another thread. std (1.94, `sys/process/windows.rs`) creates the
+    /// child-side pipe ends (`OBJ_INHERIT`) and calls `CreateProcessW` under a
+    /// process-wide `CREATE_PROCESS_LOCK`, and drops those ends before the
+    /// lock is released. If that ever regressed, a short child's stdout reader
+    /// would not reach EOF after the child exits, because a long-running
+    /// sibling would hold a copy of its write end — reader joins after child
+    /// exit (cancellable job steps, run_with_timeout, parallel thumbnails)
+    /// would then hang until the unrelated sibling exits.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_spawns_do_not_leak_stdout_pipes_into_siblings() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+
+        let system32 = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+        )
+        .join("System32");
+        let ping = system32.join("PING.EXE");
+        let cmd = system32.join("cmd.exe");
+
+        // Long-running siblings, spawned continuously from other threads while
+        // the short children below are spawned, so the spawn windows overlap.
+        let stop = Arc::new(AtomicBool::new(false));
+        let long_running: Arc<Mutex<Vec<std::process::Child>>> = Arc::default();
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                let long_running = Arc::clone(&long_running);
+                let ping = ping.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let child = Command::new(&ping)
+                            .args(["-n", "120", "127.0.0.1"])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .expect("spawn long-running sibling");
+                        let mut guard = long_running.lock().unwrap();
+                        guard.push(child);
+                        if guard.len() >= 24 {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut outcome = Ok(());
+        for round in 0..40 {
+            let mut short = Command::new(&cmd)
+                .args(["/D", "/C", "echo short"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn short child");
+            let mut stdout = short.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let result = stdout.read_to_end(&mut buf).map(|_| buf);
+                let _ = tx.send(result);
+            });
+            short.wait().expect("wait short child");
+            // The short child has exited; its stdout reader must see EOF
+            // promptly. A leaked write end held by a 120 s sibling would keep
+            // this blocked far past the bound.
+            match rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(Ok(buf)) => {
+                    assert!(String::from_utf8_lossy(&buf).contains("short"));
+                }
+                Ok(Err(err)) => {
+                    outcome = Err(format!("round {round}: reader failed: {err}"));
+                    break;
+                }
+                Err(_) => {
+                    outcome = Err(format!(
+                        "round {round}: stdout reader did not reach EOF within 15s after the \
+                         child exited — a concurrently spawned sibling inherited its pipe"
+                    ));
+                    break;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        let mut siblings = std::mem::take(&mut *long_running.lock().unwrap());
+        assert!(!siblings.is_empty(), "no long-running sibling was spawned");
+        for child in &mut siblings {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        outcome.unwrap();
+    }
+
     #[test]
     fn run_with_timeout_kills_stuck_children() {
         #[cfg(target_os = "windows")]
