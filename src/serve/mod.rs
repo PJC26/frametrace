@@ -252,6 +252,9 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
         open_in_browser(&url);
     }
     serve_on(listener, state);
+    // Drop the instance file while it still names this process, so later
+    // launches never send a token to whatever reuses the port.
+    discovery::remove_instance_file_if_owned();
     // Shutdown path (/api/shutdown ends the accept loop; it is refused while a
     // step runs, so this only reaps stragglers): never leave pipeline process
     // trees (ffmpeg grandchildren) running after the workstation exits. Kept

@@ -650,7 +650,7 @@ mod tests {
     /// to leave this list as those land.
     #[test]
     fn every_command_spawn_site_hides_the_console() {
-        const PENDING: &[&str] = &["serve/system.rs", "dfxml.rs", "html_report.rs", "report.rs"];
+        const PENDING: &[&str] = &[];
         const DEFINES_HELPERS: &[&str] = &["util.rs", "serve/proc.rs"];
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![src.clone()];

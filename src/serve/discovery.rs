@@ -35,7 +35,6 @@ fn home_dir() -> Option<PathBuf> {
 /// would orphan the live instance from discovery). Failures are reported,
 /// not swallowed. Returns whether a file was removed.
 // Called from serve::run once the accept loop ends (integration step).
-#[allow(dead_code)]
 pub(crate) fn remove_instance_file_if_owned() -> bool {
     let Some(path) = instance_file_path() else {
         return false;
@@ -57,7 +56,6 @@ pub(crate) fn remove_instance_file_if_owned() -> bool {
 /// Read-then-delete is not atomic: a server starting in the same instant
 /// could rewrite the file in between and lose it; that server is then just
 /// not discoverable until its next start (a stale window, never a leak).
-#[allow(dead_code)]
 pub(crate) fn remove_instance_file_if_pid(path: &Path, pid: u32) -> Result<bool, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,

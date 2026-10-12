@@ -90,6 +90,7 @@ pub(crate) fn tool_available(name: &str, version_arg: &str) -> bool {
         return true;
     }
     let mut command = Command::new(&resolved);
+    crate::util::hide_console(&mut command);
     command.arg(version_arg);
     command
         .stdin(std::process::Stdio::null())
