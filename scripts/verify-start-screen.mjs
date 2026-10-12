@@ -287,6 +287,14 @@ try {
   const caseRows = await page.locator('#recentCaseRow li', { hasText: 'case-a' }).count();
   check('c. the case is listed once (no duplicate from the browser history)', caseRows === 1, `${caseRows} rows`);
   check('c. empty state again: host hidden, chip hidden', await page.locator('#hViewerHost').isHidden() && await page.locator('#jobPanel').isHidden());
+  // While background work still reports busy the row is deliberately a
+  // quiet "열기" (no primary); slow runners stay there for a while after
+  // returning home, so measure the layout once it has settled.
+  const settled = await until(async () => {
+    const st = await getJson('/api/status');
+    return !st.busy && st.phase !== 'running' && await page.locator('#recentCaseRow button.primary').count() > 0;
+  }, 30000, 250);
+  check('g. with recent: [이어서 검토] appears once background work settles', !!settled);
   await shot(page, 'start-with-recent-1366');
   checkLayout('g. with recent 1366x768 light', await page.evaluate(layoutProbe), true);
   for (const [w, h] of [[1920, 1080], [1366, 768]]) {

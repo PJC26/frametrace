@@ -773,7 +773,7 @@ pub(crate) mod launch {
 
     #[cfg(test)]
     mod tests {
-        use super::{resolve_edge_path, resolve_explorer_path};
+        use super::{is_absolute_windows_path, resolve_edge_path, resolve_explorer_path};
         use std::collections::HashMap;
         use std::ffi::OsString;
         use std::path::{Path, PathBuf};
@@ -797,7 +797,8 @@ pub(crate) mod launch {
                 resolve_edge_path(&|name| env.get(name).cloned(), &|p| p == present, &|_| None)
                     .unwrap();
             assert_eq!(found, present);
-            assert!(found.is_absolute());
+            // Windows-style absolute on every host OS (the resolver's contract).
+            assert!(is_absolute_windows_path(&found));
         }
 
         #[test]
