@@ -957,3 +957,184 @@ fn copy_ranges_checks_byte_counts_and_writes_full_output() {
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
     let _ = fs::remove_dir_all(&root);
 }
+
+// --- item 18: checked offset arithmetic --------------------------------
+
+/// A region whose end overflows u64 (region_off = u64::MAX-1) is skipped
+/// with an "offset overflow" warning — no panic, no wrapped join.
+#[test]
+fn gapfill_region_offset_overflow_is_skipped_with_warning() {
+    let source = std::env::temp_dir().join(format!(
+        "frametrace-mp4-overflow-region-{}.raw",
+        std::process::id()
+    ));
+    fs::write(&source, [0u8; 64]).unwrap();
+    let artifact = fake_artifact("carve_000001", 0, 64, "mp4-ftyp", "mp4", &source);
+    for moov_hunt in [None, Some(source.as_path())] {
+        let mut joins = Vec::new();
+        let mut warnings = Vec::new();
+        super::emit_mp4_gapfills(
+            &artifact,
+            &[(u64::MAX - 1, 100)],
+            100,
+            moov_hunt,
+            &mut joins,
+            &mut warnings,
+            "test",
+        );
+        assert!(joins.is_empty(), "{} joins", joins.len());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("offset overflow"), "{warnings:?}");
+    }
+    let _ = fs::remove_file(&source);
+}
+
+/// A real fragment whose mdat declares a 64-bit largesize near u64::MAX:
+/// the box walk and the reassembly pass must not overflow (debug builds
+/// would panic); the candidate is skipped with a warning.
+#[test]
+fn mp4_huge_largesize_mdat_does_not_overflow() {
+    let (case_dir, source) = reasm_case("mp4-largesize");
+    let mut data = Vec::new();
+    data.extend_from_slice(&bx(b"ftyp", b"isom\0\0\0\0isommp42".to_vec()));
+    data.extend_from_slice(&1u32.to_be_bytes()); // size32 = 1 → largesize follows
+    data.extend_from_slice(b"mdat");
+    data.extend_from_slice(&(u64::MAX - 4).to_be_bytes());
+    data.extend_from_slice(&[0xBBu8; 400]);
+    let head_len = data.len() as u64;
+    data.extend_from_slice(&[0xCCu8; 1500]); // anonymous region
+    fs::write(&source, &data).unwrap();
+
+    let boxes = super::mp4_top_boxes(&source, 0, head_len);
+    assert_eq!(boxes.len(), 2, "{boxes:?}");
+    assert!(boxes[1].truncated, "{boxes:?}");
+
+    let mut artifacts = vec![fake_artifact(
+        "carve_000001",
+        0,
+        head_len,
+        "mp4-ftyp",
+        "mp4",
+        &source,
+    )];
+    let mut warnings = Vec::new();
+    super::reassemble_fragments(
+        &source,
+        &case_dir,
+        data.len() as u64,
+        &mut artifacts,
+        &mut warnings,
+    )
+    .unwrap();
+    assert_eq!(artifacts.len(), 1, "no join from an overflowing mdat");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("carve_000001") && w.contains("offset overflow")),
+        "{warnings:?}"
+    );
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}
+
+// --- item 19: resume twice -------------------------------------------
+
+/// Carve-file entry ids in the carve log (in order) and the number of
+/// carve-resume lines.
+fn carve_log_ids(case_dir: &Path) -> (Vec<String>, usize) {
+    let log = fs::read_to_string(case_dir.join("artifacts/carved/carve-log.jsonl")).unwrap();
+    let mut ids = Vec::new();
+    let mut resumes = 0;
+    for line in log.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        match value["event"].as_str() {
+            Some("carve-file") => ids.push(value["id"].as_str().unwrap().to_string()),
+            Some("carve-resume") => resumes += 1,
+            other => panic!("unexpected carve log event {other:?}"),
+        }
+    }
+    (ids, resumes)
+}
+
+/// Item 19: two interrupted runs, then resumes.
+///
+/// (A) Run 1 dies after artifact 1; resume 1 re-carves artifact 2 and
+/// dies before writing outputs (db/carve_results.json is blocked by a
+/// directory); resume 2 completes. Artifact log lines are written only at
+/// the end of a completed run, so each id appears once.
+///
+/// (B) A crash after the log append but before the checkpoint is deleted
+/// (simulated by restoring the checkpoint file) makes resume 3 replay the
+/// same artifacts. Their carve-file lines must not be appended again; the
+/// resume itself is still logged (one carve-resume line per completed
+/// resumed run).
+#[test]
+fn resume_twice_does_not_duplicate_artifact_log_lines() {
+    let (case_dir, source, content) = resume_fixture("twice");
+    let options = super::CarveOptions::default();
+    let progress = case_dir.join("db/carve-progress.jsonl");
+    let results = case_dir.join("db/carve_results.json");
+    let log_path = case_dir.join("artifacts/carved/carve-log.jsonl");
+    let first = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
+    assert_eq!(first.artifacts.len(), 2);
+
+    // Crash state after run 1: only artifact 1 landed, nothing logged.
+    let _ = fs::remove_file(&results);
+    let _ = fs::remove_file(&log_path);
+    fs::remove_file(&first.artifacts[1].output_path).unwrap();
+    let canonical = source.canonicalize().unwrap();
+    let metadata = fs::metadata(&source).unwrap();
+    let fingerprint = carve_fingerprint(&canonical, &metadata, &options);
+    {
+        let mut checkpoint =
+            RunCheckpoint::begin(&progress, "carve-file", &fingerprint, ResumeMode::Auto).unwrap();
+        let hits: Vec<_> = [0u64, 128]
+            .into_iter()
+            .map(|offset| super::CarveHit {
+                offset,
+                signature: "mp4-ftyp".to_string(),
+                extension: "mp4".to_string(),
+            })
+            .collect();
+        checkpoint
+            .append_line(&scan_progress_line(
+                content.len() as u64,
+                &hits,
+                &super::ScanSuppress::default(),
+            ))
+            .unwrap();
+        checkpoint
+            .append_line(&format!("{{\"carved\":{}}}", first.artifacts[0].to_json()))
+            .unwrap();
+    }
+
+    // Resume 1: re-carves artifact 2, then fails writing outputs.
+    fs::create_dir_all(results.join("blocker")).unwrap();
+    let err = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap_err();
+    assert!(err.contains("carve results"), "{err}");
+    assert!(progress.is_file(), "failed run keeps its checkpoint");
+    assert!(!log_path.exists());
+    fs::remove_dir_all(&results).unwrap();
+
+    // Resume 2 completes, replaying both artifacts.
+    let saved_checkpoint = fs::read(&progress).unwrap();
+    let second = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
+    assert_eq!(second.resumed_artifacts, 2);
+    let (ids, resumes) = carve_log_ids(&case_dir);
+    assert_eq!(ids, ["carve_000001", "carve_000002"]);
+    assert_eq!(resumes, 1);
+
+    // (B) Crash between the log append and checkpoint removal.
+    fs::write(&progress, &saved_checkpoint).unwrap();
+    let third = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
+    assert_eq!(third.resumed_artifacts, 2);
+    assert_eq!(third.artifacts.len(), 2);
+    let (ids, resumes) = carve_log_ids(&case_dir);
+    assert_eq!(
+        ids,
+        ["carve_000001", "carve_000002"],
+        "replayed artifacts were logged twice"
+    );
+    assert_eq!(resumes, 2);
+    crate::audit::verify_chained_jsonl(&log_path).unwrap();
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}

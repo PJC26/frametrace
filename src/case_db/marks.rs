@@ -104,8 +104,7 @@ pub fn patch_review_annotations_by(
     let mut conn = open_case_db(case_dir)?;
     init_schema(&conn)?;
     let now = u64_to_i64(now_unix()?);
-    let tx = conn
-        .transaction()
+    let tx = begin_write(&mut conn)
         .map_err(|err| format!("failed to start SQLite marks transaction: {err}"))?;
     for id in deleted_ids {
         let Some(old) = read_stored_mark(&tx, id)? else {

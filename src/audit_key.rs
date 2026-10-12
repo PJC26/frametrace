@@ -436,34 +436,74 @@ fn write_keyring(path: &Path, keyring: &KeyringFile) -> Result<(), String> {
     }
     let text = serde_json::to_string_pretty(keyring)
         .map_err(|err| format!("failed to serialize audit keyring: {err}"))?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|err| format!("failed to write audit keyring {}: {err}", path.display()))?;
-    file.write_all(text.as_bytes())
-        .and_then(|_| file.sync_all())
-        .map_err(|err| format!("failed to write audit keyring {}: {err}", path.display()))?;
-    drop(file);
-    // Truncate keeps a pre-existing file's mode; normalize so key material
-    // never sits group/other-readable after a re-rotation.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
+    // Atomic replace: the keyring holds every retired key, so a crash
+    // mid-write must never leave it truncated (that would strand every
+    // older keyed entry). Write + fsync a sibling temp file, then rename it
+    // over the keyring — `std::fs::rename` replaces an existing target on
+    // both Unix (rename(2)) and Windows (MoveFileExW REPLACE_EXISTING).
+    let tmp = keyring_temp_path(path);
+    let write_tmp = || -> Result<(), String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp).map_err(|err| {
             format!(
-                "failed to restrict audit keyring {} permissions: {err}",
-                path.display()
+                "failed to write audit keyring temp file {}: {err}",
+                tmp.display()
             )
         })?;
+        file.write_all(text.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|err| {
+                format!(
+                    "failed to write audit keyring temp file {}: {err}",
+                    tmp.display()
+                )
+            })?;
+        drop(file);
+        // A stale temp file from an earlier crash keeps its old mode on
+        // truncate; normalize so key material is never group/other-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(
+                |err| {
+                    format!(
+                        "failed to restrict audit keyring {} permissions: {err}",
+                        tmp.display()
+                    )
+                },
+            )?;
+        }
+        std::fs::rename(&tmp, path).map_err(|err| {
+            format!(
+                "failed to replace audit keyring {} with {}: {err} (the previous keyring is unchanged)",
+                path.display(),
+                tmp.display()
+            )
+        })
+    };
+    if let Err(err) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
     }
     crate::util::sync_parent_directory(path);
     Ok(())
+}
+
+/// Sibling temp path used by [`write_keyring`]'s atomic replace (same
+/// directory, so the rename never crosses filesystems).
+fn keyring_temp_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "audit-keys.json".into());
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 /// Key ids land inside JSON strings (`entry_hmac_key_id`, keyring `keys`
@@ -687,6 +727,40 @@ mod tests {
         );
         let keyring = load_keyring(&keyring_path).unwrap().unwrap();
         assert_eq!(keyring.keys.len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Item 17: re-writing an existing keyring goes through temp+rename —
+    /// the result holds the old and new keys, and no `.tmp` file is left.
+    /// A stale `.tmp` from an earlier crash is overwritten, not trusted.
+    #[test]
+    fn keyring_rewrite_is_atomic_and_leaves_no_temp_file() {
+        let dir = test_dir("keyring-atomic");
+        let keyring_path = dir.join("audit-keys.json");
+        let tmp = super::keyring_temp_path(&keyring_path);
+        assert_eq!(tmp, dir.join("audit-keys.json.tmp"));
+
+        rotate_at(&keyring_path, Some("one"), None).unwrap();
+        let first = fs::read_to_string(&keyring_path).unwrap();
+        assert!(!tmp.exists());
+
+        fs::write(&tmp, "stale garbage from a crashed write").unwrap();
+        let rotation = rotate_at(&keyring_path, Some("two"), None).unwrap();
+        assert!(!tmp.exists(), "temp file left behind");
+        let second = fs::read_to_string(&keyring_path).unwrap();
+        assert_ne!(first, second);
+        let keyring = load_keyring(&keyring_path).unwrap().unwrap();
+        assert_eq!(keyring.active, "two");
+        let ids: Vec<&str> = keyring.keys.iter().map(|key| key.id.as_str()).collect();
+        assert!(ids.contains(&"one") && ids.contains(&"two"), "{ids:?}");
+        let active = keyring.keys.iter().find(|key| key.id == "two").unwrap();
+        assert_eq!(active.bytes, rotation.new_key.bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&keyring_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "keyring mode was {mode:o}");
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

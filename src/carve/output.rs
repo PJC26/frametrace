@@ -36,13 +36,76 @@ pub(super) fn copy_ranges(source: &Path, ranges: &[(u64, u64)], output: &Path) -
     writer.get_ref().sync_all()
 }
 
-pub(super) fn write_carve_outputs(case_dir: &Path, result: &CarveResult) -> Result<(), String> {
+/// Writes the results index and appends one `carve-file` line per artifact.
+///
+/// `replayed_outputs` are artifacts replayed from a checkpoint. If the run
+/// that carved them died AFTER appending their log lines but BEFORE its
+/// checkpoint was removed, those lines are already in the carve log; a
+/// replayed artifact whose (id, output path, sha256) is already logged is
+/// not appended again, so a resume never duplicates artifact entries.
+/// Fresh artifacts (always a new unique output path) are always logged.
+pub(super) fn write_carve_outputs(
+    case_dir: &Path,
+    result: &CarveResult,
+    replayed_outputs: &[PathBuf],
+) -> Result<(), String> {
     write_text_atomic(&case_dir.join("db/carve_results.json"), &result.to_json())
         .map_err(|err| format!("failed to write carve results: {err}"))?;
 
     let log_path = case_dir.join("artifacts/carved/carve-log.jsonl");
+    let already_logged = if replayed_outputs.is_empty() {
+        Vec::new()
+    } else {
+        logged_carve_files(&log_path)?
+    };
     for artifact in &result.artifacts {
+        let key = (
+            artifact.id.clone(),
+            artifact.output_path.to_string_lossy().to_string(),
+            artifact.sha256.to_ascii_lowercase(),
+        );
+        if replayed_outputs.contains(&artifact.output_path) && already_logged.contains(&key) {
+            continue;
+        }
         audit::append_chained_jsonl(&log_path, &artifact.to_json())?;
     }
     Ok(())
+}
+
+/// (id, output_path, lowercase sha256) of every `carve-file` entry already
+/// in the carve log. A missing log is empty; an unreadable one is an error
+/// (never guess that nothing was logged).
+fn logged_carve_files(log_path: &Path) -> Result<Vec<(String, String, String)>, String> {
+    let text = match std::fs::read_to_string(log_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(format!(
+                "failed to read carve log {} to de-duplicate resumed artifacts: {err}",
+                log_path.display()
+            ));
+        }
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // a torn/foreign line is verify-audit's concern
+        };
+        if value.get("event").and_then(|v| v.as_str()) != Some("carve-file") {
+            continue;
+        }
+        let field = |key: &str| {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        out.push((
+            field("id"),
+            field("output_path"),
+            field("sha256").to_ascii_lowercase(),
+        ));
+    }
+    Ok(out)
 }

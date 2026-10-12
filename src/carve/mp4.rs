@@ -8,7 +8,7 @@ pub(super) struct Mp4Box {
     /// Offset of the box payload (after the 8/16-byte header).
     payload: u64,
     /// Declared size ran past `span` — box is truncated.
-    truncated: bool,
+    pub(super) truncated: bool,
 }
 
 /// Top-level box walk over [start, start+span); stops at the first
@@ -19,9 +19,14 @@ pub(super) fn mp4_top_boxes(source: &Path, start: u64, span: u64) -> Vec<Mp4Box>
     let Ok(mut file) = File::open(source) else {
         return boxes;
     };
-    let hard_end = start + span;
+    // Offsets/sizes come straight from untrusted bytes (a 64-bit largesize
+    // can be ~u64::MAX), so every sum is checked: an overflowing box is
+    // treated as running past the span, never as a wrapped small offset.
+    let Some(hard_end) = start.checked_add(span) else {
+        return boxes;
+    };
     let mut cursor = start;
-    while cursor + 8 <= hard_end && boxes.len() < 65536 {
+    while cursor.checked_add(8).is_some_and(|end| end <= hard_end) && boxes.len() < 65536 {
         let mut hdr = [0u8; 8];
         if file.seek(SeekFrom::Start(cursor)).is_err() || file.read_exact(&mut hdr).is_err() {
             break;
@@ -45,7 +50,7 @@ pub(super) fn mp4_top_boxes(source: &Path, start: u64, span: u64) -> Vec<Mp4Box>
         if size < 8 {
             break;
         }
-        let truncated = cursor + size > hard_end;
+        let truncated = cursor.checked_add(size).is_none_or(|end| end > hard_end);
         boxes.push(Mp4Box {
             typ,
             offset: cursor - start,
@@ -70,16 +75,19 @@ pub(super) fn mp4_sample_payload_bytes(
     frag_start: u64,
     moov: &Mp4Box,
 ) -> Option<u64> {
-    let moov_end = moov.offset + moov.size;
+    let moov_end = moov.offset.checked_add(moov.size)?;
     let mut total = 0u64;
     // Stack of (cursor, end) container payload ranges; seed with moov's body.
-    let mut stack = vec![(frag_start + moov.payload, frag_start + moov_end)];
+    let mut stack = vec![(
+        frag_start.checked_add(moov.payload)?,
+        frag_start.checked_add(moov_end)?,
+    )];
     let Ok(mut file) = File::open(source) else {
         return None;
     };
     let mut found = false;
     while let Some((mut cursor, end)) = stack.pop() {
-        while cursor + 8 <= end {
+        while cursor.checked_add(8).is_some_and(|next| next <= end) {
             let mut hdr = [0u8; 8];
             if file.seek(SeekFrom::Start(cursor)).is_err() || file.read_exact(&mut hdr).is_err() {
                 break;
@@ -100,7 +108,7 @@ pub(super) fn mp4_sample_payload_bytes(
                 }
                 s => (u64::from(s), 8u64),
             };
-            if size < header || cursor + size > end {
+            if size < header || cursor.checked_add(size).is_none_or(|box_end| box_end > end) {
                 break;
             }
             match typ {
@@ -122,14 +130,16 @@ pub(super) fn mp4_sample_payload_bytes(
                         return None;
                     }
                     if sample_size != 0 {
-                        total += u64::from(sample_size) * u64::from(count);
+                        total = total.checked_add(u64::from(sample_size) * u64::from(count))?;
                     } else {
                         let mut entries = vec![0u8; count as usize * 4];
                         if file.read_exact(&mut entries).is_err() {
                             return None;
                         }
                         for chunk in entries.chunks_exact(4) {
-                            total += u64::from(u32::from_be_bytes(chunk.try_into().unwrap()));
+                            total = total.checked_add(u64::from(u32::from_be_bytes(
+                                chunk.try_into().unwrap(),
+                            )))?;
                         }
                     }
                     found = true;
@@ -155,17 +165,20 @@ pub(super) fn mp4_sample_payload_bytes(
                     match field {
                         4 => {
                             for byte in &entries {
-                                total += u64::from(byte >> 4) + u64::from(byte & 0x0f);
+                                total = total
+                                    .checked_add(u64::from(byte >> 4) + u64::from(byte & 0x0f))?;
                             }
                         }
                         8 => {
                             for byte in &entries {
-                                total += u64::from(*byte);
+                                total = total.checked_add(u64::from(*byte))?;
                             }
                         }
                         16 => {
                             for chunk in entries.chunks_exact(2) {
-                                total += u64::from(u16::from_be_bytes(chunk.try_into().unwrap()));
+                                total = total.checked_add(u64::from(u16::from_be_bytes(
+                                    chunk.try_into().unwrap(),
+                                )))?;
                             }
                         }
                         _ => return None,
@@ -195,7 +208,7 @@ pub(super) fn find_moov_in_region(
     // moov for typical files is small and sits near the gap; a 16 MiB
     // window bounds I/O while covering realistic bifragment layouts.
     let window = region_len.saturating_sub(search_from).min(16 * 1024 * 1024);
-    let abs = region_start + search_from;
+    let abs = region_start.checked_add(search_from)?;
     if file.seek(SeekFrom::Start(abs)).is_err() {
         return None;
     }
@@ -214,7 +227,7 @@ pub(super) fn find_moov_in_region(
                 if child_typ.iter().all(|b| (0x20..=0x7e).contains(b)) {
                     // Caller wants the offset from the REGION start, and
                     // this window began `search_from` bytes into it.
-                    return Some((search_from + i as u64 - 4, size));
+                    return Some((search_from.checked_add(i as u64 - 4)?, size));
                 }
             }
         }
@@ -243,7 +256,13 @@ pub(super) fn mp4_bifragment_joins(
         let moov = boxes.iter().find(|b| &b.typ == b"moov" && !b.truncated);
         let mdat = boxes.iter().find(|b| &b.typ == b"mdat");
         let Some(mdat) = mdat else { continue };
-        let mdat_end = mdat.offset + mdat.size;
+        let Some(mdat_end) = mdat.offset.checked_add(mdat.size) else {
+            warnings.push(offset_overflow_warning(
+                &artifact.id,
+                "mdat offset + declared size",
+            ));
+            continue;
+        };
         // stsz re-bounding is only sound when mdat is the LAST box: if a
         // moov (or anything else) follows it inside the fragment, those
         // bytes are real content and cutting at the payload end would
@@ -253,7 +272,13 @@ pub(super) fn mp4_bifragment_joins(
             Some(moov) if mdat_is_last => {
                 match mp4_sample_payload_bytes(source, artifact.offset, moov) {
                 Some(total) => {
-                    let true_end = mdat.payload + total;
+                    let Some(true_end) = mdat.payload.checked_add(total) else {
+                        warnings.push(offset_overflow_warning(
+                            &artifact.id,
+                            "mdat payload + stsz sample total",
+                        ));
+                        continue;
+                    };
                     if true_end < artifact.size_bytes && artifact.size_bytes - true_end >= 8 {
                         joins.push(JoinSpec {
                             ranges: vec![(artifact.offset, true_end)],
@@ -325,6 +350,13 @@ pub(super) fn emit_mp4_gapfills(
         if region_len < need {
             continue;
         }
+        if region_off.checked_add(region_len).is_none() {
+            warnings.push(offset_overflow_warning(
+                &artifact.id,
+                &format!("anonymous region at {region_off} + length {region_len}"),
+            ));
+            continue;
+        }
         // The tail's placement inside the region matters: when a moov was
         // found, its position anchors the layout — the `need` payload
         // bytes are whatever immediately PRECEDES it, so foreign gap bytes
@@ -337,8 +369,19 @@ pub(super) fn emit_mp4_gapfills(
             match find_moov_in_region(source, region_off, need, region_len) {
                 Some((rel, size)) => {
                     let payload_start = rel.saturating_sub(need);
-                    tail_off = region_off + payload_start;
-                    tail_len = rel + size - payload_start;
+                    let anchored = region_off.checked_add(payload_start).zip(
+                        rel.checked_add(size)
+                            .and_then(|end| end.checked_sub(payload_start)),
+                    );
+                    let Some((anchored_off, anchored_len)) = anchored else {
+                        warnings.push(offset_overflow_warning(
+                            &artifact.id,
+                            &format!("moov at region+{rel} ({size} bytes)"),
+                        ));
+                        continue;
+                    };
+                    tail_off = anchored_off;
+                    tail_len = anchored_len;
                     moov_note = format!(
                         "; plausible moov box located at region+{rel} ({size} bytes) — tail anchored to the {tail_len} bytes ending at the moov, not a blind region prefix"
                     );
@@ -374,4 +417,11 @@ pub(super) fn emit_mp4_gapfills(
             if emitted == 1 { "is" } else { "es" }
         ));
     }
+}
+
+/// Warning for a candidate skipped because an untrusted offset/size sum
+/// overflowed u64 — the candidate is dropped, never wrapped into a bogus
+/// small range.
+fn offset_overflow_warning(artifact_id: &str, what: &str) -> String {
+    format!("{artifact_id}: offset overflow ({what} exceeds u64) — reassembly candidate skipped")
 }

@@ -498,7 +498,9 @@ fn container_stream_findings(rows: &[IndexedRow]) -> Vec<Finding> {
 /// DAV frame-interval findings: consecutive video frames on the same channel
 /// whose embedded recording times jump by more than `DAV_FRAME_GAP_SECS`,
 /// indicating dropped frames or a recorder pause. Runs only for indexed DAV
-/// sources whose files are still reachable; unreadable files are skipped.
+/// sources whose files are still reachable (missing files are skipped). A
+/// reachable DAV the frame walker cannot parse yields a
+/// `dav-parse-limitation` finding instead of being dropped silently.
 fn dav_frame_gap_findings(case_dir: &Path, rows: &[IndexedRow]) -> Vec<Finding> {
     let _ = case_dir;
     let mut out = Vec::new();
@@ -514,8 +516,22 @@ fn dav_frame_gap_findings(case_dir: &Path, rows: &[IndexedRow]) -> Vec<Finding> 
         {
             continue;
         }
-        let Ok(frames) = crate::dav::walk_frames(path) else {
-            continue; // unparseable DAV stays out of anomaly scope
+        // `walk_frames` stops at the first frame it cannot parse. Never drop
+        // the file silently: record that its frame-interval check did not
+        // run, the same way invalid dates become a coverage limitation.
+        let frames = match crate::dav::walk_frames(path) {
+            Ok(frames) => frames,
+            Err(err) => {
+                out.push(Finding {
+                    kind: "dav-parse-limitation",
+                    selector: row.id.clone(),
+                    source_path: row.source_path.clone(),
+                    detail: format!(
+                        "DAV frame walk stopped: {err}; frame-interval (gap/regression) checks were not run for this file — a parser limitation, not a finding about the recording"
+                    ),
+                });
+                continue;
+            }
         };
 
         out.extend(dav_sequence_findings(row, &frames));
@@ -703,6 +719,53 @@ mod tests {
             ffprobe_ok: None,
         }];
         assert!(dav_frame_gap_findings(&dir, &steady_rows).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 16: a DAV whose frame walk fails (here: the second frame's
+    /// DHAV magic is corrupted) yields one `dav-parse-limitation` finding
+    /// instead of vanishing; another DAV's gap finding is unaffected.
+    #[test]
+    fn broken_dav_reports_parse_limitation_instead_of_skipping() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-dav-broken-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let row = |id: &str, path: &Path| IndexedRow {
+            id: id.into(),
+            source_path: path.to_string_lossy().to_string(),
+            sha256: None,
+            size_bytes: None,
+            modified_unix: None,
+            duration_seconds: None,
+            format_name: None,
+            video_codec: None,
+            ffprobe_ok: None,
+        };
+        let mut broken = dav_fixture_with_dates(0, 1);
+        let second_frame = broken.len() / 2;
+        assert_eq!(&broken[second_frame..second_frame + 4], b"DHAV");
+        broken[second_frame..second_frame + 4].copy_from_slice(b"XXXX");
+        let broken_path = dir.join("broken.dav");
+        std::fs::write(&broken_path, &broken).unwrap();
+        let gap_path = dir.join("gap.dav");
+        std::fs::write(&gap_path, dav_fixture_with_dates(0, 10)).unwrap();
+
+        let findings =
+            dav_frame_gap_findings(&dir, &[row("vid_1", &broken_path), row("vid_2", &gap_path)]);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert_eq!(findings[0].kind, "dav-parse-limitation");
+        assert_eq!(findings[0].selector, "vid_1");
+        assert!(
+            findings[0]
+                .detail
+                .contains(&format!("offset {second_frame}"))
+                && findings[0].detail.contains("DHAV frame magic"),
+            "{}",
+            findings[0].detail
+        );
+        assert_eq!(findings[1].kind, "dav-frame-gap");
+        assert_eq!(findings[1].selector, "vid_2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
