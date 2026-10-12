@@ -17,6 +17,38 @@ pub fn now_unix() -> Result<u64, String> {
         .map_err(|err| format!("system time before UNIX epoch: {err}"))
 }
 
+/// Windows `CREATE_NO_WINDOW` process-creation flag.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Keeps an external console tool (ffmpeg, ffprobe, icat, ...) from
+/// flashing a console window when the caller has no console of its own
+/// (`frametrace-app.exe` is a `windows_subsystem = "windows"` binary).
+/// No-op off Windows. Every `Command` that reaches `spawn`/`output`/
+/// `status` goes through this (or `run_with_timeout`/`spawn_tracked`,
+/// which call it) — a source-scan test enforces that.
+pub fn hide_console(command: &mut Command) -> &mut Command {
+    hide_console_with_flags(command, 0)
+}
+
+/// [`hide_console`] plus extra process-creation flags. `creation_flags`
+/// REPLACES the flag word on std's `Command`, so the one place that needs
+/// other flags (suspended spawn for job tracking, breakaway for the
+/// browser launch) must set them together with `CREATE_NO_WINDOW` here
+/// instead of calling `creation_flags` itself.
+pub fn hide_console_with_flags(command: &mut Command, extra_flags: u32) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW | extra_flags);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = extra_flags;
+    }
+    command
+}
+
 /// Runs an external command, killing it after `timeout_secs` when set.
 /// `None` keeps the historical unlimited behaviour for long conversions.
 pub fn run_with_timeout(
@@ -24,6 +56,7 @@ pub fn run_with_timeout(
     timeout_secs: Option<u64>,
 ) -> Result<Output, String> {
     let program = command.get_program().to_string_lossy().to_string();
+    hide_console(command);
     let Some(secs) = timeout_secs else {
         return command
             .output()
@@ -590,6 +623,80 @@ mod tests {
         };
         let error = run_with_timeout(&mut command, Some(1)).unwrap_err();
         assert!(error.contains("did not finish within 1s"), "{error}");
+    }
+
+    /// `CREATE_NO_WINDOW` must not break spawning a console child or
+    /// capturing its output (the flag detaches it from any console).
+    #[cfg(windows)]
+    #[test]
+    fn hide_console_child_still_runs_and_pipes_output() {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "echo hidden-ok"]);
+        let output = super::hide_console(&mut command).output().unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hidden-ok"));
+        // Through run_with_timeout as well (the common path).
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "echo timed-ok"]);
+        let output = run_with_timeout(&mut command, Some(30)).unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("timed-ok"));
+    }
+
+    /// Every production `Command::new` must reach the OS through
+    /// `hide_console` (directly, or via `run_with_timeout` /
+    /// `spawn_tracked`), otherwise the windowed app flashes a console per
+    /// external tool. Files that only spawn in tests are skipped; files
+    /// listed in PENDING are owned by another fix track and are expected
+    /// to leave this list as those land.
+    #[test]
+    fn every_command_spawn_site_hides_the_console() {
+        const PENDING: &[&str] = &["serve/system.rs", "dfxml.rs", "html_report.rs", "report.rs"];
+        const DEFINES_HELPERS: &[&str] = &["util.rs", "serve/proc.rs"];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src.clone()];
+        let mut offenders = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&src)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let name = path.file_name().unwrap().to_string_lossy();
+                if name == "tests.rs" || name.starts_with("tests_") || rel.starts_with("tests/") {
+                    continue;
+                }
+                if DEFINES_HELPERS.contains(&rel.as_str()) || PENDING.contains(&rel.as_str()) {
+                    continue;
+                }
+                let text = fs::read_to_string(&path).unwrap();
+                // Production code only: drop everything from the first
+                // `#[cfg(test)]` module on.
+                let production = text.split("#[cfg(test)]").next().unwrap_or("");
+                if !production.contains("Command::new(") {
+                    continue;
+                }
+                let covered = production.contains("hide_console(")
+                    || production.contains("hide_console_with_flags(")
+                    || production.contains("run_with_timeout(")
+                    || production.contains("spawn_tracked(");
+                if !covered {
+                    offenders.push(rel);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Command::new without hide_console/run_with_timeout/spawn_tracked in: {offenders:?}"
+        );
     }
 
     #[test]
