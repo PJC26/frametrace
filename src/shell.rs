@@ -21,8 +21,8 @@ use crate::serve::{self, ServeOptions};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
@@ -47,11 +47,18 @@ thread_local! {
     static CONTROLLER: RefCell<Option<ICoreWebView2Controller>> = const { RefCell::new(None) };
 }
 
-/// UI thread id shared with the server-watcher thread: if the embedded
-/// server dies while the window is still open (external shutdown, crash),
-/// the watcher posts a thread message that ends the message pump. A
-/// thread message avoids HWND reuse hazards — a posted WM_CLOSE could
-/// otherwise land on an unrelated window that recycled our handle.
+/// The frame window, shared with the server-watcher and cancel-then-close
+/// threads. They post private `WM_APP + n` window messages to it: unlike
+/// thread messages (`PostThreadMessageW`, hwnd == null), window messages
+/// are dispatched by modal loops too (window drag/resize, `MessageBoxW`),
+/// so a close request can no longer be dropped while the examiner moves
+/// the window. Cleared in WM_DESTROY, so nothing is posted to a handle the
+/// system may recycle afterwards; the private message ids (not WM_CLOSE)
+/// make a stray post to a recycled handle harmless anyway.
+static FRAME_HWND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// UI thread id: fallback target while no frame window is published (the
+/// pump still handles the thread-message form).
 static FRAME_THREAD: AtomicU32 = AtomicU32::new(0);
 
 /// Port of the server this process owns (0 when attached to a foreign
@@ -60,20 +67,37 @@ static FRAME_THREAD: AtomicU32 = AtomicU32::new(0);
 /// cancel-and-quit question.
 static OWNED_PORT: AtomicU16 = AtomicU16::new(0);
 
-/// Set while a cancel-then-close is in flight so a second WM_CLOSE (the
-/// examiner clicking × again) neither re-asks nor destroys the frame early.
-static CLOSING: AtomicBool = AtomicBool::new(false);
+/// When the in-flight cancel-then-close started (`None` when none runs).
+/// A second WM_CLOSE (the examiner clicking × again) neither re-asks nor
+/// destroys the frame early — but only until [`CLOSE_FORCE_AFTER`] has
+/// passed (see [`reclose_forces_close`]), so a lost or failed worker can
+/// never latch the window open for good. The worker also clears it when
+/// it cannot deliver its message.
+static CLOSING: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Thread message (hwnd == null) posted by the server watcher: the server
-/// is gone, end the pump.
+/// Window message posted by the server watcher: the server is gone,
+/// destroy the frame (WM_DESTROY then ends the pump).
 const MSG_SERVER_GONE: u32 = WM_APP;
-/// Thread message posted by the cancel-then-close worker: the job stopped
+/// Window message posted by the cancel-then-close worker: the job stopped
 /// (or the wait ran out), destroy the frame now.
 const MSG_CLOSE_NOW: u32 = WM_APP + 1;
 
 /// How long WM_CLOSE waits for a cancelled job to stop before the frame
 /// closes anyway (the shutdown path below has its own bound after that).
 const CLOSE_CANCEL_WAIT: Duration = Duration::from_secs(10);
+/// Timeout for each connect/write/read of a request the UI thread makes
+/// itself (the WM_CLOSE status probe) and of the cancel worker's status
+/// polls: loopback answers in milliseconds, and the UI thread must not
+/// freeze for long on a stalled server.
+const UI_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+/// Timeout for each connect/write/read of the off-UI-thread shutdown and
+/// cancel requests.
+const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// After this long a repeated WM_CLOSE during cancel-then-close destroys
+/// the frame even if the worker never reported back: the worker's own
+/// bound (initial cancel request, CLOSE_CANCEL_WAIT, one in-flight status
+/// poll) plus slack.
+const CLOSE_FORCE_AFTER: Duration = Duration::from_secs(10 + 1 + 3 + 2);
 /// How long the shutdown path keeps retrying `/api/shutdown` (cancelling
 /// first) before giving up on a clean exit.
 const SHUTDOWN_RETRY_WAIT: Duration = Duration::from_secs(15);
@@ -114,7 +138,7 @@ pub fn run_hosted() -> Result<(), String> {
         let watcher = std::thread::spawn(move || {
             let _ = server.join();
             let _ = server_done_tx.send(());
-            post_thread_message(MSG_SERVER_GONE);
+            post_frame_message(MSG_SERVER_GONE);
         });
         // The server publishes its token in-process right after bind; wait
         // for that rather than re-reading the instance file.
@@ -147,6 +171,10 @@ pub fn run_hosted() -> Result<(), String> {
                     SHUTDOWN_RETRY_WAIT.as_secs()
                 );
                 serve::kill_all_tracked();
+                // process::exit skips serve::run's own cleanup: drop the
+                // instance file (only while it still names this process)
+                // so discovery does not point at a dead server.
+                serve::remove_instance_file_if_owned();
                 std::process::exit(1);
             }
             match server_done_rx.recv_timeout(SERVER_EXIT_WAIT) {
@@ -157,6 +185,7 @@ pub fn run_hosted() -> Result<(), String> {
                         SERVER_EXIT_WAIT.as_secs()
                     );
                     serve::kill_all_tracked();
+                    serve::remove_instance_file_if_owned();
                     std::process::exit(1);
                 }
             }
@@ -170,19 +199,50 @@ pub fn run_hosted() -> Result<(), String> {
     Ok(())
 }
 
-fn post_thread_message(message: u32) {
-    let thread_id = FRAME_THREAD.load(Ordering::SeqCst);
-    if thread_id != 0 {
-        // SAFETY: a thread message carrying no pointers.
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                thread_id,
+/// Posts one of the private `MSG_*` messages to the frame: as a window
+/// message while the frame exists (survives modal loops), otherwise as a
+/// thread message to the UI thread. Returns whether it was queued.
+fn post_frame_message(message: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, PostThreadMessageW};
+    let hwnd = FRAME_HWND.load(Ordering::SeqCst);
+    if !hwnd.is_null() {
+        // SAFETY: a private message carrying no pointers.
+        return unsafe {
+            PostMessageW(
+                Some(HWND(hwnd)),
                 message,
                 WPARAM::default(),
                 LPARAM::default(),
-            );
+            )
         }
+        .is_ok();
     }
+    let thread_id = FRAME_THREAD.load(Ordering::SeqCst);
+    if thread_id == 0 {
+        return false;
+    }
+    // SAFETY: a thread message carrying no pointers.
+    unsafe { PostThreadMessageW(thread_id, message, WPARAM::default(), LPARAM::default()) }.is_ok()
+}
+
+fn set_closing(started: Option<Instant>) {
+    *CLOSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = started;
+}
+
+fn closing_since() -> Option<Instant> {
+    *CLOSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What a WM_CLOSE does while a cancel-then-close is in flight (started at
+/// `started`): `true` = destroy the frame now (the worker had more than
+/// enough time and evidently never reported back), `false` = ignore the
+/// repeated click while the worker still runs.
+pub(crate) fn reclose_forces_close(started: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started) >= CLOSE_FORCE_AFTER
 }
 
 fn reserve_port() -> Result<u16, String> {
@@ -217,6 +277,17 @@ fn wait_for_server(port: u16, timeout: Duration) -> Result<(), String> {
 /// connection after the response; a read timeout bounds a stalled peer
 /// and whatever arrived before it is still returned.
 fn shell_request(port: u16, method: &str, path: &str) -> Option<String> {
+    shell_request_timed(port, method, path, WORKER_REQUEST_TIMEOUT)
+}
+
+/// [`shell_request`] with an explicit per-operation timeout (connect,
+/// write and read are each bounded by `io_timeout`).
+fn shell_request_timed(
+    port: u16,
+    method: &str,
+    path: &str,
+    io_timeout: Duration,
+) -> Option<String> {
     let query = match crate::serve::resolve_shell_token(port, crate::serve::token_for_port) {
         Some(token) => format!("?token={token}"),
         None => String::new(),
@@ -232,9 +303,10 @@ fn shell_request(port: u16, method: &str, path: &str) -> Option<String> {
     } else {
         String::new()
     };
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, io_timeout).ok()?;
+    let _ = stream.set_read_timeout(Some(io_timeout));
+    let _ = stream.set_write_timeout(Some(io_timeout));
     let request = format!(
         "{method} {path}{query} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{nonce_header}Content-Length: 0\r\n\r\n"
     );
@@ -368,18 +440,29 @@ fn confirm_cancel_dialog(hwnd: HWND) -> bool {
 /// the window stays responsive (and shows the UI's own "cancelling"
 /// state) meanwhile.
 fn cancel_then_close(port: u16) {
-    std::thread::spawn(move || {
-        let _ = shell_request(port, "POST", "/api/cancel");
-        let deadline = Instant::now() + CLOSE_CANCEL_WAIT;
-        while Instant::now() < deadline {
-            let status = shell_request(port, "GET", "/api/status");
-            if !status_has_running_work(status.as_deref()) {
-                break;
+    let spawned = std::thread::Builder::new()
+        .name("frametrace-close".to_string())
+        .spawn(move || {
+            let _ = shell_request(port, "POST", "/api/cancel");
+            let deadline = Instant::now() + CLOSE_CANCEL_WAIT;
+            while Instant::now() < deadline {
+                let status = shell_request_timed(port, "GET", "/api/status", UI_REQUEST_TIMEOUT);
+                if !status_has_running_work(status.as_deref()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
             }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        post_thread_message(MSG_CLOSE_NOW);
-    });
+            if !post_frame_message(MSG_CLOSE_NOW) {
+                // Undeliverable: unlatch so the examiner's next × starts
+                // over instead of being ignored.
+                eprintln!("frametrace: could not post the close message to the frame window");
+                set_closing(None);
+            }
+        });
+    if let Err(err) = spawned {
+        eprintln!("frametrace: could not start the cancel-then-close worker: {err}");
+        set_closing(None);
+    }
 }
 
 /// Per-process instance nonce for the nonce gate: the instance file is
@@ -457,10 +540,12 @@ fn host_window(target: &Result<String, String>) -> Result<(), String> {
             return Err("CreateWindowExW returned a null window handle".to_string());
         }
 
-        // The watcher needs our thread id so it can end the pump with a
-        // thread message if the server dies while the window is open.
+        // The watcher and the close worker post to the frame window (or,
+        // while no window is published, to this thread).
         FRAME_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
+        FRAME_HWND.store(hwnd.0, Ordering::SeqCst);
         let result = host_webview(hwnd, target);
+        FRAME_HWND.store(std::ptr::null_mut(), Ordering::SeqCst);
         FRAME_THREAD.store(0, Ordering::SeqCst);
         if let Err(err) = result {
             // Browser fallback happens at the caller — the dead frame must
@@ -581,12 +666,17 @@ unsafe fn host_webview(hwnd: HWND, target: &Result<String, String>) -> Result<()
             match result {
                 -1 => break,
                 0 => break,
-                // Thread message from the server watcher: the server is
-                // gone, so close the frame instead of serving a dead page.
-                _ if msg.hwnd.0.is_null() && msg.message == MSG_SERVER_GONE => break,
-                // The cancel-then-close worker finished its bounded wait:
-                // destroy the frame (WM_DESTROY then ends the pump).
+                // Thread-message form (posted while no frame hwnd was
+                // published; the window form is handled in
+                // frame_window_proc). Server gone → close the frame instead
+                // of serving a dead page; close-now → destroy the frame
+                // (WM_DESTROY then ends the pump).
+                _ if msg.hwnd.0.is_null() && msg.message == MSG_SERVER_GONE => {
+                    let _ = DestroyWindow(hwnd);
+                    break;
+                }
                 _ if msg.hwnd.0.is_null() && msg.message == MSG_CLOSE_NOW => {
+                    set_closing(None);
                     let _ = DestroyWindow(hwnd);
                 }
                 _ => {
@@ -624,9 +714,29 @@ unsafe extern "system" fn frame_window_proc(
             }
             LRESULT(0)
         }
+        // Posted by the server watcher (server gone) or the cancel worker
+        // (job stopped / wait over): destroy the frame.
+        MSG_SERVER_GONE | MSG_CLOSE_NOW => {
+            set_closing(None);
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
-            if CLOSING.load(Ordering::SeqCst) {
-                // A cancel-then-close is already in flight.
+            if let Some(started) = closing_since() {
+                // A cancel-then-close is already in flight: ignore the
+                // repeated ×, unless the worker is long overdue.
+                if reclose_forces_close(started, Instant::now()) {
+                    eprintln!(
+                        "frametrace: cancel-then-close did not report back in {}s; closing",
+                        CLOSE_FORCE_AFTER.as_secs()
+                    );
+                    set_closing(None);
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
                 return LRESULT(0);
             }
             let port = OWNED_PORT.load(Ordering::SeqCst);
@@ -635,7 +745,9 @@ unsafe extern "system" fn frame_window_proc(
             let action = if port == 0 {
                 CloseAction::Close
             } else {
-                let status = shell_request(port, "GET", "/api/status");
+                // On the UI thread: short timeouts keep a stalled server
+                // from freezing the window (<= 1 s per connect/write/read).
+                let status = shell_request_timed(port, "GET", "/api/status", UI_REQUEST_TIMEOUT);
                 decide_close(status.as_deref(), &|| confirm_cancel_dialog(hwnd))
             };
             match action {
@@ -644,13 +756,15 @@ unsafe extern "system" fn frame_window_proc(
                     let _ = DestroyWindow(hwnd);
                 },
                 CloseAction::CancelThenClose => {
-                    CLOSING.store(true, Ordering::SeqCst);
+                    set_closing(Some(Instant::now()));
                     cancel_then_close(port);
                 }
             }
             LRESULT(0)
         }
         WM_DESTROY => {
+            // No more posts to this handle (it may be recycled).
+            FRAME_HWND.store(std::ptr::null_mut(), Ordering::SeqCst);
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -660,7 +774,41 @@ unsafe extern "system" fn frame_window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseAction, decide_close, nonce_from_response, shutdown_accepted};
+    use super::{
+        CLOSE_CANCEL_WAIT, CLOSE_FORCE_AFTER, CloseAction, UI_REQUEST_TIMEOUT,
+        WORKER_REQUEST_TIMEOUT, decide_close, nonce_from_response, reclose_forces_close,
+        shutdown_accepted,
+    };
+    use std::time::{Duration, Instant};
+
+    /// A repeated × while cancel-then-close runs is ignored until the
+    /// worker is overdue, then it force-closes (never latched forever).
+    #[test]
+    fn repeated_close_forces_only_after_the_worker_bound() {
+        let started = Instant::now();
+        assert!(!reclose_forces_close(started, started));
+        assert!(!reclose_forces_close(started, started + CLOSE_CANCEL_WAIT));
+        assert!(!reclose_forces_close(
+            started,
+            started + CLOSE_FORCE_AFTER - Duration::from_millis(1)
+        ));
+        assert!(reclose_forces_close(started, started + CLOSE_FORCE_AFTER));
+        assert!(reclose_forces_close(
+            started,
+            started + CLOSE_FORCE_AFTER + Duration::from_secs(60)
+        ));
+        // A clock reading before `started` never forces.
+        assert!(!reclose_forces_close(
+            started + Duration::from_secs(1),
+            started
+        ));
+        // The force bound covers the worker's own worst case: the initial
+        // cancel request, the cancel wait, and one in-flight status poll.
+        assert!(
+            CLOSE_FORCE_AFTER > CLOSE_CANCEL_WAIT + UI_REQUEST_TIMEOUT + WORKER_REQUEST_TIMEOUT
+        );
+        assert!(UI_REQUEST_TIMEOUT <= Duration::from_secs(1));
+    }
 
     /// Table: status body × examiner answer → action. The question is
     /// only asked while work runs (`asked` tracks that).

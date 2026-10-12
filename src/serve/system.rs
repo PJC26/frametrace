@@ -898,10 +898,13 @@ pub(crate) fn api_preflight(request: &Request) -> String {
     let case_text = body_value(&request.body, "case_dir")
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
-    // No state here: preflight runs before any root is approved, so UNC is
-    // refused outright (item 8).
+    // Item 8 policy: preflight is a nonce-gated, Origin-checked POST the
+    // examiner fills in by hand (same as /api/start), so an explicitly
+    // typed UNC share is honoured; device-namespace paths stay refused.
+    // The SMB/NTLM leak vector — cross-origin GETs — is covered by the
+    // strict check on every GET route.
     for text in std::iter::once(source.as_str()).chain(case_text.as_deref()) {
-        if let Err(reason) = super::http::reject_remote_path(text, &[]) {
+        if let Err(reason) = super::http::reject_device_path(text) {
             return api_err(reason);
         }
     }

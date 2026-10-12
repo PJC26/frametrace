@@ -82,7 +82,7 @@ pub(crate) use discovery::probe_status_body;
 #[cfg(any(test, target_os = "windows"))]
 pub(crate) use discovery::read_instance_record;
 #[cfg(target_os = "windows")]
-pub(crate) use discovery::{resolve_shell_token, shell_target};
+pub(crate) use discovery::{remove_instance_file_if_owned, resolve_shell_token, shell_target};
 #[cfg(test)]
 pub(crate) use http::{
     AuthProof, HttpAuthClass, MAX_BODY, authorize, etag_matches, handle_connection_timed,
@@ -293,8 +293,9 @@ mod winsock {
     use std::os::windows::io::FromRawSocket;
     use windows::Win32::Networking::WinSock::{
         AF_INET, INVALID_SOCKET, IPPROTO_TCP, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR,
-        SOCKADDR_IN, SOCKET, SOL_SOCKET, SOMAXCONN, WSADATA, WSAGetLastError, WSAStartup, bind,
-        closesocket, listen, setsockopt, socket,
+        SOCKADDR_IN, SOCKET, SOL_SOCKET, SOMAXCONN, WSA_FLAG_NO_HANDLE_INHERIT,
+        WSA_FLAG_OVERLAPPED, WSADATA, WSAGetLastError, WSASocketW, WSAStartup, bind, closesocket,
+        listen, setsockopt,
     };
 
     fn last_error() -> std::io::Error {
@@ -326,13 +327,26 @@ mod winsock {
 
     /// socket -> setsockopt(option=1) -> bind(127.0.0.1:port). Returns the
     /// bound socket; the caller listens on it or closes it.
+    ///
+    /// The socket is created with `WSA_FLAG_NO_HANDLE_INHERIT` (and
+    /// `WSA_FLAG_OVERLAPPED`, matching std's own sockets): a plain
+    /// `socket()` handle is inheritable, so every child spawned through
+    /// `Command` (Edge with CREATE_BREAKAWAY_FROM_JOB, ffmpeg) would inherit
+    /// the LISTEN socket and keep the port alive after the server exits.
     fn bind_with_option(port: u16, option: i32) -> std::io::Result<SOCKET> {
         ensure_winsock();
         // SAFETY: WinSock calls on a socket this function owns until it is
         // either returned or closed on the error paths.
         unsafe {
-            let sock = socket(i32::from(AF_INET.0), SOCK_STREAM, IPPROTO_TCP.0)
-                .map_err(|_| last_error())?;
+            let sock = WSASocketW(
+                i32::from(AF_INET.0),
+                SOCK_STREAM.0,
+                IPPROTO_TCP.0,
+                None,
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+            )
+            .map_err(|_| last_error())?;
             if sock == INVALID_SOCKET {
                 return Err(last_error());
             }
@@ -433,6 +447,27 @@ mod bind_tests {
         drop(listener);
         let again = bind_loopback(port).expect("rebind same port after restart");
         assert_eq!(again.local_addr().unwrap().port(), port);
+    }
+
+    /// The LISTEN socket must not be inheritable: children spawned with
+    /// `Command` (Edge, ffmpeg) would otherwise hold the port open after
+    /// the workstation exits.
+    #[test]
+    fn listener_handle_is_not_inheritable() {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+        let listener = bind_loopback(0).expect("bind loopback");
+        let mut flags = 0u32;
+        // SAFETY: querying flags of a live socket handle we own.
+        unsafe {
+            GetHandleInformation(HANDLE(listener.as_raw_socket() as _), &mut flags)
+                .expect("GetHandleInformation on listener");
+        }
+        assert_eq!(
+            flags & HANDLE_FLAG_INHERIT.0,
+            0,
+            "listener socket is inheritable (flags {flags:#x})"
+        );
     }
 }
 

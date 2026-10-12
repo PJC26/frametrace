@@ -98,12 +98,16 @@ export async function startIsolatedServer({ root, work, token, port, release = f
       if (exited === null) {
         try { child.kill(); } catch { /* gone */ }
       }
+      // The fallback timer is unref'd so a server that exits promptly does
+      // not keep the harness's event loop alive for the full 5 s.
       return Promise.race([
         exitPromise,
-        new Promise((r) => setTimeout(() => {
-          if (exited === null) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
-          r();
-        }, 5000)),
+        new Promise((r) => {
+          setTimeout(() => {
+            if (exited === null) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+            r();
+          }, 5000).unref();
+        }),
       ]);
     },
   };

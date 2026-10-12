@@ -73,13 +73,15 @@ pub struct RunCheckpoint {
     lock: RunLock,
 }
 
-/// The sidecar lock handle. Unlocks on drop (also on the interrupted-run
-/// path, where the data file is kept for resume). The sidecar is only
-/// removed by `finish` (best effort, together with the data file): an
-/// empty `.lock` beside an interrupted checkpoint is harmless and is
-/// excluded from packages by extension.
+/// The sidecar lock handle. Unlocks on drop — on success (`finish`) and on
+/// the interrupted-run path alike. The sidecar file itself is never
+/// deleted: unlinking it after the unlock would race a run that opened the
+/// old file in between (it then locks an unlinked inode while a third run
+/// creates and locks a fresh `.lock`, so two runs hold "the" lock at
+/// once). An empty `.lock` beside the checkpoint is harmless; checkpoints
+/// live at the top of `db/`, which packaging copies only by explicit
+/// file list, so it never enters a package.
 struct RunLock {
-    path: PathBuf,
     file: Option<File>,
 }
 
@@ -99,21 +101,7 @@ impl RunLock {
                 data_path.display()
             )
         })?;
-        Ok(Self {
-            path,
-            file: Some(file),
-        })
-    }
-}
-
-impl RunLock {
-    /// Success path: unlock, then remove the sidecar (failure ignored).
-    fn release_and_remove(mut self) {
-        if let Some(file) = self.file.take() {
-            let _ = file.unlock();
-            drop(file);
-            let _ = std::fs::remove_file(&self.path);
-        }
+        Ok(Self { file: Some(file) })
     }
 }
 
@@ -258,9 +246,9 @@ impl RunCheckpoint {
             )
         });
         // The lock outlives the data-file removal so a run starting in
-        // between cannot observe a half-finished state; the sidecar goes
-        // last.
-        lock.release_and_remove();
+        // between cannot observe a half-finished state. The sidecar stays
+        // on disk (see `RunLock`): deleting it would reopen the unlink race.
+        drop(lock);
         removed?;
         sync_parent_directory(&path);
         Ok(())
@@ -567,7 +555,35 @@ mod tests {
         let resumed = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
         assert!(resumed.resumed());
         resumed.finish().unwrap();
-        assert!(!lock_path(&path).exists(), "lock sidecar left behind");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `finish` removes the data file but deliberately leaves the `.lock`
+    /// sidecar (deleting it after unlocking races a concurrent `begin`
+    /// into holding a different lock file). The leftover sidecar does not
+    /// get in the way: the next run locks it again and is exclusive.
+    #[test]
+    fn finish_leaves_the_lock_sidecar_and_a_new_run_still_locks_it() {
+        let dir = temp_dir("sidecar-kept");
+        let path = dir.join("db/progress.jsonl");
+        let first = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        first.finish().unwrap();
+        assert!(
+            !path.exists(),
+            "completed checkpoint data file must be removed"
+        );
+        assert!(
+            lock_path(&path).is_file(),
+            "lock sidecar must be left in place by finish"
+        );
+        let second = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        assert!(!second.resumed());
+        let err = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.contains("another scan-folder run active"), "{err}");
+        second.finish().unwrap();
+        assert!(lock_path(&path).is_file());
         let _ = fs::remove_dir_all(dir);
     }
 

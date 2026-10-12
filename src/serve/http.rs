@@ -596,6 +596,15 @@ pub(crate) const REMOTE_PATH_ERROR: &str = "네트워크(UNC)·장치 경로는 
 ///   on Windows) stays allowed: it never leaves the machine.
 ///
 /// The check is textual and platform-independent, so it holds on every OS.
+///
+/// Policy (which routes use this vs. [`reject_device_path`]): the SMB/NTLM
+/// leak vector is a cross-origin GET — `<img>`/`<video>` send no Origin
+/// header, so any web page can make the browser issue one. Every GET route
+/// therefore refuses UNC unless it lies under an approved UNC root. The
+/// POST routes where the examiner types a source/case path
+/// (`/api/preflight`, `/api/start`, see [`route_admits_typed_unc`]) are
+/// gated by the Origin port check and the instance nonce, so a typed UNC
+/// share is honoured there; device-namespace paths stay refused.
 pub(crate) fn reject_remote_path(
     raw: &str,
     approved_roots: &[PathBuf],
@@ -622,6 +631,34 @@ pub(crate) fn reject_remote_path(
     } else {
         Err(REMOTE_PATH_ERROR)
     }
+}
+
+/// Lenient form of [`reject_remote_path`] for the POST routes where the
+/// examiner explicitly types a path ([`route_admits_typed_unc`]): a
+/// well-formed UNC share path (`\\server\share\…`, `//server/share/…`,
+/// `\\?\UNC\server\share\…`, no `.`/`..` components) is admitted;
+/// device-namespace and malformed remote paths are still refused.
+pub(crate) fn reject_device_path(raw: &str) -> Result<(), &'static str> {
+    let text = raw.trim();
+    if is_remote_or_device_path(text)
+        && let Some(unc) = unc_share_form(text)
+    {
+        if unc.split('\\').any(|part| part == ".." || part == ".") {
+            return Err(REMOTE_PATH_ERROR);
+        }
+        return Ok(());
+    }
+    reject_remote_path(text, &[])
+}
+
+/// Routes whose path fields may name a UNC share the examiner typed (see
+/// the policy on [`reject_remote_path`]). Only same-origin, nonce-gated
+/// POSTs qualify — never a GET.
+pub(crate) fn route_admits_typed_unc(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("POST", "/api/preflight") | ("POST", "/api/start")
+    )
 }
 
 fn is_separator(byte: u8) -> bool {
@@ -696,7 +733,9 @@ pub(crate) fn approved_path_roots(state: &SharedState) -> Vec<PathBuf> {
 /// [`handle_connection_timed`] before the request is routed, so even
 /// handlers outside this file (`/api/open-folder` → `resolve_open_folder`)
 /// never reach `canonicalize` with a UNC path. Handlers in system.rs /
-/// media.rs repeat the check themselves (defense in depth).
+/// media.rs repeat the check themselves (defense in depth). Routes listed
+/// in [`route_admits_typed_unc`] get the lenient check (typed UNC shares
+/// admitted, device paths refused); every other route the strict one.
 pub(crate) fn path_fields_for(method: &str, path: &str) -> &'static [(bool, &'static str)] {
     // (from_query, field)
     match (method, path) {
@@ -705,7 +744,7 @@ pub(crate) fn path_fields_for(method: &str, path: &str) -> &'static [(bool, &'st
         ("GET", "/api/case-info") => &[(true, "case_dir")],
         ("POST", "/api/open-case") => &[(false, "case_dir")],
         ("POST", "/api/open-folder") => &[(false, "path")],
-        ("POST", "/api/preflight") => &[(false, "source_path"), (false, "case_dir")],
+        ("POST", "/api/preflight" | "/api/start") => &[(false, "source_path"), (false, "case_dir")],
         ("POST", "/api/export-clip" | "/api/telemetry" | "/api/proxy") => &[(false, "path")],
         ("POST", "/api/advanced") => &[(false, "extra")],
         _ => &[],
@@ -725,11 +764,13 @@ pub(crate) fn remote_path_refusal(reason: &str) -> Vec<u8> {
 }
 
 /// `Some(reason)` when a path field of `request` names a refused UNC or
-/// device path (see [`reject_remote_path`]).
+/// device path (see [`reject_remote_path`]; routes in
+/// [`route_admits_typed_unc`] use [`reject_device_path`]).
 pub(crate) fn remote_path_violation(
     request: &Request,
     approved_roots: &[PathBuf],
 ) -> Option<&'static str> {
+    let typed_unc_ok = route_admits_typed_unc(&request.method, &request.path);
     path_fields_for(&request.method, &request.path)
         .iter()
         .filter_map(|(from_query, field)| {
@@ -739,7 +780,13 @@ pub(crate) fn remote_path_violation(
                 body_value(&request.body, field)
             }
         })
-        .find_map(|value| reject_remote_path(&value, approved_roots).err())
+        .find_map(|value| {
+            if typed_unc_ok {
+                reject_device_path(&value).err()
+            } else {
+                reject_remote_path(&value, approved_roots).err()
+            }
+        })
 }
 
 /// Tokens are planted into a Cookie header, so they must only contain
@@ -1518,6 +1565,47 @@ mod tests_origin_and_paths {
             "",
         ] {
             assert_eq!(reject_remote_path(raw, &[]), Ok(()), "{raw} is local");
+        }
+    }
+
+    /// The lenient check for typed paths on nonce-gated POSTs: UNC shares
+    /// pass, device-namespace and malformed remote paths do not.
+    #[test]
+    fn typed_unc_is_admitted_but_device_paths_are_not() {
+        for raw in [
+            r"\\nas\evidence\case7",
+            "//nas/evidence/case7/a.mp4",
+            r"\\?\UNC\nas\evidence\a.e01",
+            r"  \\nas\evidence",
+            r"C:\cases\a.mp4",
+            r"\\?\C:\cases",
+            "",
+        ] {
+            assert_eq!(reject_device_path(raw), Ok(()), "{raw}");
+        }
+        for raw in [
+            r"\\.\PhysicalDrive0",
+            r"\\.\C:\x",
+            r"\\?\GLOBALROOT\Device\Mup\evil\share",
+            r"\??\UNC\evil\share",
+            r"\\?\Volume{0000}\x",
+            r"\\",
+            r"\\evil",
+            r"\\nas\evidence\..\..\x",
+        ] {
+            assert_eq!(reject_device_path(raw), Err(REMOTE_PATH_ERROR), "{raw}");
+        }
+        assert!(route_admits_typed_unc("POST", "/api/preflight"));
+        assert!(route_admits_typed_unc("POST", "/api/start"));
+        for (method, path) in [
+            ("GET", "/media"),
+            ("GET", "/api/browse"),
+            ("GET", "/api/case-info"),
+            ("GET", "/api/preflight"),
+            ("POST", "/api/open-case"),
+            ("POST", "/api/open-folder"),
+        ] {
+            assert!(!route_admits_typed_unc(method, path), "{method} {path}");
         }
     }
 

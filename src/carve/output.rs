@@ -76,9 +76,12 @@ pub(super) fn write_carve_outputs(
 /// in the carve log. A missing log is empty; an unreadable one is an error
 /// (never guess that nothing was logged).
 fn logged_carve_files(log_path: &Path) -> Result<Vec<(String, String, String)>, String> {
-    let text = match std::fs::read_to_string(log_path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+    // Through the audit module's lock-aware reader: on Windows the
+    // appender's byte-range lock is mandatory, so a plain second-handle
+    // read during an append would fail with ERROR_LOCK_VIOLATION.
+    let text = match audit::read_log_locked(log_path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(Vec::new()),
         Err(err) => {
             return Err(format!(
                 "failed to read carve log {} to de-duplicate resumed artifacts: {err}",
