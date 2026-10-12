@@ -115,7 +115,11 @@ if (-not (Test-Path "$srcRoot/libewf-$LibewfVersion")) {
 
 # 5. build + install. bash exits non-zero if configure, make or make install
 # fails (set -e); the exit code is checked by Invoke-Native.
-$srcUnix = (Invoke-Native { & $bash -lc ("cygpath -u '" + $srcRoot + "'") } "cygpath" -Quiet | Select-Object -Last 1).Trim()
+$cygpathOut = Invoke-Native { & $bash -lc ("cygpath -u '" + $srcRoot + "'") } "cygpath" -Quiet | Select-Object -Last 1
+if ($null -eq $cygpathOut -or [string]::IsNullOrWhiteSpace([string]$cygpathOut)) {
+    throw "cygpath -u '$srcRoot' printed nothing - cannot map the source folder to an MSYS2 path (is MSYS2's bash/cygpath working?)"
+}
+$srcUnix = ([string]$cygpathOut).Trim()
 $buildCmd = "set -e; export MSYSTEM=MINGW64; cd '$srcUnix/libewf-$LibewfVersion'; " +
     "./configure --prefix='$srcUnix/out' --disable-nls > configure.log 2>&1; " +
     "make -j`$(nproc) > make.log 2>&1; " +

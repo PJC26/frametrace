@@ -634,9 +634,13 @@ fn head_matches_get_without_a_body_and_media_directories_are_refused() {
 }
 
 /// Windows review item 8 over the wire: UNC / device paths are refused
-/// with 400 on every path-taking route, before any handler runs. (The
+/// with 400 on every GET path route and on the POST routes outside the
+/// typed-path set, before any handler runs; on the typed-path POSTs
+/// (`/api/preflight`, `/api/start`) device paths are still refused. (The
 /// paths name hosts that do not exist; the refusal is textual, so no SMB
-/// lookup is attempted even on Windows.)
+/// lookup is attempted even on Windows.) Typed UNC acceptance is checked
+/// without the wire in `typed_unc_policy_per_route`, so no test ever
+/// makes Windows resolve a UNC host.
 #[test]
 fn unc_and_device_paths_are_refused_on_every_path_route() {
     let case_dir = scratch("unc-routes");
@@ -678,10 +682,18 @@ fn unc_and_device_paths_are_refused_on_every_path_route() {
     for (path, body) in [
         ("/api/open-case", r#"{"case_dir":"\\\\evil\\share\\case"}"#),
         ("/api/open-folder", r#"{"path":"//evil/share"}"#),
-        ("/api/preflight", r#"{"source_path":"\\\\evil\\share\\ev"}"#),
         (
             "/api/preflight",
-            r#"{"source_path":"C:\\nope","case_dir":"\\\\evil\\s\\c"}"#,
+            r#"{"source_path":"\\\\.\\PhysicalDrive0"}"#,
+        ),
+        (
+            "/api/preflight",
+            r#"{"source_path":"C:\\nope","case_dir":"\\\\?\\GLOBALROOT\\Device\\Mup\\evil\\s"}"#,
+        ),
+        ("/api/start", r#"{"source_path":"\\\\.\\C:\\x"}"#),
+        (
+            "/api/start",
+            r#"{"source_path":"C:\\nope","case_dir":"\\??\\UNC\\evil\\s"}"#,
         ),
         (
             "/api/export-clip",
@@ -709,6 +721,81 @@ fn unc_and_device_paths_are_refused_on_every_path_route() {
     let _ = std::fs::remove_dir_all(case_dir);
 }
 
+/// The central guard's per-route UNC policy: GET routes refuse UNC unless
+/// it lies under an approved UNC root (cross-origin GETs carry no Origin,
+/// so they are the SMB/NTLM leak vector); the nonce-gated typed-path
+/// POSTs admit an explicitly typed UNC share; other POSTs stay strict.
+#[test]
+fn typed_unc_policy_per_route() {
+    use super::http::remote_path_violation;
+    let with = |method: &str, path: &str, query: &str, body: &str| {
+        let mut request = req(method, path);
+        request.query = query.into();
+        request.body = body.into();
+        request
+    };
+    let none: &[std::path::PathBuf] = &[];
+    // Typed UNC on the typed-path POSTs: admitted.
+    for (path, body) in [
+        (
+            "/api/preflight",
+            r#"{"source_path":"\\\\nas\\evidence\\ev"}"#,
+        ),
+        (
+            "/api/preflight",
+            r#"{"source_path":"C:\\ev","case_dir":"//nas/cases/c1"}"#,
+        ),
+        (
+            "/api/start",
+            r#"{"source_path":"\\\\?\\UNC\\nas\\evidence\\a.e01"}"#,
+        ),
+        (
+            "/api/start",
+            r#"{"source_path":"C:\\ev","case_dir":"\\\\nas\\cases\\c1"}"#,
+        ),
+    ] {
+        assert_eq!(
+            remote_path_violation(&with("POST", path, "", body), none),
+            None,
+            "{path} {body}"
+        );
+    }
+    // GET routes: refused without an approved UNC root ...
+    for (path, query) in [
+        ("/media", "path=%5C%5Cnas%5Cevidence%5Ca.mp4"),
+        ("/api/browse", "path=//nas/evidence"),
+        ("/api/case-info", "case_dir=%5C%5Cnas%5Ccases%5Cc1"),
+    ] {
+        assert_eq!(
+            remote_path_violation(&with("GET", path, query, ""), none),
+            Some(super::http::REMOTE_PATH_ERROR),
+            "{path}?{query}"
+        );
+    }
+    // ... and admitted under one (the case moved onto a share).
+    let roots = vec![std::path::PathBuf::from(r"\\nas\evidence")];
+    assert_eq!(
+        remote_path_violation(
+            &with("GET", "/media", "path=%5C%5Cnas%5Cevidence%5Ca.mp4", ""),
+            &roots
+        ),
+        None
+    );
+    // Other POSTs stay strict.
+    assert_eq!(
+        remote_path_violation(
+            &with(
+                "POST",
+                "/api/open-case",
+                "",
+                r#"{"case_dir":"//nas/cases/c1"}"#
+            ),
+            none
+        ),
+        Some(super::http::REMOTE_PATH_ERROR)
+    );
+}
+
 /// Handlers refuse UNC paths themselves too (defense in depth for callers
 /// that do not pass through `handle_connection`).
 #[test]
@@ -725,10 +812,17 @@ fn handlers_refuse_unc_paths_without_the_http_guard() {
     info.query = "case_dir=%5C%5Cevil%5Cshare".into();
     let info = api_case_info(&info, &state);
     assert!(info.contains("UNC"), "{info}");
+    // Preflight admits a typed UNC share (policy) but still refuses the
+    // device namespace on its own.
     let mut preflight = req("POST", "/api/preflight");
-    preflight.body = r#"{"source_path":"\\\\?\\UNC\\evil\\share"}"#.into();
+    preflight.body = r#"{"source_path":"\\\\?\\GLOBALROOT\\Device\\Mup\\evil\\share"}"#.into();
     let preflight = api_preflight(&preflight);
     assert!(preflight.contains("UNC"), "{preflight}");
+    let mut start = req("POST", "/api/start");
+    start.body = r#"{"source_path":"\\\\.\\PhysicalDrive0"}"#.into();
+    let started = api_start(&start, &state);
+    assert!(started.contains("UNC"), "{started}");
+    assert!(!state_lock(&state).busy);
     // Export items with a UNC path are skipped before canonicalize.
     let dir = scratch("unc-export");
     let item = serde_json::json!({"id": "x", "path": r"\\evil\share\a.mp4"});
