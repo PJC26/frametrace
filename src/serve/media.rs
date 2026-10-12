@@ -163,9 +163,10 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
     } else {
         let alt = body_value(&request.body, "path").unwrap_or_default();
         let roots = state_lock(state).media_roots.clone();
-        let canonical = PathBuf::from(alt.trim())
-            .canonicalize()
-            .ok()
+        // Item 8: a UNC/device path never reaches canonicalize.
+        let canonical = Some(alt.trim())
+            .filter(|alt| super::http::reject_remote_path(alt, &roots).is_ok())
+            .and_then(|alt| PathBuf::from(alt).canonicalize().ok())
             .filter(|canonical| {
                 roots
                     .iter()
@@ -556,15 +557,17 @@ pub(crate) fn api_telemetry(request: &Request, state: &SharedState) -> String {
         let alt = body_value(&request.body, "path").unwrap_or_default();
         let candidate = PathBuf::from(alt.trim());
         let roots = state_lock(state).media_roots.clone();
-        let allowed = candidate
-            .canonicalize()
-            .map(|canonical| {
-                roots
-                    .iter()
-                    .filter_map(|root| root.canonicalize().ok())
-                    .any(|root| path_is_under(&root, &canonical))
-            })
-            .unwrap_or(false);
+        // Item 8: a UNC/device path never reaches canonicalize.
+        let allowed = super::http::reject_remote_path(&alt, &roots).is_ok()
+            && candidate
+                .canonicalize()
+                .map(|canonical| {
+                    roots
+                        .iter()
+                        .filter_map(|root| root.canonicalize().ok())
+                        .any(|root| path_is_under(&root, &canonical))
+                })
+                .unwrap_or(false);
         if !allowed {
             return "{\"ok\":false,\"error\":\"색인된 영상 또는 허용된 경로의 파일만 텔레메트리를 추출할 수 있습니다.\"}"
                 .to_string();
@@ -693,15 +696,17 @@ pub(crate) fn api_proxy(request: &Request, state: &SharedState) -> String {
         let alt = body_value(&request.body, "path").unwrap_or_default();
         let candidate = PathBuf::from(alt.trim());
         let roots = state_lock(state).media_roots.clone();
-        let allowed = candidate
-            .canonicalize()
-            .map(|canonical| {
-                roots
-                    .iter()
-                    .filter_map(|root| root.canonicalize().ok())
-                    .any(|root| path_is_under(&root, &canonical))
-            })
-            .unwrap_or(false);
+        // Item 8: a UNC/device path never reaches canonicalize.
+        let allowed = super::http::reject_remote_path(&alt, &roots).is_ok()
+            && candidate
+                .canonicalize()
+                .map(|canonical| {
+                    roots
+                        .iter()
+                        .filter_map(|root| root.canonicalize().ok())
+                        .any(|root| path_is_under(&root, &canonical))
+                })
+                .unwrap_or(false);
         if !allowed {
             return "{\"ok\":false,\"error\":\"색인된 영상 또는 허용된 경로의 파일만 프록시로 재생할 수 있습니다.\"}"
                 .to_string();
@@ -796,6 +801,9 @@ pub(crate) fn api_advanced(request: &Request, state: &SharedState) -> String {
             "reports/qa/report-defense-checklist.md",
         ),
         "known-hash" => {
+            if let Err(reason) = super::http::reject_remote_path(&extra, &[]) {
+                return api_err(reason);
+            }
             if extra.trim().is_empty() || !PathBuf::from(&extra).is_file() {
                 return "{\"ok\":false,\"error\":\"sha256 해시 목록 파일 경로를 지정하십시오 (한 줄에 하나, 또는 'sha256,설명').\"}".to_string();
             }
@@ -1104,6 +1112,12 @@ pub(crate) fn export_one(
         outcome.skip_reason = "no-file(pre-recovery candidate)".to_string();
         return outcome;
     }
+    // Item 8: refuse UNC/device paths before canonicalize (`roots` are
+    // canonical, so a UNC root keeps its `\\?\UNC\` spelling - handled).
+    if super::http::reject_remote_path(&path_text, roots).is_err() {
+        outcome.skip_reason = "remote-path-refused".to_string();
+        return outcome;
+    }
     let canonical = match PathBuf::from(&path_text).canonicalize() {
         Ok(canonical) => canonical,
         Err(_) => {
@@ -1168,7 +1182,7 @@ pub(crate) fn copy_unique(source: &Path, dir: &Path, base_name: &str) -> Result<
                 std::io::copy(&mut reader, &mut target)
                     .map_err(|err| format!("copy failed: {err}"))?;
                 if let Ok(meta) = source.metadata() {
-                    let _ = target.set_permissions(meta.permissions());
+                    let _ = target.set_permissions(writable_copy_permissions(meta.permissions()));
                 }
                 return Ok(candidate);
             }
@@ -1177,6 +1191,31 @@ pub(crate) fn copy_unique(source: &Path, dir: &Path, base_name: &str) -> Result<
         }
     }
     Err("could not allocate a unique export filename".to_string())
+}
+
+/// Permissions for an exported copy: the source's, minus read-only. Evidence
+/// on write-protected media (or marked read-only on Windows) would otherwise
+/// hand the examiner copies they cannot later move, re-hash into a package
+/// or delete without an attribute fight (Windows review, Low).
+pub(crate) fn writable_copy_permissions(
+    mut permissions: std::fs::Permissions,
+) -> std::fs::Permissions {
+    if permissions.readonly() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Owner write only - never widen group/other access.
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        // Not unix: only the read-only attribute exists (no mode bits to
+        // widen), so the lint's world-writable concern does not apply.
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            permissions.set_readonly(false);
+        }
+    }
+    permissions
 }
 
 pub(crate) fn csv_row(fields: &[String]) -> String {
@@ -1251,5 +1290,46 @@ mod csv_row_tests {
             row,
             "\"'=HYPERLINK(\"\"x\"\")\",'@SUM(A1),-3600,\"a,b\",plain"
         );
+    }
+}
+
+#[cfg(test)]
+mod copy_permission_tests {
+    use super::*;
+
+    /// Windows review (Low): a read-only source must not yield a read-only
+    /// export copy; the copy's bytes are unchanged.
+    #[test]
+    fn copy_of_read_only_source_is_writable() {
+        let dir = std::env::temp_dir().join(format!("ft-copy-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("src.mp4");
+        std::fs::write(&source, b"evidence").unwrap();
+        let mut perms = std::fs::metadata(&source).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&source, perms).unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let copy = copy_unique(&source, &out, "copy.mp4").unwrap();
+        assert!(
+            !std::fs::metadata(&copy).unwrap().permissions().readonly(),
+            "export copy must not inherit read-only"
+        );
+        assert_eq!(std::fs::read(&copy).unwrap(), b"evidence");
+        // The source keeps its attribute (copying never touches evidence).
+        assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o022, 0, "group/other write must not be added");
+        }
+        // Clean-up needs the read-only bit cleared on Windows.
+        let mut perms = std::fs::metadata(&source).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&source, perms);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -541,18 +541,30 @@ fn origin_gate_requires_exact_loopback_authority() {
             "origin {origin} must be rejected"
         );
     }
-    // Exact loopback hosts with an optional port stay accepted.
-    for origin in [
-        "http://127.0.0.1",
-        "http://127.0.0.1:8477",
-        "http://localhost",
-        "http://localhost:3000",
-        "http://[::1]",
-        "http://[::1]:9000",
+    // Exact loopback hosts with an optional port stay accepted when the
+    // Origin authority equals the Host authority (item 7: port included).
+    for (origin, host) in [
+        ("http://127.0.0.1", "127.0.0.1"),
+        ("http://127.0.0.1:8477", "127.0.0.1:8477"),
+        ("http://localhost", "localhost"),
+        ("http://localhost:3000", "localhost:3000"),
+        ("http://[::1]", "[::1]"),
+        ("http://[::1]:9000", "[::1]:9000"),
     ] {
         assert!(
-            request_is_localhost_trusted(&request(Some(origin), Some("127.0.0.1"))),
-            "origin {origin} must be trusted"
+            request_is_localhost_trusted(&request(Some(origin), Some(host))),
+            "origin {origin} must be trusted for host {host}"
+        );
+    }
+    // ...and a loopback Origin of another port/host is a different origin.
+    for (origin, host) in [
+        ("http://127.0.0.1:9999", "127.0.0.1:8477"),
+        ("http://localhost:3000", "127.0.0.1:3000"),
+        ("http://127.0.0.1", "127.0.0.1:8477"),
+    ] {
+        assert!(
+            !request_is_localhost_trusted(&request(Some(origin), Some(host))),
+            "origin {origin} must be rejected for host {host}"
         );
     }
     // Local tools send no Origin at all; the Host gate still applies.
