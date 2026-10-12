@@ -29,6 +29,8 @@ jobs:
         run: node scripts/verify-contract-pin.mjs
       - name: Viewer JavaScript syntax
         run: node scripts/check-js.mjs
+      - name: PowerShell scripts have UTF-8 BOM
+        run: node scripts/check-ps-bom.mjs
       - name: Install ffmpeg
         run: choco install ffmpeg -y --no-progress
         shell: pwsh
@@ -42,7 +44,30 @@ jobs:
         env:
           FRAMETRACE_IT: "1"
         run: cargo test --locked --test workstation_e2e -- --ignored
+      - name: Build debug binaries for harnesses
+        run: cargo build --locked
+      - name: Install Playwright and harness dependencies
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1 axe-core@4.10.2 pngjs pixelmatch
+          npx playwright install chromium
+        shell: bash
+      - name: Viewer and workstation harnesses
+        run: |
+          export FRAMETRACE_BIN="$(cygpath -m "$GITHUB_WORKSPACE")/target/debug/frametrace-app.exe"
+          test -f "$FRAMETRACE_BIN"
+          bash scripts/ci-harnesses.sh
+        shell: bash
       - name: QA performance smoke
         run: cargo run --locked --bin frametrace -- qa performance target/frametrace-ci-performance --rows 1000
       - name: Release build
         run: cargo build --release --locked
+      - name: Portable package smoke (make-portable.ps1)
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1
+          if ($LASTEXITCODE -ne 0) { throw "make-portable.ps1 failed ($LASTEXITCODE)" }
+          if (-not (Get-ChildItem dist -Filter *.zip)) { throw 'no zip produced in dist/' }
+          $bytes = [System.IO.File]::ReadAllBytes('dist/SHA256SUMS')
+          if ($bytes.Length -eq 0) { throw 'SHA256SUMS is empty' }
+          if ($bytes -contains 13) { throw 'SHA256SUMS contains CR' }
+          Get-Content dist/SHA256SUMS
+        shell: pwsh

@@ -89,7 +89,7 @@ try {
 } finally {
   if (browser) await browser.close();
   await srv.stop();
-  rmSync(work, { recursive: true, force: true });
+  rmSync(work, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 console.log(failed ? `verify-marks-roundtrip: ${failed} failed` : 'verify-marks-roundtrip: all checks passed');
 process.exit(failed ? 1 : 0);

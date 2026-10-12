@@ -1,3 +1,6 @@
 # Pinned contracts are verified byte-for-byte (sha256) against
 # contracts/PIN.json; never let checkout rewrite their line endings.
 contracts/** -text
+# Embedded UI assets feed the byte-compared evidence viewer; keep them LF on
+# every platform so Windows checkouts (autocrlf) embed identical bytes.
+assets/** text eol=lf

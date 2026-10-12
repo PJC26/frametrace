@@ -1,4 +1,4 @@
-# Hikvision IMKH sample intake harness.
+﻿# Hikvision IMKH sample intake harness.
 # Walks exports under -Samples, remuxes via frametrace export-hik, then validates.
 #
 # Usage:

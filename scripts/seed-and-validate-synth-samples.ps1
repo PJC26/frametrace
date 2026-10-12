@@ -1,4 +1,4 @@
-# Seed synthetic DAV + IMKH fixtures outside git, then run intake harnesses.
+﻿# Seed synthetic DAV + IMKH fixtures outside git, then run intake harnesses.
 # These are NOT recorder exports — they prove the intake path end-to-end.
 # Usage: powershell -File scripts/seed-and-validate-synth-samples.ps1
 
