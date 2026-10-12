@@ -122,6 +122,12 @@ pub(crate) fn browse_json(raw: &str, want_files: bool) -> String {
         })
         .to_string();
     }
+    // Item 8: the picker has no approved roots of its own, so every UNC /
+    // device path is refused before `metadata` could open an SMB session.
+    if let Err(reason) = super::http::reject_remote_path(raw, &[]) {
+        return serde_json::json!({"ok": false, "exists": false, "path": raw, "error": reason})
+            .to_string();
+    }
     let path = PathBuf::from(raw);
     let display = path.display().to_string();
     let Ok(meta) = std::fs::metadata(&path) else {
@@ -551,6 +557,11 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     if dir_text.trim().is_empty() {
         return "{\"ok\":false,\"error\":\"케이스 폴더 경로를 입력하십시오.\"}".to_string();
     }
+    if let Err(reason) =
+        super::http::reject_remote_path(&dir_text, &super::http::approved_path_roots(state))
+    {
+        return api_err(reason);
+    }
     let case_dir = PathBuf::from(dir_text.trim());
     if !case_dir.join("case.json").is_file() {
         return "{\"ok\":false,\"error\":\"해당 폴더에 case.json이 없습니다 — 기존 케이스 폴더가 아닙니다.\"}"
@@ -730,10 +741,16 @@ pub(crate) fn api_case_info(request: &Request, state: &SharedState) -> String {
         let guard = state_lock(state);
         (guard.case_dir.clone(), guard.phase)
     };
-    let requested = query_value(&request.query, "case_dir")
+    let requested_text = query_value(&request.query, "case_dir")
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+        .filter(|v| !v.is_empty());
+    if let Some(text) = requested_text.as_deref()
+        && let Err(reason) =
+            super::http::reject_remote_path(text, &super::http::approved_path_roots(state))
+    {
+        return api_err(reason);
+    }
+    let requested = requested_text.map(PathBuf::from);
     let Some(case_dir) = requested.or_else(|| bound.clone()) else {
         return api_err("열린 케이스가 없습니다.");
     };
@@ -877,9 +894,17 @@ pub(crate) fn api_preflight(request: &Request) -> String {
     if source.is_empty() {
         return api_err("증거 소스 경로를 입력하십시오.");
     }
-    let case_dir = body_value(&request.body, "case_dir")
+    let case_text = body_value(&request.body, "case_dir")
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty());
+    // No state here: preflight runs before any root is approved, so UNC is
+    // refused outright (item 8).
+    for text in std::iter::once(source.as_str()).chain(case_text.as_deref()) {
+        if let Err(reason) = super::http::reject_remote_path(text, &[]) {
+            return api_err(reason);
+        }
+    }
+    let case_dir = case_text
         .map(PathBuf::from)
         .unwrap_or_else(default_case_dir);
     preflight_json(

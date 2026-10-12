@@ -632,3 +632,195 @@ fn head_matches_get_without_a_body_and_media_directories_are_refused() {
     );
     assert!(status_line(&dir).contains("404"), "{dir}");
 }
+
+/// Windows review item 8 over the wire: UNC / device paths are refused
+/// with 400 on every path-taking route, before any handler runs. (The
+/// paths name hosts that do not exist; the refusal is textual, so no SMB
+/// lookup is attempted even on Windows.)
+#[test]
+fn unc_and_device_paths_are_refused_on_every_path_route() {
+    let case_dir = scratch("unc-routes");
+    let (addr, state) = start_server(Some(&case_dir), None);
+    state_lock(&state).media_roots = vec![case_dir.clone()];
+    let nonce = state_lock(&state).instance.clone();
+    let get = |target: &str| {
+        raw(
+            addr,
+            &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
+        )
+    };
+    for target in [
+        r"/media?path=\\evil\share\a.mp4",
+        "/media?path=%5C%5Cevil%5Cshare%5Ca.mp4",
+        "/media?path=//evil/share/a.mp4",
+        r"/media?path=\\?\UNC\evil\share\a.mp4",
+        r"/media?path=\\.\PhysicalDrive0",
+        "/api/browse?path=//evil/share",
+        r"/api/browse?path=\\evil\share",
+        r"/api/case-info?case_dir=\\evil\share\case",
+    ] {
+        let response = get(target);
+        assert!(
+            status_line(&response).contains("400"),
+            "{target}: {response}"
+        );
+        assert!(response.contains("\"ok\":false"), "{target}: {response}");
+    }
+    let post = |path: &str, body: &str| {
+        raw(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-FrameTrace-Nonce: {nonce}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+    for (path, body) in [
+        ("/api/open-case", r#"{"case_dir":"\\\\evil\\share\\case"}"#),
+        ("/api/open-folder", r#"{"path":"//evil/share"}"#),
+        ("/api/preflight", r#"{"source_path":"\\\\evil\\share\\ev"}"#),
+        (
+            "/api/preflight",
+            r#"{"source_path":"C:\\nope","case_dir":"\\\\evil\\s\\c"}"#,
+        ),
+        (
+            "/api/export-clip",
+            r#"{"id":"carve_1","path":"\\\\evil\\s\\a.mp4"}"#,
+        ),
+        (
+            "/api/advanced",
+            r#"{"tool":"known-hash","extra":"\\\\evil\\s\\h.txt"}"#,
+        ),
+    ] {
+        let response = post(path, body);
+        assert!(
+            status_line(&response).contains("400"),
+            "{path} {body}: {response}"
+        );
+    }
+    // Local paths still reach their handlers (no 400 from the guard).
+    let local = get("/api/browse?path=");
+    assert!(status_line(&local).contains("200"), "{local}");
+    let missing = get(&format!(
+        "/media?path={}",
+        case_dir.join("missing.mp4").display()
+    ));
+    assert!(status_line(&missing).contains("404"), "{missing}");
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// Handlers refuse UNC paths themselves too (defense in depth for callers
+/// that do not pass through `handle_connection`).
+#[test]
+fn handlers_refuse_unc_paths_without_the_http_guard() {
+    let browse = super::system::browse_json(r"\\evil\share", false);
+    assert!(browse.contains("\"ok\":false"), "{browse}");
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    let mut request = req("POST", "/api/open-case");
+    request.body = r#"{"case_dir":"//evil/share/case"}"#.into();
+    let opened = api_open_case(&request, &state);
+    assert!(opened.contains("\"ok\":false"), "{opened}");
+    assert!(state_lock(&state).case_dir.is_none());
+    let mut info = req("GET", "/api/case-info");
+    info.query = "case_dir=%5C%5Cevil%5Cshare".into();
+    let info = api_case_info(&info, &state);
+    assert!(info.contains("UNC"), "{info}");
+    let mut preflight = req("POST", "/api/preflight");
+    preflight.body = r#"{"source_path":"\\\\?\\UNC\\evil\\share"}"#.into();
+    let preflight = api_preflight(&preflight);
+    assert!(preflight.contains("UNC"), "{preflight}");
+    // Export items with a UNC path are skipped before canonicalize.
+    let dir = scratch("unc-export");
+    let item = serde_json::json!({"id": "x", "path": r"\\evil\share\a.mp4"});
+    let field = |item: &serde_json::Value, key: &str| {
+        item.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let outcome = super::media::export_one(&item, std::slice::from_ref(&dir), &dir, &field);
+    assert_eq!(outcome.skip_reason, "remote-path-refused");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Item 11: every response kind carries `Referrer-Policy: no-referrer`.
+#[test]
+fn every_response_sends_referrer_policy_no_referrer() {
+    let case_dir = scratch("referrer");
+    std::fs::create_dir_all(case_dir.join("review")).unwrap();
+    std::fs::write(case_dir.join("review/a.mp4"), b"bytes").unwrap();
+    let (addr, state) = start_server(Some(&case_dir), None);
+    state_lock(&state).media_roots = vec![case_dir.clone()];
+    let media = case_dir.join("review").join("a.mp4");
+    let get = |target: &str, extra: &str| {
+        raw(
+            addr,
+            &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}\r\n"),
+        )
+    };
+    for (target, extra) in [
+        ("/".to_string(), ""),
+        ("/api/status".to_string(), ""),
+        ("/nope".to_string(), ""),
+        ("/review/a.mp4".to_string(), ""),
+        ("/review/missing.mp4".to_string(), ""),
+        (format!("/media?path={}", media.display()), ""),
+        (
+            format!("/media?path={}", media.display()),
+            "Range: bytes=0-1\r\n",
+        ),
+        (
+            format!("/media?path={}", media.display()),
+            "Range: bytes=99-\r\n",
+        ),
+        ("/media".to_string(), ""),
+        (r"/media?path=\\evil\s\a.mp4".to_string(), ""),
+    ] {
+        let response = get(&target, extra);
+        let head = &response[..response.find("\r\n\r\n").unwrap_or(response.len())];
+        assert!(
+            head.contains("\r\nReferrer-Policy: no-referrer"),
+            "{target} {extra}: {head}"
+        );
+    }
+    // Refusals before routing (403 cross-origin) carry it as well.
+    let refused = raw(
+        addr,
+        "GET /api/status HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+    );
+    assert!(
+        refused.contains("Referrer-Policy: no-referrer"),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// Item 7 over the wire: a page on another localhost port cannot drive
+/// this server even with the planted cookies; the same authority can.
+#[test]
+fn origin_from_another_local_port_is_refused() {
+    let (addr, state) = start_server(None, None);
+    let nonce = state_lock(&state).instance.clone();
+    let port = addr.port();
+    let post = |origin: &str| {
+        raw(
+            addr,
+            &format!(
+                "POST /api/cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nCookie: ft_nonce={nonce}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+    };
+    let other_port = if port == 9999 { 9998 } else { 9999 };
+    let foreign = post(&format!("http://127.0.0.1:{other_port}"));
+    assert!(status_line(&foreign).contains("403"), "{foreign}");
+    let same = post(&format!("http://127.0.0.1:{port}"));
+    assert!(status_line(&same).contains("200"), "{same}");
+    // The shell's raw-socket requests send no Origin at all: unchanged.
+    let shell = raw(
+        addr,
+        &format!(
+            "POST /api/cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-FrameTrace-Nonce: {nonce}\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(status_line(&shell).contains("200"), "{shell}");
+}
