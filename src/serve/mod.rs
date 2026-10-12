@@ -622,6 +622,9 @@ pub(crate) fn open_in_explorer(path: &Path) {
 /// injected) so the "never a relative name" contract is unit-tested on
 /// every platform; the spawn/registry/ShellExecute parts are Windows-only.
 pub(crate) mod launch {
+    // Only the unit tests use the pure resolvers off Windows.
+    #![cfg_attr(not(windows), allow(dead_code))]
+
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
