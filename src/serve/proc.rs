@@ -73,9 +73,13 @@ mod sys {
         }
     }
 
-    /// SIGINT/SIGTERM/SIGHUP -> kill every tracked process group, exit with
-    /// the conventional 128+signal status. Step processes live in their own
-    /// groups, so the terminal's Ctrl-C no longer reaches them directly.
+    /// SIGINT/SIGTERM/SIGHUP -> the watcher thread kills every tracked
+    /// process group and exits with the conventional 128+signal status.
+    /// Step children run in their own process groups (`process_group(0)`),
+    /// so a terminal Ctrl-C (delivered to the foreground group only) does
+    /// not reach them by itself — `kill_all_tracked` is what stops them.
+    /// This is the unix path; Windows uses a console-control handler plus
+    /// job objects (see the `windows` module).
     pub(super) fn install_signal_handlers() -> Result<(), String> {
         let mut fds = [0i32; 2];
         // SAFETY: pipe(2) fills two ints.
@@ -121,25 +125,36 @@ mod sys {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
     };
     use windows::core::PCWSTR;
 
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    /// Lets a child spawned with `CREATE_BREAKAWAY_FROM_JOB` (the browser /
+    /// explorer launch) leave the server job; pipeline steps never set
+    /// that flag, so they still die with the server.
+    const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
 
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtResumeProcess(process: *mut std::ffi::c_void) -> i32;
     }
 
-    /// Creates a KILL_ON_JOB_CLOSE job object.
-    unsafe fn new_kill_job() -> Option<HANDLE> {
+    /// Creates a KILL_ON_JOB_CLOSE job object. `allow_breakaway` adds
+    /// BREAKAWAY_OK so a child spawned with CREATE_BREAKAWAY_FROM_JOB can
+    /// opt out (the server job only — a browser launched from the
+    /// workstation must survive the workstation closing).
+    unsafe fn new_kill_job(allow_breakaway: bool) -> Option<HANDLE> {
         unsafe {
             let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if allow_breakaway {
+                flags |= JOB_OBJECT_LIMIT(JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+            }
+            info.BasicLimitInformation.LimitFlags = flags;
             let configured = SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
@@ -156,10 +171,11 @@ mod sys {
     }
 
     /// Spawned suspended so the child is in its job before it can run (and
-    /// spawn grandchildren that would escape the job).
+    /// spawn grandchildren that would escape the job). `creation_flags`
+    /// replaces the whole flag word, so CREATE_NO_WINDOW is set in the
+    /// same call (through the shared helper) rather than lost.
     pub(super) fn prepare(command: &mut std::process::Command) {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_SUSPENDED);
+        crate::util::hide_console_with_flags(command, CREATE_SUSPENDED);
     }
 
     pub(super) fn attach(child: &std::process::Child) -> Option<usize> {
@@ -167,7 +183,7 @@ mod sys {
         // closed in `release` (which, with KILL_ON_JOB_CLOSE, also reaps any
         // survivors of the tree).
         let result = unsafe {
-            match new_kill_job() {
+            match new_kill_job(false) {
                 Some(job) => {
                     let process = HANDLE(child.as_raw_handle());
                     match AssignProcessToJobObject(job, process) {
@@ -202,11 +218,14 @@ mod sys {
     /// Puts the server process itself in a KILL_ON_JOB_CLOSE job. Children
     /// inherit it, so every descendant dies when the server exits for any
     /// reason (the handle is intentionally never closed; process exit closes
-    /// it). Nested jobs (Windows 8+) keep the per-step jobs working.
+    /// it). Nested jobs (Windows 8+) keep the per-step jobs working. The
+    /// job allows breakaway so `open_in_browser`/`open_in_explorer` can
+    /// launch Edge/Explorer outside it (CREATE_BREAKAWAY_FROM_JOB);
+    /// pipeline steps never request breakaway and stay inside.
     pub(super) fn init_process_guard() {
         // SAFETY: Win32 calls on a handle we own and leak on purpose.
         unsafe {
-            let Some(job) = new_kill_job() else {
+            let Some(job) = new_kill_job(true) else {
                 eprintln!("frametrace: could not create server job object");
                 return;
             };
@@ -296,11 +315,16 @@ fn kill_keys(keys: &[usize]) {
     }
 }
 
-/// Process-wide setup for the server: signal / console-control handlers
-/// that reap tracked trees (step processes are in their own groups/jobs so
-/// the terminal's Ctrl-C does not reach them), and on Windows a server-wide
-/// job so no descendant outlives the server. Idempotent; failures are
-/// logged, not fatal.
+/// Process-wide setup for the server: signal (unix) / console-control
+/// (Windows) handlers that reap tracked trees, and on Windows a
+/// server-wide KILL_ON_JOB_CLOSE job so no descendant outlives the server.
+/// Unix step children sit in their own process groups, so the terminal's
+/// Ctrl-C does not reach them directly. On Windows a job object does NOT
+/// shield children from console control events; step children are instead
+/// created with CREATE_NO_WINDOW (no console attached, see
+/// `util::hide_console`), so Ctrl-C never reaches them either — the handler
+/// and the jobs are what stop them. Idempotent; failures are logged, not
+/// fatal.
 pub(crate) fn install_process_guard() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

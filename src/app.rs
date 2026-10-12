@@ -37,31 +37,36 @@ fn app_main() -> i32 {
         if let Ok(mut log) = std::fs::File::create(&log_path) {
             let _ = writeln!(log, "{error}");
         }
-        let message = std::ffi::CString::new(format!(
-            "FrameTrace failed to start: {error}
-(log: {})",
+        let message = format!(
+            "FrameTrace failed to start: {error}\n(log: {})",
             log_path.display()
-        ))
-        .expect("message is valid UTF-8");
-        #[cfg(target_os = "windows")]
-        let _ = &message;
+        );
+        // MessageBoxW + UTF-16: the ANSI variant garbles Korean text
+        // (paths, server errors) on a non-Korean code page.
         #[cfg(target_os = "windows")]
         unsafe {
-            MessageBoxA(
+            MessageBoxW(
                 std::ptr::null_mut(),
-                message.as_ptr() as *const u8,
-                c"FrameTrace".as_ptr() as *const u8,
-                0x10,
+                utf16z(&message).as_ptr(),
+                utf16z("FrameTrace").as_ptr(),
+                0x10, // MB_ICONERROR
             );
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = &message;
-            eprintln!("{error}");
+            eprintln!("{message}");
         }
         return 1;
     }
     0
+}
+
+/// Null-terminated UTF-16 for Win32 `W` APIs. Interior NULs cannot occur
+/// in a Rust `String` passed from our own error path, and a stray one
+/// would only truncate the dialog text, never panic.
+#[cfg(target_os = "windows")]
+fn utf16z(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// No-argument launch. On Windows the native WebView2 shell hosts the
@@ -89,10 +94,10 @@ fn main() {
 #[cfg(target_os = "windows")]
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn MessageBoxA(
+    fn MessageBoxW(
         hwnd: *mut core::ffi::c_void,
-        text: *const u8,
-        caption: *const u8,
+        text: *const u16,
+        caption: *const u16,
         utype: u32,
     ) -> i32;
 }

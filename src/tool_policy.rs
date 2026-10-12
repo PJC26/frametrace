@@ -59,7 +59,7 @@ pub fn command_version(input: &str, allowed_names: &[&str], version_arg: &str) -
         Ok(binary) => binary,
         Err(err) => return format!("unavailable: {err}"),
     };
-    match Command::new(&binary).arg(version_arg).output() {
+    match crate::util::hide_console(Command::new(&binary).arg(version_arg)).output() {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
