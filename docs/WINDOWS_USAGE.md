@@ -9,18 +9,18 @@ Target environment: Windows 10/11 x64, local examiner PC, attached HDD/SSD/SD ca
 2. Install Rust for Windows with the MSVC toolchain (`https://rustup.rs/`;
    `rust-toolchain.toml` pins the exact toolchain via rustup):
    - Visual Studio Build Tools may be required for the MSVC linker.
-3. Install FFmpeg for Windows (`https://winget install Gyan.FFmpeg` or
+3. Install FFmpeg for Windows (`winget install Gyan.FFmpeg` or
    `choco install ffmpeg`) and make sure both tools are in `PATH`:
    - `ffmpeg.exe`
    - `ffprobe.exe`
 4. Install libewf tools if E01/Ex01 evidence containers will be processed.
    Upstream ships source only for Windows, so use the automated source build:
-   - `powershell -File scripts/build-libewf-tools.ps1` (installs a per-user
+   - `powershell -ExecutionPolicy Bypass -File scripts/build-libewf-tools.ps1` (installs a per-user
      MSYS2, builds libewf, drops `ewf*.exe` + `libewf-3.dll` into
      `target/release/tools/bin`; no admin required)
    - or place a trusted community build into `tools/bin/`.
 5. Install The Sleuth Kit tools if raw-image file-system inspection or deleted inode recovery will be processed
-   (`https://winget install Sleuthkit.Sleuthkit` or `https://sleuthkit.org`):
+   (`winget install Sleuthkit.Sleuthkit` or `https://sleuthkit.org`):
    - `mmls.exe`
    - `fls.exe`
    - `icat.exe`
@@ -68,9 +68,10 @@ powershell -ExecutionPolicy Bypass -File scripts/make-portable.ps1
 ```
 
 This produces `dist/FrameTrace-<version>-win64/` + `.zip` + `SHA256SUMS`.
-The package contains both executables, docs, `install.ps1`, and `tools/bin`
-(pre-populated with vendored libewf/Sleuth Kit binaries when present in the
-repo — drop `ffmpeg.exe`/`ffprobe.exe` there too for a fully turnkey bundle).
+The package contains both executables, docs, `install.ps1`, and `tools/bin`.
+The bundled tools come from `tools/bin` if it exists, otherwise from
+`target/release/tools/bin` (where `build-libewf-tools.ps1` installs them).
+Drop `ffmpeg.exe`/`ffprobe.exe` into `tools/bin` too for a fully turnkey bundle.
 
 **Two ways to run it:**
 
@@ -87,11 +88,11 @@ binaries two ways:
 
 ```powershell
 # Real CA certificate (removes SmartScreen reputation warnings for users):
-powershell -File scripts/sign-release.ps1 -Thumbprint <cert-thumbprint>
+powershell -ExecutionPolicy Bypass -File scripts/sign-release.ps1 -Thumbprint <cert-thumbprint>
 
 # Local self-signed dev cert (signs but does NOT suppress SmartScreen on
 # other machines — development/internal use only):
-powershell -File scripts/sign-release.ps1 -SelfSigned
+powershell -ExecutionPolicy Bypass -File scripts/sign-release.ps1 -SelfSigned
 ```
 
 Suppressing SmartScreen reputation prompts for end users requires a real

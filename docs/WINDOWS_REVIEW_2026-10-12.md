@@ -40,3 +40,39 @@
 
 ## Low
 `src/shell.rs:222` SetProcessDpiAwareness E_ACCESSDENIED 시 셸 포기 / `src/app.rs:40` MessageBoxA 한글 깨짐 / `src/deepfake.rs:99` py 런처 미탐색 / `src/serve/media.rs:1170` 사본에 읽기 전용 속성 복사 / `src/scan/candidates.rs:95` junction 무경고 스킵 / `src/serve/discovery.rs:14` HOME 우선 / `src/serve/proc.rs:76,299` 잘못된 주석.
+
+## 처리 결과
+
+| # | 판정 | 비고 |
+|---|---|---|
+| 1 | 고침 | |
+| 2 | 고침 | |
+| 3 | 고침 | |
+| 4 | 고침 | |
+| 5 | 고침 | |
+| 6 | 고침 | |
+| 7 | 고침 | |
+| 8 | 고침 | |
+| 9 | 고침 | |
+| 10 | 고침 | |
+| 11 | 고침 | |
+| 12 | 고침 | |
+| 13 | 고침 | |
+| 15 | 고침 | |
+| 16 | 고침 | |
+| 17 | 고침 | |
+| 18 | 고침 | |
+| 14 | 비목표 | 매니페스트 앵커 스키마 변경 필요, 후속 |
+| 19 | 고침 | 재개 직후 크래시 시 중복 확인 → 동일 id/경로/sha256 재기록 방지 |
+| 20 | 고침 | libewf 빌드 전체 실행은 미검증 |
+| 21 | 고침 | |
+| 22 | 고침 | |
+| 23 | 고침 | |
+| 24 | 고침 | |
+| 25 | 고침 | |
+| 26 | 고침 | |
+| 27 | 고침 | |
+| 28 | 고침 | |
+| Low | 고침 | DPI·MessageBoxW·junction 경고·HOME 우선·읽기 전용 속성·proc 주석 고침. deepfake py 런처 탐색(`src/deepfake.rs:99`)은 비목표 |
+
+참고: 8번의 UNC 거부와 별개로, `api_start`의 UNC 원본 경로는 네트워크 공유 증거 분석을 위해 허용한다. POST 요청은 nonce + Origin 포트 검사로 보호된다.

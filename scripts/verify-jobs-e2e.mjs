@@ -270,7 +270,7 @@ try {
   const pathMatch = summary && summary.match(/(?:클립 파일|Clip file):\s*(.+)/);
   check('exhibit summary shows a SHA-256', shaMatch);
   const clipPath = pathMatch ? pathMatch[1].trim() : '';
-  check('exhibit summary shows the clip path inside the case', clipPath.startsWith(caseDir) && clipPath.includes('artifacts/clips/'), clipPath);
+  check('exhibit summary shows the clip path inside the case', clipPath.startsWith(caseDir) && clipPath.replace(/\\/g, '/').includes('artifacts/clips/'), clipPath);
   check('summary SHA-256 equals the clip file on disk', shaMatch && existsSync(clipPath) && sha256File(clipPath) === shaMatch[1],
     existsSync(clipPath) ? `${statSync(clipPath).size} bytes` : 'missing');
   const st4 = await getJson('/api/status');

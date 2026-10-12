@@ -27,7 +27,7 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 node scripts/check-js.mjs && node scripts/check-css.mjs
-cargo build --locked && FRAMETRACE_BIN=<repo>/target/debug/frametrace-app bash scripts/ci-harnesses.sh   # 22종 (Windows는 Git Bash)
+cargo build --locked && FRAMETRACE_BIN=<repo>/target/debug/frametrace-app bash scripts/ci-harnesses.sh   # 22종 (Windows는 Git Bash; 바이너리 이름은 Linux/macOS `frametrace-app`, Windows `frametrace-app.exe` — isolated-server.mjs가 .exe를 자동으로 붙임)
 FRAMETRACE_IT=1 cargo test --locked --test workstation_e2e -- --ignored
 ```
 
