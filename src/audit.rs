@@ -279,6 +279,11 @@ pub fn verify_chained_jsonl_text(
     let mut entries = 0usize;
     let mut keyed_entries = 0usize;
     let mut unauthenticated_keyed = 0usize;
+    // Line number of the first keyed entry. Keying is introduced, never
+    // withdrawn, by the appender (a configured key signs every append), so
+    // an unkeyed entry AFTER it is how stripped HMAC fields look.
+    let mut first_keyed_line: Option<usize> = None;
+    let mut unkeyed_after_keyed: Vec<usize> = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -388,12 +393,25 @@ pub fn verify_chained_jsonl_text(
             }
         };
         match verify_line() {
-            Ok(Keyed::Verified) => keyed_entries += 1,
+            Ok(Keyed::Verified) => {
+                keyed_entries += 1;
+                first_keyed_line.get_or_insert(line_number);
+            }
             Ok(Keyed::Unauthenticated) => {
                 keyed_entries += 1;
                 unauthenticated_keyed += 1;
+                first_keyed_line.get_or_insert(line_number);
             }
-            Ok(Keyed::Unkeyed) => {}
+            Ok(Keyed::Unkeyed) => {
+                if let Some(first_keyed) = first_keyed_line {
+                    if !keys.is_empty() {
+                        return Err(format!(
+                            "audit line {line_number} is unkeyed although keyed entries begin at line {first_keyed}: keyed→unkeyed transition (HMAC fields stripped, or appended without the audit key)"
+                        ));
+                    }
+                    unkeyed_after_keyed.push(line_number);
+                }
+            }
             Err(error) => {
                 if line_number == lines.len() && !complete_tail {
                     return Err(format!(
@@ -421,6 +439,21 @@ pub fn verify_chained_jsonl_text(
     if keyed_entries > 0 && keyed_entries < entries {
         warnings.push(
             "mixed keyed/unkeyed entries — log-level integrity degrades to structural-only"
+                .to_string(),
+        );
+    }
+    if let (Some(first_keyed), Some(first_unkeyed)) =
+        (first_keyed_line, unkeyed_after_keyed.first())
+    {
+        warnings.push(format!(
+            "keyed→unkeyed transition: audit line {first_unkeyed} is unkeyed although keyed entries begin at line {first_keyed} ({} unkeyed entr{} after the first keyed one) — HMAC fields may have been stripped; configure the audit key to verify (structural chain verified)",
+            unkeyed_after_keyed.len(),
+            if unkeyed_after_keyed.len() == 1 { "y" } else { "ies" }
+        ));
+    }
+    if !keys.is_empty() && entries > 0 && keyed_entries == 0 {
+        warnings.push(
+            "an audit key is configured but the log has 0 keyed entries — it predates keying, or was fully re-chained without HMAC fields (structural chain verified only)"
                 .to_string(),
         );
     }
@@ -523,6 +556,7 @@ mod tests {
     use crate::util::read_to_string;
     use std::fs;
     use std::io::Write;
+    use std::path::Path;
 
     fn test_key(id: &str, seed: u8) -> AuditKey {
         AuditKey::new(id, &[seed; 32])
@@ -798,6 +832,93 @@ mod tests {
         let verification = verify_chained_jsonl(&path).unwrap();
         assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
         assert_eq!(verification.keyed_entries, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-chains `log` from scratch, keeping each entry's body but writing
+    /// lines `0..keep_keyed` keyed and the rest unkeyed — what an attacker
+    /// who strips HMAC fields and recomputes the plain sha256 chain makes.
+    fn rechain_stripping_hmac(log: &str, keep_keyed: usize, key: &AuditKey, out: &Path) {
+        let _ = fs::remove_file(out);
+        for (index, line) in log.lines().enumerate() {
+            let cut = line.rfind(",\"previous_entry_sha256\":").unwrap();
+            let body = format!("{}}}", &line[..cut]);
+            let key = (index < keep_keyed).then_some(key);
+            append_chained_jsonl_keyed(out, &body, key).unwrap();
+        }
+    }
+
+    /// Item 13(a): HMAC stripped from EVERY line and the chain recomputed —
+    /// structurally valid, so it must at least warn when a key is configured.
+    #[test]
+    fn fully_unkeyed_rechain_warns_when_key_is_configured() {
+        use super::verify_chained_jsonl_text;
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-strip-all-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = test_key("k1", 0x51);
+        let path = dir.join("audit.jsonl");
+        for kind in ["one", "two", "three"] {
+            append_chained_jsonl_keyed(&path, &format!(r#"{{"kind":"{kind}"}}"#), Some(&key))
+                .unwrap();
+        }
+        let stripped = dir.join("stripped.jsonl");
+        rechain_stripping_hmac(&read_to_string(&path).unwrap(), 0, &key, &stripped);
+        let text = read_to_string(&stripped).unwrap();
+        assert!(!text.contains("entry_hmac_sha256"));
+
+        let keyed = verify_chained_jsonl_text(&text, "t", std::slice::from_ref(&key)).unwrap();
+        assert_eq!(keyed.integrity, AuditIntegrity::StructuralOnly);
+        assert_eq!(keyed.keyed_entries, 0);
+        assert!(
+            keyed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("0 keyed entries")),
+            "{:?}",
+            keyed.warnings
+        );
+        // No key configured: an unkeyed log is the normal pre-keying case.
+        let unkeyed = verify_chained_jsonl_text(&text, "t", &[]).unwrap();
+        assert!(unkeyed.warnings.is_empty(), "{:?}", unkeyed.warnings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Item 13(b): HMAC stripped from line 3 onward. With the key
+    /// configured that is an error; without it, a warning naming the line.
+    #[test]
+    fn keyed_to_unkeyed_transition_is_error_with_key_and_warning_without() {
+        use super::verify_chained_jsonl_text;
+        let dir = std::env::temp_dir().join(format!(
+            "frametrace-audit-strip-tail-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = test_key("k1", 0x52);
+        let path = dir.join("audit.jsonl");
+        for kind in ["one", "two", "three", "four"] {
+            append_chained_jsonl_keyed(&path, &format!(r#"{{"kind":"{kind}"}}"#), Some(&key))
+                .unwrap();
+        }
+        let stripped = dir.join("stripped.jsonl");
+        rechain_stripping_hmac(&read_to_string(&path).unwrap(), 2, &key, &stripped);
+        let text = read_to_string(&stripped).unwrap();
+
+        let err = verify_chained_jsonl_text(&text, "t", std::slice::from_ref(&key)).unwrap_err();
+        assert!(err.contains("audit line 3"), "{err}");
+        assert!(err.contains("keyed→unkeyed"), "{err}");
+
+        let unkeyed = verify_chained_jsonl_text(&text, "t", &[]).unwrap();
+        assert_eq!(unkeyed.integrity, AuditIntegrity::StructuralOnly);
+        assert!(
+            unkeyed.warnings.iter().any(|warning| warning
+                .contains("keyed→unkeyed transition: audit line 3")
+                && warning.contains("begin at line 1")),
+            "{:?}",
+            unkeyed.warnings
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
