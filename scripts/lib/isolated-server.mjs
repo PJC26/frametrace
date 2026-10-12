@@ -48,7 +48,10 @@ export async function startIsolatedServer({ root, work, token, port, release = f
   // FRAMETRACE_BIN pins an exact binary (CI builds once); otherwise
   // $CARGO_TARGET_DIR (or ./target) / debug|release / frametrace-app.
   const dir = join(process.env.CARGO_TARGET_DIR || join(root, 'target'), release ? 'release' : 'debug');
-  const exe = process.env.FRAMETRACE_BIN || join(dir, 'frametrace-app' + (process.platform === 'win32' ? '.exe' : ''));
+  let exe = process.env.FRAMETRACE_BIN || join(dir, 'frametrace-app' + (process.platform === 'win32' ? '.exe' : ''));
+  // On Windows a FRAMETRACE_BIN given without the extension (e.g. from Git Bash)
+  // still resolves: spawn() would not append .exe itself.
+  if (process.platform === 'win32' && !existsSync(exe) && !/\.exe$/i.test(exe) && existsSync(exe + '.exe')) exe += '.exe';
   if (!existsSync(exe)) throw new Error(`build first (cargo build --locked) or set FRAMETRACE_BIN: ${exe} missing`);
   const pinned = token || 'iso-' + Math.random().toString(36).slice(2, 12);
   const usePort = port || await freePort();
@@ -61,7 +64,12 @@ export async function startIsolatedServer({ root, work, token, port, release = f
   child.stdout.on('data', (d) => { log += d; });
   child.stderr.on('data', (d) => { log += d; });
   let exited = null;
-  child.on('exit', (code) => { exited = code; });
+  // Resolves once the process is gone (also for spawn errors), so callers can
+  // delete the work dir without hitting EBUSY on Windows.
+  const exitPromise = new Promise((resolve) => {
+    child.on('exit', (code) => { exited = code ?? -1; resolve(); });
+    child.on('error', () => { if (exited === null) exited = -1; resolve(); });
+  });
   const headers = { 'X-FrameTrace-Token': pinned };
   for (let i = 0; ; i++) {
     if (exited !== null) throw new Error(`server exited (${exited}):\n${log}`);
@@ -84,6 +92,19 @@ export async function startIsolatedServer({ root, work, token, port, release = f
   return {
     base, token: pinned, headers, exe, port: usePort, getJson, postJson,
     log: () => log,
-    stop() { try { child.kill(); } catch { /* gone */ } },
+    // Returns a promise that resolves when the server process has exited
+    // (bounded wait; force-kills if it ignores the first signal).
+    stop() {
+      if (exited === null) {
+        try { child.kill(); } catch { /* gone */ }
+      }
+      return Promise.race([
+        exitPromise,
+        new Promise((r) => setTimeout(() => {
+          if (exited === null) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+          r();
+        }, 5000)),
+      ]);
+    },
   };
 }

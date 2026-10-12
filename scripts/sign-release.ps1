@@ -1,4 +1,4 @@
-# Signs FrameTrace release binaries.
+﻿# Signs FrameTrace release binaries.
 #
 # Real distribution needs an OV/EV code-signing certificate bought from a CA —
 # that is a purchase decision, not something a script can fabricate. This

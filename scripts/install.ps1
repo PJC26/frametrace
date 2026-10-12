@@ -1,4 +1,4 @@
-# FrameTrace portable installer.
+﻿# FrameTrace portable installer.
 # Copies this package to %LOCALAPPDATA%\Programs\FrameTrace, creates a
 # Start Menu shortcut (and optional desktop shortcut), then unblocks the
 # binaries so Windows does not re-prompt on every launch.
