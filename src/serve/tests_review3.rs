@@ -298,6 +298,7 @@ fn signoff_refused_when_marks_cannot_be_read() {
 fn running_clip(id: &str, key: &str, output: PathBuf) -> ClipJob {
     ClipJob {
         id: id.into(),
+        kind: "export-clip",
         key: key.into(),
         record_id: "vid_0001".into(),
         rel_path: output.to_string_lossy().to_string(),
@@ -309,6 +310,9 @@ fn running_clip(id: &str, key: &str, output: PathBuf) -> ClipJob {
         size_bytes: None,
         error: None,
         cancel_requested: false,
+        progress_path: None,
+        expected_bytes: None,
+        join: None,
     }
 }
 

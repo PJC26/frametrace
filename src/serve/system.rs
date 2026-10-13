@@ -318,15 +318,30 @@ pub(crate) fn api_status(state: &SharedState) -> String {
     // runs AFTER the state lock is released. Holding the global lock across
     // those reads stalled every other endpoint for seconds while a carve
     // job was writing (measured: up to 4 s per /api/status poll).
-    let (mut body, case_dir, byte_progress, enrichment_step) = {
+    let (mut body, case_dir, byte_progress, enrichment_step, recent_clips) = {
         let guard = state_lock(state);
         (
             status_snapshot(&guard),
             guard.case_dir.clone(),
             guard.byte_progress.clone(),
             guard.enrichment,
+            // Cloned here, rendered below: a job's JSON stats its growing
+            // output / `.part` and reads the join progress file.
+            guard
+                .clip_jobs
+                .iter()
+                .rev()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>(),
         )
     };
+    // UX-09: clip exports and joins run beside `busy`; running + recent ones.
+    body["clip_jobs"] = recent_clips
+        .iter()
+        .map(clip_job_json)
+        .collect::<Vec<_>>()
+        .into();
     let progress = progress_json(case_dir.as_deref(), byte_progress.as_ref());
     // UX-02: which phase-2 step is enriching the partial index. `done` /
     // `total` are the running job's unit progress when the step reports
@@ -423,8 +438,7 @@ fn status_snapshot(guard: &JobState) -> serde_json::Value {
         // current/last background case job with its stage and outcome.
         "job_kind": status_job_kind(guard),
         "job": guard.case_job.as_ref().map(case_job_json),
-        // UX-09: clip exports run beside `busy`; running + recent ones.
-        "clip_jobs": guard.clip_jobs.iter().rev().take(8).map(clip_job_json).collect::<Vec<_>>(),
+        // `clip_jobs` is filled in by api_status outside the lock.
         "clips_running": guard.clip_jobs.iter().filter(|job| job.state == "running").count(),
     })
 }

@@ -56,6 +56,7 @@ fn job_for(case_dir: &Path) -> PipelineJob {
         with_hash: true,
         with_ffprobe: false,
         with_deepfake: false,
+        with_audio: false,
         skip_e01_verify: false,
         e01_direct: false,
     }

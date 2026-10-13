@@ -35,6 +35,8 @@ mod tests_http;
 #[cfg(test)]
 mod tests_jobs;
 #[cfg(test)]
+mod tests_join;
+#[cfg(test)]
 mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
@@ -52,14 +54,15 @@ pub(crate) use http::{
     request_is_localhost_trusted, valid_token, viewer_page, write_simple,
 };
 pub(crate) use jobs::{
-    api_carve, api_finalize, api_import_marks, api_mark_conflicts, api_recover_deleted, api_start,
-    api_verify_sources, case_job_json, default_case_dir, pending_marks_count, run_step,
-    run_step_cancellable,
+    api_audio_measure, api_carve, api_finalize, api_import_marks, api_mark_conflicts,
+    api_recover_deleted, api_start, api_verify_sources, case_job_json, default_case_dir,
+    pending_marks_count, run_step, run_step_cancellable,
 };
 pub(crate) use media::{
     api_advanced, api_capture_frame, api_export_clip, api_export_clip_cancel,
-    api_export_clip_status, api_export_selected, api_proxy, api_telemetry, api_transcode_queue,
-    cancel_all_clip_jobs, clip_job_json, newest_package_dir, opt_path, running_clip_job_count,
+    api_export_clip_status, api_export_selected, api_join, api_join_check, api_proxy,
+    api_telemetry, api_transcode_queue, cancel_all_clip_jobs, clip_job_json, newest_package_dir,
+    opt_path, running_clip_job_count,
 };
 pub(crate) use recent::{api_recent_cases, api_recent_cases_forget, record_recent_case};
 pub(crate) use records::{
@@ -68,8 +71,8 @@ pub(crate) use records::{
 };
 pub(crate) use state::{
     BusyLease, CaseJob, ClipJob, Enrichment, IndexCache, IndexFingerprint, InputKind, JobState,
-    LiveCache, PipelineJob, SharedState, StepStatus, api_err, restore_session, save_session,
-    state_lock, try_acquire_busy, try_lease_busy,
+    JoinJobInfo, LiveCache, PipelineJob, SharedState, StepStatus, api_err, restore_session,
+    save_session, state_lock, try_acquire_busy, try_lease_busy,
 };
 pub(crate) use system::{
     api_browse, api_cancel, api_case_info, api_env, api_open_case, api_preflight, api_shutdown,
@@ -98,7 +101,11 @@ pub(crate) use jobs::{
     run_folder_enrichment, source_is_volume_root, start_media_roots, warn_step,
 };
 #[cfg(test)]
-pub(crate) use media::{copy_unique, export_clip_with_exe, export_safe_name};
+pub(crate) use jobs::{audio_measure_with_exe, enrichment_plan};
+#[cfg(test)]
+pub(crate) use media::{
+    copy_unique, export_clip_with_exe, export_safe_name, join_check_with_tools, join_with_exe,
+};
 // Only the fake-CLI tests (unix-only) use these.
 #[cfg(all(test, unix))]
 pub(crate) use jobs::SIGNOFF_PENDING_REL_PATH;
@@ -1006,6 +1013,9 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/preflight") => json(api_preflight(request)),
         ("GET", "/api/export-clip-status") => json(api_export_clip_status(request, state)),
         ("POST", "/api/export-clip-cancel") => json(api_export_clip_cancel(request, state)),
+        ("POST", "/api/join-check") => json(api_join_check(request, state)),
+        ("POST", "/api/join") => json(api_join(request, state)),
+        ("POST", "/api/audio-measure") => json(api_audio_measure(request, state)),
         ("GET", "/api/recent-cases") => json(api_recent_cases()),
         ("POST", "/api/recent-cases/forget") => json(api_recent_cases_forget(request)),
         _ => plain(404, b"not found".to_vec()),

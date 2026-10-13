@@ -222,8 +222,11 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
             .clip_jobs
             .iter()
             .find(|job| job.key == key && job.state == "running" && !job.cancel_requested)
+            .cloned()
         {
-            return clip_response(existing, true);
+            // The response stats files: render it after the lock is gone.
+            drop(guard);
+            return clip_response(&existing, true);
         }
         // finalize/recover/carve take `busy` first and then count running
         // clips; re-checking `busy` in the same lock as the registration
@@ -263,6 +266,7 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
             .unwrap_or_else(|_| output.to_string_lossy().to_string());
         let job = ClipJob {
             id: job_id,
+            kind: "export-clip",
             key,
             record_id: id.clone(),
             output,
@@ -274,6 +278,9 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
             size_bytes: None,
             error: None,
             cancel_requested: false,
+            progress_path: None,
+            expected_bytes: None,
+            join: None,
         };
         guard.clip_jobs.push(job.clone());
         prune_finished_clip_jobs(&mut guard.clip_jobs);
@@ -333,23 +340,28 @@ pub(crate) fn exhibit_arg(exhibit: &str) -> String {
 /// A running (not cancel-pending) job with `key`, or a finished one whose clip is still on disk
 /// with the recorded size (so a deleted/replaced clip is exported anew).
 fn find_reusable_clip_job(state: &SharedState, key: &str) -> Option<ClipJob> {
-    let guard = state_lock(state);
-    guard
+    // Candidates are cloned under the lock; the on-disk check runs after
+    // it is released (no file I/O while holding the state lock).
+    let candidates: Vec<ClipJob> = state_lock(state)
         .clip_jobs
         .iter()
         .rev()
-        .find(|job| {
+        .filter(|job| {
             job.key == key
                 && match job.state {
                     // A cancel-pending job is about to die: joining it would
                     // hand the caller a job that ends "cancelled" (finding 3).
                     "running" => !job.cancel_requested,
-                    "done" => std::fs::metadata(&job.output)
-                        .is_ok_and(|meta| Some(meta.len()) == job.size_bytes),
+                    "done" => true,
                     _ => false,
                 }
         })
         .cloned()
+        .collect();
+    candidates.into_iter().find(|job| {
+        job.state == "running"
+            || std::fs::metadata(&job.output).is_ok_and(|meta| Some(meta.len()) == job.size_bytes)
+    })
 }
 
 fn prune_finished_clip_jobs(jobs: &mut Vec<ClipJob>) {
@@ -465,36 +477,97 @@ pub(crate) fn cancel_all_clip_jobs(guard: &mut JobState) -> usize {
     count
 }
 
-/// Public view of one clip job.
+/// The `{stage, done, total}` the join CLI writes atomically (None when
+/// absent or unreadable — it is a UI hint, never evidence).
+fn read_join_progress(path: &Path) -> Option<(String, u64, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some((
+        value.get("stage")?.as_str()?.to_string(),
+        value.get("done")?.as_u64()?,
+        value.get("total")?.as_u64()?,
+    ))
+}
+
+/// Public view of one clip export or join job.
+///
+/// Reads files (the growing output / `.part` and the join progress file),
+/// so callers render it from a clone AFTER releasing the state lock.
 pub(crate) fn clip_job_json(job: &ClipJob) -> serde_json::Value {
     let end = job
         .finished_unix
         .or_else(|| crate::util::now_unix().ok())
         .unwrap_or(job.started_unix);
-    // ffmpeg writes the clip progressively: its size is the honest
-    // progress signal (no total is known up front).
-    let bytes_written = if job.state == "running" {
-        std::fs::metadata(&job.output).map(|m| m.len()).unwrap_or(0)
+    let running = job.state == "running";
+    let progress = job
+        .progress_path
+        .as_deref()
+        .filter(|_| running)
+        .and_then(read_join_progress);
+    // ffmpeg writes progressively: the size of what it is writing (the
+    // clip itself, or a join's `.part`) is the honest progress signal.
+    let bytes_written = if running {
+        let growing = job
+            .join
+            .as_ref()
+            .map(|join| join.temps.part.as_path())
+            .unwrap_or(job.output.as_path());
+        std::fs::metadata(growing).map(|m| m.len()).unwrap_or(0)
     } else {
         job.size_bytes.unwrap_or(0)
     };
-    serde_json::json!({
+    // A join copies every source byte: the check's summed size, else the
+    // CLI's own concat-stage total.
+    let expected_bytes = job.expected_bytes.or_else(|| {
+        progress
+            .as_ref()
+            .filter(|(stage, _, _)| stage == "concat")
+            .map(|(_, _, total)| *total)
+    });
+    let path = if job.rel_path.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(job.rel_path)
+    };
+    let mut value = serde_json::json!({
         "id": job.id,
-        "kind": "export-clip",
+        "kind": job.kind,
         "record_id": job.record_id,
         "state": job.state,
         "started_unix": job.started_unix,
         "finished_unix": job.finished_unix,
         "elapsed_secs": end.saturating_sub(job.started_unix),
-        "path": job.rel_path,
+        "path": path,
+        "stage": progress.as_ref().map(|(stage, _, _)| stage.clone()),
+        "stage_done": progress.as_ref().map(|(_, done, _)| *done),
+        "stage_total": progress.as_ref().map(|(_, _, total)| *total),
         "bytes_written": bytes_written,
+        "expected_bytes": expected_bytes,
         "sha256": job.sha256,
         "size_bytes": job.size_bytes,
         "error": job.error,
         "cancel_requested": job.cancel_requested,
-    })
+    });
+    if let (Some(join), Some(map)) = (job.join.as_ref(), value.as_object_mut()) {
+        map.insert("plan_id".into(), serde_json::json!(join.plan_id));
+        map.insert("segments".into(), serde_json::json!(join.ids.len()));
+        map.insert("manifest_path".into(), serde_json::json!(join.manifest_rel));
+        map.insert(
+            "duration_check_ok".into(),
+            serde_json::json!(join.duration_check_ok),
+        );
+        map.insert(
+            "duration_check".into(),
+            join.duration_check
+                .clone()
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    value
 }
 
+/// Renders the API response for `job` (reads files: call without the
+/// state lock held).
 fn clip_response(job: &ClipJob, deduped: bool) -> String {
     let mut body = serde_json::json!({
         "ok": true,
@@ -506,16 +579,29 @@ fn clip_response(job: &ClipJob, deduped: bool) -> String {
     {
         map.insert("path".into(), serde_json::json!(job.rel_path));
         map.insert("sha256".into(), serde_json::json!(job.sha256));
+        if let Some(join) = job.join.as_ref() {
+            map.insert("manifest_path".into(), serde_json::json!(join.manifest_rel));
+            map.insert(
+                "duration_check".into(),
+                join.duration_check
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
     }
     body.to_string()
 }
 
-/// `GET /api/export-clip-status?job=ID`.
+/// `GET /api/export-clip-status?job=ID` (clip exports and joins).
 pub(crate) fn api_export_clip_status(request: &Request, state: &SharedState) -> String {
     let id = query_value(&request.query, "job").unwrap_or_default();
-    let guard = state_lock(state);
-    match guard.clip_jobs.iter().find(|job| job.id == id) {
-        Some(job) => clip_response(job, false),
+    let job = state_lock(state)
+        .clip_jobs
+        .iter()
+        .find(|job| job.id == id)
+        .cloned();
+    match job {
+        Some(job) => clip_response(&job, false),
         None => api_err("해당 클립 내보내기 작업을 찾을 수 없습니다."),
     }
 }
@@ -532,6 +618,721 @@ pub(crate) fn api_export_clip_cancel(request: &Request, state: &SharedState) -> 
         Some(_) => api_err("이미 끝난 클립 내보내기입니다."),
         None => api_err("해당 클립 내보내기 작업을 찾을 수 없습니다."),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lossless join (plan §1.6–1.7): `/api/join-check` plans synchronously,
+// `/api/join` runs `join-video` as a clip-style background job.
+// ---------------------------------------------------------------------------
+
+/// T1's "id not in the index" blocking message: the server refuses such a
+/// request outright (§1.6) instead of returning a blocked plan.
+const JOIN_UNKNOWN_ID_MESSAGE: &str = "색인에 없는 영상입니다";
+/// Plans remembered for `expected_bytes` (one per recent check).
+const KEPT_JOIN_PLANS: usize = 16;
+
+/// Serializes crash-recovery cleanup of `.join-*` leftovers against job
+/// starts, so a cleanup never sees a just-registered job's temp files as
+/// stale (every job's CLI is spawned only after it passed this gate).
+static JOIN_TEMP_GATE: Mutex<()> = Mutex::new(());
+
+/// Parsed `{"ids":[...], "tolerance":1.0, "plan_id":"…"}`.
+struct JoinRequest {
+    ids: Vec<String>,
+    tolerance: f64,
+    plan_id: Option<String>,
+}
+
+/// Parses and validates a join body (JSON array → serde_json, like
+/// export-selected). Ids must be indexed originals (`vid_*`).
+fn parse_join_request(body: &str) -> Result<JoinRequest, String> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| "요청 형식이 올바르지 않습니다 (ids, tolerance).".to_string())?;
+    let ids = value
+        .get("ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "영상을 2개 이상 선택하십시오".to_string())?
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "id는 문자열이어야 합니다.".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tolerance = match value.get("tolerance") {
+        None | Some(serde_json::Value::Null) => crate::join::DEFAULT_TOLERANCE_SECONDS,
+        Some(raw) => raw
+            .as_f64()
+            .or_else(|| raw.as_str().and_then(|text| text.trim().parse().ok()))
+            .ok_or_else(|| "허용 오차 값이 올바르지 않습니다.".to_string())?,
+    };
+    crate::join::validate_request(&ids, tolerance)?;
+    if let Some(bad) = ids
+        .iter()
+        .find(|id| !id.starts_with("vid_") || id.contains(','))
+    {
+        return Err(format!(
+            "색인된 원본 영상(vid_*)만 이어붙일 수 있습니다 (후보·복구본·결과물 제외): {}",
+            bad.chars().take(64).collect::<String>()
+        ));
+    }
+    let plan_id = match value.get("plan_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(raw) => {
+            let text = raw.as_str().unwrap_or_default().trim().to_ascii_lowercase();
+            if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("plan_id가 올바르지 않습니다 — 다시 검사하십시오.".to_string());
+            }
+            Some(text)
+        }
+    };
+    Ok(JoinRequest {
+        ids,
+        tolerance,
+        plan_id,
+    })
+}
+
+/// `POST /api/join-check {ids, tolerance}`: plans the join (live ffprobe of
+/// every segment, at most 4 at once) and returns `{ok:true, plan}` — the
+/// plan carries any `blocking` reasons; the request itself is refused only
+/// for no case, a malformed/oversized selection, non-`vid_*` or unknown
+/// ids, or while an analysis job holds `busy`.
+pub(crate) fn api_join_check(request: &Request, state: &SharedState) -> String {
+    join_check_with_tools(request, state, &crate::join::Tools::default())
+}
+
+/// [`api_join_check`] parameterised on ffmpeg/ffprobe (tests).
+pub(crate) fn join_check_with_tools(
+    request: &Request,
+    state: &SharedState,
+    tools: &crate::join::Tools,
+) -> String {
+    let (case_dir, busy) = {
+        let guard = state_lock(state);
+        (guard.case_dir.clone(), guard.busy)
+    };
+    let Some(case_dir) = case_dir else {
+        return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
+            .to_string();
+    };
+    let parsed = match parse_join_request(&request.body) {
+        Ok(parsed) => parsed,
+        Err(err) => return api_err(&err),
+    };
+    if busy {
+        return api_err(CLIP_BUSY_ERROR);
+    }
+    // Index read + up to 500 ffprobes: never under the state lock.
+    let plan = match crate::join::plan_with_tools(&case_dir, &parsed.ids, parsed.tolerance, tools) {
+        Ok(plan) => plan,
+        Err(err) => return api_err(&err),
+    };
+    let unknown: Vec<&str> = plan
+        .blocking
+        .iter()
+        .filter(|issue| {
+            issue.code == "not-indexed" && issue.message.starts_with(JOIN_UNKNOWN_ID_MESSAGE)
+        })
+        .flat_map(|issue| issue.ids.iter().map(String::as_str))
+        .collect();
+    if !unknown.is_empty() {
+        let shown = unknown
+            .iter()
+            .take(10)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = unknown.len().saturating_sub(10);
+        return api_err(&format!(
+            "{JOIN_UNKNOWN_ID_MESSAGE}: {shown}{}",
+            if more > 0 {
+                format!(" 외 {more}개")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    {
+        let mut guard = state_lock(state);
+        if guard.case_dir.as_deref() == Some(case_dir.as_path()) {
+            let total = plan.total_bytes();
+            guard.join_plan_bytes.retain(|(id, _)| *id != plan.plan_id);
+            guard.join_plan_bytes.push((plan.plan_id.clone(), total));
+            let excess = guard.join_plan_bytes.len().saturating_sub(KEPT_JOIN_PLANS);
+            guard.join_plan_bytes.drain(..excess);
+        }
+    }
+    serde_json::json!({"ok": true, "plan": plan.to_json()}).to_string()
+}
+
+/// `POST /api/join {ids, plan_id, tolerance}`: starts `join-video` as a
+/// background job sharing the clip-export list, lock, running cap (4) and
+/// protections. The CLI re-plans and refuses (exit 3) when the files
+/// changed since the check. Response: `{ok:true, job:{…, kind:"join"},
+/// deduped}`; status/cancel through export-clip-status / -cancel.
+pub(crate) fn api_join(request: &Request, state: &SharedState) -> String {
+    match std::env::current_exe() {
+        Ok(exe) => join_with_exe(request, state, &exe),
+        Err(err) => api_err(&err.to_string()),
+    }
+}
+
+/// [`api_join`] parameterised on the CLI executable (tests).
+pub(crate) fn join_with_exe(request: &Request, state: &SharedState, exe: &Path) -> String {
+    let (case_dir, busy) = {
+        let guard = state_lock(state);
+        (guard.case_dir.clone(), guard.busy)
+    };
+    let Some(case_dir) = case_dir else {
+        return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
+            .to_string();
+    };
+    let parsed = match parse_join_request(&request.body) {
+        Ok(parsed) => parsed,
+        Err(err) => return api_err(&err),
+    };
+    let Some(plan_id) = parsed.plan_id.clone() else {
+        return api_err("plan_id가 없습니다 — 먼저 검사하십시오.");
+    };
+    let mut sorted = parsed.ids.clone();
+    sorted.sort();
+    let key = format!(
+        "join\u{1f}{}\u{1f}{}\u{1f}{:.3}\u{1f}{plan_id}",
+        case_dir.display(),
+        sorted.join("\u{1e}"),
+        parsed.tolerance
+    );
+    if let Some(existing) = find_reusable_clip_job(state, &key) {
+        return clip_response(&existing, true);
+    }
+    if busy {
+        return api_err(CLIP_BUSY_ERROR);
+    }
+    let job = {
+        let mut guard = state_lock(state);
+        if let Some(existing) = guard
+            .clip_jobs
+            .iter()
+            .find(|job| job.key == key && job.state == "running" && !job.cancel_requested)
+            .cloned()
+        {
+            drop(guard);
+            return clip_response(&existing, true);
+        }
+        if guard.busy {
+            return api_err(CLIP_BUSY_ERROR);
+        }
+        if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
+            return api_err("케이스가 바뀌었습니다 — 다시 시도하십시오.");
+        }
+        if guard
+            .clip_jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .count()
+            >= MAX_RUNNING_CLIP_JOBS
+        {
+            return api_err(
+                "동시에 진행 중인 클립 내보내기·이어붙이기가 너무 많습니다 — 하나가 끝난 뒤 다시 시도하십시오.",
+            );
+        }
+        guard.clip_seq += 1;
+        let started_unix = crate::util::now_unix().unwrap_or(0);
+        let job_id = format!("join-{}", guard.clip_seq);
+        // Unique across server restarts, so a crashed run's leftovers never
+        // share a tag with a live job.
+        let tag = format!("srv-{started_unix}-{}", guard.clip_seq);
+        let temps = crate::join::temp_paths(&case_dir, &tag);
+        let expected_bytes = guard
+            .join_plan_bytes
+            .iter()
+            .find(|(id, _)| *id == plan_id)
+            .map(|(_, bytes)| *bytes);
+        let job = ClipJob {
+            id: job_id,
+            kind: "join",
+            key,
+            record_id: parsed.ids[0].clone(),
+            // The CLI picks the final name; known once the join is logged.
+            output: PathBuf::new(),
+            rel_path: String::new(),
+            started_unix,
+            finished_unix: None,
+            state: "running",
+            sha256: None,
+            size_bytes: None,
+            error: None,
+            cancel_requested: false,
+            progress_path: Some(temps.progress.clone()),
+            expected_bytes,
+            join: Some(JoinJobInfo {
+                tag,
+                plan_id: plan_id.clone(),
+                ids: parsed.ids.clone(),
+                temps,
+                manifest_rel: None,
+                duration_check_ok: None,
+                duration_check: None,
+            }),
+        };
+        guard.clip_jobs.push(job.clone());
+        prune_finished_clip_jobs(&mut guard.clip_jobs);
+        job
+    };
+    let tag = job.join.as_ref().map(|j| j.tag.clone()).unwrap_or_default();
+    let args: Vec<String> = vec![
+        "join-video".into(),
+        case_dir.to_string_lossy().to_string(),
+        "--ids".into(),
+        parsed.ids.join(","),
+        "--tolerance".into(),
+        format!("{}", parsed.tolerance),
+        "--plan-id".into(),
+        plan_id,
+        "--job-tag".into(),
+        tag,
+    ];
+    let worker_state = Arc::clone(state);
+    let worker_exe = exe.to_path_buf();
+    let job_id = job.id.clone();
+    let worker_case = case_dir.clone();
+    let spawned = thread::Builder::new()
+        .name("ft-join".into())
+        .spawn(move || run_join_job(&worker_state, &worker_exe, &job_id, &args, &worker_case));
+    if spawned.is_err() {
+        update_clip_job(state, &job.id, |job| {
+            job.state = "failed";
+            job.error = Some("작업 스레드 시작 실패".into());
+            job.finished_unix = crate::util::now_unix().ok();
+        });
+        return api_err("작업 스레드 시작 실패");
+    }
+    state_lock(state).logs.push(format!(
+        "영상 이어붙이기 시작: {}개 ({})",
+        parsed.ids.len(),
+        job.id
+    ));
+    clip_response(&job, false)
+}
+
+/// A finished, logged join as the server verified it.
+struct JoinDone {
+    output: PathBuf,
+    rel_path: String,
+    manifest_rel: String,
+    sha256: String,
+    size: u64,
+    duration_check_ok: Option<bool>,
+    duration_check: serde_json::Value,
+}
+
+/// Every parseable `join-log.jsonl` entry (missing log → empty).
+fn read_join_log(case_dir: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let path = case_dir
+        .join(crate::join::JOINED_DIR)
+        .join(crate::join::LOG_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(format!("{} 읽기 실패: {err}", path.display())),
+    }
+}
+
+/// The newest log entry this job wrote: same plan, joined at/after start.
+fn logged_join_entry(
+    entries: &[serde_json::Value],
+    plan_id: &str,
+    started_unix: u64,
+    claimed: &[PathBuf],
+) -> Option<serde_json::Value> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.get("event").and_then(|v| v.as_str()) == Some("join-video")
+                && !entry
+                    .get("output_path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|p| {
+                        claimed.contains(&crate::audit::canonical_or_original(Path::new(p)))
+                    })
+                && entry
+                    .get("plan_id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| id.eq_ignore_ascii_case(plan_id))
+                && entry
+                    .get("joined_unix")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|at| at >= started_unix)
+        })
+        .cloned()
+}
+
+/// Canonical `path` when it lies inside `case_dir/artifacts/joined`.
+fn joined_artifact(case_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let root = case_dir.join(crate::join::JOINED_DIR).canonicalize().ok()?;
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        case_dir.join(path)
+    };
+    let canonical = resolved.canonicalize().ok()?;
+    path_is_under(&root, &canonical).then_some(canonical)
+}
+
+fn case_relative(case_dir: &Path, path: &Path) -> String {
+    let base = case_dir
+        .canonicalize()
+        .unwrap_or_else(|_| case_dir.to_path_buf());
+    path.strip_prefix(&base)
+        .or_else(|_| path.strip_prefix(case_dir))
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+/// Plan §1.6: on success the server re-hashes the output and requires it
+/// to equal the log entry and the manifest's `output.sha256` (and the
+/// manifest bytes to equal the logged `manifest_sha256`).
+fn verify_logged_join(case_dir: &Path, entry: &serde_json::Value) -> Result<JoinDone, String> {
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("이어붙이기 로그 항목에 {key}가 없습니다"))
+    };
+    let output_raw = text("output_path")?;
+    let manifest_raw = text("manifest_path")?;
+    let logged_sha = text("output_sha256")?.to_ascii_lowercase();
+    let logged_manifest_sha = text("manifest_sha256")?.to_ascii_lowercase();
+    let output = joined_artifact(case_dir, Path::new(&output_raw)).ok_or_else(|| {
+        format!("이어붙인 결과물이 없거나 artifacts/joined 밖에 있습니다: {output_raw}")
+    })?;
+    let manifest = joined_artifact(case_dir, Path::new(&manifest_raw)).ok_or_else(|| {
+        format!("매니페스트가 없거나 artifacts/joined 밖에 있습니다: {manifest_raw}")
+    })?;
+    let digest = crate::audit::digest_file(&output)
+        .map_err(|err| format!("결과물 SHA-256 재계산 실패: {err}"))?;
+    let manifest_bytes =
+        std::fs::read(&manifest).map_err(|err| format!("매니페스트 읽기 실패: {err}"))?;
+    let manifest_value: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|err| format!("매니페스트 JSON 오류: {err}"))?;
+    let manifest_sha = manifest_value
+        .pointer("/output/sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !digest.eq_ignore_ascii_case(&logged_sha) || digest.to_ascii_lowercase() != manifest_sha {
+        return Err(format!(
+            "결과물 SHA-256이 기록과 다릅니다 (재계산 {digest}, 로그 {logged_sha}, 매니페스트 {manifest_sha}) — 결과물과 매니페스트를 보존했습니다. 확인하십시오."
+        ));
+    }
+    let manifest_digest = crate::sha256::digest_bytes(&manifest_bytes);
+    if !manifest_digest.eq_ignore_ascii_case(&logged_manifest_sha) {
+        return Err(format!(
+            "매니페스트 SHA-256이 로그와 다릅니다 (재계산 {manifest_digest}, 로그 {logged_manifest_sha}) — 확인하십시오."
+        ));
+    }
+    let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+    let duration_check_ok = entry.get("duration_check_ok").and_then(|v| v.as_bool());
+    // `{expected, observed, ok}` from the manifest; the log's totals when a
+    // manifest lacks it.
+    let duration_check = manifest_value
+        .get("duration_check")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "expected": entry.get("duration_seconds").cloned().unwrap_or_default(),
+                "observed": null,
+                "ok": duration_check_ok,
+            })
+        });
+    Ok(JoinDone {
+        rel_path: case_relative(case_dir, &output),
+        manifest_rel: case_relative(case_dir, &manifest),
+        output,
+        sha256: digest.to_ascii_lowercase(),
+        size,
+        duration_check_ok,
+        duration_check,
+    })
+}
+
+/// After a failed or cancelled join: removes this job's temp files and any
+/// output + manifest the CLI published but never logged (a kill between
+/// publish and the log append). Returns every removal failure.
+fn cleanup_failed_join(
+    state: &SharedState,
+    case_dir: &Path,
+    id: &str,
+    info: &JoinJobInfo,
+    started_unix: u64,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let progress_tmp = info.temps.progress.with_file_name(format!(
+        "{}.tmp",
+        info.temps
+            .progress
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    ));
+    for path in info
+        .temps
+        .all()
+        .into_iter()
+        .chain(std::iter::once(progress_tmp.as_path()))
+    {
+        if let Err(err) = crate::join::remove_file_retry(path) {
+            errors.push(err);
+        }
+    }
+    let joined_dir = case_dir.join(crate::join::JOINED_DIR);
+    let logged: Vec<PathBuf> = match read_join_log(case_dir) {
+        Ok(entries) => entries
+            .iter()
+            .flat_map(|entry| {
+                ["output_path", "manifest_path"]
+                    .into_iter()
+                    .filter_map(|key| entry.get(key).and_then(|v| v.as_str()))
+                    .map(|p| crate::audit::canonical_or_original(Path::new(p)))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+        Err(err) => {
+            errors.push(format!(
+                "이어붙이기 로그를 읽지 못해 남은 결과물을 확인하지 못했습니다: {err}"
+            ));
+            return errors;
+        }
+    };
+    let Ok(entries) = std::fs::read_dir(&joined_dir) else {
+        return errors;
+    };
+    let other_joins_running = state_lock(state)
+        .clip_jobs
+        .iter()
+        .any(|job| job.kind == "join" && job.state == "running" && job.id != id);
+    let modified_since_start = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .is_some_and(|d| d.as_secs() + 1 >= started_unix)
+    };
+    let remove = |path: &Path, errors: &mut Vec<String>| {
+        if let Err(err) = crate::join::remove_file_retry(path) {
+            errors.push(err);
+        }
+    };
+    for entry in entries.flatten() {
+        let path = crate::audit::canonical_or_original(&entry.path());
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("join_") || logged.contains(&path) || !path.is_file() {
+            continue;
+        }
+        if name.ends_with(".manifest.json") {
+            // A published-but-unlogged manifest of THIS plan.
+            let Some(manifest) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            else {
+                continue;
+            };
+            let ours = manifest
+                .get("plan_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.eq_ignore_ascii_case(&info.plan_id))
+                && manifest
+                    .get("created_unix")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|at| at >= started_unix);
+            if !ours {
+                continue;
+            }
+            if let Some(rel) = manifest
+                .pointer("/output/path_rel")
+                .and_then(|v| v.as_str())
+                && let Some(output) = joined_artifact(case_dir, Path::new(rel))
+                && !logged.contains(&output)
+            {
+                remove(&output, &mut errors);
+            }
+            remove(&path, &mut errors);
+        } else {
+            // An output published without its manifest yet: only this job
+            // can be mid-publish when no other join runs.
+            let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
+            let has_manifest = joined_dir.join(format!("{stem}.manifest.json")).exists();
+            if has_manifest || !modified_since_start(&path) {
+                continue;
+            }
+            if other_joins_running {
+                errors.push(format!(
+                    "기록되지 않은 이어붙이기 결과물이 남아 있을 수 있습니다 (다른 이어붙이기가 실행 중이라 지우지 않음): {}",
+                    path.display()
+                ));
+            } else {
+                remove(&path, &mut errors);
+            }
+        }
+    }
+    errors
+}
+
+/// Worker: stale `.join-*` cleanup → `join-video` (killed as a tree on a
+/// per-job cancel) → verify the logged output, or clean up everything the
+/// job created. Removal failures are surfaced, never swallowed.
+fn run_join_job(state: &SharedState, exe: &Path, id: &str, args: &[String], case_dir: &Path) {
+    let Some((info, started_unix)) = state_lock(state)
+        .clip_jobs
+        .iter()
+        .find(|job| job.id == id)
+        .and_then(|job| job.join.clone().map(|info| (info, job.started_unix)))
+    else {
+        return;
+    };
+    {
+        let _gate = JOIN_TEMP_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active: Vec<String> = state_lock(state)
+            .clip_jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .filter_map(|job| job.join.as_ref().map(|join| join.tag.clone()))
+            .collect();
+        let removed = crate::join::cleanup_stale_temp_files(case_dir, &active);
+        if !removed.is_empty() {
+            let mut guard = state_lock(state);
+            for (path, result) in removed {
+                guard.logs.push(match result {
+                    Ok(()) => format!(
+                        "이전 이어붙이기의 잔여 임시 파일을 지웠습니다: {}",
+                        path.display()
+                    ),
+                    Err(err) => format!("경고: {err}"),
+                });
+            }
+        }
+    }
+    let cancelled = || {
+        state_lock(state)
+            .clip_jobs
+            .iter()
+            .find(|job| job.id == id)
+            .is_none_or(|job| job.cancel_requested)
+    };
+    let result = run_step_cancellable(exe, args, &cancelled);
+    let was_cancelled = cancelled();
+    // The log entry is the authority on whether the join completed: a
+    // cancel that lost the race with completion still yields a logged,
+    // complete output, which must not be deleted from under its record.
+    // Outputs other (finished) jobs already reported: never re-claimed.
+    let claimed: Vec<PathBuf> = state_lock(state)
+        .clip_jobs
+        .iter()
+        .filter(|job| job.id != id && job.kind == "join" && !job.rel_path.is_empty())
+        .map(|job| job.output.clone())
+        .collect();
+    let logged = read_join_log(case_dir)
+        .map(|entries| logged_join_entry(&entries, &info.plan_id, started_unix, &claimed));
+    // `Err((message, keep_files))`: a logged join that fails re-verification
+    // keeps its output and manifest for review (deleting them would orphan
+    // the chained record); every other failure removes what the job made.
+    let outcome: Result<JoinDone, (String, bool)> = match (&result, logged) {
+        (_, Ok(Some(entry))) => verify_logged_join(case_dir, &entry).map_err(|err| (err, true)),
+        (Ok(_), Ok(None)) => Err((
+            "join-video가 성공을 보고했지만 이어붙이기 로그에 기록이 없습니다".to_string(),
+            false,
+        )),
+        (_, Err(err)) => Err((err, false)),
+        (Err(err), Ok(None)) => {
+            if err.contains("(exit Some(3))") || err.contains(crate::join::PLAN_CHANGED_MESSAGE) {
+                Err((crate::join::PLAN_CHANGED_MESSAGE.to_string(), false))
+            } else {
+                Err((err.clone(), false))
+            }
+        }
+    };
+    // Temp files go in every case (the CLI normally removes them itself;
+    // a killed CLI cannot). Published-but-unlogged outputs go only when
+    // nothing was logged for this job.
+    let cleanup_errors = match &outcome {
+        Ok(_) | Err((_, true)) => {
+            let mut errors = Vec::new();
+            for path in info.temps.all() {
+                if let Err(err) = crate::join::remove_file_retry(path) {
+                    errors.push(err);
+                }
+            }
+            errors
+        }
+        Err((_, false)) => cleanup_failed_join(state, case_dir, id, &info, started_unix),
+    };
+    let finished = crate::util::now_unix().ok();
+    let mut guard = state_lock(state);
+    let mut log_lines = Vec::new();
+    if let Some(job) = guard.clip_jobs.iter_mut().find(|job| job.id == id) {
+        job.finished_unix = finished;
+        match outcome {
+            Ok(done) => {
+                job.state = "done";
+                job.output = done.output;
+                job.rel_path = done.rel_path;
+                job.sha256 = Some(done.sha256.clone());
+                job.size_bytes = Some(done.size);
+                if let Some(join) = job.join.as_mut() {
+                    join.manifest_rel = Some(done.manifest_rel);
+                    join.duration_check_ok = done.duration_check_ok;
+                    join.duration_check = Some(done.duration_check);
+                }
+                log_lines.push(format!(
+                    "영상 이어붙이기 완료: {} · SHA-256 {}",
+                    job.rel_path, done.sha256
+                ));
+                if done.duration_check_ok == Some(false) {
+                    log_lines.push(format!(
+                        "경고: 이어붙인 영상 길이가 원본 합계와 다릅니다 — 매니페스트를 확인하십시오 ({})",
+                        job.rel_path
+                    ));
+                }
+                if !cleanup_errors.is_empty() {
+                    log_lines.push(format!("경고: {}", cleanup_errors.join("; ")));
+                }
+            }
+            Err((err, kept)) => {
+                let cleanup_note = (!cleanup_errors.is_empty()).then(|| cleanup_errors.join("; "));
+                if was_cancelled && cleanup_note.is_none() && !kept {
+                    job.state = "cancelled";
+                    job.error =
+                        Some("이어붙이기를 중단했습니다 — 만들던 파일은 지웠습니다.".into());
+                    log_lines.push(format!("영상 이어붙이기 중단 ({})", job.id));
+                } else {
+                    // A leftover that could not be removed is a failure even
+                    // after a cancel: the examiner must see the path.
+                    let message = match (&cleanup_note, was_cancelled) {
+                        (Some(note), true) => format!("이어붙이기를 중단했지만 {note}"),
+                        (Some(note), false) => format!("{err}; {note}"),
+                        (None, _) => err,
+                    };
+                    job.state = "failed";
+                    log_lines.push(format!(
+                        "오류: 영상 이어붙이기 실패 ({}): {message}",
+                        job.id
+                    ));
+                    job.error = Some(message);
+                }
+            }
+        }
+    }
+    guard.logs.extend(log_lines);
 }
 
 /// `POST /api/telemetry`: return the telemetry artifact for a record,

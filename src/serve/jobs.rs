@@ -42,6 +42,9 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
     let with_hash = body_value(&request.body, "with_hash").as_deref() == Some("true");
     let with_ffprobe = body_value(&request.body, "with_ffprobe").as_deref() == Some("true");
     let with_deepfake = body_value(&request.body, "with_deepfake").as_deref() == Some("true");
+    // Plan §2.2: measuring sound needs ffprobe to pick the targets, so the
+    // option only takes effect together with with_ffprobe (default off).
+    let with_audio = body_value(&request.body, "with_audio").as_deref() == Some("true");
     let skip_e01_verify = body_value(&request.body, "skip_e01_verify").as_deref() == Some("true");
     let case_dir = match body_value(&request.body, "case_dir") {
         Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
@@ -54,6 +57,7 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         with_hash,
         with_ffprobe,
         with_deepfake,
+        with_audio,
         skip_e01_verify,
         e01_direct,
     };
@@ -517,6 +521,9 @@ pub(crate) fn enrichment_plan(job: &PipelineJob) -> Vec<(&'static str, &'static 
     if job.with_ffprobe {
         plan.push(("validate", "재생성 검증"));
     }
+    if job.with_audio && job.with_ffprobe {
+        plan.push(("audio", "소리 측정"));
+    }
     plan.push(("anomalies", "이상 징후 스캔"));
     plan.push(("make-review", "리뷰 생성"));
     plan
@@ -563,7 +570,7 @@ pub(crate) fn run_folder_enrichment(
                 });
             }
         }
-        if matches!(key, "validate" | "anomalies")
+        if matches!(key, "validate" | "audio" | "anomalies")
             && let Err(err) = drain_pending_marks(state, case_dir)
         {
             warn_step(state, 3, err);
@@ -625,6 +632,24 @@ pub(crate) fn run_folder_enrichment(
         }
     } else {
         log("ffprobe 검증이 꺼져 있어 건너뜁니다.".to_string());
+    }
+    if plan.iter().any(|(step, _)| *step == "audio") {
+        if !begin("audio") {
+            return stop_enrichment(state, 3, None);
+        }
+        // measure-audio skips files that already carry a valid measurement
+        // and chains one log entry per 200 files (plan §2.1).
+        match runner(&["measure-audio".into(), case_text.clone()]) {
+            Ok(output) => log(output),
+            Err(_) if cancelled() => return stop_enrichment(state, 3, None),
+            Err(err) => warn_step(state, 3, format!("소리 측정 실패, 건너뜀: {err}")),
+        }
+    } else if job.with_audio {
+        warn_step(
+            state,
+            3,
+            "소리 측정은 ffprobe 메타데이터 보강이 켜져 있어야 합니다 — 건너뜁니다.".to_string(),
+        );
     }
     set_step(3, StepStatus::Done);
 
@@ -1256,8 +1281,8 @@ fn import_marks_during_enrichment(
     if !partial {
         return api_err("진행 중이던 작업이 방금 끝났습니다 — 잠시 후 다시 저장하십시오.");
     }
-    let direct =
-        matches!(step, Some("validate") | Some("anomalies")) && pending_marks_count(case_dir) == 0;
+    let direct = matches!(step, Some("validate") | Some("audio") | Some("anomalies"))
+        && pending_marks_count(case_dir) == 0;
     if !direct {
         let dir = case_dir.join(PENDING_MARKS_DIR);
         if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -1792,6 +1817,54 @@ pub(crate) fn carve_with_exe(request: &Request, state: &SharedState, exe: &Path)
             main_args: args,
             start_log: format!("시그니처 카빙 실행 중… ({})", raw.display()),
             done_log: "카빙 완료 — 뷰어를 새로 열면 카빙 후보가 보입니다.",
+        },
+    )
+}
+
+/// `POST /api/audio-measure {all?}`: measure the real sound level of the
+/// case's indexed videos that have an audio track (plan §2.2 "나중에 따로
+/// 실행"), then regenerate the review so the viewer sees `audioLevels`.
+/// Already-valid measurements are skipped unless `all` is true.
+///
+/// A background case job (`kind: "audio-measure"`) with the same contract
+/// as recover-deleted / carve: busy lease, marks queue meanwhile, progress
+/// and outcome through `/api/status` (`job_kind`, `job`).
+pub(crate) fn api_audio_measure(request: &Request, state: &SharedState) -> String {
+    match std::env::current_exe() {
+        Ok(exe) => audio_measure_with_exe(request, state, &exe),
+        Err(err) => api_err(&err.to_string()),
+    }
+}
+
+/// [`api_audio_measure`] parameterised on the CLI executable.
+pub(crate) fn audio_measure_with_exe(request: &Request, state: &SharedState, exe: &Path) -> String {
+    let case_dir = state_lock(state).case_dir.clone();
+    let Some(case_dir) = case_dir else {
+        return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
+            .to_string();
+    };
+    let mut args = vec![
+        "measure-audio".into(),
+        case_dir.to_string_lossy().to_string(),
+    ];
+    let all = body_value(&request.body, "all").as_deref() == Some("true");
+    if all {
+        args.push("--all".into());
+    }
+    start_case_job(
+        state,
+        exe,
+        CaseJobSpec {
+            kind: "audio-measure",
+            stage_label: "소리 측정",
+            case_dir,
+            main_args: args,
+            start_log: if all {
+                "소리 측정 중… (전체 다시 측정)".to_string()
+            } else {
+                "소리 측정 중… (미측정 항목)".to_string()
+            },
+            done_log: "소리 측정 완료 — 뷰어를 새로 열면 측정 결과가 보입니다.",
         },
     )
 }

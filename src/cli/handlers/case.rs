@@ -380,7 +380,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let join_log = redact(
         &read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default(),
     );
-    let audio_levels_json = html_report::audio_levels_json_for_case(case_dir, &index_json);
+    let audio_levels_json = measured_audio_levels_json(case_dir)?;
     // The viewer page stays slim; the (potentially huge) record payload
     // lives in data-bundle.js beside it. Standalone file:// use loads the
     // bundle through a script tag; workstation serving pages the same
@@ -683,8 +683,8 @@ pub fn make_report(
     let join_log =
         read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default();
     // Measured-sound map bound to the current index bytes (plan §2.4); the
-    // unredacted index is used for binding only, the map carries ids/numbers.
-    let audio_levels_json = html_report::audio_levels_json_for_case(case_dir, &index_json);
+    // map carries ids/numbers only, so it needs no redaction.
+    let audio_levels_json = measured_audio_levels_json(case_dir)?;
     let scan_runs_json = read_scan_runs_json(case_dir);
     // One read of marks and tags feeds the displayed annotations and both
     // sign-off digests, so the banner judges exactly what the table shows.
@@ -767,6 +767,15 @@ pub fn make_custody(case_dir: &Path) -> Result<(), String> {
     let path = crate::custody::generate(case_dir)?;
     println!("custody statement written: {}", path.display());
     Ok(())
+}
+
+/// The compact `audioLevels` map (`{id: {r,max,mean,sec,t}}`, plan §2.4)
+/// for the court viewer and the report, with T1's invalidation rule (a
+/// measurement of other bytes is `stale`). `{}` when nothing was measured;
+/// an unreadable log or index is an error, never an empty map.
+fn measured_audio_levels_json(case_dir: &Path) -> Result<String, String> {
+    crate::audio_level::audio_levels_for_case(case_dir)
+        .map(|levels| crate::audio_level::audio_levels_json(&levels).to_string())
 }
 
 /// Reads every db/scan_runs/*.json snapshot and returns them joined into a
