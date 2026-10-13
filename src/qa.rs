@@ -872,6 +872,64 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Plan §3: the join and audio-level lanes are picked up by the QA audit
+    /// sweep without any registration, anchored, and tamper-checked.
+    #[test]
+    fn audit_chain_check_recognizes_join_and_audio_level_lanes() {
+        let root =
+            std::env::temp_dir().join(format!("frametrace-qa-new-lanes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let case_dir = root.join("case");
+        let out = root.join("qa");
+        fs::create_dir_all(&out).unwrap();
+        let join_lane = case_dir.join("artifacts/joined/join-log.jsonl");
+        let audio_lane = case_dir.join("evidence/logs/audio-level-log.jsonl");
+        // Entry bodies built from the plan §1.5 / §2.3 schemas.
+        let join = r#"{"schema_version":1,"event":"join-video","joined_unix":1,"output_path":"artifacts/joined/join_F_20260910-120000_n2.mp4","output_sha256":"aa","segment_count":2,"mode":"stream-copy","gaps":0,"overlaps":1}"#;
+        let audio = r#"{"schema_version":1,"event":"audio-level","measured_unix":1,"method":"ffmpeg-volumedetect","threshold_silent_max_dbfs":-70.0,"results":[{"selector":"vid_1","result":"silent","streams":[]}]}"#;
+        for body in [join, join] {
+            crate::audit::append_chained_jsonl_keyed(&join_lane, body, None).unwrap();
+        }
+        crate::audit::append_chained_jsonl_keyed(&audio_lane, audio, None).unwrap();
+        // A stray temp file next to the lane is not a lane.
+        fs::write(
+            case_dir.join("artifacts/joined/.join-t1.progress.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let report = audit_chain_check(&case_dir, &out).unwrap();
+        let text = fs::read_to_string(report).unwrap();
+        assert!(text.contains("artifacts/joined/join-log.jsonl"), "{text}");
+        assert!(
+            text.contains("evidence/logs/audio-level-log.jsonl"),
+            "{text}"
+        );
+        assert!(text.contains("PASS: 2 log(s) intact"), "{text}");
+        let anchors = fs::read_to_string(out.join(super::AUDIT_ANCHORS_FILE)).unwrap();
+        assert!(anchors.contains("artifacts/joined/join-log.jsonl"));
+        assert!(anchors.contains("evidence/logs/audio-level-log.jsonl"));
+
+        // Dropping the last join entry is caught by the anchor.
+        let original = fs::read_to_string(&join_lane).unwrap();
+        fs::write(
+            &join_lane,
+            format!("{}\n", original.lines().next().unwrap()),
+        )
+        .unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("entry count dropped"), "{err}");
+        fs::write(&join_lane, &original).unwrap();
+        // Deleting the audio-level lane after it was anchored fails.
+        let audio_text = fs::read_to_string(&audio_lane).unwrap();
+        fs::remove_file(&audio_lane).unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+        fs::write(&audio_lane, audio_text).unwrap();
+        audit_chain_check(&case_dir, &out).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn audit_chain_check_warns_on_never_written_empty_lane() {
         let root = std::env::temp_dir().join(format!(

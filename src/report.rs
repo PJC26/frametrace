@@ -11,6 +11,13 @@ pub struct ReportInputs<'a> {
     pub validation_log_jsonl: &'a str,
     pub anomaly_log_jsonl: &'a str,
     pub batch_log_jsonl: &'a str,
+    /// `artifacts/joined/join-log.jsonl` (plan §1.5): one entry per lossless
+    /// join. Empty when the case has none.
+    pub join_log_jsonl: &'a str,
+    /// Compact measured-sound map `{id: {r, max, mean, sec, t}}` (plan §2.4),
+    /// already bound to the current bytes by the caller. Empty or `{}` when
+    /// nothing was measured. Display only — never digested.
+    pub audio_levels_json: &'a str,
     pub scan_runs_json: &'a str,
     /// Review annotations shown in the "판독" column: the
     /// `report_annotations_json` object (`{"marks":[...],"tags":{...}}`,
@@ -34,6 +41,8 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
     let validation_lines = json_for_script(&jsonl_to_array(inputs.validation_log_jsonl));
     let anomaly_lines = json_for_script(&jsonl_to_array(inputs.anomaly_log_jsonl));
     let batch_lines = json_for_script(&jsonl_to_array(inputs.batch_log_jsonl));
+    let join_lines = json_for_script(&jsonl_to_array(inputs.join_log_jsonl));
+    let audio_levels = json_for_script(&audio_levels_object(inputs.audio_levels_json));
     let scan_runs = json_for_script(inputs.scan_runs_json);
     let marks = json_for_script(inputs.marks_json);
     let redaction_note = if inputs.redaction_applied {
@@ -170,6 +179,7 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
     <div class="box">추정 소스<strong id="sources">0</strong></div>
     <div class="box">스캔 경고<strong id="warnings-count">0</strong></div>
     <div class="box">내보낸 클립<strong id="exports">0</strong></div>
+    <div class="box">이어붙임<strong id="joins">0</strong></div>
     <div class="box">리뷰 산출물<strong id="derived">0</strong></div>
     <div class="box">복구 후보<strong id="carved">0</strong></div>
     <div class="box">파일시스템 작업<strong id="filesystem-actions">0</strong></div>
@@ -190,9 +200,14 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
 
   <h2>영상 색인</h2>
   <div id="videos"></div>
+  <div class="note" id="audio-caveat">소리 측정은 오디오 트랙 전체의 신호 레벨(최대·평균, dBFS)만 잰 값입니다. 말소리나 대화가 있는지, 소리가 어디서 났는지는 판단하지 않습니다.</div>
 
   <h2>MP4/AVI 내보내기 산출물</h2>
   <div id="clip-exports"></div>
+
+  <h2>이어붙인 영상</h2>
+  <div id="joined-videos"></div>
+  <div class="note" id="join-caveat" hidden>원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. 순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. 위치·데이터 스트림(GPS 등)은 포함되지 않았습니다.</div>
 
   <h2>리뷰 산출물</h2>
   <div id="derived-artifacts"></div>
@@ -224,6 +239,8 @@ const filesystemLog = {filesystem_lines};
 const validationLog = {validation_lines};
 const anomalyLog = {anomaly_lines};
 const batchLog = {batch_lines};
+const joinLog = {join_lines};
+const audioLevels = {audio_levels};
 const scanRuns = {scan_runs};
 const annotations = {marks};
 const redaction = {{"applied": {}}};
@@ -279,6 +296,7 @@ document.getElementById("confirmed").textContent = videos.filter(video => video.
 document.getElementById("sources").textContent = sourceCounts.size;
 document.getElementById("warnings-count").textContent = warnings.length;
 document.getElementById("exports").textContent = exportsLog.length;
+document.getElementById("joins").textContent = joinLog.length;
 document.getElementById("derived").textContent = derivedLog.length;
 document.getElementById("carved").textContent = carveLog.length;
 document.getElementById("filesystem-actions").textContent = filesystemLog.length;
@@ -319,10 +337,25 @@ document.getElementById("source-assessment").innerHTML = sourceCounts.size ? `<t
   </tbody>
 </table>` : "<p>소스 평가 정보가 없습니다.</p>";
 
+// Measured-sound wording (plan §2.7). Only what was measured is claimed:
+// a signal level over the whole audio track, never speech. `audioLevels`
+// arrives already bound to the current bytes (size/mtime/hash, latest wins).
+const fmtDb = value => (value === null || value === undefined ? "-inf" : (Number.isFinite(value) ? value.toFixed(1) : "-")).replace("-", "−");
+function audioText(video) {{
+  const level = audioLevels[video.id];
+  if (level && level.r === "sound") return `소리 있음 — 측정: 최대 ${{fmtDb(level.max)}} dB, 평균 ${{fmtDb(level.mean)}} dB (dBFS, ffmpeg volumedetect)`;
+  if (level && level.r === "silent") return `무음 트랙 — 측정: 최대 ${{fmtDb(level.max)}} dB (기준: −70 dB 이하)`;
+  if (level && level.r === "stale") return "측정 후 파일 변경 — 미확인";
+  if (level && level.r === "error") return "오디오 트랙 있음 — 소리 미측정 (측정 실패)";
+  if (video.ffprobe_ok && video.audio_codec) return "오디오 트랙 있음 — 소리 미측정";
+  if (video.ffprobe_ok) return "오디오 트랙 없음 (ffprobe)";
+  return "미확인";
+}}
+
 document.getElementById("videos").innerHTML = videos.length ? `<table>
   <thead>
     <tr>
-      <th>ID</th><th>경로</th><th>소스</th><th>포맷</th><th>길이</th><th>크기</th><th>해시</th>
+      <th>ID</th><th>경로</th><th>소스</th><th>포맷</th><th>길이</th><th>크기</th><th>해시</th><th>소리(측정값)</th>
     </tr>
   </thead>
   <tbody>
@@ -334,6 +367,7 @@ document.getElementById("videos").innerHTML = videos.length ? `<table>
       <td>${{fmtDuration(video.duration_seconds)}}</td>
       <td>${{fmtBytes(video.size_bytes)}}</td>
       <td><code>${{escapeHtml(video.sha256 || video.hash_status || "-")}}</code></td>
+      <td>${{escapeHtml(audioText(video))}}</td>
     </tr>`).join("")}}
   </tbody>
 </table>` : "<p>색인된 영상이 없습니다.</p>";
@@ -353,6 +387,26 @@ document.getElementById("clip-exports").innerHTML = exportsLog.length ? `<table>
     </tr>`).join("")}}
   </tbody>
 </table>` : "<p>내보낸 클립이 없습니다.</p>";
+
+document.getElementById("joined-videos").innerHTML = joinLog.length ? `<table>
+  <thead>
+    <tr><th>산출물</th><th>SHA-256</th><th>원본 수</th><th>채널</th><th>순서 근거</th><th>총 길이</th><th>끊김·겹침</th><th>매니페스트 SHA-256</th><th>감사 체인</th></tr>
+  </thead>
+  <tbody>
+    ${{joinLog.map(item => `<tr>
+      <td><code>${{escapeHtml(item.output_path || "-")}}</code></td>
+      <td><code>${{escapeHtml(item.output_sha256 || "-")}}</code></td>
+      <td>${{escapeHtml(item.segment_count ?? "-")}}${{item.hash_mismatches ? `<br><span class="muted">색인 해시와 불일치 ${{escapeHtml(item.hash_mismatches)}}개</span>` : ""}}</td>
+      <td>${{escapeHtml(item.channel || "미확인")}}</td>
+      <td>${{escapeHtml(item.order_basis || "-")}}</td>
+      <td>${{fmtDuration(item.duration_seconds)}}</td>
+      <td>끊김 ${{escapeHtml(item.gaps ?? "-")}} / 겹침 ${{escapeHtml(item.overlaps ?? "-")}}</td>
+      <td><code>${{escapeHtml(item.manifest_sha256 || "-")}}</code></td>
+      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
+    </tr>`).join("")}}
+  </tbody>
+</table>` : "<p>이어붙인 영상이 없습니다.</p>";
+document.getElementById("join-caveat").hidden = joinLog.length === 0;
 
 document.getElementById("derived-artifacts").innerHTML = derivedLog.length ? `<table>
   <thead>
@@ -488,7 +542,7 @@ function techniqueRows() {{
     parser: `${{video.source_profile?.vendor || "-"}} / ${{video.source_profile?.parser || "-"}} (${{video.source_profile?.confidence || "-"}})`,
     where: video.source_path || video.relative_path || "-",
     when: video.modified_unix,
-    meta: [video.video_codec || video.format_name || "-", video.width && video.height ? `${{video.width}}x${{video.height}}` : "", fmtDuration(video.duration_seconds), fmtBytes(video.size_bytes)].filter(Boolean).join(" · "),
+    meta: [video.video_codec || video.format_name || "-", video.width && video.height ? `${{video.width}}x${{video.height}}` : "", fmtDuration(video.duration_seconds), fmtBytes(video.size_bytes), `소리(측정값): ${{audioText(video)}}`].filter(Boolean).join(" · "),
     hash: video.sha256 || video.hash_status || "-"
   }}));
   carveLog.forEach(item => rows.push({{
@@ -571,6 +625,12 @@ derivedLog.forEach(item => chainEvents.push({{
   ts: item.created_unix,
   name: item.kind === "proxy" ? "make-proxy (검토용 프록시)" : "make-thumbnail (썸네일)",
   detail: `${{item.source_path || "-"}} → ${{item.output_path || "-"}}`,
+  chain: item.entry_sha256 || "-"
+}}));
+joinLog.forEach(item => chainEvents.push({{
+  ts: item.joined_unix,
+  name: "join-video (이어붙이기)",
+  detail: `원본 ${{item.segment_count ?? "-"}}개 → ${{item.output_path || "-"}}`,
   chain: item.entry_sha256 || "-"
 }}));
 filesystemLog.forEach(item => chainEvents.push({{
@@ -750,6 +810,16 @@ pub fn inject_signoff_banner(
     }
 }
 
+/// The audio-level map as an object literal; anything that is not a JSON
+/// object (empty input, garbage) degrades to `{}` so the embedded script
+/// block can never be broken by it.
+pub(crate) fn audio_levels_object(json: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(json.trim()) {
+        Ok(value) if value.is_object() => value.to_string(),
+        _ => "{}".to_string(),
+    }
+}
+
 fn jsonl_to_array(jsonl: &str) -> String {
     // A torn final line (the documented crash survivability mode) is not
     // valid JSON; feeding it into the embedded array literal would be a
@@ -874,6 +944,8 @@ mod tests {
         let validation = lookup("validation");
         let anomaly = lookup("anomaly");
         let batch = lookup("batch");
+        let join = lookup("join");
+        let audio_levels = lookup("audio_levels");
         let scan_runs = lookup("scan_runs");
         let marks = lookup("marks");
         render_case_report(&super::ReportInputs {
@@ -887,6 +959,8 @@ mod tests {
             validation_log_jsonl: &validation,
             anomaly_log_jsonl: &anomaly,
             batch_log_jsonl: &batch,
+            join_log_jsonl: &join,
+            audio_levels_json: &audio_levels,
             scan_runs_json: &scan_runs,
             marks_json: &marks,
             redaction_applied: inputs
@@ -1192,6 +1266,199 @@ mod tests {
         assert!(signoff_banner_html("A", 5, SignoffCurrency::Unbound).contains(
             " — 이 기록에는 대상 내용의 해시가 없어 이후 판독 마크 변경 여부를 확인할 수 없습니다.</div>"
         ));
+    }
+
+    /// Runs the report script under node with a stub `document` and returns
+    /// every element it touched as `{id: {innerHTML, textContent, hidden}}`.
+    fn rendered_elements(inputs: &[(&str, &str)]) -> serde_json::Value {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut full: Vec<(&str, &str)> = inputs.to_vec();
+        for (key, default) in [
+            ("manifest", "{}"),
+            ("index", "{}"),
+            ("scan_runs", "[]"),
+            ("marks", "[]"),
+        ] {
+            if !full.iter().any(|(name, _)| *name == key) {
+                full.push((key, default));
+            }
+        }
+        let html = render(&full);
+        let script = html
+            .split_once("<script>")
+            .unwrap()
+            .1
+            .split_once("</script>")
+            .unwrap()
+            .0;
+        let mut child = Command::new("node")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node is required for report rendering tests");
+        let mut stdin = child.stdin.take().unwrap();
+        write!(stdin, "const elements = new Map(); const document = {{getElementById(id) {{ if (!elements.has(id)) elements.set(id, {{}}); return elements.get(id); }}}};\n{script}\nprocess.stdout.write(JSON.stringify(Object.fromEntries(elements)));").unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    /// A join-log entry per plan §1.5 (plus the chain fields the audit adds).
+    fn join_entry() -> String {
+        serde_json::json!({
+            "schema_version": 1, "event": "join-video", "joined_unix": 1_788_000_000,
+            "output_path": "artifacts/joined/join_F_20260910-120000_n10.mp4",
+            "output_sha256": "a".repeat(64), "output_size_bytes": 1234,
+            "manifest_path": "artifacts/joined/join_F_20260910-120000_n10.manifest.json",
+            "manifest_sha256": "b".repeat(64), "plan_id": "c".repeat(64),
+            "segment_count": 10, "source_ids": ["vid_1", "vid_2"],
+            "source_sha256": ["d", "e"], "hash_mismatches": 1,
+            "order_basis": "filename-time", "channel": "F", "tolerance_seconds": 1.0,
+            "gaps": 0, "overlaps": 2, "mode": "stream-copy", "duration_check_ok": true,
+            "ffmpeg_version": "7.1", "command": "ffmpeg", "command_args": ["-y"],
+            "previous_entry_sha256": "0".repeat(64), "entry_sha256": "f".repeat(64)
+        })
+        .to_string()
+    }
+
+    /// Plan §1.9: the join section, its fixed wording and the "이어붙임 N"
+    /// counter; the section caveat only shows when joins exist.
+    #[test]
+    fn report_join_section_counter_and_fixed_wording() {
+        let html = render(&[]);
+        assert!(html.contains("<h2>이어붙인 영상</h2>"));
+        assert!(html.contains("이어붙임<strong id=\"joins\">"));
+        assert!(html.contains("원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. 순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. 위치·데이터 스트림(GPS 등)은 포함되지 않았습니다."));
+
+        let empty = rendered_elements(&[("manifest", "{}")]);
+        assert_eq!(empty["joins"]["textContent"], 0);
+        assert!(
+            empty["joined-videos"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("이어붙인 영상이 없습니다.")
+        );
+        assert_eq!(empty["join-caveat"]["hidden"], true);
+
+        let entry = join_entry();
+        // A torn trailing line must not blank the section.
+        let log = format!("{entry}\n{{\"torn\":");
+        let page = rendered_elements(&[("manifest", "{}"), ("join", &log)]);
+        assert_eq!(page["joins"]["textContent"], 1);
+        assert_eq!(page["join-caveat"]["hidden"], false);
+        let table = page["joined-videos"]["innerHTML"].as_str().unwrap();
+        for needle in [
+            "artifacts/joined/join_F_20260910-120000_n10.mp4",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"f".repeat(64),
+            "<td>10<br>",
+            "색인 해시와 불일치 1개",
+            "filename-time",
+            "<td>F</td>",
+            "끊김 0 / 겹침 2",
+            "<th>매니페스트 SHA-256</th>",
+            "<th>감사 체인</th>",
+        ] {
+            assert!(table.contains(needle), "missing {needle:?}: {table}");
+        }
+        assert!(
+            page["chain"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("join-video")
+        );
+    }
+
+    fn sound_index() -> String {
+        let video = |id: &str, ok: bool, codec: Option<&str>| serde_json::json!({"id": id, "source_path": format!("/e/{id}.mp4"), "ffprobe_ok": ok, "audio_codec": codec});
+        serde_json::json!({"videos": [
+            video("v_sound", true, Some("aac")),
+            video("v_silent", true, Some("aac")),
+            video("v_track", true, Some("aac")),
+            video("v_none", true, None),
+            video("v_stale", true, Some("aac")),
+            video("v_error", true, Some("aac")),
+            video("v_unknown", false, None),
+        ]})
+        .to_string()
+    }
+
+    /// Plan §2.7: measured-sound wording in the video table and the
+    /// techniques metadata cell; only measured facts, never speech.
+    #[test]
+    fn report_sound_wording_variants_and_caveat() {
+        let levels = r#"{
+            "v_sound": {"r":"sound","max":-12.3,"mean":-38.0,"sec":60.0,"t":1},
+            "v_silent": {"r":"silent","max":-91.04,"mean":-91.04,"sec":60.0,"t":1},
+            "v_stale": {"r":"stale","max":null,"mean":null,"sec":null,"t":1},
+            "v_error": {"r":"error","max":null,"mean":null,"sec":null,"t":1}
+        }"#;
+        let page = rendered_elements(&[
+            ("manifest", "{}"),
+            ("index", &sound_index()),
+            ("audio_levels", levels),
+        ]);
+        let videos = page["videos"]["innerHTML"].as_str().unwrap();
+        let techniques = page["techniques"]["innerHTML"].as_str().unwrap();
+        assert!(videos.contains("<th>소리(측정값)</th>"));
+        for wording in [
+            "소리 있음 — 측정: 최대 \u{2212}12.3 dB, 평균 \u{2212}38.0 dB (dBFS, ffmpeg volumedetect)",
+            "무음 트랙 — 측정: 최대 \u{2212}91.0 dB (기준: \u{2212}70 dB 이하)",
+            "오디오 트랙 있음 — 소리 미측정",
+            "오디오 트랙 없음 (ffprobe)",
+            "측정 후 파일 변경 — 미확인",
+            "미확인",
+        ] {
+            assert!(videos.contains(wording), "video table lacks {wording:?}");
+            assert!(
+                techniques.contains(&format!("소리(측정값): {wording}")),
+                "techniques meta lacks {wording:?}"
+            );
+        }
+        // Row-level: the right wording lands on the right record.
+        let row = |id: &str| {
+            let start = videos.find(&format!("<td>{id}</td>")).unwrap();
+            let end = start + videos[start..].find("</tr>").unwrap();
+            videos[start..end].to_string()
+        };
+        assert!(row("v_track").contains("오디오 트랙 있음 — 소리 미측정"));
+        assert!(row("v_none").contains("오디오 트랙 없음 (ffprobe)"));
+        assert!(row("v_stale").contains("측정 후 파일 변경"));
+        assert!(row("v_unknown").ends_with("<td>미확인</td>\n    "));
+        assert!(row("v_error").contains("소리 미측정 (측정 실패)"));
+        assert!(!row("v_sound").contains("무음"));
+
+        let html = render(&[("index", &sound_index()), ("audio_levels", levels)]);
+        assert!(html.contains("소리 측정은 오디오 트랙 전체의 신호 레벨(최대·평균, dBFS)만 잰 값입니다. 말소리나 대화가 있는지, 소리가 어디서 났는지는 판단하지 않습니다."));
+        // The report never asserts speech.
+        for forbidden in ["대화 있음", "음성 녹음", "음성 있음", "말소리 있음"] {
+            assert!(!html.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    /// Without any measurement the report still tells the truth: coded track
+    /// -> "소리 미측정"; hostile or malformed map input degrades to `{}`.
+    #[test]
+    fn report_sound_map_garbage_degrades_to_unmeasured() {
+        assert_eq!(super::audio_levels_object(""), "{}");
+        assert_eq!(super::audio_levels_object("[1,2]"), "{}");
+        assert_eq!(super::audio_levels_object("</script>"), "{}");
+        let page = rendered_elements(&[
+            ("index", &sound_index()),
+            ("audio_levels", "</script><script>alert(1)"),
+        ]);
+        let videos = page["videos"]["innerHTML"].as_str().unwrap();
+        assert!(!videos.contains("소리 있음"));
+        assert!(videos.contains("오디오 트랙 있음 — 소리 미측정"));
     }
 
     #[test]

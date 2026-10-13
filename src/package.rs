@@ -255,6 +255,7 @@ fn recursive_package_dirs() -> &'static [&'static str] {
     &[
         "evidence/logs",
         "artifacts/clips",
+        "artifacts/joined",
         "artifacts/proxies",
         "artifacts/thumbnails",
         "artifacts/carved",
@@ -1414,6 +1415,9 @@ mod tests {
         let case_dir = root.join("case");
         let products = [
             "artifacts/logs/batch-log.jsonl",
+            "artifacts/joined/join_F_20260910-120000_n2.mp4",
+            "artifacts/joined/join_F_20260910-120000_n2.manifest.json",
+            "artifacts/joined/join-log.jsonl",
             "db/scan_runs/run_1.json",
             "db/timeline.jsonl",
             "review/thumbs/vid_1.jpg",
@@ -1430,6 +1434,9 @@ mod tests {
             "evidence/raw/original.raw",
             "evidence/originals/source.mp4",
             "db/job-locks/job.lock",
+            "artifacts/joined/.join-tag1.ffconcat",
+            "artifacts/joined/.join-tag1.part",
+            "artifacts/joined/.join-tag1.progress.json",
             "reports/.env",
             "reports/private.key",
             "reports/audit-key",
@@ -1471,6 +1478,67 @@ mod tests {
                     .collect::<std::collections::HashSet<_>>()
                     .len()
             );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Plan §1.9/§2.3: joined outputs, their manifest sidecar and the
+    /// chained `join-log.jsonl` / `audio-level-log.jsonl` lanes travel in the
+    /// package and verify; dot-prefixed `.join-*` temp files never do.
+    #[test]
+    fn package_carries_join_outputs_and_new_lanes_and_verifies() {
+        let root = fixture("join-lanes");
+        let case_dir = root.join("case");
+        let joined = case_dir.join("artifacts/joined");
+        fs::create_dir_all(&joined).unwrap();
+        fs::write(joined.join("join_F_20260910-120000_n2.mp4"), b"mp4 bytes").unwrap();
+        fs::write(
+            joined.join("join_F_20260910-120000_n2.manifest.json"),
+            b"{}",
+        )
+        .unwrap();
+        for tmp in [
+            ".join-t1.ffconcat",
+            ".join-t1.part",
+            ".join-t1.progress.json",
+        ] {
+            fs::write(joined.join(tmp), b"temp").unwrap();
+        }
+        crate::audit::append_chained_jsonl(
+            &joined.join("join-log.jsonl"),
+            r#"{"schema_version":1,"event":"join-video","joined_unix":1,"output_path":"artifacts/joined/join_F_20260910-120000_n2.mp4","segment_count":2}"#,
+        )
+        .unwrap();
+        crate::audit::append_chained_jsonl(
+            &case_dir.join("evidence/logs/audio-level-log.jsonl"),
+            r#"{"schema_version":1,"event":"audio-level","measured_unix":1,"method":"ffmpeg-volumedetect","threshold_silent_max_dbfs":-70.0,"results":[]}"#,
+        )
+        .unwrap();
+        let output = root.join("package");
+        package_case(&case_dir, Some(&output)).unwrap();
+        for rel in [
+            "artifacts/joined/join_F_20260910-120000_n2.mp4",
+            "artifacts/joined/join_F_20260910-120000_n2.manifest.json",
+            "artifacts/joined/join-log.jsonl",
+            "evidence/logs/audio-level-log.jsonl",
+        ] {
+            assert!(output.join(rel).is_file(), "missing {rel}");
+        }
+        for tmp in [
+            ".join-t1.ffconcat",
+            ".join-t1.part",
+            ".join-t1.progress.json",
+        ] {
+            assert!(!output.join("artifacts/joined").join(tmp).exists());
+        }
+        let result = super::verify_package(&output).unwrap();
+        assert!(result.passed(), "{:?}", result.checks);
+        for lane in [
+            "artifacts/joined/join-log.jsonl",
+            "evidence/logs/audio-level-log.jsonl",
+        ] {
+            let check = result.checks.iter().find(|c| c.subject == lane).unwrap();
+            assert_eq!(check.status, super::CheckStatus::Pass, "{check:?}");
         }
         fs::remove_dir_all(root).unwrap();
     }
