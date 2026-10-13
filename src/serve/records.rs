@@ -600,6 +600,14 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
                 "error": err,
             })
         });
+    // Plan §2.4: the measured-sound map, already bound to the current index
+    // bytes (a measurement of other bytes is `stale`). A read failure is
+    // reported beside an empty map, never presented as "nothing measured".
+    let (audio_levels, audio_levels_error) =
+        match crate::audio_level::audio_levels_for_case(&case_dir) {
+            Ok(levels) => (crate::audio_level::audio_levels_json(&levels), None),
+            Err(err) => (serde_json::json!({}), Some(err)),
+        };
     let body = serde_json::json!({
         "ok": true,
         "manifest": read_json(case_dir.join("case.json")),
@@ -617,6 +625,14 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         "deepfake": crate::deepfake::collect_reports(&case_dir),
         "telemetry": crate::telemetry::collect_reports(&case_dir),
         "proxies": proxies,
+        // Plan §1.8: one entry per completed lossless join (derived records).
+        "joinLog": read_jsonl(
+            case_dir
+                .join(crate::join::JOINED_DIR)
+                .join(crate::join::LOG_FILE)
+        ),
+        "audioLevels": audio_levels,
+        "audioLevelsError": audio_levels_error,
     });
     serde_json::to_string(&body).unwrap_or_else(|_| "{\"ok\":false}".to_string())
 }

@@ -45,6 +45,8 @@ pub(crate) struct PipelineJob {
     pub(crate) with_hash: bool,
     pub(crate) with_ffprobe: bool,
     pub(crate) with_deepfake: bool,
+    /// Phase-2 "소리 측정" step (measure-audio); only with `with_ffprobe`.
+    pub(crate) with_audio: bool,
     pub(crate) skip_e01_verify: bool,
     /// Triage mode: inspect-e01 --filesystem reads the segment set
     /// directly instead of exporting hundreds of GiB to raw first.
@@ -147,12 +149,15 @@ pub(crate) struct JobState {
     pub(crate) clip_jobs: Vec<ClipJob>,
     /// Monotonic id source for `clip_jobs`.
     pub(crate) clip_seq: u64,
+    /// Recent successful `/api/join-check` plans as `(plan_id, source
+    /// bytes)`, so a join started from that check knows its expected size.
+    pub(crate) join_plan_bytes: Vec<(String, u64)>,
 }
 
 /// A background case job (UX-06) run under the busy lease.
 #[derive(Clone, Debug)]
 pub(crate) struct CaseJob {
-    /// Stable machine key: `recover-deleted` | `carve`.
+    /// Stable machine key: `recover-deleted` | `carve` | `audio-measure`.
     pub(crate) kind: &'static str,
     pub(crate) started_unix: u64,
     pub(crate) finished_unix: Option<u64>,
@@ -165,10 +170,15 @@ pub(crate) struct CaseJob {
     pub(crate) error: Option<String>,
 }
 
-/// One clip export (UX-09). Identical requests share one job (`key`).
+/// One clip export (UX-09) or lossless join (`kind == "join"`). Identical
+/// requests share one job (`key`). Joins share the clip list, lock, cap and
+/// every protection (status, cancel, shutdown / open-case refusal,
+/// finalize and case-job waits).
 #[derive(Clone, Debug)]
 pub(crate) struct ClipJob {
     pub(crate) id: String,
+    /// `export-clip` | `join`.
+    pub(crate) kind: &'static str,
     /// Dedupe key: case + selector + range + burn-in options.
     pub(crate) key: String,
     pub(crate) record_id: String,
@@ -183,6 +193,28 @@ pub(crate) struct ClipJob {
     pub(crate) size_bytes: Option<u64>,
     pub(crate) error: Option<String>,
     pub(crate) cancel_requested: bool,
+    /// `{stage, done, total}` file the CLI writes (join only).
+    pub(crate) progress_path: Option<PathBuf>,
+    /// Bytes the finished output is expected to have (join: the summed
+    /// source size, known from the check) — `None` when unknown.
+    pub(crate) expected_bytes: Option<u64>,
+    /// Join-only details (`None` for clip exports).
+    pub(crate) join: Option<JoinJobInfo>,
+}
+
+/// What the server needs to drive, clean up and report one join job.
+#[derive(Clone, Debug)]
+pub(crate) struct JoinJobInfo {
+    /// `--job-tag`: names the `.join-<tag>.*` temp files.
+    pub(crate) tag: String,
+    pub(crate) plan_id: String,
+    pub(crate) ids: Vec<String>,
+    pub(crate) temps: crate::join::TempPaths,
+    /// Case-relative sidecar manifest (set when done).
+    pub(crate) manifest_rel: Option<String>,
+    pub(crate) duration_check_ok: Option<bool>,
+    /// The manifest's `duration_check` `{expected, observed, ok}`.
+    pub(crate) duration_check: Option<serde_json::Value>,
 }
 
 /// One phase-2 enrichment step (UX-02).
@@ -243,6 +275,7 @@ impl JobState {
             case_job: None,
             clip_jobs: Vec::new(),
             clip_seq: 0,
+            join_plan_bytes: Vec::new(),
         }
     }
 }

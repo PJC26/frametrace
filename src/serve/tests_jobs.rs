@@ -358,6 +358,7 @@ fn deferred_drain_records_conflicts_file_and_status_count() {
         with_hash: true,
         with_ffprobe: false,
         with_deepfake: false,
+        with_audio: false,
         skip_e01_verify: false,
         e01_direct: false,
     };
@@ -481,6 +482,7 @@ fn open_queue_conflict(tag: &str) -> (PathBuf, SharedState) {
         with_hash: true,
         with_ffprobe: false,
         with_deepfake: false,
+        with_audio: false,
         skip_e01_verify: false,
         e01_direct: false,
     };

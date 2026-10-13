@@ -747,6 +747,9 @@ pub(crate) fn path_fields_for(method: &str, path: &str) -> &'static [(bool, &'st
         ("POST", "/api/preflight" | "/api/start") => &[(false, "source_path"), (false, "case_dir")],
         ("POST", "/api/export-clip" | "/api/telemetry" | "/api/proxy") => &[(false, "path")],
         ("POST", "/api/advanced") => &[(false, "extra")],
+        // Join and sound measurement take indexed ids only — never a path
+        // (the CLI resolves sources from the case index).
+        ("POST", "/api/join-check" | "/api/join" | "/api/audio-measure") => &[],
         _ => &[],
     }
 }
