@@ -26,7 +26,11 @@ function parseTimeFromName(name) {
     if (Number.isFinite(ts)) {
       // hasTime:false means only the date part matched — the 00:00:00
       // time is synthetic and must not be presented as a recording time.
-      return { ts, date: `${year}-${month}-${day}`, source: pattern.hasTime ? "name" : "name-date" };
+      // wall: the device clock exactly as written. `ts` is a browser-local
+      // instant used only to sort; a wall time the local zone skips (DST
+      // spring-forward, e.g. 02:30 in Europe/Berlin on 2026-03-29) would
+      // come back shifted from it, so labels are built from `wall`.
+      return { ts, date: `${year}-${month}-${day}`, wall: `${year}-${month}-${day}T${hh}:${mm}:${ss}`, source: pattern.hasTime ? "name" : "name-date" };
     }
   }
   return null;
@@ -210,12 +214,24 @@ function recTimeParts(unix) {
     offset: `${sign}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`
   };
 }
+// A naive (file-name) time is formatted from its parsed fields
+// (record.recWall), never from a local Date: a wall time the local zone
+// skips or repeats (DST) must read exactly as the device wrote it.
+function recWallParts(record) {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})$/.exec(String(record.recWall || ""));
+  if (m) return { date: m[1], time: m[2] };
+  if (record.recDay && record.recSource === "name-date") return { date: record.recDay, time: "00:00:00" };
+  return null;
+}
 function recTimeText(record, opts) {
   if (!record || !Number.isFinite(record.recTime)) return "";
   const iso = !!(opts && opts.iso);
+  if (record.recSource === "name" || record.recSource === "name-date") {
+    const wall = recWallParts(record) || recTimeParts(record.recTime);
+    if (record.recSource === "name-date") return iso ? wall.date : `${wall.date} ${t("time.naiveDate")}`;
+    return iso ? `${wall.date}T${wall.time}` : `${wall.date} ${wall.time} ${t("time.naive")}`;
+  }
   const { date, time, offset } = recTimeParts(record.recTime);
-  if (record.recSource === "name-date") return iso ? date : `${date} ${t("time.naiveDate")}`;
-  if (record.recSource === "name") return iso ? `${date}T${time}` : `${date} ${time} ${t("time.naive")}`;
   return iso ? `${date}T${time}${offset}` : `${date} ${time} UTC${offset} ${t("detail.est")}`;
 }
 
@@ -709,6 +725,7 @@ records.forEach(record => {
   const rec = recordingTimeFor(record);
   record.recTime = rec ? rec.ts : null;
   record.recDay = rec ? rec.date : null;
+  record.recWall = rec && rec.wall ? rec.wall : null;
   record.recSource = rec ? rec.source : null;
   if (record.kind === "joined") {
     // The plan's channel (§1.8), not a guess from the output file name; a
@@ -754,6 +771,7 @@ records.forEach(record => {
     if (!first || first.recTime == null) return;
     record.recTime = first.recTime;
     record.recDay = first.recDay;
+    record.recWall = first.recWall;
     record.recSource = first.recSource;
   });
 }
@@ -1245,11 +1263,17 @@ function adoptDeadWriters(dead) {
   const gone = new Set(dead);
   gone.forEach(writer => skippedDraftWriters.delete(writer));
   let adopted = 0;
+  const adoptedIds = [];
   for (const entry of storedDraftEntries()) {
     if (!gone.has(entry.writer) || state.drafts[entry.id]) continue;
     adoptDraft(entry.id, entry.draft, entry.writer, entry.key);
+    adoptedIds.push(entry.id);
     adopted += 1;
   }
+  // An adopted draft replaced those records' values after the undo journal
+  // (or a journal restored across a reload, U4) was checked against them:
+  // their entries would now undo/redo over the dead window's edit — drop them.
+  if (adoptedIds.length && typeof dropJournalIds === "function") dropJournalIds(adoptedIds);
   gone.forEach(writer => { try { localStorage.removeItem(aliveKey(writer)); } catch (error) { /* storage blocked */ } });
   if (adopted) {
     if (typeof registerRestoredConflicts === "function") registerRestoredConflicts();

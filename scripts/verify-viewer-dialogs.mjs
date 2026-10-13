@@ -30,16 +30,16 @@ const { chromium } = require('playwright');
 
 const N = 8;
 const EVIL_CASE = 'FT"<img src=x onerror=window.__pwn=1>&';
-function buildViewer(caseId = 'FT-DLG') {
-  const evil = caseId !== 'FT-DLG';
+function buildViewer(caseId = 'FT-DLG', names = null) {
+  const evil = caseId !== 'FT-DLG' && !names;
   const dir = join(root, 'assets/viewer');
   let js = '';
   for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
     js += readFileSync(join(dir, part), 'utf8');
     if (!js.endsWith('\n')) js += '\n';
   }
-  const videos = Array.from({ length: N }, (_, i) => ({
-    id: `vid_${i}`, relative_path: evil ? `DCIM/20260910_12000${i}_F.mp4` : `DCIM/c${i}.mp4`, source_path: `/case/DCIM/c${i}.mp4`,
+  const videos = Array.from({ length: names ? names.length : N }, (_, i) => ({
+    id: `vid_${i}`, relative_path: names ? `DCIM/${names[i]}` : evil ? `DCIM/20260910_12000${i}_F.mp4` : `DCIM/c${i}.mp4`, source_path: `/case/DCIM/c${i}.mp4`,
     ffprobe_ok: true, size_bytes: 1000, extension: 'mp4', duration_seconds: 60,
   }));
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
@@ -59,11 +59,14 @@ const check = (name, ok, detail = '') => {
 
 const html = buildViewer();
 const evilHtml = buildViewer(EVIL_CASE);
+// A device-clock time that does not exist in Europe/Berlin (DST spring
+// forward 2026-03-29 02:00 → 03:00): it must read as written.
+const dstHtml = buildViewer('FT-DST', ['20260329_023000_F.mp4']);
 let thumbHits = 0;
 const server = createServer((req, res) => {
   if (req.url.startsWith('/thumbs/')) { thumbHits += 1; res.statusCode = 404; res.end('no'); return; }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(req.url === '/evil' ? evilHtml : html);
+  res.end(req.url === '/evil' ? evilHtml : req.url === '/dst' ? dstHtml : html);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -266,6 +269,19 @@ try {
     check('theater survives until the toasts are gone', await theater());
     await page.keyboard.press('Escape');
     check('last Esc leaves theater', !(await theater()));
+    // F7: focus inside a toast — Esc dismisses THAT toast (not the newest)
+    // and focus moves to the remaining toast, then back to the grid.
+    await page.evaluate(() => { FTViewer.toast('focus-older', 'error'); FTViewer.toast('focus-newer', 'error'); });
+    await page.locator('#toastHost .toast', { hasText: 'focus-older' }).locator('button').first().focus();
+    await page.keyboard.press('Escape');
+    const f7 = await page.evaluate(() => ({
+      texts: [...document.querySelectorAll('#toastHost .toast')].map((t) => t.textContent),
+      focusInToast: document.activeElement?.closest('.toast')?.textContent || '',
+    }));
+    check('Esc in a focused toast dismisses that toast and focuses the remaining one', !f7.texts.some((t) => t.includes('focus-older')) && f7.texts.some((t) => t.includes('focus-newer')) && f7.focusInToast.includes('focus-newer'), JSON.stringify(f7));
+    await page.keyboard.press('Escape');
+    const f7b = await page.evaluate(() => ({ n: document.querySelectorAll('#toastHost .toast').length, onCard: !!document.activeElement?.closest('#recordGrid') }));
+    check('Esc on the last focused toast returns focus to the grid', f7b.n === 0 && f7b.onCard, JSON.stringify(f7b));
   }
   check('no page errors', !errors.length, errors.join(' | '));
   await ctx.close();
@@ -302,6 +318,28 @@ try {
     check('summary report times carry a basis label', /시간대 미상|time zone unknown|UTC[+-]\d\d:\d\d/.test(summary));
     check('no page errors (hostile case)', !evilErrors.length, evilErrors.join(' | '));
     await evilCtx.close();
+  }
+
+  // --- F3: naive device times are formatted from their parsed fields ------
+  {
+    const dstCtx = await browser.newContext({ timezoneId: 'Europe/Berlin', locale: 'ko-KR' });
+    const dst = await dstCtx.newPage();
+    const dstErrors = [];
+    dst.on('pageerror', (e) => dstErrors.push(String(e)));
+    await dst.goto(base + 'dst');
+    await dst.waitForSelector('.card');
+    // Precondition: the emulated zone really skips 02:30 (a local Date shifts it).
+    const shifted = await dst.evaluate(() => new Date(2026, 2, 29, 2, 30, 0).getHours());
+    check('precondition: Europe/Berlin skips 2026-03-29 02:30 (local Date shifts it)', shifted === 3, `hours=${shifted}`);
+    await dst.locator('.card').first().click();
+    const shown = await dst.evaluate(() => ({
+      card: document.querySelector('#recordGrid .card .time-text')?.textContent || '',
+      detail: document.getElementById('summaryList')?.textContent || '',
+    }));
+    check('card shows the device time as written (02:30, no DST shift)', shown.card.includes('2026-03-29 02:30'), shown.card);
+    check('details show the device time as written (02:30:00, zone unknown)', shown.detail.includes('2026-03-29 02:30:00') && !shown.detail.includes('03:30'), shown.detail.slice(0, 160));
+    check('no page errors (DST zone)', !dstErrors.length, dstErrors.join(' | '));
+    await dstCtx.close();
   }
 } finally {
   await browser.close();

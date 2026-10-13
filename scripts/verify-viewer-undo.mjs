@@ -51,6 +51,8 @@ let releaseFirst = null;
 let deny401 = false;
 const savedMarks = new Map();
 const server = createServer((req, res) => {
+  // A plain same-origin page (no viewer) for tests that write storage from another tab.
+  if (req.url === '/blank') { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><title>blank</title>'); return; }
   if (req.url === '/api/import-marks' && deny401) {
     res.statusCode = 401;
     res.setHeader('Content-Type', 'application/json');
@@ -150,6 +152,7 @@ try {
   await runApplyCheck(page2);
   await page2.close();
   await runReloadCheck(browser);
+  await runChangedElsewhereCheck(browser);
   await runAuthAndOriginCheck(browser);
 } finally {
   await browser.close();
@@ -226,7 +229,75 @@ async function runReloadCheck(browser) {
   await page.close();
 }
 
-// U8: a save refused with 401 says "authorization expired — reopen", not
+// F4: undo never overwrites a value changed elsewhere.
+//  (a) in session: a journaled tag, then an unjournaled tag on the same
+//      record (detail tag button) — Ctrl+Z leaves both and says so.
+//  (b) drop path: a dead window's draft adopted for a record after it was
+//      journaled here drops that record's journal entries — Ctrl+Z then has
+//      nothing to undo and the adopted value stays.
+async function runChangedElsewhereCheck(browser) {
+  savedMarks.clear();
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(base);
+  await page.waitForSelector('.card');
+  const toastText = () => page.evaluate(() => document.getElementById('toastHost').textContent);
+  const clearToasts = () => page.evaluate(() => { document.getElementById('toastHost').textContent = ''; });
+
+  // (a)
+  await page.locator('.card[data-id="vid_a"]').click();
+  await page.evaluate(() => document.activeElement?.blur());
+  const presets = await page.locator('.tag-btn').evaluateAll((els) => els.map((b) => b.dataset.presetTag));
+  await page.locator('#btnTagMenu').click();
+  await page.locator(`#tagMenuList [data-tag="${presets[0]}"]`).click();
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.locator(`.tag-btn[data-preset-tag="${presets[1]}"]`).click(); // unjournaled
+  await page.waitForTimeout(250); // requestRender paints on the next frame
+  await page.evaluate(() => document.activeElement?.blur());
+  const tagsOn = () => page.locator('.tag-btn.on').evaluateAll((els) => els.map((b) => b.dataset.presetTag));
+  const before = await tagsOn();
+  await clearToasts();
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(200);
+  const after = await tagsOn();
+  const t1 = await toastText();
+  check('precondition: journaled tag + unjournaled tag both on', presets.length >= 2 && before.includes(presets[0]) && before.includes(presets[1]), JSON.stringify({ presets, before }));
+  check('Ctrl+Z over a value changed elsewhere leaves it and says so', JSON.stringify(after) === JSON.stringify(before) && /다른 곳에서 바뀐 항목은 되돌리지 않았습니다|changed elsewhere were not undone/.test(t1), JSON.stringify({ after, t1 }));
+  await clearToasts();
+  await page.keyboard.press('Control+y');
+  await page.waitForTimeout(150);
+  check('the skipped change is not on the redo stack', /다시 실행할 작업이 없습니다|Nothing to redo/.test(await toastText()), await toastText());
+
+  // (b)
+  await page.locator('.card[data-id="vid_b"]').click();
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.keyboard.press('1'); // journaled: vid_b reviewed
+  await page.waitForFunction(() => document.getElementById('saveState').dataset.state === 'saved', null, { timeout: 10000 }).catch(() => {});
+  const other = await ctx.newPage();
+  // A second tab of the same origin writes a CLOSED window's draft for
+  // vid_b (the storage event tells the viewer; its heartbeat adopts it).
+  await other.goto(base + 'blank');
+  await other.evaluate(() => {
+    localStorage.setItem('ft.alive:FT-UNDO:deadwriter', 'closed');
+    localStorage.setItem('ft.draft.FT-UNDO.deadwriter.vid_b', JSON.stringify({ mark: { status: 'important' }, note: '', tags: [], examiner: null, seq: 1, base: 0 }));
+  });
+  const adopted = await page.waitForFunction(() => /중요|Important/.test(document.querySelector('.card[data-id="vid_b"] .mark-chip')?.textContent || ''), null, { timeout: 15000 }).then(() => true).catch(() => false);
+  await other.close();
+  await clearToasts();
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(200);
+  const t2 = await toastText();
+  const chip = await page.evaluate(() => document.querySelector('.card[data-id="vid_b"] .mark-chip')?.textContent || '');
+  check('precondition: the dead window\'s draft was adopted (vid_b important)', adopted, chip);
+  check('adoption dropped vid_b\'s journal entry (nothing to undo, adopted value stays)', /취소할 작업이 없습니다|Nothing to undo/.test(t2) && /중요|Important/.test(chip), JSON.stringify({ t2, chip }));
+  check('no page errors (changed elsewhere)', !errors.length, errors.join(' | '));
+  await ctx.close();
+}
+
+// U8: a save refused with 401 says "save refused (auth) — close the other FrameTrace window and reload", not
 // "server unreachable". U9: a draft marker of this case under another port
 // (cookie ft_draft_ports, shared by every port of the host) is announced in
 // the notices row; this window's own drafts set its marker.
@@ -251,20 +322,27 @@ async function runAuthAndOriginCheck(browser) {
   await page.evaluate(() => document.activeElement?.blur());
   await page.keyboard.press('2');
   await page.locator('#saveState').click();
-  await page.waitForFunction(() => /인증이 만료|authorization expired/.test(document.getElementById('toastHost').textContent), null, { timeout: 8000 }).catch(() => {});
+  await page.waitForFunction(() => /인증 오류로 거부|authorization error/.test(document.getElementById('toastHost').textContent), null, { timeout: 8000 }).catch(() => {});
   const auth = await page.evaluate(() => ({
     toast: document.getElementById('toastHost').textContent,
     title: document.getElementById('saveState').title,
     state: document.getElementById('saveState').dataset.state,
   }));
-  check('401 save: "browser authorization expired — reopen" (not server down)', /브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오/.test(auth.toast) && !/연결할 수 없/.test(auth.toast), JSON.stringify(auth));
-  check('401 save: save state says why and stays unsaved', /인증이 만료/.test(auth.title) && auth.state !== 'saved', JSON.stringify(auth));
+  check('401 save: "save refused (auth) — close the other window, reload" (not server down / expired)', /저장이 인증 오류로 거부되었습니다 — 같은 컴퓨터에서 다른 FrameTrace 창이 열려 있으면 닫고 이 창을 새로 고치십시오/.test(auth.toast) && !/연결할 수 없|만료/.test(auth.toast), JSON.stringify(auth));
+  check('401 save: save state says why and stays unsaved', /인증 오류로 거부/.test(auth.title) && auth.state !== 'saved', JSON.stringify(auth));
   await page.waitForFunction((p) => document.cookie.includes(`${p}.`), myPort, { timeout: 5000 }).catch(() => {});
   const cookie = await page.evaluate(() => document.cookie);
   check('own unsaved drafts set this port\'s marker', cookie.includes(`${myPort}.${hash}`), cookie);
   await page.locator('#originDraftsDismiss').click();
   const afterDismiss = await page.evaluate(() => ({ cookie: document.cookie, notice: !!document.getElementById('originDraftsNotice') }));
   check('dismiss removes the notice and the other port\'s marker', !afterDismiss.notice && !afterDismiss.cookie.includes(`${otherPort}.${hash}`), JSON.stringify(afterDismiss));
+  // F6: another port's window may drop or rewrite the shared cookie while
+  // this one still holds drafts — the marker comes back (flush/heartbeat),
+  // it is not cached as "already written" forever.
+  await ctx.clearCookies({ name: 'ft_draft_ports' });
+  const cleared = !(await page.evaluate(() => document.cookie)).includes(`${myPort}.${hash}`);
+  const rewritten = await page.waitForFunction((p) => document.cookie.includes(`${p}.`), myPort, { timeout: 12000 }).then(() => true).catch(() => false);
+  check('marker removed elsewhere is rewritten while drafts remain', cleared && rewritten, await page.evaluate(() => document.cookie));
   deny401 = false;
   await page.locator('#saveState').click();
   await page.waitForFunction(() => document.getElementById('saveState').dataset.state === 'saved', null, { timeout: 10000 }).catch(() => {});

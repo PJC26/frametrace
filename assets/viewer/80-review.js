@@ -86,14 +86,27 @@ function journalDiff(before, after) {
   return changes;
 }
 
+// Applies one side of a journal entry. A field whose current value is no
+// longer what the entry left behind (undo expects `after`, redo `before`)
+// was changed elsewhere — another window, the server, a resolved conflict —
+// and is NOT overwritten: it is left as is and leaves the entry, so a later
+// redo/undo cannot replay it either. Returns { applied, skipped } where
+// `applied` is the changes (fields) that were restored.
 function applyJournalSide(changes, side) {
+  const expect = side === "before" ? "after" : "before";
   const current = new Map(snapshotIds(changes.map(change => change.id)).map(item => [item.id, item]));
+  const applied = [];
+  let skipped = 0;
   for (const change of changes) {
     const id = change.id;
     const item = change[side];
     const now = current.get(id);
     let annotationChanged = false;
-    for (const field of change.fields) {
+    const fields = change.fields.filter(field =>
+      !change[expect] || journalFieldValue(field, now[field]) === journalFieldValue(field, change[expect][field]));
+    skipped += change.fields.length - fields.length;
+    if (fields.length) applied.push(fields.length === change.fields.length ? change : { ...change, fields });
+    for (const field of fields) {
       if (field === "mark") {
         if (item.mark) state.marks[id] = { ...item.mark }; else delete state.marks[id];
         if (JSON.stringify(now.mark) !== JSON.stringify(item.mark)) annotationChanged = true;
@@ -113,6 +126,7 @@ function applyJournalSide(changes, side) {
     // the draft; hydration replays drafts, so no per-map storage write.
     if (annotationChanged) touchAnnotation(id);
   }
+  return { applied, skipped };
 }
 
 // A resolved save conflict (90-sync resolveConflicts) is the examiner's
@@ -327,24 +341,26 @@ function focusRecordId(id) {
 function undoJournal() {
   const entry = undoStack.pop();
   if (!entry) { toast(t("toast.nothingUndo")); return false; }
-  applyJournalSide(entry.changes, "before");
-  redoStack.push(entry);
+  const res = applyJournalSide(entry.changes, "before");
+  if (res.applied.length) redoStack.push({ ...entry, changes: res.applied });
   focusRecordId(entry.activeBefore);
   render();
   updateRangeLabel();
-  toast(tf("toast.undone", { what: entry.label }));
+  if (res.applied.length) toast(tf("toast.undone", { what: entry.label }));
+  if (res.skipped) toast(t("journal.skippedUndo"));
   return true;
 }
 
 function redoJournal() {
   const entry = redoStack.pop();
   if (!entry) { toast(t("toast.nothingRedo")); return false; }
-  applyJournalSide(entry.changes, "after");
-  undoStack.push(entry);
+  const res = applyJournalSide(entry.changes, "after");
+  if (res.applied.length) undoStack.push({ ...entry, changes: res.applied });
   focusRecordId(entry.activeBefore);
   render();
   updateRangeLabel();
-  toast(tf("toast.redone", { what: entry.label }));
+  if (res.applied.length) toast(tf("toast.redone", { what: entry.label }));
+  if (res.skipped) toast(t("journal.skippedRedo"));
   return true;
 }
 
@@ -546,17 +562,21 @@ function isTypingTarget(el) {
   return el.tagName === "INPUT" && TEXT_INPUT_TYPES.has(String(el.getAttribute("type") || "").toLowerCase());
 }
 
-// U6: the key a shortcut means. A Korean (or any non-Latin) IME reports
-// event.key as the composed jamo ("ㅓ" for J) or "Process" — the physical
-// key (event.code) then decides, so j/k/n/x/i/o/1/2/3/0/,/./[/]/? keep
-// working without switching the input language. A Latin event.key is kept
-// as is (AZERTY, Dvorak … keep their own letters). Letters follow Shift
-// alone, so CapsLock never turns j into the J shuttle (or Shift+j into j).
-const SHORTCUT_CODE_KEYS = { Comma: ",", Period: ".", BracketLeft: "[", BracketRight: "]", Space: " " };
+// U6: the key a shortcut means. A Korean (or other non-Latin-script) layout
+// or IME reports event.key as the composed jamo ("ㅓ" for J), a Cyrillic /
+// Greek / … letter ("о" for J on a Russian layout) or "Process" — the
+// physical key (event.code) then decides, so j/k/n/x/i/o/1/2/3/0/,/./[/]/?
+// and Ctrl+Z/Y/A/D/B/K keep working without switching the input language.
+// Anything else keeps event.key as is: AZERTY "&" on Digit1, "é" on Digit2,
+// Czech "ě"/"š", Turkish "ı", Nordic "å" … are that layout's own
+// characters and trigger nothing (they are not "2" or "1"). Letters follow
+// Shift alone, so CapsLock never turns j into the J shuttle (or Shift+j
+// into j). `var`: 40-grid's Ctrl+B listener calls this too.
+var SHORTCUT_CODE_KEYS = { Comma: ",", Period: ".", BracketLeft: "[", BracketRight: "]", Space: " " };
+var NON_LATIN_SCRIPT_RE = /^[\p{Script=Hangul}\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Armenian}\p{Script=Georgian}\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Thai}\p{Script=Devanagari}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Bopomofo}]$/u;
 function shortcutKey(event) {
   let key = String(event.key || "");
-  const latin = key.length === 1 && key.charCodeAt(0) < 128;
-  if (!latin && (key.length === 1 || key === "Process" || key === "Unidentified")) {
+  if (key === "Process" || key === "Unidentified" || NON_LATIN_SCRIPT_RE.test(key)) {
     const code = String(event.code || "");
     let m = /^Key([A-Z])$/.exec(code);
     if (m) key = m[1].toLowerCase();
@@ -571,6 +591,20 @@ function shortcutKey(event) {
 // A viewer modal (shortcut sheet, in-page dialog, command palette) is open.
 function viewerModalOpen() {
   return !!ftRoot.querySelector(".modal-backdrop:not([hidden])");
+}
+// Focus inside a toast (its Undo / close button): Esc dismisses THAT toast,
+// then focus moves to the newest remaining toast's button, else back to
+// the active card (viewerFocus), never left on a removed node.
+function dismissFocusedViewerToast(el) {
+  const item = el && el.closest ? el.closest("#toastHost .toast") : null;
+  if (!item) return false;
+  dismissToast(item);
+  const host = document.getElementById("toastHost");
+  const rest = host ? [...host.querySelectorAll(".toast:not(.clip-progress)")] : [];
+  const next = rest.length ? rest[rest.length - 1].querySelector("button") : null;
+  if (next) next.focus();
+  else if (typeof viewerFocus === "function") viewerFocus();
+  return true;
 }
 // Esc closes ONE layer per press (U13): newest toast first, then theater.
 function dismissNewestViewerToast() {
@@ -648,6 +682,7 @@ document.addEventListener("keydown", event => {
       // control, the shortcut sheet, the newest toast, theater mode.
       if (tag === "SELECT" || tag === "INPUT") el.blur();
       else if (!document.getElementById("shortcutsModal").hidden) toggleShortcuts(false);
+      else if (dismissFocusedViewerToast(el)) { /* the toast focus was on */ }
       else if (dismissNewestViewerToast()) { /* one toast */ }
       else if (state.layout.theater) toggleTheater();
       else handled = false;
@@ -1687,7 +1722,8 @@ const commandPalette = (() => {
     input.focus();
   }
   window.addEventListener("keydown", e => {
-    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || String(e.key).toLowerCase() !== "k") return;
+    // shortcutKey: a Russian layout's Ctrl+"л" is Ctrl+K (U6).
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || shortcutKey(e).toLowerCase() !== "k") return;
     if (document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-keys="off"]')) return;
     e.preventDefault();
     e.stopPropagation();

@@ -81,6 +81,9 @@ function searchHaystack(record) {
 // j/k under a mark or tag filter reuses the list instead of filtering and
 // sorting every record on each key press (U7).
 let filteredMemo = { key: null, list: null };
+// How many times the full filter + sort actually ran (memo misses): read by
+// harnesses through FTViewer._debugStats() (U7 — j/k must not recompute).
+var filterComputeCount = 0;
 // Every FILTER input (no sort): the facet memo keys on this alone, so a
 // new filter dimension added here invalidates both memos and a sort change
 // never recomputes the facet counts (no positional slicing of the key).
@@ -97,6 +100,7 @@ function filterMemoKey() {
 function filteredRecords() {
   const key = filterMemoKey();
   if (key !== null && filteredMemo.key === key) return filteredMemo.list;
+  filterComputeCount += 1;
   const list = computeFilteredRecords();
   filteredMemo = { key, list };
   return list;
@@ -826,7 +830,10 @@ function renderCard(record) {
   const recTime = record.recTime
     ? record.recSource === "name-date"
       ? record.recDay
-      : cardTimeFormat.format(new Date(record.recTime * 1000))
+      // A device-clock wall time reads as written (no local-Date DST shift).
+      : record.recSource === "name" && record.recWall
+        ? record.recWall.slice(0, 16).replace("T", " ")
+        : cardTimeFormat.format(new Date(record.recTime * 1000))
     : "";
   const tagsHtml = tagListFor(record).length
     ? `<div class="tag-row">${tagListFor(record).map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("")}</div>`
@@ -1009,7 +1016,10 @@ function setupLayoutChrome() {
   document.getElementById("btnRail")?.addEventListener("click", toggleRail);
   document.addEventListener("keydown", event => {
     if (event.defaultPrevented || event.altKey || event.shiftKey) return;
-    if (!(event.ctrlKey || event.metaKey) || String(event.key).toLowerCase() !== "b") return;
+    // shortcutKey (80-review): a Russian / Korean layout's Ctrl+"и" is Ctrl+B.
+    if (!(event.ctrlKey || event.metaKey) || shortcutKey(event).toLowerCase() !== "b") return;
+    // Nothing behind an open viewer modal changes (U12).
+    if (viewerModalOpen()) return;
     const el = document.activeElement;
     if (el && (el.tagName === "TEXTAREA" || el.isContentEditable)) return;
     if (el && el.closest && el.closest('[data-keys="off"]')) return;

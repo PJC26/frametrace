@@ -126,46 +126,107 @@ let lastInstance = null;
 // 31-progress.js may read it before this line has run.
 var pollStatusAt = 0;
 // The banner has two faces: "server lost" (connection refused / timed out)
-// and "browser authorization expired" (U8: the server answered 401 — it is
-// up, but this page no longer carries its ft_token / ft_nonce cookie). The
-// second never says the server is down, and its button reloads the page
-// (a fresh GET plants the nonce again; a token-gated server needs the
-// workstation window, which opens with ?token=).
-let bannerAuth = false;
+// and "authorization refused" (U8: the server answered 401 — it is up, but
+// this page's ft_token / ft_nonce cookie is missing, or another FrameTrace
+// instance on this computer replaced it). The auth face is driven by WHAT
+// is failing, not by /api/status: in no-token mode a GET needs no proof, so
+// a good status poll says nothing about saves. Kinds (authFailing):
+//   "read"  a GET was refused (token mode) — cleared by a good GET
+//   "write" a shell POST was refused — cleared by a good shell POST
+//   "save"  the hosted viewer's save was refused — cleared only when a
+//           viewer save gets through (FTViewer "save-state" auth:false)
+// A lost connection takes precedence; the auth face returns after it.
+let bannerAuth = false;     // the banner currently shows the auth face
+let connLost = false;
+let connDetail = "";
+const authFailing = new Set();
 const BANNER_LOST = { title: "", button: "" };
+const AUTH_DETAIL = "같은 컴퓨터에서 다른 FrameTrace 창이 열려 있으면 닫고 이 창을 새로 고치십시오. 서버는 응답하지만 이 창의 인증 쿠키가 없거나 다른 창의 것으로 바뀌어 요청이 거부되었습니다 (HTTP 401). 판독 내용은 이 브라우저에 보존됩니다.";
+const AUTH_GONE_DETAIL = "이 창에는 인증 정보가 남아 있지 않아 새로 고쳐도 열리지 않습니다 — FrameTrace 앱 창(또는 앱이 연 주소)에서 다시 여십시오. 판독 내용은 이 브라우저에 보존됩니다.";
+function authTitle() {
+  return authFailing.has("save") || authFailing.has("write") ? "저장이 인증 오류로 거부되었습니다" : "요청이 인증 오류로 거부되었습니다";
+}
 function bannerFace(auth) {
   const banner = $("serverBanner");
   const title = banner && typeof banner.querySelector === "function" ? banner.querySelector("b") : null;
   const button = $("btnServerRetry");
   if (!BANNER_LOST.title && title) { BANNER_LOST.title = title.textContent; BANNER_LOST.button = button ? button.textContent : ""; }
-  if (title && BANNER_LOST.title) title.textContent = auth ? "브라우저 인증이 만료되었습니다" : BANNER_LOST.title;
-  if (button && BANNER_LOST.button) button.textContent = auth ? "페이지 다시 열기" : BANNER_LOST.button;
+  const nextTitle = auth ? authTitle() : BANNER_LOST.title;
+  // Only real changes: rewriting the role=alert text re-announces it.
+  if (title && BANNER_LOST.title && title.textContent !== nextTitle) title.textContent = nextTitle;
+  if (button && BANNER_LOST.button && bannerAuth !== auth) {
+    button.textContent = auth ? "이 창 새로 고침" : BANNER_LOST.button;
+    button.hidden = false;
+    button.disabled = false;
+  }
   bannerAuth = auth;
 }
-function setServerLost(lost, detail, auth) {
+function setBannerMsg(text) {
+  if (!text) return;
+  $("serverBannerMsg").textContent = text;
+  $("serverBannerMsg").title = text;
+}
+function renderServerBanner() {
   const banner = $("serverBanner");
   const was = !banner.hidden;
-  const face = !!(lost && auth);
-  banner.hidden = !lost;
-  if (lost && (face !== bannerAuth || !was)) bannerFace(face);
-  if (!lost && bannerAuth) bannerFace(false);
-  if (lost && (!was || face) && detail) { $("serverBannerMsg").textContent = detail; $("serverBannerMsg").title = detail; }
+  const auth = !connLost && authFailing.size > 0;
+  const show = connLost || auth;
+  banner.hidden = !show;
+  if (show && (auth !== bannerAuth || !was)) { bannerFace(auth); setBannerMsg(auth ? AUTH_DETAIL : connDetail); }
+  else if (show && auth) bannerFace(true); // the title follows the failing kinds
+  if (!show && bannerAuth) bannerFace(false);
   const S = storeState();
-  if (S && (!!S.server.lost !== !!lost || !!S.server.auth !== face)) {
-    patchStore({ server: Object.assign({}, S.server, { lost: !!lost, auth: face, failures: lost ? pollFailures : 0 }) });
+  if (S && (!!S.server.lost !== show || !!S.server.auth !== auth)) {
+    patchStore({ server: Object.assign({}, S.server, { lost: show, auth, failures: connLost ? pollFailures : 0 }) });
   }
 }
-// readJson (20-net.js) calls this on any 401 — a status poll, a job POST,
-// the viewer's own save (FTViewer "error" with auth:true, 22-viewer-host).
-function noteAuthExpired() {
-  if (bannerAuth && !$("serverBanner").hidden) return;
-  setServerLost(true,
-    "워크스테이션 창에서 다시 여십시오. 서버는 응답하지만 이 창의 인증 쿠키가 없거나 만료되어 요청이 거부되었습니다 (HTTP 401). 판독 내용은 이 브라우저에 보존됩니다.",
-    true);
-  announce("브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오", true);
+function setServerLost(lost, detail) {
+  // The detail is set once when the connection drops (not per failed poll).
+  if (lost && detail && !connLost) connDetail = detail;
+  connLost = !!lost;
+  if (!lost) connDetail = "";
+  renderServerBanner();
+}
+// readJson (20-net.js) calls this on any 401 (kind "read" / "write"), the
+// viewer bridge on a refused save (22-viewer-host, kind "save"). A kind
+// that is already failing changes nothing (no re-announce).
+function noteAuthExpired(kind) {
+  const k = kind || "read";
+  if (authFailing.has(k)) return;
+  const first = authFailing.size === 0;
+  authFailing.add(k);
+  renderServerBanner();
+  if (first) announce(authTitle() + " — 다른 FrameTrace 창이 열려 있으면 닫고 이 창을 새로 고치십시오", true);
+}
+// A request of that kind got through: its proof works again.
+function noteAuthOk(kind) {
+  if (!authFailing.delete(kind || "read")) return;
+  renderServerBanner();
+}
+// [이 창 새로 고침] (auth face). Loading "/" re-plants the nonce in no-token
+// mode and still carries the ft_token cookie in token mode (the launch
+// ?token= was stripped from the address, 99-init.js). If the token cookie
+// itself is gone, "/" answers 401 — reloading would leave a dead page, so
+// probe first and then say where to reopen instead.
+async function reloadForAuth() {
+  const button = $("btnServerRetry");
+  if (button) button.disabled = true;
+  let status = 0;
+  try {
+    const r = await fetch("/", { cache: "no-store", credentials: "same-origin" });
+    status = r.status;
+  } catch (e) { status = 0; }
+  if (status === 401 || status === 403) {
+    setBannerMsg(AUTH_GONE_DETAIL);
+    if (button) button.hidden = true;
+    announce("이 창에는 인증 정보가 없습니다 — FrameTrace 앱 창에서 다시 여십시오", true);
+    return;
+  }
+  if (button) button.disabled = false;
+  window.location.assign("/");
 }
 function pollFailed(err) {
-  if (err && err.status === 401) { noteAuthExpired(); return; }
+  if (err && err.status === 401) { noteAuthExpired("read"); return; }
   pollFailures += 1;
   if (pollFailures >= 3) {
     setServerLost(true,
@@ -241,7 +302,7 @@ async function poll() {
   schedulePoll(pollActive(st) ? POLL_BUSY_MS : POLL_IDLE_MS);
 }
 $("btnServerRetry").addEventListener("click", () => {
-  if (bannerAuth) { window.location.reload(); return; }
+  if (bannerAuth) { reloadForAuth(); return; }
   pollFailures = Math.min(pollFailures, 2); schedulePoll(0); poll();
 });
 // The idle cadence is 5 s: starting or opening something from the empty

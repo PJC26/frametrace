@@ -201,6 +201,8 @@ const FTViewer = (() => {
     /** { live, generation, total, canReload } of the mounted data (same
      *  detail as the "live-state" event); null while unmounted. */
     liveState() { return impl && impl.liveState ? impl.liveState() : null; },
+    // Internal, for harnesses: memo-miss count of the filter, the active id.
+    _debugStats() { return impl && impl.debugStats ? impl.debugStats() : null; },
     popout() { return impl ? impl.popout() : null; },
     closePopout() {
       stopPopupWatch();

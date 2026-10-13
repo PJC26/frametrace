@@ -236,6 +236,11 @@ async function unitTests() {
   const records = ['a', 'b', 'c'].map(id => ({ id }));
   const els = Object.fromEntries(['resultCount', 'pageStatus', 'prevPage', 'nextPage', 'recordGrid'].map(id => [id, {}]));
   els.recordGrid.classList = { add: () => {}, remove: () => {}, toggle: () => {} };
+  // renderGrid sets / clears the grid's ARIA (U14: role, aria-rowcount).
+  els.recordGrid.attrs = {};
+  els.recordGrid.setAttribute = (k, v) => { els.recordGrid.attrs[k] = String(v); };
+  els.recordGrid.removeAttribute = (k) => { delete els.recordGrid.attrs[k]; };
+  els.recordGrid.getAttribute = (k) => (k in els.recordGrid.attrs ? els.recordGrid.attrs[k] : null);
   // State classes (vgrid, theater, ...) live on the fragment root #ftViewer.
   els.root = { classList: { add: () => {}, remove: () => {}, toggle: () => {}, contains: () => false } };
   Object.assign(state, { marks: {}, selectedIds: new Set(), pageSize: 100, currentPage: 1, groupBy: 'none', collapsedGroups: new Set() });

@@ -387,10 +387,12 @@ function renderSaveState() {
   saveStateEl.title = title;
   saveStateEl.setAttribute("aria-label", `${label} — ${title}`);
   // Host notification (FTViewer "save-state"): only on an actual change.
-  const signature = `${kind}|${n}|${queuedOnServer}|${conflictIds.size}`;
+  // `auth`: the last save attempt was refused with 401 (U8) — the host keeps
+  // its auth banner up until this goes false (a save got through).
+  const signature = `${kind}|${n}|${queuedOnServer}|${conflictIds.size}|${saveAuthExpired}`;
   if (signature !== lastSaveSignature) {
     lastSaveSignature = signature;
-    FTViewer._emit("save-state", { state: kind, pending: n, queued: queuedOnServer, conflicts: conflictIds.size });
+    FTViewer._emit("save-state", { state: kind, pending: n, queued: queuedOnServer, conflicts: conflictIds.size, auth: !!saveAuthExpired });
   }
   emitLiveState();
 }
@@ -981,6 +983,7 @@ async function syncMarksNow() {
     pendingReviewSync = false;
     saveFailures = 0;
     saveError = "";
+    saveAuthExpired = false; // nothing left to send: nothing is being refused
     renderSaveState();
     emitDirty();
     return { ok: true, empty: true };
@@ -1055,10 +1058,11 @@ async function syncMarksNow() {
     saveRetryAt = Date.now() + delay;
     scheduleAutosave(delay);
     if (auth) {
-      if (authChanged || firstFailure) {
-        toastError(saveError);
-        FTViewer._emit("error", { message: saveError, detail: String(result.error || "HTTP 401"), stage: "save", auth: true });
-      }
+      // Toast once; the host hears every refused retry (repeat: true), so
+      // its banner stays up for as long as saves keep failing even if it
+      // was cleared meanwhile (U8).
+      if (authChanged || firstFailure) toastError(saveError);
+      FTViewer._emit("error", { message: saveError, detail: String(result.error || "HTTP 401"), stage: "save", auth: true, repeat: !(authChanged || firstFailure) });
     } else {
       if (firstFailure) toast(tf("toast.saveFailed", { err: saveError }));
       if (firstFailure) FTViewer._emit("error", { message: tf("toast.saveFailed", { err: saveError }), detail: saveError, stage: "save" });
@@ -1161,6 +1165,7 @@ const aliveTimer = setInterval(() => {
   if (ftSignal.aborted) { clearInterval(aliveTimer); return; }
   writerHeartbeat();
   adoptOrphanDrafts();
+  noteOriginDrafts(); // U9: keep this port's marker while drafts exist
 }, ALIVE_TICK_MS);
 // Another window started writing drafts after this one booted: watch it.
 window.addEventListener("storage", event => {
@@ -1715,13 +1720,21 @@ function originHasStoredDrafts() {
   return false;
 }
 var originMarked = null; // last marker state this window wrote (null = unknown)
-// Called after every draft flush (30-records flushDraftsNow).
+// Called after every draft flush (30-records flushDraftsNow) and on the
+// heartbeat tick. While drafts exist the cookie is re-read every time and
+// the marker rewritten if it went missing — another port's window may have
+// dismissed its notice (dropping our marker) or rewritten the list
+// concurrently. Only "no drafts, already unmarked" is skipped.
+// The scan uses the drafts namespace of this case (DRAFT_PREFIX, keyed by
+// case id — the same keys a reopened window on that port would restore);
+// the marker's hash adds the case folder so two cases sharing an id on
+// different folders never point at each other's port.
 function noteOriginDrafts() {
   if (!viewerIsServed || typeof ORIGIN_COOKIE !== "string") return; // not initialised yet
   let mine = false;
   for (const id in state.drafts) { mine = true; break; }
   const has = mine || originHasStoredDrafts();
-  if (has === originMarked) return;
+  if (!has && originMarked === false) return;
   originMarked = has;
   const me = originPort() + "." + originCaseHash();
   const marks = readOriginMarks();
