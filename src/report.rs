@@ -207,7 +207,7 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
 
   <h2>이어붙인 영상</h2>
   <div id="joined-videos"></div>
-  <div class="note" id="join-caveat" hidden>원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. 순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. 위치·데이터 스트림(GPS 등)은 포함되지 않았습니다.</div>
+  <div class="note" id="join-caveat" hidden>원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. <span id="join-caveat-time">순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. </span><span id="join-caveat-order" hidden>순서 근거가 파일명 순(filename-order)인 항목은 녹화 시각 없이 파일 이름 순서로만 이었으므로 끊김·겹침을 확인하지 못했습니다. </span>위치·데이터 스트림(GPS 등)은 포함되지 않았습니다.</div>
 
   <h2>리뷰 산출물</h2>
   <div id="derived-artifacts"></div>
@@ -388,25 +388,6 @@ document.getElementById("clip-exports").innerHTML = exportsLog.length ? `<table>
   </tbody>
 </table>` : "<p>내보낸 클립이 없습니다.</p>";
 
-document.getElementById("joined-videos").innerHTML = joinLog.length ? `<table>
-  <thead>
-    <tr><th>산출물</th><th>SHA-256</th><th>원본 수</th><th>채널</th><th>순서 근거</th><th>총 길이</th><th>끊김·겹침</th><th>매니페스트 SHA-256</th><th>감사 체인</th></tr>
-  </thead>
-  <tbody>
-    ${{joinLog.map(item => `<tr>
-      <td><code>${{escapeHtml(item.output_path || "-")}}</code></td>
-      <td><code>${{escapeHtml(item.output_sha256 || "-")}}</code></td>
-      <td>${{escapeHtml(item.segment_count ?? "-")}}${{item.hash_mismatches ? `<br><span class="muted">색인 해시와 불일치 ${{escapeHtml(item.hash_mismatches)}}개</span>` : ""}}</td>
-      <td>${{escapeHtml(item.channel || "미확인")}}</td>
-      <td>${{escapeHtml(item.order_basis || "-")}}</td>
-      <td>${{fmtDuration(item.duration_seconds)}}</td>
-      <td>끊김 ${{escapeHtml(item.gaps ?? "-")}} / 겹침 ${{escapeHtml(item.overlaps ?? "-")}}</td>
-      <td><code>${{escapeHtml(item.manifest_sha256 || "-")}}</code></td>
-      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
-    </tr>`).join("")}}
-  </tbody>
-</table>` : "<p>이어붙인 영상이 없습니다.</p>";
-document.getElementById("join-caveat").hidden = joinLog.length === 0;
 
 document.getElementById("derived-artifacts").innerHTML = derivedLog.length ? `<table>
   <thead>
@@ -595,6 +576,45 @@ document.getElementById("techniques").innerHTML = techniqueRows().length ? `<tab
     }}).join("")}}
   </tbody>
 </table>` : "<p>정리할 증거가 없습니다.</p>";
+
+// Joined videos (plan §1.9). Each row carries the joined record's 판독
+// annotations (U2), filed under `record_id` (`join:<first 16 hex of the
+// output SHA-256>`); legacy `join:<file name>` ids are still read. A
+// filename-order join never claims "끊김 0 / 겹침 0" (B2).
+const joinRecordId = item => item.record_id || (typeof item.output_sha256 === "string" && /^[0-9a-fA-F]{{16}}/.test(item.output_sha256) ? `join:${{item.output_sha256.slice(0, 16).toLowerCase()}}` : null);
+const joinLegacyId = item => `join:${{String(item.output_path || "").split(/[\\/]/).pop()}}`;
+function joinMarkCell(item) {{
+  const id = joinRecordId(item);
+  const cell = id ? markCell(id) : "-";
+  return cell === "-" ? markCell(joinLegacyId(item)) : cell;
+}}
+function joinJunctionText(item) {{
+  if (item.order_basis === "filename-order") return "끊김·겹침 확인 불가 — 파일명 순";
+  const unknown = Number(item.unknown_junctions) > 0 ? ` / 확인 불가 ${{escapeHtml(item.unknown_junctions)}}` : "";
+  return `끊김 ${{escapeHtml(item.gaps ?? "-")}} / 겹침 ${{escapeHtml(item.overlaps ?? "-")}}${{unknown}}`;
+}}
+document.getElementById("joined-videos").innerHTML = joinLog.length ? `<table>
+  <thead>
+    <tr><th>산출물</th><th>SHA-256</th><th>원본 수</th><th>채널</th><th>순서 근거</th><th>총 길이</th><th>끊김·겹침</th><th>매니페스트 SHA-256</th><th>감사 체인</th><th>판독 (상태·메모·구간·태그)</th></tr>
+  </thead>
+  <tbody>
+    ${{joinLog.map(item => `<tr>
+      <td><code>${{escapeHtml(item.output_path || "-")}}</code></td>
+      <td><code>${{escapeHtml(item.output_sha256 || "-")}}</code></td>
+      <td>${{escapeHtml(item.segment_count ?? "-")}}${{item.hash_mismatches ? `<br><span class="muted">색인 해시와 불일치 ${{escapeHtml(item.hash_mismatches)}}개</span>` : ""}}</td>
+      <td>${{escapeHtml(item.channel || "미확인")}}</td>
+      <td>${{escapeHtml(item.order_basis || "-")}}</td>
+      <td>${{fmtDuration(item.duration_seconds)}}</td>
+      <td>${{joinJunctionText(item)}}</td>
+      <td><code>${{escapeHtml(item.manifest_sha256 || "-")}}</code></td>
+      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
+      <td>${{joinMarkCell(item)}}</td>
+    </tr>`).join("")}}
+  </tbody>
+</table>` : "<p>이어붙인 영상이 없습니다.</p>";
+document.getElementById("join-caveat").hidden = joinLog.length === 0;
+document.getElementById("join-caveat-time").hidden = !joinLog.some(item => item.order_basis !== "filename-order");
+document.getElementById("join-caveat-order").hidden = !joinLog.some(item => item.order_basis === "filename-order");
 
 const chainEvents = [];
 (Array.isArray(scanRuns) ? scanRuns : []).forEach(run => chainEvents.push({{
@@ -1336,7 +1356,13 @@ mod tests {
         let html = render(&[]);
         assert!(html.contains("<h2>이어붙인 영상</h2>"));
         assert!(html.contains("이어붙임<strong id=\"joins\">"));
-        assert!(html.contains("원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. 순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. 위치·데이터 스트림(GPS 등)은 포함되지 않았습니다."));
+        for fixed in [
+            "원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. ",
+            "순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. ",
+            "위치·데이터 스트림(GPS 등)은 포함되지 않았습니다.",
+        ] {
+            assert!(html.contains(fixed), "missing {fixed}");
+        }
 
         let empty = rendered_elements(&[("manifest", "{}")]);
         assert_eq!(empty["joins"]["textContent"], 0);
@@ -1376,6 +1402,75 @@ mod tests {
                 .unwrap()
                 .contains("join-video")
         );
+        // Time-based join only: the time caveat shows, the order one not.
+        assert_eq!(page["join-caveat-time"]["hidden"], false);
+        assert_eq!(page["join-caveat-order"]["hidden"], true);
+    }
+
+    /// B2 + U2: a filename-order join never reads "끊김 0 / 겹침 0", the
+    /// caveat switches to the filename-order wording, and annotations filed
+    /// under the joined record's `record_id` (or a legacy `join:<file>` id)
+    /// appear in the join table's 판독 column.
+    #[test]
+    fn report_join_rows_vary_by_basis_and_show_annotations() {
+        let mut ordered: serde_json::Value = serde_json::from_str(&join_entry()).unwrap();
+        ordered["order_basis"] = "filename-order".into();
+        ordered["gaps"] = serde_json::Value::Null;
+        ordered["overlaps"] = serde_json::Value::Null;
+        ordered["unknown_junctions"] = 9.into();
+        ordered["record_id"] = "join:1111111111111111".into();
+        ordered["output_path"] = "artifacts/joined/join_U_order_n10.mp4".into();
+        let mut legacy: serde_json::Value = serde_json::from_str(&join_entry()).unwrap();
+        legacy["output_path"] = "artifacts/joined/join_F_old_n2.mp4".into();
+        legacy["output_sha256"] = "2".repeat(64).into();
+        let log = format!("{}\n{ordered}\n{legacy}\n", join_entry());
+        let annotations = serde_json::json!({
+            "marks": [
+                {"id": "join:1111111111111111", "status": "important", "note": "<b>사고 장면</b>",
+                 "examiner": "kim", "range": {"in": 3, "out": 9}},
+                {"id": "join:aaaaaaaaaaaaaaaa", "status": "reviewed"},
+                {"id": "join:join_F_old_n2.mp4", "status": "needs_verification"},
+            ],
+            "tags": {"join:1111111111111111": ["충돌"]},
+        })
+        .to_string();
+        let page =
+            rendered_elements(&[("manifest", "{}"), ("join", &log), ("marks", &annotations)]);
+        let table = page["joined-videos"]["innerHTML"].as_str().unwrap();
+        assert!(
+            table.contains("<th>판독 (상태·메모·구간·태그)</th>"),
+            "{table}"
+        );
+        let rows: Vec<&str> = table.split("<tr>").skip(2).collect();
+        assert_eq!(rows.len(), 3, "{table}");
+        // Time-based entry: counts; its derived id join:aaaa… (from the
+        // output SHA-256, no record_id field) carries the reviewed mark.
+        assert!(rows[0].contains("끊김 0 / 겹침 2"), "{}", rows[0]);
+        assert!(rows[0].contains("판독 완료"), "{}", rows[0]);
+        // Filename-order entry: no zero claim, its annotations are shown
+        // escaped.
+        assert!(
+            rows[1].contains("끊김·겹침 확인 불가 — 파일명 순"),
+            "{}",
+            rows[1]
+        );
+        assert!(!rows[1].contains("끊김 0"), "{}", rows[1]);
+        assert!(rows[1].contains("중요"), "{}", rows[1]);
+        assert!(
+            rows[1].contains("&lt;b&gt;사고 장면&lt;/b&gt;"),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[1].contains("구간: 3.0s ~ 9.0s"), "{}", rows[1]);
+        assert!(rows[1].contains("태그: 충돌"), "{}", rows[1]);
+        // Legacy id by file name.
+        assert!(rows[2].contains("검증 대기"), "{}", rows[2]);
+        assert_eq!(page["join-caveat-order"]["hidden"], false);
+        assert_eq!(page["join-caveat-time"]["hidden"], false);
+        let only_order =
+            rendered_elements(&[("manifest", "{}"), ("join", &format!("{ordered}\n"))]);
+        assert_eq!(only_order["join-caveat-time"]["hidden"], true);
+        assert_eq!(only_order["join-caveat-order"]["hidden"], false);
     }
 
     fn sound_index() -> String {

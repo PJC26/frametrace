@@ -966,7 +966,10 @@ printf clip > "$out""#,
     ));
     assert_eq!(finalize["ok"], false);
     assert!(
-        finalize["error"].as_str().unwrap().contains("클립"),
+        finalize["error"]
+            .as_str()
+            .unwrap()
+            .contains("내보내기·이어붙이기"),
         "{finalize}"
     );
     // Shutdown refuses while the export runs; the global cancel stops it.

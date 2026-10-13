@@ -310,6 +310,14 @@ fn join_video_success_with_overlap_and_gap() {
     );
     assert_eq!(entry["segment_count"], 5);
     assert!(entry["duration_seconds"].as_f64().unwrap() > 10.0);
+    // U2: the derived record id comes from the output bytes.
+    let record_id = format!("join:{}", &sha[..16]);
+    assert_eq!(entry["record_id"], record_id.as_str());
+    assert_eq!(manifest["record_id"], record_id.as_str());
+    // B2: every junction was judged on the file-name time basis.
+    assert_eq!(entry["unknown_junctions"], 0);
+    assert_eq!(entry["gaps"], 1);
+    assert_eq!(manifest["totals"]["unknown_junctions"], 0);
     assert_eq!(
         log_text.lines().count(),
         1,
@@ -509,6 +517,144 @@ fn measure_audio_bench_info() {
     eprintln!(
         "measure-audio bench: {count} x 10 s 720p files in {elapsed:.2}s ({:.3}s/file)",
         elapsed / count as f64
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B2: a join ordered by file name only records its gaps/overlaps as
+/// unknown (null + `unknown_junctions`), never as zero.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn join_video_filename_order_records_unknown_junctions() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_order_it");
+    let source = root.join("src");
+    for (i, name) in ["clip_a1.mp4", "clip_a2.mp4", "clip_a3.mp4"]
+        .iter()
+        .enumerate()
+    {
+        let tone = format!("sine=frequency={}:sample_rate=48000", 500 + 100 * i);
+        make_clip(&source.join(name), 2.0, "320x240", Some(&tone));
+    }
+    let case = new_case(&root, &source, false);
+    let ids_map = ids_by_name(&case);
+    let ids_arg = ["clip_a1.mp4", "clip_a2.mp4", "clip_a3.mp4"]
+        .iter()
+        .map(|n| ids_map[*n].clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    let case_str = case.to_str().unwrap();
+    let result = last_json(&ok(
+        &frametrace(&[
+            "join-video",
+            case_str,
+            "--ids",
+            &ids_arg,
+            "--job-tag",
+            "order",
+        ]),
+        "join-video filename-order",
+    ));
+    assert!(
+        result["summary_text"]
+            .as_str()
+            .unwrap()
+            .contains("끊김·겹침 확인 불가"),
+        "{result:#}"
+    );
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(result["manifest_path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["order"]["basis"], "filename-order");
+    assert!(manifest["totals"]["gaps"].is_null(), "{manifest:#}");
+    assert!(manifest["totals"]["overlaps"].is_null(), "{manifest:#}");
+    assert_eq!(manifest["totals"]["unknown_junctions"], 2);
+    let log = std::fs::read_to_string(case.join("artifacts/joined/join-log.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert!(
+        entry["gaps"].is_null() && entry["overlaps"].is_null(),
+        "{entry:#}"
+    );
+    assert_eq!(entry["unknown_junctions"], 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B1: a silent track whose file was truncated (moov intact, mdat cut) is
+/// an ERROR, never "silent" — the decoded length falls short of the probed
+/// stream duration. `measure-audio` then exits 4 (B15) and says how many
+/// files errored; an intact silent file in the same run stays silent.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn measure_audio_truncated_track_is_an_error_not_silent() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_audio_trunc_it");
+    let source = root.join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    let faststart_silent = |path: &Path| {
+        let output = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=320x240:rate=30"])
+            .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"])
+            .args([
+                "-t", "10", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            ])
+            .args(["-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart"])
+            .arg(path)
+            .output()
+            .expect("run ffmpeg");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let truncated = source.join("truncated.mp4");
+    let intact = source.join("intact.mp4");
+    faststart_silent(&truncated);
+    faststart_silent(&intact);
+    // Cut the media data in half; the moov (at the front) still describes
+    // the full 10 s.
+    let len = std::fs::metadata(&truncated).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&truncated)
+        .unwrap()
+        .set_len(len / 2)
+        .unwrap();
+    let case = new_case(&root, &source, false);
+    let ids = ids_by_name(&case);
+    let index = std::fs::read_to_string(case.join("db/videos.jsonl")).unwrap();
+    assert!(
+        index
+            .lines()
+            .any(|l| l.contains("truncated.mp4") && l.contains("\"audio_codec\":\"aac\"")),
+        "truncated file must still probe with its audio track: {index}"
+    );
+
+    let run = frametrace(&["measure-audio", case.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(4), "stderr: {stderr}");
+    assert!(stderr.contains("소리 측정 오류 1건"), "{stderr}");
+    let summary = last_json(&String::from_utf8_lossy(&run.stdout));
+    assert_eq!(summary["error"], 1, "{summary:#}");
+    assert_eq!(summary["silent"], 1, "{summary:#}");
+
+    let levels = frametrace::audio_level::audio_levels_for_case(&case).unwrap();
+    assert_eq!(
+        levels[&ids["truncated.mp4"]].r, "error",
+        "{:?}",
+        levels[&ids["truncated.mp4"]]
+    );
+    assert_eq!(levels[&ids["intact.mp4"]].r, "silent");
+    let log = case.join("evidence/logs/audio-level-log.jsonl");
+    ok(
+        &frametrace(&["verify-audit", log.to_str().unwrap()]),
+        "verify-audit",
     );
     let _ = std::fs::remove_dir_all(&root);
 }

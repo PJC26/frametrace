@@ -640,9 +640,24 @@ pub(crate) fn run_folder_enrichment(
         // measure-audio skips files that already carry a valid measurement
         // and chains one log entry per 200 files (plan §2.1).
         match runner(&["measure-audio".into(), case_text.clone()]) {
-            Ok(output) => log(output),
+            Ok(output) => {
+                if let Some(line) = crate::audio_level::summary_log_line(&output) {
+                    log(line);
+                }
+                log(output)
+            }
             Err(_) if cancelled() => return stop_enrichment(state, 3, None),
-            Err(err) => warn_step(state, 3, format!("소리 측정 실패, 건너뜀: {err}")),
+            // B15: exit 4 = completed and logged, some files unmeasurable.
+            Err(err) => match crate::audio_level::partial_error_count(&err) {
+                Some(errors) => warn_step(
+                    state,
+                    3,
+                    format!(
+                        "소리 측정 완료(오류 {errors}건) — 측정하지 못한 영상은 '미확인'으로 표시됩니다"
+                    ),
+                ),
+                None => warn_step(state, 3, format!("소리 측정 실패, 건너뜀: {err}")),
+            },
         }
     } else if job.with_audio {
         warn_step(
@@ -1485,7 +1500,9 @@ pub(crate) fn api_finalize(request: &Request, state: &SharedState) -> String {
     // UX-09: clip exports run without `busy`; sealing while one is still
     // writing into artifacts/clips would package a torn or missing clip.
     if running_clip_job_count(state) > 0 {
-        return api_err("최종화 차단: 클립 내보내기가 진행 중입니다 — 끝난 뒤 다시 시도하십시오.");
+        return api_err(
+            "최종화 차단: 내보내기·이어붙이기 작업이 진행 중입니다 — 끝난 뒤 다시 시도하십시오.",
+        );
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -1889,7 +1906,7 @@ pub(crate) fn start_case_job(state: &SharedState, exe: &Path, spec: CaseJobSpec)
     // A clip export writes into the case while make-review/recovery would
     // rewrite it; recover/carve wait for exports like finalize does.
     if running_clip_job_count(state) > 0 {
-        return api_err("클립 내보내기가 진행 중입니다 — 내보내기가 끝난 뒤 다시 시도하십시오.");
+        return api_err("내보내기·이어붙이기 작업이 진행 중입니다 — 끝난 뒤 다시 시도하십시오.");
     }
     let started_unix = crate::util::now_unix().unwrap_or(0);
     let prior_phase = {
@@ -1956,8 +1973,28 @@ fn run_case_job(
         finish_case_job(state, lease, &spec, end, prior_phase);
     };
     match run_step(exe, &spec.main_args, state) {
-        Ok(output) => state_lock(state).logs.push(output),
+        Ok(output) => {
+            let mut guard = state_lock(state);
+            if spec.kind == "audio-measure"
+                && let Some(line) = crate::audio_level::summary_log_line(&output)
+            {
+                guard.logs.push(line);
+            }
+            guard.logs.push(output)
+        }
         Err(_) if cancelled() => return end_with(lease, CaseJobEnd::Cancelled),
+        // B15: measure-audio exit 4 completed (everything logged) with some
+        // files unmeasurable — report the count and still regenerate the
+        // review so the measured ones show.
+        Err(err)
+            if spec.kind == "audio-measure"
+                && crate::audio_level::partial_error_count(&err).is_some() =>
+        {
+            let errors = crate::audio_level::partial_error_count(&err).unwrap_or(0);
+            state_lock(state).logs.push(format!(
+                "소리 측정 완료(오류 {errors}건) — 측정하지 못한 영상은 '미확인'으로 표시됩니다"
+            ));
+        }
         Err(err) => return end_with(lease, CaseJobEnd::Failed(err)),
     }
     if cancelled() {

@@ -565,9 +565,9 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
     // (UX-09) so "중단 후 종료" never leaves an ffmpeg behind.
     let clips = cancel_all_clip_jobs(&mut guard);
     if clips > 0 {
-        guard
-            .logs
-            .push(format!("클립 내보내기 {clips}건 중단 요청을 받았습니다."));
+        guard.logs.push(format!(
+            "내보내기·이어붙이기 {clips}건 중단 요청을 받았습니다."
+        ));
         return serde_json::json!({
             "ok": true,
             "cancelled": "clips",
@@ -629,7 +629,7 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
         .count();
     if clips_running > 0 {
         return api_err(&format!(
-            "클립 내보내기 {clips_running}건이 진행 중입니다 — 끝나거나 중단한 뒤 케이스를 여십시오."
+            "내보내기·이어붙이기 작업 {clips_running}건이 진행 중입니다 — 끝나거나 중단한 뒤 케이스를 여십시오."
         ));
     }
     if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
