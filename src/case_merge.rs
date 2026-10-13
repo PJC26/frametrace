@@ -19,10 +19,16 @@
 //! ([`crate::case_db::merge_annotations`]): they are written to the target
 //! database in one transaction after the index rows and before the audit
 //! entries, so a failed annotation write rolls back every annotation and
-//! leaves no success audit line. The three index files and the database are
-//! still written one after another (not atomic as a set, I8); re-running the
-//! merge after a failure re-maps the already-indexed records by path and
-//! applies the annotations idempotently.
+//! leaves no success audit line. The three index files and the database
+//! change as one set (I8): the new index files are staged under
+//! `db/.merge-stage-*`, the database is snapshotted with SQLite's backup
+//! API and then written, and only after both database steps succeed are
+//! the staged files renamed over the originals. A failure at any step
+//! restores the database snapshot and any index file already replaced, so
+//! the target is left exactly as it was (if a restore itself fails, the
+//! error says so and the staging directory with the originals is kept).
+//! The audit entries are appended last; a failure there is reported as
+//! "merge applied, audit entry not written", never hidden.
 
 use crate::audit;
 use crate::case_db::merge_annotations::{
@@ -259,11 +265,7 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
         jsonl.push('\n');
         tsv.push_str(&tsv_row_for_line(line));
     }
-    write_text_atomic(&case_dir.join("db/videos.jsonl"), &jsonl)
-        .map_err(|err| format!("failed to write merged video jsonl: {err}"))?;
-    write_text_atomic(&case_dir.join("db/video_paths.tsv"), &tsv)
-        .map_err(|err| format!("failed to write merged video path index: {err}"))?;
-    write_merged_index_json(case_dir, &all, generated_unix)?;
+    let index_json = merged_index_json_text(case_dir, &all, generated_unix)?;
     let rows = all
         .iter()
         .map(|line| {
@@ -272,7 +274,6 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
                 .map_err(|err| format!("invalid merged record: {err}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    upsert_indexed_rows(case_dir, &rows, generated_unix)?;
     let plans: Vec<SourceAnnotationMerge<'_>> = sources
         .iter()
         .zip(&mappings)
@@ -284,7 +285,54 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
             },
         )
         .collect();
-    let outcome = apply_merge_annotations(case_dir, &plans, generated_unix)?;
+    // I8: the three index files and the database change as one set. The
+    // new index files are staged first; the database is snapshotted, then
+    // written (rows + annotations); only then are the staged files swapped
+    // in. Any failure restores the database snapshot and the index files
+    // that were already swapped, so a failed merge leaves every store as
+    // it was.
+    let staged = StagedFiles::stage(
+        case_dir,
+        &[
+            ("db/videos.jsonl", jsonl.as_str()),
+            ("db/video_paths.tsv", tsv.as_str()),
+            ("db/video_index.json", index_json.as_str()),
+        ],
+    )?;
+    let snapshot = match DbSnapshot::take(case_dir, staged.dir()) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            staged.discard();
+            return Err(err);
+        }
+    };
+    let written = upsert_indexed_rows(case_dir, &rows, generated_unix)
+        .and_then(|()| apply_merge_annotations(case_dir, &plans, generated_unix))
+        .and_then(|outcome| staged.swap().map(|()| outcome));
+    let outcome = match written {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let message = match snapshot.restore(case_dir) {
+                Ok(()) => format!(
+                    "merge-cases failed and was rolled back (index files and database unchanged): {err}"
+                ),
+                Err(restore_err) => format!(
+                    "merge-cases failed: {err}; restoring the database snapshot ALSO failed: {restore_err} — the pre-merge database is kept at {}",
+                    snapshot
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ),
+            };
+            // Backups and the snapshot stay on disk unless everything was
+            // put back.
+            if snapshot.restored_or_absent() && !staged.restore_failed.get() {
+                staged.discard();
+            }
+            return Err(message);
+        }
+    };
+    staged.discard();
     let mut audit_lines = Vec::new();
     for (summary, counts) in summaries.iter_mut().zip(outcome.per_source) {
         audit_lines.push(format!(
@@ -304,7 +352,12 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
         summary.annotations = counts;
     }
     for line in audit_lines {
-        audit::append_chained_jsonl(&case_dir.join("evidence/logs/case-merge-log.jsonl"), &line)?;
+        audit::append_chained_jsonl(&case_dir.join("evidence/logs/case-merge-log.jsonl"), &line)
+            .map_err(|err| {
+                format!(
+                    "merge-cases applied the merge (index files and database updated) but could not write its audit entry: {err}"
+                )
+            })?;
     }
 
     let duplicate_total = summaries.iter().map(|s| s.duplicate_records).sum();
@@ -490,11 +543,164 @@ fn row_from_value(value: &serde_json::Value, record_json: &str) -> IndexedVideoR
 /// top-level fields (source_path, scan options, warnings) are preserved;
 /// only `videos`, `video_count`, `total_bytes`, and a `merged_unix` stamp
 /// change. When no index exists yet a minimal document is created.
-fn write_merged_index_json(
+/// I8: new index files written beside the case (`db/.merge-stage-*`)
+/// before anything is replaced, and the originals they replace, so the set
+/// can be swapped in — or put back — as a unit.
+struct StagedFiles {
+    dir: PathBuf,
+    /// `(staged file, target, backup of the original — None when absent)`.
+    entries: Vec<(PathBuf, PathBuf, Option<PathBuf>)>,
+    /// Set when a rollback could not put an original back: the staging
+    /// directory (holding the backups) is then kept, never deleted.
+    restore_failed: std::cell::Cell<bool>,
+}
+
+impl StagedFiles {
+    fn stage(case_dir: &Path, files: &[(&str, &str)]) -> Result<Self, String> {
+        let dir = crate::util::unique_dir(&case_dir.join(format!(
+            "db/.merge-stage-{}-{}",
+            std::process::id(),
+            now_unix()?
+        )));
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("failed to create merge staging directory: {err}"))?;
+        let mut staged = Self {
+            dir,
+            entries: Vec::new(),
+            restore_failed: std::cell::Cell::new(false),
+        };
+        for (index, (rel, text)) in files.iter().enumerate() {
+            let target = case_dir.join(rel);
+            let staged_path = staged.dir.join(format!("{index}.new"));
+            let result = write_text_atomic(&staged_path, text)
+                .map_err(|err| format!("failed to stage {rel}: {err}"))
+                .and_then(|()| {
+                    if target.is_file() {
+                        let backup = staged.dir.join(format!("{index}.orig"));
+                        std::fs::copy(&target, &backup)
+                            .map(|_| Some(backup))
+                            .map_err(|err| format!("failed to back up {rel}: {err}"))
+                    } else {
+                        Ok(None)
+                    }
+                });
+            match result {
+                Ok(backup) => staged.entries.push((staged_path, target, backup)),
+                Err(err) => {
+                    staged.discard();
+                    return Err(err);
+                }
+            }
+        }
+        Ok(staged)
+    }
+
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Renames every staged file over its target. If one rename fails, the
+    /// targets already replaced are restored from their backups (or
+    /// removed when there was no original) before the error is returned.
+    fn swap(&self) -> Result<(), String> {
+        for (done, (staged, target, _)) in self.entries.iter().enumerate() {
+            if let Err(err) = std::fs::rename(staged, target) {
+                let mut message = format!("failed to replace {}: {err}", target.display());
+                for (_, swapped, backup) in &self.entries[..done] {
+                    let restored = match backup {
+                        Some(backup) => std::fs::copy(backup, swapped).map(|_| ()),
+                        None => std::fs::remove_file(swapped),
+                    };
+                    if let Err(restore_err) = restored {
+                        self.restore_failed.set(true);
+                        message.push_str(&format!(
+                            "; restoring {} FAILED: {restore_err} (original kept in {})",
+                            swapped.display(),
+                            self.dir.display()
+                        ));
+                    }
+                }
+                return Err(message);
+            }
+        }
+        Ok(())
+    }
+
+    fn discard(&self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// I8: an online-backup snapshot of `db/case.db` taken before the merge
+/// writes it, restored (backup API, not a file copy) when the merge fails.
+struct DbSnapshot {
+    /// `None` when there was no database file to snapshot.
+    path: Option<PathBuf>,
+    restored: std::cell::Cell<bool>,
+}
+
+impl DbSnapshot {
+    fn take(case_dir: &Path, staging_dir: &Path) -> Result<Self, String> {
+        let db = crate::case_db::case_db_path(case_dir);
+        if !db.is_file() {
+            return Ok(Self {
+                path: None,
+                restored: std::cell::Cell::new(true),
+            });
+        }
+        let path = staging_dir.join("case.db.snapshot");
+        let conn = crate::case_db::open_readonly_case_db(&db)?;
+        conn.backup(rusqlite::MAIN_DB, &path, None)
+            .map_err(|err| format!("failed to snapshot the case database before merging: {err}"))?;
+        Ok(Self {
+            path: Some(path),
+            restored: std::cell::Cell::new(false),
+        })
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// True when nothing is left to recover from the staging directory.
+    fn restored_or_absent(&self) -> bool {
+        self.restored.get()
+    }
+
+    fn restore(&self, case_dir: &Path) -> Result<(), String> {
+        let db = crate::case_db::case_db_path(case_dir);
+        let Some(snapshot) = &self.path else {
+            // No database before the merge: remove the one it created.
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let file = PathBuf::from(format!("{}{suffix}", db.display()));
+                if file.is_file() {
+                    std::fs::remove_file(&file)
+                        .map_err(|err| format!("failed to remove {}: {err}", file.display()))?;
+                }
+            }
+            return Ok(());
+        };
+        let mut conn = rusqlite::Connection::open(&db)
+            .map_err(|err| format!("failed to open the case database: {err}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| format!("failed to configure SQLite busy timeout: {err}"))?;
+        conn.restore(
+            rusqlite::MAIN_DB,
+            snapshot,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .map_err(|err| format!("failed to restore the case database snapshot: {err}"))?;
+        self.restored.set(true);
+        Ok(())
+    }
+}
+
+/// The merged `db/video_index.json` text (written by the staged swap).
+fn merged_index_json_text(
     case_dir: &Path,
     lines: &[String],
     merged_unix: u64,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let path = case_dir.join("db/video_index.json");
     let mut index = match read_to_string(&path) {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
@@ -524,8 +730,7 @@ fn write_merged_index_json(
     object.insert("merged_unix".to_string(), serde_json::json!(merged_unix));
     let text = serde_json::to_string_pretty(&index)
         .map_err(|err| format!("failed to serialize merged index: {err}"))?;
-    write_text_atomic(&path, &format!("{text}\n"))
-        .map_err(|err| format!("failed to write merged video index: {err}"))
+    Ok(format!("{text}\n"))
 }
 
 #[cfg(test)]
@@ -716,6 +921,95 @@ mod tests {
         files
     }
 
+    /// Bytes of the three index files (None = absent).
+    fn index_files(case_dir: &Path) -> Vec<Option<Vec<u8>>> {
+        [
+            "db/videos.jsonl",
+            "db/video_paths.tsv",
+            "db/video_index.json",
+        ]
+        .iter()
+        .map(|rel| fs::read(case_dir.join(rel)).ok())
+        .collect()
+    }
+
+    fn no_staging_left(case_dir: &Path) -> bool {
+        fs::read_dir(case_dir.join("db")).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".merge-stage-")
+        })
+    }
+
+    /// I8: a forced database failure (the row upsert aborts) leaves the
+    /// three index files byte-for-byte unchanged, the database rows as they
+    /// were, no audit entry and no staging directory.
+    #[test]
+    fn forced_db_failure_leaves_index_files_unchanged() {
+        let original = row("vid_000001", "/ev/a.mp4", 10, Some("aa"));
+        let target = temp_case("forced-db-t", Some(&original));
+        let parsed = serde_json::from_str(&original).unwrap();
+        upsert_indexed_rows(&target, &[row_from_value(&parsed, original.trim())], 1).unwrap();
+        fs::write(
+            target.join("db/video_paths.tsv"),
+            b"id\tsource_path\nvid_000001\t/ev/a.mp4\n",
+        )
+        .unwrap();
+        fs::write(target.join("db/video_index.json"), b"{\"videos\":[]}\n").unwrap();
+        let conn = rusqlite::Connection::open(target.join("db/case.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_videos BEFORE INSERT ON videos BEGIN SELECT RAISE(ABORT, 'forced db failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let source = temp_case(
+            "forced-db-s",
+            Some(&row("vid_000001", "/ev/new.mp4", 20, Some("bb"))),
+        );
+        let files_before = index_files(&target);
+        let ids_before = crate::case_db::load_video_ids(&target).unwrap();
+
+        let err = merge_cases(&target, std::slice::from_ref(&source)).unwrap_err();
+        assert!(err.contains("forced db failure"), "{err}");
+        assert_eq!(index_files(&target), files_before);
+        let ids_after = crate::case_db::load_video_ids(&target).unwrap();
+        assert_eq!(ids_after.len(), ids_before.len());
+        assert!(!target.join("evidence/logs/case-merge-log.jsonl").exists());
+        assert!(no_staging_left(&target));
+        let _ = fs::remove_dir_all(target);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    /// I8: when one staged file cannot be swapped in, the files already
+    /// replaced are put back (or removed when they did not exist).
+    #[test]
+    fn failed_swap_restores_already_replaced_files() {
+        let case_dir = temp_case("swap-rollback", Some("old jsonl\n"));
+        fs::create_dir_all(case_dir.join("db/blocked.tsv/inner")).unwrap();
+        let staged = StagedFiles::stage(
+            &case_dir,
+            &[
+                ("db/videos.jsonl", "new jsonl\n"),
+                ("db/fresh.json", "new\n"),
+                ("db/blocked.tsv", "cannot replace a directory\n"),
+            ],
+        )
+        .unwrap();
+        let err = staged.swap().unwrap_err();
+        assert!(err.contains("blocked.tsv"), "{err}");
+        assert!(!staged.restore_failed.get());
+        assert_eq!(
+            fs::read_to_string(case_dir.join("db/videos.jsonl")).unwrap(),
+            "old jsonl\n"
+        );
+        assert!(!case_dir.join("db/fresh.json").exists());
+        staged.discard();
+        assert!(no_staging_left(&case_dir));
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
     #[test]
     fn conflicting_target_records_leave_everything_unchanged() {
         for field in ["sha256", "source_profile"] {
@@ -832,15 +1126,12 @@ mod tests {
                 Some(&row("vid_000001", "/ev/a.mp4", 10, None)),
             );
             fs::create_dir(target.join(blocked)).unwrap();
+            let before = snapshot(&target);
             assert!(merge_cases(&target, std::slice::from_ref(&source)).is_err());
             assert!(!target.join("evidence/logs/case-merge-log.jsonl").exists());
-            if blocked != "db/videos.jsonl" {
-                assert_eq!(
-                    jsonl_ids(&target).len(),
-                    1,
-                    "earlier atomic file writes remain after a later store failure"
-                );
-            }
+            // I8: a failure at any store leaves every store as it was — no
+            // half-written index set, no staging leftovers.
+            assert_eq!(snapshot(&target), before, "{blocked}");
             let _ = fs::remove_dir_all(target);
             let _ = fs::remove_dir_all(source);
         }
@@ -1176,8 +1467,20 @@ mod tests {
         .unwrap();
         drop(conn);
 
+        let index_before = index_files(&target);
+        let ids_before = crate::case_db::load_video_ids(&target).unwrap();
+
         let err = merge_cases(&target, std::slice::from_ref(&source)).unwrap_err();
         assert!(err.contains("induced history failure"), "{err}");
+        assert!(err.contains("rolled back"), "{err}");
+        // I8: the rows upserted before the annotation step are rolled back
+        // with it, and no index file was replaced.
+        assert_eq!(index_files(&target), index_before);
+        assert_eq!(
+            crate::case_db::load_video_ids(&target).unwrap().len(),
+            ids_before.len()
+        );
+        assert!(no_staging_left(&target));
         assert_eq!(crate::case_db::load_review_marks(&target).unwrap(), marks);
         assert_eq!(crate::case_db::load_review_tags(&target).unwrap(), tags);
         assert_eq!(

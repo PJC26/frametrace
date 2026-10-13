@@ -33,6 +33,20 @@ const AUDIT_LOG_DIRS: &[&str] = &["artifacts", "evidence/logs"];
 /// Generates (or refreshes) `reports/custody-statement.html`.
 /// Returns the written path.
 pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
+    let html = render_statement(case_dir, false)?;
+    let out = case_dir.join(CUSTODY_REL_PATH);
+    write_text_atomic(&out, &html)
+        .map_err(|err| format!("failed to write custody statement {}: {err}", out.display()))?;
+    Ok(out)
+}
+
+/// Renders the statement without writing it. With `redact_paths` (I4, a
+/// path-redacted package) every path-bearing value — the case directory,
+/// source paths, job subjects, error texts — goes through
+/// [`crate::redact::Redactor`], and the page carries the redaction marker
+/// and note. The live checks (re-stat, chain verification) still run on the
+/// real paths; only what is printed is rewritten.
+pub fn render_statement(case_dir: &Path, redact_paths: bool) -> Result<String, String> {
     if !case_dir.join("case.json").is_file() {
         return Err(format!(
             "not a FrameTrace case directory: {}",
@@ -44,12 +58,13 @@ pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .unwrap_or(serde_json::Value::Null);
+    let redactor = redact_paths.then(|| crate::redact::Redactor::new(case_dir));
     let sources = load_evidence_sources(case_dir);
     let jobs = load_jobs(case_dir);
     let coverage = load_hash_coverage(case_dir);
     let logs = verify_audit_logs(case_dir);
-    let hash_verify_html = render_hash_verify(case_dir);
-    let html = render(
+    let hash_verify_html = render_hash_verify(case_dir, redactor.as_ref());
+    Ok(render(
         case_dir,
         &manifest,
         &sources,
@@ -58,12 +73,23 @@ pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
         &logs,
         &hash_verify_html,
         generated_unix as i64,
-    );
+        redactor.as_ref(),
+    ))
+}
 
-    let out = case_dir.join(CUSTODY_REL_PATH);
-    write_text_atomic(&out, &html)
-        .map_err(|err| format!("failed to write custody statement {}: {err}", out.display()))?;
-    Ok(out)
+/// HTML-escapes `text`, path-redacting it first when a redactor is given.
+fn esc_with(redactor: Option<&crate::redact::Redactor>, text: &str) -> String {
+    match redactor {
+        Some(redactor) => esc(&redactor.text(text)),
+        None => esc(text),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` in UTC (the statement's time basis), `—` for an
+/// unset time. Shared with the case report so both documents print the
+/// same instant the same way (I6).
+pub fn utc_timestamp(unix: i64) -> String {
+    ts(unix).trim_end_matches('Z').to_string()
 }
 
 struct SourceRow {
@@ -271,7 +297,8 @@ fn verify_audit_logs(case_dir: &Path) -> Vec<LogRow> {
 /// workstation's 원본 재검증 button runs). The statement itself never
 /// hashes anything; when no run exists it says so instead of implying the
 /// sources were verified.
-fn render_hash_verify(case_dir: &Path) -> String {
+fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor>) -> String {
+    let esc = |text: &str| esc_with(redactor, text);
     let path = case_dir.join(crate::anomaly::HASH_VERIFY_REL_PATH);
     let Some((latest, entries)) = crate::anomaly::latest_hash_verify_run(case_dir) else {
         return "<p class=\"note warn\">No completed live source re-hash has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>".to_string();
@@ -280,6 +307,8 @@ fn render_hash_verify(case_dir: &Path) -> String {
         Ok(v) => format!("log chain: {} ({} entries)", v.integrity.label(), v.entries),
         Err(err) => format!("log chain verification FAILED: {err}"),
     };
+    // Error text quotes the log's absolute path: escaped (and redacted).
+    let chain = esc(&chain);
     let mut rows = String::new();
     let (mut matched, mut mismatched, mut other) = (0usize, 0usize, 0usize);
     for entry in &entries {
@@ -421,7 +450,19 @@ fn render(
     logs: &[LogRow],
     hash_verify_html: &str,
     generated_unix: i64,
+    redactor: Option<&crate::redact::Redactor>,
 ) -> String {
+    // Every printed value goes through the (optional) path redactor.
+    let esc = |text: &str| esc_with(redactor, text);
+    let redaction_banner = if redactor.is_some() {
+        format!(
+            "{}\n<p class=\"banner warn\">{}</p>",
+            crate::redact::REDACTION_MARKER,
+            crate::util::html_escape(crate::redact::REDACTION_NOTE)
+        )
+    } else {
+        String::new()
+    };
     let field = |key: &str| -> String {
         manifest
             .get(key)
@@ -627,6 +668,7 @@ p.banner:not(.ok):not(.bad):not(.warn) {{ background: #f1f3f4; color: #444; }}
 @media print {{ body {{ margin: 0; }} }}
 </style></head><body>
 <h1>Chain of Custody Statement</h1>
+{redaction_banner}
 <p class=note>Generated {generated} by FrameTrace. At generation time the audit lanes in section 4 were re-verified and the evidence source paths in section 2 were re-stat'ed (presence/size only); original evidence was not re-hashed by this statement (section 5 shows the result of a separate live re-hash run, if one was recorded). Print to PDF for submission if required.</p>
 {integrity_banner}
 <h2>1. Case Identity</h2>
@@ -763,6 +805,7 @@ mod tests {
             &[ok_lane(audit::AuditIntegrity::StructuralOnly)],
             "",
             1_704_110_400,
+            None,
         );
         assert!(!html.contains("were not modified"));
         assert!(!html.contains("verified live"));
@@ -801,6 +844,7 @@ mod tests {
             &[],
             "",
             1_704_110_400,
+            None,
         );
         assert!(
             html.contains("<span class=ok>computed by FrameTrace</span>"),
@@ -861,6 +905,7 @@ mod tests {
             &[ok_lane(audit::AuditIntegrity::Keyed)],
             "",
             1_704_110_400,
+            None,
         );
         assert!(!html.contains("No evidence sources registered."));
         assert!(!html.contains("No jobs recorded."));
@@ -944,5 +989,67 @@ mod tests {
     fn renders_utc_timestamp() {
         assert_eq!(ts(1704110400), "2024-01-01 12:00:00Z");
         assert_eq!(ts(0), "—");
+        assert_eq!(utc_timestamp(1704110400), "2024-01-01 12:00:00");
+    }
+
+    /// I4: a statement rendered for a path-redacted package prints no
+    /// absolute path — case directory, sources, job subjects and errors —
+    /// and says so.
+    #[test]
+    fn redacted_statement_hides_every_absolute_path() {
+        let source = SourceRow {
+            source_id: "SRC-1".into(),
+            kind: "e01".into(),
+            path: "/evidence/secret/disk.E01".into(),
+            registered_unix: 1_704_110_400,
+            write_protect: None,
+            acquisition_tool: None,
+            evidence_hash: None,
+            hash_algorithm: None,
+            hash_origin: None,
+            observed: "present".into(),
+        };
+        let job = JobRow {
+            job_id: "job-1".into(),
+            job_type: "scan".into(),
+            status: "failed".into(),
+            subject_path: "/evidence/secret".into(),
+            started_unix: 1_704_110_400,
+            completed_unix: None,
+            total_units: None,
+            completed_units: 0,
+            error: Some("failed to read /evidence/secret/x.mp4: denied".into()),
+        };
+        let case_dir = Path::new("/cases/secret-case");
+        let redactor = crate::redact::Redactor::new(case_dir);
+        let html = render(
+            case_dir,
+            &serde_json::json!({"case_id": "FT-1"}),
+            &Ok(vec![source]),
+            &Ok(vec![job]),
+            &Err("cannot open /cases/secret-case/db/case.db".to_string()),
+            &[],
+            "",
+            1_704_110_400,
+            Some(&redactor),
+        );
+        assert!(!html.contains("secret"), "{html}");
+        assert!(crate::redact::html_is_redacted(&html));
+        assert!(html.contains("&lt;redacted:"), "{html}");
+        assert!(html.contains("&lt;case&gt;/db/case.db"), "{html}");
+        assert!(html.contains(": denied"), "{html}");
+        let plain = render(
+            case_dir,
+            &serde_json::Value::Null,
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &Err("n/a".into()),
+            &[],
+            "",
+            1,
+            None,
+        );
+        assert!(!crate::redact::html_is_redacted(&plain));
+        assert!(plain.contains("secret-case"));
     }
 }

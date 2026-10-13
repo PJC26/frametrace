@@ -1,5 +1,6 @@
 use crate::case_db;
-use crate::util::{html_escape, json_escape, read_to_string, write_text};
+// I14: QA reports land in the packaged report tree; written atomically.
+use crate::util::{html_escape, json_escape, read_to_string, write_text_atomic as write_text};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};

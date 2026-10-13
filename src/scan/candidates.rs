@@ -305,6 +305,13 @@ fn has_hash(record: &VideoRecord) -> bool {
     record.sha256.is_some()
 }
 
+/// A recorded hash attempt that failed (I11) — kept by passes that do not
+/// hash, so the failure stays visible.
+fn has_hash_failure(record: &VideoRecord) -> bool {
+    record.sha256.is_none()
+        && matches!(record.hash_status.as_str(), "error" | "changed-during-hash")
+}
+
 fn has_probe(record: &VideoRecord) -> bool {
     record.probe.error.as_deref() != Some("ffprobe skipped")
 }
@@ -338,10 +345,14 @@ pub(super) fn carried_facts<'a>(
     indexed: Option<&'a VideoRecord>,
     options: &ScanOptions,
 ) -> CarriedFacts<'a> {
+    // I11: a pass that does not hash also keeps a recorded hash FAILURE
+    // (`error` / `changed-during-hash`) for the unchanged file — that is a
+    // fact about these bytes too, and a lighter rescan must not turn it into
+    // `skipped`. A `--hash` pass retries the file instead.
     let hash = salvaged.filter(|r| has_hash(r)).or_else(|| {
         indexed
             .filter(|_| options.incremental || !options.hash_files)
-            .filter(|r| has_hash(r))
+            .filter(|r| has_hash(r) || (!options.hash_files && has_hash_failure(r)))
     });
     let probe = salvaged.filter(|r| has_probe(r)).or_else(|| {
         indexed

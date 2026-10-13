@@ -30,7 +30,24 @@ pub struct ReportInputs<'a> {
     pub redaction_applied: bool,
 }
 
+/// Renders the report without audit-chain verification results: every log
+/// column then reads "체인 미검증" (I9). `make-report` uses
+/// [`render_case_report_with_chains`].
 pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
+    render_case_report_with_chains(inputs, "{}")
+}
+
+/// [`render_case_report`] with the chain verification of each audit log the
+/// report quotes (I9): `{"export"|"proxy"|"thumbnail"|"carve"|"filesystem"|
+/// "validation"|"anomaly"|"batch"|"join": {"path", "status":
+/// "keyed"|"structural"|"failed"|"absent", "entries", "detail"}}`. A log
+/// missing from the map is shown as not verified — the report never calls a
+/// chain hash tamper-evident unless that log passed keyed verification.
+pub fn render_case_report_with_chains(
+    inputs: &ReportInputs<'_>,
+    audit_chains_json: &str,
+) -> String {
+    let audit_chains = json_for_script(&audio_levels_object(audit_chains_json));
     let manifest = json_for_script(inputs.manifest_json);
     let index = json_for_script(inputs.index_json);
     let export_lines = json_for_script(&jsonl_to_array(inputs.export_log_jsonl));
@@ -47,8 +64,9 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
     let marks = json_for_script(inputs.marks_json);
     let redaction_note = if inputs.redaction_applied {
         format!(
-            "  <div class=\"note\">{}</div>\n",
-            crate::redact::REDACTION_NOTE
+            "  {}\n  <div class=\"note\">{}</div>\n",
+            crate::redact::REDACTION_MARKER,
+            crate::util::html_escape(crate::redact::REDACTION_NOTE)
         )
     } else {
         String::new()
@@ -171,6 +189,7 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
 <main>
   <h1 id="title">FrameTrace 영상 포렌식 보고서</h1>
   <div class="muted" id="case-line"></div>
+  <div class="muted" id="time-basis">시각 표기: 이 보고서의 모든 시각은 UTC 기준입니다(보관 이력서 custody-statement와 같은 기준). 괄호 안은 이 보고서를 연 PC의 현지 시각과 그 UTC 오프셋입니다. 파일 수정 시각 등 장치·파일시스템이 기록한 시각은 그 장치 시계를 따르며 정확성은 검증하지 않았습니다.</div>
 {redaction_note}
   <section class="summary">
     <div class="box">색인 영상<strong id="count">0</strong></div>
@@ -217,9 +236,11 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
 
   <h2>재생 / 컨테이너 검증</h2>
   <div id="validation-results"></div>
+  <div id="validation-history"></div>
 
   <h2>이상 징후 후보 (candidate-finding)</h2>
   <div id="anomaly-findings"></div>
+  <div id="anomaly-history"></div>
   <div class="note">자동 플래그는 수동 확인이 필요한 후보 소견입니다. 조작·위변조·법적 증명으로 해석하지 마십시오. <code>qa anomalies</code>로 재생성합니다.</div>
 
   <h2>파일시스템 조사 / Inode 복구</h2>
@@ -227,8 +248,13 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
 
   <h2>처리 체인 (분석 타임라인)</h2>
   <div id="chain"></div>
-  <div class="note">스캔·검증·내보내기·복구 이벤트를 시간순으로 정렬한 처리 이력입니다. 체인 해시는 감사 로그의 변조 방지 연결 값을 나타냅니다.</div>
+  <div class="note">스캔·검증·내보내기·복구 이벤트를 시간순으로 정렬한 처리 이력입니다. 체인 해시는 감사 로그 항목을 앞 항목과 잇는 해시 값이며, 각 로그를 보고서 생성 시 다시 검증한 결과는 아래 표에 있습니다.</div>
+
+  <h2>감사 로그 체인 검증</h2>
+  <div id="audit-chains"></div>
+  <div class="note" id="audit-chain-note">integrity-keyed = 모든 항목이 설정된 키(HMAC)로 확인됨 — 키 없이 고친 항목은 드러납니다. 구조만 확인 = 항목 연결은 맞지만 서명이 없어, 파일에 접근할 수 있는 사람이 로그 전체를 다시 쓰면 탐지할 수 없습니다. 검증 실패 = 연결이 끊김 — 해당 로그의 내용을 그대로 믿으면 안 됩니다.</div>
 <script>
+const auditChains = {audit_chains};
 const manifest = {manifest};
 const scan = {index};
 const exportsLog = {export_lines};
@@ -276,10 +302,35 @@ const fmtDuration = value => {{
   return h ? `${{h}}:${{String(m).padStart(2, "0")}}:${{String(s).padStart(2, "0")}}` : `${{m}}:${{String(s).padStart(2, "0")}}`;
 }};
 
-const fmtUnix = value => {{
-  if (!Number.isFinite(value)) return "-";
-  return new Date(value * 1000).toLocaleString();
+// I6: times are shown in UTC (the custody statement's basis) with the
+// viewing PC's local time and its UTC offset spelled out, never as a bare
+// browser-local string whose time zone the reader cannot see.
+const pad2 = value => String(value).padStart(2, "0");
+const fmtOffset = date => {{
+  const minutes = -date.getTimezoneOffset();
+  const abs = Math.abs(minutes);
+  return `UTC${{minutes < 0 ? "-" : "+"}}${{pad2(Math.floor(abs / 60))}}:${{pad2(abs % 60)}}`;
 }};
+const fmtUnix = value => {{
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return "-";
+  const utc = `${{date.getUTCFullYear()}}-${{pad2(date.getUTCMonth() + 1)}}-${{pad2(date.getUTCDate())}} ${{pad2(date.getUTCHours())}}:${{pad2(date.getUTCMinutes())}}:${{pad2(date.getUTCSeconds())}} UTC`;
+  const local = `${{date.getFullYear()}}-${{pad2(date.getMonth() + 1)}}-${{pad2(date.getDate())}} ${{pad2(date.getHours())}}:${{pad2(date.getMinutes())}}:${{pad2(date.getSeconds())}}`;
+  return `${{utc}} <span class="muted">(현지 ${{local}} ${{fmtOffset(date)}})</span>`;
+}};
+
+// I9: what re-verifying each quoted audit log at report time found.
+const chainLabel = name => {{
+  const chain = auditChains[name];
+  switch (chain?.status) {{
+    case "keyed": return "체인 검증: integrity-keyed (HMAC 키로 확인)";
+    case "structural": return "체인 검증: 구조만 확인 (서명 없음 — 전체 재작성은 탐지 못함)";
+    case "failed": return "체인 검증 실패 — 이 로그를 그대로 믿으면 안 됨";
+    default: return "체인 미검증";
+  }}
+}};
+const chainCell = (name, hash) => `<code>${{escapeHtml(hash || "-")}}</code><br><span class="muted">${{escapeHtml(chainLabel(name))}}</span>`;
 
 const sourceCounts = new Map();
 videos.forEach(video => {{
@@ -363,7 +414,7 @@ document.getElementById("videos").innerHTML = videos.length ? `<table>
       <td>${{escapeHtml(video.id)}}</td>
       <td><code>${{escapeHtml(video.relative_path || video.source_path)}}</code></td>
       <td>${{escapeHtml(video.source_profile?.vendor || "-")}}<br><code>${{escapeHtml(video.source_profile?.parser || "-")}}</code></td>
-      <td>${{escapeHtml(video.video_codec || video.extension || "-")}} ${{video.width && video.height ? `(${{video.width}}x${{video.height}})` : ""}}</td>
+      <td>${{escapeHtml(video.video_codec || video.extension || "-")}} ${{video.width && video.height ? `(${{escapeHtml(video.width)}}x${{escapeHtml(video.height)}})` : ""}}</td>
       <td>${{fmtDuration(video.duration_seconds)}}</td>
       <td>${{fmtBytes(video.size_bytes)}}</td>
       <td><code>${{escapeHtml(video.sha256 || video.hash_status || "-")}}</code></td>
@@ -382,8 +433,8 @@ document.getElementById("clip-exports").innerHTML = exportsLog.length ? `<table>
       <td><code>${{escapeHtml(item.source_path || item.selector || "-")}}</code></td>
       <td><code>${{escapeHtml(item.output_path || "-")}}</code></td>
       <td><code>${{escapeHtml(item.output_sha256 || "-")}}</code></td>
-      <td>${{item.start_seconds ?? "-"}}, ${{item.duration_seconds ?? "-"}}</td>
-      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
+      <td>${{escapeHtml(item.start_seconds ?? "-")}}, ${{escapeHtml(item.duration_seconds ?? "-")}}</td>
+      <td>${{chainCell("export", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
 </table>` : "<p>내보낸 클립이 없습니다.</p>";
@@ -399,7 +450,7 @@ document.getElementById("derived-artifacts").innerHTML = derivedLog.length ? `<t
       <td><code>${{escapeHtml(item.source_path || "-")}}</code></td>
       <td><code>${{escapeHtml(item.output_path || "-")}}</code></td>
       <td><code>${{escapeHtml(item.output_sha256 || "-")}}</code></td>
-      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
+      <td>${{chainCell(item.kind === "proxy" ? "proxy" : "thumbnail", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
 </table>` : "<p>프록시 또는 썸네일 산출물이 없습니다.</p>";
@@ -417,43 +468,112 @@ document.getElementById("carved-artifacts").innerHTML = carveLog.length ? `<tabl
       <td>${{fmtBytes(item.size_bytes)}}</td>
       <td><code>${{escapeHtml(item.output_path || "-")}}</code></td>
       <td><code>${{escapeHtml(item.sha256 || "-")}}</code></td>
-      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
+      <td>${{chainCell("carve", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
 </table>` : "<p>Carving 후보가 없습니다.</p>";
 
-document.getElementById("validation-results").innerHTML = validationLog.length ? `<table>
-  <thead>
-    <tr><th>상태</th><th>대상</th><th>포맷</th><th>코덱</th><th>길이</th><th>SHA-256</th><th>검증 메모</th><th>감사 체인</th></tr>
-  </thead>
-  <tbody>
-    ${{validationLog.map(item => `<tr>
+// I5: the validation log is append-only across runs. Only the newest
+// validation of each target is "current"; superseded ones are history,
+// shown folded with their run time so an old result never reads as today's.
+const validationTarget = item => item.target_path || item.selector || "-";
+const currentValidations = [];
+const supersededValidations = [];
+{{
+  const latest = new Map();
+  validationLog.forEach((item, order) => {{
+    const key = validationTarget(item);
+    const prior = latest.get(key);
+    const ts = Number.isFinite(item.validated_unix) ? item.validated_unix : -Infinity;
+    if (!prior || ts >= prior.ts) latest.set(key, {{item, ts, order}});
+  }});
+  const keep = new Set([...latest.values()].map(entry => entry.order));
+  validationLog.forEach((item, order) => (keep.has(order) ? currentValidations : supersededValidations).push(item));
+}}
+const validationRow = (item, withTime) => `<tr>
+      ${{withTime ? `<td>${{fmtUnix(item.validated_unix)}}</td>` : ""}}
       <td>${{escapeHtml(item.validation_status || "-")}}</td>
-      <td><code>${{escapeHtml(item.target_path || item.selector || "-")}}</code></td>
+      <td><code>${{escapeHtml(validationTarget(item))}}</code></td>
       <td>${{escapeHtml(item.format_name || "-")}}</td>
       <td>${{escapeHtml(item.video_codec || "-")}} / ${{escapeHtml(item.audio_codec || "-")}}</td>
       <td>${{fmtDuration(item.duration_seconds)}}</td>
       <td><code>${{escapeHtml(item.target_sha256 || "-")}}</code></td>
       <td>${{escapeHtml(item.validation_note || item.ffprobe_error || "-")}}</td>
-      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
-    </tr>`).join("")}}
+      <td>${{chainCell("validation", item.entry_sha256)}}</td>
+    </tr>`;
+const validationHead = withTime => `<thead>
+    <tr>${{withTime ? "<th>실행 시각</th>" : ""}}<th>상태</th><th>대상</th><th>포맷</th><th>코덱</th><th>길이</th><th>SHA-256</th><th>검증 메모</th><th>감사 체인</th></tr>
+  </thead>`;
+document.getElementById("validations").textContent = currentValidations.length;
+document.getElementById("validation-results").innerHTML = currentValidations.length ? `<p class="muted">현재 결과: 대상별 가장 최근 검증 ${{currentValidations.length}}건${{supersededValidations.length ? ` (이전 검증 ${{supersededValidations.length}}건은 아래 이력에 접어 둠)` : ""}}</p><table>
+  ${{validationHead(true)}}
+  <tbody>
+    ${{currentValidations.map(item => validationRow(item, true)).join("")}}
   </tbody>
 </table>` : "<p>검증 기록이 없습니다.</p>";
+document.getElementById("validation-history").innerHTML = supersededValidations.length ? `<details><summary>이전 검증 이력 ${{supersededValidations.length}}건 — 같은 대상의 더 최근 검증으로 대체됨 (현재 결과 아님)</summary><table>
+  ${{validationHead(true)}}
+  <tbody>
+    ${{[...supersededValidations].reverse().map(item => validationRow(item, true)).join("")}}
+  </tbody>
+</table></details>` : "";
 
-const anomalyRows = anomalyLog.filter(item => item.kind && item.kind !== "none");
-document.getElementById("anomaly-findings").innerHTML = anomalyRows.length ? `<table>
+// I5: the anomaly log is append-only too. Entries belong to the run whose
+// `anomaly-scan-run` marker follows them; only the newest completed run is
+// "current". Logs written before run markers existed group by scanned_unix.
+const anomalyRuns = [];
+{{
+  let pending = [];
+  const flushUnmarked = items => {{
+    const byTime = new Map();
+    items.forEach(item => {{
+      const key = Number.isFinite(item.scanned_unix) ? item.scanned_unix : null;
+      if (!byTime.has(key)) byTime.set(key, []);
+      byTime.get(key).push(item);
+    }});
+    byTime.forEach((entries, ts) => anomalyRuns.push({{run: null, ts, entries}}));
+  }};
+  anomalyLog.forEach(item => {{
+    if (item.event === "anomaly-scan-run") {{
+      // A run writes its findings and then its marker with one scanned_unix;
+      // anything else still pending is an older unmarked (legacy or cut
+      // short) run.
+      flushUnmarked(pending.filter(entry => entry.scanned_unix !== item.scanned_unix));
+      anomalyRuns.push({{run: item, ts: item.scanned_unix, entries: pending.filter(entry => entry.scanned_unix === item.scanned_unix)}});
+      pending = [];
+    }} else {{
+      pending.push(item);
+    }}
+  }});
+  flushUnmarked(pending);
+}}
+const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(true);
+const currentAnomalyIndex = latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
+const currentAnomalyRun = anomalyRuns[currentAnomalyIndex] || null;
+const findingRows = run => run.entries.filter(item => item.kind && item.kind !== "none");
+const anomalyTable = rows => `<table>
   <thead>
     <tr><th>라벨</th><th>종류</th><th>대상</th><th>상세</th></tr>
   </thead>
   <tbody>
-    ${{anomalyRows.map(item => `<tr>
+    ${{rows.map(item => `<tr>
       <td>${{escapeHtml(item.label || "candidate-finding")}}</td>
       <td>${{escapeHtml(item.kind || "-")}}</td>
       <td><code>${{escapeHtml(item.selector || item.source_path || "-")}}</code></td>
       <td>${{escapeHtml(item.detail || "-")}}</td>
     </tr>`).join("")}}
   </tbody>
-</table>` : "<p>이상 징후 후보가 없습니다.</p>";
+</table>`;
+const anomalyRunLine = run => {{
+  const mode = run.run ? (run.run.hash_mode === "rehash" ? "해시 모드: 실시간 재해시" : "해시 모드: 색인에 저장된 해시") : "실행 기록 없음(완료 표시 없는 실행)";
+  return `실행 시각 ${{fmtUnix(run.ts)}} · ${{mode}} · 후보 ${{findingRows(run).length}}건${{run.run?.coverage_limited ? " · 일부 파일 재해시 못 함" : ""}}`;
+}};
+const anomalyRows = currentAnomalyRun ? findingRows(currentAnomalyRun) : [];
+document.getElementById("anomaly-findings").innerHTML = currentAnomalyRun
+  ? `<p class="muted">현재 결과 — ${{anomalyRunLine(currentAnomalyRun)}} · ${{escapeHtml(chainLabel("anomaly"))}}</p>${{anomalyRows.length ? anomalyTable(anomalyRows) : "<p>이 실행에서 이상 징후 후보가 없습니다.</p>"}}`
+  : "<p>이상 징후 후보가 없습니다.</p>";
+const pastAnomalyRuns = anomalyRuns.filter((_, index) => index !== currentAnomalyIndex).reverse();
+document.getElementById("anomaly-history").innerHTML = pastAnomalyRuns.length ? `<details><summary>이전 실행 ${{pastAnomalyRuns.length}}회 — 현재 결과 아님</summary>${{pastAnomalyRuns.map(run => `<p class="muted">${{anomalyRunLine(run)}}</p>${{findingRows(run).length ? anomalyTable(findingRows(run)) : "<p>후보 없음</p>"}}`).join("")}}</details>` : "";
 
 document.getElementById("filesystem-recovery").innerHTML = filesystemLog.length ? `<table>
   <thead>
@@ -468,7 +588,7 @@ document.getElementById("filesystem-recovery").innerHTML = filesystemLog.length 
       <td>${{escapeHtml(item.validation_status || `${{item.entry_count ?? "-"}} entries`)}}<br><code>${{escapeHtml(item.output_path || item.summary_path || "-")}}</code></td>
       <td>${{Array.isArray(item.warnings) && item.warnings.length ? item.warnings.map(escapeHtml).join("<br>") : "-"}}</td>
       <td><code>${{escapeHtml(item.sha256 || item.entries_jsonl_path || "-")}}</code></td>
-      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
+      <td>${{chainCell("filesystem", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
 </table>` : "<p>파일시스템 조사 또는 inode 복구 기록이 없습니다.</p>";
@@ -607,7 +727,7 @@ document.getElementById("joined-videos").innerHTML = joinLog.length ? `<table>
       <td>${{fmtDuration(item.duration_seconds)}}</td>
       <td>${{joinJunctionText(item)}}</td>
       <td><code>${{escapeHtml(item.manifest_sha256 || "-")}}</code></td>
-      <td><code>${{escapeHtml(item.entry_sha256 || "-")}}</code></td>
+      <td>${{chainCell("join", item.entry_sha256)}}</td>
       <td>${{joinMarkCell(item)}}</td>
     </tr>`).join("")}}
   </tbody>
@@ -627,37 +747,43 @@ validationLog.forEach(item => chainEvents.push({{
   ts: item.validated_unix,
   name: item.event || "validate",
   detail: `${{item.selector || "-"}} → ${{item.validation_status || "-"}}`,
-  chain: item.entry_sha256 || "-"
+  chain: item.entry_sha256 || "-",
+  log: "validation"
 }}));
 batchLog.forEach(item => chainEvents.push({{
   ts: null,
   name: item.event || "batch",
   detail: `요청 ${{item.requested ?? "-"}} · 성공 ${{item.ok ?? "-"}} · 실패 ${{item.failed ?? "-"}}`,
-  chain: item.entry_sha256 || "-"
+  chain: item.entry_sha256 || "-",
+  log: "batch"
 }}));
 exportsLog.forEach(item => chainEvents.push({{
   ts: item.exported_unix ?? item.created_unix,
   name: "export-video (클립 내보내기)",
   detail: `${{item.selector || item.source_path || "-"}} → ${{item.output_path || "-"}} (${{item.format || "-"}})`,
-  chain: item.entry_sha256 || "-"
+  chain: item.entry_sha256 || "-",
+  log: "export"
 }}));
 derivedLog.forEach(item => chainEvents.push({{
   ts: item.created_unix,
   name: item.kind === "proxy" ? "make-proxy (검토용 프록시)" : "make-thumbnail (썸네일)",
   detail: `${{item.source_path || "-"}} → ${{item.output_path || "-"}}`,
-  chain: item.entry_sha256 || "-"
+  chain: item.entry_sha256 || "-",
+  log: item.kind === "proxy" ? "proxy" : "thumbnail"
 }}));
 joinLog.forEach(item => chainEvents.push({{
   ts: item.joined_unix,
   name: "join-video (이어붙이기)",
   detail: `원본 ${{item.segment_count ?? "-"}}개 → ${{item.output_path || "-"}}`,
-  chain: item.entry_sha256 || "-"
+  chain: item.entry_sha256 || "-",
+  log: "join"
 }}));
 filesystemLog.forEach(item => chainEvents.push({{
   ts: item.recovered_unix ?? item.inspected_unix,
   name: item.event || "filesystem",
   detail: `inode ${{item.inode ?? "-"}} @ ${{item.partition_offset ?? "-"}} → ${{item.output_path || item.summary_path || `${{item.entry_count ?? "-"}} entries`}}`,
-  chain: item.entry_sha256 || "-"
+  chain: item.entry_sha256 || "-",
+  log: "filesystem"
 }}));
 chainEvents.sort((a, b) => (a.ts ?? Infinity) - (b.ts ?? Infinity));
 
@@ -670,10 +796,42 @@ document.getElementById("chain").innerHTML = chainEvents.length ? `<table>
       <td>${{event.ts ? fmtUnix(event.ts) : "-"}}</td>
       <td>${{escapeHtml(event.name)}}</td>
       <td><code>${{escapeHtml(event.detail)}}</code></td>
-      <td><code>${{escapeHtml(event.chain)}}</code></td>
+      <td>${{event.log ? chainCell(event.log, event.chain) : `<code>${{escapeHtml(event.chain)}}</code>`}}</td>
     </tr>`).join("")}}
   </tbody>
 </table>` : "<p>처리 이력이 없습니다.</p>";
+
+const chainLogNames = [
+  ["export", "클립 내보내기"], ["proxy", "검토용 프록시"], ["thumbnail", "썸네일"],
+  ["carve", "carving"], ["filesystem", "파일시스템 조사·복구"], ["validation", "재생/컨테이너 검증"],
+  ["anomaly", "이상 징후 스캔"], ["batch", "일괄 처리"], ["join", "이어붙이기"]
+];
+const chainStatusText = chain => {{
+  switch (chain?.status) {{
+    case "keyed": return "integrity-keyed — 모든 항목이 설정된 키(HMAC)로 확인됨";
+    case "structural": return "구조만 확인 (integrity-structural-only) — 항목 연결은 맞으나 서명이 없어 로그 전체 재작성은 탐지 못함";
+    case "failed": return "검증 실패";
+    case "absent": return "로그 없음";
+    default: return "미검증 (이 보고서 생성 시 검증하지 않음)";
+  }}
+}};
+document.getElementById("audit-chains").innerHTML = `<table>
+  <thead>
+    <tr><th>로그</th><th>경로</th><th>항목 수</th><th>검증 결과</th><th>상세</th></tr>
+  </thead>
+  <tbody>
+    ${{chainLogNames.map(([key, label]) => {{
+      const chain = auditChains[key];
+      return `<tr>
+      <td>${{escapeHtml(label)}}</td>
+      <td><code>${{escapeHtml(chain?.path || "-")}}</code></td>
+      <td>${{escapeHtml(chain?.entries ?? "-")}}</td>
+      <td>${{escapeHtml(chainStatusText(chain))}}</td>
+      <td>${{escapeHtml(chain?.detail || "-")}}</td>
+    </tr>`;
+    }}).join("")}}
+  </tbody>
+</table>`;
 </script>
 </main>
 </body>
@@ -805,20 +963,48 @@ pub fn signoff_banner_html(examiner: &str, signed_unix: i64, currency: SignoffCu
         ),
     };
     format!(
-        "<div style=\"padding:8px 16px;background:{background};border-bottom:1px solid {border};font-size:13px\">검토자: <strong>{}</strong> (최종화 시 입력·기록된 이름이며 신원 인증은 아닙니다; 기록 시각 unix {}){tail}</div>",
+        "<div style=\"padding:8px 16px;background:{background};border-bottom:1px solid {border};font-size:13px\">검토자: <strong>{}</strong> (최종화 시 입력·기록된 이름이며 신원 인증은 아닙니다; 기록 시각 {} UTC, unix {}){tail}</div>",
         crate::util::html_escape(examiner),
+        crate::custody::utc_timestamp(signed_unix),
         signed_unix
     )
 }
 
-/// Inserts the sign-off banner right after `<body>`.
+/// HTML comment naming the exact sign-off record a report was rendered
+/// with (SHA-256 of the record file's bytes), so `package-case` packages
+/// that record and not a leftover one (I10).
+pub fn signoff_source_marker(signoff_text: &str) -> String {
+    format!(
+        "<!-- frametrace:signoff-sha256={} -->",
+        crate::sha256::digest_bytes(signoff_text.as_bytes())
+    )
+}
+
+/// The sign-off record digest a rendered report names (see
+/// [`signoff_source_marker`]); `None` for a report without a sign-off or
+/// one rendered before the marker existed.
+pub fn report_signoff_sha256(html: &str) -> Option<&str> {
+    let start =
+        html.find("<!-- frametrace:signoff-sha256=")? + "<!-- frametrace:signoff-sha256=".len();
+    let hex = html.get(start..start + 64)?;
+    (hex.bytes().all(|b| b.is_ascii_hexdigit()) && html[start + 64..].starts_with(" -->"))
+        .then_some(hex)
+}
+
+/// Inserts the sign-off banner right after `<body>`, with the marker of the
+/// record (`signoff_text`) it was rendered from.
 pub fn inject_signoff_banner(
     html: String,
     examiner: &str,
     signed_unix: i64,
     currency: SignoffCurrency,
+    signoff_text: &str,
 ) -> String {
-    let banner = signoff_banner_html(examiner, signed_unix, currency);
+    let banner = format!(
+        "{}{}",
+        signoff_source_marker(signoff_text),
+        signoff_banner_html(examiner, signed_unix, currency)
+    );
     match html.find("<body>") {
         Some(index) => format!(
             "{}{}{}",
@@ -887,8 +1073,23 @@ mod tests {
             "홍길동 <b>",
             1700000000,
             super::SignoffCurrency::Current,
+            "{\"examiner\":\"홍길동 <b>\"}",
         );
         assert!(html.contains("검토자: <strong>홍길동 &lt;b&gt;</strong>"));
+        // I6: the signed time is spelled out in UTC, not as a bare number.
+        assert!(
+            html.contains("기록 시각 2023-11-14 22:13:20 UTC, unix 1700000000"),
+            "{html}"
+        );
+        // I10: the report names the exact record it was rendered from.
+        assert_eq!(
+            super::report_signoff_sha256(&html),
+            Some(crate::sha256::digest_bytes("{\"examiner\":\"홍길동 <b>\"}".as_bytes()).as_str())
+        );
+        assert_eq!(
+            super::report_signoff_sha256("<html><body></body></html>"),
+            None
+        );
         assert!(html.contains("신원 인증은 아닙니다"));
         assert!(html.find("검토자").unwrap() < html.find("<p>x</p>").unwrap());
         assert_eq!(
@@ -1291,9 +1492,6 @@ mod tests {
     /// Runs the report script under node with a stub `document` and returns
     /// every element it touched as `{id: {innerHTML, textContent, hidden}}`.
     fn rendered_elements(inputs: &[(&str, &str)]) -> serde_json::Value {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
         let mut full: Vec<(&str, &str)> = inputs.to_vec();
         for (key, default) in [
             ("manifest", "{}"),
@@ -1305,7 +1503,13 @@ mod tests {
                 full.push((key, default));
             }
         }
-        let html = render(&full);
+        run_report_script(&render(&full))
+    }
+
+    fn run_report_script(html: &str) -> serde_json::Value {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
         let script = html
             .split_once("<script>")
             .unwrap()
@@ -1558,11 +1762,207 @@ mod tests {
 
     #[test]
     fn redaction_note_renders_only_when_applied() {
+        let note = crate::util::html_escape(crate::redact::REDACTION_NOTE);
         let plain = render(&[]);
-        assert!(!plain.contains(crate::redact::REDACTION_NOTE));
+        assert!(!plain.contains(&note));
+        assert!(!crate::redact::html_is_redacted(&plain));
         assert!(plain.contains("\"applied\": false"));
         let redacted = render(&[("redacted", "1")]);
-        assert!(redacted.contains(crate::redact::REDACTION_NOTE));
+        assert!(redacted.contains(&note));
+        assert!(crate::redact::html_is_redacted(&redacted));
+        // The note says what was NOT redacted (I4).
+        assert!(note.contains("not rewritten"));
         assert!(redacted.contains("\"applied\": true"));
+    }
+
+    /// I5: only the newest anomaly run and the newest validation of each
+    /// target are "current"; older ones are folded history with run times.
+    #[test]
+    fn anomaly_and_validation_sections_show_only_the_latest_run_as_current() {
+        let anomaly = [
+            r#"{"event":"anomaly-scan","scanned_unix":100,"label":"candidate-finding","kind":"timestamp-regression","selector":"vid_old","detail":"old"}"#,
+            r#"{"event":"anomaly-scan-run","scanned_unix":100,"hash_mode":"stored","finding_count":1}"#,
+            r#"{"event":"anomaly-scan","scanned_unix":200,"label":"none","kind":"none","selector":"","detail":"no candidate findings"}"#,
+            r#"{"event":"anomaly-scan-run","scanned_unix":200,"hash_mode":"rehash","finding_count":0}"#,
+        ]
+        .join("\n");
+        let validation = [
+            r#"{"selector":"vid_1","target_path":"/e/a.mp4","validated_unix":10,"validation_status":"validation-failed"}"#,
+            r#"{"selector":"vid_1","target_path":"/e/a.mp4","validated_unix":20,"validation_status":"ffprobe-video-stream-confirmed"}"#,
+            r#"{"selector":"vid_2","target_path":"/e/b.mp4","validated_unix":5,"validation_status":"ffprobe-video-stream-confirmed"}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &anomaly), ("validation", &validation)]);
+        let html = |id: &str| {
+            elements[id]["innerHTML"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let current = html("anomaly-findings");
+        assert!(
+            current.contains("이 실행에서 이상 징후 후보가 없습니다."),
+            "{current}"
+        );
+        assert!(current.contains("실시간 재해시"), "{current}");
+        assert!(!current.contains("vid_old"), "{current}");
+        let history = html("anomaly-history");
+        assert!(
+            history.contains("<details>") && history.contains("vid_old"),
+            "{history}"
+        );
+        assert!(history.contains("현재 결과 아님"), "{history}");
+        let current = html("validation-results");
+        assert!(!current.contains("validation-failed"), "{current}");
+        assert_eq!(current.matches("ffprobe-video-stream-confirmed").count(), 2);
+        let history = html("validation-history");
+        assert!(history.contains("<details>") && history.contains("validation-failed"));
+        assert_eq!(elements["validations"]["textContent"], 2);
+    }
+
+    /// I5: a legacy log without run markers still separates runs by time.
+    #[test]
+    fn legacy_anomaly_log_without_run_markers_groups_by_scan_time() {
+        let anomaly = [
+            r#"{"event":"anomaly-scan","scanned_unix":100,"kind":"gap","selector":"vid_a","detail":"a"}"#,
+            r#"{"event":"anomaly-scan","scanned_unix":300,"kind":"gap","selector":"vid_b","detail":"b"}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &anomaly)]);
+        let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        assert!(
+            current.contains("vid_b") && !current.contains("vid_a"),
+            "{current}"
+        );
+        assert!(current.contains("완료 표시 없는 실행"), "{current}");
+        assert!(
+            elements["anomaly-history"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("vid_a")
+        );
+    }
+
+    /// I6: every time is UTC with the local offset spelled out, and the
+    /// report states the basis.
+    #[test]
+    fn report_times_are_utc_with_explicit_offset() {
+        let elements = rendered_elements(&[(
+            "scan_runs",
+            r#"[{"scanned_unix":1700000000,"video_count":1,"source_path":"x","warnings":[]}]"#,
+        )]);
+        let chain = elements["chain"]["innerHTML"].as_str().unwrap();
+        assert!(chain.contains("2023-11-14 22:13:20 UTC"), "{chain}");
+        assert!(
+            regex_like_offset(chain),
+            "local time must carry an explicit UTC offset: {chain}"
+        );
+        let html = render(&[]);
+        assert!(html.contains("모든 시각은 UTC 기준"));
+        assert!(html.contains("custody-statement와 같은 기준"));
+        assert!(!html.contains("toLocaleString"));
+    }
+
+    fn regex_like_offset(text: &str) -> bool {
+        text.match_indices("(현지 ").any(|(at, _)| {
+            let tail = &text[at..];
+            tail.find(" UTC+")
+                .or_else(|| tail.find(" UTC-"))
+                .is_some_and(|i| tail[i + 5..].len() >= 5 && tail.as_bytes()[i + 7] == b':')
+        })
+    }
+
+    /// I9: chain cells say what verification found; nothing is called
+    /// tamper-proof unless the log passed keyed verification.
+    #[test]
+    fn audit_chain_cells_show_verification_and_never_overclaim() {
+        let export = r#"{"format":"mp4","output_path":"o.mp4","entry_sha256":"e1"}"#;
+        let html = render(&[("export", export)]);
+        assert!(
+            !html.contains("변조 방지"),
+            "no unverified tamper-proof claim"
+        );
+        let script_for = |chains: &str| {
+            let html = super::render_case_report_with_chains(
+                &super::ReportInputs {
+                    manifest_json: "{}",
+                    index_json: "{}",
+                    export_log_jsonl: export,
+                    proxy_log_jsonl: "",
+                    thumbnail_log_jsonl: "",
+                    carve_log_jsonl: "",
+                    filesystem_log_jsonl: "",
+                    validation_log_jsonl: "",
+                    anomaly_log_jsonl: "",
+                    batch_log_jsonl: "",
+                    join_log_jsonl: "",
+                    audio_levels_json: "",
+                    scan_runs_json: "[]",
+                    marks_json: "[]",
+                    redaction_applied: false,
+                },
+                chains,
+            );
+            run_report_script(&html)
+        };
+        let unverified = script_for("{}");
+        assert!(
+            unverified["clip-exports"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("체인 미검증")
+        );
+        let structural = script_for(
+            r#"{"export":{"path":"artifacts/clips/export-log.jsonl","status":"structural","entries":1,"detail":"x"}}"#,
+        );
+        let cell = structural["clip-exports"]["innerHTML"].as_str().unwrap();
+        assert!(cell.contains("구조만 확인"), "{cell}");
+        assert!(!cell.contains("integrity-keyed"), "{cell}");
+        let table = structural["audit-chains"]["innerHTML"].as_str().unwrap();
+        assert!(
+            table.contains("artifacts/clips/export-log.jsonl"),
+            "{table}"
+        );
+        let keyed = script_for(r#"{"export":{"status":"keyed","entries":1}}"#);
+        assert!(
+            keyed["clip-exports"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("integrity-keyed")
+        );
+        let failed = script_for(r#"{"export":{"status":"failed","detail":"broken at line 2"}}"#);
+        assert!(
+            failed["clip-exports"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("체인 검증 실패")
+        );
+        assert!(
+            failed["audit-chains"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("broken at line 2")
+        );
+    }
+
+    /// I12: number-shaped fields are escaped like every other value.
+    #[test]
+    fn number_shaped_fields_are_escaped() {
+        let export = r#"{"format":"mp4","start_seconds":"<img src=x onerror=alert(1)>","duration_seconds":"<b>d</b>"}"#;
+        let carve = r#"{"id":"c1","offset":"<i>o</i>","size_bytes":3}"#;
+        let index = r#"{"videos":[{"id":"v1","source_path":"/e/a.mp4","width":"<u>w</u>","height":"<s>h</s>"}]}"#;
+        let elements = rendered_elements(&[("export", export), ("carve", carve), ("index", index)]);
+        for id in ["clip-exports", "carved-artifacts", "videos"] {
+            let html = elements[id]["innerHTML"].as_str().unwrap();
+            for tag in ["<img", "<b>", "<i>", "<u>", "<s>"] {
+                assert!(!html.contains(tag), "{id} leaks {tag}: {html}");
+            }
+        }
+        assert!(
+            elements["clip-exports"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("&lt;img src=x")
+        );
     }
 }

@@ -1,5 +1,6 @@
 use crate::audit;
-use crate::util::{json_escape, now_unix, write_text};
+// I14: the package's manifest files and README are written atomically.
+use crate::util::{json_escape, now_unix, write_text_atomic as write_text};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +9,12 @@ pub struct PackageResult {
     pub output_dir: PathBuf,
     pub file_count: usize,
     pub manifest_path: PathBuf,
+    /// Things the package could not settle silently (a leftover pending
+    /// sign-off, a report naming another sign-off record); also recorded
+    /// in package-manifest.json and README.txt.
+    pub warnings: Vec<String>,
+    /// True when the package was built in path-redaction mode (I4).
+    pub path_redacted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -17,8 +24,68 @@ struct PackageFile {
     size_bytes: u64,
 }
 
+/// I4: what a path-redacted package did with each file.
+struct PackageRedaction {
+    redactor: crate::redact::Redactor,
+    /// Package copies rewritten with paths redacted (they differ from the
+    /// case files they were made from).
+    rewritten: Vec<String>,
+    /// Copied byte-for-byte although they may contain absolute paths: the
+    /// database, index files, hash-chained logs (rewriting would break their
+    /// chains) and binary media.
+    not_redacted: Vec<String>,
+}
+
+/// Per-run state threaded through the copy helpers.
+#[derive(Default)]
+struct PackageContext {
+    redaction: Option<PackageRedaction>,
+}
+
+/// Generated pages whose redaction state decides the package mode.
+const REDACTABLE_PAGES: &[&str] = &[
+    "reports/case-report.html",
+    "review/index.html",
+    VIEWER_REL,
+    CARVE_REPORT_REL,
+];
+
+/// I4: a package is path-redacted when the case's generated pages were
+/// written with `--redact-paths`. A mix (a redacted report next to an
+/// unredacted review, say) is refused: shipping it would leak the very
+/// paths the redacted page hides.
+fn package_redaction_mode(case_dir: &Path) -> Result<bool, String> {
+    let mut redacted = Vec::new();
+    let mut plain = Vec::new();
+    for rel in REDACTABLE_PAGES {
+        let Ok(text) = fs::read_to_string(case_dir.join(rel)) else {
+            continue;
+        };
+        if crate::redact::html_is_redacted(&text) {
+            redacted.push(*rel);
+        } else {
+            plain.push(*rel);
+        }
+    }
+    if !redacted.is_empty() && !plain.is_empty() {
+        return Err(format!(
+            "package-case refused: {} were generated with --redact-paths but {} were not; a package mixing them would expose the paths the redacted pages hide. Re-run `frametrace make-report --redact-paths` and `frametrace make-review --redact-paths` (or both without the flag) and package again.",
+            redacted.join(", "),
+            plain.join(", ")
+        ));
+    }
+    Ok(!redacted.is_empty())
+}
+
 pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<PackageResult, String> {
     let created_unix = now_unix()?;
+    let mut context = PackageContext {
+        redaction: package_redaction_mode(case_dir)?.then(|| PackageRedaction {
+            redactor: crate::redact::Redactor::new(case_dir),
+            rewritten: Vec::new(),
+            not_redacted: Vec::new(),
+        }),
+    };
     let running_jobs = match crate::case_db::latest_running_jobs(case_dir) {
         Ok(jobs) => jobs,
         Err(err) => {
@@ -71,7 +138,13 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     let mut files = Vec::new();
     let mut missing_optional_files = Vec::new();
     for rel in required_package_files() {
-        copy_package_file(case_dir, &output_dir, Path::new(rel), &mut files)?;
+        copy_package_file(
+            case_dir,
+            &output_dir,
+            Path::new(rel),
+            &mut files,
+            &mut context,
+        )?;
     }
     for rel in optional_package_files() {
         copy_optional_package_file(
@@ -80,13 +153,24 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
             Path::new(rel),
             &mut files,
             &mut missing_optional_files,
+            &mut context,
         )?;
     }
     for rel_dir in recursive_package_dirs() {
-        copy_package_dir(case_dir, &output_dir, Path::new(rel_dir), &mut files)?;
+        copy_package_dir(
+            case_dir,
+            &output_dir,
+            Path::new(rel_dir),
+            &mut files,
+            &mut context,
+        )?;
     }
-    let signoff_source = copy_signoff(case_dir, &output_dir, &mut files)?;
+    let (signoff_source, warnings) = copy_signoff(case_dir, &output_dir, &mut files)?;
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    if let Some(redaction) = context.redaction.as_mut() {
+        redaction.rewritten.sort();
+        redaction.not_redacted.sort();
+    }
 
     let checksum_text = files
         .iter()
@@ -109,6 +193,8 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
         &running_jobs,
         quiescent,
         signoff_source,
+        &warnings,
+        context.redaction.as_ref(),
     );
     let manifest_path = output_dir.join("package-manifest.json");
     write_text(&manifest_path, &manifest_json)
@@ -122,19 +208,139 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     } else {
         "No HTML report is included — run `frametrace make-report <case-dir>` in the case before packaging to produce reports/case-report.html."
     };
-    write_text(
-        &output_dir.join("README.txt"),
-        &format!(
-            "FrameTrace case package\n\n{report_note} Verify package contents with manifest.sha256 before transfer (`frametrace verify-package <package-dir>` checks the manifest, audit chains and sign-off and reports what it could not verify).\n\nSnapshot scope: see snapshot_scope in package-manifest.json. For Amped FIVE or Magnet DVR Examiner handoff steps, see docs/COMMERCIAL_HANDOFF.md in the FrameTrace repository.\n"
-        ),
-    )
-    .map_err(|err| format!("failed to write package README: {err}"))?;
+    let mut readme = format!(
+        "FrameTrace case package\n\n{report_note} Verify package contents with manifest.sha256 before transfer (`frametrace verify-package <package-dir>` checks the manifest, audit chains and sign-off and reports what it could not verify).\n\nSnapshot scope: see snapshot_scope in package-manifest.json. For Amped FIVE or Magnet DVR Examiner handoff steps, see docs/COMMERCIAL_HANDOFF.md in the FrameTrace repository.\n"
+    );
+    if let Some(redaction) = &context.redaction {
+        readme.push_str(&redaction_readme_section(redaction));
+    }
+    if !warnings.is_empty() {
+        readme.push_str("\nWARNINGS\n");
+        for warning in &warnings {
+            readme.push_str(&format!("- {warning}\n"));
+        }
+    }
+    write_text(&output_dir.join("README.txt"), &readme)
+        .map_err(|err| format!("failed to write package README: {err}"))?;
 
     Ok(PackageResult {
         output_dir,
         file_count: files.len(),
         manifest_path,
+        warnings,
+        path_redacted: context.redaction.is_some(),
     })
+}
+
+/// README section of a path-redacted package: what was rewritten and —
+/// stated, never implied — which packaged files still carry absolute paths.
+fn redaction_readme_section(redaction: &PackageRedaction) -> String {
+    const LIST_LIMIT: usize = 200;
+    let mut out = String::from(
+        "\nPATH REDACTION\nThe report and review pages of this package were generated with --redact-paths, and package-case rewrote the documents listed below as path-redacted copies (absolute paths shown as <case>/... or <redacted:hash>). Rewritten copies differ from the case files they came from: a hash recorded elsewhere for the original (for example manifest_sha256 in artifacts/joined/join-log.jsonl) does not match the redacted copy.\n\nRewritten (path-redacted) copies:\n",
+    );
+    if redaction.rewritten.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    for rel in &redaction.rewritten {
+        out.push_str(&format!("- {rel}\n"));
+    }
+    out.push_str("\nFILES NOT PATH-REDACTED (copied byte-for-byte; they may contain absolute source and case paths): the SQLite database and index files are the case data itself, hash-chained audit logs cannot be rewritten without breaking their chain hashes, and binary media/images were not inspected.\n");
+    for rel in redaction.not_redacted.iter().take(LIST_LIMIT) {
+        out.push_str(&format!("- {rel}\n"));
+    }
+    if redaction.not_redacted.len() > LIST_LIMIT {
+        out.push_str(&format!(
+            "- ... and {} more (full list: path_redaction.not_redacted_files in package-manifest.json)\n",
+            redaction.not_redacted.len() - LIST_LIMIT
+        ));
+    }
+    out
+}
+
+/// How a path-redacted package treats one file.
+enum RedactedCopy {
+    /// Copy verbatim; `listed` = it may hold absolute paths and goes into
+    /// the not-redacted list.
+    Verbatim { listed: bool },
+    /// Write this redacted text instead of the case file.
+    Rewrite(String),
+}
+
+fn is_text_document(rel: &Path) -> bool {
+    matches!(
+        rel.extension().and_then(|ext| ext.to_str()),
+        Some("md" | "html" | "json" | "jsonl" | "csv" | "tsv" | "xml" | "txt" | "dfxml")
+    )
+}
+
+/// A `.jsonl` whose first record carries chain fields.
+fn is_chained_jsonl(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        })
+        .is_some_and(|value| {
+            value.get("previous_entry_sha256").is_some() || value.get("entry_sha256").is_some()
+        })
+}
+
+fn classify_redacted_copy(
+    case_dir: &Path,
+    rel: &Path,
+    source: &Path,
+    redactor: &crate::redact::Redactor,
+) -> Result<RedactedCopy, String> {
+    let rel_text = rel_manifest_path(rel);
+    if rel_text == crate::custody::CUSTODY_REL_PATH {
+        return crate::custody::render_statement(case_dir, true)
+            .map(RedactedCopy::Rewrite)
+            .map_err(|err| {
+                format!(
+                    "package-case refused: cannot render the path-redacted custody statement: {err}"
+                )
+            });
+    }
+    if REDACTABLE_PAGES.contains(&rel_text.as_str()) || rel_text == DATA_BUNDLE_REL {
+        // Generated redacted (mode check above); the bundle is written by
+        // the same make-review run as the viewer page.
+        return Ok(RedactedCopy::Verbatim { listed: false });
+    }
+    let raw_data = rel.starts_with("db") || rel == Path::new("case.json");
+    if raw_data || !is_text_document(rel) {
+        return Ok(RedactedCopy::Verbatim { listed: true });
+    }
+    let is_jsonl = rel.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
+    if is_jsonl && is_chained_jsonl(source) {
+        return Ok(RedactedCopy::Verbatim { listed: true });
+    }
+    let text = fs::read_to_string(source).map_err(|err| {
+        format!(
+            "failed to read package source {} for path redaction: {err}",
+            source.display()
+        )
+    })?;
+    if rel.extension().and_then(|ext| ext.to_str()) == Some("html")
+        && crate::redact::html_is_redacted(&text)
+    {
+        return Ok(RedactedCopy::Verbatim { listed: false });
+    }
+    // JSON is redacted value by value (string escapes decoded first); text
+    // that does not parse as JSON/JSONL is scanned as plain text instead,
+    // so a malformed document never passes through unredacted.
+    let parses_as_json = serde_json::from_str::<serde_json::Value>(&text).is_ok()
+        || text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok());
+    let rewritten = match rel.extension().and_then(|ext| ext.to_str()) {
+        Some("json" | "jsonl") if parses_as_json => redactor.json_text(&text),
+        _ => redactor.text(&text),
+    };
+    Ok(RedactedCopy::Rewrite(rewritten))
 }
 
 fn estimate_package_bytes(case_dir: &Path, output_dir: &Path) -> u64 {
@@ -314,6 +520,7 @@ fn copy_package_dir(
     output_dir: &Path,
     rel_dir: &Path,
     files: &mut Vec<PackageFile>,
+    context: &mut PackageContext,
 ) -> Result<(), String> {
     let source_dir = case_dir.join(rel_dir);
     if !source_dir.is_dir() {
@@ -343,9 +550,9 @@ fn copy_package_dir(
             ));
         }
         if file_type.is_dir() {
-            copy_package_dir(case_dir, output_dir, &rel, files)?;
+            copy_package_dir(case_dir, output_dir, &rel, files, context)?;
         } else if file_type.is_file() && is_report_file(&rel) {
-            copy_package_file(case_dir, output_dir, &rel, files)?;
+            copy_package_file(case_dir, output_dir, &rel, files, context)?;
         }
     }
     Ok(())
@@ -356,6 +563,7 @@ fn copy_package_file(
     output_dir: &Path,
     rel: &Path,
     files: &mut Vec<PackageFile>,
+    context: &mut PackageContext,
 ) -> Result<(), String> {
     let source = case_dir.join(rel);
     let metadata = match fs::symlink_metadata(&source) {
@@ -382,10 +590,35 @@ fn copy_package_file(
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create package directory: {err}"))?;
     }
+    let redacted_copy = match context.redaction.as_ref() {
+        Some(redaction) => Some(classify_redacted_copy(
+            case_dir,
+            rel,
+            &source,
+            &redaction.redactor,
+        )?),
+        None => None,
+    };
+    if let (Some(redaction), Some(copy)) = (context.redaction.as_mut(), &redacted_copy) {
+        match copy {
+            RedactedCopy::Rewrite(_) => redaction.rewritten.push(rel_manifest_path(rel)),
+            RedactedCopy::Verbatim { listed: true } => {
+                redaction.not_redacted.push(rel_manifest_path(rel))
+            }
+            RedactedCopy::Verbatim { listed: false } => {}
+        }
+    }
     if rel == Path::new("db/case.db") {
         let conn = crate::case_db::open_readonly_case_db(&source)?;
         conn.backup(rusqlite::MAIN_DB, &target, None)
             .map_err(|err| format!("failed to snapshot package SQLite database: {err}"))?;
+    } else if let Some(RedactedCopy::Rewrite(text)) = &redacted_copy {
+        write_text(&target, text).map_err(|err| {
+            format!(
+                "failed to write path-redacted package copy {}: {err}",
+                target.display()
+            )
+        })?;
     } else {
         fs::copy(&source, &target).map_err(|err| {
             format!(
@@ -407,40 +640,101 @@ fn copy_package_file(
 
 /// The workstation's not-yet-promoted finalize sign-off (mirrors
 /// `serve::jobs::SIGNOFF_PENDING_REL_PATH`).
-const SIGNOFF_PENDING_REL_PATH: &str = "review/signoff.pending.json";
+pub const SIGNOFF_PENDING_REL_PATH: &str = "review/signoff.pending.json";
 
-/// Packages the sign-off the packaged report was rendered with, as
-/// `review/signoff.json`: during finalize that is the pending record
-/// (make-report ran with `--signoff <pending>`, and promotion happens only
-/// after this package succeeds); otherwise the promoted record. Returns the
-/// case-relative source, which the manifest records as `signoff_source`.
+/// Reads a sign-off record (`None` when absent; a symlink is refused).
+fn read_signoff_record(case_dir: &Path, rel: &str) -> Result<Option<Vec<u8>>, String> {
+    let source = case_dir.join(rel);
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "package source cannot be a symlink: {}",
+            source.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    fs::read(&source)
+        .map(Some)
+        .map_err(|err| format!("failed to read sign-off {}: {err}", source.display()))
+}
+
+/// The packaged sign-off: its case-relative source and the bytes read.
+type ChosenSignoff = Option<(&'static str, Vec<u8>)>;
+
+/// I10: which sign-off record to package. The packaged report names the
+/// record it was rendered from (`report::signoff_source_marker`):
+/// - the pending record only when the report was rendered from it (a
+///   finalize in progress: make-report ran with `--signoff <pending>`, and
+///   promotion happens only after this package succeeds);
+/// - otherwise the promoted record. A pending record left by an
+///   interrupted finalize is never packaged in its place — it is reported
+///   as a warning, as is a report naming a different record.
+fn choose_signoff(case_dir: &Path) -> Result<(ChosenSignoff, Vec<String>), String> {
+    let promoted_rel = crate::report::SIGNOFF_REL_PATH;
+    let pending = read_signoff_record(case_dir, SIGNOFF_PENDING_REL_PATH)?;
+    let promoted = read_signoff_record(case_dir, promoted_rel)?;
+    let report = fs::read_to_string(case_dir.join("reports/case-report.html")).ok();
+    let named = report
+        .as_deref()
+        .and_then(crate::report::report_signoff_sha256)
+        .map(str::to_string);
+    let digest = |bytes: &[u8]| crate::sha256::digest_bytes(bytes);
+    let mut warnings = Vec::new();
+    if let Some(text) = &pending
+        && named.as_deref() == Some(digest(text).as_str())
+    {
+        return Ok((
+            Some((SIGNOFF_PENDING_REL_PATH, pending.unwrap_or_default())),
+            warnings,
+        ));
+    }
+    if pending.is_some() {
+        warnings.push(format!(
+            "{SIGNOFF_PENDING_REL_PATH} was not packaged: the packaged report was not rendered from it (left over from an interrupted finalize?). {}",
+            if promoted.is_some() {
+                format!("The promoted {promoted_rel} was packaged instead.")
+            } else {
+                "No sign-off record was packaged.".to_string()
+            }
+        ));
+    }
+    let Some(promoted) = promoted else {
+        return Ok((None, warnings));
+    };
+    if let Some(named) = &named
+        && named != &digest(&promoted)
+    {
+        warnings.push(format!(
+            "reports/case-report.html names a different sign-off record than the packaged {promoted_rel}; regenerate the report (`frametrace make-report <case-dir>`) and package again"
+        ));
+    }
+    Ok((Some((promoted_rel, promoted)), warnings))
+}
+
+/// Packages the chosen sign-off ([`choose_signoff`]) as
+/// `review/signoff.json`. Returns the case-relative source, which the
+/// manifest records as `signoff_source`, and the warnings.
 fn copy_signoff(
     case_dir: &Path,
     output_dir: &Path,
     files: &mut Vec<PackageFile>,
-) -> Result<Option<&'static str>, String> {
+) -> Result<(Option<&'static str>, Vec<String>), String> {
     let promoted = crate::report::SIGNOFF_REL_PATH;
-    for source_rel in [SIGNOFF_PENDING_REL_PATH, promoted] {
+    let (chosen, warnings) = choose_signoff(case_dir)?;
+    if let Some((source_rel, bytes)) = chosen {
         let source = case_dir.join(source_rel);
-        let metadata = match fs::symlink_metadata(&source) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "package source cannot be a symlink: {}",
-                source.display()
-            ));
-        }
-        if !metadata.is_file() {
-            continue;
-        }
         let target = output_dir.join(promoted);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create package directory: {err}"))?;
         }
-        fs::copy(&source, &target).map_err(|err| {
+        // The bytes compared with the report's marker are the bytes packaged.
+        fs::write(&target, &bytes).map_err(|err| {
             format!(
                 "failed to copy sign-off {} into the package: {err}",
                 source.display()
@@ -453,9 +747,9 @@ fn copy_signoff(
                 .map_err(|err| format!("failed to stat packaged sign-off: {err}"))?
                 .len(),
         });
-        return Ok(Some(source_rel));
+        return Ok((Some(source_rel), warnings));
     }
-    Ok(None)
+    Ok((None, warnings))
 }
 
 /// Outcome of one `verify-package` check.
@@ -1044,14 +1338,16 @@ fn copy_optional_package_file(
     rel: &Path,
     files: &mut Vec<PackageFile>,
     missing_optional_files: &mut Vec<PathBuf>,
+    context: &mut PackageContext,
 ) -> Result<(), String> {
     if !case_dir.join(rel).is_file() {
         missing_optional_files.push(rel.to_path_buf());
         return Ok(());
     }
-    copy_package_file(case_dir, output_dir, rel, files)
+    copy_package_file(case_dir, output_dir, rel, files, context)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn package_manifest_json(
     created_unix: u64,
     files: &[PackageFile],
@@ -1059,6 +1355,8 @@ fn package_manifest_json(
     running_jobs: &[crate::case_db::RunningJob],
     quiescent: bool,
     signoff_source: Option<&str>,
+    warnings: &[String],
+    redaction: Option<&PackageRedaction>,
 ) -> String {
     let mut out = String::new();
     out.push_str("{\n");
@@ -1122,6 +1420,20 @@ fn package_manifest_json(
             .map(|rel| format!("\"{}\"", json_escape(rel)))
             .unwrap_or_else(|| "null".to_string())
     ));
+    out.push_str(&format!(
+        "  \"warnings\": {},\n",
+        serde_json::to_string(warnings).unwrap_or_else(|_| "[]".to_string())
+    ));
+    let path_redaction = match redaction {
+        Some(redaction) => serde_json::json!({
+            "applied": true,
+            "rewritten_files": redaction.rewritten,
+            "not_redacted_files": redaction.not_redacted,
+            "note": "Rewritten files are path-redacted copies and differ from the case files (hashes recorded elsewhere for the originals do not match them). Files in not_redacted_files were copied byte-for-byte and may contain absolute paths: database, index files, hash-chained audit logs (never rewritten, to keep their chain hashes), binary media.",
+        }),
+        None => serde_json::json!({"applied": false}),
+    };
+    out.push_str(&format!("  \"path_redaction\": {path_redaction},\n"));
     let pdf_note = if files
         .iter()
         .any(|file| file.relative_path == Path::new("reports/case-report.html"))
@@ -1181,17 +1493,18 @@ mod tests {
                 &crate::cli::handlers::signoff_content_json(&case_dir).unwrap(),
             );
             fs::create_dir_all(case_dir.join("review")).unwrap();
-            fs::write(
-                case_dir.join("review/signoff.pending.json"),
-                format!(
-                    "{{\"schema_version\":3,\"examiner\":\"홍길동\",\"signed_unix\":5,\"content_sha256\":\"{content}\"}}\n"
-                ),
-            )
-            .unwrap();
+            let pending = format!(
+                "{{\"schema_version\":3,\"examiner\":\"홍길동\",\"signed_unix\":5,\"content_sha256\":\"{content}\"}}\n"
+            );
+            fs::write(case_dir.join("review/signoff.pending.json"), &pending).unwrap();
             fs::create_dir_all(case_dir.join("reports")).unwrap();
+            // A report rendered from the pending record names it (I10).
             fs::write(
                 case_dir.join("reports/case-report.html"),
-                "<html><body><div>검토자: <strong>홍길동</strong></div></body></html>",
+                format!(
+                    "<html><body>{}<div>검토자: <strong>홍길동</strong></div></body></html>",
+                    crate::report::signoff_source_marker(&pending)
+                ),
             )
             .unwrap();
             let output = root.join("package");
@@ -1349,6 +1662,226 @@ mod tests {
         }
     }
     use std::fs;
+
+    fn manifest_of(output: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(output.join("package-manifest.json")).unwrap())
+            .unwrap()
+    }
+
+    /// I10: a pending record left by an interrupted finalize never replaces
+    /// the promoted sign-off the report was rendered from; it is a warning.
+    #[test]
+    fn stale_pending_signoff_is_not_packaged_over_the_promoted_one() {
+        let root = fixture("stale-pending");
+        let case_dir = root.join("case");
+        fs::create_dir_all(case_dir.join("review")).unwrap();
+        fs::create_dir_all(case_dir.join("reports")).unwrap();
+        let promoted = "{\"schema_version\":3,\"examiner\":\"A\",\"signed_unix\":5}\n";
+        let stale = "{\"schema_version\":3,\"examiner\":\"B\",\"signed_unix\":9}\n";
+        fs::write(case_dir.join("review/signoff.json"), promoted).unwrap();
+        fs::write(case_dir.join("review/signoff.pending.json"), stale).unwrap();
+        fs::write(
+            case_dir.join("reports/case-report.html"),
+            format!(
+                "<html><body>{}검토자: <strong>A</strong></body></html>",
+                crate::report::signoff_source_marker(promoted)
+            ),
+        )
+        .unwrap();
+        let output = root.join("package");
+        let result = package_case(&case_dir, Some(&output)).unwrap();
+        assert_eq!(
+            fs::read_to_string(output.join("review/signoff.json")).unwrap(),
+            promoted
+        );
+        let manifest = manifest_of(&output);
+        assert_eq!(manifest["signoff_source"], "review/signoff.json");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(result.warnings[0].contains("signoff.pending.json was not packaged"));
+        assert_eq!(manifest["warnings"][0], result.warnings[0].as_str());
+        assert!(
+            fs::read_to_string(output.join("README.txt"))
+                .unwrap()
+                .contains("WARNINGS")
+        );
+
+        // Only a pending record the report does not name: nothing packaged.
+        fs::remove_file(case_dir.join("review/signoff.json")).unwrap();
+        let second = root.join("package2");
+        let result = package_case(&case_dir, Some(&second)).unwrap();
+        assert!(!second.join("review/signoff.json").exists());
+        assert!(manifest_of(&second)["signoff_source"].is_null());
+        assert!(result.warnings[0].contains("No sign-off record was packaged"));
+
+        // The report names the pending record (finalize in progress): it
+        // is packaged, with no warning.
+        fs::write(
+            case_dir.join("reports/case-report.html"),
+            format!(
+                "<html><body>{}</body></html>",
+                crate::report::signoff_source_marker(stale)
+            ),
+        )
+        .unwrap();
+        fs::write(case_dir.join("review/signoff.json"), promoted).unwrap();
+        let third = root.join("package3");
+        let result = package_case(&case_dir, Some(&third)).unwrap();
+        assert_eq!(
+            fs::read_to_string(third.join("review/signoff.json")).unwrap(),
+            stale
+        );
+        assert_eq!(
+            manifest_of(&third)["signoff_source"],
+            "review/signoff.pending.json"
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// I4: a package built from `--redact-paths` pages also redacts the
+    /// custody statement, report-side text documents and join manifests,
+    /// copies chained logs and the database verbatim (chains intact), and
+    /// lists every file it could not redact.
+    #[test]
+    fn redacted_package_covers_documents_and_lists_what_it_cannot_redact() {
+        let root = fixture("redact");
+        let case_dir = root.join("case");
+        let secret = if cfg!(windows) {
+            r"D:\Secret Evidence\cam1.mp4"
+        } else {
+            "/secret-evidence/cam1.mp4"
+        };
+        let case_text = case_dir.to_string_lossy().to_string();
+        let redacted_page = format!(
+            "<html><body>{}<p>redacted</p></body></html>",
+            crate::redact::REDACTION_MARKER
+        );
+        fs::create_dir_all(case_dir.join("reports")).unwrap();
+        fs::create_dir_all(case_dir.join("review")).unwrap();
+        fs::write(case_dir.join("reports/case-report.html"), &redacted_page).unwrap();
+        fs::write(case_dir.join("review/index.html"), &redacted_page).unwrap();
+        fs::create_dir_all(case_dir.join("artifacts/joined")).unwrap();
+        let manifest_rel = "artifacts/joined/join_x.manifest.json";
+        fs::write(
+            case_dir.join(manifest_rel),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "kind": "frametrace-join-manifest",
+                "segments": [{"source_path": secret}],
+                "output": case_dir.join("artifacts/joined/join_x.mp4"),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let log = case_dir.join("artifacts/joined/join-log.jsonl");
+        crate::audit::append_chained_jsonl_keyed(
+            &log,
+            &serde_json::json!({"event": "join-video", "source": secret}).to_string(),
+            None,
+        )
+        .unwrap();
+        fs::write(
+            case_dir.join("reports/notes.txt"),
+            format!("exported from {secret} and kept in {case_text}\n"),
+        )
+        .unwrap();
+        fs::write(
+            case_dir.join("reports/known-hash-filter.json"),
+            serde_json::json!({"source": secret, "note": format!("see {secret} again")})
+                .to_string(),
+        )
+        .unwrap();
+        crate::custody::generate(&case_dir).unwrap();
+        let output = root.join("package");
+        let result = package_case(&case_dir, Some(&output)).unwrap();
+        assert!(result.path_redacted);
+
+        let leaks = |rel: &str| {
+            let text = fs::read_to_string(output.join(rel)).unwrap();
+            text.contains("Secret") || text.contains("secret-evidence") || text.contains(&case_text)
+        };
+        for rel in [
+            manifest_rel,
+            "reports/notes.txt",
+            "reports/known-hash-filter.json",
+            crate::custody::CUSTODY_REL_PATH,
+        ] {
+            assert!(!leaks(rel), "{rel} still carries an absolute path");
+        }
+        let custody = fs::read_to_string(output.join(crate::custody::CUSTODY_REL_PATH)).unwrap();
+        assert!(crate::redact::html_is_redacted(&custody));
+        // The case copy of the statement is untouched (redaction is
+        // package-only).
+        assert!(!crate::redact::html_is_redacted(
+            &fs::read_to_string(case_dir.join(crate::custody::CUSTODY_REL_PATH)).unwrap()
+        ));
+        // Chained log: byte-identical, chain still verifies, listed.
+        let packaged_log = output.join("artifacts/joined/join-log.jsonl");
+        assert_eq!(fs::read(&packaged_log).unwrap(), fs::read(&log).unwrap());
+        crate::audit::verify_chained_jsonl(&packaged_log).unwrap();
+        let manifest = manifest_of(&output);
+        let listed = |key: &str| -> Vec<String> {
+            manifest["path_redaction"][key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(manifest["path_redaction"]["applied"], true);
+        let not_redacted = listed("not_redacted_files");
+        for rel in [
+            "db/case.db",
+            "artifacts/joined/join-log.jsonl",
+            "db/videos.jsonl",
+        ] {
+            assert!(
+                not_redacted.contains(&rel.to_string()),
+                "{rel}: {not_redacted:?}"
+            );
+        }
+        let rewritten = listed("rewritten_files");
+        assert!(
+            rewritten.contains(&manifest_rel.to_string()),
+            "{rewritten:?}"
+        );
+        assert!(!rewritten.contains(&"reports/case-report.html".to_string()));
+        let readme = fs::read_to_string(output.join("README.txt")).unwrap();
+        assert!(readme.contains("FILES NOT PATH-REDACTED"));
+        assert!(readme.contains("- db/case.db"));
+        assert!(readme.contains("- artifacts/joined/join-log.jsonl"));
+        // The redacted package still verifies.
+        let verification = super::verify_package(&output).unwrap();
+        assert!(verification.passed(), "{:?}", verification.checks);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// I4: a redacted report next to an unredacted review would leak the
+    /// paths the report hides — refused, naming both.
+    #[test]
+    fn mixed_redaction_state_is_refused() {
+        let root = fixture("redact-mixed");
+        let case_dir = root.join("case");
+        fs::create_dir_all(case_dir.join("reports")).unwrap();
+        fs::create_dir_all(case_dir.join("review")).unwrap();
+        fs::write(
+            case_dir.join("reports/case-report.html"),
+            format!(
+                "<html><body>{}</body></html>",
+                crate::redact::REDACTION_MARKER
+            ),
+        )
+        .unwrap();
+        fs::write(
+            case_dir.join("review/index.html"),
+            "<html><body></body></html>",
+        )
+        .unwrap();
+        let err = package_case(&case_dir, Some(&root.join("package"))).unwrap_err();
+        assert!(err.contains("reports/case-report.html"), "{err}");
+        assert!(err.contains("review/index.html"), "{err}");
+        assert!(!root.join("package").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn fixture(name: &str) -> std::path::PathBuf {
         let root =

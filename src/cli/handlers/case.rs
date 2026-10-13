@@ -6,7 +6,9 @@ use crate::model::{CaseManifest, ScanOptions};
 use crate::package;
 use crate::report;
 use crate::scan;
-use crate::util::{create_case_layout, now_unix, read_to_string, write_text};
+// I14: every report/review output is replaced atomically (temp + rename),
+// so a crash mid-write never leaves a torn court document.
+use crate::util::{create_case_layout, now_unix, read_to_string, write_text_atomic as write_text};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -332,25 +334,37 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let manifest_path = case_dir.join("case.json");
     let manifest_json = read_to_string(&manifest_path)
         .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
+    let redactor = crate::redact::Redactor::new(case_dir);
     let redact = |text: &str| -> String {
         if redact_paths {
-            crate::redact::redact_json_text(text, case_dir)
+            redactor.json_text(text)
         } else {
             text.to_string()
         }
     };
+    // I4: in redacted mode the generated pages never embed the real case
+    // directory either (the viewer's `caseDir`, the carve report's root);
+    // a placeholder root keeps relative artifact paths readable.
+    let page_case_dir: &Path = if redact_paths {
+        Path::new("<case>")
+    } else {
+        case_dir
+    };
+    // Thumbnails and proxies are built from the real paths; only what the
+    // pages embed is redacted.
+    let videos = collect_index_videos(&index_json);
     let manifest_json = redact(&manifest_json);
     let index_json = redact(&index_json);
     let html = html_report::render_review_html(&manifest_json, &index_json);
     let review_path = case_dir.join("review/index.html");
     write_text(&review_path, &inject_redaction_banner(html, redact_paths))
         .map_err(|err| format!("failed to write review html: {err}"))?;
-    let carve_log = redact(
-        &read_to_string(&case_dir.join("artifacts/carved/carve-log.jsonl")).unwrap_or_default(),
-    );
-    let filesystem_log = redact(
-        &read_to_string(&case_dir.join("evidence/logs/tsk-audit.jsonl")).unwrap_or_default(),
-    );
+    let carve_log_raw =
+        read_to_string(&case_dir.join("artifacts/carved/carve-log.jsonl")).unwrap_or_default();
+    let filesystem_log_raw =
+        read_to_string(&case_dir.join("evidence/logs/tsk-audit.jsonl")).unwrap_or_default();
+    let carve_log = redact(&carve_log_raw);
+    let filesystem_log = redact(&filesystem_log_raw);
     let validation_log = redact(
         &read_to_string(&case_dir.join("evidence/logs/validation-log.jsonl")).unwrap_or_default(),
     );
@@ -365,16 +379,16 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     // so an examiner who needs the standalone bundle to just play asks for
     // proxies up front instead of per-file through the workstation button.
     if build_proxies {
-        build_unplayable_proxies(case_dir, &carve_log, &filesystem_log)?;
+        build_unplayable_proxies(case_dir, &carve_log_raw, &filesystem_log_raw)?;
     }
-    let videos = collect_index_videos(&index_json);
     let (thumbs_json, thumb_stats) = generate_review_thumbnails(case_dir, &videos)?;
-    let annotations_json = crate::case_db::review_annotations_json(case_dir)?;
-    let deepfake_reports = crate::deepfake::collect_reports(case_dir).to_string();
-    let telemetry_reports = crate::telemetry::collect_reports(case_dir).to_string();
+    // I4: notes, tags and reports can quote paths mid-string; redacted too.
+    let annotations_json = redact(&crate::case_db::review_annotations_json(case_dir)?);
+    let deepfake_reports = redact(&crate::deepfake::collect_reports(case_dir).to_string());
+    let telemetry_reports = redact(&crate::telemetry::collect_reports(case_dir).to_string());
     // Proxies already on disk are embedded so the viewer (including the
     // standalone file:// bundle) can prefer them for unplayable originals.
-    let proxies_json = collect_proxies_json(case_dir);
+    let proxies_json = redact(&collect_proxies_json(case_dir));
     // Court-exhibit data additions (plan §1.9/§2.4): the join audit lane and
     // the compact measured-sound map, both redacted/bound like the others.
     // U2: each entry carries the joined record's `record_id` (the id the
@@ -402,7 +416,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         &proxies_json,
         &join_log,
         &audio_levels_json,
-        case_dir,
+        page_case_dir,
     );
     write_text(&case_dir.join("review/data-bundle.js"), &data_bundle)
         .map_err(|err| format!("failed to write review data bundle: {err}"))?;
@@ -419,12 +433,20 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     if !carve_log.trim().is_empty() {
         let carve_results =
             redact(&read_to_string(&case_dir.join("db/carve_results.json")).unwrap_or_default());
+        // Redacted in-case outputs read `<case>/…`; handed to the carve page
+        // as case-relative paths they resolve against the placeholder root
+        // instead of being re-joined onto it.
+        let carve_log_for_page = if redact_paths {
+            strip_case_placeholder(&carve_log)
+        } else {
+            carve_log.clone()
+        };
         let carve_report = html_report::render_carve_report_html(
             &manifest_json,
-            &carve_log,
+            &carve_log_for_page,
             &carve_results,
             &proxies_json,
-            case_dir,
+            page_case_dir,
             &index_json,
         );
         let carve_report_path = case_dir.join("review/carve-report.html");
@@ -454,6 +476,30 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     Ok(())
 }
 
+/// Rewrites redacted `<case>/rel` output paths of a JSONL log back to the
+/// case-relative `rel` (I4, carve page in redacted mode). Other values and
+/// unparseable lines pass through.
+fn strip_case_placeholder(jsonl: &str) -> String {
+    jsonl
+        .lines()
+        .map(|line| {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+                return line.to_string();
+            };
+            if let Some(rel) = value
+                .get("output_path")
+                .and_then(|v| v.as_str())
+                .and_then(|p| p.strip_prefix("<case>/"))
+                .map(str::to_string)
+            {
+                value["output_path"] = serde_json::Value::String(rel);
+            }
+            value.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Inserts the redaction notice right after `<body>` so generated pages that
 /// do not take an explicit flag still visibly mark themselves as redacted.
 fn inject_redaction_banner(html: String, redact_paths: bool) -> String {
@@ -461,7 +507,8 @@ fn inject_redaction_banner(html: String, redact_paths: bool) -> String {
         return html;
     }
     let banner = format!(
-        "<div style=\"padding:8px 16px;background:#fff7ed;border-bottom:1px solid #f4c790;font-size:13px\">{}</div>",
+        "{}<div style=\"padding:8px 16px;background:#fff7ed;border-bottom:1px solid #f4c790;font-size:13px\">{}</div>",
+        crate::redact::REDACTION_MARKER,
         crate::util::html_escape(crate::redact::REDACTION_NOTE)
     );
     match html.find("<body>") {
@@ -700,13 +747,17 @@ pub fn make_report(
         legacy: report::signoff_content_sha256(&review_marks_json_from_rows(&mark_rows)),
     };
     let annotations_json = report_annotations_json(&mark_rows, &tag_rows);
+    let redactor = crate::redact::Redactor::new(case_dir);
     let redact = |text: String| -> String {
         if redact_paths {
-            crate::redact::redact_json_text(&text, case_dir)
+            redactor.json_text(&text)
         } else {
             text
         }
     };
+    // I9: re-verify every audit log the report quotes, so its chain columns
+    // state what was checked instead of implying tamper-evidence.
+    let audit_chains_json = redact(report_audit_chains_json(case_dir));
     let manifest_json = redact(manifest_json);
     let index_json = redact(index_json);
     let export_log = redact(export_log);
@@ -720,23 +771,35 @@ pub fn make_report(
     let join_log = redact(join_log);
     let scan_runs_json = redact(scan_runs_json);
     let annotations_json = redact(annotations_json);
-    let html = report::render_case_report(&report::ReportInputs {
-        manifest_json: &manifest_json,
-        index_json: &index_json,
-        export_log_jsonl: &export_log,
-        proxy_log_jsonl: &proxy_log,
-        thumbnail_log_jsonl: &thumbnail_log,
-        carve_log_jsonl: &carve_log,
-        filesystem_log_jsonl: &filesystem_log,
-        validation_log_jsonl: &validation_log,
-        anomaly_log_jsonl: &anomaly_log,
-        batch_log_jsonl: &batch_log,
-        join_log_jsonl: &join_log,
-        audio_levels_json: &audio_levels_json,
-        scan_runs_json: &scan_runs_json,
-        marks_json: &annotations_json,
-        redaction_applied: redact_paths,
-    });
+    let html = report::render_case_report_with_chains(
+        &report::ReportInputs {
+            manifest_json: &manifest_json,
+            index_json: &index_json,
+            export_log_jsonl: &export_log,
+            proxy_log_jsonl: &proxy_log,
+            thumbnail_log_jsonl: &thumbnail_log,
+            carve_log_jsonl: &carve_log,
+            filesystem_log_jsonl: &filesystem_log,
+            validation_log_jsonl: &validation_log,
+            anomaly_log_jsonl: &anomaly_log,
+            batch_log_jsonl: &batch_log,
+            join_log_jsonl: &join_log,
+            audio_levels_json: &audio_levels_json,
+            scan_runs_json: &scan_runs_json,
+            marks_json: &annotations_json,
+            redaction_applied: redact_paths,
+        },
+        &audit_chains_json,
+    );
+    // I10: a pending record left by an interrupted finalize is never read
+    // as the sign-off; say it is there instead of ignoring it silently.
+    if signoff_path.is_none() && case_dir.join(package::SIGNOFF_PENDING_REL_PATH).is_file() {
+        eprintln!(
+            "warning: {} is left over from an interrupted finalize and was ignored; the report uses {} (finalize again, or remove the pending file)",
+            package::SIGNOFF_PENDING_REL_PATH,
+            report::SIGNOFF_REL_PATH
+        );
+    }
     // Finalize sign-off: the reviewer name recorded by the workstation (as
     // typed - not an authenticated identity) is printed and shown in the report.
     // `signoff_path` is the workstation's not-yet-promoted record of an
@@ -755,7 +818,13 @@ pub fn make_report(
                 "검토자: {examiner} (최종화 시 입력된 이름, 신원 미인증) — {}",
                 currency.label()
             );
-            report::inject_signoff_banner(html, &examiner, signed_unix, currency)
+            report::inject_signoff_banner(
+                html,
+                &examiner,
+                signed_unix,
+                currency,
+                signoff_text.as_deref().unwrap_or_default(),
+            )
         }
         None => html,
     };
@@ -763,6 +832,47 @@ pub fn make_report(
     write_text(&report_path, &html).map_err(|err| format!("failed to write report html: {err}"))?;
     println!("report written: {}", report_path.display());
     Ok(())
+}
+
+/// The audit logs the case report quotes, by the report's lane name.
+const REPORT_AUDIT_LOGS: &[(&str, &str)] = &[
+    ("export", "artifacts/clips/export-log.jsonl"),
+    ("proxy", "artifacts/proxies/proxy-log.jsonl"),
+    ("thumbnail", "artifacts/thumbnails/thumbnail-log.jsonl"),
+    ("carve", "artifacts/carved/carve-log.jsonl"),
+    ("filesystem", "evidence/logs/tsk-audit.jsonl"),
+    ("validation", "evidence/logs/validation-log.jsonl"),
+    ("anomaly", "evidence/logs/anomaly-log.jsonl"),
+    ("batch", "artifacts/logs/batch-log.jsonl"),
+    ("join", "artifacts/joined/join-log.jsonl"),
+];
+
+/// I9: chain verification of each quoted log, as the report's
+/// `auditChains` map (`status`: keyed / structural / failed / absent).
+pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
+    let mut map = serde_json::Map::new();
+    for (name, rel) in REPORT_AUDIT_LOGS {
+        let path = case_dir.join(rel);
+        let entry = if !path.is_file() {
+            serde_json::json!({"path": rel, "status": "absent", "entries": 0})
+        } else {
+            match crate::audit::verify_chained_jsonl(&path) {
+                Ok(result) => serde_json::json!({
+                    "path": rel,
+                    "status": if result.integrity == crate::audit::AuditIntegrity::Keyed { "keyed" } else { "structural" },
+                    "entries": result.entries,
+                    "detail": result.warnings.join("; "),
+                }),
+                Err(err) => serde_json::json!({
+                    "path": rel,
+                    "status": "failed",
+                    "detail": err,
+                }),
+            }
+        };
+        map.insert((*name).to_string(), entry);
+    }
+    serde_json::Value::Object(map).to_string()
 }
 
 pub fn make_custody(case_dir: &Path) -> Result<(), String> {
@@ -823,6 +933,14 @@ pub fn package_case(case_dir: &Path, options: PackageOptions) -> Result<(), Stri
     println!("output: {}", result.output_dir.display());
     println!("files: {}", result.file_count);
     println!("manifest: {}", result.manifest_path.display());
+    if result.path_redacted {
+        println!(
+            "path redaction: report/review/custody/text documents redacted; database, index files and chained audit logs are NOT path-redacted (listed in README.txt)"
+        );
+    }
+    for warning in &result.warnings {
+        println!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -1297,5 +1415,179 @@ mod annotation_json_tests {
             serde_json::json!({"in": 2.0, "out": null})
         );
         assert_eq!(value["tags"], serde_json::json!({}));
+    }
+}
+
+#[cfg(test)]
+mod report_output_tests {
+    use super::{InitCaseOptions, init_case, make_report, make_review};
+    use crate::model::ScanOptions;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// A scanned case (one indexed file, no ffprobe/hash) under a fresh
+    /// temp root; the source folder name is distinctive so a leak is easy
+    /// to spot. Returns `(root, case_dir, source_dir)`.
+    fn scanned_case(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "frametrace-report-out-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let case_dir = root.join("case");
+        let source_dir = root.join("SourceSecretDir");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("a.mp4"), b"\0\0\0\x18ftypmp42one").unwrap();
+        init_case(&case_dir, &InitCaseOptions::default()).unwrap();
+        crate::scan::scan_folder(
+            &case_dir,
+            &source_dir,
+            &ScanOptions {
+                hash_files: false,
+                use_ffprobe: false,
+                ..ScanOptions::default()
+            },
+            crate::checkpoint::ResumeMode::Auto,
+            None,
+        )
+        .unwrap();
+        (root, case_dir, source_dir)
+    }
+
+    fn json_spellings(path: &Path) -> [String; 2] {
+        let text = path.to_string_lossy().to_string();
+        let escaped = serde_json::to_string(&text).unwrap();
+        [text, escaped.trim_matches('"').to_string()]
+    }
+
+    /// I14: the report is replaced through a temp file + rename — a failed
+    /// write leaves the previous report intact instead of a torn one.
+    #[test]
+    fn failed_report_write_keeps_the_previous_report() {
+        let (root, case_dir, _source) = scanned_case("atomic");
+        make_report(&case_dir, false, false, None).unwrap();
+        let report = case_dir.join("reports/case-report.html");
+        let before = fs::read(&report).unwrap();
+        let temp = case_dir.join(format!(
+            "reports/.case-report.html.tmp-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(temp.join("blocker")).unwrap();
+        assert!(make_report(&case_dir, false, false, None).is_err());
+        assert_eq!(fs::read(&report).unwrap(), before);
+        fs::remove_dir_all(&temp).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// I9: make-report re-verifies the quoted logs and embeds the result.
+    #[test]
+    fn report_embeds_audit_chain_verification() {
+        let (root, case_dir, _source) = scanned_case("chains");
+        make_report(&case_dir, false, false, None).unwrap();
+        let html = fs::read_to_string(case_dir.join("reports/case-report.html")).unwrap();
+        let line = html
+            .lines()
+            .find(|line| line.starts_with("const auditChains = "))
+            .unwrap();
+        let chains: serde_json::Value = serde_json::from_str(
+            line.trim_start_matches("const auditChains = ")
+                .trim_end_matches(';')
+                .replace("\\u003c", "<")
+                .replace("\\u003e", ">")
+                .replace("\\u0026", "&")
+                .as_str(),
+        )
+        .unwrap();
+        // make-report's own anomaly scan wrote a chained log.
+        let anomaly = chains["anomaly"]["status"].as_str().unwrap();
+        assert!(matches!(anomaly, "structural" | "keyed"), "{chains}");
+        assert_eq!(chains["export"]["status"], "absent");
+        assert!(!html.contains("변조 방지"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// I4: `--redact-paths` reaches notes with mid-string paths and leaves
+    /// no absolute source or case path in the report, review page or
+    /// viewer data bundle.
+    #[test]
+    fn redacted_report_and_review_carry_no_absolute_paths() {
+        let (root, case_dir, source_dir) = scanned_case("redact");
+        let id = crate::case_db::load_video_ids(&case_dir).unwrap()[0]
+            .id
+            .clone();
+        crate::case_db::upsert_review_marks(
+            &case_dir,
+            &[crate::case_db::ReviewMarkRow {
+                record_id: id,
+                status: "important".into(),
+                marked_unix: 9,
+                note: Some(format!(
+                    "원본 사본은 {} 에 보관",
+                    source_dir.join("copy.mp4").display()
+                )),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        make_report(&case_dir, false, true, None).unwrap();
+        make_review(&case_dir, true, false).unwrap();
+        let canonical_source =
+            crate::util::strip_windows_extended_prefix(&source_dir.canonicalize().unwrap());
+        let canonical_case =
+            crate::util::strip_windows_extended_prefix(&case_dir.canonicalize().unwrap());
+        for rel in [
+            "reports/case-report.html",
+            "review/index.html",
+            "review/data-bundle.js",
+        ] {
+            let text = fs::read_to_string(case_dir.join(rel)).unwrap();
+            for path in [&source_dir, &canonical_source, &case_dir, &canonical_case] {
+                for spelling in json_spellings(path) {
+                    assert!(!text.contains(&spelling), "{rel} leaks {spelling}");
+                }
+            }
+            assert!(
+                !text.contains("SourceSecretDir"),
+                "{rel} leaks the source folder"
+            );
+        }
+        for rel in [
+            "reports/case-report.html",
+            "review/index.html",
+            "review/evidence-viewer.html",
+        ] {
+            let html = fs::read_to_string(case_dir.join(rel)).unwrap();
+            assert!(crate::redact::html_is_redacted(&html), "{rel} unmarked");
+        }
+        assert!(
+            fs::read_to_string(case_dir.join("review/data-bundle.js"))
+                .unwrap()
+                .contains("caseDir:\"\\u003ccase\\u003e\"")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// I10: without `--signoff`, a leftover pending record is not the
+    /// report's sign-off; the report names the promoted record it used.
+    #[test]
+    fn report_uses_promoted_signoff_and_names_it() {
+        let (root, case_dir, _source) = scanned_case("signoff");
+        let promoted = "{\"schema_version\":3,\"examiner\":\"Promoted\",\"signed_unix\":5}\n";
+        fs::create_dir_all(case_dir.join("review")).unwrap();
+        fs::write(case_dir.join("review/signoff.json"), promoted).unwrap();
+        fs::write(
+            case_dir.join("review/signoff.pending.json"),
+            "{\"schema_version\":3,\"examiner\":\"Stale\",\"signed_unix\":9}\n",
+        )
+        .unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        let html = fs::read_to_string(case_dir.join("reports/case-report.html")).unwrap();
+        assert!(html.contains("<strong>Promoted</strong>"));
+        assert!(!html.contains("Stale"));
+        assert_eq!(
+            crate::report::report_signoff_sha256(&html),
+            Some(crate::sha256::digest_bytes(promoted.as_bytes()).as_str())
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
