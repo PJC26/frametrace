@@ -13,8 +13,22 @@
 //! `db/video_paths.tsv`, upserts the new rows into `db/case.db`, and appends
 //! one chained audit entry per source case to
 //! `evidence/logs/case-merge-log.jsonl`.
+//!
+//! Review annotations (marks, notes, IN/OUT ranges, tags, mark history)
+//! follow their records to the renumbered ids
+//! ([`crate::case_db::merge_annotations`]): they are written to the target
+//! database in one transaction after the index rows and before the audit
+//! entries, so a failed annotation write rolls back every annotation and
+//! leaves no success audit line. The three index files and the database are
+//! still written one after another (not atomic as a set, I8); re-running the
+//! merge after a failure re-maps the already-indexed records by path and
+//! applies the annotations idempotently.
 
 use crate::audit;
+use crate::case_db::merge_annotations::{
+    AnnotationMergeCounts, MergedIdMapping, SourceAnnotationMerge, SourceAnnotations,
+    apply_merge_annotations, load_source_annotations,
+};
 use crate::case_db::{IndexedVideoRow, upsert_indexed_rows};
 use crate::scan::{json_record_lines, set_json_field, tsv_escape};
 use crate::util::{json_escape, now_unix, read_to_string, write_text_atomic};
@@ -30,6 +44,8 @@ pub struct MergeSourceSummary {
     pub case_dir: PathBuf,
     pub merged_records: usize,
     pub duplicate_records: usize,
+    /// What happened to this source's review annotations.
+    pub annotations: AnnotationMergeCounts,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +55,23 @@ pub struct MergeResult {
     pub merged_records: usize,
     pub duplicate_records: usize,
     pub sources: Vec<MergeSourceSummary>,
+}
+
+impl MergeResult {
+    /// Annotation counts summed over every source.
+    pub fn annotation_totals(&self) -> AnnotationMergeCounts {
+        let mut total = AnnotationMergeCounts::default();
+        for source in &self.sources {
+            let counts = &source.annotations;
+            total.marks_merged += counts.marks_merged;
+            total.tags_merged += counts.tags_merged;
+            total.notes_appended += counts.notes_appended;
+            total.marks_conflicted += counts.marks_conflicted;
+            total.history_rows_copied += counts.history_rows_copied;
+            total.annotations_unmapped += counts.annotations_unmapped;
+        }
+        total
+    }
 }
 
 /// Merge every `source_case_dirs` index into `case_dir`'s index. Sources are
@@ -87,7 +120,7 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
 
     // Validate every source before mutating anything: a failure here must
     // leave the target index and its audit log untouched.
-    let mut sources: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut sources: Vec<(PathBuf, Vec<String>, SourceAnnotations)> = Vec::new();
     for source_dir in source_case_dirs {
         let source_root = source_dir.canonicalize().map_err(|err| {
             format!(
@@ -102,16 +135,20 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
             ));
         }
         let source_lines = read_index_lines(&source_root, true)?;
-        sources.push((source_root, source_lines));
+        // Read annotations up front too: an unreadable source database must
+        // fail the merge before anything is written, never drop its marks.
+        let annotations = load_source_annotations(&source_root)?;
+        sources.push((source_root, source_lines, annotations));
     }
 
-    let mut audit_lines = Vec::new();
     let mut summaries = Vec::new();
+    let mut mappings: Vec<Vec<MergedIdMapping>> = Vec::new();
     let generated_unix = now_unix()?;
 
-    for (source_root, source_lines) in &sources {
+    for (source_root, source_lines, _) in &sources {
         let mut merged = 0usize;
         let mut duplicates = 0usize;
+        let mut mapping: Vec<MergedIdMapping> = Vec::new();
         for line in source_lines {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
@@ -136,6 +173,11 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
                 if !entries.contains(&provenance) {
                     entries.push(provenance);
                 }
+                mapping.push(MergedIdMapping {
+                    original_id: original_id.clone(),
+                    new_id: string_field(&kept, "id"),
+                    source_path: source_path.clone(),
+                });
                 existing_lines[position] = kept.to_string();
                 duplicates += 1;
                 continue;
@@ -176,6 +218,11 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
                     &format!("\"{}\"", json_escape(duplicate_of)),
                 );
             }
+            mapping.push(MergedIdMapping {
+                original_id: original_id.clone(),
+                new_id: new_id.clone(),
+                source_path: source_path.clone(),
+            });
             positions_by_path.insert(source_path, existing_lines.len());
             existing_lines.push(merged_line);
             merged += 1;
@@ -184,16 +231,9 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
             case_dir: source_root.clone(),
             merged_records: merged,
             duplicate_records: duplicates,
+            annotations: AnnotationMergeCounts::default(),
         });
-        let line = format!(
-            "{{\"schema_version\":1,\"event\":\"merge-cases\",\"generated_unix\":{},\"label\":\"{}\",\"source_case\":\"{}\",\"merged_records\":{},\"duplicate_records\":{}}}",
-            generated_unix,
-            LABEL,
-            json_escape(&source_root.to_string_lossy()),
-            merged,
-            duplicates,
-        );
-        audit_lines.push(line);
+        mappings.push(mapping);
     }
 
     // Deterministic ordering: existing records keep their (lower) id order
@@ -224,6 +264,36 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
         })
         .collect::<Result<Vec<_>, _>>()?;
     upsert_indexed_rows(case_dir, &rows, generated_unix)?;
+    let plans: Vec<SourceAnnotationMerge<'_>> = sources
+        .iter()
+        .zip(&mappings)
+        .map(
+            |((source_root, _, annotations), mapping)| SourceAnnotationMerge {
+                source_case: source_root.to_string_lossy().into_owned(),
+                mapping,
+                annotations,
+            },
+        )
+        .collect();
+    let outcome = apply_merge_annotations(case_dir, &plans, generated_unix)?;
+    let mut audit_lines = Vec::new();
+    for (summary, counts) in summaries.iter_mut().zip(outcome.per_source) {
+        audit_lines.push(format!(
+            "{{\"schema_version\":1,\"event\":\"merge-cases\",\"generated_unix\":{},\"label\":\"{}\",\"source_case\":\"{}\",\"merged_records\":{},\"duplicate_records\":{},\"marks_merged\":{},\"tags_merged\":{},\"notes_appended\":{},\"marks_conflicted\":{},\"history_rows_copied\":{},\"annotations_unmapped\":{}}}",
+            generated_unix,
+            LABEL,
+            json_escape(&summary.case_dir.to_string_lossy()),
+            summary.merged_records,
+            summary.duplicate_records,
+            counts.marks_merged,
+            counts.tags_merged,
+            counts.notes_appended,
+            counts.marks_conflicted,
+            counts.history_rows_copied,
+            counts.annotations_unmapped,
+        ));
+        summary.annotations = counts;
+    }
     for line in audit_lines {
         audit::append_chained_jsonl(&case_dir.join("evidence/logs/case-merge-log.jsonl"), &line)?;
     }
@@ -774,6 +844,334 @@ mod tests {
         let rows = jsonl_ids(&target);
         assert_eq!(rows[0]["id"].as_str(), Some("vid_000001"));
         assert_eq!(rows[0]["merged_from_id"].as_str(), Some("vid_000004"));
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    fn annotate(
+        case_dir: &Path,
+        id: &str,
+        status: &str,
+        note: Option<&str>,
+        range: Option<(f64, f64)>,
+        tags: &[&str],
+    ) {
+        crate::case_db::patch_review_annotations_by(
+            case_dir,
+            &[crate::case_db::ReviewMarkRow {
+                record_id: id.into(),
+                status: status.into(),
+                marked_unix: 42,
+                record_path: None,
+                examiner: Some("lee".into()),
+                note: note.map(str::to_string),
+                range: range.map(|(start, end)| crate::case_db::RangeSpan {
+                    start: Some(start),
+                    end: Some(end),
+                }),
+            }],
+            &[crate::selection::TagEntry {
+                id: id.into(),
+                tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            }],
+            &[],
+            Some("lee"),
+        )
+        .unwrap();
+    }
+
+    fn tags_of(case_dir: &Path, id: &str) -> Vec<String> {
+        crate::case_db::load_review_tags(case_dir)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.tags)
+            .unwrap_or_default()
+    }
+
+    fn mark_of(case_dir: &Path, id: &str) -> Option<crate::case_db::ReviewMarkRow> {
+        crate::case_db::load_review_marks(case_dir)
+            .unwrap()
+            .into_iter()
+            .find(|mark| mark.record_id == id)
+    }
+
+    fn source_case_string(source: &Path) -> String {
+        source
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn audit_entries(case_dir: &Path) -> Vec<serde_json::Value> {
+        read_to_string(&case_dir.join("evidence/logs/case-merge-log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// I2: a merged record's mark, note, range, tags and history follow it
+    /// to its renumbered id.
+    #[test]
+    fn merge_moves_marks_notes_ranges_tags_and_history_under_new_ids() {
+        let target = temp_case(
+            "ann-move-t",
+            Some(&row("vid_000001", "/ev/a.mp4", 10, Some("aa"))),
+        );
+        let source = temp_case(
+            "ann-move-s",
+            Some(&row("vid_000001", "/ev/b.mp4", 20, Some("bb"))),
+        );
+        annotate(
+            &source,
+            "vid_000001",
+            "relevant",
+            Some("첫 메모"),
+            None,
+            &["사고"],
+        );
+        annotate(
+            &source,
+            "vid_000001",
+            "important",
+            Some("둘째 메모"),
+            Some((1.5, 4.0)),
+            &["사고", "보류"],
+        );
+        let source_history = crate::case_db::load_review_mark_history(&source, None).unwrap();
+        assert_eq!(source_history.len(), 4, "{source_history:?}");
+
+        let result = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        let counts = &result.sources[0].annotations;
+        assert_eq!(counts.marks_merged, 1);
+        assert_eq!(counts.tags_merged, 1);
+        assert_eq!(counts.history_rows_copied, 4);
+        assert_eq!(counts.marks_conflicted, 0);
+        assert_eq!(counts.annotations_unmapped, 0);
+
+        // Under the NEW id only; the original id never leaks into the target.
+        assert!(mark_of(&target, "vid_000001").is_none());
+        assert!(tags_of(&target, "vid_000001").is_empty());
+        let merged = mark_of(&target, "vid_000002").unwrap();
+        assert_eq!(merged.status, "important");
+        assert_eq!(merged.note.as_deref(), Some("둘째 메모"));
+        assert_eq!(merged.examiner.as_deref(), Some("lee"));
+        assert_eq!(merged.marked_unix, 42);
+        assert_eq!(merged.record_path.as_deref(), Some("/ev/b.mp4"));
+        assert_eq!(
+            merged.range,
+            Some(crate::case_db::RangeSpan {
+                start: Some(1.5),
+                end: Some(4.0)
+            })
+        );
+        assert_eq!(tags_of(&target, "vid_000002"), ["보류", "사고"]);
+
+        let history =
+            crate::case_db::load_review_mark_history(&target, Some("vid_000002")).unwrap();
+        assert_eq!(history.len(), source_history.len() + 1);
+        for (copied, original) in history.iter().zip(&source_history) {
+            assert_eq!(copied.action, original.action);
+            assert_eq!(copied.changed_unix, original.changed_unix);
+            assert_eq!(copied.new_note, original.new_note);
+            assert_eq!(copied.new_tags_json, original.new_tags_json);
+        }
+        assert_eq!(history.last().unwrap().action, "merge");
+        let conn = crate::case_db::open_readonly_case_db(&target.join("db/case.db")).unwrap();
+        let details: Vec<String> = conn
+            .prepare("SELECT detail FROM review_mark_history WHERE record_id = 'vid_000002' ORDER BY history_pk")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let case = source_case_string(&source);
+        assert!(details[0].starts_with(&format!(
+            "merged-history from {case} record vid_000001 history_pk "
+        )));
+        assert!(
+            details
+                .last()
+                .unwrap()
+                .contains("\"original_id\":\"vid_000001\"")
+        );
+
+        // Marks stay a subset of indexed ids; stores agree.
+        let ids = crate::case_db::load_video_ids(&target).unwrap();
+        for mark in crate::case_db::load_review_marks(&target).unwrap() {
+            assert!(ids.iter().any(|id| id.id == mark.record_id));
+        }
+        assert!(
+            crate::qa::consistency_report(&target, &target.join("qa"))
+                .unwrap()
+                .passed
+        );
+
+        let audit = audit_entries(&target);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0]["marks_merged"], 1);
+        assert_eq!(audit[0]["tags_merged"], 1);
+        assert_eq!(audit[0]["notes_appended"], 0);
+        assert_eq!(audit[0]["marks_conflicted"], 0);
+        assert_eq!(audit[0]["history_rows_copied"], 4);
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    fn conflict_cases(name: &str) -> (PathBuf, PathBuf) {
+        let target = temp_case(
+            &format!("{name}-t"),
+            Some(&row("vid_000007", "/ev/shared.mp4", 10, Some("aa"))),
+        );
+        annotate(
+            &target,
+            "vid_000007",
+            "relevant",
+            Some("keep"),
+            None,
+            &["a"],
+        );
+        let source = temp_case(
+            &format!("{name}-s"),
+            Some(&row("vid_000001", "/ev/shared.mp4", 10, Some("aa"))),
+        );
+        annotate(
+            &source,
+            "vid_000001",
+            "important",
+            Some("src note\n둘째 줄"),
+            Some((2.0, 3.0)),
+            &["b", "a"],
+        );
+        (target, source)
+    }
+
+    /// I2: on an id the target already annotated, the target mark wins; the
+    /// source note is appended once, tags are unioned, and the source mark
+    /// survives verbatim in a `merge-skipped` history row.
+    #[test]
+    fn merge_conflict_keeps_target_mark_appends_note_unions_tags_and_keeps_source_in_history() {
+        let (target, source) = conflict_cases("ann-conflict");
+        let result = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        let counts = &result.sources[0].annotations;
+        assert_eq!(counts.marks_merged, 0);
+        assert_eq!(counts.marks_conflicted, 1);
+        assert_eq!(counts.notes_appended, 1);
+        assert_eq!(counts.tags_merged, 1);
+        assert_eq!(counts.history_rows_copied, 2);
+
+        let kept = mark_of(&target, "vid_000007").unwrap();
+        assert_eq!(kept.status, "relevant");
+        assert_eq!(kept.range, None);
+        let case = source_case_string(&source);
+        assert_eq!(
+            kept.note.as_deref(),
+            Some(format!("keep\n[병합 {case} vid_000001] src note\n둘째 줄").as_str())
+        );
+        assert_eq!(tags_of(&target, "vid_000007"), ["a", "b"]);
+        assert!(mark_of(&target, "vid_000001").is_none());
+
+        let history =
+            crate::case_db::load_review_mark_history(&target, Some("vid_000007")).unwrap();
+        let boundary = history.last().unwrap();
+        assert_eq!(boundary.action, "merge-skipped");
+        assert_eq!(boundary.old_note.as_deref(), Some("keep"));
+        assert_eq!(boundary.new_note, kept.note);
+        assert_eq!(boundary.new_status.as_deref(), Some("relevant"));
+        assert_eq!(boundary.old_tags_json.as_deref(), Some("[\"a\"]"));
+        assert_eq!(boundary.new_tags_json.as_deref(), Some("[\"a\",\"b\"]"));
+        let conn = crate::case_db::open_readonly_case_db(&target.join("db/case.db")).unwrap();
+        let detail: String = conn
+            .query_row(
+                "SELECT detail FROM review_mark_history WHERE action = 'merge-skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["source_case"], case.as_str());
+        assert_eq!(detail["original_id"], "vid_000001");
+        assert_eq!(detail["source_mark"]["status"], "important");
+        assert_eq!(detail["source_mark"]["note"], "src note\n둘째 줄");
+        assert_eq!(detail["source_mark"]["range"]["in"], 2.0);
+        assert_eq!(audit_entries(&target)[0]["marks_conflicted"], 1);
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// I2 / review point 9: merging the same source again adds no second
+    /// note segment, no duplicate history and no tag change.
+    #[test]
+    fn merge_twice_is_idempotent_for_annotations() {
+        let (target, source) = conflict_cases("ann-twice");
+        // Plus a record that is new to the target on the first merge and
+        // "kept" (same path) on the second.
+        let mut lines = read_to_string(&source.join("db/videos.jsonl")).unwrap();
+        lines.push_str(&row("vid_000002", "/ev/new.mp4", 30, Some("cc")));
+        fs::write(source.join("db/videos.jsonl"), lines).unwrap();
+        annotate(
+            &source,
+            "vid_000002",
+            "important",
+            Some("new note"),
+            Some((1.0, 2.0)),
+            &["x"],
+        );
+
+        merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        let marks = crate::case_db::load_review_marks(&target).unwrap();
+        let tags = crate::case_db::load_review_tags(&target).unwrap();
+        let history = crate::case_db::load_review_mark_history(&target, None).unwrap();
+
+        let again = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        let counts = &again.sources[0].annotations;
+        assert_eq!(counts.marks_merged, 0);
+        assert_eq!(counts.notes_appended, 0);
+        assert_eq!(counts.tags_merged, 0);
+        assert_eq!(counts.history_rows_copied, 0);
+        assert_eq!(crate::case_db::load_review_marks(&target).unwrap(), marks);
+        assert_eq!(crate::case_db::load_review_tags(&target).unwrap(), tags);
+        assert_eq!(
+            crate::case_db::load_review_mark_history(&target, None).unwrap(),
+            history
+        );
+        let note = mark_of(&target, "vid_000007").unwrap().note.unwrap();
+        assert_eq!(note.matches("[병합 ").count(), 1, "{note}");
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// I2: one transaction — a failing history write leaves every target
+    /// mark and tag as it was and appends no success audit line.
+    #[test]
+    fn merge_annotation_write_failure_rolls_back_everything() {
+        let (target, source) = conflict_cases("ann-rollback");
+        let mut lines = read_to_string(&source.join("db/videos.jsonl")).unwrap();
+        lines.push_str(&row("vid_000002", "/ev/new.mp4", 30, Some("cc")));
+        fs::write(source.join("db/videos.jsonl"), lines).unwrap();
+        annotate(&source, "vid_000002", "important", Some("n"), None, &["x"]);
+        let marks = crate::case_db::load_review_marks(&target).unwrap();
+        let tags = crate::case_db::load_review_tags(&target).unwrap();
+        let history = crate::case_db::load_review_mark_history(&target, None).unwrap();
+        let conn = rusqlite::Connection::open(target.join("db/case.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_history BEFORE INSERT ON review_mark_history BEGIN SELECT RAISE(ABORT, 'induced history failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = merge_cases(&target, std::slice::from_ref(&source)).unwrap_err();
+        assert!(err.contains("induced history failure"), "{err}");
+        assert_eq!(crate::case_db::load_review_marks(&target).unwrap(), marks);
+        assert_eq!(crate::case_db::load_review_tags(&target).unwrap(), tags);
+        assert_eq!(
+            crate::case_db::load_review_mark_history(&target, None).unwrap(),
+            history
+        );
+        assert!(!target.join("evidence/logs/case-merge-log.jsonl").exists());
         let _ = fs::remove_dir_all(&target);
         let _ = fs::remove_dir_all(&source);
     }

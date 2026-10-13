@@ -12,6 +12,10 @@ pub struct ReportInputs<'a> {
     pub anomaly_log_jsonl: &'a str,
     pub batch_log_jsonl: &'a str,
     pub scan_runs_json: &'a str,
+    /// Review annotations shown in the "판독" column: the
+    /// `report_annotations_json` object (`{"marks":[...],"tags":{...}}`,
+    /// marks with IN-OUT ranges). A bare legacy marks array is still
+    /// accepted (no ranges/tags then). Display only — never digested.
     pub marks_json: &'a str,
     /// True when the caller already redacted absolute paths in every input;
     /// the report then shows the redaction notice instead of silently
@@ -221,7 +225,7 @@ const validationLog = {validation_lines};
 const anomalyLog = {anomaly_lines};
 const batchLog = {batch_lines};
 const scanRuns = {scan_runs};
-const marks = {marks};
+const annotations = {marks};
 const redaction = {{"applied": {}}};
 const videos = Array.isArray(scan.videos) ? scan.videos : [];
 const warnings = Array.isArray(scan.warnings) ? scan.warnings : [];
@@ -434,7 +438,30 @@ document.getElementById("filesystem-recovery").innerHTML = filesystemLog.length 
   </tbody>
 </table>` : "<p>파일시스템 조사 또는 inode 복구 기록이 없습니다.</p>";
 
-const marksById = new Map((Array.isArray(marks) ? marks : []).map(mark => [mark.id, mark]));
+// `annotations` is {{marks:[...], tags:{{id:[...]}}}}; a bare marks array
+// (pre-I3 callers) is still accepted.
+const annotationMarks = Array.isArray(annotations) ? annotations : (Array.isArray(annotations?.marks) ? annotations.marks : []);
+const annotationTags = !Array.isArray(annotations) && annotations?.tags && typeof annotations.tags === "object" ? annotations.tags : {{}};
+const marksById = new Map(annotationMarks.map(mark => [mark.id, mark]));
+const tagsById = new Map(Object.entries(annotationTags).filter(([, tags]) => Array.isArray(tags) && tags.length));
+const fmtSeconds = value => typeof value === "number" && Number.isFinite(value) ? `${{Number.isInteger(value) ? value.toFixed(1) : value}}s` : "—";
+const multiline = value => escapeHtml(value).replaceAll("\n", "<br>");
+function markCell(id) {{
+  const mark = marksById.get(id);
+  const tags = tagsById.get(id) || [];
+  const parts = [];
+  if (mark) {{
+    parts.push(escapeHtml(markLabel(mark.status)));
+    if (mark.note) parts.push(`<span class="muted">${{multiline(mark.note)}}</span>`);
+    if (mark.examiner) parts.push(`<span class="muted">검토자: ${{escapeHtml(mark.examiner)}}</span>`);
+    const range = mark.range;
+    if (range && (Number.isFinite(range.in) || Number.isFinite(range.out))) {{
+      parts.push(`<span class="muted">구간: ${{escapeHtml(fmtSeconds(range.in))}} ~ ${{escapeHtml(fmtSeconds(range.out))}}</span>`);
+    }}
+  }}
+  if (tags.length) parts.push(`<span class="muted">태그: ${{tags.map(escapeHtml).join(", ")}}</span>`);
+  return parts.length ? parts.join("<br>") : "-";
+}}
 function validationForRow(row) {{
   const byExactPath = validationLog.filter(item => item.target_path === row.where);
   const eligible = byExactPath.filter(item => /^[a-fA-F0-9]{{64}}$/.test(row.hash) &&
@@ -492,14 +519,13 @@ function techniqueRows() {{
 
 document.getElementById("techniques").innerHTML = techniqueRows().length ? `<table>
   <thead>
-    <tr><th>ID</th><th>구분</th><th>발견 기법</th><th>파서 평가</th><th>위치 / 근원</th><th>시각</th><th>메타데이터</th><th>SHA-256</th><th>검증 상태 / 근거</th><th>판독</th></tr>
+    <tr><th>ID</th><th>구분</th><th>발견 기법</th><th>파서 평가</th><th>위치 / 근원</th><th>시각</th><th>메타데이터</th><th>SHA-256</th><th>검증 상태 / 근거</th><th>판독 (상태·메모·구간·태그)</th></tr>
   </thead>
   <tbody>
     ${{techniqueRows().map(row => {{
       const validation = validationForRow(row);
       const status = validation?.validation_status || (row.kind === "원본 (논리 파일)" ? "색인됨 (재생성 검증 전)" : "candidate-unvalidated");
       const reason = validation ? (validation.validation_note || validation.ffprobe_error || "-") : "재생성 검증 대기 — 판독자 재생 확인 필요";
-      const mark = marksById.get(row.id);
       return `<tr>
         <td>${{escapeHtml(row.id)}}</td>
         <td>${{escapeHtml(row.kind)}}</td>
@@ -510,7 +536,7 @@ document.getElementById("techniques").innerHTML = techniqueRows().length ? `<tab
         <td>${{escapeHtml(row.meta)}}</td>
         <td><code>${{escapeHtml(row.hash)}}</code></td>
         <td>${{escapeHtml(status)}}<br><span class="muted">${{escapeHtml(reason)}}</span></td>
-        <td>${{mark ? escapeHtml(markLabel(mark.status)) + (mark.note ? `<br><span class="muted">${{escapeHtml(mark.note)}}</span>` : "") + (mark.examiner ? `<br><span class="muted">검토자: ${{escapeHtml(mark.examiner)}}</span>` : "") : "-"}}</td>
+        <td>${{markCell(row.id)}}</td>
       </tr>`;
     }}).join("")}}
   </tbody>
@@ -680,7 +706,7 @@ pub fn signoff_banner_html(examiner: &str, signed_unix: i64, currency: SignoffCu
         SignoffCurrency::Current => (
             "#eef4f8",
             "#b9d0e0",
-            " — 이 기록 이후 판독 마크는 변경되지 않았습니다 (상태·메모·IN-OUT 구간·태그 모두 일치).".to_string(),
+            " — 이 기록 이후 판독 마크는 변경되지 않았습니다 (상태·메모·IN-OUT 구간·태그 모두 일치). (아래 '판독' 열에 구간·태그 표시)".to_string(),
         ),
         SignoffCurrency::Changed => (
             "#fce8e6",
@@ -870,6 +896,16 @@ mod tests {
     }
 
     fn rendered_techniques(index: &str, validation: &str, carve: &str, filesystem: &str) -> String {
+        rendered_techniques_with(index, validation, carve, filesystem, "[]")
+    }
+
+    fn rendered_techniques_with(
+        index: &str,
+        validation: &str,
+        carve: &str,
+        filesystem: &str,
+        annotations: &str,
+    ) -> String {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
@@ -880,7 +916,7 @@ mod tests {
             ("carve", carve),
             ("filesystem", filesystem),
             ("scan_runs", "[]"),
-            ("marks", "[]"),
+            ("marks", annotations),
         ]);
         let script = html
             .split_once("<script>")
@@ -1057,6 +1093,105 @@ mod tests {
         assert!(html.contains("논리 파일 스캔"));
         assert!(html.contains("중요"));
         assert!(html.contains("scan-folder (스캔·색인)"));
+    }
+
+    fn three_videos() -> String {
+        serde_json::json!({"videos": [
+            {"id": "vid_1", "source_path": "/evidence/a.mp4"},
+            {"id": "vid_2", "source_path": "/evidence/b.mp4"},
+            {"id": "vid_3", "source_path": "/evidence/c.mp4"},
+        ]})
+        .to_string()
+    }
+
+    /// The row of `id` in the rendered techniques table.
+    fn row_of<'a>(rows: &'a str, id: &str) -> &'a str {
+        let start = rows
+            .find(&format!("<td>{id}</td>"))
+            .unwrap_or_else(|| panic!("no row for {id}: {rows}"));
+        let end = rows[start..]
+            .find("</tr>")
+            .map_or(rows.len(), |i| start + i);
+        &rows[start..end]
+    }
+
+    /// The last ("판독") cell of a rendered row.
+    fn mark_cell(row: &str) -> &str {
+        let start = row.rfind("<td>").unwrap() + "<td>".len();
+        let end = start + row[start..].find("</td>").unwrap();
+        &row[start..end]
+    }
+
+    /// I3: the "판독" column shows status, note, examiner, IN-OUT range and
+    /// tags, all escaped (a `<` in a tag or note never becomes markup).
+    #[test]
+    fn report_mark_column_shows_range_and_tags() {
+        let annotations = serde_json::json!({
+            "marks": [
+                {"id": "vid_1", "status": "important", "marked_unix": 9, "examiner": "kim<i>",
+                 "note": "첫 줄\n<b>둘째</b>", "range": {"in": 1.5, "out": 4}},
+                {"id": "vid_2", "status": "reviewed", "marked_unix": 9, "examiner": null,
+                 "note": null, "range": {"in": 2, "out": null}},
+            ],
+            "tags": {"vid_1": ["사고", "<script>x</script>"]},
+        })
+        .to_string();
+        let rows = rendered_techniques_with(&three_videos(), "", "", "", &annotations);
+        let first = row_of(&rows, "vid_1");
+        assert!(first.contains("중요"), "{first}");
+        assert!(first.contains("구간: 1.5s ~ 4.0s"), "{first}");
+        assert!(
+            first.contains("태그: 사고, &lt;script&gt;x&lt;/script&gt;"),
+            "{first}"
+        );
+        assert!(
+            first.contains("첫 줄<br>&lt;b&gt;둘째&lt;/b&gt;"),
+            "{first}"
+        );
+        assert!(first.contains("검토자: kim&lt;i&gt;"), "{first}");
+        assert!(!rows.contains("<script>"), "{rows}");
+        assert!(!rows.contains("<b>"), "{rows}");
+        // Only IN set: the open side reads as a dash.
+        let second = row_of(&rows, "vid_2");
+        assert!(second.contains("구간: 2.0s ~ —"), "{second}");
+        assert!(!second.contains("태그:"), "{second}");
+        assert_eq!(mark_cell(row_of(&rows, "vid_3")), "-");
+        let html = render(&[("marks", annotations.as_str())]);
+        assert!(html.contains("판독 (상태·메모·구간·태그)"));
+    }
+
+    /// I3: a record with tags but no mark shows its tags instead of "-".
+    #[test]
+    fn report_tag_only_record_shows_tags() {
+        let annotations =
+            serde_json::json!({"marks": [], "tags": {"vid_3": ["보류", "a&b"]}}).to_string();
+        let rows = rendered_techniques_with(&three_videos(), "", "", "", &annotations);
+        let third = row_of(&rows, "vid_3");
+        assert!(third.contains("태그: 보류, a&amp;b"), "{third}");
+        assert_ne!(mark_cell(third), "-", "{third}");
+        // A pre-I3 bare marks array still renders (no ranges/tags then).
+        let legacy = r#"[{"id":"vid_2","status":"important","marked_unix":9}]"#;
+        let rows = rendered_techniques_with(&three_videos(), "", "", "", legacy);
+        assert!(row_of(&rows, "vid_2").contains("중요"));
+        assert!(!rows.contains("태그:"));
+    }
+
+    #[test]
+    fn current_banner_points_to_the_mark_column_and_legacy_wording_is_unchanged() {
+        use super::{SignoffCurrency, signoff_banner_html};
+        let current = signoff_banner_html("A", 5, SignoffCurrency::Current);
+        assert!(
+            current.contains(
+                "(상태·메모·IN-OUT 구간·태그 모두 일치). (아래 '판독' 열에 구간·태그 표시)"
+            ),
+            "{current}"
+        );
+        assert!(signoff_banner_html("A", 5, SignoffCurrency::LegacyBinding).contains(
+            " — 이 기록은 이전 형식이라 판독 마크의 상태·메모만 대상으로 합니다(이후 변경 없음). IN-OUT 구간·태그가 이후 바뀌었는지는 확인할 수 없습니다 — 다시 최종화하면 함께 기록됩니다.</div>"
+        ));
+        assert!(signoff_banner_html("A", 5, SignoffCurrency::Unbound).contains(
+            " — 이 기록에는 대상 내용의 해시가 없어 이후 판독 마크 변경 여부를 확인할 수 없습니다.</div>"
+        ));
     }
 
     #[test]
