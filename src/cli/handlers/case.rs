@@ -377,9 +377,11 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let proxies_json = collect_proxies_json(case_dir);
     // Court-exhibit data additions (plan §1.9/§2.4): the join audit lane and
     // the compact measured-sound map, both redacted/bound like the others.
-    let join_log = redact(
+    // U2: each entry carries the joined record's `record_id` (the id the
+    // viewer files marks/tags under), also for entries logged before it.
+    let join_log = redact(&crate::join::join_log_with_record_ids(
         &read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default(),
-    );
+    ));
     let audio_levels_json = measured_audio_levels_json(case_dir)?;
     // The viewer page stays slim; the (potentially huge) record payload
     // lives in data-bundle.js beside it. Standalone file:// use loads the
@@ -680,8 +682,9 @@ pub fn make_report(
         read_to_string(&case_dir.join("evidence/logs/anomaly-log.jsonl")).unwrap_or_default();
     let batch_log =
         read_to_string(&case_dir.join("artifacts/logs/batch-log.jsonl")).unwrap_or_default();
-    let join_log =
-        read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default();
+    let join_log = crate::join::join_log_with_record_ids(
+        &read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default(),
+    );
     // Measured-sound map bound to the current index bytes (plan §2.4); the
     // map carries ids/numbers only, so it needs no redaction.
     let audio_levels_json = measured_audio_levels_json(case_dir)?;

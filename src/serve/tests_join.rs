@@ -149,6 +149,9 @@ enum Step {
     /// Writes `.join-<tag>.{part,ffconcat,progress.json}` in the joined
     /// dir (tag = the `--job-tag` argument; progress copied from the file).
     TaggedTemps(PathBuf, PathBuf),
+    /// Copies a claim file to `.join-<tag>.claim.json` in the joined dir.
+    /// Must follow a `TaggedTemps` step (which found the tag).
+    TaggedClaim(PathBuf, PathBuf),
     Spin,
     Exit(i32),
 }
@@ -178,6 +181,11 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
                         progress.display()
                     )
                 }
+                Step::TaggedClaim(dir, claim) => format!(
+                    "cp \"{}\" \"{}/.join-$tag.claim.json\"\n",
+                    claim.display(),
+                    dir.display()
+                ),
                 Step::Spin => "sleep 30\n".to_string(),
                 Step::Exit(code) => format!("exit {code}\n"),
             });
@@ -217,6 +225,11 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
                         progress.display()
                     )
                 }
+                Step::TaggedClaim(dir, claim) => format!(
+                    "copy /y \"{}\" \"{}\\.join-%tag%.claim.json\" >nul\r\n",
+                    claim.display(),
+                    dir.display()
+                ),
                 // No child process: a killed cmd.exe must not leave a
                 // grandchild holding the stdout/stderr pipes open.
                 Step::Spin => ":spin\r\ngoto spin\r\n".to_string(),
@@ -448,8 +461,14 @@ fn join_success_is_verified_reported_and_deduped() {
     let joined = case_dir.join(crate::join::JOINED_DIR);
     let stale_part = joined.join(".join-srv-1-1.part");
     let stale_list = joined.join(".join-srv-1-1.ffconcat");
+    let stale_lock = joined.join(".join-srv-1-1.lock");
     std::fs::write(&stale_part, b"torn").unwrap();
     std::fs::write(&stale_list, b"ffconcat version 1.0\n").unwrap();
+    // Its run lock is free: the job that wrote these is dead (B13).
+    std::fs::write(&stale_lock, b"").unwrap();
+    // A fresh lock-less leftover may belong to a join running elsewhere.
+    let fresh = joined.join(".join-cli-9-9.part");
+    std::fs::write(&fresh, b"busy").unwrap();
     let staged = stage_success(&case_dir, PLAN_ID, None);
     let exe = fake_cli(&case_dir, &success_steps(&staged));
 
@@ -485,7 +504,8 @@ fn join_success_is_verified_reported_and_deduped() {
         serde_json::json!({"expected": 4.0, "observed": 3.98, "ok": true})
     );
     assert_eq!(done["duration_check"]["ok"], true);
-    assert!(!stale_part.exists() && !stale_list.exists());
+    assert!(!stale_part.exists() && !stale_list.exists() && !stale_lock.exists());
+    assert!(fresh.exists(), "a fresh lock-less temp file was removed");
 
     // /api/status lists it as a join beside clip exports.
     let listed = status(&state);
@@ -554,18 +574,36 @@ fn join_failure_removes_temp_files_and_unlogged_outputs() {
         ),
     )
     .unwrap();
-    // The CLI dies after publishing output + manifest (and an output
-    // without its manifest) but before the log append.
+    // B8: a concurrent same-plan job's unlogged output + manifest (fresh,
+    // same plan_id) and a manifest-less output — none of them claimed by
+    // this job — must survive this job's cleanup.
     let lone = joined.join("join_F_20260910-120000_n2__2.mp4");
+    let other = joined.join("join_F_20260910-120000_n2__3.mp4");
+    let other_manifest = joined.join("join_F_20260910-120000_n2__3.manifest.json");
+    // The CLI dies after publishing output + manifest (recorded in its
+    // claim) but before the log append.
     let progress_src = case_dir.join("staging/progress.json");
     std::fs::write(&progress_src, br#"{"stage":"verify","done":0,"total":1}"#).unwrap();
+    let claim_src = case_dir.join("staging").join("claim.json");
+    std::fs::write(
+        &claim_src,
+        serde_json::json!({
+            "output": staged.output.to_string_lossy(),
+            "manifest": staged.manifest.to_string_lossy(),
+        })
+        .to_string(),
+    )
+    .unwrap();
     let exe = fake_cli(
         &case_dir,
         &[
             Step::TaggedTemps(joined.clone(), progress_src),
             Step::Copy(staged.output_src.clone(), staged.output.clone()),
+            Step::TaggedClaim(joined.clone(), claim_src),
             Step::Copy(staged.manifest_src.clone(), staged.manifest.clone()),
             Step::Copy(staged.output_src.clone(), lone.clone()),
+            Step::Copy(staged.output_src.clone(), other.clone()),
+            Step::Copy(staged.manifest_src.clone(), other_manifest.clone()),
             Step::Exit(1),
         ],
     );
@@ -579,7 +617,14 @@ fn join_failure_removes_temp_files_and_unlogged_outputs() {
     );
     assert!(!staged.output.exists(), "unlogged output left behind");
     assert!(!staged.manifest.exists(), "unlogged manifest left behind");
-    assert!(!lone.exists(), "manifest-less output left behind");
+    assert!(
+        lone.exists(),
+        "an output this job never claimed was deleted"
+    );
+    assert!(
+        other.exists() && other_manifest.exists(),
+        "another same-plan job's output was deleted"
+    );
     let leftovers: Vec<String> = std::fs::read_dir(&joined)
         .unwrap()
         .flatten()
@@ -856,8 +901,20 @@ fn measure_audio_runs_as_a_case_job() {
 #[test]
 fn records_meta_carries_join_log_and_bound_audio_levels() {
     let case_dir = temp_case("records-meta");
-    std::fs::write(case_dir.join("db/video_index.json"), r#"{"videos":[]}"#).unwrap();
     write_videos(&case_dir, &[("vid_1", "a.mp4"), ("vid_2", "b.mp4")], 10);
+    // The scan writes the same rows into video_index.json; records-meta
+    // binds levels through that (cached) index (B9).
+    let index_rows: Vec<serde_json::Value> =
+        std::fs::read_to_string(case_dir.join("db/videos.jsonl"))
+            .unwrap()
+            .lines()
+            .map(parse)
+            .collect();
+    std::fs::write(
+        case_dir.join("db/video_index.json"),
+        serde_json::json!({ "videos": index_rows }).to_string(),
+    )
+    .unwrap();
     let state = bound_state(&case_dir);
     // Nothing joined or measured yet: stable empty shapes.
     let empty = parse(&api_records_meta(&state));
@@ -868,7 +925,10 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     let joined = case_dir.join(crate::join::JOINED_DIR);
     std::fs::write(
         joined.join(crate::join::LOG_FILE),
-        "{\"event\":\"join-video\",\"plan_id\":\"p\",\"segment_count\":2}\n{\"torn\":\n",
+        format!(
+            "{{\"event\":\"join-video\",\"plan_id\":\"p\",\"segment_count\":2,\"output_sha256\":\"{}\"}}\n{{\"torn\":\n",
+            "AB".repeat(32)
+        ),
     )
     .unwrap();
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(case_dir.join("db/videos.jsonl"))
@@ -899,11 +959,20 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
     std::fs::write(&log, format!("{entry}\n")).unwrap();
 
+    let computed = || super::records::AUDIO_LEVELS_COMPUTED.with(|c| c.get());
+    let before = computed();
     let meta = parse(&api_records_meta(&state));
     assert_eq!(meta["ok"], true);
     let join_log = meta["joinLog"].as_array().unwrap();
     assert_eq!(join_log.len(), 1, "torn line skipped: {meta}");
     assert_eq!(join_log[0]["event"], "join-video");
+    // U2: the derived record id, from the output bytes (not the name).
+    assert_eq!(join_log[0]["record_id"], "join:abababababababab");
+    assert_eq!(computed(), before + 1);
+    // B9: unchanged lane + index → the cached map, not a recomputation.
+    let again = parse(&api_records_meta(&state));
+    assert_eq!(again["audioLevels"], meta["audioLevels"]);
+    assert_eq!(computed(), before + 1, "second call recomputed the map");
     let levels = &meta["audioLevels"];
     assert_eq!(
         levels["vid_1"],
@@ -911,5 +980,17 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     );
     assert_eq!(levels["vid_2"]["r"], "stale", "{levels}");
     assert!(levels["vid_2"]["max"].is_null());
+    // A new lane entry invalidates the cache.
+    let newer = serde_json::json!({
+        "schema_version": 1, "event": "audio-level", "measured_unix": 99,
+        "method": crate::audio_level::METHOD,
+        "threshold_silent_max_dbfs": crate::audio_level::SILENT_MAX_DBFS,
+        "ffmpeg_version": "test", "command_template": [],
+        "results": [result(&rows[1], 10)],
+    });
+    std::fs::write(&log, format!("{entry}\n{newer}\n")).unwrap();
+    let updated = parse(&api_records_meta(&state));
+    assert_eq!(updated["audioLevels"]["vid_2"]["r"], "sound", "{updated}");
+    assert_eq!(computed(), before + 2);
     let _ = std::fs::remove_dir_all(case_dir);
 }

@@ -137,6 +137,19 @@ pub fn measure_audio(
                 );
             }
             println!("{}", summary.to_json());
+            // B15: exit 0 only when nothing errored. Exit 4 = the run
+            // completed and logged everything, but some files could not be
+            // measured (they stay "미확인"). The last stderr line carries the
+            // count for the server's "완료(오류 N건)" log.
+            if summary.error > 0 {
+                eprintln!(
+                    "{}{}건 (측정 대상 {}건)",
+                    audio_level::ERRORS_LINE_PREFIX,
+                    summary.error,
+                    summary.targets
+                );
+                std::process::exit(audio_level::EXIT_SOME_ERRORS);
+            }
             Ok(())
         }
         Err(err) => {

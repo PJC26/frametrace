@@ -3,12 +3,15 @@
 //! Each audio stream (at most [`MAX_STREAMS`]) is decoded END TO END and
 //! its peak / RMS level in dBFS recorded. A stream whose peak is at or
 //! below [`SILENT_MAX_DBFS`] is a silent track; anything louder has sound.
-//! A decode failure, timeout or `n_samples: 0` is an ERROR (unknown) —
-//! never "silent". Nothing here claims speech or conversation.
+//! A decode failure, a decoder complaint on stderr, a decode that covered
+//! less than the probed track duration (truncated / corrupt file), a
+//! timeout, `n_samples: 0`, or a file whose size/mtime no longer match the
+//! index is an ERROR (unknown) — never "silent" or "sound". Nothing here
+//! claims speech or conversation.
 //!
 //! Results go to the chained lane `evidence/logs/audio-level-log.jsonl`,
-//! one entry per [`LOG_CHUNK`] files (appends re-read the whole log, so
-//! per-file entries would be O(N²)). The case index is not touched.
+//! one entry per [`LOG_CHUNK`] files (each append fsyncs; per-file entries
+//! would mean one fsync per file). The case index is not touched.
 //! A measurement applies to a record only while the record's current
 //! `size_bytes` / `modified_unix` (and SHA-256 when both sides have one)
 //! still equal the measured values; the newest entry for an id wins.
@@ -31,6 +34,51 @@ pub const LOG_CHUNK: usize = 200;
 /// Audio streams measured per file.
 pub const MAX_STREAMS: usize = 4;
 pub const WORKERS: usize = 4;
+/// `measure-audio` exit code when the run completed but some files could
+/// not be measured (B15). 0 means no errors at all.
+pub const EXIT_SOME_ERRORS: i32 = 4;
+/// Prefix of the last stderr line `measure-audio` prints with exit 4,
+/// followed by the error count (`소리 측정 오류 3건 (측정 대상 10건)`).
+pub const ERRORS_LINE_PREFIX: &str = "소리 측정 오류 ";
+
+/// The error count from a failed `measure-audio` step's message when it
+/// exited with [`EXIT_SOME_ERRORS`] (a completed run with errors), else
+/// None (a real failure).
+pub fn partial_error_count(step_error: &str) -> Option<usize> {
+    if !step_error.contains(&format!("(exit Some({EXIT_SOME_ERRORS}))")) {
+        return None;
+    }
+    let rest = &step_error[step_error.rfind(ERRORS_LINE_PREFIX)? + ERRORS_LINE_PREFIX.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// One Korean line summarising a `measure-audio` stdout summary JSON
+/// (`소리 측정 완료: 소리 있음 2 · 무음 1 · 오류 0 · …`), None when the
+/// output carries no summary.
+pub fn summary_log_line(output: &str) -> Option<String> {
+    let value: Value = output
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .and_then(|l| serde_json::from_str(l).ok())?;
+    let n = |k: &str| value.get(k).and_then(Value::as_u64).unwrap_or(0);
+    value.get("targets")?;
+    let errors = n("error");
+    let head = if errors > 0 {
+        format!("소리 측정 완료(오류 {errors}건)")
+    } else {
+        "소리 측정 완료".to_string()
+    };
+    Some(format!(
+        "{head}: 소리 있음 {} · 무음 {} · 오류 {errors} · 이미 측정됨 {} · 트랙 없음 {} · 미프로브 {}",
+        n("sound"),
+        n("silent"),
+        n("skipped_valid"),
+        n("skipped_no_audio"),
+        n("skipped_unprobed"),
+    ))
+}
 
 /// Aggregated `volumedetect` numbers for one stream.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -188,6 +236,10 @@ pub struct FileResult {
     pub result: Verdict,
     pub streams: Vec<StreamResult>,
     pub error: Option<String>,
+    /// When this result was measured, if it differs from its log entry's
+    /// `measured_unix` (results replayed from a crash checkpoint keep their
+    /// original time). Omitted from JSON when None.
+    pub measured_unix: Option<u64>,
 }
 
 fn finite(value: f64) -> Option<f64> {
@@ -196,7 +248,7 @@ fn finite(value: f64) -> Option<f64> {
 
 impl FileResult {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "selector": self.selector,
             "source_path": self.source_path,
             "size_bytes": self.size_bytes,
@@ -215,7 +267,11 @@ impl FileResult {
                 "error": s.error,
             })).collect::<Vec<_>>(),
             "error": self.error,
-        })
+        });
+        if let (Some(at), Some(map)) = (self.measured_unix, value.as_object_mut()) {
+            map.insert("measured_unix".to_string(), json!(at));
+        }
+        value
     }
 
     pub fn from_json(value: &Value) -> Option<Self> {
@@ -254,6 +310,7 @@ impl FileResult {
             result: Verdict::parse(value.get("result")?.as_str()?)?,
             streams,
             error: s(value, "error"),
+            measured_unix: value.get("measured_unix").and_then(Value::as_u64),
         })
     }
 }
@@ -280,25 +337,34 @@ pub fn command_template() -> Vec<String> {
 }
 
 fn stream_args(src: &str, k: &str) -> Vec<String> {
-    ["-nostdin", "-hide_banner", "-v", "info", "-i", src, "-map"]
+    [
+        "-nostdin",
+        "-hide_banner",
+        "-xerror",
+        "-v",
+        "info",
+        "-i",
+        src,
+        "-map",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([format!("0:a:{k}")])
+    .chain(
+        [
+            "-vn",
+            "-sn",
+            "-dn",
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ]
         .iter()
-        .map(|s| s.to_string())
-        .chain([format!("0:a:{k}")])
-        .chain(
-            [
-                "-vn",
-                "-sn",
-                "-dn",
-                "-af",
-                "volumedetect",
-                "-f",
-                "null",
-                "-",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
-        )
-        .collect()
+        .map(|s| s.to_string()),
+    )
+    .collect()
 }
 
 /// One indexed audio stream to measure.
@@ -308,6 +374,37 @@ pub struct AudioStreamInfo {
     pub codec: Option<String>,
     pub sample_rate: Option<u64>,
     pub channels: Option<u64>,
+    /// The stream's own probed duration (seconds), when ffprobe gave one.
+    pub duration_seconds: Option<f64>,
+}
+
+fn stream_infos(probe: &Value) -> Vec<AudioStreamInfo> {
+    probe
+        .get("streams")
+        .and_then(Value::as_array)
+        .map(|streams| {
+            streams
+                .iter()
+                .filter(|st| st.get("codec_type").and_then(Value::as_str) == Some("audio"))
+                .map(|st| AudioStreamInfo {
+                    index: st.get("index").and_then(Value::as_u64),
+                    codec: st
+                        .get("codec_name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    sample_rate: st.get("sample_rate").and_then(num),
+                    channels: st.get("channels").and_then(num),
+                    duration_seconds: st
+                        .get("duration")
+                        .and_then(|d| {
+                            d.as_f64()
+                                .or_else(|| d.as_str().and_then(|t| t.trim().parse().ok()))
+                        })
+                        .filter(|d: &f64| d.is_finite() && *d > 0.0),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// An indexed video row as far as sound measurement cares.
@@ -345,25 +442,7 @@ impl IndexRow {
             Some(value) => value,
             None => &Value::Null,
         };
-        let audio_streams = probe
-            .get("streams")
-            .and_then(Value::as_array)
-            .map(|streams| {
-                streams
-                    .iter()
-                    .filter(|st| st.get("codec_type").and_then(Value::as_str) == Some("audio"))
-                    .map(|st| AudioStreamInfo {
-                        index: st.get("index").and_then(Value::as_u64),
-                        codec: st
-                            .get("codec_name")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        sample_rate: st.get("sample_rate").and_then(num),
-                        channels: st.get("channels").and_then(num),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let audio_streams = stream_infos(probe);
         Some(Self {
             id: s("id")?,
             relative_path: s("relative_path").unwrap_or_default(),
@@ -378,23 +457,30 @@ impl IndexRow {
             audio_streams,
         })
     }
+}
 
-    /// Streams to measure: the indexed audio streams, or one unnamed
-    /// stream when only `audio_codec` is known.
-    fn measurable_streams(&self) -> Vec<AudioStreamInfo> {
-        if !self.audio_streams.is_empty() {
-            return self.audio_streams.clone();
-        }
-        if self.audio_codec.is_some() {
-            return vec![AudioStreamInfo {
-                index: None,
-                codec: self.audio_codec.clone(),
-                sample_rate: None,
-                channels: None,
-            }];
-        }
-        Vec::new()
+/// B12: a row that only knows `audio_codec` (no indexed stream list) gets
+/// its audio streams from a live ffprobe, so the number of tracks — and
+/// each track's sample rate, channels and duration — is known before any
+/// "silent" claim. `Err` when the probe fails.
+pub fn probe_audio_streams(ffprobe: &str, path: &Path) -> Result<Vec<AudioStreamInfo>, String> {
+    let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
+    let mut command = Command::new(binary);
+    command
+        .args(["-v", "error", "-print_format", "json", "-show_streams"])
+        .args(["-select_streams", "a"])
+        .arg(path);
+    let output =
+        crate::util::run_with_timeout(&mut command, Some(crate::util::PROBE_TIMEOUT_SECS))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid ffprobe JSON output: {err}"))?;
+    Ok(stream_infos(&value))
 }
 
 /// Reads `db/videos.jsonl` (missing → empty).
@@ -425,11 +511,66 @@ pub fn measurement_is_current(row: &IndexRow, result: &FileResult) -> bool {
     }
 }
 
+/// B1: a decoder complaint in ffmpeg's stderr. Indented lines are stream
+/// / metadata descriptions (user-controlled tag text), so only top-level
+/// and `[component @ …]` lines count; the volumedetect report never does.
+pub fn decode_error_in(stderr: &str) -> Option<String> {
+    const NEEDLES: [&str; 7] = [
+        "error",
+        "invalid data",
+        "corrupt",
+        "partial file",
+        "truncat",
+        "concealing",
+        "missing",
+    ];
+    stderr
+        .lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .filter(|line| !line.contains("volumedetect"))
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            NEEDLES.iter().any(|needle| lower.contains(needle))
+        })
+        .map(|line| line.trim().chars().take(240).collect())
+}
+
+/// B1: the decode covered the whole track. `expected` is the stream's own
+/// probed duration (`stream_level`) or, failing that, the container's.
+/// A stream duration is exact, so more than 1 s missing — or more than 5%
+/// once over 0.25 s — is a truncated / partly undecodable track. A
+/// container duration may legitimately exceed the audio track, so it gets
+/// a wider margin (2 s or 5%).
+pub fn coverage_error(
+    measured: Option<f64>,
+    expected: Option<f64>,
+    stream_level: bool,
+) -> Option<String> {
+    let Some(expected) = expected.filter(|e| e.is_finite() && *e > 0.0) else {
+        return Some("길이를 알 수 없어 트랙 전체를 측정했는지 확인하지 못했습니다".to_string());
+    };
+    let Some(measured) = measured else {
+        return Some("샘플레이트·채널 수를 몰라 측정 길이를 확인하지 못했습니다".to_string());
+    };
+    let short = expected - measured;
+    let truncated = if stream_level {
+        short > 1.0 || (short > 0.25 && measured < expected * 0.95)
+    } else {
+        short > (expected * 0.05).max(2.0)
+    };
+    truncated.then(|| {
+        format!(
+            "디코드된 길이 {measured:.2}초가 트랙 길이 {expected:.2}초보다 짧습니다 — 잘리거나 손상된 트랙"
+        )
+    })
+}
+
 fn run_stream(
     ffmpeg: &str,
     path: &str,
     ordinal: usize,
     info: &AudioStreamInfo,
+    container_duration: Option<f64>,
     timeout_secs: u64,
 ) -> StreamResult {
     let mut out = StreamResult {
@@ -476,19 +617,90 @@ fn run_stream(
             out.max_is_neg_inf = stats.max_db == f64::NEG_INFINITY;
             out.max_volume_db = finite(stats.max_db);
             out.mean_volume_db = finite(stats.mean_db);
-            out.verdict = stream_verdict(&stats);
+            // Numbers are kept for the record, but a decode complaint or a
+            // short decode means the level describes part of the track
+            // only: never "sound" or "silent" then.
+            let problem = decode_error_in(&stderr)
+                .map(|line| format!("디코드 오류: {line}"))
+                .or_else(|| match info.duration_seconds {
+                    Some(stream) => coverage_error(out.measured_seconds, Some(stream), true),
+                    None => coverage_error(out.measured_seconds, container_duration, false),
+                });
+            match problem {
+                Some(err) => out.error = Some(err),
+                None => out.verdict = stream_verdict(&stats),
+            }
         }
         Err(err) => out.error = Some(err),
     }
     out
 }
 
+/// `(size, mtime)` of `path` right now.
+fn stat_binding(path: &str) -> Option<(u64, Option<u64>)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    Some((meta.len(), modified))
+}
+
+/// Error text for a file whose bytes no longer match the index binding.
+pub const CHANGED_ERROR: &str =
+    "changed: 파일이 색인과 다릅니다(측정 전후 크기·수정 시각 확인) — 다시 스캔하십시오";
+
 /// Measures every audio stream (up to [`MAX_STREAMS`]) of one record.
-pub fn measure_row(ffmpeg: &str, row: &IndexRow) -> FileResult {
-    let streams = row.measurable_streams();
-    let timeout = row
-        .duration_seconds
-        .filter(|d| d.is_finite() && *d > 0.0)
+/// B3: the file is re-stat'ed before and after the decode; when its size or
+/// mtime differs from the index binding the result is an error
+/// ([`CHANGED_ERROR`]), never a level for other bytes. B12: without an
+/// indexed stream list the streams come from a live ffprobe first.
+pub fn measure_row(ffmpeg: &str, ffprobe: &str, row: &IndexRow) -> FileResult {
+    let mut result = FileResult {
+        selector: row.id.clone(),
+        source_path: row.source_path.clone(),
+        size_bytes: row.size_bytes,
+        modified_unix: row.modified_unix,
+        sha256_indexed: row.sha256.clone(),
+        result: Verdict::Error,
+        streams: Vec::new(),
+        error: None,
+        measured_unix: None,
+    };
+    let bound = row.size_bytes.map(|size| (size, row.modified_unix));
+    if bound.is_none() || stat_binding(&row.source_path) != bound {
+        result.error = Some(CHANGED_ERROR.to_string());
+        return result;
+    }
+    let streams = if row.audio_streams.is_empty() {
+        match probe_audio_streams(ffprobe, Path::new(&row.source_path)) {
+            Ok(streams) if streams.is_empty() => {
+                result.error = Some(
+                    "색인에는 오디오 코덱이 있지만 ffprobe가 오디오 스트림을 찾지 못했습니다"
+                        .to_string(),
+                );
+                return result;
+            }
+            Ok(streams) => streams,
+            Err(err) => {
+                result.error = Some(format!(
+                    "오디오 트랙 수를 확인하지 못했습니다 (ffprobe): {err}"
+                ));
+                return result;
+            }
+        }
+    } else {
+        row.audio_streams.clone()
+    };
+    let container = row.duration_seconds.filter(|d| d.is_finite() && *d > 0.0);
+    let timeout = container
+        .or_else(|| {
+            streams
+                .iter()
+                .filter_map(|s| s.duration_seconds)
+                .reduce(f64::max)
+        })
         .map(|d| (d * 2.0).ceil() as u64)
         .unwrap_or(0)
         .max(60);
@@ -496,7 +708,7 @@ pub fn measure_row(ffmpeg: &str, row: &IndexRow) -> FileResult {
         .iter()
         .take(MAX_STREAMS)
         .enumerate()
-        .map(|(k, info)| run_stream(ffmpeg, &row.source_path, k, info, timeout))
+        .map(|(k, info)| run_stream(ffmpeg, &row.source_path, k, info, container, timeout))
         .collect();
     let mut verdict = record_verdict(&results);
     let mut error = results.iter().find_map(|s| s.error.clone());
@@ -508,23 +720,21 @@ pub fn measure_row(ffmpeg: &str, row: &IndexRow) -> FileResult {
             streams.len()
         ));
     }
-    FileResult {
-        selector: row.id.clone(),
-        source_path: row.source_path.clone(),
-        size_bytes: row.size_bytes,
-        modified_unix: row.modified_unix,
-        sha256_indexed: row.sha256.clone(),
-        result: verdict,
-        streams: results,
-        error: if verdict == Verdict::Sound {
-            None
-        } else {
-            error
-        },
+    if stat_binding(&row.source_path) != bound {
+        verdict = Verdict::Error;
+        error = Some(CHANGED_ERROR.to_string());
     }
+    result.result = verdict;
+    result.streams = results;
+    result.error = if verdict == Verdict::Sound {
+        None
+    } else {
+        error
+    };
+    result
 }
 
-/// One chained log entry for a chunk of results.
+// One chained log entry for a chunk of results.
 pub fn log_entry_json(measured_unix: u64, ffmpeg_version: &str, results: &[FileResult]) -> Value {
     json!({
         "schema_version": 1,
@@ -536,6 +746,29 @@ pub fn log_entry_json(measured_unix: u64, ffmpeg_version: &str, results: &[FileR
         "command_template": command_template(),
         "results": results.iter().map(FileResult::to_json).collect::<Vec<_>>(),
     })
+}
+
+/// B11: a log entry for results computed by an earlier, interrupted run
+/// and replayed from the checkpoint. Provenance stays the original one:
+/// `measured_unix` is the earliest original measurement, every result
+/// carries its own `measured_unix`, the ffmpeg version is the one that
+/// measured them, and `logged_unix` says when they were finally logged.
+pub fn replayed_log_entry_json(
+    logged_unix: u64,
+    ffmpeg_version: &str,
+    results: &[FileResult],
+) -> Value {
+    let earliest = results
+        .iter()
+        .filter_map(|r| r.measured_unix)
+        .min()
+        .unwrap_or(logged_unix);
+    let mut entry = log_entry_json(earliest, ffmpeg_version, results);
+    if let Some(map) = entry.as_object_mut() {
+        map.insert("replayed_from_checkpoint".to_string(), json!(true));
+        map.insert("logged_unix".to_string(), json!(logged_unix));
+    }
+    entry
 }
 
 /// `selector -> (result, measured_unix, method, threshold_silent_max_dbfs)`.
@@ -579,9 +812,10 @@ pub fn latest_logged_results(case_dir: &Path) -> Result<LoggedResults, String> {
             .flatten()
         {
             if let Some(result) = FileResult::from_json(item) {
+                let at = result.measured_unix.unwrap_or(measured);
                 out.insert(
                     result.selector.clone(),
-                    (result, measured, method.clone(), threshold),
+                    (result, at, method.clone(), threshold),
                 );
             }
         }
@@ -720,6 +954,7 @@ pub struct MeasureOptions {
     /// Re-measure files that already have a valid measurement.
     pub force: bool,
     pub ffmpeg: String,
+    pub ffprobe: String,
     pub resume: ResumeMode,
 }
 
@@ -729,6 +964,7 @@ impl Default for MeasureOptions {
             selectors: None,
             force: false,
             ffmpeg: "ffmpeg".to_string(),
+            ffprobe: "ffprobe".to_string(),
             resume: ResumeMode::Auto,
         }
     }
@@ -839,8 +1075,14 @@ pub fn measure_case(
         .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
     let ffmpeg_version = command_version(&options.ffmpeg, &["ffmpeg"], "-version");
 
-    let fingerprint =
-        checkpoint::fingerprint(&["measure-audio", METHOD, &format!("{SILENT_MAX_DBFS:.1}")]);
+    // B11: the ffmpeg build is part of the method — a checkpoint written by
+    // another build is not resumed into this run's log.
+    let fingerprint = checkpoint::fingerprint(&[
+        "measure-audio",
+        METHOD,
+        &format!("{SILENT_MAX_DBFS:.1}"),
+        &ffmpeg_version,
+    ]);
     let mut checkpoint = RunCheckpoint::begin(
         &case_dir.join(CHECKPOINT_REL),
         "measure-audio",
@@ -854,7 +1096,10 @@ pub fn measure_case(
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(result) = value.get("computed").and_then(FileResult::from_json) {
+        if let Some(mut result) = value.get("computed").and_then(FileResult::from_json) {
+            // Original measurement time (older checkpoints: unknown → the
+            // replay entry's own time, flagged as replayed either way).
+            result.measured_unix = value.get("measured_unix").and_then(Value::as_u64);
             replay.insert(result.selector.clone(), result);
         } else if let Some(ids) = value.get("logged").and_then(Value::as_array) {
             logged_in_ckpt.extend(ids.iter().filter_map(Value::as_str).map(str::to_string));
@@ -865,7 +1110,7 @@ pub fn measure_case(
         Verdict::Silent => summary.silent += 1,
         _ => summary.error += 1,
     };
-    let mut buffer: Vec<FileResult> = Vec::new();
+    let mut replayed: Vec<FileResult> = Vec::new();
     let mut pending: Vec<IndexRow> = Vec::new();
     for row in targets.iter() {
         match replay.get(&row.id) {
@@ -873,7 +1118,7 @@ pub fn measure_case(
                 if !logged_in_ckpt.contains(&row.id) && measurement_is_current(row, result) =>
             {
                 tally(&mut summary, result.result);
-                buffer.push(result.clone());
+                replayed.push(result.clone());
                 summary.resumed += 1;
             }
             _ => pending.push(row.clone()),
@@ -883,6 +1128,18 @@ pub fn measure_case(
     let mut done = summary.resumed;
     progress(done, total);
 
+    let flush_entry = |entry: Value,
+                       buffer: &mut Vec<FileResult>,
+                       checkpoint: &mut RunCheckpoint,
+                       summary: &mut MeasureSummary|
+     -> Result<(), String> {
+        audit::append_chained_jsonl(&case_dir.join(LOG_REL), &entry.to_string())?;
+        summary.log_entries += 1;
+        let ids: Vec<&str> = buffer.iter().map(|r| r.selector.as_str()).collect();
+        checkpoint.append_line(&json!({ "logged": ids }).to_string())?;
+        buffer.clear();
+        Ok(())
+    };
     let flush = |buffer: &mut Vec<FileResult>,
                  checkpoint: &mut RunCheckpoint,
                  summary: &mut MeasureSummary|
@@ -891,22 +1148,22 @@ pub fn measure_case(
             return Ok(());
         }
         let entry = log_entry_json(now_unix()?, &ffmpeg_version, buffer);
-        audit::append_chained_jsonl(&case_dir.join(LOG_REL), &entry.to_string())?;
-        summary.log_entries += 1;
-        let ids: Vec<&str> = buffer.iter().map(|r| r.selector.as_str()).collect();
-        checkpoint.append_line(&json!({ "logged": ids }).to_string())?;
-        buffer.clear();
-        Ok(())
+        flush_entry(entry, buffer, checkpoint, summary)
     };
-    while buffer.len() >= LOG_CHUNK {
-        let mut head: Vec<FileResult> = buffer.drain(..LOG_CHUNK).collect();
-        flush(&mut head, &mut checkpoint, &mut summary)?;
+    // Replayed results go first, in their own entries with their original
+    // provenance (B11) — never relabelled as measured now.
+    for chunk in replayed.chunks(LOG_CHUNK) {
+        let mut head = chunk.to_vec();
+        let entry = replayed_log_entry_json(now_unix()?, &ffmpeg_version, &head);
+        flush_entry(entry, &mut head, &mut checkpoint, &mut summary)?;
     }
+    let mut buffer: Vec<FileResult> = Vec::new();
 
     let (sender, receiver) = std::sync::mpsc::channel::<FileResult>();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let pending_ref = &pending;
     let ffmpeg_ref = &ffmpeg;
+    let ffprobe_ref = options.ffprobe.as_str();
     let mut outcome: Result<(), String> = Ok(());
     std::thread::scope(|scope| {
         for _ in 0..WORKERS.min(pending_ref.len()) {
@@ -918,7 +1175,10 @@ pub fn measure_case(
                     let Some(row) = pending_ref.get(i) else {
                         break;
                     };
-                    if sender.send(measure_row(ffmpeg_ref, row)).is_err() {
+                    if sender
+                        .send(measure_row(ffmpeg_ref, ffprobe_ref, row))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -931,7 +1191,12 @@ pub fn measure_case(
                 next.store(usize::MAX / 2, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
-            let line = json!({ "computed": result.to_json() }).to_string();
+            let line = json!({
+                "computed": result.to_json(),
+                "measured_unix": now_unix().unwrap_or(0),
+                "ffmpeg_version": ffmpeg_version,
+            })
+            .to_string();
             if let Err(err) = checkpoint.append_line(&line) {
                 outcome = Err(err);
                 continue;
@@ -1093,7 +1358,138 @@ mod tests {
             result: verdict,
             streams: vec![stream(verdict, Some(max))],
             error: None,
+            measured_unix: None,
         }
+    }
+
+    /// B1: decoder complaints are found in top-level / component lines, not
+    /// in indented metadata or the volumedetect report.
+    #[test]
+    fn decode_errors_are_detected_in_stderr() {
+        let clean = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':\n  Metadata:\n    comment         : error corrupt missing\n[Parsed_volumedetect_0 @ a] n_samples: 10\nsize=N/A time=00:00:02.00 bitrate=N/A speed= 300x\n";
+        assert_eq!(decode_error_in(clean), None);
+        let bad = "[aac @ 0000] Error decoding AAC frame header.\nError while decoding stream #0:1: Invalid data found when processing input\n";
+        assert!(decode_error_in(bad).unwrap().contains("Error decoding AAC"));
+        let partial = "[mov,mp4,m4a,3gp,3g2,mj2 @ 01] stream 1, offset 0x30: partial file\n";
+        assert!(decode_error_in(partial).is_some());
+    }
+
+    /// B1: a decode well short of the probed duration is not a full-track
+    /// measurement; small priming differences are.
+    #[test]
+    fn coverage_requires_the_whole_track() {
+        assert_eq!(coverage_error(Some(1.98), Some(2.0), true), None);
+        assert_eq!(coverage_error(Some(599.3), Some(600.0), true), None);
+        assert!(
+            coverage_error(Some(598.5), Some(600.0), true).is_some(),
+            "> 1 s short"
+        );
+        assert!(
+            coverage_error(Some(1.0), Some(2.0), true).is_some(),
+            "< 95%"
+        );
+        assert!(
+            coverage_error(None, Some(2.0), true).is_some(),
+            "unknown measured"
+        );
+        assert!(
+            coverage_error(Some(2.0), None, false).is_some(),
+            "unknown expected"
+        );
+        // A container duration allows the audio to end a little early.
+        assert_eq!(coverage_error(Some(58.5), Some(60.0), false), None);
+        assert!(coverage_error(Some(30.0), Some(60.0), false).is_some());
+    }
+
+    /// B3: a file whose size/mtime no longer match the index binding is not
+    /// measured (no ffmpeg needed to prove it) — the result is an error.
+    #[test]
+    fn changed_file_is_an_error_not_a_level() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-audio-changed-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let mut r = row("vid_1");
+        r.source_path = file.to_string_lossy().to_string();
+        r.size_bytes = Some(11);
+        let result = measure_row("no-such-ffmpeg", "no-such-ffprobe", &r);
+        assert_eq!(result.result, Verdict::Error);
+        assert_eq!(result.error.as_deref(), Some(CHANGED_ERROR));
+        assert!(result.streams.is_empty());
+        // Missing file: same.
+        r.source_path = dir.join("gone.mp4").to_string_lossy().to_string();
+        assert_eq!(
+            measure_row("x", "y", &r).error.as_deref(),
+            Some(CHANGED_ERROR)
+        );
+        // B12: bytes match, but only `audio_codec` is indexed and the live
+        // probe cannot run → error, never a silent/sound claim.
+        let meta = std::fs::metadata(&file).unwrap();
+        r.source_path = file.to_string_lossy().to_string();
+        r.size_bytes = Some(meta.len());
+        r.modified_unix = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let result = measure_row("no-such-ffmpeg", "no-such-ffprobe", &r);
+        assert_eq!(result.result, Verdict::Error);
+        assert!(
+            result.error.as_deref().unwrap().contains("오디오 트랙 수"),
+            "{result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B15: exit 4 is a completed run whose errors are counted; the summary
+    /// log line reports the counts.
+    #[test]
+    fn exit_four_is_a_completed_run_with_counted_errors() {
+        // The message shape `run_step` produces for a non-zero exit.
+        let partial = "measure-audio 실패 (exit Some(4)): {\"targets\":2} | 소리 측정 오류 3건 (측정 대상 9건)";
+        assert_eq!(partial_error_count(partial), Some(3));
+        let real = "measure-audio 실패 (exit Some(1)): 소리 측정 오류 3건";
+        assert_eq!(partial_error_count(real), None);
+        assert_eq!(
+            partial_error_count("measure-audio 실패 (exit Some(4)): x"),
+            None
+        );
+        let line = summary_log_line(
+            "noise\n{\"targets\":4,\"sound\":2,\"silent\":1,\"error\":1,\"skipped_valid\":5}",
+        )
+        .unwrap();
+        assert!(
+            line.starts_with("소리 측정 완료(오류 1건): 소리 있음 2 · 무음 1"),
+            "{line}"
+        );
+        assert!(summary_log_line("no json").is_none());
+        assert!(
+            summary_log_line("{\"targets\":1,\"error\":0}")
+                .unwrap()
+                .starts_with("소리 측정 완료:")
+        );
+    }
+
+    /// B11: replayed results keep their original measurement time and are
+    /// flagged as replayed; the reader uses the per-result time.
+    #[test]
+    fn replayed_entries_keep_original_provenance() {
+        let r = row("vid_1");
+        let mut result = result_for(&r, Verdict::Sound, -10.0);
+        result.measured_unix = Some(100);
+        let entry = replayed_log_entry_json(500, "ffmpeg 7.1", &[result]);
+        assert_eq!(entry["measured_unix"], 100);
+        assert_eq!(entry["logged_unix"], 500);
+        assert_eq!(entry["replayed_from_checkpoint"], true);
+        assert_eq!(entry["ffmpeg_version"], "ffmpeg 7.1");
+        assert_eq!(entry["results"][0]["measured_unix"], 100);
+        let fresh = log_entry_json(7, "v", &[result_for(&r, Verdict::Sound, -1.0)]);
+        assert!(fresh["results"][0].get("measured_unix").is_none());
     }
 
     #[test]

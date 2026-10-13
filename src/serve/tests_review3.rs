@@ -491,7 +491,7 @@ fn open_case_refused_while_clip_exports_run() {
         response["error"]
             .as_str()
             .unwrap()
-            .contains("클립 내보내기"),
+            .contains("내보내기·이어붙이기"),
         "{response}"
     );
     assert_eq!(state_lock(&state).case_dir.as_deref(), Some(old.as_path()));

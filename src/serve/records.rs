@@ -147,6 +147,78 @@ pub(crate) fn cached_fts_search(
     hit
 }
 
+/// B9: the serialized `audioLevels` map for one case, valid while the
+/// audio lane, the index generation and `db/videos.jsonl` are unchanged.
+struct AudioLevelsCacheEntry {
+    case_dir: PathBuf,
+    key: (FileStamp, u64, FileStamp),
+    json: Arc<String>,
+}
+
+/// A few cases (a reopened previous case stays warm); each entry is one
+/// serialized map.
+const AUDIO_LEVELS_CACHE_CAPACITY: usize = 4;
+static AUDIO_LEVELS_CACHE: Mutex<VecDeque<AudioLevelsCacheEntry>> = Mutex::new(VecDeque::new());
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread computed the map (cache misses).
+    pub(crate) static AUDIO_LEVELS_COMPUTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The compact `audioLevels` JSON (plan §2.4) bound to the current index,
+/// as text. Rows come from the shared parsed index (no re-read of
+/// `videos.jsonl`, no re-parse of nested ffprobe JSON) — the jsonl is read
+/// only while no `video_index.json` exists yet. Cached by (audio lane
+/// stamp, index generation, jsonl stamp); errors are never cached.
+pub(crate) fn cached_audio_levels_json(
+    state: &SharedState,
+    case_dir: &Path,
+) -> Result<Arc<String>, String> {
+    let key = (
+        file_stamp(&case_dir.join(crate::audio_level::LOG_REL)),
+        index_generation(state, case_dir),
+        file_stamp(&case_dir.join("db/videos.jsonl")),
+    );
+    if let Some(entry) = AUDIO_LEVELS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|entry| entry.case_dir == case_dir && entry.key == key)
+    {
+        return Ok(Arc::clone(&entry.json));
+    }
+    #[cfg(test)]
+    AUDIO_LEVELS_COMPUTED.with(|count| count.set(count.get() + 1));
+    let rows: Vec<crate::audio_level::IndexRow> = match cached_index(state, case_dir) {
+        Ok(index) => match index.get("videos").and_then(|v| v.as_array()) {
+            Some(videos) => videos
+                .iter()
+                .filter_map(crate::audio_level::IndexRow::from_json)
+                .collect(),
+            None => crate::audio_level::read_index(case_dir)?,
+        },
+        Err(_) => crate::audio_level::read_index(case_dir)?,
+    };
+    let logged = crate::audio_level::latest_logged_results(case_dir)?;
+    let levels = crate::audio_level::apply_levels(&rows, &logged);
+    let json = Arc::new(crate::audio_level::audio_levels_json(&levels).to_string());
+    let mut cache = AUDIO_LEVELS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|entry| entry.case_dir != case_dir);
+    cache.push_back(AudioLevelsCacheEntry {
+        case_dir: case_dir.to_path_buf(),
+        key,
+        json: Arc::clone(&json),
+    });
+    while cache.len() > AUDIO_LEVELS_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    Ok(json)
+}
+
 struct ThumbListing {
     case_dir: PathBuf,
     dir_mtime: SystemTime,
@@ -603,11 +675,23 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // Plan §2.4: the measured-sound map, already bound to the current index
     // bytes (a measurement of other bytes is `stale`). A read failure is
     // reported beside an empty map, never presented as "nothing measured".
-    let (audio_levels, audio_levels_error) =
-        match crate::audio_level::audio_levels_for_case(&case_dir) {
-            Ok(levels) => (crate::audio_level::audio_levels_json(&levels), None),
-            Err(err) => (serde_json::json!({}), Some(err)),
-        };
+    let (audio_levels, audio_levels_error) = match cached_audio_levels_json(state, &case_dir) {
+        Ok(json) => (json, None),
+        Err(err) => (Arc::new("{}".to_string()), Some(err)),
+    };
+    // U2: every joinLog entry carries the derived record's `record_id`
+    // (`join:<first 16 hex of output_sha256>`), also for entries logged
+    // before the field existed.
+    let join_log: Vec<serde_json::Value> = match read_jsonl(
+        case_dir
+            .join(crate::join::JOINED_DIR)
+            .join(crate::join::LOG_FILE),
+    ) {
+        serde_json::Value::Array(items) => {
+            items.into_iter().map(crate::join::with_record_id).collect()
+        }
+        _ => Vec::new(),
+    };
     let body = serde_json::json!({
         "ok": true,
         "manifest": read_json(case_dir.join("case.json")),
@@ -626,15 +710,19 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         "telemetry": crate::telemetry::collect_reports(&case_dir),
         "proxies": proxies,
         // Plan §1.8: one entry per completed lossless join (derived records).
-        "joinLog": read_jsonl(
-            case_dir
-                .join(crate::join::JOINED_DIR)
-                .join(crate::join::LOG_FILE)
-        ),
-        "audioLevels": audio_levels,
+        "joinLog": join_log,
         "audioLevelsError": audio_levels_error,
     });
-    serde_json::to_string(&body).unwrap_or_else(|_| "{\"ok\":false}".to_string())
+    // `audioLevels` (up to ~6 MB for 100k records) is spliced in as the
+    // cached text instead of being cloned into the body value.
+    let mut text = serde_json::to_string(&body).unwrap_or_else(|_| "{\"ok\":false}".to_string());
+    if text.ends_with('}') {
+        text.pop();
+        text.push_str(",\"audioLevels\":");
+        text.push_str(&audio_levels);
+        text.push('}');
+    }
+    text
 }
 
 /// Newest `db/filesystem/tsk-inspection-*.json` summary — carries the
