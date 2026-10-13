@@ -1212,7 +1212,7 @@ document.getElementById("btnDownloadCsv").addEventListener("click", () => {
   if (!selected.length) { toast(t("toast.selectFirst")); return; }
   const header = ["id", "kind", "name", "status", "mark", "examiner_note", "tags", "sha256", "size_bytes",
     "recorded_time", "channel", "rec_type", "inode", "original_path", "source_path",
-    "warnings", "note", "anomalies"];
+    "warnings", "note", "anomalies", "audio_state", "audio_max_db", "audio_mean_db"];
   const rows = selected.map(record => [
     record.id,
     KIND_LABELS[record.kind] || record.kind,
@@ -1231,7 +1231,8 @@ document.getElementById("btnDownloadCsv").addEventListener("click", () => {
     record.path || "",
     (record.warnings || []).join("; "),
     record.note && record.note !== "-" ? record.note : "",
-    (record.anomalies || []).map(item => item.kind).join("; ")
+    (record.anomalies || []).map(item => item.kind).join("; "),
+    ...Object.values(audioExportFields(record))
   ].map(csvCell).join(","));
   downloadText(
     `frametrace-selection-${manifest.case_id || "case"}.csv`,

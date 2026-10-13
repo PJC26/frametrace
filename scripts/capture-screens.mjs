@@ -236,6 +236,10 @@ async function runCombo({ w, h, theme }, sub) {
     await vpage.locator('.card[data-id]').first().waitFor({ timeout: 30000 });
     await sleep(1200);
     await shot('04-viewer-grid', '증거 뷰어 — 레코드 그리드와 필터 (Viewer grid + filters)', vpage);
+    // Sound states (§2.5): card flags (track / none / measured) + the 소리 facet.
+    await vpage.evaluate(() => document.querySelector('#facetTree .tree-sec:last-of-type')?.scrollIntoView({ block: 'center' })).catch(() => {});
+    await shot('04b-grid-audio-states', '증거 뷰어 — 카드의 소리 표시(트랙 있음·미측정 / 트랙 없음 / 측정값)와 소리 분류 (Sound flags + facet)', vpage);
+    await vpage.evaluate(() => { const t = document.getElementById('facetTree'); if (t) t.scrollTop = 0; document.querySelectorAll('.rail, .rail *').forEach((e) => { if (e.scrollTop) e.scrollTop = 0; }); }).catch(() => {});
     await vpage.locator('.card[data-id]').first().click();
     await sleep(900);
     await shot('05-viewer-detail', '증거 뷰어 — 선택한 영상의 상세/플레이어 패널 (Viewer detail + player)', vpage);
@@ -283,6 +287,42 @@ async function runCombo({ w, h, theme }, sub) {
     // run-dependent amount; pin it back to 0 for a stable shot.
     await cpage.evaluate(() => document.querySelectorAll('*').forEach((e) => { if (e.scrollLeft) e.scrollLeft = 0; })).catch(() => {});
     await shot('05d-clip-dialog', clipOpen ? '증거 뷰어 — 구간 내보내기 대화상자 (Clip export dialog)' : '증거 뷰어 — 구간 내보내기 시도 (영상 디코드 불가로 범위 없음 → 안내 토스트) (Clip export attempt; no usable range → toast)', cpage);
+    // Join dialog (docs/PLAN_PHASE2_JOIN_AUDIO_2026-10-13.md §1.8): the plan
+    // comes from POST /api/join-check; answered here with the §1.6 JSON so
+    // the shot does not depend on the server's join support.
+    await cpage.evaluate(() => document.querySelectorAll('.modal-backdrop').forEach((b) => b.remove()));
+    await cpage.route('**/api/join-check', async (route) => {
+      const ids = (JSON.parse(route.request().postData() || '{}').ids || []);
+      const mixed = await cpage.evaluate((list) => list.some((id) => /REAR/i.test(document.querySelector(`.card[data-id="${CSS.escape(id)}"]`)?.title || '')), ids);
+      const names = await cpage.evaluate((list) => list.map((id) => document.querySelector(`.card[data-id="${CSS.escape(id)}"]`)?.title || id), ids);
+      const segments = names.map((name, i) => ({ id: ids[i], name, recorded_start_text: `2026-09-08 01:0${i * 4}:00`, time_source: 'filename', duration_seconds: 4, size_bytes: 200000, video: { codec: 'h264', width: 640, height: 360 }, audio: null }));
+      const plan = {
+        plan_id: 'shot', order_basis: 'filename-time', tolerance_seconds: 1, channel: { code: mixed ? null : 'F', label: mixed ? '' : '전방', basis: 'filename-or-path-token' }, container: 'mp4', segments,
+        junctions: segments.slice(1).map((_, i) => ({ after_index: i + 1, delta_seconds: 236, kind: 'gap' })),
+        totals: { segments: segments.length, duration_seconds: 4 * segments.length, gaps: segments.length - 1, gap_seconds: 236 * (segments.length - 1), overlaps: 0, overlap_seconds: 0, overlap_max_seconds: 0 },
+        blocking: mixed ? [{ code: 'channel-mixed', message: '채널이 섞여 있습니다 (전방 2 · 후방 1)', ids }, { code: 'audio-presence', message: '오디오 트랙이 일부에만 있습니다 (2개 없음)', ids }] : [],
+        warnings: [],
+        summary_text: `${mixed ? '채널 미확인' : '전방'} · ${segments.length}개 · 0분 ${String(4 * segments.length).padStart(2, '0')}초 · 끊김 ${segments.length - 1}곳 / 겹침 0곳`,
+      };
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, plan }) });
+    });
+    const pickJoin = async (re) => {
+      await cpage.evaluate(() => document.getElementById('btnClearSelection')?.click());
+      const ids = await cpage.evaluate((src) => [...document.querySelectorAll('.card[data-id]')].filter((c) => new RegExp(src).test(c.title)).map((c) => c.dataset.id), re.source);
+      for (const id of ids) await cpage.locator(`.card[data-id="${id}"] input[data-check]`).check().catch(() => {});
+      await cpage.click('#btnExportMenu').catch(() => {});
+      await cpage.click('#btnJoinSelected').catch(() => {});
+      return cpage.waitForSelector('.modal.dlg.dlg-join', { timeout: 5000 }).catch(() => null);
+    };
+    if (await pickJoin(/FRONT_20260908_01(00|04|08)00.mp4$/)) {
+      await cpage.evaluate(() => { const d = document.querySelector('.modal.dlg.dlg-join details'); if (d) d.open = true; });
+      await shot('05e-join-dialog', '증거 뷰어 — 선택 영상 이어붙이기 대화상자 (요약 · 순서 근거 · 세그먼트 목록) (Join dialog)', cpage);
+      await cpage.keyboard.press('Escape');
+    }
+    if (await pickJoin(/(FRONT_20260908_01(00|04)00|REAR_20260908_010000).mp4$/)) {
+      await shot('05f-join-blocked', '증거 뷰어 — 이어붙이기 차단 (채널 혼합 · 오디오 일부) — 주 버튼 비활성 (Join blocked)', cpage);
+      await cpage.keyboard.press('Escape');
+    }
     await ctx2.close();
     const second = vpage.locator('.card[data-id]').nth(1);
     if (await second.count()) {

@@ -368,7 +368,8 @@ function finBuild() {
     `<details id="finalAdvanced" class="h-fin-adv"><summary>고급</summary><div class="h-fin-adv-body">` +
     `<h3 class="h-fin-h">검증</h3><div class="h-fin-grid">` +
     `<button type="button" id="btnVerifySources" title="색인된 모든 원본을 지금 다시 해시해 기록된 SHA-256과 비교합니다 (evidence/logs/hash-verify.jsonl, 보관 이력서 5절)">원본 재검증 (SHA-256)</button>` +
-    `<button type="button" id="btnVerifyAudit" title="체인된 감사 로그의 무결성을 다시 확인합니다">감사 로그 검증</button></div>` +
+    `<button type="button" id="btnVerifyAudit" title="체인된 감사 로그의 무결성을 다시 확인합니다">감사 로그 검증</button>` +
+    `<button type="button" id="btnAudioMeasure" title="${esc(finAudioTip())}">소리 측정 (미측정 항목)</button></div>` +
     `<h3 class="h-fin-h">내보내기 · QA</h3><div class="h-fin-grid">${advBtns}</div>` +
     `<h3 class="h-fin-h">다른 케이스 · 해시 목록</h3>` +
     `<input type="text" id="advPath" placeholder="다른 케이스 폴더 또는 sha256 목록 파일 경로" aria-label="다른 케이스 폴더 또는 해시 목록 경로">` +
@@ -397,7 +398,24 @@ function finBuild() {
   finApplyEnv();
   return true;
 }
+// Sound measurement run later (§2.2): a case job like recover/carve
+// (32-jobs.js CASE_JOBS.audio → POST /api/audio-measure); it needs ffmpeg
+// to decode and ffprobe facts to pick the audio tracks.
+function finAudioTip() { return "오디오 트랙이 있는데 아직 소리를 재지 않은 영상만 끝까지 디코드해 최대·평균 신호 레벨을 잽니다 — 진행은 작업 시트에 표시되고, 끝나면 뷰어에 반영됩니다"; }
+function finAudioMeasure() {
+  if (typeof runCaseJob !== "function") return;
+  runCaseJob("audio");
+}
+function finApplyAudioEnv() {
+  const btn = finEl("btnAudioMeasure");
+  if (!btn || !FIN.env) return;
+  const tools = FIN.env.tools || {};
+  const missing = tools.ffmpeg === false ? "ffmpeg" : tools.ffprobe === false ? "ffprobe" : "";
+  btn.disabled = !!missing;
+  btn.title = missing ? `${missing}가 없어 사용할 수 없습니다 — 도구 상태를 확인하십시오` : finAudioTip();
+}
 function finApplyEnv() {
+  finApplyAudioEnv();
   const mount = finMount();
   const btn = mount && mount.querySelector("button[data-adv='deepfake']");
   if (!btn || !FIN.env) return;
@@ -688,6 +706,7 @@ async function finOnClick(e) {
     case "btnFinalAttribute": return finAttribute();
     case "btnVerifySources": return finVerifySources();
     case "btnVerifyAudit": return finVerifyAudit();
+    case "btnAudioMeasure": return finAudioMeasure();
     case "btnImportMarks": return finEl("marksFile").click();
     // The shell closes the sheet (delegated click, 97-shell.js).
     case "hFinalizeClose": if (typeof hCloseSheet !== "function") finClose(); return;

@@ -799,11 +799,28 @@ function fmtClipBytes(n) {
   if (v >= 1024) return Math.round(v / 1024) + " KB";
   return v + " B";
 }
+// One progress line per job kind. A join job (§1.6/§1.7) reports `stage`
+// (hash i/N → concat → verify) from its progress file; concat progress is
+// the .part size against the sources total (expected_bytes). The stage may
+// arrive as a string with stage_done/stage_total, or as the progress object.
+function jobProgressText(job, kind) {
+  const sec = Number(job.elapsed_secs) || 0;
+  if (kind !== "join") return tf("clip.progress", { sec, size: fmtClipBytes(job.bytes_written) });
+  const raw = job.stage && typeof job.stage === "object" ? job.stage : { stage: job.stage, done: job.stage_done ?? job.done, total: job.stage_total ?? job.total };
+  const stage = String(raw.stage || "");
+  if (stage === "hash" && Number(raw.total) > 0) return tf("join.prog.hash", { done: Number(raw.done) || 0, total: Number(raw.total) });
+  if (stage === "concat") {
+    const expected = Number(job.expected_bytes) || 0;
+    if (expected > 0) return tf("join.prog.concat", { pct: Math.min(100, Math.floor((Number(job.bytes_written) || 0) * 100 / expected)), sec });
+  }
+  if (stage === "verify") return tf("join.prog.verify", { sec });
+  return tf("join.prog", { sec });
+}
 // Persistent progress row (in the toast host) with a cancel button.
-function clipProgressUi(onCancel) {
+function clipProgressUi(onCancel, kind) {
   const host = document.getElementById("toastHost");
   const item = document.createElement("div");
-  item.className = "toast clip-progress";
+  item.className = "toast clip-progress" + (kind ? " job-" + kind : "");
   const text = document.createElement("span");
   text.className = "toast-text";
   const cancel = document.createElement("button");
@@ -819,22 +836,24 @@ function clipProgressUi(onCancel) {
   if (host) host.appendChild(item);
   return {
     set(job) {
-      text.textContent = tf("clip.progress", { sec: Number(job.elapsed_secs) || 0, size: fmtClipBytes(job.bytes_written) });
+      text.textContent = jobProgressText(job, kind || job.kind || "");
     },
     remove() { item.remove(); }
   };
 }
-// Polls one export job until it leaves "running"; resolves with the final
-// job record (state done|failed|cancelled). Network blips are retried.
+// Polls one export job (clip or join — same status route, looked up by id)
+// until it leaves "running"; resolves with the final job record (state
+// done|failed|cancelled). Network blips are retried. `btn` is optional: a
+// menu item has no room for the elapsed counter (the progress row has it).
 async function pollExportJob(job, btn, ui) {
   const id = job.id;
-  const base = btn.dataset.label || btn.textContent;
-  btn.dataset.label = base;
+  const base = btn ? (btn.dataset.label || btn.textContent) : "";
+  if (btn) btn.dataset.label = base;
   let current = job;
   let misses = 0;
   while (current.state === "running") {
     ui.set(current);
-    btn.textContent = `${base} ${Number(current.elapsed_secs) || 0}s`;
+    if (btn) btn.textContent = `${base} ${Number(current.elapsed_secs) || 0}s`;
     await new Promise(r => setTimeout(r, 1000));
     let data = null;
     try {
@@ -849,8 +868,25 @@ async function pollExportJob(job, btn, ui) {
     if (!data || !data.ok || !data.job) throw new Error((data && data.error) || "export-clip-status");
     current = data.job;
   }
-  btn.textContent = base;
+  if (btn) btn.textContent = base;
   return current;
+}
+
+// A server path relative to the case folder, shown absolute (the examiner
+// copies it into the exhibit list).
+function caseAbsPath(path) {
+  const caseDir = String(DATA.caseDir || "");
+  const sep = caseDir.includes("\\") && !caseDir.includes("/") ? "\\" : "/";
+  return path && caseDir && !/^([a-zA-Z]:|[\\/])/.test(path)
+    ? caseDir.replace(/[\\/]+$/, "") + sep + path.split("/").join(sep) : path;
+}
+// Cancel button of a clip/join progress row (POST /api/export-clip-cancel).
+async function cancelExportJob(job, failKey) {
+  try {
+    const r = await fetch("/api/export-clip-cancel", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ job: job.id }) });
+    const d = await r.json();
+    if (!d.ok) toast(tf(failKey, { err: d.error || "" }));
+  } catch { toast(t("toast.clipOffline")); }
 }
 
 async function exportClip(btn, burn) {
@@ -883,23 +919,14 @@ async function exportClip(btn, burn) {
     let job = data.job || null;
     if (job && job.state === "running") {
       if (data.deduped) toast(t("clip.joined"));
-      const ui = clipProgressUi(async () => {
-        try {
-          const r = await fetch("/api/export-clip-cancel", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ job: job.id }) });
-          const d = await r.json();
-          if (!d.ok) toast(tf("toast.clipFail", { err: d.error || "" }));
-        } catch { toast(t("toast.clipOffline")); }
-      });
+      const ui = clipProgressUi(() => cancelExportJob(job, "toast.clipFail"));
       try { job = await pollExportJob(job, btn, ui); } finally { ui.remove(); }
     }
     if (job && job.state === "cancelled") { toast(t("toast.clipCancelled")); return; }
     if (job && job.state === "failed") throw new Error(job.error || "export failed");
     const path = (job && job.path) || data.path || "";
     const sha = (job && job.sha256) || data.sha256 || "";
-    const caseDir = String(DATA.caseDir || "");
-    const sep = caseDir.includes("\\") && !caseDir.includes("/") ? "\\" : "/";
-    const full = path && caseDir && !/^([a-zA-Z]:|[\\/])/.test(path)
-      ? caseDir.replace(/[\\/]+$/, "") + sep + path.split("/").join(sep) : path;
+    const full = caseAbsPath(path);
     toast(path ? tf("toast.clipDone", { path }) : t("clip.doneNoPath"));
     // Exhibit summary: what was cut, from what, where it is, and its hash.
     await askDialog({
@@ -918,6 +945,191 @@ async function exportClip(btn, burn) {
 }
 document.getElementById("btnExportClip").addEventListener("click", ev => exportClip(ev.currentTarget, false));
 document.getElementById("btnExportClipBurn").addEventListener("click", ev => exportClip(ev.currentTarget, true));
+
+// --- Lossless join (docs/PLAN_PHASE2_JOIN_AUDIO_2026-10-13.md §1.6-§1.8) ---
+// "보내기·복사 › 선택 영상 이어붙이기…": POST /api/join-check (synchronous
+// probe → plan) → dialog (summary, notes, blocking reasons, segment table)
+// → POST /api/join {ids, plan_id, tolerance} → a clip-style job (kind
+// "join") polled through /api/export-clip-status and cancelled through
+// /api/export-clip-cancel. The server re-checks everything; the dialog
+// only explains. Hidden where no server answers (file:// viewer).
+const joinServed = location.protocol === "http:" || location.protocol === "https:";
+const JOIN_TOLERANCE = 1.0;
+function syncJoinButton() {
+  const btn = document.getElementById("btnJoinSelected");
+  if (!btn) return;
+  btn.hidden = !joinServed;
+  if (btn.dataset.busy === "1") return;
+  const enough = state.selectedIds.size >= 2;
+  btn.disabled = !enough;
+  const key = enough ? "tip.join" : "join.needTwo";
+  if (btn.dataset.i18nTitle !== key) {
+    btn.dataset.i18nTitle = key;
+    btn.title = t(key);
+  }
+}
+// "M분 SS초" / "H시간 MM분 SS초" (the server's summary_text format).
+function fmtJoinDuration(value) {
+  const v = Number(value);
+  if (value == null || !Number.isFinite(v)) return "-";
+  const total = Math.round(v);
+  const pad = n => String(n).padStart(2, "0");
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  return h ? tf("join.dur.hms", { h, m: pad(m), s: pad(s) }) : tf("join.dur.ms", { m, s: pad(s) });
+}
+// Signed seconds of a junction: "+3.0초" (gap) / "−1.0초" (overlap).
+function fmtJoinDelta(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return "-";
+  return tf("join.sec", { v: (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(1) });
+}
+// The server always words each blocking reason / warning (Korean `message`,
+// which may differ per case, e.g. hash-unavailable); this table only covers
+// a reply without one. Unknown codes show the server text or the code.
+const JOIN_CODE_TEXT = {
+  "channel-mixed": "채널이 섞여 있습니다",
+  "stream-mismatch": "영상 스트림 설정이 서로 다릅니다",
+  "audio-presence": "오디오 트랙이 일부에만 있습니다",
+  "unknown-duration": "길이를 알 수 없는 파일이 있습니다 — 손상 의심",
+  "duplicate-file": "같은 파일이 두 번 선택되었습니다",
+  "same-start": "시작 시각이 같은 영상이 있습니다",
+  "not-indexed": "색인되지 않은 항목은 이어붙일 수 없습니다",
+  "path-unsupported": "원본 경로에 제어 문자(줄바꿈 등)가 있어 이어붙일 수 없습니다",
+  "channel-unknown": "채널을 확인할 수 없습니다",
+  "order-fallback": "녹화 시각이 일부 없어 파일명 순으로 정렬합니다",
+  "hash-unavailable": "일부 원본의 색인 해시가 없습니다",
+  "vendor-differs": "장치 제조사 판별이 서로 다릅니다",
+  "folders-differ": "원본 폴더가 서로 다릅니다",
+  "avg-frame-rate-differs": "평균 프레임레이트가 서로 다릅니다 (가변 프레임레이트일 수 있음)"
+};
+function joinBlockText(item) {
+  if (!item) return "";
+  return String(item.message || JOIN_CODE_TEXT[item.code] || item.code || "");
+}
+// Dialog body for one plan (§1.6 response). Untrusted strings (file names,
+// server messages) are escaped.
+function joinDialogContent(plan) {
+  const totals = plan.totals || {};
+  const segments = Array.isArray(plan.segments) ? plan.segments : [];
+  const junctions = Array.isArray(plan.junctions) ? plan.junctions : [];
+  const blocking = Array.isArray(plan.blocking) ? plan.blocking : [];
+  const basis = String(plan.order_basis || "");
+  const warnings = (Array.isArray(plan.warnings) ? plan.warnings : [])
+    .filter(w => w && !(w.code === "order-fallback" && basis === "filename-order"));
+  const basisKey = "join.basis." + basis;
+  const notes = [];
+  if (Number(totals.overlaps) > 0) notes.push(t("join.note.overlap"));
+  if (Number(totals.gaps) > 0) notes.push(t("join.note.gap"));
+  if (basis === "filename-order") notes.push(t("join.note.order"));
+  const gapCell = index => {
+    const j = junctions.find(x => Number(x.after_index) === index + 1) || null;
+    if (!j || index === segments.length - 1) return "-";
+    const kind = String(j.kind || "unknown");
+    if (kind === "unknown" || !Number.isFinite(Number(j.delta_seconds))) return t("join.gap.unknown");
+    return `${t("join.gap." + kind)} ${fmtJoinDelta(j.delta_seconds)}`;
+  };
+  const rows = segments.map((seg, i) => `<tr><td class="num">${i + 1}</td><td class="join-file">${escapeHtml(seg.name || seg.id || "")}</td>` +
+    `<td>${escapeHtml(seg.recorded_start_text || "-")}</td><td class="num">${escapeHtml(fmtJoinDuration(seg.duration_seconds))}</td>` +
+    `<td>${escapeHtml(gapCell(i))}</td></tr>`).join("");
+  const wrap = document.createElement("div");
+  wrap.className = "join-dlg";
+  wrap.innerHTML = [
+    `<p class="join-sum">${escapeHtml(plan.summary_text || "")}</p>`,
+    `<p class="join-basis">${escapeHtml(tf("join.basis", { basis: t(basisKey) === basisKey ? basis : t(basisKey), tol: String(Number(plan.tolerance_seconds ?? JOIN_TOLERANCE)) }))}</p>`,
+    ...notes.map(note => `<p class="join-note">${escapeHtml(note)}</p>`),
+    warnings.length ? `<div class="join-warn"><span>${escapeHtml(t("join.warnings"))}</span><ul>${warnings.map(w => `<li>${escapeHtml(joinBlockText(w))}</li>`).join("")}</ul></div>` : "",
+    blocking.length ? `<div class="join-block">${ftIcon("warning")}<div><b>${escapeHtml(t("join.blocked"))}</b><ul>${blocking.map(b => `<li>${escapeHtml(joinBlockText(b))}</li>`).join("")}</ul></div></div>` : "",
+    `<details class="join-segs"><summary>${escapeHtml(tf("join.segments", { n: segments.length }))}</summary>` +
+      `<div class="join-segs-scroll" tabindex="0" role="region" aria-label="${escapeHtml(tf("join.segments", { n: segments.length }))}"><table>` +
+      `<thead><tr><th scope="col">#</th><th scope="col">${escapeHtml(t("join.col.file"))}</th><th scope="col">${escapeHtml(t("join.col.time"))}</th>` +
+      `<th scope="col">${escapeHtml(t("join.col.len"))}</th><th scope="col">${escapeHtml(t("join.col.next"))}</th></tr></thead>` +
+      `<tbody>${rows}</tbody></table></div></details>`
+  ].join("");
+  return wrap;
+}
+async function postJoinJson(url, body) {
+  let res;
+  try {
+    res = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(body) });
+  } catch {
+    throw new Error(t("toast.clipOffline"));
+  }
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  if (!data || !data.ok) throw new Error((data && data.error) || `${url} ${res.status}`);
+  return data;
+}
+async function joinSelected(btn) {
+  const ids = selectedRecords().map(record => record.id);
+  if (ids.length < 2) { toast(t("join.needTwo")); return; }
+  let plan = null;
+  await withBusy(btn, async () => {
+    const note = toast(t("join.checking"));
+    try {
+      const data = await postJoinJson("/api/join-check", { ids, tolerance: JOIN_TOLERANCE });
+      plan = data.plan || null;
+      if (!plan) throw new Error("join-check");
+    } finally {
+      dismissToast(note);
+    }
+  }, { fail: err => tf("join.fail", { err: err?.message || "" }) });
+  syncJoinButton();
+  if (!plan) return;
+  const blocking = Array.isArray(plan.blocking) ? plan.blocking : [];
+  const ans = await askDialog({
+    title: t("join.title"),
+    content: joinDialogContent(plan),
+    ok: t("join.go"),
+    okDisabled: blocking.length > 0,
+    okTitle: blocking.length ? joinBlockText(blocking[0]) : "",
+    className: "dlg-join"
+  });
+  if (!ans || blocking.length) return;
+  await withBusy(btn, async () => {
+    const data = await postJoinJson("/api/join", { ids, plan_id: plan.plan_id, tolerance: plan.tolerance_seconds ?? JOIN_TOLERANCE });
+    let job = data.job || null;
+    if (!job) throw new Error("join");
+    if (job.state === "running") {
+      if (data.deduped) toast(t("join.deduped"));
+      const ui = clipProgressUi(() => cancelExportJob(job, "join.fail"), "join");
+      try { job = await pollExportJob(job, null, ui); } finally { ui.remove(); }
+    }
+    if (job.state === "cancelled") { toast(t("join.cancelled")); return; }
+    if (job.state === "failed") throw new Error(job.error || "join failed");
+    await showJoinDone(job, plan);
+  }, { fail: err => tf("join.fail", { err: err?.message || "" }) });
+  syncJoinButton();
+}
+// Single-button summary of a finished join: output, size, SHA-256,
+// manifest, length against the sources, gaps/overlaps — and a warning line
+// when the probed length disagrees with the sum of the sources.
+async function showJoinDone(job, plan) {
+  const totals = Object.assign({}, plan.totals || {}, job.totals || {});
+  const check = job.duration_check && typeof job.duration_check === "object" ? job.duration_check : null;
+  const observed = check && Number.isFinite(Number(check.observed)) ? Number(check.observed) : job.duration_seconds;
+  const expected = check && Number.isFinite(Number(check.expected)) ? Number(check.expected) : totals.duration_seconds;
+  const manifest = job.manifest_path || job.manifest || "";
+  const message = [
+    `${t("join.out")}: ${caseAbsPath(job.path || "") || "-"}`,
+    job.size_bytes ? `${t("clip.size")}: ${fmtClipBytes(job.size_bytes)} (${Number(job.size_bytes).toLocaleString()} B)` : "",
+    `SHA-256: ${job.sha256 || t("clip.noSha")}`,
+    `${t("join.manifest")}: ${manifest ? caseAbsPath(manifest) : "-"}`,
+    tf("join.length", { out: fmtJoinDuration(observed), src: fmtJoinDuration(expected) }),
+    tf("join.counts", { gaps: totals.gaps ?? 0, overlaps: totals.overlaps ?? 0 })
+  ].filter(Boolean).join("\n");
+  const extra = document.createElement("div");
+  extra.className = "join-dlg";
+  const lines = [];
+  if (check && check.ok === false) {
+    const diff = Number.isFinite(observed) && Number.isFinite(expected) ? Math.abs(observed - expected).toFixed(1) : "?";
+    lines.push(`<p class="join-block-line">${ftIcon("warning")}<span>${escapeHtml(tf("join.durWarn", { d: diff }))}</span></p>`);
+  }
+  lines.push(`<p class="join-basis">${escapeHtml(t(ftHosted ? "join.hostedHint" : "join.refreshHint"))}</p>`);
+  extra.innerHTML = lines.join("");
+  await askDialog({ title: t("join.doneTitle"), message, content: extra, single: true, className: "dlg-join" });
+}
+document.getElementById("btnJoinSelected").addEventListener("click", ev => joinSelected(ev.currentTarget));
+syncJoinButton();
 document.getElementById("btnShortcuts").addEventListener("click", () => toggleShortcuts(true));
 document.getElementById("btnShortcutsClose").addEventListener("click", () => toggleShortcuts(false));
 document.getElementById("btnSelectFiltered").addEventListener("click", selectAllFiltered);

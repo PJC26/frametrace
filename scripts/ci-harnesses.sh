@@ -33,6 +33,11 @@ harnesses=(
   "verify-marks-sync"
   # Adversarial-review regressions of the rebuilt shell (B1/B2/S1/S2/S4/S5).
   "verify-rebuild-regressions"
+  # Phase 2 (docs/PLAN_PHASE2_JOIN_AUDIO_2026-10-13.md §3): lossless join UI (mock API; --live once the server lands) + measured-sound facet.
+  "verify-join"
+  "verify-audio-facet"
+  # Rust/JS recording-time parser parity (tests/fixtures/rectime-cases.json, from T1).
+  "check-rectime-fixture"
 )
 
 failed=()
