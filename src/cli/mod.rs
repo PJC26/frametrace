@@ -371,6 +371,45 @@ pub enum Commands {
         #[arg(long, overrides_with = "resume")]
         no_resume: bool,
     },
+    /// Join consecutive indexed videos losslessly (ffmpeg concat, stream
+    /// copy only) into artifacts/joined with a sidecar manifest and a
+    /// chained join-log entry. Exit code 3 when --plan-id no longer matches
+    JoinVideo {
+        case_dir: PathBuf,
+        /// Indexed video ids (vid_*), comma-separated or repeated
+        #[arg(long, required = true, num_args = 1..)]
+        ids: Vec<String>,
+        /// Junction tolerance in seconds (0.5-5.0)
+        #[arg(long, default_value_t = crate::join::DEFAULT_TOLERANCE_SECONDS)]
+        tolerance: f64,
+        /// plan_id from a prior check; refuses (exit 3) when files changed
+        #[arg(long)]
+        plan_id: Option<String>,
+        /// Temp-file tag ([A-Za-z0-9_-], ≤64); default cli-<unix>-<pid>
+        #[arg(long)]
+        job_tag: Option<String>,
+        /// Print the plan JSON (the /api/join-check shape) and stop
+        #[arg(long)]
+        check: bool,
+    },
+    /// Measure the real sound level (peak/RMS dBFS via ffmpeg volumedetect)
+    /// of indexed videos that have an audio track; results go to
+    /// evidence/logs/audio-level-log.jsonl. Already-valid measurements are
+    /// skipped unless --all
+    MeasureAudio {
+        case_dir: PathBuf,
+        /// Optional viewer selection file limiting the targets
+        selection: Option<PathBuf>,
+        /// Re-measure files that already have a valid measurement
+        #[arg(long)]
+        all: bool,
+        /// Resume from an interrupted run's checkpoint (default: auto)
+        #[arg(long, overrides_with = "no_resume")]
+        resume: bool,
+        /// Discard any interrupted-run checkpoint
+        #[arg(long, overrides_with = "resume")]
+        no_resume: bool,
+    },
     /// Merge other cases' video indexes into this case's index with
     /// merged_from provenance; sha256 duplicates are kept and marked
     /// duplicate_of (candidate-grade; no re-verification)
@@ -864,6 +903,35 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         } => validate_batch(
             &case_dir,
             &selection,
+            crate::checkpoint::ResumeMode::from_flags(resume, no_resume),
+        ),
+        Commands::JoinVideo {
+            case_dir,
+            ids,
+            tolerance,
+            plan_id,
+            job_tag,
+            check,
+        } => join_video(
+            &case_dir,
+            &JoinVideoArgs {
+                ids: split_ids(&ids),
+                tolerance,
+                plan_id,
+                job_tag,
+                check,
+            },
+        ),
+        Commands::MeasureAudio {
+            case_dir,
+            selection,
+            all,
+            resume,
+            no_resume,
+        } => measure_audio(
+            &case_dir,
+            selection.as_deref(),
+            all,
             crate::checkpoint::ResumeMode::from_flags(resume, no_resume),
         ),
         Commands::KnownHashFilter {
