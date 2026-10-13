@@ -24,6 +24,14 @@ mod util {
     }
 }
 
+/// `proc.rs` reaches `super::discovery` on its fatal-signal path (P9);
+/// the test crate has no instance file, so the stub reports "not ours".
+mod discovery {
+    pub fn remove_instance_file_if_owned() -> bool {
+        false
+    }
+}
+
 #[path = "../src/serve/proc.rs"]
 mod proc;
 

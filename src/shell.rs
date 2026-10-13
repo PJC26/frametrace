@@ -414,8 +414,12 @@ fn reserve_port() -> Result<u16, String> {
     // Bind-release-bind is a tiny TOCTOU window, but serve::run returns a
     // bind error rather than grabbing a random port, and the caller turns
     // that into the browser fallback — acceptable and self-healing.
-    let listener = serve::bind_loopback(0)
-        .map_err(|err| format!("failed to reserve a loopback port: {err}"))?;
+    // Prefer the well-known ports (8477..8486) like the CLI server does:
+    // the viewer keeps unsaved drafts in per-origin localStorage, so a
+    // random port on every launch would strand a crashed session's drafts
+    // under an address the next launch never opens.
+    let listener =
+        serve::first_free_port().ok_or_else(|| "failed to reserve a loopback port".to_string())?;
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
     if port == 0 {
         return Err("reserved port resolved to 0".to_string());
