@@ -177,10 +177,12 @@ const WITH_AUDIO_TIP = "오디오 트랙을 끝까지 디코드해 최대·평�
 function syncAudioOpt() {
   const box = $("withAudio");
   if (!box) return;
-  const ff = $("withFfprobe").checked && !ffprobeMissing;
+  const ffmpegMissing = typeof envState !== "undefined" && !!envState && envState.ffmpeg === false;
+  const ff = $("withFfprobe").checked && !ffprobeMissing && !ffmpegMissing;
   box.disabled = !ff;
   if (!ff) box.checked = false;
   const tip = ff ? WITH_AUDIO_TIP
+    : ffmpegMissing ? "ffmpeg가 없어 사용할 수 없습니다 — 소리 측정은 ffmpeg로 오디오를 디코드합니다"
     : ffprobeMissing ? "ffprobe가 없어 사용할 수 없습니다 — 소리 측정은 ffprobe가 찾은 오디오 트랙만 잽니다"
       : "ffprobe 재생성 검증을 켜야 사용할 수 있습니다 — 소리 측정은 ffprobe가 찾은 오디오 트랙만 잽니다";
   const wrap = $("withAudioWrap");

@@ -23,6 +23,10 @@ async function loadEnv() {
     syncToolsBtn();
     ffprobeMissing = !t.ffprobe;
     if (!t.ffprobe) { $("withFfprobe").checked = false; syncScanMode(); }
+    // The sound option depends on ffprobe (and ffmpeg to decode): re-sync it
+    // now that the tools are known — it may have been enabled before /api/env
+    // answered, and unchecking ffprobe programmatically fires no change event.
+    if (typeof syncAudioOpt === "function") syncAudioOpt();
     // E01 is auto-detected from the path; a missing libewf is explained
     // next to the detected-kind chip instead of greying a radio.
     syncE01Need();

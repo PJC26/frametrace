@@ -250,6 +250,9 @@ async function loadViewerDataFromApi(first, ui) {
     proxies: meta.proxies,
     joinLog: meta.joinLog,
     audioLevels: meta.audioLevels,
+    // A failed read of the measurement log (records-meta reports it beside
+    // an empty map): kept so the viewer never shows it as "not measured".
+    audioLevelsError: meta.audioLevelsError || null,
   };
   if (live) {
     // The index is still growing/enriching: whatever arrived is the

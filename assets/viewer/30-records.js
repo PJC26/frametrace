@@ -448,9 +448,23 @@ const joinLog = [...new Map(
     .map(item => [normalizePath(item.output_path), item])
 ).values()];
 
+// Gaps/overlaps of a join (log entry, plan or manifest totals) are not
+// determinable when it was ordered by file name only: the server counts
+// such junctions as `unknown_junctions` (older logs: order_basis).
+function joinJunctionsUnknown(item) {
+  if (!item || typeof item !== "object") return false;
+  const totals = item.totals && typeof item.totals === "object" ? item.totals : {};
+  return Number(item.unknown_junctions ?? totals.unknown_junctions) > 0 ||
+    String(item.order_basis || "") === "filename-order";
+}
+
 // Measured sound (§2.4): the server already dropped measurements that no
 // longer match the file's bytes ("stale") — the viewer only maps them.
 const audioLevels = DATA.audioLevels && typeof DATA.audioLevels === "object" ? DATA.audioLevels : {};
+// The measurement log could not be read (records-meta audioLevelsError):
+// the map is empty for that reason, so a track reads "측정 결과를 읽지
+// 못함", never "미측정".
+const audioLevelsError = DATA.audioLevelsError ? String(DATA.audioLevelsError) : "";
 
 // §2.5 five states: sound | silent (valid measurement) · none (probed, no
 // audio stream) · track (stream present, sound not measured / failed /
@@ -462,7 +476,7 @@ function audioInfoFor(record) {
   const level = Object.prototype.hasOwnProperty.call(audioLevels, record.id) ? audioLevels[record.id] : null;
   const r = level && typeof level === "object" ? String(level.r || "") : "";
   if (r === "sound" || r === "silent") return { state: r, level, reason: "" };
-  if (hasTrack) return { state: "track", level: null, reason: r === "error" || r === "stale" ? r : "" };
+  if (hasTrack) return { state: "track", level: null, reason: r === "error" || r === "stale" ? r : audioLevelsError ? "unread" : "" };
   if (record.probeOk === true) return { state: "none", level: null, reason: "" };
   return { state: "unknown", level: null, reason: "" };
 }
@@ -485,7 +499,7 @@ function audioTipFor(record) {
     case "sound": return tf("audio.tip.sound", { max: fmtDb(level.max, 0) });
     case "silent": return tf("audio.tip.silent", { max: fmtDb(level.max, 0) });
     case "none": return t("audio.tip.none");
-    case "track": return t(record.audioReason === "error" ? "audio.tip.trackError" : record.audioReason === "stale" ? "audio.tip.trackStale" : "audio.tip.track");
+    case "track": return t(record.audioReason === "error" ? "audio.tip.trackError" : record.audioReason === "stale" ? "audio.tip.trackStale" : record.audioReason === "unread" ? "audio.tip.trackUnread" : "audio.tip.track");
     default: return "";
   }
 }
@@ -496,7 +510,7 @@ function audioDetailFor(record) {
     case "sound": return tf("audio.detail.sound", { max: fmtDb(level.max, 1), mean: fmtDb(level.mean, 1), codec });
     case "silent": return tf("audio.detail.silent", { max: fmtDb(level.max, 1) });
     case "none": return t("audio.detail.none");
-    case "track": return tf(record.audioReason === "error" ? "audio.detail.trackError" : record.audioReason === "stale" ? "audio.detail.trackStale" : "audio.detail.track", { codec });
+    case "track": return tf(record.audioReason === "error" ? "audio.detail.trackError" : record.audioReason === "stale" ? "audio.detail.trackStale" : record.audioReason === "unread" ? "audio.detail.trackUnread" : "audio.detail.track", { codec });
     default: return t("audio.unknown");
   }
 }
@@ -619,8 +633,12 @@ const records = [
     const path = absolutizeArtifactPath(item.output_path);
     const name = path.split(/[\\\/]/).pop() || String(item.output_path);
     const sources = Array.isArray(item.source_ids) ? item.source_ids.map(String) : [];
+    // The server names the record ("join:<16 hex of the output sha>"), so
+    // marks saved on it survive a rename of the output; logs written before
+    // record_id existed fall back to the output file name.
+    const serverId = typeof item.record_id === "string" ? item.record_id.trim() : "";
     return {
-      id: `join:${name}`,
+      id: serverId || `join:${name}`,
       kind: "joined",
       name,
       path,
@@ -635,12 +653,18 @@ const records = [
       container: "",
       probeOk: undefined,
       size: item.output_size_bytes,
-      note: tf("joined.note", {
-        n: item.segment_count ?? sources.length,
-        gaps: item.gaps ?? 0,
-        overlaps: item.overlaps ?? 0,
-        manifest: String(item.manifest_path || "-").split(/[\\\/]/).pop()
-      }),
+      // A filename-order join cannot tell gaps from overlaps: never "0".
+      note: joinJunctionsUnknown(item)
+        ? tf("joined.noteUnknown", {
+          n: item.segment_count ?? sources.length,
+          manifest: String(item.manifest_path || "-").split(/[\\\/]/).pop()
+        })
+        : tf("joined.note", {
+          n: item.segment_count ?? sources.length,
+          gaps: item.gaps ?? 0,
+          overlaps: item.overlaps ?? 0,
+          manifest: String(item.manifest_path || "-").split(/[\\\/]/).pop()
+        }),
       indexStatus: "active",
       joinSources: sources,
       joinInfo: item,

@@ -2,23 +2,33 @@
 //  1. one selected video: the menu item is disabled and says why (title)
 //  2. three consecutive front videos: the dialog summary reads
 //     "전방 · 3개 · 0분 0N초 · 끊김 0곳 / 겹침 1곳…", one enabled primary
-//  3. running: progress row with [중단], completion dialog with a 64-hex
-//     SHA-256; after the list is refreshed a kind=joined card is there
+//  3. running: progress row with [중단] (observed — never vacuous),
+//     completion dialog with a 64-hex SHA-256; after the list is refreshed a
+//     kind=joined card is there, under the server's record_id (old logs:
+//     "join:<file>"), and a filename-order join says "끊김·겹침 확인 불가"
 //  4. front + rear: primary disabled, its title = the first blocking reason,
-//     the reasons listed in the dialog
-//  5. cancel: the toast says the partial file was deleted (live: no .part)
+//     the reasons listed in the dialog (unknown codes still read as text)
+//  5. cancel: the toast says the partial file was deleted (live: large
+//     ffmpeg segments so the cancel always lands; no .part left)
 //  6. j / k / 1 / Space inside the dialog never reach the grid or marks
 //  7. 1366x768 and 1920x1080 (segment list open): the dialog buttons are on
 //     screen and not covered (elementFromPoint)
 //  8. axe-core WCAG 2.x A/AA on the dialog in light and dark
+//  9. (mock) a cancel that loses the race to completion: no failure toast,
+//     the success dialog only
+// 10. (mock) duration_check.observed null: "길이 확인 불가", never 0분 00초
+// 11. (live) the HOSTED shell: a join started in the shell-hosted viewer
+//     makes the shell offer '새 데이터 반영' even when its status poll never
+//     saw the job running (FTViewer "derived-job"), the shell polls fast
+//     after the start, the reload shows the joined record, and a mark on it
+//     saves through save protocol v2 and survives a page reload
 //
 //   node scripts/verify-join.mjs          mock mode: the standalone viewer
 //                                          served over http, the join API
 //                                          answered by page.route with the
-//                                          §1.6 JSON (no server needed)
+//                                          real server's JSON shapes
 //   node scripts/verify-join.mjs --live   the real workstation (isolated
-//                                          server + ffmpeg fixture); needs
-//                                          the T2 join endpoints and a build
+//                                          server + ffmpeg fixtures)
 //   (needs playwright via NODE_PATH; axe-core optional but expected)
 import { readFileSync, readdirSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -41,12 +51,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push(!!ok);
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + String(detail).slice(0, 400) : ''}`);
 };
 const skip = (name, why) => console.log(`SKIP  ${name}  — ${why}`);
 
 // ---------------------------------------------------------------- mock backend
 // Front channel: 0 s, +1 s (overlap 2 s with 3 s segments), +4 s (continuous).
+const MOCK_JOINED_ID = 'join:0123456789abcdef';
+const MOCK_OUT = 'artifacts/joined/join_F_20260910-120000_n3.mp4';
+const MOCK_MANIFEST = 'artifacts/joined/join_F_20260910-120000_n3.manifest.json';
 async function mockBackend() {
   const names = {
     vid_f1: 'DCIM/FRONT/20260910_120000_F.mp4',
@@ -66,14 +79,23 @@ async function mockBackend() {
   };
   const js = viewerBundleJs(root);
   let joined = false;
+  // join-log.jsonl entries as records-meta passes them: the new one names
+  // its record (record_id); an older filename-order one has none.
+  const joinLog = [{
+    schema_version: 1, event: 'join-video', joined_unix: 1760000050,
+    output_path: 'artifacts/joined/join_F_20260911-090000_n2.mp4', output_sha256: '9'.repeat(64), output_size_bytes: 2000,
+    manifest_path: 'artifacts/joined/join_F_20260911-090000_n2.manifest.json', manifest_sha256: '8'.repeat(64),
+    plan_id: 'plan-old', segment_count: 2, source_ids: ['vid_x1', 'vid_f1'], source_sha256: [], hash_mismatches: 0,
+    order_basis: 'filename-order', channel: 'F', tolerance_seconds: 1, gaps: 0, overlaps: 0, mode: 'stream-copy', duration_check_ok: true,
+  }, {
+    schema_version: 1, event: 'join-video', joined_unix: 1760000100, record_id: MOCK_JOINED_ID,
+    output_path: MOCK_OUT, output_sha256: 'e'.repeat(64), output_size_bytes: 3000,
+    manifest_path: MOCK_MANIFEST, manifest_sha256: 'f'.repeat(64),
+    plan_id: 'plan-front-3', segment_count: 3, source_ids: ['vid_f1', 'vid_f2', 'vid_f3'], source_sha256: [], hash_mismatches: 0,
+    order_basis: 'filename-time', channel: 'F', tolerance_seconds: 1, gaps: 0, overlaps: 1, unknown_junctions: 0, mode: 'stream-copy', duration_check_ok: true,
+  }];
   const page = () => {
-    const d = joined ? { ...data, joinLog: [{
-      schema_version: 1, event: 'join-video', joined_unix: 1760000100,
-      output_path: 'artifacts/joined/join_F_20260910-120000_n3.mp4', output_sha256: 'e'.repeat(64), output_size_bytes: 3000,
-      manifest_path: 'artifacts/joined/join_F_20260910-120000_n3.manifest.json', manifest_sha256: 'f'.repeat(64),
-      plan_id: 'plan-front-3', segment_count: 3, source_ids: ['vid_f1', 'vid_f2', 'vid_f3'], source_sha256: [], hash_mismatches: 0,
-      order_basis: 'filename-time', channel: 'F', tolerance_seconds: 1, gaps: 0, overlaps: 1, mode: 'stream-copy', duration_check_ok: true,
-    }] } : data;
+    const d = joined ? { ...data, joinLog } : data;
     return viewerPageHtml({ data: `window.__FRAMETRACE_DATA__ = ${JSON.stringify(d)};`, js, root });
   };
   const server = createServer((req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(page()); });
@@ -92,24 +114,39 @@ async function mockBackend() {
       container: 'mp4',
       segments: ids.map(seg),
       junctions: ids.slice(1).map((_, i) => ({ after_index: i + 1, delta_seconds: i === 0 ? -2 : 0, kind: i === 0 ? 'overlap' : 'continuous' })),
-      totals: { segments: ids.length, duration_seconds: 3 * ids.length, gaps: 0, gap_seconds: 0, overlaps: 1, overlap_seconds: 2, overlap_max_seconds: 2 },
+      totals: { segments: ids.length, duration_seconds: 3 * ids.length, gaps: 0, gap_seconds: 0, overlaps: 1, overlap_seconds: 2, overlap_max_seconds: 2, unknown_junctions: 0 },
       blocking: mixed ? [
         { code: 'channel-mixed', message: '채널이 섞여 있습니다 (전방 3 · 후방 1)', ids },
         { code: 'same-start', message: '시작 시각이 같은 영상 2개 — 다른 채널이나 복사본일 수 있습니다', ids: ['vid_f1', 'vid_r1'] },
         { code: 'path-unsupported', ids: ['vid_r1'] },
+        { code: 'some-future-code', ids: ['vid_r1'] },
       ] : [],
       warnings: mixed ? [] : [{ code: 'avg-frame-rate-differs', message: '평균 프레임레이트가 세그먼트마다 다릅니다 (VFR 가능)' }, { code: 'hash-unavailable', message: '색인 해시가 없는 원본 1개 — 이어붙일 때 새로 계산합니다' }],
       summary_text: mixed ? `채널 미확인 · ${ids.length}개 · 0분 12초 · 끊김 0곳 / 겹침 1곳(각 2초)` : '전방 · 3개 · 0분 09초 · 끊김 0곳 / 겹침 1곳(각 2초)',
     };
   };
-  // One job at a time: "done" walks hash → concat → verify → done; "cancel"
-  // stays running until /api/export-clip-cancel arrives.
+  // One job at a time. Modes: "done" walks hash → concat → verify → done;
+  // "done-null" finishes with duration_check.observed null; "cancel" stays
+  // running until /api/export-clip-cancel arrives; "late-cancel" finishes
+  // the moment the cancel arrives (the server then answers "already ended").
   let job = null;
   const requests = { check: [], join: [], cancel: 0 };
   const json = (route, body) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
+  // Mirrors clip_job_json (src/serve/media.rs) for kind "join": no totals,
+  // path null until the join is logged, record_id = the first source.
+  const jobJson = (over) => ({
+    id: job.id, kind: 'join', record_id: 'vid_f1', state: 'running', started_unix: job.started, finished_unix: null,
+    elapsed_secs: job.polls, path: null, stage: null, stage_done: null, stage_total: null, bytes_written: 0, expected_bytes: 3000,
+    sha256: null, size_bytes: null, error: null, cancel_requested: !!job.cancelRequested,
+    plan_id: job.plan, segments: 3, manifest_path: null, duration_check_ok: null, duration_check: null, ...over,
+  });
+  const doneJson = (check) => jobJson({
+    state: 'done', finished_unix: job.started + job.polls, path: MOCK_OUT, bytes_written: 3000, sha256: 'e'.repeat(64), size_bytes: 3000,
+    manifest_path: MOCK_MANIFEST, duration_check_ok: check.ok, duration_check: check,
+  });
   return {
     url: `http://127.0.0.1:${server.address().port}/`,
-    front: ['vid_f1', 'vid_f2', 'vid_f3'], rear: 'vid_r1', requests,
+    front: ['vid_f1', 'vid_f2', 'vid_f3'], cancelIds: ['vid_f1', 'vid_f2', 'vid_f3'], rear: 'vid_r1', requests,
     mode: 'done',
     async install(p) {
       await p.route('**/api/join-check', (route) => {
@@ -120,61 +157,88 @@ async function mockBackend() {
       await p.route('**/api/join', (route) => {
         const body = JSON.parse(route.request().postData() || '{}');
         requests.join.push(body);
-        job = { id: 'join-' + requests.join.length, kind: 'join', state: 'running', mode: this.mode, polls: 0, started_unix: 1760000000 };
-        json(route, { ok: true, deduped: false, job: { id: job.id, kind: 'join', state: 'running', stage: 'hash', stage_done: 0, stage_total: 3, elapsed_secs: 0, bytes_written: 0, expected_bytes: 3000, path: 'artifacts/joined/join_F_20260910-120000_n3.mp4' } });
+        job = { id: 'join-' + requests.join.length, state: 'running', mode: this.mode, polls: 0, started: 1760000000, plan: body.plan_id, cancelRequested: false };
+        json(route, { ok: true, deduped: false, job: jobJson({ stage: 'hash', stage_done: 0, stage_total: 3 }) });
       });
       await p.route('**/api/export-clip-status*', (route) => {
-        if (!job) return json(route, { ok: false, error: 'no job' });
+        if (!job) return json(route, { ok: false, error: '해당 클립 내보내기 작업을 찾을 수 없습니다.' });
         job.polls += 1;
-        const base = { id: job.id, kind: 'join', elapsed_secs: job.polls, path: 'artifacts/joined/join_F_20260910-120000_n3.mp4', expected_bytes: 3000 };
-        if (job.mode === 'cancel') {
-          return json(route, { ok: true, job: job.state === 'cancelled' ? { ...base, state: 'cancelled', error: '사용자가 중단했습니다' } : { ...base, state: 'running', stage: 'concat', bytes_written: 900 } });
+        if (job.mode === 'cancel' || job.mode === 'late-cancel') {
+          if (job.state === 'cancelled') return json(route, { ok: true, job: jobJson({ state: 'cancelled', finished_unix: job.started + job.polls, error: '사용자가 중단했습니다', cancel_requested: true }) });
+          if (job.state === 'done') { joined = true; return json(route, { ok: true, job: doneJson({ expected: 9, observed: 9.02, ok: true }) }); }
+          return json(route, { ok: true, job: jobJson({ stage: 'concat', stage_done: 900, stage_total: 3000, bytes_written: 900 }) });
         }
         const steps = [
-          { state: 'running', stage: 'hash', stage_done: 2, stage_total: 3, bytes_written: 0 },
-          { state: 'running', stage: 'concat', bytes_written: 1500 },
-          { state: 'running', stage: 'verify', bytes_written: 3000 },
+          { stage: 'hash', stage_done: 2, stage_total: 3 },
+          { stage: 'concat', stage_done: 1500, stage_total: 3000, bytes_written: 1500 },
+          { stage: 'verify', stage_done: 0, stage_total: 1, bytes_written: 3000 },
         ];
         const step = steps[job.polls - 1];
-        if (step) return json(route, { ok: true, job: { ...base, ...step } });
+        if (step) return json(route, { ok: true, job: jobJson(step) });
         joined = true;
-        json(route, { ok: true, job: { ...base, state: 'done', size_bytes: 3000, sha256: 'e'.repeat(64), manifest_path: 'artifacts/joined/join_F_20260910-120000_n3.manifest.json', duration_check: { expected: 9, observed: 9.02, ok: true }, totals: { gaps: 0, overlaps: 1 } } });
+        job.state = 'done';
+        // The server's fallback when the manifest has no duration_check.
+        const dc = job.mode === 'done-null' ? { expected: 9, observed: null, ok: false } : { expected: 9, observed: 9.02, ok: true };
+        json(route, { ok: true, job: doneJson(dc) });
       });
       await p.route('**/api/export-clip-cancel', (route) => {
         requests.cancel += 1;
-        if (job) job.state = 'cancelled';
+        if (job && job.mode === 'late-cancel' && job.state === 'running') job.state = 'done';
+        if (!job || job.state !== 'running') return json(route, { ok: false, error: '이미 끝난 클립 내보내기입니다.' });
+        job.cancelRequested = true;
+        job.state = 'cancelled';
         json(route, { ok: true });
       });
     },
     async afterDone(p) { await p.reload(); await p.waitForSelector('.card'); },
     leftovers() { return []; },
-    cancelObservable: true,
+    async joinedIdFor() { return MOCK_JOINED_ID; },
     async stop() { server.close(); },
   };
 }
 
 // ---------------------------------------------------------------- live backend
-// Real server + real ffmpeg fixture. Needs the join endpoints (T2) and the
-// join CLI (T1); until then the join-check request fails and this mode fails.
+// Real server + real ffmpeg fixtures: three short front clips + one rear
+// (the dialog checks), two clips without recording times (filename-order),
+// and three 30 s 40 Mbit/s clips (~450 MB — the cancel always lands while
+// the debug build hashes/copies, as in tests/workstation_e2e).
 async function liveBackend() {
   const ffmpeg = process.env.FFMPEG || 'ffmpeg';
   if (spawnSync(ffmpeg, ['-version']).status !== 0) throw new Error('ffmpeg not found (set FFMPEG=)');
   const work = mkdtempSync(join(tmpdir(), 'ft-join-'));
   const src = join(work, "증거 '따옴표' 폴더");
   const caseDir = join(work, 'case');
-  const clips = [['FRONT/20260910_120000_F.mp4', 3], ['FRONT/20260910_120001_F.mp4', 3], ['FRONT/20260910_120004_F.mp4', 3], ['REAR/20260910_120000_R.mp4', 3]];
-  for (const [rel, secs] of clips) {
+  const small = ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-g', '15'];
+  const clips = [
+    ['FRONT/20260910_120000_F.mp4', 3, 'testsrc2=size=640x360:rate=15', true, small],
+    ['FRONT/20260910_120001_F.mp4', 3, 'testsrc2=size=640x360:rate=15', true, small],
+    ['FRONT/20260910_120004_F.mp4', 3, 'testsrc2=size=640x360:rate=15', true, small],
+    ['REAR/20260910_120000_R.mp4', 3, 'testsrc2=size=640x360:rate=15', true, small],
+    ['NOTIME/clip_a_F.mp4', 2, 'testsrc2=size=640x360:rate=15', true, small],
+    ['NOTIME/clip_b_F.mp4', 2, 'testsrc2=size=640x360:rate=15', true, small],
+  ];
+  const big = ['20260911_120000_F.mp4', '20260911_120030_F.mp4', '20260911_120100_F.mp4'];
+  for (const name of big) clips.push([`BIG/${name}`, 30, 'testsrc2=size=1280x720:rate=30', false,
+    ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-b:v', '40M', '-maxrate', '40M', '-bufsize', '40M']]);
+  // Every segment must be byte-distinct (the server blocks a selection with
+  // the same hash twice — duplicate-file): a per-file hue shift, tone and
+  // container title, as tests/join_audio_it.rs varies its fixtures.
+  for (const [i, [rel, secs, video, audio, enc]] of clips.entries()) {
     const file = join(src, rel);
     mkdirSync(dirname(file), { recursive: true });
-    const r = spawnSync(ffmpeg, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=15', '-f', 'lavfi', '-i', 'sine=frequency=440',
-      '-t', String(secs), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-g', '15', '-c:a', 'aac', '-shortest', file], { encoding: 'utf8' });
+    const args = ['-y', '-v', 'error', '-f', 'lavfi', '-i', `${video},hue=h=${i * 37}`];
+    if (audio) args.push('-f', 'lavfi', '-i', `sine=frequency=${300 + i * 110}`);
+    args.push('-t', String(secs), ...enc, '-metadata', `title=ft-join-fixture-${i}-${rel}`);
+    if (audio) args.push('-c:a', 'aac', '-shortest');
+    args.push(file);
+    const r = spawnSync(ffmpeg, args, { encoding: 'utf8' });
     if (r.status !== 0) throw new Error('ffmpeg fixture failed: ' + r.stderr);
   }
   const srv = await startIsolatedServer({ root, work });
   const start = await srv.postJson('/api/start', { input_kind: 'folder', source_path: src, case_dir: caseDir, with_hash: true, with_ffprobe: true, with_deepfake: false });
   if (!start || !start.ok) throw new Error('start failed: ' + JSON.stringify(start));
   let st = null;
-  for (let i = 0; i < 480; i++) {
+  for (let i = 0; i < 960; i++) {
     st = await srv.getJson('/api/status').catch(() => null);
     if (st && ['review-ready', 'done'].includes(st.phase) && !st.busy) break;
     await sleep(500);
@@ -184,49 +248,49 @@ async function liveBackend() {
   const idOf = (name) => (recs.videos || []).find((v) => String(v.relative_path || '').replace(/\\/g, '/').endsWith(name))?.id;
   const front = ['20260910_120000_F.mp4', '20260910_120001_F.mp4', '20260910_120004_F.mp4'].map(idOf);
   const rear = idOf('20260910_120000_R.mp4');
-  if (front.some((x) => !x) || !rear) throw new Error('fixture records not indexed: ' + JSON.stringify(recs.videos?.map((v) => v.relative_path)));
+  const notime = ['clip_a_F.mp4', 'clip_b_F.mp4'].map(idOf);
+  const cancelIds = big.map(idOf);
+  if ([...front, rear, ...notime, ...cancelIds].some((x) => !x)) throw new Error('fixture records not indexed: ' + JSON.stringify(recs.videos?.map((v) => v.relative_path)));
   const joinedDir = join(caseDir, 'artifacts', 'joined');
   return {
-    url: `${srv.base}/viewer/?token=${srv.token}`, front, rear, requests: null, mode: 'done',
+    url: `${srv.base}/viewer/?token=${srv.token}`, srv, front, rear, notime, cancelIds, requests: null, mode: 'done',
     async install() { /* the real API answers */ },
     async afterDone(p) { await p.reload(); await p.waitForSelector('.card'); },
     leftovers() { return existsSync(joinedDir) ? readdirSync(joinedDir).filter((f) => f.startsWith('.join-')) : []; },
-    cancelObservable: false, // tiny fixture: the job may finish before the click
+    // The joined record id the viewer must use: the log entry's record_id
+    // (server contract), else "join:<output file name>" (older logs).
+    async joinedEntryFor(ids) {
+      const meta = await srv.getJson('/api/records-meta');
+      const want = JSON.stringify([...ids].sort());
+      return (meta.joinLog || []).filter((e) => JSON.stringify([...(e.source_ids || [])].sort()) === want).at(-1) || null;
+    },
+    async joinedIdFor(ids) {
+      const e = await this.joinedEntryFor(ids);
+      if (!e) return null;
+      return (typeof e.record_id === 'string' && e.record_id.trim()) || 'join:' + String(e.output_path || '').split(/[\\/]/).pop();
+    },
     async stop() { srv.stop(); await sleep(300); try { rmSync(work, { recursive: true, force: true }); } catch { /* busy */ } },
   };
 }
 
-// ---------------------------------------------------------------- the run
-const backend = LIVE ? await liveBackend() : await mockBackend();
-console.log(`mode: ${LIVE ? 'live (real server)' : 'mock (page.route, §1.6 JSON)'}`);
-const browser = await chromium.launch();
-try {
-  const ctx = await browser.newContext({ viewport: { width: 1366, height: 768 }, colorScheme: 'light' });
-  await ctx.addInitScript(() => { try { localStorage.setItem('ft-theme', 'light'); } catch { /* blocked */ } });
-  const page = await ctx.newPage();
-  const errors = [];
-  page.on('pageerror', (e) => errors.push(String(e)));
-  await backend.install(page);
-  await page.goto(backend.url);
-  await page.waitForSelector('.card');
-
+// ---------------------------------------------------------------- page helpers
+function helpers(page) {
   const select = async (ids) => {
     await page.evaluate(() => document.getElementById('btnClearSelection')?.click());
     for (const id of ids) await page.locator(`.card[data-id="${id}"] input[data-check]`).check();
   };
   const menuItem = async () => {
     await page.click('#btnExportMenu');
-    const info = await page.evaluate(() => {
+    return page.evaluate(() => {
       const b = document.getElementById('btnJoinSelected');
       return { hidden: b.hidden, disabled: b.disabled, title: b.title, text: b.textContent };
     });
-    return info;
   };
   const openJoin = async () => {
     const info = await menuItem();
     if (!info.disabled) await page.click('#btnJoinSelected');
     else await page.keyboard.press('Escape');
-    return page.waitForSelector('.modal.dlg.dlg-join', { timeout: 15000 }).catch(() => null);
+    return page.waitForSelector('.modal.dlg.dlg-join', { timeout: 30000 }).catch(() => null);
   };
   const dialog = () => page.evaluate(() => {
     const d = document.querySelector('.modal.dlg.dlg-join');
@@ -247,6 +311,164 @@ try {
       buttons: [...d.querySelectorAll('.dlg-actions button')].map((b) => b.textContent),
     };
   });
+  // Every state the progress row ever showed (MutationObserver: a short
+  // job cannot slip between two samples).
+  const watchRows = () => page.evaluate(() => {
+    window.__joinRows = [];
+    const host = document.getElementById('toastHost');
+    const note = () => {
+      const row = host && host.querySelector('.clip-progress.job-join');
+      if (!row) return;
+      const s = JSON.stringify({ text: row.querySelector('.toast-text')?.textContent || '', cancel: row.querySelector('button')?.textContent || '' });
+      if (window.__joinRows.at(-1) !== s) window.__joinRows.push(s);
+    };
+    if (window.__joinRowObs) window.__joinRowObs.disconnect();
+    window.__joinRowObs = new MutationObserver(note);
+    if (host) window.__joinRowObs.observe(host, { childList: true, subtree: true, characterData: true });
+  });
+  const rowsSeen = () => page.evaluate(() => (window.__joinRows || []).map((s) => JSON.parse(s)));
+  const doneDialog = (timeout) => page.waitForFunction(() => {
+    const d = [...document.querySelectorAll('.modal.dlg')].find((x) => x.querySelector('.panel-title')?.textContent === '이어붙이기 완료');
+    return d ? d.innerText : null;
+  }, null, { timeout }).then((h) => h.jsonValue()).catch(() => null);
+  const toasts = () => page.evaluate(() => [...document.querySelectorAll('#toastHost .toast:not(.clip-progress)')].map((t) => t.textContent));
+  // Clicks [이어붙이기]; a disabled (blocked) or missing primary is a clear
+  // FAIL naming the blocking reasons, not a 30 s click timeout. Closes the
+  // dialog and returns false then.
+  const startJoin = async (what) => {
+    const info = await dialog();
+    if (!info || info.okDisabled) {
+      check(`${what}: [이어붙이기] is enabled`, false, info ? 'blocked: ' + JSON.stringify(info.block) + ' warnings: ' + JSON.stringify(info.warns) : 'no join dialog');
+      if (info) await page.keyboard.press('Escape');
+      return false;
+    }
+    await page.click('.modal.dlg.dlg-join .dlg-actions button.primary');
+    return true;
+  };
+  return { select, menuItem, openJoin, dialog, watchRows, rowsSeen, doneDialog, toasts, startJoin };
+}
+
+// ---------------------------------------------------------------- hosted shell (live)
+async function hostedShellFlow(browser, backend) {
+  const { srv } = backend;
+  const ctx = await browser.newContext({ viewport: { width: 1366, height: 768 }, colorScheme: 'light' });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  // The shell's status poll must NEVER see the join running: only the
+  // viewer's "derived-job" event can then set the '새 데이터 반영' wait.
+  let hideRunning = true;
+  let hiddenSeen = 0;
+  await page.route('**/api/status*', async (route) => {
+    const res = await route.fetch();
+    let body = await res.text();
+    if (hideRunning) {
+      try {
+        const st = JSON.parse(body);
+        if (Array.isArray(st.clip_jobs)) {
+          const running = st.clip_jobs.filter((c) => c && c.kind === 'join' && c.state === 'running').length;
+          hiddenSeen += running;
+          st.clip_jobs = st.clip_jobs.filter((c) => !(c && c.kind === 'join' && c.state === 'running'));
+          st.clips_running = Math.max(0, (Number(st.clips_running) || 0) - running);
+          body = JSON.stringify(st);
+        }
+      } catch { /* not JSON: pass through */ }
+    }
+    await route.fulfill({ response: res, body });
+  });
+  const statusTimes = [];
+  let joinAnsweredAt = 0;
+  const saves = [];
+  page.on('request', (r) => {
+    if (/\/api\/status(\?|$)/.test(r.url())) statusTimes.push(Date.now());
+    if (/\/api\/import-marks/.test(r.url())) {
+      try { saves.push(JSON.parse(JSON.parse(r.postData() || '{}').marks_json || '{}')); } catch { saves.push(null); }
+    }
+  });
+  page.on('response', (r) => { if (/\/api\/join$/.test(new URL(r.url()).pathname)) joinAnsweredAt = Date.now(); });
+  const h = helpers(page);
+  try {
+    await page.goto(`${srv.base}/?token=${srv.token}`);
+    await page.waitForSelector('#recordGrid .card', { timeout: 60000 });
+    check('hosted: the shell mounts the viewer (FTViewer, data-ft-host)', await page.evaluate(() => document.documentElement.hasAttribute('data-ft-host') && typeof FTViewer === 'object'));
+    const joinedIds = () => page.evaluate(() => [...document.querySelectorAll('#recordGrid .card[data-id^="join:"]')].map((c) => c.dataset.id));
+    const before = await joinedIds();
+    const ids = backend.front.slice(0, 2);
+    await page.evaluate(() => { window.__derived = []; FTViewer.on('derived-job', (e) => window.__derived.push(e.detail)); });
+    await h.select(ids);
+    const dlg = await h.openJoin();
+    check('hosted: join dialog opens in the shell-hosted viewer', !!dlg);
+    if (!dlg) return;
+    await h.watchRows();
+    if (!(await h.startJoin('hosted join'))) return;
+    const done = await h.doneDialog(180000);
+    check('hosted: completion dialog points at the jobs sheet', !!done && /작업 시트의 '새 데이터 반영'/.test(done), String(done).slice(0, 300));
+    const derived = await page.evaluate(() => window.__derived);
+    check('hosted: viewer emitted derived-job started → done', derived.length >= 2 && derived[0].state === 'started' && derived.at(-1).state === 'done' && derived.every((d) => d.kind === 'join'), JSON.stringify(derived));
+    const firstAfter = statusTimes.find((t) => t >= joinAnsweredAt);
+    check('hosted: the shell polls fast after the join starts (< 1 s, idle cadence is 5 s)', !!joinAnsweredAt && !!firstAfter && firstAfter - joinAnsweredAt < 1000, `${firstAfter && joinAnsweredAt ? firstAfter - joinAnsweredAt : '-'} ms`);
+    await page.click('.modal.dlg .dlg-actions button.primary');
+    // Within 3 s (< one idle poll) and with the running job hidden from
+    // every poll: only the viewer event can have set it.
+    const offered = await page.waitForFunction(() => { const b = document.getElementById('btnJobReload'); return !!b && !b.hidden && /새 데이터 반영/.test(b.textContent); }, null, { timeout: 3000 }).then(() => true).catch(() => false);
+    check('hosted: shell offers 새 데이터 반영 although its poll never saw the join running', offered, `hidden running sightings: ${hiddenSeen}`);
+    const chip = await page.evaluate(() => document.getElementById('jobPanel')?.textContent || '');
+    check('hosted: the chip says 이어붙이기 완료 · 새 데이터 반영 대기', /이어붙이기 완료/.test(chip), chip);
+    hideRunning = false;
+    // Open the work sheet the way the examiner does (chip), then reload.
+    await page.click('#jobPanel button').catch(() => {});
+    const sheetBtn = page.locator('#btnJobReload');
+    if (await sheetBtn.isVisible().catch(() => false)) await sheetBtn.click();
+    else await page.evaluate(() => document.getElementById('btnJobReload').click());
+    const expectId = await backend.joinedIdFor(ids);
+    const appeared = await page.waitForFunction((id) => !!document.querySelector(`#recordGrid .card[data-id="${CSS.escape(id)}"]`), expectId, { timeout: 30000 }).then(() => true).catch(() => false);
+    const after = await joinedIds();
+    check('hosted: clicking 새 데이터 반영 shows the joined record', appeared && after.length === before.length + 1, `${expectId} | ${JSON.stringify(after)}`);
+    check('hosted: the reload offer is cleared after applying', await page.evaluate(() => document.getElementById('btnJobReload').hidden));
+    const entry = await backend.joinedEntryFor(ids);
+    if (entry && typeof entry.record_id === 'string' && entry.record_id) {
+      check('hosted: joined record id is the log entry record_id', after.includes(entry.record_id) && /^join:[0-9a-f]{16}$/.test(entry.record_id), entry.record_id);
+    } else {
+      skip('hosted: joined record id = log record_id', 'awaits backend (join-log entry has no record_id yet); fallback join:<file> used: ' + expectId);
+    }
+
+    // Mark the joined record and save through save protocol v2.
+    await page.click(`#recordGrid .card[data-id="${expectId}"]`);
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('2');
+    await page.waitForFunction((id) => !!document.querySelector(`#recordGrid .card[data-id="${CSS.escape(id)}"] .mark-chip`), expectId, { timeout: 5000 }).catch(() => {});
+    const saved = await page.evaluate(() => FTViewer.save());
+    const body = saves.filter(Boolean).find((b) => (b.marks || []).some((m) => m.id === expectId)) || null;
+    check('hosted: the joined-record mark saves (FTViewer.save → true)', saved === true && (await page.evaluate(() => FTViewer.saveState())) === 'saved', String(saved));
+    check('hosted: the save is a patch-v2 body carrying the joined id', !!body && body.protocol === 'patch-v2' && body.schema_version === 2, JSON.stringify(body).slice(0, 300));
+    const meta = await srv.getJson('/api/records-meta');
+    const row = ((meta.annotations && meta.annotations.marks) || []).find((m) => (m.record_id || m.id) === expectId);
+    const rev = Number(((meta.annotations && meta.annotations.revisions) || {})[expectId]) || 0;
+    check('hosted: the server stored the joined-record mark (important, revision ≥ 1)', !!row && row.status === 'important' && rev >= 1, JSON.stringify(row) + ' rev ' + rev);
+    await page.reload();
+    await page.waitForSelector('#recordGrid .card', { timeout: 60000 });
+    const chipAfter = await page.evaluate((id) => document.querySelector(`#recordGrid .card[data-id="${CSS.escape(id)}"] .mark-chip`)?.className || '', expectId);
+    check('hosted: the mark is still on the joined record after a page reload', /important/.test(chipAfter), chipAfter);
+    check('hosted: no page errors', !errors.length, errors.join(' | '));
+  } finally {
+    await ctx.close();
+  }
+}
+
+// ---------------------------------------------------------------- the run
+const backend = LIVE ? await liveBackend() : await mockBackend();
+console.log(`mode: ${LIVE ? 'live (real server)' : 'mock (page.route, real server JSON shapes)'}`);
+const browser = await chromium.launch();
+try {
+  const ctx = await browser.newContext({ viewport: { width: 1366, height: 768 }, colorScheme: 'light' });
+  await ctx.addInitScript(() => { try { localStorage.setItem('ft-theme', 'light'); } catch { /* blocked */ } });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await backend.install(page);
+  await page.goto(backend.url);
+  await page.waitForSelector('.card');
+  const { select, menuItem, openJoin, dialog, watchRows, rowsSeen, doneDialog, toasts, startJoin } = helpers(page);
 
   // 1. one selected video
   await select([backend.front[0]]);
@@ -326,41 +548,52 @@ try {
 
   // 3. run → progress → completion
   backend.mode = 'done';
-  const progressSeen = new Set();
-  const watch = setInterval(async () => {
-    try {
-      const t = await page.evaluate(() => {
-        const row = document.querySelector('#toastHost .clip-progress.job-join');
-        return row ? { text: row.querySelector('.toast-text')?.textContent, cancel: row.querySelector('button')?.textContent } : null;
-      });
-      if (t) progressSeen.add(JSON.stringify(t));
-    } catch { /* navigating */ }
-  }, 150);
-  await page.click('.modal.dlg.dlg-join .dlg-actions button.primary');
-  const done = await page.waitForFunction(() => {
-    const d = [...document.querySelectorAll('.modal.dlg')].find((x) => x.querySelector('.panel-title')?.textContent === '이어붙이기 완료');
-    return d ? d.innerText : null;
-  }, null, { timeout: LIVE ? 120000 : 20000 }).then((h) => h.jsonValue()).catch(() => null);
-  clearInterval(watch);
-  const seen = [...progressSeen].map((x) => JSON.parse(x));
+  await watchRows();
+  const started = await startJoin('three front videos');
+  const done = started ? await doneDialog(LIVE ? 180000 : 20000) : null;
+  const seen = await rowsSeen();
   if (backend.requests) {
     const body = backend.requests.join.at(-1) || {};
     check('join request carries ids + plan_id + tolerance', body.plan_id === 'plan-front-3' && body.ids?.length === 3 && body.tolerance === 1, JSON.stringify(body));
     check('progress row shows the stages with [중단]', seen.some((s) => /^이어붙이는 중 · 해시 \d+\/3$/.test(s.text)) && seen.some((s) => /^이어붙이는 중 · \d+% · \d+초$/.test(s.text)) && seen.every((s) => s.cancel === '중단'), JSON.stringify(seen));
   } else {
-    check('progress row shown with [중단] (or the job finished first)', seen.length === 0 || seen.every((s) => s.cancel === '중단'), JSON.stringify(seen));
+    // Never vacuous: the row is drawn as soon as /api/join answers.
+    check('progress row shown with [중단] and an 이어붙이는 중 line', seen.length > 0 && seen.every((s) => s.cancel === '중단' || s.cancel === '중단 요청 중…') && seen.some((s) => /^이어붙이는 중/.test(s.text)), JSON.stringify(seen));
   }
   check('completion dialog shows a 64-hex SHA-256', !!done && /SHA-256: [0-9a-f]{64}\b/.test(done), String(done).slice(0, 400));
   check('completion dialog: manifest, length vs sources, gaps/overlaps, refresh hint', !!done && /매니페스트: /.test(done) && /길이: \d+분 \d\d초 \(원본 합계 \d+분 \d\d초\)/.test(done) && /끊김 0곳 · 겹침 1곳/.test(done) && /목록을 새로 고치면 표시됩니다/.test(done), String(done).slice(0, 400));
   check('completion dialog has a single button', await page.evaluate(() => document.querySelectorAll('.modal.dlg .dlg-actions button').length === 1));
-  await page.click('.modal.dlg .dlg-actions button.primary');
+  if (done) await page.click('.modal.dlg .dlg-actions button.primary');
   await backend.afterDone(page);
-  const joinedCard = await page.evaluate(() => {
-    const c = [...document.querySelectorAll('.card[data-id^="join:"]')][0];
+  const jid = await backend.joinedIdFor(backend.front);
+  const joinedCard = await page.evaluate((id) => {
+    const c = id && document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
     return c ? { kind: c.querySelector('.kind-badge')?.textContent, status: c.querySelector('.badge')?.textContent } : null;
-  });
-  check('after refresh a kind=joined card is listed (이어붙임 · 파생물)', !!joinedCard && joinedCard.kind === '이어붙임' && joinedCard.status === '파생물', JSON.stringify(joinedCard));
+  }, jid);
+  check('after refresh a kind=joined card is listed under the expected id (이어붙임 · 파생물)', !!joinedCard && joinedCard.kind === '이어붙임' && joinedCard.status === '파생물', `${jid} ${JSON.stringify(joinedCard)}`);
+  if (backend.requests) {
+    check('joined record uses the log entry record_id (not join:<file>)', jid === MOCK_JOINED_ID && (await page.locator(`.card[data-id="join:join_F_20260910-120000_n3.mp4"]`).count()) === 0);
+    const old = 'join:join_F_20260911-090000_n2.mp4';
+    check('an old log entry without record_id falls back to join:<file>', (await page.locator(`.card[data-id="${old}"]`).count()) === 1);
+    await page.locator(`.card[data-id="${old}"]`).click();
+    const oldNote = await page.evaluate(() => document.querySelector('#validationList .join-sources > .muted')?.textContent || '');
+    check('a filename-order join reads "끊김·겹침 확인 불가" (never 끊김 0 / 겹침 0)', /끊김·겹침 확인 불가/.test(oldNote) && !/끊김 0/.test(oldNote), oldNote);
+  }
   check('no temporary .join-* files left (live)', backend.leftovers().length === 0, backend.leftovers().join(', '));
+
+  // filename-order (live): no recording times → notes say gaps/overlaps
+  // cannot be checked; the server's unknown_junctions count when present.
+  if (LIVE) {
+    await select(backend.notime);
+    await openJoin();
+    const dn = await dialog();
+    check('filename-order plan: the dialog says gaps/overlaps cannot be checked', !!dn && dn.notes.some((n) => /끊김·겹침은 확인할 수 없습니다|끊김·겹침 확인 불가/.test(n)), JSON.stringify(dn && dn.notes));
+    await page.keyboard.press('Escape');
+    const plan = await backend.srv.postJson('/api/join-check', { ids: backend.notime, tolerance: 1 }).catch(() => null);
+    const totals = plan && plan.plan && plan.plan.totals;
+    if (totals && 'unknown_junctions' in totals) check('server plan counts unknown_junctions for a filename-order join', Number(totals.unknown_junctions) > 0, JSON.stringify(totals));
+    else skip('server plan unknown_junctions', 'awaits backend (plan totals have no unknown_junctions yet)');
+  }
 
   // 4. front + rear → blocked
   await select([...backend.front, backend.rear]);
@@ -369,7 +602,10 @@ try {
   check('mixed channels: primary disabled', !!d && d.okDisabled === true, JSON.stringify(d));
   check('mixed channels: primary title = first blocking reason', !!d && !!d.okTitle && d.okTitle === d.block[0], `${d && d.okTitle} | ${d && d.block[0]}`);
   check('mixed channels: reasons listed under 이어붙일 수 없습니다 in --danger', !!d && d.block.length >= 1 && /채널/.test(d.block[0]) && !!d.blockColor, JSON.stringify(d && d.block));
-  if (backend.requests) check('a blocking code without a message gets the local wording (path-unsupported)', d.block.includes('원본 경로에 제어 문자(줄바꿈 등)가 있어 이어붙일 수 없습니다'), JSON.stringify(d.block));
+  if (backend.requests) {
+    check('a blocking code without a message gets the local wording (path-unsupported)', d.block.includes('원본 경로에 제어 문자(줄바꿈 등)가 있어 이어붙일 수 없습니다'), JSON.stringify(d.block));
+    check('an unknown blocking code without a message still reads as a sentence', d.block.includes('이어붙일 수 없는 조건이 있습니다 (some-future-code)'), JSON.stringify(d.block));
+  }
   check('blocked dialog focus starts on 취소', await page.evaluate(() => document.activeElement?.textContent === '취소'));
   if (axeSource) {
     for (const theme of ['light', 'dark']) {
@@ -381,30 +617,66 @@ try {
   await page.keyboard.press('Escape');
   check('Esc closes the dialog without a join', (await page.locator('.modal.dlg').count()) === 0 && (!backend.requests || backend.requests.join.length === 1));
 
-  // 5. cancel
+  // 5. cancel (live: 3 × 30 s at 40 Mbit/s — the job outlives the click)
   backend.mode = 'cancel';
-  await select(backend.front);
+  await select(backend.cancelIds);
   await openJoin();
-  await page.click('.modal.dlg.dlg-join .dlg-actions button.primary');
-  const row = await page.waitForSelector('#toastHost .clip-progress.job-join button', { timeout: 10000 }).catch(() => null);
+  const cancelStarted = await startJoin('cancel run');
+  const row = cancelStarted ? await page.waitForSelector('#toastHost .clip-progress.job-join button', { timeout: 30000 }).catch(() => null) : null;
+  check('cancel: progress row with [중단] appears', !!row);
   if (row) {
     await row.click();
-    const toastText = await page.waitForFunction(() => [...document.querySelectorAll('#toastHost .toast')].map((t) => t.textContent).find((t) => /이어붙이기를 중단했습니다/.test(t)) || null, null, { timeout: 10000 }).then((h) => h.jsonValue()).catch(() => null);
-    check('cancel: toast says the partial file was deleted', !!toastText && /이어붙이기를 중단했습니다 — 만들던 파일은 지웠습니다\./.test(toastText), String(toastText));
+    const toastText = await page.waitForFunction(() => [...document.querySelectorAll('#toastHost .toast')].map((t) => t.textContent).find((t) => /이어붙이기를 중단했습니다/.test(t)) || null, null, { timeout: 60000 }).then((h) => h.jsonValue()).catch(() => null);
+    check('cancel: toast says the partial file was deleted', !!toastText && /이어붙이기를 중단했습니다 — 만들던 파일은 지웠습니다\./.test(toastText), String(toastText) + ' | ' + JSON.stringify(await toasts()));
     if (backend.requests) check('cancel: POST /api/export-clip-cancel sent once', backend.requests.cancel === 1, String(backend.requests.cancel));
     check('cancel: progress row removed', (await page.locator('#toastHost .clip-progress').count()) === 0);
+    check('cancel: no failure toast beside the cancel toast', !(await toasts()).some((t) => /실패/.test(t)), JSON.stringify(await toasts()));
     check('cancel: no .part / temp files left (live)', backend.leftovers().length === 0, backend.leftovers().join(', '));
-  } else if (!backend.cancelObservable) {
-    skip('cancel path', 'the live fixture job finished before the progress row could be clicked');
-    await page.click('.modal.dlg .dlg-actions button.primary').catch(() => {});
-  } else {
-    check('cancel: progress row with [중단] appears', false);
+    if (LIVE) {
+      const entry = await backend.joinedEntryFor(backend.cancelIds);
+      check('cancel: no join-log entry for the cancelled join (live)', !entry, JSON.stringify(entry));
+    }
   }
   const menuAfter = await menuItem();
   await page.keyboard.press('Escape');
   check('menu item re-enabled after the job (selection still 3)', !menuAfter.disabled, JSON.stringify(menuAfter));
 
+  if (backend.requests) {
+    // 9. a cancel that loses the race: the server says "already ended", the
+    // poll then sees "done" → the success dialog only, no failure toast.
+    backend.mode = 'late-cancel';
+    await page.evaluate(() => { for (const t of document.querySelectorAll('#toastHost .toast')) t.remove(); });
+    await select(backend.front);
+    await openJoin();
+    const lateStarted = await startJoin('late cancel');
+    const lateRow = lateStarted ? await page.waitForSelector('#toastHost .clip-progress.job-join button', { timeout: 10000 }).catch(() => null) : null;
+    check('late cancel: [중단] clicked while the row was up', !!lateRow);
+    if (lateRow) await lateRow.click();
+    const lateDone = lateStarted ? await doneDialog(20000) : null;
+    const lateToasts = await toasts();
+    check('late cancel: the success dialog is shown', !!lateDone && /SHA-256: [0-9a-f]{64}/.test(lateDone), String(lateDone).slice(0, 200));
+    check('late cancel: no failure / cancelled toast', !lateToasts.some((t) => /실패|이미 끝난|중단했습니다/.test(t)), JSON.stringify(lateToasts));
+    if (lateDone) await page.click('.modal.dlg .dlg-actions button.primary');
+
+    // 10. observed null → "길이 확인 불가", and the length warning says so.
+    backend.mode = 'done-null';
+    await select(backend.front);
+    await openJoin();
+    const nullDone = (await startJoin('observed-null run')) ? await doneDialog(20000) : null;
+    check('observed null: length reads 길이 확인 불가 (not 0분 00초)', !!nullDone && /길이: 길이 확인 불가 \(원본 합계 0분 09초\)/.test(nullDone) && !/길이: 0분 00초/.test(nullDone), String(nullDone).slice(0, 400));
+    check('observed null: the warning says the length could not be determined', !!nullDone && /출력 길이를 확인하지 못했습니다/.test(nullDone) && !/\?초 다릅니다/.test(nullDone), String(nullDone).slice(0, 400));
+    check('completion counts come from the checked plan (the job reply has no totals)', !!nullDone && /끊김 0곳 · 겹침 1곳/.test(nullDone));
+    if (nullDone) await page.click('.modal.dlg .dlg-actions button.primary');
+  } else {
+    skip('late cancel / observed null', 'mock only (timing / server fallback shapes)');
+  }
+
   check('no page errors', !errors.length, errors.join(' | '));
+  await ctx.close();
+
+  // 11. hosted shell path (real server only).
+  if (LIVE) await hostedShellFlow(browser, backend);
+  else skip('hosted shell: 새 데이터 반영 after a viewer-started join, joined-record marks', 'run with --live (real server)');
 } finally {
   await browser.close();
   await backend.stop();

@@ -260,28 +260,29 @@ function renderTree(facets) {
   const { typeCounts, kindCounts, dayCounts, audioCounts } = facets || facetCounts();
   const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate"), joined: t("filter.kind.joined") };
   const items = [];
-  const addItems = (title, entries, activeKey, onPick) => {
+  // `sec` + label identify an item across re-renders (focus restore).
+  const addItems = (sec, title, entries, activeKey, onPick) => {
     items.push({ header: title });
-    items.push({ label: t("tree.all"), count: null, key: "", pick: () => onPick(""), active: activeKey === "" });
+    items.push({ sec, label: t("tree.all"), count: null, key: "", pick: () => onPick(""), active: activeKey === "" });
     [...entries.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).forEach(([key, count]) => {
-      items.push({ label: key, count, key, pick: () => onPick(key), active: key === activeKey });
+      items.push({ sec, label: key, count, key, pick: () => onPick(key), active: key === activeKey });
     });
   };
-  addItems(t("tree.rectype"), new Map([...typeCounts.entries()].map(([k, c]) => [recTypeLabel(k), c])),
+  addItems("rectype", t("tree.rectype"), new Map([...typeCounts.entries()].map(([k, c]) => [recTypeLabel(k), c])),
     state.recType ? recTypeLabel(state.recType) : "", label => {
       const match = [...typeCounts.entries()].find(([k]) => recTypeLabel(k) === label);
       state.recType = match ? match[0] : "";
       state.currentPage = 1;
       requestRender();
     });
-  addItems(t("tree.kind"), new Map([...kindCounts.entries()].map(([k, c]) => [kindLabels[k] || k, c])),
+  addItems("kind", t("tree.kind"), new Map([...kindCounts.entries()].map(([k, c]) => [kindLabels[k] || k, c])),
     kindLabels[state.kind] || "", label => {
       state.kind = Object.entries(kindLabels).find(([, kindLabel]) => kindLabel === label)?.[0] || "";
       els.kind.value = state.kind;
       state.currentPage = 1;
       requestRender();
     });
-  addItems(t("tree.date"), dayCounts, state.dateFrom && state.dateFrom === state.dateTo ? state.dateFrom : "", day => {
+  addItems("date", t("tree.date"), dayCounts, state.dateFrom && state.dateFrom === state.dateTo ? state.dateFrom : "", day => {
     state.dateFrom = day;
     state.dateTo = day;
     els.dateFrom.value = day;
@@ -297,35 +298,39 @@ function renderTree(facets) {
     requestRender();
   };
   items.push({ header: t("tree.audio") });
-  items.push({ label: t("tree.all"), count: null, key: "", pick: () => pickAudio(""), active: !state.audio, facet: "audio" });
+  items.push({ sec: "audio", label: t("tree.all"), count: null, key: "", pick: () => pickAudio(""), active: !state.audio, facet: "audio" });
   AUDIO_FACETS.forEach(value => {
-    items.push({ label: t("audio.f." + value), count: (audioCounts && audioCounts.get(value)) || 0, key: value, pick: () => pickAudio(value), active: state.audio === value, facet: "audio" });
+    items.push({ sec: "audio", label: t("audio.f." + value), count: (audioCounts && audioCounts.get(value)) || 0, key: value, pick: () => pickAudio(value), active: state.audio === value, facet: "audio" });
   });
   els.facetTree.innerHTML = items.map(item => item.header !== undefined
     ? `<div class="tree-sec">${escapeHtml(item.header)}</div>`
-    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}"${item.facet ? ` data-facet="${item.facet}" data-key="${escapeHtml(item.key)}"` : ""} tabindex="0" role="button" aria-pressed="${!!item.active}"><span>${escapeHtml(item.label)}</span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
+    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}" data-sec="${item.sec}"${item.facet ? ` data-facet="${item.facet}" data-key="${escapeHtml(item.key)}"` : ""} tabindex="0" role="button" aria-pressed="${!!item.active}"><span>${escapeHtml(item.label)}</span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
   ).join("");
   // Memo probe for harnesses: bumps only when the counts were recomputed.
   els.facetTree.dataset.facetGen = String(facetMemo.gen);
   const pickers = items.filter(item => item.pick);
   const nodes = els.facetTree.querySelectorAll(".tree-item");
   let idx = 0;
-  // Picking re-renders the tree; keep keyboard focus on the same position.
-  const pickAndKeepFocus = (entry, node, at) => {
+  // Picking re-renders the tree; keep keyboard focus on the SAME item
+  // (section + value), not the same position — picking one facet changes
+  // the values listed in the others, so positions shift. A value that is
+  // gone falls back to its section's first item ("all").
+  const pickAndKeepFocus = (entry, node) => {
     const hadFocus = document.activeElement === node;
     entry.pick(node.dataset.pick);
     if (!hadFocus) return;
     render();
-    els.facetTree.querySelectorAll(".tree-item")[at]?.focus();
+    const all = [...els.facetTree.querySelectorAll(".tree-item")];
+    (all.find(el => el.dataset.sec === entry.sec && el.dataset.pick === entry.label)
+      || all.find(el => el.dataset.sec === entry.sec))?.focus();
   };
   nodes.forEach(node => {
     const entry = pickers[idx];
     if (!entry) return;
-    const at = idx;
     idx += 1;
-    node.addEventListener("click", () => pickAndKeepFocus(entry, node, at));
+    node.addEventListener("click", () => pickAndKeepFocus(entry, node));
     node.addEventListener("keydown", e => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickAndKeepFocus(entry, node, at); }
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickAndKeepFocus(entry, node); }
     });
   });
 }

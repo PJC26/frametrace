@@ -261,6 +261,30 @@ function noteClipFailures(S) {
   }
   clipsBaselined = true;
 }
+// The hosted viewer reports joins it started (FTViewer "derived-job",
+// 22-viewer-host.js). "started": poll fast now (the idle poll is 5 s and a
+// short join can begin and end between two polls) and remember the job as
+// seen running. "done": the derived record waits for '새 데이터 반영'
+// whether or not a poll ever saw the job running.
+function noteViewerDerivedJob(d) {
+  if (!d || d.kind !== "join") return;
+  const key = `${d.id}|${d.started_unix}`;
+  if (d.state === "started" || d.state === "running") {
+    joinsSeenRunning.add(key);
+    if (typeof schedulePoll === "function") schedulePoll(300);
+    return;
+  }
+  joinsSeenRunning.delete(key);
+  if (d.state !== "done") { if (typeof schedulePoll === "function") schedulePoll(300); return; }
+  const S = storeState();
+  if (S && S.viewer && S.viewer.mounted && !joinReloadWaits) {
+    joinReloadWaits = true;
+    announce("이어붙이기 완료 — 새 데이터를 반영하면 목록에 표시됩니다.");
+  }
+  if (typeof schedulePoll === "function") schedulePoll(300);
+  renderChip();
+  renderJobsSheet();
+}
 let jobsMountedSeen = null;
 if (typeof FTStore === "object" && FTStore && typeof FTStore.on === "function") {
   FTStore.on("change", ev => {

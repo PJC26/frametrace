@@ -881,11 +881,20 @@ function caseAbsPath(path) {
     ? caseDir.replace(/[\\/]+$/, "") + sep + path.split("/").join(sep) : path;
 }
 // Cancel button of a clip/join progress row (POST /api/export-clip-cancel).
+// A cancel that lost the race to completion is not a failure: the server
+// answers "already finished" and the poll then shows the result (the
+// success dialog) — no failure toast beside it.
+function cancelLostRace(d) {
+  if (!d) return false;
+  const st = String(d.state || (d.job && d.job.state) || "");
+  if (st === "done" || st === "failed" || st === "cancelled") return true;
+  return /이미\s*끝난|already\s+(finished|done|ended)/i.test(String(d.error || ""));
+}
 async function cancelExportJob(job, failKey) {
   try {
     const r = await fetch("/api/export-clip-cancel", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ job: job.id }) });
     const d = await r.json();
-    if (!d.ok) toast(tf(failKey, { err: d.error || "" }));
+    if (!d.ok && !cancelLostRace(d)) toast(tf(failKey, { err: d.error || "" }));
   } catch { toast(t("toast.clipOffline")); }
 }
 
@@ -995,6 +1004,10 @@ const JOIN_CODE_TEXT = {
   "same-start": "시작 시각이 같은 영상이 있습니다",
   "not-indexed": "색인되지 않은 항목은 이어붙일 수 없습니다",
   "path-unsupported": "원본 경로에 제어 문자(줄바꿈 등)가 있어 이어붙일 수 없습니다",
+  "path-not-utf8": "원본 경로를 UTF-8로 읽을 수 없어 이어붙일 수 없습니다",
+  "extra-video-streams": "추가 영상 스트림은 결과 파일에 담기지 않습니다",
+  "data-streams-dropped": "데이터·자막 스트림(예: GPS)은 결과 파일에 담기지 않습니다",
+  "extradata-unavailable": "일부 원본의 코덱 설정(extradata)을 비교하지 못했습니다",
   "channel-unknown": "채널을 확인할 수 없습니다",
   "order-fallback": "녹화 시각이 일부 없어 파일명 순으로 정렬합니다",
   "hash-unavailable": "일부 원본의 색인 해시가 없습니다",
@@ -1002,9 +1015,15 @@ const JOIN_CODE_TEXT = {
   "folders-differ": "원본 폴더가 서로 다릅니다",
   "avg-frame-rate-differs": "평균 프레임레이트가 서로 다릅니다 (가변 프레임레이트일 수 있음)"
 };
-function joinBlockText(item) {
+// Server `message` first (new codes — extra video streams, audio extradata,
+// non-UTF-8 paths, hash variants — arrive worded); a code this table does
+// not know still reads as a sentence, never a bare identifier.
+function joinBlockText(item, warning) {
   if (!item) return "";
-  return String(item.message || JOIN_CODE_TEXT[item.code] || item.code || "");
+  const message = String(item.message || "").trim();
+  if (message) return message;
+  if (JOIN_CODE_TEXT[item.code]) return JOIN_CODE_TEXT[item.code];
+  return tf(warning ? "join.code.warn" : "join.code.block", { code: String(item.code || "?") });
 }
 // Dialog body for one plan (§1.6 response). Untrusted strings (file names,
 // server messages) are escaped.
@@ -1021,6 +1040,7 @@ function joinDialogContent(plan) {
   if (Number(totals.overlaps) > 0) notes.push(t("join.note.overlap"));
   if (Number(totals.gaps) > 0) notes.push(t("join.note.gap"));
   if (basis === "filename-order") notes.push(t("join.note.order"));
+  else if (joinJunctionsUnknown(plan)) notes.push(t("join.counts.unknown"));
   const gapCell = index => {
     const j = junctions.find(x => Number(x.after_index) === index + 1) || null;
     if (!j || index === segments.length - 1) return "-";
@@ -1037,7 +1057,7 @@ function joinDialogContent(plan) {
     `<p class="join-sum">${escapeHtml(plan.summary_text || "")}</p>`,
     `<p class="join-basis">${escapeHtml(tf("join.basis", { basis: t(basisKey) === basisKey ? basis : t(basisKey), tol: String(Number(plan.tolerance_seconds ?? JOIN_TOLERANCE)) }))}</p>`,
     ...notes.map(note => `<p class="join-note">${escapeHtml(note)}</p>`),
-    warnings.length ? `<div class="join-warn"><span>${escapeHtml(t("join.warnings"))}</span><ul>${warnings.map(w => `<li>${escapeHtml(joinBlockText(w))}</li>`).join("")}</ul></div>` : "",
+    warnings.length ? `<div class="join-warn"><span>${escapeHtml(t("join.warnings"))}</span><ul>${warnings.map(w => `<li>${escapeHtml(joinBlockText(w, true))}</li>`).join("")}</ul></div>` : "",
     blocking.length ? `<div class="join-block">${ftIcon("warning")}<div><b>${escapeHtml(t("join.blocked"))}</b><ul>${blocking.map(b => `<li>${escapeHtml(joinBlockText(b))}</li>`).join("")}</ul></div></div>` : "",
     `<details class="join-segs"><summary>${escapeHtml(tf("join.segments", { n: segments.length }))}</summary>` +
       `<div class="join-segs-scroll" tabindex="0" role="region" aria-label="${escapeHtml(tf("join.segments", { n: segments.length }))}"><table>` +
@@ -1090,10 +1110,15 @@ async function joinSelected(btn) {
     let job = data.job || null;
     if (!job) throw new Error("join");
     if (job.state === "running") {
+      // The host (shell) polls /api/status only every 5 s when idle: tell
+      // it a join is running so it polls fast and knows to offer '새 데이터
+      // 반영' when it ends, even if its poll never saw the job running.
+      emitDerivedJob(job, "started");
       if (data.deduped) toast(t("join.deduped"));
       const ui = clipProgressUi(() => cancelExportJob(job, "join.fail"), "join");
       try { job = await pollExportJob(job, null, ui); } finally { ui.remove(); }
     }
+    emitDerivedJob(job, job.state);
     if (job.state === "cancelled") { toast(t("join.cancelled")); return; }
     if (job.state === "failed") throw new Error(job.error || "join failed");
     await showJoinDone(job, plan);
@@ -1103,26 +1128,46 @@ async function joinSelected(btn) {
 // Single-button summary of a finished join: output, size, SHA-256,
 // manifest, length against the sources, gaps/overlaps — and a warning line
 // when the probed length disagrees with the sum of the sources.
+// FTViewer "derived-job" {kind, id, state: started|done|failed|cancelled,
+// started_unix}: a job started from this viewer that makes a derived record
+// (a join). The shell sets its '새 데이터 반영' wait on "done" and polls
+// fast after "started" (22-viewer-host.js → 31-progress.js).
+function emitDerivedJob(job, jobState) {
+  if (!job || !jobState) return;
+  FTViewer._emit("derived-job", { kind: String(job.kind || "join"), id: String(job.id || ""), state: String(jobState), started_unix: job.started_unix ?? null });
+}
+// A number only when the server gave one: null/""/absent stay unknown
+// (Number(null) is 0 — a length of "0분 00초" would be a false claim).
+function joinNum(value) {
+  if (value == null || value === "") return null;
+  const v = Number(value);
+  return Number.isFinite(v) ? v : null;
+}
 async function showJoinDone(job, plan) {
+  // The job reply carries no totals: the counts are the checked plan's.
   const totals = Object.assign({}, plan.totals || {}, job.totals || {});
   const check = job.duration_check && typeof job.duration_check === "object" ? job.duration_check : null;
-  const observed = check && Number.isFinite(Number(check.observed)) ? Number(check.observed) : job.duration_seconds;
-  const expected = check && Number.isFinite(Number(check.expected)) ? Number(check.expected) : totals.duration_seconds;
+  const observed = check ? joinNum(check.observed) : joinNum(job.duration_seconds);
+  const expected = check && joinNum(check.expected) != null ? joinNum(check.expected) : joinNum(totals.duration_seconds);
+  const fmtLen = v => (v == null ? t("join.len.unknown") : fmtJoinDuration(v));
+  const unknownJunctions = joinJunctionsUnknown(Object.assign({ order_basis: plan.order_basis }, { totals }));
   const manifest = job.manifest_path || job.manifest || "";
   const message = [
     `${t("join.out")}: ${caseAbsPath(job.path || "") || "-"}`,
     job.size_bytes ? `${t("clip.size")}: ${fmtClipBytes(job.size_bytes)} (${Number(job.size_bytes).toLocaleString()} B)` : "",
     `SHA-256: ${job.sha256 || t("clip.noSha")}`,
     `${t("join.manifest")}: ${manifest ? caseAbsPath(manifest) : "-"}`,
-    tf("join.length", { out: fmtJoinDuration(observed), src: fmtJoinDuration(expected) }),
-    tf("join.counts", { gaps: totals.gaps ?? 0, overlaps: totals.overlaps ?? 0 })
+    tf("join.length", { out: fmtLen(observed), src: fmtLen(expected) }),
+    unknownJunctions ? t("join.counts.unknown") : tf("join.counts", { gaps: totals.gaps ?? 0, overlaps: totals.overlaps ?? 0 })
   ].filter(Boolean).join("\n");
   const extra = document.createElement("div");
   extra.className = "join-dlg";
   const lines = [];
   if (check && check.ok === false) {
-    const diff = Number.isFinite(observed) && Number.isFinite(expected) ? Math.abs(observed - expected).toFixed(1) : "?";
-    lines.push(`<p class="join-block-line">${ftIcon("warning")}<span>${escapeHtml(tf("join.durWarn", { d: diff }))}</span></p>`);
+    const text = observed != null && expected != null
+      ? tf("join.durWarn", { d: Math.abs(observed - expected).toFixed(1) })
+      : t("join.durUnknown");
+    lines.push(`<p class="join-block-line">${ftIcon("warning")}<span>${escapeHtml(text)}</span></p>`);
   }
   lines.push(`<p class="join-basis">${escapeHtml(t(ftHosted ? "join.hostedHint" : "join.refreshHint"))}</p>`);
   extra.innerHTML = lines.join("");

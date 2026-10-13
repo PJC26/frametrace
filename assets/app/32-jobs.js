@@ -50,7 +50,12 @@ const CASE_JOBS = {
     serverKind: "audio-measure",
     title: "소리 측정",
     url: () => "/api/audio-measure",
-    confirm: null,
+    confirm: {
+      title: "소리 측정",
+      html: "<p>오디오 트랙이 있는데 아직 소리를 재지 않은 영상을 <b>처음부터 끝까지 디코드</b>해 최대·평균 신호 레벨을 잽니다.</p>" +
+        "<p>영상 수와 길이에 따라 오래 걸릴 수 있습니다 — 그동안 다른 작업(복구·카빙·보고서 생성)은 기다리며, 진행 상황은 작업 시트에 표시되고 언제든 중단할 수 있습니다. 계속하시겠습니까?</p>",
+      okLabel: "소리 측정 실행",
+    },
   },
 };
 // A server that went async but whose first status still reads idle gets
@@ -133,7 +138,12 @@ const CASE_JOB_TITLES = {
   btnRecoverDeleted: "조사된 이미지에서 삭제된 영상 후보를 복구한 뒤 뷰어를 갱신합니다",
   btnCarve: "export된 raw 이미지에서 영상 시그니처를 카빙합니다 (E01 전체 export 분석 필요)",
 };
+// Whether a case job (or anything the server refuses one beside) runs:
+// read by the deliverables sheet's 소리 측정 button (41-finalize.js), which
+// also depends on ffmpeg/ffprobe being present.
+let caseJobsBusy = false;
 function setCaseJobButtons(busy) {
+  caseJobsBusy = !!busy;
   for (const id of ["btnRecoverDeleted", "btnCarve"]) {
     const el = $(id);
     if (!el) continue;
@@ -141,6 +151,7 @@ function setCaseJobButtons(busy) {
     // A disabled control says why.
     el.title = busy ? "다른 작업이 진행 중입니다 — 위 칩이나 이 시트에서 진행 상황을 보고 중단할 수 있습니다" : CASE_JOB_TITLES[id];
   }
+  try { if (typeof finApplyAudioEnv === "function") finApplyAudioEnv(); } catch (e) { /* sheet not built yet */ }
 }
 setCaseToolsVisible(false);
 
@@ -363,6 +374,16 @@ async function finishCaseJob(job, outcome, error) {
   } else {
     job.message = how === "none" ? "완료 — 검토 화면을 열면 결과가 표시됩니다." : "완료 — 뷰어에 결과를 반영했습니다.";
   }
+  // Sound measurement may finish with per-file errors (server log line
+  // "소리 측정 완료(오류 N건)"): never reported as a clean success.
+  if (job.kind === "audio") {
+    const logs = typeof lastStatus !== "undefined" && lastStatus && Array.isArray(lastStatus.logs) ? lastStatus.logs : [];
+    const hit = logs.map(String).reverse().map(l => /소리 측정 완료\s*\(\s*오류\s*(\d+)\s*건\s*\)/.exec(l)).find(Boolean);
+    if (hit && Number(hit[1]) > 0) {
+      job.message = `완료 — 오류 ${hit[1]}건: 그 영상은 '측정 실패'(미확인)로 표시됩니다. 로그를 확인하십시오. ` + job.message.replace(/^완료 — /, "");
+      toast(`${title} 완료 — 오류 ${hit[1]}건 (로그 확인)`, "warn");
+    }
+  }
   setJobsNote(`${title} ${job.message}`);
   renderCaseJob();
 }
@@ -373,11 +394,17 @@ let clipCancelAsked = false;
 async function cancelPipelineOrClips(kind) {
   const clips = kind === "clips";
   const S0 = storeState();
-  const joinsOnly = clips && !!S0 && clipJobsTitle(clipView(S0).running) === "영상 이어붙이기";
+  const running = clips && !!S0 ? clipView(S0).running : [];
+  const joinsOnly = clips && clipJobsTitle(running) === "영상 이어붙이기";
+  const joinsAmong = clips && !joinsOnly && running.some(isJoinJob);
   const go = await askDialog(joinsOnly ? {
     title: "이어붙이기 중단",
-    html: "<p>진행 중인 영상 이어붙이기를 중단하시겠습니까?</p><p>만들던 파일은 지워지고, 원본은 그대로입니다. 언제든 다시 실행할 수 있습니다.</p>",
+    html: "<p>진행 중인 영상 이어붙이기를 중단하시겠습니까?</p><p>이어붙이던 파일은 지웁니다. 원본은 그대로이고, 언제든 다시 실행할 수 있습니다.</p>",
     okLabel: "이어붙이기 중단", cancelLabel: "계속", danger: true, focus: "dlgCancel",
+  } : joinsAmong ? {
+    title: "내보내기·이어붙이기 중단",
+    html: "<p>진행 중인 클립 내보내기와 영상 이어붙이기를 모두 중단하시겠습니까?</p><p>이미 만들어진 클립은 케이스 폴더에 남고, 이어붙이던 파일은 지웁니다. 원본은 그대로입니다.</p>",
+    okLabel: "모두 중단", cancelLabel: "계속", danger: true, focus: "dlgCancel",
   } : clips ? {
     title: "클립 내보내기 중단",
     html: "<p>진행 중인 클립 내보내기를 중단하시겠습니까?</p><p>이미 만들어진 파일은 케이스 폴더에 남습니다.</p>",
@@ -577,9 +604,13 @@ function renderTrack(steps, names, progress, warnings) {
 }
 
 // ---- sheet render (store -> DOM) ----
+// The output file name once known; before that "이어붙이기 #3" / "클립 #2"
+// (server ids are "join-3" / "clip-2" — the prefix is not shown twice).
 function clipName(job) {
   const p = String(job && job.path || "").split(/[\\/]/).filter(Boolean).pop();
-  return p || `클립 #${job && job.id != null ? job.id : ""}`;
+  if (p) return p;
+  const id = String(job && job.id != null ? job.id : "").replace(/^(join|clip)-/, "");
+  return `${isJoinJob(job) ? "이어붙이기" : "클립"} #${id}`;
 }
 // State words per job kind (clip_jobs also carries lossless joins).
 const CLIP_STATE = { running: "내보내는 중", done: "완료", failed: "실패", cancelled: "중단됨" };
@@ -671,7 +702,8 @@ function renderJobsSheet() {
     const asked = pv.active ? pipelineCancelAsked : clipCancelAsked;
     cancelPipe.disabled = !!asked;
     if (asked) cancelPipe.setAttribute("aria-busy", "true"); else cancelPipe.removeAttribute("aria-busy");
-    const clipWord = clipJobsTitle(clipView(S).running) === "영상 이어붙이기" ? "이어붙이기 중단" : "내보내기 중단";
+    const clipTitle = clipJobsTitle(clipView(S).running);
+    const clipWord = clipTitle === "영상 이어붙이기" ? "이어붙이기 중단" : clipTitle === "내보내기·이어붙이기" ? "내보내기·이어붙이기 중단" : "내보내기 중단";
     cancelPipe.textContent = asked ? "중단 요청 중…" : pv.active ? (pv.state === "enriching" ? "보강 중단" : "분석 중단") : clipWord;
     if (!pv.active && !clipsRunning) clipCancelAsked = false;
   }

@@ -69,7 +69,10 @@ const check = (name, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
 };
 
-const server = createServer((req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(html); });
+// records-meta could not read the measurement log: an empty map beside
+// audioLevelsError (served at /err).
+const errHtml = viewerPageHtml({ data: `window.__FRAMETRACE_DATA__ = ${JSON.stringify({ ...DATA, audioLevels: {}, audioLevelsError: '소리 측정 로그 체인이 손상되었습니다 (line 3)' })};`, js: viewerBundleJs(root), root });
+const server = createServer((req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(req.url.startsWith('/err') ? errHtml : html); });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch();
@@ -188,6 +191,25 @@ try {
   await page.locator('#facetTree .tree-item[data-facet="audio"][data-key=""]').click();
   await page.waitForTimeout(150);
 
+  // facet keyboard focus follows the ITEM (section + value), not its
+  // position: picking a date shrinks the 녹화 유형 / 출처 sections above it.
+  const focusInfo = () => page.evaluate(() => ({ sec: document.activeElement?.dataset?.sec, pick: document.activeElement?.dataset?.pick }));
+  const before = await page.evaluate(() => [...document.querySelectorAll('#facetTree .tree-item')].findIndex((n) => n.dataset.pick === '2026-09-12'));
+  await page.locator('#facetTree .tree-item[data-pick="2026-09-12"]').focus();
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(150);
+  const fDate = await focusInfo();
+  const afterIdx = await page.evaluate(() => [...document.querySelectorAll('#facetTree .tree-item')].findIndex((n) => n.dataset.pick === '2026-09-12'));
+  check('Enter on a date keeps focus on that date although items above it changed', fDate.sec === 'date' && fDate.pick === '2026-09-12' && afterIdx !== before, `${JSON.stringify(fDate)} idx ${before}→${afterIdx}`);
+  await page.locator('#facetTree .tree-item[data-facet="audio"][data-key="unknown"]').focus();
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(150);
+  const fAudio = await page.evaluate(() => ({ sec: document.activeElement?.dataset?.sec, key: document.activeElement?.dataset?.key }));
+  check('Enter on a 소리 value keeps focus on that value', fAudio.sec === 'audio' && fAudio.key === 'unknown', JSON.stringify(fAudio));
+  await page.locator('#facetTree .tree-item[data-facet="audio"][data-key=""]').click();
+  await page.evaluate(() => { for (const id of ['dateFrom', 'dateTo']) { const el = document.getElementById(id); el.value = ''; el.dispatchEvent(new Event('change', { bubbles: true })); } });
+  await page.waitForTimeout(200);
+
   // 6. keys
   const total = await page.locator('.card[data-id]').count();
   check('all records back after clearing filters', total === 9, String(total));
@@ -214,8 +236,11 @@ try {
 
   // 7. CSV
   await page.locator('.card[data-id="vid_sound"] input[data-check]').check();
+  await page.locator('.card[data-id="vid_none"] input[data-check]').check();
+  // Listen before clicking: a fast download can fire before the wait starts.
+  const dlWait = page.waitForEvent('download', { timeout: 15000 }).catch(() => null);
   await page.evaluate(() => document.getElementById('btnDownloadCsv').click());
-  const dl = await page.waitForEvent('download', { timeout: 5000 }).catch(() => null);
+  const dl = await dlWait;
   let csv = '';
   if (dl) csv = readFileSync(await dl.path(), 'utf8');
   const lines = csv.replace(/^﻿/, '').split(/\r?\n/);
@@ -225,8 +250,10 @@ try {
   const at = (name) => cells[header.indexOf(name)];
   check('CSV has the sound columns', ['audio_state', 'audio_max_db', 'audio_mean_db'].every((c) => header.includes(c)), lines[0]);
   check('CSV sound values are the measured ones', at('audio_state') === 'sound' && at('audio_max_db') === '-12.3' && at('audio_mean_db') === '-38.04', row);
-  const noneRow = (lines.find((l) => l.startsWith('vid_none,')) || '').split(',');
-  check('CSV unmeasured row has empty dB cells', !noneRow.length || noneRow.length < 2 || (noneRow[header.indexOf('audio_state')] === 'none' && noneRow[header.indexOf('audio_max_db')] === ''), noneRow.join(','));
+  // The row must exist: a missing row is a failure, never a pass.
+  const noneLine = lines.find((l) => l.startsWith('vid_none,'));
+  const noneRow = noneLine ? noneLine.split(',') : null;
+  check('CSV unmeasured row is present with state none and empty dB cells', !!noneRow && noneRow[header.indexOf('audio_state')] === 'none' && noneRow[header.indexOf('audio_max_db')] === '' && noneRow[header.indexOf('audio_mean_db')] === '', noneLine === undefined ? 'vid_none row missing' : noneLine);
 
   // 9. derived joined record
   const jid = 'join:join_F_20260910-120000_n2.mp4';
@@ -260,6 +287,34 @@ try {
     check('join menu item hidden in the file:// viewer', await fpage.evaluate(() => document.getElementById('btnJoinSelected').hidden === true));
     await fpage.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+
+  // audioLevelsError: a track reads "측정 결과를 읽지 못함" (never "미측정"),
+  // with ONE notice per case/error — not again after a reload.
+  const epage = await ctx.newPage();
+  epage.on('pageerror', (e) => errors.push('err page: ' + String(e)));
+  await epage.goto(base + 'err');
+  await epage.waitForSelector('.card');
+  const errToasts = () => epage.evaluate(() => [...document.querySelectorAll('#toastHost .toast')].map((t) => t.textContent).filter((t) => /소리 측정 기록을 읽지 못했습니다/.test(t)));
+  const t1 = await errToasts();
+  check('audioLevelsError: one notice naming the read failure', t1.length === 1 && /체인이 손상/.test(t1[0]), JSON.stringify(t1));
+  const eflag = await epage.evaluate(() => {
+    const f = document.querySelector('.card[data-id="vid_track"] .audio-flag');
+    return f ? { href: f.querySelector('use')?.getAttribute('href'), label: f.getAttribute('aria-label') } : null;
+  });
+  check('audioLevelsError: track icon says 측정 결과를 읽지 못함', !!eflag && eflag.href === '#i-audio-track' && eflag.label === '오디오 트랙 있음 · 측정 결과를 읽지 못함 — 미확인', JSON.stringify(eflag));
+  await epage.locator('.card[data-id="vid_sound"]').click();
+  const edetail = await epage.evaluate(() => {
+    const dt = [...document.querySelectorAll('#summaryList dt')].find((d) => d.textContent === '소리');
+    return dt ? dt.nextElementSibling.textContent : null;
+  });
+  check('audioLevelsError: detail says 측정 결과를 읽지 못함, not 미측정', edetail === '오디오 트랙 있음 (aac) — 측정 결과를 읽지 못함, 미확인', String(edetail));
+  const noneFlag = await epage.evaluate(() => document.querySelector('.card[data-id="vid_none"] .audio-flag')?.getAttribute('aria-label'));
+  check('audioLevelsError: a record without a track still reads 오디오 트랙 없음', noneFlag === '오디오 트랙 없음', String(noneFlag));
+  await epage.reload();
+  await epage.waitForSelector('.card');
+  await epage.waitForTimeout(300);
+  check('audioLevelsError: the notice is not repeated after a reload', (await errToasts()).length === 0, JSON.stringify(await errToasts()));
+  await epage.close();
 
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {
