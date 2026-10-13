@@ -22,7 +22,6 @@ function addTag(id, tag) {
   if (!list.includes(tag)) list.push(tag);
   state.tags[id] = list;
   touchAnnotation(id);
-  storageSet(TAGS_KEY, state.tags);
 }
 
 function removeTag(id, tag) {
@@ -31,7 +30,6 @@ function removeTag(id, tag) {
   if (idx >= 0) list.splice(idx, 1);
   state.tags[id] = list;
   touchAnnotation(id);
-  storageSet(TAGS_KEY, state.tags);
 }
 
 function toggleTag(id, tag) {
@@ -97,7 +95,6 @@ function applyMark(status) {
     // resulting state into the draft that hydration replays on reload.
     touchAnnotation(id);
   });
-  storageSet(MARKS_KEY, state.marks);
   requestRender();
   toast(tf("toast.markApplied", { n: ids.length, status: status === null ? t("mark.cleared") : markLabel(status) }));
 }

@@ -176,6 +176,15 @@ const FTViewer = (() => {
     summary() { return impl ? impl.summary() : null; },
     saveState() { return impl ? impl.saveState() : null; },
     async save() { return impl ? impl.save() : true; },
+    /** Internal (22-viewer-host.js unmount): resolves true once no marks
+     *  save request is in flight, false after `timeoutMs` (default 15 s). */
+    _whenSaveSettled(timeoutMs = 15000) {
+      if (!impl || !impl.whenSaveSettled) return Promise.resolve(true);
+      return Promise.race([
+        impl.whenSaveSettled().then(() => true),
+        new Promise(resolve => setTimeout(() => resolve(false), timeoutMs)),
+      ]);
+    },
     /** Sets the viewer's examiner (검토자) used in marks payloads — the same
      *  flow as typing into #examinerName. No-op while unmounted. */
     setExaminer(name) { if (impl) impl.setExaminer(name); },

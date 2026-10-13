@@ -151,18 +151,25 @@ FTViewer._attach({
   saveState: () => (saveStateEl && saveStateEl.dataset.state) || null,
   // Resolves true once nothing is pending (marks durably queued on the
   // server count as saved: they reach the case DB when the job ends).
+  // An open save conflict is never "saved": it needs the examiner's choice.
   async save() {
     if (!viewerIsServed) return false;
     const idle = () => reviewIdle();
     for (let attempt = 0; attempt < 4; attempt++) {
-      while (saveInFlight) await new Promise(resolve => setTimeout(resolve, 100));
+      await whenSaveSettled();
+      await whenConflictsChecked();
       if (idle()) return true;
+      if (!state.dirtyIds.size && !pendingReviewSync && conflictIds.size) return false;
       const result = await syncMarksNow();
       if (!result.ok && !result.queued) return false;
     }
-    while (saveInFlight) await new Promise(resolve => setTimeout(resolve, 100));
+    await whenSaveSettled();
+    await whenConflictsChecked();
     return idle();
   },
+  // Host unmount (22-viewer-host.js): wait for the request in flight so
+  // its reply settles the drafts before the mount goes.
+  whenSaveSettled: () => whenSaveSettled(),
   // Same path as typing into the viewer's own 검토자 field (#examinerName).
   setExaminer(name) {
     const value = String(name == null ? "" : name);

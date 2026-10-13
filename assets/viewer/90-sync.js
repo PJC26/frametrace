@@ -53,7 +53,11 @@ function marksPayload(opts) {
     const note = (state.notes[id] || "").trim();
     const range = rangeConflicts.has(id) ? null : rangeOfId(id);
     const tagList = Array.isArray(state.tags[id]) ? state.tags[id] : [];
-    baseRevisions[id] = Number.isFinite(state.revisions && state.revisions[id]) ? state.revisions[id] : 0;
+    // The base is the revision the unsaved edit was made on (the draft's,
+    // also for a draft adopted from a dead window), else the last one seen.
+    const draft = state.drafts && state.drafts[id];
+    baseRevisions[id] = draft && Number.isFinite(draft.base) ? draft.base
+      : (Number.isFinite(state.revisions && state.revisions[id]) ? state.revisions[id] : 0);
     if (!mark && !note && !range) {
       deleted.push(id);
       tags.push({ id, tags: tagList });
@@ -180,9 +184,11 @@ function splitPayloadChunks(payload, opts) {
 // fresh batch from the failed chunk's ids; any other failure stops the
 // run. Resolves the merged outcome:
 //   { ok, error, status, applied: {id: revision}, conflicts: [...],
-//     deferred, pending, posts, maxIds }
-// A legacy reply (no `applied` map, no v2 protocol) or a deferred (queued)
-// reply counts every id of that chunk as applied at its current revision.
+//     queuedIds: [id...], deferred, pending, posts, maxIds }
+// A legacy reply (no `applied` map, no v2 protocol) counts every id of that
+// chunk as applied at its sent revision; a deferred reply lists them in
+// `queuedIds` (the server applies them when its job ends — the drain, not this
+// reply, decides their revision).
 // The same chunk as a patch-v1 body for a workstation that predates v2
 // ("unsupported marks protocol"): dirty ids only, tags listed in the v1
 // `tags` array (an empty list removes them), no revision check (that
@@ -201,7 +207,7 @@ function legacyPayloadBody(chunk) {
 }
 
 async function sendPayloadChunks(payload, post, opts) {
-  const out = { ok: true, error: "", status: 0, applied: {}, conflicts: [], deferred: false, pending: 0, posts: 0, maxIds: (opts && opts.maxIds) || PAYLOAD_CHUNK_IDS, legacy: !!(opts && opts.legacy) };
+  const out = { ok: true, error: "", status: 0, applied: {}, conflicts: [], queuedIds: [], deferred: false, pending: 0, posts: 0, maxIds: (opts && opts.maxIds) || PAYLOAD_CHUNK_IDS, legacy: !!(opts && opts.legacy) };
   const minIds = (opts && opts.minIds) || PAYLOAD_CHUNK_MIN_IDS;
   let chunks = splitPayloadChunks(payload, { maxIds: out.maxIds, maxBytes: opts && opts.maxBytes });
   let at = 0;
@@ -212,7 +218,9 @@ async function sendPayloadChunks(payload, post, opts) {
     out.posts += 1;
     if (!res || typeof res !== "object") res = { ok: false, error: "bad response" };
     if (!res.ok) {
-      if (!out.legacy && /protocol/i.test(String(res.error || ""))) {
+      // Exactly the pre-v2 parser's refusal: any other error that mentions
+      // a protocol must not downgrade the session to last-write-wins.
+      if (!out.legacy && String(res.error || "") === "unsupported marks protocol") {
         out.legacy = true; // pre-v2 workstation: resend this chunk as patch-v1
         continue;
       }
@@ -238,7 +246,7 @@ async function sendPayloadChunks(payload, post, opts) {
     if (res.deferred) {
       out.deferred = true;
       out.pending = Math.max(out.pending, Number(res.pending) || 1);
-      for (const id of ids) out.applied[id] = chunk.base_revisions[id] ?? 0;
+      out.queuedIds.push(...ids);
     } else if (res.applied && typeof res.applied === "object" && !Array.isArray(res.applied)) {
       for (const [id, rev] of Object.entries(res.applied)) out.applied[id] = Number(rev);
       for (const c of Array.isArray(res.conflicts) ? res.conflicts : []) if (c && c.id) out.conflicts.push(c);
@@ -265,10 +273,10 @@ document.getElementById("btnDownloadMarks").addEventListener("click", () => {
 // backoff after a failure (busy lock, server restart, network), and never
 // dropped — the drafts stay in localStorage until the server confirms each
 // id. Ids the server refused because another window saved them first are
-// held in conflictIds and shown in #markConflictBanner until the examiner
-// picks a side. The #saveState indicator always shows which of saved /
-// saving / N pending / FAILED applies, so an examiner can never believe
-// unsaved work reached the case.
+// held in conflictIds and shown in #markConflictBanner (+ the per-record
+// #markConflictPanel) until the examiner picks a side. The #saveState
+// indicator always shows which of saved / saving / N pending / FAILED
+// applies, so an examiner can never believe unsaved work reached the case.
 // `var` (not let): render() calls renderSaveState(), and these must read
 // as undefined rather than throw if a render ever runs before this file.
 var pendingReviewSync = state.dirtyIds.size > 0;
@@ -280,15 +288,18 @@ var saveRevision = 0;       // bumps on every change; detects edits mid-flight
 var saveFailures = 0;
 var saveError = "";
 var queuedOnServer = 0;     // marks the server holds in its phase-2 queue (durable, not yet in the DB)
+var queuedIds = new Set();  // ids this window sent into that queue (reconciled after the drain)
+var conflictChecks = 0;     // server conflict lookups in flight: "saved" waits for them
 var saveRetryAt = 0;
 var saveChunkIds = PAYLOAD_CHUNK_IDS; // shrinks after a 413, for the rest of the session
 var saveLegacyProtocol = false;       // the workstation refused patch-v2 once: keep sending patch-v1
 var viewerIsServed = location.protocol === "http:" || location.protocol === "https:";
 var saveStateEl = document.getElementById("saveState");
-// id -> { server, server_revision, mine } for ids the server refused
-// (another window saved a newer revision). Not dirty, not saved: pending
-// until resolved through the banner.
+// id -> { server, server_revision, mine, queued } for ids the server
+// refused (another window saved a newer revision, or a queued save met a
+// newer one at drain time). Not dirty, not saved: pending until resolved.
 var conflictIds = new Map();
+var saveSettleWaiters = [];
 const AUTOSAVE_DEBOUNCE_MS = 2500;
 const AUTOSAVE_RETRY_BASE_MS = 2000;
 const AUTOSAVE_RETRY_MAX_MS = 60000;
@@ -301,7 +312,22 @@ function pendingSaveCount() {
   return state.dirtyIds.size + conflictIds.size || (pendingReviewSync ? 1 : 0);
 }
 function reviewIdle() {
-  return !pendingReviewSync && !state.dirtyIds.size && !conflictIds.size;
+  return !pendingReviewSync && !state.dirtyIds.size && !conflictIds.size && conflictChecks === 0;
+}
+// Resolves once no save request is in flight (host unmount, FTViewer.save).
+function whenSaveSettled() {
+  if (!saveInFlight) return Promise.resolve(true);
+  return new Promise(resolve => saveSettleWaiters.push(resolve)).then(() => whenSaveSettled());
+}
+function notifySaveSettled() {
+  const waiters = saveSettleWaiters;
+  saveSettleWaiters = [];
+  waiters.forEach(resolve => resolve());
+}
+// Resolves once the server-conflict lookups (boot, queue drain) finished.
+async function whenConflictsChecked() {
+  for (let i = 0; conflictChecks > 0 && i < 600; i++) await new Promise(resolve => setTimeout(resolve, 50));
+  return conflictChecks === 0;
 }
 
 function renderSaveState() {
@@ -338,6 +364,13 @@ function renderSaveState() {
     cls = "candidate";
     label = t("save.queuedServer");
     title = tf("save.title.queuedServer", { n: queuedOnServer });
+  } else if (conflictChecks > 0) {
+    // "saved" is never claimed before the server's conflict journal was
+    // read (a queued save may have met a newer revision at drain time).
+    kind = "saving";
+    cls = "candidate";
+    label = t("save.saving");
+    title = t("save.title.checking");
   } else {
     kind = "saved";
     cls = "ok";
@@ -389,8 +422,8 @@ function emitDirty() {
 }
 
 // --- Conflicts (another window saved a newer revision) --------------------
-// Server value shape (contract §1.4): { status, marked_unix, examiner, note,
-// range, tags } or null when the server holds no annotation for the id.
+// Annotation value shape (contract §1.4): { status, marked_unix, examiner,
+// note, range, tags }, or null when the server holds nothing for the id.
 function localAnnotationOf(id) {
   return {
     status: state.marks[id] ? state.marks[id].status : null,
@@ -401,120 +434,320 @@ function localAnnotationOf(id) {
     tags: [...(state.tags[id] || [])]
   };
 }
+function normServerAnnotation(s) {
+  if (!s || typeof s !== "object") return null;
+  return {
+    status: s.status || null,
+    marked_unix: Number.isFinite(s.marked_unix) ? s.marked_unix : null,
+    examiner: s.examiner || null,
+    note: s.note || "",
+    range: normRange(s.range),
+    tags: Array.isArray(s.tags) ? [...s.tags] : []
+  };
+}
+// The value a queued save submitted (GET /api/mark-conflicts `queued`):
+// the drain journal's { mark, tags, deleted, base_revision } or a bare
+// marks entry. Tags the body did not carry (null) were left as they were.
+function queuedAnnotation(q, server) {
+  if (!q || typeof q !== "object") return null;
+  const mark = q.mark && typeof q.mark === "object" ? q.mark : (Object.prototype.hasOwnProperty.call(q, "status") ? q : null);
+  const tags = Array.isArray(q.tags) ? q.tags : (mark && Array.isArray(mark.tags) ? mark.tags : ((server && server.tags) || []));
+  if (q.deleted || !mark) return { status: null, marked_unix: null, examiner: null, note: "", range: null, tags: [...tags] };
+  return {
+    status: mark.status || null,
+    marked_unix: Number.isFinite(mark.marked_unix) ? mark.marked_unix : null,
+    examiner: mark.examiner || null,
+    note: mark.note || "",
+    range: normRange(mark.range),
+    tags: [...tags]
+  };
+}
+// id -> server annotation value, from an `annotations` object
+// (records-meta / the bundle): marks rows + tag lists.
+function serverAnnotationMap(ann) {
+  const byId = new Map();
+  for (const mark of (ann && ann.marks) || []) {
+    const id = annotationMarkId(mark);
+    if (id) byId.set(id, { status: mark.status || null, marked_unix: Number.isFinite(mark.marked_unix) ? mark.marked_unix : null, examiner: mark.examiner || null, note: mark.note || "", range: normRange(mark.range), tags: [] });
+  }
+  for (const entry of (ann && ann.tags) || []) {
+    if (!entry || !entry.id) continue;
+    const cur = byId.get(entry.id) || { status: null, marked_unix: null, examiner: null, note: "", range: null, tags: [] };
+    cur.tags = Array.isArray(entry.tags) ? [...entry.tags] : [];
+    byId.set(entry.id, cur);
+  }
+  return byId;
+}
 function annotationText(a) {
   if (!a) return t("conflict.none");
   const parts = [];
   if (a.status) parts.push(typeof markLabel === "function" ? markLabel(a.status) : a.status);
-  if ((a.note || "").trim()) parts.push(`"${String(a.note).trim().slice(0, 40)}"`);
+  if ((a.note || "").trim()) parts.push(`"${String(a.note).trim().slice(0, 60)}"`);
   if (rangeValid(a.range)) parts.push(rangeText(a.range));
   if ((a.tags || []).length) parts.push((a.tags || []).join(", "));
   return parts.length ? parts.join(" · ") : t("conflict.none");
 }
-function registerConflicts(list) {
+// Writes an annotation value into the in-memory maps (no draft, no save).
+function applyAnnotationToState(id, a) {
+  if (a && a.status && a.status !== "noted") state.marks[id] = { status: a.status, marked_unix: Number.isFinite(a.marked_unix) ? a.marked_unix : Math.floor(Date.now() / 1000) };
+  else delete state.marks[id];
+  state.notes[id] = (a && a.note) || "";
+  state.examiners[id] = (a && a.examiner) || null;
+  if (a && rangeValid(a.range)) state.ranges[id] = normRange(a.range); else delete state.ranges[id];
+  draftRangesDirty = true;
+  if (a && Array.isArray(a.tags) && a.tags.length) state.tags[id] = [...a.tags]; else delete state.tags[id];
+}
+// The conflict rides in the id's draft, so a reload restores the banner.
+function persistConflict(id, entry) {
+  const prev = state.drafts[id];
+  const known = Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
+  const draft = prev ? { ...prev } : { ...draftValuesOf(id), seq: nextDraftSeq(), base: known };
+  draft.conflict = { server: entry.server, server_revision: entry.server_revision, queued: !!entry.queued };
+  if (entry.queued) draft.conflict.mine = entry.mine;
+  state.drafts[id] = draft;
+  draftFlushKeys.add(id);
+  scheduleDraftFlush();
+}
+//   list   [{ id, server_revision, server, mine? }]
+//   opts.queued   the conflicts come from the server's queue journal
+function registerConflicts(list, opts) {
+  const queued = !!(opts && opts.queued);
   let added = 0;
   for (const c of list || []) {
     if (!c || !c.id) continue;
     const id = c.id;
-    state.dirtyIds.delete(id);
-    conflictIds.set(id, {
-      server: c.server && typeof c.server === "object" ? c.server : null,
+    const prev = conflictIds.get(id);
+    const entry = {
+      server: normServerAnnotation(c.server),
       server_revision: Number(c.server_revision) || 0,
-      mine: localAnnotationOf(id)
-    });
+      mine: c.mine || (prev ? prev.mine : localAnnotationOf(id)),
+      queued: queued || !!(prev && prev.queued)
+    };
+    state.dirtyIds.delete(id);
+    conflictIds.set(id, entry);
+    persistConflict(id, entry);
     added += 1;
   }
   if (added) renderConflictBanner();
   return added;
 }
-// Takes the server's annotation for every conflicted id. The id is then
-// re-saved with base_revision = server_revision (sending the server's own
-// value back): a queue conflict (/api/status.mark_conflicts) is cleared
-// only once a later patch applies that id, and the no-op apply keeps the
-// revision as it is.
-function resolveConflictsUseServer(ids) {
+// Drafts adopted with a stored conflict (reload, dead-window adoption):
+// back into conflictIds, with the server side refreshed from the data
+// this mount loaded when it knows the id's revision.
+function registerRestoredConflicts() {
+  const ids = restoredConflictIds.splice(0);
+  if (!ids.length) return 0;
+  const fresh = serverAnnotationMap(DATA.annotations || {});
+  const revs = (DATA.annotations && DATA.annotations.revisions) || {};
+  const list = [];
+  for (const id of ids) {
+    const draft = state.drafts[id];
+    const c = draft && draft.conflict;
+    if (!c) continue;
+    const known = Number(revs[id]);
+    const useFresh = Number.isFinite(known) && known > 0;
+    list.push({
+      id,
+      server_revision: useFresh ? known : c.server_revision,
+      server: useFresh ? (fresh.get(id) || null) : c.server,
+      mine: c.queued && c.mine ? c.mine : localAnnotationOf(id),
+      queued: !!c.queued
+    });
+  }
+  const plain = list.filter(c => !c.queued);
+  const fromQueue = list.filter(c => c.queued);
+  return registerConflicts(plain) + registerConflicts(fromQueue, { queued: true });
+}
+// An edit to a conflicted id keeps the conflict; "mine" follows the edit.
+function conflictEdited(id) {
+  const c = conflictIds.get(id);
+  if (!c) return;
+  c.mine = localAnnotationOf(id);
+  persistConflict(id, c);
+  renderConflictBanner();
+}
+// Resolves conflicted ids. Either side is re-saved with base_revision =
+// the server's revision: "server" sends the server's own value back (a
+// no-op apply that also clears a queue-journal conflict), "mine" pushes
+// this window's value (for a queue conflict: the value that was queued).
+// Undo/redo entries of a resolved id are dropped — replaying one would
+// silently undo the examiner's choice.
+function resolveConflicts(ids, side) {
+  const done = [];
   for (const id of ids) {
     const c = conflictIds.get(id);
     if (!c) continue;
-    const s = c.server;
-    if (s && s.status && s.status !== "noted") state.marks[id] = { status: s.status, marked_unix: s.marked_unix };
-    else delete state.marks[id];
-    state.notes[id] = (s && s.note) || "";
-    state.examiners[id] = (s && s.examiner) || null;
-    if (s && rangeValid(s.range)) state.ranges[id] = normRange(s.range); else delete state.ranges[id];
-    draftRangesDirty = true;
-    if (s && Array.isArray(s.tags) && s.tags.length) state.tags[id] = [...s.tags]; else delete state.tags[id];
-    state.revisions[id] = c.server_revision;
     conflictIds.delete(id);
-    touchAnnotation(id);
-    // touchAnnotation stamps this window's examiner; the server's value is
-    // what goes back, so the re-save is a no-op (no revision bump).
-    state.examiners[id] = (s && s.examiner) || null;
-    if (state.drafts[id]) state.drafts[id].examiner = state.examiners[id];
+    state.revisions[id] = c.server_revision;
+    if (side === "server") {
+      applyAnnotationToState(id, c.server);
+      touchAnnotation(id, { base: c.server_revision });
+      // touchAnnotation stamps this window's examiner; the server's goes back.
+      state.examiners[id] = (c.server && c.server.examiner) || null;
+      if (state.drafts[id]) state.drafts[id].examiner = state.examiners[id];
+    } else {
+      if (c.queued && c.mine) applyAnnotationToState(id, c.mine);
+      touchAnnotation(id, { base: c.server_revision });
+    }
+    done.push(id);
   }
+  if (!done.length) return 0;
+  if (typeof dropJournalIds === "function") dropJournalIds(done);
   renderConflictBanner();
   if (typeof render === "function") render();
   if (typeof updateRangeLabel === "function") updateRangeLabel();
   renderSaveState();
   if (viewerIsServed) scheduleAutosave(0);
   emitDirty();
+  return done.length;
 }
-// Keeps this window's annotation and pushes it over the server's: the
-// base revision is moved to the server's, so the next save is accepted.
-function resolveConflictsUseMine(ids) {
-  for (const id of ids) {
-    const c = conflictIds.get(id);
-    if (!c) continue;
-    state.revisions[id] = c.server_revision;
-    conflictIds.delete(id);
-    touchAnnotation(id);
+function resolveConflictsUseServer(ids) { return resolveConflicts(ids, "server"); }
+function resolveConflictsUseMine(ids) { return resolveConflicts(ids, "mine"); }
+
+// --- Notices row: range-divergence + conflict banners --------------------
+// Both banners live in one row of the viewer grid (controls.css
+// .ft-notices, grid-area "notice"); colours come from the theme tokens
+// (--warn-bg / --warn / --text), so both themes hold AA contrast.
+function noticesHost() {
+  let host = ftRoot.querySelector(":scope > .ft-notices");
+  if (!host) {
+    host = document.createElement("div");
+    host.className = "ft-notices";
+    ftRoot.insertBefore(host, ftRoot.firstChild);
   }
-  renderConflictBanner();
-  renderSaveState();
-  if (viewerIsServed) scheduleAutosave(0);
+  return host;
+}
+function noticeButton(id, label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.id = id;
+  b.textContent = label;
+  b.addEventListener("click", onClick);
+  return b;
+}
+const CONFLICT_LIST_MAX = 300;
+var conflictPanelOpen = false;
+function recordLabelOf(id) {
+  const record = recordById.get(id);
+  return record ? (record.originalName || record.name || id) : id;
 }
 function renderConflictBanner() {
   let bar = document.getElementById("markConflictBanner");
-  if (!conflictIds.size) { if (bar) bar.remove(); return; }
-  const ids = [...conflictIds.keys()];
+  let panel = document.getElementById("markConflictPanel");
+  if (!conflictIds.size) {
+    const hadFocus = (bar && bar.contains(document.activeElement)) || (panel && panel.contains(document.activeElement));
+    if (bar) bar.remove();
+    if (panel) panel.remove();
+    conflictPanelOpen = false;
+    if (hadFocus && typeof viewerFocus === "function") viewerFocus();
+    return;
+  }
   if (!bar) {
     bar = document.createElement("div");
     bar.id = "markConflictBanner";
+    bar.className = "ft-banner";
     bar.setAttribute("role", "alert");
-    bar.style.cssText = "position:sticky;top:0;z-index:50;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;background:#fff3cd;color:#4a3500;border-bottom:2px solid #d9a400;font-size:13px";
     const msg = document.createElement("span");
-    msg.className = "conflict-msg";
-    msg.style.fontWeight = "700";
+    msg.className = "ft-banner-msg conflict-msg";
     bar.appendChild(msg);
-    const mk = (id, label, side) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "quiet";
-      b.id = id;
-      b.textContent = label;
-      b.addEventListener("click", () => {
-        const all = [...conflictIds.keys()];
-        if (side === "server") resolveConflictsUseServer(all); else resolveConflictsUseMine(all);
-      });
-      bar.appendChild(b);
-    };
-    mk("markConflictUseServer", t("conflict.useServer"), "server");
-    mk("markConflictUseMine", t("conflict.useMine"), "mine");
-    const anchor = document.getElementById("rangeDivergenceBanner");
-    if (anchor && anchor.parentNode === ftRoot) ftRoot.insertBefore(bar, anchor.nextSibling);
-    else ftRoot.insertBefore(bar, ftRoot.firstChild);
+    const toggle = noticeButton("markConflictList", t("conflict.list"), () => {
+      conflictPanelOpen = !conflictPanelOpen;
+      renderConflictBanner();
+      if (conflictPanelOpen) document.getElementById("markConflictPanelTitle")?.focus();
+    });
+    toggle.className = "toggle";
+    toggle.setAttribute("aria-controls", "markConflictPanel");
+    bar.appendChild(toggle);
+    bar.appendChild(noticeButton("markConflictUseServer", t("conflict.useServerAll"), () => resolveConflictsUseServer([...conflictIds.keys()])));
+    bar.appendChild(noticeButton("markConflictUseMine", t("conflict.useMineAll"), () => resolveConflictsUseMine([...conflictIds.keys()])));
+    noticesHost().appendChild(bar);
   }
+  const ids = [...conflictIds.keys()];
   const msg = bar.querySelector(".conflict-msg");
   msg.textContent = tf("conflict.msg", { n: ids.length });
-  msg.title = ids.slice(0, 20).map(id => {
-    const c = conflictIds.get(id);
-    return `${id}: ${t("conflict.server")} ${annotationText(c.server)} / ${t("conflict.mine")} ${annotationText(c.mine)}`;
-  }).join("\n");
+  const toggle = document.getElementById("markConflictList");
+  toggle.setAttribute("aria-expanded", conflictPanelOpen ? "true" : "false");
+  if (!panel) {
+    panel = document.createElement("section");
+    panel.id = "markConflictPanel";
+    panel.className = "conflict-panel";
+    panel.setAttribute("aria-labelledby", "markConflictPanelTitle");
+    panel.addEventListener("click", event => {
+      const btn = event.target.closest("button[data-side]");
+      if (!btn || !panel.contains(btn)) return;
+      const item = btn.closest("[data-id]");
+      const id = item && item.dataset.id;
+      if (!id) return;
+      const next = item.nextElementSibling && item.nextElementSibling.dataset.id;
+      const prev = item.previousElementSibling && item.previousElementSibling.dataset.id;
+      resolveConflicts([id], btn.dataset.side);
+      // Keyboard flow: focus moves to the same choice on the next record.
+      const target = [next, prev].map(other => other && panel.querySelector(`[data-id="${CSS.escape(other)}"] button[data-side="${btn.dataset.side}"]`)).find(Boolean);
+      if (target) target.focus();
+      else if (conflictIds.size) document.getElementById("markConflictPanelTitle")?.focus();
+    });
+    panel.addEventListener("keydown", event => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      conflictPanelOpen = false;
+      renderConflictBanner();
+      document.getElementById("markConflictList")?.focus();
+    });
+    bar.after(panel);
+  }
+  panel.hidden = !conflictPanelOpen;
+  if (conflictPanelOpen) renderConflictList(panel, ids);
+}
+function renderConflictList(panel, ids) {
+  const shown = ids.slice(0, CONFLICT_LIST_MAX);
+  const e = escapeHtml;
+  panel.innerHTML = `<h2 id="markConflictPanelTitle" class="conflict-title" tabindex="-1">${e(tf("conflict.listTitle", { n: ids.length }))}</h2>` +
+    `<ul class="conflict-list">${shown.map(id => {
+      const c = conflictIds.get(id);
+      const label = recordLabelOf(id);
+      return `<li class="conflict-item" data-id="${e(id)}">` +
+        `<div class="conflict-rec"><span class="conflict-name">${e(label)}</span>${label !== id ? ` <span class="conflict-id">${e(id)}</span>` : ""}${c.queued ? ` <span class="conflict-tag">${e(t("conflict.queued"))}</span>` : ""}</div>` +
+        `<dl class="conflict-vals"><div><dt>${e(t("conflict.server"))}</dt><dd>${e(annotationText(c.server))}</dd></div>` +
+        `<div><dt>${e(t("conflict.mine"))}</dt><dd>${e(annotationText(c.mine))}</dd></div></dl>` +
+        `<div class="conflict-acts">` +
+        `<button type="button" data-side="server" aria-label="${e(label)} — ${e(t("conflict.useServer"))}">${e(t("conflict.itemServer"))}</button>` +
+        `<button type="button" data-side="mine" aria-label="${e(label)} — ${e(t("conflict.useMine"))}">${e(t("conflict.itemMine"))}</button>` +
+        `</div></li>`;
+    }).join("")}</ul>` +
+    (ids.length > shown.length ? `<p class="conflict-more">${e(tf("conflict.more", { n: ids.length - shown.length }))}</p>` : "");
 }
 
-// Conflicts the server found while draining its marks queue
-// (/api/status.mark_conflicts) stay listed until a later patch applies the
-// id — which either banner choice does.
+// --- Server queue conflicts (GET /api/mark-conflicts, §10.2) -------------
+// A save the server queued (deferred) is applied when its job ends; a
+// revision that moved meanwhile is journaled, not applied. The journal's
+// `queued` value — what this (or another) window submitted — is "mine".
 var queueConflictsSeen = new Set();
+async function loadServerConflicts(st) {
+  const mc = st && st.mark_conflicts;
+  if (!mc || !(Number(mc.count) > 0)) return 0;
+  let data = null;
+  try {
+    const res = await fetch("/api/mark-conflicts", { cache: "no-store" });
+    data = res.ok ? await res.json() : null;
+  } catch (e) { data = null; }
+  if (ftSignal.aborted) return 0;
+  if (!data || data.ok === false || !Array.isArray(data.conflicts)) {
+    // A workstation without the route: ids from /api/status, values from records-meta.
+    const ids = Array.isArray(mc.ids) ? mc.ids.filter(id => typeof id === "string") : [];
+    return loadQueueConflicts(ids);
+  }
+  const list = [];
+  for (const c of data.conflicts) {
+    if (!c || typeof c.id !== "string") continue;
+    queueConflictsSeen.add(c.id);
+    const server = normServerAnnotation(c.server);
+    list.push({ id: c.id, server_revision: c.server_revision, server, mine: queuedAnnotation(c.queued, server) || localAnnotationOf(c.id) });
+  }
+  const n = registerConflicts(list, { queued: true });
+  if (n) { renderSaveState(); emitDirty(); }
+  return n;
+}
 async function loadQueueConflicts(ids) {
   const wanted = (ids || []).filter(id => !queueConflictsSeen.has(id) && !conflictIds.has(id));
   if (!wanted.length) return 0;
@@ -524,50 +757,87 @@ async function loadQueueConflicts(ids) {
     meta = res.ok ? await res.json() : null;
   } catch (e) { meta = null; }
   const ann = meta && meta.annotations;
-  if (!ann) return 0;
-  const serverById = new Map();
-  for (const mark of ann.marks || []) {
-    const id = annotationMarkId(mark);
-    if (id) serverById.set(id, { status: mark.status, marked_unix: mark.marked_unix, examiner: mark.examiner || null, note: mark.note || "", range: normRange(mark.range), tags: [] });
-  }
-  for (const entry of ann.tags || []) {
-    const cur = serverById.get(entry.id) || { status: null, marked_unix: null, examiner: null, note: "", range: null, tags: [] };
-    cur.tags = Array.isArray(entry.tags) ? entry.tags : [];
-    serverById.set(entry.id, cur);
-  }
+  if (!ann || ftSignal.aborted) return 0;
+  const serverById = serverAnnotationMap(ann);
   const list = [];
   for (const id of wanted) {
-    const rev = Number((ann.revisions || {})[id]) || 0;
     queueConflictsSeen.add(id);
-    list.push({ id, server_revision: rev, server: serverById.get(id) || null });
+    list.push({ id, server_revision: Number((ann.revisions || {})[id]) || 0, server: serverById.get(id) || null });
   }
-  const n = registerConflicts(list);
+  const n = registerConflicts(list, { queued: true });
   if (n) { renderSaveState(); emitDirty(); }
   return n;
 }
-function queueConflictsFromStatus(st) {
-  const mc = st && st.mark_conflicts;
-  if (!mc || !(Number(mc.count) > 0)) return;
-  const ids = Array.isArray(mc.ids) ? mc.ids.filter(id => typeof id === "string") : [];
-  if (ids.length) loadQueueConflicts(ids);
+// Runs `fn` while "saved" is withheld (conflictChecks > 0).
+async function withConflictCheck(fn) {
+  conflictChecks += 1;
+  renderSaveState();
+  try { return await fn(); } catch (e) { return null; } finally {
+    conflictChecks -= 1;
+    if (!ftSignal.aborted) { renderSaveState(); emitDirty(); }
+  }
 }
-// After the server queue drained, every queued id has a new revision on
-// the server; take the server's revision map so the next save of the same
-// id is not refused as stale.
-async function refreshRevisionsFromServer() {
+
+// After the server queue drained: per id whose server revision moved past
+// the one this window knows (records-meta revisions + writers, §10.3):
+//   last writer is this window      → take the revision only
+//   else, nothing unsaved here      → take value AND revision
+//   else (an unsaved local edit)    → conflict
+// Never a revision without its value: that would turn the next save of a
+// stale value into an overwrite.
+async function reconcileWithServer() {
+  let meta = null;
   try {
     const res = await fetch("/api/records-meta", { cache: "no-store" });
-    const meta = res.ok ? await res.json() : null;
-    const revs = meta && meta.annotations && meta.annotations.revisions;
-    if (!revs || typeof revs !== "object") return false;
-    for (const [id, rev] of Object.entries(revs)) if (Number.isFinite(Number(rev))) state.revisions[id] = Number(rev);
-    return true;
-  } catch (e) { return false; }
+    meta = res.ok ? await res.json() : null;
+  } catch (e) { meta = null; }
+  const ann = meta && meta.annotations;
+  if (!ann || !ann.revisions || typeof ann.revisions !== "object" || ftSignal.aborted) return false;
+  const writers = ann.writers && typeof ann.writers === "object" ? ann.writers : null;
+  const serverById = serverAnnotationMap(ann);
+  const me = writerId();
+  const conflicts = [];
+  let changed = false;
+  for (const [id, raw] of Object.entries(ann.revisions)) {
+    const rev = Number(raw);
+    const known = state.revisions[id];
+    if (!Number.isFinite(rev) || (Number.isFinite(known) && rev <= known) || conflictIds.has(id)) continue;
+    const draft = state.drafts[id];
+    if (writers && writers[id] === me) {
+      state.revisions[id] = rev;
+      if (draft && !draft.conflict) { draft.base = rev; draftFlushKeys.add(id); }
+      continue;
+    }
+    if (!draft && !state.dirtyIds.has(id)) {
+      applyAnnotationToState(id, serverById.get(id) || null);
+      state.revisions[id] = rev;
+      changed = true;
+      continue;
+    }
+    conflicts.push({ id, server_revision: rev, server: serverById.get(id) || null });
+  }
+  if (conflicts.length) registerConflicts(conflicts);
+  if (draftFlushKeys.size) scheduleDraftFlush();
+  if (changed) {
+    if (typeof requestRender === "function") requestRender();
+    if (typeof updateRangeLabel === "function") updateRangeLabel();
+  }
+  return true;
+}
+async function afterQueueDrained(st) {
+  await withConflictCheck(async () => {
+    await whenSaveSettled();
+    await loadServerConflicts(st);
+    await reconcileWithServer();
+  });
+  queuedOnServer = 0;
+  queuedIds.clear();
+  renderSaveState();
 }
 
 // While the server holds queued marks, poll until its queue is empty so the
-// indicator turns "saved" only once they really reached the case DB. The
-// same poll surfaces conflicts the drain recorded (/api/status.mark_conflicts).
+// indicator turns "saved" only once they really reached the case DB and
+// the drain's conflicts were read.
 var queueWatchTimer = null;
 function watchServerQueue() {
   if (queueWatchTimer || !viewerIsServed) return;
@@ -576,13 +846,10 @@ function watchServerQueue() {
     try {
       const res = await fetch("/api/status", { cache: "no-store" });
       const st = res.ok ? await res.json() : null;
-      if (st) queueConflictsFromStatus(st);
-      if (st && Number(st.pending_marks) === 0) {
+      if (st && Number(st.pending_marks) === 0 && queueWatchTimer) {
         clearInterval(queueWatchTimer);
         queueWatchTimer = null;
-        await refreshRevisionsFromServer();
-        queuedOnServer = 0;
-        renderSaveState();
+        await afterQueueDrained(st);
       }
     } catch (e) { /* keep waiting; the indicator stays "queued" */ }
   }, 3000);
@@ -594,6 +861,10 @@ function scheduleAutosave(delay) {
   autosaveTimer = setTimeout(() => { autosaveTimer = null; syncMarksNow(); }, delay);
 }
 
+// Called per touched id: the timer restarts right away (cheap), the
+// indicator and the host notification are coalesced into one microtask,
+// so a 30k-record bulk action renders the save state once, not 30k times.
+var dirtyRenderQueued = false;
 function markReviewDirty() {
   pendingReviewSync = true;
   saveRevision += 1;
@@ -602,22 +873,81 @@ function markReviewDirty() {
     // must not turn a busy server into a request-per-keystroke loop.
     if (!(saveFailures > 0 && autosaveTimer)) scheduleAutosave(AUTOSAVE_DEBOUNCE_MS);
   }
-  renderSaveState();
-  emitDirty();
+  if (dirtyRenderQueued) return;
+  dirtyRenderQueued = true;
+  queueMicrotask(() => {
+    dirtyRenderQueued = false;
+    if (ftSignal.aborted) return;
+    renderSaveState();
+    emitDirty();
+  });
 }
 
 // Per-id success: the server confirmed these ids at these revisions. A
 // draft is forgotten only when it is still the one that was sent (`seq`
-// unchanged) — an edit made while the request was in flight stays dirty
-// and goes out with the next save.
+// unchanged); an edit made while the request was in flight stays dirty,
+// now based on the revision just confirmed.
 function applyAppliedIds(applied, sentSeq) {
   for (const [id, rev] of Object.entries(applied || {})) {
     if (Number.isFinite(rev)) state.revisions[id] = rev;
     const draft = state.drafts[id];
     if (!draft) state.dirtyIds.delete(id);
     else if (draft.seq === sentSeq.get(id)) dropDraft(id);
+    else if (Number.isFinite(rev) && !draft.conflict) { draft.base = rev; draftFlushKeys.add(id); scheduleDraftFlush(); }
   }
 }
+// Deferred (queued on the server, durable there): the draft goes like an
+// applied one, the revision stays — the drain decides it (afterQueueDrained).
+function applyQueuedIds(ids, sentSeq) {
+  for (const id of ids || []) {
+    queuedIds.add(id);
+    const draft = state.drafts[id];
+    if (!draft) state.dirtyIds.delete(id);
+    else if (draft.seq === sentSeq.get(id)) dropDraft(id);
+  }
+}
+
+// A save whose mount was destroyed before the reply (hosted unmount,
+// FTViewer.reload): the reply still settles this writer's stored drafts —
+// a confirmed draft must not be replayed as unsaved — and the next mount
+// of the same writer (same token) is told through a window event.
+function settleLateSave(result, sentSeq) {
+  const me = writerId();
+  const stored = id => {
+    try { return JSON.parse(localStorage.getItem(draftKey(me, id)) || "null"); } catch (e) { return null; }
+  };
+  const forget = id => {
+    const d = stored(id);
+    if (d && d.seq === sentSeq.get(id)) { try { localStorage.removeItem(draftKey(me, id)); } catch (e) { /* storage blocked */ } }
+  };
+  Object.keys(result.applied || {}).forEach(forget);
+  (result.queuedIds || []).forEach(forget);
+  for (const c of result.conflicts || []) {
+    const d = stored(c.id);
+    if (!d || d.seq !== sentSeq.get(c.id)) continue;
+    d.conflict = { server: normServerAnnotation(c.server), server_revision: Number(c.server_revision) || 0, queued: false };
+    try { localStorage.setItem(draftKey(me, c.id), JSON.stringify(d)); } catch (e) { /* the draft stays dirty: resent */ }
+  }
+  try {
+    window.dispatchEvent(new CustomEvent("ft-viewer-late-save", { detail: {
+      writer: me, applied: result.applied || {}, queued: result.queuedIds || [], conflicts: result.conflicts || [],
+      pending: result.pending || 0, seqs: Object.fromEntries(sentSeq)
+    } }));
+  } catch (e) { /* no listener */ }
+}
+window.addEventListener("ft-viewer-late-save", event => {
+  const d = event.detail || {};
+  if (d.writer !== writerId()) return;
+  const seqs = new Map(Object.entries(d.seqs || {}));
+  applyAppliedIds(d.applied, seqs);
+  applyQueuedIds(d.queued, seqs);
+  registerConflicts((d.conflicts || []).filter(c => c && state.drafts[c.id] && state.drafts[c.id].seq === seqs.get(c.id)));
+  if ((d.queued || []).length) { queuedOnServer = Math.max(queuedOnServer, Number(d.pending) || 1); watchServerQueue(); }
+  pendingReviewSync = state.dirtyIds.size > 0;
+  if (typeof requestRender === "function") requestRender();
+  renderSaveState();
+  emitDirty();
+}, { signal: ftSignal });
 
 async function pushMarksToCase(payload) {
   const res = await fetch("/api/import-marks", {
@@ -666,6 +996,7 @@ async function syncMarksNow() {
       else {
         Object.assign(result.applied, r.applied);
         result.conflicts.push(...r.conflicts);
+        result.queuedIds.push(...r.queuedIds);
         result.posts += r.posts;
         result.deferred = result.deferred || r.deferred;
         result.pending = Math.max(result.pending, r.pending);
@@ -678,19 +1009,27 @@ async function syncMarksNow() {
       if (!r.ok) break;
     }
   } catch (error) {
-    result = { ok: false, offline: true, error: t("save.offlineErr"), applied: {}, conflicts: [] };
+    result = { ok: false, offline: true, error: t("save.offlineErr"), applied: {}, conflicts: [], queuedIds: [] };
   }
   saveInFlight = false;
+  if (ftSignal.aborted) {
+    settleLateSave(result, sentSeq);
+    notifySaveSettled();
+    return result;
+  }
   if (result.maxIds) saveChunkIds = result.maxIds;
   if (result.legacy) saveLegacyProtocol = true;
   // Chunks that landed before a later failure are confirmed either way.
   applyAppliedIds(result.applied, sentSeq);
+  applyQueuedIds(result.queuedIds, sentSeq);
   registerConflicts(result.conflicts);
   if (result.ok) {
     // queued: durably on the server but not in the case DB until the
     // enrichment step ends — shown as "저장 대기(보강 중)", never a failure.
-    queuedOnServer = result.deferred ? Math.max(1, Number(result.pending) || 1) : 0;
-    if (queuedOnServer) watchServerQueue();
+    if (result.deferred) {
+      queuedOnServer = Math.max(queuedOnServer, Number(result.pending) || 1);
+      watchServerQueue();
+    }
     saveFailures = 0;
     saveError = "";
     saveRetryAt = 0;
@@ -709,6 +1048,7 @@ async function syncMarksNow() {
     if (firstFailure) FTViewer._emit("error", { message: tf("toast.saveFailed", { err: saveError }), detail: saveError, stage: "save" });
   }
   scheduleDraftFlush();
+  notifySaveSettled();
   if (manualQueued) {
     // A queued manual apply always pushes once more and reports, even if
     // this save already cleared pendingReviewSync.
@@ -759,14 +1099,15 @@ document.addEventListener("visibilitychange", () => {
   if (viewerIsServed && pendingReviewSync && saveFailures > 0) scheduleAutosave(0);
 }, { signal: ftSignal });
 
-// --- Two windows on one case (U2) -----------------------------------------
-// Each window refreshes ft.alive:<case>:<writer> every 5 s; a draft whose
-// writer has not refreshed for 30 s is an orphan (crash) and is adopted by
-// whichever window notices first (30-records adoptOrphanDrafts). pagehide
-// removes the key, so a plain close/reload hands drafts over at once.
+// --- Two windows on one case (U2, §10.3) ----------------------------------
+// Each window refreshes ft.alive:<case>:<writer> every 5 s and answers
+// pings on ft-alive:<case> (30-records openAliveChannel). A real unload
+// (pagehide, not the back/forward cache) marks the writer "closed", so a
+// reload hands its drafts over at once; a crash is recognised by a 5-minute
+// stale heartbeat plus an unanswered ping (adoptOrphanDrafts).
 const ALIVE_TICK_MS = 5000;
 function writerHeartbeat() {
-  try { localStorage.setItem(aliveKey(writerId()), String(Date.now())); } catch (e) { /* storage blocked: no heartbeat, drafts stay ours by token */ }
+  try { localStorage.setItem(aliveKey(writerId()), String(Date.now())); } catch (e) { /* storage blocked/full: the ping still answers */ }
 }
 function otherLiveWriters() {
   const others = [];
@@ -775,40 +1116,58 @@ function otherLiveWriters() {
       const key = localStorage.key(i);
       if (!key || !key.startsWith(ALIVE_PREFIX)) continue;
       const writer = key.slice(ALIVE_PREFIX.length);
-      if (writer === writerId()) continue;
-      if (writerAlive(writer)) others.push(writer);
+      if (writer !== writerId() && writerRecentlyAlive(writer)) others.push(writer);
     }
   } catch (e) { /* storage blocked */ }
   return others;
 }
+// Heartbeat keys of writers that left nothing behind (closed, or stale
+// for ALIVE_STALE_MS, with no stored draft) are swept at boot.
 function sweepStaleHeartbeats() {
   try {
+    const withDrafts = new Set(storedDraftEntries().map(entry => entry.writer));
     const stale = [];
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
       if (!key || !key.startsWith(ALIVE_PREFIX)) continue;
       const writer = key.slice(ALIVE_PREFIX.length);
-      if (writer !== writerId() && !writerAlive(writer) && !skippedDraftWriters.has(writer)) stale.push(key);
+      if (writer === writerId() || withDrafts.has(writer)) continue;
+      const verdict = writerVerdict(writer);
+      if (verdict === "closed" || verdict === "stale") stale.push(key);
     }
     stale.forEach(key => localStorage.removeItem(key));
   } catch (e) { /* storage blocked */ }
 }
+openAliveChannel();
 writerHeartbeat();
 const aliveTimer = setInterval(() => {
   if (ftSignal.aborted) { clearInterval(aliveTimer); return; }
   writerHeartbeat();
   adoptOrphanDrafts();
 }, ALIVE_TICK_MS);
+// Another window started writing drafts after this one booted: watch it.
+window.addEventListener("storage", event => {
+  const at = event.key && event.newValue != null ? parseDraftKey(event.key) : null;
+  if (at && at.writer !== writerId()) skippedDraftWriters.add(at.writer);
+}, { signal: ftSignal });
 // destroy() (hosted reload, FTViewer.reload) aborts this mount: its pending
 // draft changes reach storage before the next mount reads them, or a
 // draft the server already confirmed would be replayed as unsaved.
-ftSignal.addEventListener("abort", () => { clearInterval(aliveTimer); flushDraftsNow(true); });
-window.addEventListener("pagehide", () => {
+ftSignal.addEventListener("abort", () => { clearInterval(aliveTimer); flushDraftsNow(true); notifySaveSettled(); });
+window.addEventListener("pagehide", (event) => {
   flushDraftsNow();
-  try { localStorage.removeItem(aliveKey(writerId())); } catch (e) { /* storage blocked */ }
+  if (event.persisted) return; // back/forward cache: the page may come back
+  try {
+    localStorage.removeItem(aliveKey(writerId()));
+    localStorage.setItem(aliveKey(writerId()), ALIVE_CLOSED);
+  } catch (e) { /* no marker: the ping decides */ }
 }, { signal: ftSignal });
+window.addEventListener("pageshow", (event) => { if (event.persisted) writerHeartbeat(); }, { signal: ftSignal });
 if (otherLiveWriters().length) toast(t("conflict.otherWindow"));
 sweepStaleHeartbeats();
+registerRestoredConflicts();
+// A stale writer's drafts are checked (ping) right away, not after 5 s.
+if (skippedDraftWriters.size) adoptOrphanDrafts();
 
 // Server-served viewers can push marks straight into the case DB instead of
 // the download → file-pick → import dance.
@@ -1176,11 +1535,12 @@ if (!viewerIsServed) {
 }
 if (viewerIsServed) {
   // Conflicts the server recorded while draining its marks queue (possibly
-  // before a restart) are shown on boot, not only while a queue is watched.
-  fetch("/api/status", { cache: "no-store" })
-    .then(res => (res.ok ? res.json() : null))
-    .then(st => { if (st && !ftSignal.aborted) queueConflictsFromStatus(st); })
-    .catch(() => {});
+  // before a restart) are shown on boot, and "saved" waits for that answer.
+  withConflictCheck(async () => {
+    const res = await fetch("/api/status", { cache: "no-store" });
+    const st = res.ok ? await res.json() : null;
+    if (st && !ftSignal.aborted) await loadServerConflicts(st);
+  });
 }
 renderSaveState();
 
@@ -1210,7 +1570,7 @@ function detectRangeDivergence() {
   const ids = new Set([...Object.keys(server), ...Object.keys(state.ranges)]);
   const diverged = [];
   for (const id of ids) {
-    if (pending.has(id)) continue; // unsynced local edit: will be pushed, not a conflict
+    if (pending.has(id) || conflictIds.has(id)) continue; // unsynced local edit (pushed), or already in the conflict list
     // Only a conflict when BOTH sides hold a range and they differ; a
     // one-sided range is a seed (server only) or an unsynced edit (browser only).
     if (!rangeValid(server[id]) || !rangeValid(state.ranges[id])) continue;
@@ -1239,25 +1599,23 @@ function showRangeDivergenceBanner(ids) {
   const server = serverRanges();
   const bar = document.createElement("div");
   bar.id = "rangeDivergenceBanner";
+  bar.className = "ft-banner";
   bar.setAttribute("role", "alert");
-  bar.style.cssText = "position:sticky;top:0;z-index:50;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;background:#fff3cd;color:#4a3500;border-bottom:2px solid #d9a400;font-size:13px";
   const msg = document.createElement("span");
-  msg.style.fontWeight = "700";
+  msg.className = "ft-banner-msg";
   msg.textContent = tf("range.divergeMsg", { n: ids.length });
   msg.title = ids.slice(0, 20).map(id => `${id}: ${t("range.server")} ${rangeText(server[id])} / ${t("range.browser")} ${rangeText(state.ranges[id])}`).join("\n");
   bar.appendChild(msg);
-  const mk = (id, label, side) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "quiet";
-    b.id = id;
-    b.textContent = label;
-    b.addEventListener("click", () => { resolveRangeDivergence(ids, side); bar.remove(); });
-    bar.appendChild(b);
+  const pick = side => () => {
+    const hadFocus = bar.contains(document.activeElement);
+    resolveRangeDivergence(ids, side);
+    bar.remove();
+    if (hadFocus && typeof viewerFocus === "function") viewerFocus();
   };
-  mk("rangeUseServer", t("range.useServer"), "server");
-  mk("rangeUseBrowser", t("range.useBrowser"), "browser");
-  ftRoot.insertBefore(bar, ftRoot.firstChild);
+  bar.appendChild(noticeButton("rangeUseServer", t("range.useServer"), pick("server")));
+  bar.appendChild(noticeButton("rangeUseBrowser", t("range.useBrowser"), pick("browser")));
+  const host = noticesHost();
+  host.insertBefore(bar, host.firstChild);
 }
 
 // A fresh browser (new origin/port, cleared storage) has no local ranges:

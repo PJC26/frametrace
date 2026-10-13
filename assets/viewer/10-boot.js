@@ -46,6 +46,9 @@ const BS = String.fromCharCode(92);
 const EXT_PREFIX = BS + BS + "?" + BS;
 const EXT_UNC = EXT_PREFIX + "unc" + BS;
 const LAYOUT_KEY = "ft.viewer." + (manifest.case_id || "case") + ".layout.v2";
+// MARKS_KEY / NOTES_KEY / TAGS_KEY: pre-v2 whole-map stores, no longer read or
+// written (drafts are per id, §10.3). ANNOTATIONS_KEY: the pre-§10.3 single-key
+// drafts, migrated once at boot (30-records migrateLegacyDrafts).
 const MARKS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".marks";
 const NOTES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".notes";
 const ANNOTATIONS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".annotations.v1";
@@ -59,7 +62,7 @@ const MARK_STATUSES = ["reviewed", "important", "needs_verification"];
 // evidence — with the traffic set kept at the end for dashcam cases.
 // Examiners can add/remove presets in the tag menu; the list is stored
 // globally (not per case) because an investigator's tag vocabulary is
-// personal, while applied tags stay per-case under TAGS_KEY.
+// personal, while applied tags stay per case (case DB + per-id drafts).
 const DEFAULT_TAG_PRESETS = ["핵심증거", "현장", "관련인", "동선·위치", "시간대확인", "조작의심", "출처불명", "참고자료", "보존요청", "제외", "사고", "과속", "신호위반", "차선변경", "보행자", "음주의심"];
 const TAG_PRESETS_KEY = "ft.viewer.tag_presets";
 const TAGS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".tags";
