@@ -220,6 +220,15 @@ applyLayout();
 render();
 FTViewer._emit("records", { total: records.length, byKind: viewerSummary().byKind, byStatus: viewerSummary().byStatus, generation: DATA.liveIndex ? DATA.liveIndex.generation : null });
 FTViewer._emit("ready", { total: records.length, live: !!DATA.liveIndex, generation: DATA.liveIndex ? DATA.liveIndex.generation : null });
+// The measured-sound log could not be read: say so once per case and
+// error (not on every remount), while the 소리 states read "측정 결과를
+// 읽지 못함" for the whole session. Never silent, never a toast storm.
+if (audioLevelsError) {
+  const noteKey = "ft-audio-err:" + String(DATA.caseDir || "") + "|" + audioLevelsError;
+  let noted = false;
+  try { noted = sessionStorage.getItem(noteKey) === "1"; sessionStorage.setItem(noteKey, "1"); } catch (e) { noted = false; }
+  if (!noted) toastError(tf("audio.readError", { err: audioLevelsError.split(/\r?\n/)[0].slice(0, 200) }));
+}
 }
 
 // Data loading lives in 99-loader.js (outside ftViewerBoot; see its header).

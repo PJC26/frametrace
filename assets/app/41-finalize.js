@@ -406,13 +406,23 @@ function finAudioMeasure() {
   if (typeof runCaseJob !== "function") return;
   runCaseJob("audio");
 }
+// Disabled (with the reason) while a tool is missing or another job runs;
+// "소리 측정 중…" + aria-busy while its own job runs (32-jobs.js calls this
+// from setCaseJobButtons on every status).
 function finApplyAudioEnv() {
   const btn = finEl("btnAudioMeasure");
-  if (!btn || !FIN.env) return;
-  const tools = FIN.env.tools || {};
+  if (!btn) return;
+  const tools = (FIN.env && FIN.env.tools) || {};
   const missing = tools.ffmpeg === false ? "ffmpeg" : tools.ffprobe === false ? "ffprobe" : "";
-  btn.disabled = !!missing;
-  btn.title = missing ? `${missing}가 없어 사용할 수 없습니다 — 도구 상태를 확인하십시오` : finAudioTip();
+  const busy = typeof caseJobsBusy !== "undefined" && !!caseJobsBusy;
+  const own = busy && typeof caseJob !== "undefined" && !!caseJob && !caseJob.outcome && caseJob.kind === "audio";
+  btn.disabled = !!missing || busy;
+  if (own) btn.setAttribute("aria-busy", "true"); else btn.removeAttribute("aria-busy");
+  const label = own ? "소리 측정 중…" : "소리 측정 (미측정 항목)";
+  if (btn.textContent !== label) btn.textContent = label;
+  btn.title = missing ? `${missing}가 없어 사용할 수 없습니다 — 도구 상태를 확인하십시오`
+    : own ? "소리 측정이 진행 중입니다 — 작업 시트(Alt+J)에서 진행 상황을 보고 중단할 수 있습니다"
+      : busy ? "다른 작업이 진행 중입니다 — 끝난 뒤 실행할 수 있습니다" : finAudioTip();
 }
 function finApplyEnv() {
   finApplyAudioEnv();
