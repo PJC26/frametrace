@@ -1011,48 +1011,126 @@ fn record_queue_conflicts(
     append_jsonl_lines(&pending_mark_conflicts_path(case_dir), &lines)
 }
 
+/// One record's open (unresolved) queue conflict: the latest journaled
+/// entry for it, the highest server revision any of its open entries saw
+/// (what a resolving save must have seen), and how many open entries the
+/// journal holds for it.
+struct OpenQueueConflict {
+    id: String,
+    latest: serde_json::Value,
+    server_revision: u64,
+    entries: usize,
+}
+
 /// Unresolved queue conflicts: distinct ids whose last journal entry is a
 /// conflict (not a `resolved` line), in first-seen order.
-fn unresolved_queue_conflict_ids(case_dir: &Path) -> Vec<String> {
+fn open_queue_conflicts(case_dir: &Path) -> Vec<OpenQueueConflict> {
     let Ok(text) = crate::util::read_to_string(&pending_mark_conflicts_path(case_dir)) else {
         return Vec::new();
     };
-    let mut order: Vec<String> = Vec::new();
-    let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut open: Vec<OpenQueueConflict> = Vec::new();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if let Some(id) = value.get("resolved").and_then(serde_json::Value::as_str) {
-            open.remove(id);
-        } else if let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
-            && open.insert(id.to_string())
-            && !order.iter().any(|seen| seen == id)
-        {
-            order.push(id.to_string());
+            open.retain(|entry| entry.id != id);
+        } else if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+            let revision = value
+                .get("server_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            match open.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => {
+                    entry.server_revision = entry.server_revision.max(revision);
+                    entry.entries += 1;
+                    entry.latest = value;
+                }
+                None => open.push(OpenQueueConflict {
+                    id: id.to_string(),
+                    latest: value,
+                    server_revision: revision,
+                    entries: 1,
+                }),
+            }
         }
     }
-    order.retain(|id| open.contains(id));
-    order
+    open
+}
+
+/// Number of unresolved queue conflicts (distinct ids). `/api/finalize`
+/// refuses while it is above zero.
+pub(crate) fn unresolved_queue_conflict_count(case_dir: &Path) -> usize {
+    open_queue_conflicts(case_dir).len()
 }
 
 /// `/api/status.mark_conflicts`: `{count, ids}` with at most 50 ids.
 pub(crate) fn pending_mark_conflicts(case_dir: &Path) -> serde_json::Value {
-    let ids = unresolved_queue_conflict_ids(case_dir);
+    let open = open_queue_conflicts(case_dir);
     serde_json::json!({
-        "count": ids.len(),
-        "ids": ids.iter().take(50).collect::<Vec<_>>(),
+        "count": open.len(),
+        "ids": open.iter().take(50).map(|entry| entry.id.as_str()).collect::<Vec<_>>(),
     })
 }
 
-/// After any successful in-process import: ids that were applied and had
-/// an open queue conflict are journaled as resolved (the examiner saved
-/// a decision for them with a current base).
-fn resolve_queue_conflicts(case_dir: &Path, outcome: &crate::case_db::PatchOutcome) {
+/// `GET /api/mark-conflicts` (contract §10.2): every unresolved queue
+/// conflict, one per record id (no cap), with the server value it met and
+/// the entry the window originally queued (`queued`, verbatim from the
+/// queued body: `{mark, tags, deleted, base_revision}`), so the viewer can
+/// show "my value" exactly as it was submitted.
+pub(crate) fn api_mark_conflicts(state: &SharedState) -> String {
+    let case_dir = state_lock(state).case_dir.clone();
+    let open = case_dir
+        .as_deref()
+        .map(open_queue_conflicts)
+        .unwrap_or_default();
+    let conflicts: Vec<serde_json::Value> = open
+        .iter()
+        .map(|entry| {
+            let field = |key: &str| {
+                entry
+                    .latest
+                    .get(key)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            };
+            serde_json::json!({
+                "id": entry.id,
+                "server_revision": entry.server_revision,
+                "server": field("server"),
+                "queued": field("mine"),
+                "client_id": field("client_id"),
+                "recorded_unix": field("recorded_unix"),
+                "entries": entry.entries,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "ok": true,
+        "count": conflicts.len(),
+        "conflicts": conflicts,
+    })
+    .to_string()
+}
+
+/// After a successful in-process import: an id with an open queue
+/// conflict is journaled as resolved only when a patch-v2 body APPLIED it
+/// with a base at least the journaled server revision — i.e. the window
+/// that saw the conflict decided it (contract §10.2). Legacy and patch-v1
+/// bodies (`bases == None`) never resolve; neither does a v2 save applied
+/// with an older base (same-window or unchanged-content exception).
+fn resolve_queue_conflicts(
+    case_dir: &Path,
+    outcome: &crate::case_db::PatchOutcome,
+    bases: Option<&std::collections::BTreeMap<String, u64>>,
+) {
+    let Some(bases) = bases else {
+        return;
+    };
     if outcome.applied.is_empty() || !pending_mark_conflicts_path(case_dir).is_file() {
         return;
     }
-    let open = unresolved_queue_conflict_ids(case_dir);
+    let open = open_queue_conflicts(case_dir);
     if open.is_empty() {
         return;
     }
@@ -1060,7 +1138,11 @@ fn resolve_queue_conflicts(case_dir: &Path, outcome: &crate::case_db::PatchOutco
     let lines: Vec<String> = outcome
         .applied
         .iter()
-        .filter(|(id, _)| open.iter().any(|open_id| open_id == id))
+        .filter(|(id, _)| {
+            open.iter().any(|entry| {
+                &entry.id == id && bases.get(id).copied().unwrap_or(0) >= entry.server_revision
+            })
+        })
         .map(|(id, revision)| {
             serde_json::json!({"resolved": id, "revision": revision, "unix": now}).to_string()
         })
@@ -1089,7 +1171,10 @@ fn drain_pending_marks(state: &SharedState, case_dir: &Path) -> Result<usize, St
                 path.display()
             )
         })?;
-        resolve_queue_conflicts(case_dir, &outcome);
+        let bases = crate::selection::parse_marks_file(&path)
+            .ok()
+            .and_then(|marks| marks.base_revisions);
+        resolve_queue_conflicts(case_dir, &outcome, bases.as_ref());
         conflicts += outcome.conflicts.len();
         let _ = std::fs::remove_file(&path);
         applied += 1;
@@ -1202,7 +1287,7 @@ fn import_marks_during_enrichment(
     }
     match crate::cli::handlers::import_marks_quiet(case_dir, &marks_path) {
         Ok(outcome) => {
-            resolve_queue_conflicts(case_dir, &outcome);
+            resolve_queue_conflicts(case_dir, &outcome, marks.base_revisions.as_ref());
             state_lock(state).marks_epoch += 1;
             import_marks_response(marks, &outcome, None, false)
         }
@@ -1280,7 +1365,7 @@ pub(crate) fn api_import_marks_with_runner(
         let _gate = marks_gate();
         match crate::cli::handlers::import_marks_quiet(&case_dir, &marks_path) {
             Ok(outcome) => {
-                resolve_queue_conflicts(&case_dir, &outcome);
+                resolve_queue_conflicts(&case_dir, &outcome, marks.base_revisions.as_ref());
                 state_lock(state).marks_epoch += 1;
                 outcome
             }
@@ -1409,23 +1494,47 @@ pub(crate) fn finalize_with_exe(
             ));
         }
     }
-    // The sign-off is written to a pending file that make-report reads
-    // (--signoff) so the report names the reviewer, and is promoted to
-    // review/signoff.json only after report AND package succeeded: a failed
-    // finalize never leaves a sign-off behind (SHOULD-FIX 6).
-    let pending_signoff = case_dir.join(SIGNOFF_PENDING_REL_PATH);
-    if let Err(err) = write_signoff(case_dir, SIGNOFF_PENDING_REL_PATH, examiner) {
-        return api_err(&err);
+    // §10.2: a queued save that met another window's change is an open
+    // decision — sealing now would sign one side of it unseen.
+    let open_conflicts = unresolved_queue_conflict_count(case_dir);
+    if open_conflicts > 0 {
+        return api_err(&format!(
+            "최종화 차단: 저장 충돌 {open_conflicts}건을 먼저 해결하십시오 (뷰어의 충돌 목록에서 서버 값 또는 내 값을 선택해 저장)."
+        ));
     }
+    let case_text = case_dir.to_string_lossy().to_string();
     {
         // `busy` belongs to the caller's guard: setting or clearing it here
         // would release it while that guard is still alive.
         let mut guard = state_lock(state);
         guard.phase = "finalizing";
         guard.error = None;
-        guard.logs.push("결과 보고서 생성 중…".into());
+        guard.logs.push("리뷰 데이터 갱신 중…".into());
     }
-    let case_text = case_dir.to_string_lossy().to_string();
+    // §10.2: re-render the review bundle from the database being signed,
+    // so the packaged review/data-bundle.js carries every mark saved since
+    // the last analysis (it is otherwise only rebuilt by a pipeline run).
+    if let Err(err) = run_step(exe, &["make-review".into(), case_text.clone()], state) {
+        let message = format!(
+            "최종화 차단: 리뷰 데이터(review/data-bundle.js)를 갱신하지 못했습니다 — {err}"
+        );
+        let mut guard = state_lock(state);
+        guard.phase = "review-ready";
+        guard.error = Some(message.clone());
+        return api_err(&message);
+    }
+    // The sign-off is written to a pending file that make-report reads
+    // (--signoff) so the report names the reviewer, and is promoted to
+    // review/signoff.json only after report AND package succeeded: a failed
+    // finalize never leaves a sign-off behind (SHOULD-FIX 6).
+    let pending_signoff = case_dir.join(SIGNOFF_PENDING_REL_PATH);
+    if let Err(err) = write_signoff(case_dir, SIGNOFF_PENDING_REL_PATH, examiner) {
+        let mut guard = state_lock(state);
+        guard.phase = "review-ready";
+        guard.error = Some(err.clone());
+        return api_err(&err);
+    }
+    state_lock(state).logs.push("결과 보고서 생성 중…".into());
     // --rehash makes the packaged report re-digest every indexed source file
     // and flag hash-revalidation mismatches — the integrity claim behind a
     // finalized package should rest on live digests, not stored scan hashes.

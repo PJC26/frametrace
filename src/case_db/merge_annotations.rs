@@ -291,6 +291,20 @@ pub fn merged_note_segment(source_case: &str, original_id: &str, note: &str) -> 
     format!("[병합 {source_case} {original_id}] {note}")
 }
 
+/// True when `segment` (possibly several lines) already appears in `note`
+/// as whole lines — a run of consecutive lines exactly equal to the
+/// segment's lines. A plain substring test would treat
+/// `[병합 C vid_1] a` as present inside `[병합 C vid_1] ab` and silently
+/// drop the second note (contract §10.2).
+fn note_has_segment(note: &str, segment: &str) -> bool {
+    let wanted: Vec<&str> = segment.split('\n').collect();
+    let lines: Vec<&str> = note.split('\n').collect();
+    lines.len() >= wanted.len()
+        && lines
+            .windows(wanted.len())
+            .any(|window| window == wanted.as_slice())
+}
+
 /// Hook for the per-record revision table (`review_annotation_rev`, schema
 /// v7, track A of docs/FIX_PLAN_R1_2026-10-13.md).
 ///
@@ -438,7 +452,7 @@ fn merge_one_source(
                     if let Some(note) = source_note.filter(|_| note_differs) {
                         let segment = merged_note_segment(&source.source_case, original_id, note);
                         let current = existing.note.as_deref().unwrap_or_default();
-                        if !current.contains(&segment) {
+                        if !note_has_segment(current, &segment) {
                             let combined = if current.trim().is_empty() {
                                 segment
                             } else {

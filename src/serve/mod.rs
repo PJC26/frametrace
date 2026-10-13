@@ -52,8 +52,9 @@ pub(crate) use http::{
     request_is_localhost_trusted, valid_token, viewer_page, write_simple,
 };
 pub(crate) use jobs::{
-    api_carve, api_finalize, api_import_marks, api_recover_deleted, api_start, api_verify_sources,
-    case_job_json, default_case_dir, pending_marks_count, run_step, run_step_cancellable,
+    api_carve, api_finalize, api_import_marks, api_mark_conflicts, api_recover_deleted, api_start,
+    api_verify_sources, case_job_json, default_case_dir, pending_marks_count, run_step,
+    run_step_cancellable,
 };
 pub(crate) use media::{
     api_advanced, api_capture_frame, api_export_clip, api_export_clip_cancel,
@@ -940,6 +941,7 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("GET", "/api/records") => json(api_records(request, state)),
         ("GET", "/api/records-meta") => json(api_records_meta(state)),
         ("GET", "/api/status") => json(api_status(state)),
+        ("GET", "/api/mark-conflicts") => json(api_mark_conflicts(state)),
         ("POST", "/api/start") => json(api_start(request, state)),
         ("POST", "/api/finalize") => json(api_finalize(request, state)),
         ("POST", "/api/recover-deleted") => json(api_recover_deleted(state)),

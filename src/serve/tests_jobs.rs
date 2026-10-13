@@ -427,6 +427,166 @@ fn deferred_drain_records_conflicts_file_and_status_count() {
     let _ = std::fs::remove_dir_all(case_dir);
 }
 
+fn import_body(state: &SharedState, body: serde_json::Value) -> serde_json::Value {
+    let runner = |_: &[String]| Ok(String::new());
+    parse(&super::jobs::api_import_marks_with_runner(
+        &request(
+            "POST",
+            "/api/import-marks",
+            "",
+            &serde_json::json!({"marks_json": body.to_string()}).to_string(),
+        ),
+        state,
+        &runner,
+    ))
+}
+
+/// Queues one v2 body during a long step, lets another (legacy) writer
+/// land revision 1 for the same id, and drains — leaving one open queue
+/// conflict for `vid_1` at server revision 1.
+fn open_queue_conflict(tag: &str) -> (PathBuf, SharedState) {
+    let case_dir = temp_case(tag);
+    let state = {
+        let mut job_state = JobState::new();
+        job_state.case_dir = Some(case_dir.clone());
+        job_state.phase = "review-partial";
+        job_state.busy = true;
+        job_state.enrichment = Some(Enrichment {
+            step: "hash",
+            label: "test",
+            stage: 1,
+            stages: 4,
+        });
+        Arc::new(Mutex::new(job_state))
+    };
+    let queued = parse(&api_import_marks(
+        &v2_request("vid_1", "mine", 0, "w-a", None),
+        &state,
+    ));
+    assert_eq!(queued["deferred"], true, "{queued}");
+    let server_mark = crate::case_db::ReviewMarkRow {
+        record_id: "vid_1".into(),
+        status: "reviewed".into(),
+        marked_unix: 50,
+        examiner: Some("lee".into()),
+        note: Some("server".into()),
+        ..Default::default()
+    };
+    crate::case_db::patch_review_annotations_by(&case_dir, &[server_mark], &[], &[], Some("lee"))
+        .unwrap();
+    let job = PipelineJob {
+        kind: InputKind::Folder,
+        case_dir: case_dir.clone(),
+        source_path: PathBuf::from("/ev"),
+        with_hash: true,
+        with_ffprobe: false,
+        with_deepfake: false,
+        skip_e01_verify: false,
+        e01_direct: false,
+    };
+    run_folder_enrichment(&state, &job, |_| Ok("ok".into()));
+    assert_eq!(state_lock(&state).phase, "review-ready");
+    (case_dir, state)
+}
+
+/// §10.2: `GET /api/mark-conflicts` lists every open queue conflict with
+/// the server value and the entry as originally queued; finalize refuses
+/// while one is open; only a patch-v2 save that applies the id with a base
+/// at least the journaled server revision resolves it — not a legacy/v1
+/// body, not an unchanged-content save carrying an older base.
+#[test]
+fn mark_conflicts_endpoint_resolution_rule_and_finalize_block() {
+    let (case_dir, state) = open_queue_conflict("conflict-endpoint");
+    let listed = parse(&api_mark_conflicts(&state));
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["count"], 1);
+    let entry = &listed["conflicts"][0];
+    assert_eq!(entry["id"], "vid_1");
+    assert_eq!(entry["server_revision"], 1);
+    assert_eq!(entry["server"]["note"], "server");
+    assert_eq!(entry["server"]["status"], "reviewed");
+    assert_eq!(entry["queued"]["mark"]["note"], "mine", "{entry}");
+    assert_eq!(entry["queued"]["mark"]["tags"], serde_json::json!(["사고"]));
+    assert_eq!(entry["queued"]["base_revision"], 0);
+    assert_eq!(entry["queued"]["deleted"], false);
+    assert_eq!(entry["client_id"], "w-a");
+    assert!(entry["recorded_unix"].as_u64().unwrap() > 0);
+    assert_eq!(entry["entries"], 1);
+    // Routed as a plain API GET.
+    let routed = route(&request("GET", "/api/mark-conflicts", "", ""), &state);
+    let routed = String::from_utf8_lossy(&routed);
+    let body = routed.split("\r\n\r\n").nth(1).unwrap_or_default();
+    assert_eq!(parse(body)["count"], 1, "{routed}");
+
+    // Finalize is refused before anything is written.
+    let refused = parse(&finalize_with_exe(
+        Path::new("/nonexistent/frametrace"),
+        &case_dir,
+        "kim",
+        &state,
+    ));
+    assert_eq!(refused["ok"], false);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("저장 충돌 1건을 먼저 해결하십시오"),
+        "{refused}"
+    );
+    assert!(
+        !case_dir
+            .join(super::jobs::SIGNOFF_PENDING_REL_PATH)
+            .exists()
+    );
+    assert!(!case_dir.join(crate::report::SIGNOFF_REL_PATH).exists());
+
+    // Identical content from another window with an old base: applied as
+    // a no-op at revision 1, but it is not a decision — still open.
+    let same = import_body(
+        &state,
+        serde_json::json!({
+            "schema_version": 2, "protocol": "patch-v2", "case_id": "FT-jobs",
+            "client_id": "w-c", "base_revisions": {"vid_1": 0},
+            "marks": [{"id": "vid_1", "status": "reviewed", "marked_unix": 50,
+                       "examiner": "lee", "note": "server"}],
+        }),
+    );
+    assert_eq!(same["applied"], serde_json::json!({"vid_1": 1}), "{same}");
+    assert_eq!(parse(&api_mark_conflicts(&state))["count"], 1);
+    // A patch-v1 (last write wins) body never resolves.
+    let v1 = import_body(
+        &state,
+        serde_json::json!({
+            "schema_version": 2, "protocol": "patch-v1", "case_id": "FT-jobs",
+            "marks": [{"id": "vid_1", "status": "reviewed", "marked_unix": 50, "note": "legacy"}],
+            "tags": [], "deleted_ids": [],
+        }),
+    );
+    assert_eq!(v1["applied"], serde_json::json!({"vid_1": 2}), "{v1}");
+    assert_eq!(parse(&api_status(&state))["mark_conflicts"]["count"], 1);
+    // The window decides with the current base (2 >= journaled 1).
+    let decided = parse(&super::jobs::api_import_marks_with_runner(
+        &v2_request("vid_1", "decided", 2, "w-a", None),
+        &state,
+        &|_: &[String]| Ok(String::new()),
+    ));
+    assert_eq!(
+        decided["applied"],
+        serde_json::json!({"vid_1": 3}),
+        "{decided}"
+    );
+    let listed = parse(&api_mark_conflicts(&state));
+    assert_eq!(
+        listed,
+        serde_json::json!({"ok": true, "count": 0, "conflicts": []})
+    );
+    assert_eq!(
+        parse(&api_status(&state))["mark_conflicts"],
+        serde_json::json!({"count": 0, "ids": []})
+    );
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
 /// `/api/records-meta` annotations carry the per-record revision map the
 /// v2 client seeds `state.revisions` from (empty before any save).
 #[test]
@@ -474,10 +634,20 @@ fn records_meta_annotations_include_revisions() {
         serde_json::json!({"vid_1": 1, "vid_9": 1}),
         "{annotations}"
     );
-    // Same object make-review embeds in the data bundle.
+    // §10.2: the window that wrote each current revision (null = legacy).
+    assert_eq!(
+        annotations["writers"],
+        serde_json::json!({"vid_1": "w-a", "vid_9": null}),
+        "{annotations}"
+    );
+    // Same object make-review embeds in the data bundle, minus `writers`
+    // (writer tokens stay out of the packaged bundle).
     let bundle: serde_json::Value =
         serde_json::from_str(&crate::case_db::review_annotations_json(&case_dir).unwrap()).unwrap();
-    assert_eq!(&bundle, annotations);
+    assert!(bundle.get("writers").is_none(), "{bundle}");
+    let mut served = annotations.clone();
+    served.as_object_mut().unwrap().remove("writers");
+    assert_eq!(bundle, served);
     let _ = std::fs::remove_dir_all(case_dir);
 }
 
