@@ -1025,6 +1025,70 @@ fn lighter_rescan_keeps_recorded_hashes() {
     let _ = fs::remove_dir_all(case_dir.parent().unwrap());
 }
 
+/// I11: a lighter rescan keeps a recorded hash FAILURE (`error`,
+/// `changed-during-hash`) of an unchanged file instead of rewriting it to
+/// `skipped`; a later `--hash` pass retries and records the digest.
+#[test]
+fn lighter_rescan_keeps_recorded_hash_failures() {
+    for failure in ["error", "changed-during-hash"] {
+        let (case_dir, source_dir) = incremental_fixture(&format!("keepfail-{failure}"));
+        fs::write(source_dir.join("a.mp4"), b"\0\0\0\x18ftypmp42one").unwrap();
+        fs::write(source_dir.join("b.mp4"), b"\0\0\0\x18ftypmp42two").unwrap();
+        let hashed = ScanOptions {
+            hash_files: true,
+            use_ffprobe: false,
+            ..ScanOptions::default()
+        };
+        super::scan_folder(&case_dir, &source_dir, &hashed, ResumeMode::Auto, None).unwrap();
+        // Record a failed hash attempt for a.mp4 (what hash_with_restat
+        // writes when the read fails or the file moves mid-hash).
+        let jsonl = case_dir.join("db/videos.jsonl");
+        let text = fs::read_to_string(&jsonl).unwrap();
+        let rewritten = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if value["relative_path"] == "a.mp4" {
+                    value["sha256"] = serde_json::Value::Null;
+                    value["hash_status"] = serde_json::json!(failure);
+                }
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&jsonl, format!("{rewritten}\n")).unwrap();
+
+        for incremental in [false, true] {
+            super::scan_folder(
+                &case_dir,
+                &source_dir,
+                &ScanOptions {
+                    hash_files: false,
+                    use_ffprobe: false,
+                    incremental,
+                    ..ScanOptions::default()
+                },
+                ResumeMode::Auto,
+                None,
+            )
+            .unwrap();
+            let after = jsonl_hashes(&case_dir);
+            assert_eq!(
+                after["a.mp4"],
+                (None, failure.to_string()),
+                "incremental={incremental}: lighter pass erased the {failure} record"
+            );
+            assert_eq!(after["b.mp4"].1, "complete");
+        }
+        // A real --hash pass retries the failed file.
+        super::scan_folder(&case_dir, &source_dir, &hashed, ResumeMode::Auto, None).unwrap();
+        let retried = jsonl_hashes(&case_dir);
+        assert!(retried["a.mp4"].0.is_some(), "{retried:?}");
+        assert_eq!(retried["a.mp4"].1, "complete");
+        let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+    }
+}
+
 /// Blocker 2: cancel the phase-2 `--incremental --hash` pass mid-way,
 /// re-run the analysis (phase 1 = `--incremental --no-ffprobe`, a
 /// different checkpoint fingerprint), then phase 2 again. The files the

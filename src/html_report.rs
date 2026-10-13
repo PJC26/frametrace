@@ -767,8 +767,19 @@ document.getElementById("btnTheme").addEventListener("click", () => {{
 }});
 document.getElementById("caseTitle").textContent = MANIFEST.case_id ? "— " + MANIFEST.case_id : "";
 const R = RESULTS || {{}};
+// I6: carve time in UTC (the custody statement's basis) plus the viewing
+// PC's local time with its UTC offset, never a bare browser-local string.
+const fmtCarveTime = unix => {{
+  const d = new Date(unix * 1000);
+  if (!Number.isFinite(unix) || Number.isNaN(d.getTime())) return "";
+  const p = n => String(n).padStart(2, "0");
+  const off = -d.getTimezoneOffset();
+  const utc = `${{d.getUTCFullYear()}}-${{p(d.getUTCMonth() + 1)}}-${{p(d.getUTCDate())}} ${{p(d.getUTCHours())}}:${{p(d.getUTCMinutes())}}:${{p(d.getUTCSeconds())}} UTC`;
+  const local = `${{d.getFullYear()}}-${{p(d.getMonth() + 1)}}-${{p(d.getDate())}} ${{p(d.getHours())}}:${{p(d.getMinutes())}}:${{p(d.getSeconds())}}`;
+  return `${{utc}} (현지 ${{local}} UTC${{off < 0 ? "-" : "+"}}${{p(Math.floor(Math.abs(off) / 60))}}:${{p(Math.abs(off) % 60)}})`;
+}};
 document.getElementById("sourceInfo").textContent =
-  (R.source_path || "") + (R.carved_unix ? "  ·  " + new Date(R.carved_unix*1000).toLocaleString() : "");
+  (R.source_path || "") + (R.carved_unix ? "  ·  " + fmtCarveTime(R.carved_unix) : "");
 const exts = [...new Set(ARTIFACTS.map(a => a.extension || "?"))].sort();
 const warnN = (R.warnings || []).length;
 const dupN = ARTIFACTS.filter(a => INDEXED_SHAS.has(a.sha256)).length;
@@ -1395,5 +1406,34 @@ mod tests {
         ] {
             assert!(page.contains(needle), "{needle}");
         }
+    }
+
+    /// I6: the carve report's run time names its basis (UTC plus the local
+    /// offset) instead of a bare browser-local string.
+    #[test]
+    fn carve_report_time_label_is_utc_with_offset() {
+        let html = render_carve_report_html(
+            r#"{"case_id":"FT-T"}"#,
+            "",
+            r#"{"carved_unix":1700000000}"#,
+            "[]",
+            Path::new("case"),
+            "{}",
+        );
+        assert!(!html.contains("toLocaleString"), "bare local time label");
+        let script = html.rsplit_once("<script>").unwrap().1;
+        let start = script.find("const fmtCarveTime").unwrap();
+        let end = script[start..].find("};").unwrap() + start + 2;
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(format!(
+                "{}\nprocess.stdout.write(fmtCarveTime(1700000000));",
+                &script[start..end]
+            ))
+            .output()
+            .expect("node is required for report rendering tests");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with("2023-11-14 22:13:20 UTC (현지 "), "{text}");
+        assert!(text.contains(" UTC+") || text.contains(" UTC-"), "{text}");
     }
 }
