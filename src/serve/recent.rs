@@ -63,7 +63,24 @@ fn now_unix() -> u64 {
 /// folder exists (without Windows' `\\?\` prefix), otherwise the path as
 /// given minus trailing separators.
 pub(crate) fn canonical_case_dir(path: &Path) -> String {
-    match path.canonicalize() {
+    canonical_case_dir_with(path, &|path| path.canonicalize())
+}
+
+/// [`canonical_case_dir`] with the resolver injected (tests). S5: a UNC or
+/// device path is never resolved — `canonicalize` would open an SMB
+/// session (handing the examiner's NTLM credentials to the named host),
+/// and `/api/recent-cases/forget` takes that text from any request body —
+/// it keeps its textual form instead.
+pub(crate) fn canonical_case_dir_with(
+    path: &Path,
+    resolve: &dyn Fn(&Path) -> std::io::Result<PathBuf>,
+) -> String {
+    let resolved = if super::http::reject_remote_path(&path.to_string_lossy(), &[]).is_ok() {
+        resolve(path)
+    } else {
+        Err(std::io::Error::other("remote path: not resolved"))
+    };
+    match resolved {
         Ok(resolved) => shell_path(resolved).display().to_string(),
         Err(_) => {
             let text = path.display().to_string();

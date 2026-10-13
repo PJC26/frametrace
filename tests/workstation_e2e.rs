@@ -375,7 +375,8 @@ fn workstation_csrf_and_unc_hardening_over_http() {
         for target in [
             r"/media?path=\\evil\share\a.mp4",
             "/media?path=%5C%5Cevil%5Cshare%5Ca.mp4",
-            "/api/browse?path=//evil/share",
+            // `//x` is UNC only on Windows (POSIX treats it as a local path).
+            "/api/browse?path=%5C%5Cevil%5Cshare",
             r"/api/browse?path=\\?\UNC\evil\share",
             r"/api/case-info?case_dir=\\evil\share\case",
         ] {

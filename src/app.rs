@@ -88,6 +88,10 @@ fn run_workstation() -> Result<(), String> {
 }
 
 fn main() {
+    // P7: no modal loader/critical-error dialogs for this process or the
+    // tools it spawns (inherited) — in the windowed app nobody would see
+    // them, and the probe or pipeline step would wait forever.
+    frametrace::util::suppress_os_error_dialogs();
     std::process::exit(frametrace::run_with_large_stack(app_main));
 }
 

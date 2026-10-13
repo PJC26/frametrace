@@ -89,15 +89,13 @@ pub(crate) fn tool_available(name: &str, version_arg: &str) -> bool {
     if version_arg.is_empty() {
         return true;
     }
+    // P7: bounded — this runs inside HTTP handlers (/api/env, /api/start),
+    // and a tool wedged on start (or held by a loader dialog) must not pin
+    // the handler thread; a timeout reads as "not available".
     let mut command = Command::new(&resolved);
-    crate::util::hide_console(&mut command);
     command.arg(version_arg);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
+    crate::util::run_with_timeout(&mut command, Some(crate::util::VERSION_PROBE_TIMEOUT_SECS))
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
@@ -268,13 +266,27 @@ pub(crate) fn has_ewf_signature(head: &[u8]) -> bool {
     head.len() >= 8 && SIGS.iter().any(|sig| &head[..8] == sig.as_slice())
 }
 
-/// Reads at most the first 8 bytes of `path` (read-only).
-fn has_ewf_signature_file(path: &Path) -> bool {
+/// Reads at most the first 8 bytes of `path` (read-only). S2: only a
+/// regular file of at least 8 bytes is opened — a device, FIFO or other
+/// special file can block `read_exact` forever (and pin the handler).
+pub(crate) fn has_ewf_signature_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !signature_probe_allowed(&meta) {
+        return false;
+    }
     let mut head = [0u8; 8];
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut head))
         .map(|_| has_ewf_signature(&head))
         .unwrap_or(false)
+}
+
+/// Whether the EWF signature probe may open a file with this metadata: a
+/// regular file large enough to hold the 8-byte signature.
+pub(crate) fn signature_probe_allowed(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_file() && meta.len() >= 8
 }
 
 /// `true` for the first segment of a split forensic image family. The
@@ -440,6 +452,8 @@ fn status_snapshot(guard: &JobState) -> serde_json::Value {
         "job": guard.case_job.as_ref().map(case_job_json),
         // `clip_jobs` is filled in by api_status outside the lock.
         "clips_running": guard.clip_jobs.iter().filter(|job| job.state == "running").count(),
+        // S1: export-selected / capture-frame writes in flight.
+        "writes_running": guard.write_ops,
     })
 }
 
@@ -577,6 +591,17 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
         })
         .to_string();
     }
+    // S1: a short write (export-selected / capture-frame) cannot be
+    // cancelled, but it does hold shutdown back — say so instead of
+    // "nothing runs" while shutdown keeps answering "running".
+    if guard.write_ops > 0 {
+        return serde_json::json!({
+            "ok": false,
+            "writes_running": guard.write_ops,
+            "error": "선택 내보내기·프레임 캡처가 진행 중입니다 — 곧 끝나니 잠시 후 다시 시도하십시오.",
+        })
+        .to_string();
+    }
     "{\"ok\":false,\"error\":\"진행 중인 작업이 없습니다.\"}".to_string()
 }
 
@@ -587,7 +612,9 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
 pub(crate) fn api_shutdown(state: &SharedState) -> String {
     let guard = state_lock(state);
     let clips_running = guard.clip_jobs.iter().any(|job| job.state == "running");
-    if guard.busy || clips_running {
+    // S1: an export-selected / capture-frame still writing into the case
+    // counts as running work too (it is short; the UI retries).
+    if guard.busy || clips_running || guard.write_ops > 0 {
         return "{\"ok\":false,\"running\":true,\"error\":\"작업이 진행 중입니다 — 중단 후 종료하십시오.\"}"
             .to_string();
     }
@@ -618,19 +645,12 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     if guard.busy {
         return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
     }
-    // Clip exports write into the bound case and block its finalize; a
-    // switch while one runs would leave the new case's finalize refused for
-    // the old case's export (and the export landing under a case no longer
-    // shown).
-    let clips_running = guard
-        .clip_jobs
-        .iter()
-        .filter(|job| job.state == "running")
-        .count();
-    if clips_running > 0 {
-        return api_err(&format!(
-            "내보내기·이어붙이기 작업 {clips_running}건이 진행 중입니다 — 끝나거나 중단한 뒤 케이스를 여십시오."
-        ));
+    // Clip exports (and S1 write ops) write into the bound case and block
+    // its finalize; a switch while one runs would leave the new case's
+    // finalize refused for the old case's export (and the export landing
+    // under a case no longer shown).
+    if let Some(refusal) = side_work_refusal(&guard, "케이스를 여십시오") {
+        return api_err(&refusal);
     }
     if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
         // Finished clip jobs belong to the previous binding.
@@ -811,7 +831,11 @@ pub(crate) fn api_case_info(request: &Request, state: &SharedState) -> String {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
             .and_then(|index| index_video_count(&index))
     };
-    let mut info = case_info_json(&case_dir, video_count);
+    let mut info = case_info_json(
+        &case_dir,
+        video_count,
+        &super::http::approved_path_roots(state),
+    );
     if let Some(map) = info.as_object_mut() {
         map.insert("ok".into(), serde_json::Value::Bool(true));
         map.insert(
@@ -841,12 +865,16 @@ fn index_video_count(index: &serde_json::Value) -> Option<u64> {
 /// the checkpoint itself never records a total), `fingerprint_matches` =
 /// records whose file still has the recorded size+mtime (the oracle a
 /// rerun uses to reuse them instead of re-hashing).
-pub(crate) fn case_info_json(case_dir: &Path, video_count: Option<u64>) -> serde_json::Value {
+pub(crate) fn case_info_json(
+    case_dir: &Path,
+    video_count: Option<u64>,
+    approved_roots: &[PathBuf],
+) -> serde_json::Value {
     let has_index = case_dir.join("db/video_index.json").is_file();
     let has_review = case_dir.join("review/index.html").is_file();
     let checkpoint = crate::util::read_to_string(&scan_progress_path(case_dir))
         .ok()
-        .map(|text| checkpoint_summary_json(&text, video_count));
+        .map(|text| checkpoint_summary_json(&text, video_count, approved_roots));
     let phase = if has_review {
         "review-ready"
     } else if has_index {
@@ -863,13 +891,18 @@ pub(crate) fn case_info_json(case_dir: &Path, video_count: Option<u64>) -> serde
     })
 }
 
-fn checkpoint_summary_json(text: &str, video_count: Option<u64>) -> serde_json::Value {
+pub(crate) fn checkpoint_summary_json(
+    text: &str,
+    video_count: Option<u64>,
+    approved_roots: &[PathBuf],
+) -> serde_json::Value {
     let mut kind = serde_json::Value::Null;
     let mut run_id = serde_json::Value::Null;
     let mut done = 0u64;
     let mut unreadable = 0u64;
     let mut matches = 0u64;
     let mut checked = 0usize;
+    let mut skipped = 0u64;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             unreadable += 1;
@@ -892,6 +925,16 @@ fn checkpoint_summary_json(text: &str, video_count: Option<u64>) -> serde_json::
         let path = value.get("source_path").and_then(|v| v.as_str());
         let size = value.get("size_bytes").and_then(|v| v.as_u64());
         let mtime = value.get("modified_unix").and_then(|v| v.as_u64());
+        // S6: the checkpoint may come from another (external) case: a UNC
+        // or device source path is never stat'ed (an SMB session would
+        // hand out the examiner's NTLM credentials) unless it lies under
+        // an approved root — it is counted as skipped, not as a match.
+        if let Some(path) = path
+            && super::http::reject_remote_path(path, approved_roots).is_err()
+        {
+            skipped += 1;
+            continue;
+        }
         if let (Some(path), Some(size)) = (path, size)
             && let Ok(meta) = std::fs::metadata(path)
         {
@@ -912,6 +955,7 @@ fn checkpoint_summary_json(text: &str, video_count: Option<u64>) -> serde_json::
         "total": video_count,
         "fingerprint_matches": matches,
         "fingerprint_checked": checked,
+        "fingerprint_skipped_remote": skipped,
         "unreadable_lines": unreadable,
     })
 }
@@ -950,16 +994,23 @@ pub(crate) fn api_preflight(request: &Request) -> String {
             return api_err(reason);
         }
     }
-    let case_dir = case_text
-        .map(PathBuf::from)
-        .unwrap_or_else(default_case_dir);
-    preflight_json(
+    let (case_dir, case_dir_warning) = match case_text {
+        Some(text) => (PathBuf::from(text), None),
+        None => default_case_dir_checked(),
+    };
+    let mut body = preflight_json(
         Path::new(&source),
         &case_dir,
         PREFLIGHT_MAX_ENTRIES,
         Duration::from_millis(PREFLIGHT_MAX_MILLIS),
-    )
-    .to_string()
+    );
+    // P1: a temp-dir default case folder is announced before the start.
+    if let Some(warning) = case_dir_warning
+        && let Some(list) = body.get_mut("warnings").and_then(|w| w.as_array_mut())
+    {
+        list.push(serde_json::Value::String(warning));
+    }
+    body.to_string()
 }
 
 /// `path` resolved through its nearest existing ancestor, so a case folder

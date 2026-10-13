@@ -10,6 +10,49 @@ use wait_timeout::ChildExt;
 /// hostile media, which a forensics tool must survive.
 pub const PROBE_TIMEOUT_SECS: u64 = 120;
 
+/// Presence/version probes (`tool -V`, `ffmpeg -version`) answer in well
+/// under a second; one that takes longer is wedged (or held by a loader
+/// dialog) and is treated as unavailable instead of pinning its caller.
+pub const VERSION_PROBE_TIMEOUT_SECS: u64 = 15;
+
+/// Windows `SEM_FAILCRITICALERRORS`: no critical-error / missing-DLL
+/// loader message box; the call fails instead.
+#[cfg(windows)]
+pub const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+/// Windows `SEM_NOOPENFILEERRORBOX`: no "cannot find file" message box.
+#[cfg(windows)]
+pub const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetErrorMode(mode: u32) -> u32;
+}
+
+/// P7: process-wide error mode set once at startup so neither this
+/// process nor the tools it spawns (children inherit the mode) can block
+/// on a modal system dialog — a missing DLL in an ffmpeg/libewf build
+/// otherwise pops "code execution cannot proceed" and the probe (or the
+/// whole pipeline step) waits on a click nobody sees. Existing flags are
+/// kept. No-op off Windows. Returns the resulting mode (0 off Windows).
+pub fn suppress_os_error_dialogs() -> u32 {
+    #[cfg(windows)]
+    {
+        let wanted = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX;
+        // SAFETY: SetErrorMode only swaps a process-wide flag word; the
+        // first call reads the previous mode so it can be merged.
+        unsafe {
+            let previous = SetErrorMode(wanted);
+            SetErrorMode(previous | wanted);
+            previous | wanted
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 pub fn now_unix() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

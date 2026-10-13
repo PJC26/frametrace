@@ -20,7 +20,12 @@ fn live() -> std::sync::MutexGuard<'static, Vec<usize>> {
 pub(crate) struct TrackedChild {
     pub(crate) child: Child,
     /// unix: process-group id (== child pid); windows: Job object HANDLE.
+    /// 0 = not tracked (or, on unix, no longer safe to signal).
     key: usize,
+    /// Whether `key` is still in [`LIVE`] (the shutdown kill list).
+    listed: bool,
+    /// Why tree tracking could not be set up (P6), `None` when tracked.
+    pub(crate) tracking_error: Option<String>,
 }
 
 #[cfg(unix)]
@@ -35,9 +40,38 @@ mod sys {
         command.process_group(0);
     }
 
-    pub(super) fn attach(child: &std::process::Child) -> Option<usize> {
+    pub(super) fn attach(child: &std::process::Child) -> Result<usize, String> {
         // process_group(0) makes the child its own group leader: pgid == pid.
-        Some(child.id() as usize)
+        Ok(child.id() as usize)
+    }
+
+    unsafe extern "C" {
+        fn waitid(idtype: i32, id: u32, infop: *mut u8, options: i32) -> i32;
+    }
+
+    #[cfg(target_os = "linux")]
+    const WAITID_FLAGS: Option<(i32, i32)> = Some((1, 0x4 | 0x1 | 0x0100_0000));
+    #[cfg(target_os = "macos")]
+    const WAITID_FLAGS: Option<(i32, i32)> = Some((1, 0x04 | 0x01 | 0x20));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const WAITID_FLAGS: Option<(i32, i32)> = None;
+
+    /// P8: `true` once `pid` (our child) has exited but is NOT yet reaped
+    /// — `waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)` leaves the zombie in
+    /// place, so its pid (== the group id) cannot be recycled until the
+    /// following `try_wait` reaps it. The group is untracked in between,
+    /// which closes the window where a shutdown `killpg` could hit a
+    /// recycled group. `false` while it runs (or where unsupported).
+    pub(super) fn exited_unreaped(pid: u32) -> bool {
+        let Some((p_pid, options)) = WAITID_FLAGS else {
+            return false;
+        };
+        // siginfo_t is 128 bytes on Linux and macOS; its first word
+        // (`si_signo`, `si_errno`) stays 0 when WNOHANG found no change.
+        let mut info = [0u64; 32];
+        // SAFETY: waitid writes at most one siginfo_t into the buffer.
+        let rc = unsafe { waitid(p_pid, pid, info.as_mut_ptr().cast(), options) };
+        rc == 0 && info[0] != 0
     }
 
     pub(super) fn kill(key: usize) {
@@ -96,7 +130,7 @@ mod sys {
                     // SAFETY: read(2) into a 1-byte buffer on our pipe.
                     let n = unsafe { read(read_fd, &mut byte, 1) };
                     if n == 1 {
-                        super::kill_all_tracked();
+                        super::on_fatal_signal();
                         std::process::exit(128 + i32::from(byte));
                     }
                     if n < 0
@@ -178,7 +212,7 @@ mod sys {
         crate::util::hide_console_with_flags(command, CREATE_SUSPENDED);
     }
 
-    pub(super) fn attach(child: &std::process::Child) -> Option<usize> {
+    pub(super) fn attach(child: &std::process::Child) -> Result<usize, String> {
         // SAFETY: plain Win32 calls on handles we own; the job handle is
         // closed in `release` (which, with KILL_ON_JOB_CLOSE, also reaps any
         // survivors of the tree).
@@ -187,22 +221,17 @@ mod sys {
                 Some(job) => {
                     let process = HANDLE(child.as_raw_handle());
                     match AssignProcessToJobObject(job, process) {
-                        Ok(()) => Some(job.0 as usize),
+                        Ok(()) => Ok(job.0 as usize),
                         Err(err) => {
-                            eprintln!(
-                                "frametrace: job assignment failed ({err}); cancel will only kill the direct child"
-                            );
                             let _ = CloseHandle(job);
-                            None
+                            Err(format!("job assignment failed ({err})"))
                         }
                     }
                 }
-                None => {
-                    eprintln!(
-                        "frametrace: could not create job object; cancel will only kill the direct child"
-                    );
-                    None
-                }
+                None => Err(format!(
+                    "could not create job object ({})",
+                    std::io::Error::last_os_error()
+                )),
             }
         };
         // Always resume, even when tracking failed: a suspended child hangs.
@@ -241,7 +270,7 @@ mod sys {
     }
 
     unsafe extern "system" fn on_ctrl(_ctrl_type: u32) -> windows::core::BOOL {
-        super::kill_all_tracked();
+        super::on_fatal_signal();
         // Not handled: the default handler still terminates the process.
         windows::core::BOOL(0)
     }
@@ -271,16 +300,33 @@ mod sys {
 
 /// Spawns `command` so that [`TrackedChild::kill_tree`] reaches every
 /// descendant. If tree tracking cannot be set up (Windows job assignment
-/// failure) the child is still returned and `kill_tree` falls back to
-/// killing the direct child only.
+/// failure) the child is still returned, `kill_tree` falls back to
+/// killing the direct child only, and [`TrackedChild::tracking_error`]
+/// says why — the caller surfaces it as a job warning (P6) instead of a
+/// console line the windowed app never shows.
 pub(crate) fn spawn_tracked(command: &mut Command) -> std::io::Result<TrackedChild> {
     sys::prepare(command);
     let child = command.spawn()?;
-    let key = sys::attach(&child).unwrap_or(0);
+    let (key, tracking_error) = match sys::attach(&child) {
+        Ok(key) => (key, None),
+        Err(err) => (0, Some(err)),
+    };
     if key != 0 {
         live().push(key);
     }
-    Ok(TrackedChild { child, key })
+    Ok(TrackedChild {
+        child,
+        key,
+        listed: key != 0,
+        tracking_error,
+    })
+}
+
+/// Job-warning text for a child whose process tree could not be tracked.
+pub(crate) fn tracking_warning(program: &str, err: &str) -> String {
+    format!(
+        "하위 프로세스 묶음(Job object)을 만들지 못했습니다 ({program}: {err}) — 중단·종료 시 이 단계가 띄운 ffmpeg 등 하위 프로세스가 남을 수 있습니다. 작업 관리자에서 확인하십시오."
+    )
 }
 
 impl TrackedChild {
@@ -292,12 +338,43 @@ impl TrackedChild {
         }
         let _ = self.child.kill();
     }
+
+    /// `Child::try_wait` that first drops the tree from the shutdown list
+    /// once the child has exited (P8). On unix the exit is detected
+    /// WITHOUT reaping (the zombie keeps its pid, i.e. the group id,
+    /// reserved), the group is untracked, and only then is it reaped — so
+    /// `kill_all_tracked` can no longer `killpg` a recycled group id.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        if self.key != 0 && sys::exited_unreaped(self.child.id()) {
+            self.unlist();
+            // The group id is only safe to signal while the zombie exists.
+            self.key = 0;
+        }
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.unlist();
+            #[cfg(unix)]
+            {
+                self.key = 0;
+            }
+        }
+        Ok(status)
+    }
+
+    fn unlist(&mut self) {
+        if self.listed {
+            let key = self.key;
+            live().retain(|entry| *entry != key);
+            self.listed = false;
+        }
+    }
 }
 
 impl Drop for TrackedChild {
     fn drop(&mut self) {
+        self.unlist();
         if self.key != 0 {
-            live().retain(|entry| *entry != self.key);
             sys::release(self.key);
         }
     }
@@ -307,6 +384,28 @@ impl Drop for TrackedChild {
 pub(crate) fn kill_all_tracked() {
     let keys: Vec<usize> = live().clone();
     kill_keys(&keys);
+}
+
+/// Whether `key` is in the shutdown list (tests).
+#[cfg(test)]
+pub(crate) fn is_listed(key: usize) -> bool {
+    live().contains(&key)
+}
+
+/// Fatal-signal / console-control path: reap every tracked tree, then
+/// drop the instance file while it still names this process (P9) — the
+/// process exits right after, skipping `serve::run`'s own cleanup, and a
+/// stale file would point the next launch (and its token) at a dead port.
+pub(crate) fn on_fatal_signal() {
+    fatal_signal_cleanup(&kill_all_tracked, &|| {
+        super::discovery::remove_instance_file_if_owned()
+    });
+}
+
+/// Order of [`on_fatal_signal`], with the effects injected (tests).
+pub(crate) fn fatal_signal_cleanup(kill: &dyn Fn(), remove_instance: &dyn Fn() -> bool) -> bool {
+    kill();
+    remove_instance()
 }
 
 fn kill_keys(keys: &[usize]) {
@@ -333,6 +432,51 @@ pub(crate) fn install_process_guard() {
             eprintln!("frametrace: could not install shutdown signal handler: {err}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests_try_wait {
+    use super::*;
+
+    /// P8: once `try_wait` sees the child exit, its tree is off the
+    /// shutdown kill list — on unix before the zombie is reaped, so a
+    /// recycled group id can never be signalled.
+    #[test]
+    fn exited_child_leaves_the_shutdown_list() {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit 0"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+        let mut tracked = spawn_tracked(&mut command).expect("spawn");
+        assert!(
+            tracked.tracking_error.is_none(),
+            "{:?}",
+            tracked.tracking_error
+        );
+        let key = tracked.key;
+        assert_ne!(key, 0);
+        assert!(is_listed(key), "a running tree is on the kill list");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = tracked.try_wait().expect("try_wait") {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(status.success());
+        // (Never call kill_all_tracked here: it would kill the children of
+        // tests running in parallel.) Shutdown reaping can no longer reach
+        // this key.
+        assert!(!is_listed(key), "an exited tree must leave the kill list");
+        drop(tracked);
+        assert!(!is_listed(key));
+    }
 }
 
 #[cfg(all(test, unix))]

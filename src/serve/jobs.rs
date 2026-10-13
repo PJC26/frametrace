@@ -46,9 +46,9 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
     // option only takes effect together with with_ffprobe (default off).
     let with_audio = body_value(&request.body, "with_audio").as_deref() == Some("true");
     let skip_e01_verify = body_value(&request.body, "skip_e01_verify").as_deref() == Some("true");
-    let case_dir = match body_value(&request.body, "case_dir") {
-        Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
-        _ => default_case_dir(),
+    let (case_dir, case_dir_warning) = match body_value(&request.body, "case_dir") {
+        Some(dir) if !dir.trim().is_empty() => (PathBuf::from(dir.trim()), None),
+        _ => default_case_dir_checked(),
     };
     let job = PipelineJob {
         kind: input_kind,
@@ -61,15 +61,27 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         skip_e01_verify,
         e01_direct,
     };
-    {
+    // Stats the source (canonicalize): done before the state lock.
+    let volume_root = input_kind == InputKind::Folder && source_is_volume_root(&source_path);
+    // P2: the pipeline's `busy` is a lease the worker thread owns, so a
+    // panicking worker can never leave the workstation "busy" for good.
+    let lease = {
         let mut guard = state_lock(state);
         if guard.busy {
             return "{\"ok\":false,\"error\":\"이미 분석이 진행 중입니다.\"}".to_string();
         }
-        guard.busy = true;
+        // S4: a new analysis rebinds the case; a clip export / join or a
+        // write op still writing into the current one must finish first.
+        if let Some(refusal) = side_work_refusal(&guard, "새 분석을 시작하십시오") {
+            return api_err(&refusal);
+        }
+        // S7 (shutdown requested) is refused inside the lease.
+        let lease = match lease_busy_locked(&mut guard, state) {
+            Ok(lease) => lease,
+            Err(err) => return api_err(&err),
+        };
         guard.phase = "running";
         guard.restored = false;
-        guard.cancel_requested = false;
         guard.warnings = Vec::new();
         guard.enrichment = None;
         guard.steps = [StepStatus::Pending; 5];
@@ -83,7 +95,7 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         // SEC-06: /media serves anything under a media root. A folder
         // source at a volume root (E:\ of a dashcam card) is legitimate,
         // but then the whole volume is reviewable — say so, never silently.
-        if input_kind == InputKind::Folder && source_is_volume_root(&source_path) {
+        if volume_root {
             let message = format!(
                 "소스가 볼륨 루트입니다 ({}) — 이 볼륨 전체가 검토 범위(/media)로 열립니다. 증거 폴더만 지정하는 것을 권장합니다.",
                 source_path.display()
@@ -91,7 +103,15 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
             guard.logs.push(format!("경고: {message}"));
             guard.warnings.push((1, message));
         }
-    }
+        // P1: the default case folder fell back to the temp directory
+        // (no home directory found) — say so on screen.
+        if let Some(message) = case_dir_warning {
+            guard.logs.push(format!("경고: {message}"));
+            guard.warnings.push((0, message));
+        }
+        lease
+    };
+    let epoch = lease.epoch();
     save_session(
         &case_dir,
         (input_kind == InputKind::Folder).then_some(source_path.as_path()),
@@ -100,11 +120,20 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
     let worker_state = Arc::clone(state);
     let spawned = thread::Builder::new()
         .name("ft-pipeline".into())
-        .spawn(move || run_pipeline(worker_state, job));
+        .spawn(move || {
+            // Held for the whole run: the pipeline clears `busy` itself in
+            // its final state update; if it unwinds instead, dropping the
+            // lease frees `busy` and records the failure.
+            let _lease = lease;
+            run_pipeline(worker_state, job);
+        });
     if spawned.is_err() {
+        // The closure (and with it the lease) was dropped: `busy` is free.
+        // Only reset the phase while no newer job took `busy` since.
         let mut guard = state_lock(state);
-        guard.busy = false;
-        guard.phase = "idle";
+        if guard.busy_epoch == epoch {
+            guard.phase = "idle";
+        }
         return "{\"ok\":false,\"error\":\"작업 스레드 시작 실패\"}".to_string();
     }
     "{\"ok\":true}".to_string()
@@ -129,15 +158,58 @@ pub(crate) fn source_is_volume_root(path: &Path) -> bool {
     resolved.parent().is_none()
 }
 
-pub(crate) fn default_case_dir() -> PathBuf {
-    let root = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+/// Where new cases go when the examiner leaves the case folder empty (P1),
+/// decided purely (environment and filesystem injected): Windows uses
+/// `%USERPROFILE%`; elsewhere `$HOME/Documents` when that folder exists,
+/// else `$HOME`. Only without any home directory does it fall back to the
+/// temp directory — which reboots and cleaners empty — and then the second
+/// value is `true` so the caller warns on screen.
+pub(crate) fn default_case_root(
+    windows: bool,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    is_dir: &dyn Fn(&Path) -> bool,
+    temp_dir: &Path,
+) -> (PathBuf, bool) {
+    let var = |name: &str| env(name).filter(|value| !value.is_empty());
+    if windows {
+        if let Some(profile) = var("USERPROFILE") {
+            return (PathBuf::from(profile), false);
+        }
+    } else if let Some(home) = var("HOME") {
+        let home = PathBuf::from(home);
+        let documents = home.join("Documents");
+        return if is_dir(&documents) {
+            (documents, false)
+        } else {
+            (home, false)
+        };
+    }
+    (temp_dir.to_path_buf(), true)
+}
+
+/// Warning shown when the default case folder lives in the temp directory.
+pub(crate) fn temp_case_dir_warning(dir: &Path) -> String {
+    format!(
+        "홈 폴더를 찾지 못해 케이스를 임시 폴더에 만듭니다 ({}) — 재부팅이나 정리 도구가 지울 수 있으니 케이스 폴더를 직접 지정하십시오.",
+        dir.display()
+    )
+}
+
+/// The default case folder plus the temp-fallback warning, if any (P1).
+pub(crate) fn default_case_dir_checked() -> (PathBuf, Option<String>) {
+    let (root, temp_fallback) = default_case_root(
+        cfg!(windows),
+        &|name| std::env::var_os(name),
+        &|path| path.is_dir(),
+        &std::env::temp_dir(),
+    );
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    root.join("FrameTrace").join(format!("case-{stamp}"))
+    let dir = root.join("FrameTrace").join(format!("case-{stamp}"));
+    let warning = temp_fallback.then(|| temp_case_dir_warning(&dir));
+    (dir, warning)
 }
 
 pub(crate) fn run_pipeline(state: SharedState, job: PipelineJob) {
@@ -792,16 +864,36 @@ pub(crate) fn fail(state: &SharedState, message: &str) {
 pub(crate) const STEP_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 
 pub(crate) fn run_step(exe: &Path, args: &[String], state: &SharedState) -> Result<String, String> {
-    run_step_cancellable(exe, args, &|| state_lock(state).cancel_requested)
+    run_step_cancellable(exe, args, &|| state_lock(state).cancel_requested, state)
+}
+
+/// P6: a step whose process tree could not be put in a Job object is
+/// reported as a job warning (log + `warnings` in /api/status), once per
+/// distinct message — the windowed app has no console for `eprintln!`.
+pub(crate) fn report_process_warning(state: &SharedState, message: String) {
+    eprintln!("frametrace: {message}");
+    let mut guard = state_lock(state);
+    if guard.warnings.iter().any(|(_, known)| *known == message) {
+        return;
+    }
+    let step = guard
+        .steps
+        .iter()
+        .position(|step| *step == StepStatus::Running)
+        .unwrap_or(0);
+    guard.logs.push(format!("경고: {message}"));
+    guard.warnings.push((step, message));
 }
 
 /// [`run_step`] with an explicit cancel predicate, for jobs that do not use
 /// the global cancel flag (clip exports cancel per job, UX-09). A `true`
-/// from `cancelled` kills the whole process tree.
+/// from `cancelled` kills the whole process tree. `state` receives the
+/// process-tracking warning, if any (P6).
 pub(crate) fn run_step_cancellable(
     exe: &Path,
     args: &[String],
     cancelled: &dyn Fn() -> bool,
+    state: &SharedState,
 ) -> Result<String, String> {
     // Spawned as a process tree (own group / Job object) so cancel reaches
     // the ffmpeg/ffprobe grandchildren, not just the direct child.
@@ -812,6 +904,10 @@ pub(crate) fn run_step_cancellable(
             .stderr(Stdio::piped()),
     )
     .map_err(|err| format!("{} 실행 실패: {err}", exe.display()))?;
+    if let Some(err) = tracked.tracking_error.take() {
+        let program = args.first().map(String::as_str).unwrap_or("command");
+        report_process_warning(state, super::proc::tracking_warning(program, &err));
+    }
     let child = &mut tracked.child;
     // Both pipes must be drained while the child runs: a child that fills
     // the OS pipe buffer blocks on write, and a parent that only polls
@@ -827,7 +923,7 @@ pub(crate) fn run_step_cancellable(
             killed = true;
             tracked.kill_tree();
         }
-        match tracked.child.try_wait() {
+        match tracked.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(150)),
             Err(err) => return Err(format!("{} 실행 대기 실패: {err}", exe.display())),
@@ -1398,7 +1494,9 @@ pub(crate) fn api_import_marks_with_runner(
             return api_err(&err);
         }
     }
-    if let Err(err) = std::fs::write(&marks_path, &marks_body) {
+    // P12: written atomically like the enrichment path — a torn file from
+    // a crash mid-write must never be what import-marks reads.
+    if let Err(err) = crate::util::write_text_atomic(&marks_path, &marks_body) {
         return api_err(&err.to_string());
     }
     let outcome = {
@@ -1497,13 +1595,14 @@ pub(crate) fn api_finalize(request: &Request, state: &SharedState) -> String {
         Ok(guard) => guard,
         Err(err) => return api_err(&err),
     };
-    // UX-09: clip exports run without `busy`; sealing while one is still
-    // writing into artifacts/clips would package a torn or missing clip.
-    if running_clip_job_count(state) > 0 {
-        return api_err(
-            "최종화 차단: 내보내기·이어붙이기 작업이 진행 중입니다 — 끝난 뒤 다시 시도하십시오.",
-        );
-    }
+    // UX-09 / S1: clip exports, export-selected and frame captures run
+    // without `busy`; sealing while one is still writing into the case
+    // would package a torn or missing artifact. The check and the seal
+    // flag (which refuses new write ops) share one lock.
+    let _seal = match try_begin_seal(state) {
+        Ok(seal) => seal,
+        Err(err) => return api_err(&err),
+    };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {

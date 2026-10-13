@@ -23,5 +23,8 @@ fn cli_main() -> i32 {
 }
 
 fn main() {
+    // P7: no modal loader/critical-error dialogs for this process or the
+    // tools it spawns (inherited) — they would block unseen.
+    frametrace::util::suppress_os_error_dialogs();
     std::process::exit(frametrace::run_with_large_stack(cli_main));
 }

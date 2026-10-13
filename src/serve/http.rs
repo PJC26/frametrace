@@ -183,21 +183,24 @@ pub(crate) fn handle_connection_timed(
         .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|err| format!("write timeout: {err}"))?;
     HEAD_ONLY.with(|flag| flag.set(false));
-    let (mut request, extras) = match read_request_ext(&mut stream, read_timeout) {
-        Ok(read) => read,
-        Err(err) => {
-            if err.status != 0 {
-                let _ = finish(
-                    &mut stream,
-                    &plain(err.status, err.message.clone().into_bytes()),
-                );
-                if matches!(err.status, 400 | 411 | 413 | 431) {
-                    drain_unread(&mut stream);
-                }
+    let refuse_read = |stream: &mut TcpStream, err: HttpReadError| {
+        if err.status != 0 {
+            let _ = finish(stream, &plain(err.status, err.message.clone().into_bytes()));
+            if matches!(err.status, 400 | 411 | 413 | 431) {
+                drain_unread(stream);
             }
-            return Err(err.message);
         }
+        Err(err.message)
     };
+    let (head, pending_body) = match read_request_head(&mut stream, read_timeout) {
+        Ok(read) => read,
+        Err(err) => return refuse_read(&mut stream, err),
+    };
+    let ParsedHead {
+        mut request,
+        extras,
+        ..
+    } = head;
     // HEAD is answered exactly like GET minus the body.
     let is_head = request.method == "HEAD";
     if is_head {
@@ -208,15 +211,29 @@ pub(crate) fn handle_connection_timed(
         let guard = state_lock(&state);
         (guard.token.clone(), guard.instance.clone())
     };
+    // S3: Origin/Host, token and nonce live in the header block, so the
+    // gate runs before a single body byte is read — an unauthenticated
+    // client can no longer make the server buffer a 16 MiB body first.
     let plant_cookie = match authorize(&request, token.as_deref(), &instance) {
         Ok(plant) => plant,
-        Err(403) => {
-            return finish(
-                &mut stream,
-                &plain(403, b"cross-origin request rejected".to_vec()),
-            );
+        Err(code) => {
+            let message: &[u8] = if code == 403 {
+                b"cross-origin request rejected"
+            } else {
+                b"unauthorized"
+            };
+            let result = finish(&mut stream, &plain(code, message.to_vec()));
+            if pending_body.has_unread() {
+                // Discard (never buffer) what the client keeps sending, so
+                // closing does not RST away the refusal it has not read.
+                drain_unread(&mut stream);
+            }
+            return result;
         }
-        Err(code) => return finish(&mut stream, &plain(code, b"unauthorized".to_vec())),
+    };
+    request.body = match read_request_body(&mut stream, pending_body) {
+        Ok(body) => body,
+        Err(err) => return refuse_read(&mut stream, err),
     };
     // Item 8: UNC/device paths are refused before any handler (and thus
     // any filesystem call) sees them.
@@ -349,14 +366,31 @@ pub(crate) fn parse_request_head(head: &str) -> Result<ParsedHead, HttpReadError
     })
 }
 
-/// Reads one request. `header_deadline` bounds the whole header phase (a
-/// slowloris client dripping a byte at a time resets the per-read socket
-/// timeout forever, so a wall-clock deadline is also enforced); the body
-/// gets 4x that budget.
-pub(crate) fn read_request_ext(
+/// The not-yet-read part of a request body after [`read_request_head`]:
+/// bytes that arrived with the header plus how many are still expected.
+pub(crate) struct PendingBody {
+    leftover: Vec<u8>,
+    content_length: usize,
+    started: std::time::Instant,
+    body_deadline: Duration,
+}
+
+impl PendingBody {
+    /// Whether body bytes are still in flight on the socket.
+    pub(crate) fn has_unread(&self) -> bool {
+        self.leftover.len() < self.content_length
+    }
+}
+
+/// Reads one request's header block. `header_deadline` bounds the whole
+/// header phase (a slowloris client dripping a byte at a time resets the
+/// per-read socket timeout forever, so a wall-clock deadline is also
+/// enforced); the body ([`read_request_body`]) gets 4x that budget. S3:
+/// the auth gate runs between the two, on the header alone.
+pub(crate) fn read_request_head(
     stream: &mut TcpStream,
     header_deadline: Duration,
-) -> Result<(Request, RequestExtras), HttpReadError> {
+) -> Result<(ParsedHead, PendingBody), HttpReadError> {
     let started = std::time::Instant::now();
     let mut buffer: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = [0u8; 2048];
@@ -382,9 +416,29 @@ pub(crate) fn read_request_ext(
     let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
     let parsed = parse_request_head(&head)?;
     let content_length = parsed.content_length;
-    let mut body = buffer[header_end + 4..].to_vec();
-    let body_deadline = header_deadline * 4;
-    while body.len() < content_length {
+    let pending = PendingBody {
+        leftover: buffer[header_end + 4..].to_vec(),
+        content_length,
+        started,
+        body_deadline: header_deadline * 4,
+    };
+    Ok((parsed, pending))
+}
+
+/// Body phase after [`read_request_head`]: reads up to Content-Length within
+/// the body budget (4x the header deadline, measured from the first byte).
+pub(crate) fn read_request_body(
+    stream: &mut TcpStream,
+    pending: PendingBody,
+) -> Result<String, HttpReadError> {
+    let PendingBody {
+        mut leftover,
+        content_length,
+        started,
+        body_deadline,
+    } = pending;
+    let mut chunk = [0u8; 2048];
+    while leftover.len() < content_length {
         if started.elapsed() > body_deadline {
             return Err(read_error(408, "request body timed out"));
         }
@@ -392,12 +446,10 @@ pub(crate) fn read_request_ext(
         if read == 0 {
             break;
         }
-        body.extend_from_slice(&chunk[..read]);
+        leftover.extend_from_slice(&chunk[..read]);
     }
-    body.truncate(content_length);
-    let mut request = parsed.request;
-    request.body = String::from_utf8_lossy(&body).to_string();
-    Ok((request, parsed.extras))
+    leftover.truncate(content_length);
+    Ok(String::from_utf8_lossy(&leftover).to_string())
 }
 
 /// Percent-decodes a URL component. `plus_as_space` selects query-string
@@ -605,12 +657,34 @@ pub(crate) const REMOTE_PATH_ERROR: &str = "네트워크(UNC)·장치 경로는 
 /// (`/api/preflight`, `/api/start`, see [`route_admits_typed_unc`]) are
 /// gated by the Origin port check and the instance nonce, so a typed UNC
 /// share is honoured there; device-namespace paths stay refused.
+///
+/// S8: only Windows gives two leading separators the UNC meaning; on
+/// Linux/macOS `//mnt/x` is an ordinary local path, so a path that starts
+/// with `/` is never remote there.
+///
+/// S2: on Windows a component that names a reserved DOS device (`CON`,
+/// `NUL`, `COM1`, `LPT1`, … — also with an extension, `nul.txt`) is
+/// refused too: `C:\x\COM1` opens the serial port, and a `metadata` /
+/// `read` on it can block a handler thread for good.
 pub(crate) fn reject_remote_path(
     raw: &str,
     approved_roots: &[PathBuf],
 ) -> Result<(), &'static str> {
+    reject_remote_path_on(raw, approved_roots, cfg!(windows))
+}
+
+/// [`reject_remote_path`] with the platform made explicit (`windows`
+/// selects Windows path semantics) so both are tested on every host.
+pub(crate) fn reject_remote_path_on(
+    raw: &str,
+    approved_roots: &[PathBuf],
+    windows: bool,
+) -> Result<(), &'static str> {
     let text = raw.trim();
-    if !is_remote_or_device_path(text) {
+    if windows && has_reserved_device_component(text) {
+        return Err(RESERVED_DEVICE_ERROR);
+    }
+    if !is_remote_or_device_path(text, windows) {
         return Ok(());
     }
     if is_verbatim_local_drive(text) {
@@ -639,8 +713,16 @@ pub(crate) fn reject_remote_path(
 /// `\\?\UNC\server\share\…`, no `.`/`..` components) is admitted;
 /// device-namespace and malformed remote paths are still refused.
 pub(crate) fn reject_device_path(raw: &str) -> Result<(), &'static str> {
+    reject_device_path_on(raw, cfg!(windows))
+}
+
+/// [`reject_device_path`] with explicit platform semantics (tests).
+pub(crate) fn reject_device_path_on(raw: &str, windows: bool) -> Result<(), &'static str> {
     let text = raw.trim();
-    if is_remote_or_device_path(text)
+    if windows && has_reserved_device_component(text) {
+        return Err(RESERVED_DEVICE_ERROR);
+    }
+    if is_remote_or_device_path(text, windows)
         && let Some(unc) = unc_share_form(text)
     {
         if unc.split('\\').any(|part| part == ".." || part == ".") {
@@ -648,7 +730,45 @@ pub(crate) fn reject_device_path(raw: &str) -> Result<(), &'static str> {
         }
         return Ok(());
     }
-    reject_remote_path(text, &[])
+    reject_remote_path_on(text, &[], windows)
+}
+
+/// Refusal text for a path naming a reserved Windows device (S2).
+pub(crate) const RESERVED_DEVICE_ERROR: &str = "Windows 예약 장치 이름(CON·PRN·AUX·NUL·COM0–9·LPT0–9 등)이 들어간 경로는 허용되지 않습니다. / Paths naming a reserved Windows device are refused.";
+
+/// Whether one path component names a reserved DOS device. Windows maps
+/// the name to the device regardless of extension (`NUL.txt`) and of
+/// trailing spaces/dots, and case-insensitively; the superscript digits
+/// `¹²³` count as digits for COM/LPT.
+pub(crate) fn is_reserved_device_name(component: &str) -> bool {
+    let base = component
+        .split(['.', ':'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
+        return true;
+    }
+    let Some(digit) = base
+        .strip_prefix("COM")
+        .or_else(|| base.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut chars = digit.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('0'..='9' | '¹' | '²' | '³'), None)
+    )
+}
+
+/// Whether any `\`/`/`-separated component of `text` is a reserved device.
+fn has_reserved_device_component(text: &str) -> bool {
+    text.split(['\\', '/']).any(is_reserved_device_name)
 }
 
 /// Routes whose path fields may name a UNC share the examiner typed (see
@@ -666,8 +786,12 @@ fn is_separator(byte: u8) -> bool {
 }
 
 /// Two leading separators (any mix of `\` and `/`) or the NT object prefix.
-fn is_remote_or_device_path(text: &str) -> bool {
+/// Off Windows a leading `/` is always a local absolute path (S8).
+fn is_remote_or_device_path(text: &str, windows: bool) -> bool {
     let bytes = text.as_bytes();
+    if !windows && bytes.first() == Some(&b'/') {
+        return false;
+    }
     (bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]))
         || (bytes.len() >= 4
             && is_separator(bytes[0])
@@ -1553,7 +1677,7 @@ mod tests_origin_and_paths {
             r"\\evil",
         ] {
             assert_eq!(
-                reject_remote_path(raw, &[]),
+                reject_remote_path_on(raw, &[], true),
                 Err(REMOTE_PATH_ERROR),
                 "{raw} must be refused"
             );
@@ -1567,7 +1691,11 @@ mod tests_origin_and_paths {
             r"\\?\d:",
             "",
         ] {
-            assert_eq!(reject_remote_path(raw, &[]), Ok(()), "{raw} is local");
+            assert_eq!(
+                reject_remote_path_on(raw, &[], true),
+                Ok(()),
+                "{raw} is local"
+            );
         }
     }
 
@@ -1584,7 +1712,7 @@ mod tests_origin_and_paths {
             r"\\?\C:\cases",
             "",
         ] {
-            assert_eq!(reject_device_path(raw), Ok(()), "{raw}");
+            assert_eq!(reject_device_path_on(raw, true), Ok(()), "{raw}");
         }
         for raw in [
             r"\\.\PhysicalDrive0",
@@ -1596,7 +1724,11 @@ mod tests_origin_and_paths {
             r"\\evil",
             r"\\nas\evidence\..\..\x",
         ] {
-            assert_eq!(reject_device_path(raw), Err(REMOTE_PATH_ERROR), "{raw}");
+            assert_eq!(
+                reject_device_path_on(raw, true),
+                Err(REMOTE_PATH_ERROR),
+                "{raw}"
+            );
         }
         assert!(route_admits_typed_unc("POST", "/api/preflight"));
         assert!(route_admits_typed_unc("POST", "/api/start"));
@@ -1624,7 +1756,7 @@ mod tests_origin_and_paths {
             "//nas/evidence/case7/sub/a.mp4",
             r"\\?\UNC\nas\evidence\case7\a.mp4",
         ] {
-            assert_eq!(reject_remote_path(raw, &roots), Ok(()), "{raw}");
+            assert_eq!(reject_remote_path_on(raw, &roots, true), Ok(()), "{raw}");
         }
         for raw in [
             r"\\nas\evidence\case70\a.mp4",
@@ -1635,7 +1767,7 @@ mod tests_origin_and_paths {
             r"\\.\nas\evidence\case7",
         ] {
             assert_eq!(
-                reject_remote_path(raw, &roots),
+                reject_remote_path_on(raw, &roots, true),
                 Err(REMOTE_PATH_ERROR),
                 "{raw}"
             );

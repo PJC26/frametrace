@@ -47,6 +47,67 @@ thread_local! {
     static CONTROLLER: RefCell<Option<ICoreWebView2Controller>> = const { RefCell::new(None) };
 }
 
+/// P10: the controller is only ever touched through these helpers, which
+/// hold the `RefCell` borrow just long enough to clone/move the COM
+/// pointer out — never across a WebView2 call. `SetBounds` / `Close` can
+/// pump messages and re-enter `frame_window_proc` (WM_SIZE); a borrow held
+/// across them made the re-entrant borrow panic inside an `extern
+/// "system"` callback, which aborts the process. A borrow that is still
+/// busy reads as "no controller" instead of panicking.
+pub(crate) fn cell_clone<T: Clone>(cell: &RefCell<Option<T>>) -> Option<T> {
+    cell.try_borrow().ok().and_then(|slot| slot.clone())
+}
+
+/// Moves the value out (see [`cell_clone`]); `None` when empty or busy.
+pub(crate) fn cell_take<T>(cell: &RefCell<Option<T>>) -> Option<T> {
+    cell.try_borrow_mut().ok().and_then(|mut slot| slot.take())
+}
+
+/// Stores `value`; hands it back when the cell is busy (never panics).
+pub(crate) fn cell_store<T>(cell: &RefCell<Option<T>>, value: T) -> Result<(), T> {
+    match cell.try_borrow_mut() {
+        Ok(mut slot) => {
+            *slot = Some(value);
+            Ok(())
+        }
+        Err(_) => Err(value),
+    }
+}
+
+/// P13: balances a successful `CoInitializeEx` (S_OK *and* S_FALSE both
+/// need a matching `CoUninitialize`) once every WebView2 object of the
+/// window is released.
+struct ComApartment;
+
+impl ComApartment {
+    fn init() -> Result<Self, String> {
+        // SAFETY: initializes COM for this (UI) thread.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if com_init_needs_uninit(hr.0) {
+            Ok(ComApartment)
+        } else {
+            Err(format!(
+                "CoInitializeEx failed: {}",
+                windows::core::Error::from(hr)
+            ))
+        }
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        // SAFETY: pairs the successful CoInitializeEx in `init`.
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
+/// Whether a `CoInitializeEx` HRESULT must be paired with
+/// `CoUninitialize`: every success code (S_OK, S_FALSE), never a failure
+/// such as RPC_E_CHANGED_MODE.
+pub(crate) fn com_init_needs_uninit(hresult: i32) -> bool {
+    hresult >= 0
+}
+
 /// The frame window, shared with the server-watcher and cancel-then-close
 /// threads. They post private `WM_APP + n` window messages to it: unlike
 /// thread messages (`PostThreadMessageW`, hwnd == null), window messages
@@ -117,17 +178,22 @@ pub fn run_hosted() -> Result<(), String> {
         (serve::shell_target(port, false, Duration::ZERO), None)
     } else {
         let port = reserve_port()?;
+        // P4: the server thread reports how `serve::run` ended, so a
+        // startup failure (token format, bind) is shown as itself instead
+        // of a generic "did not bind in time" after the full wait.
+        let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
         let server = std::thread::Builder::new()
             .name("frametrace-serve".to_string())
             .spawn(move || {
-                serve::run(ServeOptions {
+                let result = serve::run(ServeOptions {
                     case_dir: None,
                     port: Some(port),
                     open_browser: false,
-                })
+                });
+                let _ = result_tx.send(result);
             })
             .map_err(|err| format!("failed to spawn workstation server thread: {err}"))?;
-        wait_for_server(port, Duration::from_secs(15))?;
+        wait_for_server(port, Duration::from_secs(15), &result_rx)?;
         OWNED_PORT.store(port, Ordering::SeqCst);
         // Server-exit watcher: if the server ends while the WebView2
         // window is still up (UI 종료 button, /api/shutdown, a fatal
@@ -136,7 +202,16 @@ pub fn run_hosted() -> Result<(), String> {
         // bound instead of an unbounded `join`.
         let (server_done_tx, server_done_rx) = mpsc::channel::<()>();
         let watcher = std::thread::spawn(move || {
+            let result = result_rx
+                .recv()
+                .unwrap_or_else(|_| Err(SERVER_THREAD_PANIC.into()));
             let _ = server.join();
+            // P5: published before the frame hears about it, so a host
+            // failure caused by the dying server is never answered with a
+            // browser pointed at the dead URL.
+            *SERVER_EXIT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
             let _ = server_done_tx.send(());
             post_frame_message(MSG_SERVER_GONE);
         });
@@ -150,13 +225,15 @@ pub fn run_hosted() -> Result<(), String> {
 
     let hosted = match host_window(&target) {
         Ok(()) => true,
-        Err(err) => {
-            eprintln!("webview2 shell unavailable, falling back to browser: {err}");
-            if let Ok(url) = &target {
-                serve::open_in_browser(url);
+        Err(err) => match fallback_plan(owned_port.is_some(), server_exit(), &target, &err) {
+            Fallback::OpenBrowser(url) => {
+                eprintln!("webview2 shell unavailable, falling back to browser: {err}");
+                serve::open_in_browser(&url);
+                false
             }
-            false
-        }
+            // Shown by the caller (message box); nothing to open.
+            Fallback::Fail(message) => return Err(message),
+        },
     };
 
     if let Some((port, watcher, server_done_rx)) = owned_port {
@@ -195,8 +272,96 @@ pub fn run_hosted() -> Result<(), String> {
         // or the shutdown request above). In the browser fallback the
         // examiner ends the session from the UI, so this wait is open.
         let _ = watcher.join();
+        // A server that died with an error is reported, never a silent exit.
+        if let Some(Err(err)) = server_exit() {
+            return Err(format!(
+                "워크스테이션 서버가 오류로 종료되었습니다: {err} / The workstation server stopped with an error."
+            ));
+        }
     }
     Ok(())
+}
+
+/// Reported when the server thread unwound instead of returning.
+const SERVER_THREAD_PANIC: &str = "server thread panicked";
+
+/// How the owned server thread ended (`None` while it runs), published by
+/// the server watcher (P5).
+static SERVER_EXIT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+fn server_exit() -> Option<Result<(), String>> {
+    SERVER_EXIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// What the shell does when the WebView2 window could not be hosted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Fallback {
+    /// Open the workstation in the default browser.
+    OpenBrowser(String),
+    /// Nothing useful can be opened: show this error.
+    Fail(String),
+}
+
+/// Pure P5 decision. `owned`: the server runs in this process;
+/// `server_exit`: how it ended, if it already did; `target`: the URL (or
+/// the reason there is none); `host_err`: why hosting failed. A browser is
+/// only pointed at a server that is still alive — a dead URL would just
+/// open a connection error with the real cause lost.
+pub(crate) fn fallback_plan(
+    owned: bool,
+    server_exit: Option<Result<(), String>>,
+    target: &Result<String, String>,
+    host_err: &str,
+) -> Fallback {
+    if owned && let Some(exit) = server_exit {
+        let cause = match exit {
+            Ok(()) => "서버가 종료되었습니다 / the server exited".to_string(),
+            Err(err) => err,
+        };
+        return Fallback::Fail(format!(
+            "창을 여는 동안 워크스테이션 서버가 멈췄습니다: {cause} (WebView2: {host_err}) / The workstation server stopped while the window was opening."
+        ));
+    }
+    match target {
+        Ok(url) => Fallback::OpenBrowser(url.clone()),
+        Err(message) => Fallback::Fail(format!("{message} (WebView2: {host_err})")),
+    }
+}
+
+/// One poll of the server startup wait (P4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupPoll {
+    Ready,
+    Wait,
+    Failed(String),
+}
+
+/// Pure startup decision. `finished`: what the server thread reported, if
+/// it already ended (a server that ended before accepting is a failure,
+/// whatever else answers on the port); `connected`: the port accepts;
+/// `timed_out`: the wait budget is spent.
+pub(crate) fn startup_poll(
+    port: u16,
+    finished: Option<&Result<(), String>>,
+    connected: bool,
+    timed_out: bool,
+) -> StartupPoll {
+    match finished {
+        Some(Err(err)) => StartupPoll::Failed(format!(
+            "워크스테이션 서버를 시작하지 못했습니다: {err} / The workstation server failed to start: {err}"
+        )),
+        Some(Ok(())) => StartupPoll::Failed(format!(
+            "워크스테이션 서버가 시작 직후 종료되었습니다 (127.0.0.1:{port}). / The workstation server exited during startup."
+        )),
+        None if connected => StartupPoll::Ready,
+        None if timed_out => StartupPoll::Failed(format!(
+            "workstation server did not bind 127.0.0.1:{port} in time"
+        )),
+        None => StartupPoll::Wait,
+    }
 }
 
 /// Posts one of the private `MSG_*` messages to the frame: as a window
@@ -258,25 +423,43 @@ fn reserve_port() -> Result<u16, String> {
     Ok(port)
 }
 
-fn wait_for_server(port: u16, timeout: Duration) -> Result<(), String> {
+fn wait_for_server(
+    port: u16,
+    timeout: Duration,
+    finished: &mpsc::Receiver<Result<(), String>>,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(());
+    loop {
+        let ended = match finished.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(SERVER_THREAD_PANIC.to_string())),
+        };
+        let connected = ended.is_none() && TcpStream::connect(("127.0.0.1", port)).is_ok();
+        match startup_poll(port, ended.as_ref(), connected, Instant::now() >= deadline) {
+            StartupPoll::Ready => return Ok(()),
+            StartupPoll::Failed(message) => return Err(message),
+            StartupPoll::Wait => std::thread::sleep(Duration::from_millis(50)),
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    Err(format!(
-        "workstation server did not bind 127.0.0.1:{port} in time"
-    ))
+}
+
+/// Why a shell request produced no response (P3): the two are different
+/// facts — nothing listening vs. a server that did not answer in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestFailure {
+    /// The connect failed: nothing accepts on the port.
+    Unreachable,
+    /// Connected, but no response arrived (stalled / timed out).
+    NoAnswer,
 }
 
 /// One request to our own server over a raw socket (no HTTP client
-/// dependency). Returns the response body, `None` when the server could
-/// not be reached or answered nothing. HTTP/1.0 so the server closes the
-/// connection after the response; a read timeout bounds a stalled peer
-/// and whatever arrived before it is still returned.
-fn shell_request(port: u16, method: &str, path: &str) -> Option<String> {
+/// dependency). Returns the response body, or why there is none.
+/// HTTP/1.0 so the server closes the connection after the response; a
+/// read timeout bounds a stalled peer and whatever arrived before it is
+/// still returned.
+fn shell_request(port: u16, method: &str, path: &str) -> Result<String, RequestFailure> {
     shell_request_timed(port, method, path, WORKER_REQUEST_TIMEOUT)
 }
 
@@ -287,7 +470,7 @@ fn shell_request_timed(
     method: &str,
     path: &str,
     io_timeout: Duration,
-) -> Option<String> {
+) -> Result<String, RequestFailure> {
     let query = match crate::serve::resolve_shell_token(port, crate::serve::token_for_port) {
         Some(token) => format!("?token={token}"),
         None => String::new(),
@@ -304,33 +487,83 @@ fn shell_request_timed(
         String::new()
     };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, io_timeout).ok()?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, io_timeout).map_err(|err| match err.kind() {
+            // A connect that merely ran out of time reached no verdict.
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                RequestFailure::NoAnswer
+            }
+            _ => RequestFailure::Unreachable,
+        })?;
     let _ = stream.set_read_timeout(Some(io_timeout));
     let _ = stream.set_write_timeout(Some(io_timeout));
     let request = format!(
         "{method} {path}{query} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{nonce_header}Content-Length: 0\r\n\r\n"
     );
-    stream.write_all(request.as_bytes()).ok()?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| RequestFailure::NoAnswer)?;
     let mut buffer = Vec::new();
     // A timeout after the response arrived is not a failure: keep what
     // was read.
     let _ = stream.read_to_end(&mut buffer);
     if buffer.is_empty() {
-        return None;
+        return Err(RequestFailure::NoAnswer);
     }
     let text = String::from_utf8_lossy(&buffer);
-    Some(
-        text.split_once("\r\n\r\n")
-            .map(|(_, body)| body.to_string())
-            .unwrap_or_default(),
-    )
+    Ok(text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default())
 }
 
-/// POST /api/shutdown. `Ok(true)` accepted, `Ok(false)` refused because
-/// a job runs, `Err` when the server did not answer.
-fn request_shutdown(port: u16) -> Result<bool, ()> {
-    let body = shell_request(port, "POST", "/api/shutdown").ok_or(())?;
-    Ok(shutdown_accepted(&body))
+/// What one `/api/shutdown` attempt established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownReply {
+    Accepted,
+    /// Refused (a job runs) or an unexpected reply.
+    Refused,
+    /// Nothing listens any more: the server is gone.
+    Unreachable,
+    /// The server did not answer — NOT proof that it died (P3).
+    NoAnswer,
+}
+
+/// POST /api/shutdown.
+fn request_shutdown(port: u16) -> ShutdownReply {
+    classify_shutdown_reply(shell_request(port, "POST", "/api/shutdown"))
+}
+
+/// Pure classification of a shutdown request's outcome.
+pub(crate) fn classify_shutdown_reply(reply: Result<String, RequestFailure>) -> ShutdownReply {
+    match reply {
+        Ok(body) if shutdown_accepted(&body) => ShutdownReply::Accepted,
+        Ok(_) => ShutdownReply::Refused,
+        Err(RequestFailure::Unreachable) => ShutdownReply::Unreachable,
+        Err(RequestFailure::NoAnswer) => ShutdownReply::NoAnswer,
+    }
+}
+
+/// Next move of the bounded shutdown loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownStep {
+    /// Accepted, or the server is already gone.
+    Done,
+    /// Refused because work runs: cancel it (once), then retry.
+    CancelAndRetry,
+    /// No answer: retry without assuming anything (until the deadline).
+    Retry,
+}
+
+/// Pure P3 decision: an unanswered shutdown is retried, never taken as
+/// "the server is dead" (which skipped the forced cleanup of a live,
+/// stalled server and its tool processes).
+pub(crate) fn shutdown_step(reply: ShutdownReply) -> ShutdownStep {
+    match reply {
+        ShutdownReply::Accepted | ShutdownReply::Unreachable => ShutdownStep::Done,
+        ShutdownReply::Refused => ShutdownStep::CancelAndRetry,
+        ShutdownReply::NoAnswer => ShutdownStep::Retry,
+    }
 }
 
 /// `/api/shutdown` reply → accepted? (`{"ok":true}`; a refusal carries
@@ -345,18 +578,20 @@ fn shutdown_accepted(body: &str) -> bool {
 /// Shutdown with a bound: when the server refuses because a job runs,
 /// cancel it and keep retrying until `wait` elapses. Returns whether the
 /// shutdown was accepted (an unreachable server counts as accepted — it is
-/// already gone, and the caller's server-exit wait is bounded too).
+/// already gone, and the caller's server-exit wait is bounded too). A
+/// server that does not answer is retried; when the bound runs out the
+/// caller forces the exit (P3).
 fn shutdown_server(port: u16, wait: Duration) -> bool {
     let deadline = Instant::now() + wait;
     let mut cancelled = false;
     loop {
-        match request_shutdown(port) {
-            Ok(true) | Err(()) => return true,
-            Ok(false) => {}
-        }
-        if !cancelled {
-            let _ = shell_request(port, "POST", "/api/cancel");
-            cancelled = true;
+        match shutdown_step(request_shutdown(port)) {
+            ShutdownStep::Done => return true,
+            ShutdownStep::CancelAndRetry if !cancelled => {
+                let _ = shell_request(port, "POST", "/api/cancel");
+                cancelled = true;
+            }
+            ShutdownStep::CancelAndRetry | ShutdownStep::Retry => {}
         }
         if Instant::now() >= deadline {
             return false;
@@ -377,51 +612,99 @@ pub(crate) enum CloseAction {
     KeepOpen,
 }
 
-/// Whether `/api/status` reports work the shutdown path would refuse to
-/// interrupt: the busy pipeline/enrichment/finalize job or a running clip
-/// export. Unparseable or missing status counts as idle.
-pub(crate) fn status_has_running_work(status_json: Option<&str>) -> bool {
-    let Some(value) =
-        status_json.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-    else {
-        return false;
+/// What the owned server's `/api/status` says about running work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkState {
+    /// Nothing the shutdown path would refuse to interrupt.
+    Idle,
+    /// The busy pipeline/enrichment/finalize job, a clip export / join,
+    /// or an export-selected / capture-frame write runs.
+    Running,
+    /// The status could not be read (timeout, stall, garbage, 401) — work
+    /// MAY be running (P3: never read as "idle").
+    Unknown,
+    /// Nothing listens on the port any more: the server is gone.
+    Gone,
+}
+
+/// Pure classification of a `/api/status` request (P3).
+pub(crate) fn classify_status(reply: &Result<String, RequestFailure>) -> WorkState {
+    let text = match reply {
+        Ok(text) => text,
+        Err(RequestFailure::Unreachable) => return WorkState::Gone,
+        Err(RequestFailure::NoAnswer) => return WorkState::Unknown,
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return WorkState::Unknown;
+    };
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return WorkState::Unknown;
+    }
+    let count = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
     };
     let busy = value
         .get("busy")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let clips = value
-        .get("clips_running")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    busy || clips > 0
+    if busy || count("clips_running") > 0 || count("writes_running") > 0 {
+        WorkState::Running
+    } else {
+        WorkState::Idle
+    }
 }
 
-/// Pure close decision: `status_json` is the `/api/status` body of the
-/// owned server (`None` when it could not be fetched) and `confirm_cancel`
-/// asks the examiner — it is only called when work is running.
+/// Pure close decision: `work` is the owned server's state; the examiner
+/// is asked (`confirm_cancel` while work runs, `confirm_unknown` when the
+/// status could not be read or the server stopped answering) — closing
+/// never silently interrupts work it could not rule out.
 pub(crate) fn decide_close(
-    status_json: Option<&str>,
+    work: WorkState,
     confirm_cancel: &dyn Fn() -> bool,
+    confirm_unknown: &dyn Fn() -> bool,
 ) -> CloseAction {
-    if !status_has_running_work(status_json) {
-        return CloseAction::Close;
-    }
-    if confirm_cancel() {
+    let confirmed = match work {
+        WorkState::Idle => return CloseAction::Close,
+        WorkState::Running => confirm_cancel(),
+        WorkState::Unknown | WorkState::Gone => confirm_unknown(),
+    };
+    if confirmed {
         CloseAction::CancelThenClose
     } else {
         CloseAction::KeepOpen
     }
 }
 
+/// Whether the cancel-then-close wait may stop polling: the work stopped
+/// or the server is gone. `Unknown` keeps waiting (bounded by the caller).
+pub(crate) fn close_wait_done(work: WorkState) -> bool {
+    matches!(work, WorkState::Idle | WorkState::Gone)
+}
+
 /// Modal yes/no in the examiner's language; UTF-16 so Korean renders.
 fn confirm_cancel_dialog(hwnd: HWND) -> bool {
+    confirm_dialog(
+        hwnd,
+        "분석 작업이 진행 중입니다.\n작업을 중단하고 FrameTrace를 종료할까요?\n\n예: 중단 후 종료    아니요: 계속 작업",
+    )
+}
+
+/// Asked when the status could not be read (P3).
+fn confirm_unknown_dialog(hwnd: HWND) -> bool {
+    confirm_dialog(
+        hwnd,
+        "워크스테이션의 작업 상태를 확인하지 못했습니다 (서버 응답 없음).\n진행 중인 작업이 있다면 중단됩니다. FrameTrace를 종료할까요?\n\n예: 중단 후 종료    아니요: 계속 작업",
+    )
+}
+
+fn confirm_dialog(hwnd: HWND, text: &str) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW,
     };
-    let text = HSTRING::from(
-        "분석 작업이 진행 중입니다.\n작업을 중단하고 FrameTrace를 종료할까요?\n\n예: 중단 후 종료    아니요: 계속 작업",
-    );
+    let text = HSTRING::from(text);
     let caption = HSTRING::from("FrameTrace");
     // SAFETY: live null-terminated UTF-16 strings; modal to our own window.
     let answer = unsafe {
@@ -447,7 +730,7 @@ fn cancel_then_close(port: u16) {
             let deadline = Instant::now() + CLOSE_CANCEL_WAIT;
             while Instant::now() < deadline {
                 let status = shell_request_timed(port, "GET", "/api/status", UI_REQUEST_TIMEOUT);
-                if !status_has_running_work(status.as_deref()) {
+                if close_wait_done(classify_status(&status)) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -505,9 +788,9 @@ fn nonce_from_response(response: &str) -> Option<String> {
 
 fn host_window(target: &Result<String, String>) -> Result<(), String> {
     unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-            .ok()
-            .map_err(|err| format!("CoInitializeEx failed: {err}"))?;
+        // Dropped last (end of this function): after host_webview has
+        // released the controller, the webview and the environment.
+        let _com = ComApartment::init()?;
         // DPI awareness may already be fixed by a manifest or a parent
         // process (E_ACCESSDENIED); a slightly blurry window is far better
         // than abandoning the shell for the browser fallback over it.
@@ -656,7 +939,12 @@ unsafe fn host_webview(hwnd: HWND, target: &Result<String, String>) -> Result<()
             }
         }
 
-        CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller));
+        if CONTROLLER
+            .with(|slot| cell_store(slot, controller))
+            .is_err()
+        {
+            return Err("WebView2 controller slot was busy (re-entrant call)".to_string());
+        }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
 
@@ -686,11 +974,11 @@ unsafe fn host_webview(hwnd: HWND, target: &Result<String, String>) -> Result<()
             }
         }
 
-        CONTROLLER.with(|slot| {
-            if let Some(controller) = slot.borrow_mut().take() {
-                let _ = controller.Close();
-            }
-        });
+        // Moved out first: Close() may pump messages (WM_SIZE) that look
+        // the controller up again (P10).
+        if let Some(controller) = CONTROLLER.with(cell_take) {
+            let _ = controller.Close();
+        }
     }
     Ok(())
 }
@@ -706,11 +994,11 @@ unsafe extern "system" fn frame_window_proc(
             unsafe {
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
-                CONTROLLER.with(|slot| {
-                    if let Some(controller) = slot.borrow().as_ref() {
-                        let _ = controller.SetBounds(rect);
-                    }
-                });
+                // Cloned out (an AddRef) so no borrow is held while
+                // SetBounds runs and possibly re-enters this proc (P10).
+                if let Some(controller) = CONTROLLER.with(cell_clone) {
+                    let _ = controller.SetBounds(rect);
+                }
             }
             LRESULT(0)
         }
@@ -748,7 +1036,11 @@ unsafe extern "system" fn frame_window_proc(
                 // On the UI thread: short timeouts keep a stalled server
                 // from freezing the window (<= 1 s per connect/write/read).
                 let status = shell_request_timed(port, "GET", "/api/status", UI_REQUEST_TIMEOUT);
-                decide_close(status.as_deref(), &|| confirm_cancel_dialog(hwnd))
+                decide_close(
+                    classify_status(&status),
+                    &|| confirm_cancel_dialog(hwnd),
+                    &|| confirm_unknown_dialog(hwnd),
+                )
             };
             match action {
                 CloseAction::KeepOpen => {}
@@ -775,11 +1067,190 @@ unsafe extern "system" fn frame_window_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOSE_CANCEL_WAIT, CLOSE_FORCE_AFTER, CloseAction, UI_REQUEST_TIMEOUT,
-        WORKER_REQUEST_TIMEOUT, decide_close, nonce_from_response, reclose_forces_close,
-        shutdown_accepted,
+        CLOSE_CANCEL_WAIT, CLOSE_FORCE_AFTER, CloseAction, Fallback, RequestFailure, ShutdownReply,
+        ShutdownStep, StartupPoll, UI_REQUEST_TIMEOUT, WORKER_REQUEST_TIMEOUT, WorkState,
+        cell_clone, cell_store, cell_take, classify_shutdown_reply, classify_status,
+        close_wait_done, com_init_needs_uninit, decide_close, fallback_plan, nonce_from_response,
+        reclose_forces_close, shutdown_accepted, shutdown_step, startup_poll,
     };
+    use std::cell::RefCell;
     use std::time::{Duration, Instant};
+
+    /// P3: status reply → work state. Only a well-formed `ok` status can
+    /// say "idle"; timeouts, garbage and refusals are `Unknown`.
+    #[test]
+    fn status_classification_table() {
+        let ok = |s: &str| Ok::<String, RequestFailure>(s.to_string());
+        let cases: &[(Result<String, RequestFailure>, WorkState)] = &[
+            (
+                ok(r#"{"ok":true,"busy":false,"clips_running":0,"writes_running":0}"#),
+                WorkState::Idle,
+            ),
+            (ok(r#"{"ok":true,"busy":false}"#), WorkState::Idle),
+            (ok(r#"{"ok":true,"busy":true}"#), WorkState::Running),
+            (
+                ok(r#"{"ok":true,"busy":false,"clips_running":2}"#),
+                WorkState::Running,
+            ),
+            (
+                ok(r#"{"ok":true,"busy":false,"writes_running":1}"#),
+                WorkState::Running,
+            ),
+            (ok("<html>not json</html>"), WorkState::Unknown),
+            (ok("unauthorized"), WorkState::Unknown),
+            (ok(r#"{"ok":false}"#), WorkState::Unknown),
+            (ok(""), WorkState::Unknown),
+            (Err(RequestFailure::NoAnswer), WorkState::Unknown),
+            (Err(RequestFailure::Unreachable), WorkState::Gone),
+        ];
+        for (reply, expected) in cases {
+            assert_eq!(classify_status(reply), *expected, "{reply:?}");
+        }
+    }
+
+    /// P3: the cancel wait stops on idle or a gone server, never on an
+    /// unreadable status.
+    #[test]
+    fn close_wait_stops_only_on_idle_or_gone() {
+        assert!(close_wait_done(WorkState::Idle));
+        assert!(close_wait_done(WorkState::Gone));
+        assert!(!close_wait_done(WorkState::Running));
+        assert!(!close_wait_done(WorkState::Unknown));
+    }
+
+    /// P3: an unanswered shutdown is retried, never read as "server dead".
+    #[test]
+    fn shutdown_reply_and_step_table() {
+        let cases: &[(Result<String, RequestFailure>, ShutdownReply, ShutdownStep)] = &[
+            (
+                Ok(r#"{"ok":true}"#.into()),
+                ShutdownReply::Accepted,
+                ShutdownStep::Done,
+            ),
+            (
+                Ok(r#"{"ok":false,"running":true}"#.into()),
+                ShutdownReply::Refused,
+                ShutdownStep::CancelAndRetry,
+            ),
+            (
+                Ok("unauthorized".into()),
+                ShutdownReply::Refused,
+                ShutdownStep::CancelAndRetry,
+            ),
+            (
+                Err(RequestFailure::NoAnswer),
+                ShutdownReply::NoAnswer,
+                ShutdownStep::Retry,
+            ),
+            (
+                Err(RequestFailure::Unreachable),
+                ShutdownReply::Unreachable,
+                ShutdownStep::Done,
+            ),
+        ];
+        for (reply, kind, step) in cases {
+            let classified = classify_shutdown_reply(reply.clone());
+            assert_eq!(classified, *kind, "{reply:?}");
+            assert_eq!(shutdown_step(classified), *step, "{reply:?}");
+        }
+    }
+
+    /// P4: the startup wait reports the server's own error at once.
+    #[test]
+    fn startup_poll_table() {
+        let err: Result<(), String> = Err("FRAMETRACE_TOKEN must be 8+ chars".into());
+        let ok: Result<(), String> = Ok(());
+        assert_eq!(startup_poll(1, None, true, false), StartupPoll::Ready);
+        assert_eq!(startup_poll(1, None, false, false), StartupPoll::Wait);
+        match startup_poll(1, Some(&err), true, false) {
+            StartupPoll::Failed(message) => {
+                assert!(
+                    message.contains("FRAMETRACE_TOKEN must be 8+ chars"),
+                    "{message}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            startup_poll(1, Some(&ok), false, false),
+            StartupPoll::Failed(_)
+        ));
+        match startup_poll(7, None, false, true) {
+            StartupPoll::Failed(message) => assert!(message.contains("127.0.0.1:7"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// P5: never a browser on a dead server; a missing URL is an error.
+    #[test]
+    fn fallback_plan_table() {
+        let url: Result<String, String> = Ok("http://127.0.0.1:9/?token=x".into());
+        let no_url: Result<String, String> = Err("token missing".into());
+        assert_eq!(
+            fallback_plan(true, None, &url, "no runtime"),
+            Fallback::OpenBrowser("http://127.0.0.1:9/?token=x".into())
+        );
+        assert_eq!(
+            fallback_plan(false, None, &url, "no runtime"),
+            Fallback::OpenBrowser("http://127.0.0.1:9/?token=x".into())
+        );
+        for exit in [Ok(()), Err("bind failed".to_string())] {
+            match fallback_plan(true, Some(exit.clone()), &url, "no runtime") {
+                Fallback::Fail(message) => {
+                    assert!(message.contains("no runtime"), "{message}");
+                    if let Err(cause) = exit {
+                        assert!(message.contains(&cause), "{message}");
+                    }
+                }
+                other => panic!("dead server must not open a browser: {other:?}"),
+            }
+        }
+        // An attached (not owned) server's exit state is not ours to know.
+        assert!(matches!(
+            fallback_plan(false, Some(Ok(())), &url, "x"),
+            Fallback::OpenBrowser(_)
+        ));
+        match fallback_plan(false, None, &no_url, "no runtime") {
+            Fallback::Fail(message) => assert!(message.contains("token missing"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// P10: the controller helpers never panic on a busy cell.
+    #[test]
+    fn controller_cell_helpers_survive_reentrancy() {
+        let cell: RefCell<Option<u32>> = RefCell::new(None);
+        assert_eq!(cell_store(&cell, 7), Ok(()));
+        assert_eq!(cell_clone(&cell), Some(7));
+        {
+            // A borrow held further up the stack (the re-entrant case).
+            let _outer = cell.borrow();
+            assert_eq!(cell_clone(&cell), Some(7), "shared borrows coexist");
+            assert_eq!(cell_take(&cell), None, "busy: no panic, no take");
+            assert_eq!(cell_store(&cell, 8), Err(8), "busy: value handed back");
+        }
+        {
+            let _outer = cell.borrow_mut();
+            assert_eq!(cell_clone(&cell), None, "busy: no panic");
+        }
+        assert_eq!(cell_take(&cell), Some(7));
+        assert_eq!(cell_take(&cell), None);
+    }
+
+    /// P13: S_OK and S_FALSE are paired with CoUninitialize, failures not.
+    #[test]
+    fn com_uninit_pairing_table() {
+        let rpc_e_changed_mode = 0x8001_0106_u32 as i32;
+        let e_outofmemory = 0x8007_000E_u32 as i32;
+        for (hr, expected) in [
+            (0, true),
+            (1, true),
+            (rpc_e_changed_mode, false),
+            (e_outofmemory, false),
+        ] {
+            assert_eq!(com_init_needs_uninit(hr), expected, "{hr:#x}");
+        }
+    }
 
     /// A repeated × while cancel-then-close runs is ignored until the
     /// worker is overdue, then it force-closes (never latched forever).
@@ -810,33 +1281,71 @@ mod tests {
         assert!(UI_REQUEST_TIMEOUT <= Duration::from_secs(1));
     }
 
-    /// Table: status body × examiner answer → action. The question is
-    /// only asked while work runs (`asked` tracks that).
+    /// Table: work state × examiner answer → action, and which question
+    /// was asked (P3: an unreadable status asks instead of closing).
     #[test]
     fn close_decision_table() {
-        let idle = r#"{"ok":true,"busy":false,"clips_running":0,"has_job":false}"#;
-        let busy = r#"{"ok":true,"busy":true,"clips_running":0,"has_job":true}"#;
-        let clips = r#"{"ok":true,"busy":false,"clips_running":2}"#;
-        let garbage = "<html>not json</html>";
-        let cases: &[(Option<&str>, bool, CloseAction, bool)] = &[
-            // status, answer, expected action, question asked?
-            (Some(idle), true, CloseAction::Close, false),
-            (Some(idle), false, CloseAction::Close, false),
-            (None, false, CloseAction::Close, false),
-            (Some(garbage), false, CloseAction::Close, false),
-            (Some(busy), true, CloseAction::CancelThenClose, true),
-            (Some(busy), false, CloseAction::KeepOpen, true),
-            (Some(clips), true, CloseAction::CancelThenClose, true),
-            (Some(clips), false, CloseAction::KeepOpen, true),
+        #[derive(Debug, PartialEq, Clone, Copy)]
+        enum Asked {
+            None,
+            Running,
+            Unknown,
+        }
+        let cases: &[(WorkState, bool, CloseAction, Asked)] = &[
+            (WorkState::Idle, true, CloseAction::Close, Asked::None),
+            (WorkState::Idle, false, CloseAction::Close, Asked::None),
+            (
+                WorkState::Running,
+                true,
+                CloseAction::CancelThenClose,
+                Asked::Running,
+            ),
+            (
+                WorkState::Running,
+                false,
+                CloseAction::KeepOpen,
+                Asked::Running,
+            ),
+            (
+                WorkState::Unknown,
+                true,
+                CloseAction::CancelThenClose,
+                Asked::Unknown,
+            ),
+            (
+                WorkState::Unknown,
+                false,
+                CloseAction::KeepOpen,
+                Asked::Unknown,
+            ),
+            (
+                WorkState::Gone,
+                true,
+                CloseAction::CancelThenClose,
+                Asked::Unknown,
+            ),
+            (
+                WorkState::Gone,
+                false,
+                CloseAction::KeepOpen,
+                Asked::Unknown,
+            ),
         ];
-        for (status, answer, expected, expect_asked) in cases {
-            let asked = std::cell::Cell::new(false);
-            let action = decide_close(*status, &|| {
-                asked.set(true);
-                *answer
-            });
-            assert_eq!(action, *expected, "status={status:?} answer={answer}");
-            assert_eq!(asked.get(), *expect_asked, "status={status:?}");
+        for (work, answer, expected, expect_asked) in cases {
+            let asked = std::cell::Cell::new(Asked::None);
+            let action = decide_close(
+                *work,
+                &|| {
+                    asked.set(Asked::Running);
+                    *answer
+                },
+                &|| {
+                    asked.set(Asked::Unknown);
+                    *answer
+                },
+            );
+            assert_eq!(action, *expected, "work={work:?} answer={answer}");
+            assert_eq!(asked.get(), *expect_asked, "work={work:?}");
         }
     }
 
