@@ -69,6 +69,8 @@ try {
     return out;
   });
 
+  const sections = await page.evaluate(() => [...document.querySelectorAll('#facetTree .tree-sec')].map((n) => n.textContent));
+  check('facet tree sections: 녹화 유형 · 출처 · 날짜 · 소리', JSON.stringify(sections) === JSON.stringify(['녹화 유형', '출처', '날짜', '소리']), JSON.stringify(sections));
   check('latest month shown first with counts', JSON.stringify(await calCounts()) === JSON.stringify({ '2024-04-02': '1' }), JSON.stringify(await calCounts()));
   check('year selector present (2 years)', (await page.locator('#calYear option').count()) === 2);
   await page.selectOption('#calYear', '2024');

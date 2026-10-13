@@ -150,6 +150,7 @@
               <label><input type="checkbox" id="withHash" checked> 파일별 SHA-256 해시 계산 (증거 대조용)</label>
               <label><input type="checkbox" id="withFfprobe" checked> ffprobe 재생성 검증 (코덱/길이 메타데이터)</label>
               <label><input type="checkbox" id="withDeepfake"> 딥페이크 스크리닝 (deepfake-lens — 느릴 수 있음; 판정이 아니라 검토 우선순위)</label>
+              <label id="withAudioWrap"><input type="checkbox" id="withAudio"> 소리 측정 — 오디오 트랙을 끝까지 디코드해 무음 여부를 잽니다(대용량은 해시만큼 오래 걸릴 수 있음)</label>
             </div>
             <div class="checks" id="verifyRow" style="display:none;">
               <label><input type="checkbox" id="skipE01Verify"> E01 해시 검증 생략 (ewfverify는 이미지 크기에 비례해 오래 걸립니다 — 최종 증거용은 생략 비권장)</label>

@@ -248,6 +248,8 @@ async function loadViewerDataFromApi(first, ui) {
     deepfake: meta.deepfake,
     telemetry: meta.telemetry,
     proxies: meta.proxies,
+    joinLog: meta.joinLog,
+    audioLevels: meta.audioLevels,
   };
   if (live) {
     // The index is still growing/enriching: whatever arrived is the

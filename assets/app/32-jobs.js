@@ -43,6 +43,15 @@ const CASE_JOBS = {
       okLabel: "카빙 실행",
     },
   },
+  // Measured sound for the items not measured yet (docs/PLAN_PHASE2_JOIN_
+  // AUDIO_2026-10-13.md §2.2): started from the deliverables sheet's
+  // Advanced section (41-finalize.js); same case-job contract as recover.
+  audio: {
+    serverKind: "audio-measure",
+    title: "소리 측정",
+    url: () => "/api/audio-measure",
+    confirm: null,
+  },
 };
 // A server that went async but whose first status still reads idle gets
 // this long before "not busy" is taken as "finished".
@@ -363,7 +372,13 @@ let pipelineCancelAsked = false;
 let clipCancelAsked = false;
 async function cancelPipelineOrClips(kind) {
   const clips = kind === "clips";
-  const go = await askDialog(clips ? {
+  const S0 = storeState();
+  const joinsOnly = clips && !!S0 && clipJobsTitle(clipView(S0).running) === "영상 이어붙이기";
+  const go = await askDialog(joinsOnly ? {
+    title: "이어붙이기 중단",
+    html: "<p>진행 중인 영상 이어붙이기를 중단하시겠습니까?</p><p>만들던 파일은 지워지고, 원본은 그대로입니다. 언제든 다시 실행할 수 있습니다.</p>",
+    okLabel: "이어붙이기 중단", cancelLabel: "계속", danger: true, focus: "dlgCancel",
+  } : clips ? {
     title: "클립 내보내기 중단",
     html: "<p>진행 중인 클립 내보내기를 중단하시겠습니까?</p><p>이미 만들어진 파일은 케이스 폴더에 남습니다.</p>",
     okLabel: "내보내기 중단", cancelLabel: "계속", danger: true, focus: "dlgCancel",
@@ -566,19 +581,36 @@ function clipName(job) {
   const p = String(job && job.path || "").split(/[\\/]/).filter(Boolean).pop();
   return p || `클립 #${job && job.id != null ? job.id : ""}`;
 }
+// State words per job kind (clip_jobs also carries lossless joins).
 const CLIP_STATE = { running: "내보내는 중", done: "완료", failed: "실패", cancelled: "중단됨" };
+const JOIN_STATE = { running: "이어붙이는 중", done: "완료", failed: "실패", cancelled: "중단됨" };
+// Running join: hash i/N → concat (.part bytes / sources total) → verify.
+function joinStageText(c) {
+  const raw = c.stage && typeof c.stage === "object" ? c.stage : { stage: c.stage, done: c.stage_done ?? c.done, total: c.stage_total ?? c.total };
+  const stage = String(raw.stage || "");
+  const clock = fmtClock(c.elapsed_secs);
+  if (stage === "hash" && Number(raw.total) > 0) return `해시 ${Number(raw.done) || 0}/${Number(raw.total)} · ${clock}`;
+  if (stage === "concat" && Number(c.expected_bytes) > 0) return `${Math.min(100, Math.floor((Number(c.bytes_written) || 0) * 100 / Number(c.expected_bytes)))}% · ${clock}`;
+  if (stage === "verify") return `결과 확인 · ${clock}`;
+  return clock;
+}
 function renderClips(S) {
   const sec = $("jobsClips"), list = $("jobsClipList");
   if (!sec || !list) return;
   const clips = (S.jobs.clipJobs || []).slice(0, 8);
   sec.hidden = clips.length === 0;
+  const head = typeof sec.querySelector === "function" ? sec.querySelector("h3") : null;
+  const title = clipJobsTitle(clips);
+  if (head && head.textContent !== title) head.textContent = title;
+  if (typeof sec.setAttribute === "function") sec.setAttribute("aria-label", title);
   list.innerHTML = clips.map(c => {
     const st = String(c.state || "");
-    const tail = st === "running" ? `${fmtBytes(Number(c.bytes_written) || 0)} 기록됨 · ${fmtClock(c.elapsed_secs)}`
+    const join = isJoinJob(c);
+    const tail = st === "running" ? (join ? joinStageText(c) : `${fmtBytes(Number(c.bytes_written) || 0)} 기록됨 · ${fmtClock(c.elapsed_secs)}`)
       : st === "done" ? `${fmtBytes(Number(c.size_bytes) || 0)} · ${fmtClock(c.elapsed_secs)}`
       : st === "failed" || st === "cancelled" ? esc(String(c.error || "").split(/\r?\n/)[0].slice(0, 160)) : "";
     return `<li class="${esc(st)}"><span class="h-clip-name" title="${esc(c.path || "")}">${esc(clipName(c))}</span>` +
-      `<span class="h-clip-state">${esc(CLIP_STATE[st] || st)}</span>` +
+      `<span class="h-clip-state">${esc((join ? JOIN_STATE : CLIP_STATE)[st] || st)}</span>` +
       (tail ? `<span class="h-clip-tail mono num">${tail}</span>` : "") + `</li>`;
   }).join("");
 }
@@ -592,7 +624,8 @@ function jobsNoteText(S, pv) {
   if (cj && cj.outcome === "failed") return `${cj.title} 실패 — 원인을 확인한 뒤 다시 시도할 수 있습니다.`;
   if (cj && cj.outcome === "cancelled") return `${cj.title}이(가) 중단되었습니다.`;
   if (cj && (cj.outcome === "ok" || cj.outcome === "deferred")) return `${cj.title} ${cj.message}`;
-  if (Number(S.jobs.clipsRunning) > 0) return "클립 내보내기 진행 중…";
+  if (Number(S.jobs.clipsRunning) > 0) return `${clipJobsTitle(clipView(S).running)} 진행 중…`;
+  if (joinReloadPending()) return "이어붙이기 완료 — '새 데이터 반영'을 누르면 목록에 표시됩니다.";
   return "";
 }
 function renderJobsSheet() {
@@ -638,7 +671,8 @@ function renderJobsSheet() {
     const asked = pv.active ? pipelineCancelAsked : clipCancelAsked;
     cancelPipe.disabled = !!asked;
     if (asked) cancelPipe.setAttribute("aria-busy", "true"); else cancelPipe.removeAttribute("aria-busy");
-    cancelPipe.textContent = asked ? "중단 요청 중…" : pv.active ? (pv.state === "enriching" ? "보강 중단" : "분석 중단") : "내보내기 중단";
+    const clipWord = clipJobsTitle(clipView(S).running) === "영상 이어붙이기" ? "이어붙이기 중단" : "내보내기 중단";
+    cancelPipe.textContent = asked ? "중단 요청 중…" : pv.active ? (pv.state === "enriching" ? "보강 중단" : "분석 중단") : clipWord;
     if (!pv.active && !clipsRunning) clipCancelAsked = false;
   }
   if (!pv.active) pipelineCancelAsked = false;
@@ -660,7 +694,7 @@ function renderJobsSheet() {
   }
   const closeBtn = $("btnJobClose");
   if (closeBtn) {
-    closeBtn.hidden = !((cj && cj.outcome && cj.outcome !== "deferred") || pv.dismissible);
+    closeBtn.hidden = !((cj && cj.outcome && cj.outcome !== "deferred") || pv.dismissible || joinReloadPending());
   }
   const newBtn = $("btnNew");
   if (newBtn) newBtn.hidden = !(S.project && S.project.caseDir) || pv.active || caseRunning;

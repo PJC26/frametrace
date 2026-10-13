@@ -39,12 +39,6 @@ function drawTelemetry(report) {
   note.textContent = tf("telemetry.summary", { n: pts.length }) + speed + camm;
 }
 
-function audioDetailText(record) {
-  const codec = String(record.audioCodec || "").toLowerCase();
-  if (codec && codec !== "none" && codec !== "-") return record.audioCodec;
-  if (record.probeOk === true) return t("audio.absent");
-  return t("audio.unknown");
-}
 
 function renderDetails() {
   if (ftSignal.aborted) return; // a frame queued before destroy()
@@ -160,7 +154,7 @@ function renderDetails() {
     [t("detail.mark"), mark ? markLabel(mark.status) : t("detail.unmarked")],
     [t("detail.len"), fmtDuration(record.duration)],
     [t("detail.size"), fmtBytes(record.size)],
-    [t("detail.audio"), audioDetailText(record)],
+    [t("detail.audio"), audioDetailFor(record)],
     [t("detail.anomaly"), record.hasAnomaly ? record.anomalies.map(item => item.kind).join(", ") : "-"],
     [t("detail.dfl"), record.dfl ? (record.dfl.band
         ? tf("detail.dflScore", { label: record.dfl.band_label || record.dfl.band, score: record.dfl.score ?? "?" }) + (record.dfl.signal_titles?.length ? ": " + record.dfl.signal_titles.slice(0, 3).join(", ") : "")
@@ -238,7 +232,18 @@ function renderDetails() {
     <div class="muted">${escapeHtml(warning)}</div>
     <code>recovery-warning</code>
   </div>`);
+  // A joined file lists the sources it was concatenated from, in order.
+  const joinItems = record.kind === "joined" ? [`<div class="validation-item join-sources">
+    <strong>${escapeHtml(tf("joined.sources", { n: record.joinSources.length }))}</strong>
+    <ol>${record.joinSources.map((id, i) => {
+      const src = recordById.get(id);
+      const sha = (record.joinInfo.source_sha256 || [])[i] || "";
+      return `<li><span>${escapeHtml(src ? (src.originalName || src.name) : t("joined.missing"))}</span> <code>${escapeHtml(id)}</code>${sha ? ` <code class="muted">${escapeHtml(sha)}</code>` : ""}</li>`;
+    }).join("")}</ol>
+    <div class="muted">${escapeHtml(record.note)}</div>
+  </div>`] : [];
   els.validationList.innerHTML = [
+    ...joinItems,
     ...warningItems,
     ...related.map(item => `<div class="validation-item">
     <strong>${escapeHtml(item.validation_status || "-")}</strong>
@@ -252,8 +257,8 @@ function renderDetails() {
 // Facet counts come from facetCounts() (40-grid.js): each dimension is
 // counted with its own filter excluded, computed once per render.
 function renderTree(facets) {
-  const { typeCounts, kindCounts, dayCounts } = facets || facetCounts();
-  const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate") };
+  const { typeCounts, kindCounts, dayCounts, audioCounts } = facets || facetCounts();
+  const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate"), joined: t("filter.kind.joined") };
   const items = [];
   const addItems = (title, entries, activeKey, onPick) => {
     items.push({ header: title });
@@ -284,10 +289,24 @@ function renderTree(facets) {
     state.currentPage = 1;
     requestRender();
   });
+  // 소리 (§2.6): fixed value order (sound / silent / no track / unknown), not
+  // alphabetical; every value is listed so a zero count stays visible.
+  const pickAudio = value => {
+    state.audio = value;
+    state.currentPage = 1;
+    requestRender();
+  };
+  items.push({ header: t("tree.audio") });
+  items.push({ label: t("tree.all"), count: null, key: "", pick: () => pickAudio(""), active: !state.audio, facet: "audio" });
+  AUDIO_FACETS.forEach(value => {
+    items.push({ label: t("audio.f." + value), count: (audioCounts && audioCounts.get(value)) || 0, key: value, pick: () => pickAudio(value), active: state.audio === value, facet: "audio" });
+  });
   els.facetTree.innerHTML = items.map(item => item.header !== undefined
     ? `<div class="tree-sec">${escapeHtml(item.header)}</div>`
-    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}" tabindex="0" role="button" aria-pressed="${!!item.active}"><span>${escapeHtml(item.label)}</span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
+    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}"${item.facet ? ` data-facet="${item.facet}" data-key="${escapeHtml(item.key)}"` : ""} tabindex="0" role="button" aria-pressed="${!!item.active}"><span>${escapeHtml(item.label)}</span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
   ).join("");
+  // Memo probe for harnesses: bumps only when the counts were recomputed.
+  els.facetTree.dataset.facetGen = String(facetMemo.gen);
   const pickers = items.filter(item => item.pick);
   const nodes = els.facetTree.querySelectorAll(".tree-item");
   let idx = 0;
@@ -352,6 +371,7 @@ function renderMetrics() {
   }
   const markCount = Object.keys(state.marks).length;
   els.selectionCount.textContent = tf("sel.count", { n: state.selectedIds.size, m: markCount });
+  if (typeof syncJoinButton === "function") syncJoinButton();
   if (els.caseWarnings) {
     // FOR-09: a partial record list the examiner chose to continue with
     // stays flagged for the whole session, above inspection warnings.
@@ -445,7 +465,7 @@ function renderChips() {
 // Active filters as removable chips above the grid — visible only while the
 // rail (which shows the same state) is collapsed.
 function activeFilterList() {
-  const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate") };
+  const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate"), joined: t("filter.kind.joined") };
   const list = [];
   const chip = state.chip || "";
   if (chip && !chip.startsWith("status:")) {
@@ -455,6 +475,7 @@ function activeFilterList() {
   if (state.status) list.push(["status", tf("layout.afStatus", { v: statusLabel(state.status) })]);
   if (state.kind) list.push(["kind", tf("layout.afKind", { v: kindLabels[state.kind] || state.kind })]);
   if (state.recType) list.push(["recType", tf("layout.afType", { v: recTypeLabel(state.recType) })]);
+  if (state.audio) list.push(["audio", tf("layout.afAudio", { v: t("audio.f." + state.audio) })]);
   if (state.dateFrom || state.dateTo) {
     const v = state.dateFrom === state.dateTo ? state.dateFrom : `${state.dateFrom || "…"} ~ ${state.dateTo || "…"}`;
     list.push(["date", tf("layout.afDate", { v })]);
@@ -481,6 +502,7 @@ function clearActiveFilter(key) {
   if (all || key === "status") { state.status = ""; els.status.value = ""; }
   if (all || key === "kind") { state.kind = ""; els.kind.value = ""; }
   if (all || key === "recType") state.recType = "";
+  if (all || key === "audio") state.audio = "";
   if (all || key === "date") { state.dateFrom = ""; state.dateTo = ""; els.dateFrom.value = ""; els.dateTo.value = ""; }
   if (all || key === "query") { state.query = ""; els.query.value = ""; }
   state.currentPage = 1;

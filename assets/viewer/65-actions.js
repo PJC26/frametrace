@@ -152,13 +152,15 @@ const KIND_LABELS = {
   video: t("filter.kind.video"),
   carved: t("filter.kind.carved"),
   filesystem: t("filter.kind.filesystem"),
-  candidate: t("filter.kind.candidate")
+  candidate: t("filter.kind.candidate"),
+  joined: t("filter.kind.joined")
 };
 const KIND_SHORT = {
   video: t("kind.short.video"),
   carved: t("kind.short.carved"),
   filesystem: t("kind.short.filesystem"),
-  candidate: t("kind.short.candidate")
+  candidate: t("kind.short.candidate"),
+  joined: t("kind.short.joined")
 };
 
 function exportItem(record) {
@@ -174,7 +176,23 @@ function exportItem(record) {
     sha256: record.sha256 && record.sha256 !== "-" ? record.sha256 : "",
     rec_time: isoTime(record.recTime),
     original_path: record.originalPath || "",
-    note: record.note && record.note !== "-" ? record.note : ""
+    note: record.note && record.note !== "-" ? record.note : "",
+    ...audioExportFields(record)
+  };
+}
+
+// Measured sound columns (§2.6): the measured values as recorded, empty when
+// nothing was measured; -inf (digital zero) stays "-inf".
+function audioDbValue(value) {
+  if (value === null || (typeof value === "string" && /^-inf/i.test(value))) return "-inf";
+  return Number.isFinite(Number(value)) ? Number(value) : "";
+}
+function audioExportFields(record) {
+  const level = record.audioLevel;
+  return {
+    audio_state: record.audioState || "unknown",
+    audio_max_db: level ? audioDbValue(level.max) : "",
+    audio_mean_db: level ? audioDbValue(level.mean) : ""
   };
 }
 
@@ -288,7 +306,10 @@ async function withBusy(button, fn, opts = {}) {
 }
 
 // Accessible in-page dialog replacing window.confirm / window.prompt.
-// spec: { title?, message, fields?: [{ name, label, value }], ok?, cancel? }
+// spec: { title?, message, content?, fields?: [{ name, label, value }], ok?,
+//         cancel?, single?, okDisabled?, okTitle?, className? }
+//   content     a DOM node shown under the message (summary blocks, tables)
+//   okDisabled  the primary stays disabled (blocked action); okTitle says why
 // Resolves to null on cancel/Esc/backdrop click; otherwise to a values
 // object ({} when there are no fields). Enter confirms from an input,
 // Tab cycles inside the dialog, focus returns to the opener.
@@ -298,7 +319,7 @@ function askDialog(spec) {
     const back = document.createElement("div");
     back.className = "modal-backdrop";
     const box = document.createElement("div");
-    box.className = "modal dlg";
+    box.className = "modal dlg" + (spec.className ? " " + spec.className : "");
     box.setAttribute("role", "dialog");
     box.setAttribute("aria-modal", "true");
     const uid = "dlg" + Math.random().toString(36).slice(2, 8);
@@ -314,7 +335,13 @@ function askDialog(spec) {
       h.textContent = spec.title;
       box.appendChild(h);
     }
-    box.appendChild(msg);
+    if (spec.message || !spec.content) box.appendChild(msg);
+    if (spec.content) {
+      const body = document.createElement("div");
+      body.className = "dlg-content";
+      body.appendChild(spec.content);
+      box.appendChild(body);
+    }
     const inputs = {};
     (spec.fields || []).forEach((f, i) => {
       const label = document.createElement("label");
@@ -337,6 +364,10 @@ function askDialog(spec) {
     ok.type = "button";
     ok.className = "primary";
     ok.textContent = spec.ok || t("dlg.ok");
+    if (spec.okDisabled) {
+      ok.disabled = true;
+      if (spec.okTitle) ok.title = spec.okTitle;
+    }
     if (spec.single) row.append(ok); else row.append(cancel, ok);
     box.appendChild(row);
     back.appendChild(box);
@@ -350,6 +381,7 @@ function askDialog(spec) {
       resolve(value);
     };
     const accept = () => {
+      if (ok.disabled) return;
       const out = {};
       for (const k of Object.keys(inputs)) out[k] = inputs[k].value;
       finish(out);
@@ -358,7 +390,7 @@ function askDialog(spec) {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(null); return; }
       if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); e.stopPropagation(); accept(); return; }
       if (e.key === "Tab") {
-        const f = [...box.querySelectorAll("input,button")];
+        const f = [...box.querySelectorAll("input,button:not(:disabled),summary,[tabindex]:not([tabindex='-1'])")];
         const first = f[0], last = f[f.length - 1];
         if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
         else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
@@ -373,7 +405,7 @@ function askDialog(spec) {
     ok.addEventListener("click", accept);
     ftRoot.appendChild(back);
     const firstInput = Object.values(inputs)[0];
-    (firstInput || ok).focus();
+    (firstInput || (ok.disabled ? cancel : ok)).focus();
     if (firstInput) firstInput.select();
   });
 }

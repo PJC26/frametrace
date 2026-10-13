@@ -18,12 +18,17 @@ let pipeStartedAt = 0;          // client clock when the current run was first s
 let pipePrevState = null;       // last pipelineView().state seen (null = nothing seen yet)
 let pipeReloadWaits = false;    // enrichment finished under an open viewer: fresh data waits
 let pipeDismissed = "";         // notice key the examiner cleared
-function pipelineReloadPending() { return pipeReloadWaits; }
-function pipelineReloadDone() { pipeReloadWaits = false; }
+// A lossless join (clip job kind "join") finished under an open viewer: the
+// derived record waits for the same '새 데이터 반영' (never a silent reload).
+let joinReloadWaits = false;
+function pipelineReloadPending() { return pipeReloadWaits || joinReloadWaits; }
+function pipelineReloadDone() { pipeReloadWaits = false; joinReloadWaits = false; }
+function joinReloadPending() { return joinReloadWaits; }
 function pipelineDismiss() {
   const S = storeState();
   if (S) pipeDismissed = pipelineView(S).noticeKey;
   pipeReloadWaits = false;
+  joinReloadWaits = false;
 }
 function pipelineActive(S) { return pipelineView(S).active; }
 
@@ -82,6 +87,13 @@ function clipView(S) {
   const clips = (S.jobs && S.jobs.clipJobs) || [];
   return { running: clips.filter(c => c && c.state === "running"), all: clips };
 }
+// clip_jobs carry both clip exports and lossless joins (kind "join").
+function isJoinJob(c) { return !!c && c.kind === "join"; }
+function clipJobsTitle(list) {
+  const joins = list.filter(isJoinJob).length;
+  if (!joins) return "클립 내보내기";
+  return joins === list.length ? "영상 이어붙이기" : "내보내기·이어붙이기";
+}
 function hasProject(S) {
   return !!(S.project && S.project.caseDir) && S.phase !== "empty";
 }
@@ -114,10 +126,11 @@ function chipModel(S, now) {
     const base = Math.max(...clips.running.map(c => Number(c.elapsed_secs) || 0));
     const at = typeof pollStatusAt === "number" ? pollStatusAt : 0;
     const since = at ? Math.max(0, (now - at) / 1000) : 0;
-    return { mode: "clips", cls: "running", title: "클립 내보내기",
+    return { mode: "clips", cls: "running", title: clipJobsTitle(clips.running),
       detail: `${clips.running.length}건 진행 중` + (bytes > 0 ? JOIN + fmtBytes(bytes) : ""), elapsed: base + since, live: true };
   }
   if (cj && cj.outcome) return caseChip(cj, now);
+  if (joinReloadWaits) return { mode: "join", cls: "deferred", title: "이어붙이기 완료", detail: "새 데이터 반영 대기", elapsed: null };
   if (pv.notice) {
     if (pv.state === "failed") return { mode: "pipeline", cls: "failed", title: "분석 실패", detail: pv.errorLine, elapsed: null };
     if (pv.state === "cancelled") return { mode: "pipeline", cls: "cancelled", title: "분석 중단됨", detail: "같은 소스로 다시 분석하면 이어서 진행합니다", elapsed: null };
@@ -221,17 +234,30 @@ function onJobsStoreChange() {
   pipePrevState = pv.state;
   noteClipFailures(S);
 }
-// Clip exports end on their own: a failed one is reported once.
+// Clip exports and joins end on their own: a failed one is reported once,
+// and a join seen running that finished waits for '새 데이터 반영' (F15).
 const clipSeen = new Set();
+const joinsSeenRunning = new Set();
 let clipsBaselined = false;
 function noteClipFailures(S) {
   const clips = (S.jobs && S.jobs.clipJobs) || [];
   for (const c of clips) {
-    if (!c || c.state !== "failed") continue;
+    if (!c) continue;
     const key = `${c.id}|${c.started_unix}`;
+    if (isJoinJob(c) && c.state === "running") { joinsSeenRunning.add(key); continue; }
+    if (isJoinJob(c) && c.state === "done") {
+      if (joinsSeenRunning.delete(key) && S.viewer && S.viewer.mounted) {
+        joinReloadWaits = true;
+        announce("이어붙이기 완료 — 새 데이터를 반영하면 목록에 표시됩니다.");
+      }
+      continue;
+    }
+    if (c.state !== "failed") { joinsSeenRunning.delete(key); continue; }
+    joinsSeenRunning.delete(key);
     if (clipSeen.has(key)) continue;
     clipSeen.add(key);
-    if (clipsBaselined) toast(`클립 내보내기 실패: ${clipName(c)} — ${String(c.error || "알 수 없는 오류").split(/\r?\n/)[0].slice(0, 160)}`, "err");
+    const what = isJoinJob(c) ? "이어붙이기" : "클립 내보내기";
+    if (clipsBaselined) toast(`${what} 실패: ${clipName(c)} — ${String(c.error || "알 수 없는 오류").split(/\r?\n/)[0].slice(0, 160)}`, "err");
   }
   clipsBaselined = true;
 }

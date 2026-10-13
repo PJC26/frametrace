@@ -20,6 +20,7 @@
       <option value="carved" data-i18n="filter.kind.carved">카빙 후보</option>
       <option value="filesystem" data-i18n="filter.kind.filesystem">파일시스템 복구</option>
       <option value="candidate" data-i18n="filter.kind.candidate">삭제 영상 후보 (복구 전)</option>
+      <option value="joined" data-i18n="filter.kind.joined">이어붙인 영상</option>
     </select>
     <select id="status" title="검증 상태" data-i18n-title="filter.status" aria-label="검증 상태" data-i18n-aria-label="filter.status">
       <option value="" data-i18n="filter.status.all">전체 검증 상태</option>
@@ -256,6 +257,7 @@
           <button id="btnDownloadFiles" type="button" role="menuitem" data-i18n-title="tip.dlFiles" title="선택한 원본 파일을 그대로 내려받습니다 — 브라우저가 다중 다운로드 허용을 물을 수 있습니다. 워크스테이션 서버 필요" data-i18n="export.files">선택 파일 다운로드</button>
           <button id="btnExportSelected" type="button" role="menuitem" data-i18n-title="tip.pkgSel" title="선택 항목을 케이스 exports 폴더에 해시 매니페스트와 함께 복사합니다 — 워크스테이션 서버 필요" data-i18n="export.selected">선별 자료 묶기</button>
           <button id="btnTranscodeQueue" type="button" role="menuitem" data-i18n-title="tip.transcode" title="브라우저에서 재생되지 않는 독점 포맷(DAV/NOV/AVE 등)을 H.264 프록시로 일괄 변환합니다 — 선택 없으면 전체 후보, 서버 필요" data-i18n="export.transcode">미재생 포맷 프록시 큐</button>
+          <button id="btnJoinSelected" type="button" role="menuitem" data-i18n-title="join.needTwo" title="영상을 2개 이상 선택하십시오" data-i18n="export.join" disabled>선택 영상 이어붙이기…</button>
           <div class="menu-sec" role="presentation" data-i18n="export.grpReports">목록 · 리포트</div>
           <button id="btnDownloadCsv" type="button" role="menuitem" data-i18n-title="tip.csv" title="선택 항목의 메타데이터를 Excel용 CSV로 내려받습니다" data-i18n="export.csv">선별 CSV</button>
           <button id="btnSummary" type="button" role="menuitem" data-i18n-title="tip.summary" title="선택/마크된 항목을 인쇄 가능한 요약 리포트(HTML)로 내려받습니다" data-i18n="export.summary">요약 리포트</button>

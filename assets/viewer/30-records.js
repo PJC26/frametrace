@@ -349,12 +349,14 @@ function statusLabel(status) {
   if (status === "validation-failed") return t("status.failed");
   if (status === "candidate-unvalidated") return t("status.candidate");
   if (status === "duplicate-candidate") return t("status.duplicate");
+  if (status === "derived") return t("status.derived");
   return status;
 }
 
 function statusClass(status) {
   if (status === "ffprobe-video-stream-confirmed" || status === "ffprobe-confirmed") return "ok";
   if (status === "validation-failed") return "failed";
+  if (status === "derived") return "derived";
   return "candidate";
 }
 
@@ -436,6 +438,68 @@ const recoveredFilesystemLog = filesystemLog.filter(item => item.event === "reco
 const inspectionWarnings = filesystemLog
   .filter(item => item.event === "inspect-image-filesystem" && Array.isArray(item.warnings) && item.warnings.length)
   .flatMap(item => item.warnings);
+
+// Lossless joins (artifacts/joined/join-log.jsonl, docs/PLAN_PHASE2_JOIN_AUDIO
+// §1.5/§1.8): one derived record per output file; a later entry for the same
+// output path supersedes an earlier one.
+const joinLog = [...new Map(
+  (Array.isArray(DATA.joinLog) ? DATA.joinLog : [])
+    .filter(item => item && item.output_path)
+    .map(item => [normalizePath(item.output_path), item])
+).values()];
+
+// Measured sound (§2.4): the server already dropped measurements that no
+// longer match the file's bytes ("stale") — the viewer only maps them.
+const audioLevels = DATA.audioLevels && typeof DATA.audioLevels === "object" ? DATA.audioLevels : {};
+
+// §2.5 five states: sound | silent (valid measurement) · none (probed, no
+// audio stream) · track (stream present, sound not measured / failed /
+// changed since) · unknown (never probed). Never claims a sound that was
+// not measured.
+function audioInfoFor(record) {
+  const codec = String(record.audioCodec || "").toLowerCase();
+  const hasTrack = !!codec && codec !== "none" && codec !== "-";
+  const level = Object.prototype.hasOwnProperty.call(audioLevels, record.id) ? audioLevels[record.id] : null;
+  const r = level && typeof level === "object" ? String(level.r || "") : "";
+  if (r === "sound" || r === "silent") return { state: r, level, reason: "" };
+  if (hasTrack) return { state: "track", level: null, reason: r === "error" || r === "stale" ? r : "" };
+  if (record.probeOk === true) return { state: "none", level: null, reason: "" };
+  return { state: "unknown", level: null, reason: "" };
+}
+// Facet value of a record: track and unknown both read "미확인".
+function audioFacetOf(state) {
+  return state === "sound" || state === "silent" || state === "none" ? state : "unknown";
+}
+const AUDIO_FACETS = ["sound", "silent", "none", "unknown"];
+// dBFS with a real minus sign; -inf (digital zero) arrives as null/"-inf".
+function fmtDb(value, digits) {
+  const v = typeof value === "string" && /^-inf/i.test(value) ? -Infinity : Number(value);
+  if (value == null || v === -Infinity) return "−∞";
+  if (!Number.isFinite(v)) return "?";
+  const text = Math.abs(v).toFixed(digits);
+  return (v < 0 && Number(text) !== 0 ? "−" : "") + text;
+}
+function audioTipFor(record) {
+  const level = record.audioLevel || {};
+  switch (record.audioState) {
+    case "sound": return tf("audio.tip.sound", { max: fmtDb(level.max, 0) });
+    case "silent": return tf("audio.tip.silent", { max: fmtDb(level.max, 0) });
+    case "none": return t("audio.tip.none");
+    case "track": return t(record.audioReason === "error" ? "audio.tip.trackError" : record.audioReason === "stale" ? "audio.tip.trackStale" : "audio.tip.track");
+    default: return "";
+  }
+}
+function audioDetailFor(record) {
+  const level = record.audioLevel || {};
+  const codec = record.audioCodec ? ` (${record.audioCodec})` : "";
+  switch (record.audioState) {
+    case "sound": return tf("audio.detail.sound", { max: fmtDb(level.max, 1), mean: fmtDb(level.mean, 1), codec });
+    case "silent": return tf("audio.detail.silent", { max: fmtDb(level.max, 1) });
+    case "none": return t("audio.detail.none");
+    case "track": return tf(record.audioReason === "error" ? "audio.detail.trackError" : record.audioReason === "stale" ? "audio.detail.trackStale" : "audio.detail.track", { codec });
+    default: return t("audio.unknown");
+  }
+}
 
 const records = [
   ...videos.map(video => {
@@ -550,6 +614,38 @@ const records = [
       indexStatus: "active",
       validation
     };
+  }),
+  ...joinLog.map(item => {
+    const path = absolutizeArtifactPath(item.output_path);
+    const name = path.split(/[\\\/]/).pop() || String(item.output_path);
+    const sources = Array.isArray(item.source_ids) ? item.source_ids.map(String) : [];
+    return {
+      id: `join:${name}`,
+      kind: "joined",
+      name,
+      path,
+      fileUrl: fileUrl(path),
+      parser: "ffmpeg concat (stream copy)",
+      vendor: t("joined.vendor"),
+      status: "derived",
+      sha256: item.output_sha256 || "-",
+      duration: Number.isFinite(item.duration_seconds) ? item.duration_seconds : null,
+      codec: "-",
+      ext: extOfPath(path),
+      container: "",
+      probeOk: undefined,
+      size: item.output_size_bytes,
+      note: tf("joined.note", {
+        n: item.segment_count ?? sources.length,
+        gaps: item.gaps ?? 0,
+        overlaps: item.overlaps ?? 0,
+        manifest: String(item.manifest_path || "-").split(/[\\\/]/).pop()
+      }),
+      indexStatus: "active",
+      joinSources: sources,
+      joinInfo: item,
+      validation: null
+    };
   })
 ];
 
@@ -559,9 +655,22 @@ records.forEach(record => {
   record.recTime = rec ? rec.ts : null;
   record.recDay = rec ? rec.date : null;
   record.recSource = rec ? rec.source : null;
-  record.channelCode = channelCodeOf(record);
+  if (record.kind === "joined") {
+    // The plan's channel (§1.8), not a guess from the output file name; a
+    // joined file never pairs for dual playback.
+    const code = String(record.joinInfo.channel || "").toUpperCase();
+    record.channelCode = /^[FRIB]$/.test(code) ? code : null;
+    record.pairKey = "";
+  } else {
+    record.channelCode = channelCodeOf(record);
+    record.pairKey = pairKeyOf(record);
+  }
   record.channel = record.channelCode ? channelLabel(record.channelCode) : null;
-  record.pairKey = pairKeyOf(record);
+  const audio = audioInfoFor(record);
+  record.audioState = audio.state;
+  record.audioLevel = audio.level;
+  record.audioReason = audio.reason;
+  record.audioFacet = audioFacetOf(audio.state);
   record.prefix = prefixFor(record);
   record.recType = recTypeFor(record);
   record.originalName = originalNameFor(record);
@@ -581,6 +690,18 @@ records.forEach(record => {
   record.anomalies = merged;
   record.hasAnomaly = record.anomalies.length > 0;
 });
+// A joined record's recording time is its first segment's (§1.8).
+{
+  const videoById = new Map(records.filter(record => record.kind === "video").map(record => [record.id, record]));
+  records.forEach(record => {
+    if (record.kind !== "joined") return;
+    const first = videoById.get(record.joinSources[0]);
+    if (!first || first.recTime == null) return;
+    record.recTime = first.recTime;
+    record.recDay = first.recDay;
+    record.recSource = first.recSource;
+  });
+}
 // Carve-log and inode records duplicate indexed files under different ids;
 // reuse the indexed video's thumbnail through the shared file name.
 const thumbByName = new Map(records.filter(record => record.thumb).map(record => [record.name, record.thumb]));
@@ -670,6 +791,7 @@ const state = {
   dateFrom: "",
   dateTo: "",
   recType: "",
+  audio: "",
   collapsedGroups: new Set()
 };
 

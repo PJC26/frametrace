@@ -79,10 +79,17 @@ function searchHaystack(record) {
 // state that several modules mutate directly, so those are recomputed on
 // every call rather than risk serving a stale list.
 let filteredMemo = { key: null, list: null };
-function filterMemoKey() {
+// Every FILTER input (no sort): the facet memo keys on this alone, so a
+// new filter dimension added here invalidates both memos and a sort change
+// never recomputes the facet counts (no positional slicing of the key).
+function filterStateKey() {
   const chip = state.chip || "";
   if (chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:")) return null;
-  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.sortBy].join("\u0001");
+  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.audio].join("\u0001");
+}
+function filterMemoKey() {
+  const base = filterStateKey();
+  return base === null ? null : base + "\u0001" + state.sortBy;
 }
 
 function filteredRecords() {
@@ -98,6 +105,7 @@ function filteredRecords() {
 // day does not collapse the calendar to that one day (UX-22).
 function passesKind(record) { return !state.kind || record.kind === state.kind; }
 function passesRecType(record) { return !state.recType || (record.recType || "unclassified") === state.recType; }
+function passesAudio(record) { return !state.audio || record.audioFacet === state.audio; }
 function passesDate(record) {
   if (!state.dateFrom && !state.dateTo) return true;
   if (!record.recDay) return false;
@@ -127,23 +135,24 @@ function passesRest(record, chip, query) {
 // Counts for the calendar and the facet tree, each excluding its own
 // dimension's filter. One pass; memoised on the filter key minus sort,
 // and fetched once per render() and passed to both renderers.
-let facetMemo = { key: null, value: null };
+let facetMemo = { key: null, value: null, gen: 0 };
 function facetCounts() {
-  const base = filterMemoKey();
-  const key = base === null ? null : base.split("\u0001").slice(0, 7).join("\u0001") + "\u0001" + records.length;
+  const base = filterStateKey();
+  const key = base === null ? null : base + "\u0001" + records.length;
   if (key !== null && facetMemo.key === key) return facetMemo.value;
   const chip = state.chip || "";
   const query = state.query || "";
-  const typeCounts = new Map(), kindCounts = new Map(), dayCounts = new Map();
+  const typeCounts = new Map(), kindCounts = new Map(), dayCounts = new Map(), audioCounts = new Map();
   records.forEach(record => {
     if (!passesRest(record, chip, query)) return;
-    const k = passesKind(record), ty = passesRecType(record), d = passesDate(record);
-    if (k && d) { const tk = record.recType || "unclassified"; typeCounts.set(tk, (typeCounts.get(tk) || 0) + 1); }
-    if (ty && d) kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
-    if (k && ty && record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
+    const k = passesKind(record), ty = passesRecType(record), d = passesDate(record), a = passesAudio(record);
+    if (k && d && a) { const tk = record.recType || "unclassified"; typeCounts.set(tk, (typeCounts.get(tk) || 0) + 1); }
+    if (ty && d && a) kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
+    if (k && ty && a && record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
+    if (k && ty && d) audioCounts.set(record.audioFacet, (audioCounts.get(record.audioFacet) || 0) + 1);
   });
-  const value = { typeCounts, kindCounts, dayCounts };
-  facetMemo = { key, value };
+  const value = { typeCounts, kindCounts, dayCounts, audioCounts };
+  facetMemo = { key, value, gen: facetMemo.gen + 1 };
   return value;
 }
 
@@ -151,7 +160,7 @@ function computeFilteredRecords() {
   const chip = state.chip || "";
   const query = state.query || "";
   const list = records.filter(record =>
-    passesKind(record) && passesRecType(record) && passesDate(record) && passesRest(record, chip, query));
+    passesKind(record) && passesRecType(record) && passesDate(record) && passesAudio(record) && passesRest(record, chip, query));
   const byId = (a, b) => idCollator.compare(String(a.id), String(b.id));
   switch (state.sortBy) {
     case "time-desc":
@@ -175,7 +184,7 @@ function computeFilteredRecords() {
 function groupKeyFor(record) {
   switch (state.groupBy) {
     case "day": return record.recDay || t("group.noTime");
-    case "kind": return ({ video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate") })[record.kind] || record.kind;
+    case "kind": return ({ video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate"), joined: t("filter.kind.joined") })[record.kind] || record.kind;
     case "recType": return recTypeLabel(record.recType);
     case "status": return statusLabel(record.status);
     case "mark": return markOf(record) ? markLabel(markOf(record).status) : t("group.noMark");
@@ -737,18 +746,17 @@ function announceResultCount(n) {
   announceTimer = setTimeout(() => { live.textContent = tf("layout.live", { n }); }, 600);
 }
 
-// Tri-state audio flag: probed codec present → speaker, probed with no
-// audio stream → muted, unprobed (carved/candidate) → nothing so we never
-// claim audio state we haven't verified.
+// Sound flag (§2.5): the shape tells the state — measured sound (waves),
+// measured silent track (flat line), no audio stream (crossed), stream
+// present but not measured (bare speaker), never probed (nothing) — so the
+// grid never claims a sound that was not measured. Icon + label, never
+// colour alone.
+const AUDIO_FLAG_ICON = { sound: "audio", silent: "audio-silent", none: "mute", track: "audio-track" };
 function audioFlag(record) {
-  const codec = String(record.audioCodec || "").toLowerCase();
-  if (codec && codec !== "none" && codec !== "-") {
-    return `<span class="audio-flag has" title="${escapeHtml(record.audioCodec)}">${ftIcon("audio")}</span>`;
-  }
-  if (record.probeOk === true) {
-    return `<span class="audio-flag none" title="${escapeHtml(t("audio.absent"))}">${ftIcon("mute")}</span>`;
-  }
-  return "";
+  const icon = AUDIO_FLAG_ICON[record.audioState];
+  if (!icon) return "";
+  const tip = escapeHtml(audioTipFor(record));
+  return `<span class="audio-flag ${escapeHtml(record.audioState)}" role="img" aria-label="${tip}" title="${tip}">${ftIcon(icon)}</span>`;
 }
 
 // Thumbnail URLs that already failed (see the capture-phase error handler
@@ -761,6 +769,7 @@ function statusIcon(status) {
   if (status === "ffprobe-video-stream-confirmed" || status === "ffprobe-confirmed") return "check";
   if (status === "validation-failed") return "x";
   if (status === "duplicate-candidate") return "copy";
+  if (status === "derived") return "clip";
   return "question";
 }
 function statusBadgeHtml(status) {
