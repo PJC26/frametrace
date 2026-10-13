@@ -49,9 +49,16 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
     // immediately, bypassing busy_timeout. BEGIN IMMEDIATE takes the
     // RESERVED lock before ANY write, including the CREATE TABLE batch
     // below, so losers simply wait on busy_timeout.
+    //
+    // A migration chain (v1..v6 -> v7) is backed up ONCE, before the chain
+    // transaction begins, with SQLite's online backup API (a consistent
+    // committed snapshot, never a file copy torn by spilled pages of an
+    // open transaction), labelled with the version actually on disk:
+    // `case.db.backup-v<from>-to-v<SCHEMA_VERSION>-<unix>`.
+    let backed_up = backup_before_migration(conn)?;
     conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
         .map_err(|err| format!("failed to begin SQLite schema transaction: {err}"))?;
-    let result = init_schema_inner(conn);
+    let result = init_schema_inner(conn, backed_up.as_deref());
     match result {
         Ok(()) => conn
             .execute_batch("COMMIT")
@@ -63,7 +70,69 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
     }
 }
 
-fn init_schema_inner(conn: &Connection) -> Result<(), String> {
+/// Schema versions [`init_schema`] migrates from.
+const MIGRATABLE_VERSIONS: [&str; 6] = ["1", "2", "3", "4", "5", "6"];
+
+/// Reads `schema_version` without failing on a database that has no
+/// `schema_meta` table yet (fresh file → `None`).
+fn read_stored_schema_version(conn: &Connection) -> Result<Option<String>, String> {
+    if !table_exists(conn, "schema_meta")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| format!("failed to read SQLite schema version: {err}"))
+}
+
+/// Takes the one pre-migration backup when the stored schema is older than
+/// [`SCHEMA_VERSION`]; returns the version it backed up (`None` when no
+/// migration is due or the database is in-memory).
+fn backup_before_migration(conn: &Connection) -> Result<Option<String>, String> {
+    let Some(version) = read_stored_schema_version(conn)? else {
+        return Ok(None);
+    };
+    if !MIGRATABLE_VERSIONS.contains(&version.as_str()) {
+        return Ok(None);
+    }
+    let Some(db_path) = main_database_path(conn)? else {
+        return Ok(None);
+    };
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system time before UNIX epoch: {err}"))?
+        .as_secs();
+    let backup_name = format!("case.db.backup-v{version}-to-v{SCHEMA_VERSION}-{timestamp}");
+    let backup_path = db_path.with_file_name(backup_name);
+    conn.backup(rusqlite::MAIN_DB, &backup_path, None)
+        .map_err(|err| {
+            format!(
+                "failed to create SQLite migration backup {}: {err}",
+                backup_path.display()
+            )
+        })?;
+    Ok(Some(version))
+}
+
+fn init_schema_inner(conn: &Connection, backed_up: Option<&str>) -> Result<(), String> {
+    // Re-read under the write lock: a migration this call did not back up
+    // (the version changed between the backup and BEGIN) must not run.
+    let stored = read_stored_schema_version(conn)?;
+    if let Some(version) = stored.as_deref()
+        && MIGRATABLE_VERSIONS.contains(&version)
+        && backed_up != Some(version)
+        && main_database_path(conn)?.is_some()
+    {
+        return Err(format!(
+            "SQLite schema v{version} changed while preparing its migration backup; retry the operation"
+        ));
+    }
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_meta (
@@ -315,7 +384,6 @@ fn apply_schema_fts_index(conn: &Connection) -> Result<(), String> {
 }
 
 fn migrate_v3_to_v4(conn: &Connection) -> Result<(), String> {
-    backup_database(conn, "3", "4")?;
     apply_schema_v4_columns(conn)?;
     conn.execute(
         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -326,7 +394,6 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<(), String> {
 }
 
 fn migrate_v4_to_v5(conn: &Connection) -> Result<(), String> {
-    backup_database(conn, "4", "5")?;
     apply_schema_v5_columns(conn)?;
     conn.execute(
         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -337,7 +404,6 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<(), String> {
 }
 
 fn migrate_v5_to_v6(conn: &Connection) -> Result<(), String> {
-    backup_database(conn, "5", "6")?;
     // Older chains (e.g. a v4 file that never had review_marks) reach v6
     // with every earlier additive step re-applied; all are idempotent.
     apply_schema_v3_tables(conn)?;
@@ -380,7 +446,6 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<(), String> {
 /// (history is trigger-protected against UPDATE/DELETE anyway). Every id
 /// that currently carries a mark or a tag list starts at revision 1.
 fn migrate_v6_to_v7(conn: &Connection) -> Result<(), String> {
-    backup_database(conn, "6", "7")?;
     // Chains from older versions re-apply every earlier additive step
     // (all idempotent) before the v7 table is created.
     apply_schema_v3_tables(conn)?;
@@ -538,7 +603,6 @@ pub(crate) fn table_has_column(
 }
 
 fn migrate_v2_to_v3(conn: &Connection) -> Result<(), String> {
-    backup_database(conn, "2", "3")?;
     apply_schema_v3_tables(conn)?;
     conn.execute(
         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -567,7 +631,6 @@ fn apply_schema_v3_tables(conn: &Connection) -> Result<(), String> {
 }
 
 fn migrate_v1_to_v2(conn: &Connection) -> Result<(), String> {
-    backup_database(conn, "1", "2")?;
     apply_schema_v2_indexes(conn)?;
     conn.execute(
         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -593,28 +656,6 @@ fn apply_schema_v2_indexes(conn: &Connection) -> Result<(), String> {
         "#,
     )
     .map_err(|err| format!("failed to apply SQLite v2 indexes: {err}"))
-}
-
-fn backup_database(conn: &Connection, from_version: &str, to_version: &str) -> Result<(), String> {
-    let Some(db_path) = main_database_path(conn)? else {
-        return Ok(());
-    };
-    if !db_path.is_file() {
-        return Ok(());
-    }
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("system time before UNIX epoch: {err}"))?
-        .as_secs();
-    let backup_name = format!("case.db.backup-v{from_version}-to-v{to_version}-{timestamp}");
-    let backup_path = db_path.with_file_name(backup_name);
-    fs::copy(&db_path, &backup_path).map_err(|err| {
-        format!(
-            "failed to create SQLite migration backup {}: {err}",
-            backup_path.display()
-        )
-    })?;
-    Ok(())
 }
 
 fn main_database_path(conn: &Connection) -> Result<Option<PathBuf>, String> {
@@ -825,7 +866,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("case.db.backup-v1-to-v2-")
+                    .starts_with("case.db.backup-v1-to-v7-")
             });
         assert!(backup_exists);
 
@@ -865,7 +906,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("case.db.backup-v2-to-v3-")
+                    .starts_with("case.db.backup-v2-to-v7-")
             });
         assert!(backup_exists);
 
@@ -920,7 +961,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("case.db.backup-v4-to-v5-")
+                    .starts_with("case.db.backup-v4-to-v7-")
             });
         assert!(backup_exists);
         let _ = fs::remove_dir_all(case_dir);

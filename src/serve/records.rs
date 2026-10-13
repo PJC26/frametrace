@@ -586,17 +586,20 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         }
     }
     proxies.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
-    // `{marks, tags, revisions}` — the same object make-review embeds. A
+    // `{marks, tags, revisions, writers}` — the object make-review embeds
+    // plus `writers` (which window wrote each current revision, §10.2). A
     // read failure is reported inside the object (empty lists plus
     // `error`) rather than silently presented as "no annotations".
-    let annotations = crate::case_db::review_annotations_value(&case_dir).unwrap_or_else(|err| {
-        serde_json::json!({
-            "marks": [],
-            "tags": [],
-            "revisions": {},
-            "error": err,
-        })
-    });
+    let annotations = crate::case_db::review_annotations_value_with_writers(&case_dir)
+        .unwrap_or_else(|err| {
+            serde_json::json!({
+                "marks": [],
+                "tags": [],
+                "revisions": {},
+                "writers": {},
+                "error": err,
+            })
+        });
     let body = serde_json::json!({
         "ok": true,
         "manifest": read_json(case_dir.join("case.json")),

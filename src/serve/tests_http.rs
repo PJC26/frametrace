@@ -53,6 +53,7 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/records"),
     ("GET", "/api/records-meta"),
     ("GET", "/api/status"),
+    ("GET", "/api/mark-conflicts"),
     ("POST", "/api/start"),
     ("POST", "/api/finalize"),
     ("POST", "/api/recover-deleted"),

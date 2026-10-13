@@ -138,7 +138,16 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
         // Read annotations up front too: an unreadable source database must
         // fail the merge before anything is written, never drop its marks.
         let annotations = load_source_annotations(&source_root)?;
-        sources.push((source_root, source_lines, annotations));
+        // Every recorded spelling of the source (merged_from,
+        // merge_provenance, audit line, history detail, note segment) uses
+        // the display path without the Windows verbatim prefix that
+        // canonicalize adds (contract §10.2). All reads above used the
+        // canonical path.
+        sources.push((
+            crate::util::strip_windows_extended_prefix(&source_root),
+            source_lines,
+            annotations,
+        ));
     }
 
     let mut summaries = Vec::new();
@@ -586,7 +595,12 @@ mod tests {
         assert_eq!(merged[0]["merged_from_id"].as_str(), Some("vid_000001"));
         assert_eq!(
             merged[0]["merged_from"].as_str(),
-            Some(source.canonicalize().unwrap().to_string_lossy().as_ref())
+            Some(
+                crate::util::canonicalize_display(&source)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
 
         let index = read_to_string(&target.join("db/video_index.json")).unwrap();
@@ -897,8 +911,7 @@ mod tests {
     }
 
     fn source_case_string(source: &Path) -> String {
-        source
-            .canonicalize()
+        crate::util::canonicalize_display(source)
             .unwrap()
             .to_string_lossy()
             .into_owned()
@@ -1172,6 +1185,75 @@ mod tests {
             history
         );
         assert!(!target.join("evidence/logs/case-merge-log.jsonl").exists());
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// §10.2: every recorded spelling of the source case is the display
+    /// path — never the Windows verbatim (`\\?\`) form canonicalize returns.
+    #[test]
+    fn merge_records_source_display_path_without_verbatim_prefix() {
+        let (target, source) = conflict_cases("ann-display");
+        let mut lines = read_to_string(&source.join("db/videos.jsonl")).unwrap();
+        lines.push_str(&row("vid_000002", "/ev/new.mp4", 30, Some("cc")));
+        fs::write(source.join("db/videos.jsonl"), lines).unwrap();
+        let result = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        let display = source_case_string(&source);
+        assert!(!display.starts_with(r"\\?\"), "{display}");
+        assert_eq!(result.sources[0].case_dir.to_string_lossy(), display);
+        let rows = jsonl_ids(&target);
+        let merged = rows.iter().find(|r| r["merged_from"].is_string()).unwrap();
+        assert_eq!(merged["merged_from"], display.as_str());
+        let kept = rows
+            .iter()
+            .find(|r| r["source_path"] == "/ev/shared.mp4")
+            .unwrap();
+        assert_eq!(kept["merge_provenance"][0]["source_case"], display.as_str());
+        assert_eq!(audit_entries(&target)[0]["source_case"], display.as_str());
+        let note = mark_of(&target, "vid_000007").unwrap().note.unwrap();
+        assert!(
+            note.contains(&format!("[병합 {display} vid_000001]")),
+            "{note}"
+        );
+        let everything = read_to_string(&target.join("db/videos.jsonl")).unwrap()
+            + &read_to_string(&target.join("evidence/logs/case-merge-log.jsonl")).unwrap()
+            + &note;
+        assert!(!everything.contains(r"\\?\"), "{everything}");
+        assert!(!everything.contains(r"\\\\?\\"), "{everything}");
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// §10.2: the "already appended" check matches whole lines. A note that
+    /// is a prefix of an earlier appended segment is still appended.
+    #[test]
+    fn merge_note_duplicate_check_matches_whole_lines_only() {
+        let (target, source) = conflict_cases("ann-lines");
+        let case = source_case_string(&source);
+        // The target already carries a LONGER segment for the same source id.
+        annotate(
+            &target,
+            "vid_000007",
+            "relevant",
+            Some(&format!(
+                "keep\n[병합 {case} vid_000001] src note\n둘째 줄 (수정)"
+            )),
+            None,
+            &["a"],
+        );
+        let result = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(result.sources[0].annotations.notes_appended, 1);
+        let note = mark_of(&target, "vid_000007").unwrap().note.unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "keep\n[병합 {case} vid_000001] src note\n둘째 줄 (수정)\n[병합 {case} vid_000001] src note\n둘째 줄"
+            )
+        );
+        // Now the exact segment is present as whole lines: no second append.
+        let again = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(again.sources[0].annotations.notes_appended, 0);
+        assert_eq!(mark_of(&target, "vid_000007").unwrap().note.unwrap(), note);
         let _ = fs::remove_dir_all(&target);
         let _ = fs::remove_dir_all(&source);
     }

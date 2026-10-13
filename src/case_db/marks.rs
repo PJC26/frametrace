@@ -9,11 +9,15 @@
 //!
 //! `review_annotation_rev` holds one revision per record id covering the
 //! mark, note, examiner, IN/OUT range and tags together. A v2 client sends
-//! the revision it last saw per id; an id whose base is older than the
-//! stored revision is NOT applied and is returned as a conflict with the
-//! server's current value, while the other ids in the same patch are
-//! applied. Legacy bodies (no base) never conflict (last write wins) but
-//! still bump the revision so v2 windows notice the change.
+//! the revision it last saw per id (contract §10.1 of
+//! docs/FIX_PLAN_R1_2026-10-13.md): an id whose base differs from the
+//! stored revision (older or newer) is NOT applied and is returned as a
+//! conflict with the server's current value — unless the same window
+//! (`client_id`) wrote the stored revision, or the patch would not change
+//! the stored value at all (then it is applied at the current revision).
+//! The other ids in the same patch are applied. Legacy bodies (no base)
+//! never conflict (last write wins) but still bump the revision so v2
+//! windows notice the change.
 
 use super::*;
 use crate::util::now_unix;
@@ -161,14 +165,21 @@ fn insert_mark_history(
     Ok(())
 }
 
-fn read_revision(tx: &Transaction<'_>, record_id: &str) -> Result<u64, String> {
+/// `(revision, client_id of its writer)`; `(0, None)` without a row.
+fn read_revision_row(
+    tx: &Transaction<'_>,
+    record_id: &str,
+) -> Result<(u64, Option<String>), String> {
     tx.query_row(
-        "SELECT revision FROM review_annotation_rev WHERE record_id = ?1",
+        "SELECT revision, client_id FROM review_annotation_rev WHERE record_id = ?1",
         [record_id],
-        |row| row.get::<_, i64>(0),
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
     )
     .optional()
-    .map(|rev| rev.map(i64_to_u64).unwrap_or(0))
+    .map(|row| {
+        row.map(|(rev, client)| (i64_to_u64(rev), client))
+            .unwrap_or((0, None))
+    })
     .map_err(|err| format!("failed to read annotation revision for {record_id}: {err}"))
 }
 
@@ -252,6 +263,43 @@ fn store_tags(
     Ok(true)
 }
 
+/// The row `mark` leaves behind when written over `old` — the same rules
+/// the upsert applies: a missing `record_path`/`examiner`/`note` keeps the
+/// stored value, `range: None` keeps the stored range, and a `noted` row
+/// that stays `noted` keeps its stored `marked_unix` (the viewer stamps a
+/// note-only row with "now" on every export, which is not a change;
+/// contract §10.1.4).
+fn merged_mark(old: Option<&StoredMark>, mark: &ReviewMarkRow) -> StoredMark {
+    let keep_time = old.is_some_and(|old| old.status == "noted" && mark.status == "noted");
+    StoredMark {
+        status: mark.status.clone(),
+        marked_unix: match old {
+            Some(old) if keep_time => old.marked_unix,
+            _ => u64_to_i64(mark.marked_unix),
+        },
+        record_path: mark
+            .record_path
+            .clone()
+            .or_else(|| old.and_then(|o| o.record_path.clone())),
+        examiner: mark
+            .examiner
+            .clone()
+            .or_else(|| old.and_then(|o| o.examiner.clone())),
+        note: mark
+            .note
+            .clone()
+            .or_else(|| old.and_then(|o| o.note.clone())),
+        range_in: match mark.range {
+            Some(range) => range.start,
+            None => old.and_then(|o| o.range_in),
+        },
+        range_out: match mark.range {
+            Some(range) => range.end,
+            None => old.and_then(|o| o.range_out),
+        },
+    }
+}
+
 /// Upserts one mark; returns whether the stored row changed.
 fn upsert_mark(
     tx: &Transaction<'_>,
@@ -259,6 +307,10 @@ fn upsert_mark(
     ctx: WriteContext<'_>,
 ) -> Result<bool, String> {
     let old = read_stored_mark(tx, &mark.record_id)?;
+    let new = merged_mark(old.as_ref(), mark);
+    if old.as_ref() == Some(&new) {
+        return Ok(false);
+    }
     tx.execute(
         r#"
         INSERT INTO review_marks (record_id, status, marked_unix, record_path, examiner, note, range_in, range_out)
@@ -266,29 +318,24 @@ fn upsert_mark(
         ON CONFLICT(record_id) DO UPDATE SET
             status = excluded.status,
             marked_unix = excluded.marked_unix,
-            record_path = COALESCE(excluded.record_path, review_marks.record_path),
-            examiner = COALESCE(excluded.examiner, review_marks.examiner),
-            note = COALESCE(excluded.note, review_marks.note),
-            range_in = CASE WHEN ?9 THEN excluded.range_in ELSE review_marks.range_in END,
-            range_out = CASE WHEN ?9 THEN excluded.range_out ELSE review_marks.range_out END
+            record_path = excluded.record_path,
+            examiner = excluded.examiner,
+            note = excluded.note,
+            range_in = excluded.range_in,
+            range_out = excluded.range_out
         "#,
         params![
             mark.record_id.as_str(),
-            mark.status.as_str(),
-            u64_to_i64(mark.marked_unix),
-            mark.record_path.as_deref(),
-            mark.examiner.as_deref(),
-            mark.note.as_deref(),
-            mark.range.and_then(|range| range.start),
-            mark.range.and_then(|range| range.end),
-            mark.range.is_some(),
+            new.status.as_str(),
+            new.marked_unix,
+            new.record_path.as_deref(),
+            new.examiner.as_deref(),
+            new.note.as_deref(),
+            new.range_in,
+            new.range_out,
         ],
     )
     .map_err(|err| format!("failed to upsert review mark {}: {err}", mark.record_id))?;
-    let new = read_stored_mark(tx, &mark.record_id)?;
-    if old == new {
-        return Ok(false);
-    }
     let action = if old.is_some() { "update" } else { "insert" };
     insert_mark_history(
         tx,
@@ -297,16 +344,67 @@ fn upsert_mark(
         ctx,
         mark.examiner.as_deref().or(ctx.actor),
         old.as_ref(),
-        new.as_ref(),
+        Some(&new),
     )?;
     Ok(true)
+}
+
+/// The tag list as stored in `schema_meta` (`None` = no tags).
+fn tags_storage_value(tags: &[String]) -> Result<Option<String>, String> {
+    if tags.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_string(tags)
+            .map(Some)
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// True when applying this id's part of the patch would leave the stored
+/// annotation exactly as it is (status, note, examiner, IN/OUT range, tags
+/// and deletion — contract §10.1.3). `marked_unix` is ignored when the
+/// status stays the same (§10.1.4): a re-stamped time alone is no change.
+fn patch_is_noop(
+    tx: &Transaction<'_>,
+    id: &str,
+    mark: Option<&ReviewMarkRow>,
+    tags: Option<&crate::selection::TagEntry>,
+    deleted: bool,
+) -> Result<bool, String> {
+    if let Some(entry) = tags
+        && read_stored_tags(tx, id)? != tags_storage_value(&entry.tags)?
+    {
+        return Ok(false);
+    }
+    let old = read_stored_mark(tx, id)?;
+    let after_delete = if deleted { None } else { old.clone() };
+    let new = match mark {
+        Some(mark) => Some(merged_mark(after_delete.as_ref(), mark)),
+        None => after_delete,
+    };
+    Ok(match (&old, &new) {
+        (None, None) => true,
+        // Statuses must match, so `marked_unix` is deliberately not compared.
+        (Some(old), Some(new)) => {
+            old.status == new.status
+                && old.record_path == new.record_path
+                && old.examiner == new.examiner
+                && old.note == new.note
+                && old.range_in == new.range_in
+                && old.range_out == new.range_out
+        }
+        _ => false,
+    })
 }
 
 /// Applies one patch in a single `BEGIN IMMEDIATE` transaction.
 ///
 /// Per id (deletion, tags and mark together): with a v2 base the id is
-/// skipped and reported as a conflict when `base < stored revision`;
-/// otherwise deletion, tags and mark are applied in that order and the
+/// skipped and reported as a conflict when `base != stored revision`, the
+/// stored revision was written by another (or an unknown) `client_id`, and
+/// the patch would change the stored value (an unchanged one is applied
+/// at the current revision); otherwise deletion, tags and mark are
+/// applied in that order and the
 /// revision is bumped by one iff something effectively changed (so an
 /// identical resend is idempotent and writes neither history nor a new
 /// revision). A deleted mark keeps its revision row as a tombstone. Every
@@ -349,11 +447,29 @@ pub fn patch_review_annotations_v2(
         .copied()
         .collect();
     let mut outcome = PatchOutcome::default();
+    let request_client = client_id.filter(|id| !id.trim().is_empty());
     for id in ids {
-        let current = read_revision(&tx, id)?;
+        let (current, last_writer) = read_revision_row(&tx, id)?;
         if let Some(base) = patch.base_revisions {
             let base_revision = base.get(id).copied().unwrap_or(0);
-            if base_revision < current {
+            // §10.1.1: any mismatch (older OR newer base) is a conflict,
+            // except §10.1.2 — this same window wrote the current revision
+            // (its own consecutive edit, also across a deferred queue chain).
+            let same_window = request_client.is_some() && last_writer.as_deref() == request_client;
+            if base_revision != current && !same_window {
+                // §10.1.3: content identical to the stored value (a resend
+                // whose response was lost, a re-imported queue body) is
+                // applied at the current revision — no bump, no history.
+                if patch_is_noop(
+                    &tx,
+                    id,
+                    marks_by_id.get(id).copied(),
+                    tags_by_id.get(id).copied(),
+                    deleted.contains(id),
+                )? {
+                    outcome.applied.push((id.to_string(), current));
+                    continue;
+                }
                 outcome.conflicts.push(AnnotationConflict {
                     id: id.to_string(),
                     server_revision: current,
@@ -385,7 +501,7 @@ pub fn patch_review_annotations_v2(
                     actor = excluded.actor,
                     client_id = excluded.client_id
                 "#,
-                params![id, u64_to_i64(next), now, actor, client_id],
+                params![id, u64_to_i64(next), now, actor, request_client],
             )
             .map_err(|err| format!("failed to store annotation revision for {id}: {err}"))?;
             next
@@ -423,6 +539,34 @@ pub(crate) fn load_review_revisions_from(
     let rows = stmt
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, i64_to_u64(row.get::<_, i64>(1)?)))
+        })
+        .map_err(|err| format!("failed to query annotation revisions: {err}"))?;
+    rows.map(|row| row.map_err(|err| format!("failed to read annotation revision row: {err}")))
+        .collect()
+}
+
+/// `{record_id: (revision, writer client_id)}` over an open connection
+/// (empty for a pre-v7 db).
+pub(crate) fn load_review_revision_rows_from(
+    conn: &rusqlite::Connection,
+) -> Result<BTreeMap<String, (u64, Option<String>)>, String> {
+    if !table_exists(conn, "review_annotation_rev")? {
+        return Ok(BTreeMap::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT record_id, revision, client_id FROM review_annotation_rev ORDER BY record_id",
+        )
+        .map_err(|err| format!("failed to prepare annotation revision query: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (
+                    i64_to_u64(row.get::<_, i64>(1)?),
+                    row.get::<_, Option<String>>(2)?,
+                ),
+            ))
         })
         .map_err(|err| format!("failed to query annotation revisions: {err}"))?;
     rows.map(|row| row.map_err(|err| format!("failed to read annotation revision row: {err}")))
@@ -663,7 +807,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("case.db.backup-v5-to-v6-")
+                    .starts_with("case.db.backup-v5-to-v7-")
             });
         assert!(backup, "v5->v6 migration must leave a backup");
         let history = load_review_mark_history(&dir, None).unwrap();
@@ -711,16 +855,39 @@ mod tests {
                 Some(&1),
                 "v{version}"
             );
-            let backup = fs::read_dir(dir.join("db"))
+            // Exactly one backup, taken before the chain and labelled with
+            // the version that was on disk; it still reads as that version.
+            let backups: Vec<std::path::PathBuf> = fs::read_dir(dir.join("db"))
                 .unwrap()
                 .filter_map(Result::ok)
-                .any(|entry| {
+                .filter(|entry| {
                     entry
                         .file_name()
                         .to_string_lossy()
-                        .starts_with("case.db.backup-v6-to-v7-")
-                });
-            assert!(backup, "v{version}: v6->v7 step must leave a backup");
+                        .starts_with("case.db.backup-")
+                })
+                .map(|entry| entry.path())
+                .collect();
+            assert_eq!(backups.len(), 1, "v{version}: {backups:?}");
+            assert!(
+                backups[0]
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("case.db.backup-v{version}-to-v7-")),
+                "v{version}: {backups:?}"
+            );
+            let backup = open_readonly_case_db(&backups[0]).unwrap();
+            let backed_up: String = backup
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(backed_up, version, "backup holds the pre-migration db");
+            assert!(!table_exists(&backup, "review_annotation_rev").unwrap());
+            drop(backup);
             let _ = fs::remove_dir_all(dir);
         }
     }
@@ -1179,6 +1346,241 @@ mod tests {
             stale.conflicts[0].server.as_ref().unwrap().note.as_deref(),
             Some("legacy")
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn rev_writer(dir: &Path, id: &str) -> Option<String> {
+        open_readonly_case_db(&case_db_path(dir))
+            .unwrap()
+            .query_row(
+                "SELECT client_id FROM review_annotation_rev WHERE record_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// §10.1.2/§10.1.3: a save whose response was lost is resent with the
+    /// same (now old) base. From the same window it applies (nothing
+    /// changes); from a reloaded window with a new client id the identical
+    /// content is a no-op — applied at the current revision either way, no
+    /// history row, no revision bump.
+    #[test]
+    fn patch_v2_lost_response_resend_is_applied_not_conflicted() {
+        let dir = case("v2-lost-response");
+        let marks = [mark("important", Some("n"), None)];
+        let tags = [TagEntry {
+            id: "vid_1".into(),
+            tags: vec!["사고".into()],
+        }];
+        let first = v2(&dir, &marks, &tags, &[], &base(&[("vid_1", 0)]), "w-a");
+        assert_eq!(first.applied, vec![("vid_1".to_string(), 1)]);
+        let history = load_review_mark_history(&dir, None).unwrap().len();
+        for client in ["w-a", "w-reloaded"] {
+            let again = v2(&dir, &marks, &tags, &[], &base(&[("vid_1", 0)]), client);
+            assert_eq!(again.applied, vec![("vid_1".to_string(), 1)], "{client}");
+            assert!(again.conflicts.is_empty(), "{client}");
+            assert_eq!(load_review_mark_history(&dir, None).unwrap().len(), history);
+            assert_eq!(load_review_revisions(&dir).unwrap().get("vid_1"), Some(&1));
+        }
+        // The no-op path does not take over authorship of the revision.
+        assert_eq!(rev_writer(&dir, "vid_1").as_deref(), Some("w-a"));
+        // A delete resent after it landed is a no-op too.
+        let delete = [String::from("vid_1")];
+        let empty = [TagEntry {
+            id: "vid_1".into(),
+            tags: vec![],
+        }];
+        let gone = v2(&dir, &[], &empty, &delete, &base(&[("vid_1", 1)]), "w-a");
+        assert_eq!(gone.applied, vec![("vid_1".to_string(), 2)]);
+        let resent = v2(&dir, &[], &empty, &delete, &base(&[("vid_1", 1)]), "w-b");
+        assert_eq!(resent.applied, vec![("vid_1".to_string(), 2)]);
+        assert!(resent.conflicts.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// §10.1.2: two bodies queued by one window, both carrying the base it
+    /// knew when queuing, are applied in order at the drain — the second no
+    /// longer conflicts with the first — while a different window with the
+    /// same stale base still conflicts.
+    #[test]
+    fn patch_v2_deferred_chain_from_same_window_applies_in_order() {
+        let dir = case("v2-chain");
+        // Another window created revision 1.
+        v2(
+            &dir,
+            &[mark("reviewed", Some("start"), None)],
+            &[],
+            &[],
+            &base(&[]),
+            "w-x",
+        );
+        let one = v2(
+            &dir,
+            &[mark("important", Some("first edit"), None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 1)]),
+            "w-a",
+        );
+        assert_eq!(one.applied, vec![("vid_1".to_string(), 2)]);
+        let two = v2(
+            &dir,
+            &[mark("important", Some("second edit"), None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 1)]),
+            "w-a",
+        );
+        assert_eq!(two.applied, vec![("vid_1".to_string(), 3)]);
+        assert!(two.conflicts.is_empty());
+        assert_eq!(
+            load_review_marks(&dir).unwrap()[0].note.as_deref(),
+            Some("second edit")
+        );
+        // A different window holding revision 1 is told about it.
+        let other = v2(
+            &dir,
+            &[mark("important", Some("other window"), None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 1)]),
+            "w-b",
+        );
+        assert!(other.applied.is_empty());
+        assert_eq!(other.conflicts[0].server_revision, 3);
+        assert_eq!(
+            other.conflicts[0].server.as_ref().unwrap().note.as_deref(),
+            Some("second edit")
+        );
+        // Without a client id there is no "same window": a wrong base
+        // conflicts even when the last writer also had none.
+        crate::case_db::patch_review_annotations_by(
+            &dir,
+            &[mark("important", Some("legacy"), None)],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let anonymous = patch_review_annotations_v2(
+            &dir,
+            &AnnotationPatch {
+                marks: &[mark("important", Some("anon"), None)],
+                tags: &[],
+                deleted_ids: &[],
+                base_revisions: Some(&base(&[("vid_1", 1)])),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(anonymous.conflicts.len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// §10.1.1: a base NEWER than the stored revision (the db was restored
+    /// from a backup) is a conflict too, also for an id without a row.
+    #[test]
+    fn patch_v2_base_newer_than_server_conflicts() {
+        let dir = case("v2-newer-base");
+        v2(
+            &dir,
+            &[mark("reviewed", Some("restored"), None)],
+            &[],
+            &[],
+            &base(&[]),
+            "w-x",
+        );
+        let newer = v2(
+            &dir,
+            &[mark("important", Some("mine"), None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 5)]),
+            "w-a",
+        );
+        assert!(newer.applied.is_empty());
+        assert_eq!(newer.conflicts[0].server_revision, 1);
+        let unknown = ReviewMarkRow {
+            record_id: "vid_2".into(),
+            status: "important".into(),
+            marked_unix: 3,
+            ..Default::default()
+        };
+        let missing_row = v2(&dir, &[unknown], &[], &[], &base(&[("vid_2", 3)]), "w-a");
+        assert!(missing_row.applied.is_empty());
+        assert_eq!(missing_row.conflicts[0].server_revision, 0);
+        assert_eq!(missing_row.conflicts[0].server, None);
+        assert_eq!(load_review_marks(&dir).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// §10.1.3/§10.1.4: with an unchanged status the time stamp alone is not
+    /// a change (no-op, not a conflict), and a `noted` row keeps its stored
+    /// `marked_unix` when it is rewritten as `noted`. A status change is
+    /// always a change.
+    #[test]
+    fn patch_v2_noop_ignores_time_for_same_status_and_noted_keeps_time() {
+        let dir = case("v2-noted-time");
+        let mut noted = mark("noted", Some("memo"), None);
+        noted.marked_unix = 100;
+        v2(&dir, &[noted.clone()], &[], &[], &base(&[]), "w-a");
+        // The viewer re-stamps a note-only row with "now" on every export.
+        noted.marked_unix = 200;
+        let restamped = v2(&dir, &[noted.clone()], &[], &[], &base(&[]), "w-b");
+        assert_eq!(restamped.applied, vec![("vid_1".to_string(), 1)]);
+        assert!(restamped.conflicts.is_empty());
+        assert_eq!(load_review_marks(&dir).unwrap()[0].marked_unix, 100);
+        // Same window edits the note: applied, the noted time is kept.
+        noted.note = Some("memo 2".into());
+        noted.marked_unix = 300;
+        let edited = v2(
+            &dir,
+            &[noted.clone()],
+            &[],
+            &[],
+            &base(&[("vid_1", 1)]),
+            "w-a",
+        );
+        assert_eq!(edited.applied, vec![("vid_1".to_string(), 2)]);
+        let stored = &load_review_marks(&dir).unwrap()[0];
+        assert_eq!(stored.marked_unix, 100);
+        assert_eq!(stored.note.as_deref(), Some("memo 2"));
+        let history = load_review_mark_history(&dir, None).unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        // A re-sent legacy body that only re-stamps a noted row is no change.
+        noted.marked_unix = 400;
+        patch_review_annotations(&dir, &[noted.clone()], &[], &[]).unwrap();
+        assert_eq!(load_review_mark_history(&dir, None).unwrap().len(), 2);
+        assert_eq!(load_review_revisions(&dir).unwrap().get("vid_1"), Some(&2));
+        // Same status, different time, other window: no-op (time ignored).
+        let mut important = mark("important", Some("x"), None);
+        important.record_id = "vid_2".into();
+        important.marked_unix = 10;
+        v2(&dir, &[important.clone()], &[], &[], &base(&[]), "w-a");
+        important.marked_unix = 99;
+        let same_status = v2(&dir, &[important.clone()], &[], &[], &base(&[]), "w-b");
+        assert_eq!(same_status.applied, vec![("vid_2".to_string(), 1)]);
+        let vid_2 = load_review_marks(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.record_id == "vid_2")
+            .unwrap();
+        assert_eq!(vid_2.marked_unix, 10, "no-op writes nothing");
+        // A status change from another window with a stale base conflicts.
+        let changed = v2(
+            &dir,
+            &[ReviewMarkRow {
+                status: "reviewed".into(),
+                ..important
+            }],
+            &[],
+            &[],
+            &base(&[]),
+            "w-b",
+        );
+        assert_eq!(changed.conflicts.len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 }

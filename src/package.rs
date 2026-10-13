@@ -546,7 +546,8 @@ fn is_lower_hex_sha256(text: &str) -> bool {
 ///    (with their IN-OUT ranges) and tags in the packaged database, and the
 ///    packaged report names that examiner;
 /// 6. a packaged `review/evidence-viewer.html` has its `review/data-bundle.js`
-///    sibling (FAIL otherwise), and a non-empty carve log comes with
+///    sibling (NOT VERIFIED otherwise — older packages; package-case
+///    refuses to create one), and a non-empty carve log comes with
 ///    `review/carve-report.html` (NOT VERIFIED otherwise).
 ///
 /// Returns `Err` only when the directory cannot be inspected at all; every
@@ -740,11 +741,15 @@ fn verify_review_siblings(
                 format!("standalone viewer ships with its {DATA_BUNDLE_REL}"),
             );
         } else {
+            // NOT VERIFIED, not FAIL (contract §10.2): packages sealed
+            // before the bundle was split out carry the viewer alone and
+            // are otherwise intact; package-case itself still refuses to
+            // seal a viewer without its bundle.
             out.push(
-                CheckStatus::Fail,
+                CheckStatus::NotVerified,
                 VIEWER_REL,
                 format!(
-                    "standalone viewer is packaged without {DATA_BUNDLE_REL}: it would open with no data"
+                    "standalone viewer is packaged without {DATA_BUNDLE_REL}: it opens with no data, so the packaged review cannot be checked from the viewer (older package layout); review the packaged database and report instead"
                 ),
             );
         }

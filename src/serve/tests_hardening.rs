@@ -384,6 +384,47 @@ fn report_flags_marks_changed_after_signoff() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// §10.2: finalize re-runs make-review before package-case, so the
+/// packaged review/data-bundle.js carries a mark saved AFTER the last
+/// analysis (the bundle used to be whatever the pipeline last wrote).
+#[test]
+fn finalize_rebuilds_review_bundle_with_marks_saved_after_analysis() {
+    let (root, case, _source) = case_fixture("finalize-bundle");
+    run_cli(&["make-review", case.to_str().unwrap()]);
+    let bundle_before = std::fs::read_to_string(case.join("review/data-bundle.js")).unwrap();
+    let note = "saved-after-analysis-7f3a";
+    assert!(!bundle_before.contains(note));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(case.join("case.json")).unwrap()).unwrap();
+    let marks_path = root.join("marks.json");
+    std::fs::write(
+        &marks_path,
+        serde_json::json!({
+            "schema_version": 1,
+            "case_id": manifest["case_id"],
+            "marks": [{"id": "vid_000001", "status": "important", "note": note}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    crate::cli::handlers::import_marks_quiet(&case, &marks_path).unwrap();
+
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case.clone());
+    let response = finalize_with_exe(&cli_bin(), &case, "홍길동", &state);
+    let value: serde_json::Value = serde_json::from_str(&response).expect(&response);
+    assert_eq!(value["ok"], true, "{response}");
+    let package_dir = PathBuf::from(value["package_dir"].as_str().unwrap());
+    let packaged = std::fs::read_to_string(package_dir.join("review/data-bundle.js")).unwrap();
+    assert!(
+        packaged.contains(note),
+        "packaged bundle must carry the mark saved after the last analysis"
+    );
+    let verification = crate::package::verify_package(&package_dir).unwrap();
+    assert!(verification.passed(), "{:?}", verification.checks);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// SHOULD-FIX 5: marks still queued on disk are applied before sealing, so
 /// the packaged review always carries the latest marks.
 #[test]

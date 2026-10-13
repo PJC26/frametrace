@@ -69,8 +69,10 @@ fn package_refuses_viewer_without_data_bundle() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// An older package (viewer without its bundle) is NOT VERIFIED, not
+/// FAIL: the rest of the package still verifies (contract §10.2).
 #[test]
-fn verify_package_fails_when_viewer_lacks_data_bundle() {
+fn verify_package_not_verified_when_viewer_lacks_data_bundle() {
     let root = case_fixture("verify-fail");
     let case_dir = root.join("case");
     write_review(&case_dir, &["evidence-viewer.html", "data-bundle.js"]);
@@ -90,9 +92,18 @@ fn verify_package_fails_when_viewer_lacks_data_bundle() {
     let result = verify_package(&output).unwrap();
     assert!(
         result
-            .failures()
+            .checks
+            .iter()
             .any(|c| c.subject == "review/evidence-viewer.html"
+                && c.status == CheckStatus::NotVerified
                 && c.detail.contains("data-bundle.js")),
+        "{:?}",
+        result.checks
+    );
+    assert!(
+        result
+            .failures()
+            .all(|c| c.subject != "review/evidence-viewer.html"),
         "{:?}",
         result.checks
     );
