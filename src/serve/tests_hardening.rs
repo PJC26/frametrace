@@ -453,3 +453,43 @@ fn finalize_applies_queued_marks_before_sealing() {
     assert!(marks.iter().any(|m| m.note.as_deref() == Some("queued")));
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Sends a malformed request (answered with 400 before the handler ever
+/// touches `JobState`) and returns the reply, or the I/O error when the
+/// server did not answer within the timeout.
+fn malformed_exchange(addr: std::net::SocketAddr) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream
+        .write_all(b"POST /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: x\r\n\r\n")?;
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// The accept loop must not depend on the global state lock: while some
+/// handler holds `JobState`, new connections are still accepted and
+/// served (here: requests that never need the lock). Previously the loop
+/// took the lock every iteration to read the shutdown flag, so one long
+/// lock hold stalled accepting and let the listen backlog overflow.
+#[test]
+fn serve_on_keeps_accepting_while_the_state_lock_is_held() {
+    let listener = bind_loopback(0).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    let server_state = Arc::clone(&state);
+    let server = thread::spawn(move || serve_on(listener, server_state));
+    let first = malformed_exchange(addr).expect("server answers");
+    assert!(first.starts_with("HTTP/1.1 400"), "{first}");
+    {
+        let _held = state_lock(&state);
+        for i in 0..8 {
+            let reply = malformed_exchange(addr).unwrap_or_else(|err| {
+                panic!("request {i} not served while the lock is held: {err}")
+            });
+            assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+        }
+    }
+    state_lock(&state).request_shutdown();
+    server.join().unwrap();
+}

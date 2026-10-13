@@ -12,7 +12,7 @@ pub(crate) use std::io::{Read, Seek, SeekFrom, Write};
 pub(crate) use std::net::{TcpListener, TcpStream};
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::process::{Command, Stdio};
-pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -152,6 +152,10 @@ fn examiner_page(legacy: bool) -> &'static str {
 /// memory/handles by opening thousands of idle sockets. Overflow
 /// connections get an immediate 503 instead of a thread.
 pub(crate) const MAX_CONNECTIONS: usize = 64;
+
+/// How long the nonblocking accept loop sleeps when no connection is
+/// pending (also bounds how fast /api/shutdown ends the loop).
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
 pub struct ServeOptions {
     pub case_dir: Option<PathBuf>,
@@ -294,9 +298,8 @@ mod winsock {
     use std::os::windows::io::FromRawSocket;
     use windows::Win32::Networking::WinSock::{
         AF_INET, INVALID_SOCKET, IPPROTO_TCP, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR,
-        SOCKADDR_IN, SOCKET, SOL_SOCKET, SOMAXCONN, WSA_FLAG_NO_HANDLE_INHERIT,
-        WSA_FLAG_OVERLAPPED, WSADATA, WSAGetLastError, WSASocketW, WSAStartup, bind, closesocket,
-        listen, setsockopt,
+        SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSADATA,
+        WSAGetLastError, WSASocketW, WSAStartup, bind, closesocket, listen, setsockopt,
     };
 
     fn last_error() -> std::io::Error {
@@ -372,12 +375,21 @@ mod winsock {
         }
     }
 
+    /// Listen backlog: WinSock 2's `SOMAXCONN` (0x7fffffff = "reasonable
+    /// system maximum"). NOT the `windows` crate's `SOMAXCONN`, which is the
+    /// WinSock 1.1 value 5 from winsock.h: with a backlog of 5, a burst of
+    /// connects arriving between two polls of the nonblocking accept loop
+    /// (the viewer reloading records + thumbnails while the UI polls
+    /// /api/status) overflowed the queue and Windows answered the excess
+    /// with RST, i.e. ECONNREFUSED on a live server.
+    pub(super) const LISTEN_BACKLOG: i32 = 0x7fff_ffff;
+
     pub(super) fn bind_loopback_exclusive(port: u16) -> std::io::Result<TcpListener> {
         let sock = bind_with_option(port, SO_EXCLUSIVEADDRUSE)?;
         // SAFETY: `sock` is a bound socket we own; ownership moves into the
         // TcpListener on success.
         unsafe {
-            if listen(sock, SOMAXCONN as i32) != 0 {
+            if listen(sock, LISTEN_BACKLOG) != 0 {
                 let err = last_error();
                 let _ = closesocket(sock);
                 return Err(err);
@@ -405,6 +417,30 @@ mod winsock {
 #[cfg(all(test, windows))]
 mod bind_tests {
     use super::{bind_loopback, winsock};
+
+    /// The listen backlog must absorb a burst of connects that arrive
+    /// before the accept loop gets to them. With the `windows` crate's
+    /// `SOMAXCONN` (WinSock 1.1 value 5) every connect past the fifth was
+    /// answered with RST — ECONNREFUSED against a live server.
+    #[test]
+    fn listener_backlog_absorbs_a_burst_of_pending_connects() {
+        use std::net::TcpStream;
+        use std::time::Duration;
+        let listener = bind_loopback(0).expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let burst = 48;
+        let clients: Vec<TcpStream> = (0..burst)
+            .map(|i| {
+                TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap_or_else(|err| {
+                    panic!("connect {i} refused while nothing was accepted yet: {err}")
+                })
+            })
+            .collect();
+        for _ in 0..burst {
+            listener.accept().expect("accept a queued connection");
+        }
+        drop(clients);
+    }
 
     /// Without SO_EXCLUSIVEADDRUSE a second socket with SO_REUSEADDR can
     /// bind on top of a listening port and steal new connections; with it
@@ -500,11 +536,17 @@ pub(crate) fn resolve_token(
 /// effects here). Nonblocking so the /api/shutdown flag can end the loop
 /// without a wake-up connection. The server only exits on an explicit
 /// shutdown request — never on idle timeout.
+///
+/// The loop never takes the state lock: the shutdown flag is an atomic
+/// cloned once up front, so a handler holding `JobState` cannot stall
+/// accepting (a stalled accept loop fills the listen backlog and Windows
+/// then refuses new connections outright).
 pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::clone(&state_lock(&state).shutdown);
     let _ = listener.set_nonblocking(true);
     loop {
-        if state_lock(&state).shutdown_requested {
+        if shutdown.load(Ordering::SeqCst) {
             break;
         }
         match listener.accept() {
@@ -533,10 +575,9 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => thread::sleep(Duration::from_millis(50)),
+            // Only an empty queue sleeps; every pending connection is
+            // accepted back to back first.
+            Err(_) => thread::sleep(ACCEPT_POLL),
         }
     }
     // Drain in-flight handlers so a shutdown response (and any in-progress

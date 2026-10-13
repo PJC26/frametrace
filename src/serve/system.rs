@@ -312,9 +312,70 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         .as_deref()
         .map(|dir| index_generation(state, dir))
         .unwrap_or(0);
-    let guard = state_lock(state);
-    let case_dir = guard.case_dir.clone();
-    let byte_progress = guard.byte_progress.clone();
+    // Everything that touches the disk — the case DB (SQLite: reaping,
+    // schema check and a query, each of which can wait out the busy
+    // timeout while a running job writes) and the marks queue directory —
+    // runs AFTER the state lock is released. Holding the global lock across
+    // those reads stalled every other endpoint for seconds while a carve
+    // job was writing (measured: up to 4 s per /api/status poll).
+    let (mut body, case_dir, byte_progress, enrichment_step) = {
+        let guard = state_lock(state);
+        (
+            status_snapshot(&guard),
+            guard.case_dir.clone(),
+            guard.byte_progress.clone(),
+            guard.enrichment,
+        )
+    };
+    let progress = progress_json(case_dir.as_deref(), byte_progress.as_ref());
+    // UX-02: which phase-2 step is enriching the partial index. `done` /
+    // `total` are the running job's unit progress when the step reports
+    // one (files hashed), else the step position within the plan.
+    let enrichment = enrichment_step.map(|step| {
+        let (done, total, unit) = match (
+            progress.get("done").and_then(|v| v.as_u64()),
+            progress.get("total").and_then(|v| v.as_u64()),
+        ) {
+            (Some(done), Some(total)) if total > 0 => (done, total, "units"),
+            _ => (
+                step.stage.saturating_sub(1) as u64,
+                step.stages as u64,
+                "steps",
+            ),
+        };
+        serde_json::json!({
+            "step": step.step,
+            "label": step.label,
+            "stage": step.stage,
+            "stages": step.stages,
+            "done": done,
+            "total": total,
+            "unit": unit,
+        })
+    });
+    body["progress"] = progress;
+    body["enrichment"] = enrichment.unwrap_or(serde_json::Value::Null);
+    body["index_generation"] = index_generation.into();
+    // Marks accepted while a hash/make-review step held the case DB;
+    // applied automatically right after that step.
+    body["pending_marks"] = case_dir
+        .as_deref()
+        .map(pending_marks_count)
+        .unwrap_or(0)
+        .into();
+    // Save protocol v2: ids a queued import could not apply because the
+    // case had moved on (journaled in marks-pending/conflicts.jsonl, never
+    // dropped). `{count, ids}` with at most 50 ids; the viewer resolves
+    // them by saving the id again with a current base.
+    body["mark_conflicts"] = case_dir
+        .as_deref()
+        .map(super::jobs::pending_mark_conflicts)
+        .unwrap_or_else(|| serde_json::json!({"count": 0, "ids": []}));
+    body.to_string()
+}
+
+/// The in-memory part of /api/status, built under the state lock (no I/O).
+fn status_snapshot(guard: &JobState) -> serde_json::Value {
     let steps: Vec<&str> = guard.steps.iter().map(|step| step.as_str()).collect();
     let current = guard
         .steps
@@ -339,32 +400,6 @@ pub(crate) fn api_status(state: &SharedState) -> String {
             .as_ref()
             .map(|path| path.to_string_lossy().to_string())
     };
-    let progress = progress_json(case_dir.as_deref(), byte_progress.as_ref());
-    // UX-02: which phase-2 step is enriching the partial index. `done` /
-    // `total` are the running job's unit progress when the step reports
-    // one (files hashed), else the step position within the plan.
-    let enrichment = guard.enrichment.map(|step| {
-        let (done, total, unit) = match (
-            progress.get("done").and_then(|v| v.as_u64()),
-            progress.get("total").and_then(|v| v.as_u64()),
-        ) {
-            (Some(done), Some(total)) if total > 0 => (done, total, "units"),
-            _ => (
-                step.stage.saturating_sub(1) as u64,
-                step.stages as u64,
-                "steps",
-            ),
-        };
-        serde_json::json!({
-            "step": step.step,
-            "label": step.label,
-            "stage": step.stage,
-            "stages": step.stages,
-            "done": done,
-            "total": total,
-            "unit": unit,
-        })
-    });
     serde_json::json!({
         "ok": true,
         "app": "frametrace",
@@ -384,29 +419,14 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         "case_dir": opt(&guard.case_dir),
         "package_dir": opt(&guard.package_dir),
         "error": guard.error,
-        "progress": progress,
-        "enrichment": enrichment,
-        "index_generation": index_generation,
-        // Marks accepted while a hash/make-review step held the case DB;
-        // applied automatically right after that step.
-        "pending_marks": case_dir.as_deref().map(pending_marks_count).unwrap_or(0),
-        // Save protocol v2: ids a queued import could not apply because
-        // the case had moved on (journaled in marks-pending/conflicts.jsonl,
-        // never dropped). `{count, ids}` with at most 50 ids; the viewer
-        // resolves them by saving the id again with a current base.
-        "mark_conflicts": case_dir
-            .as_deref()
-            .map(super::jobs::pending_mark_conflicts)
-            .unwrap_or_else(|| serde_json::json!({"count": 0, "ids": []})),
         // UX-06: which kind of job holds `busy` (null when idle), and the
         // current/last background case job with its stage and outcome.
-        "job_kind": status_job_kind(&guard),
+        "job_kind": status_job_kind(guard),
         "job": guard.case_job.as_ref().map(case_job_json),
         // UX-09: clip exports run beside `busy`; running + recent ones.
         "clip_jobs": guard.clip_jobs.iter().rev().take(8).map(clip_job_json).collect::<Vec<_>>(),
         "clips_running": guard.clip_jobs.iter().filter(|job| job.state == "running").count(),
     })
-    .to_string()
 }
 
 /// `job_kind` for /api/status: the background case job when one runs,
@@ -551,13 +571,13 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
 /// a mid-pipeline exit cannot truncate audit/carve output; the UI offers a
 /// cancel-then-shutdown flow for that case.
 pub(crate) fn api_shutdown(state: &SharedState) -> String {
-    let mut guard = state_lock(state);
+    let guard = state_lock(state);
     let clips_running = guard.clip_jobs.iter().any(|job| job.state == "running");
     if guard.busy || clips_running {
         return "{\"ok\":false,\"running\":true,\"error\":\"작업이 진행 중입니다 — 중단 후 종료하십시오.\"}"
             .to_string();
     }
-    guard.shutdown_requested = true;
+    guard.request_shutdown();
     "{\"ok\":true}".to_string()
 }
 
