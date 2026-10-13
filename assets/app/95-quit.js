@@ -24,8 +24,9 @@ async function hPendingChanges() {
   try {
     const meta = await jget("/api/records-meta");
     const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
-    const drafts = caseId ? readLs(`ft.viewer.${caseId}.annotations.v1`) : null;
-    return drafts && typeof drafts === "object" ? Object.keys(drafts).length : 0;
+    // Per-id draft keys (ft.draft.<case>.<writer>.<id>) plus any legacy
+    // single-key drafts not yet migrated; null = storage unreadable.
+    return caseId ? (unsavedDraftCount(caseId) || 0) : 0;
   } catch (e) { return 0; }
 }
 $("hBtnQuit").addEventListener("click", async () => {
