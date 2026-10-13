@@ -237,8 +237,10 @@ try {
   // 7. CSV
   await page.locator('.card[data-id="vid_sound"] input[data-check]').check();
   await page.locator('.card[data-id="vid_none"] input[data-check]').check();
+  // Listen before clicking: a fast download can fire before the wait starts.
+  const dlWait = page.waitForEvent('download', { timeout: 15000 }).catch(() => null);
   await page.evaluate(() => document.getElementById('btnDownloadCsv').click());
-  const dl = await page.waitForEvent('download', { timeout: 5000 }).catch(() => null);
+  const dl = await dlWait;
   let csv = '';
   if (dl) csv = readFileSync(await dl.path(), 'utf8');
   const lines = csv.replace(/^﻿/, '').split(/\r?\n/);
