@@ -145,6 +145,7 @@ mod batch;
 mod case;
 mod doctor;
 mod forensic;
+mod join_audio;
 mod media;
 mod merge;
 
@@ -275,6 +276,7 @@ pub(crate) use doctor::{
 pub(crate) use forensic::{
     carve_file, import_e01, inspect_e01, inspect_image, recover_batch, recover_inode,
 };
+pub(crate) use join_audio::{JoinVideoArgs, join_video, measure_audio, split_ids};
 pub(crate) use media::{
     export_dav, export_hik, export_video, extract_telemetry, make_proxy, make_thumbnail,
     transcode_queue, validate_artifact,
