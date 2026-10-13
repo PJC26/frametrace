@@ -3,6 +3,7 @@ pub mod evidence;
 pub mod helpers;
 pub mod jobs;
 pub mod marks;
+pub mod merge_annotations;
 pub mod metrics;
 pub mod models;
 pub mod scan;

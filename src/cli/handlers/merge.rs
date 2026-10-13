@@ -31,16 +31,38 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<(), 
     println!("cases merged");
     println!("job: {} ({})", job.job_id, job.job_type);
     for source in &result.sources {
+        let notes = &source.annotations;
         println!(
-            "  {}: {} merged, {} duplicate(s)",
+            "  {}: {} merged, {} duplicate(s); annotations: {} mark(s) merged, {} tag set(s) merged, {} note(s) appended, {} mark conflict(s) kept target, {} history row(s) copied, {} unmapped",
             source.case_dir.display(),
             source.merged_records,
             source.duplicate_records,
+            notes.marks_merged,
+            notes.tags_merged,
+            notes.notes_appended,
+            notes.marks_conflicted,
+            notes.history_rows_copied,
+            notes.annotations_unmapped,
         );
     }
+    let totals = result.annotation_totals();
     println!("merged records: {}", result.merged_records);
     println!("duplicates marked: {}", result.duplicate_records);
     println!("total index records: {}", result.total_records);
+    println!("marks merged: {}", totals.marks_merged);
+    println!("tags merged: {}", totals.tags_merged);
+    println!("notes appended: {}", totals.notes_appended);
+    println!(
+        "marks conflicted (target kept, source mark preserved in history): {}",
+        totals.marks_conflicted
+    );
+    println!("history rows copied: {}", totals.history_rows_copied);
+    if totals.annotations_unmapped > 0 {
+        println!(
+            "warning: {} source record id(s) have annotations but no record in their source index; they were not merged (source case left unchanged)",
+            totals.annotations_unmapped
+        );
+    }
     println!(
         "label: {} (merged rows are copied index claims, not re-verified evidence)",
         crate::case_merge::LABEL

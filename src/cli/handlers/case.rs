@@ -469,16 +469,6 @@ fn inject_redaction_banner(html: String, redact_paths: bool) -> String {
     }
 }
 
-/// The review marks exactly as make-report embeds them (before path
-/// redaction). A DB read failure is an error, never an empty list: a
-/// sign-off bound to "no marks" because of a transient read failure would
-/// misstate what the examiner signed (finding 8).
-pub(crate) fn review_marks_json(case_dir: &Path) -> Result<String, String> {
-    crate::case_db::load_review_marks(case_dir)
-        .map(|rows| review_marks_json_from_rows(&rows))
-        .map_err(|err| format!("판독 마크를 읽지 못했습니다: {err}"))
-}
-
 /// Version of the content a finalize sign-off binds to. v3 adds each
 /// mark's IN-OUT range and the tag map to v2's id/status/time/examiner/
 /// note; a sign-off with an older `schema_version` cannot say whether
@@ -560,8 +550,61 @@ pub(crate) fn signoff_content_json_from(
     format!("{{\"schema\":{SIGNOFF_CONTENT_SCHEMA},\"marks\":[{marks}],\"tags\":{{{tags}}}}}")
 }
 
-/// [`review_marks_json`] over already-loaded rows, so verify-package can
-/// recompute the sign-off content digest from a packaged database.
+/// The review annotations the court report displays (I3): every mark with
+/// its IN-OUT range, plus the tag map (tags of records without a mark
+/// included). Shape:
+/// `{"marks":[{"id","status","marked_unix","examiner","note","range":{"in","out"}|null}],"tags":{"id":["tag",...]}}`.
+/// Marks keep the stored (id) order; each tag list is sorted and
+/// de-duplicated, ids without tags are omitted. Display only — sign-off
+/// digests use [`signoff_content_json_from`] / [`review_marks_json_from_rows`].
+pub(crate) fn report_annotations_json(
+    rows: &[case_db::ReviewMarkRow],
+    tags: &[crate::selection::TagEntry],
+) -> String {
+    let finite = |value: Option<f64>| value.filter(|v| v.is_finite());
+    let marks: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|mark| {
+            let range = mark.range.and_then(|span| {
+                let (start, end) = (finite(span.start), finite(span.end));
+                (start.is_some() || end.is_some())
+                    .then(|| serde_json::json!({"in": start, "out": end}))
+            });
+            serde_json::json!({
+                "id": mark.record_id,
+                "status": mark.status,
+                "marked_unix": mark.marked_unix,
+                "examiner": mark.examiner,
+                "note": mark.note,
+                "range": range,
+            })
+        })
+        .collect();
+    let mut tag_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for entry in tags {
+        tag_map
+            .entry(entry.id.as_str())
+            .or_default()
+            .extend(entry.tags.iter().map(String::as_str));
+    }
+    let tag_object: serde_json::Map<String, serde_json::Value> = tag_map
+        .into_iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(id, values)| (id.to_string(), serde_json::json!(values)))
+        .collect();
+    serde_json::json!({"marks": marks, "tags": tag_object}).to_string()
+}
+
+/// The marks JSON that make-report embedded before I3 (status / time /
+/// examiner / note per mark), so make-report and verify-package can
+/// recompute the legacy sign-off digest. A DB read failure upstream is an
+/// error, never an empty list (finding 8).
+///
+/// LEGACY DIGEST INPUT — keep byte-identical. Pre-v3 (schema 2) sign-offs
+/// recorded `sha256` of exactly this string; any change (field order,
+/// added range/tags) would flip every old sign-off to "changed". The report
+/// no longer displays it — see [`report_annotations_json`].
 pub(crate) fn review_marks_json_from_rows(rows: &[case_db::ReviewMarkRow]) -> String {
     let entries = rows
         .iter()
@@ -634,11 +677,17 @@ pub fn make_report(
     let batch_log =
         read_to_string(&case_dir.join("artifacts/logs/batch-log.jsonl")).unwrap_or_default();
     let scan_runs_json = read_scan_runs_json(case_dir);
-    let marks_json = review_marks_json(case_dir)?;
+    // One read of marks and tags feeds the displayed annotations and both
+    // sign-off digests, so the banner judges exactly what the table shows.
+    let mark_rows = crate::case_db::load_review_marks(case_dir)
+        .map_err(|err| format!("판독 마크를 읽지 못했습니다: {err}"))?;
+    let tag_rows = crate::case_db::load_review_tags(case_dir)
+        .map_err(|err| format!("판독 태그를 읽지 못했습니다: {err}"))?;
     let signoff_digests = report::SignoffDigests {
-        content: report::signoff_content_sha256(&signoff_content_json(case_dir)?),
-        legacy: report::signoff_content_sha256(&marks_json),
+        content: report::signoff_content_sha256(&signoff_content_json_from(&mark_rows, &tag_rows)),
+        legacy: report::signoff_content_sha256(&review_marks_json_from_rows(&mark_rows)),
     };
+    let annotations_json = report_annotations_json(&mark_rows, &tag_rows);
     let redact = |text: String| -> String {
         if redact_paths {
             crate::redact::redact_json_text(&text, case_dir)
@@ -657,7 +706,7 @@ pub fn make_report(
     let anomaly_log = redact(anomaly_log);
     let batch_log = redact(batch_log);
     let scan_runs_json = redact(scan_runs_json);
-    let marks_json = redact(marks_json);
+    let annotations_json = redact(annotations_json);
     let html = report::render_case_report(&report::ReportInputs {
         manifest_json: &manifest_json,
         index_json: &index_json,
@@ -670,7 +719,7 @@ pub fn make_report(
         anomaly_log_jsonl: &anomaly_log,
         batch_log_jsonl: &batch_log,
         scan_runs_json: &scan_runs_json,
-        marks_json: &marks_json,
+        marks_json: &annotations_json,
         redaction_applied: redact_paths,
     });
     // Finalize sign-off: the reviewer name recorded by the workstation (as
@@ -1117,4 +1166,112 @@ fn thumbnail_is_fresh(source: &Path, thumb: &Path) -> bool {
         return false;
     };
     thumb_time >= source_time
+}
+
+#[cfg(test)]
+mod annotation_json_tests {
+    use super::{report_annotations_json, review_marks_json_from_rows, signoff_content_json_from};
+    use crate::case_db::{RangeSpan, ReviewMarkRow};
+    use crate::selection::TagEntry;
+
+    /// Rows as an older case database holds them: a mark with every
+    /// optional field (incl. a range the legacy JSON never carried) and a
+    /// bare one.
+    fn fixture() -> (Vec<ReviewMarkRow>, Vec<TagEntry>) {
+        (
+            vec![
+                ReviewMarkRow {
+                    record_id: "vid_000001".into(),
+                    status: "important".into(),
+                    marked_unix: 1_700_000_000,
+                    record_path: Some("C:\\ev\\a.mp4".into()),
+                    examiner: Some("홍길동".into()),
+                    note: Some("line \"q\"\n<b>".into()),
+                    range: Some(RangeSpan {
+                        start: Some(1.5),
+                        end: Some(4.0),
+                    }),
+                },
+                ReviewMarkRow {
+                    record_id: "vid_000002".into(),
+                    status: "reviewed".into(),
+                    marked_unix: 5,
+                    ..Default::default()
+                },
+            ],
+            vec![
+                TagEntry {
+                    id: "vid_000001".into(),
+                    tags: vec!["보류".into(), "사고".into(), "보류".into()],
+                },
+                TagEntry {
+                    id: "vid_000009".into(),
+                    tags: vec!["<태그>".into()],
+                },
+                TagEntry {
+                    id: "vid_000010".into(),
+                    tags: vec![],
+                },
+            ],
+        )
+    }
+
+    /// I3 / review point 8: pre-v3 sign-offs digested exactly this string.
+    /// Both the bytes and the digest are pinned; changing either flips every
+    /// legacy sign-off to "changed".
+    #[test]
+    fn legacy_marks_json_and_digest_unchanged() {
+        let (rows, tags) = fixture();
+        let legacy = review_marks_json_from_rows(&rows);
+        assert_eq!(
+            legacy,
+            r#"[{"id":"vid_000001","status":"important","marked_unix":1700000000,"examiner":"홍길동","note":"line \"q\"\n<b>"},{"id":"vid_000002","status":"reviewed","marked_unix":5}]"#
+        );
+        assert_eq!(
+            crate::report::signoff_content_sha256(&legacy),
+            "31655e66b0196d4d1fc9d6fb10a921479af9b4f9ce978b015107da26b04ce3f2"
+        );
+        // The report's display JSON is a different string and never feeds
+        // either digest.
+        let display = report_annotations_json(&rows, &tags);
+        assert_ne!(display, legacy);
+        assert_ne!(display, signoff_content_json_from(&rows, &tags));
+    }
+
+    #[test]
+    fn report_annotations_json_carries_ranges_and_tag_map() {
+        let (rows, tags) = fixture();
+        let value: serde_json::Value =
+            serde_json::from_str(&report_annotations_json(&rows, &tags)).unwrap();
+        assert_eq!(
+            value["marks"][0],
+            serde_json::json!({
+                "id": "vid_000001", "status": "important", "marked_unix": 1_700_000_000u64,
+                "examiner": "홍길동", "note": "line \"q\"\n<b>",
+                "range": {"in": 1.5, "out": 4.0}
+            })
+        );
+        assert_eq!(value["marks"][1]["range"], serde_json::Value::Null);
+        assert_eq!(value["marks"][1]["examiner"], serde_json::Value::Null);
+        assert!(value["marks"][0].get("record_path").is_none());
+        // Sorted, de-duplicated; tag-only ids included; empty lists dropped.
+        assert_eq!(
+            value["tags"],
+            serde_json::json!({"vid_000001": ["보류", "사고"], "vid_000009": ["<태그>"]})
+        );
+        let one_sided = ReviewMarkRow {
+            range: Some(RangeSpan {
+                start: Some(2.0),
+                end: None,
+            }),
+            ..rows[1].clone()
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&report_annotations_json(&[one_sided], &[])).unwrap();
+        assert_eq!(
+            value["marks"][0]["range"],
+            serde_json::json!({"in": 2.0, "out": null})
+        );
+        assert_eq!(value["tags"], serde_json::json!({}));
+    }
 }
