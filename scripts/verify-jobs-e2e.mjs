@@ -258,6 +258,17 @@ try {
       document.getElementById(btn).click();
     }, [t, btn]);
   }
+  // Toasts vanish after ~3 s; keep every one shown from here on so a
+  // missing summary can be explained (e.g. "server unreachable", failure).
+  await v.evaluate(() => {
+    window.__e2eToasts = [];
+    const host = document.getElementById('toastHost');
+    if (host) {
+      new MutationObserver((muts) => {
+        for (const m of muts) for (const n of m.addedNodes) window.__e2eToasts.push(`${new Date().toISOString().slice(11, 23)} ${n.textContent}`);
+      }).observe(host, { childList: true });
+    }
+  });
   await v.evaluate(() => document.getElementById('btnExportClip').click());
   await v.waitForSelector('.modal.dlg input', { timeout: 5000 });
   await v.evaluate(() => document.querySelector('.modal.dlg button.primary').click());
@@ -266,6 +277,27 @@ try {
     return el ? el.innerText() : null;
   }, 120000, 300);
   console.log('exhibit summary:\n' + summary);
+  if (!summary) {
+    // Explain a missing summary instead of only failing on it: what the
+    // page shows, what the viewer thinks, and what the server reports.
+    const ui = await v.evaluate(() => {
+      const visible = (el) => !!el && !el.hidden && el.offsetParent !== null;
+      return {
+        dialogs: [...document.querySelectorAll('.modal, [role="dialog"], #dlgBackdrop')].filter(visible).map((el) => (el.id ? '#' + el.id + ': ' : '') + el.innerText.slice(0, 300)),
+        toasts: window.__e2eToasts || [],
+        toastsNow: [...document.querySelectorAll('#toastHost .toast')].map((el) => el.textContent),
+        saveState: window.FTViewer ? window.FTViewer.saveState() : 'no FTViewer',
+        exportBtn: (() => { const b = document.getElementById('btnExportClip'); return b ? { disabled: b.disabled, busy: b.getAttribute('aria-busy'), cls: b.className } : null; })(),
+      };
+    }).catch((e) => ({ evaluateError: String(e) }));
+    console.log('no-summary diagnostics (page):', JSON.stringify(ui, null, 1));
+    const st = await getJson('/api/status').catch((e) => ({ fetchError: String(e && e.cause ? e.cause.code || e.cause.message : e) }));
+    console.log('no-summary diagnostics (/api/status):', JSON.stringify({
+      busy: st.busy, phase: st.phase, job: st.job, job_kind: st.job_kind, clip_jobs: st.clip_jobs, clips_running: st.clips_running,
+      pending_marks: st.pending_marks, mark_conflicts: st.mark_conflicts, fetchError: st.fetchError,
+    }));
+    console.log('server log tail:\n' + server.log().split('\n').slice(-20).join('\n'));
+  }
   const shaMatch = summary && summary.match(/SHA-256:\s*([0-9a-f]{64})/);
   const pathMatch = summary && summary.match(/(?:클립 파일|Clip file):\s*(.+)/);
   check('exhibit summary shows a SHA-256', shaMatch);
@@ -290,7 +322,20 @@ try {
   }
 
   // ---- 6. finalize packages the viewer together with its data bundle ----------
-  const fin = await postJson('/api/finalize', { examiner: 'e2e' });
+  // Finalize refuses (correctly) while any job holds `busy` — including a
+  // viewer mark save, which takes busy and refreshes the report. Wait for
+  // an idle server and a settled viewer instead of racing them; a refusal
+  // that still hits a just-started save is retried until the deadline.
+  const finStart = Date.now();
+  const fin = await until(async () => {
+    const idle = await getJson('/api/status');
+    const saved = await page.evaluate(() => { const s = window.FTViewer.saveState(); return !s || s === 'saved'; });
+    if (idle.busy || idle.clips_running || !saved) return null;
+    const res = await postJson('/api/finalize', { examiner: 'e2e' });
+    return res && res.ok === false && /진행 중/.test(res.error || '') ? null : res;
+  }, 60000, 250) || await postJson('/api/finalize', { examiner: 'e2e' });
+  const marksDuring = importMarks.filter((r) => r.at >= finStart).length;
+  if (marksDuring) console.log(`finalize waited for ${marksDuring} viewer mark save(s)`);
   check('finalize succeeds', fin && fin.ok === true, JSON.stringify(fin).slice(0, 300));
   if (fin && fin.ok) {
     const pkgDir = fin.package_dir || join(caseDir, fin.package_url || '');

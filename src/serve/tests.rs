@@ -232,11 +232,11 @@ fn shutdown_refuses_while_busy_then_accepts() {
     let refused = parse(&api_shutdown(&state));
     assert_eq!(refused["ok"].as_bool(), Some(false));
     assert_eq!(refused["running"].as_bool(), Some(true));
-    assert!(!state_lock(&state).shutdown_requested);
+    assert!(!state_lock(&state).shutdown_requested());
     state_lock(&state).busy = false;
     let granted = parse(&api_shutdown(&state));
     assert_eq!(granted["ok"].as_bool(), Some(true));
-    assert!(state_lock(&state).shutdown_requested);
+    assert!(state_lock(&state).shutdown_requested());
 }
 
 #[test]

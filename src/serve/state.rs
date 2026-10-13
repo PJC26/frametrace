@@ -98,7 +98,10 @@ pub(crate) struct JobState {
     /// Set by POST /api/shutdown; the accept loop polls this flag and exits
     /// once in-flight connections drain so the workstation can actually be
     /// closed from the UI (the windowed launcher has no console to close).
-    pub(crate) shutdown_requested: bool,
+    /// An atomic shared with `serve_on`, which clones it once and then polls
+    /// it without ever taking the state lock: accepting connections must not
+    /// depend on how long some handler holds `JobState`.
+    pub(crate) shutdown: Arc<AtomicBool>,
     /// Random per-process nonce echoed by /api/status and written to the
     /// user-private instance file. `find_running_server` requires this
     /// marker so a spoofed `"app":"frametrace"` string on the probe port
@@ -204,6 +207,15 @@ pub(crate) struct IndexFingerprint {
 }
 
 impl JobState {
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             phase: "idle",
@@ -218,7 +230,7 @@ impl JobState {
             cancel_requested: false,
             byte_progress: None,
             token: None,
-            shutdown_requested: false,
+            shutdown: Arc::new(AtomicBool::new(false)),
             instance: new_instance_id(),
             index_cache: None,
             live_cache: None,
@@ -335,11 +347,63 @@ pub(crate) struct LiveCache {
 
 pub(crate) type SharedState = Arc<Mutex<JobState>>;
 
-pub(crate) fn state_lock(state: &SharedState) -> MutexGuard<'_, JobState> {
-    match state.lock() {
+/// Lock waits / holds at or above this are reported when
+/// `FRAMETRACE_DEBUG_LOCKS=1` (diagnostics for UI stalls; silent by default).
+const SLOW_LOCK: Duration = Duration::from_millis(200);
+
+fn debug_locks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FRAMETRACE_DEBUG_LOCKS").as_deref() == Ok("1"))
+}
+
+/// Guard returned by [`state_lock`]. Derefs to `JobState`; with
+/// `FRAMETRACE_DEBUG_LOCKS=1` it reports (stderr) the caller of any lock
+/// held for [`SLOW_LOCK`] or longer — every endpoint and the job threads
+/// share this one mutex, so a long hold freezes the whole UI.
+pub(crate) struct StateGuard<'a> {
+    guard: MutexGuard<'a, JobState>,
+    since: Option<(std::time::Instant, &'static std::panic::Location<'static>)>,
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = JobState;
+    fn deref(&self) -> &JobState {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut JobState {
+        &mut self.guard
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some((since, caller)) = self.since {
+            let held = since.elapsed();
+            if held >= SLOW_LOCK {
+                eprintln!("[locks] state lock held {held:?} at {caller}");
+            }
+        }
+    }
+}
+
+#[track_caller]
+pub(crate) fn state_lock(state: &SharedState) -> StateGuard<'_> {
+    let debug = debug_locks().then(|| (std::time::Instant::now(), std::panic::Location::caller()));
+    let guard = match state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
-    }
+    };
+    let since = debug.map(|(asked, caller)| {
+        let waited = asked.elapsed();
+        if waited >= SLOW_LOCK {
+            eprintln!("[locks] state lock waited {waited:?} at {caller}");
+        }
+        (std::time::Instant::now(), caller)
+    });
+    StateGuard { guard, since }
 }
 
 /// `<config>/frametrace/workstation-session.json` — remembers the last

@@ -305,7 +305,7 @@ fn import_marks_oversize_body_is_413() {
             .unwrap()
             .is_empty()
     );
-    state_lock(&state).shutdown_requested = true;
+    state_lock(&state).request_shutdown();
     let _ = std::fs::remove_dir_all(case_dir);
 }
 
@@ -1244,5 +1244,5 @@ fn media_is_confined_to_the_registered_source() {
         let link = get(&source.join("link.mp4"));
         assert!(link.starts_with("HTTP/1.1 403"), "{link}");
     }
-    state_lock(&state).shutdown_requested = true;
+    state_lock(&state).request_shutdown();
 }
