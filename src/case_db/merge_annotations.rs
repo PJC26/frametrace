@@ -294,17 +294,28 @@ pub fn merged_note_segment(source_case: &str, original_id: &str, note: &str) -> 
 /// Hook for the per-record revision table (`review_annotation_rev`, schema
 /// v7, track A of docs/FIX_PLAN_R1_2026-10-13.md).
 ///
-/// TODO(integration, after track A merges): inside this same transaction,
-/// `created` ids get revision 1 and existing ids `revision + 1`
-/// (`updated_unix = now`, `actor = NULL`, `client_id = NULL`), so the
-/// rollback test also covers the revision rows (§7 point 10). Until then
-/// this is intentionally a no-op.
+/// Bumps the record's annotation revision inside the merge transaction so
+/// open viewers see the merged value as a server-side change (a stale
+/// client save then comes back as a conflict instead of overwriting it).
+/// A record with no revision row yet starts at 1; an existing row (live or
+/// tombstone) goes up by one. Merges have no client: actor/client_id NULL.
 fn bump_annotation_revision(
-    _tx: &Transaction<'_>,
-    _record_id: &str,
+    tx: &Transaction<'_>,
+    record_id: &str,
     _created: bool,
-    _now: i64,
+    now: i64,
 ) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO review_annotation_rev (record_id, revision, updated_unix, actor, client_id)
+         VALUES (?1, 1, ?2, NULL, NULL)
+         ON CONFLICT(record_id) DO UPDATE SET
+             revision = review_annotation_rev.revision + 1,
+             updated_unix = excluded.updated_unix,
+             actor = NULL,
+             client_id = NULL",
+        rusqlite::params![record_id, now],
+    )
+    .map_err(|err| format!("failed to bump annotation revision for {record_id}: {err}"))?;
     Ok(())
 }
 
@@ -686,6 +697,9 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].action, "merge");
         assert_eq!(outcome.changed_ids, vec![("vid_000003".to_string(), true)]);
+        // The merge bumps the revision in the same transaction (new id → 1).
+        let revisions = load_review_revisions(&target).unwrap();
+        assert_eq!(revisions.get("vid_000003").copied(), Some(1));
         for dir in [none, v5, target] {
             let _ = fs::remove_dir_all(dir);
         }
