@@ -377,18 +377,80 @@ try {
         await page.keyboard.press('x').catch(() => {});
         await page.locator('#query').fill('');
 
-        // 11. U8: a 401 from the status poll is "authorization expired —
-        //     reopen", never "server down"; the next good poll clears it.
-        await page.route('**/api/status*', (route) => route.fulfill({ status: 401, contentType: 'application/json', body: '{"ok":false,"error":"unauthorized"}' }));
-        const authUp = await until(() => page.evaluate(() => {
-          const b = document.getElementById('serverBanner');
-          return !b.hidden && /브라우저 인증이 만료/.test(b.textContent) ? b.textContent : null;
-        }), 15000);
-        check('401: banner says authorization expired with a reopen action (not "server down")', !!authUp && !/연결 끊김/.test(authUp) && /다시 열기/.test(authUp), String(authUp));
+        // 10b. F5: Esc in a hosted viewer text field blurs the field only —
+        //      the shell's Esc handler leaves its toasts / popovers alone.
+        await page.evaluate(() => {
+          const el = document.createElement('div');
+          el.className = 'h-toast';
+          el.textContent = 'f5-shell-toast';
+          document.getElementById('hToastBox').appendChild(el);
+          // eslint-disable-next-line no-undef
+          toasts.push({ el, sticky: true, timer: 0 });
+        });
+        await page.locator('#query').focus();
+        await page.keyboard.press('Escape');
+        const f5 = await page.evaluate(() => ({ shellToasts: toasts.length, toastInDom: !!document.querySelector('#hToastBox .h-toast'), focusInQuery: document.activeElement?.id === 'query' }));
+        check('Esc in a viewer text field blurs it and does not dismiss a shell toast', f5.shellToasts === 1 && f5.toastInDom && !f5.focusInQuery, JSON.stringify(f5));
+        await page.evaluate(() => dismissNewestToast());
+
+        // 11. U8, modelled on the real server: the viewer's SAVE (POST
+        //     /api/import-marks) is refused with 401 while GET /api/status
+        //     keeps answering 200 (no-token mode: a GET needs no proof; the
+        //     usual cause is another instance's cookie). The banner must stay
+        //     through good status polls and refused retries, never say
+        //     "server down" / "expired", and go only when a save gets through.
+        const banner = () => page.evaluate(() => { const b = document.getElementById('serverBanner'); return { shown: !b.hidden, text: b.textContent, title: b.querySelector('b').textContent, btnHidden: document.getElementById('btnServerRetry').hidden }; });
+        let statusOk = 0, saves401 = 0;
+        const onResp = (r) => { if (/\/api\/status/.test(r.url()) && r.status() === 200) statusOk += 1; };
+        page.on('response', onResp);
+        await page.route('**/api/import-marks*', (route) => { saves401 += 1; return route.fulfill({ status: 401, contentType: 'application/json', body: '{"ok":false,"error":"unauthorized"}' }); });
+        await page.locator('#recordGrid .card').first().click();
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.keyboard.press('2');
+        const saveAuthUp = await until(async () => { const b = await banner(); return b.shown && /저장이 인증 오류로 거부/.test(b.title) ? b : null; }, 20000);
+        check('401 save: banner says the save was refused (auth), with a reload action', !!saveAuthUp && /다른 FrameTrace 창/.test(saveAuthUp.text) && /새로 고침/.test(saveAuthUp.text) && !/연결 끊김|만료/.test(saveAuthUp.text), JSON.stringify(saveAuthUp));
+        const okAtUp = statusOk, savesAtUp = saves401;
+        await until(() => statusOk >= okAtUp + 2 && saves401 >= savesAtUp + 1, 30000);
+        const stillUp = await banner();
+        check('401 save: banner stays through good /api/status polls and refused retries', stillUp.shown && /저장이 인증 오류/.test(stillUp.title) && statusOk >= okAtUp + 2 && saves401 >= savesAtUp + 1, JSON.stringify({ stillUp: stillUp.title, statusOk: statusOk - okAtUp, retries: saves401 - savesAtUp }));
+        await page.unroute('**/api/import-marks*');
+        const saveAuthGone = await until(async () => !(await banner()).shown, 70000);
+        const restored = (await banner()).title;
+        check('401 save: a save that gets through clears the banner and restores its normal face', !!saveAuthGone && /연결 끊김/.test(restored), restored);
+        page.off('response', onResp);
+
+        // Token mode, cookie gone: GET /api/status AND GET / answer 401 —
+        // [이 창 새로 고침] must not reload into a dead page: guidance instead.
+        const deny = (route) => route.fulfill({ status: 401, contentType: 'application/json', body: '{"ok":false,"error":"unauthorized"}' });
+        await page.route('**/api/status*', deny);
+        const readUp = await until(async () => { const b = await banner(); return b.shown && /인증 오류로 거부/.test(b.title) ? b : null; }, 15000);
+        check('401 status: banner shows the auth face (not "server down")', !!readUp && !/연결 끊김/.test(readUp.title), JSON.stringify(readUp));
+        const rootUrl = new URL('/', page.url()).href;
+        await page.route(rootUrl, deny);
+        let authLoads = 0;
+        const onLoad2 = () => { authLoads += 1; };
+        page.on('load', onLoad2);
+        await page.click('#btnServerRetry');
+        const gone = await until(async () => { const b = await banner(); return /FrameTrace 앱 창/.test(b.text) && b.btnHidden ? b : null; }, 8000);
+        check('401 + no cookie: reload button gives "reopen from the app window" guidance, no dead reload', !!gone && authLoads === 0, JSON.stringify({ gone, authLoads }));
+        await page.unroute(rootUrl);
+        page.off('load', onLoad2);
+        // Cookie still there (the usual token-mode case): the same button
+        // loads "/" (the stripped ?token= is not needed — the cookie is).
+        const [nav] = await Promise.all([
+          page.waitForEvent('load', { timeout: 20000 }).catch(() => null),
+          (async () => {
+            // A fresh auth face (the button is shown again when the face
+            // re-renders after a good poll); wait for the button, then click.
+            await page.unroute('**/api/status*');
+            await until(async () => !(await banner()).shown, 15000);
+            await page.route('**/api/status*', deny);
+            await until(async () => { const b = await banner(); return b.shown && !b.btnHidden ? b : null; }, 15000);
+            await page.click('#btnServerRetry');
+          })(),
+        ]);
+        check('401 + cookie present: the reload button loads "/" again', !!nav && new URL(page.url()).pathname === '/', page.url());
         await page.unroute('**/api/status*');
-        const authGone = await until(() => page.evaluate(() => document.getElementById('serverBanner').hidden), 15000);
-        const restored = await page.evaluate(() => document.getElementById('serverBanner').querySelector('b').textContent);
-        check('401: the next good poll clears the banner and restores its normal face', !!authGone && /연결 끊김/.test(restored), restored);
       }
       await context.close();
     }

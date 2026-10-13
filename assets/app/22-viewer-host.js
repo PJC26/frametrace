@@ -59,9 +59,18 @@ function hostViewerBridge() {
   // A join started inside the viewer (FTViewer "derived-job"): the shell
   // polls fast while it runs and offers '새 데이터 반영' once it is done,
   // even when the 5 s idle poll never saw it running (31-progress.js).
-  // A save refused with 401 (U8): the shell banner says "authorization
-  // expired — reopen", not "server down" (40-status.js noteAuthExpired).
-  api.on("error", e => { if (e.detail && e.detail.auth && typeof noteAuthExpired === "function") noteAuthExpired(); });
+  // A save refused with 401 (U8): the shell banner says "save refused —
+  // close the other FrameTrace window and reload", not "server down"
+  // (40-status.js). It stays while the viewer's saves keep failing — a good
+  // /api/status proves nothing in no-token mode — and goes once a save gets
+  // through: save-state carries auth on every change of that state.
+  api.on("error", e => { if (e.detail && e.detail.auth && typeof noteAuthExpired === "function") noteAuthExpired("save"); });
+  api.on("save-state", e => {
+    const d = e.detail || {};
+    if (d.auth && typeof noteAuthExpired === "function") noteAuthExpired("save");
+    else if (d.auth === false && typeof noteAuthOk === "function") noteAuthOk("save");
+  });
+  api.on("destroyed", () => { if (typeof noteAuthOk === "function") noteAuthOk("save"); });
   api.on("derived-job", e => { if (typeof noteViewerDerivedJob === "function") noteViewerDerivedJob(e.detail || {}); });
   api.on("destroyed", () => hostViewerStore({ mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, live: false, liveGeneration: null, canReload: true }));
 }

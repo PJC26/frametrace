@@ -83,15 +83,38 @@ function viewerApplyViewState(view) {
   journalImport(view.journal);
   return true;
 }
+// sessionStorage outlives the page (it stays readable in this tab until
+// it is closed): the stash carries no note text. Journal changes keep ids,
+// fields and mark / tag / range values only; a change of the note field is
+// dropped (Ctrl+Z of a note does not survive a standalone reload).
+function stashJournal(journal) {
+  if (!journal) return null;
+  const strip = side => {
+    if (!side || typeof side !== "object") return side;
+    const copy = { ...side };
+    delete copy.note;
+    return copy;
+  };
+  const plain = stack => (Array.isArray(stack) ? stack : []).map(entry => ({
+    label: entry.label,
+    activeBefore: entry.activeBefore,
+    changes: (entry.changes || [])
+      .map(change => ({ id: change.id, fields: (change.fields || []).filter(f => f !== "note"), before: strip(change.before), after: strip(change.after) }))
+      .filter(change => change.fields.length)
+  })).filter(entry => entry.changes.length);
+  return { undo: plain(journal.undo), redo: plain(journal.redo) };
+}
 function viewerStashViewState() {
   let view = null;
-  try { view = viewerViewState(); } catch (e) { return; }
+  try { view = viewerViewState(); view.journal = stashJournal(view.journal); } catch (e) { return; }
   try { sessionStorage.setItem(VIEW_STASH_KEY, JSON.stringify(view)); return; } catch (e) { /* quota: retry without the journal */ }
   try { view.journal = null; sessionStorage.setItem(VIEW_STASH_KEY, JSON.stringify(view)); } catch (e) { /* storage blocked: a plain reload */ }
 }
 function viewerTakeStashedViewState() {
   let raw = null;
-  try { raw = sessionStorage.getItem(VIEW_STASH_KEY); sessionStorage.removeItem(VIEW_STASH_KEY); } catch (e) { raw = null; }
+  try { raw = sessionStorage.getItem(VIEW_STASH_KEY); } catch (e) { raw = null; }
+  // Removed on every read, whether or not it is used (F8: no stale copy).
+  try { sessionStorage.removeItem(VIEW_STASH_KEY); } catch (e) { /* storage blocked */ }
   if (!raw) return null;
   try { return JSON.parse(raw); } catch (e) { return null; }
 }
@@ -264,6 +287,7 @@ FTViewer._attach({
     return count;
   },
   liveState: () => liveStateDetail(),
+  debugStats: () => ({ filterComputes: filterComputeCount, activeId: state.activeId }),
   popout: () => openPlayerWindow(),
   toast: (message, kind) => (kind === "error" ? toastError(message) : toast(message)),
   beforeDestroy() {
@@ -279,7 +303,9 @@ const viewerSummaryHook = window.__frametraceSummary;
 applyLayout();
 // U4: a reload brings back what the examiner was looking at (hosted: the
 // state FTViewer.reload() captured; standalone: the stashed copy).
-const restoredView = opts.restore || viewerTakeStashedViewState();
+// The stash is always consumed (a hosted mount must not leave one behind).
+const stashedView = viewerTakeStashedViewState();
+const restoredView = opts.restore || stashedView;
 const viewRestored = restoredView ? viewerApplyViewState(restoredView) : false;
 render();
 if (viewRestored && Number.isFinite(restoredView.scrollTop) && restoredView.scrollTop > 0 && els.recordGrid) {

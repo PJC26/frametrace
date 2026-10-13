@@ -228,6 +228,7 @@ window.FTViewer = {
   popout() → Window|null,            // 70-player.js openPopupPlayer(): 영상+판독 창
   closePopout(), isPoppedOut() → boolean,
   toast(message, kind = "info") → void,     // §6.5 단일 토스트 호스트
+  _debugStats() → { filterComputes, activeId } | null,       // 내부용(하네스): 필터+정렬 전체 재계산 횟수(메모 미스)와 활성 id — verify-virtual-grid U4/U7
   _whenSaveSettled(timeoutMs = 15000) → Promise<boolean>,   // 내부용(22-viewer-host 언마운트): 진행 중인 마크 저장 요청이 끝나면 true, 시간 초과면 false. 응답이 이 마운트의 드래프트를 정리한 뒤 destroy() 하기 위함
   on(event, fn, opts), off(event, fn)       // EventTarget; fn(CustomEvent) — detail는 아래 표
 };
@@ -252,7 +253,7 @@ window.FTViewer = {
 |---|---|---|---|
 | `ready` | `{ total, live, generation }` | init 완료(렌더 1회 후) | 22-viewer-host(T5), 01-store(T2) |
 | `records` | `{ total, byKind, byStatus, generation }` | 데이터 적재/재적재 후 | 31-progress(T3: 칩 "n/m") |
-| `save-state` | `{ state, pending, queued }` | `renderSaveState()` 마다 | 01-store, 40-finalize(T4), 23-popout(T2) |
+| `save-state` | `{ state, pending, queued, conflicts, auth }` (`auth`: 마지막 저장 시도가 401로 거부됨 — 저장이 통과하면 false) | `renderSaveState()` 마다 | 01-store, 40-finalize(T4), 23-popout(T2) |
 | `dirty` | `{ count }` | `markReviewDirty()/clearReviewDirty()` | 01-store, 40-finalize |
 | `live-state` | `{ live, generation, total, canReload }` | 마운트 데이터의 색인 세대(`live`=부분 색인으로 적재) · 지금 `reload()`가 받아들여질지(미저장 없음). 값이 바뀔 때만 | 22-viewer-host → `viewer.live/liveGeneration/canReload`; 31-progress·32-jobs가 `/api/status`의 `index_generation`과 비교해 칩 "보강 완료"·`btnJobReload` "새 데이터 반영 (n건)" 표시. **호스트에서 색인·보강 상태의 단일 출처는 셸의 `/api/status` 폴링**이며 뷰어는 `#ft-live-chip`을 만들지 않고 상태를 폴링하지 않는다 |
 | `selection` | `{ ids: string[], count }` | 선택 변경 | 01-store |
@@ -262,7 +263,7 @@ window.FTViewer = {
 | `request-popout` | `{}` | 뷰어 `btnPopPlayer` 클릭 | 23-popout(T2: 셸이 `popout()`를 대신 호출하고 본 창 영상을 접음) |
 | `popout` | `{ open: boolean }` | 팝업 창 열림/닫힘 감지 | 23-popout, 01-store |
 | `toast` | `{ message, kind }` | 뷰어 `toast()` 호출 | 20-net(T2) — 호스트 모드에서만 셸이 표시 |
-| `error` | `{ message, detail, stage: "load"|"save"|"export", auth? }` | 로더 실패·저장 실패. `auth: true` = 서버가 401로 거부(쿠키 없음·만료, U8) | 01-store(배너), 31-progress, 22-viewer-host(`auth`면 `noteAuthExpired()`) |
+| `error` | `{ message, detail, stage: "load"|"save"|"export", auth? }` | 로더 실패·저장 실패. `auth: true` = 서버가 401로 거부(쿠키 없음·다른 인스턴스의 쿠키, U8). 401 재시도마다 다시 보냄(`repeat: true`, 토스트는 처음 한 번) | 01-store(배너), 31-progress, 22-viewer-host(`auth`면 `noteAuthExpired()`) |
 | `derived-job` | `{ kind: "join", id, state: "started"|"running"|"done"|"failed"|"cancelled", started_unix }` | 뷰어 안에서 시작한 파생 작업(이어붙이기)의 시작·상태 변화(80-review.js `emitDerivedJob`) | 22-viewer-host → 31-progress `noteViewerDerivedJob`: 실행 중엔 빠르게 폴링, `done`이면 5 s 유휴 폴링이 실행을 못 봤어도 '새 데이터 반영'을 제안 |
 | `destroyed` | `{}` | destroy 완료 | 22-viewer-host |
 
@@ -291,7 +292,7 @@ const FTStore = {
     panels:   { jobs: false, finalize: false, project: false, tools: false, help: false },
     popout:   { open: false, writer: "main" },           // writer는 항상 "main"(팝아웃은 writer가 아님)
     viewer:   { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, locale: "ko", theme: "light", live: false, liveGeneration: null, canReload: true },
-    server:   { instance: "", lost: false, auth: false, failures: 0 },   // auth: lost의 원인이 401(브라우저 인증 만료, U8)
+    server:   { instance: "", lost: false, auth: false, failures: 0 },   // lost = 배너가 보임, auth = 배너가 인증 오류 모습(401, U8) — §11.5
     env:      null,                                      // /api/env 응답
   },
   get(path) , set(patch /* 얕은 병합, 키별 */) , on("change", fn /* ({keys:Set<string>}) */), off(),
@@ -518,7 +519,7 @@ const FTStore = {
 | `F6` | 영역 순환: 상단 띠 → 레일 → 그리드 → 미디어 → 선택 바 → (시트) | 셸 97-shell.js(신규, 선택) | 미구현 시 생략 가능 — 계약상 "권장" |
 
 충돌 규칙:
-0. **IME·CapsLock (U6)**: 뷰어 전역 핸들러(80-review.js)와 팝아웃 플레이어는 `shortcutKey(event)`로 키를 읽는다. `event.key`가 라틴 1글자면 그대로(AZERTY 등 배열 존중), 한글 자모(`"ㅓ"`)·`"Process"`·`"Unidentified"`면 `event.code`(`KeyJ`→`j`, `Digit1`→`1`, `Comma`/`Period`/`BracketLeft`/`BracketRight`, Shift+`Slash`→`?`)로 정한다. 글자의 대소문자는 **Shift만** 따른다(CapsLock+j = j, Shift+j = J 셔틀) — 예전 70-player.js의 capture 정규화 리스너는 이것으로 대체됐다. Ctrl+Z/Y/A/D도 같은 함수로 읽는다. 입력칸 포커스·AltGr·Alt 조합 무시 규칙은 그대로다. 뷰어 모달(`.modal-backdrop:not([hidden])`)이 열려 있으면 Esc 외의 뷰어 단축키는 동작하지 않는다. 하네스: verify-player-keys(`key:"ㅓ"`/`"Process"` + `code:"KeyJ"` 등).
+0. **IME·CapsLock (U6)**: 뷰어 전역 핸들러(80-review.js)와 팝아웃 플레이어는 `shortcutKey(event)`로 키를 읽는다. `event.key`가 **비라틴 문자**(유니코드 Script = Hangul·Cyrillic·Greek·Armenian·Georgian·Hebrew·Arabic·Thai·Devanagari·Bengali·Tamil·Han·Hiragana·Katakana·Bopomofo 한 글자)이거나 `"Process"`·`"Unidentified"`일 때만 `event.code`(`KeyJ`→`j`, `Digit1`→`1`, `Comma`/`Period`/`BracketLeft`/`BracketRight`, Shift+`Slash`→`?`)로 정한다. 그 밖(라틴 문자 — 악센트 포함 `é à ü ě š ı å`, AZERTY `&` 등 기호)은 `event.key` 그대로라 Digit2 위의 `é`는 `2`가 아니고 아무 동작도 하지 않는다. 글자의 대소문자는 **Shift만** 따른다(CapsLock+j = j, Shift+j = J 셔틀) — 예전 70-player.js의 capture 정규화 리스너는 이것으로 대체됐다. Ctrl+Z/Y/A/D·Ctrl+B(40-grid, 레일)·Ctrl+K(명령 팔레트)도 같은 함수로 읽는다(러시아어 배열 Ctrl+`л` = Ctrl+K). Ctrl+B도 뷰어 모달이 열려 있으면 동작하지 않는다. 입력칸 포커스·AltGr·Alt 조합 무시 규칙은 그대로다. 뷰어 모달(`.modal-backdrop:not([hidden])`)이 열려 있으면 Esc 외의 뷰어 단축키는 동작하지 않는다. 하네스: verify-player-keys(`key:"ㅓ"`/`"Process"`/`"о"` + `code:"KeyJ"` 등, 음성 검사 `{key:"é",code:"Digit2"}`·`{key:"&",code:"Digit1"}` 무동작, Ctrl+`л`/`и`).
 0. 셸 `hDialogOpen()`은 셸 대화상자·경로 선택기 외에 **뷰어 모달**(`#ftViewer .modal-backdrop:not([hidden])`: 단축키 시트, 뷰어 대화상자, 명령 팔레트)도 포함한다(U12) — 그 위에서 Alt+P/J/R·Esc는 셸이 처리하지 않는다(verify-layout 9번).
 1. 뷰어 전역 핸들러는 `isTypingTarget(activeElement)` 외에 **`activeElement.closest('[data-keys="off"]')`가 있으면 return**(T5가 80-review.js:474·70-player.js:377·40-grid.js:983 세 곳에 추가). `data-keys="off"`는 `#inputCard`, `.h-sheet`, `.h-pop`, `.h-modal-backdrop`, `#hPopoutNote`에 T2가 붙인다. 상단 띠 버튼은 keys-off가 아니다(시트를 닫고 opener로 돌아와도 `j/k`가 즉시 동작).
 2. 셸 핸들러는 Alt+문자·Esc만 가진다. 뷰어는 Alt 조합을 무시(80-review.js:490)하므로 이중 발동이 없다.
@@ -616,8 +617,8 @@ const FTStore = {
 
 ### 11.1 리로드가 보기를 보존 (U4)
 - 보존 대상: `query`(입력칸 원문 포함), `kind`, `status`, `chip`, `calMonth`, `sortBy`, `groupBy`, `dateFrom/To`, `recType`, `audio`, `chipsExpanded`, `pageSize`, `currentPage`, `collapsedGroups`, `selectedIds`, `activeId`, `#recordGrid.scrollTop`, Undo/Redo 저널(95-init.js `viewerViewState` / `viewerApplyViewState`).
-- 전달: 호스트는 `reload()`가 destroy 전에 `impl.viewState()`를 받아 `init({ restore })`로 넘긴다. standalone(페이지 리로드·레거시 `ft-reload`)은 `sessionStorage["ft.viewer.<case>.reloadView"]`에 한 번 저장하고 다음 부팅이 읽고 지운다(용량 초과면 저널 없이 재시도).
-- 걸러내기: 사라진 레코드 id는 선택·활성에서 빠진다. 저널은 맨 위(다음 Ctrl+Z/Y)부터 내려가며 가상 현재값에 재생해, **그 레코드가 여전히 그 항목이 남긴 값**(undo: `after`, redo: `before`; 마크는 상태만, 메모·태그·구간은 정규화 비교)일 때만 남긴다. 다른 창·서버가 바꾼 필드는 그 필드의 더 깊은 항목까지 버린다 — 오래된 Ctrl+Z가 남의 변경을 덮지 않는다.
+- 전달: 호스트는 `reload()`가 destroy 전에 `impl.viewState()`를 받아 `init({ restore })`로 넘긴다. standalone(페이지 리로드·레거시 `ft-reload`)은 `sessionStorage["ft.viewer.<case>.reloadView"]`에 한 번 저장하고 다음 부팅이 **항상** 읽고 지운다(호스트 모드 부팅도 지움, 용량 초과면 저널 없이 재시도). 이 사본에는 메모 원문이 없다 — 저널의 메모 필드 변경은 빼고(standalone 리로드 뒤 메모 Ctrl+Z는 없음) 마크·태그·구간 값과 id만 남긴다.
+- 걸러내기: 사라진 레코드 id는 선택·활성에서 빠진다. 저널은 맨 위(다음 Ctrl+Z/Y)부터 내려가며 가상 현재값에 재생해, **그 레코드가 여전히 그 항목이 남긴 값**(undo: `after`, redo: `before`; 마크는 상태만, 메모·태그·구간은 정규화 비교)일 때만 남긴다. 다른 창·서버가 바꾼 필드는 그 필드의 더 깊은 항목까지 버린다 — 오래된 Ctrl+Z가 남의 변경을 덮지 않는다. 부팅 뒤 죽은 창의 드래프트를 넘겨받으면(`adoptDeadWriters`) 그 id의 저널 항목은 버린다. 세션 안에서도 Undo/Redo는 필드마다 현재값이 항목이 남긴 값(undo: `after`, redo: `before`)과 같을 때만 되돌리고, 다르면(다른 곳에서 바뀜) 그 필드를 건드리지 않고 항목에서 빼며 토스트 "다른 곳에서 바뀐 항목은 되돌리지 않았습니다"(redo: "…다시 적용하지 않았습니다")를 보인다.
 - 저장 상태와 무관: 리로드는 미저장이 없을 때만 일어나고(`viewerReloadBlocker`), 드래프트·dirty·충돌은 평소 부팅처럼 저장소에서 수화된다. 보존 코드는 `state.drafts`·`dirtyIds`·`conflictIds`를 건드리지 않으며, 되살린 저널의 Undo/Redo는 일반 경로(`touchAnnotation` → 드래프트 → 저장)를 탄다. 하네스: verify-viewer-undo(standalone), verify-virtual-grid(스크롤·검색), verify-layout 10번(호스트).
 
 ### 11.2 드래프트 키·생존 확인·저장 대기 (save protocol v2 정리)
@@ -630,15 +631,22 @@ const FTStore = {
 
 ### 11.4 포트(원점)가 바뀐 경우의 드래프트 (U9) — 한계 포함
 - 브라우저 저장소(localStorage)는 원점(scheme+host+**port**)마다 따로다. 브라우저 모드는 8477이 막히면 8478…으로, WebView2 창은 **실행마다 새 포트**(src/shell.rs `reserve_port`, 포트 0)를 쓴다 → 이전 실행의 저장 안 된 드래프트는 새 원점에서 보이지 않고, 어떤 브라우저 API로도 다른 원점의 저장소를 읽을 수 없다.
-- 클라이언트 최선책: 쿠키는 포트와 무관하게 호스트 단위로 공유되므로, 이 원점에 그 케이스의 드래프트가 있는 동안 쿠키 `ft_draft_ports=<port>.<case hash>-…`(FNV-1a 8자리, 케이스 id·경로 원문 없음, `SameSite=Strict`, 60일, 최대 24개; 서버는 읽지 않음)에 표식을 둔다(90-sync.js `noteOriginDrafts`, flush마다). 그 원점에서 케이스 드래프트가 모두 사라지면 표식을 지운다. 부팅 때 **같은 케이스·다른 포트** 표식이 있으면 알림 행에 "다른 주소(127.0.0.1:PORT)의 브라우저 저장소에 남아 있을 수 있음 — 같은 주소로 다시 열면 그 창이 복원"을 `role=status`로 보이고, [알림 닫기]가 그 표식을 지운다.
+- 클라이언트 최선책: 쿠키는 포트와 무관하게 호스트 단위로 공유되므로, 이 원점에 그 케이스의 드래프트가 있는 동안 쿠키 `ft_draft_ports=<port>.<case hash>-…`(FNV-1a 8자리, 케이스 id·경로 원문 없음, `SameSite=Strict`, 60일, 최대 24개; 서버는 읽지 않음)에 표식을 둔다(90-sync.js `noteOriginDrafts`, flush마다). 그 원점에서 케이스 드래프트가 모두 사라지면 표식을 지운다. 드래프트가 있는 동안에는 flush와 5 s 하트비트마다 쿠키를 다시 읽어 표식이 없으면 다시 쓴다(다른 포트 창의 [알림 닫기]·동시 쓰기로 지워져도 복구 — "이미 썼음"을 캐시하지 않음). 저장소 검사는 이 케이스의 드래프트 이름공간(`ft.draft.<case id>.`, 다른 포트에서 다시 열면 복원될 바로 그 키)을, 표식 해시는 case id + 케이스 폴더를 쓴다. 부팅 때 **같은 케이스·다른 포트** 표식이 있으면 알림 행에 "다른 주소(127.0.0.1:PORT)의 브라우저 저장소에 남아 있을 수 있음 — 같은 주소로 다시 열면 그 창이 복원"을 `role=status`로 보이고, [알림 닫기]가 그 표식을 지운다.
 - 한계: "있을 수 있음"까지만 말한다 — 그 저장소가 이후 지워졌는지는 알 수 없다. 이 빌드 이후의 창만 표식을 쓴다. `127.0.0.1`과 `localhost`는 다른 호스트라 서로 보이지 않는다. 쿠키가 막힌 브라우저에서는 알림이 없다. 드래프트를 실제로 되살리려면 그 포트로 서버를 다시 띄워야 한다(WebView2 창은 포트를 고를 수 없음 — 실행 간 고정 선호 포트는 트랙 A(Rust) 몫, 미해결).
 
-### 11.5 401 = 브라우저 인증 만료 (U8)
-- 셸 `readJson`(20-net.js)은 401이면 `{ok:false, status:401, auth:true, error:"브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오"}`를 돌려주고 `noteAuthExpired()`(40-status.js)를 부른다. 상태 폴링의 401도 같다(3회 실패 대기 없이 즉시). 배너는 "서버 연결 끊김" 대신 "브라우저 인증이 만료되었습니다" + [페이지 다시 열기](= 새로 고침: 무토큰 모드에선 GET이 nonce 쿠키를 다시 심음; 토큰 모드는 워크스테이션 창이 `?token=`으로 연다). 다음 정상 폴링에서 원래 모습으로 돌아간다. 스토어 `server.auth`.
-- 뷰어 저장의 401: 저장 상태·토스트가 같은 문구(i18n `save.authExpired`), 드래프트는 그대로, 자동 재시도는 계속. `error` 이벤트 `auth:true` → 호스트 배너. 로더(99-loader.js)의 401도 같은 문구, 라이브 칩은 "상태 확인 실패" 대신 인증 안내.
+### 11.5 401 = 인증 오류로 거부 (U8)
+- 원인: 서버는 살아 있으나 이 창의 HttpOnly 쿠키(`ft_nonce`/`ft_token`, 트랙 A가 포트별 이름 `ft_nonce_<port>`/`ft_token_<port>`로 바꾸는 중 — JS는 쿠키를 읽지 않으므로 무관)가 없거나 같은 컴퓨터의 다른 FrameTrace 인스턴스 것으로 바뀜. 그래서 "만료"·"다시 열기" 대신 "다른 FrameTrace 창이 열려 있으면 닫고 이 창을 새로 고치십시오"라고 말한다.
+- 셸 `readJson(r, kind)`(20-net.js): 401이면 `{ok:false, status:401, auth:true, error}`와 `noteAuthExpired(kind)`, 성공하면 `noteAuthOk(kind)`. kind: GET(jget·jgetSoft) = `"read"`, POST(jpost) = `"write"`. 뷰어 저장(22-viewer-host)은 `"save"`: `error`(auth:true, 재시도마다)·`save-state`(auth:true)면 실패, `save-state` auth:false(저장 통과)·`destroyed`면 해제.
+- 배너(40-status.js)는 실패 중인 kind 집합으로 그린다 — 무토큰 모드에선 GET /api/status가 증명 없이 200이므로 **정상 폴링이 저장 인증 실패를 지우지 않는다**. 제목: save/write 실패면 "저장이 인증 오류로 거부되었습니다", read만이면 "요청이 인증 오류로 거부되었습니다". 연결 끊김이 우선이고, 다시 연결되면 인증 모습이 돌아온다. 스토어 `server.lost`(배너 보임)·`server.auth`(인증 모습).
+- [이 창 새로 고침]: 먼저 GET `/`을 확인 — 200이면 `location.assign("/")`(무토큰: nonce 재발급, 토큰 모드: `?token=`은 지워졌지만 쿠키로 열림), 401/403이면(토큰 쿠키 자체가 없음) 새로 고치지 않고 "FrameTrace 앱 창에서 다시 여십시오" 안내 + 버튼 숨김.
+- 뷰어 저장의 401: 저장 상태·토스트 i18n `save.authExpired` = "저장이 인증 오류로 거부되었습니다 — 같은 컴퓨터에서 다른 FrameTrace 창이 열려 있으면 닫고 이 창을 새로 고치십시오", 드래프트는 그대로, 자동 재시도는 계속. 로더(99-loader.js)의 401·라이브 칩은 "인증 오류로 … 거부 — FrameTrace 앱 창에서 다시 여십시오".
+- 하네스: verify-layout 11번(실서버 모델: 저장 POST 401 + /api/status 200 → 배너가 폴링·재시도 동안 유지, 저장 통과 시 해제; status 401 + `/` 401 → 안내, `/` 200 → 다시 로드), verify-viewer-undo(토스트 문구).
+
+### 11.5a Esc와 포커스 (F5·F7)
+- 셸의 문서 Esc 핸들러(97-shell.js)는 대상이 호스트 뷰어 안의 텍스트 필드(input·textarea·select·contenteditable)면 아무것도 하지 않는다 — 뷰어가 필드를 blur한다. 포커스가 토스트 안이면 그 토스트를 닫는다(셸 `.h-toast`는 셸, 뷰어 `.toast`는 뷰어). 닫은 뒤 포커스: 남은 가장 새 토스트의 버튼 → (셸) 열린 결과물 시트 → 뷰어 활성 카드(`FTViewer.focus()`/`viewerFocus`) → `#main`.
 
 ### 11.6 기타
-- U7: 마크·태그 칩 필터의 메모 키에 `annotationGen`(30-records.js `bumpAnnotations`: `touchAnnotation`, 드래프트 재생, 수화, 서버 값 적용 때 증가)을 넣어, 그 필터에서도 j/k는 필터·정렬을 다시 계산하지 않는다.
+- U7(하네스: verify-virtual-grid가 `_debugStats().filterComputes`로 j/k 300회 동안 재계산 0회, 마크 1회 = 재계산 증가를 확인): 마크·태그 칩 필터의 메모 키에 `annotationGen`(30-records.js `bumpAnnotations`: `touchAnnotation`, 드래프트 재생, 수화, 서버 값 적용 때 증가)을 넣어, 그 필터에서도 j/k는 필터·정렬을 다시 계산하지 않는다.
 - U10: 요약 보고서는 `case_id`를 제목·머리줄 모두 이스케이프하고 파일 이름은 `safeFileName`. 재생 속도는 저장된 레이아웃 값을 0.25–4 범위의 수로 정규화하고, 팝아웃 인라인 스크립트에는 `RATES`에 있는 값만 `jsLit`으로 넣는다.
 - U14: 가상 그리드는 `#recordGrid[role=grid][aria-rowcount] > .vspacer[role=rowgroup] > .vrow|.group-header[role=row][aria-rowindex] > [role=gridcell]`(axe `aria-required-children`/`-parent` 통과, verify-virtual-grid).
-- 촬영 시각 표기(트랙 B 보고서와 일치): 파일 이름의 시각은 **기기 시계의 시각(시간대 미상)** — 상세·요약 보고서에 "(기기 기록 시각, 시간대 미상)", 날짜만이면 "(파일 이름의 날짜만 · 기기 기록, 시간대 미상)"; 내보내기(JSON·CSV)는 오프셋 없는 `YYYY-MM-DDTHH:mm:ss`(Z 없음)와 JSON `rec_time_basis`(`device-clock-naive`|`device-clock-date`|`file-mtime`). 파일 수정 시각처럼 실제 순간인 값만 `UTC±HH:MM`(이 컴퓨터 기준)과 "(추정)"을 붙인다. 요약 보고서 생성 시각도 `UTC±HH:MM`. 그리드 카드의 짧은 시각(공간 부족)은 표식 없이 그대로다.
+- 촬영 시각 표기(트랙 B 보고서와 일치): 파일 이름의 시각은 **기기 시계의 시각(시간대 미상)** — 표기는 파싱한 필드(`record.recWall`)에서 만들고 이 컴퓨터의 Date로 만들지 않는다(DST로 없는 시각 02:30이 03:30으로 밀리지 않음; 그리드 카드도 같음, verify-viewer-dialogs가 `timezoneId: Europe/Berlin` 2026-03-29 02:30:00으로 확인) — 상세·요약 보고서에 "(기기 기록 시각, 시간대 미상)", 날짜만이면 "(파일 이름의 날짜만 · 기기 기록, 시간대 미상)"; 내보내기(JSON·CSV)는 오프셋 없는 `YYYY-MM-DDTHH:mm:ss`(Z 없음)와 JSON `rec_time_basis`(`device-clock-naive`|`device-clock-date`|`file-mtime`). 파일 수정 시각처럼 실제 순간인 값만 `UTC±HH:MM`(이 컴퓨터 기준)과 "(추정)"을 붙인다. 요약 보고서 생성 시각도 `UTC±HH:MM`. 그리드 카드의 짧은 시각(공간 부족)은 표식 없이 그대로다.

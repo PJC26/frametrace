@@ -372,6 +372,16 @@ document.addEventListener("keydown", e => {
   // inside), popover, newest toast. Dialogs and the viewer handle theirs
   // first and mark the event handled.
   if (e.key !== "Escape" || e.defaultPrevented || hDialogOpen()) return;
+  const target = e.target && e.target.nodeType === 1 ? e.target : document.activeElement;
+  const inViewer = !!(target && typeof target.closest === "function" && target.closest("#hViewerHost"));
+  // A text field (or select) of the hosted viewer: its Esc blurs the field
+  // first (viewer handler) — the shell must not close or dismiss anything.
+  if (inViewer && isTextField(target)) return;
+  // Focus inside a toast: Esc dismisses THAT toast (the topmost layer the
+  // examiner is on). A viewer toast is the viewer's own (80-review.js).
+  if (inViewer && target.closest(".toast")) return;
+  const shellToast = target && typeof target.closest === "function" ? target.closest(".h-toast") : null;
+  if (shellToast && dismissToastEl(shellToast)) { e.preventDefault(); return; }
   if (FTStore.state.panels.finalize) {
     const sheet = $("hFinalizeSheet");
     if (sheet.querySelector && sheet.querySelector("[aria-busy='true']")) return;

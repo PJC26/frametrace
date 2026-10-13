@@ -118,6 +118,41 @@ try {
     await key({ key: 'ㅋ', code: 'KeyZ', ctrlKey: true });
     check('IME Ctrl+KeyZ undoes', /실행 취소|Undone/.test(await toastText()), await toastText());
     await clearToasts();
+    // Cyrillic is a non-Latin script too: Russian "о" on KeyJ navigates.
+    const r0 = await active();
+    await key({ key: 'о', code: 'KeyJ' });
+    check('Russian "о" (KeyJ) navigates like j', (await active()) !== r0);
+    await key({ key: 'л', code: 'KeyK' });
+    // Latin letters (accented ones included) keep key-based behaviour: a
+    // layout's own character on a digit / letter key is not a shortcut.
+    const markChips = () => page.evaluate(() => document.querySelectorAll('#recordGrid .card .mark-chip').length);
+    const n0 = await markChips(), a0 = await active();
+    for (const [k, c] of [['é', 'Digit2'], ['&', 'Digit1'], ['à', 'Digit0'], ['ü', 'BracketLeft'], ['ě', 'Digit2'], ['š', 'Digit3'], ['ı', 'KeyI'], ['å', 'BracketLeft']]) {
+      await key({ key: k, code: c });
+    }
+    await page.waitForTimeout(100);
+    check('Latin/accented keys on digit keys mark nothing (é Digit2, AZERTY & Digit1, ě, š, à)', (await markChips()) === n0 && (await active()) === a0 && !/적용했습니다|Applied/.test(await toastText()), `${n0} -> ${await markChips()} ${await toastText()}`);
+    await clearToasts();
+    // Ctrl+K / Ctrl+B through the same mapping: Russian Ctrl+"л" opens the
+    // palette, Ctrl+"и" toggles the rail; Ctrl+B does nothing under a modal.
+    const paletteOpen = () => page.evaluate(() => { const b = document.getElementById('cmdPalette'); return !!b && !b.hidden; });
+    await page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'л', code: 'KeyK', ctrlKey: true, bubbles: true, cancelable: true })));
+    check('Russian Ctrl+"л" (KeyK) opens the command palette', await paletteOpen());
+    await page.keyboard.press('Escape');
+    check('Esc closes the palette', !(await paletteOpen()));
+    await page.evaluate(() => document.activeElement?.blur());
+    const railState = () => page.evaluate(() => document.getElementById('ftViewer').className);
+    const rail0 = await railState();
+    await key({ key: 'и', code: 'KeyB', ctrlKey: true });
+    const rail1 = await railState();
+    check('Russian Ctrl+"и" (KeyB) toggles the rail', rail1 !== rail0, `${rail0} -> ${rail1}`);
+    await key({ key: 'и', code: 'KeyB', ctrlKey: true }); // back
+    await page.keyboard.press('Shift+Slash');
+    const rail2 = await railState();
+    await key({ key: 'b', code: 'KeyB', ctrlKey: true });
+    check('Ctrl+B does nothing while a viewer modal is open', (await railState()) === rail2 && await page.evaluate(() => !document.getElementById('shortcutsModal').hidden));
+    await page.keyboard.press('Escape');
+    await clearToasts();
     await page.evaluate(() => document.activeElement?.blur());
   }
 

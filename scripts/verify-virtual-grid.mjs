@@ -183,45 +183,52 @@ try {
 
   // U7: under a mark filter j/k reuse the filtered list (memo keyed on the
   // annotation generation) instead of filtering + sorting every record per
-  // key. Compared with the same presses under no filter: the mark filter
-  // must not be several times slower.
-  const timeJ = (n) => page.evaluate(async (count) => {
-    const t0 = performance.now();
+  // key. Counted, not timed: FTViewer._debugStats().filterComputes is the
+  // number of full filter + sort runs (memo misses) — j/k must add none.
+  const stats = () => page.evaluate(() => FTViewer._debugStats());
+  const pressJK = (n) => page.evaluate((count) => {
+    document.activeElement?.blur();
     for (let i = 0; i < count; i++) document.dispatchEvent(new KeyboardEvent('keydown', { key: i % 2 ? 'k' : 'j', bubbles: true }));
-    return performance.now() - t0;
   }, n);
-  const plainMs = await timeJ(300);
   await page.evaluate(() => document.querySelector('[data-chip="mark:none"]')?.click());
   await page.waitForTimeout(300);
   const chipOn = await page.evaluate(() => document.querySelector('[data-chip="mark:none"]')?.getAttribute('aria-pressed'));
-  const markMs = await timeJ(300);
-  check('mark filter active for the timing run', chipOn === 'true', String(chipOn));
-  check('j/k under a mark filter cost about the same as unfiltered (memoised)', markMs < plainMs * 3 + 300, `plain ${plainMs.toFixed(0)} ms, mark:none ${markMs.toFixed(0)} ms`);
-  // A mark still updates the filtered list (the memo key moves with it).
+  check('mark filter active for the counting run', chipOn === 'true', String(chipOn));
+  const s0 = await stats();
+  await pressJK(300);
+  const s1 = await stats();
+  check('stats hook present and j/k moved the active card', !!s0 && Number.isFinite(s0.filterComputes) && s1.activeId !== null, JSON.stringify({ s0, s1 }));
+  check('300 j/k under a mark filter run the full filter 0 times (memoised)', s1.filterComputes === s0.filterComputes, `${s0.filterComputes} -> ${s1.filterComputes}`);
+  // A mark still updates the filtered list (the memo key moves with it) —
+  // and that is exactly one recompute, which proves the counter counts.
   const beforeMark = await page.evaluate(() => document.getElementById('resultCount').textContent);
   await page.evaluate(() => { document.activeElement?.blur(); document.dispatchEvent(new KeyboardEvent('keydown', { key: '1', bubbles: true })); });
   await page.waitForTimeout(200);
   const afterMark = await page.evaluate(() => document.getElementById('resultCount').textContent);
+  const s2 = await stats();
   check('marking under mark:none drops the record from the filtered list', Number(afterMark) === Number(beforeMark) - 1, `${beforeMark} -> ${afterMark}`);
+  check('a mark recomputes the filter (counter is live)', s2.filterComputes > s1.filterComputes, `${s1.filterComputes} -> ${s2.filterComputes}`);
   await page.evaluate(() => document.querySelector('[data-chip=""]')?.click());
   await page.waitForTimeout(200);
 
   // U4: a reload keeps the view — scroll, active card, filter — (standalone
   // FTViewer.reload() = page reload with the view stashed for the next boot).
-  await page.evaluate(() => { const g = document.getElementById('recordGrid'); g.scrollTop = Math.floor(g.scrollHeight / 3); });
-  await page.waitForTimeout(200);
-  await page.locator('#recordGrid .card').nth(3).click();
-  await page.evaluate(() => document.activeElement?.blur());
+  // Search first, then pick a card inside the result (an active card the
+  // search hides would be vacuous), then scroll away from the top.
   await page.locator('#query').fill('cam3');
   await page.waitForTimeout(400);
+  await page.evaluate(() => { const g = document.getElementById('recordGrid'); g.scrollTop = Math.floor(g.scrollHeight / 3); });
+  await page.waitForTimeout(300);
+  await page.locator('#recordGrid .card').nth(3).click();
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.waitForTimeout(200);
   const viewBefore = await page.evaluate(() => ({
-    scroll: document.getElementById('recordGrid').scrollTop,
-    active: document.querySelector('#recordGrid .card.active')?.dataset.id,
+    active: FTViewer._debugStats().activeId,
+    activeCard: document.querySelector('#recordGrid .card.active')?.dataset.id,
     count: document.getElementById('resultCount').textContent,
   }));
-  await page.evaluate(() => { const g = document.getElementById('recordGrid'); g.scrollTop = Math.floor(g.scrollHeight / 4); });
-  await page.waitForTimeout(200);
   const scrollBefore = await page.evaluate(() => document.getElementById('recordGrid').scrollTop);
+  check('U4 precondition: grid scrolled (> 0) and a searched card is active', scrollBefore > 0 && !!viewBefore.active && viewBefore.active === viewBefore.activeCard && Number(String(viewBefore.active).slice(4)) % 7 === 3, JSON.stringify({ scrollBefore, viewBefore }));
   await Promise.all([
     page.waitForEvent('load', { timeout: 60_000 }),
     page.evaluate(() => FTViewer.reload({ keepUnsaved: false, reason: 'test' })),
@@ -230,12 +237,14 @@ try {
   await page.waitForTimeout(400);
   const viewAfter = await page.evaluate(() => ({
     scroll: document.getElementById('recordGrid').scrollTop,
-    active: document.querySelector('#recordGrid .card.active')?.dataset.id || window.__none,
-    activeState: document.querySelector('#recordGrid .card[aria-current]')?.dataset.id,
+    active: FTViewer._debugStats().activeId,
+    activeCard: document.querySelector('#recordGrid .card.active')?.dataset.id,
     count: document.getElementById('resultCount').textContent,
     query: document.getElementById('query').value,
   }));
   check('reload keeps the search text and filtered result', viewAfter.query === 'cam3' && viewAfter.count === viewBefore.count, JSON.stringify({ viewBefore, viewAfter }));
+  check('reload restores the active card (state and painted card)', viewAfter.active === viewBefore.active && viewAfter.activeCard === viewBefore.active, JSON.stringify({ viewBefore, viewAfter }));
+  check('reload stash is consumed on boot', await page.evaluate(() => { try { return !Object.keys(sessionStorage).some((k) => k.endsWith('.reloadView')); } catch { return false; } }));
   check('reload keeps the grid scroll position', Math.abs(viewAfter.scroll - scrollBefore) < 2, `${scrollBefore} -> ${viewAfter.scroll}`);
   await page.locator('#query').fill('');
   await page.waitForTimeout(300);

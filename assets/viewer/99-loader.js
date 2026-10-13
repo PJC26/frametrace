@@ -148,7 +148,7 @@ async function loaderFetchJson(url) {
     // The server is up but refused this page's proof (U8): no "server
     // error" wording — the way back is reopening from the workstation.
     const error = ViewerLoadError(
-      "브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오. / Browser authorization expired — reopen it from the workstation window.",
+      "인증 오류로 요청이 거부되었습니다 — FrameTrace 앱 창에서 다시 여십시오(같은 컴퓨터의 다른 FrameTrace 창은 닫으십시오). / Request refused (authorization error) — reopen from the FrameTrace app window (close any other FrameTrace window on this computer).",
       `${url}: HTTP 401`
     );
     error.status = 401;
@@ -449,7 +449,7 @@ function startLiveIndexChip(live, root, signal) {
     try {
       const res = await fetch("/api/status", { cache: "no-store" });
       if (res.status === 401) {
-        note.textContent = "브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오. / Browser authorization expired — reopen from the workstation window.";
+        note.textContent = "인증 오류로 상태 확인이 거부되었습니다 — FrameTrace 앱 창에서 다시 여십시오. / Status refused (authorization error) — reopen from the FrameTrace app window.";
         timer = setTimeout(tick, 15000);
         return;
       }
@@ -465,7 +465,7 @@ function startLiveIndexChip(live, root, signal) {
           if (page && page.ok && Number.isFinite(Number(page.total))) newTotal = Number(page.total);
         } catch (e) { /* the count is a hint; the status line still updates */ }
       }
-      if (note.textContent.startsWith("상태 확인 실패") || note.textContent.startsWith("브라우저 인증")) note.textContent = "";
+      if (note.textContent.startsWith("상태 확인 실패") || note.textContent.startsWith("인증 오류")) note.textContent = "";
     } catch (err) {
       failures += 1;
       note.textContent = `상태 확인 실패 (${failures}회) — 재시도 중 / Status check failed, retrying`;

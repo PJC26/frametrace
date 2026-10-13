@@ -356,8 +356,9 @@ fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},
 };
 v.addEventListener("ended",function(){nav(1,true);});
 var NAV={ArrowUp:1,ArrowDown:1,ArrowLeft:1,ArrowRight:1,Home:1,End:1,PageUp:1,PageDown:1," ":1,Enter:1,Tab:1};
+var NLS=new RegExp(${jsLit(NON_LATIN_SCRIPT_RE.source)},"u");
 function skey(e){var k=String(e.key||""),c=String(e.code||""),m;
-if(!(k.length===1&&k.charCodeAt(0)<128)&&(k.length===1||k==="Process"||k==="Unidentified")){
+if(k==="Process"||k==="Unidentified"||NLS.test(k)){
 if((m=/^Key([A-Z])$/.exec(c)))k=m[1].toLowerCase();else if((m=/^(?:Digit|Numpad)([0-9])$/.exec(c))&&!e.shiftKey)k=m[1];}
 if(/^[a-z]$/i.test(k))k=e.shiftKey?k.toUpperCase():k.toLowerCase();return k;}
 document.addEventListener("keydown",function(e){
