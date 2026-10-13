@@ -75,17 +75,19 @@ function searchHaystack(record) {
 // Filter+sort memo. Every input of a non-annotation filter is either an
 // immutable record field or one of the state fields in the key, so the
 // result can be reused until one of them changes. Chips that read marks,
-// notes or tags ("marked:any", "mark:*", "tag:*") depend on annotation
-// state that several modules mutate directly, so those are recomputed on
-// every call rather than risk serving a stale list.
+// notes or tags ("marked:any", "mark:*", "tag:*") also key on
+// annotationGen (30-records.js), which every write of state.marks / notes /
+// tags bumps (touchAnnotation, draft replay, hydration, server values), so
+// j/k under a mark or tag filter reuses the list instead of filtering and
+// sorting every record on each key press (U7).
 let filteredMemo = { key: null, list: null };
 // Every FILTER input (no sort): the facet memo keys on this alone, so a
 // new filter dimension added here invalidates both memos and a sort change
 // never recomputes the facet counts (no positional slicing of the key).
 function filterStateKey() {
   const chip = state.chip || "";
-  if (chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:")) return null;
-  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.audio].join("\u0001");
+  const annotated = chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:");
+  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.audio, annotated ? "a" + annotationGen : ""].join("\u0001");
 }
 function filterMemoKey() {
   const base = filterStateKey();
@@ -492,13 +494,17 @@ function groupedModel(filtered, cols, rowH) {
   };
 }
 
-function vgRowElement(row) {
+// `index` is the row's 0-based position in the model: aria-rowindex lets a
+// screen reader report "row 412 of 2000" although only a window of rows is
+// in the DOM (U14; the grid carries aria-rowcount).
+function vgRowElement(row, index) {
   if (row.type === "h") {
     const holder = document.createElement("div");
     holder.innerHTML = groupHeaderHtml(row.key, row.kind, row.count, row.collapsed);
     const el = holder.firstElementChild;
     el.style.top = row.top + "px";
     el.style.height = row.h + "px";
+    el.setAttribute("aria-rowindex", String(index + 1));
     return el;
   }
   const html = [];
@@ -506,6 +512,7 @@ function vgRowElement(row) {
   const el = document.createElement("div");
   el.className = "vrow";
   el.setAttribute("role", "row");
+  el.setAttribute("aria-rowindex", String(index + 1));
   el.style.top = row.top + "px";
   el.style.height = row.h + "px";
   el.innerHTML = html.join("");
@@ -535,7 +542,7 @@ function paintVirtual(full) {
   for (let i = first; i <= last; i++) {
     let el = vg.painted.get(i);
     if (!el) {
-      el = vgRowElement(vg.model.get(i));
+      el = vgRowElement(vg.model.get(i), i);
       vg.painted.set(i, el);
     }
     const expectedNext = prev ? prev.nextSibling : vg.spacer.firstChild;
@@ -630,9 +637,13 @@ function renderVirtualGrid(filtered) {
     grid.textContent = "";
     spacer = document.createElement("div");
     spacer.className = "vspacer";
+    // grid > rowgroup > row > gridcell: the spacer is a structural element
+    // of the ARIA grid, not a generic wrapper (axe aria-required-children).
+    spacer.setAttribute("role", "rowgroup");
     grid.appendChild(spacer);
   }
   grid.classList.add("virtual");
+  grid.setAttribute("aria-rowcount", String(model.rowCount));
   grid.style.setProperty("--vcols", String(cols));
   spacer.style.height = model.total + "px";
   vg = { filtered, model, cols, spacer, painted: new Map(), first: 0, last: -1 };
@@ -694,6 +705,7 @@ function renderGrid(filtered) {
   }
   vg = null;
   els.recordGrid.classList.remove("virtual");
+  els.recordGrid.removeAttribute("aria-rowcount");
 
   const groupCounts = new Map();
   if (state.groupBy !== "none") {

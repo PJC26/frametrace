@@ -287,6 +287,7 @@ var manualQueued = false;   // "Apply to case" was pressed while one was in flig
 var saveRevision = 0;       // bumps on every change; detects edits mid-flight
 var saveFailures = 0;
 var saveError = "";
+var saveAuthExpired = false; // the last attempt was refused with 401 (U8)
 var queuedOnServer = 0;     // marks the server holds in its phase-2 queue (durable, not yet in the DB)
 var queuedIds = new Set();  // ids this window sent into that queue (reconciled after the drain)
 var conflictChecks = 0;     // server conflict lookups in flight: "saved" waits for them
@@ -489,6 +490,7 @@ function annotationText(a) {
 }
 // Writes an annotation value into the in-memory maps (no draft, no save).
 function applyAnnotationToState(id, a) {
+  if (typeof bumpAnnotations === "function") bumpAnnotations();
   if (a && a.status && a.status !== "noted") state.marks[id] = { status: a.status, marked_unix: Number.isFinite(a.marked_unix) ? a.marked_unix : Math.floor(Date.now() / 1000) };
   else delete state.marks[id];
   state.notes[id] = (a && a.note) || "";
@@ -1032,6 +1034,7 @@ async function syncMarksNow() {
     }
     saveFailures = 0;
     saveError = "";
+    saveAuthExpired = false;
     saveRetryAt = 0;
     // Edits made while the request was in flight (or ids the server
     // skipped) are still dirty: push again instead of forgetting them.
@@ -1040,12 +1043,26 @@ async function syncMarksNow() {
   } else {
     const firstFailure = saveFailures === 0;
     saveFailures += 1;
-    saveError = String(result.error || "?");
+    // 401: the server is up but refused this browser's proof (ft_token /
+    // ft_nonce cookie missing or stale, U8) — not "server down". The edits
+    // stay in the drafts and the retry keeps running (a page reload that
+    // re-plants the cookie lets the next attempt through).
+    const auth = Number(result.status) === 401;
+    const authChanged = auth !== saveAuthExpired;
+    saveAuthExpired = auth;
+    saveError = auth ? t("save.authExpired") : String(result.error || "?");
     const delay = autosaveRetryDelay(saveFailures);
     saveRetryAt = Date.now() + delay;
     scheduleAutosave(delay);
-    if (firstFailure) toast(tf("toast.saveFailed", { err: saveError }));
-    if (firstFailure) FTViewer._emit("error", { message: tf("toast.saveFailed", { err: saveError }), detail: saveError, stage: "save" });
+    if (auth) {
+      if (authChanged || firstFailure) {
+        toastError(saveError);
+        FTViewer._emit("error", { message: saveError, detail: String(result.error || "HTTP 401"), stage: "save", auth: true });
+      }
+    } else {
+      if (firstFailure) toast(tf("toast.saveFailed", { err: saveError }));
+      if (firstFailure) FTViewer._emit("error", { message: tf("toast.saveFailed", { err: saveError }), detail: saveError, stage: "save" });
+    }
   }
   scheduleDraftFlush();
   notifySaveSettled();
@@ -1223,7 +1240,7 @@ document.getElementById("btnDownloadCsv").addEventListener("click", () => {
     (state.tags[record.id] || []).join("; "),
     record.sha256,
     record.size ?? "",
-    isoTime(record.recTime),
+    recTimeText(record, { iso: true }),
     record.channel || "",
     record.recType || "",
     record.inode ?? "",
@@ -1259,7 +1276,7 @@ document.getElementById("btnSummary").addEventListener("click", () => {
       `<td>${e(record.status)}</td><td>${e(mark ? markLabel(mark) : (memo ? t("mark.noted") : ""))}</td>` +
       `<td>${e((state.tags[record.id] || []).join(", "))}</td>` +
       `<td class="mono">${e(record.sha256 && record.sha256 !== "-" ? record.sha256 : "")}</td>` +
-      `<td>${fmtSize(record.size)}</td><td>${e(isoTime(record.recTime))}</td>` +
+      `<td>${fmtSize(record.size)}</td><td>${e(recTimeText(record))}</td>` +
       `<td>${e(warn)}${record.note && record.note !== "-" ? `<br>${e(record.note)}` : ""}${memo ? `<br><b>${t("report.memo")}</b> ${e(memo)}` : ""}</td>` +
       `<td class="mono">${e(record.originalPath || record.path || "")}</td></tr>`;
   }).join("\n");
@@ -1280,7 +1297,7 @@ th,td{border:1px solid #d8dedb;padding:6px 8px;text-align:left;vertical-align:to
 th{background:#f2f5f4} .mono{font-family:Consolas,monospace;font-size:11px;word-break:break-all}
 </style></head><body>
 <h1>${t("report.title")}</h1>
-<div class="meta">${tf("report.meta", { case: manifest.case_id || "-", when: new Date().toLocaleString(), n: items.length })}</div>
+<div class="meta">${e(tf("report.meta", { case: manifest.case_id || "-", when: (p => `${p.date} ${p.time} UTC${p.offset}`)(recTimeParts(Date.now() / 1000)), n: items.length }))}</div>
 <div class="meta">${tf("report.counts", { v: counts.verified, c: counts.candidate, f: counts.failed })}</div>
 <div class="note">${t("report.note")}</div>
 <table><thead><tr><th>ID</th><th>${t("report.th.name")}</th><th>${t("report.th.kind")}</th><th>${t("report.th.status")}</th><th>${t("report.th.mark")}</th><th>${t("report.th.tags")}</th>
@@ -1289,7 +1306,7 @@ th{background:#f2f5f4} .mono{font-family:Consolas,monospace;font-size:11px;word-
 ${rowHtml}
 </tbody></table>
 </body></html>`;
-  downloadText(`frametrace-summary-${manifest.case_id || "case"}.html`, html, "text/html;charset=utf-8");
+  downloadText(`frametrace-summary-${safeFileName(manifest.case_id || "case")}.html`, html, "text/html;charset=utf-8");
 });
 
 // 서버 측 자료 묶음 — 선택 파일을 exports/selection-*/ 에 해시 매니페스트와 함께 복사.
@@ -1640,4 +1657,99 @@ function seedServerRanges() {
   if (!ids.length) return;
   ids.forEach(id => rangeConflictIds.add(id));
   showRangeDivergenceBanner(ids);
+})();
+
+// --- U9: drafts left under another origin ---------------------------------
+// localStorage is per origin (scheme + host + PORT). When the workstation
+// comes up on another port (browser mode falls back from 8477 to 8478…;
+// the WebView2 window takes a fresh port per launch), drafts written by an
+// earlier window are invisible here — and no browser API can read another
+// origin's storage. Cookies, unlike storage, are shared by every port of a
+// host, so each window keeps one small marker per (port, case) in a cookie
+// while this origin holds drafts of the case: `ft_draft_ports=<port>.<case
+// hash>-…` (no case id or path, only an FNV-1a hash; SameSite=Strict, not
+// HttpOnly, never read by the server). A boot that finds a marker of the
+// same case under ANOTHER port says so once in the notices row: the drafts
+// may still be there, reachable only by reopening that address. Nothing is
+// claimed beyond "may": the marker cannot see whether that storage was
+// cleared since. Limitation (docs/ui-rebuild-contract.md §11.4): only
+// windows of this build write markers, and only on the same host name
+// (127.0.0.1 and localhost are different hosts).
+// `var`, not const: flushDraftsNow (30-records) may call noteOriginDrafts
+// during hydration, before this part of the bundle has run.
+var ORIGIN_COOKIE = "ft_draft_ports";
+var ORIGIN_COOKIE_MAX = 24;
+var ORIGIN_COOKIE_AGE = 60 * 60 * 24 * 60; // 60 days
+function originCaseHash() {
+  const text = String(manifest.case_id || "case") + "|" + String(DATA.caseDir || "");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, "0");
+}
+function originPort() {
+  return String(location.port || (location.protocol === "https:" ? "443" : "80"));
+}
+function readOriginMarks() {
+  try {
+    const pair = String(document.cookie || "").split(";").map(p => p.trim()).find(p => p.startsWith(ORIGIN_COOKIE + "="));
+    if (!pair) return [];
+    return pair.slice(ORIGIN_COOKIE.length + 1).split("-").filter(m => /^\d{1,5}\.[0-9a-f]{8}$/.test(m));
+  } catch (e) { return []; }
+}
+function writeOriginMarks(marks) {
+  try {
+    const list = [...new Set(marks)].slice(-ORIGIN_COOKIE_MAX);
+    document.cookie = list.length
+      ? `${ORIGIN_COOKIE}=${list.join("-")}; Path=/; Max-Age=${ORIGIN_COOKIE_AGE}; SameSite=Strict`
+      : `${ORIGIN_COOKIE}=; Path=/; Max-Age=0; SameSite=Strict`;
+  } catch (e) { /* cookies blocked: no cross-port hint */ }
+}
+// Any stored draft of this case under THIS origin (any writer window).
+function originHasStoredDrafts() {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(DRAFT_PREFIX)) return true;
+    }
+  } catch (e) { /* storage blocked */ }
+  return false;
+}
+var originMarked = null; // last marker state this window wrote (null = unknown)
+// Called after every draft flush (30-records flushDraftsNow).
+function noteOriginDrafts() {
+  if (!viewerIsServed || typeof ORIGIN_COOKIE !== "string") return; // not initialised yet
+  let mine = false;
+  for (const id in state.drafts) { mine = true; break; }
+  const has = mine || originHasStoredDrafts();
+  if (has === originMarked) return;
+  originMarked = has;
+  const me = originPort() + "." + originCaseHash();
+  const marks = readOriginMarks();
+  const present = marks.includes(me);
+  if (has && !present) writeOriginMarks([...marks, me]);
+  else if (!has && present) writeOriginMarks(marks.filter(m => m !== me));
+}
+(function checkOtherOriginDrafts() {
+  if (!viewerIsServed) return;
+  const hash = originCaseHash();
+  const me = originPort() + "." + hash;
+  noteOriginDrafts(); // also drops a stale marker of this origin
+  const others = readOriginMarks().filter(m => m.endsWith("." + hash) && m !== me);
+  if (!others.length) return;
+  const where = others.map(m => `${location.hostname}:${m.split(".")[0]}`).join(", ");
+  const bar = document.createElement("div");
+  bar.id = "originDraftsNotice";
+  bar.className = "ft-banner";
+  bar.setAttribute("role", "status");
+  const msg = document.createElement("span");
+  msg.className = "ft-banner-msg";
+  msg.textContent = tf("origin.draftsMsg", { where });
+  bar.appendChild(msg);
+  bar.appendChild(noticeButton("originDraftsDismiss", t("origin.dismiss"), () => {
+    const hadFocus = bar.contains(document.activeElement);
+    writeOriginMarks(readOriginMarks().filter(m => !others.includes(m)));
+    bar.remove();
+    if (hadFocus && typeof viewerFocus === "function") viewerFocus();
+  }));
+  noticesHost().appendChild(bar);
 })();

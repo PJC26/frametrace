@@ -144,6 +144,16 @@ async function loaderFetchJson(url) {
       `${url}: ${err && err.message ? err.message : err}`
     );
   }
+  if (res.status === 401) {
+    // The server is up but refused this page's proof (U8): no "server
+    // error" wording — the way back is reopening from the workstation.
+    const error = ViewerLoadError(
+      "브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오. / Browser authorization expired — reopen it from the workstation window.",
+      `${url}: HTTP 401`
+    );
+    error.status = 401;
+    throw error;
+  }
   if (!res.ok) {
     const error = ViewerLoadError(
       `서버 응답 오류 (HTTP ${res.status}) / Server error (HTTP ${res.status})`,
@@ -438,6 +448,11 @@ function startLiveIndexChip(live, root, signal) {
     if (signal && signal.aborted) return; // the mount is gone
     try {
       const res = await fetch("/api/status", { cache: "no-store" });
+      if (res.status === 401) {
+        note.textContent = "브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오. / Browser authorization expired — reopen from the workstation window.";
+        timer = setTimeout(tick, 15000);
+        return;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const st = await res.json();
       failures = 0;
@@ -450,7 +465,7 @@ function startLiveIndexChip(live, root, signal) {
           if (page && page.ok && Number.isFinite(Number(page.total))) newTotal = Number(page.total);
         } catch (e) { /* the count is a hint; the status line still updates */ }
       }
-      if (note.textContent.startsWith("상태 확인 실패")) note.textContent = "";
+      if (note.textContent.startsWith("상태 확인 실패") || note.textContent.startsWith("브라우저 인증")) note.textContent = "";
     } catch (err) {
       failures += 1;
       note.textContent = `상태 확인 실패 (${failures}회) — 재시도 중 / Status check failed, retrying`;

@@ -83,8 +83,46 @@ try {
     await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'K', bubbles: true })));
   }
 
+  // U6: a Korean IME reports the composed jamo ("ㅓ" for J) or "Process";
+  // the physical key (event.code) decides. Same ignore rules as Latin keys.
+  {
+    const active = () => page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
+    const key = (init, target) => page.evaluate(([i, t]) => {
+      const el = t ? document.querySelector(t) : document;
+      if (t) el.focus();
+      el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...i }));
+      if (t) el.blur();
+    }, [init, target || null]);
+    const toastText = () => page.evaluate(() => document.getElementById('toastHost').textContent);
+    const clearToasts = () => page.evaluate(() => { document.getElementById('toastHost').textContent = ''; });
+    const i0 = await active();
+    await key({ key: 'ㅓ', code: 'KeyJ' });
+    const i1 = await active();
+    check('IME "ㅓ" (KeyJ) navigates like j', i1 !== i0, `${i0} -> ${i1}`);
+    await key({ key: 'Process', code: 'KeyK' });
+    check('IME "Process" (KeyK) navigates like k', (await active()) === i0, `${i1} -> ${await active()}`);
+    await key({ key: 'ㅓ', code: 'KeyJ', altKey: true });
+    check('IME Alt+KeyJ is ignored (shell/browser key)', (await active()) === i0);
+    await key({ key: 'ㅓ', code: 'KeyJ' }, '#query');
+    check('IME key in a focused text input is ignored', (await active()) === i0 && (await page.locator('#query').inputValue()) === '');
+    await clearToasts();
+    await key({ key: 'ㅓ', code: 'KeyJ', shiftKey: true });
+    check('IME Shift+KeyJ is the J shuttle (not navigation)', /셔틀|Shuttle|재생 중인 영상이 없습니다|No video is playing/.test(await toastText()) && (await active()) === i0, await toastText());
+    await key({ key: 'Process', code: 'KeyK', shiftKey: true }); // stop the shuttle
+    await clearToasts();
+    const m0 = await active();
+    await key({ key: 'Process', code: 'Digit1' });
+    const markToast = await toastText();
+    check('IME "Process" (Digit1) marks reviewed', /적용했습니다|Applied/.test(markToast) && (await active()) !== m0, markToast);
+    await clearToasts();
+    await key({ key: 'ㅋ', code: 'KeyZ', ctrlKey: true });
+    check('IME Ctrl+KeyZ undoes', /실행 취소|Undone/.test(await toastText()), await toastText());
+    await clearToasts();
+    await page.evaluate(() => document.activeElement?.blur());
+  }
+
   // j/k stay record navigation.
-  const before = await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
+  const before =await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
   await page.keyboard.press('j');
   const afterJ = await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
   await page.keyboard.press('k');

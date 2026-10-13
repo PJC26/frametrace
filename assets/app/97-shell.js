@@ -328,7 +328,13 @@ function isTextField(el) {
   const type = (el.type || "text").toLowerCase();
   return !["checkbox", "radio", "button", "submit", "reset", "range", "color", "file"].includes(type);
 }
-function hDialogOpen() { return !$("dlgBackdrop").hidden || !$("pickerBackdrop").hidden; }
+// A modal of the hosted viewer (shortcut sheet, in-page dialog, command
+// palette — .modal-backdrop inside the hosted fragment) counts too (U12): Alt+P/J/R
+// must not open a sheet or popover behind it, and Esc is the viewer's.
+function hViewerModalOpen() {
+  return typeof document.querySelector === "function" && !!document.querySelector("#hViewerHost .modal-backdrop:not([hidden])");
+}
+function hDialogOpen() { return !$("dlgBackdrop").hidden || !$("pickerBackdrop").hidden || hViewerModalOpen(); }
 function hShellShortcut(e, activeEl) {
   if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return false;
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;

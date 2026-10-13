@@ -129,6 +129,68 @@ function dropJournalIds(ids) {
   }
 }
 
+// --- journal across a reload (U4) ---------------------------------------
+// FTViewer.reload() rebuilds the record model; the journal goes with the
+// rest of the view state (95-init viewerViewState) and comes back filtered:
+// a change survives only when its record still exists AND the record still
+// holds the value the entry would leave (undo: `after`, redo: `before`) —
+// anything that moved meanwhile (another window, the server) is dropped
+// rather than overwritten by a stale Ctrl+Z. Undo/redo then go through the
+// normal draft + save path (touchAnnotation), so the save protocol's
+// dirty/draft/conflict state is never touched here.
+function journalFieldValue(field, v) {
+  if (field === "note") return String(v || "");
+  if (field === "tags") return JSON.stringify(Array.isArray(v) ? v : []);
+  if (field === "mark") return v && v.status ? String(v.status) : "";
+  if (field === "range") return v && (Number.isFinite(v.in) || Number.isFinite(v.out)) ? `${Number.isFinite(v.in) ? v.in : ""}|${Number.isFinite(v.out) ? v.out : ""}` : "";
+  return JSON.stringify(v ?? null);
+}
+function journalExport() {
+  const plain = stack => stack.map(entry => ({ label: entry.label, activeBefore: entry.activeBefore, changes: entry.changes }));
+  return { undo: plain(undoStack), redo: plain(redoStack) };
+}
+function journalImport(saved) {
+  if (!saved || typeof saved !== "object") return 0;
+  // Walks a stack from its top (the next Ctrl+Z / Ctrl+Y) down, replaying
+  // each kept change on a virtual copy of the current values, so a deeper
+  // entry is checked against what the record will hold by the time it is
+  // reached. A dropped change blocks every deeper change of that id+field.
+  const take = (list, side) => {
+    const other = side === "after" ? "before" : "after";
+    const virtual = new Map();
+    const blocked = new Set();
+    const valueOf = (id, field) => {
+      const k = id + "\u0001" + field;
+      if (!virtual.has(k)) virtual.set(k, journalFieldValue(field, snapshotIds([id])[0][field]));
+      return virtual.get(k);
+    };
+    const kept = [];
+    const entries = Array.isArray(list) ? list : [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (!entry || !Array.isArray(entry.changes)) continue;
+      const changes = entry.changes.filter(change => {
+        if (!change || change.id == null || !Array.isArray(change.fields) || !change[side] || !change[other]) return false;
+        const fields = change.fields;
+        const ok = recordById.has(change.id) && fields.length > 0 &&
+          fields.every(field => JOURNAL_FIELDS.includes(field) && !blocked.has(change.id + "\u0001" + field) &&
+            valueOf(change.id, field) === journalFieldValue(field, change[side][field]));
+        for (const field of fields) {
+          const k = change.id + "\u0001" + field;
+          if (ok) virtual.set(k, journalFieldValue(field, change[other][field]));
+          else blocked.add(k);
+        }
+        return ok;
+      });
+      if (changes.length) kept.unshift({ label: String(entry.label || ""), activeBefore: recordById.has(entry.activeBefore) ? entry.activeBefore : null, changes });
+    }
+    return kept.slice(-JOURNAL_LIMIT);
+  };
+  undoStack.splice(0, undoStack.length, ...take(saved.undo, "after"));
+  redoStack.splice(0, redoStack.length, ...take(saved.redo, "before"));
+  return undoStack.length + redoStack.length;
+}
+
 // --- toasts ------------------------------------------------------------
 // Top-right stack (never over the bottom action bar), at most 3 at once,
 // 6 s auto-dismiss that pauses while the pointer or keyboard focus is on a
@@ -484,6 +546,41 @@ function isTypingTarget(el) {
   return el.tagName === "INPUT" && TEXT_INPUT_TYPES.has(String(el.getAttribute("type") || "").toLowerCase());
 }
 
+// U6: the key a shortcut means. A Korean (or any non-Latin) IME reports
+// event.key as the composed jamo ("ㅓ" for J) or "Process" — the physical
+// key (event.code) then decides, so j/k/n/x/i/o/1/2/3/0/,/./[/]/? keep
+// working without switching the input language. A Latin event.key is kept
+// as is (AZERTY, Dvorak … keep their own letters). Letters follow Shift
+// alone, so CapsLock never turns j into the J shuttle (or Shift+j into j).
+const SHORTCUT_CODE_KEYS = { Comma: ",", Period: ".", BracketLeft: "[", BracketRight: "]", Space: " " };
+function shortcutKey(event) {
+  let key = String(event.key || "");
+  const latin = key.length === 1 && key.charCodeAt(0) < 128;
+  if (!latin && (key.length === 1 || key === "Process" || key === "Unidentified")) {
+    const code = String(event.code || "");
+    let m = /^Key([A-Z])$/.exec(code);
+    if (m) key = m[1].toLowerCase();
+    else if ((m = /^(?:Digit|Numpad)([0-9])$/.exec(code)) && !event.shiftKey) key = m[1];
+    else if (code === "Slash" && event.shiftKey) key = "?";
+    else if (SHORTCUT_CODE_KEYS[code] && !event.shiftKey) key = SHORTCUT_CODE_KEYS[code];
+    else return key;
+  }
+  if (/^[a-z]$/i.test(key)) key = event.shiftKey ? key.toUpperCase() : key.toLowerCase();
+  return key;
+}
+// A viewer modal (shortcut sheet, in-page dialog, command palette) is open.
+function viewerModalOpen() {
+  return !!ftRoot.querySelector(".modal-backdrop:not([hidden])");
+}
+// Esc closes ONE layer per press (U13): newest toast first, then theater.
+function dismissNewestViewerToast() {
+  const host = document.getElementById("toastHost");
+  const items = host ? [...host.querySelectorAll(".toast:not(.clip-progress)")] : [];
+  if (!items.length) return false;
+  dismissToast(items[items.length - 1]);
+  return true;
+}
+
 document.addEventListener("keydown", event => {
   if (event.defaultPrevented) return;
   const el = document.activeElement;
@@ -504,8 +601,12 @@ document.addEventListener("keydown", event => {
   const altGraph = typeof event.getModifierState === "function" && event.getModifierState("AltGraph");
   const mod = !altGraph && (event.ctrlKey || event.metaKey);
   if (!altGraph && event.altKey) return; // Alt+Left etc. belong to the browser
+  const skey = shortcutKey(event);
+  // Under an open viewer modal only Esc reaches here (its own handler
+  // usually takes it first): nothing behind it may change.
+  if (viewerModalOpen() && skey !== "Escape") return;
   if (mod) {
-    const key = String(event.key).toLowerCase();
+    const key = skey.toLowerCase();
     if (key === "z" && !event.shiftKey) { event.preventDefault(); undoJournal(); }
     else if (key === "y" || (key === "z" && event.shiftKey)) { event.preventDefault(); redoJournal(); }
     else if (event.ctrlKey && !event.metaKey && !event.shiftKey && key === "a") { event.preventDefault(); selectAllFiltered(); }
@@ -513,7 +614,7 @@ document.addEventListener("keydown", event => {
     return; // every other Ctrl/Cmd combo (zoom, find, print…) stays the browser's
   }
   let handled = true;
-  switch (event.key) {
+  switch (skey) {
     case "j": moveActive(1); break;
     case "k": moveActive(-1); break;
     case "n": moveToUnreviewed(1); break;
@@ -543,10 +644,14 @@ document.addEventListener("keydown", event => {
     case "p": togglePip(); break;
     case "?": toggleShortcuts(true); break;
     case "Escape":
+      // One layer per press, topmost first (U13): a focused filter
+      // control, the shortcut sheet, the newest toast, theater mode.
       if (tag === "SELECT" || tag === "INPUT") el.blur();
-      toggleShortcuts(false);
-      dismissToasts();
-      if (state.layout.theater) toggleTheater();
+      else if (!document.getElementById("shortcutsModal").hidden) toggleShortcuts(false);
+      else if (dismissNewestViewerToast()) { /* one toast */ }
+      else if (state.layout.theater) toggleTheater();
+      else handled = false;
+      if (handled) event.preventDefault();
       break;
     default: handled = false; break;
   }

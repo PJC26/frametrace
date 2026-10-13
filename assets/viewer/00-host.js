@@ -85,7 +85,7 @@ const FTViewer = (() => {
     writerToken,
     channels: Object.freeze({ review: "ft-review", player: caseId => `ft-player:${caseId || "case"}` }),
 
-    async init({ data = null, url = "", embed: wantEmbed = false, host = document, theme = null, locale = null } = {}) {
+    async init({ data = null, url = "", embed: wantEmbed = false, host = document, theme = null, locale = null, restore = null } = {}) {
       if (state !== "idle") throw new Error("FTViewer already mounted");
       const el = findRoot(host);
       if (!el) throw new Error("FTViewer: #ftViewer fragment not found");
@@ -110,7 +110,7 @@ const FTViewer = (() => {
       const mine = ++generation;
       try {
         await ftViewerBoot({
-          data, url, embed, hosted, root: el,
+          data, url, embed, hosted, root: el, restore,
           locale: validLocale(locale),
           signal: ac.signal,
           isCurrent: () => mine === generation && !ac.signal.aborted,
@@ -149,11 +149,17 @@ const FTViewer = (() => {
         impl.refuseReload(blocker);
         return "refused";
       }
+      // U4: the view (filters, search, selection, active card, scroll, undo
+      // journal) is carried over; the save state is not — a reload only
+      // happens with nothing unsaved, and drafts rehydrate from storage.
       if (!hosted) {
+        try { if (impl.stashViewState) impl.stashViewState(); } catch (e) { /* plain reload */ }
         location.reload();
         return "reloaded";
       }
-      const opts = { embed, host: root, theme: api.getTheme(), locale: api.getLocale() };
+      let restore = null;
+      try { restore = impl.viewState ? impl.viewState() : null; } catch (e) { restore = null; }
+      const opts = { embed, host: root, theme: api.getTheme(), locale: api.getLocale(), restore };
       const kept = root ? HOST_CLASSES.filter(c => root.classList.contains(c)) : [];
       const el = root;
       api.destroy();

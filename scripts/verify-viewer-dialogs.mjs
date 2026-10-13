@@ -29,7 +29,9 @@ const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
 const N = 8;
-function buildViewer() {
+const EVIL_CASE = 'FT"<img src=x onerror=window.__pwn=1>&';
+function buildViewer(caseId = 'FT-DLG') {
+  const evil = caseId !== 'FT-DLG';
   const dir = join(root, 'assets/viewer');
   let js = '';
   for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
@@ -37,13 +39,13 @@ function buildViewer() {
     if (!js.endsWith('\n')) js += '\n';
   }
   const videos = Array.from({ length: N }, (_, i) => ({
-    id: `vid_${i}`, relative_path: `DCIM/c${i}.mp4`, source_path: `/case/DCIM/c${i}.mp4`,
+    id: `vid_${i}`, relative_path: evil ? `DCIM/20260910_12000${i}_F.mp4` : `DCIM/c${i}.mp4`, source_path: `/case/DCIM/c${i}.mp4`,
     ffprobe_ok: true, size_bytes: 1000, extension: 'mp4', duration_seconds: 60,
   }));
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
-    manifest: { case_id: 'FT-DLG', title: 'dlg' }, caseDir: '/case', scan: { videos },
+    manifest: { case_id: caseId, title: 'dlg' }, caseDir: '/case', scan: { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
-    thumbs: { vid_0: '/thumbs/broken.jpg' }, annotations: {}, deepfake: {}, telemetry: {}, proxies: [],
+    thumbs: evil ? {} : { vid_0: '/thumbs/broken.jpg' }, annotations: {}, deepfake: {}, telemetry: {}, proxies: [],
   })};`;
   // Standalone page exactly as build.rs assembles it (shared fragment included).
   return viewerPageHtml({ data, js: js, root });
@@ -56,11 +58,12 @@ const check = (name, ok, detail = '') => {
 };
 
 const html = buildViewer();
+const evilHtml = buildViewer(EVIL_CASE);
 let thumbHits = 0;
 const server = createServer((req, res) => {
   if (req.url.startsWith('/thumbs/')) { thumbHits += 1; res.statusCode = 404; res.end('no'); return; }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(html);
+  res.end(req.url === '/evil' ? evilHtml : html);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -237,7 +240,69 @@ try {
   check('ft-locale switches the viewer language and is acked', acks.after !== acks.before && acks.got.some((m) => m.type === 'ft-locale-ack' && m.locale === acks.after), JSON.stringify(acks));
   check('ft-theme applies and is acked; invalid values are ignored and not acked',
     acks.theme === 'dark' && acks.got.some((m) => m.type === 'ft-theme-ack' && m.theme === 'dark') && acks.got.length === 2, JSON.stringify(acks));
+
+  // --- U13: Esc closes ONE layer per press, topmost first ----------------
+  // (shortcut sheet > newest toast > theater). U12 (viewer side): keys do
+  // not act behind an open viewer modal.
+  {
+    await page.evaluate(() => document.activeElement?.blur());
+    const toastCount = () => page.evaluate(() => document.querySelectorAll('#toastHost .toast:not(.clip-progress)').length);
+    const theater = () => page.evaluate(() => document.getElementById('ftViewer').classList.contains('theater'));
+    const modalOpen = () => page.evaluate(() => !document.getElementById('shortcutsModal').hidden);
+    await page.keyboard.press('t');
+    await page.evaluate(() => FTViewer.toast('esc-layer-test'));
+    await page.keyboard.press('Shift+Slash');
+    check('"?" opens the shortcut sheet over theater + a toast', (await modalOpen()) && (await theater()) && (await toastCount()) > 0);
+    const a0 = await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
+    await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', bubbles: true, cancelable: true })));
+    check('j does nothing behind the open shortcut sheet', (await page.evaluate(() => document.querySelector('.card.active')?.dataset.id)) === a0);
+    const t0 = await toastCount();
+    await page.keyboard.press('Escape');
+    check('1st Esc closes only the shortcut sheet', !(await modalOpen()) && (await theater()) && (await toastCount()) === t0, `toasts ${t0} -> ${await toastCount()}`);
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('Escape');
+    check('2nd Esc dismisses one toast, theater stays', (await toastCount()) === t0 - 1 && (await theater()), `toasts ${t0} -> ${await toastCount()}`);
+    for (let i = 0; i < 10 && (await toastCount()) > 0; i++) await page.keyboard.press('Escape');
+    check('theater survives until the toasts are gone', await theater());
+    await page.keyboard.press('Escape');
+    check('last Esc leaves theater', !(await theater()));
+  }
   check('no page errors', !errors.length, errors.join(' | '));
+  await ctx.close();
+
+  // --- U10: a hostile case id and stored playback rate -------------------
+  {
+    const evilCtx = await browser.newContext({ acceptDownloads: true });
+    await evilCtx.addInitScript((key) => {
+      localStorage.setItem(key, JSON.stringify({ rate: '1;window.__pwn=2' }));
+    }, `ft.viewer.${EVIL_CASE}.layout.v2`);
+    const evil = await evilCtx.newPage();
+    const evilErrors = [];
+    evil.on('pageerror', (e) => evilErrors.push(String(e)));
+    await evil.goto(base + 'evil');
+    await evil.waitForSelector('.card');
+    check('stored non-numeric playback rate is normalised to 1', (await evil.locator('#playRate').inputValue()) === '1');
+    await evil.locator('.card').first().click();
+    await evil.evaluate(() => document.activeElement?.blur());
+    const [popup] = await Promise.all([evil.waitForEvent('popup'), evil.evaluate(() => FTViewer.popout())]);
+    await popup.waitForLoadState('domcontentloaded');
+    const pop = await popup.evaluate(() => ({ pwn: window.__pwn, rate: document.getElementById('vv').playbackRate }));
+    check('pop-out player gets a numeric rate literal (no injected code)', pop.pwn === undefined && pop.rate === 1, JSON.stringify(pop));
+    await popup.close();
+    await evil.keyboard.press('Control+a');
+    await openTools(evil);
+    const [download] = await Promise.all([
+      evil.waitForEvent('download'),
+      evil.evaluate(() => document.getElementById('btnSummary').click()),
+    ]);
+    const summaryPath = await download.path();
+    const summary = readFileSync(summaryPath, 'utf8');
+    check('summary report escapes the case id (title and meta line)', !summary.includes('<img src=x') && (summary.match(/&lt;img src=x/g) || []).length >= 2, summary.slice(0, 200));
+    check('summary download name has no path/markup characters', !/[<>:"\/\\|?*]/.test(download.suggestedFilename()), download.suggestedFilename());
+    check('summary report times carry a basis label', /시간대 미상|time zone unknown|UTC[+-]\d\d:\d\d/.test(summary));
+    check('no page errors (hostile case)', !evilErrors.length, evilErrors.join(' | '));
+    await evilCtx.close();
+  }
 } finally {
   await browser.close();
   server.close();

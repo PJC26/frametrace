@@ -1,5 +1,6 @@
 const STEP_NAMES = ["케이스 준비", "소스 등록", "스캔 · 색인", "재생성 검증", "리뷰 생성"];
 
+const AUTH_EXPIRED_MSG = "브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오";
 // Reads a fetch Response as JSON without ever throwing: HTTP errors,
 // non-JSON bodies (a proxy error page, a truncated reply) and network
 // failures all collapse to { ok:false, error } so callers have exactly one
@@ -9,6 +10,12 @@ async function readJson(r) {
   try { data = await r.json(); } catch (e) { data = null; }
   if (!r || !r.ok) {
     const status = r && r.status ? `HTTP ${r.status}` : "응답 없음";
+    // 401 = this browser lost its proof (ft_token / ft_nonce cookie), not a
+    // dead server (U8): say so once, with the way back (40-status.js).
+    if (r && r.status === 401) {
+      if (typeof noteAuthExpired === "function") noteAuthExpired();
+      return Object.assign({}, data && typeof data === "object" ? data : {}, { ok: false, status: 401, auth: true, error: AUTH_EXPIRED_MSG });
+    }
     return Object.assign({}, data && typeof data === "object" ? data : {}, {
       ok: false,
       // HTTP status kept so callers can tell "endpoint not in this server
@@ -28,7 +35,11 @@ function netError(err) {
 async function jget(url) {
   const r = await fetch(url, { cache: "no-store" });
   const data = await readJson(r);
-  if (!(r && r.ok) || data.malformed) throw new Error(data.error);
+  if (!(r && r.ok) || data.malformed) {
+    const err = new Error(data.error);
+    err.status = data.status || 0;
+    throw err;
+  }
   return data;
 }
 // Like jpost for GET: never throws, keeps the HTTP status on failure.
