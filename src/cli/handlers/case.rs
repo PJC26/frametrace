@@ -369,11 +369,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     }
     let videos = collect_index_videos(&index_json);
     let (thumbs_json, thumb_stats) = generate_review_thumbnails(case_dir, &videos)?;
-    let annotations_json = serde_json::to_string(&serde_json::json!({
-        "marks": crate::case_db::load_review_marks(case_dir).unwrap_or_default(),
-        "tags": crate::case_db::load_review_tags(case_dir).unwrap_or_default(),
-    }))
-    .map_err(|err| err.to_string())?;
+    let annotations_json = crate::case_db::review_annotations_json(case_dir)?;
     let deepfake_reports = crate::deepfake::collect_reports(case_dir).to_string();
     let telemetry_reports = crate::telemetry::collect_reports(case_dir).to_string();
     // Proxies already on disk are embedded so the viewer (including the

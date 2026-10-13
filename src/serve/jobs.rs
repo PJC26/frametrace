@@ -917,14 +917,180 @@ pub(crate) fn pending_marks_count(case_dir: &Path) -> usize {
     pending_marks_files(case_dir).len()
 }
 
+/// Append-only journal of ids a queued (deferred) import could not apply
+/// because the case had moved on (save protocol v2). Each conflict line
+/// keeps the client's original entry, the server value and the time, so
+/// nothing an examiner typed is ever lost; a later patch that applies the
+/// id appends a `resolved` line. `/api/status.mark_conflicts` counts the
+/// unresolved ids.
+pub(crate) const PENDING_MARK_CONFLICTS_FILE: &str = "marks-pending/conflicts.jsonl";
+
+fn pending_mark_conflicts_path(case_dir: &Path) -> PathBuf {
+    case_dir.join(PENDING_MARK_CONFLICTS_FILE)
+}
+
+fn append_jsonl_lines(path: &Path, lines: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    if lines.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    for line in lines {
+        file.write_all(line.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .map_err(|err| format!("failed to append to {}: {err}", path.display()))?;
+    }
+    file.sync_data()
+        .map_err(|err| format!("failed to sync {}: {err}", path.display()))
+}
+
+/// Journals the conflicts of a queued import together with the client's
+/// original entries (read back from the queued body, verbatim).
+fn record_queue_conflicts(
+    case_dir: &Path,
+    queued_file: &Path,
+    outcome: &crate::case_db::PatchOutcome,
+) -> Result<(), String> {
+    if outcome.conflicts.is_empty() {
+        return Ok(());
+    }
+    let body: serde_json::Value = crate::util::read_to_string(queued_file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let find = |key: &str, id: &str| -> serde_json::Value {
+        body.get(key)
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(id))
+            })
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let now = crate::util::now_unix().unwrap_or(0);
+    let source = queued_file
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let lines: Vec<String> = outcome
+        .conflicts
+        .iter()
+        .map(|conflict| {
+            let deleted = body
+                .get("deleted_ids")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(&conflict.id)));
+            serde_json::json!({
+                "recorded_unix": now,
+                "source": source,
+                "id": conflict.id,
+                "server_revision": conflict.server_revision,
+                "server": conflict.server,
+                "mine": {
+                    "mark": find("marks", &conflict.id),
+                    "tags": find("tags", &conflict.id).get("tags").cloned().unwrap_or(serde_json::Value::Null),
+                    "deleted": deleted,
+                    "base_revision": body.get("base_revisions").and_then(|b| b.get(&conflict.id)).cloned().unwrap_or(serde_json::Value::Null),
+                },
+                "client_id": body.get("client_id").cloned().unwrap_or(serde_json::Value::Null),
+                "examiner": body.get("examiner").cloned().unwrap_or(serde_json::Value::Null),
+            })
+            .to_string()
+        })
+        .collect();
+    append_jsonl_lines(&pending_mark_conflicts_path(case_dir), &lines)
+}
+
+/// Unresolved queue conflicts: distinct ids whose last journal entry is a
+/// conflict (not a `resolved` line), in first-seen order.
+fn unresolved_queue_conflict_ids(case_dir: &Path) -> Vec<String> {
+    let Ok(text) = crate::util::read_to_string(&pending_mark_conflicts_path(case_dir)) else {
+        return Vec::new();
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(id) = value.get("resolved").and_then(serde_json::Value::as_str) {
+            open.remove(id);
+        } else if let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
+            && open.insert(id.to_string())
+            && !order.iter().any(|seen| seen == id)
+        {
+            order.push(id.to_string());
+        }
+    }
+    order.retain(|id| open.contains(id));
+    order
+}
+
+/// `/api/status.mark_conflicts`: `{count, ids}` with at most 50 ids.
+pub(crate) fn pending_mark_conflicts(case_dir: &Path) -> serde_json::Value {
+    let ids = unresolved_queue_conflict_ids(case_dir);
+    serde_json::json!({
+        "count": ids.len(),
+        "ids": ids.iter().take(50).collect::<Vec<_>>(),
+    })
+}
+
+/// After any successful in-process import: ids that were applied and had
+/// an open queue conflict are journaled as resolved (the examiner saved
+/// a decision for them with a current base).
+fn resolve_queue_conflicts(case_dir: &Path, outcome: &crate::case_db::PatchOutcome) {
+    if outcome.applied.is_empty() || !pending_mark_conflicts_path(case_dir).is_file() {
+        return;
+    }
+    let open = unresolved_queue_conflict_ids(case_dir);
+    if open.is_empty() {
+        return;
+    }
+    let now = crate::util::now_unix().unwrap_or(0);
+    let lines: Vec<String> = outcome
+        .applied
+        .iter()
+        .filter(|(id, _)| open.iter().any(|open_id| open_id == id))
+        .map(|(id, revision)| {
+            serde_json::json!({"resolved": id, "revision": revision, "unix": now}).to_string()
+        })
+        .collect();
+    // Best effort: a failure here leaves the conflict visible (never hides it).
+    let _ = append_jsonl_lines(&pending_mark_conflicts_path(case_dir), &lines);
+}
+
 /// Applies every queued marks import in arrival order. A file is removed
-/// only after its import committed, so a failure leaves it queued. The
-/// caller holds `MARKS_GATE`. Returns how many were applied.
+/// only after its import committed, so a failure leaves it queued. Ids a
+/// queued v2 body could no longer apply (the case moved on) are journaled
+/// in `marks-pending/conflicts.jsonl` with the client's original entry —
+/// never dropped — and surfaced through `/api/status.mark_conflicts`. The
+/// caller holds `MARKS_GATE`. Returns how many files were applied.
 fn drain_pending_marks(state: &SharedState, case_dir: &Path) -> Result<usize, String> {
     let mut applied = 0;
+    let mut conflicts = 0usize;
     for path in pending_marks_files(case_dir) {
-        crate::cli::handlers::import_marks_quiet(case_dir, &path)
+        let outcome = crate::cli::handlers::import_marks_quiet(case_dir, &path)
             .map_err(|err| format!("대기 중이던 마크 반영 실패 ({}): {err}", path.display()))?;
+        // The journal is written BEFORE the queued file goes, so a crash in
+        // between re-imports (idempotent) rather than losing the entry.
+        record_queue_conflicts(case_dir, &path, &outcome).map_err(|err| {
+            format!(
+                "대기 중이던 마크 충돌 기록 실패 ({}): {err}",
+                path.display()
+            )
+        })?;
+        resolve_queue_conflicts(case_dir, &outcome);
+        conflicts += outcome.conflicts.len();
         let _ = std::fs::remove_file(&path);
         applied += 1;
         state_lock(state).marks_epoch += 1;
@@ -934,7 +1100,41 @@ fn drain_pending_marks(state: &SharedState, case_dir: &Path) -> Result<usize, St
             "저장 대기 중이던 판독 마크 {applied}건을 반영했습니다."
         ));
     }
+    if conflicts > 0 {
+        state_lock(state).logs.push(format!(
+            "대기열 반영 중 충돌 {conflicts}건 — 뷰어에서 확인하십시오 (marks-pending/conflicts.jsonl)."
+        ));
+    }
     Ok(applied)
+}
+
+/// The `/api/import-marks` success body (save protocol v2 contract, also
+/// returned for legacy bodies): `applied` maps every applied id to its
+/// revision after the patch, `conflicts` lists ids not applied with the
+/// server's value, `batch_done` says whether this request completed its
+/// batch (always true without `batch`), `report_url` is set only when
+/// make-report ran.
+fn import_marks_response(
+    marks: &crate::selection::MarksFile,
+    outcome: &crate::case_db::PatchOutcome,
+    deferred: Option<usize>,
+    report_refreshed: bool,
+) -> String {
+    let batch_done = marks.batch.as_ref().is_none_or(|batch| batch.is_last());
+    let mut body = serde_json::json!({
+        "ok": true,
+        "protocol": marks.protocol.wire_name(),
+        "stored": outcome.stored,
+        "applied": outcome.applied_map(),
+        "conflicts": outcome.conflicts,
+        "batch_done": batch_done,
+        "deferred": deferred.is_some(),
+        "report_url": report_refreshed.then_some("case/reports/case-report.html"),
+    });
+    if let Some(pending) = deferred {
+        body["pending"] = serde_json::json!(pending);
+    }
+    body.to_string()
 }
 
 /// True while a job that holds `busy` accepts marks through the durable
@@ -960,6 +1160,7 @@ fn import_marks_during_enrichment(
     state: &SharedState,
     case_dir: &Path,
     marks_body: &str,
+    marks: &crate::selection::MarksFile,
 ) -> String {
     let _gate = marks_gate();
     // Re-checked under the gate: enrichment may have just finished.
@@ -988,29 +1189,51 @@ fn import_marks_during_enrichment(
         state_lock(state).logs.push(
             "작업 진행 중이라 판독 마크를 대기열에 저장했습니다 (해당 단계 직후 반영).".into(),
         );
-        return serde_json::json!({
-            "ok": true,
-            "deferred": true,
-            "pending": pending_marks_count(case_dir),
-        })
-        .to_string();
+        return import_marks_response(
+            marks,
+            &crate::case_db::PatchOutcome::default(),
+            Some(pending_marks_count(case_dir)),
+            false,
+        );
     }
     let marks_path = case_dir.join("marks-imported.json");
     if let Err(err) = crate::util::write_text_atomic(&marks_path, marks_body) {
         return api_err(&err.to_string());
     }
     match crate::cli::handlers::import_marks_quiet(case_dir, &marks_path) {
-        Ok(stored) => {
+        Ok(outcome) => {
+            resolve_queue_conflicts(case_dir, &outcome);
             state_lock(state).marks_epoch += 1;
-            serde_json::json!({"ok": true, "applied": true, "stored": stored}).to_string()
+            import_marks_response(marks, &outcome, None, false)
         }
         Err(err) => api_err(&err),
     }
 }
 
-/// Accepts the viewer's downloaded marks JSON, stores it in the case, and
-/// refreshes the report so examiner marks land in the deliverable.
+/// Accepts the viewer's marks JSON (legacy export, patch-v1 or patch-v2),
+/// applies it to the case in-process and refreshes the report so
+/// examiner marks land in the deliverable.
 pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => return api_err(&err.to_string()),
+    };
+    api_import_marks_with_runner(request, state, &|args| run_step(&exe, args, state))
+}
+
+/// [`api_import_marks`] with the `make-report` child invocation injected
+/// (tests count how often the report is rebuilt). The import itself runs
+/// in-process so conflicts can be returned to the client.
+///
+/// `make-report` runs once per batch — for a request without `batch` or
+/// for the last chunk (`index == total-1`) — never for an earlier chunk.
+/// Each chunk is its own transaction; a chunk the client retries after a
+/// failure is idempotent per record (revision-checked).
+pub(crate) fn api_import_marks_with_runner(
+    request: &Request,
+    state: &SharedState,
+    runner: &dyn Fn(&[String]) -> Result<String, String>,
+) -> String {
     let marks_body = match body_value(&request.body, "marks_json") {
         Some(text) if !text.trim().is_empty() => text,
         _ => {
@@ -1022,21 +1245,22 @@ pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
     };
     let marks_path = case_dir.join("marks-imported.json");
-    let preflight =
-        crate::selection::parse_marks_text(&marks_body, &marks_path).and_then(|marks| {
+    let marks =
+        match crate::selection::parse_marks_text(&marks_body, &marks_path).and_then(|marks| {
             crate::selection::enforce_case_binding(
                 &case_dir,
                 marks.case_id.as_deref(),
                 &marks_path,
                 crate::selection::ImportKind::Marks,
             )
-        });
-    if let Err(err) = preflight {
-        return serde_json::json!({"ok": false, "error": err}).to_string();
-    }
+            .map(|_| marks)
+        }) {
+            Ok(marks) => marks,
+            Err(err) => return serde_json::json!({"ok": false, "error": err}).to_string(),
+        };
     let enriching = marks_must_queue(&state_lock(state));
     if enriching {
-        return import_marks_during_enrichment(state, &case_dir, &marks_body);
+        return import_marks_during_enrichment(state, &case_dir, &marks_body, &marks);
     }
     let _busy = match try_acquire_busy(state) {
         Ok(guard) => guard,
@@ -1050,42 +1274,37 @@ pub(crate) fn api_import_marks(request: &Request, state: &SharedState) -> String
         }
     }
     if let Err(err) = std::fs::write(&marks_path, &marks_body) {
-        return format!(
-            "{{\"ok\":false,\"error\":{}}}",
-            json_string(&err.to_string())
-        );
+        return api_err(&err.to_string());
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            return format!(
-                "{{\"ok\":false,\"error\":{}}}",
-                json_string(&err.to_string())
-            );
+    let outcome = {
+        let _gate = marks_gate();
+        match crate::cli::handlers::import_marks_quiet(&case_dir, &marks_path) {
+            Ok(outcome) => {
+                resolve_queue_conflicts(&case_dir, &outcome);
+                state_lock(state).marks_epoch += 1;
+                outcome
+            }
+            Err(err) => return api_err(&err),
         }
     };
-    let case_text = case_dir.to_string_lossy().to_string();
-    if let Err(err) = run_step(
-        &exe,
-        &[
-            "import-marks".into(),
-            case_text.clone(),
-            marks_path.to_string_lossy().to_string(),
-        ],
-        state,
-    ) {
-        return serde_json::json!({"ok": false, "error": err}).to_string();
-    }
-    if let Err(err) = run_step(&exe, &["make-report".into(), case_text.clone()], state) {
-        return serde_json::json!({"ok": false, "error": err}).to_string();
-    }
-    {
+    let refresh_report = marks.batch.as_ref().is_none_or(|batch| batch.is_last());
+    if refresh_report {
+        let case_text = case_dir.to_string_lossy().to_string();
+        if let Err(err) = runner(&["make-report".into(), case_text]) {
+            return serde_json::json!({"ok": false, "error": err}).to_string();
+        }
         let mut guard = state_lock(state);
         guard
             .logs
             .push("판독 마크를 반영해 보고서를 갱신했습니다.".into());
+        if !outcome.conflicts.is_empty() {
+            guard.logs.push(format!(
+                "판독 마크 {}건은 다른 창에서 먼저 바뀌어 적용하지 않았습니다 — 뷰어에서 확인하십시오.",
+                outcome.conflicts.len()
+            ));
+        }
     }
-    "{\"ok\":true,\"report_url\":\"case/reports/case-report.html\"}".to_string()
+    import_marks_response(&marks, &outcome, None, refresh_report)
 }
 
 /// Reviewer name as typed in the finalize dialog: trimmed, control
