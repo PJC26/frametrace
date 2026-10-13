@@ -92,6 +92,18 @@ pub(super) fn collect_video_candidates(
                     continue;
                 }
             };
+            if file_type.is_symlink() {
+                // Never followed (a link out of the evidence tree would
+                // index foreign files, and a junction loop never ends),
+                // but never silently dropped either: Windows reports
+                // directory junctions as symlinks, and an examiner whose
+                // camera folder is one needs to know it was skipped.
+                warnings.push(format!(
+                    "skipped symbolic link / junction {} (links are not followed; scan its target directly)",
+                    path.display()
+                ));
+                continue;
+            }
             if file_type.is_dir() {
                 if path_is_or_is_under_excluded_dir(&path, excluded_dirs) {
                     warnings.push(format!(
@@ -114,20 +126,25 @@ pub(super) fn collect_video_candidates(
     })
 }
 
+/// `source_dir` is the scan's canonicalized source (`canonicalize_display`
+/// in `scan_folder`). The case dir is canonicalized the SAME way: a plain
+/// `canonicalize()` keeps the `\\?\` prefix on Windows, so the
+/// `starts_with` below was always false there and a case nested inside
+/// the source had its own artifacts re-indexed as evidence.
 pub(super) fn excluded_case_dirs(
     case_dir: &Path,
     source_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
-    let case_dir = case_dir
-        .canonicalize()
-        .unwrap_or_else(|_| case_dir.to_path_buf());
+    let case_dir = canonicalize_display(case_dir).unwrap_or_else(|_| case_dir.to_path_buf());
+    // Tolerate a caller that canonicalized the source with the prefix on.
+    let source_dir = crate::util::strip_windows_extended_prefix(source_dir);
     if case_dir == source_dir {
         return Err(format!(
             "source directory cannot be the FrameTrace case directory: {}",
             source_dir.display()
         ));
     }
-    if case_dir.starts_with(source_dir) {
+    if case_dir.starts_with(&source_dir) {
         Ok(vec![case_dir])
     } else {
         Ok(Vec::new())

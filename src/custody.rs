@@ -353,6 +353,14 @@ fn hash_verify_banner(matched: usize, mismatched: usize, other: usize) -> String
     }
 }
 
+/// Chained audit lanes: `*log.jsonl` plus the forensic-tool lanes named
+/// `*-audit.jsonl` (`e01-audit.jsonl`, `tsk-audit.jsonl`), which are
+/// written through the same `append_chained_jsonl` and must be verified
+/// too — leaving them out would silently skip their chain check.
+fn is_chained_log_name(name: &str) -> bool {
+    name.ends_with("log.jsonl") || name.ends_with("-audit.jsonl")
+}
+
 fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
     if depth > 4 || !dir.is_dir() {
         return;
@@ -367,7 +375,7 @@ fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
         } else if path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|name| name.ends_with("log.jsonl"))
+            .is_some_and(is_chained_log_name)
         {
             out.push(path);
         }
@@ -682,6 +690,47 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ft-custody-{}", now_unix().unwrap()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(generate(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 15: the forensic-tool lanes (`e01-audit.jsonl`,
+    /// `tsk-audit.jsonl`) are collected and chain-verified with the rest.
+    #[test]
+    fn audit_lanes_named_dash_audit_are_verified() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-custody-lanes-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        let logs = dir.join("evidence/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        audit::append_chained_jsonl_keyed(&logs.join("e01-audit.jsonl"), r#"{"k":"e01"}"#, None)
+            .unwrap();
+        audit::append_chained_jsonl_keyed(&logs.join("tsk-audit.jsonl"), r#"{"k":"tsk"}"#, None)
+            .unwrap();
+        audit::append_chained_jsonl_keyed(&logs.join("scan-log.jsonl"), r#"{"k":"scan"}"#, None)
+            .unwrap();
+        // Not a chained lane: must stay out.
+        std::fs::write(logs.join("hash-notes.jsonl"), "{}\n").unwrap();
+
+        let rows = verify_audit_logs(&dir);
+        let names: Vec<&str> = rows.iter().map(|row| row.rel_path.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "evidence/logs/e01-audit.jsonl",
+                "evidence/logs/scan-log.jsonl",
+                "evidence/logs/tsk-audit.jsonl",
+            ]
+        );
+        assert!(rows.iter().all(|row| row.result.is_ok()));
+
+        // A tampered tool lane is now reported, not skipped.
+        let e01 = logs.join("e01-audit.jsonl");
+        let text = std::fs::read_to_string(&e01).unwrap();
+        std::fs::write(&e01, text.replace("\"e01\"", "\"e02\"")).unwrap();
+        let rows = verify_audit_logs(&dir);
+        assert!(rows[0].result.is_err(), "{:?}", rows[0].result);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

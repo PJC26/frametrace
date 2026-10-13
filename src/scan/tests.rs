@@ -170,6 +170,140 @@ fn collect_candidates_skips_excluded_case_output_tree() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A case directory nested inside the source is excluded through the SAME
+/// canonical form `scan_folder` uses for the source (`canonicalize_display`,
+/// no `\\?\` prefix). With a plain `canonicalize()` the comparison was
+/// always false on Windows and the case's own clips were indexed as
+/// evidence. Runs on every platform; the prefix mismatch only exists on
+/// Windows, where this test failed before the fix.
+#[test]
+fn nested_case_dir_is_excluded_using_the_source_canonical_form() {
+    let root = std::env::temp_dir().join(format!(
+        "frametrace-nested-case-canonical-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let source_dir = root.join("source");
+    let case_dir = source_dir.join("case");
+    fs::create_dir_all(source_dir.join("camera")).unwrap();
+    fs::create_dir_all(case_dir.join("db")).unwrap();
+    fs::create_dir_all(case_dir.join("artifacts/clips")).unwrap();
+    fs::write(source_dir.join("camera/real.mp4"), b"\0\0\0\x18ftypmp42one").unwrap();
+    fs::write(
+        case_dir.join("artifacts/clips/derived.mp4"),
+        b"\0\0\0\x18ftypmp42two",
+    )
+    .unwrap();
+
+    // Exactly what scan_folder does: source canonicalized for display,
+    // case dir handed over as given (possibly relative/un-normalized).
+    let canonical_source = crate::util::canonicalize_display(&source_dir).unwrap();
+    let excluded = excluded_case_dirs(&case_dir, &canonical_source).unwrap();
+    assert_eq!(
+        excluded.len(),
+        1,
+        "nested case dir must be excluded: {excluded:?}"
+    );
+    assert!(
+        !excluded[0].to_string_lossy().starts_with(r"\\?\"),
+        "exclusion must use the display form: {:?}",
+        excluded[0]
+    );
+    let collection = collect_video_candidates(&canonical_source, None, &excluded).unwrap();
+    let names: Vec<String> = collection
+        .files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, vec!["real.mp4"]);
+    assert_eq!(
+        collection
+            .warnings
+            .iter()
+            .filter(|w| w.contains("skipped FrameTrace case output directory"))
+            .count(),
+        1,
+        "{:?}",
+        collection.warnings
+    );
+
+    // End to end through scan_folder as well.
+    let options = ScanOptions {
+        use_ffprobe: false,
+        ..ScanOptions::default()
+    };
+    let result =
+        super::scan_folder(&case_dir, &source_dir, &options, ResumeMode::Auto, None).unwrap();
+    assert_eq!(result.video_count, 1, "{:?}", result.warnings);
+    let index = fs::read_to_string(case_dir.join("db/videos.jsonl")).unwrap();
+    assert!(index.contains("real.mp4"));
+    assert!(
+        !index.contains("derived.mp4"),
+        "case output re-indexed: {index}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Links are not followed, and that is reported instead of silently
+/// dropping whatever sits behind them (Windows junctions show up as
+/// symlinks). The junction is made with `mklink /J`, which needs no
+/// privilege; the unix variant is a plain directory symlink.
+#[test]
+fn symlinked_directory_is_skipped_with_a_warning() {
+    let root =
+        std::env::temp_dir().join(format!("frametrace-scan-junction-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let source_dir = root.join("source");
+    let target = root.join("elsewhere");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("behind.mp4"), b"\0\0\0\x18ftypmp42x").unwrap();
+    fs::write(source_dir.join("direct.mp4"), b"\0\0\0\x18ftypmp42y").unwrap();
+    let link = source_dir.join("linked");
+    #[cfg(windows)]
+    {
+        let status = crate::util::hide_console(&mut std::process::Command::new("cmd"))
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J failed: {status}");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "fixture link is not reported as a symlink"
+    );
+
+    let collection = collect_video_candidates(&source_dir, None, &[]).unwrap();
+    let names: Vec<String> = collection
+        .files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, vec!["direct.mp4"], "link must not be followed");
+    assert!(
+        collection
+            .warnings
+            .iter()
+            .any(|w| w.contains("junction") && w.contains("linked")),
+        "{:?}",
+        collection.warnings
+    );
+    // Remove the link itself first so the cleanup never recurses into
+    // the target through it.
+    let _ = fs::remove_dir(&link);
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn deserializes_published_jsonl_records_through_serde() {
     let line = r#"{"id":"vid_000001","source_path":"C:\\Evidence\\a\tb.mp4","relative_path":"a\tb.mp4","extension":"mp4","size_bytes":1,"modified_unix":null,"sha256":null,"hash_status":"skipped","confidence":"extension-candidate","source_profile":{"lane":"generic-video","vendor":"Generic media","parser":"generic_media","confidence":"medium","recommended_action":"Use ffprobe/FFmpeg first; preserve original and export derived clips only when requested.","evidence":["extension"]},"duration_seconds":12.5,"format_name":"mov,mp4,m4a","video_codec":"h264","audio_codec":null,"width":1920,"height":1080,"ffprobe_ok":true,"ffprobe_error":null,"ffprobe":null}"#;

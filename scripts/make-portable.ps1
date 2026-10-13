@@ -1,7 +1,8 @@
 ﻿# Builds release binaries and a portable zip for examiners.
-# Usage: powershell -File scripts/make-portable.ps1
+# Usage: powershell -ExecutionPolicy Bypass -File scripts/make-portable.ps1
 $ErrorActionPreference = "Stop"
 cargo build --release --locked
+if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit code $LASTEXITCODE)" }
 $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
 $stage = "dist/FrameTrace-$version-win64"
 Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
@@ -15,10 +16,19 @@ Copy-Item docs/WINDOWS_VALIDATION.md $stage/docs/ -ErrorAction SilentlyContinue
 Copy-Item scripts/install.ps1 $stage/
 # Bundle vendored tool binaries (libewf / Sleuth Kit + their DLLs) when the
 # repo has them, so E01 and deleted-file workflows work out of the box.
+# tools/bin (checked in or hand-assembled) wins; scripts/build-libewf-tools.ps1
+# installs to target/release/tools/bin, so fall back to that.
 # ffmpeg/ffprobe are still expected on PATH or dropped into tools/bin by the
 # examiner (they are large and commonly already installed).
-if (Test-Path "tools/bin") {
-    Copy-Item "tools/bin/*" "$stage/tools/bin/" -Recurse -Force
+$toolsSrc = $null
+foreach ($cand in @("tools/bin", "target/release/tools/bin")) {
+    if (Test-Path $cand) { $toolsSrc = $cand; break }
+}
+if ($toolsSrc) {
+    Write-Host "bundling tools from $toolsSrc"
+    Copy-Item "$toolsSrc/*" "$stage/tools/bin/" -Recurse -Force
+} else {
+    Write-Warning "no tools/bin or target/release/tools/bin found - the package ships WITHOUT libewf/Sleuth Kit tools (E01 and deleted-file workflows need them). Run scripts/build-libewf-tools.ps1 first or copy the tools into tools/bin."
 }
 @'
 FrameTrace portable package
@@ -41,9 +51,13 @@ Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
 # SHA256SUMS covering every zip in dist/ — same manifest convention as
 # scripts/build-release.sh; consumers verify with `Get-FileHash` or
 # `sha256sum -c` (see docs/repro-build.md).
+# Written with LF endings and no BOM: Out-File on PS 5.1 emits CRLF, which
+# breaks `sha256sum -c` on Linux/macOS.
 $dist = Split-Path $stage
-Get-ChildItem $dist -Filter *.zip | ForEach-Object {
+$sumLines = @(Get-ChildItem $dist -Filter *.zip | ForEach-Object {
     "{0}  {1}" -f ((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()), $_.Name
-} | Out-File -Encoding ascii "$dist/SHA256SUMS"
+})
+$sumsPath = Join-Path (Resolve-Path $dist).Path "SHA256SUMS"
+[System.IO.File]::WriteAllText($sumsPath, (($sumLines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "package: $stage.zip"
 Write-Host "sums: $dist/SHA256SUMS"

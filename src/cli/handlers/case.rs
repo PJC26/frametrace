@@ -1044,7 +1044,7 @@ fn generate_review_thumbnails(
                     let output = thumbs_dir.join(format!("{id}.jpg"));
                     let mut created = false;
                     for seek in ["5", "0"] {
-                        let result = Command::new(&ffmpeg)
+                        let result = crate::util::hide_console(&mut Command::new(&ffmpeg))
                             .args([
                                 "-y",
                                 "-loglevel",

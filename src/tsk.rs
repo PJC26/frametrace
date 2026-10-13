@@ -366,10 +366,12 @@ pub fn recover_inode(
         .map_err(|err| format!("{err} (install Sleuth Kit and ensure icat is in PATH)"))?;
     let output = File::create(&output_path)
         .map_err(|err| format!("failed to create {}: {err}", output_path.display()))?;
-    let mut child = Command::new(&icat_bin)
+    let mut command = Command::new(&icat_bin);
+    command
         .args(&args)
         .stdout(Stdio::from(output))
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = crate::util::hide_console(&mut command)
         .spawn()
         .map_err(|err| format!("failed to run {}: {err}", options.icat_bin))?;
     let mut stderr_pipe = child.stderr.take().expect("piped icat stderr");
@@ -603,7 +605,7 @@ fn run_capture_streaming(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command
+    let child = crate::util::hide_console(&mut command)
         .spawn()
         .map_err(|err| format!("failed to run {binary}: {err}"))?;
     drain_streaming(child, timeout_secs, on_lines)

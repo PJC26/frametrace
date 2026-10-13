@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,6 +19,18 @@ pub(crate) fn open_case_db(case_dir: &Path) -> Result<Connection, String> {
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| format!("failed to enable SQLite foreign keys: {err}"))?;
     Ok(conn)
+}
+
+/// Starts a write transaction with `BEGIN IMMEDIATE`.
+///
+/// A deferred transaction (`conn.transaction()`) begins with no lock and
+/// first reads under SHARED; the later upgrade to RESERVED can fail with
+/// SQLITE_BUSY *immediately* (lock-upgrade deadlock), bypassing
+/// `busy_timeout`. Taking RESERVED up front makes a competing writer wait
+/// on the 5 s busy timeout configured by [`open_case_db`] instead, so a
+/// mark save racing a scan write does not fail with "database is locked".
+pub(crate) fn begin_write(conn: &mut Connection) -> rusqlite::Result<Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
 }
 
 pub(crate) fn open_readonly_case_db(path: &Path) -> Result<Connection, String> {
@@ -570,10 +582,58 @@ pub(crate) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::{
-        SCHEMA_VERSION, case_db_path, init_schema, open_case_db, table_exists, table_has_column,
+        SCHEMA_VERSION, begin_write, case_db_path, init_schema, open_case_db, table_exists,
+        table_has_column,
     };
     use rusqlite::{Connection, OptionalExtension};
     use std::fs;
+
+    /// `begin_write` must take the RESERVED lock at BEGIN (IMMEDIATE), so a
+    /// second writer is blocked right away (and would wait on busy_timeout)
+    /// instead of both proceeding and one failing later on lock upgrade.
+    /// Deterministic: no threads, no sleeps — the second connection uses
+    /// busy_timeout 0 so BUSY is reported instantly.
+    #[test]
+    fn begin_write_takes_reserved_lock_up_front() {
+        let case_dir = std::env::temp_dir().join(format!(
+            "frametrace-begin-write-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&case_dir);
+        let mut first = open_case_db(&case_dir).unwrap();
+        init_schema(&first).unwrap();
+
+        let second = Connection::open(case_db_path(&case_dir)).unwrap();
+        second
+            .busy_timeout(std::time::Duration::from_millis(0))
+            .unwrap();
+
+        // Control: a deferred transaction holds no lock until it touches
+        // the db, so a competing BEGIN IMMEDIATE would still succeed.
+        {
+            let deferred = first.transaction().unwrap();
+            second.execute_batch("BEGIN IMMEDIATE").unwrap();
+            second.execute_batch("ROLLBACK").unwrap();
+            deferred.rollback().unwrap();
+        }
+
+        // With the helper the writer slot is already taken.
+        let tx = begin_write(&mut first).unwrap();
+        let err = second.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "expected SQLITE_BUSY, got {err}"
+        );
+        tx.rollback().unwrap();
+        // Released on rollback: the second writer can now start.
+        second.execute_batch("BEGIN IMMEDIATE").unwrap();
+        second.execute_batch("ROLLBACK").unwrap();
+
+        drop(second);
+        drop(first);
+        let _ = fs::remove_dir_all(case_dir);
+    }
 
     #[test]
     fn initializes_new_databases_at_current_schema_version() {

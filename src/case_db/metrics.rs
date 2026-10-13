@@ -12,8 +12,7 @@ pub fn benchmark_case_db(output_dir: &Path, rows: usize) -> Result<DbBenchmarkRe
     init_schema(&conn)?;
     let started = Instant::now();
     let now = now_unix()?;
-    let tx = conn
-        .transaction()
+    let tx = begin_write(&mut conn)
         .map_err(|err| format!("failed to start benchmark transaction: {err}"))?;
     for index in 0..rows {
         let id = format!("bench_{index:08}");

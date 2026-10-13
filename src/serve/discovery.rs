@@ -11,8 +11,68 @@ pub(crate) fn instance_file_path() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(custom));
     }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".frametrace").join("server.json"))
+    Some(home_dir()?.join(".frametrace").join("server.json"))
+}
+
+/// The user's home: on Windows `USERPROFILE` first — a stray `HOME` (set by
+/// Git Bash / MSYS shells, sometimes to another drive) must not move the
+/// instance file away from where the windowed app (launched from Explorer,
+/// no `HOME`) looks for it. Elsewhere `HOME` first.
+fn home_dir() -> Option<PathBuf> {
+    let (first, second) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    std::env::var_os(first)
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os(second).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// Removes the instance file at shutdown, but only while it still records
+/// THIS process (a newer server may have overwritten it; deleting that
+/// would orphan the live instance from discovery). Failures are reported,
+/// not swallowed. Returns whether a file was removed.
+// Called from serve::run once the accept loop ends (integration step).
+pub(crate) fn remove_instance_file_if_owned() -> bool {
+    let Some(path) = instance_file_path() else {
+        return false;
+    };
+    match remove_instance_file_if_pid(&path, std::process::id()) {
+        Ok(removed) => removed,
+        Err(err) => {
+            eprintln!(
+                "인스턴스 파일을 지우지 못했습니다 ({}): {err} / could not remove the instance file",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+/// Deletes `path` only when its recorded `pid` equals `pid`. A missing file
+/// is `Ok(false)`; a file of another process (or unparsable) is left alone.
+/// Read-then-delete is not atomic: a server starting in the same instant
+/// could rewrite the file in between and lose it; that server is then just
+/// not discoverable until its next start (a stale window, never a leak).
+pub(crate) fn remove_instance_file_if_pid(path: &Path, pid: u32) -> Result<bool, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("read failed: {err}")),
+    };
+    let recorded = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("pid").and_then(|pid| pid.as_u64()));
+    if recorded != Some(u64::from(pid)) {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("remove failed: {err}")),
+    }
 }
 
 /// Records `{port, pid, instance, token?}` in a user-private file (0600 on unix).
@@ -115,6 +175,19 @@ pub(crate) fn probe_status_body(port: u16, token: Option<&str>) -> Option<Vec<u8
 /// knows. When no instance file exists (server started by an older build),
 /// fall back to the structural scan — but require the full status shape
 /// (`app` + `has_job` + `case_dir` keys), not just the spoofable marker.
+///
+/// Residual risk of the primary path (Windows review item 6, accepted):
+/// the token recorded in the instance file is sent to that file's port
+/// BEFORE the responder has proven it is our server (the nonce check needs
+/// the authenticated status body). If our server died and another local
+/// process grabbed the port, that process learns the dead server's token.
+/// Accepted because (a) the file is user-private (0600 / the user's
+/// profile), so only a process that could already read the token from disk
+/// can steer us to a port; (b) the token is a per-process random value that
+/// dies with the server that minted it — the next server mints a new one;
+/// (c) a clean shutdown removes the file while it still names this process
+/// ([`remove_instance_file_if_owned`]), narrowing the window to crashes.
+/// The fallback scan below never sends a token.
 pub(crate) fn find_running_server() -> Option<u16> {
     if let Some((port, instance, token)) = read_instance_record()
         && let Some(body) = probe_status_body(port, token.as_deref())
@@ -133,16 +206,20 @@ pub(crate) fn find_running_server() -> Option<u16> {
         }
         // Stale or foreign instance file: keep scanning below.
     }
-    for port in 8477..=8486 {
-        let Some(buf) = probe_status_body(port, token_for_port(port).as_deref()) else {
-            continue;
-        };
-        let has = |key: &[u8]| buf.windows(key.len()).any(|w| w == key);
-        if has(b"\"app\":\"frametrace\"") && has(b"\"has_job\"") && has(b"\"case_dir\"") {
-            return Some(port);
-        }
-    }
-    None
+    // Fallback: unauthenticated probes only. Any process may sit on these
+    // ports, so no secret is ever offered here; a token-gated server
+    // answers 401 and is simply not reused (a fresh one starts instead).
+    (8477..=8486).find(|&port| {
+        probe_status_body(port, None).is_some_and(|buf| status_body_is_workstation(&buf))
+    })
+}
+
+/// A full, successful `/api/status` reply: a `200` status line plus the
+/// `app` / `has_job` / `case_dir` keys (the marker alone is spoofable).
+pub(crate) fn status_body_is_workstation(buf: &[u8]) -> bool {
+    let ok_line = buf.starts_with(b"HTTP/1.1 200") || buf.starts_with(b"HTTP/1.0 200");
+    let has = |key: &[u8]| buf.windows(key.len()).any(|w| w == key);
+    ok_line && has(b"\"app\":\"frametrace\"") && has(b"\"has_job\"") && has(b"\"case_dir\"")
 }
 
 /// Port and token of the server running in THIS process, published by `run`
@@ -234,5 +311,87 @@ mod tests_shell_token {
             resolve_shell_token(2, |_| Some("fromfile".into())).as_deref(),
             Some("fromfile")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_instance_file {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ft-disc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn instance_file_removed_only_when_pid_matches() {
+        let dir = scratch("owned");
+        let file = dir.join("server.json");
+        std::fs::write(&file, r#"{"port":8477,"pid":4242,"instance":"n"}"#).unwrap();
+        // Another process's record stays in place.
+        assert_eq!(remove_instance_file_if_pid(&file, 4243), Ok(false));
+        assert!(file.is_file(), "a foreign instance file must survive");
+        // Our own record is removed.
+        assert_eq!(remove_instance_file_if_pid(&file, 4242), Ok(true));
+        assert!(!file.exists());
+        // Already gone is not an error.
+        assert_eq!(remove_instance_file_if_pid(&file, 4242), Ok(false));
+        // Corrupt / pid-less files are never deleted.
+        std::fs::write(&file, "not json").unwrap();
+        assert_eq!(remove_instance_file_if_pid(&file, 4242), Ok(false));
+        assert!(file.is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fallback_shape_requires_200_and_full_status() {
+        let full: &[u8] =
+            b"HTTP/1.1 200 OK\r\n\r\n{\"app\":\"frametrace\",\"has_job\":false,\"case_dir\":null}";
+        assert!(status_body_is_workstation(full));
+        let denied: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\r\n{\"app\":\"frametrace\",\"has_job\":false,\"case_dir\":null}";
+        assert!(!status_body_is_workstation(denied));
+        let marker_only: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"app\":\"frametrace\"}";
+        assert!(!status_body_is_workstation(marker_only));
+    }
+
+    /// The fallback scan never offers a token: a fake listener captures the
+    /// raw request the unauthenticated probe sends.
+    #[test]
+    fn unauthenticated_probe_sends_no_token_header() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        let _ = probe_status_body(port, None);
+        let request = seen.join().unwrap();
+        assert!(request.starts_with("GET /api/status"), "{request}");
+        assert!(
+            !request.to_ascii_lowercase().contains("x-frametrace-token"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn instance_file_path_prefers_userprofile_on_windows() {
+        // Reads the real environment only (never writes): the chosen home
+        // must be the platform's primary variable whenever it is set.
+        let primary = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        if let Some(value) = std::env::var_os(primary).filter(|v| !v.is_empty()) {
+            assert_eq!(home_dir(), Some(PathBuf::from(value)));
+        }
     }
 }

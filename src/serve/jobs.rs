@@ -15,6 +15,16 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
             return "{\"ok\":false,\"error\":\"증거 소스 경로를 입력하십시오.\"}".to_string();
         }
     };
+    // Item 8 policy (see http::reject_remote_path): a typed UNC share is
+    // honoured on this nonce-gated POST, device-namespace paths are not.
+    // Checked before `exists()` touches the filesystem.
+    for field in ["source_path", "case_dir"] {
+        if let Some(text) = body_value(&request.body, field)
+            && let Err(reason) = super::http::reject_device_path(&text)
+        {
+            return api_err(reason);
+        }
+    }
     if !source_path.exists() {
         return format!(
             "{{\"ok\":false,\"error\":{}}}",

@@ -23,6 +23,11 @@ pub(crate) fn http_body_limit_for(path: &str) -> usize {
 
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Windows review item 11: the workstation URL carries `?token=` on first
+/// load, so no response may leak it (or any evidence path in a query) to a
+/// link target through the Referer header. Sent on every response.
+pub(crate) const REFERRER_POLICY: &str = "Referrer-Policy: no-referrer\r\n";
+
 pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -213,6 +218,13 @@ pub(crate) fn handle_connection_timed(
         }
         Err(code) => return finish(&mut stream, &plain(code, b"unauthorized".to_vec())),
     };
+    // Item 8: UNC/device paths are refused before any handler (and thus
+    // any filesystem call) sees them.
+    if !path_fields_for(&request.method, &request.path).is_empty()
+        && let Some(reason) = remote_path_violation(&request, &approved_path_roots(&state))
+    {
+        return finish(&mut stream, &remote_path_refusal(reason));
+    }
     if request.method == "GET" && request.path == "/media" {
         let result = serve_media(&mut stream, &request, &state);
         let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -464,21 +476,38 @@ pub(crate) fn json_string(value: &str) -> String {
 /// examiner's browser can still issue `text/plain` form POSTs without a
 /// CORS preflight, and a rebinding domain can point at the same port. Gate
 /// every state-changing request on same-origin evidence: an Origin header
-/// must be absent (curl / the opened page itself) or match the loopback
-/// host, and a Host header must resolve to loopback.
+/// must be absent (curl / the shell's raw-socket requests / the opened
+/// page's own same-origin GETs) or name exactly this server's authority,
+/// and a Host header must resolve to loopback.
+///
+/// Origin present => the request came from a browser page, so its full
+/// authority (host *and* port) must equal the Host authority: a page served
+/// by some other localhost port (a dev server, another local tool) is a
+/// different origin and must not drive this workstation with the examiner's
+/// cookies (Windows review item 7). Host is then mandatory — without it the
+/// comparison cannot be made.
 pub(crate) fn request_is_localhost_trusted(request: &Request) -> bool {
     if let Some(origin) = request.origin.as_deref() {
         let origin = origin.trim();
         // `null` origins come from sandboxed frames, not our own pages.
         // The authority must parse to an exact loopback host: a prefix
         // match would admit `http://127.0.0.1.evil.com`.
-        let loopback_origin = origin
-            .strip_prefix("http://")
-            .and_then(origin_authority_host)
-            .is_some_and(|host| {
-                matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1")
-            });
-        if !loopback_origin {
+        let Some((origin_host, origin_port)) =
+            origin.strip_prefix("http://").and_then(authority_host_port)
+        else {
+            return false;
+        };
+        if !matches!(origin_host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+            return false;
+        }
+        let Some((host_host, host_port)) = request
+            .host
+            .as_deref()
+            .and_then(|host| authority_host_port(host.trim()))
+        else {
+            return false;
+        };
+        if origin_host != host_host || origin_port != host_port {
             return false;
         }
     }
@@ -512,35 +541,252 @@ pub(crate) fn secret_eq(candidate: &str, secret: &str) -> bool {
 /// `http://127.0.0.1@evil.example` both contain the loopback literal
 /// while pointing at an attacker-controlled host.
 pub(crate) fn origin_authority_host(authority: &str) -> Option<String> {
+    authority_host_port(authority).map(|(host, _)| host)
+}
+
+/// `(lowercase host, port)` of an `http` authority (`host[:port]`, IPv6 in
+/// brackets — returned without them). A missing port normalizes to 80, the
+/// http default, so `Origin: http://127.0.0.1` matches `Host: 127.0.0.1`.
+pub(crate) fn authority_host_port(authority: &str) -> Option<(String, u16)> {
     // Origins are `scheme://host[:port]`; a path tail is cut off and any
     // userinfo (`host@real-host`) disqualifies the value outright.
     let authority = authority.split('/').next()?;
     if authority.is_empty() || authority.contains('@') {
         return None;
     }
-    let host = if let Some(rest) = authority.strip_prefix('[') {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         // IPv6 literal: `[host]` followed by nothing or a valid `:port`.
         let end = rest.find(']')?;
         let tail = &rest[end + 1..];
-        if let Some(port) = tail.strip_prefix(':') {
-            port.parse::<u16>().ok()?;
-        } else if !tail.is_empty() {
+        let port = if let Some(port) = tail.strip_prefix(':') {
+            port.parse::<u16>().ok()?
+        } else if tail.is_empty() {
+            80
+        } else {
             return None;
-        }
-        &rest[..end]
+        };
+        (&rest[..end], port)
     } else {
         match authority.split_once(':') {
-            Some((host, port)) => {
-                port.parse::<u16>().ok()?;
-                host
-            }
-            None => authority,
+            Some((host, port)) => (host, port.parse::<u16>().ok()?),
+            None => (authority, 80),
         }
     };
     if host.is_empty() {
         return None;
     }
-    Some(host.to_ascii_lowercase())
+    Some((host.to_ascii_lowercase(), port))
+}
+
+/// Refusal text for a network (UNC) or device-namespace path.
+pub(crate) const REMOTE_PATH_ERROR: &str = "네트워크(UNC)·장치 경로는 허용되지 않습니다 — 로컬 드라이브 경로를 사용하십시오. / UNC and device paths are refused.";
+
+/// Windows review item 8: a user-supplied path that names a network share
+/// (`\\server\share`, `//server/share`, `\\?\UNC\…`) or the device
+/// namespace (`\\.\…`, `\\?\GLOBALROOT…`, `\??\…`) must be refused BEFORE
+/// any filesystem call — merely `canonicalize`/`metadata` on a UNC path
+/// makes Windows open an SMB session and hand the examiner's NTLM
+/// credentials to whatever host the path names, and those GET routes are
+/// reachable from any web page (e.g. `<img src=…/media?path=\\evil\x>`).
+///
+/// Exceptions:
+/// - an approved root that is itself UNC admits paths under that exact
+///   share prefix (case-insensitive, component boundary, no `..`);
+/// - the verbatim local-drive form `\\?\C:\…` (what `canonicalize` returns
+///   on Windows) stays allowed: it never leaves the machine.
+///
+/// The check is textual and platform-independent, so it holds on every OS.
+///
+/// Policy (which routes use this vs. [`reject_device_path`]): the SMB/NTLM
+/// leak vector is a cross-origin GET — `<img>`/`<video>` send no Origin
+/// header, so any web page can make the browser issue one. Every GET route
+/// therefore refuses UNC unless it lies under an approved UNC root. The
+/// POST routes where the examiner types a source/case path
+/// (`/api/preflight`, `/api/start`, see [`route_admits_typed_unc`]) are
+/// gated by the Origin port check and the instance nonce, so a typed UNC
+/// share is honoured there; device-namespace paths stay refused.
+pub(crate) fn reject_remote_path(
+    raw: &str,
+    approved_roots: &[PathBuf],
+) -> Result<(), &'static str> {
+    let text = raw.trim();
+    if !is_remote_or_device_path(text) {
+        return Ok(());
+    }
+    if is_verbatim_local_drive(text) {
+        return Ok(());
+    }
+    let Some(unc) = unc_share_form(text) else {
+        return Err(REMOTE_PATH_ERROR);
+    };
+    if unc.split('\\').any(|part| part == ".." || part == ".") {
+        return Err(REMOTE_PATH_ERROR);
+    }
+    let admitted = approved_roots
+        .iter()
+        .filter_map(|root| unc_share_form(&root.to_string_lossy()))
+        .any(|root| unc == root || unc.starts_with(&format!("{root}\\")));
+    if admitted {
+        Ok(())
+    } else {
+        Err(REMOTE_PATH_ERROR)
+    }
+}
+
+/// Lenient form of [`reject_remote_path`] for the POST routes where the
+/// examiner explicitly types a path ([`route_admits_typed_unc`]): a
+/// well-formed UNC share path (`\\server\share\…`, `//server/share/…`,
+/// `\\?\UNC\server\share\…`, no `.`/`..` components) is admitted;
+/// device-namespace and malformed remote paths are still refused.
+pub(crate) fn reject_device_path(raw: &str) -> Result<(), &'static str> {
+    let text = raw.trim();
+    if is_remote_or_device_path(text)
+        && let Some(unc) = unc_share_form(text)
+    {
+        if unc.split('\\').any(|part| part == ".." || part == ".") {
+            return Err(REMOTE_PATH_ERROR);
+        }
+        return Ok(());
+    }
+    reject_remote_path(text, &[])
+}
+
+/// Routes whose path fields may name a UNC share the examiner typed (see
+/// the policy on [`reject_remote_path`]). Only same-origin, nonce-gated
+/// POSTs qualify — never a GET.
+pub(crate) fn route_admits_typed_unc(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("POST", "/api/preflight") | ("POST", "/api/start")
+    )
+}
+
+fn is_separator(byte: u8) -> bool {
+    byte == b'\\' || byte == b'/'
+}
+
+/// Two leading separators (any mix of `\` and `/`) or the NT object prefix.
+fn is_remote_or_device_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]))
+        || (bytes.len() >= 4
+            && is_separator(bytes[0])
+            && bytes[1] == b'?'
+            && bytes[2] == b'?'
+            && is_separator(bytes[3]))
+}
+
+/// `\\?\C:` / `\\?\C:\…` — the verbatim spelling of a local drive path.
+fn is_verbatim_local_drive(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 6
+        && bytes[0] == b'\\'
+        && bytes[1] == b'\\'
+        && bytes[2] == b'?'
+        && bytes[3] == b'\\'
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && (bytes.len() == 6 || bytes[6] == b'\\')
+}
+
+/// Lowercased `\\server\share[\rest]` form of a UNC path (separators
+/// normalized to `\`, `\\?\UNC\` unwrapped, trailing separators dropped);
+/// `None` for anything else — device paths, local paths, or a UNC path
+/// without both a server and a share component.
+fn unc_share_form(text: &str) -> Option<String> {
+    let normalized = text.trim().replace('/', "\\");
+    let lower = normalized.to_ascii_lowercase();
+    let rest = if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
+        rest.to_string()
+    } else if lower.starts_with(r"\\?\") || lower.starts_with(r"\\.\") || lower.starts_with(r"\??\")
+    {
+        return None;
+    } else if let Some(rest) = lower.strip_prefix(r"\\") {
+        rest.to_string()
+    } else {
+        return None;
+    };
+    let rest = rest.trim_end_matches('\\');
+    let mut parts = rest.split('\\');
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    if server.is_empty() || share.is_empty() || matches!(server, "?" | ".") {
+        return None;
+    }
+    Some(format!(r"\\{rest}"))
+}
+
+/// Roots that may admit a UNC path: the bound case, the last package and
+/// the approved media roots.
+pub(crate) fn approved_path_roots(state: &SharedState) -> Vec<PathBuf> {
+    let guard = state_lock(state);
+    guard
+        .case_dir
+        .iter()
+        .chain(guard.package_dir.iter())
+        .chain(guard.media_roots.iter())
+        .cloned()
+        .collect()
+}
+
+/// Request fields that carry a filesystem path, per route. Checked in
+/// [`handle_connection_timed`] before the request is routed, so even
+/// handlers outside this file (`/api/open-folder` → `resolve_open_folder`)
+/// never reach `canonicalize` with a UNC path. Handlers in system.rs /
+/// media.rs repeat the check themselves (defense in depth). Routes listed
+/// in [`route_admits_typed_unc`] get the lenient check (typed UNC shares
+/// admitted, device paths refused); every other route the strict one.
+pub(crate) fn path_fields_for(method: &str, path: &str) -> &'static [(bool, &'static str)] {
+    // (from_query, field)
+    match (method, path) {
+        ("GET", "/media") => &[(true, "path")],
+        ("GET", "/api/browse") => &[(true, "path")],
+        ("GET", "/api/case-info") => &[(true, "case_dir")],
+        ("POST", "/api/open-case") => &[(false, "case_dir")],
+        ("POST", "/api/open-folder") => &[(false, "path")],
+        ("POST", "/api/preflight" | "/api/start") => &[(false, "source_path"), (false, "case_dir")],
+        ("POST", "/api/export-clip" | "/api/telemetry" | "/api/proxy") => &[(false, "path")],
+        ("POST", "/api/advanced") => &[(false, "extra")],
+        _ => &[],
+    }
+}
+
+/// 400 JSON body for a refused UNC/device path (the browse/start screens
+/// show `error` as-is).
+pub(crate) fn remote_path_refusal(reason: &str) -> Vec<u8> {
+    respond(
+        400,
+        "application/json; charset=utf-8",
+        api_err(reason).into_bytes(),
+        "no-store",
+        None,
+    )
+}
+
+/// `Some(reason)` when a path field of `request` names a refused UNC or
+/// device path (see [`reject_remote_path`]; routes in
+/// [`route_admits_typed_unc`] use [`reject_device_path`]).
+pub(crate) fn remote_path_violation(
+    request: &Request,
+    approved_roots: &[PathBuf],
+) -> Option<&'static str> {
+    let typed_unc_ok = route_admits_typed_unc(&request.method, &request.path);
+    path_fields_for(&request.method, &request.path)
+        .iter()
+        .filter_map(|(from_query, field)| {
+            if *from_query {
+                query_value(&request.query, field)
+            } else {
+                body_value(&request.body, field)
+            }
+        })
+        .find_map(|value| {
+            if typed_unc_ok {
+                reject_device_path(&value).err()
+            } else {
+                reject_remote_path(&value, approved_roots).err()
+            }
+        })
 }
 
 /// Tokens are planted into a Cookie header, so they must only contain
@@ -797,7 +1043,7 @@ pub(crate) fn serve_case_file_with(
             .is_some_and(|value| etag_matches(value, &etag))
         {
             let head = format!(
-                "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n\r\n"
             );
             return stream
                 .write_all(head.as_bytes())
@@ -808,7 +1054,7 @@ pub(crate) fn serve_case_file_with(
         ("private, max-age=60", String::new())
     };
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {total}\r\nCache-Control: {cache}\r\n{etag_header}X-Content-Type-Options: nosniff\r\n{safety}Connection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {total}\r\nCache-Control: {cache}\r\n{etag_header}X-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}{safety}Connection: close\r\n\r\n",
         mime_for(&path),
     );
     stream
@@ -1006,8 +1252,12 @@ pub(crate) fn serve_media(
     let Some(raw_path) = query_value(&request.query, "path") else {
         return write_simple(stream, 400, b"missing path");
     };
-    let candidate = PathBuf::from(&raw_path);
     let roots = state_lock(state).media_roots.clone();
+    // Item 8: textual UNC/device refusal BEFORE canonicalize touches it.
+    if let Err(reason) = reject_remote_path(&raw_path, &roots) {
+        return write_simple(stream, 400, reason.as_bytes());
+    }
+    let candidate = PathBuf::from(&raw_path);
     let canonical = match candidate.canonicalize() {
         Ok(path) => path,
         Err(_) => return write_simple(stream, 404, b"media not found"),
@@ -1050,7 +1300,7 @@ pub(crate) fn serve_media(
         return write_simple(stream, 500, b"seek failed");
     }
     let mut head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: {}\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+        "HTTP/1.1 {code} {}\r\nContent-Type: {}\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n",
         if code == 206 { "Partial Content" } else { "OK" },
         mime_for(&canonical)
     );
@@ -1073,7 +1323,7 @@ pub(crate) fn serve_media(
 
 pub(crate) fn write_range_unsatisfiable(stream: &mut TcpStream, total: u64) -> Result<(), String> {
     let head = format!(
-        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n{REFERRER_POLICY}Connection: close\r\n\r\n"
     );
     stream
         .write_all(head.as_bytes())
@@ -1082,7 +1332,7 @@ pub(crate) fn write_range_unsatisfiable(stream: &mut TcpStream, total: u64) -> R
 
 pub(crate) fn write_simple(stream: &mut TcpStream, code: u16, body: &[u8]) -> Result<(), String> {
     let head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n\r\n",
         if code == 200 { "OK" } else { "Error" },
         body.len()
     );
@@ -1143,7 +1393,7 @@ pub(crate) fn respond(
         _ => "OK",
     };
     let mut head = format!(
-        "HTTP/1.1 {code} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+        "HTTP/1.1 {code} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n",
         body.len()
     );
     if let Some(extra) = extra {
@@ -1208,5 +1458,208 @@ pub(crate) fn mime_for(path: &Path) -> &'static str {
         Some("mov") => "video/quicktime",
         Some("tsv") => "text/tab-separated-values; charset=utf-8",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests_origin_and_paths {
+    use super::*;
+
+    fn request(origin: Option<&str>, host: Option<&str>) -> Request {
+        Request {
+            method: "POST".into(),
+            path: "/api/cancel".into(),
+            query: String::new(),
+            body: String::new(),
+            range: None,
+            origin: origin.map(str::to_string),
+            host: host.map(str::to_string),
+            cookie: None,
+            token_header: None,
+            nonce_header: None,
+        }
+    }
+
+    #[test]
+    fn origin_authority_must_equal_host_authority_including_port() {
+        let trusted =
+            |o: Option<&str>, h: Option<&str>| request_is_localhost_trusted(&request(o, h));
+        // Another local port is another origin.
+        assert!(!trusted(
+            Some("http://127.0.0.1:9999"),
+            Some("127.0.0.1:8477")
+        ));
+        assert!(trusted(
+            Some("http://127.0.0.1:8477"),
+            Some("127.0.0.1:8477")
+        ));
+        // Origin without Host cannot be compared -> refused.
+        assert!(!trusted(Some("http://127.0.0.1:8477"), None));
+        // IPv6 loopback on both sides.
+        assert!(trusted(Some("http://[::1]:8477"), Some("[::1]:8477")));
+        assert!(!trusted(Some("http://[::1]:8477"), Some("[::1]:8478")));
+        // Default port 80 normalization and host case.
+        assert!(trusted(Some("http://127.0.0.1"), Some("127.0.0.1:80")));
+        assert!(trusted(
+            Some("http://LOCALHOST:8477"),
+            Some("localhost:8477")
+        ));
+        // Same port but a different loopback spelling is a different origin.
+        assert!(!trusted(
+            Some("http://localhost:8477"),
+            Some("127.0.0.1:8477")
+        ));
+        // No Origin (shell raw socket, curl): only the Host gate applies.
+        assert!(trusted(None, Some("127.0.0.1:8477")));
+        assert!(trusted(None, None));
+        assert!(!trusted(None, Some("evil.example:8477")));
+        // A non-loopback Origin is refused even when Host echoes it.
+        assert!(!trusted(
+            Some("http://evil.example:8477"),
+            Some("evil.example:8477")
+        ));
+    }
+
+    #[test]
+    fn authority_parser_normalizes_ports() {
+        assert_eq!(
+            authority_host_port("127.0.0.1"),
+            Some(("127.0.0.1".into(), 80))
+        );
+        assert_eq!(authority_host_port("[::1]:9"), Some(("::1".into(), 9)));
+        assert_eq!(authority_host_port("a@b"), None);
+        assert_eq!(authority_host_port("host:notaport"), None);
+        assert_eq!(authority_host_port("[::1]x"), None);
+    }
+
+    #[test]
+    fn remote_and_device_paths_are_rejected_textually() {
+        for raw in [
+            r"\\evil\share\a.mp4",
+            "//evil/share/a.mp4",
+            r"\/evil\share",
+            r"/\evil/share",
+            r"\\?\UNC\evil\share\a.mp4",
+            r"\\.\PhysicalDrive0",
+            r"\\.\C:\x",
+            r"\\?\GLOBALROOT\Device\Mup\evil\share",
+            r"\??\UNC\evil\share",
+            r"\\?\Volume{0000}\x",
+            r"  \\evil\share",
+            r"\\",
+            r"\\evil",
+        ] {
+            assert_eq!(
+                reject_remote_path(raw, &[]),
+                Err(REMOTE_PATH_ERROR),
+                "{raw} must be refused"
+            );
+        }
+        for raw in [
+            r"C:\cases\a.mp4",
+            "/home/user/a.mp4",
+            r"\cases\a.mp4",
+            "relative/a.mp4",
+            r"\\?\C:\cases\a.mp4",
+            r"\\?\d:",
+            "",
+        ] {
+            assert_eq!(reject_remote_path(raw, &[]), Ok(()), "{raw} is local");
+        }
+    }
+
+    /// The lenient check for typed paths on nonce-gated POSTs: UNC shares
+    /// pass, device-namespace and malformed remote paths do not.
+    #[test]
+    fn typed_unc_is_admitted_but_device_paths_are_not() {
+        for raw in [
+            r"\\nas\evidence\case7",
+            "//nas/evidence/case7/a.mp4",
+            r"\\?\UNC\nas\evidence\a.e01",
+            r"  \\nas\evidence",
+            r"C:\cases\a.mp4",
+            r"\\?\C:\cases",
+            "",
+        ] {
+            assert_eq!(reject_device_path(raw), Ok(()), "{raw}");
+        }
+        for raw in [
+            r"\\.\PhysicalDrive0",
+            r"\\.\C:\x",
+            r"\\?\GLOBALROOT\Device\Mup\evil\share",
+            r"\??\UNC\evil\share",
+            r"\\?\Volume{0000}\x",
+            r"\\",
+            r"\\evil",
+            r"\\nas\evidence\..\..\x",
+        ] {
+            assert_eq!(reject_device_path(raw), Err(REMOTE_PATH_ERROR), "{raw}");
+        }
+        assert!(route_admits_typed_unc("POST", "/api/preflight"));
+        assert!(route_admits_typed_unc("POST", "/api/start"));
+        for (method, path) in [
+            ("GET", "/media"),
+            ("GET", "/api/browse"),
+            ("GET", "/api/case-info"),
+            ("GET", "/api/preflight"),
+            ("POST", "/api/open-case"),
+            ("POST", "/api/open-folder"),
+        ] {
+            assert!(!route_admits_typed_unc(method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn approved_unc_root_admits_only_its_own_share_prefix() {
+        let roots = vec![
+            PathBuf::from(r"C:\cases\one"),
+            PathBuf::from(r"\\NAS\Evidence\case7"),
+        ];
+        for raw in [
+            r"\\nas\evidence\case7",
+            r"\\NAS\Evidence\case7\a.mp4",
+            "//nas/evidence/case7/sub/a.mp4",
+            r"\\?\UNC\nas\evidence\case7\a.mp4",
+        ] {
+            assert_eq!(reject_remote_path(raw, &roots), Ok(()), "{raw}");
+        }
+        for raw in [
+            r"\\nas\evidence\case70\a.mp4",
+            r"\\nas\evidence\other",
+            r"\\nas\evidence",
+            r"\\evil\evidence\case7\a.mp4",
+            r"\\nas\evidence\case7\..\..\x",
+            r"\\.\nas\evidence\case7",
+        ] {
+            assert_eq!(
+                reject_remote_path(raw, &roots),
+                Err(REMOTE_PATH_ERROR),
+                "{raw}"
+            );
+        }
+        // A canonical (verbatim) UNC root works the same way.
+        let verbatim = vec![PathBuf::from(r"\\?\UNC\nas\evidence")];
+        assert_eq!(
+            reject_remote_path(r"\\nas\evidence\a.mp4", &verbatim),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rendered_responses_carry_referrer_policy() {
+        for response in [
+            plain(404, b"x".to_vec()),
+            json("{}".into()),
+            page(b"<html></html>".to_vec()),
+            remote_path_refusal(REMOTE_PATH_ERROR),
+        ] {
+            let text = String::from_utf8_lossy(&response);
+            assert!(
+                text.contains("\r\nReferrer-Policy: no-referrer\r\n"),
+                "{text}"
+            );
+        }
+        let refusal = String::from_utf8_lossy(&remote_path_refusal(REMOTE_PATH_ERROR)).to_string();
+        assert!(refusal.starts_with("HTTP/1.1 400 "), "{refusal}");
     }
 }

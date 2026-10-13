@@ -52,9 +52,11 @@ impl ResumeMode {
     }
 }
 
-/// An open checkpoint file. The handle stays locked (fs2 exclusive, same
-/// convention as the audit log) for the whole run so two overlapping runs
-/// of the same command can never interleave progress records.
+/// An open checkpoint file. Run exclusivity (two overlapping runs of the
+/// same command must never interleave progress records) is held by an
+/// fs2 exclusive lock on the `<path>.lock` sidecar for the whole run; the
+/// data file itself is never locked, so the workstation can read the live
+/// checkpoint through its own handle while the scan runs.
 pub struct RunCheckpoint {
     path: PathBuf,
     run_id: String,
@@ -68,6 +70,47 @@ pub struct RunCheckpoint {
     /// zero just because a lighter pass ran in between.
     stale_lines: Vec<String>,
     file: File,
+    lock: RunLock,
+}
+
+/// The sidecar lock handle. Unlocks on drop — on success (`finish`) and on
+/// the interrupted-run path alike. The sidecar file itself is never
+/// deleted: unlinking it after the unlock would race a run that opened the
+/// old file in between (it then locks an unlinked inode while a third run
+/// creates and locks a fresh `.lock`, so two runs hold "the" lock at
+/// once). An empty `.lock` beside the checkpoint is harmless; checkpoints
+/// live at the top of `db/`, which packaging copies only by explicit
+/// file list, so it never enters a package.
+struct RunLock {
+    file: Option<File>,
+}
+
+impl RunLock {
+    fn acquire(data_path: &Path, kind: &str) -> Result<Self, String> {
+        let path = lock_path(data_path);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|err| format!("failed to open checkpoint lock {}: {err}", path.display()))?;
+        file.try_lock_exclusive().map_err(|err| {
+            format!(
+                "failed to lock checkpoint {} (is another {kind} run active?): {err}",
+                data_path.display()
+            )
+        })?;
+        Ok(Self { file: Some(file) })
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+        }
+    }
 }
 
 impl RunCheckpoint {
@@ -84,6 +127,10 @@ impl RunCheckpoint {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create checkpoint directory: {err}"))?;
         }
+        // The run lock is taken first (sidecar), so a concurrent run is
+        // refused before anything touches the data file. Dropping `lock`
+        // on any early return below releases it.
+        let lock = RunLock::acquire(path, kind)?;
         // Opened without truncate: whether to keep the prior content is
         // decided after parsing it (set_len below performs the reset).
         let mut file = OpenOptions::new()
@@ -93,12 +140,6 @@ impl RunCheckpoint {
             .truncate(false)
             .open(path)
             .map_err(|err| format!("failed to open checkpoint {}: {err}", path.display()))?;
-        file.lock_exclusive().map_err(|err| {
-            format!(
-                "failed to lock checkpoint {} (is another {kind} run active?): {err}",
-                path.display()
-            )
-        })?;
         let mut text = String::new();
         file.read_to_string(&mut text)
             .map_err(|err| format!("failed to read checkpoint {}: {err}", path.display()))?;
@@ -117,7 +158,6 @@ impl RunCheckpoint {
                         run_id = prior_run_id;
                         lines = prior_lines;
                     } else if mode == ResumeMode::Force {
-                        let _ = file.unlock();
                         return Err(format!(
                             "checkpoint {} was recorded for different inputs; rerun without --resume or pass --no-resume to start fresh",
                             path.display()
@@ -132,7 +172,6 @@ impl RunCheckpoint {
                     // writing its header, so there is nothing to resume.
                 }
                 Err(err) => {
-                    let _ = file.unlock();
                     return Err(err);
                 }
             }
@@ -176,6 +215,7 @@ impl RunCheckpoint {
             lines,
             stale_lines,
             file,
+            lock,
         })
     }
 
@@ -194,16 +234,22 @@ impl RunCheckpoint {
 
     /// Deletes the checkpoint after the run fully succeeded.
     pub fn finish(self) -> Result<(), String> {
-        let RunCheckpoint { path, file, .. } = self;
+        let RunCheckpoint {
+            path, file, lock, ..
+        } = self;
         let _ = file.sync_all();
-        let _ = file.unlock();
         drop(file);
-        std::fs::remove_file(&path).map_err(|err| {
+        let removed = std::fs::remove_file(&path).map_err(|err| {
             format!(
                 "failed to remove completed checkpoint {}: {err}",
                 path.display()
             )
-        })?;
+        });
+        // The lock outlives the data-file removal so a run starting in
+        // between cannot observe a half-finished state. The sidecar stays
+        // on disk (see `RunLock`): deleting it would reopen the unlink race.
+        drop(lock);
+        removed?;
         sync_parent_directory(&path);
         Ok(())
     }
@@ -246,6 +292,16 @@ pub fn fingerprint(parts: &[&str]) -> String {
     // Unit-separator joins keep ambiguous concatenations ("ab"|"c" vs
     // "a"|"bc") from colliding.
     sha256::digest_bytes(parts.join("\u{1f}").as_bytes())
+}
+
+/// Sidecar that carries the run lock: `<checkpoint>.lock`. The data file
+/// itself is never locked, so other readers (the workstation's live grid
+/// poll) can open it while a run is active — Windows locks are mandatory
+/// and would otherwise fail every such read with ERROR_LOCK_VIOLATION.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
 }
 
 fn new_run_id(kind: &str) -> Result<String, String> {
@@ -328,7 +384,7 @@ fn parse_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::{ResumeMode, RunCheckpoint, fingerprint};
+    use super::{ResumeMode, RunCheckpoint, fingerprint, lock_path};
     use std::fs;
     use std::path::PathBuf;
 
@@ -455,6 +511,79 @@ mod tests {
             assert!(checkpoint.data_lines().is_empty());
             checkpoint.finish().unwrap();
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The workstation polls `db/scan-progress.jsonl` through a second
+    /// handle while the scan runs (live grid). Windows file locks are
+    /// mandatory, so locking the data file itself made every such read
+    /// fail with ERROR_LOCK_VIOLATION; the run lock lives in a sidecar.
+    #[test]
+    fn data_file_stays_readable_while_a_run_holds_the_lock() {
+        let dir = temp_dir("readable");
+        let path = dir.join("db/progress.jsonl");
+        let mut checkpoint =
+            RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        checkpoint.append_line("{\"key\":\"a\"}").unwrap();
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("second handle could not read the checkpoint: {err}"));
+        assert!(text.contains("\"key\":\"a\""), "{text}");
+        // The same works through the server's reader helper.
+        let via_util = crate::util::read_to_string(&path).unwrap();
+        assert_eq!(via_util, text);
+        checkpoint.finish().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Run exclusivity still holds: a second `begin` on the same path is
+    /// refused while the first run is active, and allowed again after it
+    /// finished (or was dropped).
+    #[test]
+    fn second_begin_is_refused_while_a_run_is_active() {
+        let dir = temp_dir("exclusive");
+        let path = dir.join("db/progress.jsonl");
+        let first = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        let err = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.contains("another scan-folder run active"), "{err}");
+        first.finish().unwrap();
+        let again = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        assert!(!again.resumed());
+        drop(again);
+        // Dropped without finish (interrupted run): the lock is released.
+        let resumed = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        assert!(resumed.resumed());
+        resumed.finish().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `finish` removes the data file but deliberately leaves the `.lock`
+    /// sidecar (deleting it after unlocking races a concurrent `begin`
+    /// into holding a different lock file). The leftover sidecar does not
+    /// get in the way: the next run locks it again and is exclusive.
+    #[test]
+    fn finish_leaves_the_lock_sidecar_and_a_new_run_still_locks_it() {
+        let dir = temp_dir("sidecar-kept");
+        let path = dir.join("db/progress.jsonl");
+        let first = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        first.finish().unwrap();
+        assert!(
+            !path.exists(),
+            "completed checkpoint data file must be removed"
+        );
+        assert!(
+            lock_path(&path).is_file(),
+            "lock sidecar must be left in place by finish"
+        );
+        let second = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto).unwrap();
+        assert!(!second.resumed());
+        let err = RunCheckpoint::begin(&path, "scan-folder", "fp1", ResumeMode::Auto)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.contains("another scan-folder run active"), "{err}");
+        second.finish().unwrap();
+        assert!(lock_path(&path).is_file());
         let _ = fs::remove_dir_all(dir);
     }
 

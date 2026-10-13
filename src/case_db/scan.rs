@@ -12,8 +12,7 @@ pub fn write_scan_index(
     let mut conn = open_case_db(case_dir)?;
     init_schema(&conn)?;
 
-    let tx = conn
-        .transaction()
+    let tx = begin_write(&mut conn)
         .map_err(|err| format!("failed to start SQLite transaction: {err}"))?;
     insert_scan_run(&tx, result)?;
     for record in merged_records {
@@ -36,8 +35,7 @@ pub fn upsert_indexed_rows(
 ) -> Result<(), String> {
     let mut conn = open_case_db(case_dir)?;
     init_schema(&conn)?;
-    let tx = conn
-        .transaction()
+    let tx = begin_write(&mut conn)
         .map_err(|err| format!("failed to start SQLite transaction: {err}"))?;
     for record in merged_records {
         upsert_indexed_record(&tx, record, indexed_unix)?;

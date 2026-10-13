@@ -204,6 +204,18 @@ pub fn verify_chained_jsonl(path: &Path) -> Result<AuditChainVerification, Strin
 /// must not create the file it is asked to verify (deleting a log would
 /// otherwise be indistinguishable from "verified, 0 entries").
 fn read_log_for_verification(path: &Path) -> Result<String, String> {
+    read_log_locked(path)?.ok_or_else(|| {
+        format!(
+            "audit log {} does not exist (missing log is not verifiable; it may have been deleted)",
+            path.display()
+        )
+    })
+}
+
+/// The lock-aware read behind [`read_log_for_verification`] for callers
+/// that treat a missing log as "nothing logged yet" (`Ok(None)`), e.g. the
+/// carve resume de-duplication. Any other failure is an error.
+pub(crate) fn read_log_locked(path: &Path) -> Result<Option<String>, String> {
     use std::io::Read;
     let read_error =
         |err: std::io::Error| format!("failed to read audit log {}: {err}", path.display());
@@ -215,12 +227,7 @@ fn read_log_for_verification(path: &Path) -> Result<String, String> {
                 path.display()
             ));
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "audit log {} does not exist (missing log is not verifiable; it may have been deleted)",
-                path.display()
-            ));
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(read_error(err)),
     }
     match std::fs::OpenOptions::new()
@@ -234,10 +241,10 @@ fn read_log_for_verification(path: &Path) -> Result<String, String> {
             let _ = file.lock_exclusive();
             let mut text = String::new();
             file.read_to_string(&mut text)
-                .map(|_| text)
+                .map(|_| Some(text))
                 .map_err(read_error)
         }
-        Err(_) => read_to_string(path).map_err(read_error),
+        Err(_) => read_to_string(path).map(Some).map_err(read_error),
     }
 }
 
@@ -279,6 +286,19 @@ pub fn verify_chained_jsonl_text(
     let mut entries = 0usize;
     let mut keyed_entries = 0usize;
     let mut unauthenticated_keyed = 0usize;
+    // Line number of the first keyed entry. Keying is introduced, never
+    // withdrawn, by the appender while the key is present (a configured
+    // key signs every append), so an unkeyed entry AFTER it is either
+    // stripped HMAC fields or a legitimate hand-over (the case moved to a
+    // machine/account without the keyring). The two are indistinguishable
+    // here, so it is a loud warning — never a hard failure of an intact
+    // chain — and the log is never graded keyed (see below).
+    let mut first_keyed_line: Option<usize> = None;
+    // Latest keyed line seen so far, and the first transition point
+    // (unkeyed line, keyed line right before it).
+    let mut last_keyed_line: Option<usize> = None;
+    let mut first_transition: Option<(usize, usize)> = None;
+    let mut unkeyed_after_keyed: Vec<usize> = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -388,12 +408,23 @@ pub fn verify_chained_jsonl_text(
             }
         };
         match verify_line() {
-            Ok(Keyed::Verified) => keyed_entries += 1,
+            Ok(Keyed::Verified) => {
+                keyed_entries += 1;
+                first_keyed_line.get_or_insert(line_number);
+                last_keyed_line = Some(line_number);
+            }
             Ok(Keyed::Unauthenticated) => {
                 keyed_entries += 1;
                 unauthenticated_keyed += 1;
+                first_keyed_line.get_or_insert(line_number);
+                last_keyed_line = Some(line_number);
             }
-            Ok(Keyed::Unkeyed) => {}
+            Ok(Keyed::Unkeyed) => {
+                if let Some(last_keyed) = last_keyed_line {
+                    first_transition.get_or_insert((line_number, last_keyed));
+                    unkeyed_after_keyed.push(line_number);
+                }
+            }
             Err(error) => {
                 if line_number == lines.len() && !complete_tail {
                     return Err(format!(
@@ -424,6 +455,23 @@ pub fn verify_chained_jsonl_text(
                 .to_string(),
         );
     }
+    if let (Some(first_keyed), Some((first_unkeyed, keyed_before))) =
+        (first_keyed_line, first_transition)
+    {
+        warnings.push(format!(
+            "keyed→unkeyed transition at audit line {first_unkeyed} after keyed line {keyed_before} — unkeyed entries from line {first_unkeyed} on are not authenticated ({} unkeyed entr{} after the first keyed line {first_keyed}); HMAC fields may have been stripped, or the log was continued without the audit key (e.g. the case moved to a machine without the keyring) — structural chain verified, log not graded keyed",
+            unkeyed_after_keyed.len(),
+            if unkeyed_after_keyed.len() == 1 { "y" } else { "ies" }
+        ));
+    }
+    if !keys.is_empty() && entries > 0 && keyed_entries == 0 {
+        warnings.push(
+            "an audit key is configured but the log has 0 keyed entries — it predates keying, or was fully re-chained without HMAC fields (structural chain verified only)"
+                .to_string(),
+        );
+    }
+    // A keyed→unkeyed transition implies keyed_entries < entries, so such
+    // a log can never reach the keyed grade.
     if keyed_entries == entries && entries > 0 && unauthenticated_keyed == 0 {
         integrity = AuditIntegrity::Keyed;
     }
@@ -523,6 +571,7 @@ mod tests {
     use crate::util::read_to_string;
     use std::fs;
     use std::io::Write;
+    use std::path::Path;
 
     fn test_key(id: &str, seed: u8) -> AuditKey {
         AuditKey::new(id, &[seed; 32])
@@ -798,6 +847,121 @@ mod tests {
         let verification = verify_chained_jsonl(&path).unwrap();
         assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
         assert_eq!(verification.keyed_entries, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-chains `log` from scratch, keeping each entry's body but writing
+    /// lines `0..keep_keyed` keyed and the rest unkeyed — what an attacker
+    /// who strips HMAC fields and recomputes the plain sha256 chain makes.
+    fn rechain_stripping_hmac(log: &str, keep_keyed: usize, key: &AuditKey, out: &Path) {
+        let _ = fs::remove_file(out);
+        for (index, line) in log.lines().enumerate() {
+            let cut = line.rfind(",\"previous_entry_sha256\":").unwrap();
+            let body = format!("{}}}", &line[..cut]);
+            let key = (index < keep_keyed).then_some(key);
+            append_chained_jsonl_keyed(out, &body, key).unwrap();
+        }
+    }
+
+    /// Item 13(a): HMAC stripped from EVERY line and the chain recomputed —
+    /// structurally valid, so it must at least warn when a key is configured.
+    #[test]
+    fn fully_unkeyed_rechain_warns_when_key_is_configured() {
+        use super::verify_chained_jsonl_text;
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-strip-all-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = test_key("k1", 0x51);
+        let path = dir.join("audit.jsonl");
+        for kind in ["one", "two", "three"] {
+            append_chained_jsonl_keyed(&path, &format!(r#"{{"kind":"{kind}"}}"#), Some(&key))
+                .unwrap();
+        }
+        let stripped = dir.join("stripped.jsonl");
+        rechain_stripping_hmac(&read_to_string(&path).unwrap(), 0, &key, &stripped);
+        let text = read_to_string(&stripped).unwrap();
+        assert!(!text.contains("entry_hmac_sha256"));
+
+        let keyed = verify_chained_jsonl_text(&text, "t", std::slice::from_ref(&key)).unwrap();
+        assert_eq!(keyed.integrity, AuditIntegrity::StructuralOnly);
+        assert_eq!(keyed.keyed_entries, 0);
+        assert!(
+            keyed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("0 keyed entries")),
+            "{:?}",
+            keyed.warnings
+        );
+        // No key configured: an unkeyed log is the normal pre-keying case.
+        let unkeyed = verify_chained_jsonl_text(&text, "t", &[]).unwrap();
+        assert!(unkeyed.warnings.is_empty(), "{:?}", unkeyed.warnings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Item 13(b): HMAC stripped from line 3 onward. The chain is
+    /// structurally intact and a legitimate hand-over (case moved to a
+    /// machine without the keyring) looks identical, so it verifies — with
+    /// or without the key — but always as structural-only, with a warning
+    /// that names the transition line and the keyed line before it.
+    #[test]
+    fn keyed_to_unkeyed_transition_warns_and_is_never_graded_keyed() {
+        use super::verify_chained_jsonl_text;
+        let dir = std::env::temp_dir().join(format!(
+            "frametrace-audit-strip-tail-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = test_key("k1", 0x52);
+        let path = dir.join("audit.jsonl");
+        for kind in ["one", "two", "three", "four"] {
+            append_chained_jsonl_keyed(&path, &format!(r#"{{"kind":"{kind}"}}"#), Some(&key))
+                .unwrap();
+        }
+        let stripped = dir.join("stripped.jsonl");
+        rechain_stripping_hmac(&read_to_string(&path).unwrap(), 2, &key, &stripped);
+        let text = read_to_string(&stripped).unwrap();
+
+        for keys in [std::slice::from_ref(&key), &[][..]] {
+            let verification = verify_chained_jsonl_text(&text, "t", keys)
+                .unwrap_or_else(|err| panic!("keys={}: {err}", keys.len()));
+            assert_eq!(verification.entries, 4);
+            assert_eq!(verification.keyed_entries, 2);
+            assert_eq!(
+                verification.integrity,
+                AuditIntegrity::StructuralOnly,
+                "keys={}",
+                keys.len()
+            );
+            assert!(
+                verification.warnings.iter().any(|warning| warning
+                    .contains("keyed→unkeyed transition at audit line 3 after keyed line 2")
+                    && warning.contains("from line 3 on are not authenticated")
+                    && warning.contains("2 unkeyed entries")),
+                "keys={}: {:?}",
+                keys.len(),
+                verification.warnings
+            );
+        }
+
+        // Re-keyed after the gap (keyed, unkeyed, keyed): still a warning
+        // naming the first transition, still not graded keyed.
+        let gap = dir.join("gap.jsonl");
+        append_chained_jsonl_keyed(&gap, r#"{"kind":"a"}"#, Some(&key)).unwrap();
+        append_chained_jsonl_keyed(&gap, r#"{"kind":"b"}"#, None).unwrap();
+        append_chained_jsonl_keyed(&gap, r#"{"kind":"c"}"#, Some(&key)).unwrap();
+        let gap_text = read_to_string(&gap).unwrap();
+        let verification =
+            verify_chained_jsonl_text(&gap_text, "t", std::slice::from_ref(&key)).unwrap();
+        assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
+        assert!(
+            verification.warnings.iter().any(|warning| warning
+                .contains("keyed→unkeyed transition at audit line 2 after keyed line 1")),
+            "{:?}",
+            verification.warnings
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

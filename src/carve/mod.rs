@@ -373,6 +373,9 @@ pub fn carve_file(
 
     let mut artifacts = Vec::new();
     let mut resumed_artifacts = 0usize;
+    // Output paths of artifacts replayed from the checkpoint; a prior run
+    // may already have logged them (see `write_carve_outputs`).
+    let mut replayed_outputs: Vec<PathBuf> = Vec::new();
     let mut first_by_hash = HashMap::<String, String>::new();
     // Fragment-prone signatures (elementary streams, embeddable JPEGs)
     // inside a span already claimed by an earlier candidate are the same
@@ -435,6 +438,7 @@ pub fn carve_file(
                 .entry(artifact.sha256.clone())
                 .or_insert_with(|| artifact.id.clone());
             resumed_artifacts += 1;
+            replayed_outputs.push(artifact.output_path.clone());
             let mut replayed = artifact.clone();
             replayed.validation_note = validation_note;
             covered_until = covered_until.max(hit.offset + size_bytes);
@@ -508,7 +512,7 @@ pub fn carve_file(
         scan_end_offset: scan_end,
         options: options.clone(),
     };
-    write_carve_outputs(case_dir, &result)?;
+    write_carve_outputs(case_dir, &result, &replayed_outputs)?;
     if resumed_artifacts > 0 || resume_offset > 0 {
         let line = format!(
             "{{\"schema_version\":1,\"event\":\"carve-resume\",\"run_id\":\"{}\",\"resumed_artifacts\":{},\"resumed_scan_offset\":{}}}",

@@ -1,4 +1,4 @@
-# Real Dahua DAV sample intake harness.
+﻿# Real Dahua DAV sample intake harness.
 # Walks every .dav under -Samples, remuxes through frametrace export-dav,
 # then ffprobe-validates the MP4. Does not commit evidence into git.
 #

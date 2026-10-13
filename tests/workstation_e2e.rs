@@ -280,3 +280,125 @@ fn workstation_full_pipeline_over_http() {
 
     cleanup(&mut child);
 }
+
+/// One raw request with arbitrary extra headers; returns the full response
+/// (head + body).
+fn raw_request(port: u16, request: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect workstation");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut buffer = Vec::new();
+    let _ = stream.read_to_end(&mut buffer);
+    String::from_utf8_lossy(&buffer).to_string()
+}
+
+fn status_of(response: &str) -> u16 {
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Windows review items 7, 8 and 11 against the real binary with the
+/// default token model: the `?token=` page load plants the cookie and sends
+/// `Referrer-Policy: no-referrer`; cookie-authenticated POSTs from the same
+/// origin work, from another localhost port are 403; UNC/device paths are
+/// 400 before any filesystem access. (The browser-side `?token=` removal via
+/// `history.replaceState` is covered by the Playwright harnesses.)
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and a free loopback port"]
+fn workstation_csrf_and_unc_hardening_over_http() {
+    if !integration_enabled() {
+        eprintln!("FRAMETRACE_IT=1 not set; skipping");
+        return;
+    }
+    let work = unique_dir("ft_ws_harden");
+    std::fs::create_dir_all(&work).unwrap();
+    let port: u16 = 18578;
+    let token = "e2e-token-0123456789";
+    let app = env!("CARGO_BIN_EXE_frametrace-app");
+    let mut child: Child = Command::new(app)
+        .arg(port.to_string())
+        .env("FRAMETRACE_NO_BROWSER", "1")
+        .env("FRAMETRACE_INSTANCE_FILE", work.join("server.json"))
+        .env("XDG_CONFIG_HOME", work.join("config"))
+        .env("APPDATA", work.join("config"))
+        .env("FRAMETRACE_TOKEN", token)
+        .env_remove("FRAMETRACE_NO_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn frametrace-app");
+    let started = Instant::now();
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("workstation did not start listening");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let result = std::panic::catch_unwind(|| {
+        let host = format!("127.0.0.1:{port}");
+        // ?token= page load: cookie planted, referrer suppressed.
+        let page = raw_request(
+            port,
+            &format!("GET /?token={token} HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        );
+        assert_eq!(status_of(&page), 200, "{}", &page[..page.len().min(400)]);
+        let head = &page[..page.find("\r\n\r\n").unwrap()];
+        assert!(
+            head.contains(&format!("Set-Cookie: ft_token={token}")),
+            "{head}"
+        );
+        assert!(head.contains("Referrer-Policy: no-referrer"), "{head}");
+        let cookie = format!("Cookie: ft_token={token}\r\n");
+        let post_cancel = |origin: &str| {
+            raw_request(
+                port,
+                &format!(
+                    "POST /api/cancel HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n{cookie}Content-Length: 0\r\n\r\n"
+                ),
+            )
+        };
+        // Same origin with only the cookie (what the page does after the
+        // token left the URL): accepted.
+        let same = post_cancel(&format!("http://127.0.0.1:{port}"));
+        assert_eq!(status_of(&same), 200, "{same}");
+        // A page on another local port carrying the same cookie: refused.
+        let foreign = post_cancel("http://127.0.0.1:9");
+        assert_eq!(status_of(&foreign), 403, "{foreign}");
+        // UNC / device paths: 400 before any filesystem call.
+        for target in [
+            r"/media?path=\\evil\share\a.mp4",
+            "/media?path=%5C%5Cevil%5Cshare%5Ca.mp4",
+            "/api/browse?path=//evil/share",
+            r"/api/browse?path=\\?\UNC\evil\share",
+            r"/api/case-info?case_dir=\\evil\share\case",
+        ] {
+            let response = raw_request(
+                port,
+                &format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{cookie}\r\n"),
+            );
+            assert_eq!(status_of(&response), 400, "{target}: {response}");
+        }
+        let body = r#"{"case_dir":"\\\\evil\\share\\case"}"#;
+        let open_case = raw_request(
+            port,
+            &format!(
+                "POST /api/open-case HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\n{cookie}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert_eq!(status_of(&open_case), 400, "{open_case}");
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&work);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
