@@ -289,6 +289,15 @@ try {
     check('captured frame stored with the decoded size and its hash', existsSync(saved) && statSync(saved).size === 3 + 3 * groups && sha256File(saved) === cap.sha256);
   }
 
+  // ---- 6. finalize packages the viewer together with its data bundle ----------
+  const fin = await postJson('/api/finalize', { examiner: 'e2e' });
+  check('finalize succeeds', fin && fin.ok === true, JSON.stringify(fin).slice(0, 300));
+  if (fin && fin.ok) {
+    const pkgDir = fin.package_dir || join(caseDir, fin.package_url || '');
+    check('package folder contains review/data-bundle.js next to the viewer',
+      existsSync(join(pkgDir, 'review', 'evidence-viewer.html')) && existsSync(join(pkgDir, 'review', 'data-bundle.js')), pkgDir);
+  }
+
   check('no page errors in shell or viewer', pageErrors.length === 0, pageErrors.join(' | '));
 } catch (err) {
   check('harness ran to completion', false, String(err && err.stack || err));
