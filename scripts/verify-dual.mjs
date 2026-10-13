@@ -1,7 +1,12 @@
 // Verify dual-channel sync playback in the evidence viewer.
-// Prereq: headless Chrome on :9223. Usage: node scripts/verify-dual.mjs <page-url> <shotdir>
-const CDP = 'http://127.0.0.1:9223';
-const URL_ = process.argv[2] || 'file:///D:/devin/frametrace/tmp/dualtest/case/review/evidence-viewer.html';
+// MANUAL harness - not part of scripts/ci-harnesses.sh (needs an externally
+// started Chrome and a case with a dual-channel pair; T13).
+// Prereq: headless Chrome with --remote-debugging-port=9223 (override with CDP_URL).
+// Usage: node scripts/verify-dual.mjs <page-url> [shotdir]
+// Exits non-zero when the dual view does not show two synced panes/videos.
+const CDP = process.env.CDP_URL || 'http://127.0.0.1:9223';
+const URL_ = process.argv[2];
+if (!URL_) { console.error('usage: node scripts/verify-dual.mjs <evidence-viewer url> [shotdir]'); process.exit(2); }
 const SHOTS = process.argv[3] || 'tmp/dualtest/shots';
 const fs = await import('fs');
 let nextId = 1;
@@ -51,4 +56,11 @@ const sync = await ev(ws, sid, `(async () => {
 })()`);
 console.log('sync:', JSON.stringify(sync));
 await shot('dual');
+const problems = [];
+if (!boot.dualBtn) problems.push('no #btnDual button');
+if (dual.panes < 2 || dual.videos < 2) problems.push(`expected >=2 dual panes/videos, got ${dual.panes}/${dual.videos}`);
+if (sync.skip) problems.push('fewer than two dual videos to sync');
+else if (!(sync.drift < 0.5)) problems.push(`mate did not follow the seek (drift ${sync.drift})`);
+if (problems.length) { console.error('FAIL:', problems.join('; ')); process.exit(1); }
+console.log('PASS dual-channel sync');
 process.exit(0);

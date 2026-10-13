@@ -19,11 +19,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; toolchain pinned via input
         with:
           toolchain: 1.94.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Install ffmpeg
@@ -37,4 +37,7 @@ jobs:
       - name: Run harnesses
         env:
           FRAMETRACE_BIN: ${{ github.workspace }}/target/debug/frametrace-app
+          # T7: harnesses that can degrade to an HTTP-only run when Playwright
+          # does not resolve must fail here instead of skipping.
+          FRAMETRACE_REQUIRE_BROWSER: "1"
         run: bash scripts/ci-harnesses.sh

@@ -1,0 +1,11 @@
+# cargo-audit policy (CI: .github/workflows/audit.yml runs
+# `cargo audit --deny warnings`, so unmaintained / unsound / yanked
+# advisories fail the job as well as vulnerabilities).
+#
+# To accept an advisory, add its id below WITH a reason and a re-check date,
+# and mention it in docs/security-review.md "Dependency audit policy".
+# Nothing is currently accepted.
+[advisories]
+ignore = [
+    # "RUSTSEC-YYYY-NNNN", # reason - re-check by YYYY-MM-DD
+]
