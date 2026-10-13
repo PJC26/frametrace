@@ -375,6 +375,12 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     // Proxies already on disk are embedded so the viewer (including the
     // standalone file:// bundle) can prefer them for unplayable originals.
     let proxies_json = collect_proxies_json(case_dir);
+    // Court-exhibit data additions (plan §1.9/§2.4): the join audit lane and
+    // the compact measured-sound map, both redacted/bound like the others.
+    let join_log = redact(
+        &read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default(),
+    );
+    let audio_levels_json = html_report::audio_levels_json_for_case(case_dir, &index_json);
     // The viewer page stays slim; the (potentially huge) record payload
     // lives in data-bundle.js beside it. Standalone file:// use loads the
     // bundle through a script tag; workstation serving pages the same
@@ -392,6 +398,8 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         &deepfake_reports,
         &telemetry_reports,
         &proxies_json,
+        &join_log,
+        &audio_levels_json,
         case_dir,
     );
     write_text(&case_dir.join("review/data-bundle.js"), &data_bundle)
@@ -672,6 +680,11 @@ pub fn make_report(
         read_to_string(&case_dir.join("evidence/logs/anomaly-log.jsonl")).unwrap_or_default();
     let batch_log =
         read_to_string(&case_dir.join("artifacts/logs/batch-log.jsonl")).unwrap_or_default();
+    let join_log =
+        read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default();
+    // Measured-sound map bound to the current index bytes (plan §2.4); the
+    // unredacted index is used for binding only, the map carries ids/numbers.
+    let audio_levels_json = html_report::audio_levels_json_for_case(case_dir, &index_json);
     let scan_runs_json = read_scan_runs_json(case_dir);
     // One read of marks and tags feeds the displayed annotations and both
     // sign-off digests, so the banner judges exactly what the table shows.
@@ -701,6 +714,7 @@ pub fn make_report(
     let validation_log = redact(validation_log);
     let anomaly_log = redact(anomaly_log);
     let batch_log = redact(batch_log);
+    let join_log = redact(join_log);
     let scan_runs_json = redact(scan_runs_json);
     let annotations_json = redact(annotations_json);
     let html = report::render_case_report(&report::ReportInputs {
@@ -714,6 +728,8 @@ pub fn make_report(
         validation_log_jsonl: &validation_log,
         anomaly_log_jsonl: &anomaly_log,
         batch_log_jsonl: &batch_log,
+        join_log_jsonl: &join_log,
+        audio_levels_json: &audio_levels_json,
         scan_runs_json: &scan_runs_json,
         marks_json: &annotations_json,
         redaction_applied: redact_paths,
