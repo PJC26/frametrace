@@ -103,27 +103,75 @@ pub fn append_chained_jsonl_keyed(
     result
 }
 
-fn append_chained_locked(
-    file: &mut File,
-    body: &str,
-    key: Option<&AuditKey>,
-) -> Result<(), String> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    let mut existing = String::new();
-    file.seek(SeekFrom::Start(0))
-        .and_then(|_| file.read_to_string(&mut existing))
-        .map_err(|err| format!("failed to read audit log for chaining: {err}"))?;
-    if !existing.is_empty() && !existing.ends_with('\n') {
+/// The bytes of the last non-blank line of `file`, read backwards from the
+/// end in growing windows (a single 200-result audio entry can exceed one
+/// window). `Ok(None)` for an empty / all-blank log. A log whose final
+/// byte is not `\n` is a torn write and is refused, as before.
+fn last_committed_line(file: &mut File) -> Result<Option<Vec<u8>>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.seek(SeekFrom::End(0)).map_err(|err| err.to_string())?;
+    if len == 0 {
+        return Ok(None);
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(len - 1))
+        .and_then(|_| file.read_exact(&mut last))
+        .map_err(|err| err.to_string())?;
+    if last[0] != b'\n' {
         return Err(
             "audit log ends with an incomplete line (likely a torn write); run verify-audit and repair the log before appending"
                 .to_string(),
         );
     }
-    let previous_entry_sha256 = existing
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| sha256::digest_bytes(line.as_bytes()))
+    let is_blank = |line: &[u8]| {
+        std::str::from_utf8(line)
+            .map(|text| text.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let mut window: u64 = 64 * 1024;
+    loop {
+        let start = len.saturating_sub(window);
+        let mut buffer = vec![0u8; (len - start) as usize];
+        file.seek(SeekFrom::Start(start))
+            .and_then(|_| file.read_exact(&mut buffer))
+            .map_err(|err| err.to_string())?;
+        // Bytes before the first newline may be a partial line unless the
+        // window reaches the start of the file.
+        let complete: &[u8] = if start == 0 {
+            &buffer
+        } else {
+            match buffer.iter().position(|b| *b == b'\n') {
+                Some(pos) => &buffer[pos + 1..],
+                None => &[],
+            }
+        };
+        let found = complete
+            .split(|b| *b == b'\n')
+            .rev()
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .find(|line| !line.is_empty() && !is_blank(line));
+        if let Some(line) = found {
+            // `str::lines` (the verifier) strips a trailing `\r` too.
+            return Ok(Some(line.to_vec()));
+        }
+        if start == 0 {
+            return Ok(None);
+        }
+        window = window.saturating_mul(4);
+    }
+}
+
+fn append_chained_locked(
+    file: &mut File,
+    body: &str,
+    key: Option<&AuditKey>,
+) -> Result<(), String> {
+    use std::io::Write;
+    // Only the tail is read: the chain needs the last committed line, and
+    // re-reading the whole log on every append made N appends O(N²).
+    let previous_entry_sha256 = last_committed_line(file)
+        .map_err(|err| format!("failed to read audit log for chaining: {err}"))?
+        .map(|line| sha256::digest_bytes(&line))
         .unwrap_or_else(|| "GENESIS".to_string());
 
     let without_close = &body[..body.len() - 1];
@@ -596,6 +644,37 @@ mod tests {
         assert_eq!(verification.entries, 2);
         assert_ne!(verification.last_entry_sha256, "GENESIS");
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// B10: appends read only the log tail; entries larger than the first
+    /// read window and many appends still chain and verify, and a torn
+    /// last line is still refused.
+    #[test]
+    fn tail_read_append_chains_large_entries_and_refuses_torn_tail() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-tail-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let big = "x".repeat(300 * 1024);
+        append_chained_jsonl(&path, &format!(r#"{{"kind":"big","pad":"{big}"}}"#)).unwrap();
+        append_chained_jsonl(&path, &format!(r#"{{"kind":"big2","pad":"{big}"}}"#)).unwrap();
+        for i in 0..50 {
+            append_chained_jsonl(&path, &format!(r#"{{"kind":"n","i":{i}}}"#)).unwrap();
+        }
+        append_chained_jsonl(&path, &format!(r#"{{"kind":"after-big","pad":"{big}"}}"#)).unwrap();
+        append_chained_jsonl(&path, r#"{"kind":"last"}"#).unwrap();
+        let verification = verify_chained_jsonl(&path).unwrap();
+        assert_eq!(verification.entries, 54);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"torn\":")
+            .unwrap();
+        let err = append_chained_jsonl(&path, r#"{"kind":"x"}"#).unwrap_err();
+        assert!(err.contains("incomplete line"), "{err}");
         let _ = fs::remove_dir_all(dir);
     }
 

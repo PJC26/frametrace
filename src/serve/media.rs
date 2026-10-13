@@ -246,7 +246,7 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
             >= MAX_RUNNING_CLIP_JOBS
         {
             return api_err(
-                "동시에 진행 중인 클립 내보내기가 너무 많습니다 — 하나가 끝난 뒤 다시 시도하십시오.",
+                "동시에 진행 중인 클립 내보내기·이어붙이기가 너무 많습니다 — 하나가 끝난 뒤 다시 시도하십시오.",
             );
         }
         guard.clip_seq += 1;
@@ -602,7 +602,7 @@ pub(crate) fn api_export_clip_status(request: &Request, state: &SharedState) -> 
         .cloned();
     match job {
         Some(job) => clip_response(&job, false),
-        None => api_err("해당 클립 내보내기 작업을 찾을 수 없습니다."),
+        None => api_err("해당 내보내기·이어붙이기 작업을 찾을 수 없습니다."),
     }
 }
 
@@ -615,8 +615,9 @@ pub(crate) fn api_export_clip_cancel(request: &Request, state: &SharedState) -> 
             job.cancel_requested = true;
             "{\"ok\":true}".to_string()
         }
+        Some(job) if job.kind == "join" => api_err("이미 끝난 이어붙이기입니다."),
         Some(_) => api_err("이미 끝난 클립 내보내기입니다."),
-        None => api_err("해당 클립 내보내기 작업을 찾을 수 없습니다."),
+        None => api_err("해당 내보내기·이어붙이기 작업을 찾을 수 없습니다."),
     }
 }
 
@@ -1064,17 +1065,22 @@ fn verify_logged_join(case_dir: &Path, entry: &serde_json::Value) -> Result<Join
     })
 }
 
-/// After a failed or cancelled join: removes this job's temp files and any
-/// output + manifest the CLI published but never logged (a kill between
-/// publish and the log append). Returns every removal failure.
-fn cleanup_failed_join(
-    state: &SharedState,
-    case_dir: &Path,
-    id: &str,
-    info: &JoinJobInfo,
-    started_unix: u64,
-) -> Vec<String> {
+/// After a failed or cancelled join: removes this job's temp files and the
+/// output + manifest the CLI recorded in its own claim file
+/// (`.join-<tag>.claim.json`) but never logged (a kill between publish and
+/// the log append). B8: nothing is inferred from names, plan ids or times —
+/// another job's (or a concurrent CLI join's) output of the same plan is
+/// never touched. Returns every removal failure.
+fn cleanup_failed_join(case_dir: &Path, info: &JoinJobInfo) -> Vec<String> {
     let mut errors = Vec::new();
+    // Read the claim BEFORE the temp files (the claim is one of them) go.
+    let claimed = crate::join::read_claim(&info.temps.claim);
+    if claimed.is_none() && info.temps.claim.exists() {
+        errors.push(format!(
+            "이어붙이기 기록 파일을 읽지 못해 게시된 결과물이 남았을 수 있습니다: {}",
+            info.temps.claim.display()
+        ));
+    }
     let progress_tmp = info.temps.progress.with_file_name(format!(
         "{}.tmp",
         info.temps
@@ -1087,13 +1093,15 @@ fn cleanup_failed_join(
         .temps
         .all()
         .into_iter()
-        .chain(std::iter::once(progress_tmp.as_path()))
+        .chain([progress_tmp.as_path(), info.temps.lock.as_path()])
     {
         if let Err(err) = crate::join::remove_file_retry(path) {
             errors.push(err);
         }
     }
-    let joined_dir = case_dir.join(crate::join::JOINED_DIR);
+    let Some((output, manifest)) = claimed else {
+        return errors;
+    };
     let logged: Vec<PathBuf> = match read_join_log(case_dir) {
         Ok(entries) => entries
             .iter()
@@ -1112,81 +1120,22 @@ fn cleanup_failed_join(
             return errors;
         }
     };
-    let Ok(entries) = std::fs::read_dir(&joined_dir) else {
-        return errors;
-    };
-    let other_joins_running = state_lock(state)
-        .clip_jobs
-        .iter()
-        .any(|job| job.kind == "join" && job.state == "running" && job.id != id);
-    let modified_since_start = |path: &Path| {
-        std::fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .is_some_and(|d| d.as_secs() + 1 >= started_unix)
-    };
-    let remove = |path: &Path, errors: &mut Vec<String>| {
-        if let Err(err) = crate::join::remove_file_retry(path) {
-            errors.push(err);
-        }
-    };
-    for entry in entries.flatten() {
-        let path = crate::audit::canonical_or_original(&entry.path());
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("join_") || logged.contains(&path) || !path.is_file() {
+    for path in [output, manifest] {
+        // Only an existing file inside artifacts/joined that no log entry
+        // names (a logged artifact is never deleted from under its record).
+        let Some(canonical) = joined_artifact(case_dir, &path) else {
+            continue;
+        };
+        if logged.contains(&canonical) {
             continue;
         }
-        if name.ends_with(".manifest.json") {
-            // A published-but-unlogged manifest of THIS plan.
-            let Some(manifest) = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            else {
-                continue;
-            };
-            let ours = manifest
-                .get("plan_id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|p| p.eq_ignore_ascii_case(&info.plan_id))
-                && manifest
-                    .get("created_unix")
-                    .and_then(|v| v.as_u64())
-                    .is_some_and(|at| at >= started_unix);
-            if !ours {
-                continue;
-            }
-            if let Some(rel) = manifest
-                .pointer("/output/path_rel")
-                .and_then(|v| v.as_str())
-                && let Some(output) = joined_artifact(case_dir, Path::new(rel))
-                && !logged.contains(&output)
-            {
-                remove(&output, &mut errors);
-            }
-            remove(&path, &mut errors);
-        } else {
-            // An output published without its manifest yet: only this job
-            // can be mid-publish when no other join runs.
-            let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
-            let has_manifest = joined_dir.join(format!("{stem}.manifest.json")).exists();
-            if has_manifest || !modified_since_start(&path) {
-                continue;
-            }
-            if other_joins_running {
-                errors.push(format!(
-                    "기록되지 않은 이어붙이기 결과물이 남아 있을 수 있습니다 (다른 이어붙이기가 실행 중이라 지우지 않음): {}",
-                    path.display()
-                ));
-            } else {
-                remove(&path, &mut errors);
-            }
+        if let Err(err) = crate::join::remove_file_retry(&canonical) {
+            errors.push(err);
         }
     }
     errors
 }
-
-/// Worker: stale `.join-*` cleanup → `join-video` (killed as a tree on a
+// Worker: stale `.join-*` cleanup → `join-video` (killed as a tree on a
 /// per-job cancel) → verify the logged output, or clean up everything the
 /// job created. Removal failures are surfaced, never swallowed.
 fn run_join_job(state: &SharedState, exe: &Path, id: &str, args: &[String], case_dir: &Path) {
@@ -1267,14 +1216,19 @@ fn run_join_job(state: &SharedState, exe: &Path, id: &str, args: &[String], case
     let cleanup_errors = match &outcome {
         Ok(_) | Err((_, true)) => {
             let mut errors = Vec::new();
-            for path in info.temps.all() {
+            for path in info
+                .temps
+                .all()
+                .into_iter()
+                .chain(std::iter::once(info.temps.lock.as_path()))
+            {
                 if let Err(err) = crate::join::remove_file_retry(path) {
                     errors.push(err);
                 }
             }
             errors
         }
-        Err((_, false)) => cleanup_failed_join(state, case_dir, id, &info, started_unix),
+        Err((_, false)) => cleanup_failed_join(case_dir, &info),
     };
     let finished = crate::util::now_unix().ok();
     let mut guard = state_lock(state);

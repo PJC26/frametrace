@@ -174,13 +174,37 @@ pub struct VideoParams {
     pub avg_frame_rate: Option<String>,
     pub time_base: Option<String>,
     pub extradata_hash: Option<String>,
+    /// B6: decoder-relevant parameters ffprobe reports outside extradata,
+    /// compared when no segment has an extradata hash: `(field, value)` in
+    /// [`VIDEO_FALLBACK_FIELDS`] order.
+    pub fallback: Vec<(&'static str, Option<String>)>,
 }
+
+/// B6: ffprobe stream fields compared (blocking) when the SPS/PPS hash is
+/// unavailable for every segment — `(ffprobe key, Korean subject)`.
+pub const VIDEO_FALLBACK_FIELDS: [(&str, &str); 11] = [
+    ("level", "코덱 레벨이"),
+    ("refs", "참조 프레임 수가"),
+    ("has_b_frames", "B-프레임 설정이"),
+    ("field_order", "필드 순서(인터레이스)가"),
+    ("color_range", "색 범위가"),
+    ("color_space", "색 공간이"),
+    ("color_primaries", "색 원색 규격이"),
+    ("color_transfer", "색 전달 특성이"),
+    ("chroma_location", "색차 위치가"),
+    ("is_avc", "비트스트림 형식(avcC/Annex B)이"),
+    ("nal_length_size", "NAL 길이 크기가"),
+];
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AudioParams {
     pub codec: Option<String>,
     pub sample_rate: Option<u64>,
     pub channels: Option<u64>,
+    /// B5: compared too — a profile or AudioSpecificConfig change makes a
+    /// copied stream undecodable after the junction.
+    pub profile: Option<String>,
+    pub extradata_hash: Option<String>,
 }
 
 /// What one live ffprobe run established about a file.
@@ -205,6 +229,16 @@ fn str_field(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|text| !text.is_empty())
+}
+
+/// A scalar ffprobe field as text (numbers and strings alike).
+fn any_field(value: &Value, key: &str) -> Option<String> {
+    match value.get(key)? {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 fn num_field(value: &Value, key: &str) -> Option<u64> {
@@ -249,6 +283,10 @@ pub fn parse_probe_facts(raw: &str) -> ProbeFacts {
                         avg_frame_rate: str_field(stream, "avg_frame_rate"),
                         time_base: str_field(stream, "time_base"),
                         extradata_hash: str_field(stream, "extradata_hash"),
+                        fallback: VIDEO_FALLBACK_FIELDS
+                            .iter()
+                            .map(|(key, _)| (*key, any_field(stream, key)))
+                            .collect(),
                     });
                 }
             }
@@ -256,6 +294,8 @@ pub fn parse_probe_facts(raw: &str) -> ProbeFacts {
                 codec: str_field(stream, "codec_name"),
                 sample_rate: num_field(stream, "sample_rate"),
                 channels: num_field(stream, "channels"),
+                profile: str_field(stream, "profile"),
+                extradata_hash: str_field(stream, "extradata_hash"),
             }),
             _ => facts.other_streams += 1,
         }
@@ -393,6 +433,9 @@ pub struct Totals {
     pub overlaps: usize,
     pub overlap_seconds: f64,
     pub overlap_max_seconds: f64,
+    /// B2: junctions whose gap/overlap could not be judged (no recorded
+    /// time on the basis — every junction of a `filename-order` join).
+    pub unknown_junctions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -658,6 +701,7 @@ impl JoinPlan {
                 "overlaps": self.totals.overlaps,
                 "overlap_seconds": r3(self.totals.overlap_seconds),
                 "overlap_max_seconds": r3(self.totals.overlap_max_seconds),
+                "unknown_junctions": self.totals.unknown_junctions,
             },
             "blocking": self.blocking.iter().map(|issue| json!({
                 "code": issue.code,
@@ -989,6 +1033,25 @@ pub fn build_plan(inputs: Vec<SegmentInput>, tolerance: f64) -> JoinPlan {
         });
     }
 
+    // B7: the concat list is UTF-8; a path that is not valid Unicode
+    // cannot be written into it faithfully (lossy text would name another
+    // file), so it is refused with its own code.
+    let non_utf8: Vec<String> = segments
+        .iter()
+        .filter(|s| s.source_path.to_str().is_none())
+        .map(|s| s.id.clone())
+        .collect();
+    if !non_utf8.is_empty() {
+        blocking.push(Issue {
+            code: "path-not-utf8",
+            message: format!(
+                "경로를 UTF-8로 나타낼 수 없는 파일 {}개 — 이어붙일 수 없습니다 (폴더·파일 이름을 바꾸십시오)",
+                non_utf8.len()
+            ),
+            ids: non_utf8,
+        });
+    }
+
     // Duplicates: same id, same file, or same indexed content hash.
     let mut duplicate_ids: Vec<String> = Vec::new();
     for (i, a) in segments.iter().enumerate() {
@@ -1203,11 +1266,23 @@ pub fn build_plan(inputs: Vec<SegmentInput>, tolerance: f64) -> JoinPlan {
     );
     let extradata = field(&|v| opt_text(&v.extradata_hash));
     if !with_video.is_empty() && with_video.iter().all(|(v, _)| v.extradata_hash.is_none()) {
+        // B6: without SPS/PPS hashes the decoder-relevant values ffprobe
+        // does report must all agree (blocking), and the gap is stated.
         warnings.push(Issue {
-            code: "hash-unavailable",
-            message: "코덱 설정(SPS/PPS) 해시를 읽지 못해 비교하지 못했습니다".to_string(),
+            code: "extradata-unavailable",
+            message: "코덱 설정(SPS/PPS) 해시를 읽지 못해 직접 비교하지 못했습니다 — 대신 레벨·참조 프레임·B-프레임 등 ffprobe 값으로 비교했습니다".to_string(),
             ids: Vec::new(),
         });
+        for (position, (key, subject)) in VIDEO_FALLBACK_FIELDS.iter().enumerate() {
+            let values = field(&|v| {
+                v.fallback
+                    .get(position)
+                    .filter(|(k, _)| k == key)
+                    .and_then(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "없음".to_string())
+            });
+            mismatch(&mut blocking, subject, &values, false);
+        }
     } else {
         mismatch(&mut blocking, "코덱 설정(SPS/PPS)이", &extradata, true);
     }
@@ -1292,7 +1367,58 @@ pub fn build_plan(inputs: Vec<SegmentInput>, tolerance: f64) -> JoinPlan {
                 &values(&|a| opt_num(a.channels)),
                 false,
             );
+            mismatch(
+                &mut blocking,
+                &label("프로필이"),
+                &values(&|a| opt_text(&a.profile)),
+                false,
+            );
+            // The AudioSpecificConfig (AAC) / codec extradata: compared when
+            // any segment reports it (none → nothing to compare).
+            if with_audio
+                .iter()
+                .any(|s| s.probe.audio[track].extradata_hash.is_some())
+            {
+                mismatch(
+                    &mut blocking,
+                    &label("코덱 설정(extradata)이"),
+                    &values(&|a| opt_text(&a.extradata_hash)),
+                    true,
+                );
+            }
         }
+    }
+
+    // B4: streams the join does not carry are said up front, not only in
+    // the manifest.
+    let extra_video: usize = segments
+        .iter()
+        .map(|s| s.probe.video_streams.saturating_sub(1))
+        .sum();
+    if extra_video > 0 {
+        warnings.push(Issue {
+            code: "extra-video-streams",
+            message: format!(
+                "추가 영상 스트림 {extra_video}개는 포함되지 않습니다 (첫 번째 영상 스트림만 이어붙임)"
+            ),
+            ids: segments
+                .iter()
+                .filter(|s| s.probe.video_streams > 1)
+                .map(|s| s.id.clone())
+                .collect(),
+        });
+    }
+    let data_streams: usize = segments.iter().map(|s| s.probe.other_streams).sum();
+    if data_streams > 0 {
+        warnings.push(Issue {
+            code: "data-streams-dropped",
+            message: format!("데이터·자막 스트림 {data_streams}개(GPS 등)는 포함되지 않습니다"),
+            ids: segments
+                .iter()
+                .filter(|s| s.probe.other_streams > 0)
+                .map(|s| s.id.clone())
+                .collect(),
+        });
     }
 
     // Informational warnings.
@@ -1379,6 +1505,7 @@ pub fn build_plan(inputs: Vec<SegmentInput>, tolerance: f64) -> JoinPlan {
                 totals.overlap_seconds += -d;
                 totals.overlap_max_seconds = totals.overlap_max_seconds.max(-d);
             }
+            (JunctionKind::Unknown, _) => totals.unknown_junctions += 1,
             _ => {}
         }
         junctions.push(Junction {
@@ -1432,9 +1559,10 @@ fn compute_plan_id(plan: &JoinPlan, not_indexed: &[(String, String)]) -> String 
                 "probe_ok": s.probe.ok,
                 "video": s.probe.video.as_ref().map(|v| json!([
                     v.codec, v.profile, v.width, v.height, v.pix_fmt,
-                    v.r_frame_rate, v.avg_frame_rate, v.time_base, v.extradata_hash
+                    v.r_frame_rate, v.avg_frame_rate, v.time_base, v.extradata_hash,
+                    v.fallback.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>()
                 ])),
-                "audio": s.probe.audio.iter().map(|a| json!([a.codec, a.sample_rate, a.channels])).collect::<Vec<_>>(),
+                "audio": s.probe.audio.iter().map(|a| json!([a.codec, a.sample_rate, a.channels, a.profile, a.extradata_hash])).collect::<Vec<_>>(),
                 "other_streams": s.probe.other_streams,
                 "video_streams": s.probe.video_streams,
                 "start": s.start.as_ref().map(|t| json!([t.secs, t.source])),
@@ -1454,7 +1582,19 @@ fn compute_plan_id(plan: &JoinPlan, not_indexed: &[(String, String)]) -> String 
 /// separators, `'` escaped as `'\''`. Control characters are refused.
 pub fn concat_file_line(path: &Path) -> Result<String, String> {
     let display = crate::util::strip_windows_extended_prefix(path);
-    let text = display.to_string_lossy().replace('\\', "/");
+    let Some(text) = display.to_str() else {
+        return Err(format!(
+            "경로를 UTF-8로 나타낼 수 없어 concat 목록에 쓸 수 없습니다: {}",
+            display.to_string_lossy()
+        ));
+    };
+    // `\` is a separator only on Windows; elsewhere it is an ordinary file
+    // name byte and must stay as is.
+    let text = if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_string()
+    };
     if text.chars().any(char::is_control) {
         return Err(format!(
             "경로에 제어 문자가 있어 concat 목록에 쓸 수 없습니다: {}",
@@ -1497,6 +1637,13 @@ pub struct TempPaths {
     pub concat_list: PathBuf,
     pub part: PathBuf,
     pub progress: PathBuf,
+    /// B8: `{"output", "manifest"}` this job published, written right after
+    /// the output gets its final name. A killed job's cleanup deletes only
+    /// what its own claim names (never another job's same-plan output).
+    pub claim: PathBuf,
+    /// B13: held under an exclusive OS lock for the whole run, so another
+    /// process's crash cleanup can tell a live join from leftovers.
+    pub lock: PathBuf,
 }
 
 pub fn temp_paths(case_dir: &Path, tag: &str) -> TempPaths {
@@ -1505,13 +1652,62 @@ pub fn temp_paths(case_dir: &Path, tag: &str) -> TempPaths {
         concat_list: dir.join(format!(".join-{tag}.ffconcat")),
         part: dir.join(format!(".join-{tag}.part")),
         progress: dir.join(format!(".join-{tag}.progress.json")),
+        claim: dir.join(format!(".join-{tag}.claim.json")),
+        lock: dir.join(format!(".join-{tag}.lock")),
     }
 }
 
 impl TempPaths {
-    pub fn all(&self) -> [&Path; 3] {
-        [&self.concat_list, &self.part, &self.progress]
+    /// Every temp file except the lock (removed last, after unlocking).
+    pub fn all(&self) -> [&Path; 4] {
+        [&self.concat_list, &self.part, &self.progress, &self.claim]
     }
+}
+
+/// B8: the output + manifest a job recorded in its claim file (None when
+/// it never published, or the claim is unreadable).
+pub fn read_claim(claim: &Path) -> Option<(PathBuf, PathBuf)> {
+    let value: Value = serde_json::from_slice(&std::fs::read(claim).ok()?).ok()?;
+    Some((
+        PathBuf::from(value.get("output")?.as_str()?),
+        PathBuf::from(value.get("manifest")?.as_str()?),
+    ))
+}
+
+/// The viewer/report record id of a joined output (U2): stable for the
+/// bytes, independent of the file name — `join:<first 16 hex of sha256>`.
+pub fn joined_record_id(output_sha256: &str) -> Option<String> {
+    let hex = output_sha256.trim().to_ascii_lowercase();
+    (hex.len() >= 16 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| format!("join:{}", &hex[..16]))
+}
+
+/// Adds `record_id` (from `output_sha256`) to a join-log entry that lacks
+/// one — entries written before the field existed.
+pub fn with_record_id(mut entry: Value) -> Value {
+    if entry.get("record_id").and_then(Value::as_str).is_none()
+        && let Some(id) = entry
+            .get("output_sha256")
+            .and_then(Value::as_str)
+            .and_then(joined_record_id)
+        && let Some(map) = entry.as_object_mut()
+    {
+        map.insert("record_id".to_string(), Value::String(id));
+    }
+    entry
+}
+
+/// [`with_record_id`] over JSONL text (unparseable lines kept verbatim).
+pub fn join_log_with_record_ids(jsonl: &str) -> String {
+    let mut out = String::with_capacity(jsonl.len());
+    for line in jsonl.lines() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) if value.is_object() => out.push_str(&with_record_id(value).to_string()),
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The ffmpeg argv (relative names only — every byte is ASCII).
@@ -1573,32 +1769,88 @@ pub fn remove_file_retry(path: &Path) -> Result<(), String> {
     ))
 }
 
-/// Crash recovery: removes `.join-*` leftovers in `artifacts/joined` whose
-/// tag is not in `active_tags`. Returns each removed path with its result
-/// so the caller can log what happened.
+/// Leftovers without a lock file are removed only once this old (B13).
+pub const STALE_TEMP_AGE_SECS: u64 = 3600;
+
+/// True when another handle (any process) holds the job's run lock.
+fn lock_is_held(lock: &Path) -> bool {
+    use fs2::FileExt;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock)
+    else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// Crash recovery: removes `.join-<tag>.*` leftovers in `artifacts/joined`
+/// of jobs that are certainly dead. A tag is left alone when it is in
+/// `active_tags` (this server's running jobs) or its run lock is held by
+/// any process (a CLI join running elsewhere — B13). Without a lock file
+/// (older runs) its files go only once all are older than
+/// [`STALE_TEMP_AGE_SECS`]. Returns each removed path with its result.
 pub fn cleanup_stale_temp_files(
     case_dir: &Path,
     active_tags: &[String],
 ) -> Vec<(PathBuf, Result<(), String>)> {
-    let Ok(entries) = std::fs::read_dir(case_dir.join(JOINED_DIR)) else {
+    let dir = case_dir.join(JOINED_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
+    // tag -> files (tags never contain '.').
+    let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(rest) = name.strip_prefix(".join-") else {
             continue;
         };
-        let active = active_tags.iter().any(|tag| {
-            rest.strip_prefix(tag.as_str())
-                .is_some_and(|tail| tail.starts_with('.'))
-        });
-        if active || !entry.path().is_file() {
+        let Some((tag, _)) = rest.split_once('.') else {
+            continue;
+        };
+        if active_tags.iter().any(|active| active == tag) || !entry.path().is_file() {
             continue;
         }
-        let path = entry.path();
-        let result = remove_file_retry(&path);
-        out.push((path, result));
+        groups
+            .entry(tag.to_string())
+            .or_default()
+            .push(entry.path());
+    }
+    let now = std::time::SystemTime::now();
+    let mut out = Vec::new();
+    for (tag, files) in groups {
+        let lock = dir.join(format!(".join-{tag}.lock"));
+        let dead = if lock.is_file() {
+            !lock_is_held(&lock)
+        } else {
+            files.iter().all(|path| {
+                std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .is_some_and(|age| age.as_secs() >= STALE_TEMP_AGE_SECS)
+            })
+        };
+        if !dead {
+            continue;
+        }
+        // The lock goes last so a crash mid-cleanup still leaves the tag
+        // recognisable as dead.
+        let mut ordered: Vec<PathBuf> = files.into_iter().filter(|p| *p != lock).collect();
+        if lock.is_file() {
+            ordered.push(lock);
+        }
+        for path in ordered {
+            let result = remove_file_retry(&path);
+            out.push((path, result));
+        }
     }
     out
 }
@@ -1679,6 +1931,25 @@ pub fn run(case_dir: &Path, plan: &JoinPlan, options: &RunOptions) -> Result<Joi
     std::fs::create_dir_all(&joined_dir)
         .map_err(|err| format!("failed to create {}: {err}", joined_dir.display()))?;
     let temps = temp_paths(case_dir, &options.job_tag);
+    // B13: the run lock marks this tag live for every other process's
+    // crash cleanup until the run ends.
+    let lock = {
+        use fs2::FileExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&temps.lock)
+            .map_err(|err| format!("failed to create {}: {err}", temps.lock.display()))?;
+        file.try_lock_exclusive().map_err(|_| {
+            format!(
+                "같은 작업 태그({})의 이어붙이기가 이미 실행 중입니다",
+                options.job_tag
+            )
+        })?;
+        file
+    };
     for path in temps.all() {
         remove_file_retry(path)?;
     }
@@ -1689,6 +1960,14 @@ pub fn run(case_dir: &Path, plan: &JoinPlan, options: &RunOptions) -> Result<Joi
         if let Err(err) = remove_file_retry(path) {
             cleanup_errors.push(err);
         }
+    }
+    {
+        use fs2::FileExt;
+        let _ = FileExt::unlock(&lock);
+    }
+    drop(lock);
+    if let Err(err) = remove_file_retry(&temps.lock) {
+        cleanup_errors.push(err);
     }
     match result {
         Ok(outcome) => {
@@ -1739,49 +2018,89 @@ fn output_base_name(plan: &JoinPlan) -> String {
     format!("join_{code}_{stamp}_n{}", plan.segments.len())
 }
 
-/// Picks `<base>.<ext>` / `<base>.manifest.json` (or `<base>__N…`) with
-/// neither file present.
-fn free_output_names(dir: &Path, base: &str, ext: &str) -> (PathBuf, PathBuf) {
-    let mut n = 1usize;
-    loop {
-        let stem = if n == 1 {
-            base.to_string()
-        } else {
-            format!("{base}__{n}")
-        };
-        let output = dir.join(format!("{stem}.{ext}"));
-        let manifest = dir.join(format!("{stem}.manifest.json"));
-        if !output.exists() && !manifest.exists() {
-            return (output, manifest);
-        }
-        n += 1;
-    }
+/// Candidate `(<stem>.<ext>, <stem>.manifest.json)` names, `__N` suffixed
+/// from the second on.
+fn output_names(dir: &Path, base: &str, ext: &str, n: usize) -> (PathBuf, PathBuf) {
+    let stem = if n == 1 {
+        base.to_string()
+    } else {
+        format!("{base}__{n}")
+    };
+    (
+        dir.join(format!("{stem}.{ext}")),
+        dir.join(format!("{stem}.manifest.json")),
+    )
 }
 
-/// Moves the verified `.part` to its final name without clobbering:
-/// hard link (fails if the target exists) then unlink; filesystems without
-/// hard links (FAT/exFAT) fall back to an existence-checked rename.
-fn publish_part(part: &Path, output: &Path) -> Result<(), String> {
+/// One attempt to give the verified `.part` the final name `output` without
+/// ever clobbering: a hard link (fails if the name exists), else — FAT /
+/// exFAT have no hard links — a copy into a `create_new` target (B14: the
+/// existence check and the creation are one atomic step, so two jobs can
+/// never both take a name). `Ok(false)` = the name is taken.
+fn publish_part_as(part: &Path, output: &Path) -> Result<bool, String> {
     match std::fs::hard_link(part, output) {
         Ok(()) => {
             let _ = std::fs::remove_file(part);
-            Ok(())
+            return Ok(true);
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(format!("output already exists: {}", output.display()))
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(_) => {}
+    }
+    let mut target = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "failed to create joined output {}: {err}",
+                output.display()
+            ));
         }
-        Err(_) => {
-            if output.exists() {
-                return Err(format!("output already exists: {}", output.display()));
-            }
-            std::fs::rename(part, output).map_err(|err| {
-                format!(
-                    "failed to move joined output to {}: {err}",
-                    output.display()
-                )
-            })
+    };
+    let copied = std::fs::File::open(part)
+        .and_then(|mut source| std::io::copy(&mut source, &mut target))
+        .and_then(|_| target.sync_all());
+    drop(target);
+    match copied {
+        Ok(()) => {
+            let _ = std::fs::remove_file(part);
+            Ok(true)
+        }
+        Err(err) => {
+            // The name was ours (create_new): never leave a partial copy.
+            let _ = remove_file_retry(output);
+            Err(format!(
+                "failed to copy joined output to {}: {err}",
+                output.display()
+            ))
         }
     }
+}
+
+/// Publishes `.part` under the first free `<base>[__N]` name whose
+/// manifest name is free too. Returns `(output, manifest)`.
+fn publish_part(
+    part: &Path,
+    dir: &Path,
+    base: &str,
+    ext: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    for n in 1..10_000usize {
+        let (output, manifest) = output_names(dir, base, ext, n);
+        if manifest.exists() {
+            continue;
+        }
+        if publish_part_as(part, &output)? {
+            return Ok((output, manifest));
+        }
+    }
+    Err(format!(
+        "no free output name for {base} in {}",
+        dir.display()
+    ))
 }
 
 fn run_ffmpeg(
@@ -1919,14 +2238,33 @@ fn run_inner(
 
     // 6. Output identity, publish, manifest, log.
     let output_sha256 = audit::digest_file(&temps.part)?;
-    let (output_path, manifest_path) = free_output_names(
+    let (output_path, manifest_path) = publish_part(
+        &temps.part,
         &joined_dir,
         &output_base_name(plan),
         plan.container.as_str(),
-    );
-    publish_part(&temps.part, &output_path)?;
+    )?;
     published.push(output_path.clone());
+    // B8: name exactly what this job owns, so a killed run's cleanup never
+    // has to guess (and never touches another job's output).
+    let claim = json!({
+        "output": output_path.to_string_lossy(),
+        "manifest": manifest_path.to_string_lossy(),
+        "job_tag": options.job_tag,
+    });
+    std::fs::write(&temps.claim, claim.to_string()).map_err(|err| {
+        format!(
+            "failed to record the published output in {}: {err}",
+            temps.claim.display()
+        )
+    })?;
     write_progress(&temps.progress, "verify", 1, 1);
+    let record_id = joined_record_id(&output_sha256).unwrap_or_default();
+    // B2: a filename-order join has no recorded time to judge junctions:
+    // counts are unknown (null), not zero.
+    let judged = plan.order_basis != OrderBasis::FilenameOrder;
+    let gaps = judged.then_some(plan.totals.gaps);
+    let overlaps = judged.then_some(plan.totals.overlaps);
 
     let ffmpeg_version = command_version(&options.tools.ffmpeg, &["ffmpeg"], "-version");
     let list_lines: Vec<String> = list.lines().skip(1).map(str::to_string).collect();
@@ -1981,6 +2319,8 @@ fn run_inner(
         "schema_version": 1,
         "kind": "frametrace-join-manifest",
         "plan_id": plan.plan_id,
+        "record_id": record_id,
+        "job_tag": options.job_tag,
         "case_id": case_id,
         "created_unix": created_unix,
         "tool": {"name": "frametrace", "version": env!("CARGO_PKG_VERSION")},
@@ -2018,10 +2358,11 @@ fn run_inner(
         "totals": {
             "segments": plan.totals.segments,
             "duration_seconds": r3(plan.totals.duration_seconds),
-            "gaps": plan.totals.gaps,
-            "gap_seconds": r3(plan.totals.gap_seconds),
-            "overlaps": plan.totals.overlaps,
-            "overlap_seconds": r3(plan.totals.overlap_seconds),
+            "gaps": gaps,
+            "gap_seconds": judged.then(|| r3(plan.totals.gap_seconds)),
+            "overlaps": overlaps,
+            "overlap_seconds": judged.then(|| r3(plan.totals.overlap_seconds)),
+            "unknown_junctions": plan.totals.unknown_junctions,
         },
         "duration_check": {
             "expected": r3(expected),
@@ -2048,6 +2389,7 @@ fn run_inner(
     let log_line = json!({
         "schema_version": 1,
         "event": "join-video",
+        "record_id": record_id,
         "joined_unix": created_unix,
         "output_path": output_path.to_string_lossy(),
         "output_sha256": output_sha256,
@@ -2063,8 +2405,9 @@ fn run_inner(
         "order_basis": plan.order_basis.as_str(),
         "channel": plan.channel.map(|c| c.to_string()),
         "tolerance_seconds": plan.tolerance_seconds,
-        "gaps": plan.totals.gaps,
-        "overlaps": plan.totals.overlaps,
+        "gaps": gaps,
+        "overlaps": overlaps,
+        "unknown_junctions": plan.totals.unknown_junctions,
         "mode": "stream-copy",
         "duration_check_ok": duration_check_ok,
         "ffmpeg_version": ffmpeg_version,
@@ -2104,6 +2447,10 @@ mod tests {
             avg_frame_rate: Some("30/1".into()),
             time_base: Some("1/15360".into()),
             extradata_hash: Some("SHA256:aa".into()),
+            fallback: VIDEO_FALLBACK_FIELDS
+                .iter()
+                .map(|(key, _)| (*key, Some(format!("v-{key}"))))
+                .collect(),
         }
     }
 
@@ -2112,6 +2459,8 @@ mod tests {
             codec: Some("aac".into()),
             sample_rate: Some(48000),
             channels: Some(1),
+            profile: Some("LC".into()),
+            extradata_hash: Some("SHA256:asc".into()),
         }
     }
 
@@ -2374,6 +2723,9 @@ mod tests {
             (|a: &mut AudioParams| a.codec = Some("mp3".into())) as fn(&mut AudioParams),
             |a| a.sample_rate = Some(44100),
             |a| a.channels = Some(2),
+            // B5: profile and AudioSpecificConfig.
+            |a| a.profile = Some("HE-AAC".into()),
+            |a| a.extradata_hash = Some("SHA256:other".into()),
         ] {
             let a = seg("vid_1", "20260910_120000_F.mp4", 60.0);
             let mut b = seg("vid_2", "20260910_120100_F.mp4", 60.0);
@@ -2452,13 +2804,22 @@ mod tests {
 
     #[test]
     fn concat_list_escaping_and_no_bom() {
-        let line = concat_file_line(Path::new(
-            r"\\?\C:\증거 '따옴표' 폴더\FRONT\20260910_120000_F.mp4",
-        ))
-        .unwrap();
+        #[cfg(windows)]
+        {
+            let line = concat_file_line(Path::new(
+                r"\\?\C:\증거 '따옴표' 폴더\FRONT\20260910_120000_F.mp4",
+            ))
+            .unwrap();
+            assert_eq!(
+                line,
+                "file 'C:/증거 '\\''따옴표'\\'' 폴더/FRONT/20260910_120000_F.mp4'"
+            );
+        }
+        // B7: off Windows a backslash is a file-name byte, never a separator.
+        #[cfg(not(windows))]
         assert_eq!(
-            line,
-            "file 'C:/증거 '\\''따옴표'\\'' 폴더/FRONT/20260910_120000_F.mp4'"
+            concat_file_line(Path::new("/e/a\\b '1'.mp4")).unwrap(),
+            "file '/e/a\\b '\\''1'\\''.mp4'"
         );
         assert!(concat_file_line(Path::new("C:/a\nb.mp4")).is_err());
         assert!(concat_file_line(Path::new("C:/a\rb.mp4")).is_err());
@@ -2628,8 +2989,13 @@ mod tests {
         assert!(!parse_probe_facts("nope").ok);
     }
 
+    /// B13: crash cleanup removes only certainly-dead tags: an unlocked
+    /// lock file, or (no lock file) everything older than an hour. Active
+    /// tags, tags whose lock another handle holds (a CLI join running in
+    /// another process), and fresh lock-less files stay.
     #[test]
-    fn temp_cleanup_keeps_active_tags_and_retry_removes() {
+    fn temp_cleanup_spares_live_locked_and_fresh_tags() {
+        use fs2::FileExt;
         let dir = std::env::temp_dir().join(format!(
             "ft-join-clean-{}-{}",
             std::process::id(),
@@ -2641,16 +3007,34 @@ mod tests {
             ".join-live.part",
             ".join-dead.part",
             ".join-dead.ffconcat",
-            ".join-live2.ffconcat",
+            ".join-dead.lock",
+            ".join-running.part",
+            ".join-running.lock",
+            ".join-fresh.ffconcat",
+            ".join-old.part",
             "join_F_x_n2.mp4",
         ] {
             std::fs::write(joined.join(name), b"x").unwrap();
         }
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * STALE_TEMP_AGE_SECS);
+        std::fs::File::options()
+            .write(true)
+            .open(joined.join(".join-old.part"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // Another "process" holds the running tag's lock.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(joined.join(".join-running.lock"))
+            .unwrap();
+        held.lock_exclusive().unwrap();
         let removed = cleanup_stale_temp_files(&dir, &["live".to_string()]);
         let mut names: Vec<String> = removed
             .iter()
             .map(|(p, r)| {
-                assert!(r.is_ok());
+                assert!(r.is_ok(), "{r:?}");
                 p.file_name().unwrap().to_string_lossy().to_string()
             })
             .collect();
@@ -2659,14 +3043,195 @@ mod tests {
             names,
             [
                 ".join-dead.ffconcat",
+                ".join-dead.lock",
                 ".join-dead.part",
-                ".join-live2.ffconcat"
+                ".join-old.part"
             ]
         );
-        assert!(joined.join(".join-live.part").exists());
-        assert!(joined.join("join_F_x_n2.mp4").exists());
+        for kept in [
+            ".join-live.part",
+            ".join-running.part",
+            ".join-running.lock",
+            ".join-fresh.ffconcat",
+            "join_F_x_n2.mp4",
+        ] {
+            assert!(joined.join(kept).exists(), "{kept} was removed");
+        }
+        let _ = FileExt::unlock(&held);
+        drop(held);
         assert!(remove_file_retry(&joined.join("missing")).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B14: publishing never clobbers — a taken name (even on a filesystem
+    /// without hard links, where the fallback is a create_new copy) moves
+    /// on to the next `__N` name; a free manifest name is required too.
+    #[test]
+    fn publish_never_clobbers_and_takes_next_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-join-publish-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("join_F_x_n2.mp4"), b"theirs").unwrap();
+        std::fs::write(dir.join("join_F_x_n2__2.manifest.json"), b"{}").unwrap();
+        let part = dir.join(".join-t.part");
+        std::fs::write(&part, b"ours").unwrap();
+        assert!(!publish_part_as(&part, &dir.join("join_F_x_n2.mp4")).unwrap());
+        let (output, manifest) = publish_part(&part, &dir, "join_F_x_n2", "mp4").unwrap();
+        assert_eq!(output, dir.join("join_F_x_n2__3.mp4"));
+        assert_eq!(manifest, dir.join("join_F_x_n2__3.manifest.json"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"ours");
+        assert_eq!(
+            std::fs::read(dir.join("join_F_x_n2.mp4")).unwrap(),
+            b"theirs"
+        );
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B8 / U2: claims round-trip; record ids derive from the output bytes.
+    #[test]
+    fn claim_and_record_id_helpers() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-join-claim-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let claim = dir.join(".join-t.claim.json");
+        assert!(read_claim(&claim).is_none());
+        std::fs::write(
+            &claim,
+            r#"{"output":"/a/o.mp4","manifest":"/a/o.manifest.json"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_claim(&claim),
+            Some((
+                PathBuf::from("/a/o.mp4"),
+                PathBuf::from("/a/o.manifest.json")
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let sha = "ABCDEF0123456789".repeat(4);
+        assert_eq!(
+            joined_record_id(&sha).as_deref(),
+            Some("join:abcdef0123456789")
+        );
+        assert_eq!(joined_record_id("xyz"), None);
+        let text = format!(
+            "{}\n{{\"record_id\":\"join:keep\",\"output_sha256\":\"{sha}\"}}\n{{torn\n",
+            json!({"event": "join-video", "output_sha256": sha})
+        );
+        let out = join_log_with_record_ids(&text);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines[0].contains("\"record_id\":\"join:abcdef0123456789\""),
+            "{out}"
+        );
+        assert!(lines[1].contains("\"record_id\":\"join:keep\""), "{out}");
+        assert_eq!(lines[2], "{torn");
+    }
+
+    /// B2/B4/B6/B7 matrix additions.
+    #[test]
+    fn unknown_junctions_stream_warnings_and_extradata_fallback() {
+        // B2: a filename-order plan counts its junctions as unknown.
+        let plan = plan_of(vec![
+            seg("vid_1", "a1.mp4", 10.0),
+            seg("vid_2", "a2.mp4", 10.0),
+            seg("vid_3", "a3.mp4", 10.0),
+        ]);
+        assert_eq!(plan.order_basis, OrderBasis::FilenameOrder);
+        assert_eq!(plan.totals.unknown_junctions, 2);
+        assert_eq!(plan.to_json()["totals"]["unknown_junctions"], 2);
+        assert!(plan.summary_text().ends_with("끊김·겹침 확인 불가"));
+
+        // B4: extra video / data streams are warned about.
+        let a = seg("vid_1", "20260910_120000_F.mp4", 60.0);
+        let mut b = seg("vid_2", "20260910_120100_F.mp4", 60.0);
+        b.probe.video_streams = 3;
+        b.probe.other_streams = 1;
+        let plan = plan_of(vec![a, b]);
+        let extra = plan
+            .warnings
+            .iter()
+            .find(|w| w.code == "extra-video-streams")
+            .unwrap();
+        assert!(
+            extra
+                .message
+                .contains("추가 영상 스트림 2개는 포함되지 않습니다")
+        );
+        assert_eq!(extra.ids, vec!["vid_2"]);
+        assert!(codes(&plan.warnings).contains(&"data-streams-dropped"));
+        assert!(plan.blocking.is_empty(), "{:?}", plan.blocking);
+
+        // B6: no SPS/PPS hash anywhere → fallback fields block, and the
+        // warning says what was compared instead.
+        let strip = |mut s: Segment| {
+            s.probe.video.as_mut().unwrap().extradata_hash = None;
+            s
+        };
+        let a = strip(seg("vid_1", "20260910_120000_F.mp4", 60.0));
+        let b = strip(seg("vid_2", "20260910_120100_F.mp4", 60.0));
+        let plan = plan_of(vec![a.clone(), b.clone()]);
+        assert!(plan.blocking.is_empty(), "{:?}", plan.blocking);
+        assert!(codes(&plan.warnings).contains(&"extradata-unavailable"));
+        for (position, (key, subject)) in VIDEO_FALLBACK_FIELDS.iter().enumerate() {
+            let mut changed = b.clone();
+            changed.probe.video.as_mut().unwrap().fallback[position].1 = Some("other".into());
+            let plan = plan_of(vec![a.clone(), changed]);
+            let issue = plan
+                .blocking
+                .iter()
+                .find(|i| i.code == "stream-mismatch")
+                .unwrap_or_else(|| panic!("{key}: not blocked"));
+            assert!(
+                issue.message.starts_with(subject),
+                "{key}: {}",
+                issue.message
+            );
+        }
+        // With hashes present the fallback fields are not compared (the
+        // hash already covers them) and there is no extradata warning.
+        let a = seg("vid_1", "20260910_120000_F.mp4", 60.0);
+        let mut b = seg("vid_2", "20260910_120100_F.mp4", 60.0);
+        b.probe.video.as_mut().unwrap().fallback[0].1 = Some("other".into());
+        let plan = plan_of(vec![a, b]);
+        assert!(plan.blocking.is_empty(), "{:?}", plan.blocking);
+        assert!(!codes(&plan.warnings).contains(&"extradata-unavailable"));
+    }
+
+    /// B7: a path that is not valid Unicode blocks with its own code and is
+    /// refused by the concat writer.
+    #[test]
+    fn non_utf8_paths_block() {
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_vec(b"/e/\xff\xfe.mp4".to_vec()))
+        };
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "C:\\e\\".encode_utf16().collect();
+            wide.push(0xD800);
+            wide.extend(".mp4".encode_utf16());
+            PathBuf::from(std::ffi::OsString::from_wide(&wide))
+        };
+        assert!(concat_file_line(&bad).is_err());
+        let mut b = seg("vid_2", "20260910_120100_F.mp4", 60.0);
+        b.source_path = bad;
+        let plan = plan_of(vec![seg("vid_1", "20260910_120000_F.mp4", 60.0), b]);
+        let issue = plan
+            .blocking
+            .iter()
+            .find(|i| i.code == "path-not-utf8")
+            .unwrap();
+        assert_eq!(issue.ids, vec!["vid_2"]);
     }
 
     #[test]

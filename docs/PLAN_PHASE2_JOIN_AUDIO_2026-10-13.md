@@ -533,3 +533,65 @@ check(동기, 프로브) → [대화상자] → join(등록) → running{stage: 
 3. **facet 이름**: "음성"은 말소리로 읽힐 수 있어 측정 범위를 넘는 주장이 됩니다. **"소리"** 로 해도 될까요? (기본: "소리". 기존 상세 라벨 "음성"도 "소리"로 맞춥니다.)
 4. **허용 오차 기본값 1.0초**(요청은 0.5초)로 해도 될까요? 파일명 시각은 초 단위라 0.5초면 정상 연속을 잘못 판정합니다.
 5. **채널 인식 확장**(BlackVue `_NF/_NR`, `전방/후방/실내` 폴더 이름)을 JS와 Rust에 같이 넣을까요? 그리드 채널 표시와 쌍 재생(`pairKeyOf`, verify-dual)에도 영향이 있습니다. (기본: v1은 기존 규칙을 그대로 옮기고, 확장은 별도 작업.)
+
+---
+
+## §8 post-review changes (백엔드, 2026-10-13 적대적 리뷰 반영)
+
+계약 변경만 적습니다. 기존 필드는 그대로이고, 아래는 추가되거나 의미가 바뀐 것입니다.
+
+**join-check 응답 (`plan`)**
+- `totals.unknown_junctions`(정수): 판정하지 못한 접합부 수. `filename-order`이면 모든 접합부입니다(B2).
+- 새 차단 코드 `path-not-utf8`: 경로를 UTF-8로 나타낼 수 없는 원본(B7). concat 목록의 `\` → `/` 변환은 Windows에서만 합니다.
+- 새 경고 코드:
+  - `extra-video-streams`: "추가 영상 스트림 N개는 포함되지 않습니다"(B4)
+  - `data-streams-dropped`: "데이터·자막 스트림 N개(GPS 등)는 포함되지 않습니다"(B4)
+  - `extradata-unavailable`: 모든 세그먼트에 SPS/PPS 해시가 없을 때. 이때 `level`·`refs`·`has_b_frames`·`field_order`·색 정보·`is_avc`·`nal_length_size`를 비교하고, 다르면 `stream-mismatch`로 **차단**합니다(B6). 예전에는 이 상황도 `hash-unavailable`이었습니다.
+  - `hash-unavailable`은 이제 "색인 해시가 없는 원본"이라는 한 가지 뜻만 가집니다(B15, 뷰어 `JOIN_CODE_TEXT`와 일치).
+- `stream-mismatch` 비교 항목 추가: 오디오 `profile`, 오디오 `extradata_hash`(AAC ASC 등, 어느 하나라도 값이 있을 때)(B5).
+
+**매니페스트 (`schema_version` 1 유지)**
+- 최상위에 `record_id`, `job_tag`를 추가했습니다.
+- `totals.unknown_junctions`를 추가했습니다. `filename-order`이면 `totals.gaps`/`overlaps`/`gap_seconds`/`overlap_seconds`는 **null**입니다(0이 아님).
+
+**join-log 항목**
+- `record_id`: `"join:" + output_sha256 앞 16자(소문자 hex)`입니다. 파일 이름과 무관하고 바이트에서 나옵니다(U2).
+- `unknown_junctions`를 추가했습니다. `filename-order`이면 `gaps`/`overlaps`는 null입니다.
+- `records-meta.joinLog`와 법원 뷰어 데이터(`data-bundle.js`의 `joinLog`), 보고서 입력의 모든 항목에 `record_id`가 들어갑니다. 예전 항목은 `output_sha256`으로 계산해 채웁니다.
+- **뷰어(30-records.js)는 이어붙인 레코드 id로 `entry.record_id`를 써야 합니다.** 보고서는 `join:<출력파일명>` 예전 id에 붙은 주석도 읽어 줍니다.
+
+**임시 파일**
+- `artifacts/joined/` 안에 `.join-<tag>.claim.json`과 `.join-<tag>.lock`이 추가됐습니다.
+  - `claim.json`에는 게시된 `{output, manifest, job_tag}`가 들어갑니다.
+  - `lock`은 실행하는 동안 배타 잠금을 잡습니다. 같은 태그가 이미 실행 중이면 CLI가 거부합니다.
+- 실패나 취소 뒤 정리는 claim에 적힌 파일만 지웁니다. 같은 계획의 다른 잡이나 CLI join이 만든 결과물은 건드리지 않습니다(B8).
+- 남은 파일 정리는 잠금이 풀린 lock 파일이 있는 태그만 바로 지웁니다. lock 파일이 없으면 모든 파일이 1시간 넘게 지났을 때만 지웁니다. 다른 프로세스가 잠금을 잡고 있으면 지우지 않습니다(B13).
+- FAT/exFAT처럼 하드 링크가 없으면 `create_new`로 복사하고, 이름이 이미 있으면 다음 `__N` 이름을 씁니다(B14).
+
+**소리 측정**
+- ffmpeg 인자에 `-xerror`를 추가했습니다. 아래 경우는 `error`이고, 소리 있음·무음으로 판정하지 않습니다(B1).
+  - stderr에 디코드 오류가 있을 때. 예: `partial file`, `Error while decoding`
+  - 디코드된 길이(`measured_seconds`)가 트랙 길이보다 짧을 때
+    - 스트림 길이를 알면: 1초 넘게, 또는 0.25초 넘게 짧으면서 95% 미만일 때
+    - 컨테이너 길이만 알면: max(2초, 5%) 넘게 짧을 때
+- 측정 전후로 파일을 다시 stat합니다. 크기나 mtime이 색인과 다르면 `error`이고 오류 문구는 `changed:`로 시작합니다(B3).
+- 색인에 스트림 목록 없이 `audio_codec`만 있으면 먼저 실제 ffprobe로 오디오 트랙 수와 파라미터를 확인합니다. 확인하지 못하면 `error`입니다(B12).
+- 체크포인트 지문에 ffmpeg 버전이 들어갑니다. 체크포인트에서 재생한 결과는 별도 로그 항목으로 남깁니다(B11).
+  - 항목 수준: `replayed_from_checkpoint: true`, `logged_unix`, `measured_unix`(원래 측정 시각 중 가장 이른 값)
+  - 결과마다 `measured_unix`를 남깁니다. 읽는 쪽은 결과 수준 값을 우선합니다.
+- 로그 append는 이제 로그 끝부분만 읽습니다. 모든 체인 레인에 적용되고, 체인 검증은 그대로입니다(B10).
+- **`measure-audio` 종료 코드(B15)**: 오류가 없으면 0입니다.
+  - 일부(또는 전부) 측정하지 못했으면 **4**입니다. 이때도 모든 결과는 로그에 남고, stdout 요약 JSON은 그대로이며, stderr 마지막 줄은 `소리 측정 오류 N건 (측정 대상 M건)`입니다.
+  - 그 밖의 0이 아닌 코드는 실행 실패입니다.
+  - 서버는 종료 코드 4를 실패로 보지 않습니다. 보강 단계에서는 경고 "소리 측정 완료(오류 N건) — …"를 남기고, `audio-measure` 잡에서는 같은 로그를 남긴 뒤 리뷰를 다시 만듭니다. 성공하면 "소리 측정 완료: 소리 있음 · 무음 · 오류 · …" 집계 줄을 남깁니다.
+- `records-meta.audioLevels`: 공유 인덱스 캐시에서 계산하고, (레인 stamp, 인덱스 세대, videos.jsonl stamp)를 키로 캐시합니다(B9). 모양은 같습니다.
+
+**보고서**
+- "이어붙인 영상" 표에 `판독 (상태·메모·구간·태그)` 열을 추가했습니다. `record_id` 기준이고, 예전 `join:<파일명>`도 읽습니다(U2).
+- `filename-order` 행은 "끊김·겹침 확인 불가 — 파일명 순"으로 표시합니다.
+- 주의 문구는 순서 근거에 따라 바뀝니다(`join-caveat-time` / `join-caveat-order`).
+
+**서버 문구**
+- 최종화와 case job 거부: "내보내기·이어붙이기 작업이 진행 중입니다 — 끝난 뒤 다시 시도하십시오."
+- open-case 거부와 전역 취소 로그도 "내보내기·이어붙이기"로 바꿨습니다.
+- 끝난 join을 취소하려 하면 "이미 끝난 이어붙이기입니다."를 표시합니다.
