@@ -17,6 +17,20 @@ fn live() -> std::sync::MutexGuard<'static, Vec<usize>> {
     LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// R2: every test in a crate that spawns tracked trees or touches the
+/// global kill list holds this guard, so `kill_all_tracked` in one test can
+/// never reap another test's children and the list assertions see only
+/// their own tree. This file is also compiled straight into
+/// `tests/windows_job_tree.rs`; that crate gets its own copy of the guard,
+/// shared by its tests and by the tests below.
+#[cfg(test)]
+pub(crate) fn tree_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) struct TrackedChild {
     pub(crate) child: Child,
     /// unix: process-group id (== child pid); windows: Job object HANDLE.
@@ -392,6 +406,14 @@ pub(crate) fn is_listed(key: usize) -> bool {
     live().contains(&key)
 }
 
+/// Snapshot of the shutdown list (tests, under [`tree_test_serial`]; used
+/// by `tests/windows_job_tree.rs`).
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn listed_keys() -> Vec<usize> {
+    live().clone()
+}
+
 /// Fatal-signal / console-control path: reap every tracked tree, then
 /// drop the instance file while it still names this process (P9) — the
 /// process exits right after, skipping `serve::run`'s own cleanup, and a
@@ -443,6 +465,7 @@ mod tests_try_wait {
     /// recycled group id can never be signalled.
     #[test]
     fn exited_child_leaves_the_shutdown_list() {
+        let _serial = tree_test_serial();
         let mut command = if cfg!(windows) {
             let mut command = Command::new("cmd");
             command.args(["/C", "exit 0"]);
@@ -469,10 +492,11 @@ mod tests_try_wait {
             assert!(std::time::Instant::now() < deadline, "child never exited");
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        assert!(status.success());
-        // (Never call kill_all_tracked here: it would kill the children of
-        // tests running in parallel.) Shutdown reaping can no longer reach
-        // this key.
+        // Exit status is not asserted: an in-process test server shutting
+        // down elsewhere in this crate may reap the tree first — what this
+        // test pins is the list membership. (Never call kill_all_tracked
+        // here.) Shutdown reaping can no longer reach this key.
+        let _ = status;
         assert!(!is_listed(key), "an exited tree must leave the kill list");
         drop(tracked);
         assert!(!is_listed(key));
@@ -496,6 +520,7 @@ mod tests {
 
     #[test]
     fn kill_keys_reaps_grandchild() {
+        let _serial = tree_test_serial();
         let mut command = Command::new("sh");
         command
             .args(["-c", "sleep 30 & echo $!; wait"])

@@ -88,9 +88,12 @@ fn write_ops_block_shutdown_finalize_open_case_and_start_until_released() {
     let shutdown = parse(&api_shutdown(&state));
     assert_eq!(shutdown["running"], true, "{shutdown}");
     assert!(!state_lock(&state).shutdown_requested());
-    // Cancel cannot stop it but says what holds shutdown back.
+    // R3: cancel asks the write op to stop between items and says what
+    // still holds shutdown back.
     let cancel = parse(&api_cancel(&state));
     assert_eq!(cancel["writes_running"], 1, "{cancel}");
+    assert_eq!(cancel["writes_cancelled"], 1, "{cancel}");
+    assert!(op.cancelled(), "the running write op sees the cancel");
     // Finalize cannot start sealing.
     let seal = try_begin_seal(&state).err().expect("seal refused");
     assert!(seal.contains("최종화 차단"), "{seal}");
@@ -248,6 +251,38 @@ fn reserved_device_paths_are_refused_with_windows_semantics_only() {
     // Ordinary file names off Windows.
     assert_eq!(reject_remote_path_on("/evidence/COM1", &[], false), Ok(()));
     assert_eq!(reject_device_path_on("/evidence/nul.txt", false), Ok(()));
+}
+
+/// R4: plain (Win32-namespace) spellings stay refused even with an
+/// extension (legacy device semantics); the verbatim local form skips
+/// Win32 name parsing, so `\\?\C:\…\aux.mp4` is an ordinary file — only a
+/// bare device component stays refused there.
+#[test]
+fn verbatim_local_paths_admit_device_like_file_names_with_an_extension() {
+    use super::http::{RESERVED_DEVICE_ERROR, reject_device_path_on, reject_remote_path_on};
+    for raw in [
+        r"\\?\C:\evidence\aux.mp4",
+        r"\\?\C:\evidence\NUL.txt",
+        r"\\?\D:\cam\com1.avi",
+    ] {
+        assert_eq!(reject_remote_path_on(raw, &[], true), Ok(()), "{raw}");
+        assert_eq!(reject_device_path_on(raw, true), Ok(()), "{raw}");
+    }
+    for raw in [
+        r"C:\evidence\aux.mp4",
+        r"C:\evidence\AUX",
+        r"\\?\C:\evidence\AUX",
+        r"\\?\C:\evidence\nul.",
+        r"\\?\C:\evidence\CON ",
+        r"\\?\C:\COM1\a.mp4",
+        r"\\?\C:\x\con:stream",
+    ] {
+        assert_eq!(
+            reject_remote_path_on(raw, &[], true),
+            Err(RESERVED_DEVICE_ERROR),
+            "{raw}"
+        );
+    }
 }
 
 #[test]
@@ -640,6 +675,11 @@ fn error_mode_suppresses_critical_and_open_file_dialogs() {
     assert_eq!(
         mode & crate::util::SEM_NOOPENFILEERRORBOX,
         crate::util::SEM_NOOPENFILEERRORBOX
+    );
+    // R7: a faulting child must not park on the WER crash dialog.
+    assert_eq!(
+        mode & crate::util::SEM_NOGPFAULTERRORBOX,
+        crate::util::SEM_NOGPFAULTERRORBOX
     );
     // Idempotent: a second call keeps the flags.
     assert_eq!(crate::util::suppress_os_error_dialogs() & mode, mode);

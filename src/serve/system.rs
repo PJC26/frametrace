@@ -25,22 +25,76 @@ pub(crate) const PROBED_TOOLS: &[(&str, &str)] = &[
 /// does not change during a workstation session, so the result is cached
 /// after the first probe; `?refresh=1` forces a re-probe after the
 /// examiner installs a missing tool.
+///
+/// R6: the probes run in parallel threads (one slow tool no longer adds
+/// its whole bound to every other), outside the cache lock and never
+/// under `state_lock`. Concurrent cold callers share one probe (the
+/// single-flight lock), and a result with a timed-out probe is not cached
+/// — the next call re-probes instead of pinning "timed out" for the
+/// session.
 pub(crate) fn api_env(request: &Request) -> String {
     static ENV_CACHE: Mutex<Option<String>> = Mutex::new(None);
+    static PROBING: Mutex<()> = Mutex::new(());
     let refresh = query_value(&request.query, "refresh").as_deref() == Some("1");
-    let mut guard = ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if refresh || guard.is_none() {
-        *guard = Some(probe_env());
+    let cached = || ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !refresh && let Some(hit) = cached() {
+        return hit;
     }
-    guard
-        .clone()
-        .unwrap_or_else(|| "{\"ok\":false}".to_string())
+    let _single_flight = PROBING.lock().unwrap_or_else(|e| e.into_inner());
+    // Another caller may have finished the probe while this one waited.
+    if !refresh && let Some(hit) = cached() {
+        return hit;
+    }
+    let (body, cacheable) = probe_env_outcome();
+    if cacheable {
+        *ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(body.clone());
+    }
+    body
 }
 
-pub(crate) fn probe_env() -> String {
-    let tools: Vec<(&str, bool)> = PROBED_TOOLS
+/// Outcome of one tool presence probe (R6). A timeout is its own fact:
+/// the binary resolved and started but did not answer within the bound —
+/// not proof that it is missing or broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolProbe {
+    Present,
+    Missing,
+    Failed,
+    TimedOut,
+}
+
+impl ToolProbe {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ToolProbe::Present => "present",
+            ToolProbe::Missing => "missing",
+            ToolProbe::Failed => "failed",
+            ToolProbe::TimedOut => "timed-out",
+        }
+    }
+}
+
+/// Probes every tool in parallel; returns the env JSON and whether it may
+/// be cached (no probe timed out).
+pub(crate) fn probe_env_outcome() -> (String, bool) {
+    let probes: Vec<(&str, ToolProbe)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = PROBED_TOOLS
+            .iter()
+            .map(|(name, arg)| (*name, scope.spawn(move || tool_probe(name, arg))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(name, handle)| (name, handle.join().unwrap_or(ToolProbe::Failed)))
+            .collect()
+    });
+    let timed_out: Vec<&str> = probes
         .iter()
-        .map(|(name, arg)| (*name, tool_available(name, arg)))
+        .filter(|(_, probe)| *probe == ToolProbe::TimedOut)
+        .map(|(name, _)| *name)
+        .collect();
+    let tools: Vec<(&str, bool)> = probes
+        .iter()
+        .map(|(name, probe)| (*name, *probe == ToolProbe::Present))
         .collect();
     let has = |name: &str| tools.iter().any(|(n, ok)| *n == name && *ok);
     // Workflows require every binary in their set.
@@ -61,42 +115,69 @@ pub(crate) fn probe_env() -> String {
         .iter()
         .map(|(name, ok)| (name.to_string(), serde_json::Value::Bool(*ok)))
         .collect();
-    serde_json::json!({
+    let body = serde_json::json!({
         "ok": true,
         "ffmpeg": has("ffmpeg"),
         "ffprobe": has("ffprobe"),
         "ewf": ewf,
         "deepfake": deepfake,
         "tools": tools_map,
+        // R6: per-tool probe outcome — `timed-out` is distinct from
+        // `missing`/`failed` (the tool may well work; it was just slow).
+        "tool_probe": probes
+            .iter()
+            .map(|(name, probe)| (name.to_string(), serde_json::Value::from(probe.as_str())))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "probe_timed_out": timed_out,
+        "probe_timeout_secs": crate::util::version_probe_timeout_secs(),
         "workflows": {"media": media, "e01": ewf, "filesystem": tsk},
         "hints": {
             "media": "FFmpeg 설치 후 ffmpeg/ffprobe가 PATH에 있어야 합니다. portable 배포본은 tools/bin에 복사하면 자동 인식됩니다.",
             "e01": "libewf(ewfinfo/ewfverify/ewfexport) 설치 후 PATH 등록 또는 tools/bin에 복사하십시오.",
             "filesystem": "Sleuth Kit(mmls/fls/icat) 설치 후 PATH 등록 또는 tools/bin에 복사하십시오.",
+            "probe_timeout": "버전 확인이 시간 안에 끝나지 않은 도구는 '없음'이 아니라 '확인 시간 초과'입니다 — 백신 검사 등으로 첫 실행이 느릴 수 있습니다. 잠시 후 다시 확인하거나 FRAMETRACE_TOOL_PROBE_TIMEOUT(초)을 늘리십시오.",
         }
     })
-    .to_string()
+    .to_string();
+    (body, timed_out.is_empty())
 }
 
 pub(crate) fn tool_available(name: &str, version_arg: &str) -> bool {
+    tool_probe(name, version_arg) == ToolProbe::Present
+}
+
+/// One presence probe (R6 outcome, see [`ToolProbe`]).
+pub(crate) fn tool_probe(name: &str, version_arg: &str) -> ToolProbe {
     // resolve_tool_binary covers PATH plus the portable tools/bin layout, so
     // a bare binary dropped next to frametrace-app.exe is detected.
     let Ok(resolved) = crate::tool_policy::resolve_tool_binary(name, &[name]) else {
-        return false;
+        return ToolProbe::Missing;
     };
     // An empty version_arg means "resolution is enough" — TSK tools have no
     // -V flag and print usage to stderr, so executing them tells us nothing.
     if version_arg.is_empty() {
-        return true;
+        return ToolProbe::Present;
     }
     // P7: bounded — this runs inside HTTP handlers (/api/env, /api/start),
     // and a tool wedged on start (or held by a loader dialog) must not pin
-    // the handler thread; a timeout reads as "not available".
+    // the handler thread.
     let mut command = Command::new(&resolved);
     command.arg(version_arg);
-    crate::util::run_with_timeout(&mut command, Some(crate::util::VERSION_PROBE_TIMEOUT_SECS))
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    classify_tool_probe(crate::util::run_with_timeout_detailed(
+        &mut command,
+        Some(crate::util::version_probe_timeout_secs()),
+    ))
+}
+
+/// Pure classification of a version run (R6).
+pub(crate) fn classify_tool_probe(
+    result: Result<std::process::Output, crate::util::RunError>,
+) -> ToolProbe {
+    match result {
+        Ok(output) if output.status.success() => ToolProbe::Present,
+        Ok(_) | Err(crate::util::RunError::Failed(_)) => ToolProbe::Failed,
+        Err(crate::util::RunError::TimedOut(_)) => ToolProbe::TimedOut,
+    }
 }
 
 /// Directory listing for the in-app path picker. An empty `path` returns
@@ -488,13 +569,34 @@ pub(crate) fn progress_json(
     if !case_dir.join("case.json").is_file() || !crate::case_db::case_db_path(case_dir).is_file() {
         return byte_progress_json(byte_progress);
     }
-    let job = crate::case_db::latest_running_job(case_dir).ok().flatten();
+    // R10: read-only, write-free, bounded wait. A writer holding the DB
+    // past STATUS_DB_BUSY no longer stalls the poll (it used to wait out
+    // the 5 s busy timeout, beyond the shell's 1 s status timeout): the
+    // last progress seen for this case is reported, marked `stale`.
+    let job = match crate::case_db::latest_running_job_quick(case_dir, STATUS_DB_BUSY) {
+        Ok(job) => {
+            remember_progress(case_dir, job.as_ref());
+            job
+        }
+        Err(_) => {
+            if let Some(mut last) = remembered_progress(case_dir) {
+                last["stale"] = true.into();
+                return last;
+            }
+            None
+        }
+    };
     let Some(job) = job else {
         // Fallback: external-tool steps (e.g. ewfexport) don't touch the
         // jobs table — report output bytes seen so far as an indeterminate
         // progress signal.
         return byte_progress_json(byte_progress);
     };
+    job_progress_json(&job)
+}
+
+/// Progress JSON for one running job row.
+fn job_progress_json(job: &crate::case_db::JobProgress) -> serde_json::Value {
     let now = crate::util::now_unix().unwrap_or(job.updated_unix);
     let elapsed = now.saturating_sub(job.started_unix).max(1);
     let total = job.total_units.unwrap_or(0);
@@ -518,6 +620,36 @@ pub(crate) fn progress_json(
         "elapsed_secs": elapsed,
         "eta_secs": eta,
     })
+}
+
+/// R10: how long one `/api/status` progress read may wait for a case-DB
+/// lock (the whole poll targets < 200 ms under a carve writer).
+pub(crate) const STATUS_DB_BUSY: Duration = Duration::from_millis(100);
+
+/// Last progress JSON read per case (R10 fallback when the DB is busy).
+/// Keyed by case so polls of different cases (tests, a case switch) never
+/// clear each other's entry; bounded so it cannot grow without limit.
+static LAST_PROGRESS: Mutex<Vec<(PathBuf, serde_json::Value)>> = Mutex::new(Vec::new());
+const LAST_PROGRESS_CAP: usize = 16;
+
+fn remember_progress(case_dir: &Path, job: Option<&crate::case_db::JobProgress>) {
+    let mut last = LAST_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    last.retain(|(dir, _)| dir != case_dir);
+    if let Some(job) = job {
+        if last.len() >= LAST_PROGRESS_CAP {
+            last.remove(0);
+        }
+        last.push((case_dir.to_path_buf(), job_progress_json(job)));
+    }
+}
+
+fn remembered_progress(case_dir: &Path) -> Option<serde_json::Value> {
+    LAST_PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(dir, _)| dir == case_dir)
+        .map(|(_, value)| value.clone())
 }
 
 /// Byte-level fallback for steps whose work happens inside an external
@@ -576,29 +708,30 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
         .to_string();
     }
     // Nothing holds `busy`: the global cancel stops running clip exports
-    // (UX-09) so "중단 후 종료" never leaves an ffmpeg behind.
+    // (UX-09) so "중단 후 종료" never leaves an ffmpeg behind, and (R3)
+    // asks every write op to stop — export-selected checks its flag
+    // between items and still writes a manifest marked cancelled.
     let clips = cancel_all_clip_jobs(&mut guard);
-    if clips > 0 {
-        guard.logs.push(format!(
-            "내보내기·이어붙이기 {clips}건 중단 요청을 받았습니다."
-        ));
+    let writes = cancel_write_ops(&mut guard);
+    if clips > 0 || writes > 0 {
+        if clips > 0 {
+            guard.logs.push(format!(
+                "내보내기·이어붙이기 {clips}건 중단 요청을 받았습니다."
+            ));
+        }
+        if writes > 0 {
+            guard.logs.push(format!(
+                "선택 내보내기·프레임 캡처 {writes}건 중단 요청을 받았습니다 — 진행 중인 항목을 마치고 멈춥니다."
+            ));
+        }
         return serde_json::json!({
             "ok": true,
-            "cancelled": "clips",
+            "cancelled": if clips > 0 { "clips" } else { "writes" },
             "job_kind": null,
             "clips_cancelled": clips,
             "clips_running": clips,
-        })
-        .to_string();
-    }
-    // S1: a short write (export-selected / capture-frame) cannot be
-    // cancelled, but it does hold shutdown back — say so instead of
-    // "nothing runs" while shutdown keeps answering "running".
-    if guard.write_ops > 0 {
-        return serde_json::json!({
-            "ok": false,
+            "writes_cancelled": writes,
             "writes_running": guard.write_ops,
-            "error": "선택 내보내기·프레임 캡처가 진행 중입니다 — 곧 끝나니 잠시 후 다시 시도하십시오.",
         })
         .to_string();
     }

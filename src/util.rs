@@ -10,15 +10,57 @@ use wait_timeout::ChildExt;
 /// hostile media, which a forensics tool must survive.
 pub const PROBE_TIMEOUT_SECS: u64 = 120;
 
-/// Presence/version probes (`tool -V`, `ffmpeg -version`) answer in well
-/// under a second; one that takes longer is wedged (or held by a loader
-/// dialog) and is treated as unavailable instead of pinning its caller.
-pub const VERSION_PROBE_TIMEOUT_SECS: u64 = 15;
+/// Default bound of a presence/version probe (`tool -V`, `ffmpeg
+/// -version`). Usually well under a second, but the first launch of a
+/// tool on a workstation can take tens of seconds (antivirus scanning a
+/// freshly unpacked portable ffmpeg, a cold network profile), so R6 raised
+/// it from 15 s; [`TOOL_PROBE_TIMEOUT_ENV`] overrides it.
+pub const VERSION_PROBE_TIMEOUT_SECS: u64 = 60;
+
+/// Environment variable overriding [`VERSION_PROBE_TIMEOUT_SECS`]
+/// (whole seconds, 1..=3600; anything else keeps the default).
+pub const TOOL_PROBE_TIMEOUT_ENV: &str = "FRAMETRACE_TOOL_PROBE_TIMEOUT";
+
+/// The version-probe bound in effect (R6).
+pub fn version_probe_timeout_secs() -> u64 {
+    parse_probe_timeout(std::env::var(TOOL_PROBE_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// [`version_probe_timeout_secs`] with the raw env value injected (tests).
+pub fn parse_probe_timeout(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| (1..=3600).contains(secs))
+        .unwrap_or(VERSION_PROBE_TIMEOUT_SECS)
+}
+
+/// Why [`run_with_timeout_detailed`] produced no output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The command could not be started or waited for.
+    Failed(String),
+    /// It ran past its bound and was terminated — a fact about the run,
+    /// not about whether the tool exists or works (R6).
+    TimedOut(String),
+}
+
+impl RunError {
+    pub fn message(&self) -> &str {
+        match self {
+            RunError::Failed(message) | RunError::TimedOut(message) => message,
+        }
+    }
+}
 
 /// Windows `SEM_FAILCRITICALERRORS`: no critical-error / missing-DLL
 /// loader message box; the call fails instead.
 #[cfg(windows)]
 pub const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+/// Windows `SEM_NOGPFAULTERRORBOX`: a crashing child (an ffmpeg build
+/// faulting on hostile media) terminates instead of parking on the
+/// Windows Error Reporting "has stopped working" dialog, which would keep
+/// the step (and its timeout-less callers) waiting on a click nobody sees.
+#[cfg(windows)]
+pub const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
 /// Windows `SEM_NOOPENFILEERRORBOX`: no "cannot find file" message box.
 #[cfg(windows)]
 pub const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
@@ -38,7 +80,7 @@ unsafe extern "system" {
 pub fn suppress_os_error_dialogs() -> u32 {
     #[cfg(windows)]
     {
-        let wanted = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX;
+        let wanted = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
         // SAFETY: SetErrorMode only swaps a process-wide flag word; the
         // first call reads the previous mode so it can be merged.
         unsafe {
@@ -51,6 +93,161 @@ pub fn suppress_os_error_dialogs() -> u32 {
     {
         0
     }
+}
+
+// ---- Path-shape policy (pure, no filesystem access) ----
+//
+// Shared by the HTTP path gate (`serve::http::reject_remote_path`) and the
+// report redactor (`redact::Redactor`), so neither ever hands a remote or
+// device path to `canonicalize`/`metadata` — on Windows that opens an SMB
+// session (leaking the examiner's NTLM credentials to the named host) or
+// a device that can block the caller for good.
+
+/// Whether one path component names a reserved DOS device. Windows maps
+/// the name to the device regardless of extension (`NUL.txt`) and of
+/// trailing spaces/dots, and case-insensitively; the superscript digits
+/// `¹²³` count as digits for COM/LPT.
+pub(crate) fn is_reserved_device_name(component: &str) -> bool {
+    let base = component
+        .split(['.', ':'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
+        return true;
+    }
+    let Some(digit) = base
+        .strip_prefix("COM")
+        .or_else(|| base.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut chars = digit.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('0'..='9' | '¹' | '²' | '³'), None)
+    )
+}
+
+/// Whether any `\`/`/`-separated component of `text` is a reserved device.
+pub(crate) fn has_reserved_device_component(text: &str) -> bool {
+    text.split(['\\', '/']).any(is_reserved_device_name)
+}
+
+/// A component that stays a device name even under the verbatim `\\?\`
+/// prefix once that prefix is stripped again: the bare name, optionally
+/// with trailing spaces/dots (`AUX`, `nul.`) or a stream suffix (`CON:x`).
+/// `aux.mp4` is not bare — it has a real extension.
+fn is_bare_reserved_device_name(component: &str) -> bool {
+    let head = component.split(':').next().unwrap_or_default();
+    let trimmed = head.trim_end_matches([' ', '.']);
+    !trimmed.contains('.') && is_reserved_device_name(trimmed)
+}
+
+/// R4: whether a path is refused for naming a reserved Windows device.
+///
+/// - Ordinary (Win32-namespace) paths — `C:\x\aux.mp4`,
+///   `\\server\s\nul.txt`, relative paths — keep the conservative legacy
+///   rule: a component whose base name (before the first `.`/`:`,
+///   trailing spaces ignored) is a device is refused, extension or not.
+///   Windows 10 and older open the device for `aux.mp4`; Windows 11
+///   narrowed that to the bare name, but the server must be safe on every
+///   supported Windows.
+/// - A verbatim local path `\\?\C:\…` bypasses Win32 name parsing, so
+///   `\\?\C:\x\aux.mp4` is an ordinary file and is admitted. A *bare*
+///   device component (`\\?\C:\x\AUX`, `…\nul.`) is still refused: code
+///   that strips the verbatim prefix for display or a child process's argv
+///   would turn it back into the device.
+///
+/// Residual (accepted, documented in PLAN_PHASE3 §R): a verbatim
+/// `aux.mp4` whose prefix is stripped and reopened on Windows 10 would
+/// reach the device again; the media/export handlers open the canonical
+/// (verbatim) path.
+pub(crate) fn reserved_device_refused(text: &str) -> bool {
+    if is_verbatim_local_drive(text) {
+        text[4..]
+            .split(['\\', '/'])
+            .any(is_bare_reserved_device_name)
+    } else {
+        has_reserved_device_component(text)
+    }
+}
+
+fn is_separator(byte: u8) -> bool {
+    byte == b'\\' || byte == b'/'
+}
+
+/// Two leading separators (any mix of `\` and `/`) or the NT object prefix.
+/// Off Windows a leading `/` is always a local absolute path (S8).
+pub(crate) fn is_remote_or_device_path(text: &str, windows: bool) -> bool {
+    let bytes = text.as_bytes();
+    if !windows && bytes.first() == Some(&b'/') {
+        return false;
+    }
+    (bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]))
+        || (bytes.len() >= 4
+            && is_separator(bytes[0])
+            && bytes[1] == b'?'
+            && bytes[2] == b'?'
+            && is_separator(bytes[3]))
+}
+
+/// `\\?\C:` / `\\?\C:\…` — the verbatim spelling of a local drive path.
+pub(crate) fn is_verbatim_local_drive(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 6
+        && bytes[0] == b'\\'
+        && bytes[1] == b'\\'
+        && bytes[2] == b'?'
+        && bytes[3] == b'\\'
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && (bytes.len() == 6 || bytes[6] == b'\\')
+}
+
+/// Lowercased `\\server\share[\rest]` form of a UNC path (separators
+/// normalized to `\`, `\\?\UNC\` unwrapped, trailing separators dropped);
+/// `None` for anything else — device paths, local paths, or a UNC path
+/// without both a server and a share component.
+pub(crate) fn unc_share_form(text: &str) -> Option<String> {
+    let normalized = text.trim().replace('/', "\\");
+    let lower = normalized.to_ascii_lowercase();
+    let rest = if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
+        rest.to_string()
+    } else if lower.starts_with(r"\\?\") || lower.starts_with(r"\\.\") || lower.starts_with(r"\??\")
+    {
+        return None;
+    } else if let Some(rest) = lower.strip_prefix(r"\\") {
+        rest.to_string()
+    } else {
+        return None;
+    };
+    let rest = rest.trim_end_matches('\\');
+    let mut parts = rest.split('\\');
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    if server.is_empty() || share.is_empty() || matches!(server, "?" | ".") {
+        return None;
+    }
+    Some(format!(r"\\{rest}"))
+}
+
+/// R1: whether `text` names something that must never reach a filesystem
+/// call under `windows` path semantics: a UNC / device-namespace path
+/// (`\\host\…`, `//host/…`, `\\?\UNC\…`, `\\.\…`, `\\?\GLOBALROOT\…`,
+/// `\??\…`) or a path with a reserved device component
+/// ([`reserved_device_refused`]). The verbatim local drive form `\\?\C:\…`
+/// is local. Off Windows a leading `/` is always local (S8).
+pub(crate) fn is_remote_or_device_text(text: &str, windows: bool) -> bool {
+    let text = text.trim();
+    if windows && reserved_device_refused(text) {
+        return true;
+    }
+    is_remote_or_device_path(text, windows) && !is_verbatim_local_drive(text)
 }
 
 pub fn now_unix() -> Result<u64, String> {
@@ -98,12 +295,20 @@ pub fn run_with_timeout(
     command: &mut Command,
     timeout_secs: Option<u64>,
 ) -> Result<Output, String> {
+    run_with_timeout_detailed(command, timeout_secs).map_err(|err| err.message().to_string())
+}
+
+/// [`run_with_timeout`] that tells a timeout apart from a failure to run.
+pub fn run_with_timeout_detailed(
+    command: &mut Command,
+    timeout_secs: Option<u64>,
+) -> Result<Output, RunError> {
     let program = command.get_program().to_string_lossy().to_string();
     hide_console(command);
     let Some(secs) = timeout_secs else {
         return command
             .output()
-            .map_err(|err| format!("failed to run {program}: {err}"));
+            .map_err(|err| RunError::Failed(format!("failed to run {program}: {err}")));
     };
     command
         .stdin(std::process::Stdio::null())
@@ -111,7 +316,7 @@ pub fn run_with_timeout(
         .stderr(std::process::Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|err| format!("failed to run {program}: {err}"))?;
+        .map_err(|err| RunError::Failed(format!("failed to run {program}: {err}")))?;
     let mut stdout_pipe = child.stdout.take().expect("piped stdout");
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");
     let stdout_reader = std::thread::spawn(move || {
@@ -126,7 +331,7 @@ pub fn run_with_timeout(
     });
     let status = child
         .wait_timeout(Duration::from_secs(secs))
-        .map_err(|err| format!("failed to wait for {program}: {err}"))?;
+        .map_err(|err| RunError::Failed(format!("failed to wait for {program}: {err}")))?;
     match status {
         Some(status) => Ok(Output {
             status,
@@ -136,9 +341,9 @@ pub fn run_with_timeout(
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(format!(
+            Err(RunError::TimedOut(format!(
                 "{program} did not finish within {secs}s and was terminated (retry with a larger --timeout)"
-            ))
+            )))
         }
     }
 }
@@ -836,6 +1041,7 @@ mod tests {
                 let covered = production.contains("hide_console(")
                     || production.contains("hide_console_with_flags(")
                     || production.contains("run_with_timeout(")
+                    || production.contains("run_with_timeout_detailed(")
                     || production.contains("spawn_tracked(");
                 if !covered {
                     offenders.push(rel);

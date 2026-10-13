@@ -90,7 +90,8 @@ fn http_with(
     (status, text[body_at..].to_string())
 }
 
-/// Reads the mutation nonce from the `ft_nonce` cookie set on a page GET.
+/// Reads the mutation nonce from the `ft_nonce_<port>` cookie (C2: named
+/// per port) set on a page GET.
 fn fetch_nonce(port: u16) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect workstation");
     stream
@@ -102,10 +103,11 @@ fn fetch_nonce(port: u16) -> String {
     let mut buffer = Vec::new();
     let _ = stream.read_to_end(&mut buffer);
     let text = String::from_utf8_lossy(&buffer);
+    let name = format!("ft_nonce_{port}=");
     let at = text
-        .find("ft_nonce=")
-        .map(|at| at + "ft_nonce=".len())
-        .expect("GET / plants the ft_nonce cookie");
+        .find(&name)
+        .map(|at| at + name.len())
+        .expect("GET / plants the per-port ft_nonce cookie");
     text[at..]
         .split(|ch: char| ch == ';' || ch.is_whitespace())
         .next()
@@ -351,11 +353,11 @@ fn workstation_csrf_and_unc_hardening_over_http() {
         assert_eq!(status_of(&page), 200, "{}", &page[..page.len().min(400)]);
         let head = &page[..page.find("\r\n\r\n").unwrap()];
         assert!(
-            head.contains(&format!("Set-Cookie: ft_token={token}")),
+            head.contains(&format!("Set-Cookie: ft_token_{port}={token}")),
             "{head}"
         );
         assert!(head.contains("Referrer-Policy: no-referrer"), "{head}");
-        let cookie = format!("Cookie: ft_token={token}\r\n");
+        let cookie = format!("Cookie: ft_token_{port}={token}\r\n");
         let post_cancel = |origin: &str| {
             raw_request(
                 port,

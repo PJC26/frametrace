@@ -67,7 +67,7 @@ fn default_token_gates_every_request_and_opt_out_does_not() {
     let page = http_get(addr, &format!("GET /?token={token} HTTP/1.1"));
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     assert!(
-        page.contains(&format!("Set-Cookie: ft_token={token}")),
+        page.contains(&format!("Set-Cookie: ft_token_{}={token}", addr.port())),
         "{page}"
     );
 

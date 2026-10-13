@@ -9,6 +9,12 @@
 //! Each test spawns a child (PowerShell) that spawns a grandchild (`ping`)
 //! and reports its pid; teardown must reach the grandchild, which a plain
 //! `Child::kill` would orphan.
+//!
+//! R2: the tests share one process-wide kill list (`kill_all_tracked`
+//! reaps every listed tree), so every test here — and the `proc.rs` unit
+//! tests compiled into this crate with it — holds `proc::tree_test_serial()`
+//! for its whole run. `kill_all_tracked_reaps_grandchild_for_shutdown`
+//! therefore only ever sees its own tree on the list.
 #![cfg(windows)]
 #![allow(dead_code)]
 
@@ -91,6 +97,7 @@ fn wait_dead(pid: &str, what: &str) {
 
 #[test]
 fn kill_tree_reaps_grandchild() {
+    let _serial = proc::tree_test_serial();
     let (mut tracked, pid) = spawn_tree();
     tracked.kill_tree();
     let _ = tracked.child.wait();
@@ -101,6 +108,7 @@ fn kill_tree_reaps_grandchild() {
 fn dropping_tracked_child_closes_job_and_reaps_grandchild() {
     // KILL_ON_JOB_CLOSE: releasing the handle must reap survivors even when
     // nobody calls kill_tree (e.g. the run_step loop panicked).
+    let _serial = proc::tree_test_serial();
     let (tracked, pid) = spawn_tree();
     drop(tracked);
     wait_dead(&pid, "TrackedChild drop");
@@ -108,7 +116,14 @@ fn dropping_tracked_child_closes_job_and_reaps_grandchild() {
 
 #[test]
 fn kill_all_tracked_reaps_grandchild_for_shutdown() {
+    let _serial = proc::tree_test_serial();
     let (mut tracked, pid) = spawn_tree();
+    let key_listed = proc::listed_keys();
+    assert_eq!(
+        key_listed.len(),
+        1,
+        "only this test's tree may be on the kill list: {key_listed:?}"
+    );
     proc::kill_all_tracked();
     let _ = tracked.child.wait();
     wait_dead(&pid, "kill_all_tracked");

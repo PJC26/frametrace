@@ -37,29 +37,7 @@ pub fn reap_interrupted_jobs(case_dir: &Path) {
         .and_then(|rows| rows.ok())
         .unwrap_or_default();
     for job_id in ids {
-        let lock_path = job_lock_path(case_dir, &job_id);
-        let alive = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => {
-                // If we can take the lock, its owner is gone — locks are
-                // released by the OS on process exit (LockFileEx on
-                // Windows, flock on Unix), even for killed processes.
-                match file.try_lock_exclusive() {
-                    Ok(()) => {
-                        let _ = file.unlock();
-                        false
-                    }
-                    Err(_) => true,
-                }
-            }
-            // No lock file means the job predates the lock mechanism or
-            // the lock could not be created — treat as orphaned.
-            Err(_) => false,
-        };
-        if !alive {
+        if !job_owner_alive(case_dir, &job_id) {
             let now = match now_unix() {
                 Ok(now) => now,
                 Err(_) => continue,
@@ -81,6 +59,113 @@ pub fn reap_interrupted_jobs(case_dir: &Path) {
             }
         }
     }
+}
+
+/// Whether a live process still holds the advisory lock of `job_id`.
+fn job_owner_alive(case_dir: &Path, job_id: &str) -> bool {
+    let lock_path = job_lock_path(case_dir, job_id);
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => {
+            // If we can take the lock, its owner is gone — locks are
+            // released by the OS on process exit (LockFileEx on Windows,
+            // flock on Unix), even for killed processes.
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    let _ = file.unlock();
+                    false
+                }
+                Err(_) => true,
+            }
+        }
+        // No lock file means the job predates the lock mechanism or the
+        // lock could not be created — treat as orphaned.
+        Err(_) => false,
+    }
+}
+
+/// R10: the `/api/status` progress read, cheap enough for a 1 s poll
+/// while a carve/scan child writes the case DB. Unlike
+/// [`latest_running_job`] it never writes — no reaping (an UPDATE that
+/// queues behind the writer), no schema init (a BEGIN IMMEDIATE) — opens
+/// the DB read-only, and waits at most `busy` for a lock. Rows whose owner
+/// died are skipped (same lock-file proof the reaper uses) instead of
+/// being rewritten here; the next job start reaps them. An error (DB busy
+/// past `busy`, no jobs table yet) is returned for the caller to degrade.
+///
+/// The wait is a total deadline enforced here (SQLite's own busy handler
+/// is re-armed per lock attempt — schema read, then query — and measured
+/// ~4x its nominal timeout under an EXCLUSIVE writer on Windows).
+pub fn latest_running_job_quick(
+    case_dir: &Path,
+    busy: std::time::Duration,
+) -> Result<Option<JobProgress>, String> {
+    let deadline = std::time::Instant::now() + busy;
+    loop {
+        match read_running_job_once(case_dir) {
+            Err((true, _)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err((_, err)) => return Err(err),
+            Ok(job) => return Ok(job),
+        }
+    }
+}
+
+/// One non-blocking attempt of [`latest_running_job_quick`]; the error
+/// says whether it was a lock conflict worth retrying.
+fn read_running_job_once(case_dir: &Path) -> Result<Option<JobProgress>, (bool, String)> {
+    let is_busy = |err: &rusqlite::Error| {
+        matches!(
+            err.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    };
+    let fail = |err: rusqlite::Error| {
+        (
+            is_busy(&err),
+            format!("failed to read running job progress: {err}"),
+        )
+    };
+    let conn = rusqlite::Connection::open_with_flags(
+        case_db_path(case_dir),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(fail)?;
+    conn.busy_timeout(std::time::Duration::ZERO).map_err(fail)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT job_id, job_type, total_units, completed_units, started_unix, updated_unix
+            FROM jobs
+            WHERE status = 'running'
+            ORDER BY started_unix DESC
+            LIMIT 16
+            "#,
+        )
+        .map_err(fail)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(JobProgress {
+                job_id: row.get(0)?,
+                job_type: row.get(1)?,
+                total_units: row.get::<_, Option<i64>>(2)?.map(|v| v.max(0) as u64),
+                completed_units: row.get::<_, i64>(3)?.max(0) as u64,
+                started_unix: row.get::<_, i64>(4)?.max(0) as u64,
+                updated_unix: row.get::<_, i64>(5)?.max(0) as u64,
+            })
+        })
+        .map_err(fail)?;
+    for row in rows {
+        let job = row.map_err(fail)?;
+        if job_owner_alive(case_dir, &job.job_id) {
+            return Ok(Some(job));
+        }
+    }
+    Ok(None)
 }
 
 pub fn start_job(

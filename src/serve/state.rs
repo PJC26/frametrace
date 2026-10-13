@@ -92,10 +92,17 @@ pub(crate) struct JobState {
     /// acquisition it made, so a late drop can never free a newer job's
     /// flag.
     pub(crate) busy_epoch: u64,
-    /// Short synchronous case writes running beside `busy` (S1):
-    /// export-selected and capture-frame. Shutdown, finalize, open-case
-    /// and a new analysis refuse while any is in flight.
+    /// Synchronous case writes running beside `busy` (S1): export-selected
+    /// (a long batch — copies and hashes up to 5000 files) and
+    /// capture-frame. Shutdown, finalize, open-case and a new analysis
+    /// refuse while any is in flight.
     pub(crate) write_ops: usize,
+    /// R3: cancel flag of every write op in flight, keyed by its lease id.
+    /// `/api/cancel` (with no pipeline job holding `busy`) sets them all; a
+    /// lease removes its own entry on drop, so a cancel never reaches a
+    /// write op that starts afterwards.
+    pub(crate) write_cancels: Vec<(u64, Arc<AtomicBool>)>,
+    pub(crate) next_write_op_id: u64,
     /// Set by finalize (under the same lock that saw no write op and no
     /// clip job running) for as long as it seals the case; new write ops
     /// are refused meanwhile (S1).
@@ -108,7 +115,7 @@ pub(crate) struct JobState {
     pub(crate) byte_progress: Option<(PathBuf, Option<u64>)>,
     /// Optional shared-secret gate from FRAMETRACE_TOKEN. `None` keeps the
     /// documented loopback-trust model; when set, every request must prove
-    /// the token via header, query, or the planted `ft_token` cookie.
+    /// the token via header, query, or the planted `ft_token_<port>` cookie (C2).
     pub(crate) token: Option<String>,
     /// Set by POST /api/shutdown; the accept loop polls this flag and exits
     /// once in-flight connections drain so the workstation can actually be
@@ -295,6 +302,8 @@ impl JobState {
             busy: false,
             busy_epoch: 0,
             write_ops: 0,
+            write_cancels: Vec::new(),
+            next_write_op_id: 0,
             sealing: false,
             cancel_requested: false,
             byte_progress: None,
@@ -454,11 +463,35 @@ impl Drop for BusyLease {
     }
 }
 
-/// Registration of one short case write (S1: export-selected,
-/// capture-frame) in [`JobState::write_ops`]; dropping it (also on a
-/// panic) deregisters.
+/// Registration of one case write (S1: export-selected — possibly long —
+/// and capture-frame) in [`JobState::write_ops`]; dropping it (also on a
+/// panic) deregisters. R3: carries the op's cancel flag.
 pub(crate) struct WriteOpLease {
     state: SharedState,
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+impl WriteOpLease {
+    /// Whether `/api/cancel` asked this write op to stop (checked between
+    /// items; a file copy in progress is never torn).
+    #[cfg(test)]
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// The flag itself, for worker threads.
+    pub(crate) fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+}
+
+/// R3: asks every write op in flight to stop; returns how many were asked.
+pub(crate) fn cancel_write_ops(guard: &mut JobState) -> usize {
+    for (_, flag) in &guard.write_cancels {
+        flag.store(true, Ordering::SeqCst);
+    }
+    guard.write_cancels.len()
 }
 
 /// Registers a write op against the bound case and returns that case.
@@ -478,9 +511,15 @@ pub(crate) fn try_begin_write_op(state: &SharedState) -> Result<(WriteOpLease, P
         return Err("먼저 케이스를 열거나 분석을 실행하십시오.".to_string());
     };
     guard.write_ops += 1;
+    guard.next_write_op_id = guard.next_write_op_id.wrapping_add(1);
+    let id = guard.next_write_op_id;
+    let cancel = Arc::new(AtomicBool::new(false));
+    guard.write_cancels.push((id, Arc::clone(&cancel)));
     Ok((
         WriteOpLease {
             state: Arc::clone(state),
+            id,
+            cancel,
         },
         case_dir,
     ))
@@ -490,6 +529,8 @@ impl Drop for WriteOpLease {
     fn drop(&mut self) {
         let mut guard = state_lock(&self.state);
         guard.write_ops = guard.write_ops.saturating_sub(1);
+        let id = self.id;
+        guard.write_cancels.retain(|(entry, _)| *entry != id);
     }
 }
 
