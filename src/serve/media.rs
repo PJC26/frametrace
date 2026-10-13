@@ -7,13 +7,12 @@ use super::*;
 /// magic bytes, hash the capture, and chain an audit event so the frame is
 /// traceable back to the record and playback position.
 pub(crate) fn api_capture_frame(request: &Request, state: &SharedState) -> String {
-    let case_dir = {
-        let guard = state_lock(state);
-        guard.case_dir.clone()
-    };
-    let Some(case_dir) = case_dir else {
-        return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
-            .to_string();
+    // S1: registered as a write op for its whole run, so shutdown,
+    // finalize and open-case wait for (refuse during) the capture instead
+    // of racing it.
+    let (_write_op, case_dir) = match try_begin_write_op(state) {
+        Ok(op) => op,
+        Err(err) => return api_err(&err),
     };
     let id = body_value(&request.body, "id").unwrap_or_default();
     if id.trim().is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
@@ -231,6 +230,10 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
         // finalize/recover/carve take `busy` first and then count running
         // clips; re-checking `busy` in the same lock as the registration
         // closes the window where both could proceed (finding 4).
+        // S7: no new job once shutdown was accepted.
+        if let Some(refusal) = shutdown_refusal(&guard) {
+            return api_err(&refusal);
+        }
         if guard.busy {
             return api_err(CLIP_BUSY_ERROR);
         }
@@ -402,7 +405,7 @@ fn run_clip_job(state: &SharedState, exe: &Path, id: &str, args: &[String]) {
         .find(|job| job.id == id)
         .map(|job| job.output.clone());
     let Some(output) = output else { return };
-    let result = run_step_cancellable(exe, args, &cancelled);
+    let result = run_step_cancellable(exe, args, &cancelled, state);
     let finished = crate::util::now_unix().ok();
     let outcome = match result {
         Ok(_) => match crate::audit::digest_file(&output) {
@@ -821,6 +824,10 @@ pub(crate) fn join_with_exe(request: &Request, state: &SharedState, exe: &Path) 
             drop(guard);
             return clip_response(&existing, true);
         }
+        // S7: no new job once shutdown was accepted.
+        if let Some(refusal) = shutdown_refusal(&guard) {
+            return api_err(&refusal);
+        }
         if guard.busy {
             return api_err(CLIP_BUSY_ERROR);
         }
@@ -1178,7 +1185,7 @@ fn run_join_job(state: &SharedState, exe: &Path, id: &str, args: &[String], case
             .find(|job| job.id == id)
             .is_none_or(|job| job.cancel_requested)
     };
-    let result = run_step_cancellable(exe, args, &cancelled);
+    let result = run_step_cancellable(exe, args, &cancelled, state);
     let was_cancelled = cancelled();
     // The log entry is the authority on whether the join completed: a
     // cancel that lost the race with completion still yields a logged,
@@ -1622,13 +1629,16 @@ pub(crate) fn api_advanced(request: &Request, state: &SharedState) -> String {
 /// items without a file (e.g. pre-recovery candidates) are recorded in
 /// the manifest as skipped instead of silently vanishing.
 pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> String {
-    let (case_dir, roots) = {
-        let guard = state_lock(state);
-        (guard.case_dir.clone(), guard.media_roots.clone())
-    };
-    let Some(case_dir) = case_dir else {
+    if state_lock(state).case_dir.is_none() {
         return "{\"ok\":false,\"error\":\"열린 케이스가 없습니다.\"}".to_string();
+    }
+    // S1: a write op for the whole batch (copies, hashes, manifest), so
+    // shutdown / finalize / open-case cannot tear the export bundle.
+    let (_write_op, case_dir) = match try_begin_write_op(state) {
+        Ok(op) => op,
+        Err(err) => return api_err(&err),
     };
+    let roots = state_lock(state).media_roots.clone();
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&request.body) else {
         return "{\"ok\":false,\"error\":\"invalid export payload\"}".to_string();
     };

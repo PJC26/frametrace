@@ -87,6 +87,19 @@ pub(crate) struct JobState {
     pub(crate) package_dir: Option<PathBuf>,
     pub(crate) error: Option<String>,
     pub(crate) busy: bool,
+    /// Bumped every time `busy` is taken (P2): a [`BusyGuard`] /
+    /// [`BusyLease`] only clears `busy` on drop while it still owns the
+    /// acquisition it made, so a late drop can never free a newer job's
+    /// flag.
+    pub(crate) busy_epoch: u64,
+    /// Short synchronous case writes running beside `busy` (S1):
+    /// export-selected and capture-frame. Shutdown, finalize, open-case
+    /// and a new analysis refuse while any is in flight.
+    pub(crate) write_ops: usize,
+    /// Set by finalize (under the same lock that saw no write op and no
+    /// clip job running) for as long as it seals the case; new write ops
+    /// are refused meanwhile (S1).
+    pub(crate) sealing: bool,
     pub(crate) cancel_requested: bool,
     /// Byte-level progress hint for steps that run inside an external tool
     /// (ewfexport) where no in-process callback exists: the pipeline spawns
@@ -243,9 +256,30 @@ impl JobState {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
+    /// True once `/api/shutdown` was accepted. Every job-start path checks
+    /// it under the state lock (S7): a request already inside a handler
+    /// when the accept loop stopped must not start work the exiting
+    /// process would then cut off.
     pub(crate) fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Takes `busy` in an already-held lock (the caller may update more
+    /// state in the same critical section). Refuses while another job
+    /// holds it or once shutdown was requested; returns the new epoch.
+    pub(crate) fn take_busy(&mut self) -> Result<u64, String> {
+        if let Some(refusal) = shutdown_refusal(self) {
+            return Err(refusal);
+        }
+        if self.busy {
+            return Err(BUSY_ERROR.to_string());
+        }
+        self.busy = true;
+        self.busy_epoch = self.busy_epoch.wrapping_add(1);
+        // UX-07: a cancel aimed at a previous job must not kill this one —
+        // every run starts with a fresh cancel flag.
+        self.cancel_requested = false;
+        Ok(self.busy_epoch)
     }
 
     pub(crate) fn new() -> Self {
@@ -259,6 +293,9 @@ impl JobState {
             package_dir: None,
             error: None,
             busy: false,
+            busy_epoch: 0,
+            write_ops: 0,
+            sealing: false,
             cancel_requested: false,
             byte_progress: None,
             token: None,
@@ -288,51 +325,123 @@ impl JobState {
 /// the index while the first queue was still reading it.
 pub(crate) struct BusyGuard<'a> {
     pub(crate) state: &'a SharedState,
+    epoch: u64,
+}
+
+/// Standard refusal while another job holds `busy`.
+pub(crate) const BUSY_ERROR: &str = "분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.";
+
+/// Refusal for every job start once shutdown was requested (S7).
+pub(crate) const SHUTDOWN_ERROR: &str =
+    "워크스테이션이 종료 중입니다 — 새 작업을 시작할 수 없습니다.";
+
+/// `Some(refusal)` once shutdown was requested (S7).
+pub(crate) fn shutdown_refusal(guard: &JobState) -> Option<String> {
+    guard
+        .shutdown_requested()
+        .then(|| SHUTDOWN_ERROR.to_string())
 }
 
 /// Atomically takes `busy` or returns the standard in-progress error.
 pub(crate) fn try_acquire_busy(state: &SharedState) -> Result<BusyGuard<'_>, String> {
-    let mut guard = state_lock(state);
-    if guard.busy {
-        return Err("분석 작업이 진행 중입니다 — 완료 후 다시 시도하십시오.".to_string());
+    let epoch = state_lock(state).take_busy()?;
+    Ok(BusyGuard { state, epoch })
+}
+
+/// Clears `busy` only while it is still the acquisition `epoch` made (P2).
+fn release_busy_if_owned(guard: &mut JobState, epoch: u64) -> bool {
+    if guard.busy && guard.busy_epoch == epoch {
+        guard.busy = false;
+        true
+    } else {
+        false
     }
-    guard.busy = true;
-    // UX-07: a cancel aimed at a previous job must not kill this one —
-    // every run starts with a fresh cancel flag.
-    guard.cancel_requested = false;
-    Ok(BusyGuard { state })
+}
+
+/// Message recorded when a job thread unwinds while holding `busy`.
+pub(crate) const ABANDONED_JOB_ERROR: &str = "작업 스레드가 비정상 종료되었습니다 (내부 오류) — 작업이 완료되지 않았습니다. 다시 시도하십시오.";
+
+/// A job thread unwound while it held `busy`: never leave the UI showing a
+/// running job that no longer exists, and never fail silently (P2).
+fn record_abandoned_job(guard: &mut JobState) {
+    if matches!(guard.phase, "running" | "finalizing") {
+        guard.phase = "error";
+    }
+    if let Some(job) = guard.case_job.as_mut().filter(|job| job.state == "running") {
+        job.state = "failed";
+        job.error = Some(ABANDONED_JOB_ERROR.to_string());
+        job.finished_unix = crate::util::now_unix().ok();
+    }
+    guard.byte_progress = None;
+    guard.enrichment = None;
+    guard
+        .error
+        .get_or_insert_with(|| ABANDONED_JOB_ERROR.to_string());
+    guard.logs.push(format!("오류: {ABANDONED_JOB_ERROR}"));
+}
+
+/// Shared drop path of [`BusyGuard`] and [`BusyLease`].
+fn drop_busy(state: &SharedState, epoch: u64) {
+    let mut guard = state_lock(state);
+    if release_busy_if_owned(&mut guard, epoch) && std::thread::panicking() {
+        record_abandoned_job(&mut guard);
+    }
 }
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        state_lock(self.state).busy = false;
+        drop_busy(self.state, self.epoch);
     }
 }
 
-/// Owned busy lease for a job that outlives its HTTP handler (UX-06): the
-/// worker thread holds it and releases `busy` in the same lock as its
-/// final state update, so no window exists where another job could take
-/// `busy` and then have it cleared under it. Dropping an unreleased lease
-/// (a panicking worker) still frees `busy`.
+/// Owned busy lease for a job that outlives its HTTP handler (UX-06, and
+/// the main analysis pipeline — P2): the worker thread holds it and
+/// releases `busy` in the same lock as its final state update, so no
+/// window exists where another job could take `busy` and then have it
+/// cleared under it. Dropping an unreleased lease (a panicking worker)
+/// still frees `busy` and records the failure; a lease whose job already
+/// cleared `busy` itself (and which another job may have re-taken since)
+/// drops as a no-op.
 pub(crate) struct BusyLease {
     state: Option<SharedState>,
+    epoch: u64,
 }
 
 /// Atomically takes `busy` for a background job, like [`try_acquire_busy`].
 pub(crate) fn try_lease_busy(state: &SharedState) -> Result<BusyLease, String> {
-    std::mem::forget(try_acquire_busy(state)?);
+    let epoch = state_lock(state).take_busy()?;
     Ok(BusyLease {
         state: Some(Arc::clone(state)),
+        epoch,
+    })
+}
+
+/// [`try_lease_busy`] inside a lock the caller already holds (`guard` must
+/// be the lock of `state`), so a job's initial state is published in the
+/// same critical section that takes `busy`.
+pub(crate) fn lease_busy_locked(
+    guard: &mut JobState,
+    state: &SharedState,
+) -> Result<BusyLease, String> {
+    let epoch = guard.take_busy()?;
+    Ok(BusyLease {
+        state: Some(Arc::clone(state)),
+        epoch,
     })
 }
 
 impl BusyLease {
+    /// The `busy_epoch` this lease took.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Clears `busy` after applying `finish` under the same state lock.
     pub(crate) fn release_with(mut self, finish: impl FnOnce(&mut JobState)) {
         if let Some(state) = self.state.take() {
             let mut guard = state_lock(&state);
             finish(&mut guard);
-            guard.busy = false;
+            release_busy_if_owned(&mut guard, self.epoch);
         }
     }
 }
@@ -340,8 +449,93 @@ impl BusyLease {
 impl Drop for BusyLease {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            state_lock(&state).busy = false;
+            drop_busy(&state, self.epoch);
         }
+    }
+}
+
+/// Registration of one short case write (S1: export-selected,
+/// capture-frame) in [`JobState::write_ops`]; dropping it (also on a
+/// panic) deregisters.
+pub(crate) struct WriteOpLease {
+    state: SharedState,
+}
+
+/// Registers a write op against the bound case and returns that case.
+/// Refused once shutdown was requested or while finalize seals the case;
+/// `busy` alone does not block (examiners capture frames during phase 2).
+pub(crate) fn try_begin_write_op(state: &SharedState) -> Result<(WriteOpLease, PathBuf), String> {
+    let mut guard = state_lock(state);
+    if let Some(refusal) = shutdown_refusal(&guard) {
+        return Err(refusal);
+    }
+    if guard.sealing {
+        return Err(
+            "최종화(봉인) 중에는 케이스에 쓸 수 없습니다 — 끝난 뒤 다시 시도하십시오.".to_string(),
+        );
+    }
+    let Some(case_dir) = guard.case_dir.clone() else {
+        return Err("먼저 케이스를 열거나 분석을 실행하십시오.".to_string());
+    };
+    guard.write_ops += 1;
+    Ok((
+        WriteOpLease {
+            state: Arc::clone(state),
+        },
+        case_dir,
+    ))
+}
+
+impl Drop for WriteOpLease {
+    fn drop(&mut self) {
+        let mut guard = state_lock(&self.state);
+        guard.write_ops = guard.write_ops.saturating_sub(1);
+    }
+}
+
+/// Refusal while case writes beside `busy` run (S1/S4): clip exports,
+/// joins and write ops. Used by open-case and a new analysis start.
+pub(crate) fn side_work_refusal(guard: &JobState, what: &str) -> Option<String> {
+    let clips = guard
+        .clip_jobs
+        .iter()
+        .filter(|job| job.state == "running")
+        .count();
+    if clips > 0 {
+        return Some(format!(
+            "내보내기·이어붙이기 작업 {clips}건이 진행 중입니다 — 끝나거나 중단한 뒤 {what}."
+        ));
+    }
+    if guard.write_ops > 0 {
+        return Some(format!(
+            "선택 내보내기·프레임 캡처가 진행 중입니다 — 끝난 뒤 {what}."
+        ));
+    }
+    None
+}
+
+/// Finalize's seal flag (S1): set in the same lock as the "no write op,
+/// no clip job" check, cleared on drop.
+pub(crate) struct SealGuard {
+    state: SharedState,
+}
+
+/// Starts sealing when no write op and no clip job runs; the caller holds
+/// `busy` already.
+pub(crate) fn try_begin_seal(state: &SharedState) -> Result<SealGuard, String> {
+    let mut guard = state_lock(state);
+    if let Some(refusal) = side_work_refusal(&guard, "다시 최종화하십시오") {
+        return Err(format!("최종화 차단: {refusal}"));
+    }
+    guard.sealing = true;
+    Ok(SealGuard {
+        state: Arc::clone(state),
+    })
+}
+
+impl Drop for SealGuard {
+    fn drop(&mut self) {
+        state_lock(&self.state).sealing = false;
     }
 }
 
@@ -424,7 +618,11 @@ impl Drop for StateGuard<'_> {
 
 #[track_caller]
 pub(crate) fn state_lock(state: &SharedState) -> StateGuard<'_> {
-    let debug = debug_locks().then(|| (std::time::Instant::now(), std::panic::Location::caller()));
+    // Read outside the closure: `#[track_caller]` does not reach into
+    // closures, which made every report name this line instead of the
+    // caller.
+    let caller = std::panic::Location::caller();
+    let debug = debug_locks().then(|| (std::time::Instant::now(), caller));
     let guard = match state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

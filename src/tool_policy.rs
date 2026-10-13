@@ -61,7 +61,12 @@ pub fn command_version(input: &str, allowed_names: &[&str], version_arg: &str) -
         Ok(binary) => binary,
         Err(err) => return format!("unavailable: {err}"),
     };
-    match crate::util::hide_console(Command::new(&binary).arg(version_arg)).output() {
+    // P7: a version probe is bounded — a wedged tool must not hang the
+    // command (or the HTTP handler) that asked for its version.
+    match crate::util::run_with_timeout(
+        Command::new(&binary).arg(version_arg),
+        Some(crate::util::VERSION_PROBE_TIMEOUT_SECS),
+    ) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);

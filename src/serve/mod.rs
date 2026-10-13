@@ -41,6 +41,8 @@ mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
 #[cfg(test)]
+mod tests_phase3;
+#[cfg(test)]
 mod tests_recent;
 #[cfg(test)]
 mod tests_review3;
@@ -55,7 +57,7 @@ pub(crate) use http::{
 };
 pub(crate) use jobs::{
     api_audio_measure, api_carve, api_finalize, api_import_marks, api_mark_conflicts,
-    api_recover_deleted, api_start, api_verify_sources, case_job_json, default_case_dir,
+    api_recover_deleted, api_start, api_verify_sources, case_job_json, default_case_dir_checked,
     pending_marks_count, run_step, run_step_cancellable,
 };
 pub(crate) use media::{
@@ -71,8 +73,9 @@ pub(crate) use records::{
 };
 pub(crate) use state::{
     BusyLease, CaseJob, ClipJob, Enrichment, IndexCache, IndexFingerprint, InputKind, JobState,
-    JoinJobInfo, LiveCache, PipelineJob, SharedState, StepStatus, api_err, restore_session,
-    save_session, state_lock, try_acquire_busy, try_lease_busy,
+    JoinJobInfo, LiveCache, PipelineJob, SharedState, StepStatus, api_err, lease_busy_locked,
+    restore_session, save_session, shutdown_refusal, side_work_refusal, state_lock,
+    try_acquire_busy, try_begin_seal, try_begin_write_op, try_lease_busy,
 };
 pub(crate) use system::{
     api_browse, api_cancel, api_case_info, api_env, api_open_case, api_preflight, api_shutdown,
@@ -539,6 +542,16 @@ pub(crate) fn resolve_token(
     Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
+/// One counted in-flight connection (P11): decrements on drop, including
+/// while a panicking handler thread unwinds.
+pub(crate) struct InFlightSlot(pub(crate) Arc<AtomicUsize>);
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Accept loop shared by `run` and the integration tests (no browser side
 /// effects here). Nonblocking so the /api/shutdown flag can end the loop
 /// without a wake-up connection. The server only exits on an explicit
@@ -571,16 +584,17 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
-                let worker_count = Arc::clone(&in_flight);
-                let spawned = thread::Builder::new()
+                // P11: the slot is released by a drop guard, so a handler
+                // that panics still frees it (a leak would eventually turn
+                // every connection into a 503 and stall shutdown's drain).
+                // A failed spawn drops the closure, and with it the guard.
+                let slot = InFlightSlot(Arc::clone(&in_flight));
+                let _ = thread::Builder::new()
                     .name("ft-http".into())
                     .spawn(move || {
+                        let _slot = slot;
                         let _ = handle_connection(stream, state);
-                        worker_count.fetch_sub(1, Ordering::SeqCst);
                     });
-                if spawned.is_err() {
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                }
             }
             // Only an empty queue sleeps; every pending connection is
             // accepted back to back first.
