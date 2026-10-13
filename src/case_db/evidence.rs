@@ -46,6 +46,32 @@ pub fn patch_review_annotations(
     super::marks::patch_review_annotations_by(case_dir, marks, tags, deleted_ids, None)
 }
 
+/// The viewer's `annotations` object — marks, tags and the per-record
+/// revision map (save protocol v2) — as served by `/api/records-meta` and
+/// embedded by make-review. Reading errors are reported, never swallowed
+/// into an empty annotation set.
+///
+/// Shape: `{"marks":[ReviewMarkRow…],"tags":[{"id","tags"}…],"revisions":{id:n}}`.
+pub fn review_annotations_value(case_dir: &Path) -> Result<serde_json::Value, String> {
+    let marks =
+        load_review_marks(case_dir).map_err(|err| format!("failed to read review marks: {err}"))?;
+    let tags =
+        load_review_tags(case_dir).map_err(|err| format!("failed to read review tags: {err}"))?;
+    let revisions = super::marks::load_review_revisions(case_dir)
+        .map_err(|err| format!("failed to read annotation revisions: {err}"))?;
+    Ok(serde_json::json!({
+        "marks": marks,
+        "tags": tags,
+        "revisions": revisions,
+    }))
+}
+
+/// [`review_annotations_value`] serialized for the review data bundle.
+pub fn review_annotations_json(case_dir: &Path) -> Result<String, String> {
+    serde_json::to_string(&review_annotations_value(case_dir)?)
+        .map_err(|err| format!("failed to serialize review annotations: {err}"))
+}
+
 pub fn load_review_tags(case_dir: &Path) -> Result<Vec<crate::selection::TagEntry>, String> {
     let path = case_db_path(case_dir);
     if !path.is_file() {

@@ -1,15 +1,79 @@
-//! Review mark writes with append-only history (FOR-07, schema v6).
+//! Review mark writes with append-only history (FOR-07, schema v6) and
+//! per-record revisions for save protocol v2 (schema v7).
 //!
 //! Marks, tags and deletions stay mutable in `review_marks` /
 //! `schema_meta` (the viewer reads current state from there), but every
 //! effective change is also appended to `review_mark_history` inside the
 //! SAME transaction, so a mark can never change without its history. The
 //! history table rejects UPDATE/DELETE via triggers.
+//!
+//! `review_annotation_rev` holds one revision per record id covering the
+//! mark, note, examiner, IN/OUT range and tags together. A v2 client sends
+//! the revision it last saw per id; an id whose base is older than the
+//! stored revision is NOT applied and is returned as a conflict with the
+//! server's current value, while the other ids in the same patch are
+//! applied. Legacy bodies (no base) never conflict (last write wins) but
+//! still bump the revision so v2 windows notice the change.
 
 use super::*;
 use crate::util::now_unix;
 use rusqlite::{OptionalExtension, Transaction, params};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+
+/// One patch body as the server applies it. `base_revisions = None` is a
+/// legacy (patch-v1 / schema 1·2) body: no conflict check. `Some(map)` is
+/// a v2 body; an id missing from the map has base 0, so a v2 body that
+/// omits `base_revisions` entirely conflicts with every id the server
+/// already revised instead of overwriting it.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnotationPatch<'a> {
+    pub marks: &'a [ReviewMarkRow],
+    pub tags: &'a [crate::selection::TagEntry],
+    pub deleted_ids: &'a [String],
+    pub base_revisions: Option<&'a BTreeMap<String, u64>>,
+}
+
+/// The server's current annotation for one record, returned with a
+/// conflict so the viewer can show both sides. `status`/`marked_unix` are
+/// `None` when the record has tags but no mark.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ServerAnnotation {
+    pub status: Option<String>,
+    pub marked_unix: Option<u64>,
+    pub examiner: Option<String>,
+    pub note: Option<String>,
+    pub range: Option<RangeSpan>,
+    pub tags: Vec<String>,
+}
+
+/// An id the patch did not apply because the client's base revision is
+/// older than the stored one. `server` is `None` when the server holds
+/// neither a mark nor tags for the id any more (deleted — the revision
+/// row is a tombstone).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AnnotationConflict {
+    pub id: String,
+    pub server_revision: u64,
+    pub server: Option<ServerAnnotation>,
+}
+
+/// Result of one patch: every non-conflicting id with its revision after
+/// the patch (unchanged ids keep their revision — resending is
+/// idempotent), the conflicts, and how many mark rows were upserted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PatchOutcome {
+    pub applied: Vec<(String, u64)>,
+    pub conflicts: Vec<AnnotationConflict>,
+    pub stored: usize,
+}
+
+impl PatchOutcome {
+    /// `applied` as the `{id: revision}` map the API returns.
+    pub fn applied_map(&self) -> BTreeMap<String, u64> {
+        self.applied.iter().cloned().collect()
+    }
+}
 
 /// Stored state of one review mark, as compared for history rows.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,11 +107,20 @@ fn read_stored_mark(tx: &Transaction<'_>, record_id: &str) -> Result<Option<Stor
     .map_err(|err| format!("failed to read review mark {record_id}: {err}"))
 }
 
+/// Who/when/what wrote a history row: the acting examiner and the v2
+/// writer token (`client:<id>`, `None` for legacy/CLI writers).
+#[derive(Clone, Copy)]
+struct WriteContext<'a> {
+    now: i64,
+    actor: Option<&'a str>,
+    detail: Option<&'a str>,
+}
+
 fn insert_mark_history(
     tx: &Transaction<'_>,
     record_id: &str,
     action: &str,
-    changed_unix: i64,
+    ctx: WriteContext<'_>,
     actor: Option<&str>,
     old: Option<&StoredMark>,
     new: Option<&StoredMark>,
@@ -58,13 +131,14 @@ fn insert_mark_history(
             record_id, action, changed_unix, actor,
             old_status, new_status, old_marked_unix, new_marked_unix,
             old_record_path, new_record_path, old_examiner, new_examiner,
-            old_note, new_note, old_range_in, new_range_in, old_range_out, new_range_out
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            old_note, new_note, old_range_in, new_range_in, old_range_out, new_range_out,
+            detail
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
         "#,
         params![
             record_id,
             action,
-            changed_unix,
+            ctx.now,
             actor,
             old.map(|m| m.status.as_str()),
             new.map(|m| m.status.as_str()),
@@ -80,10 +154,279 @@ fn insert_mark_history(
             new.and_then(|m| m.range_in),
             old.and_then(|m| m.range_out),
             new.and_then(|m| m.range_out),
+            ctx.detail,
         ],
     )
     .map_err(|err| format!("failed to record review mark history for {record_id}: {err}"))?;
     Ok(())
+}
+
+fn read_revision(tx: &Transaction<'_>, record_id: &str) -> Result<u64, String> {
+    tx.query_row(
+        "SELECT revision FROM review_annotation_rev WHERE record_id = ?1",
+        [record_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|rev| rev.map(i64_to_u64).unwrap_or(0))
+    .map_err(|err| format!("failed to read annotation revision for {record_id}: {err}"))
+}
+
+fn read_stored_tags(tx: &Transaction<'_>, record_id: &str) -> Result<Option<String>, String> {
+    tx.query_row(
+        "SELECT value FROM schema_meta WHERE key = ?1",
+        [format!("review_tags.v1:{record_id}")],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| format!("failed to read review tags for {record_id}: {err}"))
+}
+
+fn read_server_annotation(
+    tx: &Transaction<'_>,
+    record_id: &str,
+) -> Result<Option<ServerAnnotation>, String> {
+    let mark = read_stored_mark(tx, record_id)?;
+    let tags: Vec<String> = match read_stored_tags(tx, record_id)? {
+        Some(json) => serde_json::from_str(&json)
+            .map_err(|err| format!("invalid stored tags for {record_id}: {err}"))?,
+        None => Vec::new(),
+    };
+    if mark.is_none() && tags.is_empty() {
+        return Ok(None);
+    }
+    let range = mark.as_ref().and_then(|m| {
+        (m.range_in.is_some() || m.range_out.is_some()).then_some(RangeSpan {
+            start: m.range_in,
+            end: m.range_out,
+        })
+    });
+    Ok(Some(ServerAnnotation {
+        status: mark.as_ref().map(|m| m.status.clone()),
+        marked_unix: mark.as_ref().map(|m| i64_to_u64(m.marked_unix)),
+        examiner: mark.as_ref().and_then(|m| m.examiner.clone()),
+        note: mark.as_ref().and_then(|m| m.note.clone()),
+        range,
+        tags,
+    }))
+}
+
+/// Removes the mark row (tags are separate); returns whether a row went.
+fn delete_mark(tx: &Transaction<'_>, id: &str, ctx: WriteContext<'_>) -> Result<bool, String> {
+    let Some(old) = read_stored_mark(tx, id)? else {
+        return Ok(false);
+    };
+    tx.execute("DELETE FROM review_marks WHERE record_id = ?1", [id])
+        .map_err(|err| format!("failed to remove review mark: {err}"))?;
+    insert_mark_history(tx, id, "delete", ctx, ctx.actor, Some(&old), None)?;
+    Ok(true)
+}
+
+/// Stores (or, for an empty list, removes) a record's tag list; returns
+/// whether the stored value changed.
+fn store_tags(
+    tx: &Transaction<'_>,
+    entry: &crate::selection::TagEntry,
+    ctx: WriteContext<'_>,
+) -> Result<bool, String> {
+    let key = format!("review_tags.v1:{}", entry.id);
+    let old_tags = read_stored_tags(tx, &entry.id)?;
+    let new_tags = if entry.tags.is_empty() {
+        tx.execute("DELETE FROM schema_meta WHERE key = ?1", [&key])
+            .map_err(|err| format!("failed to remove review tags: {err}"))?;
+        None
+    } else {
+        let value = serde_json::to_string(&entry.tags).map_err(|err| err.to_string())?;
+        tx.execute("INSERT INTO schema_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])
+            .map_err(|err| format!("failed to store review tags: {err}"))?;
+        Some(value)
+    };
+    if old_tags == new_tags {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO review_mark_history (record_id, action, changed_unix, actor, old_tags_json, new_tags_json, detail) VALUES (?1, 'tags', ?2, ?3, ?4, ?5, ?6)",
+        params![entry.id, ctx.now, ctx.actor, old_tags, new_tags, ctx.detail],
+    )
+    .map_err(|err| format!("failed to record review tag history for {}: {err}", entry.id))?;
+    Ok(true)
+}
+
+/// Upserts one mark; returns whether the stored row changed.
+fn upsert_mark(
+    tx: &Transaction<'_>,
+    mark: &ReviewMarkRow,
+    ctx: WriteContext<'_>,
+) -> Result<bool, String> {
+    let old = read_stored_mark(tx, &mark.record_id)?;
+    tx.execute(
+        r#"
+        INSERT INTO review_marks (record_id, status, marked_unix, record_path, examiner, note, range_in, range_out)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(record_id) DO UPDATE SET
+            status = excluded.status,
+            marked_unix = excluded.marked_unix,
+            record_path = COALESCE(excluded.record_path, review_marks.record_path),
+            examiner = COALESCE(excluded.examiner, review_marks.examiner),
+            note = COALESCE(excluded.note, review_marks.note),
+            range_in = CASE WHEN ?9 THEN excluded.range_in ELSE review_marks.range_in END,
+            range_out = CASE WHEN ?9 THEN excluded.range_out ELSE review_marks.range_out END
+        "#,
+        params![
+            mark.record_id.as_str(),
+            mark.status.as_str(),
+            u64_to_i64(mark.marked_unix),
+            mark.record_path.as_deref(),
+            mark.examiner.as_deref(),
+            mark.note.as_deref(),
+            mark.range.and_then(|range| range.start),
+            mark.range.and_then(|range| range.end),
+            mark.range.is_some(),
+        ],
+    )
+    .map_err(|err| format!("failed to upsert review mark {}: {err}", mark.record_id))?;
+    let new = read_stored_mark(tx, &mark.record_id)?;
+    if old == new {
+        return Ok(false);
+    }
+    let action = if old.is_some() { "update" } else { "insert" };
+    insert_mark_history(
+        tx,
+        &mark.record_id,
+        action,
+        ctx,
+        mark.examiner.as_deref().or(ctx.actor),
+        old.as_ref(),
+        new.as_ref(),
+    )?;
+    Ok(true)
+}
+
+/// Applies one patch in a single `BEGIN IMMEDIATE` transaction.
+///
+/// Per id (deletion, tags and mark together): with a v2 base the id is
+/// skipped and reported as a conflict when `base < stored revision`;
+/// otherwise deletion, tags and mark are applied in that order and the
+/// revision is bumped by one iff something effectively changed (so an
+/// identical resend is idempotent and writes neither history nor a new
+/// revision). A deleted mark keeps its revision row as a tombstone. Every
+/// history row written by a v2 client carries `client:<client_id>` in
+/// `detail`.
+pub fn patch_review_annotations_v2(
+    case_dir: &Path,
+    patch: &AnnotationPatch<'_>,
+    actor: Option<&str>,
+    client_id: Option<&str>,
+) -> Result<PatchOutcome, String> {
+    let mut conn = open_case_db(case_dir)?;
+    init_schema(&conn)?;
+    let now = u64_to_i64(now_unix()?);
+    let tx = begin_write(&mut conn)
+        .map_err(|err| format!("failed to start SQLite marks transaction: {err}"))?;
+    let detail = client_id
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("client:{id}"));
+    let ctx = WriteContext {
+        now,
+        actor,
+        detail: detail.as_deref(),
+    };
+    let marks_by_id: HashMap<&str, &ReviewMarkRow> = patch
+        .marks
+        .iter()
+        .map(|mark| (mark.record_id.as_str(), mark))
+        .collect();
+    let tags_by_id: HashMap<&str, &crate::selection::TagEntry> = patch
+        .tags
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
+    let deleted: HashSet<&str> = patch.deleted_ids.iter().map(String::as_str).collect();
+    let ids: BTreeSet<&str> = marks_by_id
+        .keys()
+        .chain(tags_by_id.keys())
+        .chain(deleted.iter())
+        .copied()
+        .collect();
+    let mut outcome = PatchOutcome::default();
+    for id in ids {
+        let current = read_revision(&tx, id)?;
+        if let Some(base) = patch.base_revisions {
+            let base_revision = base.get(id).copied().unwrap_or(0);
+            if base_revision < current {
+                outcome.conflicts.push(AnnotationConflict {
+                    id: id.to_string(),
+                    server_revision: current,
+                    server: read_server_annotation(&tx, id)?,
+                });
+                continue;
+            }
+        }
+        let mut changed = false;
+        if deleted.contains(id) {
+            changed |= delete_mark(&tx, id, ctx)?;
+        }
+        if let Some(entry) = tags_by_id.get(id) {
+            changed |= store_tags(&tx, entry, ctx)?;
+        }
+        if let Some(mark) = marks_by_id.get(id) {
+            changed |= upsert_mark(&tx, mark, ctx)?;
+            outcome.stored += 1;
+        }
+        let revision = if changed {
+            let next = current + 1;
+            tx.execute(
+                r#"
+                INSERT INTO review_annotation_rev (record_id, revision, updated_unix, actor, client_id)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(record_id) DO UPDATE SET
+                    revision = excluded.revision,
+                    updated_unix = excluded.updated_unix,
+                    actor = excluded.actor,
+                    client_id = excluded.client_id
+                "#,
+                params![id, u64_to_i64(next), now, actor, client_id],
+            )
+            .map_err(|err| format!("failed to store annotation revision for {id}: {err}"))?;
+            next
+        } else {
+            current
+        };
+        outcome.applied.push((id.to_string(), revision));
+    }
+    tx.commit()
+        .map_err(|err| format!("failed to commit review marks: {err}"))?;
+    Ok(outcome)
+}
+
+/// Current `{record_id: revision}` map (empty when the case has no db).
+pub fn load_review_revisions(case_dir: &Path) -> Result<BTreeMap<String, u64>, String> {
+    let path = case_db_path(case_dir);
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let conn = open_readonly_case_db(&path)?;
+    load_review_revisions_from(&conn)
+}
+
+/// [`load_review_revisions`] over an already-open (possibly read-only,
+/// pre-v7) connection: a db without the table yields an empty map.
+pub(crate) fn load_review_revisions_from(
+    conn: &rusqlite::Connection,
+) -> Result<BTreeMap<String, u64>, String> {
+    if !table_exists(conn, "review_annotation_rev")? {
+        return Ok(BTreeMap::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT record_id, revision FROM review_annotation_rev ORDER BY record_id")
+        .map_err(|err| format!("failed to prepare annotation revision query: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, i64_to_u64(row.get::<_, i64>(1)?)))
+        })
+        .map_err(|err| format!("failed to query annotation revisions: {err}"))?;
+    rows.map(|row| row.map_err(|err| format!("failed to read annotation revision row: {err}")))
+        .collect()
 }
 
 /// [`patch_review_annotations`] with the acting examiner recorded on every
@@ -94,6 +437,9 @@ fn insert_mark_history(
 /// History rows: `insert`, `update`, `delete` (a tombstone whose `old_*`
 /// columns keep the last stored values), `tags`. A re-sent mark that
 /// changes nothing writes no row.
+///
+/// Legacy entry point: no base revisions, so nothing conflicts (last
+/// write wins) — see [`patch_review_annotations_v2`].
 pub fn patch_review_annotations_by(
     case_dir: &Path,
     marks: &[ReviewMarkRow],
@@ -101,92 +447,13 @@ pub fn patch_review_annotations_by(
     deleted_ids: &[String],
     actor: Option<&str>,
 ) -> Result<usize, String> {
-    let mut conn = open_case_db(case_dir)?;
-    init_schema(&conn)?;
-    let now = u64_to_i64(now_unix()?);
-    let tx = begin_write(&mut conn)
-        .map_err(|err| format!("failed to start SQLite marks transaction: {err}"))?;
-    for id in deleted_ids {
-        let Some(old) = read_stored_mark(&tx, id)? else {
-            continue;
-        };
-        tx.execute("DELETE FROM review_marks WHERE record_id = ?1", [id])
-            .map_err(|err| format!("failed to remove review mark: {err}"))?;
-        insert_mark_history(&tx, id, "delete", now, actor, Some(&old), None)?;
-    }
-    for entry in tags {
-        let key = format!("review_tags.v1:{}", entry.id);
-        let old_tags: Option<String> = tx
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = ?1",
-                [&key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| format!("failed to read review tags: {err}"))?;
-        let new_tags = if entry.tags.is_empty() {
-            tx.execute("DELETE FROM schema_meta WHERE key = ?1", [&key])
-                .map_err(|err| format!("failed to remove review tags: {err}"))?;
-            None
-        } else {
-            let value = serde_json::to_string(&entry.tags).map_err(|err| err.to_string())?;
-            tx.execute("INSERT INTO schema_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])
-                .map_err(|err| format!("failed to store review tags: {err}"))?;
-            Some(value)
-        };
-        if old_tags != new_tags {
-            tx.execute(
-                "INSERT INTO review_mark_history (record_id, action, changed_unix, actor, old_tags_json, new_tags_json) VALUES (?1, 'tags', ?2, ?3, ?4, ?5)",
-                params![entry.id, now, actor, old_tags, new_tags],
-            )
-            .map_err(|err| format!("failed to record review tag history for {}: {err}", entry.id))?;
-        }
-    }
-    for mark in marks {
-        let old = read_stored_mark(&tx, &mark.record_id)?;
-        tx.execute(
-            r#"
-            INSERT INTO review_marks (record_id, status, marked_unix, record_path, examiner, note, range_in, range_out)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(record_id) DO UPDATE SET
-                status = excluded.status,
-                marked_unix = excluded.marked_unix,
-                record_path = COALESCE(excluded.record_path, review_marks.record_path),
-                examiner = COALESCE(excluded.examiner, review_marks.examiner),
-                note = COALESCE(excluded.note, review_marks.note),
-                range_in = CASE WHEN ?9 THEN excluded.range_in ELSE review_marks.range_in END,
-                range_out = CASE WHEN ?9 THEN excluded.range_out ELSE review_marks.range_out END
-            "#,
-            params![
-                mark.record_id.as_str(),
-                mark.status.as_str(),
-                u64_to_i64(mark.marked_unix),
-                mark.record_path.as_deref(),
-                mark.examiner.as_deref(),
-                mark.note.as_deref(),
-                mark.range.and_then(|range| range.start),
-                mark.range.and_then(|range| range.end),
-                mark.range.is_some(),
-            ],
-        )
-        .map_err(|err| format!("failed to upsert review mark {}: {err}", mark.record_id))?;
-        let new = read_stored_mark(&tx, &mark.record_id)?;
-        if old != new {
-            let action = if old.is_some() { "update" } else { "insert" };
-            insert_mark_history(
-                &tx,
-                &mark.record_id,
-                action,
-                now,
-                mark.examiner.as_deref().or(actor),
-                old.as_ref(),
-                new.as_ref(),
-            )?;
-        }
-    }
-    tx.commit()
-        .map_err(|err| format!("failed to commit review marks: {err}"))?;
-    Ok(marks.len())
+    let patch = AnnotationPatch {
+        marks,
+        tags,
+        deleted_ids,
+        base_revisions: None,
+    };
+    patch_review_annotations_v2(case_dir, &patch, actor, None).map(|outcome| outcome.stored)
 }
 
 /// One append-only `review_mark_history` row.
@@ -387,7 +654,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
         assert!(table_has_column(&conn, "evidence_sources", "evidence_hash_origin").unwrap());
         let backup = fs::read_dir(dir.join("db"))
             .unwrap()
@@ -413,8 +680,8 @@ mod tests {
     }
 
     #[test]
-    fn every_older_schema_reaches_v6() {
-        for version in ["1", "2", "3", "4", "5"] {
+    fn every_older_schema_reaches_v7() {
+        for version in ["1", "2", "3", "4", "5", "6"] {
             let dir = case(&format!("chain-v{version}"));
             let seed = Connection::open(case_db_path(&dir)).unwrap();
             seed.execute_batch(&format!(
@@ -433,13 +700,485 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(stored, "6", "v{version}");
+            assert_eq!(stored, "7", "v{version}");
             assert_eq!(
                 load_review_mark_history(&dir, None).unwrap().len(),
                 1,
                 "v{version}"
             );
+            assert_eq!(
+                load_review_revisions(&dir).unwrap().get("vid_1"),
+                Some(&1),
+                "v{version}"
+            );
+            let backup = fs::read_dir(dir.join("db"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("case.db.backup-v6-to-v7-")
+                });
+            assert!(backup, "v{version}: v6->v7 step must leave a backup");
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    /// Exact v6 shape (marks with ranges, two tag lists — one on a record
+    /// without a mark — and five history rows). The migration must leave
+    /// every loaded value byte-identical, seed revision 1 for marks ∪ tag
+    /// ids, and leave a backup.
+    #[test]
+    fn v6_case_migrates_to_v7_losslessly_with_backup() {
+        let dir = case("v6-lossless");
+        let seed = Connection::open(case_db_path(&dir)).unwrap();
+        seed.execute_batch(
+            r#"
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta (key, value) VALUES ('schema_version', '6');
+            CREATE TABLE evidence_sources (
+                source_id TEXT PRIMARY KEY, kind TEXT NOT NULL, path TEXT NOT NULL,
+                registered_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL,
+                write_protect TEXT, acquisition_tool TEXT, evidence_hash TEXT,
+                notes TEXT, metadata_json TEXT NOT NULL,
+                evidence_hash_algorithm TEXT, evidence_hash_origin TEXT
+            );
+            CREATE TABLE review_marks (
+                record_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                marked_unix INTEGER NOT NULL, record_path TEXT, examiner TEXT,
+                note TEXT, range_in REAL, range_out REAL
+            );
+            INSERT INTO review_marks VALUES ('vid_1', 'important', 100, '/e/a.mp4', 'kim', '메모 "따옴표"', 1.5, 4.0);
+            INSERT INTO review_marks VALUES ('vid_2', 'reviewed', 200, NULL, NULL, NULL, NULL, NULL);
+            INSERT INTO review_marks VALUES ('vid_3', 'noted', 300, NULL, 'lee', 'n3', 2.0, NULL);
+            INSERT INTO schema_meta (key, value) VALUES ('review_tags.v1:vid_1', '["사고","보류"]');
+            INSERT INTO schema_meta (key, value) VALUES ('review_tags.v1:vid_9', '["tag-only"]');
+            CREATE TABLE review_mark_history (
+                history_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_id TEXT NOT NULL, action TEXT NOT NULL, changed_unix INTEGER NOT NULL,
+                actor TEXT, old_status TEXT, new_status TEXT, old_marked_unix INTEGER,
+                new_marked_unix INTEGER, old_record_path TEXT, new_record_path TEXT,
+                old_examiner TEXT, new_examiner TEXT, old_note TEXT, new_note TEXT,
+                old_range_in REAL, new_range_in REAL, old_range_out REAL, new_range_out REAL,
+                old_tags_json TEXT, new_tags_json TEXT, detail TEXT
+            );
+            CREATE TRIGGER review_mark_history_no_update BEFORE UPDATE ON review_mark_history
+            BEGIN SELECT RAISE(ABORT, 'review_mark_history is append-only'); END;
+            CREATE TRIGGER review_mark_history_no_delete BEFORE DELETE ON review_mark_history
+            BEGIN SELECT RAISE(ABORT, 'review_mark_history is append-only'); END;
+            INSERT INTO review_mark_history (record_id, action, changed_unix, new_status) VALUES ('vid_1', 'insert', 10, 'noted');
+            INSERT INTO review_mark_history (record_id, action, changed_unix, old_status, new_status) VALUES ('vid_1', 'update', 11, 'noted', 'important');
+            INSERT INTO review_mark_history (record_id, action, changed_unix, new_tags_json) VALUES ('vid_1', 'tags', 12, '["사고","보류"]');
+            INSERT INTO review_mark_history (record_id, action, changed_unix, new_status) VALUES ('vid_2', 'insert', 13, 'reviewed');
+            INSERT INTO review_mark_history (record_id, action, changed_unix, new_tags_json) VALUES ('vid_9', 'tags', 14, '["tag-only"]');
+            "#,
+        )
+        .unwrap();
+        drop(seed);
+
+        let before_marks = load_review_marks(&dir).unwrap();
+        let before_tags = load_review_tags(&dir).unwrap();
+        let before_history = load_review_mark_history(&dir, None).unwrap();
+        assert_eq!(before_marks.len(), 3);
+        assert_eq!(before_tags.len(), 2);
+        assert_eq!(before_history.len(), 5);
+        assert!(load_review_revisions(&dir).unwrap().is_empty());
+
+        let conn = open_case_db(&dir).unwrap();
+        init_schema(&conn).unwrap();
+        drop(conn);
+
+        assert_eq!(load_review_marks(&dir).unwrap(), before_marks);
+        assert_eq!(load_review_tags(&dir).unwrap(), before_tags);
+        assert_eq!(
+            load_review_mark_history(&dir, None).unwrap(),
+            before_history
+        );
+        let revisions = load_review_revisions(&dir).unwrap();
+        let expected: BTreeMap<String, u64> = ["vid_1", "vid_2", "vid_3", "vid_9"]
+            .iter()
+            .map(|id| (id.to_string(), 1))
+            .collect();
+        assert_eq!(revisions, expected);
+        let conn = open_readonly_case_db(&case_db_path(&dir)).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "7");
+        let backup = fs::read_dir(dir.join("db"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("case.db.backup-v6-to-v7-")
+            });
+        assert!(backup, "v6->v7 migration must leave a backup");
+        // Re-opening at v7 is idempotent (no second seeding, no error).
+        drop(conn);
+        let conn = open_case_db(&dir).unwrap();
+        init_schema(&conn).unwrap();
+        assert_eq!(load_review_revisions(&dir).unwrap(), expected);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn base(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(id, rev)| (id.to_string(), *rev))
+            .collect()
+    }
+
+    fn v2(
+        dir: &Path,
+        marks: &[ReviewMarkRow],
+        tags: &[TagEntry],
+        deleted: &[String],
+        base_revisions: &BTreeMap<String, u64>,
+        client: &str,
+    ) -> PatchOutcome {
+        patch_review_annotations_v2(
+            dir,
+            &AnnotationPatch {
+                marks,
+                tags,
+                deleted_ids: deleted,
+                base_revisions: Some(base_revisions),
+            },
+            Some("kim"),
+            Some(client),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn patch_v2_applies_when_base_matches_and_bumps_revision() {
+        let dir = case("v2-apply");
+        let first = v2(
+            &dir,
+            &[mark("relevant", Some("a"), None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 0)]),
+            "w-a",
+        );
+        assert_eq!(first.applied, vec![("vid_1".to_string(), 1)]);
+        assert!(first.conflicts.is_empty());
+        assert_eq!(first.stored, 1);
+        assert_eq!(load_review_revisions(&dir).unwrap().get("vid_1"), Some(&1));
+        // A base id absent from the map counts as 0; a newer base passes.
+        let second = v2(
+            &dir,
+            &[mark("important", Some("b"), None)],
+            &[TagEntry {
+                id: "vid_1".into(),
+                tags: vec!["사고".into()],
+            }],
+            &[],
+            &base(&[("vid_1", 1)]),
+            "w-b",
+        );
+        assert_eq!(second.applied, vec![("vid_1".to_string(), 2)]);
+        let history = load_review_mark_history(&dir, Some("vid_1")).unwrap();
+        let actions: Vec<&str> = history.iter().map(|row| row.action.as_str()).collect();
+        assert_eq!(actions, ["insert", "tags", "update"]);
+        let conn = open_readonly_case_db(&case_db_path(&dir)).unwrap();
+        let details: Vec<Option<String>> = conn
+            .prepare("SELECT detail FROM review_mark_history ORDER BY history_pk")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            details,
+            vec![
+                Some("client:w-a".to_string()),
+                Some("client:w-b".to_string()),
+                Some("client:w-b".to_string())
+            ]
+        );
+        let (actor, client): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT actor, client_id FROM review_annotation_rev WHERE record_id = 'vid_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor.as_deref(), Some("kim"));
+        assert_eq!(client.as_deref(), Some("w-b"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn patch_v2_refuses_stale_base_without_touching_row_or_history() {
+        let dir = case("v2-stale");
+        v2(
+            &dir,
+            &[mark("relevant", Some("server"), None)],
+            &[],
+            &[],
+            &base(&[]),
+            "w-a",
+        );
+        let history_before = load_review_mark_history(&dir, None).unwrap().len();
+        let other = ReviewMarkRow {
+            record_id: "vid_2".into(),
+            status: "noted".into(),
+            marked_unix: 9,
+            ..Default::default()
+        };
+        // Stale window: base 0 for vid_1 (server is at 1), fresh vid_2.
+        let outcome = v2(
+            &dir,
+            &[mark("important", Some("mine"), None), other],
+            &[],
+            &[],
+            &base(&[("vid_1", 0), ("vid_2", 0)]),
+            "w-b",
+        );
+        assert_eq!(outcome.applied, vec![("vid_2".to_string(), 1)]);
+        assert_eq!(outcome.stored, 1);
+        assert_eq!(outcome.conflicts.len(), 1);
+        let conflict = &outcome.conflicts[0];
+        assert_eq!(conflict.id, "vid_1");
+        assert_eq!(conflict.server_revision, 1);
+        let server = conflict.server.as_ref().unwrap();
+        assert_eq!(server.status.as_deref(), Some("relevant"));
+        assert_eq!(server.note.as_deref(), Some("server"));
+        assert_eq!(server.examiner.as_deref(), Some("kim"));
+        assert!(server.tags.is_empty());
+        let stored = load_review_marks(&dir).unwrap();
+        let vid_1 = stored.iter().find(|m| m.record_id == "vid_1").unwrap();
+        assert_eq!(vid_1.status, "relevant");
+        assert_eq!(vid_1.note.as_deref(), Some("server"));
+        assert_eq!(load_review_revisions(&dir).unwrap().get("vid_1"), Some(&1));
+        // Exactly one history row was added — the vid_2 insert.
+        assert_eq!(
+            load_review_mark_history(&dir, None).unwrap().len(),
+            history_before + 1
+        );
+        // A v2 body with no base map at all conflicts on every revised id
+        // instead of overwriting (review point 7.1).
+        let no_base = v2(
+            &dir,
+            &[mark("important", Some("mine"), None)],
+            &[],
+            &[],
+            &base(&[]),
+            "w-c",
+        );
+        assert_eq!(no_base.conflicts.len(), 1);
+        assert!(no_base.applied.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn patch_v2_resend_identical_is_idempotent_and_keeps_revision() {
+        let dir = case("v2-idempotent");
+        let span = RangeSpan {
+            start: Some(1.0),
+            end: Some(2.5),
+        };
+        let marks = [mark("important", Some("same"), Some(span))];
+        let tags = [TagEntry {
+            id: "vid_1".into(),
+            tags: vec!["a".into(), "b".into()],
+        }];
+        let first = v2(&dir, &marks, &tags, &[], &base(&[("vid_1", 0)]), "w-a");
+        assert_eq!(first.applied, vec![("vid_1".to_string(), 1)]);
+        // Resent with the base it was told (e.g. after a 413 retry).
+        let again = v2(&dir, &marks, &tags, &[], &base(&[("vid_1", 1)]), "w-a");
+        assert_eq!(again.applied, vec![("vid_1".to_string(), 1)]);
+        assert!(again.conflicts.is_empty());
+        assert_eq!(load_review_revisions(&dir).unwrap().get("vid_1"), Some(&1));
+        let history = load_review_mark_history(&dir, None).unwrap();
+        assert_eq!(history.len(), 2, "{history:?}"); // insert + tags, no duplicates
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn patch_v2_delete_keeps_rev_row_so_stale_recreate_conflicts() {
+        let dir = case("v2-tombstone");
+        v2(
+            &dir,
+            &[mark("important", None, None)],
+            &[],
+            &[],
+            &base(&[]),
+            "w-a",
+        );
+        let deleted = v2(
+            &dir,
+            &[],
+            &[TagEntry {
+                id: "vid_1".into(),
+                tags: vec![],
+            }],
+            &["vid_1".to_string()],
+            &base(&[("vid_1", 1)]),
+            "w-a",
+        );
+        assert_eq!(deleted.applied, vec![("vid_1".to_string(), 2)]);
+        assert!(load_review_marks(&dir).unwrap().is_empty());
+        assert_eq!(load_review_revisions(&dir).unwrap().get("vid_1"), Some(&2));
+        // Another window that still believes revision 1 cannot resurrect it.
+        let stale = v2(
+            &dir,
+            &[mark("important", None, None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 1)]),
+            "w-b",
+        );
+        assert!(stale.applied.is_empty());
+        assert_eq!(stale.conflicts[0].server_revision, 2);
+        assert_eq!(
+            stale.conflicts[0].server, None,
+            "tombstone: no server value"
+        );
+        assert!(load_review_marks(&dir).unwrap().is_empty());
+        // The deleting window itself may recreate with its own revision.
+        let same = v2(
+            &dir,
+            &[mark("important", None, None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 2)]),
+            "w-a",
+        );
+        assert_eq!(same.applied, vec![("vid_1".to_string(), 3)]);
+        assert_eq!(load_review_marks(&dir).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn patch_v2_explicit_empty_tags_clears_server_tags_without_mark() {
+        let dir = case("v2-tags-only");
+        let tagged = v2(
+            &dir,
+            &[],
+            &[TagEntry {
+                id: "vid_9".into(),
+                tags: vec!["보류".into()],
+            }],
+            &[],
+            &base(&[]),
+            "w-a",
+        );
+        assert_eq!(tagged.applied, vec![("vid_9".to_string(), 1)]);
+        assert_eq!(tagged.stored, 0);
+        assert_eq!(load_review_tags(&dir).unwrap().len(), 1);
+        let cleared = v2(
+            &dir,
+            &[],
+            &[TagEntry {
+                id: "vid_9".into(),
+                tags: vec![],
+            }],
+            &[],
+            &base(&[("vid_9", 1)]),
+            "w-a",
+        );
+        assert_eq!(cleared.applied, vec![("vid_9".to_string(), 2)]);
+        assert!(load_review_tags(&dir).unwrap().is_empty());
+        assert!(load_review_marks(&dir).unwrap().is_empty());
+        let actions: Vec<String> = load_review_mark_history(&dir, Some("vid_9"))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.action)
+            .collect();
+        assert_eq!(actions, ["tags", "tags"]);
+        // A stale window conflicts and sees "tags but no mark" as the server value.
+        v2(
+            &dir,
+            &[],
+            &[TagEntry {
+                id: "vid_9".into(),
+                tags: vec!["x".into()],
+            }],
+            &[],
+            &base(&[("vid_9", 2)]),
+            "w-a",
+        );
+        let stale = v2(
+            &dir,
+            &[],
+            &[TagEntry {
+                id: "vid_9".into(),
+                tags: vec!["y".into()],
+            }],
+            &[],
+            &base(&[("vid_9", 2)]),
+            "w-b",
+        );
+        let server = stale.conflicts[0].server.as_ref().unwrap();
+        assert_eq!(server.status, None);
+        assert_eq!(server.tags, vec!["x".to_string()]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn patch_v1_legacy_body_still_applies_and_bumps_revision() {
+        let dir = case("v1-legacy");
+        v2(
+            &dir,
+            &[mark("relevant", Some("v2"), None)],
+            &[],
+            &[],
+            &base(&[]),
+            "w-a",
+        );
+        // Legacy client: no base, last write wins, revision still moves.
+        let stored = patch_review_annotations_by(
+            &dir,
+            &[mark("important", Some("legacy"), None)],
+            &[],
+            &[],
+            Some("lee"),
+        )
+        .unwrap();
+        assert_eq!(stored, 1);
+        let marks = load_review_marks(&dir).unwrap();
+        assert_eq!(marks[0].status, "important");
+        assert_eq!(load_review_revisions(&dir).unwrap().get("vid_1"), Some(&2));
+        let conn = open_readonly_case_db(&case_db_path(&dir)).unwrap();
+        let client: Option<String> = conn
+            .query_row(
+                "SELECT client_id FROM review_annotation_rev WHERE record_id = 'vid_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(client, None, "legacy writers carry no client id");
+        let detail: Option<String> = conn
+            .query_row(
+                "SELECT detail FROM review_mark_history ORDER BY history_pk DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, None);
+        // Now the v2 window that still holds revision 1 is told about it.
+        let stale = v2(
+            &dir,
+            &[mark("noted", None, None)],
+            &[],
+            &[],
+            &base(&[("vid_1", 1)]),
+            "w-a",
+        );
+        assert_eq!(stale.conflicts[0].server_revision, 2);
+        assert_eq!(
+            stale.conflicts[0].server.as_ref().unwrap().note.as_deref(),
+            Some("legacy")
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

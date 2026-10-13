@@ -90,6 +90,397 @@ fn marks_request(id: &str) -> Request {
     )
 }
 
+/// A patch-v2 request body for one record (dirty id only), optionally
+/// chunked as `batch {id, index, total}`.
+fn v2_request(
+    id: &str,
+    note: &str,
+    base: u64,
+    client: &str,
+    batch: Option<(&str, u64, u64)>,
+) -> Request {
+    let mut marks = serde_json::json!({
+        "schema_version": 2,
+        "protocol": "patch-v2",
+        "case_id": "FT-jobs",
+        "examiner": "kim",
+        "client_id": client,
+        "exported_unix": 1,
+        "base_revisions": { id: base },
+        "marks": [{"id": id, "status": "important", "marked_unix": 100, "note": note,
+                   "examiner": "kim", "range": {"in": 1.0, "out": 2.0}, "tags": ["사고"]}],
+        "tags": [],
+        "deleted_ids": [],
+    });
+    if let Some((batch_id, index, total)) = batch {
+        marks["batch"] = serde_json::json!({"id": batch_id, "index": index, "total": total});
+    }
+    request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": marks.to_string()}).to_string(),
+    )
+}
+
+/// `make-report` is rebuilt once per batch: never for a middle chunk,
+/// once on the last chunk, and every time for a request without `batch`
+/// (legacy clients keep their current behaviour).
+#[test]
+fn import_marks_batch_runs_make_report_once_on_last_chunk() {
+    let case_dir = temp_case("batch-report");
+    let state = bound_state(&case_dir, "review-ready");
+    let reports = std::cell::Cell::new(0usize);
+    let runner = |args: &[String]| {
+        assert_eq!(args[0], "make-report", "{args:?}");
+        assert_eq!(args[1], case_dir.to_string_lossy());
+        reports.set(reports.get() + 1);
+        Ok(String::new())
+    };
+    let send = |req: Request| {
+        parse(&super::jobs::api_import_marks_with_runner(
+            &req, &state, &runner,
+        ))
+    };
+
+    let first = send(v2_request("vid_1", "a", 0, "w-a", Some(("b-1", 0, 3))));
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["batch_done"], false, "{first}");
+    assert!(first["report_url"].is_null(), "{first}");
+    assert_eq!(reports.get(), 0);
+    let middle = send(v2_request("vid_2", "b", 0, "w-a", Some(("b-1", 1, 3))));
+    assert_eq!(middle["batch_done"], false, "{middle}");
+    assert_eq!(reports.get(), 0);
+    let last = send(v2_request("vid_3", "c", 0, "w-a", Some(("b-1", 2, 3))));
+    assert_eq!(last["ok"], true, "{last}");
+    assert_eq!(last["batch_done"], true, "{last}");
+    assert_eq!(last["report_url"], "case/reports/case-report.html");
+    assert_eq!(reports.get(), 1, "exactly one make-report per batch");
+    // Every chunk was applied as its own transaction.
+    let mut ids: Vec<String> = crate::case_db::load_review_marks(&case_dir)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.record_id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["vid_1", "vid_2", "vid_3"]);
+    // No batch (single request) and a legacy body: report every time.
+    let single = send(v2_request("vid_4", "d", 0, "w-a", None));
+    assert_eq!(single["batch_done"], true, "{single}");
+    assert_eq!(reports.get(), 2);
+    let legacy = send(request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": serde_json::json!({
+            "schema_version": 2, "protocol": "patch-v1", "case_id": "FT-jobs",
+            "marks": [{"id": "vid_1", "status": "noted", "note": "legacy"}], "tags": [], "deleted_ids": []
+        }).to_string()}).to_string(),
+    ));
+    assert_eq!(legacy["ok"], true, "{legacy}");
+    assert_eq!(legacy["protocol"], "patch-v1");
+    assert_eq!(
+        legacy["applied"]["vid_1"], 2,
+        "legacy writes still bump the revision"
+    );
+    assert_eq!(reports.get(), 3);
+    // The busy lease is released after each request.
+    assert!(!state_lock(&state).busy);
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// §1.4 response contract: a stale id is reported with the server value
+/// and not applied, the other ids in the same body are applied, and a
+/// resend with the returned revision goes through.
+#[test]
+fn import_marks_conflict_response_shape() {
+    let case_dir = temp_case("conflict-shape");
+    let state = bound_state(&case_dir, "review-ready");
+    let runner = |_: &[String]| Ok(String::new());
+    let send = |req: Request| {
+        parse(&super::jobs::api_import_marks_with_runner(
+            &req, &state, &runner,
+        ))
+    };
+    // Window B saves vid_1 first (revision 1).
+    let b = send(v2_request("vid_1", "from B", 0, "w-b", None));
+    assert_eq!(b["applied"], serde_json::json!({"vid_1": 1}), "{b}");
+    assert_eq!(b["conflicts"], serde_json::json!([]), "{b}");
+    // Window A, still at base 0 for vid_1, also saves a fresh vid_2.
+    let mut marks = serde_json::json!({
+        "schema_version": 2, "protocol": "patch-v2", "case_id": "FT-jobs", "examiner": "lee",
+        "client_id": "w-a", "base_revisions": {"vid_1": 0, "vid_2": 0},
+        "marks": [
+            {"id": "vid_1", "status": "noted", "marked_unix": 7, "note": "from A", "examiner": "lee", "tags": []},
+            {"id": "vid_2", "status": "reviewed", "marked_unix": 8, "note": "", "examiner": "lee", "tags": ["x"]}
+        ],
+        "tags": [], "deleted_ids": []
+    });
+    let a = send(request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": marks.to_string()}).to_string(),
+    ));
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["protocol"], "patch-v2");
+    assert_eq!(a["stored"], 1);
+    assert_eq!(a["applied"], serde_json::json!({"vid_2": 1}), "{a}");
+    assert_eq!(a["batch_done"], true);
+    assert_eq!(a["deferred"], false);
+    assert_eq!(a["report_url"], "case/reports/case-report.html");
+    let conflicts = a["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "{a}");
+    assert_eq!(
+        conflicts[0],
+        serde_json::json!({
+            "id": "vid_1",
+            "server_revision": 1,
+            "server": {
+                "status": "important", "marked_unix": 100, "examiner": "kim", "note": "from B",
+                "range": {"in": 1.0, "out": 2.0}, "tags": ["사고"]
+            }
+        }),
+        "{a}"
+    );
+    let stored = crate::case_db::load_review_marks(&case_dir).unwrap();
+    let vid_1 = stored.iter().find(|m| m.record_id == "vid_1").unwrap();
+    assert_eq!(
+        vid_1.note.as_deref(),
+        Some("from B"),
+        "stale save must not apply"
+    );
+    // "내 값으로 덮어쓰기": resend with the server revision as base.
+    marks["base_revisions"] = serde_json::json!({"vid_1": 1});
+    marks["marks"].as_array_mut().unwrap().truncate(1);
+    let retry = send(request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": marks.to_string()}).to_string(),
+    ));
+    assert_eq!(retry["applied"], serde_json::json!({"vid_1": 2}), "{retry}");
+    assert_eq!(retry["conflicts"], serde_json::json!([]));
+    let stored = crate::case_db::load_review_marks(&case_dir).unwrap();
+    let vid_1 = stored.iter().find(|m| m.record_id == "vid_1").unwrap();
+    assert_eq!(vid_1.note.as_deref(), Some("from A"));
+    assert!(
+        crate::case_db::load_review_tags(&case_dir)
+            .unwrap()
+            .iter()
+            .all(|t| t.id != "vid_1"),
+        "explicit empty tags cleared the server tags"
+    );
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// A body over the 4 MiB cap is refused with HTTP 413 before anything is
+/// read or applied (the client halves its chunk size on this status).
+/// The 413 body is plain text, not JSON — clients branch on the status.
+#[test]
+fn import_marks_oversize_body_is_413() {
+    let case_dir = temp_case("oversize");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = bound_state(&case_dir, "review-ready");
+    let server_state = Arc::clone(&state);
+    thread::spawn(move || serve_on(listener, server_state));
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let five_mib = 5 * 1024 * 1024;
+    write!(
+        stream,
+        "POST /api/import-marks HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {five_mib}\r\n\r\n"
+    )
+    .unwrap();
+    let _ = stream.write_all(&vec![b'x'; 64 * 1024]);
+    let mut buffer = Vec::new();
+    let _ = stream.read_to_end(&mut buffer);
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    assert!(
+        crate::case_db::load_review_marks(&case_dir)
+            .unwrap()
+            .is_empty()
+    );
+    state_lock(&state).shutdown_requested = true;
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// A v2 body queued during a long step whose ids moved on before the
+/// drain: the conflict is journaled with the client's original entry
+/// (never dropped), `/api/status.mark_conflicts` reports it — also from a
+/// fresh server state (restart) — and a later save of that id with a
+/// current base resolves it while the journal keeps the original line.
+#[test]
+fn deferred_drain_records_conflicts_file_and_status_count() {
+    let case_dir = temp_case("drain-conflict");
+    let state = {
+        let mut job_state = JobState::new();
+        job_state.case_dir = Some(case_dir.clone());
+        job_state.phase = "review-partial";
+        job_state.busy = true;
+        job_state.enrichment = Some(Enrichment {
+            step: "hash",
+            label: "test",
+            stage: 1,
+            stages: 4,
+        });
+        Arc::new(Mutex::new(job_state))
+    };
+    let queued = parse(&api_import_marks(
+        &v2_request("vid_1", "mine", 0, "w-a", None),
+        &state,
+    ));
+    assert_eq!(queued["ok"], true, "{queued}");
+    assert_eq!(queued["deferred"], true);
+    assert_eq!(queued["pending"], 1);
+    assert_eq!(queued["applied"], serde_json::json!({}));
+    assert_eq!(queued["conflicts"], serde_json::json!([]));
+    // Meanwhile another window's save lands (revision 1 for vid_1).
+    let server_mark = crate::case_db::ReviewMarkRow {
+        record_id: "vid_1".into(),
+        status: "reviewed".into(),
+        marked_unix: 50,
+        examiner: Some("lee".into()),
+        note: Some("server".into()),
+        ..Default::default()
+    };
+    crate::case_db::patch_review_annotations_by(&case_dir, &[server_mark], &[], &[], Some("lee"))
+        .unwrap();
+    // The drain at the next short step applies the queue.
+    let job = PipelineJob {
+        kind: InputKind::Folder,
+        case_dir: case_dir.clone(),
+        source_path: PathBuf::from("/ev"),
+        with_hash: true,
+        with_ffprobe: false,
+        with_deepfake: false,
+        skip_e01_verify: false,
+        e01_direct: false,
+    };
+    run_folder_enrichment(&state, &job, |_| Ok("ok".into()));
+    assert_eq!(pending_marks_count(&case_dir), 0);
+    assert_eq!(state_lock(&state).phase, "review-ready");
+    let stored = crate::case_db::load_review_marks(&case_dir).unwrap();
+    assert_eq!(
+        stored[0].note.as_deref(),
+        Some("server"),
+        "stale queued save not applied"
+    );
+    let journal_path = case_dir.join(super::jobs::PENDING_MARK_CONFLICTS_FILE);
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    let lines: Vec<serde_json::Value> = journal.lines().map(parse).collect();
+    assert_eq!(lines.len(), 1, "{journal}");
+    assert_eq!(lines[0]["id"], "vid_1");
+    assert_eq!(lines[0]["server_revision"], 1);
+    assert_eq!(lines[0]["server"]["note"], "server");
+    assert_eq!(
+        lines[0]["mine"]["mark"]["note"], "mine",
+        "original entry kept verbatim"
+    );
+    assert_eq!(
+        lines[0]["mine"]["mark"]["tags"],
+        serde_json::json!(["사고"])
+    );
+    assert_eq!(lines[0]["mine"]["base_revision"], 0);
+    assert_eq!(lines[0]["mine"]["deleted"], false);
+    assert_eq!(lines[0]["client_id"], "w-a");
+    assert!(lines[0]["recorded_unix"].as_u64().unwrap() > 0);
+    let logs = state_lock(&state).logs.join("\n");
+    assert!(logs.contains("충돌 1건"), "{logs}");
+    let status = parse(&api_status(&state));
+    assert_eq!(
+        status["mark_conflicts"],
+        serde_json::json!({"count": 1, "ids": ["vid_1"]}),
+        "{status}"
+    );
+    // Survives a server restart: a fresh state reads the same journal.
+    let restarted = bound_state(&case_dir, "review-ready");
+    assert_eq!(parse(&api_status(&restarted))["mark_conflicts"]["count"], 1);
+    // The examiner decides ("내 값") and saves with the current base.
+    let runner = |_: &[String]| Ok(String::new());
+    let resolved = parse(&super::jobs::api_import_marks_with_runner(
+        &v2_request("vid_1", "mine again", 1, "w-a", None),
+        &state,
+        &runner,
+    ));
+    assert_eq!(
+        resolved["applied"],
+        serde_json::json!({"vid_1": 2}),
+        "{resolved}"
+    );
+    let status = parse(&api_status(&state));
+    assert_eq!(
+        status["mark_conflicts"],
+        serde_json::json!({"count": 0, "ids": []}),
+        "{status}"
+    );
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    let lines: Vec<serde_json::Value> = journal.lines().map(parse).collect();
+    assert_eq!(lines.len(), 2, "journal is append-only: {journal}");
+    assert_eq!(lines[0]["mine"]["mark"]["note"], "mine");
+    assert_eq!(lines[1]["resolved"], "vid_1");
+    assert_eq!(lines[1]["revision"], 2);
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// `/api/records-meta` annotations carry the per-record revision map the
+/// v2 client seeds `state.revisions` from (empty before any save).
+#[test]
+fn records_meta_annotations_include_revisions() {
+    let case_dir = temp_case("meta-revisions");
+    let state = bound_state(&case_dir, "review-ready");
+    let empty = parse(&api_records_meta(&state));
+    assert_eq!(empty["ok"], true, "{empty}");
+    assert_eq!(empty["annotations"]["marks"], serde_json::json!([]));
+    assert_eq!(empty["annotations"]["revisions"], serde_json::json!({}));
+    let runner = |_: &[String]| Ok(String::new());
+    let saved = parse(&super::jobs::api_import_marks_with_runner(
+        &v2_request("vid_1", "n", 0, "w-a", None),
+        &state,
+        &runner,
+    ));
+    assert_eq!(saved["ok"], true, "{saved}");
+    crate::case_db::patch_review_annotations_by(
+        &case_dir,
+        &[],
+        &[crate::selection::TagEntry {
+            id: "vid_9".into(),
+            tags: vec!["t".into()],
+        }],
+        &[],
+        None,
+    )
+    .unwrap();
+    let meta = parse(&api_records_meta(&state));
+    let annotations = &meta["annotations"];
+    assert_eq!(
+        annotations["marks"][0]["record_id"], "vid_1",
+        "{annotations}"
+    );
+    assert_eq!(
+        annotations["marks"][0]["range"],
+        serde_json::json!({"in": 1.0, "out": 2.0})
+    );
+    assert_eq!(
+        annotations["tags"],
+        serde_json::json!([{"id": "vid_1", "tags": ["사고"]}, {"id": "vid_9", "tags": ["t"]}])
+    );
+    assert_eq!(
+        annotations["revisions"],
+        serde_json::json!({"vid_1": 1, "vid_9": 1}),
+        "{annotations}"
+    );
+    // Same object make-review embeds in the data bundle.
+    let bundle: serde_json::Value =
+        serde_json::from_str(&crate::case_db::review_annotations_json(&case_dir).unwrap()).unwrap();
+    assert_eq!(&bundle, annotations);
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
 #[cfg(unix)]
 fn pid_alive(pid: &str) -> bool {
     Command::new("kill")

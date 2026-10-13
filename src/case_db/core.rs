@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) const SCHEMA_VERSION: &str = "6";
+pub(crate) const SCHEMA_VERSION: &str = "7";
 
 pub fn case_db_path(case_dir: &Path) -> PathBuf {
     case_dir.join("db/case.db")
@@ -191,6 +191,7 @@ fn init_schema_locked(conn: &Connection) -> Result<(), String> {
             apply_schema_v4_columns(conn)?;
             apply_schema_v5_columns(conn)?;
             apply_schema_v6_history(conn)?;
+            apply_schema_v7_rev(conn)?;
             conn.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
                 [SCHEMA_VERSION],
@@ -203,29 +204,38 @@ fn init_schema_locked(conn: &Connection) -> Result<(), String> {
             migrate_v3_to_v4(conn)?;
             migrate_v4_to_v5(conn)?;
             migrate_v5_to_v6(conn)?;
+            migrate_v6_to_v7(conn)?;
         }
         Some("2") => {
             migrate_v2_to_v3(conn)?;
             migrate_v3_to_v4(conn)?;
             migrate_v4_to_v5(conn)?;
             migrate_v5_to_v6(conn)?;
+            migrate_v6_to_v7(conn)?;
         }
         Some("3") => {
             migrate_v3_to_v4(conn)?;
             migrate_v4_to_v5(conn)?;
             migrate_v5_to_v6(conn)?;
+            migrate_v6_to_v7(conn)?;
         }
         Some("4") => {
             migrate_v4_to_v5(conn)?;
             migrate_v5_to_v6(conn)?;
+            migrate_v6_to_v7(conn)?;
         }
-        Some("5") => migrate_v5_to_v6(conn)?,
+        Some("5") => {
+            migrate_v5_to_v6(conn)?;
+            migrate_v6_to_v7(conn)?;
+        }
+        Some("6") => migrate_v6_to_v7(conn)?,
         Some(SCHEMA_VERSION) => {
             apply_schema_v2_indexes(conn)?;
             apply_schema_v3_tables(conn)?;
             apply_schema_v4_columns(conn)?;
             apply_schema_v5_columns(conn)?;
             apply_schema_v6_history(conn)?;
+            apply_schema_v7_rev(conn)?;
         }
         Some(version) => {
             return Err(format!("unsupported SQLite schema version: {version}"));
@@ -362,6 +372,67 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|err| format!("failed to update SQLite schema version: {err}"))?;
     Ok(())
+}
+
+/// v6 → v7: adds the per-record annotation revision table (save protocol
+/// v2, optimistic concurrency). Purely additive — `review_marks`, the
+/// `review_tags.v1:*` rows and `review_mark_history` are not touched
+/// (history is trigger-protected against UPDATE/DELETE anyway). Every id
+/// that currently carries a mark or a tag list starts at revision 1.
+fn migrate_v6_to_v7(conn: &Connection) -> Result<(), String> {
+    backup_database(conn, "6", "7")?;
+    // Chains from older versions re-apply every earlier additive step
+    // (all idempotent) before the v7 table is created.
+    apply_schema_v3_tables(conn)?;
+    apply_schema_v4_columns(conn)?;
+    apply_schema_v5_columns(conn)?;
+    apply_schema_v6_history(conn)?;
+    apply_schema_v7_rev(conn)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system time before UNIX epoch: {err}"))?
+        .as_secs();
+    conn.execute(
+        r#"
+        INSERT OR IGNORE INTO review_annotation_rev (record_id, revision, updated_unix, actor, client_id)
+        SELECT record_id, 1, marked_unix, examiner, NULL FROM review_marks
+        "#,
+        [],
+    )
+    .map_err(|err| format!("failed to seed v7 annotation revisions from marks: {err}"))?;
+    conn.execute(
+        r#"
+        INSERT OR IGNORE INTO review_annotation_rev (record_id, revision, updated_unix, actor, client_id)
+        SELECT substr(key, 16), 1, ?1, NULL, NULL FROM schema_meta
+        WHERE substr(key, 1, 15) = 'review_tags.v1:'
+        "#,
+        [i64::try_from(now).unwrap_or(i64::MAX)],
+    )
+    .map_err(|err| format!("failed to seed v7 annotation revisions from tags: {err}"))?;
+    conn.execute(
+        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+        [SCHEMA_VERSION],
+    )
+    .map_err(|err| format!("failed to update SQLite schema version: {err}"))?;
+    Ok(())
+}
+
+/// v7: one revision counter per annotated record (marks, note, range and
+/// tags together). A row outlives its mark (tombstone) so a stale client
+/// recreating a deleted mark is caught as a conflict.
+pub(crate) fn apply_schema_v7_rev(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS review_annotation_rev (
+            record_id    TEXT PRIMARY KEY,
+            revision     INTEGER NOT NULL,
+            updated_unix INTEGER NOT NULL,
+            actor        TEXT,
+            client_id    TEXT
+        );
+        "#,
+    )
+    .map_err(|err| format!("failed to apply SQLite v7 annotation revision table: {err}"))
 }
 
 /// v6: append-only review mark history (FOR-07) and hash provenance for

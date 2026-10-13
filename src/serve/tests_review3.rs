@@ -198,6 +198,81 @@ fn legacy_signoff_reads_as_binding_unknown() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Digest pin (save protocol v2): the sign-off content must not include
+/// the v7 revision table, so an existing sign-off still reads as
+/// "unchanged" after the migration and after revision bumps that change
+/// no content. Both the JSON string and its SHA-256 are pinned.
+#[test]
+fn signoff_content_json_unchanged_by_revision_table() {
+    let rows = vec![
+        crate::case_db::ReviewMarkRow {
+            record_id: "vid_000002".into(),
+            status: "reviewed".into(),
+            marked_unix: 200,
+            ..Default::default()
+        },
+        crate::case_db::ReviewMarkRow {
+            record_id: "vid_000001".into(),
+            status: "important".into(),
+            marked_unix: 100,
+            record_path: Some("/e/a.mp4".into()),
+            examiner: Some("kim".into()),
+            note: Some("메모 \"q\"".into()),
+            range: Some(crate::case_db::RangeSpan {
+                start: Some(1.5),
+                end: Some(4.0),
+            }),
+        },
+    ];
+    let tags = vec![
+        crate::selection::TagEntry {
+            id: "vid_000009".into(),
+            tags: vec!["tag-only".into()],
+        },
+        crate::selection::TagEntry {
+            id: "vid_000001".into(),
+            tags: vec!["사고".into(), "보류".into(), "사고".into()],
+        },
+    ];
+    let expected = concat!(
+        r#"{"schema":3,"marks":[{"id":"vid_000001","status":"important","marked_unix":100,"examiner":"kim","note":"메모 \"q\"","range_in":1.5,"range_out":4.0},"#,
+        r#"{"id":"vid_000002","status":"reviewed","marked_unix":200,"examiner":null,"note":null,"range_in":null,"range_out":null}],"#,
+        r#""tags":{"vid_000001":["보류","사고"],"vid_000009":["tag-only"]}}"#
+    );
+    let content = crate::cli::handlers::signoff_content_json_from(&rows, &tags);
+    assert_eq!(content, expected);
+    assert_eq!(
+        crate::report::signoff_content_sha256(&content),
+        "e16c86c1dc661a526d17237a1b349a0db2eff7a1b265712262dc3e90c96aba50"
+    );
+    // Through a real v7 case: revisions move, the digest does not.
+    let case = scratch("signoff-rev-pin");
+    std::fs::create_dir_all(case.join("db")).unwrap();
+    std::fs::write(case.join("case.json"), br#"{"case_id":"FT-pin"}"#).unwrap();
+    let base = std::collections::BTreeMap::new();
+    let patch = crate::case_db::AnnotationPatch {
+        marks: &rows,
+        tags: &tags,
+        deleted_ids: &[],
+        base_revisions: Some(&base),
+    };
+    crate::case_db::patch_review_annotations_v2(&case, &patch, Some("kim"), Some("w-1")).unwrap();
+    let stored = crate::cli::handlers::signoff_content_json(&case).unwrap();
+    assert_eq!(stored, expected);
+    assert!(!stored.contains("revision"));
+    // Legacy digest helper is byte-stable too (older sign-offs compare to it).
+    let loaded = crate::case_db::load_review_marks(&case).unwrap();
+    assert_eq!(
+        crate::cli::handlers::review_marks_json_from_rows(&loaded),
+        r#"[{"id":"vid_000001","status":"important","marked_unix":100,"examiner":"kim","note":"메모 \"q\""},{"id":"vid_000002","status":"reviewed","marked_unix":200}]"#
+    );
+    assert_eq!(
+        crate::case_db::load_review_revisions(&case).unwrap().len(),
+        3
+    );
+    let _ = std::fs::remove_dir_all(case);
+}
+
 /// Finding 8: a review-mark read failure must refuse the sign-off rather
 /// than bind it to an empty mark list.
 #[cfg(unix)]

@@ -390,6 +390,14 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         // Marks accepted while a hash/make-review step held the case DB;
         // applied automatically right after that step.
         "pending_marks": case_dir.as_deref().map(pending_marks_count).unwrap_or(0),
+        // Save protocol v2: ids a queued import could not apply because
+        // the case had moved on (journaled in marks-pending/conflicts.jsonl,
+        // never dropped). `{count, ids}` with at most 50 ids; the viewer
+        // resolves them by saving the id again with a current base.
+        "mark_conflicts": case_dir
+            .as_deref()
+            .map(super::jobs::pending_mark_conflicts)
+            .unwrap_or_else(|| serde_json::json!({"count": 0, "ids": []})),
         // UX-06: which kind of job holds `busy` (null when idle), and the
         // current/last background case job with its stage and outcome.
         "job_kind": status_job_kind(&guard),
