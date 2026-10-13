@@ -52,6 +52,11 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
         ),
     };
     validate_required_package_files(case_dir)?;
+    if case_dir.join(VIEWER_REL).is_file() && !case_dir.join(DATA_BUNDLE_REL).is_file() {
+        return Err(format!(
+            "{VIEWER_REL} is present but {DATA_BUNDLE_REL} is missing: the standalone viewer would be packaged without its data. Re-run `frametrace make-review <case-dir>` and package again."
+        ));
+    }
     // Preflight: the package duplicates every report/artifact under the
     // case dir, so ensure the target volume can hold a second copy before
     // the copy loop starts.
@@ -211,11 +216,19 @@ fn required_package_files() -> &'static [&'static str] {
     ]
 }
 
+/// The standalone viewer and the data file it loads as a sibling.
+const VIEWER_REL: &str = "review/evidence-viewer.html";
+const DATA_BUNDLE_REL: &str = "review/data-bundle.js";
+const CARVE_REPORT_REL: &str = "review/carve-report.html";
+const CARVE_LOG_REL: &str = "artifacts/carved/carve-log.jsonl";
+
 fn optional_package_files() -> &'static [&'static str] {
     &[
         "db/carve_results.json",
         "review/index.html",
-        "review/evidence-viewer.html",
+        VIEWER_REL,
+        DATA_BUNDLE_REL,
+        CARVE_REPORT_REL,
         "review/thumbs.json",
         "artifacts/logs/batch-log.jsonl",
         "db/timeline.jsonl",
@@ -531,7 +544,10 @@ fn is_lower_hex_sha256(text: &str) -> bool {
 /// 4. the packaged SQLite snapshot passes `integrity_check`;
 /// 5. a packaged sign-off's `content_sha256` matches the review marks
 ///    (with their IN-OUT ranges) and tags in the packaged database, and the
-///    packaged report names that examiner.
+///    packaged report names that examiner;
+/// 6. a packaged `review/evidence-viewer.html` has its `review/data-bundle.js`
+///    sibling (FAIL otherwise), and a non-empty carve log comes with
+///    `review/carve-report.html` (NOT VERIFIED otherwise).
 ///
 /// Returns `Err` only when the directory cannot be inspected at all; every
 /// finding (including failures) is a check in the result.
@@ -692,6 +708,9 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
     // 4 + 5. Database snapshot and sign-off.
     verify_package_db_and_signoff(package_dir, &listed, &mut out);
 
+    // 6. Viewer sibling data and carve report.
+    verify_review_siblings(package_dir, &listed, &mut out);
+
     out.push(
         CheckStatus::NotVerified,
         "authenticity",
@@ -706,6 +725,41 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
         "original evidence media are not in the package and were not re-hashed (see the packaged custody/report re-hash results)",
     );
     Ok(out)
+}
+
+fn verify_review_siblings(
+    package_dir: &Path,
+    listed: &std::collections::BTreeMap<String, String>,
+    out: &mut PackageVerification,
+) {
+    if listed.contains_key(VIEWER_REL) {
+        if listed.contains_key(DATA_BUNDLE_REL) {
+            out.push(
+                CheckStatus::Pass,
+                VIEWER_REL,
+                format!("standalone viewer ships with its {DATA_BUNDLE_REL}"),
+            );
+        } else {
+            out.push(
+                CheckStatus::Fail,
+                VIEWER_REL,
+                format!(
+                    "standalone viewer is packaged without {DATA_BUNDLE_REL}: it would open with no data"
+                ),
+            );
+        }
+    }
+    let carve_log_has_entries = listed.contains_key(CARVE_LOG_REL)
+        && fs::read_to_string(package_dir.join(CARVE_LOG_REL))
+            .map(|text| text.lines().any(|line| !line.trim().is_empty()))
+            .unwrap_or(true);
+    if carve_log_has_entries && !listed.contains_key(CARVE_REPORT_REL) {
+        out.push(
+            CheckStatus::NotVerified,
+            CARVE_REPORT_REL,
+            "the package has carve log entries but no carve report; the carving results cannot be reviewed from the package (run make-review before packaging)",
+        );
+    }
 }
 
 fn collect_package_files(
