@@ -148,6 +148,97 @@ try {
   await page.waitForTimeout(400);
   const colsAfter = await page.evaluate(() => document.querySelector('#recordGrid .vrow')?.children.length);
   check('resize recomputes columns', colsAfter > 0 && colsAfter < colsBefore, `${colsBefore} -> ${colsAfter}`);
+
+  // U14: grid > rowgroup (the spacer) > row > gridcell, with aria-rowcount
+  // on the grid and aria-rowindex on every painted row.
+  const aria = await page.evaluate(() => {
+    const g = document.getElementById('recordGrid');
+    const spacer = g.querySelector(':scope > .vspacer');
+    const rows = [...(spacer ? spacer.children : [])];
+    return {
+      gridChildrenOk: [...g.children].every((c) => ['row', 'rowgroup'].includes(c.getAttribute('role'))),
+      spacerRole: spacer && spacer.getAttribute('role'),
+      rowsOk: rows.length > 0 && rows.every((r) => r.getAttribute('role') === 'row' && Number(r.getAttribute('aria-rowindex')) >= 1),
+      cellsOk: rows.every((r) => [...r.children].every((c) => c.getAttribute('role') === 'gridcell')),
+      rowcount: Number(g.getAttribute('aria-rowcount')),
+      maxIndex: Math.max(...rows.map((r) => Number(r.getAttribute('aria-rowindex')))),
+    };
+  });
+  check('virtual grid ARIA chain grid > rowgroup > row > gridcell', aria.gridChildrenOk && aria.spacerRole === 'rowgroup' && aria.rowsOk && aria.cellsOk, JSON.stringify(aria));
+  check('aria-rowcount covers every painted aria-rowindex', aria.rowcount > 0 && aria.maxIndex <= aria.rowcount, JSON.stringify(aria));
+  {
+    let axeSource = '';
+    try { axeSource = readFileSync(require.resolve('axe-core/axe.min.js'), 'utf8'); } catch { /* optional */ }
+    if (axeSource) {
+      await page.addScriptTag({ content: axeSource });
+      const v = await page.evaluate(async () => {
+        const r = await window.axe.run(document.getElementById('recordGrid'), { runOnly: { type: 'rule', values: ['aria-required-children', 'aria-required-parent'] } });
+        return r.violations.map((x) => `${x.id}: ${x.nodes.length}`);
+      });
+      check('axe aria-required-children / -parent on the virtual grid', v.length === 0, v.join(', '));
+    } else {
+      console.log('SKIP  axe-core not resolvable (aria-required-children)');
+    }
+  }
+
+  // U7: under a mark filter j/k reuse the filtered list (memo keyed on the
+  // annotation generation) instead of filtering + sorting every record per
+  // key. Compared with the same presses under no filter: the mark filter
+  // must not be several times slower.
+  const timeJ = (n) => page.evaluate(async (count) => {
+    const t0 = performance.now();
+    for (let i = 0; i < count; i++) document.dispatchEvent(new KeyboardEvent('keydown', { key: i % 2 ? 'k' : 'j', bubbles: true }));
+    return performance.now() - t0;
+  }, n);
+  const plainMs = await timeJ(300);
+  await page.evaluate(() => document.querySelector('[data-chip="mark:none"]')?.click());
+  await page.waitForTimeout(300);
+  const chipOn = await page.evaluate(() => document.querySelector('[data-chip="mark:none"]')?.getAttribute('aria-pressed'));
+  const markMs = await timeJ(300);
+  check('mark filter active for the timing run', chipOn === 'true', String(chipOn));
+  check('j/k under a mark filter cost about the same as unfiltered (memoised)', markMs < plainMs * 3 + 300, `plain ${plainMs.toFixed(0)} ms, mark:none ${markMs.toFixed(0)} ms`);
+  // A mark still updates the filtered list (the memo key moves with it).
+  const beforeMark = await page.evaluate(() => document.getElementById('resultCount').textContent);
+  await page.evaluate(() => { document.activeElement?.blur(); document.dispatchEvent(new KeyboardEvent('keydown', { key: '1', bubbles: true })); });
+  await page.waitForTimeout(200);
+  const afterMark = await page.evaluate(() => document.getElementById('resultCount').textContent);
+  check('marking under mark:none drops the record from the filtered list', Number(afterMark) === Number(beforeMark) - 1, `${beforeMark} -> ${afterMark}`);
+  await page.evaluate(() => document.querySelector('[data-chip=""]')?.click());
+  await page.waitForTimeout(200);
+
+  // U4: a reload keeps the view — scroll, active card, filter — (standalone
+  // FTViewer.reload() = page reload with the view stashed for the next boot).
+  await page.evaluate(() => { const g = document.getElementById('recordGrid'); g.scrollTop = Math.floor(g.scrollHeight / 3); });
+  await page.waitForTimeout(200);
+  await page.locator('#recordGrid .card').nth(3).click();
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.locator('#query').fill('cam3');
+  await page.waitForTimeout(400);
+  const viewBefore = await page.evaluate(() => ({
+    scroll: document.getElementById('recordGrid').scrollTop,
+    active: document.querySelector('#recordGrid .card.active')?.dataset.id,
+    count: document.getElementById('resultCount').textContent,
+  }));
+  await page.evaluate(() => { const g = document.getElementById('recordGrid'); g.scrollTop = Math.floor(g.scrollHeight / 4); });
+  await page.waitForTimeout(200);
+  const scrollBefore = await page.evaluate(() => document.getElementById('recordGrid').scrollTop);
+  await Promise.all([
+    page.waitForEvent('load', { timeout: 60_000 }),
+    page.evaluate(() => FTViewer.reload({ keepUnsaved: false, reason: 'test' })),
+  ]);
+  await page.waitForSelector('#recordGrid .card', { timeout: 60_000 });
+  await page.waitForTimeout(400);
+  const viewAfter = await page.evaluate(() => ({
+    scroll: document.getElementById('recordGrid').scrollTop,
+    active: document.querySelector('#recordGrid .card.active')?.dataset.id || window.__none,
+    activeState: document.querySelector('#recordGrid .card[aria-current]')?.dataset.id,
+    count: document.getElementById('resultCount').textContent,
+    query: document.getElementById('query').value,
+  }));
+  check('reload keeps the search text and filtered result', viewAfter.query === 'cam3' && viewAfter.count === viewBefore.count, JSON.stringify({ viewBefore, viewAfter }));
+  check('reload keeps the grid scroll position', Math.abs(viewAfter.scroll - scrollBefore) < 2, `${scrollBefore} -> ${viewAfter.scroll}`);
+  await page.locator('#query').fill('');
+  await page.waitForTimeout(300);
   check('no page errors', !errors.length, errors.join(' | '));
   await page.close();
 

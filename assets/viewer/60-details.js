@@ -148,7 +148,7 @@ function renderDetails() {
   ].join(" ");
   els.summaryList.innerHTML = [
     [t("detail.recTime"), record.recTime
-      ? fmtUnix(record.recTime) + (record.recSource === "name" ? "" : record.recSource === "name-date" ? " " + t("detail.dateOnly") : " " + t("detail.est"))
+      ? recTimeText(record)
       : t("detail.unknown")],
     [t("detail.channel"), record.channel || "-"],
     [t("detail.mark"), mark ? markLabel(mark.status) : t("detail.unmarked")],

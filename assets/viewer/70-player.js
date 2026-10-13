@@ -232,7 +232,9 @@ function openPlayerWindow() {
   const win = window.open("", "frametrace-player", "popup=yes,width=1100,height=880");
   if (!win) { toast(t("toast.popupBlocked")); return null; }
   const e = escapeHtml;
-  const rate = state.layout.rate || 1;
+  // Only a listed speed reaches the inline script (U10): a stored layout
+  // value is never written into the popup's code as a literal.
+  const rate = RATES.includes(Number(state.layout.rate)) ? Number(state.layout.rate) : 1;
   const rateOptions = RATES.map(r => `<option value="${r}"${r === rate ? " selected" : ""}>${r}×</option>`).join("");
   const tagButtons = tagPresets().map(tag => `<button class="tg" data-tag="${e(tag)}">${e(tag)}</button>`).join("");
   win.document.open();
@@ -291,7 +293,7 @@ var v=document.getElementById("vv");
 var RATES=[${RATES.join(",")}];
 var rate=document.getElementById("rate");
 var cur=null;
-v.playbackRate=${rate};
+v.playbackRate=${jsLit(rate)};
 var TOKEN=${jsLit(FTViewer.writerToken)};var seqN=0,pend={},chan=("BroadcastChannel" in window)?new BroadcastChannel(${jsLit(`ft-player:${manifest.case_id || "case"}`)}):null;
 if(chan){chan.onmessage=function(ev){var m=ev.data||{},f=m.seq&&pend[m.seq];if(f){delete pend[m.seq];f(m.payload);}};}
 function call(op,arg,cb){
@@ -354,11 +356,16 @@ fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},
 };
 v.addEventListener("ended",function(){nav(1,true);});
 var NAV={ArrowUp:1,ArrowDown:1,ArrowLeft:1,ArrowRight:1,Home:1,End:1,PageUp:1,PageDown:1," ":1,Enter:1,Tab:1};
+function skey(e){var k=String(e.key||""),c=String(e.code||""),m;
+if(!(k.length===1&&k.charCodeAt(0)<128)&&(k.length===1||k==="Process"||k==="Unidentified")){
+if((m=/^Key([A-Z])$/.exec(c)))k=m[1].toLowerCase();else if((m=/^(?:Digit|Numpad)([0-9])$/.exec(c))&&!e.shiftKey)k=m[1];}
+if(/^[a-z]$/i.test(k))k=e.shiftKey?k.toUpperCase():k.toLowerCase();return k;}
 document.addEventListener("keydown",function(e){
 var tn=e.target&&e.target.tagName;
 if(tn==="SELECT"&&NAV[e.key])return;
 var ag=e.getModifierState&&e.getModifierState("AltGraph");
-if(!ag&&(e.ctrlKey||e.metaKey)){var k=String(e.key).toLowerCase();
+var K=skey(e);
+if(!ag&&(e.ctrlKey||e.metaKey)){var k=K.toLowerCase();
 if(k==="z"&&!e.shiftKey){e.preventDefault();doHist("undo");}
 else if(k==="y"||(k==="z"&&e.shiftKey)){e.preventDefault();doHist("redo");}
 return;}
@@ -371,9 +378,9 @@ if(e.key==="ArrowLeft")skip(-10);else if(e.key==="ArrowRight")skip(10);
 else if(e.key==="ArrowUp"){e.preventDefault();stepRate(1);}
 else if(e.key==="ArrowDown"){e.preventDefault();stepRate(-1);}
 else if(e.key===" "){e.preventDefault();v.paused?v.play():v.pause();}
-else if(e.key==="j")nav(1,true);else if(e.key==="k")nav(-1,true);
-else if(e.key==="1")doMark("reviewed");else if(e.key==="2")doMark("important");
-else if(e.key==="3")doMark("needs_verification");else if(e.key==="0")doMark("");});
+else if(K==="j")nav(1,true);else if(K==="k")nav(-1,true);
+else if(K==="1")doMark("reviewed");else if(K==="2")doMark("important");
+else if(K==="3")doMark("needs_verification");else if(K==="0")doMark("");});
 call("descriptor",null,function(d){if(d===undefined){dead();}else{applyDesc(d,true);}});
 <\/script></body></html>`);
   win.document.close();
@@ -384,25 +391,6 @@ call("descriptor",null,function(d){if(d===undefined){dead();}else{applyDesc(d,tr
 
 
 // CapsLock flips event.key's case: Caps+j arrives as "J" without Shift and
-// would trigger shuttle, while Shift+j with CapsLock arrives as "j" and would
-// navigate records. Normalise in the capture phase: shuttle only when Shift is
-// really held. (The J/K/L switch itself lives in 80-review.js.)
-window.addEventListener("keydown", event => {
-  if (event.ctrlKey || event.metaKey || event.altKey) return;
-  const key = String(event.key);
-  if (!/^[jkl]$/i.test(key)) return;
-  if (typeof isTypingTarget === "function" && isTypingTarget(document.activeElement)) return;
-  if (document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-keys="off"]')) return;
-  if (!event.shiftKey) {
-    if (key !== key.toUpperCase()) return; // plain j/k/l keep their normal meaning
-    event.stopImmediatePropagation(); // CapsLock-only "J": not a shuttle key
-    event.preventDefault();
-    if (key === "J") moveActive(1); else if (key === "K") moveActive(-1); // behave as plain j/k
-    return;
-  }
-  if (key === key.toLowerCase()) { // Shift+j while CapsLock is on
-    event.stopImmediatePropagation();
-    event.preventDefault();
-    shuttleKey(key === "j" ? -1 : key === "k" ? 0 : 1);
-  }
-}, { capture: true, signal: ftSignal });
+// Shift+j with CapsLock as "j". The global handler (80-review.js) reads keys
+// through shortcutKey(), where a letter's case follows Shift alone — so the
+// J/K/L shuttle needs a real Shift and Caps+j still navigates like j.

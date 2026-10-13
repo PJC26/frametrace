@@ -125,17 +125,47 @@ let lastInstance = null;
 // change on every poll and wake every jobs listener for nothing. `var` so
 // 31-progress.js may read it before this line has run.
 var pollStatusAt = 0;
-function setServerLost(lost, detail) {
+// The banner has two faces: "server lost" (connection refused / timed out)
+// and "browser authorization expired" (U8: the server answered 401 — it is
+// up, but this page no longer carries its ft_token / ft_nonce cookie). The
+// second never says the server is down, and its button reloads the page
+// (a fresh GET plants the nonce again; a token-gated server needs the
+// workstation window, which opens with ?token=).
+let bannerAuth = false;
+const BANNER_LOST = { title: "", button: "" };
+function bannerFace(auth) {
+  const banner = $("serverBanner");
+  const title = banner && typeof banner.querySelector === "function" ? banner.querySelector("b") : null;
+  const button = $("btnServerRetry");
+  if (!BANNER_LOST.title && title) { BANNER_LOST.title = title.textContent; BANNER_LOST.button = button ? button.textContent : ""; }
+  if (title && BANNER_LOST.title) title.textContent = auth ? "브라우저 인증이 만료되었습니다" : BANNER_LOST.title;
+  if (button && BANNER_LOST.button) button.textContent = auth ? "페이지 다시 열기" : BANNER_LOST.button;
+  bannerAuth = auth;
+}
+function setServerLost(lost, detail, auth) {
   const banner = $("serverBanner");
   const was = !banner.hidden;
+  const face = !!(lost && auth);
   banner.hidden = !lost;
-  if (lost && !was && detail) { $("serverBannerMsg").textContent = detail; $("serverBannerMsg").title = detail; }
+  if (lost && (face !== bannerAuth || !was)) bannerFace(face);
+  if (!lost && bannerAuth) bannerFace(false);
+  if (lost && (!was || face) && detail) { $("serverBannerMsg").textContent = detail; $("serverBannerMsg").title = detail; }
   const S = storeState();
-  if (S && !!S.server.lost !== !!lost) {
-    patchStore({ server: Object.assign({}, S.server, { lost: !!lost, failures: lost ? pollFailures : 0 }) });
+  if (S && (!!S.server.lost !== !!lost || !!S.server.auth !== face)) {
+    patchStore({ server: Object.assign({}, S.server, { lost: !!lost, auth: face, failures: lost ? pollFailures : 0 }) });
   }
 }
+// readJson (20-net.js) calls this on any 401 — a status poll, a job POST,
+// the viewer's own save (FTViewer "error" with auth:true, 22-viewer-host).
+function noteAuthExpired() {
+  if (bannerAuth && !$("serverBanner").hidden) return;
+  setServerLost(true,
+    "워크스테이션 창에서 다시 여십시오. 서버는 응답하지만 이 창의 인증 쿠키가 없거나 만료되어 요청이 거부되었습니다 (HTTP 401). 판독 내용은 이 브라우저에 보존됩니다.",
+    true);
+  announce("브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오", true);
+}
 function pollFailed(err) {
+  if (err && err.status === 401) { noteAuthExpired(); return; }
   pollFailures += 1;
   if (pollFailures >= 3) {
     setServerLost(true,
@@ -210,7 +240,10 @@ async function poll() {
   }
   schedulePoll(pollActive(st) ? POLL_BUSY_MS : POLL_IDLE_MS);
 }
-$("btnServerRetry").addEventListener("click", () => { pollFailures = Math.min(pollFailures, 2); schedulePoll(0); poll(); });
+$("btnServerRetry").addEventListener("click", () => {
+  if (bannerAuth) { window.location.reload(); return; }
+  pollFailures = Math.min(pollFailures, 2); schedulePoll(0); poll();
+});
 // The idle cadence is 5 s: starting or opening something from the empty
 // state must not wait that long for the first status, so a click inside the
 // input card re-polls shortly after (the poll then switches to 1 s itself).

@@ -212,7 +212,7 @@ K=유지, R=개명(구→신), X=삭제. "하네스" = 바꿔야 하는 스크�
 window.FTViewer = {
   version: 2,
   // 마운트. host: 조각 루트(#ftViewer)를 포함하는 요소(기본 document). data: 인라인 번들(옛 __FRAMETRACE_DATA__). url: 레코드 API base(기본 "" = 같은 origin /api/records). embed: 헤더 숨김.
-  init({ data = null, url = "", embed = false, host = document, theme = null, locale = null } = {}) → Promise<void>,
+  init({ data = null, url = "", embed = false, host = document, theme = null, locale = null, restore = null } = {}) → Promise<void>,   // restore: 내부용 — reload()가 넘기는 보기 상태(§11.1)
   destroy() → void,                 // AbortController.abort() + root.innerHTML 유지(마크업은 남고 상태·리스너만 제거)
   reload({ keepUnsaved = true, reason = "" } = {}) → Promise<"reloaded"|"refused">,
   setLocale("ko"|"en"), getLocale() → "ko"|"en",
@@ -228,6 +228,7 @@ window.FTViewer = {
   popout() → Window|null,            // 70-player.js openPopupPlayer(): 영상+판독 창
   closePopout(), isPoppedOut() → boolean,
   toast(message, kind = "info") → void,     // §6.5 단일 토스트 호스트
+  _whenSaveSettled(timeoutMs = 15000) → Promise<boolean>,   // 내부용(22-viewer-host 언마운트): 진행 중인 마크 저장 요청이 끝나면 true, 시간 초과면 false. 응답이 이 마운트의 드래프트를 정리한 뒤 destroy() 하기 위함
   on(event, fn, opts), off(event, fn)       // EventTarget; fn(CustomEvent) — detail는 아래 표
 };
 ```
@@ -242,7 +243,7 @@ window.FTViewer = {
 | 랜드마크 | 조각의 `#mainArea`는 `role="main"`인 `<div>`(standalone: 페이지의 유일한 main). hosted `init()`은 이를 `role="region"` + `aria-label`("증거 검토", i18n `layout.review`)로 바꾼다 — 셸의 `<main id="main">`이 페이지의 유일한 main. `verify-embed` 9번이 양쪽 모두 main 정확히 1개를 확인(axe `landmark-*` 포함). |
 | 호스트 클래스 | `reload()`(destroy→init)는 호스트가 `#ftViewer`에 건 `.popped`를 보존한다(destroy 단독은 원본 className으로 복원). |
 | 리스너 | 뷰어가 `document`/`window`/`matchMedia`에 거는 모든 리스너는 `{ signal: FTViewer._ac.signal }`로 등록(T5가 grep 기준: `addEventListener(` 호출 전부). `destroy()`는 abort 후 새 AbortController를 만든다. |
-| 데이터 재적재 | `reload()`는 현 `ft-reload` 핸들러 로직(95-init.js:28-63)을 함수화: 미저장이면 `"refused"`(저장 시작 + `toast(t("reload.refused"))`), 아니면 **페이지 리로드 대신** `destroy()`→`init()`(호스트)·`location.reload()`(standalone). 호스트에서 `keepUnsaved=false`면 미저장 무시하고 재적재(사용 금지: 호출자는 T3가 아니라 사용자 확인 대화상자를 거친 T2만). |
+| 데이터 재적재 | `reload()`는 현 `ft-reload` 핸들러 로직(95-init.js:28-63)을 함수화: 미저장이면 `"refused"`(저장 시작 + `toast(t("reload.refused"))`), 아니면 **페이지 리로드 대신** `destroy()`→`init()`(호스트)·`location.reload()`(standalone). 호스트에서 `keepUnsaved=false`면 미저장 무시하고 재적재(사용 금지: 호출자는 T3가 아니라 사용자 확인 대화상자를 거친 T2만). 어느 경로든 **보기 상태(필터·검색·정렬·묶기·선택·활성 카드·그리드 스크롤·Undo/Redo 저널)를 보존**한다(§11.1, U4). |
 | postMessage 호환 | 레거시 iframe(§9.3)을 위해 `ft-theme/ft-locale/ft-reload/ft-embed` 메시지 핸들러는 standalone 모드에서 유지한다. 호스트 모드에서는 등록하지 않는다. |
 
 ### 3.2 이벤트 (CustomEvent 이름 / detail / 리스너)
@@ -261,12 +262,14 @@ window.FTViewer = {
 | `request-popout` | `{}` | 뷰어 `btnPopPlayer` 클릭 | 23-popout(T2: 셸이 `popout()`를 대신 호출하고 본 창 영상을 접음) |
 | `popout` | `{ open: boolean }` | 팝업 창 열림/닫힘 감지 | 23-popout, 01-store |
 | `toast` | `{ message, kind }` | 뷰어 `toast()` 호출 | 20-net(T2) — 호스트 모드에서만 셸이 표시 |
-| `error` | `{ message, detail, stage: "load"|"save"|"export" }` | 로더 실패·저장 실패 | 01-store(배너), 31-progress |
+| `error` | `{ message, detail, stage: "load"|"save"|"export", auth? }` | 로더 실패·저장 실패. `auth: true` = 서버가 401로 거부(쿠키 없음·만료, U8) | 01-store(배너), 31-progress, 22-viewer-host(`auth`면 `noteAuthExpired()`) |
+| `derived-job` | `{ kind: "join", id, state: "started"|"running"|"done"|"failed"|"cancelled", started_unix }` | 뷰어 안에서 시작한 파생 작업(이어붙이기)의 시작·상태 변화(80-review.js `emitDerivedJob`) | 22-viewer-host → 31-progress `noteViewerDerivedJob`: 실행 중엔 빠르게 폴링, `done`이면 5 s 유휴 폴링이 실행을 못 봤어도 '새 데이터 반영'을 제안 |
 | `destroyed` | `{}` | destroy 완료 | 22-viewer-host |
 
 ### 3.3 BroadcastChannel
 
 - `ft-review` (T2 23-popout.js, 세션 단위, 이름 고정 `"ft-review"`): 메시지 `{ type: "popout-open"|"popout-closed"|"theme"|"locale"|"project-changed", caseDir, value, from: instanceId }`. 수신자: 같은 origin의 다른 셸 탭·팝아웃 창. 쓰기는 **본 창(셸)만**: 팝아웃은 마크를 직접 저장하지 않고 `ft-player:<case_id>`(기존 70-player.js 브리지, 불변)로 본 창에 위임한다 → "단일 writer"는 구조적으로 보장된다.
+- `ft-alive:<case_id>` (save protocol v2, 30-records.js `openAliveChannel`): 같은 origin의 창끼리 `{type:"ping", nonce, writers[], from}` / `{type:"pong", nonce, writer}`. 다른 writer의 드래프트를 넘겨받기 전에(하트비트 `ft.alive:<case>:<writer>`가 5분 넘게 멈췄을 때) 그 창이 살아 있는지 묻는다 — 응답하면 드래프트를 건드리지 않는다(§11.2).
 - `ft-player:<case_id>` (T5, 불변): 팝업 플레이어 ↔ 본 창 브리지(`focus/navigate/mark/toggleTag/list/undo/redo`). 모든 요청은 `token`(= 팝업을 연 창의 `FTViewer.writerToken`)을 담아야 하며, 토큰이 일치하는 창만 응답한다.
 
 ---
@@ -288,7 +291,7 @@ const FTStore = {
     panels:   { jobs: false, finalize: false, project: false, tools: false, help: false },
     popout:   { open: false, writer: "main" },           // writer는 항상 "main"(팝아웃은 writer가 아님)
     viewer:   { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, locale: "ko", theme: "light", live: false, liveGeneration: null, canReload: true },
-    server:   { instance: "", lost: false, failures: 0 },
+    server:   { instance: "", lost: false, auth: false, failures: 0 },   // auth: lost의 원인이 401(브라우저 인증 만료, U8)
     env:      null,                                      // /api/env 응답
   },
   get(path) , set(patch /* 얕은 병합, 키별 */) , on("change", fn /* ({keys:Set<string>}) */), off(),
@@ -510,11 +513,13 @@ const FTStore = {
 | `Alt+P` | 프로젝트 팝오버 토글 | 셸 97-shell.js, `event.code === "KeyP"` + altKey, AltGraph 제외, 텍스트 필드 제외 | 브라우저 예약 아님(Chrome/Edge) |
 | `Alt+J` | 작업 시트 토글 | 동일 | |
 | `Alt+R` | 결과물 시트 토글(프로젝트 없으면 토스트) | 동일 | |
-| `Esc` | 순서: ① 셸 대화상자(자체) ② 뷰어 열린 메뉴(window capture, 80-review.js:1077) ③ 뷰어 모달/팔레트 ④ 결과물 시트 ⑤ 작업 시트 ⑥ 셸 팝오버 ⑦ 최신 토스트 ⑧ 뷰어 모드(시어터/전체화면) | 셸은 `document` bubble 단계에서 `e.defaultPrevented`면 중단 | 각 단계는 처리 시 `preventDefault()` |
+| `Esc` | 순서: ① 셸 대화상자(자체) ② 뷰어 열린 메뉴(window capture, 80-review.js:1077) ③ 뷰어 모달/팔레트 ④ 결과물 시트 ⑤ 작업 시트 ⑥ 셸 팝오버 ⑦ 최신 토스트 ⑧ 뷰어 모드(시어터/전체화면) | 셸은 `document` bubble 단계에서 `e.defaultPrevented`면 중단 | 각 단계는 처리 시 `preventDefault()`. **한 번 누르면 한 층만**(U13): 뷰어 전역 핸들러도 필터 컨트롤 blur → 단축키 시트 → 최신 토스트 1개 → 시어터 중 하나만 처리 |
 | `Tab` | 순서: skiplink → 상단 띠 → (빈 상태 열 | 뷰어 topbar → 레일 → 그리드 → 미디어 → 선택 바) → 열린 시트 | 시트(결과물)는 트랩 | |
 | `F6` | 영역 순환: 상단 띠 → 레일 → 그리드 → 미디어 → 선택 바 → (시트) | 셸 97-shell.js(신규, 선택) | 미구현 시 생략 가능 — 계약상 "권장" |
 
 충돌 규칙:
+0. **IME·CapsLock (U6)**: 뷰어 전역 핸들러(80-review.js)와 팝아웃 플레이어는 `shortcutKey(event)`로 키를 읽는다. `event.key`가 라틴 1글자면 그대로(AZERTY 등 배열 존중), 한글 자모(`"ㅓ"`)·`"Process"`·`"Unidentified"`면 `event.code`(`KeyJ`→`j`, `Digit1`→`1`, `Comma`/`Period`/`BracketLeft`/`BracketRight`, Shift+`Slash`→`?`)로 정한다. 글자의 대소문자는 **Shift만** 따른다(CapsLock+j = j, Shift+j = J 셔틀) — 예전 70-player.js의 capture 정규화 리스너는 이것으로 대체됐다. Ctrl+Z/Y/A/D도 같은 함수로 읽는다. 입력칸 포커스·AltGr·Alt 조합 무시 규칙은 그대로다. 뷰어 모달(`.modal-backdrop:not([hidden])`)이 열려 있으면 Esc 외의 뷰어 단축키는 동작하지 않는다. 하네스: verify-player-keys(`key:"ㅓ"`/`"Process"` + `code:"KeyJ"` 등).
+0. 셸 `hDialogOpen()`은 셸 대화상자·경로 선택기 외에 **뷰어 모달**(`#ftViewer .modal-backdrop:not([hidden])`: 단축키 시트, 뷰어 대화상자, 명령 팔레트)도 포함한다(U12) — 그 위에서 Alt+P/J/R·Esc는 셸이 처리하지 않는다(verify-layout 9번).
 1. 뷰어 전역 핸들러는 `isTypingTarget(activeElement)` 외에 **`activeElement.closest('[data-keys="off"]')`가 있으면 return**(T5가 80-review.js:474·70-player.js:377·40-grid.js:983 세 곳에 추가). `data-keys="off"`는 `#inputCard`, `.h-sheet`, `.h-pop`, `.h-modal-backdrop`, `#hPopoutNote`에 T2가 붙인다. 상단 띠 버튼은 keys-off가 아니다(시트를 닫고 opener로 돌아와도 `j/k`가 즉시 동작).
 2. 셸 핸들러는 Alt+문자·Esc만 가진다. 뷰어는 Alt 조합을 무시(80-review.js:490)하므로 이중 발동이 없다.
 3. 셸 텍스트 입력(`sourcePath`, `caseDir`, `finalExaminer`, `advPath`, `pickerPath`)은 `isTypingTarget`로 자동 보호된다.
@@ -605,3 +610,35 @@ const FTStore = {
 1. **판독 바: 전폭 하단 44px 유지(기본안 채택).** 뷰어 id·standalone 동등성·레이아웃 시프트 0을 지킨다. 다중 선택 시에도 같은 바를 쓴다.
 2. **결과물: 열리되 차단 표시(기본안 채택).** `review-partial`에서는 체크리스트 첫 행에 "분석 보강 중"을 block으로 보이고 `btnFinalize`는 사유 툴팁과 함께 비활성.
 3. **보고서 범례: 추가한다.** T4가 `src/report.rs`(머리말 note 옆)에 "판독 마크 범례: 판독완료 = 회색 체크 · 중요 = 호박색 깃발 · 검증대기 = 보라 물음표" 한 줄과 테스트 1개를 추가한다.
+
+
+## 11. 3단계 트랙 C 추가 계약 (2026-10-13)
+
+### 11.1 리로드가 보기를 보존 (U4)
+- 보존 대상: `query`(입력칸 원문 포함), `kind`, `status`, `chip`, `calMonth`, `sortBy`, `groupBy`, `dateFrom/To`, `recType`, `audio`, `chipsExpanded`, `pageSize`, `currentPage`, `collapsedGroups`, `selectedIds`, `activeId`, `#recordGrid.scrollTop`, Undo/Redo 저널(95-init.js `viewerViewState` / `viewerApplyViewState`).
+- 전달: 호스트는 `reload()`가 destroy 전에 `impl.viewState()`를 받아 `init({ restore })`로 넘긴다. standalone(페이지 리로드·레거시 `ft-reload`)은 `sessionStorage["ft.viewer.<case>.reloadView"]`에 한 번 저장하고 다음 부팅이 읽고 지운다(용량 초과면 저널 없이 재시도).
+- 걸러내기: 사라진 레코드 id는 선택·활성에서 빠진다. 저널은 맨 위(다음 Ctrl+Z/Y)부터 내려가며 가상 현재값에 재생해, **그 레코드가 여전히 그 항목이 남긴 값**(undo: `after`, redo: `before`; 마크는 상태만, 메모·태그·구간은 정규화 비교)일 때만 남긴다. 다른 창·서버가 바꾼 필드는 그 필드의 더 깊은 항목까지 버린다 — 오래된 Ctrl+Z가 남의 변경을 덮지 않는다.
+- 저장 상태와 무관: 리로드는 미저장이 없을 때만 일어나고(`viewerReloadBlocker`), 드래프트·dirty·충돌은 평소 부팅처럼 저장소에서 수화된다. 보존 코드는 `state.drafts`·`dirtyIds`·`conflictIds`를 건드리지 않으며, 되살린 저널의 Undo/Redo는 일반 경로(`touchAnnotation` → 드래프트 → 저장)를 탄다. 하네스: verify-viewer-undo(standalone), verify-virtual-grid(스크롤·검색), verify-layout 10번(호스트).
+
+### 11.2 드래프트 키·생존 확인·저장 대기 (save protocol v2 정리)
+- 드래프트는 **레코드 id마다 한 키**: `ft.draft.<case>.<writer>.<id>` = `{ mark, note, tags, examiner, range, seq, base, conflict? }`(30-records.js). 창(writer = `FTViewer.writerToken`)은 자기 키만 쓴다. 쓰기는 250 ms 디바운스 1회 flush. 예전 단일 키 `ft.viewer.<case>.annotations.v1`은 부팅 때 한 번 이관(base 0 → 서버 값과 다르면 충돌로 표시).
+- 생존: 각 창이 5 s마다 `ft.alive:<case>:<writer>`에 시각을 쓰고, 정상 종료(pagehide)는 `"closed"`. 닫힌 창의 드래프트는 즉시, 5분 넘게 멈춘 창의 드래프트는 `ft-alive:<case>` ping(1.5 s)에 응답이 없을 때만 넘겨받는다(§3.3).
+- `FTViewer._whenSaveSettled(ms)`(§3): 22-viewer-host 언마운트가 진행 중 저장의 응답을 기다린 뒤 destroy — 응답이 다음 마운트와 경합하지 않는다.
+
+### 11.3 알림 행 (notices grid row)
+- `#ftViewer > .ft-notices`(grid-area `notice`, controls.css): 구간 불일치 배너 `#rangeDivergenceBanner`, 저장 충돌 배너 `#markConflictBanner` + 목록 `#markConflictPanel`, 다른 주소 드래프트 알림 `#originDraftsNotice`(§11.4)가 이 한 행에 쌓인다. 비면 `display:none`. 색은 `--warn-bg`/`--warn`/`--text`(두 테마 AA).
+
+### 11.4 포트(원점)가 바뀐 경우의 드래프트 (U9) — 한계 포함
+- 브라우저 저장소(localStorage)는 원점(scheme+host+**port**)마다 따로다. 브라우저 모드는 8477이 막히면 8478…으로, WebView2 창은 **실행마다 새 포트**(src/shell.rs `reserve_port`, 포트 0)를 쓴다 → 이전 실행의 저장 안 된 드래프트는 새 원점에서 보이지 않고, 어떤 브라우저 API로도 다른 원점의 저장소를 읽을 수 없다.
+- 클라이언트 최선책: 쿠키는 포트와 무관하게 호스트 단위로 공유되므로, 이 원점에 그 케이스의 드래프트가 있는 동안 쿠키 `ft_draft_ports=<port>.<case hash>-…`(FNV-1a 8자리, 케이스 id·경로 원문 없음, `SameSite=Strict`, 60일, 최대 24개; 서버는 읽지 않음)에 표식을 둔다(90-sync.js `noteOriginDrafts`, flush마다). 그 원점에서 케이스 드래프트가 모두 사라지면 표식을 지운다. 부팅 때 **같은 케이스·다른 포트** 표식이 있으면 알림 행에 "다른 주소(127.0.0.1:PORT)의 브라우저 저장소에 남아 있을 수 있음 — 같은 주소로 다시 열면 그 창이 복원"을 `role=status`로 보이고, [알림 닫기]가 그 표식을 지운다.
+- 한계: "있을 수 있음"까지만 말한다 — 그 저장소가 이후 지워졌는지는 알 수 없다. 이 빌드 이후의 창만 표식을 쓴다. `127.0.0.1`과 `localhost`는 다른 호스트라 서로 보이지 않는다. 쿠키가 막힌 브라우저에서는 알림이 없다. 드래프트를 실제로 되살리려면 그 포트로 서버를 다시 띄워야 한다(WebView2 창은 포트를 고를 수 없음 — 실행 간 고정 선호 포트는 트랙 A(Rust) 몫, 미해결).
+
+### 11.5 401 = 브라우저 인증 만료 (U8)
+- 셸 `readJson`(20-net.js)은 401이면 `{ok:false, status:401, auth:true, error:"브라우저 인증이 만료되었습니다 — 워크스테이션 창에서 다시 여십시오"}`를 돌려주고 `noteAuthExpired()`(40-status.js)를 부른다. 상태 폴링의 401도 같다(3회 실패 대기 없이 즉시). 배너는 "서버 연결 끊김" 대신 "브라우저 인증이 만료되었습니다" + [페이지 다시 열기](= 새로 고침: 무토큰 모드에선 GET이 nonce 쿠키를 다시 심음; 토큰 모드는 워크스테이션 창이 `?token=`으로 연다). 다음 정상 폴링에서 원래 모습으로 돌아간다. 스토어 `server.auth`.
+- 뷰어 저장의 401: 저장 상태·토스트가 같은 문구(i18n `save.authExpired`), 드래프트는 그대로, 자동 재시도는 계속. `error` 이벤트 `auth:true` → 호스트 배너. 로더(99-loader.js)의 401도 같은 문구, 라이브 칩은 "상태 확인 실패" 대신 인증 안내.
+
+### 11.6 기타
+- U7: 마크·태그 칩 필터의 메모 키에 `annotationGen`(30-records.js `bumpAnnotations`: `touchAnnotation`, 드래프트 재생, 수화, 서버 값 적용 때 증가)을 넣어, 그 필터에서도 j/k는 필터·정렬을 다시 계산하지 않는다.
+- U10: 요약 보고서는 `case_id`를 제목·머리줄 모두 이스케이프하고 파일 이름은 `safeFileName`. 재생 속도는 저장된 레이아웃 값을 0.25–4 범위의 수로 정규화하고, 팝아웃 인라인 스크립트에는 `RATES`에 있는 값만 `jsLit`으로 넣는다.
+- U14: 가상 그리드는 `#recordGrid[role=grid][aria-rowcount] > .vspacer[role=rowgroup] > .vrow|.group-header[role=row][aria-rowindex] > [role=gridcell]`(axe `aria-required-children`/`-parent` 통과, verify-virtual-grid).
+- 촬영 시각 표기(트랙 B 보고서와 일치): 파일 이름의 시각은 **기기 시계의 시각(시간대 미상)** — 상세·요약 보고서에 "(기기 기록 시각, 시간대 미상)", 날짜만이면 "(파일 이름의 날짜만 · 기기 기록, 시간대 미상)"; 내보내기(JSON·CSV)는 오프셋 없는 `YYYY-MM-DDTHH:mm:ss`(Z 없음)와 JSON `rec_time_basis`(`device-clock-naive`|`device-clock-date`|`file-mtime`). 파일 수정 시각처럼 실제 순간인 값만 `UTC±HH:MM`(이 컴퓨터 기준)과 "(추정)"을 붙인다. 요약 보고서 생성 시각도 `UTC±HH:MM`. 그리드 카드의 짧은 시각(공간 부족)은 표식 없이 그대로다.

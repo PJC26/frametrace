@@ -188,6 +188,37 @@ function fmtUnix(value) {
   return new Date(value * 1000).toLocaleString();
 }
 
+// Recording-time text with an explicit time basis (same rule as the case
+// report's "UTC (현지 … UTC±HH:MM)" for real instants):
+//   name       the device's clock as written in the file name — a wall
+//              time with NO known zone (parseTimeFromName builds it as a
+//              browser-local date only to sort/bucket it): shown as is,
+//              labelled "기기 기록 시각, 시간대 미상", never with an offset.
+//   name-date  the same, date only.
+//   mtime      a real instant (file modification time): this computer's
+//              local time with its UTC offset, marked as an estimate.
+// opts.iso: machine form for exports — naive "YYYY-MM-DDTHH:mm:ss" (no Z),
+// an instant as ISO 8601 with its offset.
+function recTimeParts(unix) {
+  const d = new Date(unix * 1000);
+  const p = n => String(n).padStart(2, "0");
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? "+" : "-";
+  return {
+    date: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`,
+    time: `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`,
+    offset: `${sign}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`
+  };
+}
+function recTimeText(record, opts) {
+  if (!record || !Number.isFinite(record.recTime)) return "";
+  const iso = !!(opts && opts.iso);
+  const { date, time, offset } = recTimeParts(record.recTime);
+  if (record.recSource === "name-date") return iso ? date : `${date} ${t("time.naiveDate")}`;
+  if (record.recSource === "name") return iso ? `${date}T${time}` : `${date} ${time} ${t("time.naive")}`;
+  return iso ? `${date}T${time}${offset}` : `${date} ${time} UTC${offset} ${t("detail.est")}`;
+}
+
 function normalizePath(value) {
   let text = String(value || "");
   if (text.slice(0, 4).toLowerCase() === EXT_PREFIX) text = text.slice(4);
@@ -818,6 +849,13 @@ const state = {
   audio: "",
   collapsedGroups: new Set()
 };
+// The stored layout is browser data: a playback rate is only ever a finite
+// number in the player's range (U10), never a string carried into
+// video.playbackRate or the pop-out player's inline script.
+{
+  const r = Number(state.layout.rate);
+  state.layout.rate = Number.isFinite(r) && r >= 0.25 && r <= 4 ? r : 1;
+}
 
 // --- Drafts (docs/FIX_PLAN_R1_2026-10-13.md §1.6, §10.3) --------------------
 // A draft is the full annotation of one record as this window last edited
@@ -843,6 +881,11 @@ var draftAdoptedFrom = new Map(); // id -> the dead writer's key, removed once o
 var draftRangesDirty = false;     // RANGES_KEY joins the flush (the server seeds it on boot)
 var draftsUnpersisted = false;    // the last flush could not be stored (quota) — warn before unload
 var restoredConflictIds = [];     // adopted drafts that carry a conflict (90-sync registers them)
+// Bumped on every write of state.marks / notes / tags (touchAnnotation, a
+// replayed draft, hydration, a server value applied by 90-sync): the
+// filter memo of the mark/tag chips keys on it (40-grid filterStateKey, U7).
+var annotationGen = 0;
+function bumpAnnotations() { annotationGen += 1; }
 const DRAFT_FLUSH_MS = 250;
 const DRAFT_PREFIX = "ft.draft." + (manifest.case_id || "case") + ".";
 const ALIVE_PREFIX = "ft.alive:" + (manifest.case_id || "case") + ":";
@@ -1011,6 +1054,7 @@ function flushDraftsNow(quiet) {
     draftsUnpersisted = false;
   }
   if (draftRangesDirty && storageSet(RANGES_KEY, state.ranges)) draftRangesDirty = false;
+  if (typeof noteOriginDrafts === "function") noteOriginDrafts();
   if (!quiet && typeof renderSaveState === "function") renderSaveState();
 }
 
@@ -1020,6 +1064,7 @@ function flushDraftsNow(quiet) {
 // to the server's revision). An id with an open conflict stays in conflict
 // (its "mine" follows the edit) until the examiner resolves it.
 function touchAnnotation(id, opts) {
+  if (typeof bumpAnnotations === "function") bumpAnnotations();
   state.examiners[id] = (state.examiner || "").trim() || state.examiners[id] || null;
   const prev = state.drafts[id];
   const known = state.revisions && Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
@@ -1050,6 +1095,7 @@ function dropDraft(id) {
 
 // Replays one stored draft's values into the in-memory annotation maps.
 function applyDraftValues(id, draft) {
+  if (typeof bumpAnnotations === "function") bumpAnnotations();
   if (draft.mark) state.marks[id] = draft.mark;
   else delete state.marks[id];
   state.notes[id] = draft.note || "";
@@ -1100,6 +1146,7 @@ function annotationMarkId(mark) {
 var skippedDraftWriters = new Set();
 
 function hydrateAnnotations(annotations) {
+  if (typeof bumpAnnotations === "function") bumpAnnotations();
   state.marks = {}; state.notes = {}; state.tags = {}; state.examiners = {};
   state.revisions = {};
   for (const [id, rev] of Object.entries(annotations.revisions || {})) {

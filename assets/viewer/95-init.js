@@ -38,6 +38,63 @@ async function viewerReloadBlocker() {
   }
   return "";
 }
+// U4: what the examiner was looking at survives a reload — filters, search,
+// sort/group, selection, the active card, the grid scroll and the undo
+// journal (80-review journalExport/journalImport). Only view state: the
+// reload itself runs only when nothing is unsaved (viewerReloadBlocker), and
+// drafts / dirty ids / conflicts come back from storage through hydration
+// as on any boot. Hosted: FTViewer.reload() hands it to the next init()
+// (opts.restore); standalone (a page reload): one sessionStorage entry that
+// the next boot of the same case consumes.
+const VIEW_STASH_KEY = "ft.viewer." + (manifest.case_id || "case") + ".reloadView";
+const VIEW_STRING_FIELDS = ["query", "kind", "status", "chip", "calMonth", "sortBy", "groupBy", "dateFrom", "dateTo", "recType", "audio"];
+function viewerViewState() {
+  const view = { v: 1, caseId: manifest.case_id || "", queryText: els.query ? els.query.value : "" };
+  for (const field of VIEW_STRING_FIELDS) view[field] = String(state[field] || "");
+  view.activeId = state.activeId;
+  view.selectedIds = [...state.selectedIds];
+  view.collapsedGroups = [...state.collapsedGroups];
+  view.chipsExpanded = !!state.chipsExpanded;
+  view.pageSize = state.pageSize;
+  view.currentPage = state.currentPage;
+  view.scrollTop = els.recordGrid ? els.recordGrid.scrollTop : 0;
+  view.journal = journalExport();
+  return view;
+}
+function viewerApplyViewState(view) {
+  if (!view || view.v !== 1 || view.caseId !== (manifest.case_id || "")) return false;
+  for (const field of VIEW_STRING_FIELDS) if (typeof view[field] === "string") state[field] = view[field];
+  if (typeof view.chipsExpanded === "boolean") state.chipsExpanded = view.chipsExpanded;
+  if (Number.isFinite(view.pageSize) && view.pageSize > 0) state.pageSize = view.pageSize;
+  if (Number.isFinite(view.currentPage) && view.currentPage > 0) state.currentPage = view.currentPage;
+  state.selectedIds = new Set((Array.isArray(view.selectedIds) ? view.selectedIds : []).filter(id => recordById.has(id)));
+  state.collapsedGroups = new Set((Array.isArray(view.collapsedGroups) ? view.collapsedGroups : []).map(String));
+  if (view.activeId != null && recordById.has(view.activeId)) state.activeId = view.activeId;
+  // The controls show what the state now filters by.
+  if (els.query) els.query.value = typeof view.queryText === "string" ? view.queryText : state.query;
+  const setSelect = (el, value) => { if (el) el.value = value; };
+  setSelect(els.kind, state.kind);
+  setSelect(els.status, state.status);
+  setSelect(els.sortBy, state.sortBy);
+  setSelect(els.groupBy, state.groupBy);
+  setSelect(els.pageSize, String(state.pageSize));
+  setSelect(els.dateFrom, state.dateFrom);
+  setSelect(els.dateTo, state.dateTo);
+  journalImport(view.journal);
+  return true;
+}
+function viewerStashViewState() {
+  let view = null;
+  try { view = viewerViewState(); } catch (e) { return; }
+  try { sessionStorage.setItem(VIEW_STASH_KEY, JSON.stringify(view)); return; } catch (e) { /* quota: retry without the journal */ }
+  try { view.journal = null; sessionStorage.setItem(VIEW_STASH_KEY, JSON.stringify(view)); } catch (e) { /* storage blocked: a plain reload */ }
+}
+function viewerTakeStashedViewState() {
+  let raw = null;
+  try { raw = sessionStorage.getItem(VIEW_STASH_KEY); sessionStorage.removeItem(VIEW_STASH_KEY); } catch (e) { raw = null; }
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
 function viewerRefuseReload(blocker) {
   if (blocker === "unsaved" && viewerIsServed && !saveInFlight) syncMarksNow();
   toast(t("reload.refused"));
@@ -76,6 +133,7 @@ if (!ftHosted) {
       return;
     }
     answer(true, "");
+    viewerStashViewState();
     location.reload();
   }, { signal: ftSignal });
   // The legacy shell pushes theme / language into the framed viewer. Same
@@ -143,6 +201,8 @@ function viewerFocus() {
 FTViewer._attach({
   reloadBlocker: viewerReloadBlocker,
   refuseReload: viewerRefuseReload,
+  viewState: viewerViewState,
+  stashViewState: viewerStashViewState,
   setLocale: viewerSetLocale,
   getLocale: () => state.locale,
   syncTheme: syncThemeBtn,
@@ -217,7 +277,17 @@ FTViewer._attach({
 });
 const viewerSummaryHook = window.__frametraceSummary;
 applyLayout();
+// U4: a reload brings back what the examiner was looking at (hosted: the
+// state FTViewer.reload() captured; standalone: the stashed copy).
+const restoredView = opts.restore || viewerTakeStashedViewState();
+const viewRestored = restoredView ? viewerApplyViewState(restoredView) : false;
 render();
+if (viewRestored && Number.isFinite(restoredView.scrollTop) && restoredView.scrollTop > 0 && els.recordGrid) {
+  const top = restoredView.scrollTop;
+  els.recordGrid.scrollTop = top;
+  // The virtual grid may size its spacer a frame later (ResizeObserver).
+  requestAnimationFrame(() => { if (!ftSignal.aborted && els.recordGrid.scrollTop !== top) els.recordGrid.scrollTop = top; });
+}
 FTViewer._emit("records", { total: records.length, byKind: viewerSummary().byKind, byStatus: viewerSummary().byStatus, generation: DATA.liveIndex ? DATA.liveIndex.generation : null });
 FTViewer._emit("ready", { total: records.length, live: !!DATA.liveIndex, generation: DATA.liveIndex ? DATA.liveIndex.generation : null });
 // The measured-sound log could not be read: say so once per case and

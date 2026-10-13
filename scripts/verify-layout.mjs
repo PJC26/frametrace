@@ -343,6 +343,52 @@ try {
         const a1 = await panels();
         check('keys: Alt+1 does nothing (no stages)', !a1.project && !a1.jobs && !a1.finalize && page.url() === url0 && await page.locator('#hViewerHost').isVisible());
         await page.locator('#sourcePath').evaluate(() => {}).catch(() => {});
+
+        // 9. U12: a viewer modal blocks the shell's Alt+P/J/R; Esc is the
+        //    modal's (one layer) and leaves the shell alone.
+        await page.locator('#recordGrid .card').first().click();
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.keyboard.press('Shift+Slash');
+        const modalUp = await page.evaluate(() => !document.getElementById('shortcutsModal').hidden);
+        await page.keyboard.press('Alt+KeyJ');
+        await page.keyboard.press('Alt+KeyP');
+        const underModal = await panels();
+        check('keys: Alt+J / Alt+P do nothing while a viewer modal is open', modalUp && !underModal.jobs && !underModal.project, JSON.stringify({ modalUp, underModal }));
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.keyboard.press('Alt+KeyR');
+        check('keys: Alt+R does nothing while a viewer modal is open (focus on body)', !(await panels()).finalize);
+        await page.keyboard.press('Escape');
+        const afterEsc = await page.evaluate(() => !document.getElementById('shortcutsModal').hidden);
+        check('keys: Esc closes the viewer modal only', !afterEsc && !Object.values(await panels()).some(Boolean));
+
+        // 10. U4 hosted: FTViewer.reload() (destroy + init in place) keeps
+        //     the search, the active card and the selection.
+        await page.locator('#query').fill('front');
+        await sleep(400);
+        await page.locator('#recordGrid .card').nth(1).click();
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.keyboard.press('x');
+        const vBefore = await page.evaluate(() => ({ active: document.querySelector('#recordGrid .card.active')?.dataset.id, count: document.getElementById('resultCount').textContent, sel: [...document.querySelectorAll('#recordGrid .card input[type="checkbox"]:checked')].map((c) => c.closest('.card').dataset.id) }));
+        const reloaded = await page.evaluate(() => FTViewer.reload({ reason: 'test' }));
+        await until(() => cardCount(page), 20000);
+        await sleep(400);
+        const vAfter = await page.evaluate(() => ({ active: document.querySelector('#recordGrid .card.active')?.dataset.id, count: document.getElementById('resultCount').textContent, query: document.getElementById('query').value, sel: [...document.querySelectorAll('#recordGrid .card input[type="checkbox"]:checked')].map((c) => c.closest('.card').dataset.id) }));
+        check('hosted reload keeps search, active card and selection', reloaded === 'reloaded' && vAfter.query === 'front' && vAfter.count === vBefore.count && vAfter.active === vBefore.active && JSON.stringify(vAfter.sel) === JSON.stringify(vBefore.sel) && vBefore.sel.length === 1, JSON.stringify({ reloaded, vBefore, vAfter }));
+        await page.keyboard.press('x').catch(() => {});
+        await page.locator('#query').fill('');
+
+        // 11. U8: a 401 from the status poll is "authorization expired —
+        //     reopen", never "server down"; the next good poll clears it.
+        await page.route('**/api/status*', (route) => route.fulfill({ status: 401, contentType: 'application/json', body: '{"ok":false,"error":"unauthorized"}' }));
+        const authUp = await until(() => page.evaluate(() => {
+          const b = document.getElementById('serverBanner');
+          return !b.hidden && /브라우저 인증이 만료/.test(b.textContent) ? b.textContent : null;
+        }), 15000);
+        check('401: banner says authorization expired with a reopen action (not "server down")', !!authUp && !/연결 끊김/.test(authUp) && /다시 열기/.test(authUp), String(authUp));
+        await page.unroute('**/api/status*');
+        const authGone = await until(() => page.evaluate(() => document.getElementById('serverBanner').hidden), 15000);
+        const restored = await page.evaluate(() => document.getElementById('serverBanner').querySelector('b').textContent);
+        check('401: the next good poll clears the banner and restores its normal face', !!authGone && /연결 끊김/.test(restored), restored);
       }
       await context.close();
     }

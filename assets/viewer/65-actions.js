@@ -174,7 +174,9 @@ function exportItem(record) {
     tags: state.tags[record.id] || [],
     warnings: record.warnings || [],
     sha256: record.sha256 && record.sha256 !== "-" ? record.sha256 : "",
-    rec_time: isoTime(record.recTime),
+    // Naive device times carry no offset (no Z): see recTimeText.
+    rec_time: recTimeText(record, { iso: true }),
+    rec_time_basis: record.recTime == null ? "" : record.recSource === "mtime" ? "file-mtime" : record.recSource === "name-date" ? "device-clock-date" : "device-clock-naive",
     original_path: record.originalPath || "",
     note: record.note && record.note !== "-" ? record.note : "",
     ...audioExportFields(record)
