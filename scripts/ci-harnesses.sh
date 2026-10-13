@@ -29,6 +29,8 @@ harnesses=(
   "verify-progress"
   "verify-finalize-sheet"
   "verify-marks-roundtrip"
+  # Save protocol v2 (docs/FIX_PLAN_R1_2026-10-13.md §1.7): two windows, conflicts, chunked bulk saves.
+  "verify-marks-sync"
   # Adversarial-review regressions of the rebuilt shell (B1/B2/S1/S2/S4/S5).
   "verify-rebuild-regressions"
 )

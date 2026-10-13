@@ -376,12 +376,26 @@ function storageGet(key, fallback) {
   }
 }
 
+// Quota exhaustion (tens of thousands of drafts in one case) is reported
+// once per session; the live condition is tracked by draftsUnpersisted
+// (save indicator title + beforeunload warning), never by a toast storm.
+var storageQuotaToasted = false;
+function isQuotaError(error) {
+  return !!error && (error.name === "QuotaExceededError" || error.name === "NS_ERROR_DOM_QUOTA_REACHED" || error.code === 22 || error.code === 1014);
+}
 function storageSet(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
     return true;
   } catch (error) {
-    toast(tf("toast.storageFail", { err: error.message }));
+    if (isQuotaError(error)) {
+      if (!storageQuotaToasted) {
+        storageQuotaToasted = true;
+        toast(t("toast.storageQuota"));
+      }
+    } else {
+      toast(tf("toast.storageFail", { err: error.message }));
+    }
     return false;
   }
 }
@@ -616,7 +630,14 @@ const state = {
   selectedIds: new Set(),
   lastCheckedKey: null,
   drafts: storageGet(ANNOTATIONS_KEY, {}),
-  deletedIds: [],
+  // Record ids edited since the server last confirmed them (save protocol
+  // v2, docs/FIX_PLAN_R1_2026-10-13.md §1.6): the save payload is built
+  // from this set alone.
+  dirtyIds: new Set(),
+  // Per-record annotation revision the server reported last (records-meta /
+  // the exported bundle seed it; every applied save bumps it). Sent back as
+  // base_revisions so a stale window can never silently overwrite another.
+  revisions: {},
   examiners: {},
   marks: storageGet(MARKS_KEY, {}),
   notes: storageGet(NOTES_KEY, {}),
@@ -644,18 +665,131 @@ const state = {
   collapsedGroups: new Set()
 };
 
+// --- Drafts (docs/FIX_PLAN_R1_2026-10-13.md §1.6) ---------------------------
+// A draft is the full annotation of one record as this window last edited
+// it: { mark, note, tags, examiner, range, seq, writer }. `seq` is a
+// per-window counter (a save removes a draft only when the seq it sent is
+// still the current one, so an edit made mid-flight survives) and `writer`
+// is this window's FTViewer.writerToken: several windows on the same case
+// share ANNOTATIONS_KEY, and a window only ever rewrites its own entries.
+// Drafts are written to localStorage in one debounced flush (never per
+// edit), so a 30k-record bulk mark costs one serialisation, not 30k.
+var draftSeq = 0;
+var draftFlushTimer = null;
+var draftFlushKeys = new Set();   // ids whose storage entry must be (re)written or removed
+var draftRangesDirty = false;     // RANGES_KEY joins the flush (the server seeds it on boot)
+var draftsUnpersisted = false;    // the last flush could not be stored (quota) — warn before unload
+const DRAFT_FLUSH_MS = 250;
+const ALIVE_PREFIX = "ft.alive:" + (manifest.case_id || "case") + ":";
+const ALIVE_STALE_MS = 30000;
+
+function writerId() {
+  return (typeof FTViewer !== "undefined" && FTViewer.writerToken) || "";
+}
+function aliveKey(writer) {
+  return ALIVE_PREFIX + writer;
+}
+function writerAlive(writer) {
+  if (!writer || writer === writerId()) return writer === writerId();
+  let ts = NaN;
+  try { ts = Number(localStorage.getItem(aliveKey(writer))); } catch (error) { ts = NaN; }
+  return Number.isFinite(ts) && ts > 0 && Date.now() - ts < ALIVE_STALE_MS;
+}
+// A stored draft is this window's to replay when it wrote it (hosted
+// destroy()+init() keeps the token), when it predates writer tagging, or
+// when its writer stopped heart-beating (crash / closed window recovery).
+// A live other window's drafts are left alone — it will push them itself.
+function draftAdoptable(draft) {
+  return !!draft && (!draft.writer || draft.writer === writerId() || !writerAlive(draft.writer));
+}
+function nextDraftSeq() {
+  draftSeq += 1;
+  return draftSeq;
+}
+function draftRangeOf(id) {
+  const r = state.ranges && state.ranges[id];
+  return r && (Number.isFinite(r.in) || Number.isFinite(r.out))
+    ? { in: Number.isFinite(r.in) ? r.in : null, out: Number.isFinite(r.out) ? r.out : null }
+    : null;
+}
+
+function scheduleDraftFlush() {
+  if (draftFlushTimer) return;
+  const run = () => { draftFlushTimer = null; if (!ftSignal.aborted) flushDraftsNow(); };
+  draftFlushTimer = setTimeout(() => {
+    if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: DRAFT_FLUSH_MS * 2 });
+    else run();
+  }, DRAFT_FLUSH_MS);
+}
+
+// Writes only the entries this window changed since the last flush,
+// merged over what is stored (other windows' entries stay untouched).
+function flushDraftsNow(quiet) {
+  clearTimeout(draftFlushTimer);
+  draftFlushTimer = null;
+  if (draftFlushKeys.size) {
+    const stored = storageGet(ANNOTATIONS_KEY, {}) || {};
+    for (const id of draftFlushKeys) {
+      if (state.drafts[id]) stored[id] = state.drafts[id];
+      else delete stored[id];
+    }
+    if (storageSet(ANNOTATIONS_KEY, stored)) {
+      draftFlushKeys.clear();
+      draftsUnpersisted = false;
+    } else {
+      draftsUnpersisted = true;
+    }
+  }
+  if (draftRangesDirty && storageSet(RANGES_KEY, state.ranges)) draftRangesDirty = false;
+  if (!quiet && typeof renderSaveState === "function") renderSaveState();
+}
+
 function touchAnnotation(id) {
   state.examiners[id] = (state.examiner || "").trim() || state.examiners[id] || null;
-  const draft = {
+  state.drafts[id] = {
     mark: state.marks[id] || null,
     note: state.notes[id] || "",
     tags: state.tags[id] || [],
-    examiner: state.examiners[id]
+    examiner: state.examiners[id],
+    range: draftRangeOf(id),
+    seq: nextDraftSeq(),
+    writer: writerId()
   };
-  state.drafts[id] = draft;
-  state.deletedIds = [...new Set([...state.deletedIds, id])];
-  storageSet(ANNOTATIONS_KEY, state.drafts);
+  state.dirtyIds.add(id);
+  draftFlushKeys.add(id);
+  draftRangesDirty = true;
+  scheduleDraftFlush();
   markReviewDirty();
+}
+
+// Forgets a draft this window owns (the server confirmed it, or the
+// examiner took the server's value). Storage follows at the next flush.
+function dropDraft(id) {
+  delete state.drafts[id];
+  state.dirtyIds.delete(id);
+  draftFlushKeys.add(id);
+  scheduleDraftFlush();
+}
+
+// Replays one stored draft into the in-memory annotation maps and claims
+// it for this window (re-tagged with our writer token when it was another,
+// now-dead, window's).
+function adoptDraft(id, draft) {
+  if (draft.mark) state.marks[id] = draft.mark;
+  else delete state.marks[id];
+  state.notes[id] = draft.note || "";
+  state.tags[id] = Array.isArray(draft.tags) ? draft.tags : [];
+  state.examiners[id] = draft.examiner ?? null;
+  if (Object.prototype.hasOwnProperty.call(draft, "range")) {
+    if (draft.range) state.ranges[id] = { ...draft.range };
+    else delete state.ranges[id];
+    draftRangesDirty = true;
+  }
+  if (Number.isFinite(draft.seq)) draftSeq = Math.max(draftSeq, draft.seq);
+  const mine = draft.writer === writerId();
+  state.drafts[id] = mine ? draft : { ...draft, writer: writerId(), seq: nextDraftSeq() };
+  if (!mine) draftFlushKeys.add(id);
+  state.dirtyIds.add(id);
 }
 
 // Case-DB rows (records-meta, the exported bundle) key marks by `record_id`;
@@ -665,8 +799,16 @@ function annotationMarkId(mark) {
   return mark ? (mark.id || mark.record_id || "") : "";
 }
 
+// Writers whose stored drafts were skipped at boot because they were still
+// alive; the heartbeat tick adopts them once their heartbeat goes stale.
+var skippedDraftWriters = new Set();
+
 function hydrateAnnotations(annotations) {
   state.marks = {}; state.notes = {}; state.tags = {}; state.examiners = {};
+  state.revisions = {};
+  for (const [id, rev] of Object.entries(annotations.revisions || {})) {
+    if (Number.isFinite(Number(rev))) state.revisions[id] = Number(rev);
+  }
   for (const mark of annotations.marks || []) {
     const id = annotationMarkId(mark);
     if (!id) continue;
@@ -675,15 +817,39 @@ function hydrateAnnotations(annotations) {
     state.examiners[id] = mark.examiner || null;
   }
   for (const entry of annotations.tags || []) state.tags[entry.id] = entry.tags;
-  state.deletedIds = [];
-  for (const [id, draft] of Object.entries(state.drafts)) {
-    if (draft.mark) state.marks[id] = draft.mark;
-    else delete state.marks[id];
-    state.notes[id] = draft.note;
-    state.tags[id] = draft.tags;
-    state.examiners[id] = draft.examiner;
-    state.deletedIds.push(id);
+  state.dirtyIds = new Set();
+  const stored = state.drafts && typeof state.drafts === "object" ? state.drafts : {};
+  state.drafts = {};
+  skippedDraftWriters = new Set();
+  for (const [id, draft] of Object.entries(stored)) {
+    if (!draft || typeof draft !== "object") continue;
+    if (!draftAdoptable(draft)) { skippedDraftWriters.add(draft.writer); continue; }
+    adoptDraft(id, draft);
   }
+  if (draftFlushKeys.size) scheduleDraftFlush();
+}
+
+// Heartbeat tick: drafts of a window that stopped heart-beating (crash,
+// closed without pagehide) are adopted here, so recovery never waits for
+// the next page load.
+function adoptOrphanDrafts() {
+  if (!skippedDraftWriters.size) return 0;
+  const dead = [...skippedDraftWriters].filter(writer => !writerAlive(writer));
+  if (!dead.length) return 0;
+  dead.forEach(writer => skippedDraftWriters.delete(writer));
+  const stored = storageGet(ANNOTATIONS_KEY, {}) || {};
+  let adopted = 0;
+  for (const [id, draft] of Object.entries(stored)) {
+    if (!draft || !dead.includes(draft.writer) || state.drafts[id]) continue;
+    adoptDraft(id, draft);
+    adopted += 1;
+  }
+  if (adopted) {
+    scheduleDraftFlush();
+    markReviewDirty();
+    if (typeof requestRender === "function") requestRender();
+  }
+  return adopted;
 }
 
 hydrateAnnotations(DATA.annotations || { marks: [], tags: [] });

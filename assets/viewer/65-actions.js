@@ -101,16 +101,16 @@ function applyTag(tag) {
     state.tags[id] = list;
     touchAnnotation(id);
   });
-  storageSet(TAGS_KEY, state.tags);
   requestRender();
   toast(tf("toast.tagApplied", { n: ids.length, tag }));
 }
 
+// Dropping the id from state.tags makes the draft carry tags: [] — the
+// v2 payload sends that explicitly, so "all tags removed" reaches the DB.
 function clearTags() {
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   ids.forEach(id => { delete state.tags[id]; touchAnnotation(id); });
-  storageSet(TAGS_KEY, state.tags);
   requestRender();
   toast(tf("toast.tagCleared", { n: ids.length }));
 }
