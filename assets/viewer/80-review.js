@@ -115,6 +115,20 @@ function applyJournalSide(changes, side) {
   }
 }
 
+// A resolved save conflict (90-sync resolveConflicts) is the examiner's
+// decision for those ids: undo/redo must not replay an older value of
+// theirs over it, so their journal changes go (an entry left with no
+// change goes too).
+function dropJournalIds(ids) {
+  const drop = new Set(ids);
+  for (const stack of [undoStack, redoStack]) {
+    for (let i = stack.length - 1; i >= 0; i--) {
+      stack[i].changes = stack[i].changes.filter(change => !drop.has(change.id));
+      if (!stack[i].changes.length) stack.splice(i, 1);
+    }
+  }
+}
+
 // --- toasts ------------------------------------------------------------
 // Top-right stack (never over the bottom action bar), at most 3 at once,
 // 6 s auto-dismiss that pauses while the pointer or keyboard focus is on a

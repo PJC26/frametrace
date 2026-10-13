@@ -254,17 +254,17 @@ async function unitTests() {
   Object.assign(state, { drafts: {}, dirtyIds: new Set(), revisions: {}, examiners: {}, notes: {}, tags: {}, ranges: {} });
   // Save protocol v2 (docs/FIX_PLAN_R1_2026-10-13.md §1.6): touchAnnotation
   // only records the draft in memory + dirtyIds; storage is a debounced flush.
-  const draftsSrc = [fn('writerId'), fn('nextDraftSeq'), fn('draftRangeOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
+  const draftsSrc = [fn('writerId'), fn('nextDraftSeq'), fn('draftRangeOf'), fn('draftValuesOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
   const touch = 'draftSeq=0;draftFlushKeys=new Set();draftRangesDirty=false;\n' + draftsSrc;
   let flushes = 0;
   Object.assign(grid, { FTViewer: { writerToken: 'w1' }, scheduleDraftFlush: () => { flushes += 1; }, markLabel: s => s, document: { getElementById: () => null, body: { classList: { toggle: () => {} } } }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
   const journalSrc = [fn('snapshotIds'), fn('journalDiff'), fn('toastUndo'), fn('journaled'), fn('markStatusLabel')].join('\n');
   runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
   assert.equal(state.activeId, 'b');
-  assert.ok(state.dirtyIds.has('a') && state.drafts.a.writer === 'w1' && state.drafts.a.seq === 1, 'draft tagged with writer + seq');
+  assert.ok(state.dirtyIds.has('a') && state.drafts.a.seq === 1 && state.drafts.a.base === 0 && !('writer' in state.drafts.a), 'draft carries seq + base (the writer is in its storage key)');
   assert.equal(flushes, 1, 'one debounced flush scheduled, no synchronous storage write');
   console.log('PASS VM empty filter, collapsed group, sequential triage');
-  Object.assign(state, { marks: {}, notes: {}, tags: {}, examiner: 'New', dirtyIds: new Set(['a']), revisions: { a: 4 }, examiners: { b: 'Bob' } });
+  Object.assign(state, { marks: {}, notes: {}, tags: {}, drafts: {}, examiner: 'New', dirtyIds: new Set(['a']), revisions: { a: 4 }, examiners: { b: 'Bob' } });
   Object.assign(grid, { manifest: { case_id: 'test' } });
   state.ranges = {}; // range-only records are exported too (FOR-01); this block tests marks/notes
   const payloadSrc = [fn('marksPayload'), fn('payloadIds'), fn('payloadEmpty')].join('\n');
@@ -286,6 +286,13 @@ async function unitTests() {
   assert.equal(JSON.stringify(payload.marks[0].tags), '["사고"]', 'tags ride inside the mark entry');
   assert.equal(payload.tags.length, 1, 'no second tags entry for a marked id (server rejects duplicate ids)');
   assert.equal(payload.base_revisions.b, 0, 'unknown revision is sent as 0');
+  // §10.3: a draft's stored base wins over the last revision seen — an
+  // adopted (dead-window) draft goes out on the revision it was made on.
+  state.drafts.b = { mark: null, note: '', tags: ['사고'], examiner: 'Bob', range: null, seq: 9, base: 2 };
+  state.revisions.b = 5;
+  payload = runInNewContext(payloadSrc + '\nmarksPayload();', grid);
+  assert.equal(payload.base_revisions.b, 2, 'draft base sent, not the newer known revision');
+  delete state.drafts.b; delete state.revisions.b;
   const everything = runInNewContext(payloadSrc + '\nmarksPayload({ all: true });', grid);
   state.dirtyIds.delete('b');
   const allButDirty = runInNewContext(payloadSrc + '\nmarksPayload({ all: true });', grid);
@@ -349,7 +356,12 @@ async function unitTests() {
   assert.ok(legacy.ok && Object.keys(legacy.applied).length === 4500 && legacy.applied.vid_000001 === 1 && legacy.posts === 3);
   grid.postDeferred = async () => ({ ok: true, deferred: true, pending: 2 });
   const deferred = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postDeferred);', grid);
-  assert.ok(deferred.ok && deferred.deferred && deferred.pending === 2 && Object.keys(deferred.applied).length === 4500);
+  assert.ok(deferred.ok && deferred.deferred && deferred.pending === 2 && deferred.queuedIds.length === 4500 && Object.keys(deferred.applied).length === 0,
+    'a deferred reply queues the ids; it confirms no revision (the drain decides)');
+  // §10.3: only the exact pre-v2 refusal downgrades to patch-v1.
+  grid.postProtoErr = async () => ({ ok: false, error: 'protocol error: bad batch' });
+  const protoErr = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postProtoErr);', grid);
+  assert.ok(!protoErr.ok && !protoErr.legacy && protoErr.posts === 1, 'an error merely mentioning "protocol" is a failure, not a legacy switch');
   // A pre-v2 workstation refuses the protocol: the same chunk is resent as
   // patch-v1 (tags in the v1 array, no revisions) and the run continues.
   const v1Bodies = [];
@@ -359,37 +371,91 @@ async function unitTests() {
   assert.ok(v1Bodies.length === 3 && v1Bodies.every(b => b.protocol === 'patch-v1' && !('base_revisions' in b) && !('batch' in b) && b.marks.every(m => !('tags' in m))), 'v1 bodies carry no v2 fields');
   assert.ok(v1Bodies[2].tags.length === 500 && v1Bodies[0].tags.length === 2000, 'v1 bodies list every id\'s tags in the tags array');
   console.log('PASS VM chunking (2000 ids / 1 MiB), 413 halving, per-id outcome merge');
-  // Drafts: hydration replays this window's drafts and orphaned ones (dead
-  // writer), never a live other window's; adopted foreign drafts are re-keyed.
-  Object.assign(grid, { ANNOTATIONS_KEY: 'annotations', storageSet: () => {} });
-  state.drafts = {};
-  state.dirtyIds = new Set();
-  runInNewContext(touch + '\ntouchAnnotation("a");', grid);
-  assert.ok(state.dirtyIds.has('a') && state.drafts.a.writer === 'w1');
-  const saved = JSON.stringify(state.drafts);
-  const stored = Object.assign(JSON.parse(saved), {
-    c: { mark: { status: 'reviewed', marked_unix: 5 }, note: 'orphan', tags: ['x'], examiner: 'Dead', range: { in: 1, out: 2 }, seq: 40, writer: 'dead' },
-    d: { mark: { status: 'important', marked_unix: 6 }, note: 'theirs', tags: [], examiner: 'Live', seq: 3, writer: 'live' },
-    e: { mark: null, note: 'legacy draft without writer', tags: [] },
+  // Drafts (§10.3): one key per id, ft.draft.<case>.<writer>.<id>. Hydration
+  // replays this window's drafts and those of a CLOSED writer — never a live
+  // one, and a merely stale one only after an unanswered ping
+  // (adoptOrphanDrafts). Adopted drafts keep their base and are re-keyed;
+  // the pre-§10.3 single key is migrated once (base 0); a stored conflict
+  // is restored as a conflict, not as a dirty edit.
+  const store = new Map();
+  let storeFull = false;
+  const quota = () => Object.assign(new Error('quota'), { name: 'QuotaExceededError' });
+  const ls = {
+    get length() { return store.size; },
+    key: (i) => [...store.keys()][i] ?? null,
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => { if (storeFull) throw quota(); store.set(k, String(v)); },
+    removeItem: (k) => { store.delete(k); },
+  };
+  const P = 'ft.draft.test.';
+  const put = (k, v) => store.set(k, JSON.stringify(v));
+  put(P + 'w1.a', { mark: null, note: '', tags: [], examiner: null, range: null, seq: 3, base: 3 });
+  put(P + 'dead.c', { mark: { status: 'reviewed', marked_unix: 5 }, note: 'orphan', tags: ['x'], examiner: 'Dead', range: { in: 1, out: 2 }, seq: 40, base: 1 });
+  put(P + 'live.d', { mark: { status: 'important', marked_unix: 6 }, note: 'theirs', tags: [], examiner: 'Live', seq: 3, base: 0 });
+  put(P + 'stale.f', { mark: { status: 'important', marked_unix: 6 }, note: 'stale', tags: [], examiner: null, seq: 2, base: 1 });
+  put(P + 'w1.g', { mark: { status: 'reviewed', marked_unix: 7 }, note: 'mine, in conflict', tags: [], examiner: null, range: null, seq: 5, base: 1, conflict: { server: { status: 'important', note: 'srv', tags: [] }, server_revision: 2, queued: false } });
+  store.set('ft.alive:test:live', String(Date.now() - 60000));       // throttled, < 5 min: alive
+  store.set('ft.alive:test:stale', String(Date.now() - 6 * 60000));  // >= 5 min: ping first
+  store.set('ft.alive:test:dead', 'closed');
+  store.set('ft.alive:test:gone1', 'closed');
+  put('annotations', { e: { mark: null, note: 'pre-10.3 draft', tags: [], writer: 'gone1', seq: 4 }, h: { mark: { status: 'reviewed', marked_unix: 1 }, note: '', tags: [] } });
+  Object.assign(state, { marks: {}, notes: {}, tags: {}, examiners: {}, ranges: {}, dirtyIds: new Set(), drafts: {} });
+  let storageReports = 0;
+  Object.assign(grid, {
+    localStorage: ls, ANNOTATIONS_KEY: 'annotations', DRAFT_PREFIX: P, ALIVE_PREFIX: 'ft.alive:test:', ALIVE_CLOSED: 'closed',
+    ALIVE_STALE_MS: 300000, ALIVE_RECENT_MS: 30000, Date, JSON, clearTimeout, setTimeout,
+    reportStorageError: () => { storageReports += 1; }, ftSignal: { aborted: false },
   });
-  Object.assign(state, { marks: {}, notes: {}, tags: {}, examiners: {}, ranges: {}, dirtyIds: new Set(), drafts: stored });
-  const alive = { 'ft.alive:test:live': String(Date.now()), 'ft.alive:test:dead': String(Date.now() - 60000) };
-  grid.localStorage = { getItem: k => alive[k] ?? null };
-  grid.ALIVE_PREFIX = 'ft.alive:test:'; grid.ALIVE_STALE_MS = 30000; grid.Date = Date;
-  grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }], revisions: { a: 3, b: 1 } };
-  const hydrateSrc = [fn('aliveKey'), fn('writerAlive'), fn('draftAdoptable'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations')].join('\n');
-  runInNewContext('skippedDraftWriters=new Set();\n' + draftsSrc + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
+  grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }], revisions: { a: 3, b: 1, c: 2 } };
+  const hydrateSrc = [fn('aliveKey'), fn('draftKey'), fn('parseDraftKey'), fn('writerVerdict'), fn('storedDraftEntries'), fn('migrateLegacyDrafts'), fn('applyDraftValues'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations'), fn('adoptOrphanDrafts'), fn('adoptDeadWriters'), fn('flushDraftsNow'), fn('applyAppliedIds'), fn('dropJournalIds')].join('\n');
+  runInNewContext('skippedDraftWriters=new Set();restoredConflictIds=[];draftAdoptedFrom=new Map();orphanCheck=null;draftsUnpersisted=false;draftFlushTimer=null;\n' + touch + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
   assert.equal(state.marks.a, undefined, 'own draft (cleared mark) replays over the DB row');
   assert.equal(state.notes.b, 'DB memo');
   assert.equal(state.examiners.b, 'Bob');
   assert.equal(JSON.stringify(state.tags.b), '["DB tag"]');
-  assert.equal(JSON.stringify(state.revisions), '{"a":3,"b":1}', 'revisions seeded from annotations.revisions');
-  assert.ok(state.marks.c?.status === 'reviewed' && state.ranges.c?.out === 2 && state.drafts.c.writer === 'w1' && state.dirtyIds.has('c'), 'dead writer draft adopted + re-keyed');
+  assert.equal(JSON.stringify(state.revisions), '{"a":3,"b":1,"c":2}', 'revisions seeded from annotations.revisions');
+  assert.ok(state.marks.c?.status === 'reviewed' && state.ranges.c?.out === 2 && state.dirtyIds.has('c'), 'closed writer draft adopted');
+  assert.ok(state.drafts.c.base === 1, 'adopted draft keeps ITS base (1), not the newer known revision (2) — the server answers with a conflict');
+  assert.ok(store.has(P + 'w1.c') && !store.has(P + 'dead.c'), 'adopted draft re-keyed under this writer, the dead key removed after');
   assert.ok(state.drafts.c.seq > 40 && runInNewContext('draftSeq', grid) >= 41, 'seq counter moves past adopted seqs');
-  assert.ok(!state.marks.d && !state.dirtyIds.has('d') && !state.drafts.d, 'live other window draft left alone');
-  assert.ok(runInNewContext('skippedDraftWriters.has("live")', grid), 'skipped writer remembered for later adoption');
-  assert.ok(state.dirtyIds.has('e') && state.drafts.e.writer === 'w1', 'legacy draft without writer adopted');
-  console.log('PASS VM DB hydration with pending tombstone, revisions, two-window draft ownership');
+  assert.ok(!state.marks.d && !state.dirtyIds.has('d') && !state.drafts.d && store.has(P + 'live.d'), 'live other window draft left alone');
+  assert.ok(!state.drafts.f && store.has(P + 'stale.f'), 'stale-heartbeat draft not adopted at boot (ping first)');
+  assert.ok(runInNewContext('skippedDraftWriters.has("live") && skippedDraftWriters.has("stale")', grid), 'skipped writers remembered for the heartbeat tick');
+  assert.ok(!store.has('annotations') && state.dirtyIds.has('e') && state.drafts.e.base === 0 && state.notes.e === 'pre-10.3 draft', 'pre-§10.3 single-key draft migrated (base 0) and adopted');
+  assert.ok(state.marks.h?.status === 'reviewed' && state.drafts.h.base === 0, 'writer-less legacy draft migrated and adopted');
+  assert.ok(!state.dirtyIds.has('g') && runInNewContext('restoredConflictIds.includes("g")', grid) && state.drafts.g.conflict.server_revision === 2, 'stored conflict restored as a conflict, not a dirty edit');
+  // Heartbeat tick: a stale writer that answers the ping keeps its drafts;
+  // one that does not is adopted (with its base).
+  grid.pingWriters = async () => new Set(['stale']);
+  assert.equal(await runInNewContext('adoptOrphanDrafts()', grid), 0, 'stale but answering the ping: not adopted');
+  assert.ok(!state.drafts.f && store.has(P + 'stale.f'));
+  grid.pingWriters = async () => new Set();
+  assert.equal(await runInNewContext('adoptOrphanDrafts()', grid), 1, 'stale and silent: adopted');
+  assert.ok(state.drafts.f && state.drafts.f.base === 1 && state.dirtyIds.has('f') && !store.has(P + 'stale.f'));
+  assert.ok(!state.drafts.d, 'the live writer is never pinged into adoption');
+  console.log('PASS VM per-id drafts: migration, closed/stale/live writers, ping-gated adoption, stored base + conflict');
+  // Flush: removals first; the first quota failure stops the pass (ONE
+  // report, not one per key) and keeps the rest for the next flush.
+  state.drafts = { x1: { seq: 1, base: 0 }, x2: { seq: 2, base: 0 } };
+  store.set(P + 'w1.gone', '{}');
+  storeFull = true;
+  storageReports = 0;
+  runInNewContext('draftFlushKeys=new Set(["x1","x2","gone"]);\nflushDraftsNow(true);', grid);
+  assert.ok(!store.has(P + 'w1.gone'), 'removal done even with storage full');
+  assert.ok(storageReports === 1 && runInNewContext('draftsUnpersisted && draftFlushKeys.size === 2', grid), `one quota report per flush, rest kept (${storageReports})`);
+  storeFull = false;
+  runInNewContext('flushDraftsNow(true);', grid);
+  assert.ok(store.has(P + 'w1.x1') && store.has(P + 'w1.x2') && runInNewContext('!draftsUnpersisted && draftFlushKeys.size === 0', grid), 'next flush stores the rest');
+  // A confirmed id drops its draft only when the sent seq is current; an
+  // edit made mid-flight stays dirty, now based on the confirmed revision.
+  state.drafts = { p: { seq: 7, base: 1 }, q: { seq: 3, base: 1 } };
+  state.dirtyIds = new Set(['p', 'q']);
+  runInNewContext('applyAppliedIds({ p: 2, q: 2 }, new Map([["p", 7], ["q", 2]]));', grid);
+  assert.ok(!state.drafts.p && !state.dirtyIds.has('p') && state.drafts.q.base === 2 && state.dirtyIds.has('q') && state.revisions.q === 2, 'mid-flight edit rebased on the confirmed revision');
+  // Resolving a conflict drops that id's undo/redo changes (entries left empty go).
+  runInNewContext('undoStack=[{changes:[{id:"a"},{id:"b"}]},{changes:[{id:"a"}]}];redoStack=[{changes:[{id:"a"}]}];dropJournalIds(["a"]);', grid);
+  assert.equal(runInNewContext('JSON.stringify([undoStack.map(e => e.changes.map(c => c.id)), redoStack.length])', grid), '[[["b"]],0]', 'resolved ids leave the undo/redo journal');
+  console.log('PASS VM quota-bounded flush, seq-guarded confirm with rebase, journal drop on resolve');
   // Drafts must snapshot post-mutation state: a draft recorded before the
   // mark/tag mutation replays the old value on reload and resurrects
   // cleared annotations (or drops new ones) after hydration.
@@ -469,6 +535,14 @@ async function unitTests() {
   assert.ok(levels({ pendingMarks: 0, saveState: 'queued', drafts: 0 }).includes('block'), 'queued marks block');
   assert.ok(blockRetry({ pendingMarks: 0, saveState: null, drafts: 3 }), 'browser-only drafts block');
   assert.ok(levels({ pendingMarks: null, saveState: 'saved', drafts: 0 }).includes('block'), 'unknown server queue blocks');
+  // §10.3: unresolved server queue conflicts (/api/status.mark_conflicts.count) block.
+  assert.ok(levels({ pendingMarks: 0, saveState: 'saved', drafts: 0, markConflicts: 2 }).includes('block'), 'queue conflicts block the finalize');
+  assert.ok(ex.unsavedMarksChecks({ pendingMarks: 0, saveState: 'saved', drafts: 0, markConflicts: 2 }).some(c => /저장 충돌 2건/.test(c.text)));
+  assert.equal(JSON.stringify(levels({ pendingMarks: 0, saveState: 'saved', drafts: 0, markConflicts: 0 })), '["ok"]');
+  // Browser-only drafts are counted from the per-id keys (+ an unmigrated legacy key).
+  const lsKeys = { 'ft.draft.c1.w1.vid_1': '{}', 'ft.draft.c1.w2.vid_2': '{}', 'ft.draft.c10.w1.vid_3': '{}', 'ft.viewer.c1.annotations.v1': '{"vid_4":{}}', other: '1' };
+  ex.localStorage = { get length() { return Object.keys(lsKeys).length; }, key: (i) => Object.keys(lsKeys)[i] ?? null, getItem: (k) => lsKeys[k] ?? null, setItem() {} };
+  assert.equal(runInNewContext('unsavedDraftCount("c1")', ex), 3, 'per-id drafts of this case (not c10) + legacy entries');
   assert.ok(!levels({ pendingMarks: 0, saveState: null, drafts: null }).includes('block'));
   console.log('PASS VM finalize precheck blocks on unsaved marks');
   // Browser-playability gate: AVI/bin/proprietary records must prefer a

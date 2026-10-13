@@ -51,6 +51,22 @@ function retryViewerSave() {
   if (v && typeof v.save === "function") { Promise.resolve(v.save()).catch(() => {}); return true; }
   return false;
 }
+// Browser-only mark drafts of a case (any window): the viewer's per-id keys
+// ft.draft.<case>.<writer>.<id> (§10.3) plus a not-yet-migrated pre-§10.3
+// single-key store. Shared with the quit guard.
+function unsavedDraftCount(caseId) {
+  let n = 0;
+  try {
+    const prefix = `ft.draft.${caseId}.`;
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) n += 1;
+    }
+  } catch (e) { return null; }
+  const legacy = readLs(`ft.viewer.${caseId}.annotations.v1`);
+  if (legacy && typeof legacy === "object") n += Object.keys(legacy).length;
+  return n;
+}
 function finViewerSummary() {
   const v = finViewer();
   try { return v && typeof v.summary === "function" ? v.summary() : null; } catch (e) { return null; }
@@ -58,12 +74,17 @@ function finViewerSummary() {
 
 // Pure: finalize checklist rows for unsaved marks. `retry: true` rows get
 // the sheet's "저장 다시 시도" button.
-function unsavedMarksChecks({ pendingMarks, saveState, drafts }) {
+//   markConflicts  /api/status.mark_conflicts.count — saves the server's
+//                  queue could not apply (a newer revision); the examiner
+//                  resolves them in the viewer's conflict list.
+function unsavedMarksChecks({ pendingMarks, saveState, drafts, markConflicts = 0 }) {
   const out = [];
   const add = (level, text, sub, retry) => out.push({ level, text, sub: sub || "", retry: !!retry });
   if (pendingMarks === null) add("block", "서버의 마크 저장 대기열을 확인할 수 없습니다", "연결이 복구된 뒤 '다시 확인'을 누르십시오.");
   else if (pendingMarks > 0) add("block", `케이스 DB에 아직 반영되지 않은 저장 대기 마크 ${pendingMarks}건`,
     "보강 작업이 끝나면 자동 반영됩니다 — 잠시 뒤 '다시 확인'을 누르십시오.");
+  if (Number(markConflicts) > 0) add("block", `해결하지 않은 저장 충돌 ${Number(markConflicts)}건`,
+    "뷰어 위쪽 충돌 배너의 '충돌 목록'에서 건별로 서버 값 또는 내 값을 고르십시오.");
   if (saveState === "failed") add("block", "뷰어의 마크·메모 저장이 실패했습니다",
     "최신 판독 내용 없이 보고서를 봉인할 수 없습니다 — '저장 다시 시도'를 누르십시오.", true);
   else if (saveState === "pending" || saveState === "saving") add("block", "뷰어에 아직 저장되지 않은 마크·메모 변경이 있습니다",
@@ -236,15 +257,12 @@ async function gatherFinalizeChecks() {
 
   // Unsaved / queued marks block the finalize: sealing a package without
   // the examiner's latest marks is a silent loss.
-  let drafts = null;
-  if (caseId) {
-    const stored = readLs(`ft.viewer.${caseId}.annotations.v1`);
-    drafts = stored && typeof stored === "object" ? Object.keys(stored).length : 0;
-  }
+  const drafts = caseId ? unsavedDraftCount(caseId) : null;
   unsavedMarksChecks({
     pendingMarks: st ? Number(st.pending_marks) || 0 : null,
     saveState: finViewerSaveState(),
     drafts,
+    markConflicts: st && st.mark_conflicts ? Number(st.mark_conflicts.count) || 0 : 0,
   }).forEach(c => checks.push(c));
 
   const marks = meta && meta.annotations && Array.isArray(meta.annotations.marks) ? meta.annotations.marks : null;
@@ -522,6 +540,7 @@ async function finLateBlocker() {
   const st = await jgetSoft("/api/status");
   if (!st || st.ok === false || st.malformed) return "서버 상태를 확인할 수 없습니다.";
   if (Number(st.pending_marks) > 0) return `저장 대기 마크 ${Number(st.pending_marks)}건이 아직 케이스에 반영되지 않았습니다.`;
+  if (st.mark_conflicts && Number(st.mark_conflicts.count) > 0) return `해결하지 않은 저장 충돌 ${Number(st.mark_conflicts.count)}건이 있습니다.`;
   if (st.busy) return "다른 작업이 진행 중입니다.";
   return viewerSays();
 }

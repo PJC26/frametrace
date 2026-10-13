@@ -195,7 +195,6 @@ function renderDetails() {
     if (value.trim()) state.notes[record.id] = value;
     else state.notes[record.id] = "";
     touchAnnotation(record.id);
-    storageSet(NOTES_KEY, state.notes);
   });
   ftRoot.querySelectorAll(".tag-btn").forEach(btn => {
     btn.addEventListener("click", () => {

@@ -16,7 +16,7 @@
 // scope with the viewer bundle; scripts/check-js.mjs).
 const HOST_VIEWER_NODE = "hViewerHost";
 const HOST_VIEWER_EMPTY = "inputCard";
-const hostViewer = { mounted: false, pending: null, bridged: false, seq: 0 };
+const hostViewer = { mounted: false, pending: null, unmounting: null, bridged: false, seq: 0 };
 
 function hostViewerAvailable() {
   const html = document.documentElement;
@@ -78,6 +78,11 @@ function hostViewerWanted() {
 
 async function hostViewerMount() {
   if (!hostViewerAvailable() || !hostViewerWanted()) return false;
+  // An unmount still waiting for its save goes first (FTViewer is single-mount).
+  if (hostViewer.unmounting) {
+    await hostViewer.unmounting;
+    if (!hostViewerAvailable() || !hostViewerWanted()) return false;
+  }
   if (hostViewer.mounted) return true;
   if (hostViewer.pending) return hostViewer.pending;
   hostViewerBridge();
@@ -96,12 +101,29 @@ async function hostViewerMount() {
   return hostViewer.pending;
 }
 
+// A marks save still in flight is waited for (bounded, FTViewer
+// _whenSaveSettled) before the mount goes, so its reply settles the drafts
+// in this mount rather than racing the next one. Returns a promise; the
+// next hostViewerMount() waits for it. Callers that cannot wait (the store
+// renderer) may ignore it: the viewer itself settles a late reply too.
 function hostViewerUnmount() {
-  if (!hostViewerAvailable()) return;
+  if (!hostViewerAvailable()) return Promise.resolve();
   hostViewer.seq += 1;
   hostViewer.pending = null;
-  window.FTViewer.destroy();
   hostViewer.mounted = false;
+  if (hostViewer.unmounting) return hostViewer.unmounting;
+  const api = window.FTViewer;
+  let saving = false;
+  try { saving = typeof api._whenSaveSettled === "function" && api.saveState() === "saving"; } catch (e) { saving = false; }
+  if (!saving) {
+    api.destroy();
+    return Promise.resolve();
+  }
+  hostViewer.unmounting = api._whenSaveSettled(15000)
+    .catch(() => false)
+    .then(() => { api.destroy(); })
+    .finally(() => { hostViewer.unmounting = null; });
+  return hostViewer.unmounting;
 }
 
 // Project switch without a page reload. Resolves false (and changes
@@ -124,7 +146,7 @@ async function hostViewerSwitch(openFn) {
       const saved = await window.FTViewer.save();
       if (!saved) return false;
     }
-    hostViewerUnmount();
+    await hostViewerUnmount();
   }
   const opened = typeof openFn === "function" ? await openFn() : true;
   if (opened !== false && hostViewerAvailable()) await hostViewerMount();

@@ -383,19 +383,24 @@ var storageQuotaToasted = false;
 function isQuotaError(error) {
   return !!error && (error.name === "QuotaExceededError" || error.name === "NS_ERROR_DOM_QUOTA_REACHED" || error.code === 22 || error.code === 1014);
 }
+var storageFailToasted = false;
+function reportStorageError(error) {
+  if (isQuotaError(error)) {
+    if (!storageQuotaToasted) {
+      storageQuotaToasted = true;
+      toast(t("toast.storageQuota"));
+    }
+  } else if (!storageFailToasted) {
+    storageFailToasted = true;
+    toast(tf("toast.storageFail", { err: error && error.message }));
+  }
+}
 function storageSet(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
     return true;
   } catch (error) {
-    if (isQuotaError(error)) {
-      if (!storageQuotaToasted) {
-        storageQuotaToasted = true;
-        toast(t("toast.storageQuota"));
-      }
-    } else {
-      toast(tf("toast.storageFail", { err: error.message }));
-    }
+    reportStorageError(error);
     return false;
   }
 }
@@ -629,7 +634,8 @@ const state = {
   activeId: records[0]?.id || null,
   selectedIds: new Set(),
   lastCheckedKey: null,
-  drafts: storageGet(ANNOTATIONS_KEY, {}),
+  // Per-id drafts this window replays or wrote (hydrateAnnotations fills it).
+  drafts: {},
   // Record ids edited since the server last confirmed them (save protocol
   // v2, docs/FIX_PLAN_R1_2026-10-13.md §1.6): the save payload is built
   // from this set alone.
@@ -639,12 +645,14 @@ const state = {
   // base_revisions so a stale window can never silently overwrite another.
   revisions: {},
   examiners: {},
-  marks: storageGet(MARKS_KEY, {}),
-  notes: storageGet(NOTES_KEY, {}),
+  // marks / notes / tags come from the case data + the per-id drafts
+  // (hydrateAnnotations); the old whole-map keys are no longer written.
+  marks: {},
+  notes: {},
   ranges: storageGet(RANGES_KEY, {}),
   proxies: storageGet(PROXIES_KEY, {}),
   examiner: storageGet(EXAMINER_KEY, ""),
-  tags: storageGet(TAGS_KEY, {}),
+  tags: {},
   tagPresets: storageGet(TAG_PRESETS_KEY, null),
   // A host-supplied locale (FTViewer.init({ locale })) wins and is remembered.
   locale: opts.locale || (storageGet(LOCALE_KEY, "ko") === "en" ? "en" : "ko"),
@@ -665,23 +673,43 @@ const state = {
   collapsedGroups: new Set()
 };
 
-// --- Drafts (docs/FIX_PLAN_R1_2026-10-13.md §1.6) ---------------------------
+// --- Drafts (docs/FIX_PLAN_R1_2026-10-13.md §1.6, §10.3) --------------------
 // A draft is the full annotation of one record as this window last edited
-// it: { mark, note, tags, examiner, range, seq, writer }. `seq` is a
-// per-window counter (a save removes a draft only when the seq it sent is
-// still the current one, so an edit made mid-flight survives) and `writer`
-// is this window's FTViewer.writerToken: several windows on the same case
-// share ANNOTATIONS_KEY, and a window only ever rewrites its own entries.
-// Drafts are written to localStorage in one debounced flush (never per
-// edit), so a 30k-record bulk mark costs one serialisation, not 30k.
+// it, stored under its OWN key ft.draft.<case>.<writer>.<id> =
+//   { mark, note, tags, examiner, range, seq, base, conflict? }
+//   seq       per-window counter: a save forgets a draft only while the seq
+//             it sent is still the current one (an edit made mid-flight
+//             survives the save)
+//   base      the server revision the edit was made on. It travels as the
+//             id's base_revision, so a draft adopted from a dead window is
+//             refused (conflict) when anyone saved that id since — an
+//             adopted draft can never overwrite silently.
+//   conflict  { server, server_revision, queued, mine? } while the server
+//             refused the id: a reload restores the conflict banner from it.
+// One key per id keeps every write O(1) and a window only ever writes its
+// own keys. Writes are batched into one debounced flush (a 30k-record bulk
+// mark is one flush, not 30k). The pre-§10.3 single-key store
+// (ANNOTATIONS_KEY) is migrated once at boot (migrateLegacyDrafts).
 var draftSeq = 0;
 var draftFlushTimer = null;
 var draftFlushKeys = new Set();   // ids whose storage entry must be (re)written or removed
+var draftAdoptedFrom = new Map(); // id -> the dead writer's key, removed once ours is stored
 var draftRangesDirty = false;     // RANGES_KEY joins the flush (the server seeds it on boot)
 var draftsUnpersisted = false;    // the last flush could not be stored (quota) — warn before unload
+var restoredConflictIds = [];     // adopted drafts that carry a conflict (90-sync registers them)
 const DRAFT_FLUSH_MS = 250;
+const DRAFT_PREFIX = "ft.draft." + (manifest.case_id || "case") + ".";
 const ALIVE_PREFIX = "ft.alive:" + (manifest.case_id || "case") + ":";
-const ALIVE_STALE_MS = 30000;
+// Liveness of the other windows on this case (§10.3): each refreshes its
+// heartbeat every 5 s; pagehide (a real unload, not the back/forward cache)
+// replaces it with ALIVE_CLOSED. Another writer's drafts are adopted only
+// when its page is closed, or when its heartbeat is ALIVE_STALE_MS old AND
+// it does not answer a same-origin BroadcastChannel ping (a throttled or
+// frozen live tab keeps its drafts).
+const ALIVE_CLOSED = "closed";
+const ALIVE_RECENT_MS = 30000;
+const ALIVE_STALE_MS = 5 * 60 * 1000;
+const ALIVE_PING_MS = 1500;
 
 function writerId() {
   return (typeof FTViewer !== "undefined" && FTViewer.writerToken) || "";
@@ -689,18 +717,34 @@ function writerId() {
 function aliveKey(writer) {
   return ALIVE_PREFIX + writer;
 }
-function writerAlive(writer) {
-  if (!writer || writer === writerId()) return writer === writerId();
+function draftKey(writer, id) {
+  return DRAFT_PREFIX + writer + "." + id;
+}
+// Writer tokens never contain a dot; record ids may.
+function parseDraftKey(key) {
+  if (!key || !key.startsWith(DRAFT_PREFIX)) return null;
+  const rest = key.slice(DRAFT_PREFIX.length);
+  const dot = rest.indexOf(".");
+  return dot > 0 && dot < rest.length - 1 ? { writer: rest.slice(0, dot), id: rest.slice(dot + 1) } : null;
+}
+// "mine" | "alive" | "closed" | "stale" — what this window may do with
+// another writer's drafts. "stale" (no heartbeat for ALIVE_STALE_MS, or
+// none at all) still needs an unanswered ping before adoption.
+function writerVerdict(writer) {
+  if (!writer || writer === "legacy") return "closed";
+  if (writer === writerId()) return "mine";
+  let raw = null;
+  try { raw = localStorage.getItem(aliveKey(writer)); } catch (error) { raw = null; }
+  if (raw === ALIVE_CLOSED) return "closed";
+  const ts = Number(raw);
+  if (raw != null && Number.isFinite(ts) && ts > 0 && Date.now() - ts < ALIVE_STALE_MS) return "alive";
+  return "stale";
+}
+// Heart-beating right now (the "also open in another window" toast).
+function writerRecentlyAlive(writer) {
   let ts = NaN;
   try { ts = Number(localStorage.getItem(aliveKey(writer))); } catch (error) { ts = NaN; }
-  return Number.isFinite(ts) && ts > 0 && Date.now() - ts < ALIVE_STALE_MS;
-}
-// A stored draft is this window's to replay when it wrote it (hosted
-// destroy()+init() keeps the token), when it predates writer tagging, or
-// when its writer stopped heart-beating (crash / closed window recovery).
-// A live other window's drafts are left alone — it will push them itself.
-function draftAdoptable(draft) {
-  return !!draft && (!draft.writer || draft.writer === writerId() || !writerAlive(draft.writer));
+  return Number.isFinite(ts) && ts > 0 && Date.now() - ts < ALIVE_RECENT_MS;
 }
 function nextDraftSeq() {
   draftSeq += 1;
@@ -712,6 +756,72 @@ function draftRangeOf(id) {
     ? { in: Number.isFinite(r.in) ? r.in : null, out: Number.isFinite(r.out) ? r.out : null }
     : null;
 }
+// The annotation values a draft stores for `id` (post-mutation state).
+function draftValuesOf(id) {
+  return {
+    mark: state.marks[id] || null,
+    note: state.notes[id] || "",
+    tags: state.tags[id] || [],
+    examiner: state.examiners[id] ?? null,
+    range: draftRangeOf(id)
+  };
+}
+
+// Every stored draft of this case: [{ key, writer, id, draft }].
+function storedDraftEntries() {
+  const out = [];
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(DRAFT_PREFIX)) keys.push(key);
+    }
+    for (const key of keys) {
+      const at = parseDraftKey(key);
+      if (!at) continue;
+      let draft = null;
+      try { draft = JSON.parse(localStorage.getItem(key)); } catch (error) { draft = null; }
+      if (draft && typeof draft === "object") out.push({ key, writer: at.writer, id: at.id, draft });
+    }
+  } catch (error) { /* storage blocked: nothing stored */ }
+  return out;
+}
+
+// One-time move of the pre-§10.3 single-key drafts ({id: draft}) into
+// per-id keys. Those drafts carry no base revision: they are migrated with
+// base 0, so a value the server already holds comes back as a conflict
+// (or a no-op when identical) instead of being overwritten. The old key
+// goes only once every entry is stored under its new key.
+function migrateLegacyDrafts() {
+  let legacy = null;
+  try {
+    const raw = localStorage.getItem(ANNOTATIONS_KEY);
+    if (raw == null) return 0;
+    legacy = JSON.parse(raw);
+  } catch (error) { legacy = null; }
+  let moved = 0;
+  let complete = true;
+  for (const [id, draft] of Object.entries(legacy && typeof legacy === "object" ? legacy : {})) {
+    if (!draft || typeof draft !== "object") continue;
+    const writer = typeof draft.writer === "string" && /^[A-Za-z0-9_-]+$/.test(draft.writer) ? draft.writer : "legacy";
+    const record = {
+      mark: draft.mark || null, note: draft.note || "", tags: Array.isArray(draft.tags) ? draft.tags : [],
+      examiner: draft.examiner ?? null, seq: Number.isFinite(draft.seq) ? draft.seq : 0,
+      base: Number.isFinite(draft.base) ? draft.base : 0
+    };
+    if (Object.prototype.hasOwnProperty.call(draft, "range")) record.range = draft.range || null;
+    try {
+      if (localStorage.getItem(draftKey(writer, id)) == null) localStorage.setItem(draftKey(writer, id), JSON.stringify(record));
+      moved += 1;
+    } catch (error) {
+      reportStorageError(error);
+      complete = false;
+      break;
+    }
+  }
+  if (complete) { try { localStorage.removeItem(ANNOTATIONS_KEY); } catch (error) { /* retried next boot */ } }
+  return moved;
+}
 
 function scheduleDraftFlush() {
   if (draftFlushTimer) return;
@@ -722,40 +832,61 @@ function scheduleDraftFlush() {
   }, DRAFT_FLUSH_MS);
 }
 
-// Writes only the entries this window changed since the last flush,
-// merged over what is stored (other windows' entries stay untouched).
+// Writes (or removes) only this window's keys for the ids changed since the
+// last flush. Removals go first (they free space); the first storage
+// failure (quota) stops the pass and keeps the rest for the next flush —
+// one toast per session, never one per key.
 function flushDraftsNow(quiet) {
   clearTimeout(draftFlushTimer);
   draftFlushTimer = null;
   if (draftFlushKeys.size) {
-    const stored = storageGet(ANNOTATIONS_KEY, {}) || {};
-    for (const id of draftFlushKeys) {
-      if (state.drafts[id]) stored[id] = state.drafts[id];
-      else delete stored[id];
+    const me = writerId();
+    const order = [...draftFlushKeys].sort((a, b) => (state.drafts[a] ? 1 : 0) - (state.drafts[b] ? 1 : 0));
+    let blocked = false;
+    for (const id of order) {
+      const draft = state.drafts[id];
+      try {
+        if (draft) localStorage.setItem(draftKey(me, id), JSON.stringify(draft));
+        else localStorage.removeItem(draftKey(me, id));
+      } catch (error) {
+        reportStorageError(error);
+        blocked = true;
+        break;
+      }
+      draftFlushKeys.delete(id);
+      const foreign = draftAdoptedFrom.get(id);
+      if (foreign) {
+        draftAdoptedFrom.delete(id);
+        try { localStorage.removeItem(foreign); } catch (error) { /* a duplicate resends idempotently */ }
+      }
     }
-    if (storageSet(ANNOTATIONS_KEY, stored)) {
-      draftFlushKeys.clear();
-      draftsUnpersisted = false;
-    } else {
-      draftsUnpersisted = true;
-    }
+    draftsUnpersisted = blocked;
+  } else {
+    draftsUnpersisted = false;
   }
   if (draftRangesDirty && storageSet(RANGES_KEY, state.ranges)) draftRangesDirty = false;
   if (!quiet && typeof renderSaveState === "function") renderSaveState();
 }
 
-function touchAnnotation(id) {
+// Records a mutation of `id` (call AFTER the mutation: the draft snapshots
+// the resulting state). The base revision stays the one the first unsaved
+// edit was made on; opts.base overrides it (a conflict resolution moves it
+// to the server's revision). An id with an open conflict stays in conflict
+// (its "mine" follows the edit) until the examiner resolves it.
+function touchAnnotation(id, opts) {
   state.examiners[id] = (state.examiner || "").trim() || state.examiners[id] || null;
-  state.drafts[id] = {
-    mark: state.marks[id] || null,
-    note: state.notes[id] || "",
-    tags: state.tags[id] || [],
-    examiner: state.examiners[id],
-    range: draftRangeOf(id),
-    seq: nextDraftSeq(),
-    writer: writerId()
-  };
-  state.dirtyIds.add(id);
+  const prev = state.drafts[id];
+  const known = state.revisions && Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
+  const base = opts && Number.isFinite(opts.base) ? opts.base : (prev && Number.isFinite(prev.base) ? prev.base : known);
+  const draft = { ...draftValuesOf(id), seq: nextDraftSeq(), base };
+  const conflicted = typeof conflictIds !== "undefined" && conflictIds.has(id);
+  if (conflicted && prev && prev.conflict) draft.conflict = prev.conflict;
+  state.drafts[id] = draft;
+  if (conflicted) {
+    if (typeof conflictEdited === "function") conflictEdited(id);
+  } else {
+    state.dirtyIds.add(id);
+  }
   draftFlushKeys.add(id);
   draftRangesDirty = true;
   scheduleDraftFlush();
@@ -771,10 +902,8 @@ function dropDraft(id) {
   scheduleDraftFlush();
 }
 
-// Replays one stored draft into the in-memory annotation maps and claims
-// it for this window (re-tagged with our writer token when it was another,
-// now-dead, window's).
-function adoptDraft(id, draft) {
+// Replays one stored draft's values into the in-memory annotation maps.
+function applyDraftValues(id, draft) {
   if (draft.mark) state.marks[id] = draft.mark;
   else delete state.marks[id];
   state.notes[id] = draft.note || "";
@@ -785,11 +914,32 @@ function adoptDraft(id, draft) {
     else delete state.ranges[id];
     draftRangesDirty = true;
   }
+}
+
+// Claims one stored draft for this window. Another (dead) writer's draft is
+// re-keyed under this window's writer — ours is written first, theirs
+// removed after, so a crash in between leaves a duplicate, never a loss —
+// and keeps ITS base revision.
+function adoptDraft(id, draft, writer, key) {
+  applyDraftValues(id, draft);
   if (Number.isFinite(draft.seq)) draftSeq = Math.max(draftSeq, draft.seq);
-  const mine = draft.writer === writerId();
-  state.drafts[id] = mine ? draft : { ...draft, writer: writerId(), seq: nextDraftSeq() };
-  if (!mine) draftFlushKeys.add(id);
-  state.dirtyIds.add(id);
+  const mine = writer === writerId();
+  const adopted = {
+    mark: draft.mark || null, note: draft.note || "", tags: Array.isArray(draft.tags) ? draft.tags : [],
+    examiner: draft.examiner ?? null, range: Object.prototype.hasOwnProperty.call(draft, "range") ? (draft.range || null) : draftRangeOf(id),
+    seq: mine && Number.isFinite(draft.seq) ? draft.seq : nextDraftSeq(),
+    base: Number.isFinite(draft.base) ? draft.base : 0
+  };
+  if (draft.conflict && typeof draft.conflict === "object") adopted.conflict = draft.conflict;
+  state.drafts[id] = adopted;
+  if (!mine && key) {
+    let stored = false;
+    try { localStorage.setItem(draftKey(writerId(), id), JSON.stringify(adopted)); stored = true; } catch (error) { reportStorageError(error); }
+    if (stored) { try { localStorage.removeItem(key); } catch (error) { /* duplicate, resent idempotently */ } }
+    else { draftAdoptedFrom.set(id, key); draftFlushKeys.add(id); }
+  }
+  if (adopted.conflict) restoredConflictIds.push(id);
+  else state.dirtyIds.add(id);
 }
 
 // Case-DB rows (records-meta, the exported bundle) key marks by `record_id`;
@@ -799,8 +949,8 @@ function annotationMarkId(mark) {
   return mark ? (mark.id || mark.record_id || "") : "";
 }
 
-// Writers whose stored drafts were skipped at boot because they were still
-// alive; the heartbeat tick adopts them once their heartbeat goes stale.
+// Writers whose stored drafts were left alone because the window looked
+// alive (or stale but not yet pinged); the heartbeat tick re-checks them.
 var skippedDraftWriters = new Set();
 
 function hydrateAnnotations(annotations) {
@@ -818,33 +968,98 @@ function hydrateAnnotations(annotations) {
   }
   for (const entry of annotations.tags || []) state.tags[entry.id] = entry.tags;
   state.dirtyIds = new Set();
-  const stored = state.drafts && typeof state.drafts === "object" ? state.drafts : {};
   state.drafts = {};
   skippedDraftWriters = new Set();
-  for (const [id, draft] of Object.entries(stored)) {
-    if (!draft || typeof draft !== "object") continue;
-    if (!draftAdoptable(draft)) { skippedDraftWriters.add(draft.writer); continue; }
-    adoptDraft(id, draft);
+  restoredConflictIds = [];
+  migrateLegacyDrafts();
+  // This window's own drafts first (a hosted destroy()+init() keeps the
+  // writer token): a closed window's draft for the same id stays stored.
+  const entries = storedDraftEntries();
+  const verdicts = new Map();
+  const verdictOf = writer => {
+    if (!verdicts.has(writer)) verdicts.set(writer, writerVerdict(writer));
+    return verdicts.get(writer);
+  };
+  entries.sort((a, b) => (verdictOf(a.writer) === "mine" ? 0 : 1) - (verdictOf(b.writer) === "mine" ? 0 : 1));
+  for (const entry of entries) {
+    const verdict = verdictOf(entry.writer);
+    if (verdict === "mine") adoptDraft(entry.id, entry.draft, entry.writer, entry.key);
+    else if (verdict === "closed") { if (!state.drafts[entry.id]) adoptDraft(entry.id, entry.draft, entry.writer, entry.key); }
+    else skippedDraftWriters.add(entry.writer);
   }
   if (draftFlushKeys.size) scheduleDraftFlush();
 }
 
-// Heartbeat tick: drafts of a window that stopped heart-beating (crash,
-// closed without pagehide) are adopted here, so recovery never waits for
-// the next page load.
+// --- Dead-window detection (§10.3) -----------------------------------------
+// Same-origin windows on this case answer {type:"ping"} for their writer
+// token on BroadcastChannel ft-alive:<case>. A heartbeat can go stale in a
+// live tab (timer throttling, frozen tab, storage full); the ping tells.
+var aliveChannel = null;
+var alivePings = new Map(); // nonce -> Set of writers that answered
+function openAliveChannel() {
+  if (aliveChannel || typeof BroadcastChannel !== "function" || ftSignal.aborted) return aliveChannel;
+  try { aliveChannel = new BroadcastChannel("ft-alive:" + (manifest.case_id || "case")); } catch (error) { aliveChannel = null; return null; }
+  const channel = aliveChannel;
+  channel.onmessage = event => {
+    const msg = event.data || {};
+    if (msg.type === "ping" && Array.isArray(msg.writers) && msg.writers.includes(writerId())) {
+      try { channel.postMessage({ type: "pong", nonce: msg.nonce, writer: writerId() }); } catch (error) { /* closed */ }
+    } else if (msg.type === "pong" && alivePings.has(msg.nonce)) {
+      alivePings.get(msg.nonce).add(msg.writer);
+    }
+  };
+  ftSignal.addEventListener("abort", () => { try { channel.close(); } catch (error) { /* closed */ } if (aliveChannel === channel) aliveChannel = null; });
+  return channel;
+}
+// Resolves the set of `writers` that answered within ALIVE_PING_MS.
+function pingWriters(writers) {
+  const channel = openAliveChannel();
+  if (!channel || !writers.length) return Promise.resolve(new Set());
+  const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const answered = new Set();
+  alivePings.set(nonce, answered);
+  try { channel.postMessage({ type: "ping", nonce, writers, from: writerId() }); } catch (error) { /* closed */ }
+  return new Promise(resolve => setTimeout(() => { alivePings.delete(nonce); resolve(answered); }, ALIVE_PING_MS));
+}
+
+// Heartbeat tick: drafts of a writer whose page closed, or whose heartbeat
+// is ALIVE_STALE_MS old and who does not answer the ping, are adopted
+// here — with their base revision, so a value saved since by someone else
+// comes back as a conflict, never an overwrite.
+var orphanCheck = null;
 function adoptOrphanDrafts() {
-  if (!skippedDraftWriters.size) return 0;
-  const dead = [...skippedDraftWriters].filter(writer => !writerAlive(writer));
-  if (!dead.length) return 0;
-  dead.forEach(writer => skippedDraftWriters.delete(writer));
-  const stored = storageGet(ANNOTATIONS_KEY, {}) || {};
+  if (orphanCheck) return orphanCheck;
+  if (!skippedDraftWriters.size) return Promise.resolve(0);
+  orphanCheck = (async () => {
+    const closed = [];
+    const stale = [];
+    for (const writer of skippedDraftWriters) {
+      const verdict = writerVerdict(writer);
+      if (verdict === "closed") closed.push(writer);
+      else if (verdict === "stale") stale.push(writer);
+    }
+    let dead = closed;
+    if (stale.length) {
+      const alive = await pingWriters(stale);
+      dead = closed.concat(stale.filter(writer => !alive.has(writer)));
+    }
+    if (ftSignal.aborted || !dead.length) return 0;
+    return adoptDeadWriters(dead);
+  })().finally(() => { orphanCheck = null; });
+  return orphanCheck;
+}
+function adoptDeadWriters(dead) {
+  const gone = new Set(dead);
+  gone.forEach(writer => skippedDraftWriters.delete(writer));
   let adopted = 0;
-  for (const [id, draft] of Object.entries(stored)) {
-    if (!draft || !dead.includes(draft.writer) || state.drafts[id]) continue;
-    adoptDraft(id, draft);
+  for (const entry of storedDraftEntries()) {
+    if (!gone.has(entry.writer) || state.drafts[entry.id]) continue;
+    adoptDraft(entry.id, entry.draft, entry.writer, entry.key);
     adopted += 1;
   }
+  gone.forEach(writer => { try { localStorage.removeItem(aliveKey(writer)); } catch (error) { /* storage blocked */ } });
   if (adopted) {
+    if (typeof registerRestoredConflicts === "function") registerRestoredConflicts();
     scheduleDraftFlush();
     markReviewDirty();
     if (typeof requestRender === "function") requestRender();

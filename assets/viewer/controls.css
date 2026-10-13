@@ -209,3 +209,33 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
 #selectionBar button.save-ind[data-state="saving"] .ic { animation: ft-spin 1s linear infinite; }
 @media (prefers-reduced-motion: reduce) { #selectionBar button.save-ind[data-state="saving"] .ic { animation: none; } }
 #mediaToolbar .ic { flex: none; }
+
+/* ======================================================================
+   Notices row — range-divergence + save-conflict banners and the
+   per-record conflict list (90-sync.js). A row of its own in the root
+   grid, so a banner never overlaps the grid or the action bar. Colours are
+   theme tokens only: --text on --warn-bg holds AA in both themes; the
+   buttons keep the kit's secondary look (own --surface background).
+   ====================================================================== */
+.ft-viewer { grid-template-rows: auto auto auto minmax(0, 1fr) auto; grid-template-areas: "head" "notice" "top" "work" "bar"; }
+.ft-viewer > .ft-notices { grid-area: notice; min-width: 0; display: flex; flex-direction: column; }
+.ft-notices:empty { display: none; }
+.ft-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 12px; background: var(--warn-bg); color: var(--text); border-bottom: 2px solid var(--warn); font-size: var(--fs-sm); }
+.ft-banner .ft-banner-msg { font-weight: 700; color: var(--text); margin-right: 4px; min-width: 0; }
+.conflict-panel { max-height: min(30vh, 320px); overflow: auto; padding: 8px 12px; background: var(--surface); color: var(--text); border-bottom: 1px solid var(--border-strong); }
+.conflict-panel[hidden] { display: none; }
+.conflict-title { margin: 0 0 6px; font-size: var(--fs-sm); font-weight: 700; }
+.conflict-title:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
+.conflict-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.conflict-item { display: grid; grid-template-columns: minmax(140px, 1.1fr) minmax(0, 3fr) auto; gap: 4px 12px; align-items: center; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.conflict-rec { min-width: 0; overflow-wrap: anywhere; }
+.conflict-name { font-weight: 600; }
+.conflict-id { color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-xs); }
+.conflict-tag { color: var(--warn-fg); background: var(--warn-bg); border-radius: var(--radius); padding: 0 6px; font-size: var(--fs-xs); white-space: nowrap; }
+.conflict-vals { margin: 0; display: grid; gap: 2px; min-width: 0; }
+.conflict-vals > div { display: flex; gap: 8px; min-width: 0; }
+.conflict-vals dt { flex: none; width: 4.5em; color: var(--muted); font-size: var(--fs-xs); line-height: inherit; }
+.conflict-vals dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.conflict-acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.conflict-more { margin: 6px 0 0; color: var(--muted); font-size: var(--fs-xs); }
+@media (max-width: 1100px) { .conflict-item { grid-template-columns: minmax(0, 1fr); } .conflict-acts { justify-content: flex-start; } }

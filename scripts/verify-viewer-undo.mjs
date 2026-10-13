@@ -84,19 +84,18 @@ try {
   const tagName = await page.locator('.tag-btn').first().getAttribute('data-preset-tag');
   await page.locator('.tag-btn').first().click();
   await page.evaluate(() => document.activeElement?.blur());
-  // Persisted state lives in the per-case drafts (ft.viewer.<case>.annotations.v1,
-  // {mark, note, tags, ...} per record): hydration replays them on reload.
-  // They are written by a debounced flush, so poll until the flush landed.
+  // Persisted state lives in the per-id drafts (ft.draft.<case>.<writer>.<id>
+  // = {mark, note, tags, ..., seq, base}, §10.3): hydration replays them on
+  // reload. They are written by a debounced flush, so poll until it landed.
   const draftOf = async (rid, want) => {
     await page.waitForFunction(([r, w]) => {
-      const key = Object.keys(localStorage).find((k) => k.endsWith('.annotations.v1'));
-      const d = key ? (JSON.parse(localStorage.getItem(key) || '{}') || {})[r] : null;
+      const key = `ft.draft.FT-UNDO.${FTViewer.writerToken}.${r}`;
+      const d = JSON.parse(localStorage.getItem(key) || 'null');
       return !!d && (w === 'nomark' ? !d.mark : d.mark?.status === w);
     }, [rid, want], { timeout: 5000 }).catch(() => {});
     return page.evaluate((r) => {
-      const key = Object.keys(localStorage).find((k) => k.endsWith('.annotations.v1'));
-      const d = (key ? JSON.parse(localStorage.getItem(key) || '{}') : {})[r] || {};
-      return { note: d.note, tags: d.tags, mark: d.mark, noteBox: document.getElementById('evidenceNote')?.value };
+      const d = JSON.parse(localStorage.getItem(`ft.draft.FT-UNDO.${FTViewer.writerToken}.${r}`) || '{}') || {};
+      return { note: d.note, tags: d.tags, mark: d.mark, base: d.base, noteBox: document.getElementById('evidenceNote')?.value };
     }, rid);
   };
   await page.keyboard.press('Control+z');
@@ -109,6 +108,11 @@ try {
   check('redo restores the mark and keeps note/tag',
     afterRedo.mark?.status === 'reviewed' && afterRedo.note === 'keep this note' && afterRedo.tags?.includes(tagName),
     JSON.stringify(afterRedo));
+  check('draft carries its base revision', afterRedo.base === 0, JSON.stringify(afterRedo));
+  // §10.3: no whole-map MARKS / NOTES / TAGS store is written any more —
+  // the per-id drafts are the only browser copy.
+  const wholeMaps = await page.evaluate(() => Object.keys(localStorage).filter((k) => /^ft\.viewer\.FT-UNDO\.(marks|notes|tags|annotations\.v1)$/.test(k)));
+  check('no whole-map marks/notes/tags writes', wholeMaps.length === 0, wholeMaps.join(','));
 
   // (2) Space on a focused grid card does not toggle selection.
   const card = page.locator('.card').nth(1);
