@@ -109,12 +109,10 @@ function applyJournalSide(changes, side) {
         if (JSON.stringify(now.range) !== JSON.stringify(item.range)) annotationChanged = true;
       }
     }
+    // touchAnnotation snapshots the restored annotation (incl. range) into
+    // the draft; hydration replays drafts, so no per-map storage write.
     if (annotationChanged) touchAnnotation(id);
   }
-  storageSet(MARKS_KEY, state.marks);
-  storageSet(NOTES_KEY, state.notes);
-  storageSet(TAGS_KEY, state.tags);
-  storageSet(RANGES_KEY, state.ranges);
 }
 
 // --- toasts ------------------------------------------------------------
@@ -302,7 +300,6 @@ function applyMarkJournaled(status) {
         else state.marks[id] = { status, marked_unix: stamped };
         touchAnnotation(id);
       });
-      storageSet(MARKS_KEY, state.marks);
     }, tf("toast.markApplied", { n: ids.length, status: label }));
     render();
   });
@@ -333,7 +330,6 @@ function markActive(status) {
     if (status === null) delete state.marks[id];
     else state.marks[id] = { status, marked_unix: Math.floor(Date.now() / 1000) };
     touchAnnotation(id);
-    storageSet(MARKS_KEY, state.marks);
   }, tf("toast.markApplied", { n: 1, status: label }));
   const after = filteredRecords();
   const next = before.slice(index + 1).find(record => after.some(item => item.id === record.id));
@@ -704,8 +700,8 @@ function setRangePoint(which) {
   }
   journaled(t("journal.range"), [record.id], () => {
     state.ranges[record.id] = range;
-    storageSet(RANGES_KEY, state.ranges);
-    // Ranges persist server-side (FOR-01): queue the case-DB sync.
+    // Ranges persist server-side (FOR-01): queue the case-DB sync. The
+    // RANGES_KEY write rides in the draft flush.
     touchAnnotation(record.id);
   }, tf("range.label", {
     in: Number.isFinite(range.in) ? `${range.in.toFixed(1)}s` : "—",

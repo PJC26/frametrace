@@ -221,7 +221,7 @@ async function unitTests() {
   const viewerDir = new URL('../assets/viewer/', import.meta.url);
   const source = readdirSync(viewerDir, 'utf8').filter(f => f.endsWith('.js')).sort()
     .map(f => readFileSync(new URL(f, viewerDir), 'utf8')).join('\n');
-  const fn = name => source.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const fn = name => source.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
   const label = { textContent: '' };
   const state = { activeId: 'a', ranges: { a: { in: 1, out: null } }, proxies: {} };
   const t = key => ({ 'range.label': '구간 {in} ~ {out}' })[key] || key;
@@ -251,41 +251,149 @@ async function unitTests() {
   assert.ok(!els.recordGrid.innerHTML.includes('<card>'));
   state.groupBy = 'none'; state.activeId = 'a';
   Object.assign(grid, { MARKS_KEY: 'marks', ANNOTATIONS_KEY: 'annotations', storageSet: () => {}, markReviewDirty: () => {}, filteredRecords: () => records.filter(r => !state.marks[r.id]), render: () => runInNewContext(fn('renderGrid') + '\nrenderGrid(filteredRecords());', grid), moveActive: () => { state.activeId = 'c'; } });
-  Object.assign(state, { drafts: {}, deletedIds: [], examiners: {}, notes: {}, tags: {} });
-  const touch = fn('touchAnnotation');
-  Object.assign(grid, { markLabel: s => s, document: { getElementById: () => null, body: { classList: { toggle: () => {} } } }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
+  Object.assign(state, { drafts: {}, dirtyIds: new Set(), revisions: {}, examiners: {}, notes: {}, tags: {}, ranges: {} });
+  // Save protocol v2 (docs/FIX_PLAN_R1_2026-10-13.md §1.6): touchAnnotation
+  // only records the draft in memory + dirtyIds; storage is a debounced flush.
+  const draftsSrc = [fn('writerId'), fn('nextDraftSeq'), fn('draftRangeOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
+  const touch = 'draftSeq=0;draftFlushKeys=new Set();draftRangesDirty=false;\n' + draftsSrc;
+  let flushes = 0;
+  Object.assign(grid, { FTViewer: { writerToken: 'w1' }, scheduleDraftFlush: () => { flushes += 1; }, markLabel: s => s, document: { getElementById: () => null, body: { classList: { toggle: () => {} } } }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
   const journalSrc = [fn('snapshotIds'), fn('journalDiff'), fn('toastUndo'), fn('journaled'), fn('markStatusLabel')].join('\n');
   runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
   assert.equal(state.activeId, 'b');
+  assert.ok(state.dirtyIds.has('a') && state.drafts.a.writer === 'w1' && state.drafts.a.seq === 1, 'draft tagged with writer + seq');
+  assert.equal(flushes, 1, 'one debounced flush scheduled, no synchronous storage write');
   console.log('PASS VM empty filter, collapsed group, sequential triage');
-  Object.assign(state, { marks: {}, notes: {}, tags: {}, examiner: 'New', deletedIds: ['a'], examiners: { b: 'Bob' } });
+  Object.assign(state, { marks: {}, notes: {}, tags: {}, examiner: 'New', dirtyIds: new Set(['a']), revisions: { a: 4 }, examiners: { b: 'Bob' } });
   Object.assign(grid, { manifest: { case_id: 'test' } });
   state.ranges = {}; // range-only records are exported too (FOR-01); this block tests marks/notes
-  let payload = runInNewContext(fn('marksPayload') + '\nmarksPayload();', grid);
-  assert.equal(payload.protocol, 'patch-v1');
+  const payloadSrc = [fn('marksPayload'), fn('payloadIds'), fn('payloadEmpty')].join('\n');
+  let payload = runInNewContext(payloadSrc + '\nmarksPayload();', grid);
+  assert.equal(payload.protocol, 'patch-v2');
+  assert.equal(payload.client_id, 'w1');
   assert.equal(JSON.stringify(payload.deleted_ids), '["a"]');
+  assert.equal(JSON.stringify(payload.tags), '[{"id":"a","tags":[]}]', 'a deleted id still sends its (empty) tags explicitly');
+  assert.equal(JSON.stringify(payload.base_revisions), '{"a":4}');
+  assert.equal(payload.marks.length, 0, 'only dirty ids travel — nothing else');
   state.marks.b = { status: 'important', marked_unix: 1 };
-  payload = runInNewContext(fn('marksPayload') + '\nmarksPayload();', grid);
+  payload = runInNewContext(payloadSrc + '\nmarksPayload();', grid);
+  assert.equal(payload.marks.length, 0, 'a clean (not dirty) mark is not re-sent');
+  state.dirtyIds.add('b');
+  state.tags.b = ['사고'];
+  payload = runInNewContext(payloadSrc + '\nmarksPayload();', grid);
   assert.equal(payload.marks[0].note, '');
   assert.equal(payload.marks[0].examiner, 'Bob');
-  console.log('PASS VM explicit annotation clears and examiner preservation');
+  assert.equal(JSON.stringify(payload.marks[0].tags), '["사고"]', 'tags ride inside the mark entry');
+  assert.equal(payload.tags.length, 1, 'no second tags entry for a marked id (server rejects duplicate ids)');
+  assert.equal(payload.base_revisions.b, 0, 'unknown revision is sent as 0');
+  const everything = runInNewContext(payloadSrc + '\nmarksPayload({ all: true });', grid);
+  state.dirtyIds.delete('b');
+  const allButDirty = runInNewContext(payloadSrc + '\nmarksPayload({ all: true });', grid);
+  assert.ok(everything.marks.some(m => m.id === 'b') && allButDirty.marks.some(m => m.id === 'b'), 'the marks download ({all}) includes clean marks');
+  // "[서버 값 사용]" on a row with no examiner: that mark must not pick up
+  // the body's top-level examiner, so it travels in its own body.
+  state.dirtyIds = new Set(['a', 'b', 'c']);
+  state.marks.c = { status: 'reviewed', marked_unix: 2 };
+  state.examiners.c = null;
+  state.revisions.c = 7;
+  payload = runInNewContext(payloadSrc + '\nmarksPayload();', grid);
+  assert.equal(payload.marks.find(m => m.id === 'c').examiner, null, 'explicit null examiner is kept, not the current name');
+  const splitSrc = payloadSrc + '\n' + fn('splitByExaminer') + '\n';
+  const parts = JSON.parse(runInNewContext(splitSrc + 'JSON.stringify(splitByExaminer(marksPayload()));', grid));
+  assert.equal(parts.length, 2);
+  assert.equal(JSON.stringify(parts.map(p => [p.examiner, p.marks.map(m => m.id), p.deleted_ids, Object.keys(p.base_revisions)])), '[["New",["b"],["a"],["b","a"]],[null,["c"],[],["c"]]]');
+  delete state.marks.c; delete state.examiners.c; delete state.revisions.c;
+  state.dirtyIds = new Set(['a']);
+  assert.equal(runInNewContext(splitSrc + 'splitByExaminer(marksPayload()).length;', grid), 1, 'no split when every mark is named');
+  console.log('PASS VM explicit annotation clears, dirty-only payload, examiner preservation');
+  // Chunking: 2000 ids / 1 MiB per POST; every chunk is a complete body
+  // with batch {id, index, total}; ids never repeat across chunks.
+  const chunkSrc = payloadSrc + '\n' + [fn('splitPayloadChunks'), fn('legacyPayloadBody'), fn('sendPayloadChunks')].join('\n') + '\nPAYLOAD_CHUNK_IDS=2000;PAYLOAD_CHUNK_BYTES=1048576;PAYLOAD_CHUNK_MIN_IDS=50;';
+  const bigIds = Array.from({ length: 4500 }, (_, i) => `vid_${String(i).padStart(6, '0')}`);
+  const big = { schema_version: 2, protocol: 'patch-v2', case_id: 'c', examiner: 'x', client_id: 'w1', exported_unix: 1, base_revisions: Object.fromEntries(bigIds.map(id => [id, 1])), marks: bigIds.slice(0, 4000).map(id => ({ id, status: 'reviewed', marked_unix: 1, note: '', examiner: 'x', tags: [], range: { in: null, out: null } })), tags: bigIds.slice(4000).map(id => ({ id, tags: [] })), deleted_ids: bigIds.slice(4000) };
+  grid.big = big;
+  const chunks = runInNewContext(chunkSrc + '\nsplitPayloadChunks(big);', grid);
+  assert.equal(chunks.length, 3, `ceil(4500/2000) chunks, got ${chunks.length}`);
+  assert.equal(JSON.stringify(chunks.map(c => c.batch.index)), '[0,1,2]');
+  assert.ok(chunks.every(c => c.batch.total === 3 && c.batch.id === chunks[0].batch.id && c.protocol === 'patch-v2'));
+  const seen = chunks.flatMap(c => [...c.marks.map(m => m.id), ...c.deleted_ids]);
+  assert.equal(new Set(seen).size, 4500);
+  assert.equal(seen.length, 4500, 'no id in two chunks');
+  assert.ok(chunks.every(c => Object.keys(c.base_revisions).length === c.marks.length + c.deleted_ids.length), 'base_revisions only for the chunk ids');
+  assert.ok(chunks[2].deleted_ids.length === 500 && chunks[2].tags.length === 500, 'deleted ids keep their explicit tags entry');
+  grid.fat = { ...big, deleted_ids: [], tags: [], marks: bigIds.slice(0, 3000).map(id => ({ id, status: 'reviewed', marked_unix: 1, note: 'x'.repeat(1024), examiner: 'x', tags: [] })) };
+  const fatChunks = runInNewContext(chunkSrc + '\nsplitPayloadChunks(fat);', grid);
+  assert.ok(fatChunks.length > 3 && fatChunks.every(c => JSON.stringify(c).length <= 1048576), `1 MiB cap splits further (${fatChunks.length} chunks)`);
+  // 413 halving: 2000 → 1000 → 500 ids, a fresh batch from the failed chunk on.
+  const posted = [];
+  grid.post413 = async body => { posted.push(body); if (body.marks.length + body.deleted_ids.length > 600) return { ok: false, status: 413, error: 'HTTP 413' }; return { ok: true, protocol: 'patch-v2', applied: Object.fromEntries([...body.marks.map(m => m.id), ...body.deleted_ids].map(id => [id, 2])), conflicts: [] }; };
+  const halved = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, post413);', grid);
+  assert.ok(halved.ok && halved.maxIds === 500, `413 halves the chunk size to 500 (got ${halved.maxIds})`);
+  assert.equal(Object.keys(halved.applied).length, 4500, 'every id applied after halving');
+  assert.ok(posted.filter(b => b.marks.length + b.deleted_ids.length > 600).length === 2, 'two 413s (2000, 1000) before 500 fits');
+  const lastBatch = posted.at(-1).batch;
+  assert.ok(lastBatch.index === lastBatch.total - 1 && posted.filter(b => b.batch.id === lastBatch.id).length === lastBatch.total, 'the final batch is complete (post-save work runs once on its last chunk)');
+  // Below the 50-id floor a 413 is a failure (no endless halving).
+  grid.postAlways413 = async () => ({ ok: false, status: 413, error: 'HTTP 413' });
+  const floor = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postAlways413, { maxIds: 50 });', grid);
+  assert.ok(!floor.ok && floor.status === 413, 'at the floor the 413 surfaces as a failure');
+  // Per-id outcome merge: applied map + conflicts, partial progress on a later failure.
+  grid.postMixed = async body => body.batch.index === 0
+    ? { ok: true, protocol: 'patch-v2', applied: Object.fromEntries(body.marks.slice(1).map(m => [m.id, 7])), conflicts: [{ id: body.marks[0].id, server_revision: 9, server: null }] }
+    : { ok: false, status: 503, error: 'busy' };
+  const mixed = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postMixed);', grid);
+  assert.ok(!mixed.ok && mixed.error === 'busy' && Object.keys(mixed.applied).length === 1999 && mixed.conflicts.length === 1 && mixed.conflicts[0].server_revision === 9, 'first chunk outcome kept, second chunk failure reported');
+  // Legacy / deferred replies confirm the chunk's ids at their sent revision.
+  grid.postLegacy = async () => ({ ok: true });
+  const legacy = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postLegacy);', grid);
+  assert.ok(legacy.ok && Object.keys(legacy.applied).length === 4500 && legacy.applied.vid_000001 === 1 && legacy.posts === 3);
+  grid.postDeferred = async () => ({ ok: true, deferred: true, pending: 2 });
+  const deferred = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postDeferred);', grid);
+  assert.ok(deferred.ok && deferred.deferred && deferred.pending === 2 && Object.keys(deferred.applied).length === 4500);
+  // A pre-v2 workstation refuses the protocol: the same chunk is resent as
+  // patch-v1 (tags in the v1 array, no revisions) and the run continues.
+  const v1Bodies = [];
+  grid.postOld = async body => { if (body.protocol === 'patch-v2') return { ok: false, error: 'unsupported marks protocol' }; v1Bodies.push(body); return { ok: true, applied: true, stored: 1 }; };
+  const old = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postOld);', grid);
+  assert.ok(old.ok && old.legacy && old.posts === 4 && Object.keys(old.applied).length === 4500, `legacy fallback (${old.posts} posts)`);
+  assert.ok(v1Bodies.length === 3 && v1Bodies.every(b => b.protocol === 'patch-v1' && !('base_revisions' in b) && !('batch' in b) && b.marks.every(m => !('tags' in m))), 'v1 bodies carry no v2 fields');
+  assert.ok(v1Bodies[2].tags.length === 500 && v1Bodies[0].tags.length === 2000, 'v1 bodies list every id\'s tags in the tags array');
+  console.log('PASS VM chunking (2000 ids / 1 MiB), 413 halving, per-id outcome merge');
+  // Drafts: hydration replays this window's drafts and orphaned ones (dead
+  // writer), never a live other window's; adopted foreign drafts are re-keyed.
   Object.assign(grid, { ANNOTATIONS_KEY: 'annotations', storageSet: () => {} });
   state.drafts = {};
-  runInNewContext(fn('touchAnnotation') + '\ntouchAnnotation("a");', grid);
-  assert.ok(state.deletedIds.includes('a'));
+  state.dirtyIds = new Set();
+  runInNewContext(touch + '\ntouchAnnotation("a");', grid);
+  assert.ok(state.dirtyIds.has('a') && state.drafts.a.writer === 'w1');
   const saved = JSON.stringify(state.drafts);
-  Object.assign(state, { marks: {}, notes: {}, tags: {}, examiners: {}, deletedIds: [], drafts: JSON.parse(saved) });
-  grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }] };
-  runInNewContext(fn('annotationMarkId') + '\n' + fn('hydrateAnnotations') + '\nhydrateAnnotations(annotations);', grid);
-  assert.equal(state.marks.a, undefined);
+  const stored = Object.assign(JSON.parse(saved), {
+    c: { mark: { status: 'reviewed', marked_unix: 5 }, note: 'orphan', tags: ['x'], examiner: 'Dead', range: { in: 1, out: 2 }, seq: 40, writer: 'dead' },
+    d: { mark: { status: 'important', marked_unix: 6 }, note: 'theirs', tags: [], examiner: 'Live', seq: 3, writer: 'live' },
+    e: { mark: null, note: 'legacy draft without writer', tags: [] },
+  });
+  Object.assign(state, { marks: {}, notes: {}, tags: {}, examiners: {}, ranges: {}, dirtyIds: new Set(), drafts: stored });
+  const alive = { 'ft.alive:test:live': String(Date.now()), 'ft.alive:test:dead': String(Date.now() - 60000) };
+  grid.localStorage = { getItem: k => alive[k] ?? null };
+  grid.ALIVE_PREFIX = 'ft.alive:test:'; grid.ALIVE_STALE_MS = 30000; grid.Date = Date;
+  grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }], revisions: { a: 3, b: 1 } };
+  const hydrateSrc = [fn('aliveKey'), fn('writerAlive'), fn('draftAdoptable'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations')].join('\n');
+  runInNewContext('skippedDraftWriters=new Set();\n' + draftsSrc + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
+  assert.equal(state.marks.a, undefined, 'own draft (cleared mark) replays over the DB row');
   assert.equal(state.notes.b, 'DB memo');
   assert.equal(state.examiners.b, 'Bob');
   assert.equal(JSON.stringify(state.tags.b), '["DB tag"]');
-  console.log('PASS VM DB hydration with pending tombstone');
+  assert.equal(JSON.stringify(state.revisions), '{"a":3,"b":1}', 'revisions seeded from annotations.revisions');
+  assert.ok(state.marks.c?.status === 'reviewed' && state.ranges.c?.out === 2 && state.drafts.c.writer === 'w1' && state.dirtyIds.has('c'), 'dead writer draft adopted + re-keyed');
+  assert.ok(state.drafts.c.seq > 40 && runInNewContext('draftSeq', grid) >= 41, 'seq counter moves past adopted seqs');
+  assert.ok(!state.marks.d && !state.dirtyIds.has('d') && !state.drafts.d, 'live other window draft left alone');
+  assert.ok(runInNewContext('skippedDraftWriters.has("live")', grid), 'skipped writer remembered for later adoption');
+  assert.ok(state.dirtyIds.has('e') && state.drafts.e.writer === 'w1', 'legacy draft without writer adopted');
+  console.log('PASS VM DB hydration with pending tombstone, revisions, two-window draft ownership');
   // Drafts must snapshot post-mutation state: a draft recorded before the
   // mark/tag mutation replays the old value on reload and resurrects
   // cleared annotations (or drops new ones) after hydration.
-  Object.assign(state, { marks: {}, notes: {}, tags: {}, drafts: {}, deletedIds: [], selectedIds: new Set(['a']) });
+  Object.assign(state, { marks: {}, notes: {}, tags: {}, drafts: {}, dirtyIds: new Set(), selectedIds: new Set(['a']) });
   Object.assign(grid, { toast: () => {}, requestRender: () => {}, storageSet: () => {}, MARKS_KEY: 'marks', markLabel: s => s, NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
   const ops = [fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags')].join('\n');
   runInNewContext(ops + '\napplyMark("important");', grid);
@@ -296,7 +404,12 @@ async function unitTests() {
   assert.equal(JSON.stringify(state.drafts.a.tags), '["사고"]');
   runInNewContext(ops + '\nclearTags();', grid);
   assert.equal(JSON.stringify(state.drafts.a.tags), '[]');
-  console.log('PASS VM annotation drafts capture post-mutation state');
+  // A draft is dropped only when its seq is the one that was sent.
+  const seqSent = state.drafts.a.seq;
+  runInNewContext(ops + '\ntouchAnnotation("a");', grid);
+  assert.notEqual(state.drafts.a.seq, seqSent, 'a mid-flight edit bumps seq');
+  assert.ok(state.drafts.a && state.dirtyIds.has('a'), 'edited-while-saving draft survives the save');
+  console.log('PASS VM annotation drafts capture post-mutation state, seq-guarded drop');
   // STR-01: the shell script is bundled from assets/app/*.js (build.rs).
   const { appBundleJs } = await import('./lib/app-bundle.mjs');
   const exScript = appBundleJs();

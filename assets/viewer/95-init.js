@@ -21,7 +21,7 @@ const exitFsBtn = document.getElementById("btnExitFs");
 // annotations are never lost to a refresh. Shared by FTViewer.reload()
 // (hosted) and the legacy ft-reload postMessage (standalone iframe).
 async function viewerReloadBlocker() {
-  if (pendingReviewSync || saveInFlight || state.deletedIds.length) return "unsaved";
+  if (pendingReviewSync || saveInFlight || state.dirtyIds.size || conflictIds.size) return "unsaved";
   if (queuedOnServer > 0) {
     // Marks durably queued on the server are applied before the job frees
     // the case; confirm the queue is empty before reloading over them.
@@ -153,7 +153,7 @@ FTViewer._attach({
   // server count as saved: they reach the case DB when the job ends).
   async save() {
     if (!viewerIsServed) return false;
-    const idle = () => !pendingReviewSync && !state.deletedIds.length;
+    const idle = () => reviewIdle();
     for (let attempt = 0; attempt < 4; attempt++) {
       while (saveInFlight) await new Promise(resolve => setTimeout(resolve, 100));
       if (idle()) return true;

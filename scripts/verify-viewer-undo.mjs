@@ -84,19 +84,28 @@ try {
   const tagName = await page.locator('.tag-btn').first().getAttribute('data-preset-tag');
   await page.locator('.tag-btn').first().click();
   await page.evaluate(() => document.activeElement?.blur());
+  // Persisted state lives in the per-case drafts (ft.viewer.<case>.annotations.v1,
+  // {mark, note, tags, ...} per record): hydration replays them on reload.
+  // They are written by a debounced flush, so poll until the flush landed.
+  const draftOf = async (rid, want) => {
+    await page.waitForFunction(([r, w]) => {
+      const key = Object.keys(localStorage).find((k) => k.endsWith('.annotations.v1'));
+      const d = key ? (JSON.parse(localStorage.getItem(key) || '{}') || {})[r] : null;
+      return !!d && (w === 'nomark' ? !d.mark : d.mark?.status === w);
+    }, [rid, want], { timeout: 5000 }).catch(() => {});
+    return page.evaluate((r) => {
+      const key = Object.keys(localStorage).find((k) => k.endsWith('.annotations.v1'));
+      const d = (key ? JSON.parse(localStorage.getItem(key) || '{}') : {})[r] || {};
+      return { note: d.note, tags: d.tags, mark: d.mark, noteBox: document.getElementById('evidenceNote')?.value };
+    }, rid);
+  };
   await page.keyboard.press('Control+z');
-  const afterUndo = await page.evaluate((rid) => {
-    const ls = (k) => { for (let i = 0; i < localStorage.length; i++) { const key = localStorage.key(i); if (key.includes(k)) return JSON.parse(localStorage.getItem(key)); } return {}; };
-    return { note: (ls('notes') || {})[rid], tags: (ls('tags') || {})[rid], mark: (ls('marks') || {})[rid], noteBox: document.getElementById('evidenceNote')?.value };
-  }, id);
+  const afterUndo = await draftOf(id, 'nomark');
   check('undo removes the mark', !afterUndo.mark, JSON.stringify(afterUndo));
   check('undo keeps the later note', afterUndo.note === 'keep this note' && afterUndo.noteBox === 'keep this note');
   check('undo keeps the later tag', Array.isArray(afterUndo.tags) && afterUndo.tags.includes(tagName));
   await page.keyboard.press('Control+y');
-  const afterRedo = await page.evaluate((rid) => {
-    const ls = (k) => { for (let i = 0; i < localStorage.length; i++) { const key = localStorage.key(i); if (key.includes(k)) return JSON.parse(localStorage.getItem(key)); } return {}; };
-    return { note: (ls('notes') || {})[rid], tags: (ls('tags') || {})[rid], mark: (ls('marks') || {})[rid] };
-  }, id);
+  const afterRedo = await draftOf(id, 'reviewed');
   check('redo restores the mark and keeps note/tag',
     afterRedo.mark?.status === 'reviewed' && afterRedo.note === 'keep this note' && afterRedo.tags?.includes(tagName),
     JSON.stringify(afterRedo));
@@ -130,6 +139,10 @@ async function runApplyCheck(page) {
   // Click the save indicator to start a save right away (held by the server).
   await page.locator('#saveState').click();
   await page.waitForFunction(() => document.getElementById('saveState').dataset.state === 'saving');
+  // An edit made while the save is in flight is not in that request; the
+  // queued "Apply to case" must push it (save protocol v2 sends dirty ids only).
+  await page.keyboard.press('j');
+  await page.keyboard.press('3');
   await page.evaluate(() => document.getElementById('btnApplyMarks').click());
   const sawQueued = await page.locator('#toastHost').innerText();
   releaseFirst?.();
