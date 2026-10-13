@@ -729,9 +729,10 @@ fn server_answers_status_env_and_guards() {
     assert!(cookie.contains("\"ok\":false"), "{cookie}");
     // GETs plant the ft_nonce cookie so the served page's same-origin
     // fetches carry the proof automatically.
+    // C2: named after this server's port.
     assert!(
-        status.contains("Set-Cookie: ft_nonce="),
-        "GET responses must plant the nonce cookie: {status}"
+        status.contains(&format!("Set-Cookie: ft_nonce_{}=", addr.port())),
+        "GET responses must plant the per-port nonce cookie: {status}"
     );
 }
 
@@ -809,12 +810,28 @@ fn token_gate_over_socket_plants_cookie() {
     // Query token authenticates and plants the ft_token cookie.
     let query = response("GET /api/status?token=testtoken-1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
     assert!(query.contains("200"), "{query}");
+    // C2: the cookie is named after the server's port.
     assert!(
-        query.contains("Set-Cookie: ft_token=testtoken-1; HttpOnly; SameSite=Strict"),
+        query.contains(&format!(
+            "Set-Cookie: ft_token_{}=testtoken-1; HttpOnly; SameSite=Strict",
+            addr.port()
+        )),
         "{query}"
     );
-    // The planted cookie then authorizes header-less follow-ups,
-    // including media requests (video elements cannot set headers).
+    let scoped = response(&format!(
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ft_token_{}=testtoken-1\r\n\r\n",
+        addr.port()
+    ));
+    assert!(scoped.contains("200"), "{scoped}");
+    // Another port's cookie is not this server's proof.
+    let foreign = response(&format!(
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ft_token_{}=testtoken-1\r\n\r\n",
+        addr.port().wrapping_add(1)
+    ));
+    assert!(foreign.contains("401"), "{foreign}");
+    // The legacy (pre-C2) cookie name still authorizes for one release
+    // when its value validates — header-less follow-ups included (video
+    // elements cannot set headers).
     let cookie =
         response("GET /media HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ft_token=testtoken-1\r\n\r\n");
     assert!(cookie.contains("400"), "{cookie}");

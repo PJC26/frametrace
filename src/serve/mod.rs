@@ -43,6 +43,8 @@ mod tests_marks_live;
 #[cfg(test)]
 mod tests_phase3;
 #[cfg(test)]
+mod tests_post_review;
+#[cfg(test)]
 mod tests_recent;
 #[cfg(test)]
 mod tests_review3;
@@ -73,13 +75,13 @@ pub(crate) use records::{
 };
 pub(crate) use state::{
     BusyLease, CaseJob, ClipJob, Enrichment, IndexCache, IndexFingerprint, InputKind, JobState,
-    JoinJobInfo, LiveCache, PipelineJob, SharedState, StepStatus, api_err, lease_busy_locked,
-    restore_session, save_session, shutdown_refusal, side_work_refusal, state_lock,
-    try_acquire_busy, try_begin_seal, try_begin_write_op, try_lease_busy,
+    JoinJobInfo, LiveCache, PipelineJob, SharedState, StepStatus, api_err, cancel_write_ops,
+    lease_busy_locked, restore_session, save_session, shutdown_refusal, side_work_refusal,
+    state_lock, try_acquire_busy, try_begin_seal, try_begin_write_op, try_lease_busy,
 };
 pub(crate) use system::{
     api_browse, api_cancel, api_case_info, api_env, api_open_case, api_preflight, api_shutdown,
-    api_status, api_verify_audit, tool_available,
+    api_status, api_verify_audit,
 };
 
 // ---- test-only re-exports (names only the unit tests reach through `super::*`)
@@ -177,6 +179,19 @@ pub struct ServeOptions {
 }
 
 pub fn run(options: ServeOptions) -> Result<(), String> {
+    run_on(options, None)
+}
+
+/// [`run`] on a listener the caller already bound (R5: the WebView2 shell
+/// binds its port itself and hands the very socket over, so no other
+/// process can claim the port between "probe says free" and the bind).
+/// The "reuse an already-running workstation" step is skipped — the
+/// caller decided to own this server.
+pub fn run_with_listener(options: ServeOptions, listener: TcpListener) -> Result<(), String> {
+    run_on(options, Some(listener))
+}
+
+fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), String> {
     proc::install_process_guard();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     if let Some(case_dir) = &options.case_dir {
@@ -209,7 +224,7 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
     // that guessed the port) can otherwise read evidence over GET.
     // FRAMETRACE_TOKEN pins a specific token; FRAMETRACE_NO_TOKEN=1 opts
     // out (E2E harnesses). The token must be cookie-safe because a
-    // successful ?token= request plants it as the ft_token cookie.
+    // successful ?token= request plants it as the ft_token_<port> cookie.
     let token = resolve_token(
         std::env::var("FRAMETRACE_TOKEN").ok().as_deref(),
         std::env::var("FRAMETRACE_NO_TOKEN").ok().as_deref(),
@@ -221,7 +236,8 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
     // the already-running workstation instead of stacking zombie servers on
     // successive ports. Skipped when a port or case is explicitly given —
     // that is the E2E harness / CLI asking for a fresh dedicated instance.
-    if options.port.is_none()
+    if bound.is_none()
+        && options.port.is_none()
         && options.case_dir.is_none()
         && let Some(existing_port) = find_running_server()
     {
@@ -239,14 +255,15 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
         }
         return Ok(());
     }
-    let listener = match options.port {
-        Some(port) => {
+    let listener = match (bound, options.port) {
+        (Some(listener), _) => listener,
+        (None, Some(port)) => {
             bind_loopback(port).map_err(|err| format!("failed to bind 127.0.0.1:{port}: {err}"))?
         }
         // The probe listener is passed straight through instead of being
         // dropped and re-bound: between "probe says free" and "bind for
         // real" another process could claim the port (classic TOCTOU).
-        None => first_free_port().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?,
+        (None, None) => first_free_port().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?,
     };
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
     // In-process publish first: the shell must never depend on the file.
@@ -611,8 +628,13 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
     }
 }
 
+/// The well-known workstation ports, tried in order before a random one
+/// (the viewer keeps unsaved drafts per origin, so a stable port keeps a
+/// crashed session's drafts reachable).
+pub(crate) const PREFERRED_PORTS: std::ops::RangeInclusive<u16> = 8477..=8486;
+
 pub(crate) fn first_free_port() -> Option<TcpListener> {
-    for port in 8477..=8486 {
+    for port in PREFERRED_PORTS {
         if let Ok(listener) = bind_loopback(port) {
             return Some(listener);
         }

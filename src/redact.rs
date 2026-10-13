@@ -74,10 +74,27 @@ pub const REDACTION_NOTE: &str = "path redaction applied: absolute source paths 
 pub struct Redactor {
     case_roots: Vec<PathBuf>,
     cache: RefCell<HashMap<String, String>>,
+    /// Resolves a candidate path (`Path::canonicalize` in production,
+    /// injected by tests). Only ever called for local paths that textually
+    /// lie under a case root — see [`Redactor::may_resolve`].
+    canonicalize: Canonicalize,
+}
+
+/// The filesystem hook [`Redactor`] resolves candidate paths through.
+pub type Canonicalize = fn(&Path) -> std::io::Result<PathBuf>;
+
+fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize()
 }
 
 impl Redactor {
     pub fn new(case_dir: &Path) -> Self {
+        Self::with_canonicalizer(case_dir, fs_canonicalize)
+    }
+
+    /// [`Redactor::new`] with the path-resolution hook made explicit
+    /// (tests count the filesystem calls a redaction pass makes).
+    pub fn with_canonicalizer(case_dir: &Path, canonicalize: Canonicalize) -> Self {
         let mut case_roots = Vec::new();
         if let Ok(canonical) = case_dir.canonicalize() {
             case_roots.push(strip_windows_extended_prefix(&canonical));
@@ -91,6 +108,7 @@ impl Redactor {
         Self {
             case_roots,
             cache: RefCell::new(HashMap::new()),
+            canonicalize,
         }
     }
 
@@ -184,12 +202,47 @@ impl Redactor {
         token
     }
 
+    /// R1: whether `path` may be resolved on the filesystem at all. A
+    /// remote or device token (`\\203.0.113.5\x`, `//host/x` on Windows,
+    /// `\\?\UNC\…`, `\\.\pipe\…`, `\\?\GLOBALROOT\…`, a reserved device
+    /// name) is redacted textually only: resolving it would open an SMB
+    /// session to the named host (handing it the examiner's NTLM
+    /// credentials) or a device that can block the report run. Of the
+    /// local paths, only those that textually lie under a case root are
+    /// resolved (to see through `..`, symlinks, short names); any other
+    /// path becomes a hash token without touching the disk.
+    fn may_resolve(&self, path: &str, normalized: &Path) -> bool {
+        if crate::util::is_remote_or_device_text(path, cfg!(windows)) {
+            return false;
+        }
+        let text = normalized.to_string_lossy();
+        self.case_roots.iter().any(|root| {
+            let root = root.to_string_lossy();
+            let root = root.trim_end_matches(['\\', '/']);
+            let head_matches = text.get(..root.len()).is_some_and(|head| {
+                if cfg!(windows) {
+                    head.eq_ignore_ascii_case(root)
+                } else {
+                    head == root
+                }
+            });
+            head_matches
+                && text[root.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c == '/' || c == '\\')
+        })
+    }
+
     fn map_path(&self, path: &str) -> String {
         let normalized = strip_windows_extended_prefix(Path::new(path));
-        let canonical = normalized
-            .canonicalize()
-            .ok()
-            .map(|p| strip_windows_extended_prefix(&p));
+        let canonical = if self.may_resolve(path, &normalized) {
+            (self.canonicalize)(&normalized)
+                .ok()
+                .map(|p| strip_windows_extended_prefix(&p))
+        } else {
+            None
+        };
         for candidate in canonical.iter().chain(std::iter::once(&normalized)) {
             for root in &self.case_roots {
                 if let Ok(relative) = candidate.strip_prefix(root) {
@@ -572,6 +625,51 @@ mod tests {
             "{once}"
         );
         assert_eq!(redactor.text(&once), once);
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// R1: remote/device tokens are redacted textually — the redactor
+    /// never hands them (nor any path outside the case) to the filesystem.
+    #[test]
+    fn remote_and_device_paths_are_redacted_without_any_filesystem_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        fn counting(path: &std::path::Path) -> std::io::Result<PathBuf> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            SEEN.lock().unwrap().push(path.to_path_buf());
+            Ok(path.to_path_buf())
+        }
+        let case_dir = temp_case("remote-no-fs");
+        let redactor = Redactor::with_canonicalizer(&case_dir, counting);
+        let mut notes = vec![
+            r"메모: 원본은 \\203.0.113.5\x\y 에 있음".to_string(),
+            r"see \\?\UNC\203.0.113.5\share\clip.mp4 now".to_string(),
+            r"pipe \\.\pipe\evil and \\?\GLOBALROOT\Device\Harddisk0".to_string(),
+            "outside /evidence/secret/clip.mp4 and D:/other/x.mp4".to_string(),
+        ];
+        if cfg!(windows) {
+            notes.push(r"device C:\x\COM1 and C:\cases\nul.txt".to_string());
+        }
+        for note in &notes {
+            let out = redactor.text(note);
+            assert!(!out.contains("203.0.113.5"), "{out}");
+            assert!(!out.contains("evil") && !out.contains("Harddisk0"), "{out}");
+            assert!(!out.contains("secret") && !out.contains("other"), "{out}");
+            assert!(out.contains("<redacted:"), "{out}");
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            0,
+            "no filesystem call for remote/device/outside paths: {:?}",
+            SEEN.lock().unwrap()
+        );
+        // A path under the case root is still resolved (once, cached).
+        let inside = case_dir.join("artifacts/clip.mp4");
+        let text = format!("{} {}", inside.display(), inside.display());
+        let out = redactor.text(&text);
+        assert!(out.starts_with("<case>/artifacts/clip.mp4"), "{out}");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         let _ = fs::remove_dir_all(case_dir);
     }
 

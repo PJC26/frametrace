@@ -550,6 +550,13 @@ const anomalyRuns = [];
 const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(true);
 const currentAnomalyIndex = latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
 const currentAnomalyRun = anomalyRuns[currentAnomalyIndex] || null;
+// R8: a newer run without its completion marker (cut short) exists, so the
+// "current" result is an OLDER completed run — say so instead of letting
+// the reader assume the latest scan is shown.
+const newestAnomalyRunInterrupted = latestCompleted >= 0 && latestCompleted < anomalyRuns.length - 1;
+const anomalyInterruptedNotice = newestAnomalyRunInterrupted
+  ? `<p class="muted"><strong>최근 실행이 중단되어 이전 완료 실행을 현재로 표시합니다</strong> — 중단된 실행(${{fmtUnix(anomalyRuns[anomalyRuns.length - 1].ts)}})의 부분 결과는 아래 이력에 있으며 현재 결과가 아닙니다.</p>`
+  : "";
 const findingRows = run => run.entries.filter(item => item.kind && item.kind !== "none");
 const anomalyTable = rows => `<table>
   <thead>
@@ -570,7 +577,7 @@ const anomalyRunLine = run => {{
 }};
 const anomalyRows = currentAnomalyRun ? findingRows(currentAnomalyRun) : [];
 document.getElementById("anomaly-findings").innerHTML = currentAnomalyRun
-  ? `<p class="muted">현재 결과 — ${{anomalyRunLine(currentAnomalyRun)}} · ${{escapeHtml(chainLabel("anomaly"))}}</p>${{anomalyRows.length ? anomalyTable(anomalyRows) : "<p>이 실행에서 이상 징후 후보가 없습니다.</p>"}}`
+  ? `${{anomalyInterruptedNotice}}<p class="muted">현재 결과 — ${{anomalyRunLine(currentAnomalyRun)}} · ${{escapeHtml(chainLabel("anomaly"))}}</p>${{anomalyRows.length ? anomalyTable(anomalyRows) : "<p>이 실행에서 이상 징후 후보가 없습니다.</p>"}}`
   : "<p>이상 징후 후보가 없습니다.</p>";
 const pastAnomalyRuns = anomalyRuns.filter((_, index) => index !== currentAnomalyIndex).reverse();
 document.getElementById("anomaly-history").innerHTML = pastAnomalyRuns.length ? `<details><summary>이전 실행 ${{pastAnomalyRuns.length}}회 — 현재 결과 아님</summary>${{pastAnomalyRuns.map(run => `<p class="muted">${{anomalyRunLine(run)}}</p>${{findingRows(run).length ? anomalyTable(findingRows(run)) : "<p>후보 없음</p>"}}`).join("")}}</details>` : "";
@@ -1818,6 +1825,37 @@ mod tests {
         let history = html("validation-history");
         assert!(history.contains("<details>") && history.contains("validation-failed"));
         assert_eq!(elements["validations"]["textContent"], 2);
+    }
+
+    /// R8: when the newest run never wrote its completion marker, the
+    /// report says the shown "current" result is the previous completed run.
+    #[test]
+    fn interrupted_newest_anomaly_run_is_called_out() {
+        let anomaly = [
+            r#"{"event":"anomaly-scan","scanned_unix":100,"kind":"gap","selector":"vid_done","detail":"a"}"#,
+            r#"{"event":"anomaly-scan-run","scanned_unix":100,"hash_mode":"stored","finding_count":1}"#,
+            r#"{"event":"anomaly-scan","scanned_unix":300,"kind":"gap","selector":"vid_cut","detail":"b"}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &anomaly)]);
+        let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        assert!(
+            current.contains("최근 실행이 중단되어 이전 완료 실행을 현재로 표시"),
+            "{current}"
+        );
+        assert!(
+            current.contains("vid_done") && !current.contains("vid_cut"),
+            "{current}"
+        );
+        // A complete newest run carries no such notice.
+        let complete = [
+            r#"{"event":"anomaly-scan","scanned_unix":100,"kind":"gap","selector":"vid_done","detail":"a"}"#,
+            r#"{"event":"anomaly-scan-run","scanned_unix":100,"hash_mode":"stored","finding_count":1}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &complete)]);
+        let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        assert!(!current.contains("최근 실행이 중단"), "{current}");
     }
 
     /// I5: a legacy log without run markers still separates runs by time.

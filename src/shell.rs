@@ -59,6 +59,8 @@ pub(crate) fn cell_clone<T: Clone>(cell: &RefCell<Option<T>>) -> Option<T> {
 }
 
 /// Moves the value out (see [`cell_clone`]); `None` when empty or busy.
+/// Teardown goes through [`release_slot`], which also reports a busy slot.
+#[cfg(test)]
 pub(crate) fn cell_take<T>(cell: &RefCell<Option<T>>) -> Option<T> {
     cell.try_borrow_mut().ok().and_then(|mut slot| slot.take())
 }
@@ -74,17 +76,43 @@ pub(crate) fn cell_store<T>(cell: &RefCell<Option<T>>, value: T) -> Result<(), T
     }
 }
 
+/// R9: takes the value out of `cell` and hands it to `close`, then drops
+/// it. Returns whether the slot is verifiably empty afterwards — `false`
+/// when the cell was still borrowed (a re-entrant path holds it), in which
+/// case the value is left where it is and the caller must not tear down
+/// what it depends on (COM) underneath it.
+pub(crate) fn release_slot<T>(cell: &RefCell<Option<T>>, close: impl FnOnce(&T)) -> bool {
+    match cell.try_borrow_mut() {
+        Ok(mut slot) => {
+            let taken = slot.take();
+            // The borrow ends before `close` runs: Close() may pump
+            // messages that look the slot up again (P10).
+            drop(slot);
+            if let Some(value) = taken {
+                close(&value);
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// P13: balances a successful `CoInitializeEx` (S_OK *and* S_FALSE both
 /// need a matching `CoUninitialize`) once every WebView2 object of the
-/// window is released.
-struct ComApartment;
+/// window is released. R9: when a WebView2 object could not be released
+/// (its slot was busy), uninitialization is skipped — releasing a COM
+/// pointer after `CoUninitialize` (at thread-local teardown) is undefined
+/// behaviour, while a still-initialized apartment at process exit is not.
+struct ComApartment {
+    uninit: bool,
+}
 
 impl ComApartment {
     fn init() -> Result<Self, String> {
         // SAFETY: initializes COM for this (UI) thread.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         if com_init_needs_uninit(hr.0) {
-            Ok(ComApartment)
+            Ok(ComApartment { uninit: true })
         } else {
             Err(format!(
                 "CoInitializeEx failed: {}",
@@ -94,10 +122,20 @@ impl ComApartment {
     }
 }
 
+impl ComApartment {
+    /// R9: leave COM initialized (a WebView2 object is still alive).
+    fn keep_initialized(&mut self) {
+        self.uninit = false;
+    }
+}
+
 impl Drop for ComApartment {
     fn drop(&mut self) {
-        // SAFETY: pairs the successful CoInitializeEx in `init`.
-        unsafe { windows::Win32::System::Com::CoUninitialize() };
+        if self.uninit {
+            // SAFETY: pairs the successful CoInitializeEx in `init`; every
+            // WebView2 object of this thread was released before.
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
     }
 }
 
@@ -172,55 +210,65 @@ pub fn run_hosted() -> Result<(), String> {
     // An already-running workstation wins: attach a window to it instead
     // of stacking a second server. We don't own it, so closing the window
     // leaves it running — same contract as the browser flow.
-    let (target, owned_port) = if let Some(port) = serve::find_running_server() {
-        // Attaching to a separately launched server: the instance file is
-        // the only token source.
-        (serve::shell_target(port, false, Duration::ZERO), None)
-    } else {
-        let port = reserve_port()?;
-        // P4: the server thread reports how `serve::run` ended, so a
-        // startup failure (token format, bind) is shown as itself instead
-        // of a generic "did not bind in time" after the full wait.
-        let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
-        let server = std::thread::Builder::new()
-            .name("frametrace-serve".to_string())
-            .spawn(move || {
-                let result = serve::run(ServeOptions {
-                    case_dir: None,
-                    port: Some(port),
-                    open_browser: false,
-                });
-                let _ = result_tx.send(result);
-            })
-            .map_err(|err| format!("failed to spawn workstation server thread: {err}"))?;
-        wait_for_server(port, Duration::from_secs(15), &result_rx)?;
-        OWNED_PORT.store(port, Ordering::SeqCst);
-        // Server-exit watcher: if the server ends while the WebView2
-        // window is still up (UI 종료 button, /api/shutdown, a fatal
-        // error), close the frame rather than leaving a dead page open.
-        // The channel lets the shutdown path wait for the server with a
-        // bound instead of an unbounded `join`.
-        let (server_done_tx, server_done_rx) = mpsc::channel::<()>();
-        let watcher = std::thread::spawn(move || {
-            let result = result_rx
-                .recv()
-                .unwrap_or_else(|_| Err(SERVER_THREAD_PANIC.into()));
-            let _ = server.join();
-            // P5: published before the frame hears about it, so a host
-            // failure caused by the dying server is never answered with a
-            // browser pointed at the dead URL.
-            *SERVER_EXIT
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
-            let _ = server_done_tx.send(());
-            post_frame_message(MSG_SERVER_GONE);
-        });
-        // The server publishes its token in-process right after bind; wait
-        // for that rather than re-reading the instance file.
-        (
-            serve::shell_target(port, true, Duration::from_secs(10)),
-            Some((port, watcher, server_done_rx)),
-        )
+    let (target, owned_port) = match claim_port()? {
+        PortClaim::Attach(port) => {
+            // Attaching to a separately launched server: the instance
+            // file is the only token source.
+            (serve::shell_target(port, false, Duration::ZERO), None)
+        }
+        PortClaim::Own(listener, port) => {
+            // P4: the server thread reports how `serve::run` ended, so a
+            // startup failure (token format, bind) is shown as itself instead
+            // of a generic "did not bind in time" after the full wait.
+            let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
+            let server = std::thread::Builder::new()
+                .name("frametrace-serve".to_string())
+                .spawn(move || {
+                    // R5: the listener bound by `claim_port` is served as is —
+                    // never released and re-bound, so a second shell (or any
+                    // other process) cannot take the port in between.
+                    let result = serve::run_with_listener(
+                        ServeOptions {
+                            case_dir: None,
+                            port: Some(port),
+                            open_browser: false,
+                        },
+                        listener,
+                    );
+                    let _ = result_tx.send(result);
+                })
+                .map_err(|err| format!("failed to spawn workstation server thread: {err}"))?;
+            wait_for_server(port, Duration::from_secs(15), &result_rx)?;
+            // Only now, with this process's own listener serving, is the port
+            // "ours" (R5): WM_CLOSE shuts down exactly what OWNED_PORT names.
+            OWNED_PORT.store(port, Ordering::SeqCst);
+            // Server-exit watcher: if the server ends while the WebView2
+            // window is still up (UI 종료 button, /api/shutdown, a fatal
+            // error), close the frame rather than leaving a dead page open.
+            // The channel lets the shutdown path wait for the server with a
+            // bound instead of an unbounded `join`.
+            let (server_done_tx, server_done_rx) = mpsc::channel::<()>();
+            let watcher = std::thread::spawn(move || {
+                let result = result_rx
+                    .recv()
+                    .unwrap_or_else(|_| Err(SERVER_THREAD_PANIC.into()));
+                let _ = server.join();
+                // P5: published before the frame hears about it, so a host
+                // failure caused by the dying server is never answered with a
+                // browser pointed at the dead URL.
+                *SERVER_EXIT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+                let _ = server_done_tx.send(());
+                post_frame_message(MSG_SERVER_GONE);
+            });
+            // The server publishes its token in-process right after bind; wait
+            // for that rather than re-reading the instance file.
+            (
+                serve::shell_target(port, true, Duration::from_secs(10)),
+                Some((port, watcher, server_done_rx)),
+            )
+        }
     };
 
     let hosted = match host_window(&target) {
@@ -410,21 +458,94 @@ pub(crate) fn reclose_forces_close(started: Instant, now: Instant) -> bool {
     now.saturating_duration_since(started) >= CLOSE_FORCE_AFTER
 }
 
-fn reserve_port() -> Result<u16, String> {
-    // Bind-release-bind is a tiny TOCTOU window, but serve::run returns a
-    // bind error rather than grabbing a random port, and the caller turns
-    // that into the browser fallback — acceptable and self-healing.
-    // Prefer the well-known ports (8477..8486) like the CLI server does:
-    // the viewer keeps unsaved drafts in per-origin localStorage, so a
-    // random port on every launch would strand a crashed session's drafts
-    // under an address the next launch never opens.
+/// Where the shell's workstation comes from (R5).
+enum PortClaim {
+    /// Another FrameTrace instance already serves (or just started on)
+    /// this port: attach a window to it.
+    Attach(u16),
+    /// This process bound the port; the listener goes straight to the
+    /// server thread (never released and re-bound).
+    Own(std::net::TcpListener, u16),
+}
+
+/// One step of the R5 port decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortDecision {
+    /// Serve on the port this process bound.
+    Own,
+    /// Drop our listener and attach to the instance on this port.
+    Attach(u16),
+    /// Another instance announced itself but does not answer yet: look
+    /// again shortly.
+    Recheck,
+}
+
+/// How long a shell that lost the first preferred port waits for the
+/// instance that announced itself there to start answering (a double
+/// launch: both shells start at once, the other one won 8477).
+const ATTACH_GRACE: Duration = Duration::from_secs(3);
+
+/// Pure R5 decision. `bound`: the port this process holds; `first`: the
+/// first preferred port; `running`: a FrameTrace instance discovery
+/// verified (nonce match / full status shape); `announced`: the port the
+/// instance file names (a server writes it right after its bind, before it
+/// serves); `grace_left`: the [`ATTACH_GRACE`] budget is not spent.
+pub(crate) fn decide_port(
+    bound: u16,
+    first: u16,
+    running: Option<u16>,
+    announced: Option<u16>,
+    grace_left: bool,
+) -> PortDecision {
+    if let Some(port) = running.filter(|port| *port != bound) {
+        return PortDecision::Attach(port);
+    }
+    if bound == first {
+        // Nobody held the first preferred port: no other instance can be
+        // starting ahead of us.
+        return PortDecision::Own;
+    }
+    if grace_left && announced.is_some_and(|port| port != bound) {
+        return PortDecision::Recheck;
+    }
+    PortDecision::Own
+}
+
+/// Picks the shell's server (R5): an already-running instance wins;
+/// otherwise this process binds a preferred port and KEEPS the listener.
+/// When the first preferred port was taken, the taker may be a second
+/// FrameTrace shell starting at the same moment — attach to it once
+/// discovery verifies it instead of stacking a second workstation.
+fn claim_port() -> Result<PortClaim, String> {
+    if let Some(port) = serve::find_running_server() {
+        return Ok(PortClaim::Attach(port));
+    }
     let listener =
         serve::first_free_port().ok_or_else(|| "failed to reserve a loopback port".to_string())?;
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
     if port == 0 {
         return Err("reserved port resolved to 0".to_string());
     }
-    Ok(port)
+    let first = *serve::PREFERRED_PORTS.start();
+    let deadline = Instant::now() + ATTACH_GRACE;
+    loop {
+        let (running, announced) = if port == first {
+            (None, None)
+        } else {
+            (
+                serve::find_running_server(),
+                serve::read_instance_record().map(|(announced, _, _)| announced),
+            )
+        };
+        match decide_port(port, first, running, announced, Instant::now() < deadline) {
+            PortDecision::Own => return Ok(PortClaim::Own(listener, port)),
+            PortDecision::Attach(other) => {
+                drop(listener);
+                return Ok(PortClaim::Attach(other));
+            }
+            PortDecision::Recheck => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 fn wait_for_server(
@@ -774,7 +895,15 @@ fn instance_nonce(port: u16) -> Option<String> {
     nonce_from_response(&String::from_utf8_lossy(&buffer))
 }
 
-/// Extracts the `ft_nonce` cookie value from a raw HTTP response's
+/// C2: `ft_nonce_<port>` (current servers) or the legacy `ft_nonce`.
+fn is_nonce_cookie_name(name: &str) -> bool {
+    name == "ft_nonce"
+        || name
+            .strip_prefix("ft_nonce_")
+            .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Extracts the `ft_nonce[_<port>]` cookie value from a raw HTTP response's
 /// `Set-Cookie` headers (header block only; the body is ignored).
 fn nonce_from_response(response: &str) -> Option<String> {
     let head = response.split("\r\n\r\n").next().unwrap_or(response);
@@ -786,15 +915,16 @@ fn nonce_from_response(response: &str) -> Option<String> {
         let pair = value.trim().split(';').next()?;
         let (cookie, nonce) = pair.split_once('=')?;
         let nonce = nonce.trim();
-        (cookie.trim() == "ft_nonce" && !nonce.is_empty()).then(|| nonce.to_string())
+        (is_nonce_cookie_name(cookie.trim()) && !nonce.is_empty()).then(|| nonce.to_string())
     })
 }
 
 fn host_window(target: &Result<String, String>) -> Result<(), String> {
     unsafe {
         // Dropped last (end of this function): after host_webview has
-        // released the controller, the webview and the environment.
-        let _com = ComApartment::init()?;
+        // released the webview and the environment, and after the
+        // controller slot was emptied below (R9).
+        let mut com = ComApartment::init()?;
         // DPI awareness may already be fixed by a manifest or a parent
         // process (E_ACCESSDENIED); a slightly blurry window is far better
         // than abandoning the shell for the browser fallback over it.
@@ -832,6 +962,20 @@ fn host_window(target: &Result<String, String>) -> Result<(), String> {
         FRAME_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
         FRAME_HWND.store(hwnd.0, Ordering::SeqCst);
         let result = host_webview(hwnd, target);
+        // R9: the controller is released here, on every path, BEFORE the
+        // apartment is torn down. Moved out first: Close() may pump
+        // messages (WM_SIZE) that look the controller up again (P10).
+        let released = CONTROLLER.with(|slot| {
+            release_slot(slot, |controller| {
+                let _ = controller.Close();
+            })
+        });
+        if !released {
+            eprintln!(
+                "frametrace: WebView2 controller still borrowed at teardown; leaving COM initialized"
+            );
+            com.keep_initialized();
+        }
         FRAME_HWND.store(std::ptr::null_mut(), Ordering::SeqCst);
         FRAME_THREAD.store(0, Ordering::SeqCst);
         if let Err(err) = result {
@@ -977,12 +1121,7 @@ unsafe fn host_webview(hwnd: HWND, target: &Result<String, String>) -> Result<()
                 }
             }
         }
-
-        // Moved out first: Close() may pump messages (WM_SIZE) that look
-        // the controller up again (P10).
-        if let Some(controller) = CONTROLLER.with(cell_take) {
-            let _ = controller.Close();
-        }
+        // The controller is closed and released by host_window (R9).
     }
     Ok(())
 }
@@ -1241,6 +1380,94 @@ mod tests {
         assert_eq!(cell_take(&cell), None);
     }
 
+    /// R9: the controller slot is emptied (and the value closed) before
+    /// COM teardown; a busy slot reports failure so uninit is deferred.
+    #[test]
+    fn release_slot_closes_and_empties_or_reports_a_busy_slot() {
+        use super::release_slot;
+        let closed = std::cell::Cell::new(0);
+        let cell = RefCell::new(Some(7));
+        assert!(release_slot(&cell, |value| {
+            assert_eq!(*value, 7);
+            closed.set(closed.get() + 1);
+        }));
+        assert_eq!(closed.get(), 1);
+        assert!(cell.borrow().is_none());
+        // Empty slot: nothing to close, still verifiably empty.
+        assert!(release_slot(&cell, |_| closed.set(closed.get() + 1)));
+        assert_eq!(closed.get(), 1);
+        // Busy slot (a re-entrant borrow): not released, value untouched.
+        let busy = RefCell::new(Some(9));
+        let held = busy.borrow();
+        assert!(!release_slot(&busy, |_| closed.set(closed.get() + 1)));
+        drop(held);
+        assert_eq!(closed.get(), 1);
+        assert_eq!(*busy.borrow(), Some(9));
+        // The close callback may look the slot up again (P10).
+        let reentrant = RefCell::new(Some(1));
+        assert!(release_slot(&reentrant, |_| {
+            assert!(super::cell_clone(&reentrant).is_none());
+        }));
+    }
+
+    /// R5: a verified instance is attached to; a shell that won the first
+    /// preferred port owns it; one that lost it waits (bounded) for the
+    /// instance that announced itself, then owns what it bound.
+    #[test]
+    fn port_decision_table() {
+        use super::{PortDecision, decide_port};
+        let first = 8477;
+        // Discovery verified another instance: attach, whatever we bound.
+        assert_eq!(
+            decide_port(8478, first, Some(8477), Some(8477), true),
+            PortDecision::Attach(8477)
+        );
+        assert_eq!(
+            decide_port(8477, first, Some(8479), None, false),
+            PortDecision::Attach(8479)
+        );
+        // Our own port never counts as "another instance".
+        assert_eq!(
+            decide_port(8478, first, Some(8478), Some(8478), true),
+            PortDecision::Own
+        );
+        // Won the first preferred port: nobody can be ahead of us.
+        assert_eq!(
+            decide_port(8477, first, None, Some(8477), true),
+            PortDecision::Own
+        );
+        assert_eq!(
+            decide_port(8477, first, None, Some(8480), true),
+            PortDecision::Own
+        );
+        // Lost it to an instance that announced itself but does not answer
+        // yet (double launch): look again while the grace lasts...
+        assert_eq!(
+            decide_port(8478, first, None, Some(8477), true),
+            PortDecision::Recheck
+        );
+        // ...then own what we bound (a stale file / a foreign occupant).
+        assert_eq!(
+            decide_port(8478, first, None, Some(8477), false),
+            PortDecision::Own
+        );
+        // Lost it to something that never announced itself: own at once.
+        assert_eq!(
+            decide_port(8478, first, None, None, true),
+            PortDecision::Own
+        );
+    }
+
+    /// R5: the listener `claim_port` binds is the one served — a port held
+    /// by a listener cannot be taken by a second shell's bind.
+    #[test]
+    fn a_held_listener_keeps_its_port_from_a_second_bind() {
+        let held = crate::serve::bind_loopback(0).expect("bind");
+        let port = held.local_addr().unwrap().port();
+        assert!(crate::serve::bind_loopback(port).is_err());
+        drop(held);
+    }
+
     /// P13: S_OK and S_FALSE are paired with CoUninitialize, failures not.
     #[test]
     fn com_uninit_pairing_table() {
@@ -1367,6 +1594,16 @@ mod tests {
     fn parses_ft_nonce_from_set_cookie() {
         let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: ft_nonce=abc123; HttpOnly; SameSite=Strict; Path=/\r\n\r\n<html>ft_nonce=bogus</html>";
         assert_eq!(nonce_from_response(response).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn parses_per_port_ft_nonce_from_set_cookie() {
+        let response = "HTTP/1.1 200 OK\r\nSet-Cookie: ft_nonce_8478=n8478; HttpOnly; SameSite=Strict; Path=/\r\n\r\n";
+        assert_eq!(nonce_from_response(response).as_deref(), Some("n8478"));
+        assert_eq!(
+            nonce_from_response("HTTP/1.1 200 OK\r\nSet-Cookie: ft_nonce_x=bad\r\n\r\n"),
+            None
+        );
     }
 
     #[test]

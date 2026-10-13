@@ -1628,13 +1628,35 @@ pub(crate) fn api_advanced(request: &Request, state: &SharedState) -> String {
 /// requester. Only paths under the approved media roots are copied, and
 /// items without a file (e.g. pre-recovery candidates) are recorded in
 /// the manifest as skipped instead of silently vanishing.
+///
+/// R3: the batch can be long (up to 5000 copies + hashes), so it is
+/// cancellable through `/api/cancel`: the flag is checked between items
+/// (a copy in progress is finished, never torn), and a cancelled export
+/// still writes its full manifest — every selected item appears, the ones
+/// never reached as `not-exported(cancelled)` — with `cancelled`,
+/// `items_done` and `items_total` in `manifest-audit.json`, the README and
+/// the audit event. The reply is then `ok:false, cancelled:true`.
 pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> String {
+    api_export_selected_with(request, state, &|_| {})
+}
+
+/// Skip reason recorded for selected items a cancel stopped the batch
+/// before (R3).
+pub(crate) const EXPORT_CANCELLED_REASON: &str = "not-exported(cancelled)";
+
+/// [`api_export_selected`] with a hook run before each item is exported
+/// (tests use it to cancel mid-batch deterministically).
+pub(crate) fn api_export_selected_with(
+    request: &Request,
+    state: &SharedState,
+    before_item: &(dyn Fn(usize) + Sync),
+) -> String {
     if state_lock(state).case_dir.is_none() {
         return "{\"ok\":false,\"error\":\"열린 케이스가 없습니다.\"}".to_string();
     }
     // S1: a write op for the whole batch (copies, hashes, manifest), so
     // shutdown / finalize / open-case cannot tear the export bundle.
-    let (_write_op, case_dir) = match try_begin_write_op(state) {
+    let (write_op, case_dir) = match try_begin_write_op(state) {
         Ok(op) => op,
         Err(err) => return api_err(&err),
     };
@@ -1704,14 +1726,20 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
         let outcomes = &outcomes;
         let next_index = &next_index;
         let field = &field;
+        let cancel = write_op.cancel_flag();
         thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(move || {
                     loop {
+                        // R3: checked before taking the next item.
+                        if cancel.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let index = next_index.fetch_add(1, Ordering::SeqCst);
                         let Some(item) = items.get(index) else {
                             break;
                         };
+                        before_item(index);
                         let outcome = export_one(item, roots, export_dir, field);
                         outcomes.lock().unwrap_or_else(|e| e.into_inner())[index] = Some(outcome);
                     }
@@ -1729,10 +1757,18 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
     let mut jsonl_rows: Vec<String> = Vec::new();
     let mut copied = 0usize;
     let mut skipped = 0usize;
+    let items_total = items.len();
+    let items_done = outcomes.iter().filter(|outcome| outcome.is_some()).count();
+    // Partial only when items were actually left out; a cancel that
+    // arrived after the last item changed nothing.
+    let cancelled = items_done < items_total;
     for (item, outcome) in items.iter().zip(outcomes) {
-        let Some(outcome) = outcome else {
-            continue;
-        };
+        // R3: an item the cancel stopped the batch before stays in the
+        // manifest — a selection is never silently shortened.
+        let outcome = outcome.unwrap_or_else(|| ExportOutcome {
+            skip_reason: EXPORT_CANCELLED_REASON.to_string(),
+            ..ExportOutcome::default()
+        });
         let id = field(item, "id");
         let path_text = field(item, "path");
         let ExportOutcome {
@@ -1787,9 +1823,8 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
     let audit_result = audit::append_chained_jsonl(
         &audit_log,
         &format!(
-            "{{\"event\":\"selection-export\",\"export_dir\":{},\"items\":{},\"copied\":{copied},\"skipped\":{skipped},\"unix\":{stamp}}}",
+            "{{\"event\":\"selection-export\",\"export_dir\":{},\"items\":{items_total},\"items_done\":{items_done},\"cancelled\":{cancelled},\"copied\":{copied},\"skipped\":{skipped},\"unix\":{stamp}}}",
             json_string(&export_dir.to_string_lossy()),
-            items.len()
         ),
     );
     let write = |name: &str, contents: String| -> Result<(), String> {
@@ -1800,13 +1835,20 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
         .ok()
         .flatten()
         .unwrap_or_default();
+    let status_line = if cancelled {
+        format!(
+            "상태: 중단됨 — 선택 {items_total}개 중 {items_done}개만 처리했습니다. 나머지는 manifest에 {EXPORT_CANCELLED_REASON}로 기록되어 있으며 이 폴더에 사본이 없습니다."
+        )
+    } else {
+        "상태: 완료 — 선택한 모든 항목을 처리했습니다.".to_string()
+    };
     let result = write("manifest.csv", format!("\u{feff}{}\n", csv_rows.join("\n")))
         .and_then(|_| write("manifest.jsonl", jsonl_rows.join("\n") + "\n"))
         .and_then(|_| {
             write(
                 "manifest-audit.json",
                 format!(
-                    "{{\"audit_log\":{},\"chain_head_sha256\":{},\"audit_logged\":{},\"unix\":{stamp}}}\n",
+                    "{{\"audit_log\":{},\"chain_head_sha256\":{},\"audit_logged\":{},\"cancelled\":{cancelled},\"items_done\":{items_done},\"items_total\":{items_total},\"unix\":{stamp}}}\n",
                     json_string("evidence/logs/export-log.jsonl"),
                     json_string(&head),
                     audit_result.is_ok()
@@ -1819,6 +1861,7 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
                 format!(
                     "FrameTrace 선별 증거 묶음\n\n\
                      생성 시각(unix): {stamp}\n\
+                     {status_line}\n\
                      항목: {}개 — 복사 {copied}개, 제외 {skipped}개\n\n\
                      - 복사된 파일은 원본의 사본입니다. manifest의 sha256_copy가\n  \
                      sha256_source와 동일하면 복사가 정확히 이루어진 것입니다.\n\
@@ -1834,7 +1877,36 @@ pub(crate) fn api_export_selected(request: &Request, state: &SharedState) -> Str
             )
         });
     if let Err(err) = result {
+        // Best effort: a folder whose manifest could not be written says so
+        // itself, so nobody mistakes the bare copies for a complete bundle.
+        let _ = std::fs::write(
+            export_dir.join("MANIFEST-WRITE-FAILED.txt"),
+            format!(
+                "이 선별 묶음의 manifest를 쓰지 못했습니다 — 묶음으로 사용하지 마십시오.\n{err}\n"
+            ),
+        );
         return serde_json::json!({"ok": false, "error": err}).to_string();
+    }
+    if cancelled {
+        let audit_note = match &audit_result {
+            Ok(()) => String::new(),
+            Err(err) => format!(" 감사 로그 기록도 실패했습니다: {err}"),
+        };
+        return serde_json::json!({
+            "ok": false,
+            "cancelled": true,
+            "partial": true,
+            "unlogged": audit_result.is_err(),
+            "error": format!(
+                "선택 내보내기를 중단했습니다 — {items_total}개 중 {items_done}개 처리. 폴더에 부분 묶음과 manifest(중단 표시)가 남아 있습니다.{audit_note}"
+            ),
+            "export_dir": export_dir.to_string_lossy(),
+            "items_done": items_done,
+            "items_total": items_total,
+            "copied": copied,
+            "skipped": skipped,
+        })
+        .to_string();
     }
     if let Err(err) = audit_result {
         return serde_json::json!({

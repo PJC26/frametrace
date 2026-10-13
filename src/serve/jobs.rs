@@ -34,10 +34,18 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
             ))
         );
     }
-    if matches!(input_kind, InputKind::E01 | InputKind::E01Direct)
-        && !tool_available("ewfinfo", "-V")
-    {
-        return "{\"ok\":false,\"error\":\"E01 처리에는 libewf 도구(ewfinfo/ewfverify/ewfexport)가 필요합니다. 도구를 설치한 뒤 다시 시도하십시오.\"}".to_string();
+    if matches!(input_kind, InputKind::E01 | InputKind::E01Direct) {
+        match super::system::tool_probe("ewfinfo", "-V") {
+            super::system::ToolProbe::Present => {}
+            // R6: a slow first start is not "not installed".
+            super::system::ToolProbe::TimedOut => {
+                return api_err(&format!(
+                    "ewfinfo 버전 확인이 {}초 안에 끝나지 않았습니다 — 도구가 없는 것이 아니라 응답이 늦습니다(백신 검사 등). 잠시 후 다시 시도하거나 FRAMETRACE_TOOL_PROBE_TIMEOUT(초)을 늘리십시오.",
+                    crate::util::version_probe_timeout_secs()
+                ));
+            }
+            _ => return "{\"ok\":false,\"error\":\"E01 처리에는 libewf 도구(ewfinfo/ewfverify/ewfexport)가 필요합니다. 도구를 설치한 뒤 다시 시도하십시오.\"}".to_string(),
+        }
     }
     let with_hash = body_value(&request.body, "with_hash").as_deref() == Some("true");
     let with_ffprobe = body_value(&request.body, "with_ffprobe").as_deref() == Some("true");

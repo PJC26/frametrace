@@ -1,6 +1,11 @@
 //! HTTP request parsing, loopback/token auth gating, and response/static/media serving.
 
 use super::*;
+#[cfg(test)]
+pub(crate) use crate::util::is_reserved_device_name;
+use crate::util::{
+    is_remote_or_device_path, is_verbatim_local_drive, reserved_device_refused, unc_share_form,
+};
 
 // Bounded so a malformed client cannot exhaust memory; export payloads
 // carry one small JSON record per selected item.
@@ -112,23 +117,37 @@ pub(crate) fn http_auth_class(method: &str, token_configured: bool) -> HttpAuthC
 /// the ft_nonce cookie a GET / plants or from the user-private instance
 /// file and send X-FrameTrace-Nonce (/api/status's "instance" is only a
 /// fingerprint, not the nonce).
+#[cfg(test)]
 pub(crate) fn authorize(
     request: &Request,
     token: Option<&str>,
     instance: &str,
+) -> Result<bool, u16> {
+    authorize_on(request, token, instance, None)
+}
+
+/// [`authorize`] for a server listening on `port` (C2: the auth cookies
+/// are named per port; `None` = only the legacy names, tests).
+pub(crate) fn authorize_on(
+    request: &Request,
+    token: Option<&str>,
+    instance: &str,
+    port: Option<u16>,
 ) -> Result<bool, u16> {
     if !request_is_localhost_trusted(request) {
         return Err(403);
     }
     match http_auth_class(&request.method, token.is_some()) {
         HttpAuthClass::Public => Ok(false),
-        HttpAuthClass::Token => match request_authorized(request, token.unwrap_or_default()) {
-            AuthProof::Denied => Err(401),
-            AuthProof::Query => Ok(true),
-            AuthProof::Header | AuthProof::Cookie => Ok(false),
-        },
+        HttpAuthClass::Token => {
+            match request_authorized_on(request, token.unwrap_or_default(), port) {
+                AuthProof::Denied => Err(401),
+                AuthProof::Query => Ok(true),
+                AuthProof::Header | AuthProof::Cookie => Ok(false),
+            }
+        }
         HttpAuthClass::Nonce => {
-            if request_nonce_authorized(request, instance) {
+            if request_nonce_authorized(request, instance, port) {
                 Ok(false)
             } else {
                 Err(401)
@@ -211,10 +230,13 @@ pub(crate) fn handle_connection_timed(
         let guard = state_lock(&state);
         (guard.token.clone(), guard.instance.clone())
     };
+    // C2: cookies are scoped by host, not by port, so the auth cookies are
+    // named after the port this server listens on.
+    let port = stream.local_addr().ok().map(|addr| addr.port());
     // S3: Origin/Host, token and nonce live in the header block, so the
     // gate runs before a single body byte is read — an unauthenticated
     // client can no longer make the server buffer a 16 MiB body first.
-    let plant_cookie = match authorize(&request, token.as_deref(), &instance) {
+    let plant_cookie = match authorize_on(&request, token.as_deref(), &instance, port) {
         Ok(plant) => plant,
         Err(code) => {
             let message: &[u8] = if code == 403 {
@@ -263,12 +285,12 @@ pub(crate) fn handle_connection_timed(
     }
     let mut response = route(&request, &state);
     if plant_cookie && let Some(token) = token.as_deref() {
-        set_token_cookie(&mut response, token);
+        set_token_cookie(&mut response, token, port);
     }
     // GETs under the no-token model also plant the instance nonce so the
     // just-served page can satisfy the mutating-request gate.
     if token.is_none() && request.method == "GET" && !instance.is_empty() {
-        set_nonce_cookie(&mut response, &instance);
+        set_nonce_cookie(&mut response, &instance, port);
     }
     if is_head && let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
         response.truncate(end + 4);
@@ -681,7 +703,7 @@ pub(crate) fn reject_remote_path_on(
     windows: bool,
 ) -> Result<(), &'static str> {
     let text = raw.trim();
-    if windows && has_reserved_device_component(text) {
+    if windows && reserved_device_refused(text) {
         return Err(RESERVED_DEVICE_ERROR);
     }
     if !is_remote_or_device_path(text, windows) {
@@ -719,7 +741,7 @@ pub(crate) fn reject_device_path(raw: &str) -> Result<(), &'static str> {
 /// [`reject_device_path`] with explicit platform semantics (tests).
 pub(crate) fn reject_device_path_on(raw: &str, windows: bool) -> Result<(), &'static str> {
     let text = raw.trim();
-    if windows && has_reserved_device_component(text) {
+    if windows && reserved_device_refused(text) {
         return Err(RESERVED_DEVICE_ERROR);
     }
     if is_remote_or_device_path(text, windows)
@@ -736,41 +758,6 @@ pub(crate) fn reject_device_path_on(raw: &str, windows: bool) -> Result<(), &'st
 /// Refusal text for a path naming a reserved Windows device (S2).
 pub(crate) const RESERVED_DEVICE_ERROR: &str = "Windows 예약 장치 이름(CON·PRN·AUX·NUL·COM0–9·LPT0–9 등)이 들어간 경로는 허용되지 않습니다. / Paths naming a reserved Windows device are refused.";
 
-/// Whether one path component names a reserved DOS device. Windows maps
-/// the name to the device regardless of extension (`NUL.txt`) and of
-/// trailing spaces/dots, and case-insensitively; the superscript digits
-/// `¹²³` count as digits for COM/LPT.
-pub(crate) fn is_reserved_device_name(component: &str) -> bool {
-    let base = component
-        .split(['.', ':'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    if matches!(
-        base.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
-    ) {
-        return true;
-    }
-    let Some(digit) = base
-        .strip_prefix("COM")
-        .or_else(|| base.strip_prefix("LPT"))
-    else {
-        return false;
-    };
-    let mut chars = digit.chars();
-    matches!(
-        (chars.next(), chars.next()),
-        (Some('0'..='9' | '¹' | '²' | '³'), None)
-    )
-}
-
-/// Whether any `\`/`/`-separated component of `text` is a reserved device.
-fn has_reserved_device_component(text: &str) -> bool {
-    text.split(['\\', '/']).any(is_reserved_device_name)
-}
-
 /// Routes whose path fields may name a UNC share the examiner typed (see
 /// the policy on [`reject_remote_path`]). Only same-origin, nonce-gated
 /// POSTs qualify — never a GET.
@@ -779,65 +766,6 @@ pub(crate) fn route_admits_typed_unc(method: &str, path: &str) -> bool {
         (method, path),
         ("POST", "/api/preflight") | ("POST", "/api/start")
     )
-}
-
-fn is_separator(byte: u8) -> bool {
-    byte == b'\\' || byte == b'/'
-}
-
-/// Two leading separators (any mix of `\` and `/`) or the NT object prefix.
-/// Off Windows a leading `/` is always a local absolute path (S8).
-fn is_remote_or_device_path(text: &str, windows: bool) -> bool {
-    let bytes = text.as_bytes();
-    if !windows && bytes.first() == Some(&b'/') {
-        return false;
-    }
-    (bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]))
-        || (bytes.len() >= 4
-            && is_separator(bytes[0])
-            && bytes[1] == b'?'
-            && bytes[2] == b'?'
-            && is_separator(bytes[3]))
-}
-
-/// `\\?\C:` / `\\?\C:\…` — the verbatim spelling of a local drive path.
-fn is_verbatim_local_drive(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() >= 6
-        && bytes[0] == b'\\'
-        && bytes[1] == b'\\'
-        && bytes[2] == b'?'
-        && bytes[3] == b'\\'
-        && bytes[4].is_ascii_alphabetic()
-        && bytes[5] == b':'
-        && (bytes.len() == 6 || bytes[6] == b'\\')
-}
-
-/// Lowercased `\\server\share[\rest]` form of a UNC path (separators
-/// normalized to `\`, `\\?\UNC\` unwrapped, trailing separators dropped);
-/// `None` for anything else — device paths, local paths, or a UNC path
-/// without both a server and a share component.
-fn unc_share_form(text: &str) -> Option<String> {
-    let normalized = text.trim().replace('/', "\\");
-    let lower = normalized.to_ascii_lowercase();
-    let rest = if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
-        rest.to_string()
-    } else if lower.starts_with(r"\\?\") || lower.starts_with(r"\\.\") || lower.starts_with(r"\??\")
-    {
-        return None;
-    } else if let Some(rest) = lower.strip_prefix(r"\\") {
-        rest.to_string()
-    } else {
-        return None;
-    };
-    let rest = rest.trim_end_matches('\\');
-    let mut parts = rest.split('\\');
-    let server = parts.next().unwrap_or_default();
-    let share = parts.next().unwrap_or_default();
-    if server.is_empty() || share.is_empty() || matches!(server, "?" | ".") {
-        return None;
-    }
-    Some(format!(r"\\{rest}"))
 }
 
 /// Roots that may admit a UNC path: the bound case, the last package and
@@ -933,11 +861,56 @@ pub(crate) enum AuthProof {
     Denied,
 }
 
+/// C2: name of an auth cookie (`ft_token` / `ft_nonce`) for the server on
+/// `port`. Browsers scope cookies by host only — a `Path=/` cookie set by
+/// 127.0.0.1:8478 replaces the one 127.0.0.1:8477 planted — so two
+/// workstation instances side by side overwrote each other's proof and
+/// answered each other's pages with intermittent 401s. Each server plants
+/// `ft_token_<port>` / `ft_nonce_<port>`. `None` (no listening port known,
+/// tests) yields the legacy name.
+pub(crate) fn auth_cookie_name(base: &str, port: Option<u16>) -> String {
+    match port {
+        Some(port) => format!("{base}_{port}"),
+        None => base.to_string(),
+    }
+}
+
+/// Whether the Cookie header carries `base` for `port` with a value equal
+/// to `secret`. The per-port name is checked; the legacy unsuffixed name
+/// (planted by builds before C2) is accepted for one release as a
+/// fallback — only when its value validates, so another instance's stale
+/// legacy cookie can never stand in for this one's.
+pub(crate) fn auth_cookie_matches(
+    cookie_header: Option<&str>,
+    base: &str,
+    port: Option<u16>,
+    secret: &str,
+) -> bool {
+    let scoped = auth_cookie_name(base, port);
+    cookie_header.is_some_and(|header| {
+        header.split(';').any(|pair| {
+            let mut parts = pair.trim().splitn(2, '=');
+            let name = parts.next().map(str::trim).unwrap_or_default();
+            (name == scoped || name == base) && parts.next().is_some_and(|v| secret_eq(v, secret))
+        })
+    })
+}
+
 /// Checks the optional shared-secret gate. A valid `?token=` query value
-/// authenticates *and* asks the caller to plant the `ft_token` cookie —
-/// page-initiated fetches (video elements, fetch() without headers) can
-/// only carry cookies, not custom headers.
+/// authenticates *and* asks the caller to plant the `ft_token_<port>`
+/// cookie — page-initiated fetches (video elements, fetch() without
+/// headers) can only carry cookies, not custom headers.
+#[cfg(test)]
 pub(crate) fn request_authorized(request: &Request, token: &str) -> AuthProof {
+    request_authorized_on(request, token, None)
+}
+
+/// [`request_authorized`] for the server on `port` (C2 cookie names).
+pub(crate) fn request_authorized_on(
+    request: &Request,
+    token: &str,
+    port: Option<u16>,
+) -> AuthProof {
     if request
         .token_header
         .as_deref()
@@ -948,24 +921,18 @@ pub(crate) fn request_authorized(request: &Request, token: &str) -> AuthProof {
     if query_value(&request.query, "token").is_some_and(|value| secret_eq(&value, token)) {
         return AuthProof::Query;
     }
-    let cookie_match = request.cookie.as_deref().is_some_and(|header| {
-        header.split(';').any(|pair| {
-            let mut parts = pair.trim().splitn(2, '=');
-            parts.next().map(str::trim) == Some("ft_token")
-                && parts.next().is_some_and(|value| secret_eq(value, token))
-        })
-    });
-    if cookie_match {
+    if auth_cookie_matches(request.cookie.as_deref(), "ft_token", port, token) {
         AuthProof::Cookie
     } else {
         AuthProof::Denied
     }
 }
 
-/// Inserts the `ft_token` cookie into an already-rendered response, right
-/// after the status line.
-pub(crate) fn set_token_cookie(response: &mut Vec<u8>, token: &str) {
-    let header = format!("Set-Cookie: ft_token={token}; HttpOnly; SameSite=Strict; Path=/\r\n");
+/// Inserts the `ft_token_<port>` cookie into an already-rendered response,
+/// right after the status line.
+pub(crate) fn set_token_cookie(response: &mut Vec<u8>, token: &str, port: Option<u16>) {
+    let name = auth_cookie_name("ft_token", port);
+    let header = format!("Set-Cookie: {name}={token}; HttpOnly; SameSite=Strict; Path=/\r\n");
     if let Some(pos) = response.windows(2).position(|w| w == b"\r\n") {
         response.splice(pos + 2..pos + 2, header.into_bytes());
     }
@@ -974,7 +941,7 @@ pub(crate) fn set_token_cookie(response: &mut Vec<u8>, token: &str) {
 /// Checks the instance-nonce proof for mutating requests in the no-token
 /// model. An empty configured nonce can never authenticate (entropy
 /// failure is fail-closed, matching the instance-file check).
-pub(crate) fn request_nonce_authorized(request: &Request, nonce: &str) -> bool {
+pub(crate) fn request_nonce_authorized(request: &Request, nonce: &str, port: Option<u16>) -> bool {
     if nonce.is_empty() {
         return false;
     }
@@ -988,13 +955,7 @@ pub(crate) fn request_nonce_authorized(request: &Request, nonce: &str) -> bool {
     if query_value(&request.query, "nonce").is_some_and(|value| secret_eq(&value, nonce)) {
         return true;
     }
-    request.cookie.as_deref().is_some_and(|cookie| {
-        cookie.split(';').any(|part| {
-            let mut parts = part.trim().splitn(2, '=');
-            parts.next().map(str::trim) == Some("ft_nonce")
-                && parts.next().is_some_and(|value| secret_eq(value, nonce))
-        })
-    })
+    auth_cookie_matches(request.cookie.as_deref(), "ft_nonce", port, nonce)
 }
 
 /// Public, non-secret fingerprint of the instance nonce. `/api/status`
@@ -1011,11 +972,12 @@ pub(crate) fn instance_fingerprint(instance: &str) -> String {
     digest[..12].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Inserts the `ft_nonce` cookie so the served page's same-origin fetches
-/// carry the instance proof automatically. SameSite=Strict keeps it off
-/// cross-site form POSTs — the request then fails the nonce gate.
-pub(crate) fn set_nonce_cookie(response: &mut Vec<u8>, nonce: &str) {
-    let header = format!("Set-Cookie: ft_nonce={nonce}; HttpOnly; SameSite=Strict; Path=/\r\n");
+/// Inserts the `ft_nonce_<port>` cookie so the served page's same-origin
+/// fetches carry the instance proof automatically. SameSite=Strict keeps
+/// it off cross-site form POSTs — the request then fails the nonce gate.
+pub(crate) fn set_nonce_cookie(response: &mut Vec<u8>, nonce: &str, port: Option<u16>) {
+    let name = auth_cookie_name("ft_nonce", port);
+    let header = format!("Set-Cookie: {name}={nonce}; HttpOnly; SameSite=Strict; Path=/\r\n");
     if let Some(pos) = response.windows(2).position(|w| w == b"\r\n") {
         response.splice(pos + 2..pos + 2, header.into_bytes());
     }

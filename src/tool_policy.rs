@@ -63,10 +63,25 @@ pub fn command_version(input: &str, allowed_names: &[&str], version_arg: &str) -
     };
     // P7: a version probe is bounded — a wedged tool must not hang the
     // command (or the HTTP handler) that asked for its version.
-    match crate::util::run_with_timeout(
-        Command::new(&binary).arg(version_arg),
-        Some(crate::util::VERSION_PROBE_TIMEOUT_SECS),
-    ) {
+    let secs = crate::util::version_probe_timeout_secs();
+    let result =
+        crate::util::run_with_timeout_detailed(Command::new(&binary).arg(version_arg), Some(secs));
+    describe_version_probe(&binary, secs, result)
+}
+
+/// Provenance text for one version probe. R6: a probe that ran out of
+/// time says exactly that — the tool resolved and started, its version is
+/// simply not known — and is never recorded as "unavailable", which would
+/// claim as fact that the tool was missing or broken.
+pub fn describe_version_probe(
+    binary: &str,
+    secs: u64,
+    result: Result<std::process::Output, crate::util::RunError>,
+) -> String {
+    match result {
+        Err(crate::util::RunError::TimedOut(_)) => format!(
+            "version probe timed out after {secs}s ({binary} started but did not report its version; version not recorded)"
+        ),
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -82,7 +97,7 @@ pub fn command_version(input: &str, allowed_names: &[&str], version_arg: &str) -
             "unavailable: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ),
-        Err(err) => format!("unavailable: {err}"),
+        Err(err) => format!("unavailable: {}", err.message()),
     }
 }
 
