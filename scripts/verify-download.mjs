@@ -1,4 +1,6 @@
 // Verify single + multi file download from the viewer.
+// MANUAL harness - not in scripts/ci-harnesses.sh (T13): needs headless Edge on
+// :9222, a workstation on :8477 with a case open, and writes to C:/Temp.
 // Note: headless Edge cancels every download (even blob:) at the download
 // manager, so we assert on Page.downloadWillBegin — the browser observed
 // the request, resolved the filename, and started a download. Byte-level

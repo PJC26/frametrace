@@ -12,7 +12,7 @@
 //! benchmark harness"). The assertions below are generous sanity ceilings
 //! for a debug build — an order-of-magnitude regression fails, ordinary
 //! machine noise does not. They complement (not replace) the field budgets
-//! in `docs/ROADMAP-v2.md` §3, which target release builds on real media.
+//! in `docs/archive/ROADMAP-v2.md` §3, which target release builds on real media.
 
 use std::fs;
 use std::path::PathBuf;
@@ -57,7 +57,7 @@ fn report(metric: &str, count: usize, elapsed_ms: u128, ceiling_ms: u128) {
 /// SQLite index write (single transaction, production `videos` schema) plus
 /// the read paths used by scans (`load_video_ids`) and `inspect`
 /// (`summarize_case_db`). Field reference: 10k rows ≈ 591 ms release on
-/// Apple Silicon (`docs/PERFORMANCE_VALIDATION.md`, ROADMAP-v2 §1).
+/// Apple Silicon (`docs/PERFORMANCE_VALIDATION.md`, `docs/archive/ROADMAP-v2.md` §1).
 #[test]
 #[ignore = "perf harness; run with --ignored --nocapture"]
 fn index_write_read_10k_rows() {

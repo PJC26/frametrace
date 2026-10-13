@@ -106,8 +106,9 @@ fn full_lifecycle_with_real_ffmpeg() {
         return;
     }
     let Some(ffmpeg) = ffmpeg_binary() else {
-        eprintln!("ffmpeg not found on PATH; skipping");
-        return;
+        panic!(
+            "FRAMETRACE_IT=1 is set but ffmpeg was not found on PATH (T2: a requested integration run must not pass by skipping)"
+        );
     };
 
     let source_dir = unique_dir("ft_it_src");
@@ -267,8 +268,9 @@ fn dav_export_remuxes_real_h264_and_validates() {
         return;
     }
     let Some(ffmpeg) = ffmpeg_binary() else {
-        eprintln!("ffmpeg not found on PATH; skipping");
-        return;
+        panic!(
+            "FRAMETRACE_IT=1 is set but ffmpeg was not found on PATH (T2: a requested integration run must not pass by skipping)"
+        );
     };
     let work = unique_dir("ft_it_dav");
     std::fs::create_dir_all(&work).unwrap();
@@ -340,8 +342,9 @@ fn hik_export_strips_imkh_and_validates() {
         return;
     }
     let Some(ffmpeg) = ffmpeg_binary() else {
-        eprintln!("ffmpeg not found on PATH; skipping");
-        return;
+        panic!(
+            "FRAMETRACE_IT=1 is set but ffmpeg was not found on PATH (T2: a requested integration run must not pass by skipping)"
+        );
     };
     let work = unique_dir("ft_it_hik");
     std::fs::create_dir_all(&work).unwrap();
@@ -410,7 +413,9 @@ fn ewf_tool(name: &str) -> Option<PathBuf> {
 
 /// Real libewf round trip: acquire a raw image to E01 with ewfacquire, then
 /// run the real import-e01 (ewfverify -> ewfexport -> raw -> SHA-256 chain).
-/// Skips silently until libewf Windows binaries are installed on the machine.
+/// With FRAMETRACE_IT=1 it FAILS when the tools are missing (it only skips when
+/// FRAMETRACE_IT is unset); exclude it explicitly with `--skip e01_import` on
+/// machines without libewf.
 #[test]
 #[ignore = "requires FRAMETRACE_IT=1 and libewf (ewfacquire/ewfinfo/ewfverify/ewfexport) on PATH"]
 fn e01_import_roundtrip_with_real_libewf() {
@@ -424,8 +429,9 @@ fn e01_import_roundtrip_with_real_libewf() {
         ewf_tool("ewfverify"),
         ewf_tool("ewfexport"),
     ) else {
-        eprintln!("libewf tools not found on PATH; skipping");
-        return;
+        panic!(
+            "FRAMETRACE_IT=1 is set but libewf tools (ewfacquire/ewfinfo/ewfverify/ewfexport) were not found on PATH (T2: a requested integration run must not pass by skipping)"
+        );
     };
 
     let work = unique_dir("ft_it_e01");

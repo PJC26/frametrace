@@ -1,0 +1,23 @@
+name: Performance budgets
+
+# tests/perf_budgets.rs is all #[ignore]d so the per-push suites stay fast.
+# Run it weekly and on demand (debug build: the in-test ceilings are
+# order-of-magnitude regression tripwires, not field budgets - see
+# docs/PERFORMANCE_VALIDATION.md "In-tree benchmark harness").
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+
+jobs:
+  perf-budgets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; toolchain pinned via input
+        with:
+          toolchain: 1.94.0
+      - name: Performance budget harness
+        run: cargo test --locked --test perf_budgets -- --ignored --nocapture
