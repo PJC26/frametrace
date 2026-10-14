@@ -58,6 +58,10 @@ pub(crate) enum StepStatus {
     Pending,
     Running,
     Done,
+    /// R4-B16: the step completed but its tool reported a partial result
+    /// (CLI exit code 5, e.g. an fls listing cut off by its timeout). The
+    /// run continues; a job warning says what is missing.
+    Partial,
     Failed,
 }
 
@@ -67,6 +71,7 @@ impl StepStatus {
             StepStatus::Pending => "pending",
             StepStatus::Running => "running",
             StepStatus::Done => "done",
+            StepStatus::Partial => "partial",
             StepStatus::Failed => "failed",
         }
     }
@@ -172,6 +177,22 @@ pub(crate) struct JobState {
     /// Recent successful `/api/join-check` plans as `(plan_id, source
     /// bytes)`, so a join started from that check knows its expected size.
     pub(crate) join_plan_bytes: Vec<(String, u64)>,
+    /// R4-B15: the `--key-source` spec this workstation runs with, handed
+    /// to every CLI child it spawns so their audit appends use the same
+    /// key (`None` = ambient key configuration only).
+    pub(crate) key_source: Option<String>,
+    /// R4-B15: `<key id>:<fingerprint>` (or `none`) of the audit key this
+    /// workstation resolved at startup; children compare their own key
+    /// against it and warn on a mismatch.
+    pub(crate) audit_key_tag: Option<String>,
+    /// R4-B2: outstanding one-time launch codes `(code, expires)`. A code
+    /// opened as `/?launch=<code>` is consumed and plants the auth cookie,
+    /// so the token itself never appears on a browser command line.
+    pub(crate) launch_codes: Vec<(String, std::time::Instant)>,
+    /// R4-B12: connections per peer address still in the unauthenticated
+    /// header phase (shared with the connection threads; never held across
+    /// I/O).
+    pub(crate) preauth_conns: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
 }
 
 /// A background case job (UX-06) run under the busy lease.
@@ -322,6 +343,10 @@ impl JobState {
             clip_jobs: Vec::new(),
             clip_seq: 0,
             join_plan_bytes: Vec::new(),
+            key_source: None,
+            audit_key_tag: None,
+            launch_codes: Vec::new(),
+            preauth_conns: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -391,9 +416,20 @@ fn record_abandoned_job(guard: &mut JobState) {
 
 /// Shared drop path of [`BusyGuard`] and [`BusyLease`].
 fn drop_busy(state: &SharedState, epoch: u64) {
-    let mut guard = state_lock(state);
-    if release_busy_if_owned(&mut guard, epoch) && std::thread::panicking() {
-        record_abandoned_job(&mut guard);
+    {
+        let mut guard = state_lock(state);
+        if release_busy_if_owned(&mut guard, epoch) && std::thread::panicking() {
+            record_abandoned_job(&mut guard);
+        }
+    }
+    after_busy_release(state);
+}
+
+/// R4-B4: whenever `busy` is released, marks that were queued while a job
+/// held it are applied (outside the state lock; skipped while unwinding).
+fn after_busy_release(state: &SharedState) {
+    if !std::thread::panicking() {
+        super::jobs::drain_after_busy_release(state);
     }
 }
 
@@ -416,7 +452,10 @@ pub(crate) struct BusyLease {
     epoch: u64,
 }
 
-/// Atomically takes `busy` for a background job, like [`try_acquire_busy`].
+/// Atomically takes `busy` for a background job, like [`try_acquire_busy`]
+/// (production code takes it with [`lease_busy_locked`] inside its own
+/// critical section, R4-B17).
+#[cfg(test)]
 pub(crate) fn try_lease_busy(state: &SharedState) -> Result<BusyLease, String> {
     let epoch = state_lock(state).take_busy()?;
     Ok(BusyLease {
@@ -448,9 +487,12 @@ impl BusyLease {
     /// Clears `busy` after applying `finish` under the same state lock.
     pub(crate) fn release_with(mut self, finish: impl FnOnce(&mut JobState)) {
         if let Some(state) = self.state.take() {
-            let mut guard = state_lock(&state);
-            finish(&mut guard);
-            release_busy_if_owned(&mut guard, self.epoch);
+            {
+                let mut guard = state_lock(&state);
+                finish(&mut guard);
+                release_busy_if_owned(&mut guard, self.epoch);
+            }
+            after_busy_release(&state);
         }
     }
 }

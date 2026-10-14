@@ -187,35 +187,66 @@ pub(crate) fn probe_status_body(port: u16, token: Option<&str>) -> Option<Vec<u8
 /// dies with the server that minted it — the next server mints a new one;
 /// (c) a clean shutdown removes the file while it still names this process
 /// ([`remove_instance_file_if_owned`]), narrowing the window to crashes.
-/// The fallback scan below never sends a token.
+///
+/// R4-B1: there is NO structural fallback any more. A process that merely
+/// answers `/api/status` like a workstation on 8477..8486 (but is not
+/// named by the instance file) used to be reused — the browser was then
+/// pointed at it. Now only an instance-file-verified server is reused;
+/// any other occupant of a preferred port is skipped and a fresh
+/// workstation starts on the next free port (with a warning).
 pub(crate) fn find_running_server() -> Option<u16> {
-    if let Some((port, instance, token)) = read_instance_record()
-        && let Some(body) = probe_status_body(port, token.as_deref())
-    {
-        // Current servers publish only the nonce's fingerprint (SEC-04);
-        // older builds echoed the raw nonce — accept either.
-        let matches = [instance_fingerprint(&instance), instance]
-            .iter()
-            .filter(|value| !value.is_empty())
-            .any(|value| {
-                let needle = format!("\"instance\":\"{value}\"");
-                body.windows(needle.len()).any(|w| w == needle.as_bytes())
-            });
-        if matches {
-            return Some(port);
-        }
-        // Stale or foreign instance file: keep scanning below.
+    verified_running_server(read_instance_record())
+}
+
+/// [`find_running_server`] on an explicit instance record (tests).
+pub(crate) fn verified_running_server(
+    record: Option<(u16, String, Option<String>)>,
+) -> Option<u16> {
+    let (port, instance, token) = record?;
+    let body = probe_status_body(port, token.as_deref())?;
+    // Current servers publish only the nonce's fingerprint (SEC-04);
+    // older builds echoed the raw nonce — accept either.
+    let matches = [instance_fingerprint(&instance), instance]
+        .iter()
+        .filter(|value| !value.is_empty())
+        .any(|value| {
+            let needle = format!("\"instance\":\"{value}\"");
+            body.windows(needle.len()).any(|w| w == needle.as_bytes())
+        });
+    matches.then_some(port)
+}
+
+/// R4-B2: asks the (verified) workstation on `port` for a one-time launch
+/// code, authenticating with `token` in a header. `None` on any failure —
+/// the caller then prints the bare URL instead of ever printing the token.
+pub(crate) fn request_launch_code(port: u16, token: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let request = format!(
+        "POST /api/launch-code HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-FrameTrace-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    let _ = stream.take(64 * 1024).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    if !text.starts_with("HTTP/1.1 200") {
+        return None;
     }
-    // Fallback: unauthenticated probes only. Any process may sit on these
-    // ports, so no secret is ever offered here; a token-gated server
-    // answers 401 and is simply not reused (a fresh one starts instead).
-    (8477..=8486).find(|&port| {
-        probe_status_body(port, None).is_some_and(|buf| status_body_is_workstation(&buf))
-    })
+    let body = text.split("\r\n\r\n").nth(1)?;
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    value
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| code.len() == 32 && code.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string)
 }
 
 /// A full, successful `/api/status` reply: a `200` status line plus the
 /// `app` / `has_job` / `case_dir` keys (the marker alone is spoofable).
+/// R4-B1: no longer enough to reuse a server (identity needs the instance
+/// file); kept for diagnostics and its tests.
+#[cfg(test)]
 pub(crate) fn status_body_is_workstation(buf: &[u8]) -> bool {
     let ok_line = buf.starts_with(b"HTTP/1.1 200") || buf.starts_with(b"HTTP/1.0 200");
     let has = |key: &[u8]| buf.windows(key.len()).any(|w| w == key);
