@@ -8,7 +8,7 @@ pub(super) struct IdRegistry {
 
 impl IdRegistry {
     pub(super) fn id_for(&mut self, path: &Path) -> String {
-        let source_path = normalize_source_key(&path.to_string_lossy());
+        let source_path = source_key(path);
         if let Some(id) = self.ids_by_source.get(&source_path) {
             return id.clone();
         }
@@ -29,6 +29,23 @@ pub(super) fn normalize_source_key(source_path: &str) -> String {
         .to_string()
 }
 
+/// Lossless id key for an OS path. Valid-Unicode paths keep the exact key
+/// older binaries used (`normalize_source_key` of the string), so their
+/// ids stay stable. A non-Unicode name (`\xff.mp4` on unix, an unpaired
+/// surrogate on NTFS) used to collapse through `to_string_lossy` onto the
+/// same U+FFFD key as every other such name, so two files shared one id
+/// and one record. Those keys now append the raw encoding
+/// (`crate::model::path_raw_hex`) after a NUL, which no real path string
+/// contains: they never collide with each other or with a UTF-8 path that
+/// literally contains U+FFFD.
+pub(super) fn source_key(path: &Path) -> String {
+    let display = normalize_source_key(&path.to_string_lossy());
+    match crate::model::path_raw_hex(path) {
+        None => display,
+        Some(raw) => format!("{display}\0{raw}"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct IndexedRecordLine {
     pub(super) id: String,
@@ -41,6 +58,11 @@ pub(super) struct IndexedRecordLine {
 }
 
 impl IndexedRecordLine {
+    /// Lossless id key of this record's source (see [`source_key`]).
+    pub(super) fn key(&self) -> String {
+        source_key(&self.record.source_path)
+    }
+
     pub(super) fn from_record(record: &VideoRecord) -> Self {
         Self {
             id: record.id.clone(),
@@ -106,19 +128,29 @@ pub(super) fn load_existing_video_ids(case_dir: &Path) -> Result<IdRegistry, Str
     let existing = load_existing_record_lines(case_dir)?;
     let mut ids_by_source = HashMap::new();
     let mut max_number = 0usize;
+    // The JSONL record carries the lossless path (E1); the SQLite row only
+    // its lossy display string. An id the JSONL already describes is keyed
+    // from the JSONL alone, so a lossy DB spelling can never hand that id
+    // to a different file.
+    let jsonl_ids = existing
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<std::collections::HashSet<_>>();
 
     for record in case_db::load_video_ids(case_dir)? {
         if let Some(number) = record.id.strip_prefix("vid_").and_then(parse_usize) {
             max_number = max_number.max(number);
         }
-        ids_by_source.insert(normalize_source_key(&record.source_path), record.id);
+        if !jsonl_ids.contains(&record.id) {
+            ids_by_source.insert(normalize_source_key(&record.source_path), record.id);
+        }
     }
 
     for record in existing {
         if let Some(number) = record.id.strip_prefix("vid_").and_then(parse_usize) {
             max_number = max_number.max(number);
         }
-        ids_by_source.insert(normalize_source_key(&record.source_path), record.id);
+        ids_by_source.insert(record.key(), record.id);
     }
 
     Ok(IdRegistry {
@@ -143,14 +175,14 @@ pub(super) fn merge_existing_with_scan(
         .records
         .iter()
         .map(IndexedRecordLine::from_record)
-        .map(|record| (normalize_source_key(&record.source_path), record))
+        .map(|record| (record.key(), record))
         .collect::<HashMap<_, _>>();
 
     let mut merged = Vec::new();
     let mut updated_keys = std::collections::HashSet::new();
     let mut stale_keys = std::collections::HashSet::new();
     for existing in load_existing_record_lines(case_dir)? {
-        let key = normalize_source_key(&existing.source_path);
+        let key = existing.key();
         if let Some(updated) = current_by_source.get(&key) {
             // Legacy and clean spellings of one file may both exist in old
             // indexes; converge to a single refreshed record.
@@ -160,7 +192,9 @@ pub(super) fn merge_existing_with_scan(
         } else if stale_keys.contains(&key) {
             // Duplicate spelling of an already-decided record; skip.
             continue;
-        } else if source_presence(Path::new(&existing.source_path)) != SourcePresence::Missing {
+        } else if source_presence(&existing.record.source_path) != SourcePresence::Missing {
+            // (Checked on the lossless OS path: the lossy display string of
+            // a non-Unicode name does not exist on disk.)
             // The file EXISTS on disk — it merely belongs to a different
             // registered source that this scan did not cover. Sequential
             // multi-source scans (README workflow: scan E:\ then
@@ -179,10 +213,10 @@ pub(super) fn merge_existing_with_scan(
 
     let existing_sources = merged
         .iter()
-        .map(|record| normalize_source_key(&record.source_path))
+        .map(IndexedRecordLine::key)
         .collect::<std::collections::HashSet<_>>();
     for record in result.records.iter().map(IndexedRecordLine::from_record) {
-        if !existing_sources.contains(&normalize_source_key(&record.source_path)) {
+        if !existing_sources.contains(&record.key()) {
             merged.push(record);
         }
     }

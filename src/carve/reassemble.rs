@@ -21,12 +21,25 @@ pub(super) struct JoinSpec {
     pub(super) note: String,
 }
 
+/// Test entry point with a fixed run tag.
+#[cfg(test)]
 pub(super) fn reassemble_fragments(
     source: &Path,
     case_dir: &Path,
     source_size: u64,
     artifacts: &mut Vec<CarvedArtifact>,
     warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    reassemble_fragments_tagged(source, case_dir, source_size, artifacts, warnings, "test")
+}
+
+pub(super) fn reassemble_fragments_tagged(
+    source: &Path,
+    case_dir: &Path,
+    source_size: u64,
+    artifacts: &mut Vec<CarvedArtifact>,
+    warnings: &mut Vec<String>,
+    run_tag: &str,
 ) -> Result<(), String> {
     let regions = anonymous_regions(artifacts, source_size);
     let mut joins: Vec<JoinSpec> = Vec::new();
@@ -47,7 +60,8 @@ pub(super) fn reassemble_fragments(
         .collect();
     let carve_dir = case_dir.join("artifacts/carved");
     for (index, join) in joins.into_iter().enumerate() {
-        let id = format!("reasm_{:06}", index + 1);
+        // Run-unique like carve ids (E4).
+        let id = format!("reasm_{run_tag}_{:06}", index + 1);
         let output_path =
             unique_path(&carve_dir.join(format!("{}_{:012x}.{}", id, join.offset, join.extension)));
         let total: u64 = join.ranges.iter().map(|(_, len)| len).sum();
@@ -82,6 +96,8 @@ pub(super) fn reassemble_fragments(
             .to_string(),
             validation_note: join.note,
             duplicate_of,
+            run_id: Some(run_tag.to_string()),
+            carved_unix: Some(now_unix()?),
         });
     }
     Ok(())
@@ -259,15 +275,18 @@ pub(super) fn flush_ts_group(
         signature: "reassembled-ts-cc",
         extension: "ts",
         offset: group[0].offset,
+        // E7: a continuity counter is 4 bits, so ANY two fragments agree
+        // on a shared PID by chance 1 time in 16 per boundary. That is a
+        // weak structural hint, not join evidence — the grade says so.
         note: format!(
-            "REASSEMBLY HYPOTHESIS: {} MPEG-TS fragments ({}) joined — per-PID continuity counters interlock at every boundary (pids {:?}). Structural join evidence; still a candidate — validate playback before reporting.",
+            "REASSEMBLY HYPOTHESIS (evidence grade: weak): {} MPEG-TS fragments ({}) joined because per-PID continuity counters line up at every boundary (pids {:?}). Weak structural evidence only: a 4-bit counter matches by chance about 1 in 16 per boundary PID, so unrelated fragments can interlock; still a candidate — validate playback and content continuity before reporting.",
             group.len(),
             members.join(", "),
             unique_pids
         ),
     });
     warnings.push(format!(
-        "reassembled {} TS fragments into one join candidate (continuity-counter match)",
+        "reassembled {} TS fragments into one weak join hypothesis (continuity counters line up; about 1-in-16 chance agreement per boundary PID)",
         group.len()
     ));
 }
