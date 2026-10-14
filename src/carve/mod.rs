@@ -68,6 +68,9 @@ struct ScanSuppress {
     embedded_until: u64,
     /// Next absolute offset at which an Annex-B anchor may emit.
     annexb_next_emit: u64,
+    /// Every RIFF-declared span `[riff_offset, end)` inside which
+    /// fragment-prone signatures were not emitted (E3), in offset order.
+    spans: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +110,10 @@ pub struct CarveHit {
     pub offset: u64,
     pub signature: String,
     pub extension: String,
+    /// Offset of the RIFF AVI whose declared span contains this container
+    /// signature (E3): still a candidate, but possibly that AVI's payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_in: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,12 +129,29 @@ pub struct CarvedArtifact {
     pub validation_status: String,
     pub validation_note: String,
     pub duplicate_of: Option<String>,
+    /// Carve run that produced the artifact (E4: `<unix>-<hex4>`, also the
+    /// middle of its id). `None` for entries written before E4.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// When the artifact was written. `None` for entries written before
+    /// E4, whose time is only known from the run's `db/carve_results.json`.
+    #[serde(default)]
+    pub carved_unix: Option<u64>,
 }
 
 impl CarvedArtifact {
     fn to_json(&self) -> String {
+        // E4 fields go last and only when known, so pre-E4 replays keep
+        // their exact line shape.
+        let mut run_fields = String::new();
+        if let Some(run_id) = &self.run_id {
+            run_fields.push_str(&format!(",\"run_id\":\"{}\"", json_escape(run_id)));
+        }
+        if let Some(carved_unix) = self.carved_unix {
+            run_fields.push_str(&format!(",\"carved_unix\":{carved_unix}"));
+        }
         format!(
-            "{{\"schema_version\":3,\"event\":\"carve-file\",\"id\":\"{}\",\"artifact_type\":\"carved-candidate\",\"validation_status\":\"{}\",\"validation_note\":\"{}\",\"duplicate_of\":{},\"source_path\":\"{}\",\"output_path\":\"{}\",\"offset\":{},\"size_bytes\":{},\"signature\":\"{}\",\"extension\":\"{}\",\"sha256\":\"{}\"}}",
+            "{{\"schema_version\":3,\"event\":\"carve-file\",\"id\":\"{}\",\"artifact_type\":\"carved-candidate\",\"validation_status\":\"{}\",\"validation_note\":\"{}\",\"duplicate_of\":{},\"source_path\":\"{}\",\"output_path\":\"{}\",\"offset\":{},\"size_bytes\":{},\"signature\":\"{}\",\"extension\":\"{}\",\"sha256\":\"{}\"{run_fields}}}",
             json_escape(&self.id),
             json_escape(&self.validation_status),
             json_escape(&self.validation_note),
@@ -164,6 +188,23 @@ pub struct CarveResult {
     pub scan_start_offset: u64,
     pub scan_end_offset: u64,
     pub options: CarveOptions,
+    /// Run tag shared by every artifact id of this run (E4).
+    pub run_id: String,
+    /// RIFF-declared spans inside which fragment-prone signatures
+    /// (Annex-B, JPEG, MPEG-PS/TS) were not emitted as candidates (E3).
+    pub suppressed_spans: Vec<(u64, u64)>,
+    /// Parts of `suppressed_spans` that no carved artifact covers: bytes
+    /// that were neither carved nor offered as fragment candidates. Any
+    /// entry forces `scan_complete = false`.
+    pub unexamined_spans: Vec<(u64, u64)>,
+}
+
+fn spans_json(spans: &[(u64, u64)]) -> String {
+    spans
+        .iter()
+        .map(|(start, end)| format!("[{start}, {end}]"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl CarveResult {
@@ -195,6 +236,12 @@ impl CarveResult {
         out.push_str(&format!(
             "  \"scan_start_offset\": {},\n  \"scan_end_offset\": {},\n",
             self.scan_start_offset, self.scan_end_offset
+        ));
+        out.push_str(&format!(
+            "  \"run_id\": \"{}\",\n  \"suppressed_spans\": [{}],\n  \"unexamined_spans\": [{}],\n",
+            json_escape(&self.run_id),
+            spans_json(&self.suppressed_spans),
+            spans_json(&self.unexamined_spans)
         ));
         out.push_str("  \"options\": {\n");
         out.push_str(&format!("    \"max_bytes\": {},\n", self.options.max_bytes));
@@ -318,7 +365,11 @@ pub fn carve_file(
         "carve-file",
     )?;
 
-    let (hits, scanned_to) = scan_signatures(
+    // E4: one tag per run, derived from the checkpoint's run id so an
+    // interrupted run resumes under the same tag (replayed and fresh
+    // artifacts share it) while every new run gets a fresh one.
+    let run_tag = carve_run_tag(checkpoint.run_id());
+    let (hits, scanned_to, suppress) = scan_signatures(
         &source_path,
         ScanWindow {
             start: scan_start,
@@ -329,6 +380,7 @@ pub fn carve_file(
         ScanSuppress {
             embedded_until: prior.embedded_until,
             annexb_next_emit: prior.annexb_next_emit,
+            spans: prior.suppressed_spans,
         },
         options.max_candidates,
         &mut checkpoint,
@@ -383,15 +435,23 @@ pub fn carve_file(
     // fragments. Container signatures are never suppressed.
     let is_fragment_sig = |sig: &str| sig.ends_with("-annexb") || sig == "jpeg";
     let mut covered_until = 0u64;
+    let replayed_ids: std::collections::HashSet<String> = carved_map
+        .values()
+        .map(|artifact| artifact.id.clone())
+        .collect();
+    let mut next_number = 0usize;
     for hit in &hits {
         if is_fragment_sig(&hit.signature) && hit.offset < covered_until {
             continue;
         }
         // Extents run to the next container signature; mid-run fragment-sig
-        // anchors inside the same span would otherwise truncate it.
+        // anchors inside the same span would otherwise truncate it. A
+        // container signature nested inside THIS hit's RIFF span (E3) is
+        // a candidate of its own, not this AVI's end boundary.
         let next_offset = hits
             .iter()
             .filter(|candidate| !is_fragment_sig(&candidate.signature))
+            .filter(|candidate| candidate.nested_in != Some(hit.offset))
             .map(|candidate| candidate.offset)
             .filter(|offset| offset > &hit.offset)
             .min()
@@ -416,6 +476,11 @@ pub fn carve_file(
             validation_note_for_signature(&hit.signature),
             boundary_note
         );
+        if let Some(owner) = hit.nested_in {
+            validation_note.push_str(&format!(
+                " Signature lies inside the RIFF AVI span declared at offset {owner}; it may be that container's own payload rather than an independent file."
+            ));
+        }
         if available > options.max_bytes {
             let note = format!(
                 "truncated by max_bytes={} from a heuristic span of {} bytes at offset {}",
@@ -446,7 +511,18 @@ pub fn carve_file(
             continue;
         }
 
-        let id = format!("carve_{:06}", artifacts.len() + 1);
+        // E4: `carve_<run>_<n>` — unique across runs, so a validation,
+        // deepfake screening or timeline entry can never be attributed to
+        // a different run's artifact that reused the same number.
+        // Numbered by position (as before), skipping any replayed id.
+        next_number = next_number.max(artifacts.len());
+        let id = loop {
+            next_number += 1;
+            let candidate = format!("carve_{run_tag}_{next_number:06}");
+            if !replayed_ids.contains(&candidate) {
+                break candidate;
+            }
+        };
         let output_path = unique_path(
             &case_dir
                 .join("artifacts/carved")
@@ -480,6 +556,8 @@ pub fn carve_file(
             validation_status,
             validation_note,
             duplicate_of,
+            run_id: Some(run_tag.clone()),
+            carved_unix: Some(now_unix()?),
         };
         // Checkpoint the artifact right after it lands on disk: a crash
         // before this line re-carves the range, a crash after it replays.
@@ -489,14 +567,42 @@ pub fn carve_file(
     }
 
     if options.reassemble {
-        reassemble_fragments(
+        reassemble_fragments_tagged(
             &source_path,
             case_dir,
             source_size,
             &mut artifacts,
             &mut warnings,
+            &run_tag,
         )?;
     }
+
+    // E3: suppressed spans are reported, and any part of one that no
+    // artifact covers (the AVI was truncated by --max-bytes, skipped, or
+    // its structural extent ended early) was never examined for fragment
+    // candidates — the scan cannot claim completeness over it.
+    let suppressed_spans: Vec<(u64, u64)> = suppress
+        .spans
+        .iter()
+        .map(|(start, end)| ((*start).max(scan_start), (*end).min(scan_end)))
+        .filter(|(start, end)| end > start)
+        .collect();
+    let unexamined_spans = uncovered_parts(&suppressed_spans, &artifacts);
+    if !suppressed_spans.is_empty() {
+        warnings.push(format!(
+            "fragment-signature suppression: Annex-B/JPEG/MPEG-PS/TS signatures inside {} RIFF-declared span(s) were not emitted as candidates (treated as that AVI's payload): {}",
+            suppressed_spans.len(),
+            span_list(&suppressed_spans)
+        ));
+    }
+    if !unexamined_spans.is_empty() {
+        warnings.push(format!(
+            "unexamined bytes: {} suppressed span part(s) are not covered by any carved artifact and were never offered as fragment candidates: {}; scan completeness is not established",
+            unexamined_spans.len(),
+            span_list(&unexamined_spans)
+        ));
+    }
+    let scan_complete = scan_complete && unexamined_spans.is_empty();
 
     let result = CarveResult {
         source_path,
@@ -511,6 +617,9 @@ pub fn carve_file(
         scan_start_offset: scan_start,
         scan_end_offset: scan_end,
         options: options.clone(),
+        run_id: run_tag,
+        suppressed_spans,
+        unexamined_spans,
     };
     write_carve_outputs(case_dir, &result, &replayed_outputs)?;
     if resumed_artifacts > 0 || resume_offset > 0 {
@@ -524,4 +633,70 @@ pub fn carve_file(
     }
     checkpoint.finish()?;
     Ok(result)
+}
+
+/// `<unix>-<hex4>` run tag from a checkpoint run id
+/// (`carve-file-<unix>-<nanos>`): the run's start second plus four hex
+/// digits of the id's SHA-256, so two runs started in the same second
+/// still differ. Deterministic for a given run id (a resume keeps it).
+pub(super) fn carve_run_tag(run_id: &str) -> String {
+    let unix = run_id
+        .split('-')
+        .find(|part| part.len() >= 9 && part.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("0");
+    let digest = crate::sha256::digest_bytes(run_id.as_bytes());
+    format!("{unix}-{}", &digest[..4])
+}
+
+/// Parts of `spans` not covered by any artifact's carved extent.
+pub(super) fn uncovered_parts(
+    spans: &[(u64, u64)],
+    artifacts: &[CarvedArtifact],
+) -> Vec<(u64, u64)> {
+    // Reassembly hypotheses concatenate non-contiguous ranges, so their
+    // (offset, size) is not a contiguous extent — only direct carves count.
+    let mut covered: Vec<(u64, u64)> = artifacts
+        .iter()
+        .filter(|artifact| !artifact.signature.starts_with("reassembled-"))
+        .map(|artifact| {
+            (
+                artifact.offset,
+                artifact.offset.saturating_add(artifact.size_bytes),
+            )
+        })
+        .collect();
+    covered.sort_unstable();
+    let mut out = Vec::new();
+    for &(start, end) in spans {
+        let mut cursor = start;
+        for &(cov_start, cov_end) in &covered {
+            if cov_end <= cursor || cov_start >= end {
+                continue;
+            }
+            if cov_start > cursor {
+                out.push((cursor, cov_start.min(end)));
+            }
+            cursor = cursor.max(cov_end);
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            out.push((cursor, end));
+        }
+    }
+    out
+}
+
+/// At most 16 spans spelled out, then a count — warnings stay readable.
+fn span_list(spans: &[(u64, u64)]) -> String {
+    let mut parts: Vec<String> = spans
+        .iter()
+        .take(16)
+        .map(|(start, end)| format!("[{start}, {end})"))
+        .collect();
+    if spans.len() > 16 {
+        parts.push(format!("and {} more", spans.len() - 16));
+    }
+    parts.join(", ")
 }

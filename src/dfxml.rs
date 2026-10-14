@@ -8,8 +8,8 @@
 //! case directory and a chained entry lands in
 //! `evidence/logs/dfxml-export-log.jsonl`.
 
-use crate::anomaly::{IndexedRow, read_indexed_rows};
 use crate::audit;
+use crate::scan::{IndexRow, IndexRows, read_index_rows};
 use crate::util::{html_escape, json_escape, now_unix};
 use std::path::{Path, PathBuf};
 
@@ -22,6 +22,13 @@ pub struct DfxmlExportResult {
     pub generated_unix: u64,
     pub object_count: usize,
     pub hashed_count: usize,
+    /// Rows a rescan marked stale (file absent at that scan); exported with
+    /// `<frametrace:index_status>stale</frametrace:index_status>`.
+    pub stale_count: usize,
+    /// Index lines that could not become a fileobject (unparseable / no id).
+    /// Non-zero means the document does NOT cover the whole index.
+    pub skipped_index_lines: usize,
+    pub warnings: Vec<String>,
 }
 
 /// Write the case index as DFXML inside the case and append a chained audit
@@ -29,9 +36,10 @@ pub struct DfxmlExportResult {
 /// (`require_case_output_path`).
 pub fn export_dfxml(case_dir: &Path, output_path: &Path) -> Result<DfxmlExportResult, String> {
     crate::tool_policy::require_case_output_path(case_dir, output_path, "DFXML export")?;
-    let rows = read_indexed_rows(case_dir)?;
+    let index = read_index_rows(case_dir)?;
+    let rows = &index.rows;
     let generated_unix = now_unix()?;
-    let document = render_dfxml(&rows, generated_unix);
+    let document = render_dfxml(&index, generated_unix);
     crate::tool_policy::write_case_report(
         case_dir,
         output_path,
@@ -41,12 +49,14 @@ pub fn export_dfxml(case_dir: &Path, output_path: &Path) -> Result<DfxmlExportRe
     )?;
     let hashed_count = rows.iter().filter(|row| row.sha256.is_some()).count();
     let line = format!(
-        "{{\"schema_version\":1,\"event\":\"export-dfxml\",\"generated_unix\":{},\"label\":\"{}\",\"output_path\":\"{}\",\"object_count\":{},\"hashed_count\":{},\"detail\":\"fileobject entries reflect recorded index rows, not re-verified content\"}}",
+        "{{\"schema_version\":1,\"event\":\"export-dfxml\",\"generated_unix\":{},\"label\":\"{}\",\"output_path\":\"{}\",\"object_count\":{},\"hashed_count\":{},\"stale_count\":{},\"skipped_index_lines\":{},\"detail\":\"fileobject entries reflect recorded index rows, not re-verified content\"}}",
         generated_unix,
         LABEL,
         json_escape(&output_path.to_string_lossy()),
         rows.len(),
         hashed_count,
+        index.stale_count(),
+        index.skipped_lines(),
     );
     audit::append_chained_jsonl(
         &case_dir.join("evidence/logs/dfxml-export-log.jsonl"),
@@ -57,6 +67,9 @@ pub fn export_dfxml(case_dir: &Path, output_path: &Path) -> Result<DfxmlExportRe
         generated_unix,
         object_count: rows.len(),
         hashed_count,
+        stale_count: index.stale_count(),
+        skipped_index_lines: index.skipped_lines(),
+        warnings: index.warnings(),
     })
 }
 
@@ -77,7 +90,8 @@ fn xml_escape(value: &str) -> String {
     )
 }
 
-fn render_dfxml(rows: &[IndexedRow], generated_unix: u64) -> String {
+fn render_dfxml(index: &IndexRows, generated_unix: u64) -> String {
+    let rows: &[IndexRow] = &index.rows;
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str("<dfxml xmlns=\"http://www.forensicswiki.org/wiki/Category:Digital_Forensics_XML\" xmlns:frametrace=\"urn:frametrace:dfxml:1\" xmloutputversion=\"1.0\">\n");
@@ -89,7 +103,17 @@ fn render_dfxml(rows: &[IndexedRow], generated_unix: u64) -> String {
     out.push_str(&format!(
         "    <generated_unix>{generated_unix}</generated_unix>\n"
     ));
-    out.push_str("    <note>fileobject values are recorded index claims, not re-verified measurements; characters forbidden by XML 1.0 are replaced with U+FFFD</note>\n");
+    out.push_str("    <note>fileobject values are recorded index claims, not re-verified measurements; characters forbidden by XML 1.0 are replaced with U+FFFD; an mtime recorded as 0 is treated as absent; fileobjects marked frametrace:index_status stale were missing from disk at a later rescan</note>\n");
+    // E8: coverage is stated, never implied — lines that did not become a
+    // fileobject are counted in the document itself.
+    out.push_str(&format!(
+        "    <frametrace:skipped_index_lines>{}</frametrace:skipped_index_lines>\n",
+        index.skipped_lines()
+    ));
+    out.push_str(&format!(
+        "    <frametrace:stale_count>{}</frametrace:stale_count>\n",
+        index.stale_count()
+    ));
     out.push_str("  </metadata>\n");
     out.push_str("  <creator>\n");
     out.push_str(&format!(
@@ -125,6 +149,16 @@ fn render_dfxml(rows: &[IndexedRow], generated_unix: u64) -> String {
             out.push_str(&format!(
                 "    <frametrace:id>{}</frametrace:id>\n",
                 xml_escape(&row.id)
+            ));
+        }
+        if row.stale {
+            out.push_str("    <frametrace:index_status>stale</frametrace:index_status>\n");
+        }
+        if let Some(raw) = row.source_path_raw_hex.as_deref() {
+            // E1: the exact (non-Unicode) name, losslessly.
+            out.push_str(&format!(
+                "    <frametrace:filename_raw_hex>{}</frametrace:filename_raw_hex>\n",
+                xml_escape(raw)
             ));
         }
         out.push_str("  </fileobject>\n");
@@ -241,6 +275,37 @@ mod tests {
             audit::verify_chained_jsonl(&case_dir.join("evidence/logs/dfxml-export-log.jsonl"))
                 .unwrap();
         assert_eq!(verification.entries, 1);
+        let _ = fs::remove_dir_all(&case_dir);
+    }
+
+    /// E8: the old reader dropped broken lines silently, presented stale
+    /// rows as present files, and exported `modified_unix: 0` as a 1970
+    /// mtime.
+    #[test]
+    fn counts_broken_lines_marks_stale_and_omits_zero_mtime() {
+        let case_dir = temp_case(
+            "e8",
+            concat!(
+                "{\"id\":\"vid_1\",\"source_path\":\"/ev/a.mp4\",\"size_bytes\":1,\"modified_unix\":0,\"sha256\":null}\n",
+                "{\"id\":\"vid_2\",\"source_path\":\"/ev/b.mp4\",\"size_bytes\":2,\"modified_unix\":1609459200,\"sha256\":null,\"index_status\":\"stale\",\"stale_since_unix\":9}\n",
+                "{\"id\":\"vid_3\",\"source_pa\n",
+            ),
+        );
+        let output = case_dir.join("reports/case-index.dfxml");
+        let result = export_dfxml(&case_dir, &output).unwrap();
+        assert_eq!(result.object_count, 2);
+        assert_eq!(result.skipped_index_lines, 1);
+        assert_eq!(result.stale_count, 1);
+        assert_eq!(result.warnings.len(), 1);
+        let text = read_to_string(&output).unwrap();
+        assert!(!text.contains("1970-01-01"), "{text}");
+        assert!(
+            text.contains("<frametrace:skipped_index_lines>1</frametrace:skipped_index_lines>")
+        );
+        let second = text.rsplit("<fileobject>").next().unwrap();
+        assert!(second.contains("<frametrace:index_status>stale</frametrace:index_status>"));
+        let log = read_to_string(&case_dir.join("evidence/logs/dfxml-export-log.jsonl")).unwrap();
+        assert!(log.contains("\"skipped_index_lines\":1"), "{log}");
         let _ = fs::remove_dir_all(&case_dir);
     }
 

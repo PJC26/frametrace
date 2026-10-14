@@ -49,6 +49,8 @@ pub(super) struct CarveCheckpointState {
     /// re-floods `hits` with embedded Annex-B/JPEG anchors.
     pub(super) embedded_until: u64,
     pub(super) annexb_next_emit: u64,
+    /// RIFF-declared suppression spans recorded so far (E3).
+    pub(super) suppressed_spans: Vec<(u64, u64)>,
 }
 
 /// Decodes a prior run's carve checkpoint lines into `CarveCheckpointState`.
@@ -80,6 +82,15 @@ pub(super) fn load_carve_checkpoint(
                 .get("annexb_next_emit")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            // Absent before E3: an older checkpoint resumes with no
+            // recorded spans (its suppressed bytes go unreported, as they
+            // did when that checkpoint was written).
+            state.suppressed_spans = serde_json::from_value(
+                scan.get("suppressed_spans")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+            )
+            .map_err(|err| corrupt(format!("scan record suppressed_spans do not parse: {err}")))?;
             state.hits = serde_json::from_value(
                 scan.get("hits").cloned().unwrap_or(serde_json::Value::Null),
             )
