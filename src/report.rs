@@ -36,6 +36,11 @@ pub struct ReportInputs<'a> {
     /// chain map plus `scan_runs` / `audio`). A section whose input failed
     /// says so instead of "없음". Empty or `{}` when everything was read.
     pub read_errors_json: &'a str,
+    /// Telemetry extracts as `{name: {selector, source, point_count,
+    /// total_points, truncated, first_ts_unix, last_ts_unix, note}}` (points
+    /// stripped). E9: a track cut at the point cap says so. Empty or `{}`
+    /// when the case has none.
+    pub telemetry_json: &'a str,
 }
 
 /// Renders the report without audit-chain verification results: every log
@@ -72,6 +77,7 @@ pub fn render_case_report_with_chains(
     let marks = json_for_script(inputs.marks_json);
     let review_warnings = json_for_script(&json_array_or_empty(inputs.review_warnings_json));
     let read_errors = json_for_script(&audio_levels_object(inputs.read_errors_json));
+    let telemetry = json_for_script(&audio_levels_object(inputs.telemetry_json));
     let redaction_note = if inputs.redaction_applied {
         format!(
             "  {}\n  <div class=\"note\">{}</div>\n",
@@ -240,6 +246,9 @@ pub fn render_case_report_with_chains(
   <div id="joined-videos"></div>
   <div class="note" id="join-caveat" hidden>원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. <span id="join-caveat-time">순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. </span><span id="join-caveat-order" hidden>순서 근거가 파일명 순(filename-order)인 항목은 녹화 시각 없이 파일 이름 순서로만 이었으므로 끊김·겹침을 확인하지 못했습니다. </span>위치·데이터 스트림(GPS 등)은 포함되지 않았습니다.</div>
 
+  <h2>위치·텔레메트리 추출</h2>
+  <div id="telemetry"></div>
+
   <h2>리뷰 산출물</h2>
   <div id="derived-artifacts"></div>
 
@@ -283,6 +292,7 @@ const scanRuns = {scan_runs};
 const annotations = {marks};
 const reviewWarnings = {review_warnings};
 const readErrors = {read_errors};
+const telemetry = {telemetry};
 const redaction = {{"applied": {}}};
 const videos = Array.isArray(scan.videos) ? scan.videos : [];
 const warnings = Array.isArray(scan.warnings) ? scan.warnings : [];
@@ -596,9 +606,18 @@ const anomalyTable = rows => `<table>
     </tr>`).join("")}}
   </tbody>
 </table>`;
+// E8: index lines/records the scan did not examine, disclosed per run.
+const indexCoverageText = marker => {{
+  if (!marker) return "";
+  const parts = [];
+  if (marker.index_unparseable_lines) parts.push(`색인 손상 줄 ${{marker.index_unparseable_lines}}개 미검사`);
+  if (marker.index_rows_without_id) parts.push(`id 없는 색인 기록 ${{marker.index_rows_without_id}}개 미검사`);
+  if (marker.index_stale_rows) parts.push(`최근 스캔 때 없던 파일(stale) ${{marker.index_stale_rows}}개 제외`);
+  return parts.length ? " · " + parts.join(" · ") : "";
+}};
 const anomalyRunLine = run => {{
   const mode = run.run ? (run.run.hash_mode === "rehash" ? "해시 모드: 실시간 재해시" : "해시 모드: 색인에 저장된 해시") : "실행 기록 없음(완료 표시 없는 실행)";
-  return `실행 시각 ${{fmtUnix(run.ts)}} · ${{mode}} · 후보 ${{findingRows(run).length}}건${{run.run?.coverage_limited ? " · 일부 파일 재해시 못 함" : ""}}`;
+  return `실행 시각 ${{fmtUnix(run.ts)}} · ${{mode}} · 후보 ${{findingRows(run).length}}건${{run.run?.coverage_limited && run.run?.hash_mode === "rehash" && (run.run.skipped_no_hash || run.run.skipped_missing || run.run.skipped_error) ? " · 일부 파일 재해시 못 함" : ""}}${{indexCoverageText(run.run)}}`;
 }};
 const anomalyRows = currentAnomalyRun ? findingRows(currentAnomalyRun) : [];
 document.getElementById("anomaly-findings").innerHTML = currentAnomalyRun
@@ -787,6 +806,31 @@ document.getElementById("joined-videos").innerHTML = joinLog.length ? `<table>
 document.getElementById("join-caveat").hidden = joinLog.length === 0;
 document.getElementById("join-caveat-time").hidden = !joinLog.some(item => item.order_basis !== "filename-order");
 document.getElementById("join-caveat-order").hidden = !joinLog.some(item => item.order_basis === "filename-order");
+
+// E9: a telemetry track cut at the point cap is never shown as complete.
+{{
+  const items = Object.entries(telemetry).filter(([, t]) => t && typeof t === "object");
+  const pointsText = t => {{
+    const kept = Number.isFinite(t.point_count) ? t.point_count : null;
+    const total = Number.isFinite(t.total_points) ? t.total_points : null;
+    if (t.truncated === true) return `전체 ${{total ?? "?"}}점 중 ${{kept ?? "?"}}점만 기록 — 잘림 (시작·끝 시각과 최고 속도는 기록된 점 기준)`;
+    return `${{kept ?? total ?? "-"}}점`;
+  }};
+  document.getElementById("telemetry").innerHTML = items.length ? `<table>
+  <thead><tr><th>추출</th><th>원본</th><th>출처</th><th>점 수</th><th>시작</th><th>끝</th><th>메모</th></tr></thead>
+  <tbody>
+    ${{items.map(([name, t]) => `<tr>
+      <td><code>${{escapeHtml(name)}}</code></td>
+      <td><code>${{escapeHtml(t.selector || t.source_path || "-")}}</code></td>
+      <td>${{escapeHtml(t.source || "-")}}</td>
+      <td>${{escapeHtml(pointsText(t))}}</td>
+      <td>${{fmtUnix(t.first_ts_unix)}}</td>
+      <td>${{fmtUnix(t.last_ts_unix)}}</td>
+      <td>${{escapeHtml(t.note || "-")}}</td>
+    </tr>`).join("")}}
+  </tbody>
+</table>` : emptyOr("telemetry", "<p>위치·텔레메트리 추출 기록이 없습니다.</p>");
+}}
 
 const chainEvents = [];
 (Array.isArray(scanRuns) ? scanRuns : []).forEach(run => chainEvents.push({{
@@ -1804,6 +1848,7 @@ mod tests {
         let marks = lookup("marks");
         let review_warnings = lookup("review_warnings");
         let read_errors = lookup("read_errors");
+        let telemetry = lookup("telemetry");
         render_case_report(&super::ReportInputs {
             manifest_json: &manifest,
             index_json: &index,
@@ -1824,6 +1869,7 @@ mod tests {
                 .any(|(name, value)| *name == "redacted" && *value == "1"),
             review_warnings_json: &review_warnings,
             read_errors_json: &read_errors,
+            telemetry_json: &telemetry,
         })
     }
 
@@ -2570,6 +2616,7 @@ mod tests {
                     redaction_applied: false,
                     review_warnings_json: "",
                     read_errors_json: "",
+                    telemetry_json: "",
                 },
                 chains,
             );
@@ -2965,5 +3012,26 @@ mod tests {
             SignoffCurrency::LegacyBinding
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// E9: a telemetry track cut at the point cap is shown as truncated
+    /// with its total, never as a complete track.
+    #[test]
+    fn truncated_telemetry_track_is_labelled() {
+        let telemetry = r#"{"t1":{"selector":"vid_1","source":"nmea-file-scan","point_count":20000,"total_points":51234,"truncated":true},"t2":{"selector":"vid_2","point_count":12,"total_points":12,"truncated":false}}"#;
+        let html = rendered_elements(&[("telemetry", telemetry)])["telemetry"]["innerHTML"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            html.contains("전체 51234점 중 20000점만 기록 — 잘림"),
+            "{html}"
+        );
+        assert!(html.contains("<td>12점</td>"), "{html}");
+        let empty = rendered_elements(&[])["telemetry"]["innerHTML"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(empty.contains("추출 기록이 없습니다"), "{empty}");
     }
 }

@@ -52,11 +52,68 @@ pub struct AnomalyScanResult {
     pub log_path: PathBuf,
     pub scanned_unix: u64,
     pub coverage: RehashCoverage,
+    /// What of the index the scan did not cover (E8 counted reader).
+    pub index: IndexCoverage,
+}
+
+/// Index lines and records an anomaly scan did not examine (E8): lines
+/// that are not JSON objects, records without an id, and records a rescan
+/// marked `stale` (the file was absent then — their facts are not current
+/// and must not yield current findings). Disclosed in the run record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexCoverage {
+    pub unparseable_lines: usize,
+    pub rows_without_id: usize,
+    pub stale_rows: usize,
+}
+
+impl IndexCoverage {
+    pub fn limited(&self) -> bool {
+        self.unparseable_lines != 0 || self.rows_without_id != 0 || self.stale_rows != 0
+    }
+
+    /// One disclosure sentence, empty when everything was covered.
+    pub fn note(&self) -> String {
+        if !self.limited() {
+            return String::new();
+        }
+        format!(
+            "; index coverage: {} unparseable line(s) and {} record(s) without id were not examined, {} stale record(s) (file absent at the last scan) were excluded",
+            self.unparseable_lines, self.rows_without_id, self.stale_rows
+        )
+    }
+}
+
+/// [`read_indexed_rows`] through the counted index reader
+/// (`scan::read_index_rows`): stale records are left out and everything
+/// not examined is counted.
+pub fn read_indexed_rows_checked(
+    case_dir: &Path,
+) -> Result<(Vec<IndexedRow>, IndexCoverage), String> {
+    let index = crate::scan::read_index_rows(case_dir)?;
+    let stale: std::collections::HashSet<&str> = index
+        .rows
+        .iter()
+        .filter(|row| row.stale)
+        .map(|row| row.id.as_str())
+        .collect();
+    let rows = read_indexed_rows(case_dir)?
+        .into_iter()
+        .filter(|row| !stale.contains(row.id.as_str()))
+        .collect();
+    Ok((
+        rows,
+        IndexCoverage {
+            unparseable_lines: index.unparseable_lines,
+            rows_without_id: index.rows_without_id,
+            stale_rows: stale.len(),
+        },
+    ))
 }
 
 /// Scan the case index for candidate anomalies and append a chained log.
 pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, String> {
-    let rows = read_indexed_rows(case_dir)?;
+    let (rows, index_coverage) = read_indexed_rows_checked(case_dir)?;
     let mut findings = Vec::new();
     let mut coverage = RehashCoverage::default();
     let mut checks: Vec<HashCheck> = Vec::new();
@@ -106,7 +163,7 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         )
     } else {
         String::new()
-    };
+    } + &index_coverage.note();
     let detail = if !rehash {
         format!("stored index hashes only; pass --rehash for full revalidation{mtime_note}")
     } else {
@@ -128,7 +185,7 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         ) + &mtime_note
     };
     let line = format!(
-        "{{\"schema_version\":1,\"event\":\"anomaly-scan-run\",\"scanned_unix\":{},\"hash_mode\":\"{}\",\"finding_count\":{},\"mtime_unavailable\":{},\"skipped_no_hash\":{},\"skipped_missing\":{},\"skipped_error\":{},\"coverage_limited\":{},\"detail\":\"{}\"}}",
+        "{{\"schema_version\":1,\"event\":\"anomaly-scan-run\",\"scanned_unix\":{},\"hash_mode\":\"{}\",\"finding_count\":{},\"mtime_unavailable\":{},\"skipped_no_hash\":{},\"skipped_missing\":{},\"skipped_error\":{},\"index_unparseable_lines\":{},\"index_rows_without_id\":{},\"index_stale_rows\":{},\"coverage_limited\":{},\"detail\":\"{}\"}}",
         scanned_unix,
         if rehash { "rehash" } else { "stored" },
         findings.len(),
@@ -136,7 +193,10 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         coverage.skipped_no_hash,
         coverage.skipped_missing,
         coverage.skipped_error,
-        coverage.limited() && rehash,
+        index_coverage.unparseable_lines,
+        index_coverage.rows_without_id,
+        index_coverage.stale_rows,
+        (coverage.limited() && rehash) || index_coverage.limited(),
         json_escape(&detail),
     );
     audit::append_chained_jsonl(&log_path, &line)?;
@@ -145,6 +205,7 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         log_path,
         scanned_unix,
         coverage,
+        index: index_coverage,
     })
 }
 
@@ -720,9 +781,11 @@ pub fn read_indexed_rows(case_dir: &Path) -> Result<Vec<IndexedRow>, String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
             size_bytes: value.get("size_bytes").and_then(serde_json::Value::as_u64),
+            // E8: 0 is the "no timestamp" placeholder, never 1970.
             modified_unix: value
                 .get("modified_unix")
-                .and_then(serde_json::Value::as_u64),
+                .and_then(serde_json::Value::as_u64)
+                .filter(|mtime| *mtime > 0),
             duration_seconds: value
                 .get("duration_seconds")
                 .and_then(serde_json::Value::as_f64),
@@ -1105,5 +1168,53 @@ mod tests {
         assert_eq!(LABEL, "candidate-finding");
         assert!(!LABEL.contains("tamper"));
         assert!(!LABEL.contains("authentic"));
+    }
+
+    /// E8 follow-up: the scan reads the index through the counted reader —
+    /// a torn line and an id-less record are counted, a stale record (file
+    /// absent at the last scan) yields no current finding, mtime 0 is "no
+    /// time" — and the run record discloses all of it.
+    #[test]
+    fn scan_discloses_index_lines_and_stale_records_it_did_not_examine() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-anomaly-index-coverage-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let missing = dir.join("gone.mp4").to_string_lossy().to_string();
+        let lines = [
+            serde_json::json!({"id": "vid_1", "source_path": missing, "sha256": "ab", "size_bytes": 3, "modified_unix": 5, "index_status": "stale"}).to_string(),
+            serde_json::json!({"source_path": "/x.mp4"}).to_string(),
+            serde_json::json!({"id": "vid_2", "source_path": "/y.mp4", "modified_unix": 0}).to_string(),
+            "{\"id\":\"vid_3\",\"sour".to_string(),
+        ];
+        std::fs::write(dir.join("db/videos.jsonl"), lines.join("\n")).unwrap();
+        let result = scan_case(&dir, false).unwrap();
+        assert_eq!(
+            result.index,
+            IndexCoverage {
+                unparseable_lines: 1,
+                rows_without_id: 1,
+                stale_rows: 1
+            }
+        );
+        assert!(
+            !result.findings.iter().any(|f| f.selector == "vid_1"),
+            "stale record yields no current finding: {:?}",
+            result.findings
+        );
+        let rows = read_indexed_rows(&dir).unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.id == "vid_2").unwrap().modified_unix,
+            None
+        );
+        let log = std::fs::read_to_string(&result.log_path).unwrap();
+        let marker: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!(marker["index_stale_rows"], 1);
+        assert_eq!(marker["index_unparseable_lines"], 1);
+        assert_eq!(marker["coverage_limited"], true);
+        assert!(marker["detail"].as_str().unwrap().contains("stale record"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

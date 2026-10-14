@@ -717,6 +717,12 @@ pub fn make_report(
             "stored index hashes (pass --rehash for full revalidation)"
         }
     );
+    if anomaly_scan.index.limited() {
+        eprintln!(
+            "warning: anomaly scan{}",
+            anomaly_scan.index.note().trim_start_matches(';')
+        );
+    }
     let manifest_path = case_dir.join("case.json");
     let manifest_json = read_to_string(&manifest_path)
         .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
@@ -772,6 +778,7 @@ pub fn make_report(
     }
     let review_warnings_json = serde_json::to_string(&review_warnings).unwrap_or_default();
     let read_errors_json = serde_json::to_string(&read_errors).unwrap_or_default();
+    let telemetry_json = report_telemetry_json(case_dir);
     // One read of marks and tags feeds the displayed annotations and both
     // sign-off digests, so the banner judges exactly what the table shows.
     let mark_rows = crate::case_db::load_review_marks(case_dir)
@@ -809,6 +816,7 @@ pub fn make_report(
     let annotations_json = redact(annotations_json);
     let review_warnings_json = redact(review_warnings_json);
     let read_errors_json = redact(read_errors_json);
+    let telemetry_json = redact(telemetry_json);
     let html = report::render_case_report_with_chains(
         &report::ReportInputs {
             manifest_json: &manifest_json,
@@ -828,6 +836,7 @@ pub fn make_report(
             redaction_applied: redact_paths,
             review_warnings_json: &review_warnings_json,
             read_errors_json: &read_errors_json,
+            telemetry_json: &telemetry_json,
         },
         &audit_chains_json,
     );
@@ -983,6 +992,38 @@ pub(crate) fn report_join_log(case_dir: &Path, jsonl: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The telemetry extracts the report lists (E9): every
+/// `artifacts/telemetry/*.json` extract without its point array, keeping
+/// `point_count` / `total_points` / `truncated` so a capped track is
+/// never presented as complete.
+pub(crate) fn report_telemetry_json(case_dir: &Path) -> String {
+    let reports = crate::telemetry::collect_reports(case_dir);
+    let mut out = serde_json::Map::new();
+    if let Some(map) = reports.as_object() {
+        for (name, report) in map {
+            let mut summary = serde_json::Map::new();
+            for key in [
+                "selector",
+                "source_path",
+                "source",
+                "point_count",
+                "total_points",
+                "truncated",
+                "first_ts_unix",
+                "last_ts_unix",
+                "max_speed_kmh",
+                "note",
+            ] {
+                if let Some(value) = report.get(key) {
+                    summary.insert(key.to_string(), value.clone());
+                }
+            }
+            out.insert(name.clone(), serde_json::Value::Object(summary));
+        }
+    }
+    serde_json::Value::Object(out).to_string()
 }
 
 /// D9: marks accepted but not yet applied (`marks-pending/*.json`) and
@@ -1952,8 +1993,29 @@ mod report_output_tests {
             b"p",
         )
         .unwrap();
+        // E4/E9: the deepfake report's target path and a telemetry
+        // extract's source path are redacted like every other path.
+        fs::create_dir_all(case_dir.join("artifacts/deepfake")).unwrap();
+        fs::write(
+            case_dir.join("artifacts/deepfake/vid_000001.json"),
+            serde_json::json!({"frametrace_target_path": source_dir.join("a.mp4"), "score": 0.1})
+                .to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(case_dir.join("artifacts/telemetry")).unwrap();
+        fs::write(
+            case_dir.join("artifacts/telemetry/vid_000001.json"),
+            serde_json::json!({"event": "telemetry-extract", "source_path": source_dir.join("a.mp4"),
+                "point_count": 2, "total_points": 30000, "truncated": true, "points": []})
+            .to_string(),
+        )
+        .unwrap();
         make_report(&case_dir, false, true, None).unwrap();
         make_review(&case_dir, true, false).unwrap();
+        // E9: the report lists the capped track as truncated.
+        let telemetry = embedded_json(&report_html(&case_dir), "telemetry");
+        assert_eq!(telemetry["vid_000001"]["truncated"], true, "{telemetry}");
+        assert_eq!(telemetry["vid_000001"]["total_points"], 30000);
         // D12: the redacted bundle carries the redaction marker line.
         assert!(crate::redact::bundle_is_redacted(
             &fs::read_to_string(case_dir.join("review/data-bundle.js")).unwrap()
