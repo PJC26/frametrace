@@ -777,7 +777,7 @@ function joinLengthText(item) {{
   parts.push(observed === null ? "관측 길이 미기록" : `관측 ${{fmtDuration(observed)}} / 예상 ${{fmtDuration(expected)}}`);
   parts.push(ok === null ? "길이 검사 결과 미기록" : (ok ? "길이 검사 통과" : "길이 검사 불일치"));
   const boundary = item.boundary_check && typeof item.boundary_check === "object" ? item.boundary_check : null;
-  parts.push(boundary && typeof boundary.ok === "boolean" ? (boundary.ok ? "세그먼트 경계 검증 통과" : `세그먼트 경계 검증 실패${{boundary.detail ? ` — ${{boundary.detail}}` : ""}}`) : "세그먼트 경계 검증 미기록");
+  parts.push(boundary && typeof boundary.ok === "boolean" ? (boundary.ok ? `세그먼트 경계 검증 통과${{boundary.detail ? ` — ${{boundary.detail}}` : ""}}` : `세그먼트 경계 검증 실패${{boundary.detail ? ` — ${{boundary.detail}}` : ""}}`) : "세그먼트 경계 검증 미기록");
   return parts.map(escapeHtml).join("<br>");
 }}
 function joinJunctionText(item) {{

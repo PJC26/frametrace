@@ -13,7 +13,6 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone, Default)]
 pub struct InitCaseOptions {
@@ -975,7 +974,7 @@ pub(crate) fn report_join_log(case_dir: &Path, jsonl: &str) -> String {
                 map.insert("record_id".into(), serde_json::Value::String(id));
                 map.insert("record_id_derived".into(), serde_json::Value::Bool(true));
             }
-            if map.get("duration_check").is_none()
+            if (map.get("duration_check").is_none() || map.get("boundary_check").is_none())
                 && let (Some(manifest_path), Some(manifest_sha)) = (
                     map.get("manifest_path").and_then(|v| v.as_str()),
                     map.get("manifest_sha256").and_then(|v| v.as_str()),
@@ -985,15 +984,61 @@ pub(crate) fn report_join_log(case_dir: &Path, jsonl: &str) -> String {
                 if let Ok(text) = read_to_string(&path)
                     && crate::sha256::digest_bytes(text.as_bytes()) == manifest_sha
                     && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text)
-                    && let Some(check) = manifest.get("duration_check")
                 {
-                    map.insert("duration_check".into(), check.clone());
+                    if let Some(check) = manifest.get("duration_check")
+                        && map.get("duration_check").is_none()
+                    {
+                        map.insert("duration_check".into(), check.clone());
+                    }
+                    // C14: the packet / segment-boundary verification.
+                    if let Some(check) = manifest.get("segment_check")
+                        && map.get("boundary_check").is_none()
+                    {
+                        map.insert("boundary_check".into(), segment_check_summary(check));
+                    }
                 }
             }
             value.to_string()
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// D3: a join manifest's `segment_check` (C14) as the report's
+/// `boundary_check`: `{ok, detail}` with the packet counts, the boundaries
+/// located, and any problem the check recorded.
+fn segment_check_summary(check: &serde_json::Value) -> serde_json::Value {
+    let num = |key: &str| check.get(key).and_then(|v| v.as_u64());
+    let mut parts = Vec::new();
+    if let (Some(expected), Some(observed)) =
+        (num("video_packets_expected"), num("video_packets_observed"))
+    {
+        parts.push(format!("영상 패킷 {observed}/{expected}"));
+    }
+    if let (Some(expected), Some(observed)) =
+        (num("audio_packets_expected"), num("audio_packets_observed"))
+    {
+        parts.push(format!("소리 패킷 {observed}/{expected}"));
+    }
+    if let Some(boundaries) = check.get("boundaries").and_then(|v| v.as_array()) {
+        let located = boundaries
+            .iter()
+            .filter(|b| !b["observed_start_seconds"].is_null())
+            .count();
+        parts.push(format!("경계 {located}/{}개 확인", boundaries.len()));
+    }
+    if let Some(problems) = check.get("problems").and_then(|v| v.as_array()) {
+        parts.extend(
+            problems
+                .iter()
+                .filter_map(|p| p.as_str())
+                .map(str::to_string),
+        );
+    }
+    serde_json::json!({
+        "ok": check.get("ok").and_then(|v| v.as_bool()),
+        "detail": parts.join("; "),
+    })
 }
 
 /// The telemetry extracts the report lists (E9): every
@@ -1701,34 +1746,28 @@ fn generate_review_thumbnails(
                     };
                     let output = thumbs_dir.join(format!("{id}.jpg"));
                     let mut created = false;
+                    let mut last_error = String::new();
                     for seek in ["5", "0"] {
-                        let result = crate::util::hide_console(&mut Command::new(&ffmpeg))
-                            .args([
-                                "-y",
-                                "-loglevel",
-                                "error",
-                                "-ss",
-                                seek,
-                                "-i",
-                                source,
-                                "-frames:v",
-                                "1",
-                                "-vf",
-                                "scale=288:-2",
-                                "-q:v",
-                                "5",
-                            ])
-                            .arg(&output)
-                            .output();
-                        match result {
-                            Ok(result) if result.status.success() => {
+                        // C6: bounded per-thumbnail ffmpeg run, written
+                        // to a part file and published only when complete.
+                        match crate::video_export::extract_review_thumbnail(
+                            Path::new(&ffmpeg),
+                            source,
+                            &output,
+                            seek,
+                            crate::video_export::REVIEW_THUMB_TIMEOUT_SECS,
+                        ) {
+                            Ok(()) => {
                                 created = true;
                                 break;
                             }
-                            _ => {
-                                let _ = std::fs::remove_file(&output);
-                            }
+                            Err(err) => last_error = err,
                         }
+                    }
+                    if !created {
+                        // No silent failure: the viewer shows a placeholder,
+                        // and the run says which record and why.
+                        eprintln!("warning: thumbnail for {id} not created: {last_error}");
                     }
                     if created {
                         lock_or_recover(created_ids).push((*id).clone());
@@ -2209,7 +2248,7 @@ mod report_output_tests {
             std::env::temp_dir().join(format!("frametrace-report-join-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("artifacts/joined")).unwrap();
-        let manifest = "{\"duration_check\":{\"expected\":60.0,\"observed\":59.5,\"ok\":true}}\n";
+        let manifest = "{\"duration_check\":{\"expected\":60.0,\"observed\":59.5,\"ok\":true},\"segment_check\":{\"video_packets_expected\":10,\"video_packets_observed\":9,\"boundaries\":[{\"segment\":2,\"expected_start_seconds\":30.0,\"observed_start_seconds\":null}],\"ok\":false,\"problems\":[\"segment 2 missing\"]}}\n";
         fs::write(root.join("artifacts/joined/a.manifest.json"), manifest).unwrap();
         let manifest_sha = crate::sha256::digest_bytes(manifest.as_bytes());
         let lines = [
@@ -2225,6 +2264,12 @@ mod report_output_tests {
         assert_eq!(out[0]["record_id"], "join:abababababababab");
         assert_eq!(out[0]["record_id_derived"], true);
         assert_eq!(out[0]["duration_check"]["observed"], 59.5);
+        // C14's packet / boundary verification becomes boundary_check.
+        assert_eq!(out[0]["boundary_check"]["ok"], false);
+        assert_eq!(
+            out[0]["boundary_check"]["detail"],
+            "영상 패킷 9/10; 경계 0/1개 확인; segment 2 missing"
+        );
         assert_eq!(out[1]["record_id"], "join:own");
         assert!(out[1].get("record_id_derived").is_none());
         assert!(
