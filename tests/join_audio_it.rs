@@ -658,3 +658,128 @@ fn measure_audio_truncated_track_is_an_error_not_silent() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Real ffmpeg concat (stream copy) of `inputs` into `output`.
+fn concat_copy(inputs: &[&Path], output: &Path) {
+    let dir = output.parent().unwrap();
+    let list = dir.join(format!(
+        "{}.ffconcat",
+        output.file_name().unwrap().to_string_lossy()
+    ));
+    let mut text = String::from("ffconcat version 1.0\n");
+    for input in inputs {
+        text.push_str(&format!(
+            "file '{}'\n",
+            input.to_string_lossy().replace('\\', "/")
+        ));
+    }
+    std::fs::write(&list, text).unwrap();
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "concat"])
+        .args(["-safe", "0", "-i"])
+        .arg(&list)
+        .args(["-map", "0:v:0", "-map", "0:a?", "-c", "copy"])
+        .args(["-avoid_negative_ts", "make_zero", "-f", "mp4"])
+        .arg(output)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// C14: the packet-level segment check passes a complete stream-copy join
+/// and FAILS one whose middle segment is missing — a 2.2 s hole in a
+/// 6.6 s join that the old duration tolerance (max(1 s, 1 %)) let through
+/// on long joins, and that the new max(1 s, 0.2 %) bound plus the
+/// per-segment packet / boundary check refuse.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn join_segment_check_catches_a_missing_segment() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_c14");
+    let source = root.join("src");
+    let names = [
+        ("20260910_120000_F.mp4", 2.1),
+        ("20260910_120002_F.mp4", 2.2),
+        ("20260910_120004_F.mp4", 2.3),
+    ];
+    for (i, (name, seconds)) in names.iter().enumerate() {
+        let tone = format!("sine=frequency={}:sample_rate=48000", 400 + 100 * i);
+        make_clip(&source.join(name), *seconds, "160x120", Some(&tone));
+    }
+    let case = new_case(&root, &source, false);
+    let ids_map = ids_by_name(&case);
+    let ids: Vec<String> = names.iter().map(|(n, _)| ids_map[*n].clone()).collect();
+    let plan = frametrace::join::plan(&case, &ids, 1.0).unwrap();
+    assert!(plan.blocking.is_empty(), "{:?}", plan.blocking);
+    let paths: Vec<PathBuf> = plan
+        .segments
+        .iter()
+        .map(|s| s.source_path.clone())
+        .collect();
+    let full = root.join("full.mp4");
+    concat_copy(&[&paths[0], &paths[1], &paths[2]], &full);
+    let check = frametrace::join::verify_segments("ffprobe", &full, &plan, None).unwrap();
+    assert!(check.ok, "{:?}", check.problems);
+    assert_eq!(check.video_packets_expected, check.video_packets_observed);
+
+    let missing = root.join("missing.mp4");
+    concat_copy(&[&paths[0], &paths[2]], &missing);
+    let check = frametrace::join::verify_segments("ffprobe", &missing, &plan, None).unwrap();
+    assert!(!check.ok, "a missing segment must fail the check");
+    assert!(
+        check.video_packets_observed < check.video_packets_expected,
+        "{check:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C13: every join-log entry carries the job tag that wrote it (the
+/// server attributes entries by this tag only).
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn join_log_entry_carries_the_job_tag() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_c13");
+    let source = root.join("src");
+    for (i, name) in ["20260910_120000_F.mp4", "20260910_120002_F.mp4"]
+        .iter()
+        .enumerate()
+    {
+        let tone = format!("sine=frequency={}:sample_rate=48000", 500 + 100 * i);
+        make_clip(&source.join(name), 2.0, "160x120", Some(&tone));
+    }
+    let case = new_case(&root, &source, false);
+    let ids: Vec<String> = ids_by_name(&case).values().cloned().collect();
+    let ids_arg = ids.join(",");
+    let case_str = case.to_str().unwrap();
+    let result = last_json(&ok(
+        &frametrace(&[
+            "join-video",
+            case_str,
+            "--ids",
+            &ids_arg,
+            "--job-tag",
+            "srv-c13-1",
+        ]),
+        "join-video",
+    ));
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(result["manifest_path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["segment_check"]["ok"], true, "{manifest:#}");
+    assert!(
+        manifest["duration_check"]["tolerance_seconds"]
+            .as_f64()
+            .is_some()
+    );
+    let log = std::fs::read_to_string(case.join("artifacts/joined/join-log.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(entry["job_tag"], "srv-c13-1");
+    assert_eq!(entry["segment_check_ok"], true);
+    let _ = std::fs::remove_dir_all(&root);
+}

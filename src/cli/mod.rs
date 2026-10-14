@@ -576,6 +576,11 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     if let Some(spec) = &cli.key_source {
         crate::audit_key::install_source_override(spec)?;
     }
+    // R4-B15: a child started by the workstation checks that it signs with
+    // the same audit key source as its parent and says so when it does not.
+    if let Some(warning) = crate::serve::key_source_mismatch_warning() {
+        eprintln!("warning: {warning}");
+    }
 
     match cli.command {
         Commands::InitCase {
@@ -834,7 +839,9 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                 // probe default would kill them mid-walk.
                 timeout_secs: match timeout {
                     Some(0) => None,
-                    other => Some(other.unwrap_or(crate::tsk::TSK_PROBE_TIMEOUT_SECS)),
+                    Some(t) => Some(t),
+                    // R4-C7: default scales with the image (1 h per started TB).
+                    None => Some(crate::tsk::scaled_inspect_timeout_secs(&image_file)),
                 },
             };
             inspect_image(&case_dir, &image_file, options)

@@ -45,6 +45,8 @@ mod tests_phase3;
 #[cfg(test)]
 mod tests_post_review;
 #[cfg(test)]
+mod tests_r4_jobs;
+#[cfg(test)]
 mod tests_r4_server;
 #[cfg(test)]
 mod tests_recent;
@@ -343,6 +345,20 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
 #[cfg(target_os = "windows")]
 pub(crate) fn kill_all_tracked() {
     proc::kill_all_tracked();
+}
+
+/// C4: stamps every selection export this process is still writing as
+/// "중단됨" (the shell's forced-exit path, after its bounded wait).
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn mark_abandoned_exports() -> usize {
+    media::mark_abandoned_exports()
+}
+
+/// C8: a step child started by the workstation server watches the server
+/// and takes its process group down when the server dies (unix; no-op
+/// elsewhere). Called first thing by every binary's `main`.
+pub fn watch_parent_from_env() {
+    proc::watch_parent_from_env();
 }
 
 /// Binds a loopback listener. On Windows the socket is created through
@@ -734,8 +750,8 @@ pub(crate) fn key_tag_mismatch(expected: &str, actual: &str) -> Option<String> {
 /// (`FRAMETRACE_EXPECTED_AUDIT_KEY`) and returns a warning on mismatch.
 /// `None` outside the workstation or when they agree.
 ///
-/// INTEGRATION TODO(B15): `cli::run` calls this right after installing
-/// `--key-source` and prints the warning to stderr.
+/// `cli::run` calls this right after installing `--key-source` and prints
+/// the warning to stderr.
 pub fn key_source_mismatch_warning() -> Option<String> {
     let expected = std::env::var(jobs::EXPECTED_AUDIT_KEY_ENV).ok()?;
     key_tag_mismatch(&expected, &audit_key_tag(crate::audit_key::configured()))

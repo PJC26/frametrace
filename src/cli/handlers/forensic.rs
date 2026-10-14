@@ -50,9 +50,24 @@ pub fn inspect_e01(
             timeout_secs: None,
             ..Default::default()
         };
-        inspect_image(case_dir, e01_file, tsk_options)?;
+        // C7 / B16: a partial listing (direct triage) exits 5 — completed,
+        // but the server must report it as partial, never as a clean pass.
+        if let Some(reason) = inspect_image_run(case_dir, e01_file, tsk_options)? {
+            exit_partial(&reason);
+        }
     }
     Ok(())
+}
+
+/// C7 / B16 contract: the step completed and recorded everything, but its
+/// result is PARTIAL. The last stderr line starts with
+/// [`crate::tsk::PARTIAL_LINE_PREFIX`].
+fn exit_partial(reason: &str) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprintln!("{}{reason}", crate::tsk::PARTIAL_LINE_PREFIX);
+    let _ = std::io::stderr().flush();
+    std::process::exit(crate::tsk::EXIT_PARTIAL);
 }
 
 pub fn import_e01(case_dir: &Path, e01_file: &Path, options: E01Options) -> Result<(), String> {
@@ -134,6 +149,9 @@ pub fn carve_file(
     resume: ResumeMode,
 ) -> Result<(), String> {
     ensure_case(case_dir)?;
+    // C1: an imported raw image is carved only when its completion marker
+    // proves the export finished (a killed import's torn image is refused).
+    e01::require_complete_case_raw(case_dir, source_file)?;
     let source = case_db::register_evidence_source(
         case_dir,
         &case_db::EvidenceSourceInput {
@@ -194,6 +212,20 @@ pub fn inspect_image(
     image_file: &Path,
     options: TskInspectOptions,
 ) -> Result<(), String> {
+    // C7 / B16: exit code 5 when the listing is partial.
+    if let Some(reason) = inspect_image_run(case_dir, image_file, options)? {
+        exit_partial(&reason);
+    }
+    Ok(())
+}
+
+/// Runs the inspection; `Ok(Some(reason))` when the result is partial
+/// (fls timed out, or the listing was truncated to `--max-entries`).
+fn inspect_image_run(
+    case_dir: &Path,
+    image_file: &Path,
+    options: TskInspectOptions,
+) -> Result<Option<String>, String> {
     ensure_case(case_dir)?;
     let source = case_db::register_evidence_source(
         case_dir,
@@ -265,8 +297,11 @@ pub fn inspect_image(
     println!("fls log: {}", result.fls_log_path.display());
     if !result.warnings.is_empty() {
         println!("warnings: {}", result.warnings.len());
+        for warning in &result.warnings {
+            println!("warning: {warning}");
+        }
     }
-    Ok(())
+    Ok(crate::tsk::partial_reason(&result))
 }
 
 pub fn recover_inode(

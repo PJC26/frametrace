@@ -352,6 +352,225 @@ pub fn probe_file(ffprobe: &str, path: &Path) -> ProbeFacts {
     }
 }
 
+/// C14: allowed |observed − expected| output duration: max(1 s, 0.2 %).
+pub fn duration_tolerance(expected_seconds: f64) -> f64 {
+    (expected_seconds * 0.002).max(1.0)
+}
+
+/// C14: packet-level verification of a joined output against its plan.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SegmentCheck {
+    pub video_packets_expected: u64,
+    pub video_packets_observed: u64,
+    pub audio_packets_expected: Option<u64>,
+    pub audio_packets_observed: Option<u64>,
+    /// `(1-based segment, expected start s, observed start s)` per
+    /// boundary that could be located in the output.
+    pub boundaries: Vec<(usize, f64, Option<f64>)>,
+    pub ok: bool,
+    pub problems: Vec<String>,
+}
+
+impl SegmentCheck {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "video_packets_expected": self.video_packets_expected,
+            "video_packets_observed": self.video_packets_observed,
+            "audio_packets_expected": self.audio_packets_expected,
+            "audio_packets_observed": self.audio_packets_observed,
+            "boundaries": self.boundaries.iter().map(|(index, expected, observed)| json!({
+                "segment": index,
+                "expected_start_seconds": r3(*expected),
+                "observed_start_seconds": observed.map(r3),
+            })).collect::<Vec<_>>(),
+            "ok": self.ok,
+            "problems": self.problems,
+        })
+    }
+}
+
+/// Packet counts of the first video and first audio stream
+/// (`ffprobe -count_packets`, which demuxes the whole file).
+pub fn stream_packet_counts(
+    ffprobe: &str,
+    path: &Path,
+    timeout_secs: Option<u64>,
+) -> Result<(u64, Option<u64>), String> {
+    let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
+    let mut command = Command::new(&binary);
+    command
+        .args(["-v", "error", "-count_packets", "-print_format", "json"])
+        .args(["-show_entries", "stream=codec_type,nb_read_packets"])
+        .arg(path);
+    let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe packet count failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid ffprobe packet JSON: {err}"))?;
+    let streams = value
+        .get("streams")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let first = |kind: &str| {
+        streams
+            .iter()
+            .find(|s| s.get("codec_type").and_then(Value::as_str) == Some(kind))
+            .and_then(|s| num_field(s, "nb_read_packets"))
+    };
+    let video = first("video").ok_or_else(|| {
+        format!(
+            "ffprobe could not count video packets of {}",
+            path.display()
+        )
+    })?;
+    Ok((video, first("audio")))
+}
+
+/// Decode timestamps (seconds) of the first video stream's packets, in
+/// file order; a packet without a dts repeats the previous value.
+pub fn video_packet_dts(
+    ffprobe: &str,
+    path: &Path,
+    timeout_secs: Option<u64>,
+) -> Result<Vec<f64>, String> {
+    let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
+    let mut command = Command::new(&binary);
+    command
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "packet=dts_time", "-of", "csv=p=0"])
+        .arg(path);
+    let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe packet listing failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut out = Vec::new();
+    let mut last = 0.0f64;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let field = line.trim().trim_end_matches(',');
+        if field.is_empty() {
+            continue;
+        }
+        if let Ok(value) = field.parse::<f64>()
+            && value.is_finite()
+        {
+            last = value;
+        }
+        out.push(last);
+    }
+    Ok(out)
+}
+
+/// Pure C14 decision. `sources`: per segment (output order) its
+/// `(video packets, audio packets)`; `offsets`: each segment's planned
+/// output start; `output_audio`: the output's audio packet count;
+/// `output_dts`: the output's video packet dts in file order.
+///
+/// Missing material shows up as a video packet deficit (stream copy moves
+/// every packet, so the counts must be equal) or as a segment that does
+/// not start where the plan puts it (± max(1 s, 0.2 %)). Audio is allowed
+/// one packet of slack per segment (encoder priming at a junction).
+pub fn evaluate_segment_check(
+    sources: &[(u64, Option<u64>)],
+    offsets: &[f64],
+    output_audio: Option<u64>,
+    output_dts: &[f64],
+) -> SegmentCheck {
+    let mut check = SegmentCheck {
+        video_packets_expected: sources.iter().map(|(v, _)| *v).sum(),
+        video_packets_observed: output_dts.len() as u64,
+        audio_packets_observed: output_audio,
+        ..SegmentCheck::default()
+    };
+    if sources.iter().all(|(_, a)| a.is_some()) && !sources.is_empty() {
+        check.audio_packets_expected = Some(sources.iter().filter_map(|(_, a)| *a).sum());
+    }
+    if check.video_packets_observed != check.video_packets_expected {
+        check.problems.push(format!(
+            "영상 패킷 수가 원본 합계와 다릅니다 (출력 {}, 원본 합계 {})",
+            check.video_packets_observed, check.video_packets_expected
+        ));
+    }
+    match (check.audio_packets_expected, output_audio) {
+        (Some(expected), Some(observed)) => {
+            if expected.abs_diff(observed) > sources.len() as u64 {
+                check.problems.push(format!(
+                    "소리 패킷 수가 원본 합계와 다릅니다 (출력 {observed}, 원본 합계 {expected})"
+                ));
+            }
+        }
+        (Some(expected), None) => check.problems.push(format!(
+            "원본에 소리가 있는데 출력에 소리 트랙이 없습니다 (원본 패킷 {expected})"
+        )),
+        _ => {}
+    }
+    let origin = output_dts.first().copied().unwrap_or(0.0);
+    let base = offsets.first().copied().unwrap_or(0.0);
+    let mut start_index = 0u64;
+    for (index, (packets, _)) in sources.iter().enumerate() {
+        let expected = offsets.get(index).copied().unwrap_or(0.0) - base;
+        let observed = output_dts.get(start_index as usize).map(|dts| dts - origin);
+        check.boundaries.push((index + 1, expected, observed));
+        match observed {
+            Some(observed) if (observed - expected).abs() <= duration_tolerance(expected) => {}
+            Some(observed) => check.problems.push(format!(
+                "{}번째 원본이 출력의 예상 위치에서 시작하지 않습니다 (예상 {expected:.3}초, 관측 {observed:.3}초)",
+                index + 1
+            )),
+            None => check.problems.push(format!(
+                "{}번째 원본의 영상 패킷이 출력에 없습니다",
+                index + 1
+            )),
+        }
+        start_index += packets;
+    }
+    if sources.is_empty() {
+        check.problems.push("검증할 원본이 없습니다".to_string());
+    }
+    check.ok = check.problems.is_empty();
+    check
+}
+
+/// C14: counts every source's packets and lists the output's video packet
+/// timestamps, then applies [`evaluate_segment_check`]. `Err` = the check
+/// itself could not run (which fails the join too — never published
+/// unverified).
+pub fn verify_segments(
+    ffprobe: &str,
+    output: &Path,
+    plan: &JoinPlan,
+    timeout_secs: Option<u64>,
+) -> Result<SegmentCheck, String> {
+    let fail = |err: String| format!("이어붙인 결과물의 구간 검증을 실행하지 못했습니다: {err}");
+    let mut sources = Vec::with_capacity(plan.segments.len());
+    for segment in &plan.segments {
+        sources
+            .push(stream_packet_counts(ffprobe, &segment.source_path, timeout_secs).map_err(fail)?);
+    }
+    let offsets: Vec<f64> = plan
+        .segments
+        .iter()
+        .map(|segment| segment.output_offset_seconds)
+        .collect();
+    let (_, output_audio) = stream_packet_counts(ffprobe, output, timeout_secs).map_err(fail)?;
+    let dts = video_packet_dts(ffprobe, output, timeout_secs).map_err(fail)?;
+    Ok(evaluate_segment_check(
+        &sources,
+        &offsets,
+        output_audio,
+        &dts,
+    ))
+}
+
 /// A recording start on the plan's basis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedStart {
@@ -1667,11 +1886,125 @@ impl TempPaths {
 /// B8: the output + manifest a job recorded in its claim file (None when
 /// it never published, or the claim is unreadable).
 pub fn read_claim(claim: &Path) -> Option<(PathBuf, PathBuf)> {
+    read_join_claim(claim).map(|claim| (claim.output, claim.manifest))
+}
+
+/// C3: what one join job's claim file says it reserved / published.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClaim {
+    pub output: PathBuf,
+    pub manifest: PathBuf,
+    /// `Some(false)`: written BEFORE the output got its final name (the
+    /// manifest name is reserved, the output may or may not exist yet);
+    /// `Some(true)` / `None` (claims written before C3): the output under
+    /// that name is this job's.
+    pub published: Option<bool>,
+    /// Size of the verified `.part` — identifies an unconfirmed output.
+    pub part_size: Option<u64>,
+}
+
+/// C3: the full claim record (None when absent or unreadable).
+pub fn read_join_claim(claim: &Path) -> Option<JoinClaim> {
     let value: Value = serde_json::from_slice(&std::fs::read(claim).ok()?).ok()?;
-    Some((
-        PathBuf::from(value.get("output")?.as_str()?),
-        PathBuf::from(value.get("manifest")?.as_str()?),
-    ))
+    Some(JoinClaim {
+        output: PathBuf::from(value.get("output")?.as_str()?),
+        manifest: PathBuf::from(value.get("manifest")?.as_str()?),
+        published: value.get("published").and_then(Value::as_bool),
+        part_size: value.get("part_size").and_then(Value::as_u64),
+    })
+}
+
+fn write_join_claim(path: &Path, claim: &JoinClaim, job_tag: &str) -> Result<(), String> {
+    let body = json!({
+        "output": claim.output.to_string_lossy(),
+        "manifest": claim.manifest.to_string_lossy(),
+        "job_tag": job_tag,
+        "published": claim.published,
+        "part_size": claim.part_size,
+    });
+    crate::util::write_text_atomic(path, &body.to_string()).map_err(|err| {
+        format!(
+            "failed to record the join output claim in {}: {err}",
+            path.display()
+        )
+    })
+}
+
+/// Canonical output + manifest paths every parseable join-log entry names
+/// (a logged artifact is never deleted from under its record).
+pub fn logged_join_artifacts(case_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let path = case_dir.join(JOINED_DIR).join(LOG_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("{} 읽기 실패: {err}", path.display())),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .flat_map(|entry| {
+            ["output_path", "manifest_path"]
+                .into_iter()
+                .filter_map(|key| entry.get(key).and_then(Value::as_str).map(str::to_string))
+                .map(|p| audit::canonical_or_original(Path::new(&p)))
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+/// Canonical `path` when it is an existing file inside
+/// `case_dir/artifacts/joined`.
+fn joined_file(case_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let root = case_dir.join(JOINED_DIR).canonicalize().ok()?;
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        case_dir.join(path)
+    };
+    let canonical = resolved.canonicalize().ok()?;
+    (canonical.starts_with(&root) && canonical != root && canonical.is_file()).then_some(canonical)
+}
+
+/// C3: removes what a dead join job's claim names but the join log never
+/// recorded — the reserved/written manifest and, when it is provably this
+/// job's (published, or the size of its verified `.part`), the output.
+/// Files outside `artifacts/joined` and logged artifacts are never touched.
+/// Returns each removal attempted with its result; a join-log read failure
+/// removes nothing and is returned as one `Err` (against the claimed
+/// output path).
+pub fn remove_unlogged_claimed(
+    case_dir: &Path,
+    claim: &JoinClaim,
+) -> Vec<(PathBuf, Result<(), String>)> {
+    let logged = match logged_join_artifacts(case_dir) {
+        Ok(logged) => logged,
+        Err(err) => {
+            return vec![(
+                claim.output.clone(),
+                Err(format!(
+                    "이어붙이기 로그를 읽지 못해 남은 결과물을 확인하지 못했습니다: {err}"
+                )),
+            )];
+        }
+    };
+    let output_is_ours = |path: &Path| match claim.published {
+        Some(false) => claim
+            .part_size
+            .is_some_and(|size| std::fs::metadata(path).is_ok_and(|m| m.len() == size)),
+        _ => true,
+    };
+    let mut out = Vec::new();
+    for (path, check_owner) in [(&claim.output, true), (&claim.manifest, false)] {
+        let Some(canonical) = joined_file(case_dir, path) else {
+            continue;
+        };
+        if logged.contains(&canonical) || (check_owner && !output_is_ours(&canonical)) {
+            continue;
+        }
+        let result = remove_file_retry(&canonical);
+        out.push((canonical, result));
+    }
+    out
 }
 
 /// The viewer/report record id of a joined output (U2): stable for the
@@ -1827,6 +2160,7 @@ pub fn cleanup_stale_temp_files(
     let mut out = Vec::new();
     for (tag, files) in groups {
         let lock = dir.join(format!(".join-{tag}.lock"));
+        let claim_path = dir.join(format!(".join-{tag}.claim.json"));
         let dead = if lock.is_file() {
             !lock_is_held(&lock)
         } else {
@@ -1840,6 +2174,32 @@ pub fn cleanup_stale_temp_files(
         };
         if !dead {
             continue;
+        }
+        // C3: a dead job's claim names the output/manifest it reserved or
+        // published but never logged — those go first (the claim, read
+        // here, is removed with the temp files below). A claim that cannot
+        // be read keeps the tag's files, so the next sweep sees it again.
+        if claim_path.is_file() {
+            match read_join_claim(&claim_path) {
+                Some(claim) => {
+                    let removed = remove_unlogged_claimed(case_dir, &claim);
+                    let failed = removed.iter().any(|(_, result)| result.is_err());
+                    out.extend(removed);
+                    if failed {
+                        continue;
+                    }
+                }
+                None => {
+                    out.push((
+                        claim_path.clone(),
+                        Err(format!(
+                            "이어붙이기 기록 파일을 읽지 못해 남은 결과물을 지우지 않았습니다: {}",
+                            claim_path.display()
+                        )),
+                    ));
+                    continue;
+                }
+            }
         }
         // The lock goes last so a crash mid-cleanup still leaves the tag
         // recognisable as dead.
@@ -2032,75 +2392,251 @@ fn output_names(dir: &Path, base: &str, ext: &str, n: usize) -> (PathBuf, PathBu
     )
 }
 
-/// One attempt to give the verified `.part` the final name `output` without
-/// ever clobbering: a hard link (fails if the name exists), else — FAT /
-/// exFAT have no hard links — a copy into a `create_new` target (B14: the
-/// existence check and the creation are one atomic step, so two jobs can
-/// never both take a name). `Ok(false)` = the name is taken.
-fn publish_part_as(part: &Path, output: &Path) -> Result<bool, String> {
+/// One attempt to give a finished `.part` the final name `output` without
+/// ever clobbering and without ever exposing partial bytes under `output`:
+/// a hard link (fails if the name exists), else — FAT / exFAT have no hard
+/// links — the name is reserved with `create_new` (B14: check and creation
+/// are one atomic step, so two writers can never both take it) and the
+/// `.part` is renamed over that empty reservation (C3: no byte copy, so a
+/// kill can only ever leave the empty reservation, never a torn file).
+/// `Ok(false)` = the name is taken. Shared by every `.part` publisher
+/// (join, inode recovery, E01 export, clip export, selection export).
+pub fn publish_part_as(part: &Path, output: &Path) -> Result<bool, String> {
     match std::fs::hard_link(part, output) {
         Ok(()) => {
-            let _ = std::fs::remove_file(part);
+            let _ = remove_file_retry(part);
             return Ok(true);
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(_) => {}
     }
-    let mut target = match std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)
     {
-        Ok(file) => file,
+        // Closed right away: Windows refuses to replace an open file.
+        Ok(file) => drop(file),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(err) => {
             return Err(format!(
-                "failed to create joined output {}: {err}",
+                "failed to reserve output name {}: {err}",
                 output.display()
             ));
         }
-    };
-    let copied = std::fs::File::open(part)
-        .and_then(|mut source| std::io::copy(&mut source, &mut target))
-        .and_then(|_| target.sync_all());
-    drop(target);
-    match copied {
-        Ok(()) => {
-            let _ = std::fs::remove_file(part);
-            Ok(true)
+    }
+    let mut last_err = None;
+    for attempt in 0..5 {
+        match std::fs::rename(part, output) {
+            Ok(()) => {
+                crate::util::sync_parent_directory(output);
+                return Ok(true);
+            }
+            Err(err) => last_err = Some(err),
         }
-        Err(err) => {
-            // The name was ours (create_new): never leave a partial copy.
-            let _ = remove_file_retry(output);
-            Err(format!(
-                "failed to copy joined output to {}: {err}",
-                output.display()
-            ))
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
+    // The empty reservation was ours (create_new): never leave it behind.
+    let _ = remove_file_retry(output);
+    Err(format!(
+        "failed to publish {} as {}: {}",
+        part.display(),
+        output.display(),
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    ))
 }
 
 /// Publishes `.part` under the first free `<base>[__N]` name whose
 /// manifest name is free too. Returns `(output, manifest)`.
+///
+/// C3: the manifest name is reserved first (`create_new`, so every other
+/// join skips that stem), then `before_publish(output, manifest)` records
+/// the claim, and only then does the output get its name — a kill at any
+/// point leaves a claim naming exactly what this job reserved.
 fn publish_part(
     part: &Path,
     dir: &Path,
     base: &str,
     ext: &str,
+    before_publish: &mut dyn FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<(PathBuf, PathBuf), String> {
     for n in 1..10_000usize {
         let (output, manifest) = output_names(dir, base, ext, n);
-        if manifest.exists() {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest)
+        {
+            Ok(file) => drop(file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to reserve manifest name {}: {err}",
+                    manifest.display()
+                ));
+            }
+        }
+        let release = |manifest: &Path| {
+            let _ = remove_file_retry(manifest);
+        };
+        if output.exists() {
+            release(&manifest);
             continue;
         }
-        if publish_part_as(part, &output)? {
-            return Ok((output, manifest));
+        if let Err(err) = before_publish(&output, &manifest) {
+            release(&manifest);
+            return Err(err);
+        }
+        match publish_part_as(part, &output) {
+            Ok(true) => return Ok((output, manifest)),
+            Ok(false) => release(&manifest),
+            Err(err) => {
+                release(&manifest);
+                return Err(err);
+            }
         }
     }
     Err(format!(
         "no free output name for {base} in {}",
         dir.display()
     ))
+}
+
+/// C10: how long a pipe-reader thread may still run after its child
+/// exited. The pipes reach EOF when the child exits — unless a grandchild
+/// that escaped tree tracking inherited them; then the reader is abandoned
+/// (its retained output is lost) instead of hanging the caller forever.
+pub const READER_JOIN_CAP: Duration = Duration::from_secs(10);
+
+/// Joins `handle` if it finishes within `cap`; `None` (thread left
+/// detached) otherwise or when it panicked.
+pub fn join_reader_bounded<T>(handle: std::thread::JoinHandle<T>, cap: Duration) -> Option<T> {
+    let deadline = std::time::Instant::now() + cap;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    handle.join().ok()
+}
+
+/// C1/C2/C4: the in-progress name of `final_path` written by process
+/// `pid`: `.<file name>.ft<pid>.part` beside it. Hidden (leading dot, so
+/// packaging and listings skip it) and pid-tagged, so the server can sweep
+/// exactly what a killed step left ([`sweep_pid_parts`]).
+pub fn pid_part_path(final_path: &Path, pid: u32) -> PathBuf {
+    let name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".to_string());
+    final_path.with_file_name(format!(".{name}.ft{pid}.part"))
+}
+
+/// Whether `name` is an in-progress name (file or directory) of `pid`
+/// (`None` = any pid).
+pub fn is_pid_part_name(name: &str, pid: Option<u32>) -> bool {
+    if !name.starts_with('.') {
+        return false;
+    }
+    let Some(pos) = name.rfind(".ft") else {
+        return false;
+    };
+    let rest = &name[pos + 3..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || !rest[digits.len()..].starts_with(".part") {
+        return false;
+    }
+    pid.is_none_or(|pid| digits == pid.to_string())
+}
+
+fn remove_path_retry(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        let mut last = None;
+        for attempt in 0..5 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => last = Some(err),
+            }
+            if attempt < 4 {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        Err(format!(
+            "임시 폴더를 지우지 못했습니다: {} ({})",
+            path.display(),
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    } else {
+        remove_file_retry(path)
+    }
+}
+
+/// Removes every in-progress file/directory process `pid` left in `dir`
+/// (the server's sweep after it killed that step). Returns each removal.
+pub fn sweep_pid_parts(dir: &Path, pid: u32) -> Vec<(PathBuf, Result<(), String>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| is_pid_part_name(&entry.file_name().to_string_lossy(), Some(pid)))
+        .map(|entry| {
+            let path = entry.path();
+            let result = remove_path_retry(&path);
+            (path, result)
+        })
+        .collect()
+}
+
+/// Newest modification time under `path` (a directory is walked).
+fn newest_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let own = meta.modified().ok();
+    if !meta.is_dir() {
+        return own;
+    }
+    let mut newest = own;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        if let Some(time) = newest_mtime(&entry.path())
+            && newest.is_none_or(|current| time > current)
+        {
+            newest = Some(time);
+        }
+    }
+    newest
+}
+
+/// Crash recovery for `.part` leftovers of OTHER processes in `dir`: an
+/// in-progress name whose newest write is at least [`STALE_TEMP_AGE_SECS`]
+/// old belongs to a dead writer (a live writer keeps touching it) and is
+/// removed. This process's own parts are never touched.
+pub fn sweep_stale_parts(dir: &Path) -> Vec<(PathBuf, Result<(), String>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let own = std::process::id();
+    let now = std::time::SystemTime::now();
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            is_pid_part_name(&name, None) && !is_pid_part_name(&name, Some(own))
+        })
+        .filter(|entry| {
+            newest_mtime(&entry.path())
+                .and_then(|time| now.duration_since(time).ok())
+                .is_some_and(|age| age.as_secs() >= STALE_TEMP_AGE_SECS)
+        })
+        .map(|entry| {
+            let path = entry.path();
+            let result = remove_path_retry(&path);
+            (path, result)
+        })
+        .collect()
 }
 
 fn run_ffmpeg(
@@ -2154,7 +2690,8 @@ fn run_ffmpeg(
             }
         }
     };
-    let stderr = reader.join().unwrap_or_default();
+    // C10: a grandchild still holding the pipe must not hang the join.
+    let stderr = join_reader_bounded(reader, READER_JOIN_CAP).unwrap_or_default();
     if !status.success() {
         let text = String::from_utf8_lossy(&stderr);
         let tail: String = text
@@ -2228,8 +2765,33 @@ fn run_inner(
     };
     let expected = plan.totals.duration_seconds;
     let observed = probed.duration_seconds;
-    let duration_check_ok =
-        observed.is_some_and(|value| (value - expected).abs() <= (expected * 0.01).max(1.0));
+    // C14: max(1 s, 0.2 %) — the old max(1 s, 1 %) let a whole short
+    // segment go missing from a long join unnoticed.
+    let tolerance = duration_tolerance(expected);
+    let duration_check_ok = observed.is_some_and(|value| (value - expected).abs() <= tolerance);
+    // C14: packet-level check of every segment boundary in the output.
+    let segment_check = verify_segments(
+        &options.tools.ffprobe,
+        &temps.part,
+        plan,
+        options.timeout_secs,
+    )?;
+    if !duration_check_ok || !segment_check.ok {
+        let mut problems = Vec::new();
+        if !duration_check_ok {
+            problems.push(match observed {
+                Some(value) => format!(
+                    "출력 길이 {value:.3}초가 원본 합계 {expected:.3}초와 허용치 {tolerance:.3}초 넘게 다릅니다"
+                ),
+                None => "출력 길이를 확인할 수 없습니다".to_string(),
+            });
+        }
+        problems.extend(segment_check.problems.iter().cloned());
+        return Err(format!(
+            "이어붙인 결과물 검증 실패 — 빠진 구간이 있을 수 있어 게시하지 않았습니다: {}",
+            problems.join("; ")
+        ));
+    }
 
     // 5. Sources unchanged while ffmpeg read them.
     for segment in &plan.segments {
@@ -2238,26 +2800,42 @@ fn run_inner(
 
     // 6. Output identity, publish, manifest, log.
     let output_sha256 = audit::digest_file(&temps.part)?;
+    // C3 / B8: the claim names exactly what this job reserves BEFORE the
+    // output gets its name, so a kill during publishing still leaves a
+    // record the server (or the next join's stale sweep) cleans up from —
+    // never touching another job's output.
+    let claim_path = temps.claim.clone();
+    let job_tag = options.job_tag.clone();
     let (output_path, manifest_path) = publish_part(
         &temps.part,
         &joined_dir,
         &output_base_name(plan),
         plan.container.as_str(),
+        &mut |output, manifest| {
+            write_join_claim(
+                &claim_path,
+                &JoinClaim {
+                    output: output.to_path_buf(),
+                    manifest: manifest.to_path_buf(),
+                    published: Some(false),
+                    part_size: Some(part_size),
+                },
+                &job_tag,
+            )
+        },
     )?;
+    published.push(manifest_path.clone());
     published.push(output_path.clone());
-    // B8: name exactly what this job owns, so a killed run's cleanup never
-    // has to guess (and never touches another job's output).
-    let claim = json!({
-        "output": output_path.to_string_lossy(),
-        "manifest": manifest_path.to_string_lossy(),
-        "job_tag": options.job_tag,
-    });
-    std::fs::write(&temps.claim, claim.to_string()).map_err(|err| {
-        format!(
-            "failed to record the published output in {}: {err}",
-            temps.claim.display()
-        )
-    })?;
+    write_join_claim(
+        &temps.claim,
+        &JoinClaim {
+            output: output_path.clone(),
+            manifest: manifest_path.clone(),
+            published: Some(true),
+            part_size: Some(part_size),
+        },
+        &options.job_tag,
+    )?;
     write_progress(&temps.progress, "verify", 1, 1);
     let record_id = joined_record_id(&output_sha256).unwrap_or_default();
     // B2: a filename-order join has no recorded time to judge junctions:
@@ -2367,8 +2945,10 @@ fn run_inner(
         "duration_check": {
             "expected": r3(expected),
             "observed": observed.map(r3),
+            "tolerance_seconds": r3(tolerance),
             "ok": duration_check_ok,
         },
+        "segment_check": segment_check.to_json(),
         "not_carried": not_carried,
         "caveats": CAVEATS,
     });
@@ -2377,7 +2957,6 @@ fn run_inner(
         serde_json::to_string_pretty(&manifest)
             .map_err(|err| format!("failed to serialize join manifest: {err}"))?
     );
-    published.push(manifest_path.clone());
     crate::util::write_text_atomic(&manifest_path, &manifest_text).map_err(|err| {
         format!(
             "failed to write join manifest {}: {err}",
@@ -2390,6 +2969,10 @@ fn run_inner(
         "schema_version": 1,
         "event": "join-video",
         "record_id": record_id,
+        // C13: the server attributes a log entry to its job by this tag
+        // only (never by plan id + time, which another process's join of
+        // the same plan also matches).
+        "job_tag": options.job_tag,
         "joined_unix": created_unix,
         "output_path": output_path.to_string_lossy(),
         "output_sha256": output_sha256,
@@ -2410,6 +2993,7 @@ fn run_inner(
         "unknown_junctions": plan.totals.unknown_junctions,
         "mode": "stream-copy",
         "duration_check_ok": duration_check_ok,
+        "segment_check_ok": segment_check.ok,
         "ffmpeg_version": ffmpeg_version,
         "command": "ffmpeg",
         "command_args": args,
@@ -3079,9 +3663,27 @@ mod tests {
         let part = dir.join(".join-t.part");
         std::fs::write(&part, b"ours").unwrap();
         assert!(!publish_part_as(&part, &dir.join("join_F_x_n2.mp4")).unwrap());
-        let (output, manifest) = publish_part(&part, &dir, "join_F_x_n2", "mp4").unwrap();
+        let mut claimed = Vec::new();
+        let (output, manifest) = publish_part(
+            &part,
+            &dir,
+            "join_F_x_n2",
+            "mp4",
+            &mut |output, manifest| {
+                // C3: the claim is recorded while the output name is still
+                // free and the manifest name already reserved.
+                assert!(!output.exists(), "claim must precede the publish");
+                assert!(manifest.exists(), "manifest name reserved first");
+                claimed.push(output.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(claimed, [dir.join("join_F_x_n2__3.mp4")]);
         assert_eq!(output, dir.join("join_F_x_n2__3.mp4"));
         assert_eq!(manifest, dir.join("join_F_x_n2__3.manifest.json"));
+        // The reservation of the taken stem was released.
+        assert!(!dir.join("join_F_x_n2.manifest.json").exists());
         assert_eq!(std::fs::read(&output).unwrap(), b"ours");
         assert_eq!(
             std::fs::read(dir.join("join_F_x_n2.mp4")).unwrap(),
@@ -3245,5 +3847,218 @@ mod tests {
         assert!(validate_request(&ids(2), f64::NAN).is_err());
         assert!(validate_request(&["vid_1".into(), "a\nb".into()], 1.0).is_err());
         assert!(validate_request(&["vid_1".into(), "x".repeat(513)], 1.0).is_err());
+    }
+
+    /// C14: the tolerance is max(1 s, 0.2 %) — the old max(1 s, 1 %) let a
+    /// 30 s segment vanish from a one-hour join.
+    #[test]
+    fn duration_tolerance_is_tight() {
+        assert_eq!(duration_tolerance(10.0), 1.0);
+        assert!((duration_tolerance(3600.0) - 7.2).abs() < 1e-9);
+        // A missing 30 s segment of a 1 h join exceeds it (old: 36 s).
+        assert!(30.0 > duration_tolerance(3600.0));
+    }
+
+    fn dts_run(start: f64, count: u64) -> Vec<f64> {
+        (0..count).map(|i| start + i as f64 / 30.0).collect()
+    }
+
+    /// C14: a complete output passes; a dropped segment (packet deficit and
+    /// a misplaced boundary) or a truncated tail fails; audio may differ
+    /// by one packet per segment.
+    #[test]
+    fn segment_check_table() {
+        let sources = [(63, Some(100)), (66, Some(105)), (69, Some(109))];
+        let offsets = [0.0, 2.1, 4.3];
+        let mut full = dts_run(-0.0007, 63);
+        full.extend(dts_run(2.099, 66));
+        full.extend(dts_run(4.266, 69));
+        let check = evaluate_segment_check(&sources, &offsets, Some(314), &full);
+        assert!(check.ok, "{:?}", check.problems);
+        assert_eq!(check.video_packets_expected, 198);
+        assert_eq!(check.boundaries.len(), 3);
+        // Audio within slack (one per segment).
+        assert!(evaluate_segment_check(&sources, &offsets, Some(312), &full).ok);
+        assert!(!evaluate_segment_check(&sources, &offsets, Some(300), &full).ok);
+        assert!(!evaluate_segment_check(&sources, &offsets, None, &full).ok);
+
+        // The middle segment is missing from the output.
+        let mut missing = dts_run(0.0, 63);
+        missing.extend(dts_run(2.1, 69));
+        let check = evaluate_segment_check(&sources, &offsets, Some(209), &missing);
+        assert!(!check.ok);
+        assert!(
+            check.problems.iter().any(|p| p.contains("패킷 수")),
+            "{:?}",
+            check.problems
+        );
+
+        // Same packet count but the third segment starts 3 s late (a gap
+        // ffmpeg inserted where the plan has none).
+        let mut shifted = dts_run(0.0, 63);
+        shifted.extend(dts_run(2.1, 66));
+        shifted.extend(dts_run(7.3, 69));
+        let check = evaluate_segment_check(&sources, &offsets, Some(314), &shifted);
+        assert!(!check.ok);
+        assert!(check.problems.iter().any(|p| p.contains("3번째")));
+
+        // Truncated tail: last segment only partly present.
+        let check = evaluate_segment_check(&sources, &offsets, Some(314), &full[..150]);
+        assert!(!check.ok);
+    }
+
+    fn joined_case(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-join-c3-{tag}-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(JOINED_DIR)).unwrap();
+        dir
+    }
+
+    fn age(path: &Path) {
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * STALE_TEMP_AGE_SECS);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// C3: a join killed while publishing (claim written, manifest name
+    /// reserved, output published but never logged) is cleaned up by the
+    /// next join's stale sweep through its claim — the old sweep removed
+    /// only the `.join-*` temp files and left the unlogged output and
+    /// manifest behind forever. A logged output named by a claim stays.
+    #[test]
+    fn stale_sweep_removes_unlogged_claimed_outputs() {
+        let case = joined_case("sweep");
+        let joined = case.join(JOINED_DIR);
+        let output = joined.join("join_F_x_n2.mp4");
+        let manifest = joined.join("join_F_x_n2.manifest.json");
+        std::fs::write(&output, b"0123456789").unwrap();
+        std::fs::write(&manifest, b"").unwrap();
+        let claim = joined.join(".join-dead.claim.json");
+        write_join_claim(
+            &claim,
+            &JoinClaim {
+                output: output.clone(),
+                manifest: manifest.clone(),
+                published: Some(true),
+                part_size: Some(10),
+            },
+            "dead",
+        )
+        .unwrap();
+        std::fs::write(joined.join(".join-dead.lock"), b"").unwrap();
+        // A logged join of another tag whose claim was left behind.
+        let kept = joined.join("join_F_y_n2.mp4");
+        let kept_manifest = joined.join("join_F_y_n2.manifest.json");
+        std::fs::write(&kept, b"logged").unwrap();
+        std::fs::write(&kept_manifest, b"{}").unwrap();
+        std::fs::write(
+            joined.join(LOG_FILE),
+            format!(
+                "{}\n",
+                json!({"event": "join-video", "output_path": kept.to_string_lossy(), "manifest_path": kept_manifest.to_string_lossy()})
+            ),
+        )
+        .unwrap();
+        let kept_claim = joined.join(".join-old.claim.json");
+        write_join_claim(
+            &kept_claim,
+            &JoinClaim {
+                output: kept.clone(),
+                manifest: kept_manifest.clone(),
+                published: Some(true),
+                part_size: Some(6),
+            },
+            "old",
+        )
+        .unwrap();
+        age(&kept_claim);
+
+        let removed = cleanup_stale_temp_files(&case, &[]);
+        for (path, result) in &removed {
+            assert!(result.is_ok(), "{path:?}: {result:?}");
+        }
+        assert!(!output.exists(), "unlogged claimed output must go");
+        assert!(!manifest.exists(), "unlogged claimed manifest must go");
+        assert!(!claim.exists());
+        assert!(kept.exists() && kept_manifest.exists(), "logged join kept");
+        assert!(!kept_claim.exists(), "the stale claim itself goes");
+        let _ = std::fs::remove_dir_all(&case);
+    }
+
+    /// C3: a claim written before the publish (`published:false`) only
+    /// lets the sweep remove an output of the claimed `.part` size — a
+    /// different file that took the name is never this job's.
+    #[test]
+    fn unpublished_claim_removes_only_its_own_output() {
+        let case = joined_case("unpub");
+        let joined = case.join(JOINED_DIR);
+        let output = joined.join("join_F_z_n2.mp4");
+        let manifest = joined.join("join_F_z_n2.manifest.json");
+        std::fs::write(&output, b"someone else").unwrap();
+        std::fs::write(&manifest, b"").unwrap();
+        let claim = JoinClaim {
+            output: output.clone(),
+            manifest: manifest.clone(),
+            published: Some(false),
+            part_size: Some(3),
+        };
+        let removed = remove_unlogged_claimed(&case, &claim);
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(output.exists(), "not ours (size differs) — kept");
+        assert!(!manifest.exists(), "our reservation — removed");
+        std::fs::write(&output, b"abc").unwrap();
+        let removed = remove_unlogged_claimed(&case, &claim);
+        assert_eq!(removed.len(), 1);
+        assert!(!output.exists(), "size of our .part — ours, removed");
+        let _ = std::fs::remove_dir_all(&case);
+    }
+
+    /// C1/C2/C4: pid-tagged in-progress names and their sweeps.
+    #[test]
+    fn pid_part_names_and_sweeps() {
+        let dir = joined_case("pid");
+        let final_path = dir.join("evidence.raw");
+        let part = pid_part_path(&final_path, 4242);
+        assert_eq!(
+            part.file_name().unwrap().to_string_lossy(),
+            ".evidence.raw.ft4242.part"
+        );
+        assert!(is_pid_part_name(".evidence.raw.ft4242.part", Some(4242)));
+        assert!(is_pid_part_name(
+            ".evidence.raw.ft4242.part.raw",
+            Some(4242)
+        ));
+        assert!(!is_pid_part_name(".evidence.raw.ft4242.part", Some(42)));
+        assert!(!is_pid_part_name("evidence.raw.ft4242.part", None));
+        assert!(!is_pid_part_name(".evidence.raw", None));
+        std::fs::write(&part, b"torn").unwrap();
+        std::fs::create_dir_all(dir.join(".package_1.ft4242.part/sub")).unwrap();
+        std::fs::write(dir.join(".package_1.ft4242.part/sub/f"), b"x").unwrap();
+        let other = dir.join(".other.bin.ft7.part");
+        std::fs::write(&other, b"live").unwrap();
+        std::fs::write(&final_path, b"done").unwrap();
+        let removed = sweep_pid_parts(&dir, 4242);
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert!(!part.exists() && !dir.join(".package_1.ft4242.part").exists());
+        assert!(other.exists() && final_path.exists());
+        // Stale sweep: only old parts of other processes.
+        assert!(sweep_stale_parts(&dir).is_empty(), "fresh part kept");
+        age(&other);
+        let removed = sweep_stale_parts(&dir);
+        assert_eq!(removed.len(), 1);
+        assert!(!other.exists() && final_path.exists());
+        let own = pid_part_path(&final_path, std::process::id());
+        std::fs::write(&own, b"mine").unwrap();
+        age(&own);
+        assert!(sweep_stale_parts(&dir).is_empty(), "own part never swept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

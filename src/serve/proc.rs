@@ -49,9 +49,124 @@ mod sys {
     }
     const SIGKILL: i32 = 9;
 
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+        fn getppid() -> i32;
+    }
+    #[cfg(target_os = "linux")]
+    const PR_SET_PDEATHSIG: i32 = 1;
+
     pub(super) fn prepare(command: &mut std::process::Command) {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        // C8: the parent-watch pipe (both unix flavours): the child's
+        // watcher thread kills the child's whole process group (itself and
+        // its ffmpeg/icat grandchildren) once the server's write end
+        // closes — i.e. when the server dies for ANY reason, SIGKILL
+        // included, when no handler of ours can run.
+        if let Some(fd) = parent_watch_read_fd() {
+            command.env(super::PARENT_WATCH_ENV, fd.to_string());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // C8: Linux also delivers SIGKILL to the direct child as soon
+            // as the spawning thread exits (the step's runner waits for
+            // the child, so that is the server dying), even before the
+            // child's own watcher thread runs.
+            let parent = std::process::id();
+            // SAFETY: only async-signal-safe syscalls run between fork
+            // and exec (prctl, getppid); no allocation (raw OS errors).
+            unsafe {
+                command.pre_exec(move || {
+                    if prctl(PR_SET_PDEATHSIG, SIGKILL as u64, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // The parent may have died between fork and prctl.
+                    if getppid() as u32 != parent {
+                        return Err(std::io::Error::from_raw_os_error(3));
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        fn getpgrp() -> i32;
+        fn getpid() -> i32;
+    }
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+
+    /// The read end of this process's parent-watch pipe (created once).
+    /// The write end is close-on-exec and never closed: it disappears
+    /// only when this process exits. The read end is inherited by step
+    /// children (no close-on-exec), which watch it for EOF.
+    fn parent_watch_read_fd() -> Option<i32> {
+        static FDS: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+        *FDS.get_or_init(|| {
+            let mut fds = [0i32; 2];
+            // SAFETY: pipe(2) fills two ints; fcntl on our own fds.
+            unsafe {
+                if pipe(fds.as_mut_ptr()) != 0 {
+                    return None;
+                }
+                if fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0 {
+                    return None;
+                }
+            }
+            Some(fds[0])
+        })
+    }
+
+    /// Child side of the parent-watch pipe (see [`prepare`]): when the
+    /// inherited fd hits EOF the parent is gone, and this process — a
+    /// step child leading its own process group — kills its group.
+    pub(super) fn watch_parent(fd: i32) {
+        // SAFETY: plain syscalls on integers.
+        let leader = unsafe { getpgrp() == getpid() };
+        if !leader {
+            // Not a group of our own: never signal someone else's group.
+            return;
+        }
+        // Our own children need not inherit the fd.
+        // SAFETY: fcntl on an inherited fd number.
+        unsafe {
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+        let _ = std::thread::Builder::new()
+            .name("frametrace-parent-watch".into())
+            .spawn(move || {
+                let mut byte = 0u8;
+                loop {
+                    // SAFETY: read(2) into a 1-byte buffer.
+                    let n = unsafe { read(fd, &mut byte, 1) };
+                    if n < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    if n > 0 {
+                        // Nobody writes to the pipe; ignore stray bytes.
+                        continue;
+                    }
+                    // EOF (or a broken fd): the parent is gone.
+                    // SAFETY: killpg(0, …) signals the caller's own group.
+                    unsafe {
+                        killpg(0, SIGKILL);
+                    }
+                    return;
+                }
+            });
+    }
+
+    /// Unix leader-exit sweep: kills what is left of the group while the
+    /// exited leader is still an unreaped zombie (its pid — the group id —
+    /// cannot be recycled until then).
+    pub(super) fn kill_group_of_exited_leader(key: usize) {
+        kill(key);
     }
 
     pub(super) fn attach(child: &std::process::Child) -> Result<usize, String> {
@@ -310,6 +425,37 @@ mod sys {
             let _ = CloseHandle(HANDLE(key as *mut std::ffi::c_void));
         }
     }
+
+    /// Leader-exit sweep: terminates what is left in the step's job (a
+    /// grandchild still holding the step's pipes) — the job handle stays
+    /// valid until `release`, so this can never hit another tree.
+    pub(super) fn kill_group_of_exited_leader(key: usize) {
+        kill(key);
+    }
+}
+
+/// C8: environment variable carrying the parent-watch pipe's read fd to
+/// a step child (unix).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const PARENT_WATCH_ENV: &str = "FRAMETRACE_PARENT_WATCH_FD";
+
+/// C8: child side of the parent-watch pipe. A `frametrace` step child
+/// started by the workstation server (env [`PARENT_WATCH_ENV`]) starts a
+/// watcher thread that kills the child's whole process group — the child
+/// and its ffmpeg/icat/ewfexport grandchildren — the moment the server's
+/// end of the pipe closes, i.e. when the server dies for any reason
+/// (SIGKILL included). Linux additionally sets `PR_SET_PDEATHSIG` on the
+/// direct child at spawn. No-op elsewhere and for processes not started
+/// that way. Call once, early, from every binary's `main`.
+pub fn watch_parent_from_env() {
+    #[cfg(unix)]
+    if let Some(fd) = std::env::var(PARENT_WATCH_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+    {
+        sys::watch_parent(fd);
+    }
 }
 
 /// Spawns `command` so that [`TrackedChild::kill_tree`] reaches every
@@ -361,12 +507,23 @@ impl TrackedChild {
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         #[cfg(unix)]
         if self.key != 0 && sys::exited_unreaped(self.child.id()) {
+            // C8/C10: nothing of the step outlives its leader — a straggler
+            // (an orphaned ffmpeg still holding the step's pipes, which
+            // would hang the reader joins) is killed while the exited
+            // leader's zombie still reserves the group id.
+            sys::kill_group_of_exited_leader(self.key);
             self.unlist();
             // The group id is only safe to signal while the zombie exists.
             self.key = 0;
         }
         let status = self.child.try_wait()?;
         if status.is_some() {
+            #[cfg(windows)]
+            if self.key != 0 {
+                // Same leader-exit sweep on Windows: the job handle stays
+                // valid (and ours) until `release`.
+                sys::kill_group_of_exited_leader(self.key);
+            }
             self.unlist();
             #[cfg(unix)]
             {
@@ -541,5 +698,104 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         panic!("grandchild {pid} survived kill_keys");
+    }
+
+    /// C8/C10: a straggler left in the step's process group when the
+    /// leader exits is killed at once (while the leader's zombie still
+    /// reserves the group id) — before, it outlived the step and kept the
+    /// step's pipes open.
+    #[test]
+    fn leader_exit_kills_group_stragglers() {
+        let _serial = tree_test_serial();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!"])
+            .stdout(Stdio::piped());
+        let mut tracked = spawn_tracked(&mut command).expect("spawn");
+        let mut line = String::new();
+        BufReader::new(tracked.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let pid = line.trim().to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tracked.try_wait().expect("try_wait").is_none() {
+            assert!(std::time::Instant::now() < deadline, "leader never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for _ in 0..100 {
+            if !alive(&pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = Command::new("kill").args(["-9", &pid]).status();
+        panic!("straggler {pid} outlived its exited leader");
+    }
+
+    /// C8 (Linux): `PR_SET_PDEATHSIG` — the step child receives SIGKILL
+    /// as soon as the thread that spawned it dies (in the server: the
+    /// step runner, i.e. the server itself). Before, the child kept
+    /// running for its full 30 s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn step_child_dies_with_its_spawning_thread() {
+        let _serial = tree_test_serial();
+        let pid = std::thread::spawn(|| {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            let tracked = spawn_tracked(&mut command).expect("spawn");
+            let pid = tracked.child.id();
+            // Dropping the handle neither kills nor waits on unix.
+            drop(tracked);
+            pid
+        })
+        .join()
+        .unwrap();
+        let state = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+                })
+        };
+        for _ in 0..100 {
+            match state(pid).as_deref() {
+                None | Some("Z") | Some("X") => {
+                    // Reap the zombie (we are its parent).
+                    let mut status = 0i32;
+                    unsafe extern "C" {
+                        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+                    }
+                    // SAFETY: plain syscall on our own child.
+                    unsafe {
+                        waitpid(pid as i32, &mut status, 1);
+                    }
+                    return;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        panic!("step child {pid} survived its spawning thread");
+    }
+
+    /// C8: a step child is handed the parent-watch pipe (unix) through
+    /// the environment.
+    #[test]
+    fn step_child_receives_the_parent_watch_fd() {
+        let _serial = tree_test_serial();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &format!("echo ${}", PARENT_WATCH_ENV)])
+            .stdout(Stdio::piped());
+        let mut tracked = spawn_tracked(&mut command).expect("spawn");
+        let mut line = String::new();
+        BufReader::new(tracked.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let _ = tracked.child.wait();
+        let fd: i32 = line.trim().parse().expect("fd number in the env");
+        assert!(fd > 2, "{fd}");
     }
 }

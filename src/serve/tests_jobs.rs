@@ -838,7 +838,7 @@ case "$1" in
 esac"#;
 
 fn clip_body(extra: &str) -> String {
-    format!(r#"{{"id":"vid_0001","start":"1.500","duration":"4.000"{extra}}}"#)
+    format!(r#"{{"id":"vid_000001","start":"1.500","duration":"4.000"{extra}}}"#)
 }
 
 #[cfg(unix)]
@@ -873,7 +873,10 @@ fn double_export_returns_the_same_job_and_clip_sha256() {
         &state,
     ));
     let rel = done["path"].as_str().unwrap();
-    assert!(rel.starts_with("artifacts/clips/vid_0001__1s+4s"), "{rel}");
+    assert!(
+        rel.starts_with("artifacts/clips/vid_000001__1s+4s"),
+        "{rel}"
+    );
     let digest = crate::audit::digest_file(&case_dir.join(rel)).unwrap();
     assert_eq!(done["sha256"], digest);
     assert_eq!(done["job"]["sha256"], digest);
@@ -890,7 +893,7 @@ fn double_export_returns_the_same_job_and_clip_sha256() {
             "POST",
             "/api/export-clip",
             "",
-            r#"{"id":"vid_0001","start":"9","duration":"1"}"#,
+            r#"{"id":"vid_000001","start":"9","duration":"1"}"#,
         ),
         &state,
         &exe,
