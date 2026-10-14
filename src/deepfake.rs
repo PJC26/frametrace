@@ -213,6 +213,67 @@ pub struct ScreenTarget {
     pub id: String,
     pub path: std::path::PathBuf,
     pub origin: &'static str,
+    /// The id was logged with more than one output path (pre-E4 carve ids
+    /// such as `carve_000001` repeat across runs). A report without a
+    /// recorded target path cannot be trusted to describe `path`.
+    pub id_reused: bool,
+}
+
+/// Key the screened file's path is recorded under inside each
+/// `artifacts/deepfake/<id>.json` (E4: reports are matched by the
+/// (id, path) pair, never by id alone).
+pub const TARGET_PATH_KEY: &str = "frametrace_target_path";
+
+/// Whether an existing report may stand for `target` without screening.
+/// A report recorded for a different file (same reused id, other carve
+/// run) is stale; a legacy report with no recorded path is trusted only
+/// while the id is unambiguous.
+fn report_matches_target(artifact: &Path, target: &ScreenTarget) -> bool {
+    let Ok(text) = fs::read_to_string(artifact) else {
+        return false;
+    };
+    let recorded = serde_json::from_str::<serde_json::Value>(text.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get(TARGET_PATH_KEY)
+                .and_then(|path| path.as_str())
+                .map(str::to_string)
+        });
+    match recorded {
+        Some(path) => path == target.path.to_string_lossy(),
+        None => !target.id_reused,
+    }
+}
+
+/// Screening decision for one target (shared by both screen passes).
+fn needs_screening(
+    artifact: &Path,
+    target: &ScreenTarget,
+    force: bool,
+    retry_failed: bool,
+) -> bool {
+    !artifact.is_file()
+        || force
+        || (retry_failed && artifact_failed(artifact))
+        || !report_matches_target(artifact, target)
+}
+
+/// The report body written for `target`: the tool's JSON (or a failure
+/// object) with the screened path recorded under [`TARGET_PATH_KEY`].
+fn report_body(screening: &DeepfakeSummary, target: &ScreenTarget) -> String {
+    let body = screening.raw_json.clone().unwrap_or_else(|| {
+        format!(
+            "{{\"ok\":false,\"error\":\"{}\",\"origin\":\"{}\"}}",
+            crate::util::json_escape(screening.error.as_deref().unwrap_or("unknown")),
+            target.origin
+        )
+    });
+    let path_json = format!(
+        "\"{}\"",
+        crate::util::json_escape(&target.path.to_string_lossy())
+    );
+    crate::scan::try_set_json_field(&body, TARGET_PATH_KEY, &path_json).unwrap_or(body)
 }
 
 /// Artifact filenames derive from record ids, which can contain
@@ -273,6 +334,7 @@ pub fn collect_targets(case_dir: &Path) -> Vec<ScreenTarget> {
                 id: format!("inode:{offset}:{inode}"),
                 path: std::path::PathBuf::from(path),
                 origin: "recover",
+                id_reused: false,
             });
         }
     }
@@ -289,6 +351,13 @@ fn collect_jsonl_targets(
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
+    // One target per id, the LAST logged path winning — the record the
+    // viewer shows for a reused legacy id is the latest run's (E4). Every
+    // distinct path an id was logged with is remembered so a report
+    // screened for an older run's file is not reused for the newer one.
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: std::collections::HashMap<String, (String, usize)> =
+        std::collections::HashMap::new();
     for line in text.lines() {
         // A torn tail line (documented crash-survivability mode) is not
         // valid JSON — skip it rather than aborting the pass.
@@ -301,10 +370,26 @@ fn collect_jsonl_targets(
         ) else {
             continue;
         };
+        match latest.get_mut(id) {
+            Some((current, distinct)) => {
+                if current != file {
+                    *distinct += 1;
+                    *current = file.to_string();
+                }
+            }
+            None => {
+                order.push(id.to_string());
+                latest.insert(id.to_string(), (file.to_string(), 1));
+            }
+        }
+    }
+    for id in order {
+        let (file, distinct) = &latest[&id];
         out.push(ScreenTarget {
-            id: id.to_string(),
             path: std::path::PathBuf::from(file),
             origin,
+            id_reused: *distinct > 1,
+            id,
         });
     }
 }
@@ -355,7 +440,7 @@ pub fn screen_case(
     for (idx, target) in targets.into_iter().enumerate() {
         progress(idx, total, &target.id);
         let artifact = artifact_dir.join(format!("{}.json", artifact_name(&target.id)));
-        if artifact.is_file() && !force && !(retry_failed && artifact_failed(&artifact)) {
+        if !needs_screening(&artifact, &target, force, retry_failed) {
             stats.skipped_existing += 1;
             continue;
         }
@@ -365,13 +450,7 @@ pub fn screen_case(
         }
         let screening = screen(&target.path);
         let screen_error = screening.error.clone();
-        let body = screening.raw_json.clone().unwrap_or_else(|| {
-            format!(
-                "{{\"ok\":false,\"error\":\"{}\",\"origin\":\"{}\"}}",
-                crate::util::json_escape(screen_error.as_deref().unwrap_or("unknown")),
-                target.origin
-            )
-        });
+        let body = report_body(&screening, &target);
         match crate::util::write_text_atomic(&artifact, &body) {
             Ok(()) => {
                 if screen_error.is_some() {
@@ -411,7 +490,7 @@ pub fn screen_case_parallel(
     let mut queue = Vec::new();
     for target in targets {
         let artifact = artifact_dir.join(format!("{}.json", artifact_name(&target.id)));
-        if artifact.is_file() && !force && !(retry_failed && artifact_failed(&artifact)) {
+        if !needs_screening(&artifact, &target, force, retry_failed) {
             stats.skipped_existing += 1;
             continue;
         }
@@ -448,13 +527,7 @@ pub fn screen_case_parallel(
             let target = &queue[idx];
             progress(done, queued, &target.id);
             let screen_error = screening.error.clone();
-            let body = screening.raw_json.clone().unwrap_or_else(|| {
-                format!(
-                    "{{\"ok\":false,\"error\":\"{}\",\"origin\":\"{}\"}}",
-                    crate::util::json_escape(screen_error.as_deref().unwrap_or("unknown")),
-                    target.origin
-                )
-            });
+            let body = report_body(&screening, target);
             let artifact = artifact_dir.join(format!("{}.json", artifact_name(&target.id)));
             match crate::util::write_text_atomic(&artifact, &body) {
                 Ok(()) => {
@@ -674,6 +747,59 @@ mod tests {
         assert!(map.get("ok_1").is_some());
         assert!(map.get("bad_1").is_none());
         assert_eq!(map.as_object().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// E4: a pre-E4 carve id reused by two runs yields ONE target (the
+    /// latest run's file, as the viewer shows it), and a report screened
+    /// for the other run's file — or a legacy report with no recorded
+    /// path — is not accepted for it. The old pass skipped the second
+    /// run's file because `carve_000001.json` already existed.
+    #[test]
+    fn reused_carve_id_report_is_matched_by_id_and_path() {
+        let dir = temp_dir();
+        let carved = dir.join("artifacts/carved");
+        fs::create_dir_all(&carved).unwrap();
+        fs::write(
+            carved.join("carve-log.jsonl"),
+            "{\"id\":\"carve_000001\",\"output_path\":\"/run1/a.mp4\"}\n{\"id\":\"carve_000001\",\"output_path\":\"/run2/a.mp4\"}\n{\"id\":\"carve_9-abcd_000001\",\"output_path\":\"/run3/b.mp4\"}\n",
+        )
+        .unwrap();
+        let targets = collect_targets(&dir);
+        let carve: Vec<(&str, &Path, bool)> = targets
+            .iter()
+            .map(|t| (t.id.as_str(), t.path.as_path(), t.id_reused))
+            .collect();
+        assert_eq!(
+            carve,
+            vec![
+                ("carve_000001", Path::new("/run2/a.mp4"), true),
+                ("carve_9-abcd_000001", Path::new("/run3/b.mp4"), false),
+            ]
+        );
+        let reports = dir.join("artifacts/deepfake");
+        fs::create_dir_all(&reports).unwrap();
+        let legacy = reports.join("carve_000001.json");
+        fs::write(&legacy, "{\"ok\":true,\"score\":10}").unwrap();
+        assert!(needs_screening(&legacy, &targets[0], false, false));
+        let summary = DeepfakeSummary {
+            ok: true,
+            raw_json: Some("{\"ok\":true,\"score\":10}".to_string()),
+            ..DeepfakeSummary::default()
+        };
+        fs::write(&legacy, report_body(&summary, &targets[0])).unwrap();
+        assert!(!needs_screening(&legacy, &targets[0], false, false));
+        let other_run = ScreenTarget {
+            id: "carve_000001".to_string(),
+            path: "/run1/a.mp4".into(),
+            origin: "carve",
+            id_reused: true,
+        };
+        assert!(needs_screening(&legacy, &other_run, false, false));
+        // An unambiguous legacy report is still trusted (no rescreen churn).
+        let fresh = reports.join("carve_9-abcd_000001.json");
+        fs::write(&fresh, "{\"ok\":true}").unwrap();
+        assert!(!needs_screening(&fresh, &targets[1], false, false));
         let _ = fs::remove_dir_all(dir);
     }
 

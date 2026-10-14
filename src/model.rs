@@ -147,10 +147,15 @@ impl SourceProfile {
     }
 }
 
+/// `source_path` is the lossless OS path. The published record contract
+/// stores a display string (`source_path`, lossy UTF-8) plus — only when
+/// the name is not valid Unicode — `source_path_raw_hex` (see
+/// [`path_raw_hex`]), from which deserialization restores the exact OS
+/// path. Records of UTF-8 paths are byte-identical to older binaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "VideoRecordWire", into = "VideoRecordWire")]
 pub struct VideoRecord {
     pub id: String,
-    #[serde(with = "lossy_path")]
     pub source_path: PathBuf,
     pub relative_path: String,
     pub extension: String,
@@ -169,9 +174,157 @@ pub struct VideoRecord {
     pub source_profile: SourceProfile,
 }
 
+/// Serde wire shape of [`VideoRecord`]: identical to the published JSONL
+/// keys, plus the optional lossless raw path for non-Unicode names.
+#[derive(Serialize, Deserialize)]
+struct VideoRecordWire {
+    id: String,
+    #[serde(with = "lossy_path")]
+    source_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_path_raw_hex: Option<String>,
+    relative_path: String,
+    extension: String,
+    size_bytes: u64,
+    modified_unix: Option<u64>,
+    sha256: Option<String>,
+    hash_status: String,
+    #[serde(flatten, with = "probe_summary_flat")]
+    probe: ProbeSummary,
+    confidence: String,
+    source_profile: SourceProfile,
+}
+
+impl From<VideoRecordWire> for VideoRecord {
+    fn from(wire: VideoRecordWire) -> Self {
+        // The raw form wins when this platform can represent it; otherwise
+        // (e.g. a Windows WTF-16 name read on Linux) the display string is
+        // the best available path and the raw field is still preserved on
+        // disk by the verbatim JSONL line.
+        let source_path = wire
+            .source_path_raw_hex
+            .as_deref()
+            .and_then(path_from_raw_hex)
+            .unwrap_or(wire.source_path);
+        Self {
+            id: wire.id,
+            source_path,
+            relative_path: wire.relative_path,
+            extension: wire.extension,
+            size_bytes: wire.size_bytes,
+            modified_unix: wire.modified_unix,
+            sha256: wire.sha256,
+            hash_status: wire.hash_status,
+            probe: wire.probe,
+            confidence: wire.confidence,
+            source_profile: wire.source_profile,
+        }
+    }
+}
+
+impl From<VideoRecord> for VideoRecordWire {
+    fn from(record: VideoRecord) -> Self {
+        Self {
+            source_path_raw_hex: path_raw_hex(&record.source_path),
+            id: record.id,
+            source_path: record.source_path,
+            relative_path: record.relative_path,
+            extension: record.extension,
+            size_bytes: record.size_bytes,
+            modified_unix: record.modified_unix,
+            sha256: record.sha256,
+            hash_status: record.hash_status,
+            probe: record.probe,
+            confidence: record.confidence,
+            source_profile: record.source_profile,
+        }
+    }
+}
+
+/// Lossless encoding of a path that is NOT valid Unicode (`None` for
+/// ordinary UTF-8 paths, so their records stay unchanged):
+/// - unix: `unix:` + hex of the raw `OsStr` bytes;
+/// - Windows: `wtf16:` + 4 hex digits (big-endian) per UTF-16 code unit,
+///   which keeps unpaired surrogates NTFS allows in names.
+pub fn path_raw_hex(path: &std::path::Path) -> Option<String> {
+    if path.to_str().is_some() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let hex: String = path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Some(format!("unix:{hex}"))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let hex: String = path
+            .as_os_str()
+            .encode_wide()
+            .map(|unit| format!("{unit:04x}"))
+            .collect();
+        Some(format!("wtf16:{hex}"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// Inverse of [`path_raw_hex`]. `None` when the encoding is malformed or
+/// belongs to the other platform family.
+pub fn path_from_raw_hex(raw: &str) -> Option<PathBuf> {
+    fn hex_digits(text: &str, width: usize) -> Option<Vec<u32>> {
+        if text.is_empty() || !text.len().is_multiple_of(width) || !text.is_ascii() {
+            return None;
+        }
+        (0..text.len())
+            .step_by(width)
+            .map(|start| u32::from_str_radix(&text[start..start + width], 16).ok())
+            .collect()
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let hex = raw.strip_prefix("unix:")?;
+        let bytes = hex_digits(hex, 2)?
+            .into_iter()
+            .map(|value| value as u8)
+            .collect::<Vec<u8>>();
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let hex = raw.strip_prefix("wtf16:")?;
+        let units = hex_digits(hex, 4)?
+            .into_iter()
+            .map(|value| value as u16)
+            .collect::<Vec<u16>>();
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (raw, hex_digits);
+        None
+    }
+}
+
 impl VideoRecord {
     pub fn to_json(&self) -> String {
         let source_path = self.source_path.to_string_lossy();
+        // Only non-Unicode names carry the raw key, so UTF-8 records stay
+        // byte-identical to what older binaries wrote.
+        let raw_path = match path_raw_hex(&self.source_path) {
+            Some(raw) => format!(",\"source_path_raw_hex\":\"{}\"", json_escape(&raw)),
+            None => String::new(),
+        };
         let file_url = path_to_file_url(&self.source_path);
         let sha256 = optional_string_json(self.sha256.as_deref());
         let modified_unix = optional_u64_json(self.modified_unix);
@@ -195,9 +348,10 @@ impl VideoRecord {
             None => "null".to_string(),
         };
         format!(
-            "{{\"id\":\"{}\",\"source_path\":\"{}\",\"file_url\":\"{}\",\"relative_path\":\"{}\",\"extension\":\"{}\",\"size_bytes\":{},\"modified_unix\":{},\"sha256\":{},\"hash_status\":\"{}\",\"confidence\":\"{}\",\"source_profile\":{},\"duration_seconds\":{},\"format_name\":{},\"video_codec\":{},\"audio_codec\":{},\"width\":{},\"height\":{}{},\"ffprobe_ok\":{},\"ffprobe_error\":{},\"ffprobe\":{}}}",
+            "{{\"id\":\"{}\",\"source_path\":\"{}\"{},\"file_url\":\"{}\",\"relative_path\":\"{}\",\"extension\":\"{}\",\"size_bytes\":{},\"modified_unix\":{},\"sha256\":{},\"hash_status\":\"{}\",\"confidence\":\"{}\",\"source_profile\":{},\"duration_seconds\":{},\"format_name\":{},\"video_codec\":{},\"audio_codec\":{},\"width\":{},\"height\":{}{},\"ffprobe_ok\":{},\"ffprobe_error\":{},\"ffprobe\":{}}}",
             json_escape(&self.id),
             json_escape(&source_path),
+            raw_path,
             json_escape(&file_url),
             json_escape(&self.relative_path),
             json_escape(&self.extension),

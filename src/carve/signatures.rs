@@ -11,8 +11,12 @@ pub(super) fn scan_progress_line(
     let hits_json = hits
         .iter()
         .map(|hit| {
+            let nested = hit
+                .nested_in
+                .map(|owner| format!(",\"nested_in\":{owner}"))
+                .unwrap_or_default();
             format!(
-                "{{\"offset\":{},\"signature\":\"{}\",\"extension\":\"{}\"}}",
+                "{{\"offset\":{},\"signature\":\"{}\",\"extension\":\"{}\"{nested}}}",
                 hit.offset,
                 json_escape(&hit.signature),
                 json_escape(&hit.extension)
@@ -20,8 +24,14 @@ pub(super) fn scan_progress_line(
         })
         .collect::<Vec<_>>()
         .join(",");
+    let spans_json = suppress
+        .spans
+        .iter()
+        .map(|(start, end)| format!("[{start},{end}]"))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{{\"scan\":{{\"offset\":{offset},\"embedded_until\":{},\"annexb_next_emit\":{},\"hits\":[{hits_json}]}}}}",
+        "{{\"scan\":{{\"offset\":{offset},\"embedded_until\":{},\"annexb_next_emit\":{},\"suppressed_spans\":[{spans_json}],\"hits\":[{hits_json}]}}}}",
         suppress.embedded_until, suppress.annexb_next_emit
     )
 }
@@ -53,7 +63,7 @@ pub(super) fn scan_signatures(
     max_candidates: usize,
     checkpoint: &mut RunCheckpoint,
     progress: Option<&CarveProgress<'_>>,
-) -> Result<(Vec<CarveHit>, u64), String> {
+) -> Result<(Vec<CarveHit>, u64, ScanSuppress), String> {
     let scan_start = window.start;
     let resume_offset = window.resume;
     let scan_end = window.end;
@@ -63,7 +73,7 @@ pub(super) fn scan_signatures(
     if hits.len() >= max_candidates {
         // The interrupted run had already stopped scanning at the cap.
         hits.truncate(max_candidates);
-        return Ok((hits, resume_offset));
+        return Ok((hits, resume_offset, prior_suppress));
     }
     let mut file =
         File::open(source_path).map_err(|err| format!("failed to open carve source: {err}"))?;
@@ -126,8 +136,10 @@ pub(super) fn scan_signatures(
     hits.sort_by_key(|hit| hit.offset);
     hits.dedup_by_key(|hit| hit.offset);
     // `offset` is how far the walk actually read; the caller compares it with
-    // the requested end to detect a short read.
-    Ok((hits, offset))
+    // the requested end to detect a short read. The suppression state goes
+    // back too: its spans are where fragment signatures were NOT emitted,
+    // which the caller must account for before claiming completeness.
+    Ok((hits, offset, suppress))
 }
 
 /// EWF segment files begin with the libewf file signature
@@ -257,59 +269,67 @@ pub(super) fn scan_buffer_state(
             continue;
         }
 
-        // Every signature is suppressed inside a RIFF-declared container
-        // span: those bytes are the outer container's payload, and no real
-        // file can begin there. The claim is capped (MAX_RIFF_CLAIM_BYTES)
-        // so a corrupt header cannot blind the scan beyond a bounded span.
+        // Inside a RIFF-declared container span (E3) only the
+        // fragment-prone signatures (Annex-B anchors, JPEG, MPEG-PS/TS
+        // runs) are suppressed — those are the container's own payload
+        // and would flood `hits`. Container signatures with a real file
+        // header (MP4 ftyp, RIFF AVI, DHAV, IMKH, EBML) are still emitted,
+        // tagged `nested_in` = the span's RIFF offset: a false or
+        // oversized RIFF size field (capped at MAX_RIFF_CLAIM_BYTES) must
+        // not blind the scan to unrelated files inside that span. Spans
+        // are recorded so the carve can report them and withhold
+        // `scan_complete` where suppressed bytes were never carved.
         let embedded = absolute < suppress.embedded_until;
-        if index >= 4 && scan.get(index..index + 4) == Some(b"ftyp") && !embedded {
-            hits.push(CarveHit {
-                offset: absolute - 4,
-                signature: "mp4-ftyp".to_string(),
-                extension: "mp4".to_string(),
-            });
+        let nested_in = if embedded {
+            suppress.spans.last().map(|(start, _)| *start)
+        } else {
+            None
+        };
+        let container_hit = |offset: u64, signature: &str, extension: &str| CarveHit {
+            offset,
+            signature: signature.to_string(),
+            extension: extension.to_string(),
+            nested_in,
+        };
+        if index >= 4 && scan.get(index..index + 4) == Some(b"ftyp") {
+            hits.push(container_hit(absolute - 4, "mp4-ftyp", "mp4"));
         }
+        // A RIFF header re-seen in the chunk overlap is the one that opened
+        // its own span — never a hit nested inside itself.
+        let span_owner = suppress
+            .spans
+            .binary_search_by_key(&absolute, |(start, _)| *start)
+            .is_ok();
         if scan.get(index..index + 4) == Some(b"RIFF")
             && scan.get(index + 8..index + 11) == Some(b"AVI")
-            && !embedded
+            && !span_owner
         {
-            hits.push(CarveHit {
-                offset: absolute,
-                signature: "riff-avi".to_string(),
-                extension: "avi".to_string(),
-            });
+            hits.push(container_hit(absolute, "riff-avi", "avi"));
             // The RIFF header declares its own file extent: the size
             // field counts bytes after it, so the payload ends at
-            // absolute + 8 + declared. Signatures inside that span are
-            // this container's payload, not candidates — suppress them
-            // at scan time or embedded SPS anchors/JPEG thumbnails flood
-            // `hits` and exhaust the candidate cap. The strict "AVI "
-            // check keeps suppression off weaker near-matches.
-            if scan.get(index + 8..index + 12) == Some(b"AVI ") {
+            // absolute + 8 + declared. Fragment signatures inside that
+            // span are this container's payload — suppress them at scan
+            // time or embedded SPS anchors/JPEG thumbnails flood `hits`
+            // and exhaust the candidate cap. The strict "AVI " check keeps
+            // suppression off weaker near-matches, and a nested RIFF never
+            // widens the outer claim.
+            if !embedded && scan.get(index + 8..index + 12) == Some(b"AVI ") {
                 let declared = scan
                     .get(index + 4..index + 8)
                     .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
                     .unwrap_or(0);
                 if declared > 8 {
-                    suppress.embedded_until = suppress
-                        .embedded_until
-                        .max(absolute + 8 + declared.min(MAX_RIFF_CLAIM_BYTES));
+                    let end = absolute + 8 + declared.min(MAX_RIFF_CLAIM_BYTES);
+                    suppress.embedded_until = suppress.embedded_until.max(end);
+                    suppress.spans.push((absolute, end));
                 }
             }
         }
-        if scan.get(index..index + 4) == Some(b"DHAV") && !embedded {
-            hits.push(CarveHit {
-                offset: absolute,
-                signature: "dahua-dhav".to_string(),
-                extension: "dav".to_string(),
-            });
+        if scan.get(index..index + 4) == Some(b"DHAV") {
+            hits.push(container_hit(absolute, "dahua-dhav", "dav"));
         }
-        if scan.get(index..index + 4) == Some(b"IMKH") && !embedded {
-            hits.push(CarveHit {
-                offset: absolute,
-                signature: "hikvision-imkh".to_string(),
-                extension: "mpg".to_string(),
-            });
+        if scan.get(index..index + 4) == Some(b"IMKH") {
+            hits.push(container_hit(absolute, "hikvision-imkh", "mpg"));
         }
         // JPEG stills: dashcam snapshots / embedded thumbnails —
         // thumbnails inside a declared container span are payload.
@@ -320,6 +340,7 @@ pub(super) fn scan_buffer_state(
                 offset: absolute,
                 signature: "jpeg".to_string(),
                 extension: "jpg".to_string(),
+                nested_in: None,
             });
         }
         // MPEG program-stream pack start (DVR exports): 00 00 01 BA
@@ -335,19 +356,14 @@ pub(super) fn scan_buffer_state(
                     offset: absolute,
                     signature: "mpeg-ps".to_string(),
                     extension: "mpg".to_string(),
+                    nested_in: None,
                 });
             }
         }
-        // EBML header — Matroska/WebM containers. A full MKV cannot sit
-        // inside an AVI payload, so headers in a declared span are noise.
-        if scan.get(index..index + 4) == Some(&[0x1a, 0x45, 0xdf, 0xa3][..])
-            && absolute >= suppress.embedded_until
-        {
-            hits.push(CarveHit {
-                offset: absolute,
-                signature: "ebml-mkv".to_string(),
-                extension: "mkv".to_string(),
-            });
+        // EBML header — Matroska/WebM containers. Inside a declared AVI
+        // span it is emitted as a nested candidate (see above).
+        if scan.get(index..index + 4) == Some(&[0x1a, 0x45, 0xdf, 0xa3][..]) {
+            hits.push(container_hit(absolute, "ebml-mkv", "mkv"));
         }
         // MPEG-TS: 188-byte packets with a 0x47 sync byte. Require 3 more
         // syncs ahead (kills random 0x47 noise) and none 188 bytes behind
@@ -373,6 +389,7 @@ pub(super) fn scan_buffer_state(
                 offset: absolute,
                 signature: "mpegts-sync".to_string(),
                 extension: "ts".to_string(),
+                nested_in: None,
             });
         }
         // Annex-B elementary streams: dashcams write raw H.264/H.265 to
@@ -407,6 +424,7 @@ pub(super) fn scan_buffer_state(
                         offset: absolute,
                         signature: signature.to_string(),
                         extension: extension.to_string(),
+                        nested_in: None,
                     });
                     suppress.annexb_next_emit = absolute + ANNEXB_COALESCE_BYTES;
                 }
