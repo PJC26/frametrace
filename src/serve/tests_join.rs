@@ -104,10 +104,16 @@ fn job_status(state: &SharedState, id: &str) -> serde_json::Value {
 
 fn wait_job_end(state: &SharedState, id: &str) -> serde_json::Value {
     let mut last = serde_json::Value::Null;
-    wait_for(&format!("job {id} to end"), Duration::from_secs(30), || {
-        last = job_status(state, id);
-        last["job"]["state"] != "running"
-    });
+    // A generous upper bound (polled, not slept): under full-suite load a
+    // cmd.exe fake can take seconds just to start.
+    wait_for(
+        &format!("job {id} to end"),
+        Duration::from_secs(120),
+        || {
+            last = job_status(state, id);
+            last["job"]["state"] != "running"
+        },
+    );
     last
 }
 
@@ -238,9 +244,13 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
                     claim.display(),
                     dir.display()
                 ),
-                // No child process: a killed cmd.exe must not leave a
-                // grandchild holding the stdout/stderr pipes open.
-                Step::Spin => ":spin\r\ngoto spin\r\n".to_string(),
+                // Item 8: an idle wait, not a busy `goto` loop — several
+                // spinning cmd.exe (the running-cap test starts four) pinned
+                // the CPU under full-suite load and starved the other join
+                // tests' fakes past their deadlines. `ping` gets `nul` for
+                // both streams, so it never holds the step's pipes open
+                // (and dies with the job object on cancel).
+                Step::Spin => ":spin\r\nping -n 2 127.0.0.1 >nul 2>&1\r\ngoto spin\r\n".to_string(),
                 Step::Exit(code) => format!("exit /b {code}\r\n"),
             });
         }
@@ -665,7 +675,7 @@ fn join_cancel_kills_the_cli_and_removes_its_temp_files() {
     let response = start_join(&state, &exe, &join_body(&["vid_1", "vid_2"], PLAN_ID));
     assert_eq!(response["ok"], true, "{response}");
     let id = response["job"]["id"].as_str().unwrap().to_string();
-    wait_for("progress visible", Duration::from_secs(20), || {
+    wait_for("progress visible", Duration::from_secs(120), || {
         job_status(&state, &id)["job"]["stage"] == "hash"
     });
     let running = job_status(&state, &id);

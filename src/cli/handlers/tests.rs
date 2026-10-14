@@ -345,3 +345,48 @@ fn latest_entries_jsonl_picks_newest_and_handles_missing() {
     assert_eq!(latest_entries_jsonl(&case_dir).unwrap(), newer);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Integration: `package-case --allow-pending` reaches
+/// `package_case_with_pending` — without the flag a case with queued marks
+/// is refused (D9), with it the package is written.
+#[test]
+fn package_case_cli_allow_pending_flag() {
+    let base = std::env::temp_dir().join(format!("ft-cli-allow-pending-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let case_dir = base.join("case");
+    fs::create_dir_all(case_dir.join("db")).unwrap();
+    fs::write(case_dir.join("case.json"), b"{}").unwrap();
+    fs::write(case_dir.join("db/video_index.json"), b"{}").unwrap();
+    fs::write(case_dir.join("db/videos.jsonl"), b"").unwrap();
+    fs::write(case_dir.join("db/video_paths.tsv"), b"id\tsource_path\n").unwrap();
+    let conn = crate::case_db::open_case_db(&case_dir).unwrap();
+    crate::case_db::init_schema(&conn).unwrap();
+    drop(conn);
+    fs::create_dir_all(case_dir.join("marks-pending")).unwrap();
+    fs::write(
+        case_dir.join("marks-pending/00000000000000000000000000000001.json"),
+        b"{\"marks\":[]}",
+    )
+    .unwrap();
+    let args = |output: &Path, allow: bool| {
+        let mut args = vec![
+            "frametrace".to_string(),
+            "package-case".to_string(),
+            case_dir.to_string_lossy().to_string(),
+            "--output".to_string(),
+            output.to_string_lossy().to_string(),
+        ];
+        if allow {
+            args.push("--allow-pending".to_string());
+        }
+        args
+    };
+    let refused = base.join("refused");
+    let err = crate::cli::run(args(&refused, false)).unwrap_err();
+    assert!(err.contains("--allow-pending"), "{err}");
+    assert!(!refused.exists());
+    let allowed = base.join("allowed");
+    crate::cli::run(args(&allowed, true)).unwrap();
+    assert!(allowed.join("manifest.sha256").is_file());
+    let _ = fs::remove_dir_all(&base);
+}

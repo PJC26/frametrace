@@ -2250,33 +2250,28 @@ pub(crate) fn sanitize_examiner(raw: &str) -> String {
 /// `review/signoff.json` (SHOULD-FIX 6).
 pub(crate) const SIGNOFF_PENDING_REL_PATH: &str = "review/signoff.pending.json";
 
-/// Writes a sign-off record atomically to `rel_path`. It binds the examiner
-/// to the current review marks, their IN-OUT ranges and the tag map
-/// (`content_sha256`, see
-/// `report::signoff_content_sha256`) so a later make-report can say whether
-/// the marks changed after the sign-off. Returns the signed unix time.
+/// Writes a schema-v4 sign-off record (`report::Signoff::build_v4`)
+/// atomically to `rel_path`. It binds the examiner to the current review
+/// marks, their IN-OUT ranges and the tag map (`annotations_sha256`), the
+/// SHA-256 of every annotated record's target file and the head of every
+/// audit lane (`content_sha256`), so a later make-report / verify-package
+/// can say whether anything it covers changed after the sign-off.
 pub(crate) fn write_signoff(
     case_dir: &Path,
     rel_path: &str,
     examiner: &str,
-) -> Result<i64, String> {
+) -> Result<crate::report::Signoff, String> {
     let signed_unix = crate::util::now_unix()? as i64;
     // A read failure refuses the sign-off (finding 8): binding it to an
     // empty mark list would misstate what the examiner signed.
-    let content = crate::cli::handlers::signoff_content_json(case_dir).map_err(|err| {
-        format!("최종화 차단: 검토자 기록에 묶을 판독 내용을 읽지 못했습니다 — {err}")
-    })?;
-    let content_sha256 = crate::report::signoff_content_sha256(&content);
-    let body = format!(
-        "{{\"schema_version\":{},\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks (status, note, IN-OUT range) and tags\",\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
-        crate::report::SIGNOFF_SCHEMA_VERSION,
-        json_string(examiner),
-        json_string(&content_sha256)
-    );
+    let signoff =
+        crate::report::Signoff::build_v4(case_dir, examiner, signed_unix).map_err(|err| {
+            format!("최종화 차단: 검토자 기록에 묶을 판독 내용을 읽지 못했습니다 — {err}")
+        })?;
     let path = case_dir.join(rel_path);
-    crate::util::write_text_atomic(&path, &body)
+    crate::util::write_text_atomic(&path, &signoff.text)
         .map_err(|err| format!("검토자 기록 저장 실패 {}: {err}", path.display()))?;
-    Ok(signed_unix)
+    Ok(signoff)
 }
 
 #[cfg(test)]
@@ -2423,11 +2418,29 @@ pub(crate) fn finalize_with_exe(
     // review/signoff.json only after report AND package succeeded: a failed
     // finalize never leaves a sign-off behind (SHOULD-FIX 6).
     let pending_signoff = case_dir.join(SIGNOFF_PENDING_REL_PATH);
-    if let Err(err) = write_signoff(case_dir, SIGNOFF_PENDING_REL_PATH, examiner) {
+    let signoff = match write_signoff(case_dir, SIGNOFF_PENDING_REL_PATH, examiner) {
+        Ok(signoff) => signoff,
+        Err(err) => {
+            let mut guard = state_lock(state);
+            guard.phase = "review-ready";
+            guard.error = Some(err.clone());
+            return api_err(&err);
+        }
+    };
+    // R4-B18 / D13: the sign-off is chained into the audit trail right
+    // after it is written and BEFORE make-report and package-case, so the
+    // packaged report and verify-package find it in `signoff-log.jsonl`.
+    // A failed append fails the finalize (a seal whose sign-off is not in
+    // the chain would claim more than it can prove). If report or package
+    // fails later, the chained entry stays (append-only) but the sign-off
+    // is never promoted.
+    if let Err(err) = record_signoff_audit(case_dir, &signoff.text) {
+        let _ = std::fs::remove_file(&pending_signoff);
+        let message = format!("검토자 기록을 감사 로그에 남기지 못했습니다: {err}");
         let mut guard = state_lock(state);
         guard.phase = "review-ready";
-        guard.error = Some(err.clone());
-        return api_err(&err);
+        guard.error = Some(message.clone());
+        return api_err(&message);
     }
     state_lock(state).logs.push("결과 보고서 생성 중…".into());
     // --rehash makes the packaged report re-digest every indexed source file
@@ -2450,26 +2463,14 @@ pub(crate) fn finalize_with_exe(
         report.clone()
     };
     let promoted = match (&report, &packaging) {
-        // R4-B18: the sign-off is chained into the audit trail before it
-        // is promoted; a failed audit append fails the finalize (a seal
-        // whose sign-off is not in the chain would claim more than it can
-        // prove).
-        (Ok(_), Ok(_)) => crate::util::read_to_string(&pending_signoff)
-            .map_err(|err| format!("검토자 기록을 읽지 못했습니다: {err}"))
-            .and_then(|signoff| {
-                record_signoff_audit(case_dir, &signoff)
-                    .map_err(|err| format!("검토자 기록을 감사 로그에 남기지 못했습니다: {err}"))
-            })
-            .and_then(|()| {
-                std::fs::rename(
-                    &pending_signoff,
-                    case_dir.join(crate::report::SIGNOFF_REL_PATH),
-                )
-                .map_err(|err| format!("검토자 기록 확정 실패: {err}"))
-            })
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(&pending_signoff);
-            }),
+        (Ok(_), Ok(_)) => std::fs::rename(
+            &pending_signoff,
+            case_dir.join(crate::report::SIGNOFF_REL_PATH),
+        )
+        .map_err(|err| format!("검토자 기록 확정 실패: {err}"))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&pending_signoff);
+        }),
         _ => {
             let _ = std::fs::remove_file(&pending_signoff);
             // The report on disk was rendered with the abandoned sign-off;

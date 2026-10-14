@@ -447,7 +447,7 @@ fn part_writing_step(dir: &Path) -> PathBuf {
         std::fs::write(
             &path,
             format!(
-                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" \"%~2\"\r\n:spin\r\ngoto spin\r\n",
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" \"%~2\"\r\n:spin\r\nping -n 2 127.0.0.1 >nul 2>&1\r\ngoto spin\r\n",
                 helper.display()
             ),
         )

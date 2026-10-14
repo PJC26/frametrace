@@ -224,7 +224,10 @@ fn recent_routes_list_and_forget() {
     let root = scratch("routes");
     let case = root.join("case");
     make_case(&case);
+    // Item 7: this test's own list file (parallel tests never share it).
+    let _own = override_recent_cases_file(root.join("recent.json"));
     let file = recent_cases_file().unwrap();
+    assert_eq!(file, root.join("recent.json"));
     record_recent_in(&file, &case, Some(Path::new("/ev/src")), u64::MAX / 2).unwrap();
     let listed = body_of(&route(&route_req("GET", "/api/recent-cases", ""), &state));
     let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
@@ -270,6 +273,7 @@ fn open_case_records_the_case_in_the_recent_list() {
     let root = scratch("open");
     let case = root.join("case");
     make_case(&case);
+    let _own = override_recent_cases_file(root.join("recent.json"));
     let body = serde_json::json!({"case_dir": case.display().to_string()}).to_string();
     let out = api_open_case(&route_req("POST", "/api/open-case", &body), &state);
     assert!(out.contains("\"ok\":true"), "{out}");
@@ -333,5 +337,33 @@ fn evidence_kind_is_auto_detected() {
         serde_json::from_str(&browse_json(&alias.display().to_string(), false)).unwrap();
     assert_eq!(listed["is_case"], true);
     assert_eq!(listed["canonical"], canonical_case_dir(&case).as_str());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Item 7: the override is per thread — another test thread keeps the
+/// shared per-process file, and neither is the examiner's real list.
+#[test]
+fn recent_file_override_is_per_thread_and_never_the_real_config() {
+    let root = scratch("override");
+    let own = root.join("recent.json");
+    {
+        let _own = override_recent_cases_file(own.clone());
+        assert_eq!(recent_cases_file().unwrap(), own);
+        let other = std::thread::spawn(recent_cases_file)
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_ne!(other, own);
+        assert!(
+            other.starts_with(std::env::temp_dir()),
+            "{}",
+            other.display()
+        );
+    }
+    let after = recent_cases_file().unwrap();
+    assert_ne!(after, own, "the guard clears the override");
+    if let Some(config) = crate::audit_key::config_dir() {
+        assert!(!after.starts_with(config), "{}", after.display());
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
