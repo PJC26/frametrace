@@ -484,11 +484,29 @@ function startLiveIndexChip(live, root, signal) {
   return () => { if (timer) clearTimeout(timer); };
 }
 
+// A served standalone viewer (/viewer/?token=…, or the one-time launch
+// code /?launch=… of R4 B2) drops those secrets from the address bar and
+// history once the page has them (the server already planted its cookie on
+// this response). Every other query parameter and the hash stay.
+function loaderStripLaunchSecrets() {
+  try {
+    if (location.protocol !== "http:" && location.protocol !== "https:") return;
+    const url = new URL(location.href);
+    if (!url.searchParams.has("token") && !url.searchParams.has("launch")) return;
+    url.searchParams.delete("token");
+    url.searchParams.delete("launch");
+    history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+  } catch (err) {
+    console.warn("토큰 URL 정리 실패 / could not strip the launch secret from the URL", err);
+  }
+}
+
 // ---- standalone auto-init (docs/ui-rebuild-contract.md §3.1) --------------
 // /review/evidence-viewer.html, /viewer/, the packaged file and the legacy
 // iframe mount themselves; a hosting page (<html data-ft-host>) calls
 // FTViewer.init() when a project opens.
 if (!document.documentElement.hasAttribute("data-ft-host")) {
+  loaderStripLaunchSecrets();
   FTViewer.init({ embed: new URLSearchParams(location.search).has("embed") || window.self !== window.top })
     .catch(err => { console.error("FrameTrace viewer failed to start", err); });
 }

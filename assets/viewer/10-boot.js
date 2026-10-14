@@ -52,6 +52,8 @@ const LAYOUT_KEY = "ft.viewer." + (manifest.case_id || "case") + ".layout.v2";
 const MARKS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".marks";
 const NOTES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".notes";
 const ANNOTATIONS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".annotations.v1";
+// RANGES_KEY: the pre-R4 whole-map range store — retired (A2), only read once
+// at boot to migrate (30-records migrateLegacyRanges).
 const RANGES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".ranges";
 const PROXIES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".proxies";
 const EXAMINER_KEY = "ft.viewer." + (manifest.case_id || "case") + ".examiner";

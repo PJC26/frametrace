@@ -31,10 +31,14 @@
 //  ⑥ 30 000-record bulk "판독완료" with storage pre-filled to the quota →
 //    ceil(n/2000) POSTs, no 413, saved, exactly ONE storage-quota toast
 //  ⑦ a legacy patch-v1 body sent with fetch still lands (200 + applied)
+//  ⑮ R4 A1/A2: an older browser range (retired RANGES_KEY) vs a range another
+//    window stored → an ordinary conflict; i/o, a tag and a cleared mark
+//    meanwhile send nothing and never read "saved"; the server keeps its
+//    range, mark and tags
 //
 // --pre-v10: skip the checks that need the §10.1/§10.2 server rules
 // (reported as SKIP), for a workstation built before them.
-import { mkdtempSync, rmSync, openSync, writeSync, closeSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, openSync, writeSync, closeSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { randomFillSync } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -190,7 +194,11 @@ try {
 
   const A = await open('A');
   const B = await open('B');
-  check('second window toasts that the case is open elsewhere', await B.evaluate(() => window.__toasts.length >= 0) && await B.locator('#toastHost').innerText().then((t) => /다른 창|another window/.test(t)));
+  // F12: the toast fires during boot (before instrument() listens), so the
+  // assertion reads the rendered toast in whichever host shows it.
+  const otherToast = await B.waitForFunction(() => [...document.querySelectorAll('#toastHost .toast, #hToastBox .h-toast')]
+    .map((t) => t.textContent).find((t) => /다른 창|another window/.test(t)) || null, null, { timeout: 10000 }).then((h) => h.jsonValue()).catch(() => null);
+  check('second window toasts that the case is open elsewhere', !!otherToast, String(otherToast));
 
   // ① B saves first, A's stale save conflicts.
   await mark(B, vid1, '2'); // important
@@ -431,7 +439,18 @@ try {
 
   // ⑫ Server queue: a carve job holds the case busy, so saves are queued
   // (deferred) and applied when the job ends.
-  writeRaw(join(caseDir, 'evidence/images/evidence.raw'), 200);
+  const rawPath = join(caseDir, 'evidence/images/evidence.raw');
+  writeRaw(rawPath, 200);
+  // R4 C1: a raw image is carved only with its completion marker (size +
+  // modification time in ns, src/e01.rs write_raw_done_marker).
+  {
+    const st = statSync(rawPath, { bigint: true });
+    // modified_nanos exceeds 2^53: written as the exact BigInt digits.
+    writeFileSync(rawPath + '.done.json', JSON.stringify({
+      schema_version: 1, kind: 'frametrace-e01-raw-complete', raw_path: rawPath, size_bytes: Number(st.size),
+      modified_nanos: '@NANOS@', sha256: '0'.repeat(64), e01_path: join(work, 'synthetic.E01'), imported_unix: 1,
+    }).replace('"@NANOS@"', st.mtimeNs.toString()));
+  }
   const imports = [];
   await A.route('**/api/import-marks', async (route) => {
     const res = await route.fetch();
@@ -453,7 +472,8 @@ try {
   await mark(A, vid8, '2');
   await mark(A, vid7, '2');
   await saveNow(A);
-  await A.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 30000 });
+  await A.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 30000 })
+    .catch(async (err) => { const s = await srv.getJson("/api/status").catch(() => ({})); throw new Error(`⑫ never "queued": status busy=${s.busy} job=${JSON.stringify(s.job)} other=${JSON.stringify(otherQueued).slice(0, 120)} state=${await saveState(A)} replies=${JSON.stringify(imports).slice(0, 400)} — ${err.message.split('\n')[0]}`); });
   await A.click(`#recordGrid .card[data-id="${vid7}"]`);
   await A.locator('#evidenceNote').fill('queued note');
   await A.waitForFunction(() => FTViewer.summary().pending > 0);
@@ -492,6 +512,66 @@ try {
   const v8Row = await serverRow(vid8);
   const st12b = await srv.getJson('/api/status');
   check('⑫ [내 값] on the queue conflict: server = A\'s queued value, journal resolved', v8Row.row?.status === 'important' && Number(st12b.mark_conflicts?.count) === 0, `${JSON.stringify(v8Row)} ${JSON.stringify(st12b.mark_conflicts)}`);
+  await A.unroute('**/api/import-marks');
+
+  // ⑮ R4 A1/A2: IN/OUT ranges are first-class. Another window stored a
+  // range on vid_2; this browser still has an older one in the retired
+  // whole-map store (RANGES_KEY). After a reload that is an ordinary
+  // conflict: i/o, a tag and a cleared mark meanwhile send nothing for the
+  // id and never read "saved"; the server keeps its range, tags and mark.
+  // vid_2 (vid_6 of the demo is a deliberately broken file: no player).
+  const vidR = vid2;
+  const vR = await serverRow(vidR);
+  const rangeSave = await srv.postJson('/api/import-marks', { marks_json: JSON.stringify({
+    schema_version: 2, protocol: 'patch-v2', case_id: caseId, examiner: 'other', client_id: 'w-other-window', exported_unix: 1,
+    base_revisions: { [vidR]: vR.revision }, marks: [{ id: vidR, status: 'important', marked_unix: 1, note: '', examiner: 'other', tags: ['현장'], range: { in: 10, out: 20 } }], tags: [], deleted_ids: [],
+  }) });
+  const vRr = await serverRow(vidR);
+  check('⑮ another window stored vid_2 = important, range 10~20, tag 현장', rangeSave.ok === true && vRr.row?.range?.in === 10 && vRr.tags.includes('현장'), JSON.stringify(vRr));
+  await A.evaluate(([c, id]) => localStorage.setItem(`ft.viewer.${c}.ranges`, JSON.stringify({ [id]: { in: 3, out: 4 } })), [caseId, vidR]);
+  await reloadPage(A);
+  await A.waitForSelector('#markConflictBanner', { timeout: 30000 });
+  await A.waitForFunction(() => FTViewer.saveState() === 'pending', null, { timeout: 30000 });
+  check('⑮ the old browser range is a conflict (not a silent overwrite, not "saved"), the retired key is gone',
+    await conflictCount(A) === 1 && await A.evaluate(([c]) => localStorage.getItem(`ft.viewer.${c}.ranges`) === null, [caseId]));
+  const rangeImports = [];
+  await A.route('**/api/import-marks', async (route) => {
+    try { rangeImports.push(JSON.parse(JSON.parse(route.request().postData()).marks_json)); } catch { /* not JSON */ }
+    await route.continue();
+  });
+  await A.click(`#recordGrid .card[data-id="${vidR}"]`);
+  await A.evaluate(() => document.activeElement?.blur());
+  await A.waitForSelector('#mediaStage video', { state: 'attached', timeout: 30000 })
+    .catch(async (err) => {
+      const why = await A.evaluate(() => `${document.querySelector('#recordGrid .card.active')?.dataset.id || '-'} | ${(document.getElementById('mediaStage')?.innerHTML || '').slice(0, 300)} | ${document.getElementById('ftViewer').className}`);
+      throw new Error(`⑮ no video element: ${why} — ${err.message.split('\n')[0]}`);
+    });
+  for (const [btn, t] of [['btnSetOut', 9], ['btnSetIn', 5]]) {
+    await A.evaluate(([b, v]) => {
+      const video = document.querySelector('#mediaStage video');
+      Object.defineProperty(video, 'currentTime', { get: () => v, configurable: true });
+      document.getElementById(b).click();
+    }, [btn, t]);
+  }
+  await A.evaluate(() => document.getElementById('btnTagMenu').click());
+  await A.click('#tagMenuList [data-tag="사고"]');
+  await A.keyboard.press('Escape');
+  await A.click(`#recordGrid .card[data-id="${vidR}"]`);
+  await A.evaluate(() => document.activeElement?.blur());
+  await A.keyboard.press('0');
+  await saveNow(A);
+  await A.waitForFunction(() => FTViewer.saveState() !== 'saving', null, { timeout: 30000 });
+  const sentV6 = rangeImports.filter((b) => (b.marks || []).some((m) => m.id === vidR) || (b.deleted_ids || []).includes(vidR) || (b.tags || []).some((t) => t.id === vidR));
+  const vRafter = await serverRow(vidR);
+  check('⑮ i/o + tag + cleared mark on the conflicted id: nothing sent, still pending',
+    sentV6.length === 0 && await saveState(A) === 'pending', `${JSON.stringify(sentV6).slice(0, 200)} state=${await saveState(A)}`);
+  check('⑮ the server kept vid_2\'s range, mark and tags (revision unchanged)',
+    vRafter.row?.range?.in === 10 && vRafter.row?.range?.out === 20 && vRafter.row?.status === 'important' && vRafter.tags.includes('현장') && !vRafter.tags.includes('사고') && vRafter.revision === vRr.revision, JSON.stringify(vRafter));
+  await A.click('#markConflictUseServer');
+  await A.waitForFunction(() => !document.getElementById('markConflictBanner'));
+  await waitState(A, 'saved', 60000);
+  const vRfinal = await serverRow(vidR);
+  check('⑮ [서버 값 사용]: saved, the server value untouched', vRfinal.row?.range?.in === 10 && vRfinal.revision === vRr.revision, JSON.stringify(vRfinal));
   await A.unroute('**/api/import-marks');
   check('A/B/C/D no page errors', errors.length === 0, errors.join(' | '));
 

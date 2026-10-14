@@ -304,7 +304,7 @@ function setupColumnSplitter() {
     else if (event.key === "ArrowRight") next = now + step;
     else if (event.key === "Home") next = COL_MIN;
     else if (event.key === "End") next = COL_MAX;
-    else if (event.key === "Enter") { event.preventDefault(); state.layout.colSplit = 0; saveLayout(); applyLayout(); return; }
+    else if (event.key === "Enter" && !imeComposing(event)) { event.preventDefault(); state.layout.colSplit = 0; saveLayout(); applyLayout(); return; }
     if (next === null) return;
     event.preventDefault();
     event.stopPropagation();
@@ -351,7 +351,7 @@ function setupHeightSplitter() {
     let next = null;
     if (event.key === "ArrowUp") next = cur - step;
     else if (event.key === "ArrowDown") next = cur + step;
-    else if (event.key === "Enter") { event.preventDefault(); state.layout.stageH = 0; saveLayout(); applyLayout(); return; }
+    else if (event.key === "Enter" && !imeComposing(event)) { event.preventDefault(); state.layout.stageH = 0; saveLayout(); applyLayout(); return; }
     if (next === null) return;
     event.preventDefault();
     event.stopPropagation();

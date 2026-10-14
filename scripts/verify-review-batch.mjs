@@ -14,8 +14,12 @@
 //          --mute-audio about:blank
 //   5. Run:  node scripts/verify-review-batch.mjs
 const CDP = 'http://127.0.0.1:9222';
-const BASE = 'http://127.0.0.1:8477';
-const VIEWER = BASE + '/review/evidence-viewer.html';
+// F7: the live mode drives a REAL workstation; lib/real-server-guard.mjs
+// (track F) refuses the user's own 8477 unless --i-know. Imported lazily in
+// main() so the --unit mode (CI) never depends on it.
+//   const BASE = guardBase('verify-review-batch', process.env.FT_BASE || 'http://127.0.0.1:8477')
+let BASE = '';
+let VIEWER = '';
 
 let nextId = 1;
 const pending = new Map();
@@ -67,6 +71,9 @@ async function attachToNewTarget(browserWs, url) {
 }
 
 async function main() {
+  const { guardBase } = await import('./lib/real-server-guard.mjs');
+  BASE = guardBase('verify-review-batch', process.env.FT_BASE || 'http://127.0.0.1:8477');
+  VIEWER = BASE + '/review/evidence-viewer.html';
   const results = [];
   const check = (name, ok, detail = '') => {
     results.push({ name, ok, detail });
@@ -259,12 +266,12 @@ async function unitTests() {
   Object.assign(state, { drafts: {}, dirtyIds: new Set(), revisions: {}, examiners: {}, notes: {}, tags: {}, ranges: {} });
   // Save protocol v2 (docs/FIX_PLAN_R1_2026-10-13.md §1.6): touchAnnotation
   // only records the draft in memory + dirtyIds; storage is a debounced flush.
-  const draftsSrc = [fn('writerId'), fn('nextDraftSeq'), fn('draftRangeOf'), fn('draftValuesOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
+  const draftsSrc = [fn('writerId'), fn('nextDraftSeq'), fn('draftNormRange'), fn('draftRangeOf'), fn('draftValuesOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
   const touch = 'draftSeq=0;draftFlushKeys=new Set();draftRangesDirty=false;\n' + draftsSrc;
   let flushes = 0;
   Object.assign(grid, { FTViewer: { writerToken: 'w1' }, scheduleDraftFlush: () => { flushes += 1; }, markLabel: s => s, document: { getElementById: () => null, body: { classList: { toggle: () => {} } } }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
-  const journalSrc = [fn('snapshotIds'), fn('journalDiff'), fn('toastUndo'), fn('journaled'), fn('markStatusLabel')].join('\n');
-  runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
+  const journalSrc = [fn('snapshotIds'), fn('journalDiff'), fn('journalPack'), fn('journalEntry'), fn('journalIdCount'), fn('trimJournal'), fn('toastUndo'), fn('journaled'), fn('markStatusLabel')].join('\n');
+  runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;JOURNAL_ID_CAP=200000;JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
   assert.equal(state.activeId, 'b');
   assert.ok(state.dirtyIds.has('a') && state.drafts.a.seq === 1 && state.drafts.a.base === 0 && !('writer' in state.drafts.a), 'draft carries seq + base (the writer is in its storage key)');
   assert.equal(flushes, 1, 'one debounced flush scheduled, no synchronous storage write');
@@ -375,7 +382,20 @@ async function unitTests() {
   assert.ok(old.ok && old.legacy && old.posts === 4 && Object.keys(old.applied).length === 4500, `legacy fallback (${old.posts} posts)`);
   assert.ok(v1Bodies.length === 3 && v1Bodies.every(b => b.protocol === 'patch-v1' && !('base_revisions' in b) && !('batch' in b) && b.marks.every(m => !('tags' in m))), 'v1 bodies carry no v2 fields');
   assert.ok(v1Bodies[2].tags.length === 500 && v1Bodies[0].tags.length === 2000, 'v1 bodies list every id\'s tags in the tags array');
-  console.log('PASS VM chunking (2000 ids / 1 MiB), 413 halving, per-id outcome merge');
+  // R4 B4/B7 (server as implemented): "briefly busy, retry" is transient
+  // (busy + retryAfterMs, nothing confirmed); report_error rides beside ok.
+  grid.postBusy = async () => ({ ok: false, busy: true, retry: true, retry_after_ms: 1500, error: 'busy' });
+  const busyOut = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postBusy);', grid);
+  assert.ok(!busyOut.ok && busyOut.busy === true && busyOut.retryAfterMs === 1500 && Object.keys(busyOut.applied).length === 0 && busyOut.posts === 1, 'B4: busy/retry reply is transient, nothing confirmed');
+  grid.postReportErr = async (body) => ({ ok: true, protocol: 'patch-v2', applied: Object.fromEntries(body.marks.map(m => [m.id, 2])), conflicts: [], report_error: 'make-report failed' });
+  const repOut = await runInNewContext(chunkSrc + '\nsendPayloadChunks(big, postReportErr);', grid);
+  assert.ok(repOut.ok && repOut.reportError === 'make-report failed', 'B7: report_error is surfaced beside a successful save');
+  // B3/B6: paging follows next_offset until null.
+  const pages = [];
+  grid.getPaged = async (url) => { const o = Number(new URL(url, 'http://x').searchParams.get('offset')); pages.push(o); return { ok: true, count: 5, next_offset: o + 2 < 5 ? o + 2 : null, conflicts: [o, o + 1].filter(n => n < 5).map(n => ({ id: 'c' + n })) }; };
+  const paged = await runInNewContext(fn('readPagedList') + '\nCONFLICT_PAGE=500;CONFLICT_PAGES_MAX=2000;\nreadPagedList(getPaged, "/api/mark-conflicts", d => d.conflicts);', grid);
+  assert.equal(JSON.stringify([paged.map(c => c.id), pages]), '[["c0","c1","c2","c3","c4"],[0,2,4]]', 'B3: every page read via next_offset');
+  console.log('PASS VM chunking (2000 ids / 1 MiB), 413 halving, per-id outcome merge, busy/retry, report_error, next_offset paging');
   // Drafts (§10.3): one key per id, ft.draft.<case>.<writer>.<id>. Hydration
   // replays this window's drafts and those of a CLOSED writer — never a live
   // one, and a merely stale one only after an unanswered ping
@@ -412,8 +432,8 @@ async function unitTests() {
     reportStorageError: () => { storageReports += 1; }, ftSignal: { aborted: false },
   });
   grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }], revisions: { a: 3, b: 1, c: 2 } };
-  const hydrateSrc = [fn('aliveKey'), fn('draftKey'), fn('parseDraftKey'), fn('writerVerdict'), fn('storedDraftEntries'), fn('migrateLegacyDrafts'), fn('applyDraftValues'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations'), fn('adoptOrphanDrafts'), fn('adoptDeadWriters'), fn('flushDraftsNow'), fn('applyAppliedIds'), fn('dropJournalIds')].join('\n');
-  runInNewContext('skippedDraftWriters=new Set();restoredConflictIds=[];draftAdoptedFrom=new Map();orphanCheck=null;draftsUnpersisted=false;draftFlushTimer=null;\n' + touch + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
+  const hydrateSrc = [fn('aliveKey'), fn('draftKey'), fn('parseDraftKey'), fn('writerVerdict'), fn('storedDraftEntries'), fn('migrateLegacyDrafts'), fn('applyDraftValues'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations'), fn('adoptOrphanDrafts'), fn('adoptDeadWriters'), fn('flushDraftsNow'), fn('applyAppliedIds'), fn('dropJournalIds'), fn('draftNormRange'), fn('draftSameValues'), fn('serverDraftValues'), fn('noteOrphanDraft'), fn('migrateLegacyRanges')].join('\n');
+  runInNewContext('orphanDrafts=new Map();legacyRangesLeft=null;annotationsError="";markRowMaybe=new Set();skippedDraftWriters=new Set();restoredConflictIds=[];draftAdoptedFrom=new Map();orphanCheck=null;draftsUnpersisted=false;draftFlushTimer=null;\n' + touch + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
   assert.equal(state.marks.a, undefined, 'own draft (cleared mark) replays over the DB row');
   assert.equal(state.notes.b, 'DB memo');
   assert.equal(state.examiners.b, 'Bob');
@@ -458,8 +478,8 @@ async function unitTests() {
   runInNewContext('applyAppliedIds({ p: 2, q: 2 }, new Map([["p", 7], ["q", 2]]));', grid);
   assert.ok(!state.drafts.p && !state.dirtyIds.has('p') && state.drafts.q.base === 2 && state.dirtyIds.has('q') && state.revisions.q === 2, 'mid-flight edit rebased on the confirmed revision');
   // Resolving a conflict drops that id's undo/redo changes (entries left empty go).
-  runInNewContext('undoStack=[{changes:[{id:"a"},{id:"b"}]},{changes:[{id:"a"}]}];redoStack=[{changes:[{id:"a"}]}];dropJournalIds(["a"]);', grid);
-  assert.equal(runInNewContext('JSON.stringify([undoStack.map(e => e.changes.map(c => c.id)), redoStack.length])', grid), '[[["b"]],0]', 'resolved ids leave the undo/redo journal');
+  runInNewContext('undoStack=[{n:2,groups:[{ids:["a","b"],fields:["mark"],before:{mark:null},after:{mark:null}}]},{n:1,groups:[{ids:["a"],fields:["mark"],before:{},after:{}}]}];redoStack=[{n:1,groups:[{ids:["a"],fields:["mark"],before:{},after:{}}]}];dropJournalIds(["a"]);', grid);
+  assert.equal(runInNewContext('JSON.stringify([undoStack.map(e => e.groups.map(g => g.ids)), undoStack.map(e => e.n), redoStack.length])', grid), '[[[["b"]]],[1],0]', 'resolved ids leave the undo/redo journal');
   console.log('PASS VM quota-bounded flush, seq-guarded confirm with rebase, journal drop on resolve');
   // Drafts must snapshot post-mutation state: a draft recorded before the
   // mark/tag mutation replays the old value on reload and resurrects
@@ -481,6 +501,124 @@ async function unitTests() {
   assert.notEqual(state.drafts.a.seq, seqSent, 'a mid-flight edit bumps seq');
   assert.ok(state.drafts.a && state.dirtyIds.has('a'), 'edited-while-saving draft survives the save');
   console.log('PASS VM annotation drafts capture post-mutation state, seq-guarded drop');
+
+  // ---- R4 track A (docs/PLAN_R4_2026-10-14.md) -----------------------------
+  // A1: every marks entry carries an explicit range; deleted_ids only for a
+  // record with no mark, note AND range — and only when the server may hold
+  // its row (a tags-only record sends its tags alone).
+  Object.assign(state, { marks: {}, notes: {}, tags: { r: ['x'], q: ['y'], t: ['z'] }, ranges: { r: { in: 1, out: 2 } }, drafts: {}, dirtyIds: new Set(['r', 'q', 't']), revisions: {}, examiners: {} });
+  grid.markRowMaybe = new Set(['q']);
+  const pr = runInNewContext(payloadSrc + '\nmarksPayload();', grid);
+  const rEntry = pr.marks.find(m => m.id === 'r');
+  assert.ok(rEntry && rEntry.range.in === 1 && rEntry.range.out === 2 && !pr.deleted_ids.includes('r'), 'A1: a record that keeps its range travels as an entry with that range, never in deleted_ids');
+  assert.ok(pr.marks.every(m => m.range && 'in' in m.range && 'out' in m.range), 'A1: every marks entry carries an explicit range');
+  assert.ok(pr.deleted_ids.includes('q') && pr.tags.some(e => e.id === 'q' && e.tags[0] === 'y'), 'A1: a cleared mark row is deleted, its remaining tags travel explicitly');
+  assert.ok(!pr.deleted_ids.includes('t') && pr.tags.some(e => e.id === 't'), 'A1: a record whose server row never existed sends its tags only');
+  assert.equal(runInNewContext(payloadSrc + '\nJSON.stringify(payloadIds(marksPayload()).sort());', grid), '["q","r","t"]', 'a tags-only id is part of the body (chunking keeps it)');
+  delete grid.markRowMaybe;
+  console.log('PASS VM A1 explicit ranges, deleted_ids only for mark-row deletions');
+
+  // A2: ranges hydrate from the case data; the retired RANGES_KEY is migrated
+  // (served: a different value → a draft carrying a conflict; equal → dropped).
+  store.clear();
+  const RK = 'ft.viewer.test.ranges';
+  store.set(RK, JSON.stringify({ a: { in: 3, out: 4 }, b: { in: 7, out: 8 }, zz: { in: 1, out: 2 } }));
+  Object.assign(grid, { RANGES_KEY: RK, recordById: new Map(['a', 'b', 'c'].map(id => [id, { id }])), location: { protocol: 'http:' } });
+  grid.annotations = { marks: [{ record_id: 'a', status: 'important', note: '', range: { in: 1, out: 2 } }, { record_id: 'b', status: 'noted', note: '', range: { in: 7, out: 8 } }], tags: [{ id: 'a', tags: ['현장'] }], revisions: { a: 5, b: 2 } };
+  const a2Src = [fn('draftNormRange'), fn('draftSameValues'), fn('serverDraftValues'), fn('noteOrphanDraft'), fn('migrateLegacyRanges')].join('\n');
+  runInNewContext('orphanDrafts=new Map();legacyRangesLeft=null;annotationsError="";markRowMaybe=new Set();\n' + a2Src + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
+  assert.ok(state.ranges.b && state.ranges.b.in === 7, 'A2: the server range hydrates like a mark');
+  assert.ok(state.ranges.a.in === 3 && state.drafts.a.conflict && state.drafts.a.conflict.legacy && state.drafts.a.conflict.server.range.in === 1 && state.drafts.a.base === 5 && runInNewContext('restoredConflictIds.includes("a")', grid), 'A2: a different stored range becomes a conflict (server 1~2 vs mine 3~4), base = the server revision');
+  assert.ok(!state.drafts.b && !state.dirtyIds.has('b'), 'A2: an equal stored range is no edit');
+  assert.ok(!store.has(RK) && store.has(P + 'w1.a'), 'A2: the retired key is gone once every entry is stored');
+  assert.ok(!state.drafts.zz, 'A2: an id this case no longer lists is not invented');
+  // A14: hydrated tag lists are copies — a tag edit never rewrites the case data.
+  state.tags.a.push('local');
+  assert.deepEqual(grid.annotations.tags[0].tags, ['현장'], 'A14: the server tag list stays the server\'s');
+  // file:// (standalone): the bundle wins, leftovers are only reported.
+  store.clear();
+  store.set(RK, JSON.stringify({ b: { in: 9, out: 10 } }));
+  grid.location = { protocol: 'file:' };
+  runInNewContext('hydrateAnnotations(annotations);', grid);
+  assert.ok(state.ranges.b.in === 7 && !state.drafts.b && runInNewContext('legacyRangesLeft && legacyRangesLeft.count === 1', grid) && store.has(RK), 'A2: file:// keeps the bundle range, reports (and keeps) the leftover');
+  grid.location = { protocol: 'http:' };
+  console.log('PASS VM A2 range hydration + one-time RANGES_KEY migration, A14 copied tag lists');
+
+  // A7: a closed window's draft for an id this window holds a draft of:
+  // identical → removed now; different → held, and once ours is confirmed it
+  // becomes a conflict (server = what was saved, mine = the closed window's).
+  store.clear();
+  store.set('ft.alive:test:gone', 'closed');
+  put(P + 'w1.a', { mark: { status: 'reviewed', marked_unix: 1 }, note: '', tags: [], examiner: null, range: null, seq: 2, base: 5 });
+  put(P + 'gone.a', { mark: { status: 'important', marked_unix: 1 }, note: 'old', tags: [], examiner: null, range: null, seq: 9, base: 4 });
+  put(P + 'w1.b', { mark: { status: 'reviewed', marked_unix: 1 }, note: '', tags: [], examiner: null, range: { in: 7, out: 8 }, seq: 3, base: 2 });
+  put(P + 'gone.b', { mark: { status: 'reviewed', marked_unix: 9 }, note: '', tags: [], examiner: null, range: { in: 7, out: 8 }, seq: 1, base: 2 });
+  runInNewContext('hydrateAnnotations(annotations);', grid);
+  assert.ok(!store.has(P + 'gone.b'), 'A7: an identical closed-window draft is removed at once');
+  assert.ok(store.has(P + 'gone.a') && runInNewContext('orphanDrafts.has("a") && !orphanDrafts.has("b")', grid) && state.marks.a.status === 'reviewed', 'A7: a different one is held (ours shown), not dropped');
+  const registered = [];
+  Object.assign(grid, { registerConflicts: list => { registered.push(...list); return list.length; }, normRange: r => (r && (Number.isFinite(r.in) || Number.isFinite(r.out)) ? { in: r.in ?? null, out: r.out ?? null } : null),
+    localAnnotationOf: id => ({ status: state.marks[id] ? state.marks[id].status : null, note: state.notes[id] || '', range: state.ranges[id] || null, tags: [...(state.tags[id] || [])] }) });
+  runInNewContext(fn('settleOrphanDrafts') + '\n' + fn('applyAppliedIds') + '\napplyAppliedIds({ a: 6 }, new Map([["a", state.drafts.a.seq]]));', grid);
+  assert.ok(registered.length === 1 && registered[0].id === 'a' && registered[0].orphan && registered[0].server.status === 'reviewed' && registered[0].mine.status === 'important' && registered[0].mine.note === 'old' && registered[0].server_revision === 6,
+    'A7: after our save the closed window\'s different draft is a conflict at once (never re-adopted later)');
+  assert.ok(runInNewContext('draftAdoptedFrom.get("a")', grid) === P + 'gone.a', 'A7: its key goes once ours (with the conflict) is stored');
+  console.log('PASS VM A7 closed-window drafts: dropped when identical, conflict after our save otherwise');
+
+  // A8: the journal packs a bulk action into one group and is capped by ids.
+  const jstate = { marks: {}, notes: {}, tags: {}, ranges: {}, activeId: null };
+  const jctx = { state: jstate, document: { getElementById: () => null }, toastUndo: () => {}, JSON, Set, Map };
+  const journalA8 = [fn('snapshotIds'), fn('journalDiff'), fn('journalPack'), fn('journalEntry'), fn('journalUnpack'), fn('journalIdCount'), fn('trimJournal'), fn('journalStats'), fn('journaled')].join('\n');
+  runInNewContext('var undoStack=[],redoStack=[];var JOURNAL_LIMIT=200,JOURNAL_ID_CAP=200000;var JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalA8, jctx);
+  const big100k = Array.from({ length: 100000 }, (_, i) => 'v' + i);
+  jctx.big100k = big100k;
+  runInNewContext('journaled("bulk", big100k, () => { for (const id of big100k) state.marks[id] = { status: "reviewed", marked_unix: 7 }; });', jctx);
+  const st1 = runInNewContext('journalStats()', jctx);
+  assert.ok(st1.ids === 100000 && runInNewContext('undoStack[0].groups.length', jctx) === 1, `A8: a 100 000-record bulk mark is ONE group (${runInNewContext('undoStack[0].groups.length', jctx)})`);
+  assert.ok(st1.bytes < 100000 * 12, `A8: ~ids only, no per-record snapshots (${st1.bytes} bytes)`);
+  for (const status of ['important', 'needs_verification']) {
+    jctx.status = status;
+    runInNewContext('journaled("bulk2", big100k, () => { for (const id of big100k) state.marks[id] = { status, marked_unix: 8 }; });', jctx);
+  }
+  const st2 = runInNewContext('journalStats()', jctx);
+  assert.ok(st2.ids <= 200000 && runInNewContext('undoStack.length', jctx) === 2 && runInNewContext('undoStack[1].label', jctx) === 'bulk2', `A8: past ${200000} ids the oldest entries go first (${st2.ids} ids in ${runInNewContext('undoStack.length', jctx)} entries)`);
+  const back = runInNewContext('journalUnpack(undoStack[1])', jctx);
+  assert.ok(back.length === 100000 && back[0].fields.join() === 'mark' && back[0].before.mark.status === 'important' && back[0].after.mark.status === 'needs_verification' && !('note' in back[0].before), 'A8: unpacking restores per-record changes of the changed fields only');
+  console.log(`PASS VM A8 packed journal (${st1.bytes} B for 100 000 ids) + id cap`);
+
+  // A14: search highlighting matches the raw text, then escapes each piece.
+  const hl = runInNewContext([fn('escapeHtml'), fn('highlightEscape')].join('\n') + '\n[highlightEscape("R&D amp <b>", "amp"), highlightEscape("a&b", "&"), highlightEscape("x<y", "<y"), highlightEscape("AmP", "amp")];', {});
+  assert.deepEqual(JSON.parse(JSON.stringify(hl)), ['R&amp;D <mark>amp</mark> &lt;b&gt;', 'a<mark>&amp;</mark>b', 'x<mark>&lt;y</mark>', '<mark>AmP</mark>'], 'A14: no entity is split, the match is escaped');
+  console.log('PASS VM A14 highlight escapes per piece');
+
+  // R4 D1/D2: "unverified" / "replayed" measurements never read as sound/silent.
+  const audioCtx = { audioLevels: { u: { r: 'unverified', max: -3 }, p: { r: 'replayed', max: -80 }, s: { r: 'sound', max: -3 } }, audioLevelsError: '' };
+  runInNewContext([fn('audioInfoFor'), fn('audioFacetOf')].join('\n') + '\nthis.info = (r) => { const i = audioInfoFor(r); return [i.state, i.reason, audioFacetOf(i.state)].join("|"); };', audioCtx);
+  assert.equal(audioCtx.info({ id: 'u', audioCodec: 'aac', probeOk: true }), 'track|unverified|unknown', 'unverified → 미확인');
+  assert.equal(audioCtx.info({ id: 'p', audioCodec: 'aac', probeOk: true }), 'track|replayed|unknown', 'replayed → 미확인');
+  assert.equal(audioCtx.info({ id: 'p', audioCodec: '', probeOk: true }), 'unknown|replayed|unknown', 'replayed without a probed track → 미확인, never "none"');
+  assert.equal(audioCtx.info({ id: 's', audioCodec: 'aac', probeOk: true }), 'sound||sound');
+  console.log('PASS VM unverified / replayed sound measurements read 미확인');
+
+  // R4 D5: path-free proxy names (proxy_<id>_<hash8>(_NNN).mp4) are matched.
+  const proxyRe = /^proxy_(.+)_[0-9a-f]{8}(?:_\d{3})?\.mp4$/;
+  assert.ok(/proxy_\(\.\+\)_\[0-9a-f\]\{8\}/.test(source) && proxyRe.exec('proxy_vid_000001_0a1b2c3d_002.mp4')[1] === 'vid_000001', 'D5 proxy name pattern in 30-records');
+
+  // A10: the jobs sheet's failure box is rewritten only when its markup changes
+  // (a re-serializing element: the read-back never equals the written string).
+  const appSrc = (await import('./lib/app-bundle.mjs')).appBundleJs();
+  const jobsErrFn = appSrc.match(/^let jobsErrWritten = null;\nfunction jobsErrWrite\([^]*?^}/m)?.[0];
+  assert.ok(jobsErrFn, 'jobsErrWrite exists');
+  let writes = 0;
+  const box = { _h: '', get innerHTML() { return this._h.replaceAll('&quot;', '"'); }, set innerHTML(v) { writes += 1; this._h = v; } };
+  const jctx2 = { box };
+  runInNewContext(jobsErrFn + '\nthis.w = jobsErrWrite;', jctx2);
+  const errHtml = '<div>오류: &quot;x&quot;</div><details><summary>자세한 오류 내용</summary><pre>&quot;x&quot;</pre></details>';
+  for (let i = 0; i < 5; i++) jctx2.w(box, errHtml);
+  assert.equal(writes, 1, `A10: five polls with the same error write the box once (${writes})`);
+  jctx2.w(box, '<div>other</div>');
+  assert.equal(writes, 2, 'A10: a new error is written');
+  console.log('PASS VM A10 failure box written only on change');
   // STR-01: the shell script is bundled from assets/app/*.js (build.rs).
   const { appBundleJs } = await import('./lib/app-bundle.mjs');
   const exScript = appBundleJs();
@@ -549,7 +687,15 @@ async function unitTests() {
   ex.localStorage = { get length() { return Object.keys(lsKeys).length; }, key: (i) => Object.keys(lsKeys)[i] ?? null, getItem: (k) => lsKeys[k] ?? null, setItem() {} };
   assert.equal(runInNewContext('unsavedDraftCount("c1")', ex), 3, 'per-id drafts of this case (not c10) + legacy entries');
   assert.ok(!levels({ pendingMarks: 0, saveState: null, drafts: null }).includes('block'));
+  // R4 A3/A5: readonly and unknown save states block the finalize too.
+  assert.ok(levels({ pendingMarks: 0, saveState: 'readonly', drafts: 0 }).includes('block'), 'readonly (annotations unreadable) blocks');
+  assert.ok(levels({ pendingMarks: 0, saveState: 'unknown', drafts: 0 }).includes('block'), 'unknown (conflict lookup failed) blocks');
   console.log('PASS VM finalize precheck blocks on unsaved marks');
+  // R4 B16: a "partial" pipeline step is drawn as a warning, not done/failed.
+  ex.renderTrack(['done', 'done', 'partial', 'pending', 'pending'], null, null, []);
+  const trackHtml = dom.getElementById('track').innerHTML;
+  assert.ok(/data-step="partial"/.test(trackHtml) && /부분 결과/.test(trackHtml) && /class="done warned"/.test(trackHtml) && !/class="failed"/.test(trackHtml), 'partial step = warning state');
+  console.log('PASS VM partial pipeline step shows as a warning');
   // Browser-playability gate: AVI/bin/proprietary records must prefer a
   // proxy and never reach a dead <video>; playable mp4 keeps the original.
   const consts = [...source.matchAll(/^const (BROWSER_CODECS|BROWSER_CONTAINERS|PROPRIETARY_EXTS|PLAYABLE_EXTS) = .*$/gm)].map(m => m[0]).join('\n');

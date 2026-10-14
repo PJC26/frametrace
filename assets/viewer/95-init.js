@@ -95,13 +95,14 @@ function stashJournal(journal) {
     delete copy.note;
     return copy;
   };
+  // Packed entries (A8): the note field leaves each group.
   const plain = stack => (Array.isArray(stack) ? stack : []).map(entry => ({
     label: entry.label,
     activeBefore: entry.activeBefore,
-    changes: (entry.changes || [])
-      .map(change => ({ id: change.id, fields: (change.fields || []).filter(f => f !== "note"), before: strip(change.before), after: strip(change.after) }))
-      .filter(change => change.fields.length)
-  })).filter(entry => entry.changes.length);
+    groups: (entry.groups || [])
+      .map(group => ({ ids: group.ids, fields: (group.fields || []).filter(f => f !== "note"), before: strip(group.before), after: strip(group.after) }))
+      .filter(group => group.fields.length && group.ids.length)
+  })).filter(entry => entry.groups.length);
   return { undo: plain(journal.undo), redo: plain(journal.redo) };
 }
 function viewerStashViewState() {
@@ -234,15 +235,20 @@ FTViewer._attach({
   saveState: () => (saveStateEl && saveStateEl.dataset.state) || null,
   // Resolves true once nothing is pending (marks durably queued on the
   // server count as saved: they reach the case DB when the job ends).
-  // An open save conflict is never "saved": it needs the examiner's choice.
+  // An open save conflict is never "saved": it needs the examiner's choice;
+  // neither is an unread conflict lookup (A5) or a read-only mount (A3).
+  // A save already in flight is awaited first (A15: the shell's close path
+  // calls this and must get the answer of the request on the wire).
   async save() {
-    if (!viewerIsServed) return false;
-    const idle = () => reviewIdle();
+    if (!viewerIsServed || annotationsReadOnly) return false;
+    const idle = () => localReviewIdle();
     for (let attempt = 0; attempt < 4; attempt++) {
       await whenSaveSettled();
       await whenConflictsChecked();
       if (idle()) return true;
+      if (conflictLookupFailed && !(await checkServerConflicts())) return false;
       if (!state.dirtyIds.size && !pendingReviewSync && conflictIds.size) return false;
+      if (!state.dirtyIds.size && !pendingReviewSync && !conflictIds.size) continue;
       const result = await syncMarksNow();
       if (!result.ok && !result.queued) return false;
     }
@@ -269,22 +275,34 @@ FTViewer._attach({
   // sheet): marks/notes saved without an examiner get this one and go
   // through the normal draft + save path. The server upsert takes the new
   // non-empty examiner over the stored one and logs it in review_mark_history.
-  attributeUnassignedMarks(name) {
+  // A9: resolves only once the save of those records came back — the count
+  // when every one of them reached the case (or its durable queue); it
+  // REJECTS when the save failed or some of them ran into a conflict, so
+  // the caller never reports success for a name that was not recorded.
+  async attributeUnassignedMarks(name) {
     FTViewer.setExaminer(name);
     const who = (state.examiner || "").trim();
     if (!who) return 0;
+    if (annotationsReadOnly) throw new Error(t("save.readonlyMsg"));
     const ids = new Set([
       ...Object.keys(state.marks),
       ...Object.keys(state.notes).filter(id => (state.notes[id] || "").trim())
     ]);
-    let count = 0;
+    const touched = [];
     for (const id of ids) {
       if ((state.examiners[id] || "").trim()) continue;
       touchAnnotation(id);
-      count += 1;
+      touched.push(id);
     }
-    if (count) { try { void syncMarksNow(); } catch (e) { /* retried by autosave */ } }
-    return count;
+    if (!touched.length) return 0;
+    // Other records' state (an unrelated open conflict) does not decide it:
+    // only whether THESE records left the drafts without a conflict.
+    await FTViewer.save();
+    const conflicted = touched.filter(id => conflictIds.has(id)).length;
+    if (conflicted) throw new Error(tf("attr.conflict", { n: conflicted }));
+    const unsaved = touched.filter(id => state.dirtyIds.has(id) || state.drafts[id]).length;
+    if (unsaved) throw new Error(tf("attr.unsaved", { n: unsaved, err: saveError || "" }));
+    return touched.length;
   },
   liveState: () => liveStateDetail(),
   debugStats: () => ({ filterComputes: filterComputeCount, activeId: state.activeId }),

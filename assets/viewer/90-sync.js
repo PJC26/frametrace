@@ -1,11 +1,11 @@
-// --- IN/OUT range sync (FOR-01) ------------------------------------------
-// Ranges ride in the marks payload as `range: {in, out}` (null = unset).
-// Ids whose server and browser ranges disagree at boot stay in
-// rangeConflictIds until the examiner picks a side; while there, the
-// payload omits their range so a routine save can never overwrite the
-// other side silently.
-var rangeConflictIds = new Set();
-
+// --- IN/OUT range sync (FOR-01, R4 A1/A2) ---------------------------------
+// Ranges are first-class annotation fields of save protocol v2: every
+// marks entry carries `range: {in, out}` ({null, null} = cleared), they
+// hydrate from the server like marks, edits ride in the per-id drafts, and
+// a disagreement with the server is an ordinary conflict (the conflict
+// list: server value / mine) — never a separate banner, never an omitted
+// range that the server would read as "keep" while the indicator says
+// "saved".
 function rangeValid(range) {
   return !!range && (Number.isFinite(range.in) || Number.isFinite(range.out));
 }
@@ -22,15 +22,19 @@ function sameRange(a, b) {
 // carries ONLY the dirty record ids — each with its whole annotation
 // (mark, note, examiner, range, tags) and the revision this window last
 // saw (`base_revisions`), so the server applies per id and reports the
-// ids whose revision moved on instead of overwriting them. An id with no
-// mark, note or range goes to `deleted_ids`; its tags (possibly empty)
-// ride in `tags` so "all tags removed" reaches the server explicitly.
+// ids whose revision moved on instead of overwriting them. `deleted_ids`
+// means "remove the mark row" and is used only for an id with no mark, no
+// note AND no range (A1): a record that keeps its range always travels as a
+// marks entry with that range, so a tag edit or a cleared mark can never
+// delete a stored range. Tags (possibly empty) always ride explicitly —
+// inside the marks entry, or in `tags` beside a deletion — so "all tags
+// removed" reaches the server too.
 // Self-contained on purpose (the review-batch VM harness evaluates this
-// function alone): ranges are normalised and conflict ids read locally.
+// function alone): ranges are normalised locally.
 //   opts.all   every annotated id (the marks download), not just dirty ones
 function marksPayload(opts) {
   const all = !!(opts && opts.all);
-  const rangeConflicts = typeof rangeConflictIds === "undefined" ? new Set() : rangeConflictIds;
+  const markRows = typeof markRowMaybe === "undefined" ? null : markRowMaybe;
   const rangeOfId = id => {
     const r = state.ranges && state.ranges[id];
     return r && (Number.isFinite(r.in) || Number.isFinite(r.out))
@@ -41,7 +45,7 @@ function marksPayload(opts) {
   if (all) {
     Object.keys(state.marks).forEach(id => ids.add(id));
     Object.keys(state.notes).forEach(id => { if ((state.notes[id] || "").trim()) ids.add(id); });
-    Object.keys(state.ranges || {}).forEach(id => { if (rangeOfId(id) && !rangeConflicts.has(id)) ids.add(id); });
+    Object.keys(state.ranges || {}).forEach(id => { if (rangeOfId(id)) ids.add(id); });
     Object.keys(state.tags || {}).forEach(id => { if ((state.tags[id] || []).length) ids.add(id); });
   }
   const marks = [];
@@ -51,15 +55,18 @@ function marksPayload(opts) {
   for (const id of ids) {
     const mark = state.marks[id];
     const note = (state.notes[id] || "").trim();
-    const range = rangeConflicts.has(id) ? null : rangeOfId(id);
-    const tagList = Array.isArray(state.tags[id]) ? state.tags[id] : [];
+    const range = rangeOfId(id);
+    const tagList = Array.isArray(state.tags[id]) ? [...state.tags[id]] : [];
     // The base is the revision the unsaved edit was made on (the draft's,
     // also for a draft adopted from a dead window), else the last one seen.
     const draft = state.drafts && state.drafts[id];
     baseRevisions[id] = draft && Number.isFinite(draft.base) ? draft.base
       : (Number.isFinite(state.revisions && state.revisions[id]) ? state.revisions[id] : 0);
     if (!mark && !note && !range) {
-      deleted.push(id);
+      // Nothing left of the mark row: delete it — but only when the server
+      // may hold one (markRowMaybe: hydrated, or a marks entry was sent
+      // since). A record that only ever had tags sends its tags alone.
+      if (!markRows || markRows.has(id)) deleted.push(id);
       tags.push({ id, tags: tagList });
       continue;
     }
@@ -76,9 +83,10 @@ function marksPayload(opts) {
       // the server keeps its examiner on null); only an unknown id falls
       // back to the current examiner name.
       examiner: Object.prototype.hasOwnProperty.call(state.examiners, id) ? state.examiners[id] : ((state.examiner || "").trim() || null),
-      tags: tagList
+      tags: tagList,
+      // Always explicit: {null, null} clears, a value sets — never omitted.
+      range: range || { in: null, out: null }
     };
-    if (!rangeConflicts.has(id)) entry.range = range || { in: null, out: null };
     marks.push(entry);
   }
   return {
@@ -123,8 +131,9 @@ function splitByExaminer(payload) {
   return out;
 }
 
+// Every id a body touches: marks entries, deletions and tag-only entries.
 function payloadIds(payload) {
-  return [...new Set([...payload.marks.map(m => m.id), ...payload.deleted_ids])];
+  return [...new Set([...payload.marks.map(m => m.id), ...payload.deleted_ids, ...(payload.tags || []).map(t => t.id)])];
 }
 function payloadEmpty(payload) {
   return !payload.marks.length && !payload.tags.length && !payload.deleted_ids.length;
@@ -240,8 +249,16 @@ async function sendPayloadChunks(payload, post, opts) {
       out.error = String(res.error || (res.status ? `HTTP ${res.status}` : "?"));
       out.status = Number(res.status) || 0;
       out.offline = !!res.offline;
+      // R4 B4: the server was briefly busy and queued nothing — transient,
+      // retried after `retry_after_ms`; the ids stay dirty.
+      if (res.busy && res.retry) {
+        out.busy = true;
+        out.retryAfterMs = Math.max(250, Number(res.retry_after_ms) || 1000);
+      }
       return out;
     }
+    // R4 B7: the marks are in, only the report refresh failed.
+    if (res.report_error) out.reportError = String(res.report_error);
     const ids = payloadIds(chunk);
     if (res.deferred) {
       out.deferred = true;
@@ -286,6 +303,9 @@ var saveQueued = false;     // a save was requested while one was in flight
 var manualQueued = false;   // "Apply to case" was pressed while one was in flight
 var saveRevision = 0;       // bumps on every change; detects edits mid-flight
 var saveFailures = 0;
+var saveBusyRetries = 0;          // consecutive "busy, retry" replies (R4 B4)
+const SAVE_BUSY_RETRIES = 10;
+var lastReportError = "";         // R4 B7 notice shown once per text
 var saveError = "";
 var saveAuthExpired = false; // the last attempt was refused with 401 (U8)
 var queuedOnServer = 0;     // marks the server holds in its phase-2 queue (durable, not yet in the DB)
@@ -301,6 +321,17 @@ var saveStateEl = document.getElementById("saveState");
 // newer one at drain time). Not dirty, not saved: pending until resolved.
 var conflictIds = new Map();
 var saveSettleWaiters = [];
+// A5: the server holds queue conflicts (or a queue) this window could not
+// read — "saved" is never claimed then; the lookup retries with backoff.
+var conflictLookupFailed = false;
+var conflictLookupFailures = 0;
+var conflictLookupTimer = null;
+// A3: annotations could not be read at load — nothing is ever sent.
+var annotationsReadOnly = !!annotationsError;
+// A4: ids the server holds in its marks queue (from /api/marks-pending at
+// boot, or this window's own deferred saves): shown with the queued value.
+var serverQueuedIds = new Set();
+var conflictLookupRetryAt = 0;
 const AUTOSAVE_DEBOUNCE_MS = 2500;
 const AUTOSAVE_RETRY_BASE_MS = 2000;
 const AUTOSAVE_RETRY_MAX_MS = 60000;
@@ -312,8 +343,15 @@ function autosaveRetryDelay(failures) {
 function pendingSaveCount() {
   return state.dirtyIds.size + conflictIds.size || (pendingReviewSync ? 1 : 0);
 }
+// Nothing unsaved anywhere: no local edit, no conflict, no conflict lookup
+// running or failed, and nothing waiting in the server's queue (A4/A5).
 function reviewIdle() {
-  return !pendingReviewSync && !state.dirtyIds.size && !conflictIds.size && conflictChecks === 0;
+  return localReviewIdle() && queuedOnServer === 0;
+}
+// This window holds nothing the server has not durably accepted (marks in
+// the server's queue are durable there: FTViewer.save() resolves true).
+function localReviewIdle() {
+  return !pendingReviewSync && !state.dirtyIds.size && !conflictIds.size && conflictChecks === 0 && !conflictLookupFailed && !annotationsReadOnly;
 }
 // Resolves once no save request is in flight (host unmount, FTViewer.save).
 function whenSaveSettled() {
@@ -341,6 +379,13 @@ function renderSaveState() {
     cls = "candidate";
     label = n ? tf("save.local", { n }) : t("save.localClean");
     title = t("save.title.local");
+  } else if (annotationsReadOnly) {
+    // A3: the case's annotations could not be read — saving would write
+    // over records this window never saw. Edits stay in this browser.
+    kind = "readonly";
+    cls = "failed";
+    label = t("save.readonly");
+    title = tf("save.title.readonly", { err: annotationsError || "?", n: state.dirtyIds.size });
   } else if (saveInFlight) {
     kind = "saving";
     cls = "candidate";
@@ -360,6 +405,14 @@ function renderSaveState() {
       ? tf("save.title.conflict", { n: conflictIds.size })
       : tf("save.title.pending", { n });
     if (conflictIds.size && state.dirtyIds.size) title += " " + tf("save.title.conflict", { n: conflictIds.size });
+  } else if (conflictLookupFailed) {
+    // A5: the server reported conflicts (or queued saves) that could not be
+    // read: unknown, never "saved". Retried with backoff.
+    kind = "unknown";
+    cls = "failed";
+    label = t("save.unknown");
+    const sec = Math.max(0, Math.ceil((conflictLookupRetryAt - Date.now()) / 1000));
+    title = tf("save.title.unknown", { sec });
   } else if (queuedOnServer > 0) {
     kind = "queued";
     cls = "candidate";
@@ -380,9 +433,9 @@ function renderSaveState() {
   }
   if (draftsUnpersisted) title += " " + t("save.title.quota");
   saveStateEl.className = `quiet save-ind ${cls}`;
-  saveStateEl.style.fontWeight = kind === "failed" || kind === "pending" ? "700" : "";
+  saveStateEl.style.fontWeight = kind === "failed" || kind === "pending" || kind === "readonly" || kind === "unknown" ? "700" : "";
   saveStateEl.dataset.state = kind;
-  saveStateEl.innerHTML = `${ftIcon(kind === "failed" ? "warning" : kind === "saved" ? "check" : kind === "saving" ? "spinner" : "save")}<span class="save-label"></span>`;
+  saveStateEl.innerHTML = `${ftIcon(kind === "failed" || kind === "readonly" || kind === "unknown" ? "warning" : kind === "saved" ? "check" : kind === "saving" ? "spinner" : "save")}<span class="save-label"></span>`;
   saveStateEl.lastElementChild.textContent = label;
   saveStateEl.title = title;
   saveStateEl.setAttribute("aria-label", `${label} — ${title}`);
@@ -493,12 +546,12 @@ function annotationText(a) {
 // Writes an annotation value into the in-memory maps (no draft, no save).
 function applyAnnotationToState(id, a) {
   if (typeof bumpAnnotations === "function") bumpAnnotations();
+  if (a && (a.status || (a.note || "").trim() || rangeValid(a.range))) markRowMaybe.add(id);
   if (a && a.status && a.status !== "noted") state.marks[id] = { status: a.status, marked_unix: Number.isFinite(a.marked_unix) ? a.marked_unix : Math.floor(Date.now() / 1000) };
   else delete state.marks[id];
   state.notes[id] = (a && a.note) || "";
   state.examiners[id] = (a && a.examiner) || null;
   if (a && rangeValid(a.range)) state.ranges[id] = normRange(a.range); else delete state.ranges[id];
-  draftRangesDirty = true;
   if (a && Array.isArray(a.tags) && a.tags.length) state.tags[id] = [...a.tags]; else delete state.tags[id];
 }
 // The conflict rides in the id's draft, so a reload restores the banner.
@@ -507,7 +560,11 @@ function persistConflict(id, entry) {
   const known = Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
   const draft = prev ? { ...prev } : { ...draftValuesOf(id), seq: nextDraftSeq(), base: known };
   draft.conflict = { server: entry.server, server_revision: entry.server_revision, queued: !!entry.queued };
-  if (entry.queued) draft.conflict.mine = entry.mine;
+  // A queued save's value, or a closed window's (A7), is not this window's
+  // state: it is kept so a reload shows (and [내 값] sends) that value.
+  if (entry.queued || entry.orphan) draft.conflict.mine = entry.mine;
+  if (entry.orphan) draft.conflict.orphan = true;
+  if (entry.legacy) draft.conflict.legacy = true;
   state.drafts[id] = draft;
   draftFlushKeys.add(id);
   scheduleDraftFlush();
@@ -525,9 +582,12 @@ function registerConflicts(list, opts) {
       server: normServerAnnotation(c.server),
       server_revision: Number(c.server_revision) || 0,
       mine: c.mine || (prev ? prev.mine : localAnnotationOf(id)),
-      queued: queued || !!(prev && prev.queued)
+      queued: queued || !!(prev && prev.queued),
+      orphan: !!(c.orphan || (prev && prev.orphan)),
+      legacy: !!(c.legacy || (prev && prev.legacy))
     };
     state.dirtyIds.delete(id);
+    if (entry.server) markRowMaybe.add(id);
     conflictIds.set(id, entry);
     persistConflict(id, entry);
     added += 1;
@@ -554,19 +614,23 @@ function registerRestoredConflicts() {
       id,
       server_revision: useFresh ? known : c.server_revision,
       server: useFresh ? (fresh.get(id) || null) : c.server,
-      mine: c.queued && c.mine ? c.mine : localAnnotationOf(id),
-      queued: !!c.queued
+      mine: (c.queued || c.orphan) && c.mine ? c.mine : localAnnotationOf(id),
+      queued: !!c.queued,
+      orphan: !!c.orphan,
+      legacy: !!c.legacy
     });
   }
   const plain = list.filter(c => !c.queued);
   const fromQueue = list.filter(c => c.queued);
   return registerConflicts(plain) + registerConflicts(fromQueue, { queued: true });
 }
-// An edit to a conflicted id keeps the conflict; "mine" follows the edit.
+// An edit to a conflicted id keeps the conflict; "mine" follows the edit
+// (it is now this window's value — no longer a queued / closed-window one).
 function conflictEdited(id) {
   const c = conflictIds.get(id);
   if (!c) return;
   c.mine = localAnnotationOf(id);
+  c.orphan = false;
   persistConflict(id, c);
   renderConflictBanner();
 }
@@ -590,7 +654,7 @@ function resolveConflicts(ids, side) {
       state.examiners[id] = (c.server && c.server.examiner) || null;
       if (state.drafts[id]) state.drafts[id].examiner = state.examiners[id];
     } else {
-      if (c.queued && c.mine) applyAnnotationToState(id, c.mine);
+      if ((c.queued || c.orphan) && c.mine) applyAnnotationToState(id, c.mine);
       touchAnnotation(id, { base: c.server_revision });
     }
     done.push(id);
@@ -711,7 +775,7 @@ function renderConflictList(panel, ids) {
       const c = conflictIds.get(id);
       const label = recordLabelOf(id);
       return `<li class="conflict-item" data-id="${e(id)}">` +
-        `<div class="conflict-rec"><span class="conflict-name">${e(label)}</span>${label !== id ? ` <span class="conflict-id">${e(id)}</span>` : ""}${c.queued ? ` <span class="conflict-tag">${e(t("conflict.queued"))}</span>` : ""}</div>` +
+        `<div class="conflict-rec"><span class="conflict-name">${e(label)}</span>${label !== id ? ` <span class="conflict-id">${e(id)}</span>` : ""}${c.queued ? ` <span class="conflict-tag">${e(t("conflict.queued"))}</span>` : ""}${c.orphan ? ` <span class="conflict-tag">${e(t("conflict.orphan"))}</span>` : ""}${c.legacy ? ` <span class="conflict-tag">${e(t("conflict.legacyRange"))}</span>` : ""}</div>` +
         `<dl class="conflict-vals"><div><dt>${e(t("conflict.server"))}</dt><dd>${e(annotationText(c.server))}</dd></div>` +
         `<div><dt>${e(t("conflict.mine"))}</dt><dd>${e(annotationText(c.mine))}</dd></div></dl>` +
         `<div class="conflict-acts">` +
@@ -722,27 +786,66 @@ function renderConflictList(panel, ids) {
     (ids.length > shown.length ? `<p class="conflict-more">${e(tf("conflict.more", { n: ids.length - shown.length }))}</p>` : "");
 }
 
-// --- Server queue conflicts (GET /api/mark-conflicts, §10.2) -------------
+// --- Server queue conflicts (GET /api/mark-conflicts, §10.2, R4 B3) -------
 // A save the server queued (deferred) is applied when its job ends; a
 // revision that moved meanwhile is journaled, not applied. The journal's
 // `queued` value — what this (or another) window submitted — is "mine".
+// The route is paged (`?offset&limit`, R4 B3) and every page is read; a
+// server without paging ignores the query and answers the whole list once
+// (no `total`): the loop stops there. Throws when the conflicts the server
+// reported could be read by neither route (A5: the caller shows "충돌 확인
+// 실패" and retries — never "saved").
 var queueConflictsSeen = new Set();
-async function loadServerConflicts(st) {
+const CONFLICT_PAGE = 500;
+const CONFLICT_PAGES_MAX = 2000;
+async function fetchJsonOrNull(url) {
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) { return null; }
+}
+// Reads every page of a paged list route. `pick(data)` returns the page's
+// items (null = not this route's shape). Resolves null when the FIRST page
+// is unreadable (route missing / down); throws when a later one is (a
+// partial list must not pass for the whole).
+async function readPagedList(get, path, pick) {
+  const all = [];
+  let offset = 0;
+  for (let page = 0; page < CONFLICT_PAGES_MAX; page++) {
+    const data = await get(`${path}?offset=${offset}&limit=${CONFLICT_PAGE}`);
+    const items = data && data.ok !== false ? pick(data) : null;
+    if (!items) {
+      if (page === 0) return null;
+      throw new Error(`${path}: page at ${offset} unreadable`);
+    }
+    all.push(...items);
+    // R4 B3/B6 as implemented: `next_offset` (null on the last page).
+    if (Object.prototype.hasOwnProperty.call(data, "next_offset")) {
+      const next = data.next_offset;
+      if (next == null || !Number.isFinite(Number(next)) || Number(next) <= offset) break;
+      offset = Number(next);
+      continue;
+    }
+    // Otherwise a `total` / `count`, or a server without paging (whole list).
+    const total = Number(data.total ?? data.count);
+    offset += items.length;
+    if (!items.length || !Number.isFinite(total) || offset >= total || items.length > CONFLICT_PAGE) break;
+  }
+  return all;
+}
+async function loadServerConflicts(st, get = fetchJsonOrNull) {
   const mc = st && st.mark_conflicts;
   if (!mc || !(Number(mc.count) > 0)) return 0;
-  let data = null;
-  try {
-    const res = await fetch("/api/mark-conflicts", { cache: "no-store" });
-    data = res.ok ? await res.json() : null;
-  } catch (e) { data = null; }
+  const conflicts = await readPagedList(get, "/api/mark-conflicts", data => (Array.isArray(data.conflicts) ? data.conflicts : null));
   if (ftSignal.aborted) return 0;
-  if (!data || data.ok === false || !Array.isArray(data.conflicts)) {
+  if (!conflicts) {
     // A workstation without the route: ids from /api/status, values from records-meta.
     const ids = Array.isArray(mc.ids) ? mc.ids.filter(id => typeof id === "string") : [];
-    return loadQueueConflicts(ids);
+    return loadQueueConflicts(ids, get);
   }
   const list = [];
-  for (const c of data.conflicts) {
+  for (const c of conflicts) {
     if (!c || typeof c.id !== "string") continue;
     queueConflictsSeen.add(c.id);
     const server = normServerAnnotation(c.server);
@@ -752,16 +855,15 @@ async function loadServerConflicts(st) {
   if (n) { renderSaveState(); emitDirty(); }
   return n;
 }
-async function loadQueueConflicts(ids) {
-  const wanted = (ids || []).filter(id => !queueConflictsSeen.has(id) && !conflictIds.has(id));
+async function loadQueueConflicts(ids, get = fetchJsonOrNull) {
+  // The status reports conflicts but names none: nothing to read them by.
+  if (!(ids || []).length) throw new Error("mark conflicts unreadable");
+  const wanted = ids.filter(id => !queueConflictsSeen.has(id) && !conflictIds.has(id));
   if (!wanted.length) return 0;
-  let meta = null;
-  try {
-    const res = await fetch("/api/records-meta", { cache: "no-store" });
-    meta = res.ok ? await res.json() : null;
-  } catch (e) { meta = null; }
+  const meta = await get("/api/records-meta");
   const ann = meta && meta.annotations;
-  if (!ann || ftSignal.aborted) return 0;
+  if (ftSignal.aborted) return 0;
+  if (!ann || ann.error) throw new Error("records-meta unreadable");
   const serverById = serverAnnotationMap(ann);
   const list = [];
   for (const id of wanted) {
@@ -771,6 +873,122 @@ async function loadQueueConflicts(ids) {
   const n = registerConflicts(list, { queued: true });
   if (n) { renderSaveState(); emitDirty(); }
   return n;
+}
+// A5: one conflict lookup — the status, its queue conflicts and, after a
+// queue drain (`reconcileDue`), the reconcile with records-meta. Any failure
+// leaves the indicator at "unknown" ("충돌 확인 실패") and retries with
+// backoff (2 s … 60 s) until it gets through.
+var reconcileDue = false;
+// /api/status for the conflict lookup: null when it failed (network, HTTP
+// error — "unknown"), {} when this server has no such route (404, or a page
+// that is not JSON — a plain file server: nothing to look up).
+async function fetchLookupStatus() {
+  try {
+    const res = await fetch("/api/status", { cache: "no-store" });
+    if (res.status === 404) return {};
+    if (!res.ok) return null;
+    try { return await res.json(); } catch (e) { return {}; }
+  } catch (e) { return null; }
+}
+async function checkServerConflicts(knownStatus) {
+  if (!viewerIsServed || ftSignal.aborted) return false;
+  clearTimeout(conflictLookupTimer);
+  conflictLookupTimer = null;
+  let ok = false;
+  await withConflictCheck(async () => {
+    const st = knownStatus || await fetchLookupStatus();
+    if (ftSignal.aborted) return;
+    if (!st) throw new Error("status unreadable");
+    await loadServerConflicts(st);
+    if (reconcileDue) {
+      if (!(await reconcileWithServer())) throw new Error("records-meta unreadable");
+      reconcileDue = false;
+    }
+    ok = true;
+  });
+  if (ftSignal.aborted) return false;
+  if (ok) {
+    conflictLookupFailed = false;
+    conflictLookupFailures = 0;
+    conflictLookupRetryAt = 0;
+  } else {
+    conflictLookupFailed = true;
+    conflictLookupFailures += 1;
+    const delay = autosaveRetryDelay(conflictLookupFailures);
+    conflictLookupRetryAt = Date.now() + delay;
+    conflictLookupTimer = setTimeout(() => { conflictLookupTimer = null; checkServerConflicts(); }, delay);
+  }
+  renderSaveState();
+  emitDirty();
+  return ok;
+}
+
+// --- A4: the server's marks queue across a reload ------------------------
+// Saves the server queued (deferred, durable) are not in records-meta until
+// the job ends: a reload in between would show the old values, as if the
+// edits were gone. At boot, when /api/status reports pending_marks, the
+// queued values come from GET /api/marks-pending (R4 B6; paged like
+// mark-conflicts: { ok, total, items: [{ id, mark|null, tags|null, deleted,
+// base_revision, client_id }] }) and are shown over the server's for ids
+// this window holds no draft of. The indicator says "저장 대기", the queue
+// is watched until it drains (the normal reconcile then decides), leaving
+// the page warns. A server without the route still gets the "저장 대기"
+// state, the watch and the warning — only the values cannot be shown.
+// What the id will hold once its queued body applies (the server's queue
+// semantics): a deletion clears mark / note / range, a mark entry sets
+// them (an omitted range or note keeps the stored one), tags replace only
+// when the body carried them.
+function pendingAnnotation(q, server) {
+  const out = server
+    ? { ...server, tags: [...(server.tags || [])] }
+    : { status: null, marked_unix: null, examiner: null, note: "", range: null, tags: [] };
+  if (!q || typeof q !== "object") return out;
+  const mark = q.mark && typeof q.mark === "object" ? q.mark : (Object.prototype.hasOwnProperty.call(q, "status") ? q : null);
+  if (q.deleted) Object.assign(out, { status: null, marked_unix: null, examiner: null, note: "", range: null });
+  if (mark) {
+    out.status = mark.status && mark.status !== "noted" ? mark.status : null;
+    if (Number.isFinite(mark.marked_unix)) out.marked_unix = mark.marked_unix;
+    if (mark.examiner) out.examiner = mark.examiner;
+    if (typeof mark.note === "string") out.note = mark.note;
+    if (Object.prototype.hasOwnProperty.call(mark, "range") && mark.range) out.range = normRange(mark.range);
+  }
+  if (Array.isArray(q.tags)) out.tags = [...q.tags];
+  else if (mark && Array.isArray(mark.tags)) out.tags = [...mark.tags];
+  return out;
+}
+async function loadServerQueue(st, get = fetchJsonOrNull) {
+  const pending = Number(st && st.pending_marks) || 0;
+  if (!(pending > 0)) return 0;
+  queuedOnServer = Math.max(queuedOnServer, pending);
+  watchServerQueue();
+  let items = null;
+  try {
+    items = await readPagedList(get, "/api/marks-pending", data =>
+      Array.isArray(data.entries) ? data.entries : Array.isArray(data.items) ? data.items : Array.isArray(data.pending) ? data.pending : null);
+  } catch (e) { items = null; }
+  if (ftSignal.aborted) return 0;
+  let shown = 0;
+  if (items) {
+    const serverById = serverAnnotationMap(DATA.annotations || {});
+    for (const item of items) {
+      const id = item && typeof item.id === "string" ? item.id : null;
+      if (!id) continue;
+      serverQueuedIds.add(id);
+      // This window's own unsaved edit (or open conflict) of the id is newer
+      // than what was queued and goes out with its base: it stays.
+      if (state.drafts[id] || conflictIds.has(id)) continue;
+      const value = pendingAnnotation(item.value && typeof item.value === "object" ? item.value : item, serverById.get(id) || null);
+      applyAnnotationToState(id, value);
+      shown += 1;
+    }
+    if (shown) {
+      if (typeof requestRender === "function") requestRender();
+      if (typeof updateRangeLabel === "function") updateRangeLabel();
+    }
+  }
+  renderSaveState();
+  emitDirty();
+  return shown;
 }
 // Runs `fn` while "saved" is withheld (conflictChecks > 0).
 async function withConflictCheck(fn) {
@@ -829,13 +1047,16 @@ async function reconcileWithServer() {
   return true;
 }
 async function afterQueueDrained(st) {
-  await withConflictCheck(async () => {
-    await whenSaveSettled();
-    await loadServerConflicts(st);
-    await reconcileWithServer();
-  });
+  await whenSaveSettled();
+  reconcileDue = true;
+  // Holds "saved" back (conflictChecks) until the lookup is through; a
+  // failure turns the indicator "unknown" and retries (A5).
+  const pending = checkServerConflicts(st);
   queuedOnServer = 0;
   queuedIds.clear();
+  serverQueuedIds.clear();
+  await pending;
+  if (typeof requestRender === "function") requestRender();
   renderSaveState();
 }
 
@@ -892,13 +1113,47 @@ function markReviewDirty() {
 // unchanged); an edit made while the request was in flight stays dirty,
 // now based on the revision just confirmed.
 function applyAppliedIds(applied, sentSeq) {
+  const settled = [];
   for (const [id, rev] of Object.entries(applied || {})) {
     if (Number.isFinite(rev)) state.revisions[id] = rev;
     const draft = state.drafts[id];
     if (!draft) state.dirtyIds.delete(id);
-    else if (draft.seq === sentSeq.get(id)) dropDraft(id);
+    else if (draft.seq === sentSeq.get(id)) { dropDraft(id); settled.push(id); }
     else if (Number.isFinite(rev) && !draft.conflict) { draft.base = rev; draftFlushKeys.add(id); scheduleDraftFlush(); }
   }
+  if (settled.length && typeof orphanDrafts !== "undefined" && orphanDrafts.size) settleOrphanDrafts(settled);
+}
+// A7: our draft of these ids was just confirmed. A closed window's draft of
+// the same id (held back at hydration) now either holds exactly what was
+// saved — it goes — or it is a conflict right away: server = what was just
+// saved, mine = the closed window's value (tagged "닫힌 창의 편집"). Its
+// storage key is removed once ours (carrying the conflict) is stored.
+function settleOrphanDrafts(ids) {
+  const list = [];
+  for (const id of ids) {
+    const orphan = orphanDrafts.get(id);
+    if (!orphan) continue;
+    orphanDrafts.delete(id);
+    if (draftSameValues(orphan.draft, draftValuesOf(id))) {
+      try { localStorage.removeItem(orphan.key); } catch (error) { /* retried next boot */ }
+      continue;
+    }
+    const d = orphan.draft;
+    list.push({
+      id,
+      server_revision: Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0,
+      server: localAnnotationOf(id),
+      mine: {
+        status: d.mark && d.mark.status ? d.mark.status : null,
+        marked_unix: d.mark && Number.isFinite(d.mark.marked_unix) ? d.mark.marked_unix : null,
+        examiner: d.examiner ?? null, note: d.note || "", range: normRange(d.range),
+        tags: Array.isArray(d.tags) ? [...d.tags] : []
+      },
+      orphan: true
+    });
+    draftAdoptedFrom.set(id, orphan.key);
+  }
+  if (list.length) registerConflicts(list);
 }
 // Deferred (queued on the server, durable there): the draft goes like an
 // applied one, the revision stays — the drain decides it (afterQueueDrained).
@@ -974,6 +1229,8 @@ async function syncMarksNow() {
   if (!viewerIsServed) return { ok: false, offline: true, error: t("save.offlineErr") };
   // A destroyed mount never writes: the next mount owns the drafts.
   if (ftSignal.aborted) return { ok: false, error: "viewer destroyed" };
+  // A3: the case's annotations were not readable — never write over them.
+  if (annotationsReadOnly) { renderSaveState(); return { ok: false, readonly: true, error: t("save.readonly") }; }
   if (saveInFlight) {
     saveQueued = true;
     return { ok: false, queued: true };
@@ -989,6 +1246,8 @@ async function syncMarksNow() {
     return { ok: true, empty: true };
   }
   const sentSeq = new Map(payloadIds(payload).map(id => [id, state.drafts[id] ? state.drafts[id].seq : undefined]));
+  // A marks entry may create the row (whatever the reply says, it may land).
+  for (const m of payload.marks) markRowMaybe.add(m.id);
   saveInFlight = true;
   clearTimeout(autosaveTimer);
   autosaveTimer = null;
@@ -1007,7 +1266,8 @@ async function syncMarksNow() {
         result.pending = Math.max(result.pending, r.pending);
         result.maxIds = r.maxIds;
         result.legacy = r.legacy;
-        if (!r.ok) Object.assign(result, { ok: false, error: r.error, status: r.status, offline: r.offline });
+        if (r.reportError) result.reportError = r.reportError;
+        if (!r.ok) Object.assign(result, { ok: false, error: r.error, status: r.status, offline: r.offline, busy: r.busy, retryAfterMs: r.retryAfterMs });
       }
       if (r.maxIds) saveChunkIds = r.maxIds;
       if (r.legacy) saveLegacyProtocol = true;
@@ -1025,6 +1285,8 @@ async function syncMarksNow() {
   if (result.maxIds) saveChunkIds = result.maxIds;
   if (result.legacy) saveLegacyProtocol = true;
   // Chunks that landed before a later failure are confirmed either way.
+  // A deletion the server applied leaves no row behind.
+  for (const id of payload.deleted_ids) if (result.applied && Object.prototype.hasOwnProperty.call(result.applied, id) && !state.marks[id]) markRowMaybe.delete(id);
   applyAppliedIds(result.applied, sentSeq);
   applyQueuedIds(result.queuedIds, sentSeq);
   registerConflicts(result.conflicts);
@@ -1041,9 +1303,24 @@ async function syncMarksNow() {
     saveRetryAt = 0;
     // Edits made while the request was in flight (or ids the server
     // skipped) are still dirty: push again instead of forgetting them.
+    saveBusyRetries = 0;
     pendingReviewSync = state.dirtyIds.size > 0;
     if (pendingReviewSync) scheduleAutosave(AUTOSAVE_DEBOUNCE_MS);
+    // R4 B7: saved, but the case report was not refreshed — say so once per text.
+    if (result.reportError && result.reportError !== lastReportError) {
+      lastReportError = result.reportError;
+      const firstLine = result.reportError.split(String.fromCharCode(10))[0].trim();
+      toast(tf("save.reportError", { err: firstLine.slice(0, 200) }), { error: true });
+    }
+  } else if (result.busy && saveBusyRetries < SAVE_BUSY_RETRIES) {
+    // R4 B4: "briefly busy, nothing queued" — transient: the edits stay
+    // dirty ("미저장", never "saved"), retried after retry_after_ms without
+    // counting as a failure (a long busy spell becomes one after a few tries).
+    saveBusyRetries += 1;
+    pendingReviewSync = true;
+    scheduleAutosave(result.retryAfterMs || 1000);
   } else {
+    saveBusyRetries = 0;
     const firstFailure = saveFailures === 0;
     saveFailures += 1;
     // 401: the server is up but refused this browser's proof (ft_token /
@@ -1097,7 +1374,10 @@ function autoApplyMarks() {
 
 window.addEventListener("beforeunload", (event) => {
   flushDraftsNow();
-  if (!pendingReviewSync && !state.dirtyIds.size && !conflictIds.size && !saveInFlight && !draftsUnpersisted) return;
+  // A4: marks still in the server's queue (not yet in the case DB) and an
+  // unread conflict lookup also warn before the page goes.
+  if (!pendingReviewSync && !state.dirtyIds.size && !conflictIds.size && !saveInFlight && !draftsUnpersisted &&
+    !(queuedOnServer > 0) && !conflictLookupFailed && !(annotationsReadOnly && Object.keys(state.drafts).length)) return;
   event.preventDefault();
   event.returnValue = "";
 }, { signal: ftSignal });
@@ -1106,6 +1386,8 @@ if (saveStateEl) {
   // Clicking the indicator saves (or retries) right away.
   saveStateEl.addEventListener("click", () => {
     if (!viewerIsServed) { toast(t("save.title.local")); return; }
+    if (annotationsReadOnly) { toast(t("save.readonlyMsg")); return; }
+    if (conflictLookupFailed && !saveInFlight) { checkServerConflicts(); return; }
     if (reviewIdle() && !saveInFlight) { toast(t("save.title.saved")); return; }
     if (!state.dirtyIds.size && conflictIds.size && !saveInFlight) { toast(tf("conflict.msg", { n: conflictIds.size })); return; }
     syncMarksNow();
@@ -1320,21 +1602,13 @@ document.getElementById("btnExportSelected").addEventListener("click", async () 
   if (!selected.length) { toast(t("toast.selectFirst")); return; }
   const btn = document.getElementById("btnExportSelected");
   await withBusy(btn, async () => {
-    const res = await fetch("/api/export-selected", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: selected.map(exportItem) })
-    }).then(reply => reply.json());
+    const res = await viewerPost("/api/export-selected", { items: selected.map(exportItem) }, { contentType: "application/json" });
     if (!res.ok) {
       toast(tf("toast.exportFail", { err: res.error || "" }));
       return;
     }
     toast(tf("toast.exportDone", { copied: res.copied, skipped: res.skipped, dir: res.export_dir }));
-    fetch("/api/open-folder", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: res.export_dir })
-    }).catch(() => {});
+    viewerPost("/api/open-folder", { path: res.export_dir }, { contentType: "application/json" }).catch(() => {});
   }, { fail: () => t("toast.offline") });
 });
 
@@ -1442,12 +1716,7 @@ document.getElementById("btnDownloadFiles").addEventListener("click", async (ev)
 document.getElementById("btnTranscodeQueue").addEventListener("click", async (ev) => {
   const ids = selectedRecords().map(r => r.id).join(",");
   await withBusy(ev.currentTarget, async () => {
-    const res = await fetch("/api/transcode-queue", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ ids })
-    });
-    const data = await res.json();
+    const data = await viewerPost("/api/transcode-queue", { ids });
     if (data.ok && data.summary) {
       toast(tf("toast.queueDone", { t: data.summary.total ?? 0, p: data.summary.proxied ?? 0, c: data.summary.skipped_existing ?? 0, f: data.summary.failed ?? 0 }));
     } else {
@@ -1467,13 +1736,9 @@ async function loadTimeline(regenerate) {
   if (regenerate) {
     meta.textContent = t("timeline.building");
     try {
-      const res = await fetch("/api/advanced", {
-        method: "POST", headers: { "Content-Type": "text/plain" },
-        body: JSON.stringify({ tool: "timeline" })
-      });
-      const data = await res.json();
+      const data = await viewerPost("/api/advanced", { tool: "timeline" });
       if (!data.ok) { meta.textContent = tf("timeline.fail", { err: data.error || "" }); return; }
-    } catch { meta.textContent = t("timeline.failOffline"); return; }
+    } catch (err) { meta.textContent = err && err.ftAuth ? err.message : t("timeline.failOffline"); return; }
   }
   try {
     const res = await fetch("/case/db/timeline.jsonl");
@@ -1556,13 +1821,17 @@ if (!viewerIsServed) {
   // save landed) are pushed without waiting for the next edit.
   scheduleAutosave(1500);
 }
-if (viewerIsServed) {
+if (viewerIsServed && !annotationsReadOnly) {
   // Conflicts the server recorded while draining its marks queue (possibly
-  // before a restart) are shown on boot, and "saved" waits for that answer.
+  // before a restart) are shown on boot, and "saved" waits for that answer
+  // (A5: an unreadable answer is "unknown" and retried, never "saved").
+  // Marks still in the server's queue are shown with their queued values (A4).
+  // withConflictCheck from the first moment: "saved" is withheld until then.
   withConflictCheck(async () => {
-    const res = await fetch("/api/status", { cache: "no-store" });
-    const st = res.ok ? await res.json() : null;
-    if (st && !ftSignal.aborted) await loadServerConflicts(st);
+    const st = await fetchLookupStatus();
+    if (ftSignal.aborted) return;
+    if (st) await loadServerQueue(st);
+    await checkServerConflicts(st || null);
   });
 }
 renderSaveState();
@@ -1570,98 +1839,74 @@ renderSaveState();
 state.pageSize = Number(els.pageSize.value) || 100;
 
 
-// --- Range divergence check on boot ---------------------------------------
+// --- Range text + boot notices (A2/A3) -------------------------------------
 function rangeText(range) {
   const r = normRange(range);
   const p = v => Number.isFinite(v) ? `${v.toFixed(1)}s` : "—";
   return r ? `${p(r.in)} ~ ${p(r.out)}` : t("range.none");
 }
 
-function serverRanges() {
-  const map = {};
-  for (const mark of (DATA.annotations && DATA.annotations.marks) || []) {
-    const id = annotationMarkId(mark);
-    if (id && rangeValid(mark.range)) map[id] = normRange(mark.range);
-  }
-  return map;
-}
-
-function detectRangeDivergence() {
-  if (!viewerIsServed) return [];
-  const server = serverRanges();
-  const pending = state.dirtyIds;
-  const ids = new Set([...Object.keys(server), ...Object.keys(state.ranges)]);
-  const diverged = [];
-  for (const id of ids) {
-    if (pending.has(id) || conflictIds.has(id)) continue; // unsynced local edit (pushed), or already in the conflict list
-    // Only a conflict when BOTH sides hold a range and they differ; a
-    // one-sided range is a seed (server only) or an unsynced edit (browser only).
-    if (!rangeValid(server[id]) || !rangeValid(state.ranges[id])) continue;
-    if (!sameRange(server[id], state.ranges[id])) diverged.push(id);
-  }
-  return diverged;
-}
-
-function resolveRangeDivergence(ids, side) {
-  const server = serverRanges();
-  for (const id of ids) {
-    if (side === "server") {
-      if (server[id]) state.ranges[id] = { ...server[id] }; else delete state.ranges[id];
-    }
-  }
-  storageSet(RANGES_KEY, state.ranges);
-  ids.forEach(id => rangeConflictIds.delete(id));
-  if (side === "browser") {
-    // Push the browser's version (also clears server ranges the browser lacks).
-    ids.forEach(id => touchAnnotation(id));
-  }
-  if (typeof updateRangeLabel === "function") updateRangeLabel();
-}
-
-function showRangeDivergenceBanner(ids) {
-  const server = serverRanges();
+// A2 (standalone, file://): ranges an older page kept in this browser's
+// whole-map store (RANGES_KEY) are never applied over this package's data —
+// the bundle is the reference. They are only reported here, with a way to
+// keep them (download as JSON) and to drop them; nothing is removed unasked.
+(function showLegacyRangesNotice() {
+  if (!legacyRangesLeft || !legacyRangesLeft.count) return;
+  const left = legacyRangesLeft;
   const bar = document.createElement("div");
-  bar.id = "rangeDivergenceBanner";
+  bar.id = "legacyRangesNotice";
+  bar.className = "ft-banner";
+  bar.setAttribute("role", "status");
+  const msg = document.createElement("span");
+  msg.className = "ft-banner-msg";
+  msg.textContent = tf("range.legacyMsg", { n: left.count });
+  msg.title = Object.entries(left.ranges).slice(0, 20).map(([id, r]) => `${recordLabelOf(id)}: ${rangeText(r)}`).join("\n");
+  bar.appendChild(msg);
+  const done = () => {
+    const hadFocus = bar.contains(document.activeElement);
+    bar.remove();
+    if (hadFocus && typeof viewerFocus === "function") viewerFocus();
+  };
+  bar.appendChild(noticeButton("legacyRangesSave", t("range.legacySave"), () => {
+    downloadJSON(`frametrace-browser-ranges-${safeFileName(manifest.case_id || "case")}.json`, { case_id: manifest.case_id || null, ranges: left.ranges });
+  }));
+  bar.appendChild(noticeButton("legacyRangesDrop", t("range.legacyDrop"), () => {
+    try { localStorage.removeItem(RANGES_KEY); } catch (e) { /* storage blocked */ }
+    legacyRangesLeft = null;
+    done();
+  }));
+  noticesHost().appendChild(bar);
+})();
+
+// A3: records-meta could not read the case's annotations. The marks, notes,
+// tags and ranges shown are NOT the case's: saving is blocked (a save would
+// write over records this window never saw), the summary report and CSV
+// are off (they would claim "no marks"), and the shell's finalize blocks on
+// the "readonly" save state. Edits made meanwhile stay in this browser's
+// drafts and go out with their base once the annotations read again.
+const ANNOTATION_GATED_CONTROLS = ["btnSummary", "btnDownloadCsv", "btnDownloadMarks", "btnApplyMarks"];
+(function showAnnotationsReadOnly() {
+  if (!annotationsReadOnly) return;
+  for (const id of ANNOTATION_GATED_CONTROLS) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    btn.disabled = true;
+    btn.setAttribute("aria-disabled", "true");
+    btn.dataset.i18nTitle = "save.readonlyMsg";
+    btn.title = t("save.readonlyMsg");
+  }
+  const bar = document.createElement("div");
+  bar.id = "annotationsErrorBanner";
   bar.className = "ft-banner";
   bar.setAttribute("role", "alert");
   const msg = document.createElement("span");
   msg.className = "ft-banner-msg";
-  msg.textContent = tf("range.divergeMsg", { n: ids.length });
-  msg.title = ids.slice(0, 20).map(id => `${id}: ${t("range.server")} ${rangeText(server[id])} / ${t("range.browser")} ${rangeText(state.ranges[id])}`).join("\n");
+  msg.textContent = t("save.readonlyMsg");
+  msg.title = annotationsError;
   bar.appendChild(msg);
-  const pick = side => () => {
-    const hadFocus = bar.contains(document.activeElement);
-    resolveRangeDivergence(ids, side);
-    bar.remove();
-    if (hadFocus && typeof viewerFocus === "function") viewerFocus();
-  };
-  bar.appendChild(noticeButton("rangeUseServer", t("range.useServer"), pick("server")));
-  bar.appendChild(noticeButton("rangeUseBrowser", t("range.useBrowser"), pick("browser")));
   const host = noticesHost();
   host.insertBefore(bar, host.firstChild);
-}
-
-// A fresh browser (new origin/port, cleared storage) has no local ranges:
-// adopt the server's so they are visible and a later save can never send a
-// null range for an id the browser merely has no value for.
-function seedServerRanges() {
-  const server = serverRanges();
-  let changed = false;
-  for (const id of Object.keys(server)) {
-    if (rangeValid(state.ranges[id])) continue;
-    state.ranges[id] = { ...server[id] };
-    changed = true;
-  }
-  if (changed) storageSet(RANGES_KEY, state.ranges);
-  return changed;
-}
-
-(function initRangeDivergence() {
-  seedServerRanges();
-  const ids = detectRangeDivergence();
-  if (!ids.length) return;
-  ids.forEach(id => rangeConflictIds.add(id));
-  showRangeDivergenceBanner(ids);
+  FTViewer._emit("error", { message: t("save.readonlyMsg"), detail: annotationsError, stage: "load" });
 })();
 
 // --- U9: drafts left under another origin ---------------------------------

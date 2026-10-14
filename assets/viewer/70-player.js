@@ -330,7 +330,7 @@ var on=listEl.querySelector(".li.on");if(on)on.scrollIntoView({block:"nearest"})
 });
 }
 listEl.addEventListener("click",function(e){var it=e.target.closest(".li");if(!it)return;call("focus",it.dataset.id,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});
-listEl.addEventListener("keydown",function(e){if(e.key!=="Enter"&&e.key!==" ")return;var it=e.target.closest(".li");if(!it)return;e.preventDefault();call("focus",it.dataset.id,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});
+listEl.addEventListener("keydown",function(e){if((e.key!=="Enter"&&e.key!==" ")||e.isComposing||e.keyCode===229)return;var it=e.target.closest(".li");if(!it)return;e.preventDefault();call("focus",it.dataset.id,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});
 function nav(step,autoplay){call("navigate",step,function(r){if(!r){dead();return;}applyDesc(r.descriptor,autoplay);if(!r.moved)note(step>0?${jsLit(t("player.last"))}:${jsLit(t("player.first"))});else note("");});}
 function doMark(m){if(!cur)return;call("focus",cur.id,function(f){if(f===undefined){dead();return;}call("mark",m||null,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});}
 function doHist(op){call(op,null,function(d){if(d===undefined){dead();return;}applyDesc(d,false);note(op==="undo"?${jsLit(t("player.undone"))}:${jsLit(t("player.redone"))});});}

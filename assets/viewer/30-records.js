@@ -358,18 +358,29 @@ function mediaSrcFor(record) {
   return record.fileUrl;
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
+// A14: matches are found in the RAW text and every piece is escaped on its
+// own — matching inside the escaped string split entities ("amp" would
+// match the "&amp;" of "&" and emit "&<mark>amp</mark>;").
 function highlightEscape(value, query) {
-  const safe = escapeHtml(value);
-  if (!query) return safe;
-  try {
-    return safe.replaceAll(new RegExp("(" + escapeRegExp(escapeHtml(query)) + ")", "gi"), "<mark>$1</mark>");
-  } catch (error) {
-    return safe;
+  const text = String(value ?? "");
+  const needle = String(query ?? "");
+  if (!needle) return escapeHtml(text);
+  const hay = text.toLowerCase();
+  const low = needle.toLowerCase();
+  // toLowerCase may change the length (e.g. "İ"): then no highlight, never a wrong one.
+  if (hay.length !== text.length || low.length !== needle.length) return escapeHtml(text);
+  let out = "";
+  let at = 0;
+  for (let hit = hay.indexOf(low); hit >= 0; hit = hay.indexOf(low, hit + low.length)) {
+    out += escapeHtml(text.slice(at, hit)) + "<mark>" + escapeHtml(text.slice(hit, hit + low.length)) + "</mark>";
+    at = hit + low.length;
   }
+  return out + escapeHtml(text.slice(at));
+}
+// A6: an Enter (or any key) that only commits an IME composition (Korean,
+// Japanese, Chinese input) is not a command.
+function imeComposing(event) {
+  return !!event && (event.isComposing === true || event.keyCode === 229);
 }
 
 function fmtBytes(value) {
@@ -523,7 +534,11 @@ function audioInfoFor(record) {
   const level = Object.prototype.hasOwnProperty.call(audioLevels, record.id) ? audioLevels[record.id] : null;
   const r = level && typeof level === "object" ? String(level.r || "") : "";
   if (r === "sound" || r === "silent") return { state: r, level, reason: "" };
-  if (hasTrack) return { state: "track", level: null, reason: r === "error" || r === "stale" ? r : audioLevelsError ? "unread" : "" };
+  // R4 D1/D2: "unverified" (the measurement log failed its chain check) and
+  // "replayed" (a checkpoint result recorded without re-measuring) are never
+  // sound/silent — the track reads 미확인 with the reason.
+  if (hasTrack) return { state: "track", level: null, reason: ["error", "stale", "unverified", "replayed"].includes(r) ? r : audioLevelsError ? "unread" : "" };
+  if (r === "unverified" || r === "replayed") return { state: "unknown", level: null, reason: r };
   if (record.probeOk === true) return { state: "none", level: null, reason: "" };
   return { state: "unknown", level: null, reason: "" };
 }
@@ -546,7 +561,7 @@ function audioTipFor(record) {
     case "sound": return tf("audio.tip.sound", { max: fmtDb(level.max, 0) });
     case "silent": return tf("audio.tip.silent", { max: fmtDb(level.max, 0) });
     case "none": return t("audio.tip.none");
-    case "track": return t(record.audioReason === "error" ? "audio.tip.trackError" : record.audioReason === "stale" ? "audio.tip.trackStale" : record.audioReason === "unread" ? "audio.tip.trackUnread" : "audio.tip.track");
+    case "track": return t(record.audioReason === "error" ? "audio.tip.trackError" : record.audioReason === "stale" ? "audio.tip.trackStale" : record.audioReason === "unread" ? "audio.tip.trackUnread" : record.audioReason === "unverified" ? "audio.tip.trackUnverified" : record.audioReason === "replayed" ? "audio.tip.trackReplayed" : "audio.tip.track");
     default: return "";
   }
 }
@@ -557,7 +572,7 @@ function audioDetailFor(record) {
     case "sound": return tf("audio.detail.sound", { max: fmtDb(level.max, 1), mean: fmtDb(level.mean, 1), codec });
     case "silent": return tf("audio.detail.silent", { max: fmtDb(level.max, 1) });
     case "none": return t("audio.detail.none");
-    case "track": return tf(record.audioReason === "error" ? "audio.detail.trackError" : record.audioReason === "stale" ? "audio.detail.trackStale" : record.audioReason === "unread" ? "audio.detail.trackUnread" : "audio.detail.track", { codec });
+    case "track": return tf(record.audioReason === "error" ? "audio.detail.trackError" : record.audioReason === "stale" ? "audio.detail.trackStale" : record.audioReason === "unread" ? "audio.detail.trackUnread" : record.audioReason === "unverified" ? "audio.detail.trackUnverified" : record.audioReason === "replayed" ? "audio.detail.trackReplayed" : "audio.detail.track", { codec });
     default: return t("audio.unknown");
   }
 }
@@ -794,6 +809,10 @@ const proxyIndexByPrefix = new Map();
 proxyFiles.forEach((path, index) => {
   const name = String(path).split(/[\\\/]/).pop() || "";
   if (!name.endsWith(".mp4")) return;
+  // R4 D5: current proxies are path-free — proxy_<sanitized id>_<hash8>(_NNN).mp4.
+  const fresh = /^proxy_(.+)_[0-9a-f]{8}(?:_\d{3})?\.mp4$/.exec(name);
+  if (fresh && !proxyIndexByPrefix.has(fresh[1])) proxyIndexByPrefix.set(fresh[1], index);
+  // Older "<sanitized id or path>_proxy_…" names keep working.
   for (let at = name.indexOf("_proxy_"); at >= 0; at = name.indexOf("_proxy_", at + 1)) {
     const prefix = name.slice(0, at);
     if (!proxyIndexByPrefix.has(prefix)) proxyIndexByPrefix.set(prefix, index);
@@ -843,7 +862,10 @@ const state = {
   // (hydrateAnnotations); the old whole-map keys are no longer written.
   marks: {},
   notes: {},
-  ranges: storageGet(RANGES_KEY, {}),
+  // IN/OUT ranges are case annotations like marks (A1/A2): the server's (or
+  // the bundle's) value + this window's per-id drafts, nothing else. The old
+  // whole-map RANGES_KEY store is migrated once (migrateLegacyRanges).
+  ranges: {},
   proxies: storageGet(PROXIES_KEY, {}),
   examiner: storageGet(EXAMINER_KEY, ""),
   tags: {},
@@ -896,9 +918,25 @@ var draftSeq = 0;
 var draftFlushTimer = null;
 var draftFlushKeys = new Set();   // ids whose storage entry must be (re)written or removed
 var draftAdoptedFrom = new Map(); // id -> the dead writer's key, removed once ours is stored
-var draftRangesDirty = false;     // RANGES_KEY joins the flush (the server seeds it on boot)
 var draftsUnpersisted = false;    // the last flush could not be stored (quota) — warn before unload
 var restoredConflictIds = [];     // adopted drafts that carry a conflict (90-sync registers them)
+// A7: a closed window's draft for an id this window also has a draft of.
+// It is neither adopted over ours nor left in storage to be re-adopted some
+// day: once our draft is confirmed it becomes a conflict (90-sync
+// settleOrphanDrafts) — or goes, when it holds exactly what was saved.
+var orphanDrafts = new Map();     // id -> { key, writer, draft }
+// A2: RANGES_KEY leftovers of a standalone (file://) page: never applied
+// over the bundle, only reported (90-sync legacy-ranges notice).
+var legacyRangesLeft = null;      // { count, ranges } | null
+// A3: records-meta could not read the case's annotations (annotations.error):
+// the viewer shows none of the server's marks, so it must never save over
+// them (90-sync: read-only banner, saves blocked).
+var annotationsError = "";
+// Ids whose mark row the server may hold (hydrated rows, rows this window
+// sent since, server values taken over). A record left with no mark, note
+// or range sends `deleted_ids` only when its id is here — a record that
+// only ever carried tags never asks the server to delete anything (A1).
+var markRowMaybe = new Set();
 // Bumped on every write of state.marks / notes / tags (touchAnnotation, a
 // replayed draft, hydration, a server value applied by 90-sync): the
 // filter memo of the mark/tag chips keys on it (40-grid filterStateKey, U7).
@@ -911,8 +949,13 @@ const ALIVE_PREFIX = "ft.alive:" + (manifest.case_id || "case") + ":";
 // heartbeat every 5 s; pagehide (a real unload, not the back/forward cache)
 // replaces it with ALIVE_CLOSED. Another writer's drafts are adopted only
 // when its page is closed, or when its heartbeat is ALIVE_STALE_MS old AND
-// it does not answer a same-origin BroadcastChannel ping (a throttled or
-// frozen live tab keeps its drafts).
+// it does not answer a same-origin BroadcastChannel ping. A throttled
+// background tab still answers and keeps its drafts; a FROZEN tab (page
+// lifecycle "frozen", discarded) runs no script, cannot answer, and IS
+// adopted — safely: the adopted draft goes out with ITS base revision, and
+// when the frozen tab resumes, its in-memory copy goes out with the same
+// old base; whichever lands second meets a moved revision and is a
+// conflict (A11), never an overwrite.
 const ALIVE_CLOSED = "closed";
 const ALIVE_RECENT_MS = 30000;
 const ALIVE_STALE_MS = 5 * 60 * 1000;
@@ -957,21 +1000,36 @@ function nextDraftSeq() {
   draftSeq += 1;
   return draftSeq;
 }
-function draftRangeOf(id) {
-  const r = state.ranges && state.ranges[id];
-  return r && (Number.isFinite(r.in) || Number.isFinite(r.out))
+function draftNormRange(r) {
+  return r && typeof r === "object" && (Number.isFinite(r.in) || Number.isFinite(r.out))
     ? { in: Number.isFinite(r.in) ? r.in : null, out: Number.isFinite(r.out) ? r.out : null }
     : null;
 }
+function draftRangeOf(id) {
+  return draftNormRange(state.ranges && state.ranges[id]);
+}
 // The annotation values a draft stores for `id` (post-mutation state).
+// Copies: a later in-place edit of state must not rewrite the draft (A14).
 function draftValuesOf(id) {
   return {
-    mark: state.marks[id] || null,
+    mark: state.marks[id] ? { ...state.marks[id] } : null,
     note: state.notes[id] || "",
-    tags: state.tags[id] || [],
+    tags: [...(state.tags[id] || [])],
     examiner: state.examiners[id] ?? null,
     range: draftRangeOf(id)
   };
+}
+// Two drafts (or a draft and an annotation in draft shape) hold the same
+// annotation: mark status, note, tags, range (A7).
+function draftSameValues(a, b) {
+  if (!a || !b) return false;
+  const norm = d => JSON.stringify([
+    d.mark && d.mark.status ? d.mark.status : null,
+    String(d.note || "").trim(),
+    [...(Array.isArray(d.tags) ? d.tags : [])].sort(),
+    draftNormRange(d.range)
+  ]);
+  return norm(a) === norm(b);
 }
 
 // Every stored draft of this case: [{ key, writer, id, draft }].
@@ -1071,7 +1129,6 @@ function flushDraftsNow(quiet) {
   } else {
     draftsUnpersisted = false;
   }
-  if (draftRangesDirty && storageSet(RANGES_KEY, state.ranges)) draftRangesDirty = false;
   if (typeof noteOriginDrafts === "function") noteOriginDrafts();
   if (!quiet && typeof renderSaveState === "function") renderSaveState();
 }
@@ -1097,7 +1154,6 @@ function touchAnnotation(id, opts) {
     state.dirtyIds.add(id);
   }
   draftFlushKeys.add(id);
-  draftRangesDirty = true;
   scheduleDraftFlush();
   markReviewDirty();
 }
@@ -1117,12 +1173,13 @@ function applyDraftValues(id, draft) {
   if (draft.mark) state.marks[id] = draft.mark;
   else delete state.marks[id];
   state.notes[id] = draft.note || "";
-  state.tags[id] = Array.isArray(draft.tags) ? draft.tags : [];
+  // A copy: the tag editors change state.tags lists (A14).
+  state.tags[id] = Array.isArray(draft.tags) ? [...draft.tags] : [];
   state.examiners[id] = draft.examiner ?? null;
   if (Object.prototype.hasOwnProperty.call(draft, "range")) {
-    if (draft.range) state.ranges[id] = { ...draft.range };
+    const range = draftNormRange(draft.range);
+    if (range) state.ranges[id] = range;
     else delete state.ranges[id];
-    draftRangesDirty = true;
   }
 }
 
@@ -1163,28 +1220,116 @@ function annotationMarkId(mark) {
 // alive (or stale but not yet pinged); the heartbeat tick re-checks them.
 var skippedDraftWriters = new Set();
 
+// The server's value of `id` in draft shape (hydrated maps, before drafts).
+function serverDraftValues(annotations, id) {
+  const mark = (annotations.marks || []).find(m => annotationMarkId(m) === id) || null;
+  const tags = (annotations.tags || []).find(entry => entry && entry.id === id);
+  return {
+    mark: mark && mark.status && mark.status !== "noted" ? { status: mark.status } : null,
+    note: mark ? mark.note || "" : "",
+    tags: tags && Array.isArray(tags.tags) ? tags.tags : [],
+    range: mark ? draftNormRange(mark.range) : null
+  };
+}
+
+// A closed (or dead) writer's draft for an id this window already holds a
+// draft of (A7). Identical → the orphan goes now. Otherwise it waits in
+// orphanDrafts and becomes a conflict once ours is confirmed (90-sync
+// settleOrphanDrafts) — it is never silently dropped and never re-adopted
+// at some later boot.
+function noteOrphanDraft(entry) {
+  const mine = state.drafts[entry.id];
+  if (mine && draftSameValues(mine, entry.draft)) {
+    try { localStorage.removeItem(entry.key); } catch (error) { /* retried next boot */ }
+    return;
+  }
+  orphanDrafts.set(entry.id, { key: entry.key, writer: entry.writer, draft: entry.draft });
+}
+
+// A2: the pre-R4 whole-map range store (RANGES_KEY) is retired. Served:
+// each stored range that differs from the server's (and has no draft of
+// its own) is moved into a per-id draft carrying a conflict — the examiner
+// picks the server's or this browser's range in the conflict list; a
+// deleted range never comes back on its own. The key goes once every
+// entry is stored. Standalone (file://): the bundle is the reference — the
+// leftovers are never applied, only reported (legacyRangesLeft).
+function migrateLegacyRanges(annotations) {
+  let raw = null;
+  try { raw = localStorage.getItem(RANGES_KEY); } catch (error) { return 0; }
+  if (raw == null) return 0;
+  let stored = null;
+  try { stored = JSON.parse(raw); } catch (error) { stored = null; }
+  const entries = Object.entries(stored && typeof stored === "object" ? stored : {})
+    .map(([id, r]) => [id, draftNormRange(r)]).filter(([, r]) => r);
+  const served = location.protocol === "http:" || location.protocol === "https:";
+  if (!served) {
+    if (entries.length) legacyRangesLeft = { count: entries.length, ranges: Object.fromEntries(entries) };
+    else { try { localStorage.removeItem(RANGES_KEY); } catch (error) { /* harmless */ } }
+    return 0;
+  }
+  let moved = 0;
+  let complete = true;
+  for (const [id, range] of entries) {
+    if (state.drafts[id] || !recordById.has(id)) continue; // a draft is newer; an unknown id has nothing to show
+    const server = serverDraftValues(annotations, id);
+    if (JSON.stringify(server.range) === JSON.stringify(range)) continue;
+    const known = Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
+    const draft = {
+      mark: state.marks[id] ? { ...state.marks[id] } : null, note: state.notes[id] || "", tags: [...(state.tags[id] || [])],
+      examiner: state.examiners[id] ?? null, range, seq: nextDraftSeq(), base: known,
+      conflict: {
+        server: {
+          status: server.mark ? server.mark.status : null, marked_unix: null, examiner: state.examiners[id] ?? null,
+          note: server.note, range: server.range, tags: [...server.tags]
+        },
+        server_revision: known, queued: false, legacy: true
+      }
+    };
+    try { localStorage.setItem(draftKey(writerId(), id), JSON.stringify(draft)); } catch (error) {
+      reportStorageError(error);
+      complete = false;
+      break;
+    }
+    state.drafts[id] = draft;
+    state.ranges[id] = range;
+    restoredConflictIds.push(id);
+    moved += 1;
+  }
+  if (complete) { try { localStorage.removeItem(RANGES_KEY); } catch (error) { /* retried next boot */ } }
+  return moved;
+}
+
 function hydrateAnnotations(annotations) {
   if (typeof bumpAnnotations === "function") bumpAnnotations();
-  state.marks = {}; state.notes = {}; state.tags = {}; state.examiners = {};
+  state.marks = {}; state.notes = {}; state.tags = {}; state.examiners = {}; state.ranges = {};
   state.revisions = {};
+  annotationsError = annotations && annotations.error ? String(annotations.error) : "";
   for (const [id, rev] of Object.entries(annotations.revisions || {})) {
     if (Number.isFinite(Number(rev))) state.revisions[id] = Number(rev);
   }
+  markRowMaybe = new Set();
   for (const mark of annotations.marks || []) {
     const id = annotationMarkId(mark);
     if (!id) continue;
+    markRowMaybe.add(id);
     if (mark.status !== "noted") state.marks[id] = { status: mark.status, marked_unix: mark.marked_unix };
     state.notes[id] = mark.note || "";
     state.examiners[id] = mark.examiner || null;
+    const range = draftNormRange(mark.range);
+    if (range) state.ranges[id] = range;
   }
-  for (const entry of annotations.tags || []) state.tags[entry.id] = entry.tags;
+  // Copies: the server's lists stay the server's (A14 — a tag edit must
+  // never rewrite DATA.annotations, the conflict list reads it).
+  for (const entry of annotations.tags || []) if (entry && entry.id) state.tags[entry.id] = Array.isArray(entry.tags) ? [...entry.tags] : [];
   state.dirtyIds = new Set();
   state.drafts = {};
   skippedDraftWriters = new Set();
   restoredConflictIds = [];
+  orphanDrafts = new Map();
+  legacyRangesLeft = null;
   migrateLegacyDrafts();
   // This window's own drafts first (a hosted destroy()+init() keeps the
-  // writer token): a closed window's draft for the same id stays stored.
+  // writer token); a closed window's draft for the same id is an orphan (A7).
   const entries = storedDraftEntries();
   const verdicts = new Map();
   const verdictOf = writer => {
@@ -1195,16 +1340,20 @@ function hydrateAnnotations(annotations) {
   for (const entry of entries) {
     const verdict = verdictOf(entry.writer);
     if (verdict === "mine") adoptDraft(entry.id, entry.draft, entry.writer, entry.key);
-    else if (verdict === "closed") { if (!state.drafts[entry.id]) adoptDraft(entry.id, entry.draft, entry.writer, entry.key); }
-    else skippedDraftWriters.add(entry.writer);
+    else if (verdict === "closed") {
+      if (!state.drafts[entry.id]) adoptDraft(entry.id, entry.draft, entry.writer, entry.key);
+      else noteOrphanDraft(entry);
+    } else skippedDraftWriters.add(entry.writer);
   }
+  migrateLegacyRanges(annotations);
   if (draftFlushKeys.size) scheduleDraftFlush();
 }
 
 // --- Dead-window detection (§10.3) -----------------------------------------
 // Same-origin windows on this case answer {type:"ping"} for their writer
 // token on BroadcastChannel ft-alive:<case>. A heartbeat can go stale in a
-// live tab (timer throttling, frozen tab, storage full); the ping tells.
+// live tab (timer throttling, storage full); the ping tells. A frozen tab
+// cannot answer (no script runs) — see ALIVE_* above for why that is safe.
 var aliveChannel = null;
 var alivePings = new Map(); // nonce -> Set of writers that answered
 function openAliveChannel() {
@@ -1265,7 +1414,8 @@ function adoptDeadWriters(dead) {
   let adopted = 0;
   const adoptedIds = [];
   for (const entry of storedDraftEntries()) {
-    if (!gone.has(entry.writer) || state.drafts[entry.id]) continue;
+    if (!gone.has(entry.writer)) continue;
+    if (state.drafts[entry.id]) { noteOrphanDraft(entry); continue; }
     adoptDraft(entry.id, entry.draft, entry.writer, entry.key);
     adoptedIds.push(entry.id);
     adopted += 1;

@@ -90,6 +90,13 @@ function writeRaw(path, mib) {
     writeSync(fd, i % 3 === 0 ? noise : zero);
   }
   closeSync(fd);
+  // R4 C1: a raw image is carved only with its completion marker (size +
+  // modification time in ns — written as the exact BigInt digits, > 2^53).
+  const st = statSync(path, { bigint: true });
+  writeFileSync(path + '.done.json', JSON.stringify({
+    schema_version: 1, kind: 'frametrace-e01-raw-complete', raw_path: path, size_bytes: Number(st.size),
+    modified_nanos: '@NANOS@', sha256: '0'.repeat(64), e01_path: join(dirname(path), 'synthetic.E01'), imported_unix: 1,
+  }).replace('"@NANOS@"', st.mtimeNs.toString()));
 }
 
 const server = await startIsolatedServer({ root, work });

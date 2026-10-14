@@ -1,63 +1,130 @@
-// FOR-01 regression check: IN/OUT ranges persist server-side and a
-// server/browser divergence is surfaced with an explicit choice.
+// IN/OUT ranges as first-class annotations of save protocol v2 (FOR-01,
+// docs/PLAN_R4_2026-10-14.md A1/A2).
 //
 //   node scripts/verify-range-sync.mjs
+//   FT_ASSETS_ROOT=<other checkout> node scripts/verify-range-sync.mjs   (run against other assets)
 //
-// Builds a standalone viewer page from assets/ (same bundling as build.rs),
-// serves it from a mock case server that stores what /api/import-marks
-// receives and returns it as annotations on the next page load.
-import { readFileSync, readdirSync } from 'node:fs';
+// Builds a standalone viewer page from assets/ (same bundling as build.rs)
+// and serves it from a mock case server that implements the patch-v2 rules
+// of src/case_db/marks.rs: per-id revisions, a stale base is a conflict
+// (unless the patch changes nothing), `deleted_ids` removes the mark row
+// (status, note AND range), an absent range keeps the stored one and
+// {in:null,out:null} clears it. Every step awaits a DOM / save-state
+// condition — no fixed sleeps.
+//
+//  ① i/o → the range rides in the payload, lands on the server, "saved"
+//  ② the old whole-map RANGES_KEY equal to the server: dropped, no conflict
+//  ③ RANGES_KEY different from the server → an ordinary conflict (the
+//    conflict list, tagged as this browser's earlier range), "pending";
+//    i/o, a tag and a cleared mark meanwhile send NOTHING for that id and
+//    never show "saved"; the server keeps its range, tags, mark
+//  ④ [서버 값 사용] → the server's range shown, saved, RANGES_KEY gone
+//  ⑤ [내 값으로 덮어쓰기] → the browser's range reaches the server
+//  ⑥ a fresh browser: the server's ranges show (hydrated like marks); a tag
+//    and a cleared mark keep the stored range (explicit range, no
+//    deleted_ids for a record that still has one)
+//  ⑦ a range another window deleted does not come back from an old
+//    RANGES_KEY: it is a conflict, the server stays empty until chosen
+//  ⑧ standalone file:// page: an old package's RANGES_KEY never wins over
+//    the new bundle — the bundle's range shows, the leftovers are only
+//    reported (#legacyRangesNotice) and kept until discarded
+// Save-state recovery (same mock):
+//  ⑨ A3 records-meta `annotations.error` → read-only banner, state
+//    "readonly", an edit sends nothing, summary / CSV disabled
+//  ⑩ A4 a reload while the server queue holds marks: the queued values
+//    (GET /api/marks-pending, R4 B6) show, state "queued", leaving warns;
+//    once the queue drains the indicator turns "saved". A server without
+//    the route still shows "queued" (never "saved")
+//  ⑪ A5 the queue conflicts cannot be read (both routes fail) → "unknown",
+//    never "saved"; the lookup retries and, once readable, reads EVERY page
+//    of GET /api/mark-conflicts?offset&limit (R4 B3)
+//  ⑫ A9 attributeUnassignedMarks resolves only after its save landed, and
+//    rejects (no success to report) when the save met a conflict
+import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
-import { viewerPageHtml } from './lib/app-bundle.mjs';
+import { viewerPageHtml, viewerBundleJs } from './lib/app-bundle.mjs';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const require = createRequire(import.meta.url);
-const { chromium } = require('playwright');
+const here = join(dirname(fileURLToPath(import.meta.url)), '..');
+const root = process.env.FT_ASSETS_ROOT || here;
+const require = createRequire(join(here, 'package.json'));
+let chromium;
+try { ({ chromium } = require('playwright')); } catch {
+  console.error('playwright not resolvable — set NODE_PATH to a node_modules with playwright');
+  process.exit(2);
+}
 
 const CASE = 'FT-RANGE';
 const RANGES_KEY = `ft.viewer.${CASE}.ranges`;
+const IDS = ['vid_a', 'vid_b', 'vid_c'];
 
-function viewerJs() {
-  const dir = join(root, 'assets/viewer');
-  let js = '';
-  for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
-    js += readFileSync(join(dir, part), 'utf8');
-    if (!js.endsWith('\n')) js += '\n';
-  }
-  return js;
-}
-
-// Server-side state: id -> { status, range }
-const serverMarks = new Map();
+// ---- mock workstation (patch-v2 rules) ----------------------------------
+// id -> { status, note, examiner, range, tags, rev }
+const rows = new Map();
 const imports = [];
-
+// Server switches for ⑨–⑪.
+const mock = { annError: null, pending: 0, pendingRoute: true, pendingItems: [], conflicts: [], conflictsFail: false, metaFail: false, pageCap: 2, conflictPages: [] };
+const row = (id) => rows.get(id) || { status: null, note: '', examiner: null, range: null, tags: [], rev: 0 };
+const valueOf = (r) => JSON.stringify([r.status, r.note || '', r.examiner || null, r.range || null, [...(r.tags || [])]]);
+function apply(body) {
+  const v2 = body.protocol === 'patch-v2';
+  const marks = new Map((body.marks || []).map((m) => [m.id, m]));
+  const tags = new Map((body.tags || []).map((t) => [t.id, t.tags]));
+  for (const m of body.marks || []) if (v2 && Array.isArray(m.tags)) tags.set(m.id, m.tags);
+  const deleted = new Set(body.deleted_ids || []);
+  const ids = new Set([...marks.keys(), ...tags.keys(), ...deleted]);
+  const applied = {};
+  const conflicts = [];
+  for (const id of ids) {
+    const cur = row(id);
+    const next = { ...cur, tags: [...cur.tags] };
+    if (deleted.has(id)) Object.assign(next, { status: null, note: '', range: null, examiner: null });
+    if (tags.has(id)) next.tags = [...tags.get(id)];
+    const m = marks.get(id);
+    if (m) {
+      next.status = m.status === 'noted' ? 'noted' : m.status;
+      if (typeof m.note === 'string') next.note = m.note;
+      if (m.examiner) next.examiner = m.examiner;
+      if (m.range && typeof m.range === 'object') next.range = m.range.in == null && m.range.out == null ? null : { in: m.range.in ?? null, out: m.range.out ?? null };
+    }
+    const changed = valueOf(next) !== valueOf(cur);
+    if (v2) {
+      const base = Number((body.base_revisions || {})[id]) || 0;
+      const forced = mock.forceConflict && mock.forceConflict.has(id);
+      if ((base !== cur.rev && changed) || forced) {
+        conflicts.push({ id, server_revision: cur.rev, server: cur.status || cur.tags.length || cur.range ? { status: cur.status, note: cur.note, examiner: cur.examiner, range: cur.range, tags: cur.tags } : null });
+        continue;
+      }
+    }
+    if (changed) { next.rev = cur.rev + 1; rows.set(id, next); }
+    applied[id] = changed ? next.rev : cur.rev;
+  }
+  return { ok: true, protocol: 'patch-v2', applied, conflicts };
+}
+function annotations() {
+  if (mock.annError) return { marks: [], tags: [], revisions: {}, error: mock.annError };
+  const marks = [];
+  const tags = [];
+  const revisions = {};
+  for (const [id, r] of rows) {
+    revisions[id] = r.rev;
+    if (r.status || r.note || r.range) marks.push({ record_id: id, status: r.status || 'noted', marked_unix: 1, note: r.note, examiner: r.examiner, ...(r.range ? { range: r.range } : {}) });
+    if (r.tags.length) tags.push({ id, tags: r.tags });
+  }
+  return { marks, tags, revisions };
+}
 function buildHtml() {
-  const videos = ['a', 'b'].map((n) => ({
-    id: `vid_${n}`, relative_path: `DCIM/${n}.mp4`, source_path: `/case/DCIM/${n}.mp4`,
-    ffprobe_ok: true, size_bytes: 1000, extension: 'mp4',
-  }));
-  const marks = [...serverMarks.entries()].map(([id, m]) => ({
-    id, status: m.status, marked_unix: 1, note: '', examiner: null,
-    ...(m.range ? { range: m.range } : {}),
-  }));
+  const videos = IDS.map((id, i) => ({ id, relative_path: `DCIM/${i}.mp4`, source_path: `/case/DCIM/${i}.mp4`, ffprobe_ok: true, size_bytes: 1000, extension: 'mp4' }));
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
     manifest: { case_id: CASE, title: 'range' }, caseDir: '/case', scan: { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
-    thumbs: {}, annotations: { marks, tags: [] }, deepfake: {}, telemetry: {}, proxies: [],
+    thumbs: {}, annotations: annotations(), deepfake: {}, telemetry: {}, proxies: [],
   })};`;
-  // Standalone page exactly as build.rs assembles it (shared fragment included).
-  return viewerPageHtml({ data, js: viewerJs(), root });
+  return viewerPageHtml({ data, js: viewerBundleJs(root), root });
 }
-
-const results = [];
-const check = (name, ok, detail = '') => {
-  results.push(ok);
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
-};
-
 const server = createServer((req, res) => {
   if (req.url === '/api/import-marks') {
     let body = '';
@@ -65,121 +132,317 @@ const server = createServer((req, res) => {
     req.on('end', () => {
       const payload = JSON.parse(JSON.parse(body).marks_json);
       imports.push(payload);
-      for (const id of payload.deleted_ids || []) serverMarks.delete(id);
-      for (const m of payload.marks) {
-        const prev = serverMarks.get(m.id) || {};
-        // Mirrors patch_review_annotations: absent range keeps, {null,null} clears.
-        let range = prev.range;
-        if (m.range !== undefined && m.range !== null) {
-          range = m.range.in == null && m.range.out == null ? undefined : m.range;
-        }
-        serverMarks.set(m.id, { status: m.status, range });
+      if (mock.busyReplies > 0) {
+        // R4 B4: briefly busy outside enrichment — nothing queued, retry.
+        mock.busyReplies -= 1;
+        res.statusCode = 503;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: false, busy: true, retry: true, retry_after_ms: 300, error: '다른 작업이 진행 중입니다' }));
+        return;
       }
       res.setHeader('Content-Type', 'application/json');
-      res.end('{"ok":true}');
+      res.end(JSON.stringify(apply(payload)));
     });
     return;
   }
+  const json = (code, body) => { res.statusCode = code; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(body)); };
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname === '/api/status') {
+    return json(200, { ok: true, pending_marks: mock.pending, mark_conflicts: { count: mock.conflicts.length, ids: mock.conflicts.map((c) => c.id) } });
+  }
+  if (url.pathname === '/api/records-meta') {
+    if (mock.metaFail) return json(500, { ok: false, error: 'meta down' });
+    return json(200, { ok: true, annotations: annotations() });
+  }
+  if (url.pathname === '/api/marks-pending') {
+    if (!mock.pendingRoute) return json(404, { ok: false, error: 'not found' });
+    const offset = Number(url.searchParams.get('offset')) || 0;
+    // Shape of the real route (docs/PLAN_R4 §B4 as implemented): count, next_offset (null at the end), entries.
+    const end = offset + mock.pageCap;
+    return json(200, { ok: true, count: mock.pendingItems.length, offset, limit: 500, next_offset: end < mock.pendingItems.length ? end : null, entries: mock.pendingItems.slice(offset, end) });
+  }
+  if (url.pathname === '/api/mark-conflicts') {
+    if (mock.conflictsFail) return json(500, { ok: false, error: 'down' });
+    const offset = Number(url.searchParams.get('offset')) || 0;
+    const limit = Number(url.searchParams.get('limit')) || 500;
+    mock.conflictPages.push([offset, limit]);
+    // The server caps a page (mock: 2) below the asked limit: the client pages on.
+    const cEnd = offset + Math.min(limit, mock.pageCap);
+    return json(200, { ok: true, count: mock.conflicts.length, offset, limit, next_offset: cEnd < mock.conflicts.length ? cEnd : null, conflicts: mock.conflicts.slice(offset, cEnd) });
+  }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  if (url.pathname === '/blank') { res.end('<!doctype html><title>blank</title>'); return; }
   res.end(buildHtml());
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
+
+let failed = 0;
+const check = (name, ok, detail = '') => {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + String(detail).slice(0, 300) : ''}`);
+  if (!ok) failed += 1;
+};
+
 const browser = await chromium.launch();
-
-async function open(page, lsRanges) {
-  await page.goto(base);
-  await page.evaluate(({ key, value }) => {
-    try {
-      localStorage.clear();
-      if (value) localStorage.setItem(key, JSON.stringify(value));
-    } catch {}
-  }, { key: RANGES_KEY, value: lsRanges });
-  await page.reload();
-  await page.waitForSelector('.card');
-}
-const waitSaved = (page) => page.waitForFunction(
-  () => document.getElementById('saveState').dataset.state === 'saved', null, { timeout: 8000 });
-
+const work = mkdtempSync(join(tmpdir(), 'ft-range-sync-'));
 try {
-  const page = await browser.newPage();
+  const ctx = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+  const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
+  // Loads the page with exactly `ls` in localStorage (null = nothing).
+  async function open(ls) {
+    // Storage is set on a blank page of the same origin: a viewer page would
+    // flush its drafts back on pagehide, after the clear.
+    await page.goto(base + 'blank');
+    await page.evaluate((entries) => {
+      localStorage.clear();
+      for (const [k, v] of Object.entries(entries || {})) localStorage.setItem(k, JSON.stringify(v));
+    }, ls);
+    await page.goto(base);
+    await page.waitForSelector('#recordGrid .card');
+  }
+  const state = () => page.evaluate(() => FTViewer.saveState());
+  const waitState = (want, ms = 10000) => page.waitForFunction((w) => FTViewer.saveState() === w, want, { timeout: ms })
+    .catch(async (err) => { throw new Error(`waiting for "${want}", state is "${await state().catch(() => '?')}" (${await page.evaluate(() => document.getElementById('saveState').title).catch(() => '')}): ${err.message.split('\n')[0]}`); });
+  const select = async (id) => {
+    await page.click(`#recordGrid .card[data-id="${id}"]`);
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.waitForSelector('#mediaStage video', { state: 'attached' });
+  };
+  const setPoint = async (which, t) => {
+    await page.evaluate((v) => {
+      const video = document.querySelector('#mediaStage video');
+      Object.defineProperty(video, 'currentTime', { get: () => v, configurable: true });
+    }, t);
+    await page.evaluate((w) => document.getElementById(w === 'in' ? 'btnSetIn' : 'btnSetOut').click(), which);
+  };
+  const addTag = async (tag) => {
+    await page.evaluate(() => document.getElementById('btnTagMenu').click());
+    await page.click(`#tagMenuList [data-tag="${tag}"]`);
+    await page.keyboard.press('Escape');
+  };
+  const saveNow = () => page.evaluate(() => document.getElementById('saveState').click());
+  const sentFor = (id) => imports.flatMap((b) => [...(b.marks || []).filter((m) => m.id === id), ...(b.deleted_ids || []).filter((d) => d === id).map(() => ({ deleted: true }))]);
+  const conflictItem = (id) => page.evaluate((i) => {
+    if (!document.getElementById('markConflictPanel') || document.getElementById('markConflictPanel').hidden) document.getElementById('markConflictList')?.click();
+    return document.querySelector(`#markConflictPanel [data-id="${CSS.escape(i)}"]`)?.innerText || '';
+  }, id);
+  const [A, B, C] = IDS;
 
-  // (1) Set IN/OUT: the range rides in the payload and lands on the server.
-  await open(page, null);
-  await page.locator('.card').first().click();
-  const id = await page.locator('.card').first().getAttribute('data-id');
+  // ① i/o → payload → server → saved.
+  await open(null);
+  await select(A);
+  await setPoint('in', 12.5);
+  await setPoint('out', 20);
+  await saveNow();
+  await waitState('saved');
+  const sent = imports.at(-1)?.marks.find((m) => m.id === A);
+  check('① payload carries range {in,out}', sent?.range?.in === 12.5 && sent?.range?.out === 20, JSON.stringify(sent));
+  check('① server stored the range', row(A).range?.out === 20, JSON.stringify(row(A)));
+
+  // ② An old RANGES_KEY that matches the server: no conflict, key dropped.
+  await open({ [RANGES_KEY]: { [A]: { in: 12.5, out: 20 } } });
+  await waitState('saved');
+  check('② equal old RANGES_KEY: no conflict, saved, key removed', (await page.locator('#markConflictBanner').count()) === 0 &&
+    await page.evaluate((k) => localStorage.getItem(k) === null, RANGES_KEY));
+  check('② no separate range banner any more', (await page.locator('#rangeDivergenceBanner').count()) === 0);
+
+  // ③ An old RANGES_KEY that differs: an ordinary conflict, and edits of
+  // that id meanwhile never reach the server nor read as "saved".
   await page.evaluate(() => { document.activeElement?.blur(); });
-  await page.waitForSelector('#mediaStage video', { state: 'attached' });
-  await page.evaluate(() => {
-    const video = document.querySelector('#mediaStage video');
-    Object.defineProperty(video, 'currentTime', { get: () => window.__t, configurable: true });
-    window.__t = 12.5;
-  });
-  await page.evaluate(() => document.getElementById('btnSetIn').click());
-  await page.evaluate(() => { window.__t = 20; });
-  await page.evaluate(() => document.getElementById('btnSetOut').click());
-  await page.locator('#saveState').click();
-  await waitSaved(page);
-  const last = imports.at(-1);
-  const sent = last?.marks.find((m) => m.id === id);
-  check('payload carries range {in,out}', sent?.range?.in === 12.5 && sent?.range?.out === 20, JSON.stringify(sent));
-  check('server stored the range', serverMarks.get(id)?.range?.out === 20);
-
-  // (2) Same ranges in the browser -> no banner.
-  await open(page, { [id]: { in: 12.5, out: 20 } });
-  check('no banner when server and browser agree', (await page.locator('#rangeDivergenceBanner').count()) === 0);
-
-  // (3) Different browser range -> banner; routine edit must not overwrite.
-  await open(page, { [id]: { in: 3, out: 4 } });
-  const banner = page.locator('#rangeDivergenceBanner');
-  check('divergence banner shown', (await banner.count()) === 1, await banner.innerText().catch(() => ''));
-  check('banner wording', /서버와 다른 1건/.test(await banner.innerText()) && /서버 기준/.test(await banner.innerText()) && /브라우저 기준/.test(await banner.innerText()));
+  rows.set(A, { ...row(A), status: 'important', tags: ['현장'] });
+  rows.get(A).rev += 1;
+  await open({ [RANGES_KEY]: { [A]: { in: 3, out: 4 } } });
+  await page.waitForSelector('#markConflictBanner', { timeout: 10000 });
+  const item = await conflictItem(A);
+  check('③ differing old range → the conflict list (server 12.5~20 vs mine 3~4, tagged)', /12\.5s ~ 20\.0s/.test(item) && /3\.0s ~ 4\.0s/.test(item) && /이전 구간/.test(item), item.replace(/\s+/g, ' '));
+  check('③ save state pending (never saved) while the conflict is open', await state() === 'pending');
   imports.length = 0;
-  await page.locator('.card').first().click();
+  const revBefore = row(A).rev;
+  await select(A);
+  await setPoint('out', 9);
+  await setPoint('in', 5);
+  await addTag('사고');
   await page.evaluate(() => document.activeElement?.blur());
-  await page.keyboard.press('1');
-  await page.locator('#saveState').click();
-  await waitSaved(page);
-  const during = imports.at(-1)?.marks.find((m) => m.id === id);
-  check('unresolved conflict never sends a range', during && !('range' in during), JSON.stringify(during));
-  check('server range untouched while unresolved', serverMarks.get(id)?.range?.out === 20);
+  await page.keyboard.press('0'); // clear the mark of the active record
+  await saveNow();
+  await page.waitForFunction(() => FTViewer.saveState() !== 'saving');
+  check('③ i/o, a tag and a cleared mark on the conflicted id: nothing sent for it', sentFor(A).length === 0, JSON.stringify(imports).slice(0, 300));
+  check('③ still pending, never "saved"', await state() === 'pending' && await page.evaluate(() => FTViewer.summary().pending) >= 1, await state());
+  check('③ server kept its range, mark and tags', row(A).range?.in === 12.5 && row(A).status === 'important' && JSON.stringify(row(A).tags) === '["현장"]' && row(A).rev === revBefore, JSON.stringify(row(A)));
+  const mine3 = await conflictItem(A);
+  check('③ the conflict\'s "mine" follows the new edit (5~9)', /5\.0s ~ 9\.0s/.test(mine3), mine3.replace(/\s+/g, ' '));
 
-  // (4) Choose server: browser adopts server range, nothing is pushed.
-  await page.locator('#rangeUseServer').click();
-  const afterServer = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)), RANGES_KEY);
-  check('"서버 기준" adopts server range', afterServer?.[id]?.in === 12.5 && afterServer?.[id]?.out === 20, JSON.stringify(afterServer));
-  check('banner dismissed', (await banner.count()) === 0);
+  // ④ [서버 값 사용]: the server's range, saved, the old key gone.
+  await page.click('#markConflictUseServer');
+  await page.waitForFunction(() => !document.getElementById('markConflictBanner'));
+  await waitState('saved');
+  await select(A);
+  check('④ [서버 값 사용]: server range shown, server unchanged, old key gone',
+    /12\.5s/.test(await page.locator('#rangeLabel').innerText()) && row(A).range?.in === 12.5 && row(A).rev === revBefore &&
+    await page.evaluate((k) => localStorage.getItem(k) === null, RANGES_KEY), await page.locator('#rangeLabel').innerText());
 
-  // (5) Choose browser: browser range is pushed to the server.
-  await open(page, { [id]: { in: 3, out: 4 } });
+  // ⑤ [내 값으로 덮어쓰기]: the browser's range reaches the server.
+  await open({ [RANGES_KEY]: { [A]: { in: 3, out: 4 } } });
+  await page.waitForSelector('#markConflictBanner', { timeout: 10000 });
   imports.length = 0;
-  await page.locator('#rangeUseBrowser').click();
-  await page.locator('#saveState').click();
-  await waitSaved(page);
-  const pushed = imports.at(-1)?.marks.find((m) => m.id === id);
-  check('"브라우저 기준" pushes browser range', pushed?.range?.in === 3 && pushed?.range?.out === 4, JSON.stringify(pushed));
-  check('server now has browser range', serverMarks.get(id)?.range?.in === 3);
+  await page.click('#markConflictUseMine');
+  await page.waitForFunction(() => !document.getElementById('markConflictBanner'));
+  await waitState('saved');
+  const pushed = sentFor(A).at(-1);
+  check('⑤ [내 값으로 덮어쓰기] pushes the browser range', pushed?.range?.in === 3 && pushed?.range?.out === 4 && row(A).range?.in === 3, JSON.stringify(pushed));
 
-  // (6) Fresh browser (no local ranges): server ranges are seeded, no banner,
-  // and a routine save never clears them.
-  await open(page, null);
-  check('no banner when browser merely lacks a range', (await page.locator('#rangeDivergenceBanner').count()) === 0);
-  const seeded = await page.evaluate((key) => JSON.parse(localStorage.getItem(key) || '{}'), RANGES_KEY);
-  check('server range seeded into browser', seeded?.[id]?.in === 3 && seeded?.[id]?.out === 4, JSON.stringify(seeded));
+  // ⑥ Fresh browser: ranges hydrate from the server; a tag and a cleared
+  // mark keep the stored range (no deleted_ids while it has one).
+  rows.set(B, { status: 'reviewed', note: '', examiner: null, range: { in: 7, out: 8 }, tags: [], rev: 1 });
+  await open(null);
+  await select(B);
+  check('⑥ fresh browser shows the server range (hydrated like marks)', /7\.0s ~ 8\.0s/.test(await page.locator('#rangeLabel').innerText()), await page.locator('#rangeLabel').innerText());
   imports.length = 0;
-  await page.locator('.card').first().click();
+  await addTag('현장');
   await page.evaluate(() => document.activeElement?.blur());
+  await page.keyboard.press('0');
+  await saveNow();
+  await waitState('saved');
+  const bSent = sentFor(B);
+  check('⑥ tag + cleared mark: explicit range sent, never deleted_ids', bSent.length > 0 && bSent.every((m) => !m.deleted && m.range?.in === 7), JSON.stringify(bSent));
+  check('⑥ server kept the range (mark cleared, tag added)', row(B).range?.in === 7 && row(B).status === 'noted' && row(B).tags.includes('현장'), JSON.stringify(row(B)));
+
+  // ⑦ Another window deleted C's range; an old RANGES_KEY still has it.
+  rows.set(C, { status: 'reviewed', note: '', examiner: null, range: null, tags: [], rev: 4 });
+  imports.length = 0;
+  await open({ [RANGES_KEY]: { [C]: { in: 1, out: 2 } } });
+  await page.waitForSelector('#markConflictBanner', { timeout: 10000 });
+  await page.waitForFunction(() => FTViewer.saveState() === 'pending');
+  await conflictItem(C); // opens the list
+  const vals7 = await page.evaluate((i) => [...document.querySelectorAll(`#markConflictPanel [data-id="${CSS.escape(i)}"] dd`)].map((d) => d.textContent), C);
+  check('⑦ a range deleted elsewhere is not resurrected: conflict (server: no range, mine: 1~2), server still empty, nothing sent',
+    row(C).range === null && sentFor(C).length === 0 && vals7.length === 2 && !/1\.0s/.test(vals7[0]) && /1\.0s ~ 2\.0s/.test(vals7[1]), JSON.stringify(vals7));
+  await page.click('#markConflictUseServer');
+  await waitState('saved');
+  check('⑦ [서버 값 사용] keeps it deleted', row(C).range === null && !(await page.evaluate(() => document.getElementById('rangeLabel').textContent)).includes('1.0s'));
+
+  // ⑧ file:// standalone page: the bundle wins over an old package's leftovers.
+  rows.set(A, { status: 'reviewed', note: '', examiner: null, range: { in: 30, out: 31 }, tags: [], rev: 9 });
+  const file = join(work, 'evidence-viewer.html');
+  writeFileSync(file, buildHtml());
+  const fpage = await ctx.newPage();
+  fpage.on('pageerror', (e) => errors.push('file: ' + String(e)));
+  await fpage.goto(pathToFileURL(file).href);
+  await fpage.evaluate((k) => { localStorage.clear(); localStorage.setItem(k, JSON.stringify({ vid_a: { in: 1, out: 2 } })); }, RANGES_KEY);
+  await fpage.reload();
+  await fpage.waitForSelector('#recordGrid .card');
+  await fpage.click(`#recordGrid .card[data-id="${A}"]`);
+  await fpage.waitForFunction(() => /\d/.test(document.getElementById('rangeLabel').textContent));
+  const fLabel = await fpage.locator('#rangeLabel').innerText();
+  check('⑧ file://: the new bundle\'s range shows, not the leftover', /30\.0s ~ 31\.0s/.test(fLabel), fLabel);
+  const note = fpage.locator('#legacyRangesNotice');
+  check('⑧ file://: the leftover is reported ("이 브라우저의 이전 편집"), kept until discarded',
+    (await note.count()) === 1 && /이전 편집/.test(await note.innerText()) && await fpage.evaluate((k) => localStorage.getItem(k) !== null, RANGES_KEY), await note.innerText().catch(() => ''));
+  await fpage.click('#legacyRangesDrop');
+  check('⑧ [이전 편집 지우기] removes it', (await note.count()) === 0 && await fpage.evaluate((k) => localStorage.getItem(k) === null, RANGES_KEY));
+
+  await fpage.close();
+  const chipOf = (id) => page.evaluate((i) => document.querySelector(`#recordGrid .card[data-id="${CSS.escape(i)}"] .mark-chip`)?.className || '', id);
+
+  // ⑨ A3: the annotations could not be read.
+  mock.annError = 'database is locked';
+  imports.length = 0;
+  await open(null);
+  await page.waitForSelector('#annotationsErrorBanner');
+  check('⑨ read-only banner (role=alert, "판독 기록을 읽지 못했습니다"), state "readonly"',
+    /판독 기록을 읽지 못했습니다/.test(await page.locator('#annotationsErrorBanner').innerText()) &&
+    await page.locator('#annotationsErrorBanner').getAttribute('role') === 'alert' && await state() === 'readonly', await state());
+  await select(B);
   await page.keyboard.press('2');
-  await page.locator('#saveState').click();
-  await waitSaved(page);
-  const kept = imports.at(-1)?.marks.find((m) => m.id === id);
-  check('save after seeding keeps server range', serverMarks.get(id)?.range?.in === 3 && kept?.range?.in === 3, JSON.stringify(kept));
+  await saveNow();
+  await page.waitForFunction(() => FTViewer.saveState() === 'readonly');
+  check('⑨ an edit is never sent, the state stays "readonly", save() resolves false',
+    imports.length === 0 && await page.evaluate(() => FTViewer.save()) === false && await state() === 'readonly');
+  check('⑨ summary report / CSV disabled', await page.evaluate(() => ['btnSummary', 'btnDownloadCsv'].every((id) => document.getElementById(id).disabled)));
+  mock.annError = null;
+
+  // ⑩ A4: marks in the server's queue across a reload.
+  rows.delete(C);
+  mock.pending = 1;
+  mock.pendingItems = [{ id: C, mark: { id: C, status: 'important', note: 'queued note', marked_unix: 5 }, tags: ['현장'], deleted: false, base_revision: 0, client_id: 'w-before-reload' }];
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 10000 });
+  check('⑩ after a reload the queued value shows (important) and the state is "queued"', /important/.test(await chipOf(C)) && await state() === 'queued', await chipOf(C));
+  const warns = await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented; });
+  check('⑩ leaving the page warns while the server queue holds marks', warns === true);
+  check('⑩ FTViewer.save() is true (the queue is durable), the indicator is not "saved"', await page.evaluate(() => FTViewer.save()) === true && await state() === 'queued');
+  // The queue drains: the value lands in the case DB.
+  rows.set(C, { status: 'important', note: 'queued note', examiner: null, range: null, tags: ['현장'], rev: 1 });
+  mock.pending = 0;
+  await waitState('saved', 15000);
+  check('⑩ queue drained → "saved", the value stays', /important/.test(await chipOf(C)));
+  mock.pending = 1;
+  mock.pendingRoute = false;
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 10000 });
+  check('⑩ a server without /api/marks-pending: still "queued", never "saved"', await state() === 'queued');
+  mock.pending = 0;
+  mock.pendingRoute = true;
+  await waitState('saved', 15000);
+
+  // ⑪ A5: the server's queue conflicts cannot be read.
+  mock.conflicts = [A, B, C].map((id) => ({ id, server_revision: row(id).rev, server: { status: 'reviewed', note: 'srv', tags: [] }, queued: { mark: { id, status: 'important', note: 'q' }, tags: null, deleted: false } }));
+  mock.conflictsFail = true;
+  mock.metaFail = true;
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'unknown', null, { timeout: 10000 });
+  check('⑪ conflicts unreadable (both routes fail) → "unknown" ("충돌 확인 실패"), never "saved"',
+    /충돌 확인 실패/.test(await page.locator('#saveState').innerText()) && await page.evaluate(() => FTViewer.save()) === false);
+  mock.conflictsFail = false;
+  mock.metaFail = false;
+  mock.conflictPages = [];
+  await page.waitForSelector('#markConflictBanner', { timeout: 15000 }); // the backoff retry (2 s)
+  await page.waitForFunction(() => FTViewer.saveState() === 'pending');
+  check('⑪ the retry reads every page (server caps at 2 of 3): all 3 conflicts listed', /3/.test(await page.locator('#markConflictBanner .conflict-msg').innerText()) &&
+    mock.conflictPages.length >= 2 && mock.conflictPages[1][0] === 2, JSON.stringify(mock.conflictPages));
+  mock.conflicts = [];
+
+  // ⑫ A9: "현재 이름으로 귀속" reports success only after the save came
+  // back — and never when it ran into a conflict.
+  for (const id of IDS) rows.set(id, { status: 'important', note: '', examiner: null, range: null, tags: [], rev: 3 });
+  await open(null);
+  await waitState('saved');
+  mock.forceConflict = new Set([C]);
+  imports.length = 0;
+  const a9fail = await page.evaluate(() => FTViewer.attributeUnassignedMarks('검사관').then((n) => ({ ok: true, n }), (e) => ({ ok: false, err: String(e && e.message) })));
+  check('⑫ a conflicted attribution rejects (no success to report)', a9fail.ok === false && /충돌/.test(a9fail.err) && imports.length >= 1, JSON.stringify(a9fail));
+  mock.forceConflict = null;
+  await page.click('#markConflictUseMine');
+  await waitState('saved');
+  for (const id of IDS) rows.set(id, { ...row(id), examiner: null, rev: row(id).rev + 1 });
+  await open(null);
+  await waitState('saved');
+  imports.length = 0;
+  const a9ok = await page.evaluate(() => FTViewer.attributeUnassignedMarks('검사관2').then((n) => ({ ok: true, n, state: FTViewer.saveState() }), (e) => ({ ok: false, err: String(e && e.message) })));
+  check('⑫ attribution resolves with the count only after the save landed', a9ok.ok === true && a9ok.n === 3 && imports.length >= 1 && IDS.every((id) => row(id).examiner === '검사관2'), JSON.stringify(a9ok));
+
+  // ⑬ R4 B4: a "busy, retry" reply is transient — never "saved", never
+  // "failed", retried after retry_after_ms until it lands.
+  mock.busyReplies = 2;
+  imports.length = 0;
+  const seen13 = [];
+  await page.evaluate(() => { window.__ss13 = []; FTViewer.on('save-state', (e) => window.__ss13.push(e.detail.state)); });
+  await select(A);
+  await page.keyboard.press('3');
+  await saveNow();
+  await waitState('saved', 15000);
+  seen13.push(...await page.evaluate(() => window.__ss13));
+  check('⑬ busy/retry replies: retried until saved, never shown as failed', imports.length >= 3 && !seen13.includes('failed') && row(A).status === 'needs_verification', `${imports.length} posts, states ${seen13.join(',')}`);
 
   check('no page errors', !errors.length, errors.join(' | '));
+} catch (err) {
+  check('harness ran to the end', false, err && err.stack || String(err));
 } finally {
   await browser.close();
   server.close();
+  rmSync(work, { recursive: true, force: true });
 }
-if (results.some((ok) => !ok) || !results.length) process.exit(1);
+console.log(failed ? `verify-range-sync: ${failed} failed` : 'verify-range-sync: all checks passed');
+process.exit(failed ? 1 : 0);

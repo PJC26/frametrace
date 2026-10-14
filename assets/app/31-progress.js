@@ -52,7 +52,7 @@ function pipelineView(S) {
   const steps = p.steps || [];
   const labels = p.stepNames && p.stepNames.length === 5 ? p.stepNames : STEP_NAMES;
   const runIdx = steps.indexOf("running");
-  const doneN = steps.filter(s => s === "done").length;
+  const doneN = steps.filter(s => s === "done" || s === "partial").length; // R4 B16: "partial" finished (with a warning)
   const stepNo = Math.min(labels.length, (runIdx >= 0 ? runIdx : doneN) + 1);
   const err = String(p.error || "");
   let state = "idle";

@@ -194,7 +194,7 @@ K=유지, R=개명(구→신), X=삭제. "하네스" = 바꿔야 하는 스크�
 
 ### 2.3 뷰어 id — 전부 K (T5)
 
-`btnExitFs caseLine linkCarveReport btnTheme btnLang btnRail query kind status btnMoreFilters filtersExtra btnDensityComfortable btnDensityCompact sortBy groupBy btnGroupKind tagFilter pageSize dateFrom dateTo btnClearDates pillVerified metricVerified pillFailed metricFailed pillCandidate metricCarved pillAnomaly metricAnomaly btnViewMenu viewMenuList btnTheater btnFullscreen btnPip btnTimeline btnShortcuts leftRail railTitle presetChips facetTree calTitle dayHistogram periodLabel mainArea caseWarnings timelinePanel timelineMeta btnTimelineGen btnTimelineClose timelineList activeFilters recordGrid dflSummary triageStatus resultCount prevPage pageStatus nextPage gridLive vsplitter mediaTitle mediaStatus mediaStage mediaToolbar btnSkipBack btnSkipFwd playRate btnStepBack btnStepFwd btnSetIn btnSetOut rangeLabel tbMore btnMoreTools moreToolsList toolsRow btnPopPlayer btnDual btnDownloadFile btnCaptureFrame btnExportClip btnExportClipBurn btnProxy videoSizeLabel videoMode videoZoom metricVideos hsplitter detailsTitle detailBadges detailTabs tabSummary tabInspector tabValidation tabTelemetry tpSummary summaryList tpInspector metaList tpValidation validationList tpTelemetry telemetryTitle btnTelemetry telemetryPane telemetryCanvas telemetryNote telemetryEmpty selectionBar scopeToggle btnScopeActive btnScopeSelected scopeSelLabel btnSelectFiltered btnClearSelection selectionCount btnMarkReviewed btnMarkImportant btnMarkVerify btnMarkClear btnTagMenu tagMenuList examinerName saveState btnApplyMarks btnExportMenu exportMenuList btnDownloadFiles btnExportSelected btnTranscodeQueue btnDownloadCsv btnSummary btnDownloadMarks btnDownloadSelection btnCopyIds btnCopyPaths toastHost shortcutsModal shortcutsTitle btnShortcutsClose` 및 JS 생성 id `ft-live-chip ft-load-note calPrev calNext calYear chipMore customTagInput btnAddCustomTag btnSaveCustomTag evidenceNote tagPresetInput cmdPalette cmdList reviewProgress rangeDivergenceBanner rangeUseServer rangeUseBrowser` + 팝업 플레이어 문서의 `stage vv novid title meta note list play rate prev next cap wrap left b1…b10 f1…f10`.
+`btnExitFs caseLine linkCarveReport btnTheme btnLang btnRail query kind status btnMoreFilters filtersExtra btnDensityComfortable btnDensityCompact sortBy groupBy btnGroupKind tagFilter pageSize dateFrom dateTo btnClearDates pillVerified metricVerified pillFailed metricFailed pillCandidate metricCarved pillAnomaly metricAnomaly btnViewMenu viewMenuList btnTheater btnFullscreen btnPip btnTimeline btnShortcuts leftRail railTitle presetChips facetTree calTitle dayHistogram periodLabel mainArea caseWarnings timelinePanel timelineMeta btnTimelineGen btnTimelineClose timelineList activeFilters recordGrid dflSummary triageStatus resultCount prevPage pageStatus nextPage gridLive vsplitter mediaTitle mediaStatus mediaStage mediaToolbar btnSkipBack btnSkipFwd playRate btnStepBack btnStepFwd btnSetIn btnSetOut rangeLabel tbMore btnMoreTools moreToolsList toolsRow btnPopPlayer btnDual btnDownloadFile btnCaptureFrame btnExportClip btnExportClipBurn btnProxy videoSizeLabel videoMode videoZoom metricVideos hsplitter detailsTitle detailBadges detailTabs tabSummary tabInspector tabValidation tabTelemetry tpSummary summaryList tpInspector metaList tpValidation validationList tpTelemetry telemetryTitle btnTelemetry telemetryPane telemetryCanvas telemetryNote telemetryEmpty selectionBar scopeToggle btnScopeActive btnScopeSelected scopeSelLabel btnSelectFiltered btnClearSelection selectionCount btnMarkReviewed btnMarkImportant btnMarkVerify btnMarkClear btnTagMenu tagMenuList examinerName saveState btnApplyMarks btnExportMenu exportMenuList btnDownloadFiles btnExportSelected btnTranscodeQueue btnDownloadCsv btnSummary btnDownloadMarks btnDownloadSelection btnCopyIds btnCopyPaths toastHost shortcutsModal shortcutsTitle btnShortcutsClose` 및 JS 생성 id `ft-live-chip ft-load-note calPrev calNext calYear chipMore customTagInput btnAddCustomTag btnSaveCustomTag evidenceNote tagPresetInput cmdPalette cmdList reviewProgress markConflictBanner markConflictPanel legacyRangesNotice legacyRangesSave legacyRangesDrop annotationsErrorBanner` (R4: `rangeDivergenceBanner rangeUseServer rangeUseBrowser` 삭제 — 구간 불일치는 일반 충돌 목록, §11.7) + 팝업 플레이어 문서의 `stage vv novid title meta note list play rate prev next cap wrap left b1…b10 f1…f10`.
 
 신규 뷰어 id(T5): `ftViewer`(루트). 조각 안의 `btnTheme`/`btnLang`/`.app-header`는 standalone 전용이며 호스트에서는 `.ft-viewer.hosted .app-header{display:none}`.
 
@@ -219,10 +219,10 @@ window.FTViewer = {
   setTheme("light"|"dark"), getTheme(),
   focus() → boolean,                // 활성 카드(없으면 #recordGrid)에 포커스
   summary() → { total, byKind, byStatus, warned, marked, noted, pending },   // = __frametraceSummary() + pending(미저장 건수)
-  saveState() → "saved"|"pending"|"saving"|"failed"|"queued"|"local"|null,
-  save() → Promise<boolean>,         // syncMarksNow()
+  saveState() → "saved"|"pending"|"saving"|"failed"|"queued"|"readonly"|"unknown"|"local"|null,   // readonly = 판독 기록 읽기 실패로 저장 차단(R4 A3), unknown = 저장 충돌 확인 실패(R4 A5) — 둘 다 "저장됨"이 아니다
+  save() → Promise<boolean>,         // 진행 중 저장의 응답을 먼저 기다리고 남은 것을 보낸다(R4 A15). true = 이 창에 미저장 없음(서버 대기열은 내구 저장이라 true), false = 실패·충돌·확인 실패·읽기 전용
   setExaminer(name), getExaminer() → string|null,   // 검토자(마크 귀속). 호스트 선택 바에는 입력란이 없고 41-finalize `#finalExaminer`가 호출
-  attributeUnassignedMarks(name) → number,   // setExaminer(name) 후, 검토자가 비어 있는 마크·메모를 같은 드래프트→저장 경로로 재전송하고 건수를 돌려줌(0이면 무동작). 서버 upsert는 `examiner = COALESCE(excluded.examiner, 기존)`이라 비어 있지 않은 새 값이 기존 값을 덮고 `review_mark_history`에 update로 남는다(src/case_db/marks.rs). setExaminer만으로는 이미 저장된 마크가 바뀌지 않는다
+  attributeUnassignedMarks(name) → Promise<number>,   // R4 A9: 그 마크들의 저장 응답까지 기다린 뒤 건수로 resolve, 저장 실패·충돌이면 reject(성공 통보 금지).   // setExaminer(name) 후, 검토자가 비어 있는 마크·메모를 같은 드래프트→저장 경로로 재전송하고 건수를 돌려줌(0이면 무동작). 서버 upsert는 `examiner = COALESCE(excluded.examiner, 기존)`이라 비어 있지 않은 새 값이 기존 값을 덮고 `review_mark_history`에 update로 남는다(src/case_db/marks.rs). setExaminer만으로는 이미 저장된 마크가 바뀌지 않는다
   writerToken,                       // 이 창의 고유 토큰: 이 창이 연 팝아웃만 `ft-player:<case>` 메시지에 담아 보내고, 토큰이 다른 창(같은 케이스의 다른 셸 탭)은 응답하지 않는다(단일 writer)
   liveState() → { live, generation, total, canReload }|null,   // = 마지막 `live-state` detail
   popout() → Window|null,            // 70-player.js openPopupPlayer(): 영상+판독 창
@@ -623,7 +623,8 @@ const FTStore = {
 
 ### 11.2 드래프트 키·생존 확인·저장 대기 (save protocol v2 정리)
 - 드래프트는 **레코드 id마다 한 키**: `ft.draft.<case>.<writer>.<id>` = `{ mark, note, tags, examiner, range, seq, base, conflict? }`(30-records.js). 창(writer = `FTViewer.writerToken`)은 자기 키만 쓴다. 쓰기는 250 ms 디바운스 1회 flush. 예전 단일 키 `ft.viewer.<case>.annotations.v1`은 부팅 때 한 번 이관(base 0 → 서버 값과 다르면 충돌로 표시).
-- 생존: 각 창이 5 s마다 `ft.alive:<case>:<writer>`에 시각을 쓰고, 정상 종료(pagehide)는 `"closed"`. 닫힌 창의 드래프트는 즉시, 5분 넘게 멈춘 창의 드래프트는 `ft-alive:<case>` ping(1.5 s)에 응답이 없을 때만 넘겨받는다(§3.3).
+- 생존: 각 창이 5 s마다 `ft.alive:<case>:<writer>`에 시각을 쓰고, 정상 종료(pagehide)는 `"closed"`. 닫힌 창의 드래프트는 즉시, 5분 넘게 멈춘 창의 드래프트는 `ft-alive:<case>` ping(1.5 s)에 응답이 없을 때만 넘겨받는다(§3.3). **정정(R4 A11)**: 예전 문구의 "얼어붙은 탭은 드래프트를 지킨다"는 틀렸다 — 타이머만 느려진 백그라운드 탭은 ping에 답해 드래프트를 지키지만, 브라우저가 **얼린(frozen·discarded) 탭은 스크립트가 돌지 않아 답하지 못하고 그 드래프트는 넘겨받힌다**. 그래도 덮어쓰기는 없다: 넘겨받은 드래프트는 **그 드래프트의 base 리비전**으로 전송되고, 얼었던 탭이 깨어나 같은 값을 자기 base로 다시 보내면 둘 중 나중 것은 바뀐 리비전을 만나 **충돌**이 된다(서버 `base_revisions` 검사, 같은 client_id 예외는 같은 창일 때만).
+- 닫힌 창 드래프트와 내 드래프트가 같은 id(R4 A7): 값이 같으면 닫힌 창 키를 즉시 지우고, 다르면 내 드래프트가 저장된 직후 **충돌**로 등록한다(서버 = 방금 저장된 값, 내 값 = 닫힌 창의 값, 표식 "닫힌 창의 편집") — 저장소에 남아 나중 부팅에 다시 채택되는 일이 없다.
 - `FTViewer._whenSaveSettled(ms)`(§3): 22-viewer-host 언마운트가 진행 중 저장의 응답을 기다린 뒤 destroy — 응답이 다음 마운트와 경합하지 않는다.
 
 ### 11.3 알림 행 (notices grid row)
@@ -640,6 +641,7 @@ const FTStore = {
 - 배너(40-status.js)는 실패 중인 kind 집합으로 그린다 — 무토큰 모드에선 GET /api/status가 증명 없이 200이므로 **정상 폴링이 저장 인증 실패를 지우지 않는다**. 제목: save/write 실패면 "저장이 인증 오류로 거부되었습니다", read만이면 "요청이 인증 오류로 거부되었습니다". 연결 끊김이 우선이고, 다시 연결되면 인증 모습이 돌아온다. 스토어 `server.lost`(배너 보임)·`server.auth`(인증 모습).
 - [이 창 새로 고침]: 먼저 GET `/`을 확인 — 200이면 `location.assign("/")`(무토큰: nonce 재발급, 토큰 모드: `?token=`은 지워졌지만 쿠키로 열림), 401/403이면(토큰 쿠키 자체가 없음) 새로 고치지 않고 "FrameTrace 앱 창에서 다시 여십시오" 안내 + 버튼 숨김.
 - 뷰어 저장의 401: 저장 상태·토스트 i18n `save.authExpired` = "저장이 인증 오류로 거부되었습니다 — 같은 컴퓨터에서 다른 FrameTrace 창이 열려 있으면 닫고 이 창을 새로 고치십시오", 드래프트는 그대로, 자동 재시도는 계속. 로더(99-loader.js)의 401·라이브 칩은 "인증 오류로 … 거부 — FrameTrace 앱 창에서 다시 여십시오".
+- R4 A13: 뷰어의 저장 외 POST(자료 묶음·시간표·텔레메트리·캡처·클립·프록시·이어붙이기)는 `viewerPost`(65-actions.js) 하나로 보내고 401이면 i18n `net.authRefused`와 `error`(`auth:true, stage:"request"`) — 셸은 `noteAuthExpired("write")`. "오프라인"이라고 말하지 않는다.
 - 하네스: verify-layout 11번(실서버 모델: 저장 POST 401 + /api/status 200 → 배너가 폴링·재시도 동안 유지, 저장 통과 시 해제; status 401 + `/` 401 → 안내, `/` 200 → 다시 로드), verify-viewer-undo(토스트 문구).
 
 ### 11.5a Esc와 포커스 (F5·F7)
@@ -650,3 +652,32 @@ const FTStore = {
 - U10: 요약 보고서는 `case_id`를 제목·머리줄 모두 이스케이프하고 파일 이름은 `safeFileName`. 재생 속도는 저장된 레이아웃 값을 0.25–4 범위의 수로 정규화하고, 팝아웃 인라인 스크립트에는 `RATES`에 있는 값만 `jsLit`으로 넣는다.
 - U14: 가상 그리드는 `#recordGrid[role=grid][aria-rowcount] > .vspacer[role=rowgroup] > .vrow|.group-header[role=row][aria-rowindex] > [role=gridcell]`(axe `aria-required-children`/`-parent` 통과, verify-virtual-grid).
 - 촬영 시각 표기(트랙 B 보고서와 일치): 파일 이름의 시각은 **기기 시계의 시각(시간대 미상)** — 표기는 파싱한 필드(`record.recWall`)에서 만들고 이 컴퓨터의 Date로 만들지 않는다(DST로 없는 시각 02:30이 03:30으로 밀리지 않음; 그리드 카드도 같음, verify-viewer-dialogs가 `timezoneId: Europe/Berlin` 2026-03-29 02:30:00으로 확인) — 상세·요약 보고서에 "(기기 기록 시각, 시간대 미상)", 날짜만이면 "(파일 이름의 날짜만 · 기기 기록, 시간대 미상)"; 내보내기(JSON·CSV)는 오프셋 없는 `YYYY-MM-DDTHH:mm:ss`(Z 없음)와 JSON `rec_time_basis`(`device-clock-naive`|`device-clock-date`|`file-mtime`). 파일 수정 시각처럼 실제 순간인 값만 `UTC±HH:MM`(이 컴퓨터 기준)과 "(추정)"을 붙인다. 요약 보고서 생성 시각도 `UTC±HH:MM`. 그리드 카드의 짧은 시각(공간 부족)은 표식 없이 그대로다.
+
+## 12. R4 트랙 A 추가 계약 (2026-10-14, docs/PLAN_R4_2026-10-14.md)
+
+### 12.1 구간(IN/OUT)은 저장 프로토콜 v2의 일급 필드 (A1/A2)
+- 구간은 마크처럼 서버(또는 번들) 값으로 수화되고(`annotations.marks[].range`), 편집은 id별 드래프트(`range`)에만 남는다. 모든 marks 항목은 `range`를 **항상 명시**(`{in:null,out:null}` = 지움)한다 — 생략으로 "유지"시키고 "저장됨"을 보이는 경로는 없다.
+- `deleted_ids`는 마크 행 삭제에만 쓴다: 마크·메모·구간이 모두 없고, 서버에 그 행이 있을 수 있을 때(`markRowMaybe`: 수화된 행, 이 창이 보낸 항목, 받아들인 서버 값). 태그는 언제나 명시 전송(태그만 있는 레코드는 태그 항목만).
+- 서버와 다른 구간은 일반 충돌 목록(`#markConflictPanel`, 서버 값/내 값)으로만 다룬다. 충돌 중인 id의 편집(i/o·태그·마크 해제)은 전송되지 않고 "미저장"으로 남는다. `#rangeDivergenceBanner`는 없다.
+- 예전 전체 맵 키 `ft.viewer.<case>.ranges`(RANGES_KEY) 폐지: 서비스 모드는 부팅 때 1회 이관 — 서버와 같으면 버리고, 다르면 그 id의 드래프트(충돌 표식 "이 브라우저의 이전 구간", base = 서버 리비전)로 옮긴 뒤 키를 지운다. 독립 뷰어(file://)는 번들이 기준이고 잔여는 적용하지 않고 `#legacyRangesNotice`(`role=status`, [이전 편집 내려받기] [이전 편집 지우기])로만 알린다.
+
+### 12.2 저장 상태 `readonly`·`unknown`, 서버 대기열 (A3/A4/A5)
+- `annotations.error`(records-meta가 판독 기록을 못 읽음): `#annotationsErrorBanner`(`role=alert`, "판독 기록을 읽지 못했습니다 — 편집 저장이 막혀 있습니다"), 저장 상태 `readonly`, 저장 요청 없음, 요약 보고서·CSV·마크 내려받기·케이스 반영 비활성, 셸 최종화 차단. 그동안의 편집은 이 브라우저 드래프트에 남고 다시 읽힌 뒤 자기 base로 전송된다.
+- 서버 대기열(A4): 부팅 때 `/api/status.pending_marks > 0`이면 `GET /api/marks-pending?offset&limit`(트랙 B6) — 응답 `{ ok, total, offset, items: [{ id, mark|null, tags|null, deleted, base_revision, client_id }] }`(`items` 대신 `pending`도 허용, 페이지는 `total`까지 순회) — 의 값을 내 드래프트가 없는 id 위에 보이고, 상태 `queued`, 대기열 감시, 떠날 때 경고. 라우트가 없는 서버도 `queued`·감시·경고는 같다(값만 못 보임).
+- 충돌 조회(A5): `GET /api/mark-conflicts?offset&limit`(트랙 B3)을 `total`까지 순회(페이지 상한 500; `total` 없는 옛 서버는 한 번에 전체). 두 경로(이 라우트, records-meta 폴백)가 모두 실패하면 상태 `unknown`("충돌 확인 실패"), 2 s~60 s 백오프로 재시도, "저장됨" 금지.
+
+- 트랙 B 구현에 맞춘 세부(PLAN_R4 "§B4 as implemented"): 두 라우트 모두 `next_offset`(마지막 페이지 `null`)으로 순회하고 `count`를 전체 수로 본다. 대기열 항목 키는 `entries`(`items`·`pending`도 허용).
+- 저장 응답 `{"ok":false,"busy":true,"retry":true,"retry_after_ms":n}`(보강 밖의 짧은 busy, 대기열에 넣지 않음)은 일시 상태: dirty 유지(상태 `pending`, "저장됨"·"실패" 아님), `retry_after_ms` 뒤 재시도(연속 10회까지, 넘으면 일반 실패·백오프). `ok:true`와 함께 온 `report_error`는 저장 성공이고 오류 토스트 "마크는 케이스에 저장되었지만 보고서 갱신에 실패했습니다"를 문구마다 한 번 보인다.
+- 작업 시트 단계 상태 `"partial"`(종료 코드 5, B16)은 경고 모습(`li.done.warned[data-step=partial]`, "부분 결과로 끝났습니다")이며 완료 단계로 센다.
+
+### 12.3 셸 닫기 전 저장 (A15 ↔ C15)
+- 셸 JS `window.hBeforeClose(timeoutMs = 5000) → Promise<{ ok, pending, state, message }>`: `FTViewer.save()`(진행 중 저장의 응답 대기 포함)를 상한까지 기다린다. `ok:false`면 `message`가 확인창 문구("저장 안 된 편집 N건").
+- WebView2 경로(트랙 C 구현, src/shell.rs `FLUSH_SCRIPT`): WM_CLOSE 때 셸이 페이지에서 `FTViewer.save()`를 실행하고 결과 `{ft_close_save:1, ok, pending}`를 `chrome.webview.postMessage`로 받는다(대기 상한 5 s). `save()`는 진행 중 저장의 응답을 먼저 기다리며, 미저장·충돌·확인 실패·읽기 전용이면 false, 서버 대기열만 남았으면(내구 저장) true다.
+
+### 12.4 기타
+- A6: 모든 Enter 처리(태그 입력·팔레트·대화상자·셸 입력)는 IME 조합 중(`isComposing` 또는 `keyCode 229`)이면 무시한다. 뷰어 전역 단축키 처리기는 예외(비라틴 배열 단축키가 `Process`/229로 오므로 U6 `shortcutKey`가 처리).
+- A8: Undo 저널 항목은 압축 저장 `{ label, activeBefore, n, groups: [{ ids, fields, before, after }] }`(같은 전후 값끼리 묶음, 바뀐 필드만), 두 스택 합계 20만 id 초과 시 오래된 항목부터 폐기(가장 최근 항목은 유지).
+- A12: 명령 팔레트(Ctrl+K)는 뷰어 모달 또는 셸 모달(`[aria-modal=true]`, 보이는 것)이 열려 있으면 열리지 않는다.
+- A14: 검색 강조는 원문에서 찾고 조각별로 이스케이프한다. 태그 목록은 제자리 수정 없이 교체한다.
+- B2 계약: 셸(99-init.js)과 서비스 독립 뷰어(99-loader.js)는 `?token=`과 1회용 `?launch=`를 주소창·기록에서 지운다.
+
