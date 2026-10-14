@@ -128,7 +128,7 @@ function hExaminerSave() {
 }
 $("hBtnExaminerSave").addEventListener("click", () => { hExaminerSave(); });
 $("hExaminerInput").addEventListener("keydown", e => {
-  if (e.key === "Enter") { e.preventDefault(); hExaminerSave(); }
+  if (e.key === "Enter") { e.preventDefault(); if (!hImeComposing(e)) hExaminerSave(); }
 });
 
 // ---- sheets (§6.3) ----

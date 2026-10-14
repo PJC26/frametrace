@@ -36,7 +36,7 @@ function finViewer() { return typeof window !== "undefined" && window.FTViewer ?
 function readLs(key) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
 }
-// "saved" | "pending" | "saving" | "failed" | "queued" | "local" | null.
+// "saved" | "pending" | "saving" | "failed" | "queued" | "readonly" | "unknown" | "local" | null.
 function finViewerSaveState() {
   const v = finViewer();
   try { return v && typeof v.saveState === "function" ? (v.saveState() || null) : null; } catch (e) { return null; }
@@ -90,6 +90,10 @@ function unsavedMarksChecks({ pendingMarks, saveState, drafts, markConflicts = 0
   else if (saveState === "pending" || saveState === "saving") add("block", "뷰어에 아직 저장되지 않은 마크·메모 변경이 있습니다",
     "'저장 다시 시도'로 지금 저장한 뒤 '다시 확인'을 누르십시오.", true);
   else if (saveState === "queued") add("block", "마크가 서버 대기열에 있습니다 (보강 작업 중)", "보강 작업이 끝난 뒤 다시 확인하십시오.");
+  else if (saveState === "readonly") add("block", "판독 기록을 읽지 못했습니다 — 편집 저장이 막혀 있습니다",
+    "케이스의 마크·메모를 읽을 수 있게 된 뒤 뷰어를 새로 고치고 다시 확인하십시오.");
+  else if (saveState === "unknown") add("block", "저장 충돌 확인에 실패했습니다 — 모두 저장되었는지 알 수 없습니다",
+    "연결이 복구되면 자동으로 다시 확인합니다 — 잠시 뒤 '다시 확인'을 누르십시오.", true);
   if (drafts > 0 && !out.some(c => c.retry)) add("block", `브라우저에만 남아 있는 마크·메모 변경 ${drafts}건`,
     "'저장 다시 시도'로 저장을 완료하십시오.", true);
   if (drafts === null && saveState === null) add("warn", "뷰어의 미저장 변경을 확인할 수 없습니다", "뷰어가 아직 열리지 않았거나 케이스 정보를 읽지 못했습니다.");
@@ -198,10 +202,18 @@ async function finAttribute() {
     if (!marks) { msg = "케이스의 마크 정보를 읽지 못했습니다 — 연결을 확인한 뒤 다시 누르십시오."; return; }
     const todo = marks.filter(m => m && !String(m.examiner || "").trim() && (m.record_id || m.id) && m.status);
     if (!todo.length) { ok = true; msg = "검토자 이름이 없는 마크가 없습니다."; return; }
+    // A9: save protocol v2 with the revision each row was read at — a row
+    // another window changed since comes back as a conflict, never silently
+    // overwritten. Note, range and tags are not sent (kept as stored).
+    const revisions = (meta.annotations && meta.annotations.revisions) || {};
+    const ids = todo.map(m => String(m.record_id || m.id));
     const payload = {
-      schema_version: 2, protocol: "patch-v1",
+      schema_version: 2, protocol: "patch-v2",
       case_id: (meta.manifest && meta.manifest.case_id) || null,
       examiner: name,
+      client_id: "shell-attribute",
+      exported_unix: Math.floor(Date.now() / 1000),
+      base_revisions: Object.fromEntries(ids.map(id => [id, Number(revisions[id]) || 0])),
       marks: todo.map(m => {
         const e = { id: String(m.record_id || m.id), status: m.status, examiner: name };
         if (Number.isFinite(Number(m.marked_unix))) e.marked_unix = Number(m.marked_unix);
@@ -211,6 +223,11 @@ async function finAttribute() {
     };
     const res = await jpost("/api/import-marks", { marks_json: JSON.stringify(payload) });
     if (!res || !res.ok) { msg = "검토자 이름을 기록하지 못했습니다: " + ((res && res.error) || "알 수 없는 오류"); return; }
+    const conflicts = Array.isArray(res.conflicts) ? res.conflicts.length : 0;
+    if (conflicts) {
+      msg = `마크 ${conflicts}건은 그 사이 다른 창이 바꿔 검토자를 기록하지 않았습니다 — ‘다시 확인’ 후 다시 누르십시오.`;
+      return;
+    }
     ok = true;
     msg = res.deferred
       ? `마크 ${todo.length}건의 검토자 기록을 저장 대기열에 넣었습니다 — 보강 작업이 끝나면 반영됩니다.`
@@ -553,7 +570,7 @@ function finSetFinalizing(on) {
 // ---- actions ----
 // "local" (edits only in this browser) counts as unsaved once anything is
 // pending — the dirty count below, the same rule as hViewer.hasUnsaved().
-const FIN_UNSAVED = ["pending", "saving", "failed", "queued"];
+const FIN_UNSAVED = ["pending", "saving", "failed", "queued", "readonly", "unknown"];
 // "" = nothing new stands in the way; otherwise why the seal must wait.
 async function finLateBlocker() {
   const viewerSays = () => {

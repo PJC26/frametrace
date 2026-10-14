@@ -20,11 +20,15 @@
 //   7. project switch between the two cases: no page load, the grid's card
 //      count changes
 //   8. Alt+P / Alt+J / Alt+R toggle; Alt+1 does nothing
+//   … 9–11 (keys, hosted reload, 401 banner: see the sections below)
+//  12. R4 A12: Ctrl+K does not open the viewer palette over a shell dialog
+//  13. R4 A15: hBeforeClose waits for the save in flight; a failing save →
+//      ok:false with "저장 안 된 편집 N건"
+//  14. R4 B2: ?launch= (and ?token=) leave the address bar — shell + /viewer/
 //
 // Checks 1-5 run at 1366x768 and 1920x1080 in light and dark; 6-8 once.
-// Until the viewer fragment is hosted in the page (T5), the review page is
-// a frame in the same mount: viewer-internal rects are then reported as
-// SKIP and the frame box stands in for the grid.
+// The viewer fragment must be hosted in the page (T5): a legacy frame in
+// its place FAILS (F4).
 //
 //   node scripts/verify-layout.mjs [--keep] [--shots DIR]
 import { mkdtempSync, mkdirSync, rmSync, copyFileSync, readdirSync } from 'node:fs';
@@ -138,7 +142,8 @@ function checkRegions(label, g, wide) {
   check(`${label}: no horizontal scroll`, !g.hscroll);
   check(`${label}: top-strip controls inside the viewport, >= 24px, not covered`, !g.covered.length && !g.small.length && !g.outside.length, [...g.covered, ...g.small, ...g.outside].join(', '));
   check(`${label}: host fills the screen under the strip`, g.host && Math.abs(g.host.top - 44) < 1 && Math.abs(g.host.bottom - g.vh) < 1 && Math.abs(g.host.w - g.vw) < 1, JSON.stringify(g.host));
-  if (!g.hosted) { skip(`${label}: viewer regions (rail/media/stage/selection/grid)`, 'legacy viewer frame (viewer fragment not hosted yet)'); return; }
+  // F4: the viewer fragment is hosted in the shell page — a legacy frame is a failure.
+  if (!check(`${label}: viewer fragment hosted in the page (no legacy frame)`, g.hosted)) return;
   const [rail, media, stage, grid] = wide ? [280, 640, 360, 960] : [240, 480, 270, 600];
   check(`${label}: #leftRail ${rail}px`, g.rail && Math.round(g.rail.w) === rail, JSON.stringify(g.rail && g.rail.w));
   check(`${label}: section.media ${media}px`, g.media && Math.round(g.media.w) === media, JSON.stringify(g.media && g.media.w));
@@ -451,6 +456,58 @@ try {
         ]);
         check('401 + cookie present: the reload button loads "/" again', !!nav && new URL(page.url()).pathname === '/', page.url());
         await page.unroute('**/api/status*');
+        await until(() => cardCount(page), 30000);
+        await page.waitForFunction(() => window.FTViewer && FTViewer.saveState() === 'saved', null, { timeout: 60000 }).catch(() => {});
+
+        // 12. R4 A12: Ctrl+K never opens the viewer's command palette over a
+        //     shell modal (here the shell's in-page dialog).
+        await page.evaluate(() => { window.__dlg = askDialog({ title: 'A12', html: '<p>a12</p>', okLabel: '확인', cancelLabel: '취소', focus: 'dlgCancel' }); });
+        await page.waitForSelector('#dlgBackdrop:not([hidden])');
+        await page.keyboard.press('Control+k');
+        const a12 = await page.evaluate(() => { const p = document.getElementById('cmdPalette'); return !p || p.hidden; });
+        check('A12: Ctrl+K over a shell dialog does not open the command palette', a12);
+        await page.click('#dlgCancel');
+        await page.waitForSelector('#dlgBackdrop', { state: 'hidden' });
+
+        // 13. R4 A15: before the window closes the shell waits for the
+        //     viewer's save (hBeforeClose — the WebView2 close path, C15).
+        check('A15: nothing unsaved → hBeforeClose ok', (await page.evaluate(() => hBeforeClose(5000))).ok === true);
+        let release;
+        const held = new Promise((r) => { release = r; });
+        let replied = 0;
+        await page.route('**/api/import-marks*', async (route) => { await held; await route.continue(); replied = Date.now(); });
+        await page.locator('#recordGrid .card').nth(2).click();
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.keyboard.press('3');
+        const t0 = Date.now();
+        const closing = page.evaluate(() => hBeforeClose(20000));
+        await sleep(1500);
+        release();
+        const r13 = await closing;
+        check('A15: hBeforeClose waits for the save in flight, then ok (nothing pending)', r13.ok === true && r13.pending === 0 && replied > 0 && Date.now() - t0 >= 1500, JSON.stringify(r13));
+        await page.unroute('**/api/import-marks*');
+        await page.route('**/api/import-marks*', (route) => route.fulfill({ status: 503, contentType: 'application/json', body: '{"ok":false,"error":"busy"}' }));
+        await page.locator('#recordGrid .card').nth(2).click();
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.keyboard.press('1');
+        const r13b = await page.evaluate(() => hBeforeClose(4000));
+        check('A15: a failing save → ok:false, "저장 안 된 편집 N건" for the confirmation', r13b.ok === false && r13b.pending >= 1 && /저장 안 된 편집 \d+건/.test(r13b.message), JSON.stringify(r13b));
+        await page.unroute('**/api/import-marks*');
+        await page.evaluate(() => FTViewer.save());
+        await page.waitForFunction(() => FTViewer.saveState() === 'saved', null, { timeout: 60000 }).catch(() => {});
+
+        // 14. R4 B2 contract: the one-time launch code (?launch=) leaves the
+        //     address bar like ?token= — the shell and the served viewer.
+        await page.goto(`${base}/?launch=a4test&keep=1#frag`);
+        await until(() => page.evaluate(() => !location.search.includes('launch')), 10000);
+        const shellUrl = await page.evaluate(() => ({ search: location.search, hash: location.hash }));
+        // The server answers /?launch= with 303 → "/" (§B4); the shell's own
+        // strip (99-init.js) is the fallback — either way no code remains.
+        check('B2: no ?launch= left in the shell address bar (hash kept)', !/launch/.test(shellUrl.search) && shellUrl.hash === '#frag', JSON.stringify(shellUrl));
+        await page.goto(`${base}/viewer/?token=${token}&launch=a4test&keep=2`);
+        await until(() => page.evaluate(() => !/launch|token/.test(location.search)), 15000);
+        const viewerUrl = await page.evaluate(() => location.search);
+        check('B2: the served standalone viewer drops ?token= and ?launch=', viewerUrl === '?keep=2', viewerUrl);
       }
       await context.close();
     }

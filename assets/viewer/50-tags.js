@@ -17,15 +17,18 @@ function removeTagPreset(tag) {
   saveTagPresets();
 }
 
+// A14: tag lists are replaced, never edited in place — a list may still be
+// shared with a snapshot (a draft, a conflict's server value, the loaded
+// case data) that must keep its own value.
 function addTag(id, tag) {
-  const list = state.tags[id] || [];
+  const list = [...(state.tags[id] || [])];
   if (!list.includes(tag)) list.push(tag);
   state.tags[id] = list;
   touchAnnotation(id);
 }
 
 function removeTag(id, tag) {
-  const list = state.tags[id] || [];
+  const list = [...(state.tags[id] || [])];
   const idx = list.indexOf(tag);
   if (idx >= 0) list.splice(idx, 1);
   state.tags[id] = list;

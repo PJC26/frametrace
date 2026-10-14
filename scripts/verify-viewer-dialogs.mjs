@@ -7,6 +7,9 @@
 //    state and recovers after an error
 //  - a thumbnail that fails to load is retried once, then a placeholder
 //  - the zoom slider leaves "fit" mode instead of doing nothing
+//  - A6: an Enter that only commits an IME composition (isComposing, or
+//    keyCode 229) never adds a tag, runs a palette command or confirms a
+//    dialog; the next real Enter does
 //
 //   node scripts/verify-viewer-dialogs.mjs   (needs playwright via NODE_PATH)
 import { readFileSync, readdirSync } from 'node:fs';
@@ -24,7 +27,8 @@ const openTools = (p) => p.evaluate(() => {
 });
 import { viewerPageHtml } from './lib/app-bundle.mjs';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+// FT_ASSETS_ROOT: build the page from another checkout's assets (regression runs).
+const root = process.env.FT_ASSETS_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
@@ -45,7 +49,11 @@ function buildViewer(caseId = 'FT-DLG', names = null) {
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
     manifest: { case_id: caseId, title: 'dlg' }, caseDir: '/case', scan: { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
-    thumbs: evil ? {} : { vid_0: '/thumbs/broken.jpg' }, annotations: {}, deepfake: {}, telemetry: {}, proxies: [],
+    thumbs: evil ? {} : { vid_0: '/thumbs/broken.jpg' },
+    // vid_1's IN/OUT is a case annotation (R4 A2: ranges hydrate from the
+    // case data like marks; the old browser-only range store is retired).
+    annotations: caseId === 'FT-DLG' ? { marks: [{ record_id: 'vid_1', status: 'noted', marked_unix: 1, note: '', range: { in: 5, out: 15 } }], tags: [], revisions: { vid_1: 1 } } : {},
+    deepfake: {}, telemetry: {}, proxies: [],
   })};`;
   // Standalone page exactly as build.rs assembles it (shared fragment included).
   return viewerPageHtml({ data, js: js, root });
@@ -73,9 +81,6 @@ const base = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch();
 try {
   const ctx = await browser.newContext();
-  await ctx.addInitScript(() => {
-    localStorage.setItem('ft.viewer.FT-DLG.ranges', JSON.stringify({ vid_1: { in: 5, out: 15 } }));
-  });
   const page = await ctx.newPage();
   const errors = [];
   const nativeDialogs = [];
@@ -282,6 +287,49 @@ try {
     await page.keyboard.press('Escape');
     const f7b = await page.evaluate(() => ({ n: document.querySelectorAll('#toastHost .toast').length, onCard: !!document.activeElement?.closest('#recordGrid') }));
     check('Esc on the last focused toast returns focus to the grid', f7b.n === 0 && f7b.onCard, JSON.stringify(f7b));
+  }
+  // --- A6: IME composition Enter is not a command -------------------------
+  {
+    // keydown Enter while composing: isComposing (standard) or keyCode 229
+    // (what Chromium reports for keys the IME consumes).
+    const imeEnter = (selector, kind) => page.evaluate(([sel, k]) => {
+      const el = document.querySelector(sel);
+      const ev = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true, isComposing: k === 'composing' });
+      if (k === '229') Object.defineProperty(ev, 'keyCode', { get: () => 229 });
+      el.dispatchEvent(ev);
+    }, [selector, kind]);
+    await page.locator('.card[data-id="vid_3"]').click();
+    await page.waitForSelector('#customTagInput');
+    await page.locator('#customTagInput').fill('합성태그');
+    await imeEnter('#customTagInput', 'composing');
+    await imeEnter('#customTagInput', '229');
+    const kept = await page.evaluate(() => ({ value: document.getElementById('customTagInput')?.value, tagged: (document.querySelector('.card[data-id="vid_3"]')?.textContent || '').includes('합성태그') }));
+    check('A6 composing Enter (isComposing / keyCode 229) in the tag input adds nothing', kept.value === '합성태그' && !kept.tagged, JSON.stringify(kept));
+    await page.locator('#customTagInput').press('Enter');
+    await page.waitForFunction(() => (document.querySelector('.card[data-id="vid_3"]')?.textContent || '').includes('합성태그'), null, { timeout: 3000 }).catch(() => {});
+    check('A6 the next real Enter adds the tag once', await page.evaluate(() => (document.querySelector('.card[data-id="vid_3"]')?.textContent.match(/합성태그/g) || []).length) === 1);
+    // Command palette: a composing Enter does not run the highlighted command.
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('Control+k');
+    await page.waitForSelector('#cmdPalette:not([hidden])');
+    await page.locator('#cmdPalette input').fill('btnShortcuts'); // matches the shortcuts-sheet command by id
+    await imeEnter('#cmdPalette input', 'composing');
+    await imeEnter('#cmdPalette input', '229');
+    check('A6 composing Enter in the command palette runs nothing (palette stays open)', await page.evaluate(() => !document.getElementById('cmdPalette').hidden && document.getElementById('shortcutsModal').hidden));
+    await page.keyboard.press('Escape');
+    // In-page dialog: a composing Enter in its input does not confirm.
+    await page.locator('.card[data-id="vid_1"]').click();
+    await page.evaluate(() => document.activeElement?.blur());
+    await openTools(page);
+    await page.unroute('**/api/export-clip').catch(() => {});
+    let clipPosts = 0;
+    await page.route('**/api/export-clip', (route) => { clipPosts += 1; route.fulfill({ contentType: 'application/json', body: '{"ok":false,"error":"test"}' }); });
+    await page.locator('#btnExportClip').click();
+    await page.waitForSelector('.modal.dlg input');
+    await imeEnter('.modal.dlg input', 'composing');
+    await imeEnter('.modal.dlg input', '229');
+    check('A6 composing Enter in a dialog input does not confirm it', await page.locator('.modal.dlg').count() === 1 && clipPosts === 0);
+    await page.keyboard.press('Escape');
   }
   check('no page errors', !errors.length, errors.join(' | '));
   await ctx.close();

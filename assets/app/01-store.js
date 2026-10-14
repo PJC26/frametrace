@@ -113,7 +113,9 @@ function hViewerApi() {
 }
 // saveState → unsaved? pendingCount() is only asked for "local".
 function hViewerStateUnsaved(ss, pendingCount) {
-  if (ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued") return true;
+  // readonly (A3: annotations unreadable, saving blocked) and unknown (A5:
+  // conflict lookup failed) are never "saved" either.
+  if (ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued" || ss === "readonly" || ss === "unknown") return true;
   return ss === "local" && (typeof pendingCount === "function" ? pendingCount() : 0) > 0;
 }
 let hHostedWired = false;
@@ -146,7 +148,7 @@ const hViewer = {
     try { hostViewerUnmount(); } catch (e) { console.error("viewer unmount failed:", e); }
     FTStore.set({ viewer: { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null }, popout: { open: false } });
   },
-  // "saved"|"pending"|"saving"|"failed"|"queued"|"local"|null (null = no viewer).
+  // "saved"|"pending"|"saving"|"failed"|"queued"|"readonly"|"unknown"|"local"|null (null = no viewer).
   saveState() {
     const v = hViewerApi();
     if (!v || !FTStore.state.viewer.mounted) return null;

@@ -42,7 +42,7 @@ function setupGridDelegation() {
   els.recordGrid.addEventListener("keydown", event => {
     if (event.target.closest("input")) return;
     const header = event.target.closest(".group-header");
-    if (header && (event.key === "Enter" || event.key === " ")) {
+    if (header && (event.key === "Enter" || event.key === " ") && !event.isComposing) {
       event.preventDefault();
       event.stopPropagation();
       const key = header.dataset.group;
@@ -96,7 +96,7 @@ function applyTag(tag) {
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   ids.forEach(id => {
-    const list = state.tags[id] || [];
+    const list = [...(state.tags[id] || [])]; // a copy (A14, see addTag)
     if (!list.includes(tag)) list.push(tag);
     state.tags[id] = list;
     touchAnnotation(id);
@@ -272,6 +272,31 @@ async function togglePip() {
 // -> string|null, opts.fail(err) -> string. Errors never stay silent: an
 // exception always ends in an error toast and the button is re-enabled.
 // A second click while busy is ignored.
+// A13: the viewer's POSTs other than the marks save (자료 묶음, 시간표,
+// 텔레메트리, 캡처, 클립, 프록시, 이어붙이기 …) share one door, so a 401 —
+// the server is up but refused this browser's cookie (U8) — reads as an
+// authorization error, never as "server offline". Resolves the parsed JSON
+// reply (a non-JSON reply becomes { ok:false, error:"HTTP n" }); a network
+// failure rejects with the fetch TypeError (the callers' "offline" text);
+// a 401 rejects with err.ftAuth and tells the host (FTViewer "error",
+// auth: true, stage "request") so its banner shows the same cause.
+async function viewerPost(url, body, opts = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": opts.contentType || "text/plain" },
+    body: JSON.stringify(body)
+  });
+  if (res.status === 401) {
+    const err = new Error(t("net.authRefused"));
+    err.ftAuth = true;
+    FTViewer._emit("error", { message: err.message, detail: `${url}: HTTP 401`, stage: "request", auth: true });
+    throw err;
+  }
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  return data && typeof data === "object" ? data : { ok: false, error: `HTTP ${res.status}` };
+}
+
 async function withBusy(button, fn, opts = {}) {
   let hadFocus = false;
   if (button) {
@@ -289,7 +314,9 @@ async function withBusy(button, fn, opts = {}) {
     if (done) toast(done);
     return result;
   } catch (err) {
-    const msg = typeof opts.fail === "function" ? opts.fail(err) : tf("toast.busyFail", { err: err?.message || String(err) });
+    // A13: an authorization refusal says so, whatever the caller's text.
+    const msg = err && err.ftAuth ? err.message
+      : typeof opts.fail === "function" ? opts.fail(err) : tf("toast.busyFail", { err: err?.message || String(err) });
     if (msg) toastError(msg); // failures persist until dismissed
     return undefined;
   } finally {
@@ -390,7 +417,8 @@ function askDialog(spec) {
     };
     function onKey(e) {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(null); return; }
-      if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); e.stopPropagation(); accept(); return; }
+      // An Enter that commits an IME composition (Korean input) is not "OK".
+      if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); e.stopPropagation(); if (!imeComposing(e)) accept(); return; }
       if (e.key === "Tab") {
         const f = [...box.querySelectorAll("input,button:not(:disabled),summary,[tabindex]:not([tabindex='-1'])")];
         const first = f[0], last = f[f.length - 1];

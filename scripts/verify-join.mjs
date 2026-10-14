@@ -426,11 +426,11 @@ async function hostedShellFlow(browser, backend) {
     check('hosted: clicking 새 데이터 반영 shows the joined record', appeared && after.length === before.length + 1, `${expectId} | ${JSON.stringify(after)}`);
     check('hosted: the reload offer is cleared after applying', await page.evaluate(() => document.getElementById('btnJobReload').hidden));
     const entry = await backend.joinedEntryFor(ids);
-    if (entry && typeof entry.record_id === 'string' && entry.record_id) {
-      check('hosted: joined record id is the log entry record_id', after.includes(entry.record_id) && /^join:[0-9a-f]{16}$/.test(entry.record_id), entry.record_id);
-    } else {
-      skip('hosted: joined record id = log record_id', 'awaits backend (join-log entry has no record_id yet); fallback join:<file> used: ' + expectId);
-    }
+    // F4: the backend writes record_id on every join-log entry — a missing
+    // one is a failure, not a skip.
+    check('hosted: joined record id is the log entry record_id',
+      !!entry && typeof entry.record_id === 'string' && after.includes(entry.record_id) && /^join:[0-9a-f]{16}$/.test(entry.record_id),
+      entry ? String(entry.record_id) : 'no join-log entry; fallback ' + expectId);
 
     // Mark the joined record and save through save protocol v2.
     await page.click(`#recordGrid .card[data-id="${expectId}"]`);
@@ -589,10 +589,12 @@ try {
     const dn = await dialog();
     check('filename-order plan: the dialog says gaps/overlaps cannot be checked', !!dn && dn.notes.some((n) => /끊김·겹침은 확인할 수 없습니다|끊김·겹침 확인 불가/.test(n)), JSON.stringify(dn && dn.notes));
     await page.keyboard.press('Escape');
-    const plan = await backend.srv.postJson('/api/join-check', { ids: backend.notime, tolerance: 1 }).catch(() => null);
+    // F4: a failed join-check request or a plan without unknown_junctions fails.
+    let plan = null;
+    let planErr = '';
+    try { plan = await backend.srv.postJson('/api/join-check', { ids: backend.notime, tolerance: 1 }); } catch (err) { planErr = String(err && err.message || err); }
     const totals = plan && plan.plan && plan.plan.totals;
-    if (totals && 'unknown_junctions' in totals) check('server plan counts unknown_junctions for a filename-order join', Number(totals.unknown_junctions) > 0, JSON.stringify(totals));
-    else skip('server plan unknown_junctions', 'awaits backend (plan totals have no unknown_junctions yet)');
+    check('server plan counts unknown_junctions for a filename-order join', !!totals && 'unknown_junctions' in totals && Number(totals.unknown_junctions) > 0, planErr || JSON.stringify(totals || plan));
   }
 
   // 4. front + rear → blocked

@@ -583,7 +583,10 @@ function renderTrack(steps, names, progress, warnings) {
   const labels = (names && names.length === 5) ? names : STEP_NAMES;
   el.innerHTML = labels.map((name, i) => {
     const s = steps[i] || "pending";
-    const cls = s === "done" ? "done" : s === "running" ? "running" : s === "failed" ? "failed" : "";
+    // R4 B16: "partial" = the step finished with a partial result (child
+    // exit code 5) — a warning state, neither done nor failed.
+    const partial = s === "partial";
+    const cls = s === "done" || partial ? "done" : s === "running" ? "running" : s === "failed" ? "failed" : "";
     let extra = "";
     const ws = (warnings || []).filter(w => w && w.step === i && w.message);
     if (s === "running" && progress && progress.total > 0) {
@@ -594,12 +597,15 @@ function renderTrack(steps, names, progress, warnings) {
       const bytes = progress.done > 0 ? `${fmtBytes(progress.done)} 기록됨 · ` : "";
       extra = `<span class="h-prog"><span class="h-bar indet" role="progressbar" aria-label="${esc(name)} 진행 중"><i></i></span><span class="h-ptext mono num">${bytes}${esc(progress.job_type)} · ${fmtClock(progress.elapsed_secs || 0)}</span></span>`;
     }
-    if (s === "done" && ws.length) {
+    if (partial) {
+      extra = `<span class="h-trk-warn">부분 결과로 끝났습니다 — 일부만 조사되었습니다</span>` +
+        (ws.length ? `<span class="h-wlist">${ws.map(w => `<span>• ${esc(w.message)}</span>`).join("")}</span>` : "");
+    } else if (s === "done" && ws.length) {
       extra = `<span class="h-trk-warn">경고 ${ws.length}건과 함께 완료</span>` +
         `<span class="h-wlist">${ws.map(w => `<span>• ${esc(w.message)}</span>`).join("")}</span>`;
     }
-    const state = s === "done" ? (ws.length ? "완료(경고)" : "완료") : s === "running" ? "진행 중" : s === "failed" ? "실패" : "대기";
-    return `<li class="${cls}${s === "done" && ws.length ? " warned" : ""}"><span class="h-trk-dot" aria-hidden="true"></span><span class="h-trk-lbl">${esc(name)}</span><span class="sr-only">${state}</span>${extra}</li>`;
+    const state = partial ? "부분 결과(경고)" : s === "done" ? (ws.length ? "완료(경고)" : "완료") : s === "running" ? "진행 중" : s === "failed" ? "실패" : "대기";
+    return `<li class="${cls}${(s === "done" && ws.length) || partial ? " warned" : ""}"${partial ? ' data-step="partial"' : ""}><span class="h-trk-dot" aria-hidden="true"></span><span class="h-trk-lbl">${esc(name)}</span><span class="sr-only">${state}</span>${extra}</li>`;
   }).join("");
 }
 
@@ -659,6 +665,19 @@ function jobsNoteText(S, pv) {
   if (joinReloadPending()) return "이어붙이기 완료 — '새 데이터 반영'을 누르면 목록에 표시됩니다.";
   return "";
 }
+// A10: the failure box is rewritten only when its markup string changes —
+// compared with what was last WRITTEN, never with innerHTML (the browser
+// re-serializes it: an escaped quote reads back as a plain one, so the
+// read-back never matched and every poll rebuilt the box, folding the
+// examiner's opened "자세한 오류 내용"). Same rule as 40-status.js.
+let jobsErrWritten = null;
+function jobsErrWrite(el, html) {
+  if (!el) return false;
+  if (jobsErrWritten === html && (el.innerHTML !== "" || html === "")) return false;
+  jobsErrWritten = html;
+  el.innerHTML = html;
+  return true;
+}
 function renderJobsSheet() {
   const S = storeState();
   if (!S || !$("track")) return;
@@ -686,7 +705,7 @@ function renderJobsSheet() {
     let html = "";
     if (pv.state === "failed" || (pv.state === "stopped" && p.error)) html = errorHtml(p.error);
     else if (cj && cj.outcome === "failed") html = `<div>오류: ${esc(cj.message)}</div>`;
-    if (err.innerHTML !== html) err.innerHTML = html;
+    jobsErrWrite(err, html);
     err.hidden = !html;
   }
 

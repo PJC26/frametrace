@@ -64,7 +64,13 @@ function hostViewerBridge() {
   // (40-status.js). It stays while the viewer's saves keep failing — a good
   // /api/status proves nothing in no-token mode — and goes once a save gets
   // through: save-state carries auth on every change of that state.
-  api.on("error", e => { if (e.detail && e.detail.auth && typeof noteAuthExpired === "function") noteAuthExpired("save"); });
+  // A13: a refused viewer request other than the marks save (export,
+  // telemetry, capture …, stage "request") is a "write" refusal — it clears
+  // with the next write that gets through, not with a save.
+  api.on("error", e => {
+    if (!(e.detail && e.detail.auth) || typeof noteAuthExpired !== "function") return;
+    noteAuthExpired(e.detail.stage === "request" ? "write" : "save");
+  });
   api.on("save-state", e => {
     const d = e.detail || {};
     if (d.auth && typeof noteAuthExpired === "function") noteAuthExpired("save");

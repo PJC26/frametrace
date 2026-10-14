@@ -29,6 +29,36 @@ async function hPendingChanges() {
     return caseId ? (unsavedDraftCount(caseId) || 0) : 0;
   } catch (e) { return 0; }
 }
+// ---- A15 / C15: flush the viewer before the window closes ----
+// The desktop shell (src/shell.rs FLUSH_SCRIPT, C15) runs FTViewer.save()
+// in the page before its window goes (capped at 5 s) and names the unsaved
+// edits in its confirmation. hBeforeClose is the same flush for the page
+// itself (and the harness): FTViewer.save() awaits a save already in flight
+// and pushes what is left; ok:false comes with "저장 안 된 편집 N건".
+async function hBeforeClose(timeoutMs = 5000) {
+  const api = hViewerApi();
+  const mounted = !!(api && FTStore.state.viewer && FTStore.state.viewer.mounted);
+  if (!mounted) return { ok: true, pending: 0, state: null, message: "" };
+  let saved = false;
+  let timedOut = false;
+  try {
+    saved = await Promise.race([
+      Promise.resolve(api.save()).then(v => v === true),
+      new Promise(resolve => setTimeout(() => { timedOut = true; resolve(false); }, Math.max(0, Number(timeoutMs) || 0))),
+    ]);
+  } catch (e) { saved = false; }
+  let pending = 0;
+  let state = null;
+  try { pending = Number((api.summary() || {}).pending) || 0; state = api.saveState(); } catch (e) { pending = 0; }
+  // A durable server queue counts as saved (it reaches the case DB when the job ends).
+  const ok = saved && !hViewerStateUnsaved(state === "queued" ? "saved" : state, () => pending);
+  const message = ok ? ""
+    : pending > 0 ? `저장 안 된 편집 ${pending}건` + (timedOut ? " (저장 응답 대기 시간 초과)" : "")
+    : state === "readonly" ? "판독 기록을 읽지 못해 저장이 막혀 있습니다"
+    : "모든 편집이 저장되었는지 확인하지 못했습니다";
+  return { ok, pending, state, message };
+}
+window.hBeforeClose = hBeforeClose;
 $("hBtnQuit").addEventListener("click", async () => {
   const btn = $("hBtnQuit");
   btn.disabled = true;

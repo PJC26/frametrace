@@ -1,13 +1,15 @@
-// Windows review item 11: the launch URL carries ?token= once. The server
-// has already planted the HttpOnly ft_token cookie on this very response,
-// so drop the token from the address bar / history (bookmarks, screenshots,
-// session restore) while keeping every other query parameter and the hash.
-// Reloads and follow-up requests authenticate with the cookie.
+// Windows review item 11: the launch URL carries ?token= once — or, since
+// R4 B2, a one-time launch code ?launch= (30 s, single use). The server has
+// already planted the HttpOnly cookie on this very response, so drop both
+// from the address bar / history (bookmarks, screenshots, session restore)
+// while keeping every other query parameter and the hash. Reloads and
+// follow-up requests authenticate with the cookie.
 (function stripTokenFromUrl() {
   try {
     const url = new URL(window.location.href);
-    if (!url.searchParams.has('token')) return;
+    if (!url.searchParams.has('token') && !url.searchParams.has('launch')) return;
     url.searchParams.delete('token');
+    url.searchParams.delete('launch');
     window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash);
   } catch (err) {
     // Not fatal for the session (the cookie still authenticates), but never silent.

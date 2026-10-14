@@ -208,7 +208,7 @@ function renderDetails() {
       document.getElementById("customTagInput")?.focus();
     };
     customBtn.addEventListener("click", addCustom);
-    customInput.addEventListener("keydown", e => { if (e.key === "Enter") addCustom(); });
+    customInput.addEventListener("keydown", e => { if (e.key === "Enter" && !imeComposing(e)) addCustom(); });
     const savePresetBtn = document.getElementById("btnSaveCustomTag");
     if (savePresetBtn) {
       savePresetBtn.addEventListener("click", () => {
@@ -330,7 +330,7 @@ function renderTree(facets) {
     idx += 1;
     node.addEventListener("click", () => pickAndKeepFocus(entry, node));
     node.addEventListener("keydown", e => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickAndKeepFocus(entry, node); }
+      if ((e.key === "Enter" || e.key === " ") && !imeComposing(e)) { e.preventDefault(); pickAndKeepFocus(entry, node); }
     });
   });
 }
