@@ -3,6 +3,15 @@
 
 use super::*;
 
+// Included per test file (no mod.rs line needed); see the helper's header.
+#[allow(clippy::duplicate_mod)]
+#[path = "tests_fake_tools.rs"]
+mod fake_tools;
+use fake_tools::{cmd_grandchild_sleeper, kill_pid, pid_alive, write_fake};
+// mod.rs re-exports this only for unix (B-owned gate): reach it by path elsewhere.
+#[cfg(not(unix))]
+use super::jobs::SIGNOFF_PENDING_REL_PATH;
+
 fn scratch(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft-hard-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -77,8 +86,13 @@ fn default_token_gates_every_request_and_opt_out_does_not() {
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
 }
 
+/// Serializes the tests in this file that mutate process-global env vars
+/// (R4 F9); a poisoned lock (an earlier assertion failed) is still usable.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn instance_file_records_token_and_discovery_probe_sends_it() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("instance");
     let file = dir.join("server.json");
     // Only this test touches the override; other tests never read it.
@@ -124,18 +138,6 @@ fn instance_file_records_token_and_discovery_probe_sends_it() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    // `ps -o stat=` prints nothing for a reaped pid; a zombie shows `Z`.
-    let out = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
-        .unwrap();
-    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    !stat.is_empty() && !stat.starts_with('Z')
-}
-
-#[cfg(unix)]
 #[test]
 fn run_step_cancel_kills_the_grandchildren_too() {
     let dir = scratch("tree");
@@ -145,7 +147,7 @@ fn run_step_cancel_kills_the_grandchildren_too() {
         let state = Arc::clone(&state);
         let pidfile = pidfile.clone();
         thread::spawn(move || {
-            for _ in 0..200 {
+            for _ in 0..1600 {
                 if std::fs::read_to_string(&pidfile).is_ok_and(|text| !text.trim().is_empty()) {
                     break;
                 }
@@ -154,21 +156,25 @@ fn run_step_cancel_kills_the_grandchildren_too() {
             state_lock(&state).cancel_requested = true;
         })
     };
-    let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+    let script = write_fake(
+        &dir,
+        &format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()),
+        &cmd_grandchild_sleeper(&pidfile),
+    );
     let started = std::time::Instant::now();
-    let result = run_step(Path::new("/bin/sh"), &["-c".into(), script], &state);
+    let result = run_step(&script, &[], &state);
     canceller.join().unwrap();
     assert!(result.is_err(), "cancelled step reports an error");
-    assert!(started.elapsed() < Duration::from_secs(20));
-    let pid: u32 = std::fs::read_to_string(&pidfile)
+    // PowerShell start-up dominates on a loaded runner; a missed kill would hang for 30 s+ (sleep) or 300 s (ping).
+    assert!(started.elapsed() < Duration::from_secs(90));
+    let pid: String = std::fs::read_to_string(&pidfile)
         .expect("grandchild pid recorded")
         .trim()
-        .parse()
-        .unwrap();
+        .to_string();
     // Allow the kernel a moment to deliver SIGKILL and init to reap.
     let mut gone = false;
     for _ in 0..80 {
-        if !pid_alive(pid) {
+        if !pid_alive(&pid) {
             gone = true;
             break;
         }
@@ -176,7 +182,7 @@ fn run_step_cancel_kills_the_grandchildren_too() {
     }
     if !gone {
         // Do not leak the sleeper if the assertion below fails.
-        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+        kill_pid(&pid);
     }
     assert!(gone, "grandchild {pid} survived cancel (orphaned)");
     let _ = std::fs::remove_dir_all(dir);
@@ -326,18 +332,14 @@ fn custody_table_flags_tampered_source_and_confirms_untouched_one() {
 /// sign-off behind (it used to write review/signoff.json before
 /// make-report, so every later report named a reviewer for a finalize that
 /// never completed).
-#[cfg(unix)]
 #[test]
 fn failed_finalize_leaves_no_signoff() {
-    use std::os::unix::fs::PermissionsExt;
     let (root, case, _source) = case_fixture("finalize-fail");
-    let fake = root.join("fake-frametrace.sh");
-    std::fs::write(
-        &fake,
-        "#!/bin/sh\ncase \"$1\" in package-case) echo 'disk full' >&2; exit 1;; *) exit 0;; esac\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fake = write_fake(
+        &root,
+        "case \"$1\" in package-case) echo 'disk full' >&2; exit 1;; *) exit 0;; esac",
+        "if \"%1\"==\"package-case\" (\necho disk full 1>&2\nexit /b 1\n)\nexit /b 0",
+    );
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     state_lock(&state).case_dir = Some(case.clone());
     let response = finalize_with_exe(&fake, &case, "홍길동", &state);

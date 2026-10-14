@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -18,6 +20,7 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 fn run(args: &[&str]) -> Output {
     Command::new(frametrace())
         .args(args)
+        .envs(common::isolated_env())
         .output()
         .expect("frametrace binary should run")
 }
@@ -716,6 +719,7 @@ fn rotate_audit_key_round_trips_through_verify() {
     let framed = |args: &[&str]| {
         Command::new(frametrace())
             .args(args)
+            .envs(common::isolated_env())
             .env("FRAMETRACE_AUDIT_KEYRING_FILE", &keyring)
             .env_remove("FRAMETRACE_AUDIT_KEY")
             .env_remove("FRAMETRACE_AUDIT_KEY_FILE")

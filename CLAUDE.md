@@ -26,9 +26,11 @@
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-node scripts/check-js.mjs && node scripts/check-css.mjs
-cargo build --locked && FRAMETRACE_BIN=<repo>/target/debug/frametrace-app bash scripts/ci-harnesses.sh   # 22종 (Windows는 Git Bash; 바이너리 이름은 Linux/macOS `frametrace-app`, Windows `frametrace-app.exe` — isolated-server.mjs가 .exe를 자동으로 붙임)
+node scripts/check-js.mjs && node scripts/check-css.mjs && node scripts/check-ps-bom.mjs && node scripts/verify-contract-pin.mjs && node scripts/check-rectime-fixture.mjs
+cargo build --locked && FRAMETRACE_BIN=<repo>/target/debug/frametrace-app bash scripts/ci-harnesses.sh   # 27종 (Windows는 Git Bash; 바이너리 이름은 Linux/macOS `frametrace-app`, Windows `frametrace-app.exe` — isolated-server.mjs가 .exe를 자동으로 붙임)
 FRAMETRACE_IT=1 cargo test --locked --test workstation_e2e -- --ignored
+FRAMETRACE_IT=1 cargo test --locked --test integration_tools -- --ignored   # ffmpeg 필요; libewf 없는 PC는 `--skip e01_import_roundtrip_with_real_libewf`
+FRAMETRACE_IT=1 cargo test --locked --test join_audio_it -- --ignored       # ffmpeg·ffprobe 필요
 ```
 
 Playwright 설치는 **한 번에 함께**: `npm install --no-save --no-package-lock playwright@1.56.1 axe-core@4.10.2 pngjs pixelmatch` 후 `npx playwright install chromium`. (`npm i --no-save X`를 따로 하면 다른 패키지가 지워진다.)

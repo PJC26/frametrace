@@ -17,7 +17,7 @@ jobs:
       # 1.94 toolchain and its dependencies now need a newer rustc.
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
       # --deny warnings: unmaintained/unsound/yanked advisories fail the job
       # too. Accepted advisories must be listed in .cargo/audit.toml
       # ([advisories] ignore = [...]) with a reason and a re-check date;

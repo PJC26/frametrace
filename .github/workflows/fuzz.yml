@@ -28,7 +28,7 @@ jobs:
       - name: Format fuzz targets
         run: cargo fmt --check
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
         working-directory: .
       - name: Build fuzz targets
         run: cargo +nightly-2026-10-01 fuzz build
