@@ -590,6 +590,10 @@ pub struct Segment {
     pub source_path: PathBuf,
     pub size_bytes: u64,
     pub modified_unix: Option<u64>,
+    /// Modification time in nanoseconds (D17): what [`stat_matches`]
+    /// compares, so a rewrite within the same second is still caught.
+    /// Not part of the plan id (which stays on whole seconds).
+    pub modified_nanos: Option<u128>,
     pub sha256_indexed: Option<String>,
     pub vendor: Option<String>,
     pub name_time: Option<NaiveRecTime>,
@@ -1079,6 +1083,7 @@ pub fn plan_with_tools(
             name,
             size_bytes: meta.len(),
             modified_unix: modified_unix(&meta),
+            modified_nanos: crate::audit::modified_nanos(&meta),
             sha256_indexed: row
                 .get("sha256")
                 .and_then(Value::as_str)
@@ -2358,7 +2363,14 @@ fn stat_matches(segment: &Segment) -> Result<(), String> {
             segment.source_path.display()
         )
     })?;
-    if meta.len() != segment.size_bytes || modified_unix(&meta) != segment.modified_unix {
+    // D17: nanosecond mtime (the same helper the audio cache uses) — a
+    // whole-second comparison misses a source rewritten within the second
+    // the plan was made in.
+    let changed_mtime = match segment.modified_nanos {
+        Some(nanos) => crate::audit::modified_nanos(&meta) != Some(nanos),
+        None => modified_unix(&meta) != segment.modified_unix,
+    };
+    if meta.len() != segment.size_bytes || changed_mtime {
         return Err(format!(
             "이어붙이는 동안 원본이 바뀌었습니다: {}",
             segment.source_path.display()
@@ -3059,6 +3071,7 @@ mod tests {
             source_path,
             size_bytes: 1000,
             modified_unix: Some(1),
+            modified_nanos: None,
             sha256_indexed: Some(format!("hash-{id}")),
             vendor: Some("Generic media".into()),
             creation: None,
@@ -3434,6 +3447,38 @@ mod tests {
         assert!(validate_job_tag("한글").is_err());
         assert!(validate_job_tag("a b").is_err());
         assert!(validate_job_tag("").is_err());
+    }
+
+    /// D17: a source rewritten within the same second (same size, same
+    /// whole-second mtime) is caught by the nanosecond comparison.
+    #[test]
+    fn stat_matches_compares_nanosecond_mtime() {
+        let dir = std::env::temp_dir().join(format!("ft-join-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.mp4");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let base = std::time::UNIX_EPOCH + std::time::Duration::new(1_800_000_000, 100_000_000);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(base).unwrap();
+        drop(file);
+        let meta = std::fs::metadata(&path).unwrap();
+        let mut segment = seg("vid_1", "a.mp4", 1.0);
+        segment.source_path = path.clone();
+        segment.size_bytes = meta.len();
+        segment.modified_unix = modified_unix(&meta);
+        segment.modified_nanos = crate::audit::modified_nanos(&meta);
+        stat_matches(&segment).unwrap();
+        // Same second, other sub-second time.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(base + std::time::Duration::from_millis(500))
+            .unwrap();
+        drop(file);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(modified_unix(&meta), segment.modified_unix, "same second");
+        let err = stat_matches(&segment).expect_err("sub-second change is a change");
+        assert!(err.contains("원본이 바뀌었습니다"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

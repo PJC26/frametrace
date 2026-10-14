@@ -537,6 +537,9 @@ pub const SIGNOFF_CONTENT_SCHEMA: u64 = 3;
 
 /// The content a finalize sign-off binds to ([`report::signoff_content_sha256`]):
 /// every review mark with its range, plus the tag map, in a stable order.
+/// Finalize now builds the record with `report::Signoff::build_v4` (which
+/// uses [`signoff_content_json_from`]); tests pin the bytes through this.
+#[cfg(test)]
 pub(crate) fn signoff_content_json(case_dir: &Path) -> Result<String, String> {
     let rows = crate::case_db::load_review_marks(case_dir)
         .map_err(|err| format!("판독 마크를 읽지 못했습니다: {err}"))?;
@@ -1226,6 +1229,9 @@ fn read_scan_runs_json_checked(case_dir: &Path) -> Result<String, String> {
     Ok(format!("[{joined}]"))
 }
 
+/// `package-case` without `--allow-pending` (tests; the CLI dispatches to
+/// [`package_case_with_pending`]).
+#[cfg(test)]
 pub fn package_case(case_dir: &Path, options: PackageOptions) -> Result<(), String> {
     package_case_with_pending(case_dir, options, false)
 }
@@ -1314,194 +1320,13 @@ pub fn verify_package(package_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// `package::verify_package` plus the track-D checks (D10/D13/D16) that
-/// need only the package itself:
-/// - a PASS line claiming "no unlisted files" is dropped when an unlisted
-///   file failed (D10);
-/// - the packaged report must have been rendered from exactly the packaged
-///   sign-off record (marker = record SHA-256), not merely name the same
-///   examiner (D10);
-/// - a schema-v4 sign-off is checked against the packaged evidence hashes
-///   and the anchors of every packaged audit lane (D13);
-/// - whether the sign-off is in the packaged sign-off audit lane;
-/// - every listed lane that is a chain lane by name is chain-verified, even
-///   when its first line does not look chained (D16).
+/// The checks `verify-package` prints. Since the R4 integration the
+/// track-D checks (D10 report marker and "no unlisted files" only without
+/// an unlisted FAIL, D13 v4 bindings and the sign-off audit lane, D16
+/// known chain lanes) live in [`package::verify_package`] itself, so
+/// library callers get them too; this name is kept for the CLI and tests.
 pub fn verify_package_extended(package_dir: &Path) -> Result<package::PackageVerification, String> {
-    use package::{CheckStatus, PackageCheck};
-    let mut result = package::verify_package(package_dir)?;
-    let push = |result: &mut package::PackageVerification,
-                status: CheckStatus,
-                subject: &str,
-                detail: String| {
-        result.checks.push(PackageCheck {
-            status,
-            subject: subject.to_string(),
-            detail,
-        });
-    };
-    let listed: std::collections::BTreeSet<String> =
-        read_to_string(&package_dir.join("manifest.sha256"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.split_once("  ").map(|(_, rel)| rel.to_string()))
-            .collect();
-    // D10: never print "no unlisted files" next to an unlisted-file FAIL.
-    let unlisted_failed = result.checks.iter().any(|check| {
-        check.status == CheckStatus::Fail && check.detail.contains("not listed in manifest.sha256")
-    });
-    if unlisted_failed {
-        result.checks.retain(|check| {
-            !(check.status == CheckStatus::Pass && check.detail.contains("no unlisted files"))
-        });
-    }
-    // D16: known chain lanes are always chain-verified.
-    for rel in listed
-        .iter()
-        .filter(|rel| crate::audit::is_known_chain_lane(rel))
-    {
-        let already = result
-            .checks
-            .iter()
-            .any(|check| check.subject == *rel && check.status != CheckStatus::NotVerified);
-        if already {
-            continue;
-        }
-        let detail = match crate::audit::verify_chained_jsonl(&package_dir.join(rel)) {
-            Ok(verification) => {
-                result.checks.retain(|check| {
-                    !(check.subject == *rel && check.status == CheckStatus::NotVerified)
-                });
-                push(
-                    &mut result,
-                    CheckStatus::Pass,
-                    rel,
-                    format!(
-                        "audit chain verified (known chain lane): {} entries, {}",
-                        verification.entries,
-                        verification.integrity.label()
-                    ),
-                );
-                continue;
-            }
-            Err(err) => err,
-        };
-        result
-            .checks
-            .retain(|check| !(check.subject == *rel && check.status == CheckStatus::NotVerified));
-        push(
-            &mut result,
-            CheckStatus::Fail,
-            rel,
-            format!("known audit chain lane does not verify as a chain: {detail}"),
-        );
-    }
-    let signoff_rel = report::SIGNOFF_REL_PATH;
-    if !listed.contains(signoff_rel) {
-        return Ok(result);
-    }
-    let Ok(signoff_text) = read_to_string(&package_dir.join(signoff_rel)) else {
-        return Ok(result);
-    };
-    // D10: the report must name THIS record.
-    let report_rel = "reports/case-report.html";
-    if listed.contains(report_rel) {
-        match read_to_string(&package_dir.join(report_rel)) {
-            Ok(html) => match report::report_matches_signoff(&html, &signoff_text) {
-                Ok(()) => push(
-                    &mut result,
-                    CheckStatus::Pass,
-                    report_rel,
-                    "report was rendered from the packaged sign-off record (signoff-sha256 marker matches the record bytes)".to_string(),
-                ),
-                Err(err) => push(&mut result, CheckStatus::Fail, report_rel, err),
-            },
-            Err(err) => push(
-                &mut result,
-                CheckStatus::Fail,
-                report_rel,
-                format!("packaged report could not be read: {err}"),
-            ),
-        }
-    }
-    // D13: v4 bindings, against the packaged db's marks.
-    match packaged_signoff_digests(package_dir) {
-        Ok(digests) => {
-            let is_listed = |rel: &str| listed.contains(rel);
-            let check = report::check_signoff(
-                package_dir,
-                &signoff_text,
-                &digests,
-                report::SignoffScope::Package(&is_listed),
-            );
-            let v4 = report::Signoff::parse(&signoff_text)
-                .is_some_and(|signoff| signoff.schema_version >= report::SIGNOFF_SCHEMA_V4);
-            if v4 {
-                if check.changes.is_empty() {
-                    push(
-                        &mut result,
-                        CheckStatus::Pass,
-                        signoff_rel,
-                        "sign-off v4: marks, evidence SHA-256 bindings and audit-lane anchors match the package".to_string(),
-                    );
-                } else {
-                    for change in &check.changes {
-                        push(&mut result, CheckStatus::Fail, signoff_rel, change.clone());
-                    }
-                }
-                for item in &check.not_verified {
-                    push(
-                        &mut result,
-                        CheckStatus::NotVerified,
-                        signoff_rel,
-                        item.clone(),
-                    );
-                }
-            }
-        }
-        Err(err) => push(
-            &mut result,
-            CheckStatus::NotVerified,
-            signoff_rel,
-            format!("sign-off bindings not checked: {err}"),
-        ),
-    }
-    let (recorded, note) = report::signoff_audit_status(package_dir, &signoff_text);
-    push(
-        &mut result,
-        if recorded {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::NotVerified
-        },
-        report::SIGNOFF_LOG_REL_PATH,
-        note,
-    );
-    Ok(result)
-}
-
-/// The sign-off digests of the review marks in a package's `db/case.db`,
-/// read from a private copy (verification never writes into the package).
-fn packaged_signoff_digests(package_dir: &Path) -> Result<report::SignoffDigests, String> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let scratch = std::env::temp_dir().join(format!(
-        "frametrace-verify-signoff-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let outcome = (|| -> Result<report::SignoffDigests, String> {
-        fs::create_dir_all(&scratch).map_err(|err| err.to_string())?;
-        let copy = scratch.join("case.db");
-        fs::copy(package_dir.join("db/case.db"), &copy).map_err(|err| err.to_string())?;
-        let conn = crate::case_db::open_readonly_case_db(&copy)?;
-        let marks = crate::case_db::load_review_marks_from(&conn)?;
-        let tags = crate::case_db::load_review_tags_from(&conn)?;
-        Ok(report::SignoffDigests {
-            content: report::signoff_content_sha256(&signoff_content_json_from(&marks, &tags)),
-            legacy: report::signoff_content_sha256(&review_marks_json_from_rows(&marks)),
-        })
-    })();
-    let _ = fs::remove_dir_all(&scratch);
-    outcome
+    package::verify_package(package_dir)
 }
 
 pub fn inspect(case_dir: &Path) -> Result<(), String> {

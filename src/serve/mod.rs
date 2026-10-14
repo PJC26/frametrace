@@ -45,6 +45,8 @@ mod tests_phase3;
 #[cfg(test)]
 mod tests_post_review;
 #[cfg(test)]
+mod tests_r4_integration;
+#[cfg(test)]
 mod tests_r4_jobs;
 #[cfg(test)]
 mod tests_r4_server;
@@ -119,15 +121,18 @@ pub(crate) use jobs::{audio_measure_with_exe, enrichment_plan};
 pub(crate) use media::{
     copy_unique, export_clip_with_exe, export_safe_name, join_check_with_tools, join_with_exe,
 };
-// Only the fake-CLI tests (unix-only) use these.
-#[cfg(all(test, unix))]
+// The fake-CLI tests use these (unix scripts and Windows `.cmd` fakes).
+#[cfg(test)]
 pub(crate) use jobs::SIGNOFF_PENDING_REL_PATH;
-#[cfg(all(test, unix))]
+// Unused by the current Windows test set; kept for the fake-CLI tests.
+#[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use media::exhibit_arg;
 #[cfg(test)]
 pub(crate) use recent::{
-    RECENT_CAP, RecentCase, canonical_case_dir, forget_recent_in, load_recent, recent_case_json,
-    recent_cases_file, recent_cases_json_from, record_recent_in, upsert_recent,
+    RECENT_CAP, RecentCase, canonical_case_dir, forget_recent_in, load_recent,
+    override_recent_cases_file, recent_case_json, recent_cases_file, recent_cases_json_from,
+    record_recent_in, upsert_recent,
 };
 #[cfg(test)]
 pub(crate) use records::{

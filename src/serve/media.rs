@@ -1468,24 +1468,11 @@ pub(crate) fn api_proxy(request: &Request, state: &SharedState) -> String {
         }
         candidate.to_string_lossy().to_string()
     };
-    let dir = case_dir.join("artifacts/proxies");
-    let find_existing = |dir: &Path| -> Option<PathBuf> {
-        // generate_proxy names outputs with video_export::sanitize_filename,
-        // not export_safe_name — match that or the cache lookup misses.
-        let prefix = format!(
-            "{}_proxy_",
-            crate::video_export::sanitize_filename(&selector)
-        );
-        std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&prefix) && name.ends_with(".mp4") {
-                Some(entry.path())
-            } else {
-                None
-            }
-        })
-    };
-    let proxy = match find_existing(&dir) {
+    // D5: proxies are named `proxy_<record id>_<hash8>.mp4` (path-free);
+    // the shared lookup prefers those and still finds pre-D5
+    // `<sanitize(selector)>_proxy_*` names.
+    let find_existing = || crate::artifacts::find_existing_proxy(&case_dir, &selector);
+    let proxy = match find_existing() {
         Some(path) => path,
         None => {
             let exe = match std::env::current_exe() {
@@ -1505,7 +1492,7 @@ pub(crate) fn api_proxy(request: &Request, state: &SharedState) -> String {
             if let Err(err) = run_step(&exe, &args, state) {
                 return serde_json::json!({"ok": false, "error": err}).to_string();
             }
-            match find_existing(&dir) {
+            match find_existing() {
                 Some(path) => path,
                 None => {
                     return "{\"ok\":false,\"error\":\"프록시 생성 후 파일을 찾지 못했습니다.\"}"

@@ -162,7 +162,7 @@ fn signoff_detects_range_and_tag_changes() {
         crate::package::CheckStatus::Fail
     );
     let signoff = std::fs::read_to_string(case.join(crate::report::SIGNOFF_REL_PATH)).unwrap();
-    assert!(signoff.contains("\"schema_version\":3"), "{signoff}");
+    assert!(signoff.contains("\"schema_version\":4"), "{signoff}");
     let _ = std::fs::remove_dir_all(root);
 }
 

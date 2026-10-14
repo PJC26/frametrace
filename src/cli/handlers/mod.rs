@@ -264,10 +264,12 @@ mod tests;
 pub(crate) use batch::{
     export_batch, export_marks, import_marks, import_marks_quiet, validate_batch,
 };
+#[cfg(test)]
+pub(crate) use case::signoff_content_json;
 pub(crate) use case::{
     InitCaseOptions, PackageOptions, RegisterSourceOptions, init_case, inspect, make_custody,
-    make_report, make_review, package_case, register_source, review_marks_json_from_rows,
-    scan_folder, signoff_content_json, signoff_content_json_from, verify_package,
+    make_report, make_review, package_case_with_pending, register_source,
+    review_marks_json_from_rows, scan_folder, signoff_content_json_from, verify_package,
 };
 pub(crate) use doctor::{
     BenchmarkOptions, benchmark_db, deepfake_scan, deepfake_screen, doctor, rotate_audit_key,

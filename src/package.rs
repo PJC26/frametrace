@@ -34,6 +34,10 @@ struct PackageRedaction {
     /// database, index files, hash-chained logs (rewriting would break their
     /// chains) and binary media.
     not_redacted: Vec<String>,
+    /// Pre-D5 artifact files whose names embed the selector (often an
+    /// absolute source path), shipped under a path-free name instead:
+    /// (package path, SHA-256 of the withheld original name).
+    renamed: Vec<(String, String)>,
 }
 
 /// Per-run state threaded through the copy helpers.
@@ -65,6 +69,15 @@ fn package_redaction_mode(case_dir: &Path) -> Result<bool, String> {
             redacted.push(*rel);
         } else {
             plain.push(*rel);
+        }
+    }
+    // D12: the viewer's data bundle carries every record's paths; it is
+    // shipped verbatim in redacted mode, so its own marker must agree.
+    if let Ok(js) = fs::read_to_string(case_dir.join(DATA_BUNDLE_REL)) {
+        if crate::redact::bundle_is_redacted(&js) {
+            redacted.push(DATA_BUNDLE_REL);
+        } else {
+            plain.push(DATA_BUNDLE_REL);
         }
     }
     if !redacted.is_empty() && !plain.is_empty() {
@@ -158,6 +171,7 @@ fn package_case_into(
             redactor: crate::redact::Redactor::new(case_dir),
             rewritten: Vec::new(),
             not_redacted: Vec::new(),
+            renamed: Vec::new(),
         }),
     };
     let running_jobs = match crate::case_db::latest_running_jobs(case_dir) {
@@ -238,7 +252,42 @@ fn package_case_into(
     if let Some(redaction) = context.redaction.as_mut() {
         redaction.rewritten.sort();
         redaction.not_redacted.sort();
+        redaction.renamed.sort();
     }
+
+    let report_included = files
+        .iter()
+        .any(|file| file.relative_path == Path::new("reports/case-report.html"));
+    let report_note = if report_included {
+        "Open reports/case-report.html for the HTML report. Use the browser print dialog to create a PDF when required by the engagement."
+    } else {
+        "No HTML report is included — run `frametrace make-report <case-dir>` in the case before packaging to produce reports/case-report.html."
+    };
+    let mut readme = format!(
+        "FrameTrace case package\n\n{report_note} Verify package contents with manifest.sha256 before transfer (`frametrace verify-package <package-dir>` checks the manifest, audit chains and sign-off and reports what it could not verify).\n\nSnapshot scope: see snapshot_scope in package-manifest.json. For Amped FIVE or Magnet DVR Examiner handoff steps, see docs/COMMERCIAL_HANDOFF.md in the FrameTrace repository.\n"
+    );
+    if let Some(redaction) = &context.redaction {
+        readme.push_str(&redaction_readme_section(redaction));
+    }
+    if !warnings.is_empty() {
+        readme.push_str("\nWARNINGS\n");
+        for warning in &warnings {
+            readme.push_str(&format!("- {warning}\n"));
+        }
+    }
+    // D10: README.txt is covered by manifest.sha256 like every other
+    // packaged file (only the two manifests themselves are unlisted).
+    let readme_path = output_dir.join(README_REL);
+    write_text(&readme_path, &readme)
+        .map_err(|err| format!("failed to write package README: {err}"))?;
+    files.push(PackageFile {
+        relative_path: PathBuf::from(README_REL),
+        sha256: audit::digest_file(&readme_path)?,
+        size_bytes: fs::metadata(&readme_path)
+            .map_err(|err| format!("failed to stat package README: {err}"))?
+            .len(),
+    });
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
     let checksum_text = files
         .iter()
@@ -267,29 +316,6 @@ fn package_case_into(
     let manifest_path = output_dir.join("package-manifest.json");
     write_text(&manifest_path, &manifest_json)
         .map_err(|err| format!("failed to write package manifest: {err}"))?;
-
-    let report_included = files
-        .iter()
-        .any(|file| file.relative_path == Path::new("reports/case-report.html"));
-    let report_note = if report_included {
-        "Open reports/case-report.html for the HTML report. Use the browser print dialog to create a PDF when required by the engagement."
-    } else {
-        "No HTML report is included — run `frametrace make-report <case-dir>` in the case before packaging to produce reports/case-report.html."
-    };
-    let mut readme = format!(
-        "FrameTrace case package\n\n{report_note} Verify package contents with manifest.sha256 before transfer (`frametrace verify-package <package-dir>` checks the manifest, audit chains and sign-off and reports what it could not verify).\n\nSnapshot scope: see snapshot_scope in package-manifest.json. For Amped FIVE or Magnet DVR Examiner handoff steps, see docs/COMMERCIAL_HANDOFF.md in the FrameTrace repository.\n"
-    );
-    if let Some(redaction) = &context.redaction {
-        readme.push_str(&redaction_readme_section(redaction));
-    }
-    if !warnings.is_empty() {
-        readme.push_str("\nWARNINGS\n");
-        for warning in &warnings {
-            readme.push_str(&format!("- {warning}\n"));
-        }
-    }
-    write_text(&output_dir.join("README.txt"), &readme)
-        .map_err(|err| format!("failed to write package README: {err}"))?;
 
     Ok(PackageResult {
         output_dir,
@@ -323,7 +349,41 @@ fn redaction_readme_section(redaction: &PackageRedaction) -> String {
             redaction.not_redacted.len() - LIST_LIMIT
         ));
     }
+    if !redaction.renamed.is_empty() {
+        out.push_str("\nRENAMED ARTIFACT FILES\nThese proxy/thumbnail files were written before path-free artifact names and their case file names embed the source selector (often an absolute path). They are packaged under path-free names; the original name is withheld and identified only by its SHA-256. Chained logs (e.g. proxy-log.jsonl) still record the original names and are listed above as not path-redacted.\n");
+        for (rel, name_sha256) in &redaction.renamed {
+            out.push_str(&format!(
+                "- {rel} (original file name SHA-256 {name_sha256})\n"
+            ));
+        }
+    }
     out
+}
+
+/// D5 in packages: a pre-D5 proxy / thumbnail name
+/// (`<sanitize(selector)>_proxy_<ts>.mp4`, `<sanitize(selector)>_thumb_<ts>.jpg`)
+/// embeds the selector — often an absolute source path. A path-redacted
+/// package ships such a file as `legacy_<kind>_<sha256(name)[..12]>.<ext>`.
+/// `None` for every other file (path-free `proxy_<id>_<hash8>` names
+/// included).
+fn legacy_artifact_package_rel(rel: &Path) -> Option<(PathBuf, String)> {
+    let parent = rel.parent()?;
+    let name = rel.file_name()?.to_string_lossy().into_owned();
+    let (kind, marker, ext) = if parent == Path::new("artifacts/proxies") {
+        ("proxy", "_proxy_", ".mp4")
+    } else if parent == Path::new("artifacts/thumbnails") {
+        ("thumb", "_thumb_", ".jpg")
+    } else {
+        return None;
+    };
+    if name.starts_with(&format!("{kind}_")) || !name.contains(marker) || !name.ends_with(ext) {
+        return None;
+    }
+    let name_sha256 = crate::sha256::digest_bytes(name.as_bytes());
+    Some((
+        parent.join(format!("legacy_{kind}_{}{ext}", &name_sha256[..12])),
+        name_sha256,
+    ))
 }
 
 /// How a path-redacted package treats one file.
@@ -653,7 +713,22 @@ fn copy_package_file(
     if !metadata.is_file() {
         return Ok(());
     }
-    let target = output_dir.join(rel);
+    // D5: a redacted package never ships a file name that embeds a path.
+    let renamed = context
+        .redaction
+        .as_ref()
+        .and_then(|_| legacy_artifact_package_rel(rel));
+    let package_rel = renamed
+        .as_ref()
+        .map(|(package_rel, _)| package_rel.clone())
+        .unwrap_or_else(|| rel.to_path_buf());
+    let target = output_dir.join(&package_rel);
+    if renamed.is_some() && target.exists() {
+        return Err(format!(
+            "package-case refused: two case files map to the package path {}",
+            rel_manifest_path(&package_rel)
+        ));
+    }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create package directory: {err}"))?;
@@ -669,11 +744,16 @@ fn copy_package_file(
     };
     if let (Some(redaction), Some(copy)) = (context.redaction.as_mut(), &redacted_copy) {
         match copy {
-            RedactedCopy::Rewrite(_) => redaction.rewritten.push(rel_manifest_path(rel)),
+            RedactedCopy::Rewrite(_) => redaction.rewritten.push(rel_manifest_path(&package_rel)),
             RedactedCopy::Verbatim { listed: true } => {
-                redaction.not_redacted.push(rel_manifest_path(rel))
+                redaction.not_redacted.push(rel_manifest_path(&package_rel))
             }
             RedactedCopy::Verbatim { listed: false } => {}
+        }
+        if let Some((_, name_sha256)) = &renamed {
+            redaction
+                .renamed
+                .push((rel_manifest_path(&package_rel), name_sha256.clone()));
         }
     }
     if rel == Path::new("db/case.db") {
@@ -697,7 +777,7 @@ fn copy_package_file(
         })?;
     }
     files.push(PackageFile {
-        relative_path: rel.to_path_buf(),
+        relative_path: package_rel,
         sha256: audit::digest_file(&target)?,
         size_bytes: fs::metadata(&target)
             .map_err(|err| format!("failed to stat final package file: {err}"))?
@@ -879,7 +959,11 @@ impl PackageVerification {
 }
 
 /// Files `package_case` writes after (or outside) `manifest.sha256`.
-const UNLISTED_PACKAGE_FILES: &[&str] = &["manifest.sha256", "package-manifest.json", "README.txt"];
+const UNLISTED_PACKAGE_FILES: &[&str] = &["manifest.sha256", "package-manifest.json"];
+
+/// The package README; listed in `manifest.sha256` since D10 (older
+/// packages left it unlisted — reported as not verified, not as added).
+const README_REL: &str = "README.txt";
 
 /// Rejects manifest paths that could escape the package or are not the
 /// portable '/'-separated relative form `package_case` writes.
@@ -1010,16 +1094,28 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
     }
     let mut present = Vec::new();
     collect_package_files(package_dir, Path::new(""), &mut present, &mut out);
+    let mut unlisted_found = false;
     for rel in present {
-        if !listed.contains_key(&rel) && !UNLISTED_PACKAGE_FILES.contains(&rel.as_str()) {
-            out.push(
-                CheckStatus::Fail,
-                &rel,
-                "present in the package but not listed in manifest.sha256 (added after packaging)",
-            );
+        if listed.contains_key(&rel) || UNLISTED_PACKAGE_FILES.contains(&rel.as_str()) {
+            continue;
         }
+        if rel == README_REL {
+            out.push(
+                CheckStatus::NotVerified,
+                README_REL,
+                "not listed in manifest.sha256 (package written before the README was covered); its text is not verified",
+            );
+            continue;
+        }
+        unlisted_found = true;
+        out.push(
+            CheckStatus::Fail,
+            &rel,
+            "present in the package but not listed in manifest.sha256 (added after packaging)",
+        );
     }
-    if manifest_ok && out.files_verified == listed.len() {
+    // D10: never claim "no unlisted files" next to an unlisted-file FAIL.
+    if manifest_ok && !unlisted_found && out.files_verified == listed.len() {
         out.push(
             CheckStatus::Pass,
             "manifest.sha256",
@@ -1033,17 +1129,16 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
     // 2. package-manifest.json vs manifest.sha256 and sizes.
     verify_package_manifest_json(package_dir, &listed, &mut out);
 
-    // 3. Hash-chained logs.
-    for rel in listed.keys().filter(|rel| rel.ends_with(".jsonl")) {
+    // 3. Hash-chained logs. A lane that is a chain lane by name (D16) is
+    // always chain-verified, whatever its first line looks like — a lane
+    // rewritten as plain JSON must not pass as "not a chain".
+    for rel in listed
+        .keys()
+        .filter(|rel| rel.ends_with(".jsonl") || audit::is_known_chain_lane(rel))
+    {
         let path = package_dir.join(rel);
-        let text = fs::read_to_string(&path).unwrap_or_default();
-        let chained = text
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .is_some_and(|value| {
-                value.get("previous_entry_sha256").is_some() || value.get("entry_sha256").is_some()
-            });
+        let known_lane = audit::is_known_chain_lane(rel);
+        let chained = known_lane || is_chained_jsonl(&path);
         if !chained {
             out.push(
                 CheckStatus::NotVerified,
@@ -1065,6 +1160,13 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
                 }
                 out.push(CheckStatus::Pass, rel, detail);
             }
+            Err(err) if known_lane => out.push(
+                CheckStatus::Fail,
+                rel,
+                format!(
+                    "audit chain broken (known audit chain lane does not verify as a chain): {err}"
+                ),
+            ),
             Err(err) => out.push(CheckStatus::Fail, rel, format!("audit chain broken: {err}")),
         }
     }
@@ -1345,7 +1447,31 @@ fn verify_package_db_and_signoff(
             &crate::cli::handlers::review_marks_json_from_rows(&marks),
         ),
     };
-    match crate::report::signoff_currency(&text, &digests) {
+    // D13: a schema-v4 record is checked against the packaged evidence
+    // hashes and every packaged audit lane's anchor as well; older records
+    // keep their legacy meaning.
+    let is_listed = |rel: &str| listed.contains_key(rel);
+    let check = crate::report::check_signoff(
+        package_dir,
+        &text,
+        &digests,
+        crate::report::SignoffScope::Package(&is_listed),
+    );
+    let v4 = crate::report::Signoff::parse(&text)
+        .is_some_and(|signoff| signoff.schema_version >= crate::report::SIGNOFF_SCHEMA_V4);
+    match check.currency {
+        crate::report::SignoffCurrency::Current if v4 => out.push(
+            CheckStatus::Pass,
+            signoff_rel,
+            format!(
+                "sign-off v4: marks, evidence SHA-256 bindings and audit-lane anchors match the package (examiner recorded as typed: {examiner}; not an authenticated identity)"
+            ),
+        ),
+        crate::report::SignoffCurrency::Changed if v4 => {
+            for change in &check.changes {
+                out.push(CheckStatus::Fail, signoff_rel, change.clone());
+            }
+        }
         crate::report::SignoffCurrency::Current => out.push(
             CheckStatus::Pass,
             signoff_rel,
@@ -1372,6 +1498,9 @@ fn verify_package_db_and_signoff(
             "sign-off predates content binding (no content_sha256); which marks it covers cannot be checked",
         ),
     }
+    for item in &check.not_verified {
+        out.push(CheckStatus::NotVerified, signoff_rel, item.clone());
+    }
     match report {
         Some(html) => {
             let banner = format!(
@@ -1391,6 +1520,17 @@ fn verify_package_db_and_signoff(
                     "report does not name the examiner recorded in review/signoff.json",
                 );
             }
+            // D10: the report must have been rendered from THIS record
+            // (marker = SHA-256 of the record bytes), not merely name the
+            // same examiner.
+            match crate::report::report_matches_signoff(&html, &text) {
+                Ok(()) => out.push(
+                    CheckStatus::Pass,
+                    report_rel,
+                    "report was rendered from the packaged sign-off record (signoff-sha256 marker matches the record bytes)",
+                ),
+                Err(err) => out.push(CheckStatus::Fail, report_rel, err),
+            }
         }
         None => out.push(
             CheckStatus::NotVerified,
@@ -1398,6 +1538,17 @@ fn verify_package_db_and_signoff(
             "no packaged report to compare with the sign-off",
         ),
     }
+    // D13: whether the record is in the packaged sign-off audit lane.
+    let (recorded, note) = crate::report::signoff_audit_status(package_dir, &text);
+    out.push(
+        if recorded {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::NotVerified
+        },
+        crate::report::SIGNOFF_LOG_REL_PATH,
+        note,
+    );
 }
 
 fn copy_optional_package_file(
@@ -1459,11 +1610,16 @@ fn package_manifest_json(
     out.push_str(&format!("    \"quiescent\": {},\n", quiescent));
     out.push_str("    \"running_jobs\": [\n");
     for (index, job) in running_jobs.iter().enumerate() {
+        // D6: a redacted package never names the job's subject path.
+        let subject_path = match redaction {
+            Some(redaction) => redaction.redactor.text(&job.subject_path),
+            None => job.subject_path.clone(),
+        };
         out.push_str(&format!(
             "    {{\"job_id\":\"{}\",\"job_type\":\"{}\",\"subject_path\":\"{}\",\"started_unix\":{}}}",
             json_escape(&job.job_id),
             json_escape(&job.job_type),
-            json_escape(&job.subject_path),
+            json_escape(&subject_path),
             job.started_unix
         ));
         if index + 1 != running_jobs.len() {
@@ -1497,6 +1653,7 @@ fn package_manifest_json(
             "applied": true,
             "rewritten_files": redaction.rewritten,
             "not_redacted_files": redaction.not_redacted,
+            "renamed_files": redaction.renamed.iter().map(|(rel, name_sha256)| serde_json::json!({"package_path": rel, "original_name_sha256": name_sha256})).collect::<Vec<_>>(),
             "note": "Rewritten files are path-redacted copies and differ from the case files (hashes recorded elsewhere for the originals do not match them). Files in not_redacted_files were copied byte-for-byte and may contain absolute paths: database, index files, hash-chained audit logs (never rewritten, to keep their chain hashes), binary media.",
         }),
         None => serde_json::json!({"applied": false}),
@@ -1728,8 +1885,223 @@ mod tests {
             assert!(failure.detail.contains("does not cover"), "{failure:?}");
             fs::remove_dir_all(root).unwrap();
         }
+
+        /// Rewrites a packaged file and recomputes both manifests, so only
+        /// the content checks can catch the change.
+        fn rewrite_listed(package: &Path, rel: &str, text: &str) {
+            fs::write(package.join(rel), text).unwrap();
+            let sha = crate::sha256::digest_bytes(text.as_bytes());
+            let manifest: String = fs::read_to_string(package.join("manifest.sha256"))
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    if line.ends_with(&format!("  {rel}")) {
+                        format!("{sha}  {rel}\n")
+                    } else {
+                        format!("{line}\n")
+                    }
+                })
+                .collect();
+            fs::write(package.join("manifest.sha256"), manifest).unwrap();
+            let path = package.join("package-manifest.json");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            for file in json["files"].as_array_mut().unwrap() {
+                if file["relative_path"] == rel {
+                    file["sha256"] = sha.clone().into();
+                    file["size_bytes"] = (text.len() as u64).into();
+                }
+            }
+            fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        }
+
+        /// D10: README.txt is in manifest.sha256 and checked; a package
+        /// from before (README unlisted) reads NOT VERIFIED, not FAIL.
+        #[test]
+        fn readme_is_listed_and_checked() {
+            let (root, _case, output) = signed_package("verify-readme");
+            let manifest = fs::read_to_string(output.join("manifest.sha256")).unwrap();
+            assert!(manifest.contains("  README.txt\n"), "{manifest}");
+            let result = verify_package(&output).unwrap();
+            assert!(result.passed(), "{:?}", result.checks);
+            fs::write(output.join("README.txt"), "edited after packaging").unwrap();
+            let result = verify_package(&output).unwrap();
+            assert!(
+                failing_subjects(&result).contains(&"README.txt".to_string()),
+                "{:?}",
+                result.checks
+            );
+            // Older layout: README not listed anywhere.
+            let manifest: String = manifest
+                .lines()
+                .filter(|line| !line.ends_with("  README.txt"))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            fs::write(output.join("manifest.sha256"), manifest).unwrap();
+            let path = output.join("package-manifest.json");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            json["files"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|file| file["relative_path"] != "README.txt");
+            json["file_count"] = (json["files"].as_array().unwrap().len() as u64).into();
+            fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+            let result = verify_package(&output).unwrap();
+            assert!(result.passed(), "{:?}", result.checks);
+            assert_eq!(
+                check(&result, "README.txt").unwrap().status,
+                CheckStatus::NotVerified
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// D10/D16 in the library check (not only the CLI): a known chain
+        /// lane rewritten as plain JSON (manifests recomputed) FAILS, the
+        /// report marker is compared, and "no unlisted files" is never
+        /// printed next to an unlisted-file FAIL.
+        #[test]
+        fn library_verify_has_marker_known_lane_and_unlisted_rules() {
+            let (root, _case, output) = signed_package("verify-lib-d10");
+            let result = verify_package(&output).unwrap();
+            assert!(
+                result
+                    .checks
+                    .iter()
+                    .any(|c| c.subject == "reports/case-report.html"
+                        && c.status == CheckStatus::Pass
+                        && c.detail.contains("signoff-sha256 marker")),
+                "{:?}",
+                result.checks
+            );
+            let lane = "evidence/logs/scan-log.jsonl";
+            rewrite_listed(&output, lane, "{\"plain\":true}\n");
+            let result = verify_package(&output).unwrap();
+            assert!(
+                result.failures().any(|c| c.subject == lane
+                    && c.detail
+                        .contains("known audit chain lane does not verify as a chain")),
+                "{:?}",
+                result.checks
+            );
+            fs::write(output.join("reports/extra.txt"), "added").unwrap();
+            let result = verify_package(&output).unwrap();
+            assert!(failing_subjects(&result).contains(&"reports/extra.txt".to_string()));
+            assert!(
+                !result.checks.iter().any(
+                    |c| c.status == CheckStatus::Pass && c.detail.contains("no unlisted files")
+                ),
+                "contradictory PASS line"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
     }
     use std::fs;
+
+    /// D6/D12/D5 in a path-redacted package: the data bundle's own marker
+    /// takes part in the mode decision, a running job's subject path is
+    /// redacted in package-manifest.json, and pre-D5 artifact names that
+    /// embed a path are shipped under path-free names (listed in README).
+    #[test]
+    fn redacted_package_redacts_job_paths_bundle_mode_and_legacy_names() {
+        let root = fixture("redact-r4i");
+        let case_dir = root.join("case");
+        let secret_dir = root.join("Secret Evidence");
+        fs::create_dir_all(&secret_dir).unwrap();
+        let redacted_page = format!(
+            "<html><body>{}<p>redacted</p></body></html>",
+            crate::redact::REDACTION_MARKER
+        );
+        fs::create_dir_all(case_dir.join("reports")).unwrap();
+        fs::create_dir_all(case_dir.join("review")).unwrap();
+        fs::write(case_dir.join("reports/case-report.html"), &redacted_page).unwrap();
+        fs::write(case_dir.join("review/index.html"), &redacted_page).unwrap();
+        // D12: an unredacted bundle next to redacted pages is a mix.
+        fs::write(
+            case_dir.join("review/data-bundle.js"),
+            "window.FT_DATA = {};\n",
+        )
+        .unwrap();
+        let err = package_case(&case_dir, Some(&root.join("refused"))).unwrap_err();
+        assert!(err.contains("review/data-bundle.js"), "{err}");
+        fs::write(
+            case_dir.join("review/data-bundle.js"),
+            crate::redact::mark_bundle_redacted("window.FT_DATA = {};\n"),
+        )
+        .unwrap();
+        // D6: a running job naming a path outside the case.
+        let job =
+            crate::case_db::start_job(&case_dir, "scan-folder", &secret_dir, None, "{}").unwrap();
+        // D5: one pre-D5 proxy and thumbnail (names embed the path), one
+        // path-free proxy.
+        fs::create_dir_all(case_dir.join("artifacts/proxies")).unwrap();
+        fs::create_dir_all(case_dir.join("artifacts/thumbnails")).unwrap();
+        let legacy_proxy = format!(
+            "{}_proxy_1700000000.mp4",
+            crate::video_export::sanitize_filename(&secret_dir.join("cam1.mp4").to_string_lossy())
+        );
+        assert!(legacy_proxy.contains("Secret"), "{legacy_proxy}");
+        fs::write(case_dir.join("artifacts/proxies").join(&legacy_proxy), b"p").unwrap();
+        let legacy_thumb = legacy_proxy
+            .replace("_proxy_", "_thumb_")
+            .replace(".mp4", ".jpg");
+        fs::write(
+            case_dir.join("artifacts/thumbnails").join(&legacy_thumb),
+            b"t",
+        )
+        .unwrap();
+        fs::write(
+            case_dir.join("artifacts/proxies/proxy_vid_000001_0123abcd.mp4"),
+            b"n",
+        )
+        .unwrap();
+
+        let output = root.join("package");
+        let result = package_case(&case_dir, Some(&output)).unwrap();
+        assert!(result.path_redacted);
+        let manifest_text = fs::read_to_string(output.join("package-manifest.json")).unwrap();
+        assert!(
+            !manifest_text.contains("Secret"),
+            "a path leaked into package-manifest.json: {manifest_text}"
+        );
+        let manifest = manifest_of(&output);
+        assert_eq!(manifest["quiescence"]["quiescent"], false);
+        let subject = manifest["quiescence"]["running_jobs"][0]["subject_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(subject.contains("redacted"), "{subject}");
+        // No packaged file name carries the path; both legacy files are
+        // there under path-free names, the path-free proxy as it was.
+        let checksums = fs::read_to_string(output.join("manifest.sha256")).unwrap();
+        assert!(!checksums.contains("Secret"), "{checksums}");
+        assert!(
+            output
+                .join("artifacts/proxies/proxy_vid_000001_0123abcd.mp4")
+                .is_file()
+        );
+        let renamed = manifest["path_redaction"]["renamed_files"]
+            .as_array()
+            .unwrap();
+        assert_eq!(renamed.len(), 2, "{renamed:?}");
+        let readme = fs::read_to_string(output.join("README.txt")).unwrap();
+        assert!(readme.contains("RENAMED ARTIFACT FILES"), "{readme}");
+        assert!(!readme.contains("Secret"), "{readme}");
+        for entry in renamed {
+            let rel = entry["package_path"].as_str().unwrap();
+            assert!(
+                rel.starts_with("artifacts/proxies/legacy_proxy_")
+                    || rel.starts_with("artifacts/thumbnails/legacy_thumb_"),
+                "{rel}"
+            );
+            assert!(output.join(rel).is_file(), "{rel}");
+            assert!(readme.contains(rel), "{rel} not in README");
+        }
+        let verification = super::verify_package(&output).unwrap();
+        assert!(verification.passed(), "{:?}", verification.checks);
+        crate::case_db::complete_job(&case_dir, &job.job_id, 0, "done").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn manifest_of(output: &std::path::Path) -> serde_json::Value {
         serde_json::from_str(&fs::read_to_string(output.join("package-manifest.json")).unwrap())
