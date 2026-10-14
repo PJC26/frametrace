@@ -228,16 +228,23 @@ fn status_answers_fast_while_the_case_db_is_write_locked() {
     // A carve child holds the DB (EXCLUSIVE: even readers wait).
     let writer = rusqlite::Connection::open(crate::case_db::case_db_path(&case)).unwrap();
     writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
-    let started = std::time::Instant::now();
+    // R4-B20: proven by counters, not wall time (flaky on a loaded
+    // runner): the poll made exactly one bounded (`_quick`) progress read,
+    // and that read found the DB locked and fell back to the remembered
+    // progress instead of waiting out a busy timeout.
+    let reads = super::system::STATUS_PROGRESS_READS.with(std::cell::Cell::get);
+    let fallbacks = super::system::STATUS_PROGRESS_BUSY_FALLBACKS.with(std::cell::Cell::get);
     let status = parse(&api_status(&state));
-    let elapsed = started.elapsed();
     writer.execute_batch("ROLLBACK").unwrap();
-    eprintln!("R10: /api/status under an exclusive DB writer took {elapsed:?}");
-    assert!(
-        // Target < 200 ms (measured ~115 ms: one 100 ms lock wait); the
-        // bound leaves headroom for a loaded test runner.
-        elapsed < std::time::Duration::from_millis(300),
-        "status must not wait out the 5 s busy timeout: {elapsed:?}"
+    assert_eq!(
+        super::system::STATUS_PROGRESS_READS.with(std::cell::Cell::get),
+        reads + 1,
+        "one bounded progress read per status poll"
+    );
+    assert_eq!(
+        super::system::STATUS_PROGRESS_BUSY_FALLBACKS.with(std::cell::Cell::get),
+        fallbacks + 1,
+        "the locked DB took the non-waiting fallback"
     );
     // The last progress seen is reported, marked stale — not dropped.
     assert_eq!(status["progress"]["job_type"], "carve", "{status}");

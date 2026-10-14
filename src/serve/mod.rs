@@ -45,6 +45,8 @@ mod tests_phase3;
 #[cfg(test)]
 mod tests_post_review;
 #[cfg(test)]
+mod tests_r4_server;
+#[cfg(test)]
 mod tests_recent;
 #[cfg(test)]
 mod tests_review3;
@@ -53,12 +55,14 @@ pub(crate) use discovery::{
     find_running_server, publish_local_server, token_for_port, write_instance_file,
 };
 pub(crate) use http::{
-    MAX_CAPTURE_FRAME_BODY, Request, body_value, handle_connection, instance_fingerprint,
-    is_viewer_page_path, json, json_string, page, path_is_under, plain, query_value,
-    request_is_localhost_trusted, valid_token, viewer_page, write_simple,
+    MAX_CAPTURE_FRAME_BODY, Request, body_value, instance_fingerprint, is_viewer_page_path, json,
+    json_string, page, path_is_under, plain, query_value, request_is_localhost_trusted,
+    valid_token, viewer_page, write_simple,
 };
+#[cfg(test)]
+pub(crate) use jobs::api_mark_conflicts;
 pub(crate) use jobs::{
-    api_audio_measure, api_carve, api_finalize, api_import_marks, api_mark_conflicts,
+    api_audio_measure, api_carve, api_finalize, api_import_marks, api_marks_pending,
     api_recover_deleted, api_start, api_verify_sources, case_job_json, default_case_dir_checked,
     pending_marks_count, run_step, run_step_cancellable,
 };
@@ -73,11 +77,13 @@ pub(crate) use records::{
     api_records, api_records_meta, cached_index, index_generation, newest_tsk_inspection,
     scan_progress_path,
 };
+#[cfg(test)]
+pub(crate) use state::try_lease_busy;
 pub(crate) use state::{
     BusyLease, CaseJob, ClipJob, Enrichment, IndexCache, IndexFingerprint, InputKind, JobState,
     JoinJobInfo, LiveCache, PipelineJob, SharedState, StepStatus, api_err, cancel_write_ops,
     lease_busy_locked, restore_session, save_session, shutdown_refusal, side_work_refusal,
-    state_lock, try_acquire_busy, try_begin_seal, try_begin_write_op, try_lease_busy,
+    state_lock, try_acquire_busy, try_begin_seal, try_begin_write_op,
 };
 pub(crate) use system::{
     api_browse, api_cancel, api_case_info, api_env, api_open_case, api_preflight, api_shutdown,
@@ -232,26 +238,49 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
     if let Some(token) = &token {
         state_lock(&state).token = Some(token.clone());
     }
+    // R4-B15: the audit key source this workstation runs with is handed to
+    // every CLI child, and installed here too for the in-process appends.
+    let key_source = workstation_key_source();
+    if let Some(spec) = &key_source
+        && let Err(err) = crate::audit_key::install_source_override(spec)
+        && !err.contains("already installed")
+    {
+        return Err(err);
+    }
+    let key_tag = audit_key_tag(crate::audit_key::configured());
+    {
+        let mut guard = state_lock(&state);
+        guard.key_source = key_source;
+        guard.audit_key_tag = Some(key_tag);
+    }
     // Relaunching the app (e.g. after closing the browser tab) must reuse
     // the already-running workstation instead of stacking zombie servers on
     // successive ports. Skipped when a port or case is explicitly given —
     // that is the E2E harness / CLI asking for a fresh dedicated instance.
+    // R4-B1: only a server whose identity the user-private instance file
+    // proves is reused — never one that merely answers like a workstation.
     if bound.is_none()
         && options.port.is_none()
         && options.case_dir.is_none()
         && let Some(existing_port) = find_running_server()
     {
-        // The running instance's token lives in the user-private instance
-        // file (or FRAMETRACE_TOKEN pinned it for both processes).
-        let url = match token_for_port(existing_port).or_else(|| token.clone()) {
-            Some(token) => format!("http://127.0.0.1:{existing_port}/?token={token}"),
-            None => format!("http://127.0.0.1:{existing_port}/"),
-        };
+        // R4-B2: the running instance mints a one-time launch code; the
+        // token (instance file or FRAMETRACE_TOKEN) is only sent to it in
+        // a header, never put on a command line or printed.
+        let code = token_for_port(existing_port)
+            .or_else(|| token.clone())
+            .and_then(|token| discovery::request_launch_code(existing_port, &token));
+        let url = launch_url(existing_port, code.as_deref());
         println!("FrameTrace workstation is already running — reusing it.");
         println!("  {url}");
+        if code.is_some() {
+            println!("{LAUNCH_URL_NOTE}");
+        }
         let _ = std::io::stdout().flush();
-        if should_open_browser(&options) {
-            open_in_browser(&url);
+        if should_open_browser(&options)
+            && let Err(err) = try_open_in_browser(&url)
+        {
+            eprintln!("frametrace: {err}");
         }
         return Ok(());
     }
@@ -263,25 +292,38 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
         // The probe listener is passed straight through instead of being
         // dropped and re-bound: between "probe says free" and "bind for
         // real" another process could claim the port (classic TOCTOU).
-        (None, None) => first_free_port().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?,
+        (None, None) => {
+            let (listener, occupied) =
+                first_free_port_noting().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?;
+            // R4-B1: a preferred port held by something we could not
+            // identify as our workstation is skipped — say so.
+            if let Some(warning) = occupied_ports_warning(&occupied) {
+                eprintln!("{warning}");
+            }
+            listener
+        }
     };
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
     // In-process publish first: the shell must never depend on the file.
     publish_local_server(port, token.as_deref());
     write_instance_file(port, &state_lock(&state).instance, token.as_deref());
-    let url = match &token {
-        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
-        None => format!("http://127.0.0.1:{port}/"),
-    };
+    // R4-B2: printed and opened with a one-time launch code, not the token.
+    let code = token.as_ref().and_then(|_| mint_launch_code(&state));
+    let url = launch_url(port, code.as_deref());
     println!("FrameTrace examiner workstation is running.");
     println!("  {url}");
+    if code.is_some() {
+        println!("{LAUNCH_URL_NOTE}");
+    }
     println!("Close this window to stop the workstation.");
     let _ = std::io::stdout().flush();
     // Test harnesses set FRAMETRACE_NO_BROWSER=1 so spawning the server
     // never steals focus with a real browser window; the WebView2 shell
     // suppresses it via `open_browser: false` because it hosts the UI.
-    if should_open_browser(&options) {
-        open_in_browser(&url);
+    if should_open_browser(&options)
+        && let Err(err) = try_open_in_browser(&url)
+    {
+        eprintln!("frametrace: {err}");
     }
     serve_on(listener, state);
     // Drop the instance file while it still names this process, so later
@@ -559,6 +601,146 @@ pub(crate) fn resolve_token(
     Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
+// ---- R4-B2: one-time launch codes ----
+
+/// How long a launch code stays valid.
+pub(crate) const LAUNCH_CODE_TTL: Duration = Duration::from_secs(30);
+/// Outstanding codes kept at most (oldest dropped first).
+const LAUNCH_CODES_CAP: usize = 16;
+
+/// Printed under a launch URL.
+pub(crate) const LAUNCH_URL_NOTE: &str = "  (이 주소는 30초 동안 한 번만 열 수 있습니다 — 다시 열려면 프로그램을 다시 실행하십시오. / one-time link, valid for 30 s)";
+
+/// The URL printed / handed to the browser: `/?launch=<code>` when a code
+/// was minted, else the bare page (no-token mode, or the code could not be
+/// obtained). Never carries the token.
+pub(crate) fn launch_url(port: u16, code: Option<&str>) -> String {
+    match code {
+        Some(code) => format!("http://127.0.0.1:{port}/?launch={code}"),
+        None => format!("http://127.0.0.1:{port}/"),
+    }
+}
+
+/// Mints a one-time launch code (only meaningful while a token is
+/// configured; `None` otherwise or when entropy fails).
+pub(crate) fn mint_launch_code(state: &SharedState) -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let code: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let now = std::time::Instant::now();
+    let mut guard = state_lock(state);
+    guard.token.as_ref()?;
+    guard.launch_codes.retain(|(_, expires)| *expires > now);
+    if guard.launch_codes.len() >= LAUNCH_CODES_CAP {
+        guard.launch_codes.remove(0);
+    }
+    guard
+        .launch_codes
+        .push((code.clone(), now + LAUNCH_CODE_TTL));
+    Some(code)
+}
+
+/// Consumes `code` if it is outstanding and unexpired at `now` (single
+/// use: a consumed or expired code never validates again).
+pub(crate) fn consume_launch_code(
+    guard: &mut JobState,
+    code: &str,
+    now: std::time::Instant,
+) -> bool {
+    guard.launch_codes.retain(|(_, expires)| *expires > now);
+    match guard
+        .launch_codes
+        .iter()
+        .position(|(known, _)| http::secret_eq(code, known))
+    {
+        Some(position) => {
+            guard.launch_codes.remove(position);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `POST /api/launch-code` (token-authenticated): a fresh one-time code,
+/// for a relaunch that reuses this running workstation.
+pub(crate) fn api_launch_code(state: &SharedState) -> String {
+    match mint_launch_code(state) {
+        Some(code) => serde_json::json!({
+            "ok": true,
+            "code": code,
+            "url": format!("/?launch={code}"),
+            "expires_in_secs": LAUNCH_CODE_TTL.as_secs(),
+        })
+        .to_string(),
+        None => api_err("이 워크스테이션은 접근 토큰 없이 실행 중이라 실행 코드가 필요 없습니다."),
+    }
+}
+
+// ---- R4-B15: audit key source handed to CLI children ----
+
+static KEY_SOURCE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Sets the `--key-source` spec the workstation runs with (the launcher
+/// calls this when started as `frametrace --key-source <spec>`). Without
+/// it `FRAMETRACE_KEY_SOURCE` is used.
+pub fn set_key_source(spec: Option<String>) {
+    *KEY_SOURCE_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = spec;
+}
+
+/// The key source spec this workstation process runs with.
+fn workstation_key_source() -> Option<String> {
+    KEY_SOURCE_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .or_else(|| std::env::var("FRAMETRACE_KEY_SOURCE").ok())
+        .map(|spec| spec.trim().to_string())
+        .filter(|spec| !spec.is_empty())
+}
+
+/// `<key id>:<12-hex fingerprint>` of a resolved audit key, `none` without
+/// one, `error` when the configured source is unusable. The fingerprint
+/// is a domain-separated hash prefix — it identifies, never reveals, the
+/// key.
+pub(crate) fn audit_key_tag(key: Result<Option<crate::audit_key::AuditKey>, String>) -> String {
+    use sha2::{Digest, Sha256};
+    match key {
+        Ok(Some(key)) => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"frametrace-key-tag:");
+            hasher.update(&key.bytes);
+            let digest = hasher.finalize();
+            let fp: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+            format!("{}:{fp}", key.id)
+        }
+        Ok(None) => "none".to_string(),
+        Err(_) => "error".to_string(),
+    }
+}
+
+/// Pure comparison behind [`key_source_mismatch_warning`].
+pub(crate) fn key_tag_mismatch(expected: &str, actual: &str) -> Option<String> {
+    (expected.trim() != actual.trim()).then(|| {
+        format!(
+            "경고: 이 단계의 감사 키({actual})가 워크스테이션의 감사 키({expected})와 다릅니다 — 감사 기록의 키가 섞일 수 있습니다. --key-source 설정을 확인하십시오. / audit key differs from the workstation's"
+        )
+    })
+}
+
+/// R4-B15, child side: a CLI process started by the workstation compares
+/// its own resolved audit key with the one the workstation announced
+/// (`FRAMETRACE_EXPECTED_AUDIT_KEY`) and returns a warning on mismatch.
+/// `None` outside the workstation or when they agree.
+///
+/// INTEGRATION TODO(B15): `cli::run` calls this right after installing
+/// `--key-source` and prints the warning to stderr.
+pub fn key_source_mismatch_warning() -> Option<String> {
+    let expected = std::env::var(jobs::EXPECTED_AUDIT_KEY_ENV).ok()?;
+    key_tag_mismatch(&expected, &audit_key_tag(crate::audit_key::configured()))
+}
+
 /// One counted in-flight connection (P11): decrements on drop, including
 /// while a panicking handler thread unwinds.
 pub(crate) struct InFlightSlot(pub(crate) Arc<AtomicUsize>);
@@ -580,7 +762,13 @@ impl Drop for InFlightSlot {
 /// then refuses new connections outright).
 pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
     let in_flight = Arc::new(AtomicUsize::new(0));
-    let shutdown = Arc::clone(&state_lock(&state).shutdown);
+    let (shutdown, preauth) = {
+        let guard = state_lock(&state);
+        (
+            Arc::clone(&guard.shutdown),
+            Arc::clone(&guard.preauth_conns),
+        )
+    };
     let _ = listener.set_nonblocking(true);
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -606,11 +794,17 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
                 // every connection into a 503 and stall shutdown's drain).
                 // A failed spawn drops the closure, and with it the guard.
                 let slot = InFlightSlot(Arc::clone(&in_flight));
+                let preauth = Arc::clone(&preauth);
                 let _ = thread::Builder::new()
                     .name("ft-http".into())
                     .spawn(move || {
                         let _slot = slot;
-                        let _ = handle_connection(stream, state);
+                        let _ = http::handle_connection_with(
+                            stream,
+                            state,
+                            http::HEADER_READ_TIMEOUT,
+                            &preauth,
+                        );
                     });
             }
             // Only an empty queue sleeps; every pending connection is
@@ -634,19 +828,108 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
 pub(crate) const PREFERRED_PORTS: std::ops::RangeInclusive<u16> = 8477..=8486;
 
 pub(crate) fn first_free_port() -> Option<TcpListener> {
+    first_free_port_noting().map(|(listener, _)| listener)
+}
+
+/// [`first_free_port`] plus the preferred ports it had to skip because
+/// something else holds them (R4-B1 warning).
+pub(crate) fn first_free_port_noting() -> Option<(TcpListener, Vec<u16>)> {
+    let mut occupied = Vec::new();
     for port in PREFERRED_PORTS {
-        if let Ok(listener) = bind_loopback(port) {
-            return Some(listener);
+        match bind_loopback(port) {
+            Ok(listener) => return Some((listener, occupied)),
+            Err(_) => occupied.push(port),
         }
     }
-    bind_loopback(0).ok()
+    bind_loopback(0).ok().map(|listener| (listener, occupied))
+}
+
+/// R4-B1: warning for preferred ports held by processes that are not a
+/// workstation this user's instance file vouches for (they are never
+/// reused, whatever they answer).
+pub(crate) fn occupied_ports_warning(occupied: &[u16]) -> Option<String> {
+    (!occupied.is_empty()).then(|| {
+        let list = occupied
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "경고: 포트 {list}을(를) 신원이 확인되지 않은 다른 프로세스가 쓰고 있어 건너뜁니다 — 이 워크스테이션은 다른 포트에서 시작합니다. / ports in use by an unverified process were skipped"
+        )
+    })
 }
 
 pub(crate) fn should_open_browser(options: &ServeOptions) -> bool {
     options.open_browser && std::env::var("FRAMETRACE_NO_BROWSER").as_deref() != Ok("1")
 }
 
+/// R4-B14: the system "open this" program off Windows — `open` on macOS
+/// (there is no xdg-open there), `xdg-open` elsewhere.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn system_opener(target_os: &str) -> &'static str {
+    if target_os == "macos" {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+/// How long the opener may take before the open counts as failed (it
+/// normally hands off to the desktop and exits within a second).
+#[cfg_attr(windows, allow(dead_code))]
+const OPENER_TIMEOUT_SECS: u64 = 15;
+
+/// R4-B14: runs `program target`, waits for it (no zombie), and reports a
+/// spawn failure, a timeout or a non-zero exit as an error — the old code
+/// spawned and forgot, so "no browser opened" looked like success.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn run_opener(program: &str, target: &std::ffi::OsStr) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.arg(target);
+    match crate::util::run_with_timeout_detailed(&mut command, Some(OPENER_TIMEOUT_SECS)) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "{program} 실패 (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(err) => Err(format!("{program} 실행 실패: {}", err.message())),
+    }
+}
+
+/// [`try_open_in_browser`] for callers without an error channel (the
+/// WebView2 shell's fallback): a failure is printed, never swallowed.
+/// R4-B2: a tokenized workstation URL is exchanged for a one-time launch
+/// URL first — the token never reaches a browser command line.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn open_in_browser(url: &str) {
+    let url = browser_safe_url(url, &discovery::request_launch_code);
+    if let Err(err) = try_open_in_browser(&url) {
+        eprintln!("frametrace: {err}");
+    }
+}
+
+/// `http://127.0.0.1:<port>/?token=<t>` → `/?launch=<code>` (code minted
+/// by that server through `mint`), or the bare page when no code could be
+/// obtained. Any other URL is returned unchanged.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn browser_safe_url(url: &str, mint: &dyn Fn(u16, &str) -> Option<String>) -> String {
+    let Some(rest) = url.strip_prefix("http://127.0.0.1:") else {
+        return url.to_string();
+    };
+    let Some((port, query)) = rest.split_once("/?") else {
+        return url.to_string();
+    };
+    let (Ok(port), Some(token)) = (port.parse::<u16>(), query_value(query, "token")) else {
+        return url.to_string();
+    };
+    launch_url(port, mint(port, &token).as_deref())
+}
+
+/// Opens the workstation URL in a browser. `Err` when no launch strategy
+/// worked (R4-B14) — the caller tells the examiner to open it by hand.
+pub(crate) fn try_open_in_browser(url: &str) -> Result<(), String> {
     // Windows-first: prefer Edge app mode so the workstation opens as a
     // dedicated chromeless window instead of a tab inside the examiner's
     // browsing session. Edge and Explorer are resolved to ABSOLUTE paths
@@ -662,43 +945,52 @@ pub(crate) fn open_in_browser(url: &str) {
         if let Some(edge) = launch::resolve_edge_path(&env, &|p| p.is_file(), &launch::app_path)
             && launch::spawn_detached(&edge, &[std::ffi::OsString::from(format!("--app={url}"))])
         {
-            return;
+            return Ok(());
         }
         if let Some(explorer) = launch::resolve_explorer_path(&env)
             && launch::spawn_detached(&explorer, &[std::ffi::OsString::from(url)])
         {
-            return;
+            return Ok(());
         }
-        if !launch::shell_open(url) {
-            eprintln!("frametrace: could not open a browser for {url}; open it manually");
+        if launch::shell_open(url) {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not open a browser for {url}; open it manually"
+            ))
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = crate::util::hide_console(&mut Command::new("xdg-open"))
-            .arg(url)
-            .spawn();
+        run_opener(
+            system_opener(std::env::consts::OS),
+            std::ffi::OsStr::new(url),
+        )
+        .map_err(|err| format!("could not open a browser for {url} ({err}); open it manually"))
     }
 }
 
-pub(crate) fn open_in_explorer(path: &Path) {
+/// Opens a folder in the system file manager; `Err` when it could not be
+/// opened (R4-B14 — reported to the UI instead of a silent success).
+pub(crate) fn open_in_explorer(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let env = |name: &str| std::env::var_os(name);
         if let Some(explorer) = launch::resolve_explorer_path(&env)
             && launch::spawn_detached(&explorer, &[path.as_os_str().to_owned()])
         {
-            return;
+            return Ok(());
         }
-        if !launch::shell_open(&path.to_string_lossy()) {
-            eprintln!("frametrace: could not open {} in Explorer", path.display());
+        if launch::shell_open(&path.to_string_lossy()) {
+            Ok(())
+        } else {
+            Err(format!("탐색기에서 열지 못했습니다: {}", path.display()))
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = crate::util::hide_console(&mut Command::new("xdg-open"))
-            .arg(path)
-            .spawn();
+        run_opener(system_opener(std::env::consts::OS), path.as_os_str())
+            .map_err(|err| format!("폴더를 열지 못했습니다 ({}): {err}", path.display()))
     }
 }
 
@@ -1002,11 +1294,8 @@ pub(crate) fn shell_path(path: PathBuf) -> PathBuf {
 
 pub(crate) fn api_open_folder(request: &Request, state: &SharedState) -> String {
     let raw = body_value(&request.body, "path").unwrap_or_default();
-    match resolve_open_folder(state, &raw) {
-        Ok(path) => {
-            open_in_explorer(&path);
-            "{\"ok\":true}".to_string()
-        }
+    match resolve_open_folder(state, &raw).and_then(|path| open_in_explorer(&path)) {
+        Ok(()) => "{\"ok\":true}".to_string(),
         Err(err) => api_err(&err),
     }
 }
@@ -1018,6 +1307,15 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
     if !request_is_localhost_trusted(request) {
         return plain(403, b"cross-origin request rejected".to_vec());
     }
+    // R4-B19: the UNC/device gate also guards every direct `route` caller
+    // (handle_connection runs it first too) — path fields such as
+    // `/api/advanced`'s `extra` never reach a handler unchecked.
+    if !http::path_fields_for(&request.method, &request.path).is_empty()
+        && let Some(reason) =
+            http::remote_path_violation(request, &http::approved_path_roots(state))
+    {
+        return http::remote_path_refusal(reason);
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => page(examiner_page(legacy_ui()).as_bytes().to_vec()),
         ("GET", "/api/env") => json(api_env(request)),
@@ -1025,7 +1323,9 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("GET", "/api/records") => json(api_records(request, state)),
         ("GET", "/api/records-meta") => json(api_records_meta(state)),
         ("GET", "/api/status") => json(api_status(state)),
-        ("GET", "/api/mark-conflicts") => json(api_mark_conflicts(state)),
+        ("GET", "/api/mark-conflicts") => json(jobs::api_mark_conflicts_page(request, state)),
+        ("GET", "/api/marks-pending") => json(api_marks_pending(request, state)),
+        ("POST", "/api/launch-code") => json(api_launch_code(state)),
         ("POST", "/api/start") => json(api_start(request, state)),
         ("POST", "/api/finalize") => json(api_finalize(request, state)),
         ("POST", "/api/recover-deleted") => json(api_recover_deleted(state)),
