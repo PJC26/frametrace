@@ -177,14 +177,25 @@ pub fn import_e01(
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create E01 output directory: {err}"))?;
     }
-    let export_target = ewfexport_target_for_output(&requested_raw_path);
-    let generated_raw_path = expected_ewfexport_output(&export_target);
-    if generated_raw_path != requested_raw_path && generated_raw_path.exists() {
-        return Err(format!(
-            "ewfexport target already exists: {} (choose a new --output path)",
-            generated_raw_path.display()
-        ));
+    // C1: ewfexport writes a pid-tagged in-progress image
+    // (`.<name>.ft<pid>.part` + the `.raw` ewfexport always appends); only
+    // a complete, hashed export is renamed to the final name, and only
+    // then is the completion marker written. A killed import can never
+    // leave a torn image under `evidence.raw` for a later run to reuse or
+    // carve.
+    if let Some(parent) = requested_raw_path.parent() {
+        for (path, result) in crate::join::sweep_stale_parts(parent) {
+            if let Err(err) = result {
+                eprintln!("warning: {err} ({})", path.display());
+            }
+        }
     }
+    let export_target = crate::join::pid_part_path(&requested_raw_path, std::process::id());
+    let generated_raw_path = expected_ewfexport_output(&export_target);
+    crate::join::remove_file_retry(&generated_raw_path)?;
+    let remove_part = || {
+        let _ = crate::join::remove_file_retry(&generated_raw_path);
+    };
 
     let export_log_path = unique_path(
         &case_dir
@@ -200,23 +211,39 @@ pub fn import_e01(
     ) {
         // ewfexport can leave a partial raw behind when it is killed or fails;
         // never let a torn image masquerade as a completed export.
-        let _ = std::fs::remove_file(&generated_raw_path);
-        let _ = std::fs::remove_file(&requested_raw_path);
+        remove_part();
         return Err(error);
     }
-    let generated_raw_path = resolve_ewfexport_output(&generated_raw_path)?;
-    if generated_raw_path != requested_raw_path {
-        std::fs::rename(&generated_raw_path, &requested_raw_path).map_err(|err| {
-            format!(
-                "failed to rename E01 raw output {} to {}: {err}",
-                generated_raw_path.display(),
+    let generated_raw_path = match resolve_ewfexport_output(&generated_raw_path) {
+        Ok(path) => path,
+        Err(err) => {
+            remove_part();
+            return Err(err);
+        }
+    };
+    let raw_sha256 = match audit::digest_file(&generated_raw_path) {
+        Ok(digest) => digest,
+        Err(err) => {
+            remove_part();
+            return Err(err);
+        }
+    };
+    match crate::join::publish_part_as(&generated_raw_path, &requested_raw_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            remove_part();
+            return Err(format!(
+                "output already exists: {} (choose a new --output path)",
                 requested_raw_path.display()
-            )
-        })?;
+            ));
+        }
+        Err(err) => {
+            remove_part();
+            return Err(err);
+        }
     }
     let raw_output_path = canonicalize_display(&requested_raw_path)
         .map_err(|err| format!("failed to canonicalize raw E01 output: {err}"))?;
-    let raw_sha256 = audit::digest_file(&raw_output_path)?;
     let e01_sha256 = if options.hash_e01 {
         Some(audit::digest_file(&e01_path)?)
     } else {
@@ -253,6 +280,10 @@ pub fn import_e01(
             audit::json_string_array(&export_args)
         ),
     )?;
+    // C1: written last (after the audit entry), and its failure is the
+    // import's failure — a raw without a matching marker is never reused
+    // or carved.
+    write_raw_done_marker(&raw_output_path, &raw_sha256, &e01_path, imported_unix)?;
 
     Ok(E01ImportResult {
         e01_path,
@@ -264,6 +295,179 @@ pub fn import_e01(
         e01_sha256,
         is_corrupted,
     })
+}
+
+/// C1: the completion marker beside an imported raw image
+/// (`<raw>.done.json`).
+pub fn raw_done_marker_path(raw: &Path) -> PathBuf {
+    let mut name = raw.as_os_str().to_os_string();
+    name.push(".done.json");
+    PathBuf::from(name)
+}
+
+/// The legacy server-side binding (`evidence.raw.source`, the E01 path
+/// only — written by servers before C1).
+fn legacy_binding_path(raw: &Path) -> PathBuf {
+    raw.with_extension("raw.source")
+}
+
+fn modified_nanos(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+}
+
+fn write_raw_done_marker(
+    raw: &Path,
+    raw_sha256: &str,
+    e01_path: &Path,
+    imported_unix: u64,
+) -> Result<(), String> {
+    let meta = std::fs::metadata(raw)
+        .map_err(|err| format!("failed to stat imported raw {}: {err}", raw.display()))?;
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "kind": "frametrace-e01-raw-complete",
+        "raw_path": raw.to_string_lossy(),
+        "size_bytes": meta.len(),
+        "modified_nanos": modified_nanos(&meta),
+        "sha256": raw_sha256,
+        "e01_path": e01_path.to_string_lossy(),
+        "e01_size_bytes": std::fs::metadata(e01_path).map(|m| m.len()).ok(),
+        "imported_unix": imported_unix,
+    });
+    crate::util::write_text_atomic(&raw_done_marker_path(raw), &format!("{body:#}\n")).map_err(
+        |err| {
+            format!(
+                "failed to write the import completion marker for {} — the raw image will not be reused or carved: {err}",
+                raw.display()
+            )
+        },
+    )
+}
+
+/// C1: whether an imported raw image is known complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawImportStatus {
+    /// No raw image at that path.
+    Missing,
+    /// The completion marker matches the file (size + modification time).
+    Complete { e01_path: PathBuf, sha256: String },
+    /// Present but not provably complete: no marker (a killed import, or
+    /// one made before markers existed) or a marker that no longer matches.
+    Unverified(String),
+}
+
+/// Reads `raw`'s completion marker and compares it with the file.
+pub fn raw_import_status(raw: &Path) -> RawImportStatus {
+    let Ok(meta) = std::fs::metadata(raw) else {
+        return RawImportStatus::Missing;
+    };
+    let marker_path = raw_done_marker_path(raw);
+    let text = match std::fs::read_to_string(&marker_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return RawImportStatus::Unverified(
+                "완료 표식이 없습니다 (중단된 임포트의 부분 이미지일 수 있음)".to_string(),
+            );
+        }
+        Err(err) => {
+            return RawImportStatus::Unverified(format!("완료 표식을 읽지 못했습니다: {err}"));
+        }
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return RawImportStatus::Unverified("완료 표식이 손상되었습니다".to_string());
+    };
+    let size = value.get("size_bytes").and_then(serde_json::Value::as_u64);
+    let nanos = value
+        .get("modified_nanos")
+        .and_then(serde_json::Value::as_u64);
+    if size != Some(meta.len()) || nanos.is_none() || nanos != modified_nanos(&meta) {
+        return RawImportStatus::Unverified(
+            "raw 이미지가 완료 표식과 다릅니다 (크기 또는 수정 시각)".to_string(),
+        );
+    }
+    match (
+        value.get("e01_path").and_then(serde_json::Value::as_str),
+        value.get("sha256").and_then(serde_json::Value::as_str),
+    ) {
+        (Some(e01), Some(sha)) if !e01.is_empty() && !sha.is_empty() => RawImportStatus::Complete {
+            e01_path: PathBuf::from(e01),
+            sha256: sha.to_string(),
+        },
+        _ => RawImportStatus::Unverified("완료 표식에 원본 E01·해시가 없습니다".to_string()),
+    }
+}
+
+/// C1: what the workstation does with an existing `raw` before importing
+/// `source` into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawReuse {
+    /// Nothing there: import.
+    Absent,
+    /// Complete import of this very E01: reuse it.
+    Reuse,
+    /// Partial, unverifiable, changed or from another E01: warn with the
+    /// reason, discard ([`discard_raw`]) and import again.
+    Reimport(String),
+}
+
+/// Pure decision on top of [`raw_import_status`]. The E01 paths are
+/// compared canonically when possible.
+pub fn raw_reuse_decision(raw: &Path, source: &Path) -> RawReuse {
+    let same = |a: &Path, b: &Path| {
+        let a = canonicalize_display(a).unwrap_or_else(|_| a.to_path_buf());
+        let b = canonicalize_display(b).unwrap_or_else(|_| b.to_path_buf());
+        a == b
+    };
+    match raw_import_status(raw) {
+        RawImportStatus::Missing => RawReuse::Absent,
+        RawImportStatus::Complete { e01_path, .. } if same(&e01_path, source) => RawReuse::Reuse,
+        RawImportStatus::Complete { e01_path, .. } => RawReuse::Reimport(format!(
+            "기존 raw 이미지는 다른 E01({})에서 임포트된 것입니다",
+            e01_path.display()
+        )),
+        RawImportStatus::Unverified(reason) => RawReuse::Reimport(format!(
+            "기존 raw 이미지를 완료된 임포트로 확인할 수 없습니다 — {reason}"
+        )),
+    }
+}
+
+/// C1: removes a raw image that will be re-imported, with its marker and
+/// the legacy binding file. Any failure is returned (the caller fails the
+/// step rather than importing next to stale bytes).
+pub fn discard_raw(raw: &Path) -> Result<(), String> {
+    for path in [
+        raw.to_path_buf(),
+        raw_done_marker_path(raw),
+        legacy_binding_path(raw),
+    ] {
+        crate::join::remove_file_retry(&path)?;
+    }
+    Ok(())
+}
+
+/// C1: carving / analysis of a raw image inside the case's
+/// `evidence/images` (where imports land) requires a matching completion
+/// marker; images elsewhere are the examiner's own and are not judged.
+pub fn require_complete_case_raw(case_dir: &Path, source: &Path) -> Result<(), String> {
+    let images = case_dir.join("evidence/images");
+    let (Ok(images), Ok(canonical)) = (canonicalize_display(&images), canonicalize_display(source))
+    else {
+        return Ok(());
+    };
+    if !canonical.starts_with(&images) {
+        return Ok(());
+    }
+    match raw_import_status(&canonical) {
+        RawImportStatus::Complete { .. } | RawImportStatus::Missing => Ok(()),
+        RawImportStatus::Unverified(reason) => Err(format!(
+            "{}: {reason}. 완료가 확인되지 않은 raw 이미지는 카빙하지 않습니다 — import-e01을 다시 실행하십시오 (refusing to carve a raw image without a matching completion marker; re-run import-e01)",
+            canonical.display()
+        )),
+    }
 }
 
 /// Parses the media byte size out of `ewfinfo -f text` output, whose
@@ -376,6 +580,7 @@ fn ewfexport_args(
 /// literal ".raw" suffix — never a generic extension — because a basename
 /// like "4. 한주연 HDD.raw" contains interior dots that `with_extension`
 /// would wrongly treat as the extension boundary (producing "4.raw").
+#[cfg(test)]
 fn ewfexport_target_for_output(raw_path: &Path) -> PathBuf {
     match raw_path.file_name().and_then(|n| n.to_str()) {
         Some(name) if name.to_ascii_lowercase().ends_with(".raw") => {
@@ -590,6 +795,152 @@ mod tests {
             path.canonicalize().unwrap()
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn c1_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ft-c1-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("evidence/images")).unwrap();
+        dir
+    }
+
+    /// C1: a raw image is reusable only when its completion marker matches
+    /// the file and names the same E01; a torn / pre-marker / changed /
+    /// foreign image is re-imported. The old binding (`.raw.source`, the
+    /// E01 path only) reused any bytes under the name.
+    #[test]
+    fn raw_completion_marker_decides_reuse() {
+        use super::{
+            RawImportStatus, RawReuse, discard_raw, raw_done_marker_path, raw_import_status,
+            raw_reuse_decision, write_raw_done_marker,
+        };
+        let dir = c1_dir("reuse");
+        let e01 = dir.join("disk.E01");
+        let other = dir.join("other.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        fs::write(&other, b"ewf2").unwrap();
+        let raw = dir.join("evidence/images/evidence.raw");
+        assert_eq!(raw_import_status(&raw), RawImportStatus::Missing);
+        assert_eq!(raw_reuse_decision(&raw, &e01), RawReuse::Absent);
+        // A torn image from a killed import (no marker) — even with the
+        // legacy binding naming this very E01.
+        fs::write(&raw, b"torn").unwrap();
+        fs::write(
+            raw.with_extension("raw.source"),
+            e01.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            raw_import_status(&raw),
+            RawImportStatus::Unverified(_)
+        ));
+        assert!(matches!(
+            raw_reuse_decision(&raw, &e01),
+            RawReuse::Reimport(_)
+        ));
+        // Completed import.
+        fs::write(&raw, b"complete-image").unwrap();
+        write_raw_done_marker(&raw, "ab".repeat(32).as_str(), &e01, 1).unwrap();
+        assert!(matches!(
+            raw_import_status(&raw),
+            RawImportStatus::Complete { .. }
+        ));
+        assert_eq!(raw_reuse_decision(&raw, &e01), RawReuse::Reuse);
+        match raw_reuse_decision(&raw, &other) {
+            RawReuse::Reimport(reason) => assert!(reason.contains("다른 E01"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        // Bytes changed after the marker.
+        fs::write(&raw, b"complete-image-plus").unwrap();
+        assert!(matches!(
+            raw_reuse_decision(&raw, &e01),
+            RawReuse::Reimport(_)
+        ));
+        discard_raw(&raw).unwrap();
+        assert!(!raw.exists());
+        assert!(!raw_done_marker_path(&raw).exists());
+        assert!(!raw.with_extension("raw.source").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C1: carving an imported image (inside `evidence/images`) requires
+    /// its completion marker; the examiner's own images elsewhere are not
+    /// judged.
+    #[test]
+    fn carving_requires_a_completed_case_raw() {
+        use super::{require_complete_case_raw, write_raw_done_marker};
+        let dir = c1_dir("carve");
+        let raw = dir.join("evidence/images/evidence.raw");
+        fs::write(&raw, b"torn").unwrap();
+        let err = require_complete_case_raw(&dir, &raw).unwrap_err();
+        assert!(err.contains("import-e01"), "{err}");
+        let e01 = dir.join("disk.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        write_raw_done_marker(&raw, &"cd".repeat(32), &e01, 1).unwrap();
+        require_complete_case_raw(&dir, &raw).unwrap();
+        let own = dir.join("my-own.dd");
+        fs::write(&own, b"examiner image").unwrap();
+        require_complete_case_raw(&dir, &own).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C1 end to end (fake libewf tools): a failing export leaves no image
+    /// under the final name and no in-progress file; a completed one is
+    /// published with its marker.
+    #[cfg(unix)]
+    #[test]
+    fn import_publishes_only_complete_exports() {
+        use super::{E01Options, RawImportStatus, import_e01, raw_import_status};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = c1_dir("import");
+        fs::create_dir_all(dir.join("evidence/logs")).unwrap();
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = bin.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().to_string()
+        };
+        let ewfinfo = script("ewfinfo", "echo 'Media size: 1 KiB (16 bytes)'");
+        let ewfverify = script("ewfverify", "exit 0");
+        let export_body = |fail: bool| {
+            format!(
+                "t=''; while [ $# -gt 0 ]; do if [ \"$1\" = -t ]; then t=\"$2\"; shift; fi; shift; done\nprintf 'RAWDATA-RAWDATA!' > \"$t.raw\"\n{}",
+                if fail { "exit 1" } else { "exit 0" }
+            )
+        };
+        let e01 = dir.join("disk.E01");
+        fs::write(&e01, b"ewf-segment").unwrap();
+        let raw = dir.join("evidence/images/evidence.raw");
+        let options = |ewfexport: String| E01Options {
+            output_path: Some(raw.clone()),
+            ewfinfo_bin: ewfinfo.clone(),
+            ewfverify_bin: ewfverify.clone(),
+            ewfexport_bin: ewfexport,
+            ..E01Options::default()
+        };
+        let failing = script("ewfexport", &export_body(true));
+        assert!(import_e01(&dir, &e01, &options(failing)).is_err());
+        assert!(
+            !raw.exists(),
+            "a failed export must not land under the final name"
+        );
+        let leftovers: Vec<String> = fs::read_dir(dir.join("evidence/images"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let working = script("ewfexport", &export_body(false));
+        let result = import_e01(&dir, &e01, &options(working)).unwrap();
+        assert!(result.raw_output_path.ends_with("evidence.raw"));
+        assert_eq!(fs::read(&raw).unwrap(), b"RAWDATA-RAWDATA!");
+        assert!(matches!(
+            raw_import_status(&raw),
+            RawImportStatus::Complete { .. }
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

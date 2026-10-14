@@ -395,7 +395,7 @@ fn export_dedupe_skips_cancel_pending_jobs() {
     let case = temp_case("clip-cancel-dedupe");
     let exe = fake_cli(&case, SLOW_EXPORT);
     let state = bound(&case, "review-ready");
-    let body = r#"{"id":"vid_0001","start":"1","duration":"2"}"#;
+    let body = r#"{"id":"vid_000001","start":"1","duration":"2"}"#;
     let req = request("POST", "/api/export-clip", "", body);
     let first = parse(&export_clip_with_exe(&req, &state, &exe));
     let first_id = first["job"]["id"].as_str().unwrap().to_string();

@@ -23,6 +23,8 @@ fn cli_main() -> i32 {
 }
 
 fn main() {
+    // C8: a step child of the workstation dies with it (unix watch pipe).
+    frametrace::serve::watch_parent_from_env();
     // P7: no modal loader/critical-error dialogs for this process or the
     // tools it spawns (inherited) — they would block unseen.
     frametrace::util::suppress_os_error_dialogs();

@@ -77,8 +77,82 @@ fn package_redaction_mode(case_dir: &Path) -> Result<bool, String> {
     Ok(!redacted.is_empty())
 }
 
+/// C2: builds the package in a hidden, pid-tagged sibling directory
+/// (`.<name>.ft<pid>.part`, skipped by packaging and package listings)
+/// and renames it to its final name only once complete; any failure
+/// removes the temporary directory. A killed package-case therefore never
+/// leaves a half-written `package_*` folder that looks like a deliverable
+/// — the server sweeps the `.part` directory of the killed step.
 pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<PackageResult, String> {
     let created_unix = now_unix()?;
+    let final_dir = match output_dir {
+        Some(path) => path.to_path_buf(),
+        None => crate::util::unique_dir(
+            &case_dir
+                .join("reports")
+                .join(format!("package_{created_unix}")),
+        ),
+    };
+    // `unique_dir` reserved the default name by creating it; an explicit
+    // output may exist only as an empty directory (checked below).
+    let reserved_default = output_dir.is_none();
+    if let Some(parent) = final_dir.parent() {
+        for (path, result) in crate::join::sweep_stale_parts(parent) {
+            if let Err(err) = result {
+                eprintln!("warning: {err} ({})", path.display());
+            }
+        }
+    }
+    let work_dir = crate::join::pid_part_path(&final_dir, std::process::id());
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir)
+            .map_err(|err| format!("failed to clear {}: {err}", work_dir.display()))?;
+    }
+    let result = package_case_into(case_dir, output_dir, &work_dir, created_unix);
+    let release_reservation = || {
+        if reserved_default {
+            let _ = fs::remove_dir(&final_dir);
+        }
+    };
+    let mut result = match result {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&work_dir);
+            release_reservation();
+            return Err(err);
+        }
+    };
+    // The final name holds at most an empty directory (our reservation or
+    // an empty explicit output); it is replaced by the finished package.
+    if final_dir.exists()
+        && let Err(err) = fs::remove_dir(&final_dir)
+    {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(format!(
+            "package output {} is not empty or cannot be replaced: {err}",
+            final_dir.display()
+        ));
+    }
+    if let Err(err) = fs::rename(&work_dir, &final_dir) {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(format!(
+            "failed to publish package {} as {}: {err}",
+            work_dir.display(),
+            final_dir.display()
+        ));
+    }
+    crate::util::sync_parent_directory(&final_dir);
+    result.manifest_path = final_dir.join("package-manifest.json");
+    result.output_dir = final_dir;
+    Ok(result)
+}
+
+fn package_case_into(
+    case_dir: &Path,
+    requested_output: Option<&Path>,
+    work_dir: &Path,
+    created_unix: u64,
+) -> Result<PackageResult, String> {
     let mut context = PackageContext {
         redaction: package_redaction_mode(case_dir)?.then(|| PackageRedaction {
             redactor: crate::redact::Redactor::new(case_dir),
@@ -95,29 +169,23 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
         }
     };
     let quiescent = running_jobs.is_empty();
-    let output_dir = match output_dir {
-        Some(path) => {
-            reject_recursive_package_output(case_dir, path)?;
-            if path.exists()
-                && path
-                    .read_dir()
-                    .map_err(|err| format!("failed to inspect package output: {err}"))?
-                    .next()
-                    .is_some()
-            {
-                return Err(format!(
-                    "package output already exists and is not empty: {}",
-                    path.display()
-                ));
-            }
-            path.to_path_buf()
+    if let Some(path) = requested_output {
+        reject_recursive_package_output(case_dir, path)?;
+        if path.exists()
+            && path
+                .read_dir()
+                .map_err(|err| format!("failed to inspect package output: {err}"))?
+                .next()
+                .is_some()
+        {
+            return Err(format!(
+                "package output already exists and is not empty: {}",
+                path.display()
+            ));
         }
-        None => crate::util::unique_dir(
-            &case_dir
-                .join("reports")
-                .join(format!("package_{created_unix}")),
-        ),
-    };
+    }
+    // Everything is written into the in-progress directory (C2).
+    let output_dir = work_dir.to_path_buf();
     validate_required_package_files(case_dir)?;
     if case_dir.join(VIEWER_REL).is_file() && !case_dir.join(DATA_BUNDLE_REL).is_file() {
         return Err(format!(

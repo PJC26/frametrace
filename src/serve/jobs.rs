@@ -338,21 +338,25 @@ pub(crate) fn run_e01_pipeline_with(state: SharedState, job: PipelineJob, exe: &
     // the same E01 path; otherwise the wizard would silently analyze the
     // previous evidence end-to-end (wrong-evidence results).
     set_step(&state, 1, StepStatus::Running);
-    let raw_source_binding = raw_path.with_extension("raw.source");
-    let reuse_existing_raw = raw_path.exists() && {
-        let previous_source = std::fs::read_to_string(&raw_source_binding)
-            .map(|text| text.trim().to_string())
-            .unwrap_or_default();
-        let same_source = previous_source == source_text;
-        if !same_source && !previous_source.is_empty() {
-            log(
-                &state,
-                format!(
-                    "기존 raw 이미지는 다른 E01에서 임포트된 것입니다. 재임포트합니다: {raw_text}"
-                ),
-            );
+    // C1: reuse only an image whose completion marker (written by
+    // import-e01 after the export, hash and audit entry) matches the file
+    // and names this E01; anything else — a killed import's torn image,
+    // a pre-marker import, another E01 — is discarded and re-imported.
+    let reuse_existing_raw = match crate::e01::raw_reuse_decision(&raw_path, &job.source_path) {
+        crate::e01::RawReuse::Reuse => true,
+        crate::e01::RawReuse::Absent => false,
+        crate::e01::RawReuse::Reimport(reason) => {
+            warn_step(&state, 1, format!("{reason} — 재임포트합니다: {raw_text}"));
+            if let Err(err) = crate::e01::discard_raw(&raw_path) {
+                set_step(&state, 1, StepStatus::Failed);
+                fail(
+                    &state,
+                    &format!("이전 raw 이미지를 지우지 못해 재임포트할 수 없습니다: {err}"),
+                );
+                return;
+            }
+            false
         }
-        same_source
     };
     if reuse_existing_raw {
         log(&state, format!("기존 raw 이미지 재사용: {raw_text}"));
@@ -378,9 +382,8 @@ pub(crate) fn run_e01_pipeline_with(state: SharedState, job: PipelineJob, exe: &
         match import_result {
             Ok(output) => {
                 log(&state, output);
-                // Bind the imported raw to this E01 so a later run with a
-                // different E01 re-imports instead of reusing stale bytes.
-                let _ = std::fs::write(&raw_source_binding, &source_text);
+                // C1: import-e01 itself bound the raw to this E01 (its
+                // completion marker); a marker write failure failed the step.
                 set_step(&state, 1, StepStatus::Done);
             }
             Err(err) => {
@@ -1039,6 +1042,7 @@ pub(crate) fn run_step_detailed(
         let program = args.first().map(String::as_str).unwrap_or("command");
         report_process_warning(state, super::proc::tracking_warning(program, &err));
     }
+    let child_pid = tracked.child.id();
     let child = &mut tracked.child;
     // Both pipes must be drained while the child runs: a child that fills
     // the OS pipe buffer blocks on write, and a parent that only polls
@@ -1060,10 +1064,28 @@ pub(crate) fn run_step_detailed(
             Err(err) => return Err(format!("{} 실행 대기 실패: {err}", exe.display())),
         }
     };
-    // The child has exited, so both pipes are at EOF and these joins
-    // return immediately with whatever tail was retained.
-    let stdout_tail = stdout_reader.join().unwrap_or_default();
-    let stderr_tail = stderr_reader.join().unwrap_or_default();
+    // The child has exited, so both pipes are normally at EOF and these
+    // joins return immediately with whatever tail was retained. C10: a
+    // grandchild that escaped tree tracking can still hold them — the
+    // joins are bounded and the abandoned output is reported, never
+    // waited on forever.
+    let cap = crate::join::READER_JOIN_CAP;
+    let stdout_tail = crate::join::join_reader_bounded(stdout_reader, cap);
+    let stderr_tail = crate::join::join_reader_bounded(stderr_reader, cap);
+    if stdout_tail.is_none() || stderr_tail.is_none() {
+        report_process_warning(state, super::media::reader_abandoned_warning(args, cap));
+    }
+    let stdout_tail = stdout_tail.unwrap_or_default();
+    let stderr_tail = stderr_tail.unwrap_or_default();
+    if killed {
+        // C1/C2/C4: the killed step's in-progress `.part` files go.
+        for line in super::media::sweep_killed_step(args, child_pid) {
+            match line {
+                Ok(line) => state_lock(state).logs.push(line),
+                Err(err) => report_process_warning(state, err),
+            }
+        }
+    }
     if killed || cancelled() {
         return Err("사용자가 분석을 중단했습니다.".to_string());
     }

@@ -38,7 +38,8 @@ use windows::Win32::UI::HiDpi::{PROCESS_PER_MONITOR_DPI_AWARE, SetProcessDpiAwar
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetMessageW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_SIZE, WM_TIMER, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::core::w;
 use windows::core::{HSTRING, PCWSTR};
@@ -174,6 +175,10 @@ static OWNED_PORT: AtomicU16 = AtomicU16::new(0);
 /// it cannot deliver its message.
 static CLOSING: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// C9: `WM_QUERYENDSESSION` / `WM_ENDSESSION`.
+const WM_QUERYENDSESSION_ID: u32 = 0x0011;
+const WM_ENDSESSION_ID: u32 = 0x0016;
+
 /// Window message posted by the server watcher: the server is gone,
 /// destroy the frame (WM_DESTROY then ends the pump).
 const MSG_SERVER_GONE: u32 = WM_APP;
@@ -271,8 +276,20 @@ pub fn run_hosted() -> Result<(), String> {
         }
     };
 
+    let smoke = smoke_mode();
+    if smoke {
+        smoke_watchdog();
+    }
     let hosted = match host_window(&target) {
         Ok(()) => true,
+        // The smoke run proves the WebView2 shell itself: no browser.
+        Err(err) if smoke => {
+            smoke_fail(format!("WebView2 shell could not be hosted: {err}"));
+            if let Some((port, _, _)) = owned_port.as_ref() {
+                let _ = shutdown_server(*port, SHUTDOWN_RETRY_WAIT);
+            }
+            return Err(smoke_failure().unwrap_or(err));
+        }
         Err(err) => match fallback_plan(owned_port.is_some(), server_exit(), &target, &err) {
             Fallback::OpenBrowser(url) => {
                 eprintln!("webview2 shell unavailable, falling back to browser: {err}");
@@ -295,6 +312,9 @@ pub fn run_hosted() -> Result<(), String> {
                     "frametrace: server still refused shutdown after {}s; forcing exit",
                     SHUTDOWN_RETRY_WAIT.as_secs()
                 );
+                // C4: running writes get their cancel flag and up to 30 s
+                // to finish; what is still being written is marked 중단됨.
+                settle_writes_before_forced_exit(port);
                 serve::kill_all_tracked();
                 // process::exit skips serve::run's own cleanup: drop the
                 // instance file (only while it still names this process)
@@ -309,6 +329,7 @@ pub fn run_hosted() -> Result<(), String> {
                         "frametrace: server thread did not exit within {}s; forcing exit",
                         SERVER_EXIT_WAIT.as_secs()
                     );
+                    serve::mark_abandoned_exports();
                     serve::kill_all_tracked();
                     serve::remove_instance_file_if_owned();
                     std::process::exit(1);
@@ -326,6 +347,9 @@ pub fn run_hosted() -> Result<(), String> {
                 "워크스테이션 서버가 오류로 종료되었습니다: {err} / The workstation server stopped with an error."
             ));
         }
+    }
+    if smoke && let Some(reason) = smoke_failure() {
+        return Err(format!("FRAMETRACE_SHELL_SMOKE failed: {reason}"));
     }
     Ok(())
 }
@@ -389,8 +413,9 @@ pub(crate) enum StartupPoll {
 
 /// Pure startup decision. `finished`: what the server thread reported, if
 /// it already ended (a server that ended before accepting is a failure,
-/// whatever else answers on the port); `connected`: the port accepts;
-/// `timed_out`: the wait budget is spent.
+/// whatever else answers on the port); `connected`: `/api/status`
+/// answered 200 to our token (C11: [`status_ready`]); `timed_out`: the
+/// wait budget is spent.
 pub(crate) fn startup_poll(
     port: u16,
     finished: Option<&Result<(), String>>,
@@ -560,8 +585,15 @@ fn wait_for_server(
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(Err(SERVER_THREAD_PANIC.to_string())),
         };
-        let connected = ended.is_none() && TcpStream::connect(("127.0.0.1", port)).is_ok();
-        match startup_poll(port, ended.as_ref(), connected, Instant::now() >= deadline) {
+        // C11: ready = an authorized 200 from /api/status, not a connect.
+        let ready = ended.is_none()
+            && status_ready(&shell_request_full(
+                port,
+                "GET",
+                "/api/status",
+                UI_REQUEST_TIMEOUT,
+            ));
+        match startup_poll(port, ended.as_ref(), ready, Instant::now() >= deadline) {
             StartupPoll::Ready => return Ok(()),
             StartupPoll::Failed(message) => return Err(message),
             StartupPoll::Wait => std::thread::sleep(Duration::from_millis(50)),
@@ -596,6 +628,17 @@ fn shell_request_timed(
     path: &str,
     io_timeout: Duration,
 ) -> Result<String, RequestFailure> {
+    shell_request_full(port, method, path, io_timeout).map(|(_, body)| body)
+}
+
+/// [`shell_request_timed`] that also returns the HTTP status code (0 when
+/// the status line is unreadable).
+fn shell_request_full(
+    port: u16,
+    method: &str,
+    path: &str,
+    io_timeout: Duration,
+) -> Result<(u16, String), RequestFailure> {
     let query = match crate::serve::resolve_shell_token(port, crate::serve::token_for_port) {
         Some(token) => format!("?token={token}"),
         None => String::new(),
@@ -636,10 +679,32 @@ fn shell_request_timed(
         return Err(RequestFailure::NoAnswer);
     }
     let text = String::from_utf8_lossy(&buffer);
-    Ok(text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default())
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok((
+        status,
+        text.split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default(),
+    ))
+}
+
+/// C11: the server is ready only when `/api/status` answers 200 with a
+/// well-formed `ok:true` body to THIS process's token — a bare TCP
+/// connect (the old check) also succeeds against a listener that cannot
+/// serve the UI yet (token not published: 401) or a foreign responder.
+pub(crate) fn status_ready(reply: &Result<(u16, String), RequestFailure>) -> bool {
+    match reply {
+        Ok((200, body)) => serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("ok").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// What one `/api/shutdown` attempt established.
@@ -809,6 +874,446 @@ pub(crate) fn close_wait_done(work: WorkState) -> bool {
     matches!(work, WorkState::Idle | WorkState::Gone)
 }
 
+// ---------------------------------------------------------------------------
+// C15: viewer flush before close.
+// ---------------------------------------------------------------------------
+
+/// How long WM_CLOSE waits for `FTViewer.save()` (A15 contract).
+const CLOSE_FLUSH_WAIT: Duration = Duration::from_secs(5);
+/// Timer id of the flush wait.
+const FLUSH_TIMER_ID: usize = 0xF7_15;
+
+/// Runs in the page: awaits `FTViewer.save()` (which resolves once every
+/// pending edit is saved or durably queued — A15) and posts the result
+/// back. Never throws; a page without a viewer reports a clean save.
+const FLUSH_SCRIPT: &str = r#"(async () => {
+  const r = { ft_close_save: 1, ok: true, pending: 0 };
+  try {
+    const v = window.FTViewer;
+    if (v && typeof v.save === "function") {
+      r.ok = (await v.save()) !== false;
+      const s = typeof v.summary === "function" ? v.summary() : null;
+      r.pending = (s && Number(s.pending)) || 0;
+    }
+  } catch (e) {
+    r.ok = false;
+    r.error = String((e && e.message) || e);
+  }
+  try { window.chrome.webview.postMessage(JSON.stringify(r)); } catch (e) {}
+})();"#;
+
+/// What the page reported after `FTViewer.save()`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SaveReport {
+    pub(crate) ok: bool,
+    pub(crate) pending: u64,
+}
+
+/// Parses a web message posted by [`FLUSH_SCRIPT`] (None for any other
+/// message).
+pub(crate) fn parse_save_report(message: &str) -> Option<SaveReport> {
+    let value: serde_json::Value = serde_json::from_str(message).ok()?;
+    if value
+        .get("ft_close_save")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return None;
+    }
+    Some(SaveReport {
+        ok: value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        pending: value
+            .get("pending")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .map(|n| n as u64)
+            .unwrap_or(0),
+    })
+}
+
+/// How the pre-close flush ended.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FlushOutcome {
+    /// No web view (error page / not created): nothing to save.
+    NoViewer,
+    Report(SaveReport),
+    /// No answer within [`CLOSE_FLUSH_WAIT`].
+    TimedOut,
+    /// `ExecuteScript` itself failed.
+    ScriptFailed,
+}
+
+/// What the close does with a flush outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushVerdict {
+    /// Everything saved: continue closing.
+    Clean,
+    /// The viewer still holds this many unsaved edits: ask first.
+    Unsaved(u64),
+    /// Could not confirm (timeout, script failure, save refused with no
+    /// count): ask first.
+    Unknown,
+}
+
+/// Pure C15 decision.
+pub(crate) fn flush_verdict(outcome: &FlushOutcome) -> FlushVerdict {
+    match outcome {
+        FlushOutcome::NoViewer => FlushVerdict::Clean,
+        FlushOutcome::Report(report) if report.ok && report.pending == 0 => FlushVerdict::Clean,
+        FlushOutcome::Report(report) if report.pending > 0 => FlushVerdict::Unsaved(report.pending),
+        FlushOutcome::Report(_) | FlushOutcome::TimedOut | FlushOutcome::ScriptFailed => {
+            FlushVerdict::Unknown
+        }
+    }
+}
+
+/// Close-flush progress (UI thread only; a Mutex for simplicity).
+#[derive(Debug, Clone, PartialEq)]
+enum FlushPhase {
+    Idle,
+    Flushing(Instant),
+    Done(FlushOutcome),
+}
+
+static FLUSH: Mutex<FlushPhase> = Mutex::new(FlushPhase::Idle);
+
+fn flush_phase() -> FlushPhase {
+    FLUSH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn set_flush_phase(phase: FlushPhase) {
+    *FLUSH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = phase;
+}
+
+thread_local! {
+    static WEBVIEW: RefCell<Option<ICoreWebView2>> = const { RefCell::new(None) };
+}
+
+/// Ends a running flush with `outcome` and re-sends WM_CLOSE so the close
+/// continues with it. Ignored when no flush is running (a late answer).
+fn finish_flush(hwnd: HWND, outcome: FlushOutcome) {
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW};
+    if !matches!(flush_phase(), FlushPhase::Flushing(_)) {
+        return;
+    }
+    set_flush_phase(FlushPhase::Done(outcome));
+    // SAFETY: our own timer on our own window; a private re-post.
+    unsafe {
+        let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
+        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM::default(), LPARAM::default());
+    }
+}
+
+/// Starts the flush: runs [`FLUSH_SCRIPT`] and arms the bounded wait.
+/// Returns the outcome right away when no flush can run.
+fn start_flush(hwnd: HWND) -> Option<FlushOutcome> {
+    use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+    let Some(webview) = WEBVIEW.with(cell_clone) else {
+        return Some(FlushOutcome::NoViewer);
+    };
+    set_flush_phase(FlushPhase::Flushing(Instant::now()));
+    let script = HSTRING::from(FLUSH_SCRIPT);
+    // The script's completion value is a pending Promise; the real answer
+    // arrives as a web message (see `install_web_message_handler`).
+    let handler =
+        webview2_com::ExecuteScriptCompletedHandler::create(Box::new(|_error, _result| Ok(())));
+    // SAFETY: live null-terminated UTF-16; COM call on the UI thread.
+    let started = unsafe { webview.ExecuteScript(PCWSTR::from_raw(script.as_ptr()), &handler) };
+    if started.is_err() {
+        set_flush_phase(FlushPhase::Idle);
+        return Some(FlushOutcome::ScriptFailed);
+    }
+    // SAFETY: a timer on our own window.
+    unsafe {
+        SetTimer(
+            Some(hwnd),
+            FLUSH_TIMER_ID,
+            CLOSE_FLUSH_WAIT.as_millis() as u32,
+            None,
+        );
+    }
+    None
+}
+
+/// Registers the web-message handler that receives the flush report.
+unsafe fn install_web_message_handler(webview: &ICoreWebView2, hwnd: HWND) -> Result<(), String> {
+    let hwnd_raw = hwnd.0 as usize;
+    let handler =
+        webview2_com::WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let mut message = windows::core::PWSTR::null();
+            // SAFETY: WebView2 allocates the string; take_pwstr frees it.
+            if unsafe { args.TryGetWebMessageAsString(&mut message) }.is_ok() {
+                let text = webview2_com::take_pwstr(message);
+                if let Some(report) = parse_save_report(&text) {
+                    finish_flush(
+                        HWND(hwnd_raw as *mut core::ffi::c_void),
+                        FlushOutcome::Report(report),
+                    );
+                }
+            }
+            Ok(())
+        }));
+    let mut token = 0i64;
+    // SAFETY: COM registration on the UI thread.
+    unsafe { webview.add_WebMessageReceived(&handler, &mut token) }
+        .map_err(|err| format!("WebView2 add_WebMessageReceived failed: {err}"))
+}
+
+/// Asked when the viewer still holds unsaved edits (C15 / A15).
+fn confirm_unsaved_dialog(hwnd: HWND, verdict: FlushVerdict) -> bool {
+    let text = match verdict {
+        FlushVerdict::Unsaved(count) => format!(
+            "저장 안 된 편집 {count}건이 있습니다.\n지금 종료하면 이 편집은 저장되지 않습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 저장"
+        ),
+        _ => "편집 저장을 확인하지 못했습니다 (5초 안에 응답 없음).\n저장 안 된 편집이 있을 수 있습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 확인".to_string(),
+    };
+    confirm_dialog(hwnd, &text)
+}
+
+// ---------------------------------------------------------------------------
+// C9: Windows shutdown / logoff.
+// ---------------------------------------------------------------------------
+
+/// What WM_QUERYENDSESSION answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndSessionDecision {
+    /// Nothing runs: let Windows end the session.
+    Allow,
+    /// Work runs (or cannot be ruled out): block with a visible reason.
+    Block,
+}
+
+/// Pure C9 decision: a running (or unknown) job blocks the session end
+/// with a reason Windows shows; an idle or gone server lets it proceed.
+pub(crate) fn decide_end_session(work: WorkState) -> EndSessionDecision {
+    match work {
+        WorkState::Idle | WorkState::Gone => EndSessionDecision::Allow,
+        WorkState::Running | WorkState::Unknown => EndSessionDecision::Block,
+    }
+}
+
+/// What WM_ENDSESSION does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndSessionAction {
+    /// The session end was cancelled: drop the block reason, keep going.
+    Resume,
+    /// The session ends: cancel work, wait briefly, mark unfinished
+    /// exports, stop process trees, drop the instance file.
+    CancelAndCleanUp,
+}
+
+/// Pure C9 decision on WM_ENDSESSION's `wParam` (TRUE = ending).
+pub(crate) fn end_session_action(ending: bool) -> EndSessionAction {
+    if ending {
+        EndSessionAction::CancelAndCleanUp
+    } else {
+        EndSessionAction::Resume
+    }
+}
+
+/// Reason text Windows shows on the shutdown screen.
+const SHUTDOWN_BLOCK_REASON: &str =
+    "FrameTrace 작업 진행 중 — 작업을 마치거나 중단한 뒤 종료하십시오";
+/// How long WM_ENDSESSION waits for cancelled work (Windows allows ~5 s).
+const END_SESSION_WAIT: Duration = Duration::from_secs(3);
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn ShutdownBlockReasonCreate(hwnd: *mut core::ffi::c_void, reason: *const u16) -> i32;
+    fn ShutdownBlockReasonDestroy(hwnd: *mut core::ffi::c_void) -> i32;
+}
+
+/// WM_ENDSESSION(TRUE): best effort within the session-end budget.
+fn end_session_cleanup(port: u16) {
+    if port != 0 {
+        let _ = shell_request_timed(port, "POST", "/api/cancel", UI_REQUEST_TIMEOUT);
+        let deadline = Instant::now() + END_SESSION_WAIT;
+        while Instant::now() < deadline {
+            let status = shell_request_timed(port, "GET", "/api/status", UI_REQUEST_TIMEOUT);
+            if close_wait_done(classify_status(&status)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    serve::mark_abandoned_exports();
+    serve::kill_all_tracked();
+    serve::remove_instance_file_if_owned();
+}
+
+// ---------------------------------------------------------------------------
+// C4: forced exit.
+// ---------------------------------------------------------------------------
+
+/// How long the forced-exit path waits for running case writes (export
+/// copies, hashes, audit appends) after asking them to stop.
+const FORCED_EXIT_WRITE_WAIT: Duration = Duration::from_secs(30);
+
+/// `writes_running` from a status reply (`None` = unreadable).
+pub(crate) fn writes_running(reply: &Result<String, RequestFailure>) -> Option<u64> {
+    match reply {
+        Err(RequestFailure::Unreachable) => Some(0),
+        Err(RequestFailure::NoAnswer) => None,
+        Ok(text) => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .filter(|value| value.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
+            .map(|value| {
+                value
+                    .get("writes_running")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            }),
+    }
+}
+
+/// Pure C4 decision after the bounded write wait: exports still being
+/// written (or an unreadable status) get stamped "중단됨" before exit.
+pub(crate) fn must_mark_abandoned(writes: Option<u64>) -> bool {
+    writes != Some(0)
+}
+
+/// C4: the forced-exit path's write lease handling — the cancel flags were
+/// set by `/api/cancel` (shutdown_server); wait up to 30 s for every write
+/// to finish (a copy in progress is completed, never torn), then stamp
+/// whatever is still being written as "중단됨".
+fn settle_writes_before_forced_exit(port: u16) {
+    let _ = shell_request(port, "POST", "/api/cancel");
+    let deadline = Instant::now() + FORCED_EXIT_WRITE_WAIT;
+    let mut writes = None;
+    while Instant::now() < deadline {
+        writes = writes_running(&shell_request_timed(
+            port,
+            "GET",
+            "/api/status",
+            UI_REQUEST_TIMEOUT,
+        ));
+        if writes == Some(0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if must_mark_abandoned(writes) {
+        let marked = serve::mark_abandoned_exports();
+        eprintln!("frametrace: forced exit — {marked} unfinished export(s) marked 중단됨");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FRAMETRACE_SHELL_SMOKE=1 (CI): load the UI, wait for an authorized
+// /api/status 200, then close cleanly through the normal path; exit 0.
+// ---------------------------------------------------------------------------
+
+/// Whether the smoke mode is on.
+pub(crate) fn smoke_mode() -> bool {
+    smoke_requested(std::env::var("FRAMETRACE_SHELL_SMOKE").ok().as_deref())
+}
+
+pub(crate) fn smoke_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// Upper bound for the whole smoke run before it is failed and closed.
+const SMOKE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// First smoke failure (None = passing so far).
+static SMOKE_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+fn smoke_fail(reason: String) {
+    eprintln!("frametrace smoke: {reason}");
+    let mut slot = SMOKE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(reason);
+    }
+}
+
+fn smoke_failure() -> Option<String> {
+    SMOKE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// After the page loaded: wait for an authorized /api/status 200, then
+/// ask the frame to close (the normal WM_CLOSE path, flush included).
+fn smoke_after_load(port: u16) {
+    let _ = std::thread::Builder::new()
+        .name("frametrace-smoke".into())
+        .spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if port == 0
+                    || status_ready(&shell_request_full(
+                        port,
+                        "GET",
+                        "/api/status",
+                        UI_REQUEST_TIMEOUT,
+                    ))
+                {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    smoke_fail("/api/status did not answer 200 within 60 s".into());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            post_frame_message(WM_CLOSE);
+        });
+}
+
+/// Smoke watchdog: a run that is still up after [`SMOKE_DEADLINE`] fails
+/// and its frame is destroyed.
+fn smoke_watchdog() {
+    let _ = std::thread::Builder::new()
+        .name("frametrace-smoke-watchdog".into())
+        .spawn(|| {
+            std::thread::sleep(SMOKE_DEADLINE);
+            if !FRAME_HWND.load(Ordering::SeqCst).is_null() {
+                smoke_fail(format!(
+                    "the window did not close within {}s",
+                    SMOKE_DEADLINE.as_secs()
+                ));
+                post_frame_message(MSG_CLOSE_NOW);
+            }
+        });
+}
+
+/// Registers the navigation-completed handler of the smoke mode.
+unsafe fn install_smoke_handler(webview: &ICoreWebView2) -> Result<(), String> {
+    let handler =
+        webview2_com::NavigationCompletedEventHandler::create(Box::new(move |_sender, args| {
+            let mut success = windows::core::BOOL(0);
+            if let Some(args) = args {
+                // SAFETY: COM getter on the UI thread.
+                let _ = unsafe { args.IsSuccess(&mut success) };
+            }
+            if success.as_bool() {
+                smoke_after_load(OWNED_PORT.load(Ordering::SeqCst));
+            } else {
+                smoke_fail("the workstation page failed to load".into());
+                post_frame_message(MSG_CLOSE_NOW);
+            }
+            Ok(())
+        }));
+    let mut token = 0i64;
+    // SAFETY: COM registration on the UI thread.
+    unsafe { webview.add_NavigationCompleted(&handler, &mut token) }
+        .map_err(|err| format!("WebView2 add_NavigationCompleted failed: {err}"))
+}
+
 /// Modal yes/no in the examiner's language; UTF-16 so Korean renders.
 fn confirm_cancel_dialog(hwnd: HWND) -> bool {
     confirm_dialog(
@@ -829,6 +1334,14 @@ fn confirm_dialog(hwnd: HWND, text: &str) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW,
     };
+    if smoke_mode() {
+        // CI has nobody to answer: a question here is a smoke failure.
+        smoke_fail(format!(
+            "unexpected close question: {}",
+            text.replace('\n', " ")
+        ));
+        return true;
+    }
     let text = HSTRING::from(text);
     let caption = HSTRING::from("FrameTrace");
     // SAFETY: live null-terminated UTF-16 strings; modal to our own window.
@@ -962,14 +1475,18 @@ fn host_window(target: &Result<String, String>) -> Result<(), String> {
         FRAME_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
         FRAME_HWND.store(hwnd.0, Ordering::SeqCst);
         let result = host_webview(hwnd, target);
+        // R9: the web view (C15 flush handle) goes before the controller
+        // and the apartment.
+        let webview_released = WEBVIEW.with(|slot| release_slot(slot, |_| {}));
         // R9: the controller is released here, on every path, BEFORE the
         // apartment is torn down. Moved out first: Close() may pump
         // messages (WM_SIZE) that look the controller up again (P10).
-        let released = CONTROLLER.with(|slot| {
-            release_slot(slot, |controller| {
-                let _ = controller.Close();
-            })
-        });
+        let released = webview_released
+            && CONTROLLER.with(|slot| {
+                release_slot(slot, |controller| {
+                    let _ = controller.Close();
+                })
+            });
         if !released {
             eprintln!(
                 "frametrace: WebView2 controller still borrowed at teardown; leaving COM initialized"
@@ -1063,6 +1580,17 @@ unsafe fn host_webview(hwnd: HWND, target: &Result<String, String>) -> Result<()
         let webview = controller
             .CoreWebView2()
             .map_err(|err| format!("WebView2 CoreWebView2 failed: {err}"))?;
+        // C15: the close flush's answer channel.
+        install_web_message_handler(&webview, hwnd)?;
+        if smoke_mode() {
+            install_smoke_handler(&webview)?;
+        }
+        if WEBVIEW
+            .with(|slot| cell_store(slot, webview.clone()))
+            .is_err()
+        {
+            return Err("WebView2 web view slot was busy (re-entrant call)".to_string());
+        }
 
         match target {
             Ok(url) => {
@@ -1154,6 +1682,50 @@ unsafe extern "system" fn frame_window_proc(
             }
             LRESULT(0)
         }
+        WM_TIMER if w_param.0 == FLUSH_TIMER_ID => {
+            // C15: the viewer did not answer within the bound.
+            finish_flush(hwnd, FlushOutcome::TimedOut);
+            LRESULT(0)
+        }
+        WM_QUERYENDSESSION_ID => {
+            // C9: Windows asks whether the session may end (restart,
+            // shutdown, logoff). Running work blocks it with a reason the
+            // examiner sees on the shutdown screen.
+            let port = OWNED_PORT.load(Ordering::SeqCst);
+            let work = if port == 0 {
+                WorkState::Idle
+            } else {
+                classify_status(&shell_request_timed(
+                    port,
+                    "GET",
+                    "/api/status",
+                    UI_REQUEST_TIMEOUT,
+                ))
+            };
+            match decide_end_session(work) {
+                EndSessionDecision::Allow => LRESULT(1),
+                EndSessionDecision::Block => {
+                    let reason = HSTRING::from(SHUTDOWN_BLOCK_REASON);
+                    // SAFETY: our own window; live UTF-16 string.
+                    unsafe {
+                        ShutdownBlockReasonCreate(hwnd.0, reason.as_ptr());
+                    }
+                    LRESULT(0)
+                }
+            }
+        }
+        WM_ENDSESSION_ID => {
+            // SAFETY: our own window (no reason registered is harmless).
+            unsafe {
+                ShutdownBlockReasonDestroy(hwnd.0);
+            }
+            if end_session_action(w_param.0 != 0) == EndSessionAction::CancelAndCleanUp {
+                // The session ends: the process may be terminated as soon
+                // as this returns — cancel, settle, mark, reap now.
+                end_session_cleanup(OWNED_PORT.load(Ordering::SeqCst));
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             if let Some(started) = closing_since() {
                 // A cancel-then-close is already in flight: ignore the
@@ -1169,6 +1741,32 @@ unsafe extern "system" fn frame_window_proc(
                     }
                 }
                 return LRESULT(0);
+            }
+            // C15: first let the viewer save (bounded), then decide.
+            let outcome = match flush_phase() {
+                FlushPhase::Idle => match start_flush(hwnd) {
+                    // Flushing: WM_CLOSE comes back with the answer.
+                    None => return LRESULT(0),
+                    Some(outcome) => outcome,
+                },
+                FlushPhase::Flushing(started) => {
+                    if started.elapsed() < CLOSE_FLUSH_WAIT + Duration::from_secs(2) {
+                        // A repeated × while the save runs.
+                        return LRESULT(0);
+                    }
+                    FlushOutcome::TimedOut
+                }
+                FlushPhase::Done(outcome) => outcome,
+            };
+            // The next close starts a fresh flush (e.g. after "keep open").
+            set_flush_phase(FlushPhase::Idle);
+            let verdict = flush_verdict(&outcome);
+            if verdict != FlushVerdict::Clean {
+                if smoke_mode() {
+                    smoke_fail(format!("viewer flush before close: {outcome:?}"));
+                } else if !confirm_unsaved_dialog(hwnd, verdict) {
+                    return LRESULT(0);
+                }
             }
             let port = OWNED_PORT.load(Ordering::SeqCst);
             // A foreign (attached) server is not shut down on close, so
@@ -1218,6 +1816,123 @@ mod tests {
     };
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
+
+    /// C11: only an authorized 200 with `ok:true` means "ready"; a bare
+    /// accepted connection (the old check) does not.
+    #[test]
+    fn startup_readiness_table() {
+        use super::status_ready;
+        let reply = |code: u16, body: &str| Ok::<_, RequestFailure>((code, body.to_string()));
+        assert!(status_ready(&reply(200, r#"{"ok":true,"busy":false}"#)));
+        assert!(!status_ready(&reply(401, "unauthorized")));
+        assert!(!status_ready(&reply(200, "<html>someone else</html>")));
+        assert!(!status_ready(&reply(200, r#"{"ok":false}"#)));
+        assert!(!status_ready(&reply(503, r#"{"ok":true}"#)));
+        assert!(!status_ready(&reply(0, "")));
+        assert!(!status_ready(&Err(RequestFailure::NoAnswer)));
+        assert!(!status_ready(&Err(RequestFailure::Unreachable)));
+    }
+
+    /// C15: the viewer's save report → close verdict. Anything but a
+    /// confirmed clean save asks before closing.
+    #[test]
+    fn close_flush_verdict_table() {
+        use super::{FlushOutcome, FlushVerdict, SaveReport, flush_verdict, parse_save_report};
+        assert_eq!(
+            parse_save_report(r#"{"ft_close_save":1,"ok":true,"pending":0}"#),
+            Some(SaveReport {
+                ok: true,
+                pending: 0
+            })
+        );
+        assert_eq!(
+            parse_save_report(r#"{"ft_close_save":1,"ok":false,"pending":3}"#),
+            Some(SaveReport {
+                ok: false,
+                pending: 3
+            })
+        );
+        assert_eq!(parse_save_report(r#"{"ok":true}"#), None, "foreign message");
+        assert_eq!(parse_save_report("not json"), None);
+        let report = |ok, pending| FlushOutcome::Report(SaveReport { ok, pending });
+        let cases = [
+            (FlushOutcome::NoViewer, FlushVerdict::Clean),
+            (report(true, 0), FlushVerdict::Clean),
+            (report(true, 2), FlushVerdict::Unsaved(2)),
+            (report(false, 5), FlushVerdict::Unsaved(5)),
+            (report(false, 0), FlushVerdict::Unknown),
+            (FlushOutcome::TimedOut, FlushVerdict::Unknown),
+            (FlushOutcome::ScriptFailed, FlushVerdict::Unknown),
+        ];
+        for (outcome, verdict) in cases {
+            assert_eq!(flush_verdict(&outcome), verdict, "{outcome:?}");
+        }
+        assert_eq!(super::CLOSE_FLUSH_WAIT, Duration::from_secs(5));
+        assert!(super::FLUSH_SCRIPT.contains("FTViewer"));
+        assert!(super::FLUSH_SCRIPT.contains("save()"));
+    }
+
+    /// C9: session end (restart / shutdown / logoff) is blocked while work
+    /// runs or cannot be ruled out; an ending session cancels and cleans.
+    #[test]
+    fn end_session_decision_table() {
+        use super::{EndSessionAction, EndSessionDecision, decide_end_session, end_session_action};
+        assert_eq!(
+            decide_end_session(WorkState::Idle),
+            EndSessionDecision::Allow
+        );
+        assert_eq!(
+            decide_end_session(WorkState::Gone),
+            EndSessionDecision::Allow
+        );
+        assert_eq!(
+            decide_end_session(WorkState::Running),
+            EndSessionDecision::Block
+        );
+        assert_eq!(
+            decide_end_session(WorkState::Unknown),
+            EndSessionDecision::Block
+        );
+        assert_eq!(end_session_action(true), EndSessionAction::CancelAndCleanUp);
+        assert_eq!(end_session_action(false), EndSessionAction::Resume);
+        assert!(super::END_SESSION_WAIT < Duration::from_secs(5));
+    }
+
+    /// C4: the forced exit marks exports that are still being written (or
+    /// whose state cannot be read) as 중단됨.
+    #[test]
+    fn forced_exit_write_table() {
+        use super::{must_mark_abandoned, writes_running};
+        let ok = |s: &str| Ok::<String, RequestFailure>(s.to_string());
+        assert_eq!(
+            writes_running(&ok(r#"{"ok":true,"writes_running":0}"#)),
+            Some(0)
+        );
+        assert_eq!(
+            writes_running(&ok(r#"{"ok":true,"writes_running":2}"#)),
+            Some(2)
+        );
+        assert_eq!(writes_running(&ok(r#"{"ok":true}"#)), Some(0));
+        assert_eq!(writes_running(&ok("garbage")), None);
+        assert_eq!(writes_running(&ok(r#"{"ok":false}"#)), None);
+        assert_eq!(writes_running(&Err(RequestFailure::NoAnswer)), None);
+        assert_eq!(writes_running(&Err(RequestFailure::Unreachable)), Some(0));
+        assert!(!must_mark_abandoned(Some(0)));
+        assert!(must_mark_abandoned(Some(1)));
+        assert!(must_mark_abandoned(None));
+        assert_eq!(super::FORCED_EXIT_WRITE_WAIT, Duration::from_secs(30));
+    }
+
+    /// F2 contract: `FRAMETRACE_SHELL_SMOKE=1` exactly.
+    #[test]
+    fn smoke_switch_table() {
+        use super::smoke_requested;
+        assert!(smoke_requested(Some("1")));
+        assert!(smoke_requested(Some(" 1 ")));
+        assert!(!smoke_requested(Some("0")));
+        assert!(!smoke_requested(Some("true")));
+        assert!(!smoke_requested(None));
+    }
 
     /// P3: status reply → work state. Only a well-formed `ok` status can
     /// say "idle"; timeouts, garbage and refusals are `Unknown`.
