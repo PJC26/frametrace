@@ -162,20 +162,25 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut body =
-            String::from("#!/bin/sh\nif [ \"$1\" != \"join-video\" ]; then echo ok; exit 0; fi\n");
+        // C13: the job tag (`--job-tag`) is found once; `Append` writes
+        // it into staged log lines (`@TAG@`) like the real CLI does.
+        let mut body = String::from(
+            "#!/bin/sh\nif [ \"$1\" != \"join-video\" ]; then echo ok; exit 0; fi\n\
+             tag=\"\"; prev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--job-tag\" ]; then tag=\"$a\"; fi; prev=\"$a\"; done\n",
+        );
         for step in steps {
             body.push_str(&match step {
                 Step::Copy(src, dst) => format!("cp \"{}\" \"{}\"\n", src.display(), dst.display()),
-                Step::Append(src, dst) => {
-                    format!("cat \"{}\" >> \"{}\"\n", src.display(), dst.display())
-                }
+                Step::Append(src, dst) => format!(
+                    "sed \"s/@TAG@/$tag/g\" \"{}\" >> \"{}\"\n",
+                    src.display(),
+                    dst.display()
+                ),
                 Step::Stderr(text) => format!("echo \"{text}\" >&2\n"),
                 Step::TaggedTemps(dir, progress) => {
                     let dir = dir.display();
                     format!(
-                        "tag=\"\"; prev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--job-tag\" ]; then tag=\"$a\"; fi; prev=\"$a\"; done\n\
-                         echo partial > \"{dir}/.join-$tag.part\"\n\
+                        "echo partial > \"{dir}/.join-$tag.part\"\n\
                          echo list > \"{dir}/.join-$tag.ffconcat\"\n\
                          cp \"{}\" \"{dir}/.join-$tag.progress.json\"\n",
                         progress.display()
@@ -198,8 +203,12 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
     }
     #[cfg(windows)]
     {
+        // cmd also splits arguments on commas: find the tag by its flag
+        // instead of by position (once, up front — `shift` consumes them).
         let mut body = String::from(
-            "@echo off\r\nif not \"%1\"==\"join-video\" (\r\n  echo ok\r\n  exit /b 0\r\n)\r\n",
+            "@echo off\r\nif not \"%1\"==\"join-video\" (\r\n  echo ok\r\n  exit /b 0\r\n)\r\n\
+             set tag=\r\n:findtag\r\nif \"%~1\"==\"\" goto gottag\r\n\
+             if \"%~1\"==\"--job-tag\" set tag=%~2\r\nshift\r\ngoto findtag\r\n:gottag\r\n",
         );
         for step in steps {
             body.push_str(&match step {
@@ -208,18 +217,17 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
                     src.display(),
                     dst.display()
                 ),
-                Step::Append(src, dst) => {
-                    format!("type \"{}\" >> \"{}\"\r\n", src.display(), dst.display())
-                }
+                // C13: staged log lines carry `@TAG@` for the job tag.
+                Step::Append(src, dst) => format!(
+                    "powershell -NoProfile -Command \"[IO.File]::AppendAllText('{}', [IO.File]::ReadAllText('{}').Replace('@TAG@','%tag%'))\"\r\n",
+                    dst.display(),
+                    src.display()
+                ),
                 Step::Stderr(text) => format!("echo {text} 1>&2\r\n"),
-                // cmd also splits arguments on commas: find the tag by its
-                // flag instead of by position.
                 Step::TaggedTemps(dir, progress) => {
                     let dir = dir.display();
                     format!(
-                        "set tag=\r\n:findtag\r\nif \"%~1\"==\"\" goto gottag\r\n\
-                         if \"%~1\"==\"--job-tag\" set tag=%~2\r\nshift\r\ngoto findtag\r\n:gottag\r\n\
-                         echo partial> \"{dir}\\.join-%tag%.part\"\r\n\
+                        "echo partial> \"{dir}\\.join-%tag%.part\"\r\n\
                          echo list> \"{dir}\\.join-%tag%.ffconcat\"\r\n\
                          copy /y \"{}\" \"{dir}\\.join-%tag%.progress.json\" >nul\r\n",
                         progress.display()
@@ -298,6 +306,8 @@ fn stage_success(case_dir: &Path, plan_id: &str, manifest_sha_override: Option<&
         "manifest_path": manifest.to_string_lossy(),
         "manifest_sha256": crate::sha256::digest_bytes(manifest_text.as_bytes()),
         "plan_id": plan_id,
+        // C13: substituted with the job's `--job-tag` by the fake CLI.
+        "job_tag": "@TAG@",
         "segment_count": 2,
         "source_ids": ["vid_1", "vid_2"],
         "duration_check_ok": true,

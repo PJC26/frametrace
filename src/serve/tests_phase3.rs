@@ -420,7 +420,7 @@ fn no_job_starts_once_shutdown_was_requested() {
         &request(
             "POST",
             "/api/export-clip",
-            r#"{"id":"vid_0001","start":"0","duration":"1"}"#,
+            r#"{"id":"vid_000001","start":"0","duration":"1"}"#,
         ),
         &state,
         &exe,

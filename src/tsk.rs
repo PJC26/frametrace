@@ -118,11 +118,90 @@ pub struct TskInspectResult {
     /// then holds a *partial* listing (clearly flagged in warnings,
     /// the summary, and the audit event), not a complete one.
     pub fls_completed: bool,
+    /// The listing was cut to `--max-entries` (also partial).
+    pub entries_truncated: bool,
     pub warnings: Vec<String>,
     pub mmls_log_path: PathBuf,
     pub fls_log_path: PathBuf,
     pub entries_jsonl_path: PathBuf,
     pub summary_path: PathBuf,
+}
+
+/// C7 / B16 contract: process exit code of a step that completed and
+/// recorded everything but whose result is PARTIAL (inspect-image, or
+/// inspect-e01 --filesystem direct triage, with a timed-out or truncated
+/// fls listing). The server reports it as a warning / `partial` step,
+/// never as a clean pass.
+pub const EXIT_PARTIAL: i32 = 5;
+/// Prefix of the last stderr line of an [`EXIT_PARTIAL`] exit.
+pub const PARTIAL_LINE_PREFIX: &str = "PARTIAL: ";
+
+/// Why an inspection result is partial (`None` = complete).
+pub fn partial_reason(result: &TskInspectResult) -> Option<String> {
+    let mut reasons = Vec::new();
+    if !result.fls_completed {
+        reasons.push(
+            "fls 시간 초과로 파일 목록이 일부만 수집되었습니다 (fls timed out; listing is partial)",
+        );
+    }
+    if result.entries_truncated {
+        reasons
+            .push("파일 목록이 --max-entries에서 잘렸습니다 (listing truncated to --max-entries)");
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// C7: default bound for an inspect-image run — one hour per started
+/// terabyte of image, at least one hour (`--timeout 0` = unlimited).
+/// For an EWF set the sizes of all its segment files count.
+pub fn scaled_inspect_timeout_secs(image: &Path) -> u64 {
+    scaled_timeout_for_bytes(image_size_for_timeout(image))
+}
+
+/// Pure part of [`scaled_inspect_timeout_secs`].
+pub fn scaled_timeout_for_bytes(bytes: u64) -> u64 {
+    const TB: u64 = 1_000_000_000_000;
+    let terabytes = bytes.div_ceil(TB).max(1);
+    terabytes.saturating_mul(TSK_PROBE_TIMEOUT_SECS)
+}
+
+fn image_size_for_timeout(image: &Path) -> u64 {
+    let own = fs::metadata(image).map(|m| m.len()).unwrap_or(0);
+    let (Some(stem), Some(ext)) = (
+        image.file_stem().and_then(|s| s.to_str()),
+        image.extension().and_then(|e| e.to_str()),
+    ) else {
+        return own;
+    };
+    let lower = ext.to_ascii_lowercase();
+    if !matches!(lower.as_str(), "e01" | "ex01" | "s01" | "l01") {
+        return own;
+    }
+    let letter = lower.chars().next().unwrap_or('e');
+    let Some(dir) = image.parent() else {
+        return own;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return own;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let same_stem = path.file_stem().and_then(|s| s.to_str()) == Some(stem);
+            let segment_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|e| {
+                    (3..=4).contains(&e.len())
+                        && e.starts_with(letter)
+                        && e.chars().all(|c| c.is_ascii_alphanumeric())
+                });
+            (same_stem && segment_ext).then(|| entry.metadata().map(|m| m.len()).unwrap_or(0))
+        })
+        .sum::<u64>()
+        .max(own)
 }
 
 #[derive(Debug, Clone)]
@@ -250,7 +329,8 @@ pub fn inspect_image(
     }
 
     let mut entries = parse_fls_entries(&fls.output.stdout);
-    if entries.len() > options.max_entries {
+    let entries_truncated = entries.len() > options.max_entries;
+    if entries_truncated {
         warnings.push(format!(
             "filesystem listing truncated from {} to {} entries",
             entries.len(),
@@ -321,6 +401,7 @@ pub fn inspect_image(
         partitions,
         entries,
         fls_completed,
+        entries_truncated,
         warnings,
         mmls_log_path,
         fls_log_path,
@@ -349,7 +430,8 @@ pub fn recover_inode(
             }
             path.to_path_buf()
         }
-        None => unique_path(
+        // Not reserved: no empty placeholder under the final name (C2).
+        None => crate::util::unique_available_path(
             &case_dir
                 .join("artifacts/recovered/filesystem")
                 .join(format!("inode_{}.bin", sanitize_filename(&options.inode))),
@@ -359,13 +441,28 @@ pub fn recover_inode(
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create recovery output directory: {err}"))?;
+        for (path, result) in crate::join::sweep_stale_parts(parent) {
+            if let Err(err) = result {
+                eprintln!("warning: {err} ({})", path.display());
+            }
+        }
     }
 
     let args = icat_args(&image_path, options);
     let icat_bin = resolve_tool_binary(&options.icat_bin, &["icat"])
         .map_err(|err| format!("{err} (install Sleuth Kit and ensure icat is in PATH)"))?;
-    let output = File::create(&output_path)
-        .map_err(|err| format!("failed to create {}: {err}", output_path.display()))?;
+    // C2: icat streams into a pid-tagged `.part`; only a complete recovery
+    // is published under the final name (a killed recovery leaves just the
+    // `.part`, which the server sweeps).
+    let part_path = crate::join::pid_part_path(&output_path, std::process::id());
+    crate::join::remove_file_retry(&part_path)?;
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part_path)
+        .map_err(|err| format!("failed to create {}: {err}", part_path.display()))?;
+    let final_path = output_path;
+    let output_path = part_path.clone();
     let mut command = Command::new(&icat_bin);
     command
         .args(&args)
@@ -401,7 +498,10 @@ pub fn recover_inode(
             .wait()
             .map_err(|err| format!("failed to wait for icat: {err}"))?,
     };
-    let stderr_bytes = stderr_reader.join().unwrap_or_default();
+    // C10: bounded — a grandchild holding the pipe must not hang us.
+    let stderr_bytes =
+        crate::join::join_reader_bounded(stderr_reader, crate::join::READER_JOIN_CAP)
+            .unwrap_or_default();
     if !status.success() {
         let _ = fs::remove_file(&output_path);
         return Err(format!(
@@ -411,6 +511,34 @@ pub fn recover_inode(
             String::from_utf8_lossy(&stderr_bytes).trim()
         ));
     }
+    let explicit_output = options.output_path.is_some();
+    let mut target = final_path;
+    let mut published = false;
+    for _ in 0..16 {
+        match crate::join::publish_part_as(&output_path, &target) {
+            Ok(true) => {
+                published = true;
+                break;
+            }
+            Ok(false) if !explicit_output => {
+                // Another recovery took the name meanwhile: next free one.
+                target = crate::util::unique_available_path(&target);
+            }
+            Ok(false) => break,
+            Err(err) => {
+                let _ = fs::remove_file(&output_path);
+                return Err(err);
+            }
+        }
+    }
+    if !published {
+        let _ = fs::remove_file(&output_path);
+        return Err(format!(
+            "output already exists: {} (choose a new --output path)",
+            target.display()
+        ));
+    }
+    let output_path = target;
 
     let output_path = canonicalize_display(&output_path)
         .map_err(|err| format!("failed to canonicalize recovered output: {err}"))?;
@@ -1172,5 +1300,120 @@ Units are in 512-byte sectors
         assert!(!result.timed_out);
         assert!(!result.output.status_success);
         assert!(result.output.stdout.contains("doomed"));
+    }
+
+    fn inspect_result(fls_completed: bool, entries_truncated: bool) -> super::TskInspectResult {
+        super::TskInspectResult {
+            image_path: Path::new("img.raw").to_path_buf(),
+            inspected_unix: 1,
+            partition_offset: 0,
+            partitions: Vec::new(),
+            entries: Vec::new(),
+            fls_completed,
+            entries_truncated,
+            warnings: Vec::new(),
+            mmls_log_path: Path::new("m").to_path_buf(),
+            fls_log_path: Path::new("f").to_path_buf(),
+            entries_jsonl_path: Path::new("e").to_path_buf(),
+            summary_path: Path::new("s").to_path_buf(),
+        }
+    }
+
+    /// C7 / B16: a timed-out or truncated listing is PARTIAL (exit 5),
+    /// never a clean completion.
+    #[test]
+    fn partial_reason_table() {
+        use super::{EXIT_PARTIAL, partial_reason};
+        assert_eq!(EXIT_PARTIAL, 5);
+        assert_eq!(partial_reason(&inspect_result(true, false)), None);
+        assert!(
+            partial_reason(&inspect_result(false, false))
+                .unwrap()
+                .contains("timed out")
+        );
+        assert!(
+            partial_reason(&inspect_result(true, true))
+                .unwrap()
+                .contains("truncated")
+        );
+        let both = partial_reason(&inspect_result(false, true)).unwrap();
+        assert!(both.contains("timed out") && both.contains("truncated"));
+    }
+
+    /// C7: one hour per started terabyte, at least one hour; an EWF set
+    /// counts all its segments.
+    #[test]
+    fn inspect_timeout_scales_with_image_size() {
+        use super::{scaled_inspect_timeout_secs, scaled_timeout_for_bytes};
+        const TB: u64 = 1_000_000_000_000;
+        assert_eq!(scaled_timeout_for_bytes(0), 3600);
+        assert_eq!(scaled_timeout_for_bytes(232 * 1_000_000_000), 3600);
+        assert_eq!(scaled_timeout_for_bytes(TB), 3600);
+        assert_eq!(scaled_timeout_for_bytes(TB + 1), 7200);
+        assert_eq!(scaled_timeout_for_bytes(4 * TB), 4 * 3600);
+        let dir = std::env::temp_dir().join(format!("ft-c7-ewf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("disk.E01");
+        std::fs::write(&first, vec![0u8; 10]).unwrap();
+        std::fs::write(dir.join("disk.E02"), vec![0u8; 10]).unwrap();
+        std::fs::write(dir.join("other.E01"), vec![0u8; 10]).unwrap();
+        assert_eq!(super::image_size_for_timeout(&first), 20);
+        assert_eq!(scaled_inspect_timeout_secs(&first), 3600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2: icat writes into a pid-tagged `.part`; a failed recovery leaves
+    /// nothing, a successful one is published under the final name only.
+    #[cfg(unix)]
+    #[test]
+    fn icat_recovery_publishes_only_complete_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = std::env::temp_dir().join(format!("ft-c2-icat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case);
+        std::fs::create_dir_all(case.join("evidence/logs")).unwrap();
+        let image = case.join("disk.raw");
+        std::fs::write(&image, b"img").unwrap();
+        let icat = |name: &str, body: &str| {
+            let dir = case.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("icat");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().to_string()
+        };
+        let options = |bin: String| TskRecoverOptions {
+            partition_offset: 0,
+            inode: "42".to_string(),
+            output_path: None,
+            recover_deleted: false,
+            include_slack: false,
+            skip_sparse_holes: false,
+            icat_bin: bin,
+            timeout_secs: Some(30),
+        };
+        let out_dir = case.join("artifacts/recovered/filesystem");
+        let failing = icat("fail", "printf 'partial'; exit 1");
+        assert!(super::recover_inode(&case, &image, &options(failing)).is_err());
+        let names = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(names(&out_dir).is_empty(), "{:?}", names(&out_dir));
+        let working = icat("ok", "printf 'recovered-bytes'");
+        let result = super::recover_inode(&case, &image, &options(working)).unwrap();
+        assert!(result.output_path.ends_with("inode_42.bin"));
+        assert_eq!(names(&out_dir), ["inode_42.bin"]);
+        assert_eq!(
+            std::fs::read(&result.output_path).unwrap(),
+            b"recovered-bytes"
+        );
+        let _ = std::fs::remove_dir_all(&case);
     }
 }

@@ -157,7 +157,12 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
     // those the viewer also sends the record's file path, which we only
     // honor when it sits inside the approved media roots. The canonical
     // (absolute) path is what reaches argv, so it can never read as a flag.
+    // C12: a `vid_*` id is honored only in its exact index form and is
+    // resolved through the index alone (never as a path).
     let selector = if id.starts_with("vid_") {
+        if let Err(err) = check_index_video_id(&id) {
+            return api_err(&err);
+        }
         id.clone()
     } else {
         let alt = body_value(&request.body, "path").unwrap_or_default();
@@ -338,6 +343,21 @@ pub(crate) fn export_clip_with_exe(request: &Request, state: &SharedState, exe: 
 /// The single argv token carrying the burn-in exhibit label (SEC-06).
 pub(crate) fn exhibit_arg(exhibit: &str) -> String {
     format!("--exhibit={exhibit}")
+}
+
+/// C12: a `vid_*` record id must be exactly `^vid_\d{6,}$` (what the
+/// scanner assigns). Anything else carrying the prefix (`vid_x\..\..\f`)
+/// is refused instead of being handed to a resolver that also accepts
+/// paths — the prefix used to skip the approved-roots check.
+pub(crate) fn check_index_video_id(id: &str) -> Result<(), String> {
+    if crate::video_export::is_index_video_id(id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "영상 id 형식이 올바르지 않습니다 (vid_ 뒤에 숫자 6자리 이상): {}",
+            id.chars().take(64).collect::<String>().escape_debug()
+        ))
+    }
 }
 
 /// A running (not cancel-pending) job with `key`, or a finished one whose clip is still on disk
@@ -951,32 +971,25 @@ fn read_join_log(case_dir: &Path) -> Result<Vec<serde_json::Value>, String> {
     }
 }
 
-/// The newest log entry this job wrote: same plan, joined at/after start.
-fn logged_join_entry(
+/// C13: the log entry THIS job's CLI wrote — matched by its unique
+/// `job_tag` (and plan id) only. Plan id + time alone also match another
+/// process's join of the same plan (a CLI run, a second workstation),
+/// whose output was then reported as this job's.
+pub(crate) fn logged_join_entry(
     entries: &[serde_json::Value],
+    job_tag: &str,
     plan_id: &str,
-    started_unix: u64,
-    claimed: &[PathBuf],
 ) -> Option<serde_json::Value> {
     entries
         .iter()
         .rev()
         .find(|entry| {
             entry.get("event").and_then(|v| v.as_str()) == Some("join-video")
-                && !entry
-                    .get("output_path")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|p| {
-                        claimed.contains(&crate::audit::canonical_or_original(Path::new(p)))
-                    })
+                && entry.get("job_tag").and_then(|v| v.as_str()) == Some(job_tag)
                 && entry
                     .get("plan_id")
                     .and_then(|v| v.as_str())
                     .is_some_and(|id| id.eq_ignore_ascii_case(plan_id))
-                && entry
-                    .get("joined_unix")
-                    .and_then(|v| v.as_u64())
-                    .is_some_and(|at| at >= started_unix)
         })
         .cloned()
 }
@@ -1081,7 +1094,9 @@ fn verify_logged_join(case_dir: &Path, entry: &serde_json::Value) -> Result<Join
 fn cleanup_failed_join(case_dir: &Path, info: &JoinJobInfo) -> Vec<String> {
     let mut errors = Vec::new();
     // Read the claim BEFORE the temp files (the claim is one of them) go.
-    let claimed = crate::join::read_claim(&info.temps.claim);
+    // C3: the CLI writes it BEFORE the output gets its final name, so a
+    // kill mid-publish is covered too.
+    let claimed = crate::join::read_join_claim(&info.temps.claim);
     if claimed.is_none() && info.temps.claim.exists() {
         errors.push(format!(
             "이어붙이기 기록 파일을 읽지 못해 게시된 결과물이 남았을 수 있습니다: {}",
@@ -1106,51 +1121,27 @@ fn cleanup_failed_join(case_dir: &Path, info: &JoinJobInfo) -> Vec<String> {
             errors.push(err);
         }
     }
-    let Some((output, manifest)) = claimed else {
+    let Some(claim) = claimed else {
         return errors;
     };
-    let logged: Vec<PathBuf> = match read_join_log(case_dir) {
-        Ok(entries) => entries
-            .iter()
-            .flat_map(|entry| {
-                ["output_path", "manifest_path"]
-                    .into_iter()
-                    .filter_map(|key| entry.get(key).and_then(|v| v.as_str()))
-                    .map(|p| crate::audit::canonical_or_original(Path::new(p)))
-                    .collect::<Vec<_>>()
-            })
-            .collect(),
-        Err(err) => {
-            errors.push(format!(
-                "이어붙이기 로그를 읽지 못해 남은 결과물을 확인하지 못했습니다: {err}"
-            ));
-            return errors;
-        }
-    };
-    for path in [output, manifest] {
-        // Only an existing file inside artifacts/joined that no log entry
-        // names (a logged artifact is never deleted from under its record).
-        let Some(canonical) = joined_artifact(case_dir, &path) else {
-            continue;
-        };
-        if logged.contains(&canonical) {
-            continue;
-        }
-        if let Err(err) = crate::join::remove_file_retry(&canonical) {
-            errors.push(err);
-        }
-    }
+    // Only existing files inside artifacts/joined that no log entry names
+    // (a logged artifact is never deleted from under its record).
+    errors.extend(
+        crate::join::remove_unlogged_claimed(case_dir, &claim)
+            .into_iter()
+            .filter_map(|(_, result)| result.err()),
+    );
     errors
 }
 // Worker: stale `.join-*` cleanup → `join-video` (killed as a tree on a
 /// per-job cancel) → verify the logged output, or clean up everything the
 /// job created. Removal failures are surfaced, never swallowed.
 fn run_join_job(state: &SharedState, exe: &Path, id: &str, args: &[String], case_dir: &Path) {
-    let Some((info, started_unix)) = state_lock(state)
+    let Some(info) = state_lock(state)
         .clip_jobs
         .iter()
         .find(|job| job.id == id)
-        .and_then(|job| job.join.clone().map(|info| (info, job.started_unix)))
+        .and_then(|job| job.join.clone())
     else {
         return;
     };
@@ -1190,15 +1181,9 @@ fn run_join_job(state: &SharedState, exe: &Path, id: &str, args: &[String], case
     // The log entry is the authority on whether the join completed: a
     // cancel that lost the race with completion still yields a logged,
     // complete output, which must not be deleted from under its record.
-    // Outputs other (finished) jobs already reported: never re-claimed.
-    let claimed: Vec<PathBuf> = state_lock(state)
-        .clip_jobs
-        .iter()
-        .filter(|job| job.id != id && job.kind == "join" && !job.rel_path.is_empty())
-        .map(|job| job.output.clone())
-        .collect();
+    // C13: only the entry carrying this job's tag counts.
     let logged = read_join_log(case_dir)
-        .map(|entries| logged_join_entry(&entries, &info.plan_id, started_unix, &claimed));
+        .map(|entries| logged_join_entry(&entries, &info.tag, &info.plan_id));
     // `Err((message, keep_files))`: a logged join that fails re-verification
     // keeps its output and manifest for review (deleting them would orphan
     // the chained record); every other failure removes what the job made.
@@ -1314,6 +1299,10 @@ pub(crate) fn api_telemetry(request: &Request, state: &SharedState) -> String {
         return "{\"ok\":false,\"error\":\"증거 id가 비어 있습니다.\"}".to_string();
     }
     let selector = if id.starts_with("vid_") {
+        // C12: exact index id, resolved through the index only.
+        if let Err(err) = check_index_video_id(&id) {
+            return api_err(&err);
+        }
         id.clone()
     } else {
         let alt = body_value(&request.body, "path").unwrap_or_default();
@@ -1453,6 +1442,10 @@ pub(crate) fn api_proxy(request: &Request, state: &SharedState) -> String {
     // those the viewer also sends the record's file path, which we only
     // honor when it sits inside the approved media roots.
     let selector = if id.starts_with("vid_") {
+        // C12: exact index id, resolved through the index only.
+        if let Err(err) = check_index_video_id(&id) {
+            return api_err(&err);
+        }
         id.clone()
     } else {
         let alt = body_value(&request.body, "path").unwrap_or_default();
@@ -1680,6 +1673,7 @@ pub(crate) fn api_export_selected_with(
         .duration_since(UNIX_EPOCH)
         .map(|span| span.as_secs())
         .unwrap_or(0);
+    sweep_dead_export_parts(&case_dir.join("exports"));
     let export_dir =
         crate::util::unique_dir(&case_dir.join("exports").join(format!("selection-{stamp}")));
     if let Err(err) = std::fs::create_dir_all(&export_dir) {
@@ -1688,6 +1682,14 @@ pub(crate) fn api_export_selected_with(
             json_string(&format!("내보내기 폴더 생성 실패: {err}"))
         );
     }
+    // C4: the bundle says "in progress" from its first byte; only the
+    // finished manifest replaces that. A process killed mid-export leaves
+    // a folder that plainly reads as incomplete (and the forced-exit path
+    // stamps it "중단됨", see [`mark_abandoned_exports`]).
+    let _in_progress = match begin_export_bundle(&export_dir, stamp, items.len()) {
+        Ok(registration) => registration,
+        Err(err) => return api_err(&err),
+    };
     let roots: Vec<PathBuf> = roots
         .iter()
         .filter_map(|root| root.canonicalize().ok())
@@ -1848,7 +1850,8 @@ pub(crate) fn api_export_selected_with(
             write(
                 "manifest-audit.json",
                 format!(
-                    "{{\"audit_log\":{},\"chain_head_sha256\":{},\"audit_logged\":{},\"cancelled\":{cancelled},\"items_done\":{items_done},\"items_total\":{items_total},\"unix\":{stamp}}}\n",
+                    "{{\"state\":{},\"audit_log\":{},\"chain_head_sha256\":{},\"audit_logged\":{},\"cancelled\":{cancelled},\"items_done\":{items_done},\"items_total\":{items_total},\"unix\":{stamp}}}\n",
+                    json_string(if cancelled { "cancelled" } else { "complete" }),
                     json_string("evidence/logs/export-log.jsonl"),
                     json_string(&head),
                     audit_result.is_ok()
@@ -1885,6 +1888,11 @@ pub(crate) fn api_export_selected_with(
                 "이 선별 묶음의 manifest를 쓰지 못했습니다 — 묶음으로 사용하지 마십시오.\n{err}\n"
             ),
         );
+        return serde_json::json!({"ok": false, "error": err}).to_string();
+    }
+    // The bundle is now final (complete or marked cancelled): the
+    // in-progress note goes.
+    if let Err(err) = crate::join::remove_file_retry(&export_dir.join(EXPORT_IN_PROGRESS_FILE)) {
         return serde_json::json!({"ok": false, "error": err}).to_string();
     }
     if cancelled {
@@ -1971,28 +1979,79 @@ pub(crate) fn export_one(
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| field(item, "name"));
     let base_name = format!("{}__{}", export_safe_name(&id), export_safe_name(&filename));
-    match copy_unique(&canonical, export_dir, &base_name) {
-        Ok(target) => {
-            outcome.exported = target
+    match copy_hashed_unique(&canonical, export_dir, &base_name) {
+        Ok(copy) => {
+            outcome.exported = copy
+                .path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            outcome.copy_hash = audit::digest_file(&target).unwrap_or_default();
-            outcome.size = std::fs::metadata(&target)
-                .map(|meta| meta.len().to_string())
-                .unwrap_or_default();
+            outcome.copy_hash = copy.sha256;
+            outcome.size = copy.size.to_string();
         }
-        Err(err) => outcome.skip_reason = format!("copy-failed: {err}"),
+        // C5: a failed copy or hash is a failed item — never a "copied"
+        // row with an empty hash, never a torn file under the final name.
+        Err(err) => outcome.skip_reason = err,
     }
     outcome
 }
 
-/// Copies `source` to `dir/base_name`, atomically allocating a unique name
-/// with create_new: the batch runs on parallel workers, so a check-then-
-/// create helper would race when two items produce the same name.
-pub(crate) fn copy_unique(source: &Path, dir: &Path, base_name: &str) -> Result<PathBuf, String> {
+/// One finished, hashed export copy.
+pub(crate) struct ExportCopy {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
+}
+
+/// Distinguishes the `.part` names of parallel workers in one process.
+static EXPORT_PART_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// C4/C5: copies `source` into a pid-tagged `.part` in `dir`, syncs and
+/// hashes it, and only then publishes it under the first free
+/// `base_name[-N]` (no clobbering: the batch runs on parallel workers).
+/// Any failure removes the `.part`; the `Err` text is the item's skip
+/// reason (`copy-failed: …` / `hash-failed: …`).
+pub(crate) fn copy_hashed_unique(
+    source: &Path,
+    dir: &Path,
+    base_name: &str,
+) -> Result<ExportCopy, String> {
     let mut reader =
-        std::fs::File::open(source).map_err(|err| format!("open source failed: {err}"))?;
+        std::fs::File::open(source).map_err(|err| format!("copy-failed: open source: {err}"))?;
+    let seq = EXPORT_PART_SEQ.fetch_add(1, Ordering::SeqCst);
+    let part =
+        crate::join::pid_part_path(&dir.join(format!("{base_name}.{seq}")), std::process::id());
+    let remove_part = || {
+        let _ = crate::join::remove_file_retry(&part);
+    };
+    let copied = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .and_then(|mut target| {
+            std::io::copy(&mut reader, &mut target)?;
+            target.sync_all()?;
+            if let Ok(meta) = source.metadata() {
+                let _ = target.set_permissions(writable_copy_permissions(meta.permissions()));
+            }
+            Ok(())
+        });
+    if let Err(err) = copied {
+        remove_part();
+        return Err(format!("copy-failed: {err}"));
+    }
+    let sha256 = match audit::digest_file(&part) {
+        Ok(digest) if !digest.is_empty() => digest,
+        Ok(_) => {
+            remove_part();
+            return Err("hash-failed: empty digest".to_string());
+        }
+        Err(err) => {
+            remove_part();
+            return Err(format!("hash-failed: {err}"));
+        }
+    };
+    let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     let base = Path::new(base_name);
     let stem = base
         .file_stem()
@@ -2010,24 +2069,131 @@ pub(crate) fn copy_unique(source: &Path, dir: &Path, base_name: &str) -> Result<
         } else {
             dir.join(format!("{stem}-{attempt}{ext}"))
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut target) => {
-                std::io::copy(&mut reader, &mut target)
-                    .map_err(|err| format!("copy failed: {err}"))?;
-                if let Ok(meta) = source.metadata() {
-                    let _ = target.set_permissions(writable_copy_permissions(meta.permissions()));
-                }
-                return Ok(candidate);
+        match crate::join::publish_part_as(&part, &candidate) {
+            Ok(true) => {
+                return Ok(ExportCopy {
+                    path: candidate,
+                    sha256,
+                    size,
+                });
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(format!("create target failed: {err}")),
+            Ok(false) => continue,
+            Err(err) => {
+                remove_part();
+                return Err(format!("copy-failed: {err}"));
+            }
         }
     }
-    Err("could not allocate a unique export filename".to_string())
+    remove_part();
+    Err("copy-failed: could not allocate a unique export filename".to_string())
+}
+
+/// [`copy_hashed_unique`] returning only the published path (tests).
+#[cfg(test)]
+pub(crate) fn copy_unique(source: &Path, dir: &Path, base_name: &str) -> Result<PathBuf, String> {
+    copy_hashed_unique(source, dir, base_name).map(|copy| copy.path)
+}
+
+/// C4: note file present while a selection export is being written.
+pub(crate) const EXPORT_IN_PROGRESS_FILE: &str = "EXPORT-IN-PROGRESS.txt";
+/// C4: note file written when an in-progress export was abandoned.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub(crate) const EXPORT_INCOMPLETE_FILE: &str = "EXPORT-INCOMPLETE.txt";
+
+/// Selection exports being written by this process (C4).
+static EXPORTS_IN_PROGRESS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn exports_in_progress() -> MutexGuard<'static, Vec<PathBuf>> {
+    EXPORTS_IN_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Deregisters an export bundle when the export returns (any path).
+pub(crate) struct ExportBundleRegistration {
+    dir: PathBuf,
+}
+
+impl Drop for ExportBundleRegistration {
+    fn drop(&mut self) {
+        let dir = self.dir.clone();
+        exports_in_progress().retain(|entry| *entry != dir);
+    }
+}
+
+/// C4: marks `export_dir` "in progress" on disk (an in-progress
+/// `manifest-audit.json` plus a note file) and registers it for
+/// [`mark_abandoned_exports`].
+pub(crate) fn begin_export_bundle(
+    export_dir: &Path,
+    stamp: u64,
+    items_total: usize,
+) -> Result<ExportBundleRegistration, String> {
+    let note = format!(
+        "FrameTrace 선별 증거 묶음 — 작성 중\n\n이 폴더는 아직 완성되지 않았습니다 (생성 시작 unix {stamp}, 항목 {items_total}개).\n이 파일이 남아 있다면 내보내기가 끝나지 못한 것이므로 묶음으로 사용하지 마십시오.\n"
+    );
+    std::fs::write(export_dir.join(EXPORT_IN_PROGRESS_FILE), note)
+        .and_then(|_| {
+            std::fs::write(
+                export_dir.join("manifest-audit.json"),
+                format!(
+                    "{{\"state\":\"in-progress\",\"items_total\":{items_total},\"unix\":{stamp}}}\n"
+                ),
+            )
+        })
+        .map_err(|err| format!("내보내기 시작 기록 실패: {err}"))?;
+    exports_in_progress().push(export_dir.to_path_buf());
+    Ok(ExportBundleRegistration {
+        dir: export_dir.to_path_buf(),
+    })
+}
+
+/// C4: the forced-exit path (the shell gave up waiting for running
+/// writes): stamps every export bundle this process is still writing as
+/// "중단됨" — an incomplete-note file and an `aborted` manifest-audit —
+/// so the folder can never be mistaken for a finished bundle. Returns how
+/// many were marked.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub(crate) fn mark_abandoned_exports() -> usize {
+    let dirs = exports_in_progress().clone();
+    let mut marked = 0;
+    for dir in dirs {
+        let note = "FrameTrace 선별 증거 묶음 — 중단됨\n\n프로그램이 종료되면서 이 내보내기는 끝나지 못했습니다.\n일부 파일만 들어 있을 수 있으며 manifest가 없거나 불완전합니다. 묶음으로 사용하지 말고 다시 내보내십시오.\n";
+        let written = std::fs::write(dir.join(EXPORT_INCOMPLETE_FILE), note).and_then(|_| {
+            std::fs::write(
+                dir.join("manifest-audit.json"),
+                "{\"state\":\"aborted\",\"reason\":\"process-exit\"}\n",
+            )
+        });
+        if written.is_ok() {
+            marked += 1;
+        } else {
+            eprintln!(
+                "frametrace: could not mark abandoned export {}",
+                dir.display()
+            );
+        }
+    }
+    marked
+}
+
+/// Removes in-progress copy `.part` files that dead exports left in
+/// `exports/selection-*` folders this process is not writing (C4).
+fn sweep_dead_export_parts(exports: &Path) {
+    let Ok(entries) = std::fs::read_dir(exports) else {
+        return;
+    };
+    let live = exports_in_progress().clone();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && !live.contains(&path) {
+            for (path, result) in crate::join::sweep_stale_parts(&path) {
+                if let Err(err) = result {
+                    eprintln!("frametrace: {err} ({})", path.display());
+                }
+            }
+        }
+    }
 }
 
 /// Permissions for an exported copy: the source's, minus read-only. Evidence
@@ -2169,4 +2335,79 @@ mod copy_permission_tests {
         let _ = std::fs::set_permissions(&source, perms);
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+/// C10: job warning for a step whose output readers had to be abandoned.
+pub(crate) fn reader_abandoned_warning(args: &[String], cap: Duration) -> String {
+    format!(
+        "{} 단계가 끝난 뒤에도 출력 파이프가 {}초 안에 닫히지 않았습니다 — 하위 프로세스가 남아 있을 수 있어 출력 일부를 버리고 계속합니다. 작업 관리자에서 남은 ffmpeg 등을 확인하십시오.",
+        args.first().map(String::as_str).unwrap_or("command"),
+        cap.as_secs()
+    )
+}
+
+/// Every directory a killed step may have left pid-tagged `.part` files
+/// in (C1/C2/C4): the step's case directories plus the parent of an
+/// explicit `--output`.
+pub(crate) fn step_part_dirs(args: &[String]) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(case) = args.get(1) {
+        let case = std::path::Path::new(case);
+        for rel in [
+            "evidence/images",
+            "artifacts/recovered/filesystem",
+            "artifacts/clips",
+            "reports",
+            "review/thumbs",
+        ] {
+            dirs.push(case.join(rel));
+        }
+    }
+    if let Some(output) = args
+        .iter()
+        .position(|arg| arg == "--output")
+        .and_then(|index| args.get(index + 1))
+        && let Some(parent) = std::path::Path::new(output).parent()
+    {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs
+}
+
+/// C1/C2/C4: after the server killed a step (cancel, shutdown), removes
+/// the in-progress `.part` files and directories that step's process
+/// (`pid`) left, plus empty `package_*` reservations in `reports/`.
+/// Returns one log line per removal (`Ok`) or failure (`Err`).
+pub(crate) fn sweep_killed_step(args: &[String], pid: u32) -> Vec<Result<String, String>> {
+    let mut out = Vec::new();
+    for dir in step_part_dirs(args) {
+        for (path, result) in crate::join::sweep_pid_parts(&dir, pid) {
+            out.push(match result {
+                Ok(()) => Ok(format!(
+                    "중단된 단계가 남긴 임시 파일을 지웠습니다: {}",
+                    path.display()
+                )),
+                Err(err) => Err(err),
+            });
+        }
+    }
+    if args.first().map(String::as_str) == Some("package-case")
+        && let Some(case) = args.get(1)
+        && let Ok(entries) = std::fs::read_dir(std::path::Path::new(case).join("reports"))
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // remove_dir only removes an EMPTY directory: a finished
+            // package is never touched.
+            if name.starts_with("package_")
+                && entry.path().is_dir()
+                && std::fs::remove_dir(entry.path()).is_ok()
+            {
+                out.push(Ok(format!(
+                    "중단된 패키지 생성의 빈 폴더를 지웠습니다: {}",
+                    entry.path().display()
+                )));
+            }
+        }
+    }
+    out
 }
