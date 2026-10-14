@@ -787,7 +787,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let fake = if cfg!(windows) {
             let path = dir.join("hang.cmd");
-            std::fs::write(&path, "@echo off\r\n:spin\r\ngoto spin\r\n").unwrap();
+            // Idle, not a CPU-pinning `goto` loop (parallel tests).
+            std::fs::write(
+                &path,
+                "@echo off\r\n:spin\r\nping -n 2 127.0.0.1 >nul 2>&1\r\ngoto spin\r\n",
+            )
+            .unwrap();
             path
         } else {
             let path = dir.join("hang.sh");

@@ -165,6 +165,11 @@ pub enum Commands {
         case_dir: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Package even while review marks are still queued
+        /// (marks-pending/) or save conflicts are unresolved; the state is
+        /// printed as a warning (default: refuse)
+        #[arg(long)]
+        allow_pending: bool,
     },
     /// Verify a package written by package-case: manifest.sha256 entries vs
     /// files, package-manifest.json, audit chains, database snapshot and
@@ -723,9 +728,13 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             signoff,
         } => make_report(&case_dir, rehash, redact_paths, signoff.as_deref()),
         Commands::MakeCustody { case_dir } => make_custody(&case_dir),
-        Commands::PackageCase { case_dir, output } => {
+        Commands::PackageCase {
+            case_dir,
+            output,
+            allow_pending,
+        } => {
             let options = PackageOptions { output_dir: output };
-            package_case(&case_dir, options)
+            package_case_with_pending(&case_dir, options, allow_pending)
         }
         Commands::VerifyPackage { package_dir } => verify_package(&package_dir),
         Commands::ExportVideo {

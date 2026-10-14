@@ -22,7 +22,7 @@ Requires a nightly toolchain (libFuzzer needs `-Z` flags) and cargo-fuzz:
 
 ```sh
 rustup toolchain install nightly
-cargo install cargo-fuzz
+cargo install cargo-fuzz --version 0.13.2 --locked   # CI pins the same version
 cargo +nightly fuzz run audit_jsonl_verify
 ```
 

@@ -1,6 +1,8 @@
+// MANUAL harness (not in ci-harnesses.sh) - attaches to a running server; pass --i-know for the real :8477.
 // Verify the tidied viewer top filter area. Prereqs: app on :8477 (case open), Edge on :9222.
 const CDP = 'http://127.0.0.1:9222';
-const BASE = 'http://127.0.0.1:8477';
+import { guardBase } from './lib/real-server-guard.mjs';
+const BASE = guardBase('verify-topfilters', process.env.FT_BASE || 'http://127.0.0.1:8477'); // R4 F7: refuses the real :8477 without --i-know
 const fs = await import('fs');
 let nextId = 1;
 const pending = new Map();

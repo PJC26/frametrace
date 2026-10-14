@@ -336,9 +336,7 @@ for (const [w, h] of [[1366, 768], [1920, 1080]]) {
       }
       const fin = btns.find((b) => b.id === 'btnFinalize');
       assert.ok(fin && fin.inView && !fin.covered, 'btnFinalize inside the viewport, not covered');
-      if (KIT_LANDED) {
-        for (const b of btns) { assert.ok(b.h >= 24, `${b.id} height ${b.h} < 24`); if (b.primary) assert.ok(b.h >= 36, `${b.id} primary height ${b.h} < 36`); }
-      }
+      for (const b of btns) { assert.ok(b.h >= 24, `${b.id} height ${b.h} < 24`); if (b.primary) assert.ok(b.h >= 36, `${b.id} primary height ${b.h} < 36`); }
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'no horizontal scroll');
       // AA 4.5 for every text node in the sheet (incl. verdict, block/warn rows).
       const report = await contrastReport(page);
@@ -348,10 +346,16 @@ for (const [w, h] of [[1366, 768], [1920, 1080]]) {
     });
   }
 }
-if (!KIT_LANDED) skip('7b button heights (>=24, primary >=36)', 'assets/kit.css has no .primary yet (T1 not landed) — enforced by verify-buttons');
+// R4 F4: a missing kit/mount/token is a FAIL, never a silent SKIP.
+await check('7b kit.css defines .primary (button-height checks above are real)', async () => {
+  assert.ok(KIT_LANDED, 'assets/kit.css has no .primary rule');
+});
 
 // ⑧ opening the sheet under the REAL shell page (once T2's mount exists)
 const shellHasMount = /id="hFinalizeSheet"/.test(read('assets/examiner_app.html'));
+await check('8 real shell has the #hFinalizeSheet mount', async () => {
+  assert.ok(shellHasMount, 'assets/examiner_app.html has no #hFinalizeSheet mount');
+});
 if (shellHasMount) {
   await check('8 real shell: mount renders, #main is inert while open, Esc closes when idle', async () => {
     const ctx = await browser.newContext({ viewport: { width: 1366, height: 768 } });
@@ -372,14 +376,13 @@ if (shellHasMount) {
     assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.id), 'hBtnFinalize');
     await ctx.close();
   });
-} else skip('8 real shell inert/Esc/focus', 'assets/examiner_app.html has no #hFinalizeSheet mount yet (T2 not landed)');
+}
 
 // ⑨ package viewer parity: the exported viewer carries the contract mark colours
-if (T1_LANDED) {
-  await check('9 viewer bundle carries the contract --mark-important-bg', async () => {
-    assert.match(viewerBundleCss(), /--mark-important-bg:\s*#f6dfb3/i);
-  });
-} else skip('9 viewer --mark-important-bg parity', 'tokens.css has no --mark-* tokens yet (T1 not landed); Rust html_report tests own the package side');
+await check('9 viewer bundle carries the contract --mark-important-bg', async () => {
+  assert.ok(T1_LANDED, 'tokens.css has no --mark-* tokens');
+  assert.match(viewerBundleCss(), /--mark-important-bg:\s*#f6dfb3/i);
+});
 
 await browser.close();
 if (failed) { console.error(`\n${failed} check(s) failed`); process.exit(1); }

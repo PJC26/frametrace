@@ -44,12 +44,40 @@ jobs:
         env:
           FRAMETRACE_IT: "1"
         run: cargo test --locked --test integration_tools -- --ignored --skip e01_import_roundtrip_with_real_libewf
+      # R4 F1: real-ffmpeg join-video / measure-audio (ffmpeg from choco above).
+      - name: Join and audio integration tests (real ffmpeg)
+        env:
+          FRAMETRACE_IT: "1"
+        run: cargo test --locked --test join_audio_it -- --ignored
       - name: Workstation end-to-end test
         env:
           FRAMETRACE_IT: "1"
         run: cargo test --locked --test workstation_e2e -- --ignored
       - name: Build debug binaries for harnesses
         run: cargo build --locked
+      # R4 F2: the real WebView2 shell (frametrace-app.exe, no arguments).
+      # FRAMETRACE_SHELL_SMOKE=1 (provided by the shell, track C) makes it
+      # close itself with exit code 0 once the page has loaded; a hang is
+      # killed after 90 s and fails the job. Config dirs are isolated.
+      - name: WebView2 shell smoke (FRAMETRACE_SHELL_SMOKE=1)
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          FRAMETRACE_SHELL_SMOKE: "1"
+        run: |
+          $smoke = Join-Path $env:RUNNER_TEMP 'ft-shell-smoke'
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          $env:APPDATA = Join-Path $smoke 'appdata'
+          $env:LOCALAPPDATA = Join-Path $smoke 'localappdata'
+          $env:FRAMETRACE_INSTANCE_FILE = Join-Path $smoke 'server.json'
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target/debug/frametrace-app.exe'
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $proc = Start-Process -FilePath $exe -PassThru
+          if (-not $proc.WaitForExit(90000)) {
+            Stop-Process -Id $proc.Id -Force
+            throw 'shell smoke: frametrace-app.exe did not exit within 90 s'
+          }
+          if ($proc.ExitCode -ne 0) { throw "shell smoke: exit code $($proc.ExitCode)" }
       - name: Install Playwright and harness dependencies
         run: |
           npm install --no-save --no-package-lock playwright@1.56.1 axe-core@4.10.2 pngjs pixelmatch
