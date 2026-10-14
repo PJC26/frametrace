@@ -240,6 +240,11 @@ pub struct FileResult {
     /// `measured_unix` (results replayed from a crash checkpoint keep their
     /// original time). Omitted from JSON when None.
     pub measured_unix: Option<u64>,
+    /// D2: the result was logged from a crash checkpoint without being
+    /// measured again (entries flagged `replayed_from_checkpoint`). Such a
+    /// result is never shown as sound/silent — it is re-measured instead.
+    /// Set by the log reader, never serialized into a result.
+    pub replayed_unverified: bool,
 }
 
 fn finite(value: f64) -> Option<f64> {
@@ -311,6 +316,7 @@ impl FileResult {
             streams,
             error: s(value, "error"),
             measured_unix: value.get("measured_unix").and_then(Value::as_u64),
+            replayed_unverified: false,
         })
     }
 }
@@ -636,15 +642,43 @@ fn run_stream(
     out
 }
 
-/// `(size, mtime)` of `path` right now.
-fn stat_binding(path: &str) -> Option<(u64, Option<u64>)> {
+/// A file's size and full-resolution mtime at one moment (D17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub size: u64,
+    /// Nanoseconds since the epoch (as fine as the filesystem keeps).
+    pub modified_nanos: Option<u128>,
+}
+
+impl FileStamp {
+    /// The index binding (size, whole-second mtime) this stamp matches.
+    pub fn binding(&self) -> (u64, Option<u64>) {
+        (
+            self.size,
+            self.modified_nanos
+                .map(|nanos| (nanos / 1_000_000_000) as u64),
+        )
+    }
+}
+
+/// `path`'s size and nanosecond mtime right now; `None` when it cannot be
+/// stat'ed.
+pub fn stat_stamp(path: &str) -> Option<FileStamp> {
     let meta = std::fs::metadata(path).ok()?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
-    Some((meta.len(), modified))
+    Some(FileStamp {
+        size: meta.len(),
+        modified_nanos: audit::modified_nanos(&meta),
+    })
+}
+
+/// D17: whether a file changed between two stamps — size, or the mtime at
+/// full resolution (a whole-second comparison misses a rewrite within the
+/// same second). A file that could not be stat'ed either time is changed.
+pub fn stamp_changed(before: Option<FileStamp>, after: Option<FileStamp>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before != after,
+        _ => true,
+    }
 }
 
 /// Error text for a file whose bytes no longer match the index binding.
@@ -667,9 +701,11 @@ pub fn measure_row(ffmpeg: &str, ffprobe: &str, row: &IndexRow) -> FileResult {
         streams: Vec::new(),
         error: None,
         measured_unix: None,
+        replayed_unverified: false,
     };
     let bound = row.size_bytes.map(|size| (size, row.modified_unix));
-    if bound.is_none() || stat_binding(&row.source_path) != bound {
+    let before = stat_stamp(&row.source_path);
+    if bound.is_none() || before.as_ref().map(FileStamp::binding) != bound {
         result.error = Some(CHANGED_ERROR.to_string());
         return result;
     }
@@ -720,7 +756,9 @@ pub fn measure_row(ffmpeg: &str, ffprobe: &str, row: &IndexRow) -> FileResult {
             streams.len()
         ));
     }
-    if stat_binding(&row.source_path) != bound {
+    // D17: before/after compare the full-resolution mtime, so a rewrite
+    // within the same second as the measurement is still caught.
+    if stamp_changed(before, stat_stamp(&row.source_path)) {
         verdict = Verdict::Error;
         error = Some(CHANGED_ERROR.to_string());
     }
@@ -777,13 +815,42 @@ pub type LoggedResults = BTreeMap<String, (FileResult, u64, String, f64)>;
 /// Latest logged result per selector with its entry's `measured_unix`,
 /// method and threshold. Later lines (and later results within a line)
 /// win. A missing log is empty.
+///
+/// D1: the lane is chain-verified first; a log whose chain does not verify
+/// (an edited line, a torn tail) is an error — no sound/silence is ever
+/// read out of an unverified measurement log.
 pub fn latest_logged_results(case_dir: &Path) -> Result<LoggedResults, String> {
+    let (logged, chain_error) = read_logged_results(case_dir)?;
+    match chain_error {
+        Some(err) => Err(err),
+        None => Ok(logged),
+    }
+}
+
+/// Reads and parses the lane, reporting a chain-verification failure
+/// separately (`Ok((parsed, Some(reason)))`) from a read failure (`Err`).
+fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Option<String>), String> {
     let path = case_dir.join(LOG_REL);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+    let text = match audit::read_log_locked(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok((BTreeMap::new(), None)),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
+    let keys = crate::audit_key::verification_keys()?;
+    let chain_error = audit::verify_chained_jsonl_text(&text, LOG_REL, &keys)
+        .err()
+        .map(|err| format!("{UNVERIFIED_ERROR}: {err}"));
+    Ok((parse_logged_results(&text), chain_error))
+}
+
+/// Error prefix for a measurement log whose chain did not verify (D1).
+pub const UNVERIFIED_ERROR: &str =
+    "소리 측정 기록 검증 실패 — 측정 기록(audio-level-log)의 체인이 맞지 않아 표시하지 않습니다";
+
+/// Parses every `audio-level` entry of the lane text (no verification).
+/// Results of entries replayed from a crash checkpoint are flagged
+/// `replayed_unverified` (D2).
+fn parse_logged_results(text: &str) -> LoggedResults {
     let mut out = BTreeMap::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -805,13 +872,16 @@ pub fn latest_logged_results(case_dir: &Path) -> Result<LoggedResults, String> {
             .get("threshold_silent_max_dbfs")
             .and_then(Value::as_f64)
             .unwrap_or(f64::NAN);
+        let flagged = |key: &str| entry.get(key).and_then(Value::as_bool) == Some(true);
+        let replayed = flagged("replayed_from_checkpoint") || flagged("replayed_unverified");
         for item in entry
             .get("results")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            if let Some(result) = FileResult::from_json(item) {
+            if let Some(mut result) = FileResult::from_json(item) {
+                result.replayed_unverified = replayed;
                 let at = result.measured_unix.unwrap_or(measured);
                 out.insert(
                     result.selector.clone(),
@@ -820,13 +890,15 @@ pub fn latest_logged_results(case_dir: &Path) -> Result<LoggedResults, String> {
             }
         }
     }
-    Ok(out)
+    out
 }
 
 /// The per-record state handed to the viewer / report (§2.4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioLevelState {
-    /// `sound` | `silent` | `error` | `stale`.
+    /// `sound` | `silent` | `error` | `stale` | `unverified` (D1: the
+    /// measurement log's chain did not verify) | `replayed` (D2: logged
+    /// from a crash checkpoint without a fresh measurement).
     pub r: &'static str,
     /// Loudest stream's peak (dBFS); None for `-inf`, error, or stale.
     pub max: Option<f64>,
@@ -851,6 +923,14 @@ impl AudioLevelState {
 }
 
 fn state_from(result: &FileResult, measured: u64) -> Option<AudioLevelState> {
+    if result.replayed_unverified {
+        // D2: never a level — say why instead.
+        return Some(unconfirmed_state(
+            "replayed",
+            measured,
+            "체크포인트에서 재기록된 측정 — 다시 측정하기 전에는 미확인",
+        ));
+    }
     let r = match result.result {
         Verdict::Sound => "sound",
         Verdict::Silent => "silent",
@@ -894,13 +974,43 @@ fn state_from(result: &FileResult, measured: u64) -> Option<AudioLevelState> {
     })
 }
 
+/// A state that claims no level (`unverified` / `replayed`).
+fn unconfirmed_state(r: &'static str, measured: u64, why: &str) -> AudioLevelState {
+    AudioLevelState {
+        r,
+        max: None,
+        mean: None,
+        sec: None,
+        t: measured,
+        error: Some(why.to_string()),
+        codec: None,
+        max_is_neg_inf: false,
+    }
+}
+
 /// Applies the latest measurement per id to the current index: a
 /// measurement whose size/mtime/hash binding no longer matches becomes
 /// `stale` ("측정 후 파일 변경 — 미확인"). Ids absent from the index are
 /// dropped. This is the single invalidation rule the server and report use.
+///
+/// D1: when the measurement log's chain does not verify, every record that
+/// has a logged measurement is `unverified` — the report says the record
+/// could not be trusted instead of claiming sound or silence.
 pub fn audio_levels_for_case(case_dir: &Path) -> Result<BTreeMap<String, AudioLevelState>, String> {
     let rows = read_index(case_dir)?;
-    let logged = latest_logged_results(case_dir)?;
+    let (logged, chain_error) = read_logged_results(case_dir)?;
+    if let Some(err) = chain_error {
+        return Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let (_, measured, _, _) = logged.get(&row.id)?;
+                Some((
+                    row.id.clone(),
+                    unconfirmed_state("unverified", *measured, &err),
+                ))
+            })
+            .collect());
+    }
     Ok(apply_levels(&rows, &logged))
 }
 
@@ -983,6 +1093,9 @@ pub struct MeasureSummary {
     pub silent: usize,
     pub error: usize,
     pub log_entries: usize,
+    /// D2: computed-but-unlogged results of an interrupted run that were
+    /// discarded and measured again.
+    pub discarded_checkpoint_results: usize,
 }
 
 impl MeasureSummary {
@@ -999,6 +1112,7 @@ impl MeasureSummary {
             "silent": self.silent,
             "error": self.error,
             "log_entries": self.log_entries,
+            "discarded_checkpoint_results": self.discarded_checkpoint_results,
         })
     }
 }
@@ -1019,7 +1133,13 @@ pub fn measure_case(
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<MeasureSummary, String> {
     let rows = read_index(case_dir)?;
-    let logged = latest_logged_results(case_dir)?;
+    // D1: a log whose chain does not verify vouches for nothing — every
+    // target is measured again (the fresh entries are what a report may
+    // quote once the lane is repaired).
+    let logged = match read_logged_results(case_dir)? {
+        (logged, None) => logged,
+        (_, Some(_)) => BTreeMap::new(),
+    };
     let mut summary = MeasureSummary::default();
 
     let selected: Vec<&IndexRow> = match &options.selectors {
@@ -1060,6 +1180,7 @@ pub fn measure_case(
             && method == METHOD
             && *threshold == SILENT_MAX_DBFS
             && result.result != Verdict::Error
+            && !result.replayed_unverified
             && measurement_is_current(row, result)
         {
             summary.skipped_valid += 1;
@@ -1089,43 +1210,21 @@ pub fn measure_case(
         &fingerprint,
         options.resume,
     )?;
-    // Replay computed-but-unlogged results that still describe current bytes.
-    let mut logged_in_ckpt: HashSet<String> = HashSet::new();
-    let mut replay: BTreeMap<String, FileResult> = BTreeMap::new();
-    for line in checkpoint.data_lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if let Some(mut result) = value.get("computed").and_then(FileResult::from_json) {
-            // Original measurement time (older checkpoints: unknown → the
-            // replay entry's own time, flagged as replayed either way).
-            result.measured_unix = value.get("measured_unix").and_then(Value::as_u64);
-            replay.insert(result.selector.clone(), result);
-        } else if let Some(ids) = value.get("logged").and_then(Value::as_array) {
-            logged_in_ckpt.extend(ids.iter().filter_map(Value::as_str).map(str::to_string));
-        }
-    }
+    // D2: results computed by an interrupted run are NOT logged from the
+    // checkpoint — a checkpoint line is not evidence the bytes were
+    // measured (it can be edited, or describe other bytes). Every target
+    // without a valid logged measurement is measured again; the checkpoint
+    // only tells how many computed results were discarded.
+    summary.discarded_checkpoint_results =
+        discarded_checkpoint_results(checkpoint.data_lines().iter().map(String::as_str));
     let tally = |summary: &mut MeasureSummary, verdict: Verdict| match verdict {
         Verdict::Sound => summary.sound += 1,
         Verdict::Silent => summary.silent += 1,
         _ => summary.error += 1,
     };
-    let mut replayed: Vec<FileResult> = Vec::new();
-    let mut pending: Vec<IndexRow> = Vec::new();
-    for row in targets.iter() {
-        match replay.get(&row.id) {
-            Some(result)
-                if !logged_in_ckpt.contains(&row.id) && measurement_is_current(row, result) =>
-            {
-                tally(&mut summary, result.result);
-                replayed.push(result.clone());
-                summary.resumed += 1;
-            }
-            _ => pending.push(row.clone()),
-        }
-    }
+    let pending: Vec<IndexRow> = targets.clone();
     let total = targets.len();
-    let mut done = summary.resumed;
+    let mut done = 0usize;
     progress(done, total);
 
     let flush_entry = |entry: Value,
@@ -1150,13 +1249,6 @@ pub fn measure_case(
         let entry = log_entry_json(now_unix()?, &ffmpeg_version, buffer);
         flush_entry(entry, buffer, checkpoint, summary)
     };
-    // Replayed results go first, in their own entries with their original
-    // provenance (B11) — never relabelled as measured now.
-    for chunk in replayed.chunks(LOG_CHUNK) {
-        let mut head = chunk.to_vec();
-        let entry = replayed_log_entry_json(now_unix()?, &ffmpeg_version, &head);
-        flush_entry(entry, &mut head, &mut checkpoint, &mut summary)?;
-    }
     let mut buffer: Vec<FileResult> = Vec::new();
 
     let (sender, receiver) = std::sync::mpsc::channel::<FileResult>();
@@ -1217,6 +1309,24 @@ pub fn measure_case(
     flush(&mut buffer, &mut checkpoint, &mut summary)?;
     checkpoint.finish()?;
     Ok(summary)
+}
+
+/// Computed-but-unlogged results an interrupted run left in the checkpoint
+/// (D2: discarded and measured again, never logged as measurements).
+fn discarded_checkpoint_results<'a>(lines: impl IntoIterator<Item = &'a str>) -> usize {
+    let mut logged: HashSet<String> = HashSet::new();
+    let mut computed: HashSet<String> = HashSet::new();
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(result) = value.get("computed").and_then(FileResult::from_json) {
+            computed.insert(result.selector);
+        } else if let Some(ids) = value.get("logged").and_then(Value::as_array) {
+            logged.extend(ids.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+    computed.difference(&logged).count()
 }
 
 /// Absolute path of the lane for a case.
@@ -1359,6 +1469,7 @@ mod tests {
             streams: vec![stream(verdict, Some(max))],
             error: None,
             measured_unix: None,
+            replayed_unverified: false,
         }
     }
 
@@ -1570,6 +1681,145 @@ mod tests {
         let parsed = IndexRow::from_json(&row_json).unwrap();
         assert_eq!(parsed.audio_streams[0].channels, Some(2));
         assert_eq!(parsed.audio_streams[0].sample_rate, Some(48000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A case dir with one indexed row (`vid_1`) and a chained audio lane
+    /// holding `entries` (raw entry JSON values).
+    fn audio_case(name: &str, entries: &[Value]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-audio-{name}-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let row_json = json!({
+            "id": "vid_1", "relative_path": "vid_1.mp4", "source_path": "/e/vid_1.mp4",
+            "size_bytes": 100, "modified_unix": 5, "sha256": "aa", "audio_codec": "aac"
+        });
+        std::fs::write(dir.join("db/videos.jsonl"), format!("{row_json}\n")).unwrap();
+        for entry in entries {
+            audit::append_chained_jsonl_keyed(&dir.join(LOG_REL), &entry.to_string(), None)
+                .unwrap();
+        }
+        dir
+    }
+
+    /// D1: one forged line (sound → silent, chain not recomputed) and the
+    /// lane vouches for nothing: no record reads silent or sound, the
+    /// verified reader refuses, and the reason is the chain failure.
+    #[test]
+    fn forged_measurement_line_is_unverified_never_silent() {
+        let r = row("vid_1");
+        let dir = audio_case(
+            "forged",
+            &[log_entry_json(
+                7,
+                "ffmpeg x",
+                &[result_for(&r, Verdict::Sound, -12.0)],
+            )],
+        );
+        assert_eq!(audio_levels_for_case(&dir).unwrap()["vid_1"].r, "sound");
+        let log = dir.join(LOG_REL);
+        let forged = std::fs::read_to_string(&log)
+            .unwrap()
+            .replace("\"result\":\"sound\"", "\"result\":\"silent\"")
+            .replace("-12.0", "-91.0");
+        std::fs::write(&log, forged).unwrap();
+        let levels = audio_levels_for_case(&dir).unwrap();
+        assert_eq!(levels["vid_1"].r, "unverified");
+        assert_eq!(levels["vid_1"].max, None);
+        assert!(
+            levels["vid_1"]
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with(UNVERIFIED_ERROR),
+            "{:?}",
+            levels["vid_1"].error
+        );
+        let err = latest_logged_results(&dir).unwrap_err();
+        assert!(err.starts_with(UNVERIFIED_ERROR), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D2: a result logged from a crash checkpoint (never re-measured) is
+    /// not a level — it reads `replayed` until measured again.
+    #[test]
+    fn replayed_checkpoint_result_is_not_a_level() {
+        let r = row("vid_1");
+        let mut result = result_for(&r, Verdict::Silent, -91.0);
+        result.measured_unix = Some(3);
+        let dir = audio_case(
+            "replayed",
+            &[replayed_log_entry_json(9, "ffmpeg x", &[result])],
+        );
+        let levels = audio_levels_for_case(&dir).unwrap();
+        assert_eq!(levels["vid_1"].r, "replayed");
+        assert_eq!(levels["vid_1"].max, None);
+        let logged = latest_logged_results(&dir).unwrap();
+        assert!(logged["vid_1"].0.replayed_unverified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D2: a resumed run discards computed-but-unlogged checkpoint results
+    /// (they are measured again) and counts them.
+    #[test]
+    fn checkpoint_results_are_counted_and_discarded() {
+        let r = row("vid_1");
+        let computed = |id: &str| {
+            let mut result = result_for(&r, Verdict::Sound, -1.0);
+            result.selector = id.to_string();
+            json!({"computed": result.to_json(), "measured_unix": 1}).to_string()
+        };
+        let lines = [
+            computed("vid_1"),
+            computed("vid_2"),
+            json!({"logged": ["vid_1"]}).to_string(),
+            computed("vid_3"),
+            "{torn".to_string(),
+        ];
+        assert_eq!(
+            discarded_checkpoint_results(lines.iter().map(String::as_str)),
+            2
+        );
+    }
+
+    /// D17: a rewrite within the same second changes the stamp even though
+    /// the whole-second index binding is unchanged.
+    #[test]
+    fn same_second_rewrite_changes_the_stamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-audio-stamp-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_100);
+        let set = |at: std::time::SystemTime| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        set(base);
+        let path = file.to_string_lossy().to_string();
+        let before = stat_stamp(&path);
+        set(base + std::time::Duration::from_millis(500));
+        let after = stat_stamp(&path);
+        assert_eq!(
+            before.unwrap().binding(),
+            after.unwrap().binding(),
+            "same size and whole second"
+        );
+        assert!(stamp_changed(before, after), "{before:?} vs {after:?}");
+        assert!(!stamp_changed(after, stat_stamp(&path)));
+        assert!(stamp_changed(after, None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

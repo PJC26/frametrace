@@ -418,6 +418,13 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         &audio_levels_json,
         page_case_dir,
     );
+    // D12: a redacted bundle says so on its first line, so package-case can
+    // tell it from an unredacted one like it does the HTML pages.
+    let data_bundle = if redact_paths {
+        crate::redact::mark_bundle_redacted(&data_bundle)
+    } else {
+        data_bundle
+    };
     write_text(&case_dir.join("review/data-bundle.js"), &data_bundle)
         .map_err(|err| format!("failed to write review data bundle: {err}"))?;
     let evidence_viewer = html_report::render_evidence_viewer_html_slim();
@@ -713,29 +720,58 @@ pub fn make_report(
     let manifest_path = case_dir.join("case.json");
     let manifest_json = read_to_string(&manifest_path)
         .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
-    let export_log =
-        read_to_string(&case_dir.join("artifacts/clips/export-log.jsonl")).unwrap_or_default();
-    let proxy_log =
-        read_to_string(&case_dir.join("artifacts/proxies/proxy-log.jsonl")).unwrap_or_default();
-    let thumbnail_log = read_to_string(&case_dir.join("artifacts/thumbnails/thumbnail-log.jsonl"))
-        .unwrap_or_default();
-    let carve_log =
-        read_to_string(&case_dir.join("artifacts/carved/carve-log.jsonl")).unwrap_or_default();
-    let filesystem_log =
-        read_to_string(&case_dir.join("evidence/logs/tsk-audit.jsonl")).unwrap_or_default();
-    let validation_log =
-        read_to_string(&case_dir.join("evidence/logs/validation-log.jsonl")).unwrap_or_default();
-    let anomaly_log =
-        read_to_string(&case_dir.join("evidence/logs/anomaly-log.jsonl")).unwrap_or_default();
-    let batch_log =
-        read_to_string(&case_dir.join("artifacts/logs/batch-log.jsonl")).unwrap_or_default();
-    let join_log = crate::join::join_log_with_record_ids(
-        &read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default(),
-    );
+    // D11: a log that exists but cannot be read is named in the report
+    // (and on stderr) — never rendered as an empty "none" section.
+    let mut read_errors: std::collections::BTreeMap<String, String> = Default::default();
+    let mut lane = |name: &str, rel: &str| -> String {
+        match read_optional_text(&case_dir.join(rel)) {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!("warning: {rel} could not be read: {err}");
+                read_errors.insert(name.to_string(), format!("{rel}: {err}"));
+                String::new()
+            }
+        }
+    };
+    let export_log = lane("export", "artifacts/clips/export-log.jsonl");
+    let proxy_log = lane("proxy", "artifacts/proxies/proxy-log.jsonl");
+    let thumbnail_log = lane("thumbnail", "artifacts/thumbnails/thumbnail-log.jsonl");
+    let carve_log = lane("carve", "artifacts/carved/carve-log.jsonl");
+    let filesystem_log = lane("filesystem", "evidence/logs/tsk-audit.jsonl");
+    let validation_log = lane("validation", "evidence/logs/validation-log.jsonl");
+    let anomaly_log = lane("anomaly", "evidence/logs/anomaly-log.jsonl");
+    let batch_log = lane("batch", "artifacts/logs/batch-log.jsonl");
+    // D3/D18: join entries carry the measured length from their manifest
+    // and say whether their record id is the log's own or derived.
+    let join_log = report_join_log(case_dir, &lane("join", "artifacts/joined/join-log.jsonl"));
     // Measured-sound map bound to the current index bytes (plan §2.4); the
-    // map carries ids/numbers only, so it needs no redaction.
-    let audio_levels_json = measured_audio_levels_json(case_dir)?;
-    let scan_runs_json = read_scan_runs_json(case_dir);
+    // map carries ids/numbers only, so it needs no redaction. D1: a log
+    // whose chain fails yields `unverified` states, never levels; D11: a
+    // read failure is named instead of aborting or claiming "unmeasured".
+    let audio_levels_json = match measured_audio_levels_json(case_dir) {
+        Ok(json) => json,
+        Err(err) => {
+            eprintln!("warning: sound measurements could not be read: {err}");
+            read_errors.insert("audio".to_string(), err);
+            "{}".to_string()
+        }
+    };
+    let scan_runs_json = match read_scan_runs_json_checked(case_dir) {
+        Ok(json) => json,
+        Err(err) => {
+            eprintln!("warning: {err}");
+            read_errors.insert("scan_runs".to_string(), err);
+            "[]".to_string()
+        }
+    };
+    // D9: marks still queued or save conflicts still open mean the report
+    // may not show the latest review — said on stderr and in the report.
+    let review_warnings = review_state_warnings(case_dir);
+    for warning in &review_warnings {
+        eprintln!("warning: {warning}");
+    }
+    let review_warnings_json = serde_json::to_string(&review_warnings).unwrap_or_default();
+    let read_errors_json = serde_json::to_string(&read_errors).unwrap_or_default();
     // One read of marks and tags feeds the displayed annotations and both
     // sign-off digests, so the banner judges exactly what the table shows.
     let mark_rows = crate::case_db::load_review_marks(case_dir)
@@ -771,6 +807,8 @@ pub fn make_report(
     let join_log = redact(join_log);
     let scan_runs_json = redact(scan_runs_json);
     let annotations_json = redact(annotations_json);
+    let review_warnings_json = redact(review_warnings_json);
+    let read_errors_json = redact(read_errors_json);
     let html = report::render_case_report_with_chains(
         &report::ReportInputs {
             manifest_json: &manifest_json,
@@ -788,6 +826,8 @@ pub fn make_report(
             scan_runs_json: &scan_runs_json,
             marks_json: &annotations_json,
             redaction_applied: redact_paths,
+            review_warnings_json: &review_warnings_json,
+            read_errors_json: &read_errors_json,
         },
         &audit_chains_json,
     );
@@ -807,24 +847,60 @@ pub fn make_report(
     let signoff_file = signoff_path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| case_dir.join(report::SIGNOFF_REL_PATH));
-    let signoff_text = read_to_string(&signoff_file).ok();
-    let html = match signoff_text.as_deref().and_then(report::parse_signoff) {
-        Some((examiner, signed_unix)) => {
-            let currency = report::signoff_currency(
-                signoff_text.as_deref().unwrap_or_default(),
+    let signoff_text = match read_optional_text(&signoff_file) {
+        Ok(text) if text.is_empty() => None,
+        Ok(text) => Some(text),
+        Err(err) => {
+            // D11: an unreadable sign-off is not "no sign-off".
+            return Err(format!(
+                "검토자 기록 {}을(를) 읽지 못했습니다: {err}",
+                signoff_file.display()
+            ));
+        }
+    };
+    let html = match signoff_text.as_deref().and_then(report::Signoff::parse) {
+        Some(signoff) => {
+            // D13: a v4 record is checked against the evidence hashes and
+            // the audit-lane anchors too; older records keep their legacy
+            // binding meaning.
+            let check = report::check_signoff(
+                case_dir,
+                &signoff.text,
                 &signoff_digests,
+                report::SignoffScope::Case,
             );
+            let (_, audit_note) = report::signoff_audit_status(case_dir, &signoff.text);
             println!(
-                "검토자: {examiner} (최종화 시 입력된 이름, 신원 미인증) — {}",
-                currency.label()
+                "검토자: {} (최종화 시 입력된 이름, 신원 미인증) — {}",
+                signoff.examiner,
+                check.currency.label()
             );
-            report::inject_signoff_banner(
-                html,
-                &examiner,
-                signed_unix,
-                currency,
-                signoff_text.as_deref().unwrap_or_default(),
-            )
+            for change in &check.changes {
+                println!("  변경: {change}");
+            }
+            for item in &check.not_verified {
+                println!("  확인 불가: {item}");
+            }
+            println!("  {audit_note}");
+            let audit_note = if redact_paths {
+                redactor.text(&audit_note)
+            } else {
+                audit_note
+            };
+            let check = if redact_paths {
+                report::SignoffCheck {
+                    currency: check.currency,
+                    changes: check.changes.iter().map(|c| redactor.text(c)).collect(),
+                    not_verified: check
+                        .not_verified
+                        .iter()
+                        .map(|c| redactor.text(c))
+                        .collect(),
+                }
+            } else {
+                check
+            };
+            report::inject_signoff_banner_checked(html, &signoff, &check, &audit_note)
         }
         None => html,
     };
@@ -834,7 +910,9 @@ pub fn make_report(
     Ok(())
 }
 
-/// The audit logs the case report quotes, by the report's lane name.
+/// The audit logs the case report quotes, by the report's lane name. D1:
+/// the sound-measurement lane is verified like the others; D13: so is the
+/// sign-off lane.
 const REPORT_AUDIT_LOGS: &[(&str, &str)] = &[
     ("export", "artifacts/clips/export-log.jsonl"),
     ("proxy", "artifacts/proxies/proxy-log.jsonl"),
@@ -845,7 +923,118 @@ const REPORT_AUDIT_LOGS: &[(&str, &str)] = &[
     ("anomaly", "evidence/logs/anomaly-log.jsonl"),
     ("batch", "artifacts/logs/batch-log.jsonl"),
     ("join", "artifacts/joined/join-log.jsonl"),
+    ("audio", crate::audio_level::LOG_REL),
+    ("signoff", report::SIGNOFF_LOG_REL_PATH),
 ];
+
+/// The text of an optional file: `""` when it does not exist, an error
+/// when it exists but cannot be read (D11).
+fn read_optional_text(path: &Path) -> Result<String, String> {
+    match read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// D3/D18: the join log as the report shows it. Every entry carries a
+/// `record_id`; one the log line did not have is derived from the output
+/// hash and flagged `record_id_derived` (only such legacy entries may fall
+/// back to `join:<file name>` annotations). An entry without a recorded
+/// observed length gets its manifest's `duration_check` (expected /
+/// observed / ok) when the manifest still has the SHA-256 the log
+/// recorded. Unparseable lines are kept verbatim.
+pub(crate) fn report_join_log(case_dir: &Path, jsonl: &str) -> String {
+    jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+                return line.to_string();
+            };
+            let Some(map) = value.as_object_mut() else {
+                return line.to_string();
+            };
+            if map.get("record_id").and_then(|v| v.as_str()).is_none()
+                && let Some(id) = map
+                    .get("output_sha256")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::join::joined_record_id)
+            {
+                map.insert("record_id".into(), serde_json::Value::String(id));
+                map.insert("record_id_derived".into(), serde_json::Value::Bool(true));
+            }
+            if map.get("duration_check").is_none()
+                && let (Some(manifest_path), Some(manifest_sha)) = (
+                    map.get("manifest_path").and_then(|v| v.as_str()),
+                    map.get("manifest_sha256").and_then(|v| v.as_str()),
+                )
+            {
+                let path = crate::util::resolve_case_artifact_path(case_dir, manifest_path);
+                if let Ok(text) = read_to_string(&path)
+                    && crate::sha256::digest_bytes(text.as_bytes()) == manifest_sha
+                    && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text)
+                    && let Some(check) = manifest.get("duration_check")
+                {
+                    map.insert("duration_check".into(), check.clone());
+                }
+            }
+            value.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// D9: marks accepted but not yet applied (`marks-pending/*.json`) and
+/// unresolved save conflicts (`marks-pending/conflicts.jsonl`: ids whose
+/// last journal line is a conflict, not a `resolved` line).
+pub(crate) fn review_queue_state(case_dir: &Path) -> (usize, usize) {
+    let dir = case_dir.join("marks-pending");
+    let queued = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let mut open: Vec<String> = Vec::new();
+    for line in read_to_string(&dir.join("conflicts.jsonl"))
+        .unwrap_or_default()
+        .lines()
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(id) = value.get("resolved").and_then(|v| v.as_str()) {
+            open.retain(|open_id| open_id != id);
+        } else if let Some(id) = value.get("id").and_then(|v| v.as_str())
+            && !open.iter().any(|open_id| open_id == id)
+        {
+            open.push(id.to_string());
+        }
+    }
+    (queued, open.len())
+}
+
+/// D9: the review-state warnings make-report prints and shows.
+fn review_state_warnings(case_dir: &Path) -> Vec<String> {
+    let (queued, conflicts) = review_queue_state(case_dir);
+    let mut out = Vec::new();
+    if queued > 0 {
+        out.push(format!(
+            "저장 대기열에 아직 반영되지 않은 판독 마크 묶음 {queued}건이 있습니다 — 이 보고서에는 그 내용이 빠져 있습니다 (워크스테이션에서 반영 후 보고서를 다시 만드십시오)."
+        ));
+    }
+    if conflicts > 0 {
+        out.push(format!(
+            "해결되지 않은 판독 저장 충돌 {conflicts}건이 있습니다 — 해당 기록은 어느 쪽 값도 확정되지 않았습니다 (뷰어의 충돌 목록에서 해결하십시오)."
+        ));
+    }
+    out
+}
 
 /// I9: chain verification of each quoted log, as the report's
 /// `auditChains` map (`status`: keyed / structural / failed / absent).
@@ -892,11 +1081,19 @@ fn measured_audio_levels_json(case_dir: &Path) -> Result<String, String> {
 }
 
 /// Reads every db/scan_runs/*.json snapshot and returns them joined into a
-/// JSON array literal for the report script.
-fn read_scan_runs_json(case_dir: &Path) -> String {
+/// JSON array literal for the report script. D11: a missing directory is
+/// "no runs"; an unreadable directory or snapshot is an error.
+fn read_scan_runs_json_checked(case_dir: &Path) -> Result<String, String> {
     let runs_dir = case_dir.join("db/scan_runs");
-    let Ok(entries) = std::fs::read_dir(&runs_dir) else {
-        return "[]".to_string();
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok("[]".to_string()),
+        Err(err) => {
+            return Err(format!(
+                "스캔 실행 기록 {}을(를) 읽지 못했습니다: {err}",
+                runs_dir.display()
+            ));
+        }
     };
     let mut runs: Vec<(String, String)> = Vec::new();
     for entry in entries.flatten() {
@@ -904,9 +1101,19 @@ fn read_scan_runs_json(case_dir: &Path) -> String {
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let Ok(content) = read_to_string(&path) else {
-            continue;
-        };
+        let content = read_to_string(&path).map_err(|err| {
+            format!(
+                "스캔 실행 기록 {}을(를) 읽지 못했습니다: {err}",
+                path.display()
+            )
+        })?;
+        // A snapshot that is not JSON would break the report script.
+        if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+            return Err(format!(
+                "스캔 실행 기록 {}이(가) 올바른 JSON이 아닙니다",
+                path.display()
+            ));
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         runs.push((name, content));
     }
@@ -916,11 +1123,35 @@ fn read_scan_runs_json(case_dir: &Path) -> String {
         .map(|(_, content)| content.trim())
         .collect::<Vec<_>>()
         .join(",");
-    format!("[{joined}]")
+    Ok(format!("[{joined}]"))
 }
 
 pub fn package_case(case_dir: &Path, options: PackageOptions) -> Result<(), String> {
+    package_case_with_pending(case_dir, options, false)
+}
+
+/// `package-case` (D9): refuses while marks are still queued or save
+/// conflicts are unresolved — the package would seal a review that is not
+/// the examiner's latest — unless `allow_pending` (`--allow-pending`) is
+/// given, in which case the state is printed as a warning.
+pub fn package_case_with_pending(
+    case_dir: &Path,
+    options: PackageOptions,
+    allow_pending: bool,
+) -> Result<(), String> {
     ensure_case(case_dir)?;
+    let (queued, conflicts) = review_queue_state(case_dir);
+    if queued > 0 || conflicts > 0 {
+        let state = format!(
+            "저장 대기 중인 판독 마크 묶음 {queued}건, 해결되지 않은 저장 충돌 {conflicts}건"
+        );
+        if !allow_pending {
+            return Err(format!(
+                "package-case refused: {state} — 반영·해결한 뒤 다시 패키징하거나, 그대로 봉인하려면 --allow-pending을 주십시오."
+            ));
+        }
+        eprintln!("warning: packaging with {state} (--allow-pending)");
+    }
     // A package should never ship without its custody statement; refresh it
     // best-effort so a stale statement can't be sealed into a checksum
     // manifest. Generation failure must not block packaging — the missing
@@ -949,7 +1180,7 @@ pub fn package_case(case_dir: &Path, options: PackageOptions) -> Result<(), Stri
 /// or NOT VERIFIED (what the package alone cannot prove). Exits non-zero
 /// when any check fails.
 pub fn verify_package(package_dir: &Path) -> Result<(), String> {
-    let result = package::verify_package(package_dir)?;
+    let result = verify_package_extended(package_dir)?;
     println!("package: {}", package_dir.display());
     if let Some(hash) = &result.manifest_sha256 {
         println!("manifest.sha256 SHA-256: {hash}");
@@ -981,6 +1212,196 @@ pub fn verify_package(package_dir: &Path) -> Result<(), String> {
             names.join(", ")
         ))
     }
+}
+
+/// `package::verify_package` plus the track-D checks (D10/D13/D16) that
+/// need only the package itself:
+/// - a PASS line claiming "no unlisted files" is dropped when an unlisted
+///   file failed (D10);
+/// - the packaged report must have been rendered from exactly the packaged
+///   sign-off record (marker = record SHA-256), not merely name the same
+///   examiner (D10);
+/// - a schema-v4 sign-off is checked against the packaged evidence hashes
+///   and the anchors of every packaged audit lane (D13);
+/// - whether the sign-off is in the packaged sign-off audit lane;
+/// - every listed lane that is a chain lane by name is chain-verified, even
+///   when its first line does not look chained (D16).
+pub fn verify_package_extended(package_dir: &Path) -> Result<package::PackageVerification, String> {
+    use package::{CheckStatus, PackageCheck};
+    let mut result = package::verify_package(package_dir)?;
+    let push = |result: &mut package::PackageVerification,
+                status: CheckStatus,
+                subject: &str,
+                detail: String| {
+        result.checks.push(PackageCheck {
+            status,
+            subject: subject.to_string(),
+            detail,
+        });
+    };
+    let listed: std::collections::BTreeSet<String> =
+        read_to_string(&package_dir.join("manifest.sha256"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once("  ").map(|(_, rel)| rel.to_string()))
+            .collect();
+    // D10: never print "no unlisted files" next to an unlisted-file FAIL.
+    let unlisted_failed = result.checks.iter().any(|check| {
+        check.status == CheckStatus::Fail && check.detail.contains("not listed in manifest.sha256")
+    });
+    if unlisted_failed {
+        result.checks.retain(|check| {
+            !(check.status == CheckStatus::Pass && check.detail.contains("no unlisted files"))
+        });
+    }
+    // D16: known chain lanes are always chain-verified.
+    for rel in listed
+        .iter()
+        .filter(|rel| crate::audit::is_known_chain_lane(rel))
+    {
+        let already = result
+            .checks
+            .iter()
+            .any(|check| check.subject == *rel && check.status != CheckStatus::NotVerified);
+        if already {
+            continue;
+        }
+        let detail = match crate::audit::verify_chained_jsonl(&package_dir.join(rel)) {
+            Ok(verification) => {
+                result.checks.retain(|check| {
+                    !(check.subject == *rel && check.status == CheckStatus::NotVerified)
+                });
+                push(
+                    &mut result,
+                    CheckStatus::Pass,
+                    rel,
+                    format!(
+                        "audit chain verified (known chain lane): {} entries, {}",
+                        verification.entries,
+                        verification.integrity.label()
+                    ),
+                );
+                continue;
+            }
+            Err(err) => err,
+        };
+        result
+            .checks
+            .retain(|check| !(check.subject == *rel && check.status == CheckStatus::NotVerified));
+        push(
+            &mut result,
+            CheckStatus::Fail,
+            rel,
+            format!("known audit chain lane does not verify as a chain: {detail}"),
+        );
+    }
+    let signoff_rel = report::SIGNOFF_REL_PATH;
+    if !listed.contains(signoff_rel) {
+        return Ok(result);
+    }
+    let Ok(signoff_text) = read_to_string(&package_dir.join(signoff_rel)) else {
+        return Ok(result);
+    };
+    // D10: the report must name THIS record.
+    let report_rel = "reports/case-report.html";
+    if listed.contains(report_rel) {
+        match read_to_string(&package_dir.join(report_rel)) {
+            Ok(html) => match report::report_matches_signoff(&html, &signoff_text) {
+                Ok(()) => push(
+                    &mut result,
+                    CheckStatus::Pass,
+                    report_rel,
+                    "report was rendered from the packaged sign-off record (signoff-sha256 marker matches the record bytes)".to_string(),
+                ),
+                Err(err) => push(&mut result, CheckStatus::Fail, report_rel, err),
+            },
+            Err(err) => push(
+                &mut result,
+                CheckStatus::Fail,
+                report_rel,
+                format!("packaged report could not be read: {err}"),
+            ),
+        }
+    }
+    // D13: v4 bindings, against the packaged db's marks.
+    match packaged_signoff_digests(package_dir) {
+        Ok(digests) => {
+            let is_listed = |rel: &str| listed.contains(rel);
+            let check = report::check_signoff(
+                package_dir,
+                &signoff_text,
+                &digests,
+                report::SignoffScope::Package(&is_listed),
+            );
+            let v4 = report::Signoff::parse(&signoff_text)
+                .is_some_and(|signoff| signoff.schema_version >= report::SIGNOFF_SCHEMA_V4);
+            if v4 {
+                if check.changes.is_empty() {
+                    push(
+                        &mut result,
+                        CheckStatus::Pass,
+                        signoff_rel,
+                        "sign-off v4: marks, evidence SHA-256 bindings and audit-lane anchors match the package".to_string(),
+                    );
+                } else {
+                    for change in &check.changes {
+                        push(&mut result, CheckStatus::Fail, signoff_rel, change.clone());
+                    }
+                }
+                for item in &check.not_verified {
+                    push(
+                        &mut result,
+                        CheckStatus::NotVerified,
+                        signoff_rel,
+                        item.clone(),
+                    );
+                }
+            }
+        }
+        Err(err) => push(
+            &mut result,
+            CheckStatus::NotVerified,
+            signoff_rel,
+            format!("sign-off bindings not checked: {err}"),
+        ),
+    }
+    let (recorded, note) = report::signoff_audit_status(package_dir, &signoff_text);
+    push(
+        &mut result,
+        if recorded {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::NotVerified
+        },
+        report::SIGNOFF_LOG_REL_PATH,
+        note,
+    );
+    Ok(result)
+}
+
+/// The sign-off digests of the review marks in a package's `db/case.db`,
+/// read from a private copy (verification never writes into the package).
+fn packaged_signoff_digests(package_dir: &Path) -> Result<report::SignoffDigests, String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "frametrace-verify-signoff-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let outcome = (|| -> Result<report::SignoffDigests, String> {
+        fs::create_dir_all(&scratch).map_err(|err| err.to_string())?;
+        let copy = scratch.join("case.db");
+        fs::copy(package_dir.join("db/case.db"), &copy).map_err(|err| err.to_string())?;
+        let conn = crate::case_db::open_readonly_case_db(&copy)?;
+        let marks = crate::case_db::load_review_marks_from(&conn)?;
+        let tags = crate::case_db::load_review_tags_from(&conn)?;
+        Ok(report::SignoffDigests {
+            content: report::signoff_content_sha256(&signoff_content_json_from(&marks, &tags)),
+            legacy: report::signoff_content_sha256(&review_marks_json_from_rows(&marks)),
+        })
+    })();
+    let _ = fs::remove_dir_all(&scratch);
+    outcome
 }
 
 pub fn inspect(case_dir: &Path) -> Result<(), String> {
@@ -1126,17 +1547,8 @@ fn build_unplayable_proxies(
             skipped_playable += 1;
             continue;
         };
-        let prefix = format!("{}_proxy_", crate::video_export::sanitize_filename(&path));
-        let exists = std::fs::read_dir(case_dir.join("artifacts/proxies"))
-            .ok()
-            .map(|entries| {
-                entries.flatten().any(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    name.starts_with(&prefix) && name.ends_with(".mp4")
-                })
-            })
-            .unwrap_or(false);
-        if exists {
+        // D5: path-free proxy names, with pre-D5 names still recognised.
+        if crate::artifacts::find_existing_proxy(case_dir, &path).is_some() {
             skipped_existing += 1;
             continue;
         }
@@ -1529,8 +1941,23 @@ mod report_output_tests {
             }],
         )
         .unwrap();
+        // D5: a proxy written before D5 is named after the flattened source
+        // path; the redacted bundle must not reveal it through that name.
+        fs::create_dir_all(case_dir.join("artifacts/proxies")).unwrap();
+        fs::write(
+            case_dir.join("artifacts/proxies").join(format!(
+                "{}_proxy_1700000000.mp4",
+                crate::video_export::sanitize_filename(&source_dir.join("a.mp4").to_string_lossy())
+            )),
+            b"p",
+        )
+        .unwrap();
         make_report(&case_dir, false, true, None).unwrap();
         make_review(&case_dir, true, false).unwrap();
+        // D12: the redacted bundle carries the redaction marker line.
+        assert!(crate::redact::bundle_is_redacted(
+            &fs::read_to_string(case_dir.join("review/data-bundle.js")).unwrap()
+        ));
         let canonical_source =
             crate::util::strip_windows_extended_prefix(&source_dir.canonicalize().unwrap());
         let canonical_case =
@@ -1587,6 +2014,388 @@ mod report_output_tests {
         assert_eq!(
             crate::report::report_signoff_sha256(&html),
             Some(crate::sha256::digest_bytes(promoted.as_bytes()).as_str())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The embedded `const <name> = …;` JSON of a rendered report.
+    fn embedded_json(html: &str, name: &str) -> serde_json::Value {
+        let prefix = format!("const {name} = ");
+        let line = html
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no {name} in report"));
+        serde_json::from_str(
+            line.trim_start_matches(&prefix)
+                .trim_end_matches(';')
+                .replace("\\u003c", "<")
+                .replace("\\u003e", ">")
+                .replace("\\u0026", "&")
+                .as_str(),
+        )
+        .unwrap()
+    }
+
+    fn report_html(case_dir: &Path) -> String {
+        fs::read_to_string(case_dir.join("reports/case-report.html")).unwrap()
+    }
+
+    /// D1: make-report re-verifies the sound lane; one forged line and no
+    /// record reads silent (or sound) — the chain table says why.
+    #[test]
+    fn forged_sound_log_line_never_becomes_a_silence_claim() {
+        let (root, case_dir, _source) = scanned_case("audio-forged");
+        let row: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(case_dir.join("db/videos.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let id = row["id"].as_str().unwrap().to_string();
+        let result = crate::audio_level::FileResult {
+            selector: id.clone(),
+            source_path: row["source_path"].as_str().unwrap().to_string(),
+            size_bytes: row["size_bytes"].as_u64(),
+            modified_unix: row["modified_unix"].as_u64(),
+            sha256_indexed: None,
+            result: crate::audio_level::Verdict::Sound,
+            streams: Vec::new(),
+            error: None,
+            measured_unix: None,
+            replayed_unverified: false,
+        };
+        let log = case_dir.join(crate::audio_level::LOG_REL);
+        crate::audit::append_chained_jsonl_keyed(
+            &log,
+            &crate::audio_level::log_entry_json(7, "ffmpeg x", &[result]).to_string(),
+            None,
+        )
+        .unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        let levels = embedded_json(&report_html(&case_dir), "audioLevels");
+        assert_eq!(levels[&id]["r"], "sound", "{levels}");
+
+        let forged = fs::read_to_string(&log)
+            .unwrap()
+            .replace("\"result\":\"sound\"", "\"result\":\"silent\"");
+        fs::write(&log, forged).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        let html = report_html(&case_dir);
+        let levels = embedded_json(&html, "audioLevels");
+        assert_eq!(levels[&id]["r"], "unverified", "{levels}");
+        let chains = embedded_json(&html, "auditChains");
+        assert_eq!(chains["audio"]["status"], "failed", "{chains}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// D11: a log that exists but cannot be read is named in the report,
+    /// not shown as "none". D9: queued marks / open conflicts are warned
+    /// about and package-case refuses them without --allow-pending.
+    #[test]
+    fn unreadable_logs_and_pending_review_state_are_disclosed() {
+        let (root, case_dir, _source) = scanned_case("read-errors");
+        fs::create_dir_all(case_dir.join("artifacts/carved/carve-log.jsonl")).unwrap();
+        fs::create_dir_all(case_dir.join("marks-pending")).unwrap();
+        fs::write(case_dir.join("marks-pending/00000001.json"), "{}").unwrap();
+        fs::write(
+            case_dir.join("marks-pending/conflicts.jsonl"),
+            "{\"id\":\"vid_000001\",\"server_revision\":2}\n{\"id\":\"vid_000002\"}\n{\"resolved\":\"vid_000002\"}\n",
+        )
+        .unwrap();
+        assert_eq!(super::review_queue_state(&case_dir), (1, 1));
+        make_report(&case_dir, false, false, None).unwrap();
+        let html = report_html(&case_dir);
+        let errors = embedded_json(&html, "readErrors");
+        assert!(
+            errors["carve"]
+                .as_str()
+                .unwrap()
+                .contains("artifacts/carved/carve-log.jsonl"),
+            "{errors}"
+        );
+        let warnings = embedded_json(&html, "reviewWarnings");
+        assert_eq!(warnings.as_array().unwrap().len(), 2, "{warnings}");
+
+        let err = super::package_case(&case_dir, super::PackageOptions::default()).unwrap_err();
+        assert!(err.contains("--allow-pending"), "{err}");
+        assert!(err.contains("1건"), "{err}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// D3/D18: join entries get their manifest's measured length (only
+    /// when the manifest still has the recorded hash) and say whether
+    /// their record id is the log's own.
+    #[test]
+    fn report_join_log_adds_manifest_length_and_legacy_flag() {
+        let root =
+            std::env::temp_dir().join(format!("frametrace-report-join-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("artifacts/joined")).unwrap();
+        let manifest = "{\"duration_check\":{\"expected\":60.0,\"observed\":59.5,\"ok\":true}}\n";
+        fs::write(root.join("artifacts/joined/a.manifest.json"), manifest).unwrap();
+        let manifest_sha = crate::sha256::digest_bytes(manifest.as_bytes());
+        let lines = [
+            serde_json::json!({"output_sha256": "ab".repeat(32), "manifest_path": "artifacts/joined/a.manifest.json", "manifest_sha256": manifest_sha}),
+            serde_json::json!({"record_id": "join:own", "output_sha256": "cd".repeat(32), "manifest_path": "artifacts/joined/a.manifest.json", "manifest_sha256": "0".repeat(64)}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let out: Vec<serde_json::Value> = super::report_join_log(&root, &lines)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(out[0]["record_id"], "join:abababababababab");
+        assert_eq!(out[0]["record_id_derived"], true);
+        assert_eq!(out[0]["duration_check"]["observed"], 59.5);
+        assert_eq!(out[1]["record_id"], "join:own");
+        assert!(out[1].get("record_id_derived").is_none());
+        assert!(
+            out[1].get("duration_check").is_none(),
+            "manifest hash mismatch: not trusted"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A scanned case WITH file hashes, one marked record, a two-entry
+    /// validation lane, a v4 sign-off recorded in the sign-off lane, and a
+    /// report. Returns `(root, case_dir, record id)`.
+    fn signed_case(name: &str) -> (PathBuf, PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "frametrace-report-out-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let case_dir = root.join("case");
+        let source_dir = root.join("src");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("a.mp4"), b"\0\0\0\x18ftypmp42one").unwrap();
+        init_case(&case_dir, &InitCaseOptions::default()).unwrap();
+        crate::scan::scan_folder(
+            &case_dir,
+            &source_dir,
+            &ScanOptions {
+                hash_files: true,
+                use_ffprobe: false,
+                ..ScanOptions::default()
+            },
+            crate::checkpoint::ResumeMode::Auto,
+            None,
+        )
+        .unwrap();
+        let id = crate::case_db::load_video_ids(&case_dir).unwrap()[0]
+            .id
+            .clone();
+        crate::case_db::upsert_review_marks(
+            &case_dir,
+            &[crate::case_db::ReviewMarkRow {
+                record_id: id.clone(),
+                status: "important".into(),
+                marked_unix: 9,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let lane = case_dir.join("evidence/logs/validation-log.jsonl");
+        for n in 0..2 {
+            crate::audit::append_chained_jsonl_keyed(&lane, &format!(r#"{{"n":{n}}}"#), None)
+                .unwrap();
+        }
+        let signoff = crate::report::Signoff::build_v4(&case_dir, "홍길동", 1_700_000_000).unwrap();
+        // Determinism: same state → same record bytes.
+        assert_eq!(
+            crate::report::Signoff::build_v4(&case_dir, "홍길동", 1_700_000_000)
+                .unwrap()
+                .text,
+            signoff.text
+        );
+        fs::write(
+            case_dir.join(crate::report::SIGNOFF_REL_PATH),
+            &signoff.text,
+        )
+        .unwrap();
+        crate::report::record_signoff_audit(&case_dir, &signoff).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        (root, case_dir, id)
+    }
+
+    /// D13: make-report says a v4 sign-off is current (with the chain
+    /// record), then "changed" when the marked record's target hash
+    /// changes or an anchored lane loses its tail.
+    #[test]
+    fn report_flags_v4_signoff_changed_on_target_hash_or_lane_truncation() {
+        let (root, case_dir, id) = signed_case("v4-report");
+        let html = report_html(&case_dir);
+        assert!(html.contains("변경되지 않았습니다"), "current at first");
+        assert!(html.contains("서명 형식 v4"), "v4 detail shown");
+        assert!(
+            html.contains("서명 기록이 감사 체인(signoff-log"),
+            "chain record found"
+        );
+        let record = fs::read_to_string(case_dir.join(crate::report::SIGNOFF_REL_PATH)).unwrap();
+        assert!(record.contains("\"schema_version\":4"));
+        assert!(
+            record.contains("\"evidence/logs/validation-log.jsonl\":{\"entries\":2"),
+            "{record}"
+        );
+
+        // Lane tail removed (the chain alone still verifies).
+        let lane = case_dir.join("evidence/logs/validation-log.jsonl");
+        let text = fs::read_to_string(&lane).unwrap();
+        fs::write(&lane, format!("{}\n", text.lines().next().unwrap())).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        let html = report_html(&case_dir);
+        assert!(html.contains("변경되었습니다"), "truncation flagged");
+        assert!(html.contains("validation-log.jsonl: 감사 레인 끝부분이 삭제됨"));
+        fs::write(&lane, &text).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        assert!(
+            report_html(&case_dir).contains("변경되지 않았습니다"),
+            "restored"
+        );
+
+        // The marked record's target hash changes (re-scan of other bytes).
+        let videos = case_dir.join("db/videos.jsonl");
+        let rows = fs::read_to_string(&videos).unwrap();
+        let mut row: serde_json::Value =
+            serde_json::from_str(rows.lines().next().unwrap()).unwrap();
+        row["sha256"] = "f".repeat(64).into();
+        fs::write(&videos, format!("{row}\n")).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        let html = report_html(&case_dir);
+        assert!(html.contains("변경되었습니다"));
+        assert!(
+            html.contains(&format!("{id}: 대상 파일 SHA-256이 서명 후 바뀜")),
+            "target change named"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Rewrites one packaged file and fixes both manifests for it — what an
+    /// adversary who recomputes the package hashes does.
+    fn rewrite_packaged_file(package: &Path, rel: &str, text: &str) {
+        fs::write(package.join(rel), text).unwrap();
+        let sha = crate::sha256::digest_bytes(text.as_bytes());
+        let manifest = fs::read_to_string(package.join("manifest.sha256")).unwrap();
+        let manifest: String = manifest
+            .lines()
+            .map(|line| {
+                if line.ends_with(&format!("  {rel}")) {
+                    format!("{sha}  {rel}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        fs::write(package.join("manifest.sha256"), manifest).unwrap();
+        let path = package.join("package-manifest.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for file in json["files"].as_array_mut().unwrap() {
+            if file["relative_path"] == rel {
+                file["sha256"] = sha.clone().into();
+                file["size_bytes"] = (text.len() as u64).into();
+            }
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    fn failed_subjects(result: &crate::package::PackageVerification) -> Vec<String> {
+        result
+            .failures()
+            .map(|check| format!("{}: {}", check.subject, check.detail))
+            .collect()
+    }
+
+    /// D13/D10/D16: verify-package checks the v4 bindings against the
+    /// package (a truncated lane or a swapped target hash FAILS even with
+    /// recomputed manifests), checks the report marker, and chain-verifies
+    /// a known lane whose first line no longer looks chained.
+    #[test]
+    fn verify_package_checks_v4_bindings_marker_and_known_lanes() {
+        let (root, case_dir, id) = signed_case("v4-package");
+        let package = root.join("package");
+        super::package_case(
+            &case_dir,
+            super::PackageOptions {
+                output_dir: Some(package.clone()),
+            },
+        )
+        .unwrap();
+        let result = super::verify_package_extended(&package).unwrap();
+        assert!(result.passed(), "{:?}", failed_subjects(&result));
+        let details: Vec<&str> = result.checks.iter().map(|c| c.detail.as_str()).collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("sign-off v4: marks, evidence")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("signoff-sha256 marker matches"))
+        );
+
+        // Truncated lane with recomputed manifests.
+        let lane_rel = "evidence/logs/validation-log.jsonl";
+        let lane = fs::read_to_string(package.join(lane_rel)).unwrap();
+        rewrite_packaged_file(
+            &package,
+            lane_rel,
+            &format!("{}\n", lane.lines().next().unwrap()),
+        );
+        let result = super::verify_package_extended(&package).unwrap();
+        assert!(
+            failed_subjects(&result)
+                .iter()
+                .any(|f| f.contains("끝부분이 삭제됨")),
+            "{:?}",
+            failed_subjects(&result)
+        );
+        rewrite_packaged_file(&package, lane_rel, &lane);
+
+        // Swapped target hash in the packaged index.
+        let videos = fs::read_to_string(package.join("db/videos.jsonl")).unwrap();
+        let mut row: serde_json::Value =
+            serde_json::from_str(videos.lines().next().unwrap()).unwrap();
+        row["sha256"] = "e".repeat(64).into();
+        rewrite_packaged_file(&package, "db/videos.jsonl", &format!("{row}\n"));
+        let result = super::verify_package_extended(&package).unwrap();
+        assert!(
+            failed_subjects(&result)
+                .iter()
+                .any(|f| f.contains(&format!("{id}: 대상 파일 SHA-256"))),
+            "{:?}",
+            failed_subjects(&result)
+        );
+        rewrite_packaged_file(&package, "db/videos.jsonl", &videos);
+
+        // D16: a known lane whose first line is not chained still FAILS.
+        rewrite_packaged_file(&package, lane_rel, "{\"plain\":true}\n");
+        let result = super::verify_package_extended(&package).unwrap();
+        assert!(
+            failed_subjects(&result)
+                .iter()
+                .any(|f| f.starts_with(lane_rel) && f.contains("does not verify as a chain")),
+            "{:?}",
+            failed_subjects(&result)
+        );
+        rewrite_packaged_file(&package, lane_rel, &lane);
+
+        // D10: an unlisted file FAILS and the "no unlisted files" PASS line
+        // is not printed next to it.
+        fs::write(package.join("reports/extra.txt"), "added").unwrap();
+        let result = super::verify_package_extended(&package).unwrap();
+        assert!(!result.passed());
+        assert!(
+            !result
+                .checks
+                .iter()
+                .any(|c| c.status == crate::package::CheckStatus::Pass
+                    && c.detail.contains("no unlisted files")),
+            "contradictory PASS line kept"
         );
         fs::remove_dir_all(root).unwrap();
     }

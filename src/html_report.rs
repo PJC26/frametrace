@@ -745,7 +745,10 @@ function proxyFor(a) {{
   const keys = [a.id, a.output_path, base].filter(Boolean).map(sanitizeSelector);
   return PROXIES.find(p => {{
     const name = String(p).split(/[\\/]/).pop() || "";
+    // D5: path-free names are proxy_<sanitized record id>_<8 hex>[_NNN].mp4;
+    // names written before D5 embed the sanitized selector.
     return name.endsWith(".mp4") && keys.some(k =>
+      new RegExp("^proxy_" + k.replace(/[-]/g, "\\-") + "_[0-9a-f]{{8}}(_[0-9]{{3}})?\\.mp4$").test(name) ||
       name.startsWith(k + "_proxy_") || name.includes(k + "_proxy_"));
   }}) || "";
 }}
@@ -1246,6 +1249,8 @@ mod tests {
                 scan_runs_json: "[]",
                 marks_json: "[]",
                 redaction_applied: false,
+                review_warnings_json: "",
+                read_errors_json: "",
             }),
         );
     }

@@ -203,27 +203,93 @@ pub struct HashVerifySummary {
     pub not_comparable: usize,
 }
 
-/// Newest *completed* run in `hash-verify.jsonl`: per-record entries are
-/// followed by a `hash-verify-run` marker, so a run cut short by a crash or
-/// cancel (records without a marker) is never presented as a result.
-pub fn latest_hash_verify_run(case_dir: &Path) -> Option<(i64, Vec<serde_json::Value>)> {
-    let text = read_to_string(&case_dir.join(HASH_VERIFY_REL_PATH)).ok()?;
-    let mut pending: Vec<serde_json::Value> = Vec::new();
-    let mut latest: Option<(i64, Vec<serde_json::Value>)> = None;
+/// One run in `hash-verify.jsonl`, grouped by its run id (D4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashVerifyRun {
+    /// `run_id` (`<run_unix>-<random>`), or the `run_unix` of a run logged
+    /// before run ids existed.
+    pub run_id: String,
+    pub run_unix: i64,
+    /// Per-record `hash-verify` entries of this run only.
+    pub entries: Vec<serde_json::Value>,
+    /// True when the run's `hash-verify-run` completion marker is present.
+    pub completed: bool,
+}
+
+/// Every run in `hash-verify.jsonl`, in first-appearance order. Entries are
+/// grouped by their run id — never by position — so the records of a run
+/// cut short by a crash or cancel cannot be absorbed into the next run's
+/// result (D4). `Ok(empty)` when there is no log; an unreadable log is an
+/// error, never "no run" (D11).
+pub fn hash_verify_runs(case_dir: &Path) -> Result<Vec<HashVerifyRun>, String> {
+    let path = case_dir.join(HASH_VERIFY_REL_PATH);
+    let text = match read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(format!(
+                "원본 재검증 기록을 읽지 못했습니다 {}: {err}",
+                path.display()
+            ));
+        }
+    };
+    let mut runs: Vec<HashVerifyRun> = Vec::new();
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        match value.get("event").and_then(|e| e.as_str()) {
-            Some("hash-verify") => pending.push(value),
-            Some("hash-verify-run") => {
-                let run_unix = value.get("run_unix").and_then(|v| v.as_i64()).unwrap_or(0);
-                latest = Some((run_unix, std::mem::take(&mut pending)));
+        let event = value.get("event").and_then(|e| e.as_str());
+        if !matches!(event, Some("hash-verify" | "hash-verify-run")) {
+            continue;
+        }
+        let run_unix = value.get("run_unix").and_then(|v| v.as_i64()).unwrap_or(0);
+        let run_id = value
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| run_unix.to_string());
+        let index = match runs.iter().position(|run| run.run_id == run_id) {
+            Some(index) => index,
+            None => {
+                runs.push(HashVerifyRun {
+                    run_id,
+                    run_unix,
+                    entries: Vec::new(),
+                    completed: false,
+                });
+                runs.len() - 1
             }
-            _ => {}
+        };
+        if event == Some("hash-verify-run") {
+            runs[index].completed = true;
+        } else {
+            runs[index].entries.push(value);
         }
     }
-    latest
+    Ok(runs)
+}
+
+/// The newest completed run and the runs after it that never completed
+/// (interrupted — shown separately, never as the result).
+pub fn latest_completed_and_interrupted(
+    runs: &[HashVerifyRun],
+) -> (Option<&HashVerifyRun>, Vec<&HashVerifyRun>) {
+    let latest = runs.iter().rposition(|run| run.completed);
+    let after = latest.map_or(0, |index| index + 1);
+    (
+        latest.map(|index| &runs[index]),
+        runs[after..].iter().filter(|run| !run.completed).collect(),
+    )
+}
+
+/// Newest *completed* run in `hash-verify.jsonl`: per-record entries are
+/// followed by a `hash-verify-run` marker, so a run cut short by a crash or
+/// cancel (records without a marker) is never presented as a result. Only
+/// the completed run's own records are returned (grouped by run id).
+pub fn latest_hash_verify_run(case_dir: &Path) -> Option<(i64, Vec<serde_json::Value>)> {
+    let runs = hash_verify_runs(case_dir).ok()?;
+    let (latest, _) = latest_completed_and_interrupted(&runs);
+    latest.map(|run| (run.run_unix, run.entries.clone()))
 }
 
 pub fn latest_hash_verify_summary(case_dir: &Path) -> Option<HashVerifySummary> {
@@ -252,9 +318,13 @@ fn write_hash_verify_log(
         Some(text) => format!("\"{}\"", json_escape(text)),
         None => "null".to_string(),
     };
+    // D4: every entry names its run, so readers group by run, not position.
+    let mut nonce = [0u8; 2];
+    getrandom::fill(&mut nonce).map_err(|err| format!("failed to draw a run id: {err}"))?;
+    let run_id = format!("{run_unix}-{:02x}{:02x}", nonce[0], nonce[1]);
     for check in checks {
         let line = format!(
-            "{{\"schema_version\":1,\"event\":\"hash-verify\",\"run_unix\":{run_unix},\"id\":\"{}\",\"source_path\":\"{}\",\"recorded_sha256\":{},\"observed_sha256\":{},\"status\":\"{}\"}}",
+            "{{\"schema_version\":1,\"event\":\"hash-verify\",\"run_unix\":{run_unix},\"run_id\":\"{run_id}\",\"id\":\"{}\",\"source_path\":\"{}\",\"recorded_sha256\":{},\"observed_sha256\":{},\"status\":\"{}\"}}",
             json_escape(&check.id),
             json_escape(&check.source_path),
             opt(&check.recorded),
@@ -264,7 +334,7 @@ fn write_hash_verify_log(
         audit::append_chained_jsonl(&log_path, &line)?;
     }
     let summary = format!(
-        "{{\"schema_version\":1,\"event\":\"hash-verify-run\",\"run_unix\":{run_unix},\"records\":{}}}",
+        "{{\"schema_version\":1,\"event\":\"hash-verify-run\",\"run_unix\":{run_unix},\"run_id\":\"{run_id}\",\"records\":{}}}",
         checks.len()
     );
     audit::append_chained_jsonl(&log_path, &summary)

@@ -222,6 +222,177 @@ pub fn chain_head(path: &Path) -> Result<Option<String>, String> {
         .map(|line| sha256::digest_bytes(line.as_bytes())))
 }
 
+/// D16: every hash-chained audit lane FrameTrace writes, relative to a case
+/// (or package) root. A lane on this list is always chain-verified — never
+/// classified by sniffing its first line, which a tampered first line could
+/// defeat.
+pub const KNOWN_CHAIN_LANES: &[&str] = &[
+    "artifacts/carved/carve-log.jsonl",
+    "artifacts/clips/export-log.jsonl",
+    "artifacts/joined/join-log.jsonl",
+    "artifacts/logs/batch-log.jsonl",
+    "artifacts/logs/transcode-queue-log.jsonl",
+    "artifacts/proxies/proxy-log.jsonl",
+    "artifacts/thumbnails/thumbnail-log.jsonl",
+    "evidence/logs/anomaly-log.jsonl",
+    "evidence/logs/audio-level-log.jsonl",
+    "evidence/logs/capture-log.jsonl",
+    "evidence/logs/case-compare-log.jsonl",
+    "evidence/logs/case-merge-log.jsonl",
+    "evidence/logs/dfxml-export-log.jsonl",
+    "evidence/logs/e01-audit.jsonl",
+    "evidence/logs/evidence-source-log.jsonl",
+    "evidence/logs/export-log.jsonl",
+    "evidence/logs/hash-verify.jsonl",
+    "evidence/logs/known-hash-log.jsonl",
+    "evidence/logs/scan-log.jsonl",
+    "evidence/logs/signoff-log.jsonl",
+    "evidence/logs/timeline-log.jsonl",
+    "evidence/logs/tsk-audit.jsonl",
+    "evidence/logs/validation-log.jsonl",
+];
+
+/// D16: whether a root-relative (`/`-separated) path is a chained audit
+/// lane by NAME: a [`KNOWN_CHAIN_LANES`] entry, or a `*log.jsonl` /
+/// `*-audit.jsonl` file under `artifacts/` or `evidence/logs/` (the
+/// naming every lane follows).
+pub fn is_known_chain_lane(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    if KNOWN_CHAIN_LANES.contains(&rel.as_str()) {
+        return true;
+    }
+    let name = rel.rsplit('/').next().unwrap_or_default();
+    (rel.starts_with("artifacts/") || rel.starts_with("evidence/logs/"))
+        && (name.ends_with("log.jsonl") || name.ends_with("-audit.jsonl"))
+}
+
+/// Every chained audit lane present under `root` (a case or package
+/// directory): files under `artifacts/` and `evidence/logs/` that are
+/// lanes by name ([`is_known_chain_lane`]), as sorted `/`-separated
+/// relative paths. Deterministic for a given tree.
+pub fn collect_chain_lanes(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, depth: u32, out: &mut Vec<String>) {
+        if depth > 6 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(root, &path, depth + 1, out);
+            } else if kind.is_file()
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if is_known_chain_lane(&rel) {
+                    out.push(rel);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for top in ["artifacts", "evidence/logs"] {
+        walk(root, &root.join(top), 0, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A lane's head at one moment (D13 truncation anchor): how many entries
+/// it had and the `entry_sha256` of the last one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneHead {
+    pub entries: u64,
+    pub last_entry_sha256: String,
+}
+
+/// The head of the lane at `path`: entry count and last `entry_sha256`.
+/// `Ok(None)` for a missing or empty lane. Lines are counted exactly as
+/// the verifier splits them (on `\n`).
+pub fn lane_head(path: &Path) -> Result<Option<LaneHead>, String> {
+    let Some(text) = read_log_locked(path)? else {
+        return Ok(None);
+    };
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let lines: Vec<&str> = body.split('\n').collect();
+    let last = lines.last().copied().unwrap_or_default();
+    let last_entry_sha256 = recorded_entry_hash(last).ok_or_else(|| {
+        format!(
+            "audit lane {} ends with a line without entry_sha256",
+            path.display()
+        )
+    })?;
+    Ok(Some(LaneHead {
+        entries: lines.len() as u64,
+        last_entry_sha256,
+    }))
+}
+
+/// What became of a recorded lane head (D13/D14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorStatus {
+    /// The lane still holds the anchored entry at the anchored position
+    /// (entries appended since are fine).
+    Intact,
+    /// The lane file is gone.
+    Missing,
+    /// The lane has fewer entries than when it was anchored — its tail
+    /// was removed.
+    Truncated { now: u64 },
+    /// The entry at the anchored position is a different one — the lane
+    /// was rewritten.
+    Rewritten,
+    /// The lane could not be read.
+    Unreadable(String),
+}
+
+/// Checks a recorded lane head against the lane at `path` now.
+pub fn check_lane_anchor(path: &Path, head: &LaneHead) -> AnchorStatus {
+    let text = match read_log_locked(path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return AnchorStatus::Missing,
+        Err(err) => return AnchorStatus::Unreadable(err),
+    };
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    let lines: Vec<&str> = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split('\n').collect()
+    };
+    let anchored = head.entries as usize;
+    if anchored == 0 {
+        return AnchorStatus::Intact;
+    }
+    if lines.len() < anchored {
+        return AnchorStatus::Truncated {
+            now: lines.len() as u64,
+        };
+    }
+    match recorded_entry_hash(lines[anchored - 1]) {
+        Some(hash) if hash == head.last_entry_sha256 => AnchorStatus::Intact,
+        _ => AnchorStatus::Rewritten,
+    }
+}
+
+/// D17: a file's modification time at the platform's full resolution
+/// (nanoseconds since the epoch where the filesystem keeps them), so two
+/// writes within one second still compare different.
+pub fn modified_nanos(meta: &std::fs::Metadata) -> Option<u128> {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+}
+
 pub fn verify_chained_jsonl(path: &Path) -> Result<AuditChainVerification, String> {
     let keys = crate::audit_key::verification_keys()?;
     let text = read_log_for_verification(path)?;
@@ -347,6 +518,11 @@ pub fn verify_chained_jsonl_text(
     let mut last_keyed_line: Option<usize> = None;
     let mut first_transition: Option<(usize, usize)> = None;
     let mut unkeyed_after_keyed: Vec<usize> = Vec::new();
+    // D15: the newest key generation that has signed an entry so far, and
+    // the key ids an in-log `audit-key-rotate` marker retired. A retired
+    // key signing after either is refused.
+    let mut newest_generation: Option<KeyGeneration> = None;
+    let mut rotated_away: std::collections::BTreeSet<String> = Default::default();
 
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -354,7 +530,7 @@ pub fn verify_chained_jsonl_text(
         // log-level tallies.
         enum Keyed {
             Unkeyed,
-            Verified,
+            Verified(KeyGeneration),
             Unauthenticated,
         }
         let verify_line = || -> Result<Keyed, String> {
@@ -436,30 +612,53 @@ pub fn verify_chained_jsonl_text(
                     // Declared key_id first, then every known key — a
                     // renamed id must not brick old entries (rotation
                     // rules in the design doc).
-                    let verified = keys
+                    let tag = decode_hex_tag(&recorded).unwrap_or([0xff; 32]);
+                    let matching: Vec<&AuditKey> = keys
                         .iter()
                         .filter(|key| key.id == key_id)
                         .chain(keys.iter().filter(|key| key.id != key_id))
-                        .any(|key| {
+                        .filter(|key| {
                             crate::hmac::tags_equal(
                                 &crate::hmac::hmac_sha256(&key.bytes, signed_entry.as_bytes()),
-                                &decode_hex_tag(&recorded).unwrap_or([0xff; 32]),
+                                &tag,
                             )
-                        });
-                    if !verified {
+                        })
+                        .collect();
+                    if matching.is_empty() {
                         return Err(format!(
                             "audit line {line_number} HMAC verification failed (key_id \"{key_id}\"): the entry was re-written or signed under a different key"
                         ));
                     }
-                    Ok(Keyed::Verified)
+                    // D15: a retired key only authenticates entries that
+                    // predate its retirement. The first key that may sign
+                    // this entry wins; when only retired keys match and the
+                    // entry is provably later than their retirement, the
+                    // entry fails like any other forged HMAC.
+                    let mut refusal = None;
+                    for key in &matching {
+                        match retired_key_refusal(key, line, newest_generation, &rotated_away) {
+                            None => return Ok(Keyed::Verified(key_generation(key))),
+                            Some(reason) => {
+                                refusal.get_or_insert(reason);
+                            }
+                        }
+                    }
+                    Err(format!(
+                        "audit line {line_number} is signed under retired audit key \"{key_id}\" but {}: an entry signed with a key after it was retired is not authentic",
+                        refusal.unwrap_or_default()
+                    ))
                 }
             }
         };
         match verify_line() {
-            Ok(Keyed::Verified) => {
+            Ok(Keyed::Verified(generation)) => {
                 keyed_entries += 1;
                 first_keyed_line.get_or_insert(line_number);
                 last_keyed_line = Some(line_number);
+                newest_generation = newest_generation.max(Some(generation));
+                if let Some(from) = rotation_marker_from(line) {
+                    rotated_away.insert(from);
+                }
             }
             Ok(Keyed::Unauthenticated) => {
                 keyed_entries += 1;
@@ -532,6 +731,94 @@ pub fn verify_chained_jsonl_text(
         integrity,
         warnings,
     })
+}
+
+/// Which generation of audit key signed an entry (D15): a retired key
+/// ranks by its retirement time, every key that is not retired ranks above
+/// all retired ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum KeyGeneration {
+    Retired(u64),
+    Current,
+}
+
+fn key_generation(key: &AuditKey) -> KeyGeneration {
+    match key.retired_unix {
+        Some(at) => KeyGeneration::Retired(at),
+        None => KeyGeneration::Current,
+    }
+}
+
+/// Top-level fields that carry the time an audit entry was written. The
+/// newest present one dates the entry for the retired-key cut-off (device
+/// or file times — `modified_unix` and friends — are deliberately not used).
+const ENTRY_TIME_FIELDS: &[&str] = &[
+    "created_unix",
+    "logged_unix",
+    "measured_unix",
+    "scanned_unix",
+    "validated_unix",
+    "exported_unix",
+    "joined_unix",
+    "recovered_unix",
+    "inspected_unix",
+    "run_unix",
+    "signed_unix",
+    "registered_unix",
+    "recorded_unix",
+    "rotated_unix",
+    "unix",
+];
+
+/// The newest event time an entry carries (see [`ENTRY_TIME_FIELDS`]).
+fn entry_event_unix(line: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    ENTRY_TIME_FIELDS
+        .iter()
+        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_u64))
+        .max()
+}
+
+/// `from` of a `{"kind":"audit-key-rotate","from":"<id>",...}` marker.
+fn rotation_marker_from(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    (value.get("kind").and_then(serde_json::Value::as_str) == Some("audit-key-rotate"))
+        .then(|| value.get("from")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+/// Why `key` may not authenticate this entry (D15), or `None` when it may.
+/// Only retired keys are ever refused: after the log recorded the key's
+/// rotation, after a newer key generation already signed an earlier entry
+/// of the same log, or when the entry is dated after the retirement. An
+/// entry with no event time that precedes every newer signature is
+/// accepted — nothing in the log says it is late.
+fn retired_key_refusal(
+    key: &AuditKey,
+    line: &str,
+    newest_generation: Option<KeyGeneration>,
+    rotated_away: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let retired = key.retired_unix?;
+    if rotated_away.contains(&key.id) {
+        return Some(format!(
+            "an earlier audit-key-rotate entry of this log already retired \"{}\"",
+            key.id
+        ));
+    }
+    if newest_generation.is_some_and(|newest| newest > KeyGeneration::Retired(retired)) {
+        return Some(format!(
+            "a newer audit key already signed an earlier entry of this log (\"{}\" was retired at unix {retired})",
+            key.id
+        ));
+    }
+    match entry_event_unix(line) {
+        Some(at) if at > retired => Some(format!(
+            "the entry is dated unix {at}, after \"{}\" was retired at unix {retired}",
+            key.id
+        )),
+        _ => None,
+    }
 }
 
 /// Hex-decodes a recorded `entry_hmac_sha256` into a fixed-size tag.
@@ -1040,6 +1327,176 @@ mod tests {
                 .contains("keyed→unkeyed transition at audit line 2 after keyed line 1")),
             "{:?}",
             verification.warnings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D15: a retired key only authenticates entries that predate its
+    /// retirement — dated later, after a newer key signed the log, or after
+    /// the log's own rotation marker, its HMAC is refused.
+    #[test]
+    fn retired_key_cannot_authenticate_entries_after_its_retirement() {
+        use super::verify_chained_jsonl_text;
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-retired-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let old = test_key("old", 0x61);
+        let new = test_key("new", 0x62);
+        let keys = [old.clone().retired_at(1_000), new.clone()];
+        let log = |name: &str, entries: &[(&str, &AuditKey)]| -> String {
+            let path = dir.join(name);
+            for (body, key) in entries {
+                append_chained_jsonl_keyed(&path, body, Some(key)).unwrap();
+            }
+            read_to_string(&path).unwrap()
+        };
+
+        // Signed before the retirement: still authentic.
+        let before = log(
+            "before.jsonl",
+            &[(r#"{"kind":"a","created_unix":900}"#, &old)],
+        );
+        let verification = verify_chained_jsonl_text(&before, "t", &keys).unwrap();
+        assert_eq!(verification.integrity, AuditIntegrity::Keyed);
+
+        // Dated after the retirement: refused.
+        let late = log(
+            "late.jsonl",
+            &[(r#"{"kind":"a","created_unix":2000}"#, &old)],
+        );
+        let err = verify_chained_jsonl_text(&late, "t", &keys).unwrap_err();
+        assert!(err.contains("retired") && err.contains("2000"), "{err}");
+        // A verifier that does not know about the retirement still accepts
+        // it (no keyring retirement time = no cut-off).
+        assert!(verify_chained_jsonl_text(&late, "t", std::slice::from_ref(&old)).is_ok());
+
+        // Undated, but after the newer key already signed this log.
+        let after_new = log(
+            "after-new.jsonl",
+            &[
+                (r#"{"kind":"a"}"#, &old),
+                (r#"{"kind":"b"}"#, &new),
+                (r#"{"kind":"c"}"#, &old),
+            ],
+        );
+        let err = verify_chained_jsonl_text(&after_new, "t", &keys).unwrap_err();
+        assert!(
+            err.contains("audit line 3") && err.contains("newer audit key"),
+            "{err}"
+        );
+
+        // After the log's own rotation marker (even a marker the old
+        // generation could not out-rank by time).
+        let marked = log(
+            "marked.jsonl",
+            &[
+                (r#"{"kind":"a"}"#, &old),
+                (
+                    r#"{"kind":"audit-key-rotate","from":"old","to":"new"}"#,
+                    &old,
+                ),
+                (r#"{"kind":"x"}"#, &old),
+            ],
+        );
+        let err = verify_chained_jsonl_text(&marked, "t", &keys).unwrap_err();
+        assert!(
+            err.contains("audit line 3") && err.contains("audit-key-rotate"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D13/D14: a lane anchor survives appends but catches a removed tail
+    /// (which the chain itself cannot see), a rewrite and a deleted lane.
+    #[test]
+    fn lane_anchor_detects_truncation_rewrite_and_removal_but_not_appends() {
+        use super::{AnchorStatus, check_lane_anchor, lane_head};
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-anchor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lane-log.jsonl");
+        assert_eq!(lane_head(&path).unwrap(), None);
+        for kind in ["one", "two", "three"] {
+            append_chained_jsonl_keyed(&path, &format!(r#"{{"kind":"{kind}"}}"#), None).unwrap();
+        }
+        let head = lane_head(&path).unwrap().unwrap();
+        assert_eq!(head.entries, 3);
+        assert_eq!(check_lane_anchor(&path, &head), AnchorStatus::Intact);
+        append_chained_jsonl_keyed(&path, r#"{"kind":"four"}"#, None).unwrap();
+        assert_eq!(check_lane_anchor(&path, &head), AnchorStatus::Intact);
+
+        // Tail removed at an entry boundary: still a valid chain (D14) —
+        // only the anchor reveals it.
+        let text = read_to_string(&path).unwrap();
+        let kept: String = text
+            .lines()
+            .take(2)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&path, &kept).unwrap();
+        assert!(verify_chained_jsonl(&path).is_ok());
+        assert_eq!(
+            check_lane_anchor(&path, &head),
+            AnchorStatus::Truncated { now: 2 }
+        );
+
+        // Rewritten with as many entries: the anchored entry differs.
+        let _ = fs::remove_file(&path);
+        for kind in ["x", "y", "z", "w"] {
+            append_chained_jsonl_keyed(&path, &format!(r#"{{"kind":"{kind}"}}"#), None).unwrap();
+        }
+        assert_eq!(check_lane_anchor(&path, &head), AnchorStatus::Rewritten);
+        let _ = fs::remove_file(&path);
+        assert_eq!(check_lane_anchor(&path, &head), AnchorStatus::Missing);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D16: chain lanes are recognised by name, so a lane with a tampered
+    /// first line is still verified as a chain; data files are not lanes.
+    #[test]
+    fn known_chain_lanes_are_recognised_by_name() {
+        use super::{collect_chain_lanes, is_known_chain_lane};
+        for rel in [
+            "evidence/logs/hash-verify.jsonl",
+            "evidence/logs/audio-level-log.jsonl",
+            "evidence/logs/signoff-log.jsonl",
+            "evidence/logs/e01-audit.jsonl",
+            "artifacts/joined/join-log.jsonl",
+            "artifacts/some/new-lane-log.jsonl",
+        ] {
+            assert!(is_known_chain_lane(rel), "{rel}");
+        }
+        for rel in [
+            "db/videos.jsonl",
+            "db/progress.jsonl",
+            "marks-pending/conflicts.jsonl",
+            "review/signoff.json",
+            "evidence/logs/notes.jsonl",
+        ] {
+            assert!(!is_known_chain_lane(rel), "{rel}");
+        }
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-lanes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for rel in [
+            "evidence/logs/scan-log.jsonl",
+            "evidence/logs/hash-verify.jsonl",
+            "artifacts/carved/carve-log.jsonl",
+            "evidence/logs/notes.jsonl",
+            "db/progress.jsonl",
+        ] {
+            fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+            fs::write(dir.join(rel), "{}\n").unwrap();
+        }
+        assert_eq!(
+            collect_chain_lanes(&dir),
+            [
+                "artifacts/carved/carve-log.jsonl",
+                "evidence/logs/hash-verify.jsonl",
+                "evidence/logs/scan-log.jsonl",
+            ]
         );
         let _ = fs::remove_dir_all(&dir);
     }
