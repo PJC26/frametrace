@@ -750,8 +750,8 @@ pub(crate) fn key_tag_mismatch(expected: &str, actual: &str) -> Option<String> {
 /// (`FRAMETRACE_EXPECTED_AUDIT_KEY`) and returns a warning on mismatch.
 /// `None` outside the workstation or when they agree.
 ///
-/// INTEGRATION TODO(B15): `cli::run` calls this right after installing
-/// `--key-source` and prints the warning to stderr.
+/// `cli::run` calls this right after installing `--key-source` and prints
+/// the warning to stderr.
 pub fn key_source_mismatch_warning() -> Option<String> {
     let expected = std::env::var(jobs::EXPECTED_AUDIT_KEY_ENV).ok()?;
     key_tag_mismatch(&expected, &audit_key_tag(crate::audit_key::configured()))
