@@ -122,6 +122,9 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
     let mut skipped = 0usize;
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            // E8: an unparseable index line is counted, never dropped
+            // without trace.
+            skipped += 1;
             continue;
         };
         let id = value
@@ -168,10 +171,16 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             // A tag that will not parse is excluded, never emitted as 0.
             if let Some((ts, tz_assumed)) = parse_creation_time(&raw) {
                 emitted = true;
+                // E5: the tag comes from the container header (MP4 mvhd /
+                // tkhd / mdhd creation_time as ffprobe reports it), written
+                // from the recorder's own clock. A trailing `Z` is how
+                // ffprobe formats that field, not proof the device clock
+                // ran on UTC — so every such time is labelled device-
+                // recorded with its zone unverified.
                 let caveat = if tz_assumed {
-                    " (tz_assumed: tag has no zone, interpreted as UTC; recorder clocks are often local time)"
+                    " (device-recorded, time zone not verified; tz_assumed: tag has no zone, interpreted as UTC; recorder clocks are often local time)"
                 } else {
-                    ""
+                    " (device-recorded, time zone not verified: container creation_time comes from the recorder clock; a Z/offset in the tag does not prove the clock was set to UTC)"
                 };
                 events.push(TimelineEvent {
                     ts_unix: ts,
@@ -191,14 +200,19 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
     Ok(skipped)
 }
 
-/// One event per carved artifact stamped with its run's `carved_unix` from
-/// `db/carve_results.json` (the per-artifact carve-log lines carry no
-/// timestamp of their own). Returns how many artifacts were skipped.
+/// One event per carved artifact of EVERY carve run (E4). The append-only
+/// carve log holds all runs; since E4 each `carve-file` line carries its
+/// own `carved_unix`. Older lines have none — their time is taken from
+/// `db/carve_results.json` (which only describes the latest run) when the
+/// (id, output_path) pair matches, otherwise the artifact is counted as
+/// skipped (no timestamp), never stamped 0. Artifacts present only in the
+/// results snapshot (log missing) are still emitted. Returns how many
+/// artifacts were skipped.
 fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usize, String> {
     let path = case_dir.join("db/carve_results.json");
-    let text = match read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+    let snapshot = match read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text).ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             return Err(format!(
                 "failed to read carve results {}: {err}",
@@ -206,45 +220,86 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             ));
         }
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Ok(0); // unparsable snapshot is not fatal to the timeline
+    let snapshot_unix = snapshot
+        .as_ref()
+        .and_then(|value| value.get("carved_unix"))
+        .and_then(serde_json::Value::as_u64);
+    let snapshot_artifacts: Vec<serde_json::Value> = snapshot
+        .as_ref()
+        .and_then(|value| value.get("artifacts"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let field = |value: &serde_json::Value, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
     };
-    let Some(carved_unix) = value.get("carved_unix").and_then(serde_json::Value::as_u64) else {
-        return Ok(0);
+    let key_of = |value: &serde_json::Value| (field(value, "id"), field(value, "output_path"));
+    let snapshot_keys: std::collections::HashSet<(String, String)> =
+        snapshot_artifacts.iter().map(key_of).collect();
+
+    let log_path = case_dir.join("artifacts/carved/carve-log.jsonl");
+    let log_text = match read_to_string(&log_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(format!(
+                "failed to read carve log {}: {err}",
+                log_path.display()
+            ));
+        }
     };
     let mut skipped = 0usize;
-    let Some(artifacts) = value.get("artifacts").and_then(|v| v.as_array()) else {
-        return Ok(0);
-    };
-    for artifact in artifacts {
-        let output_path = artifact
-            .get("output_path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut emit = |artifact: &serde_json::Value, ts: Option<u64>, skipped: &mut usize| {
+        let (id, output_path) = key_of(artifact);
         if output_path.is_empty() {
-            skipped += 1;
-            continue;
+            *skipped += 1;
+            return;
         }
-        let id = artifact
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let source = artifact
-            .get("source_path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
+        if !seen.insert((id.clone(), output_path.clone())) {
+            return; // the same artifact logged again by a resumed run
+        }
+        let Some(ts_unix) = ts else {
+            *skipped += 1;
+            return;
+        };
+        let source = field(artifact, "source_path");
         let offset = artifact
             .get("offset")
             .and_then(serde_json::Value::as_u64)
             .map(|offset| offset.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         events.push(TimelineEvent {
-            ts_unix: carved_unix,
+            ts_unix,
             source: "carve",
             kind: "carved-candidate",
-            path: output_path.to_string(),
+            path: output_path,
             detail: format!("carved candidate {id} from {source} at offset {offset}"),
         });
+    };
+    for line in log_text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // torn/foreign lines are counted by audit_log_events
+        };
+        if value.get("event").and_then(serde_json::Value::as_str) != Some("carve-file") {
+            continue;
+        }
+        let ts = value
+            .get("carved_unix")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(&value))));
+        emit(&value, ts, &mut skipped);
+    }
+    for artifact in &snapshot_artifacts {
+        let ts = artifact
+            .get("carved_unix")
+            .and_then(serde_json::Value::as_u64)
+            .or(snapshot_unix);
+        emit(artifact, ts, &mut skipped);
     }
     Ok(skipped)
 }
@@ -535,6 +590,66 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    /// E4: every carve run reaches the timeline. The old code read only
+    /// `db/carve_results.json` (latest run), so earlier runs' artifacts —
+    /// still on disk and in the carve log — vanished from the timeline.
+    #[test]
+    fn carve_events_cover_every_run_in_the_log() {
+        let case_dir = temp_case("allruns");
+        fs::write(case_dir.join("case.json"), "{}").unwrap();
+        fs::create_dir_all(case_dir.join("artifacts/carved")).unwrap();
+        fs::write(
+            case_dir.join("artifacts/carved/carve-log.jsonl"),
+            concat!(
+                // legacy run 1: no carved_unix, not in the snapshot → skipped
+                "{\"event\":\"carve-file\",\"id\":\"carve_000001\",\"output_path\":\"/c/old.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":1}\n",
+                // run 2 (E4 ids, own timestamps)
+                "{\"event\":\"carve-file\",\"id\":\"carve_100-abcd_000001\",\"output_path\":\"/c/r2.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":2,\"run_id\":\"100-abcd\",\"carved_unix\":150}\n",
+                // run 3, also the latest snapshot
+                "{\"event\":\"carve-file\",\"id\":\"carve_200-ef01_000001\",\"output_path\":\"/c/r3.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":3,\"run_id\":\"200-ef01\",\"carved_unix\":250}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            case_dir.join("db/carve_results.json"),
+            "{\"carved_unix\":260,\"artifacts\":[{\"id\":\"carve_200-ef01_000001\",\"output_path\":\"/c/r3.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":3,\"carved_unix\":250}]}",
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let skipped = carve_events(&case_dir, &mut events).unwrap();
+        let paths: Vec<(&str, u64)> = events
+            .iter()
+            .map(|e| (e.path.as_str(), e.ts_unix))
+            .collect();
+        assert_eq!(paths, vec![("/c/r2.mp4", 150), ("/c/r3.mp4", 250)]);
+        assert_eq!(skipped, 1, "legacy entry without any timestamp is counted");
+        let _ = fs::remove_dir_all(&case_dir);
+    }
+
+    /// E5: a `Z`-suffixed MP4 creation_time is a device-recorded clock
+    /// value; the event must not present it as verified UTC.
+    #[test]
+    fn zulu_creation_time_is_labelled_device_recorded() {
+        let case_dir = temp_case("zulu");
+        fs::write(
+            case_dir.join("db/videos.jsonl"),
+            "{\"id\":\"vid_1\",\"source_path\":\"/ev/a.mp4\",\"modified_unix\":0,\"ffprobe\":{\"format\":{\"tags\":{\"creation_time\":\"2021-01-01T00:00:00.000000Z\"}}}}\nnot json\n",
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let skipped = index_events(&case_dir, &mut events).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .detail
+                .contains("device-recorded, time zone not verified"),
+            "{}",
+            events[0].detail
+        );
+        assert_eq!(skipped, 1, "the unparseable index line is counted (E8)");
+        let _ = fs::remove_dir_all(&case_dir);
     }
 
     #[test]

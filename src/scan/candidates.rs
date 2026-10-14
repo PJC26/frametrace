@@ -16,7 +16,11 @@ pub(super) fn scan_fingerprint(
         format!("max_depth={:?}", options.max_depth),
         format!("incremental={}", options.incremental),
     ];
-    parts.extend(files.iter().map(|path| path.to_string_lossy().to_string()));
+    // Lossless per-file spelling: two non-Unicode names must not
+    // fingerprint as one candidate list (UTF-8 names are unchanged).
+    parts.extend(files.iter().map(|path| {
+        crate::model::path_raw_hex(path).unwrap_or_else(|| path.to_string_lossy().to_string())
+    }));
     checkpoint::fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
@@ -34,10 +38,7 @@ pub(super) fn load_checkpoint_records(
                 checkpoint.path().display()
             )
         })?;
-        records.insert(
-            normalize_source_key(&record.source_path.to_string_lossy()),
-            record,
-        );
+        records.insert(source_key(&record.source_path), record);
     }
     Ok(records)
 }
@@ -282,12 +283,7 @@ pub(super) fn salvage_checkpoint_records(
         .stale_data_lines()
         .iter()
         .filter_map(|line| serde_json::from_str::<VideoRecord>(line).ok())
-        .map(|record| {
-            (
-                normalize_source_key(&record.source_path.to_string_lossy()),
-                record,
-            )
-        })
+        .map(|record| (source_key(&record.source_path), record))
         .collect()
 }
 

@@ -69,6 +69,22 @@ pub const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetErrorMode(mode: u32) -> u32;
+    fn GetErrorMode() -> u32;
+}
+
+/// R4-B21: the process error mode as the OS reports it right now
+/// (`GetErrorMode`), so tests check the real flag word instead of the value
+/// [`suppress_os_error_dialogs`] claims to have set. 0 off Windows.
+pub fn current_error_mode() -> u32 {
+    #[cfg(windows)]
+    {
+        // SAFETY: GetErrorMode only reads a process-wide flag word.
+        unsafe { GetErrorMode() }
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
 }
 
 /// P7: process-wide error mode set once at startup so neither this
@@ -134,8 +150,22 @@ pub(crate) fn is_reserved_device_name(component: &str) -> bool {
 }
 
 /// Whether any `\`/`/`-separated component of `text` is a reserved device.
+///
+/// R4-B9: a drive-relative component (`C:NUL`, `d:com1.txt`) names the
+/// device too — Windows resolves `C:NUL` against drive C's current
+/// directory and still opens NUL — so the part after a leading `X:` is
+/// checked as its own component.
 pub(crate) fn has_reserved_device_component(text: &str) -> bool {
-    text.split(['\\', '/']).any(is_reserved_device_name)
+    text.split(['\\', '/']).any(|component| {
+        is_reserved_device_name(component)
+            || drive_relative_tail(component).is_some_and(is_reserved_device_name)
+    })
+}
+
+/// `NUL` of `C:NUL`: the name after a leading drive designator, if any.
+fn drive_relative_tail(component: &str) -> Option<&str> {
+    let bytes = component.as_bytes();
+    (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':').then(|| &component[2..])
 }
 
 /// A component that stays a device name even under the verbatim `\\?\`
@@ -801,6 +831,316 @@ fn percent_encode_path(input: &str) -> String {
             }
             byte => out.push_str(&format!("%{byte:02X}")),
         }
+    }
+    out
+}
+
+/// R4-B5: which HTML pages under a case folder FrameTrace itself generated.
+///
+/// The workstation used to trust `review/*.html` / `reports/**.html` by
+/// location alone, so a case folder handed over by someone else (or
+/// tampered with) could run arbitrary script in the workstation origin and
+/// drive every mutating API. Now a page at a generated location is trusted
+/// only when its SHA-256 is listed in `review/.generated.json` AND that
+/// list carries a valid HMAC under a per-user key kept outside the case
+/// (`<config>/frametrace/generated-pages.key`) — a foreign or edited case
+/// cannot forge the list. Everything else is served sandboxed (no script).
+///
+/// Writers: make-review / make-report (CLI) and the workstation after
+/// every generator step it drives call [`record_generated_pages`] /
+/// [`record_case_generated_pages`].
+pub mod generated_pages {
+    use std::path::{Path, PathBuf};
+
+    /// Case-relative path of the manifest.
+    pub const MANIFEST_REL: &str = "review/.generated.json";
+    /// Most recent hashes kept (older finalized package copies stay
+    /// trusted until this many newer pages were generated).
+    const MAX_HASHES: usize = 1024;
+    const MAC_DOMAIN: &str = "frametrace-generated-pages-v1";
+
+    fn key_path() -> Option<PathBuf> {
+        if let Ok(custom) = std::env::var("FRAMETRACE_PAGES_KEY_FILE")
+            && !custom.trim().is_empty()
+        {
+            return Some(PathBuf::from(custom.trim()));
+        }
+        // Unit tests never touch the examiner's real config directory.
+        if cfg!(test) {
+            return Some(
+                std::env::temp_dir()
+                    .join(format!("frametrace-test-pages-key-{}", std::process::id())),
+            );
+        }
+        crate::audit_key::config_dir().map(|dir| dir.join("generated-pages.key"))
+    }
+
+    fn parse_hex32(text: &str) -> Option<Vec<u8>> {
+        let text = text.trim();
+        if text.len() != 64 {
+            return None;
+        }
+        (0..32)
+            .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok())
+            .collect()
+    }
+
+    /// The per-user page key; created (0600) on first use when `create`.
+    fn key(create: bool) -> Option<Vec<u8>> {
+        let path = key_path()?;
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            return parse_hex32(&text);
+        }
+        if !create {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).ok()?;
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // create_new: two writers racing on the first use agree on whichever
+        // key landed first instead of overwriting each other.
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, hex.as_bytes()));
+        #[cfg(unix)]
+        if created.is_ok() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = created;
+        parse_hex32(&std::fs::read_to_string(&path).ok()?)
+    }
+
+    fn mac(key: &[u8], hashes: &[String]) -> String {
+        let mut sorted: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        let message = format!("{MAC_DOMAIN}\n{}", sorted.join("\n"));
+        crate::hmac::hmac_sha256_hex(key, message.as_bytes())
+    }
+
+    /// Verified hash list of the case (empty when missing, unreadable,
+    /// foreign or tampered — i.e. nothing is trusted).
+    pub fn trusted_hashes(case_dir: &Path) -> Vec<String> {
+        let Some(key) = key(false) else {
+            return Vec::new();
+        };
+        read_verified(case_dir, &key)
+    }
+
+    fn read_verified(case_dir: &Path, key: &[u8]) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(case_dir.join(MANIFEST_REL)) else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Vec::new();
+        };
+        let hashes: Vec<String> = value
+            .get("hashes")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let recorded = value.get("mac").and_then(serde_json::Value::as_str);
+        let expected = mac(key, &hashes);
+        match recorded {
+            Some(recorded) if constant_time_eq(recorded, &expected) => hashes,
+            _ => Vec::new(),
+        }
+    }
+
+    fn constant_time_eq(a: &str, b: &str) -> bool {
+        a.len() == b.len()
+            && a.bytes()
+                .zip(b.bytes())
+                .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                == 0
+    }
+
+    /// Whether the case-relative page exists and is listed in the verified
+    /// manifest.
+    pub fn page_is_trusted(case_dir: &Path, rel: &str) -> bool {
+        file_sha256(&case_dir.join(rel)).is_some_and(|sha| trusted_hashes(case_dir).contains(&sha))
+    }
+
+    /// SHA-256 (hex) of a file's bytes.
+    pub fn file_sha256(path: &Path) -> Option<String> {
+        crate::audit::digest_file(path).ok()
+    }
+
+    /// Records the listed case-relative pages (missing files are skipped)
+    /// as generated. Returns how many were recorded. A manifest that does
+    /// not verify under this user's key is replaced, never extended — its
+    /// hashes were never trusted.
+    pub fn record_generated_pages(case_dir: &Path, rels: &[&str]) -> Result<usize, String> {
+        let key = key(true).ok_or_else(|| {
+            "생성 페이지 키를 만들 수 없습니다 (설정 폴더 확인) / generated-page key unavailable"
+                .to_string()
+        })?;
+        let mut hashes = read_verified(case_dir, &key);
+        let mut recorded = 0usize;
+        for rel in rels {
+            let path = case_dir.join(rel);
+            if !path.is_file() {
+                continue;
+            }
+            let Some(hash) = file_sha256(&path) else {
+                continue;
+            };
+            hashes.retain(|known| *known != hash);
+            hashes.push(hash);
+            recorded += 1;
+        }
+        if hashes.len() > MAX_HASHES {
+            let excess = hashes.len() - MAX_HASHES;
+            hashes.drain(..excess);
+        }
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "note": "SHA-256 of pages FrameTrace generated; HMAC under the examiner's per-user key (not stored in the case).",
+            "hashes": hashes,
+            "mac": mac(&key, &hashes),
+        });
+        super::write_text_atomic(&case_dir.join(MANIFEST_REL), &format!("{body}\n"))
+            .map_err(|err| format!("생성 페이지 목록 저장 실패: {err}"))?;
+        Ok(recorded)
+    }
+
+    /// Every page at a generated location (`review/*.html`,
+    /// `reports/**/*.html` outside `package_*`), case-relative.
+    pub fn case_generated_page_rels(case_dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let is_html = |path: &Path| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"))
+        };
+        if let Ok(entries) = std::fs::read_dir(case_dir.join("review")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && is_html(&path) {
+                    out.push(format!("review/{}", entry.file_name().to_string_lossy()));
+                }
+            }
+        }
+        let mut pending = vec![(case_dir.join("reports"), "reports".to_string(), 0usize)];
+        while let Some((dir, rel, depth)) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    if depth < 4 && !name.starts_with("package_") {
+                        pending.push((path, format!("{rel}/{name}"), depth + 1));
+                    }
+                } else if kind.is_file() && is_html(&path) {
+                    out.push(format!("{rel}/{name}"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// [`record_generated_pages`] over [`case_generated_page_rels`].
+    pub fn record_case_generated_pages(case_dir: &Path) -> Result<usize, String> {
+        let rels = case_generated_page_rels(case_dir);
+        let refs: Vec<&str> = rels.iter().map(String::as_str).collect();
+        record_generated_pages(case_dir, &refs)
+    }
+
+    /// CSP `script-src` sources for a verified page: `'self'` plus the
+    /// SHA-256 of every inline `<script>` block. `None` when the page uses
+    /// inline event handlers or `javascript:` URLs (a hash list cannot
+    /// allow those without `'unsafe-hashes'`), so such pages get no
+    /// script-src rather than a broken one.
+    pub fn inline_script_sources(html: &str) -> Option<String> {
+        let lower = html.to_ascii_lowercase();
+        if lower.contains("javascript:") || has_inline_handler(&lower) {
+            return None;
+        }
+        let mut sources = vec!["'self'".to_string()];
+        let mut cursor = 0usize;
+        while let Some(found) = lower[cursor..].find("<script") {
+            let tag_start = cursor + found;
+            let Some(tag_len) = lower[tag_start..].find('>') else {
+                break;
+            };
+            let tag = &lower[tag_start..tag_start + tag_len];
+            let body_start = tag_start + tag_len + 1;
+            let Some(body_len) = lower[body_start..].find("</script") else {
+                break;
+            };
+            if !tag.contains(" src=") && !tag.contains(" src =") {
+                use sha2::Digest;
+                let digest =
+                    sha2::Sha256::digest(&html.as_bytes()[body_start..body_start + body_len]);
+                sources.push(format!("'sha256-{}'", super::base64_encode(&digest)));
+            }
+            cursor = body_start + body_len;
+        }
+        Some(sources.join(" "))
+    }
+
+    /// ` on<letters>=` inside a tag (approximate; a false positive only
+    /// drops the optional script-src, never trusts more).
+    fn has_inline_handler(lower: &str) -> bool {
+        let bytes = lower.as_bytes();
+        let mut index = 0;
+        while let Some(found) = lower[index..].find(" on") {
+            let mut cursor = index + found + 3;
+            let letters_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_lowercase() {
+                cursor += 1;
+            }
+            while cursor < bytes.len() && bytes[cursor] == b' ' {
+                cursor += 1;
+            }
+            if cursor > letters_start && cursor < bytes.len() && bytes[cursor] == b'=' {
+                return true;
+            }
+            index = letters_start;
+        }
+        false
+    }
+}
+
+/// Standard (padded) base64 of `bytes` (CSP hash sources).
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }

@@ -573,12 +573,14 @@ pub(crate) fn progress_json(
     // past STATUS_DB_BUSY no longer stalls the poll (it used to wait out
     // the 5 s busy timeout, beyond the shell's 1 s status timeout): the
     // last progress seen for this case is reported, marked `stale`.
+    STATUS_PROGRESS_READS.with(|reads| reads.set(reads.get() + 1));
     let job = match crate::case_db::latest_running_job_quick(case_dir, STATUS_DB_BUSY) {
         Ok(job) => {
             remember_progress(case_dir, job.as_ref());
             job
         }
         Err(_) => {
+            STATUS_PROGRESS_BUSY_FALLBACKS.with(|count| count.set(count.get() + 1));
             if let Some(mut last) = remembered_progress(case_dir) {
                 last["stale"] = true.into();
                 return last;
@@ -620,6 +622,17 @@ fn job_progress_json(job: &crate::case_db::JobProgress) -> serde_json::Value {
         "elapsed_secs": elapsed,
         "eta_secs": eta,
     })
+}
+
+thread_local! {
+    /// R4-B20: bounded (`latest_running_job_quick`) progress reads made by
+    /// `/api/status` on this thread — the only case-DB access it makes.
+    pub(crate) static STATUS_PROGRESS_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// R4-B20: of those, reads that found the DB locked and fell back to
+    /// the remembered (stale) progress instead of waiting.
+    pub(crate) static STATUS_PROGRESS_BUSY_FALLBACKS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// R10: how long one `/api/status` progress read may wait for a case-DB
@@ -774,6 +787,10 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     // A case whose enrichment pass was cancelled (or failed) before
     // make-review still has a reviewable index (UX-02).
     let has_index = case_dir.join("db/video_index.json").is_file();
+    // R4-B5: pages this user's FrameTrace did not generate open without
+    // script — say so instead of leaving a blank dashboard unexplained.
+    let unverified_pages = has_review
+        && !crate::util::generated_pages::page_is_trusted(&case_dir, "review/index.html");
     let mut guard = state_lock(state);
     if guard.busy {
         return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
@@ -806,6 +823,11 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     guard.enrichment = None;
     // The last recover/carve outcome belonged to the previous binding.
     guard.case_job = None;
+    // R4-B8: so did the last package (the review-ready branch used to keep
+    // it, so "open package folder" offered the previous case's package and
+    // /api/open-folder admitted it as an approved root).
+    guard.package_dir = None;
+    guard.error = None;
     if has_review {
         guard.phase = "review-ready";
         guard.steps = [StepStatus::Done; 5];
@@ -837,6 +859,11 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
             "케이스를 열었습니다 (검토 결과 없음): {}",
             case_dir.display()
         ));
+    }
+    if unverified_pages {
+        let message = "이 케이스의 대시보드·보고서 페이지는 이 컴퓨터의 FrameTrace가 만든 것으로 확인되지 않아 스크립트 없이(보기 전용) 열립니다 — 최종화하거나 다시 분석하면 새로 생성됩니다. 검토 화면(뷰어)은 영향을 받지 않습니다.".to_string();
+        guard.logs.push(format!("경고: {message}"));
+        guard.warnings.push((4, message));
     }
     drop(guard);
     save_session(&case_dir, extra_root.as_deref());

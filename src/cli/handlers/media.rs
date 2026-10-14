@@ -71,17 +71,10 @@ fn export_dav_inner(
         ));
     }
 
-    let walk = crate::dav::walk_frames(dav_file);
-    let (frames, channel) = match &walk {
-        Ok(list) => {
-            let video: Vec<_> = list
-                .iter()
-                .filter(|frame| matches!(frame.stream_type, 0xFC | 0xFD))
-                .collect();
-            (video.len(), video.first().map(|frame| frame.channel))
-        }
-        Err(_) => (0, None),
-    };
+    // E10: a frame walk that fails fails the export (never logged as 0).
+    let summary = crate::dav::summarize_frames(dav_file)?;
+    let frames = summary.video_frames();
+    let channel = summary.first_video_channel;
     let method =
         crate::dav::remux_dav_to_mp4(dav_file, &requested_raw, timeout_secs).inspect_err(|_| {
             let _ = std::fs::remove_file(&requested_raw);
@@ -93,17 +86,34 @@ fn export_dav_inner(
         "es-extract-remux-candidate"
     };
 
+    // The ES fallback carries only the first video channel; ffmpeg's demuxer
+    // decides itself, so its exported frame count is not known here.
+    let (exported_video_frames, exported_note) = if method == "ffmpeg-dhav-demux" {
+        (
+            "null".to_string(),
+            "ffmpeg dhav demuxer chose the exported stream; per-channel count not verified",
+        )
+    } else {
+        (
+            summary.pinned_channel_frames().to_string(),
+            "es-extract-remux exports only the first video channel",
+        )
+    };
     let line = format!(
-        "{{\"schema_version\":1,\"event\":\"export-dav\",\"selector\":\"{}\",\"source_path\":\"{}\",\"format\":\"mp4\",\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"remux_method\":\"{}\",\"video_frames\":{},\"channel\":{},\"container_validation\":\"{}\"}}",
+        "{{\"schema_version\":1,\"event\":\"export-dav\",\"selector\":\"{}\",\"source_path\":\"{}\",\"format\":\"mp4\",\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"remux_method\":\"{}\",\"video_frames\":{},\"video_frames_by_channel\":{},\"audio_frames\":{},\"channel\":{},\"exported_video_frames\":{},\"exported_frames_note\":\"{}\",\"container_validation\":\"{}\"}}",
         json_escape(stem),
         json_escape(&dav_file.to_string_lossy()),
         json_escape(&requested_raw.to_string_lossy()),
         json_escape(&output_sha256),
         json_escape(method),
         frames,
+        summary.channels_json(),
+        summary.audio_frames,
         channel
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_string()),
+        exported_video_frames,
+        json_escape(exported_note),
         json_escape(validation),
     );
     audit::append_chained_jsonl(&case_dir.join("artifacts/clips/export-log.jsonl"), &line)?;
