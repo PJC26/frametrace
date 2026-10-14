@@ -51,6 +51,21 @@ pub fn html_is_redacted(html: &str) -> bool {
     html.contains(REDACTION_MARKER)
 }
 
+/// D12: first line of a `review/data-bundle.js` written in path-redaction
+/// mode. The bundle's data is JSON/script-escaped (`<` never appears raw),
+/// so case data cannot forge it.
+pub const BUNDLE_REDACTION_MARKER: &str = "/* <!-- frametrace:path-redaction=applied --> */";
+
+/// D12: whether a viewer data bundle was written with path redaction.
+pub fn bundle_is_redacted(js: &str) -> bool {
+    js.lines().next() == Some(BUNDLE_REDACTION_MARKER)
+}
+
+/// D12: the bundle text with its redaction marker line prepended.
+pub fn mark_bundle_redacted(js: &str) -> String {
+    format!("{BUNDLE_REDACTION_MARKER}\n{js}")
+}
+
 /// Redact every absolute path embedded in `input`. Whole-input JSON first;
 /// if that does not parse, each non-empty line is treated as one JSONL
 /// record. Unparseable input is returned unchanged (same failure-soft policy
@@ -67,7 +82,7 @@ pub fn redact_text(text: &str, case_dir: &Path) -> String {
 
 /// The redaction note rendered into reports/review pages so the reader can
 /// tell the paths were deliberately rewritten — and what was NOT rewritten.
-pub const REDACTION_NOTE: &str = "path redaction applied: absolute source paths were rewritten as <case>/… or <redacted:hash> tokens in this document. Raw case data (the SQLite database, the index files and the hash-chained audit logs) is not rewritten and still contains the absolute paths — see the package README for the list of files that are not path-redacted.";
+pub const REDACTION_NOTE: &str = "path redaction applied: absolute source paths (and file names derived from them) were rewritten as <case>/… or <redacted:hash> tokens in this document. Raw case data (the SQLite database, the index files and the hash-chained audit logs) is not rewritten and still contains the absolute paths — see the package README for the list of files that are not path-redacted. Operator and host names are not paths and are shown as recorded unless stated otherwise.";
 
 /// One redaction pass over a case: case roots resolved once, path tokens
 /// cached (the same path appears in many records).
@@ -127,14 +142,83 @@ impl Redactor {
             }
             match serde_json::from_str::<serde_json::Value>(line) {
                 Ok(value) => out.push_str(&self.value(&value).to_string()),
-                // A torn final line (documented crash-survivability mode) passes
-                // through verbatim; downstream consumers already skip it.
-                Err(_) => out.push_str(line),
+                // D7: a line that does not parse (a torn final line, a
+                // damaged record) is still redacted — string literal by
+                // string literal, decoded first so an escaped path
+                // (`C:\\Users\\kim`, a path after `\n`) is seen as written.
+                Err(_) => out.push_str(&self.json_literals(line)),
             }
         }
         if input.ends_with('\n') && !out.ends_with('\n') {
             out.push('\n');
         }
+        out
+    }
+
+    /// D7: redacts unparseable JSON text one string literal at a time. Each
+    /// `"…"` literal is decoded, redacted and re-encoded; an unterminated
+    /// final literal (torn write) is decoded as far as it goes. Text
+    /// between literals is scanned as plain text too.
+    pub fn json_literals(&self, line: &str) -> String {
+        let bytes = line.as_bytes();
+        let mut out = String::with_capacity(line.len());
+        let mut plain_start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            out.push_str(&self.text(&line[plain_start..i]));
+            // Find the closing quote, skipping escaped characters.
+            let mut end = i + 1;
+            let mut closed = false;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'\\' => end += 2,
+                    b'"' => {
+                        closed = true;
+                        break;
+                    }
+                    _ => end += 1,
+                }
+            }
+            let mut end = end.min(bytes.len());
+            while !line.is_char_boundary(end) {
+                end += 1;
+            }
+            let literal = if closed {
+                &line[i..=end]
+            } else {
+                &line[i..end]
+            };
+            let decoded = if closed {
+                serde_json::from_str::<String>(literal).ok()
+            } else {
+                serde_json::from_str::<String>(&format!("{literal}\""))
+                    .ok()
+                    .or_else(|| {
+                        let trimmed = literal.strip_suffix('\\').unwrap_or(literal);
+                        serde_json::from_str::<String>(&format!("{trimmed}\"")).ok()
+                    })
+            };
+            match decoded {
+                Some(text) => {
+                    let encoded = serde_json::to_string(&self.text(&text))
+                        .unwrap_or_else(|_| "\"\"".to_string());
+                    if closed {
+                        out.push_str(&encoded);
+                    } else {
+                        // Keep the literal unterminated, as it was.
+                        out.push_str(encoded.strip_suffix('"').unwrap_or(&encoded));
+                    }
+                }
+                None => out.push_str(&self.text(literal)),
+            }
+            i = if closed { end + 1 } else { bytes.len() };
+            plain_start = i;
+        }
+        out.push_str(&self.text(&line[plain_start.min(line.len())..]));
         out
     }
 
@@ -169,6 +253,7 @@ impl Redactor {
             let end = match kind {
                 StartKind::Url => token_end(bytes, i, true),
                 StartKind::Path => path_end(bytes, i),
+                StartKind::SanitizedPath => sanitized_end(bytes, i),
             };
             // Paths start at ASCII bytes and end before an ASCII terminator,
             // so both ends are char boundaries.
@@ -183,6 +268,9 @@ impl Redactor {
                     out.push_str(&format!("<redacted-url:{}>", stable_token(found)));
                 }
                 StartKind::Path => out.push_str(&self.path_token(found)),
+                StartKind::SanitizedPath => {
+                    out.push_str(&format!("<redacted:{}>", stable_token(found)));
+                }
             }
             copied = end;
             i = end;
@@ -249,7 +337,15 @@ impl Redactor {
                     let mut rendered = String::from("<case>");
                     for component in relative.components() {
                         rendered.push('/');
-                        rendered.push_str(&component.as_os_str().to_string_lossy());
+                        let name = component.as_os_str().to_string_lossy();
+                        // D5: an artifact named after a flattened source
+                        // path (`C__Users_kim_…_proxy_….mp4`) keeps its
+                        // directory but not the name.
+                        if is_sanitized_path_start(name.as_bytes()) {
+                            rendered.push_str(&format!("<redacted:{}>", stable_token(&name)));
+                        } else {
+                            rendered.push_str(&name);
+                        }
                     }
                     return rendered;
                 }
@@ -270,6 +366,9 @@ fn stable_token(input: &str) -> String {
 enum StartKind {
     Path,
     Url,
+    /// D5: a path flattened by `sanitize_filename` into one file-name word
+    /// (`C__Users_kim_clip_mp4_proxy_…`, `_home_kim_…`).
+    SanitizedPath,
 }
 
 /// A byte that may precede a path at the start of a "word".
@@ -278,6 +377,77 @@ fn is_word_boundary(prev: Option<u8>) -> bool {
         None => true,
         Some(b) => b.is_ascii_whitespace() || b"\"'`([{=,;|>".contains(&b),
     }
+}
+
+/// D7: `i` directly follows a JSON/C escape such as `\n`, `\t` or `\r`
+/// (text that still carries its escapes — a raw JSON line, script data):
+/// the escape ends the previous word even though its last byte is a letter.
+fn after_escape(bytes: &[u8], i: usize) -> bool {
+    i >= 2
+        && bytes[i - 2] == b'\\'
+        && matches!(bytes[i - 1], b'n' | b't' | b'r')
+        && (i < 3 || bytes[i - 3] != b'\\')
+}
+
+/// D7: punctuation that may glue a path to the preceding text
+/// (`원본경로:/home/…`, `**/home/…`, `#/mnt/…`).
+fn is_glue_punctuation(prev: Option<u8>) -> bool {
+    prev.is_some_and(|b| b":*!#".contains(&b))
+}
+
+/// URL schemes whose whole URL is redacted (D7: `smb://`, `nfs://`, …).
+const NETWORK_URL_SCHEMES: &[&[u8]] = &[b"smb://", b"nfs://", b"afp://", b"cifs://"];
+
+/// Root directory names a `sanitize_filename`-flattened POSIX path starts
+/// with (`/home/kim` → `_home_kim`).
+const SANITIZED_POSIX_ROOTS: &[&[u8]] = &[
+    b"home", b"Users", b"Volumes", b"mnt", b"media", b"private", b"var", b"tmp", b"root", b"srv",
+    b"opt", b"data", b"run", b"net",
+];
+
+/// D5: a `sanitize_filename`-flattened absolute path starting at `rest`:
+/// `C__…` (drive), `__host_share_…` (UNC, three or more parts) or
+/// `_home_…`-style POSIX roots.
+fn is_sanitized_path_start(rest: &[u8]) -> bool {
+    let word_len = rest
+        .iter()
+        .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        .unwrap_or(rest.len());
+    let word = &rest[..word_len];
+    if word.len() >= 4
+        && word[0].is_ascii_alphabetic()
+        && word[1] == b'_'
+        && word[2] == b'_'
+        && word[3].is_ascii_alphanumeric()
+    {
+        return true;
+    }
+    if word.len() >= 3 && word[0] == b'_' && word[1] == b'_' && word[2].is_ascii_alphanumeric() {
+        let parts = word[2..]
+            .split(|&b| b == b'_')
+            .filter(|part| !part.is_empty())
+            .count();
+        return parts >= 3;
+    }
+    if word.first() == Some(&b'_') {
+        return SANITIZED_POSIX_ROOTS.iter().any(|root| {
+            word.len() > root.len() + 2
+                && word[1..].starts_with(root)
+                && word[1 + root.len()] == b'_'
+                && word[2 + root.len()].is_ascii_alphanumeric()
+        });
+    }
+    false
+}
+
+/// End of a flattened path: the rest of the file-name word (a directory
+/// separator, whitespace, quote or prose punctuation ends it).
+fn sanitized_end(bytes: &[u8], start: usize) -> usize {
+    let end = token_end(bytes, start, false);
+    bytes[start..end]
+        .iter()
+        .position(|&b| b == b'/' || b == b'\\')
+        .map_or(end, |offset| start + offset)
 }
 
 /// Bytes that end an embedded path.
@@ -290,18 +460,30 @@ fn path_start(text: &str, i: usize) -> Option<StartKind> {
     let prev = i.checked_sub(1).map(|p| bytes[p]);
     // A non-ASCII predecessor (Korean prose glued to a drive path) still
     // starts a drive/UNC/URL path; those shapes are specific enough.
-    let loose_boundary = is_word_boundary(prev) || prev.is_some_and(|b| b >= 0x80);
+    // D7: a path may also follow a JSON escape (`\n/home/…`), glue
+    // punctuation (`경로:/home`, `**/home`) or non-ASCII prose.
+    let escaped = after_escape(bytes, i);
+    let loose_boundary = is_word_boundary(prev) || prev.is_some_and(|b| b >= 0x80) || escaped;
     let rest = &bytes[i..];
     if rest.len() >= 6
         && rest[..5].eq_ignore_ascii_case(b"file:")
-        && loose_boundary
+        && (loose_boundary || is_glue_punctuation(prev))
         && !is_terminator(rest[5])
+    {
+        return Some(StartKind::Url);
+    }
+    if (loose_boundary || is_glue_punctuation(prev))
+        && NETWORK_URL_SCHEMES.iter().any(|scheme| {
+            rest.len() > scheme.len()
+                && rest[..scheme.len()].eq_ignore_ascii_case(scheme)
+                && !is_terminator(rest[scheme.len()])
+        })
     {
         return Some(StartKind::Url);
     }
     if rest.starts_with(b"\\\\")
         && prev != Some(b'\\')
-        && loose_boundary
+        && (loose_boundary || is_glue_punctuation(prev))
         && rest
             .get(2)
             .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'?' || b == b'.' || b >= 0x80)
@@ -312,18 +494,47 @@ fn path_start(text: &str, i: usize) -> Option<StartKind> {
         && rest[0].is_ascii_alphabetic()
         && rest[1] == b':'
         && (rest[2] == b'\\' || rest[2] == b'/')
-        && prev.is_none_or(|b| !(b.is_ascii_alphanumeric() || b"_.-/\\:".contains(&b)))
+        // D7: a `:` before the drive (`원본경로:D:\…`, `path:C:\…`) no
+        // longer hides it.
+        && (escaped || prev.is_none_or(|b| !(b.is_ascii_alphanumeric() || b"_.-/\\".contains(&b))))
+    {
+        return Some(StartKind::Path);
+    }
+    // D7: `//host/share/…` (a UNC path written with forward slashes). Not
+    // after `:` — that is a URL (`https://…`).
+    if rest.starts_with(b"//")
+        && (loose_boundary || matches!(prev, Some(b'*' | b'!' | b'#')))
+        && rest.get(2).is_some_and(|&b| b.is_ascii_alphanumeric())
+        && {
+            let end = token_end(bytes, i, false);
+            bytes[i + 2..end].contains(&b'/')
+        }
     {
         return Some(StartKind::Path);
     }
     if rest[0] == b'/'
-        && is_word_boundary(prev)
         && !text[..i].ends_with("<case>")
         && rest.get(1).is_some_and(|&b| {
             b != b'/' && (b.is_ascii_alphanumeric() || b"_.~-$".contains(&b) || b >= 0x80)
         })
     {
-        return Some(StartKind::Path);
+        let strict = is_word_boundary(prev) || escaped || is_glue_punctuation(prev);
+        // After non-ASCII prose (`경로/home/kim`) a slash alone is too
+        // common (`판독/검증`): require at least two path components.
+        let after_prose = prev.is_some_and(|b| b >= 0x80) && {
+            let end = token_end(bytes, i, false);
+            bytes[i + 1..end].contains(&b'/')
+        };
+        if strict || after_prose {
+            return Some(StartKind::Path);
+        }
+    }
+    // D5: sanitize_filename-flattened paths, usually a file-name component
+    // right after a directory separator.
+    if (is_word_boundary(prev) || escaped || matches!(prev, Some(b'/' | b'\\')))
+        && is_sanitized_path_start(rest)
+    {
+        return Some(StartKind::SanitizedPath);
     }
     None
 }
@@ -433,7 +644,135 @@ mod tests {
         assert!(!looks_like_absolute_path("camera/a.mp4"));
         assert!(!looks_like_absolute_path("vid_000001"));
         assert!(!looks_like_absolute_path("h264"));
-        assert!(!looks_like_absolute_path("//host/share"));
+        // D7: a forward-slash UNC path (`//host/share/…`) is a path; a bare
+        // `//host` is not.
+        assert!(looks_like_absolute_path("//host/share"));
+        assert!(!looks_like_absolute_path("//host"));
+    }
+
+    /// D7: paths glued to punctuation or prose, network URLs, forward-slash
+    /// UNC paths and paths after a JSON escape are all redacted; ordinary
+    /// prose with slashes and URLs of other schemes is untouched.
+    #[test]
+    fn paths_after_punctuation_prose_escapes_and_network_urls_are_redacted() {
+        let case_dir = temp_case("d7");
+        for input in [
+            r"원본경로:D:\Evidence\kim\a.mp4",
+            r"path:C:\Users\kim\a.mp4",
+            "**/home/kim/clip.mp4",
+            "경로:/home/kim/clip.mp4",
+            "참고/home/kim/clip.mp4",
+            "see //nas01/share/kim/a.mp4 now",
+            "참고//nas01/share/kim/a.mp4",
+            "smb://nas01/share/kim/a.mp4",
+            "경로:smb://nas01/share/kim/a.mp4",
+            "NFS://nas01/export/kim",
+            r"line one\nC:\Users\kim\a.mp4",
+            r"line one\n/home/kim/a.mp4",
+            r"tab\t/home/kim/a.mp4",
+        ] {
+            let out = redact_text(input, &case_dir);
+            assert!(
+                !out.contains("kim") && !out.contains("nas01"),
+                "{input} -> {out}"
+            );
+            assert!(out.contains("<redacted"), "{input} -> {out}");
+        }
+        for prose in [
+            "https://example.com/a/b",
+            "판독/검증",
+            "IN/OUT 1/2",
+            "ratio: 4:3 a:b",
+            "</td><td>x</td>",
+            "and/or",
+        ] {
+            assert_eq!(redact_text(prose, &case_dir), prose);
+        }
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// D7: a JSONL line that does not parse is still redacted, string
+    /// literal by string literal (escaped paths decoded first), and keeps
+    /// its JSON shape.
+    #[test]
+    fn unparseable_json_lines_are_redacted_per_literal() {
+        let case_dir = temp_case("d7-literals");
+        let input = concat!(
+            "{\"ok\":\"/home/kim/a.mp4\"}\n",
+            "{\"note\":\"line\\nC:\\\\Users\\\\kim\\\\a.mp4\",\"n\":1,broken}\n",
+            "{\"torn\":\"/home/kim/torn"
+        );
+        let out = redact_json_text(input, &case_dir);
+        assert!(!out.contains("kim"), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(
+            lines[1].starts_with("{\"note\":\"line\\n<redacted:"),
+            "{out}"
+        );
+        assert!(lines[1].ends_with(",\"n\":1,broken}"), "{out}");
+        assert!(lines[2].starts_with("{\"torn\":\"<redacted:"), "{out}");
+        assert!(
+            !lines[2].ends_with('"'),
+            "torn literal stays unterminated: {out}"
+        );
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// D5: file names that carry a path flattened by `sanitize_filename`
+    /// (legacy proxy/clip names) are redacted, also inside the case
+    /// directory; path-free artifact names and ordinary ids are kept.
+    #[test]
+    fn sanitized_path_file_names_are_redacted() {
+        let case_dir = temp_case("d5");
+        for name in [
+            "C__Users_kim_Videos_a_mp4_proxy_1700000000.mp4",
+            "D__Evidence_kim_cam1_avi_clip_17.mp4",
+            "_home_kim_clip_mp4_proxy_1.mp4",
+            "_Users_kim_Movies_a_mp4_thumb_3.jpg",
+            "__nas01_share_kim_a_mp4_proxy_2.mp4",
+        ] {
+            let out = redact_text(&format!("built {name}."), &case_dir);
+            assert!(!out.contains("kim"), "{name} -> {out}");
+            assert!(
+                out.starts_with("built <redacted:") && out.ends_with(">."),
+                "{out}"
+            );
+        }
+        let inside = case_dir.join("artifacts/proxies/C__Users_kim_a_mp4_proxy_1.mp4");
+        let out = Redactor::new(&case_dir).text(&inside.to_string_lossy());
+        assert!(
+            out.starts_with("<case>/artifacts/proxies/<redacted:"),
+            "{out}"
+        );
+        assert!(!out.contains("kim"), "{out}");
+        for kept in [
+            "proxy_vid_000001_ab12cd34.mp4",
+            "thumb_join_abcdef0123456789_0011aabb.jpg",
+            "vid_000001",
+            "carve_1_avi",
+            "__FRAMETRACE_DATA__",
+            "snake_case_name",
+        ] {
+            assert_eq!(redact_text(kept, &case_dir), kept);
+        }
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// D12: the bundle redaction marker is a first-line comment only a
+    /// redacted make-review writes.
+    #[test]
+    fn bundle_redaction_marker_round_trips() {
+        let js = "window.__FRAMETRACE_DATA__ = {};";
+        assert!(!super::bundle_is_redacted(js));
+        let marked = super::mark_bundle_redacted(js);
+        assert!(super::bundle_is_redacted(&marked));
+        assert!(marked.ends_with(js));
+        // Data mentioning the marker mid-file does not count.
+        assert!(!super::bundle_is_redacted(&format!(
+            "{js}\n{}",
+            super::BUNDLE_REDACTION_MARKER
+        )));
     }
 
     #[test]

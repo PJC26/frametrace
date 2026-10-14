@@ -300,9 +300,36 @@ fn verify_audit_logs(case_dir: &Path) -> Vec<LogRow> {
 fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor>) -> String {
     let esc = |text: &str| esc_with(redactor, text);
     let path = case_dir.join(crate::anomaly::HASH_VERIFY_REL_PATH);
-    let Some((latest, entries)) = crate::anomaly::latest_hash_verify_run(case_dir) else {
-        return "<p class=\"note warn\">No completed live source re-hash has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>".to_string();
+    // D11: an unreadable log is an error, never "no run recorded".
+    let runs = match crate::anomaly::hash_verify_runs(case_dir) {
+        Ok(runs) => runs,
+        Err(err) => {
+            return format!(
+                "<p class=\"note bad\">The live source re-hash log could not be read — re-verification status unknown: {}</p>",
+                esc(&err)
+            );
+        }
     };
+    // D4: runs are grouped by run id; only the newest COMPLETED run is the
+    // result, and a newer run without its completion marker is disclosed
+    // as interrupted instead of being mixed into (or shown as) the result.
+    let (latest_run, interrupted) = crate::anomaly::latest_completed_and_interrupted(&runs);
+    let interrupted_html = interrupted
+        .iter()
+        .map(|run| {
+            format!(
+                "<p class=\"note warn\">Interrupted run started {} ({} record(s) logged, no completion marker): not a result — its partial records are not shown as the latest re-verification.</p>\n",
+                ts(run.run_unix),
+                run.entries.len()
+            )
+        })
+        .collect::<String>();
+    let Some(latest_run) = latest_run else {
+        return format!(
+            "{interrupted_html}<p class=\"note warn\">No completed live source re-hash has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>"
+        );
+    };
+    let (latest, entries) = (latest_run.run_unix, &latest_run.entries);
     let chain = match audit::verify_chained_jsonl(&path) {
         Ok(v) => format!("log chain: {} ({} entries)", v.integrity.label(), v.entries),
         Err(err) => format!("log chain verification FAILED: {err}"),
@@ -311,7 +338,7 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
     let chain = esc(&chain);
     let mut rows = String::new();
     let (mut matched, mut mismatched, mut other) = (0usize, 0usize, 0usize);
-    for entry in &entries {
+    for entry in entries {
         let get = |key: &str| entry.get(key).and_then(|v| v.as_str()).unwrap_or("");
         let status = get("status");
         let (class, label) = match status {
@@ -352,8 +379,9 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
     }
     let banner = hash_verify_banner(matched, mismatched, other);
     format!(
-        "<p class=note>Live re-hash run at {} (newest run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
+        "{interrupted_html}<p class=note>Latest completed live re-hash run at {} (run {}, newest completed run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
         ts(latest),
+        esc(&latest_run.run_id),
         crate::anomaly::HASH_VERIFY_REL_PATH,
     )
 }
@@ -411,8 +439,27 @@ fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
     }
 }
 
-fn opt(value: &Option<String>) -> String {
-    value.as_deref().map(esc).unwrap_or_else(|| "—".to_string())
+/// An optional field, escaped — and path-redacted when a redactor is
+/// given (D8: write-protect / acquisition-tool notes can quote paths).
+fn opt(redactor: Option<&crate::redact::Redactor>, value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .map(|text| esc_with(redactor, text))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// D8: the host name in a redacted statement — a stable hash token (the
+/// machine name can identify a person or organisation); the operator is
+/// printed as recorded and the redaction banner says so.
+fn host_cell(redactor: Option<&crate::redact::Redactor>, host: Option<&str>) -> String {
+    match (redactor, host.filter(|h| !h.is_empty())) {
+        (_, None) => "—".to_string(),
+        (Some(_), Some(host)) => esc(&format!(
+            "<redacted-host:{}>",
+            &crate::sha256::digest_bytes(host.as_bytes())[..16]
+        )),
+        (None, Some(host)) => esc(host),
+    }
 }
 
 fn ts(unix: i64) -> String {
@@ -456,7 +503,7 @@ fn render(
     let esc = |text: &str| esc_with(redactor, text);
     let redaction_banner = if redactor.is_some() {
         format!(
-            "{}\n<p class=\"banner warn\">{}</p>",
+            "{}\n<p class=\"banner warn\">{} The host name is replaced by a hash token; the operator name is shown as recorded at case creation.</p>",
             crate::redact::REDACTION_MARKER,
             crate::util::html_escape(crate::redact::REDACTION_NOTE)
         )
@@ -484,8 +531,8 @@ fn render(
                     esc(&s.kind),
                     esc(&s.path),
                     ts(s.registered_unix),
-                    opt(&s.write_protect),
-                    opt(&s.acquisition_tool),
+                    opt(redactor, &s.write_protect),
+                    opt(redactor, &s.acquisition_tool),
                     evidence_hash_cell(s),
                     esc(&s.observed),
                 ));
@@ -711,7 +758,7 @@ access would not be detected. A failed lane is disclosed in section 4 rather tha
         case_id = field("case_id"),
         title = field("title"),
         operator = field("operator"),
-        host = field("host"),
+        host = host_cell(redactor, manifest.get("host").and_then(|v| v.as_str())),
         created = manifest
             .get("created_unix")
             .and_then(|v| v.as_i64())
@@ -985,6 +1032,101 @@ mod tests {
         assert!(hash_verify_banner(3, 1, 0).contains("banner bad"));
     }
 
+    /// Writes `evidence/logs/hash-verify.jsonl` lines (unchained is fine
+    /// for the reader) under a fresh case dir.
+    fn hash_verify_case(name: &str, lines: &[serde_json::Value]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-custody-hv-{name}-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(dir.join("evidence/logs")).unwrap();
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(dir.join(crate::anomaly::HASH_VERIFY_REL_PATH), text).unwrap();
+        dir
+    }
+
+    fn hv(run: i64, run_id: Option<&str>, id: &str, status: &str) -> serde_json::Value {
+        let mut value = serde_json::json!({"event": "hash-verify", "run_unix": run, "id": id,
+            "source_path": format!("/e/{id}.mp4"), "status": status});
+        if let Some(run_id) = run_id {
+            value["run_id"] = run_id.into();
+        }
+        value
+    }
+
+    fn hv_done(run: i64, run_id: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({"event": "hash-verify-run", "run_unix": run});
+        if let Some(run_id) = run_id {
+            value["run_id"] = run_id.into();
+        }
+        value
+    }
+
+    /// D4: an interrupted run's records are never mixed into the next
+    /// completed run, and a newer interrupted run is shown separately —
+    /// only the newest COMPLETED run is the result.
+    #[test]
+    fn hash_verify_groups_by_run_and_shows_interrupted_runs_separately() {
+        let dir = hash_verify_case(
+            "mixed",
+            &[
+                hv(100, Some("100-aaaa"), "vid_old", "match"),
+                hv_done(100, Some("100-aaaa")),
+                // Interrupted (no marker) — must not join run 300.
+                hv(200, Some("200-bbbb"), "vid_cut", "mismatch"),
+                hv(300, Some("300-cccc"), "vid_new", "match"),
+                hv_done(300, Some("300-cccc")),
+                // Newer interrupted run.
+                hv(400, Some("400-dddd"), "vid_late", "mismatch"),
+            ],
+        );
+        let (latest, entries) = crate::anomaly::latest_hash_verify_run(&dir).unwrap();
+        assert_eq!(latest, 300);
+        let ids: Vec<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["vid_new"], "only the completed run's own records");
+        let html = render_hash_verify(&dir, None);
+        assert!(html.contains("Latest completed live re-hash run"), "{html}");
+        assert!(html.contains("Interrupted run started"), "{html}");
+        assert!(html.contains("vid_new"), "{html}");
+        assert!(
+            !html.contains("vid_cut") && !html.contains("vid_late"),
+            "{html}"
+        );
+        assert!(html.contains("banner ok"), "{html}");
+
+        // Logs written before run ids existed group by run_unix the same way.
+        let legacy = hash_verify_case(
+            "legacy",
+            &[
+                hv(200, None, "vid_cut", "mismatch"),
+                hv(300, None, "vid_new", "match"),
+                hv_done(300, None),
+            ],
+        );
+        let (_, entries) = crate::anomaly::latest_hash_verify_run(&legacy).unwrap();
+        assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&legacy);
+    }
+
+    /// D11: a re-hash log that exists but cannot be read is an error in the
+    /// statement, never "no re-hash recorded".
+    #[test]
+    fn unreadable_hash_verify_log_is_an_error_not_absence() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-custody-hv-unreadable-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        // A directory where the log should be: exists, cannot be read.
+        std::fs::create_dir_all(dir.join(crate::anomaly::HASH_VERIFY_REL_PATH)).unwrap();
+        let html = render_hash_verify(&dir, None);
+        assert!(html.contains("could not be read"), "{html}");
+        assert!(!html.contains("No completed live source re-hash"), "{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn renders_utc_timestamp() {
         assert_eq!(ts(1704110400), "2024-01-01 12:00:00Z");
@@ -1002,8 +1144,9 @@ mod tests {
             kind: "e01".into(),
             path: "/evidence/secret/disk.E01".into(),
             registered_unix: 1_704_110_400,
-            write_protect: None,
-            acquisition_tool: None,
+            // D8: free-text custody fields quoting paths are redacted too.
+            write_protect: Some("blocker log at /evidence/secret/blocker.txt".into()),
+            acquisition_tool: Some(r"ewfacquire from C:\Users\secret\tools".into()),
             evidence_hash: None,
             hash_algorithm: None,
             hash_origin: None,
@@ -1024,7 +1167,7 @@ mod tests {
         let redactor = crate::redact::Redactor::new(case_dir);
         let html = render(
             case_dir,
-            &serde_json::json!({"case_id": "FT-1"}),
+            &serde_json::json!({"case_id": "FT-1", "host": "SECRET-LAPTOP", "operator": "Examiner Lee"}),
             &Ok(vec![source]),
             &Ok(vec![job]),
             &Err("cannot open /cases/secret-case/db/case.db".to_string()),
@@ -1033,7 +1176,13 @@ mod tests {
             1_704_110_400,
             Some(&redactor),
         );
-        assert!(!html.contains("secret"), "{html}");
+        assert!(!html.to_ascii_lowercase().contains("secret"), "{html}");
+        assert!(html.contains("&lt;redacted-host:"), "{html}");
+        assert!(html.contains("Examiner Lee"), "operator shown as recorded");
+        assert!(
+            html.contains("operator name is shown as recorded"),
+            "{html}"
+        );
         assert!(crate::redact::html_is_redacted(&html));
         assert!(html.contains("&lt;redacted:"), "{html}");
         assert!(html.contains("&lt;case&gt;/db/case.db"), "{html}");

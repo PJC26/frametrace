@@ -69,9 +69,16 @@ mismatches.
 ## What the unkeyed chain does and does not prove
 
 The chain is **tamper-evident against accidental damage**: bit rot, torn
-writes, truncated copies, and naive single-line edits all break verification.
-That is already valuable — it proves the log was not corrupted in storage or
-transit.
+writes, a copy cut off mid-line, and naive single-line edits all break
+verification. That is already valuable — it proves the log was not corrupted
+in storage or transit.
+
+It does **not** detect truncation at an entry boundary: a log whose last N
+entries were removed whole is still a valid chain (the remaining prefix
+verifies). Truncation is detected only by comparing with an anchor recorded
+elsewhere — the schema-v4 finalize sign-off records every lane's entry count
+and last `entry_sha256` (see "Truncation anchors" below), and `qa`'s
+`audit-chain-anchors.json` does the same between QA runs.
 
 It is **not tamper-evident against a rewriting adversary.** Anyone with write
 access to the case directory can modify or drop entries and recompute both
@@ -199,8 +206,32 @@ the rotation rules:
   "anyone with the key", nothing more. Asymmetric signing is a larger legal
   and operational commitment and out of scope for M5.
 - **Not a write-once guarantee.** Truncating the log back to an earlier
-  prefix remains possible regardless of keying; package-level manifests
-  (`manifest.sha256`) and external timestamping are the controls for that.
+  prefix remains possible regardless of keying, and the chain alone does not
+  reveal it. The sign-off anchors below reveal truncation of anything
+  recorded before the sign-off; package-level manifests (`manifest.sha256`)
+  and external timestamping remain the controls for the rest.
+
+## Truncation anchors (sign-off schema v4)
+
+A finalize sign-off (`review/signoff.json`, schema 4) records, for every
+chained lane under `artifacts/` and `evidence/logs/`, the entry count and the
+`entry_sha256` of the last entry at sign-off time. `make-report` and
+`verify-package` check each anchor: the lane must still hold that entry at
+that position (later appends are fine). A removed tail, a rewritten prefix
+or a deleted lane reads "changed since the sign-off". The sign-off itself is
+appended to `evidence/logs/signoff-log.jsonl` (HMAC-keyed when a key is
+configured), naming the record by the SHA-256 of its bytes.
+
+## Retired keys
+
+Each key the keyring retires gets a retirement time (`retired` map in
+`audit-keys.json`, written by `rotate-audit-key`). A retired key only
+authenticates entries that predate its retirement: an entry it signed is
+refused when the entry is dated later (its event-time field), when the same
+log recorded the key's `audit-key-rotate` marker earlier, or when a newer key
+generation already signed an earlier entry of that log. Keyrings written
+before retirement times were recorded load their non-active keys as retired
+at an unknown time (only the positional rules apply).
 - **Not a replacement for chain-of-custody documentation.** The legal review
   that gates this feature decides how much weight a keyed log carries in
   testimony; the design deliberately exposes the "integrity-structural-only"

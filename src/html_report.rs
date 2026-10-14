@@ -679,7 +679,7 @@ pub fn render_carve_report_html(
   <div class="subtle" id="countLine"></div>
   <table>
     <thead><tr>
-      <th data-k="id">ID</th><th data-k="extension">확장자</th><th data-k="size_bytes">크기</th>
+      <th data-k="run_order">실행</th><th data-k="id">ID</th><th data-k="extension">확장자</th><th data-k="size_bytes">크기</th>
       <th data-k="offset">오프셋</th><th>라이브FS</th><th data-k="validation_status">검증 상태</th>
       <th>SHA-256</th><th>비고</th><th></th>
     </tr></thead>
@@ -745,7 +745,10 @@ function proxyFor(a) {{
   const keys = [a.id, a.output_path, base].filter(Boolean).map(sanitizeSelector);
   return PROXIES.find(p => {{
     const name = String(p).split(/[\\/]/).pop() || "";
+    // D5: path-free names are proxy_<sanitized record id>_<8 hex>[_NNN].mp4;
+    // names written before D5 embed the sanitized selector.
     return name.endsWith(".mp4") && keys.some(k =>
+      new RegExp("^proxy_" + k.replace(/[-]/g, "\\-") + "_[0-9a-f]{{8}}(_[0-9]{{3}})?\\.mp4$").test(name) ||
       name.startsWith(k + "_proxy_") || name.includes(k + "_proxy_"));
   }}) || "";
 }}
@@ -832,7 +835,10 @@ function rows() {{
     (!state.big || (a.size_bytes || 0) > 50_000_000) &&
     (!state.newOnly || !INDEXED_SHAS.has(a.sha256)) &&
     (!state.q || [a.id, a.output_path, a.validation_note].join(" ").toLowerCase().includes(state.q)));
+  // Runs stay grouped (latest run first); the chosen column sorts within a run.
   list.sort((a, b) => {{
+    const run = (a.run_order ?? 0) - (b.run_order ?? 0);
+    if (state.sort !== "run_order" && run) return run;
     const x = a[state.sort], y = b[state.sort];
     const c = typeof x === "number" && typeof y === "number" ? x - y : String(x ?? "").localeCompare(String(y ?? ""));
     return state.asc ? c : -c;
@@ -843,16 +849,18 @@ function render() {{
   const list = rows();
   document.getElementById("countLine").textContent = `${{list.length}} / ${{ARTIFACTS.length}} 표시`;
   tbody.innerHTML = list.map(a => `<tr data-id="${{esc(a.id)}}">
-    <td>${{esc(a.id)}}</td><td>${{esc(a.extension || "-")}}</td><td>${{fmtSize(a.size_bytes)}}</td>
+    <td class="muted">${{esc(a.run_label || "-")}}</td><td>${{esc(a.id)}}</td><td>${{esc(a.extension || "-")}}</td><td>${{fmtSize(a.size_bytes)}}</td>
     <td title="${{a.offset}}">${{hex(a.offset)}}</td>
     <td>${{INDEXED_SHAS.has(a.sha256) ? '<span class="badge">중복</span>' : '<span class="badge ok">신규</span>'}}</td>
     <td><span class="badge ${{(a.validation_status||"").includes("failed") ? "failed" : (a.validation_status||"").includes("confirmed") ? "ok" : ""}}">${{esc(a.validation_status || "-")}}</span></td>
     <td class="muted">${{esc((a.sha256 || "").slice(0, 12))}}</td>
     <td class="muted" title="${{esc(a.validation_note)}}">${{esc((a.validation_note || "").slice(0, 60))}}</td>
-    <td><a href="${{esc(downloadHref(a.output_path))}}" onclick="event.stopPropagation()">저장</a></td>
+    <td><a href="${{esc(downloadHref(a.output_path))}}">저장</a></td>
   </tr>`).join("");
 }}
 tbody.addEventListener("click", e => {{
+  // The 저장 link downloads; it does not select the row.
+  if (e.target.closest("a")) return;
   const tr = e.target.closest("tr[data-id]"); if (!tr) return;
   tbody.querySelectorAll("tr.sel").forEach(x => x.classList.remove("sel"));
   tr.classList.add("sel");
@@ -903,19 +911,24 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
         .filter(|line| !line.is_empty())
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .collect();
-    // The audit log is append-only across runs: a recarve re-emits the
-    // same id space (carve_000001…), so every earlier entry for an id
-    // is superseded by the latest run's record for that id. Keep the
-    // last occurrence — the report must show one current artifact set,
-    // not the union of every run that ever wrote to the log. Lines
-    // without an id are run-level events (e.g. carve-resume), not
-    // artifacts, and are dropped.
+    // Carve ids are run-unique since E4 (`carve_<runid>_<n>`, entries carry
+    // `run_id` / `carved_unix`), so every run is shown, grouped by run with
+    // the latest run first. Within one run a repeated id (a resumed run
+    // re-logging an artifact) keeps its last entry. Entries logged before
+    // run ids existed share one "earlier runs" group where the old id space
+    // repeated across runs, so there the last entry per id still wins.
+    // Lines without an id are run-level events (e.g. carve-resume).
     {
         use std::collections::HashMap;
-        let mut last: HashMap<String, usize> = HashMap::new();
+        let run_of = |item: &serde_json::Value| {
+            item.get("run_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let mut last: HashMap<(Option<String>, String), usize> = HashMap::new();
         for (i, item) in items.iter().enumerate() {
             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                last.insert(id.to_string(), i);
+                last.insert((run_of(item), id.to_string()), i);
             }
         }
         let keep: std::collections::HashSet<usize> = last.into_values().collect();
@@ -925,6 +938,43 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
             i += 1;
             keep_it
         });
+        // Run order: newest carved_unix first (then latest in the log);
+        // the legacy group (no run id) last.
+        let mut runs: Vec<(Option<String>, u64, usize)> = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let run = run_of(item);
+            let at = item
+                .get("carved_unix")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            match runs.iter_mut().find(|(known, _, _)| *known == run) {
+                Some(entry) => {
+                    entry.1 = entry.1.max(at);
+                    entry.2 = index;
+                }
+                None => runs.push((run, at, index)),
+            }
+        }
+        runs.sort_by(|a, b| {
+            a.0.is_none()
+                .cmp(&b.0.is_none())
+                .then(b.1.cmp(&a.1))
+                .then(b.2.cmp(&a.2))
+        });
+        for item in &mut items {
+            let run = run_of(item);
+            let order = runs
+                .iter()
+                .position(|(known, _, _)| *known == run)
+                .unwrap_or(0);
+            let label = match &run {
+                Some(run_id) => run_id.clone(),
+                None => "이전 실행(실행 id 없음)".to_string(),
+            };
+            item["run_order"] = serde_json::json!(order);
+            item["run_label"] = serde_json::Value::String(label);
+        }
+        items.sort_by_key(|item| item["run_order"].as_u64().unwrap_or(0));
     }
     for item in &mut items {
         let Some(raw) = item.get("output_path").and_then(|v| v.as_str()) else {
@@ -1246,6 +1296,9 @@ mod tests {
                 scan_runs_json: "[]",
                 marks_json: "[]",
                 redaction_applied: false,
+                review_warnings_json: "",
+                read_errors_json: "",
+                telemetry_json: "",
             }),
         );
     }
@@ -1435,5 +1488,41 @@ mod tests {
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.starts_with("2023-11-14 22:13:20 UTC (현지 "), "{text}");
         assert!(text.contains(" UTC+") || text.contains(" UTC-"), "{text}");
+    }
+
+    /// E4 follow-up: carve ids are run-unique, so every run is shown,
+    /// grouped by run with the latest run first; only legacy entries
+    /// (no run id, repeating id space) keep the last entry per id.
+    #[test]
+    fn carve_page_shows_every_run_grouped_latest_first() {
+        let log = [
+            r#"{"id":"carve_000001","output_path":"/c/a.mp4"}"#,
+            r#"{"id":"carve_000001","output_path":"/c/a2.mp4"}"#,
+            r#"{"id":"carve_r1_1","run_id":"r1","carved_unix":100,"output_path":"/c/r1.mp4"}"#,
+            r#"{"event":"carve-resume","run_id":"r1"}"#,
+            r#"{"id":"carve_r2_1","run_id":"r2","carved_unix":200,"output_path":"/c/r2a.mp4"}"#,
+            r#"{"id":"carve_r2_2","run_id":"r2","carved_unix":200,"output_path":"/c/r2b.mp4"}"#,
+        ]
+        .join("\n");
+        let items: Vec<serde_json::Value> = serde_json::from_str(&super::carve_artifacts_json(
+            std::path::Path::new("/c"),
+            &log,
+        ))
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["carve_r2_1", "carve_r2_2", "carve_r1_1", "carve_000001"]
+        );
+        assert_eq!(items[0]["run_label"], "r2");
+        assert_eq!(items[2]["run_order"], 1);
+        assert!(
+            items[3]["output_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("a2.mp4"),
+            "legacy: last entry per id"
+        );
+        assert_eq!(items[3]["run_label"], "이전 실행(실행 id 없음)");
     }
 }

@@ -28,6 +28,19 @@ pub struct ReportInputs<'a> {
     /// the report then shows the redaction notice instead of silently
     /// presenting rewritten paths as real ones.
     pub redaction_applied: bool,
+    /// D9: review-state warnings shown at the top of the report (marks
+    /// still queued, unresolved save conflicts), as a JSON array of
+    /// strings. Empty or `[]` when there are none.
+    pub review_warnings_json: &'a str,
+    /// D11: inputs that could not be read, `{name: error}` (names as in the
+    /// chain map plus `scan_runs` / `audio`). A section whose input failed
+    /// says so instead of "없음". Empty or `{}` when everything was read.
+    pub read_errors_json: &'a str,
+    /// Telemetry extracts as `{name: {selector, source, point_count,
+    /// total_points, truncated, first_ts_unix, last_ts_unix, note}}` (points
+    /// stripped). E9: a track cut at the point cap says so. Empty or `{}`
+    /// when the case has none.
+    pub telemetry_json: &'a str,
 }
 
 /// Renders the report without audit-chain verification results: every log
@@ -62,6 +75,9 @@ pub fn render_case_report_with_chains(
     let audio_levels = json_for_script(&audio_levels_object(inputs.audio_levels_json));
     let scan_runs = json_for_script(inputs.scan_runs_json);
     let marks = json_for_script(inputs.marks_json);
+    let review_warnings = json_for_script(&json_array_or_empty(inputs.review_warnings_json));
+    let read_errors = json_for_script(&audio_levels_object(inputs.read_errors_json));
+    let telemetry = json_for_script(&audio_levels_object(inputs.telemetry_json));
     let redaction_note = if inputs.redaction_applied {
         format!(
             "  {}\n  <div class=\"note\">{}</div>\n",
@@ -184,13 +200,15 @@ pub fn render_case_report_with_chains(
 </head>
 <body>
 <div class="print-bar">
-  <button onclick="window.print()" type="button">인쇄 / PDF로 저장</button>
+  <button id="print-button" type="button">인쇄 / PDF로 저장</button>
 </div>
 <main>
   <h1 id="title">FrameTrace 영상 포렌식 보고서</h1>
   <div class="muted" id="case-line"></div>
   <div class="muted" id="time-basis">시각 표기: 이 보고서의 모든 시각은 UTC 기준입니다(보관 이력서 custody-statement와 같은 기준). 괄호 안은 이 보고서를 연 PC의 현지 시각과 그 UTC 오프셋입니다. 파일 수정 시각 등 장치·파일시스템이 기록한 시각은 그 장치 시계를 따르며 정확성은 검증하지 않았습니다.</div>
 {redaction_note}
+  <div id="review-warnings"></div>
+  <div id="read-errors"></div>
   <section class="summary">
     <div class="box">색인 영상<strong id="count">0</strong></div>
     <div class="box">증거 총 용량<strong id="bytes">0</strong></div>
@@ -228,6 +246,9 @@ pub fn render_case_report_with_chains(
   <div id="joined-videos"></div>
   <div class="note" id="join-caveat" hidden>원본 영상 프레임을 재인코딩 없이 순서대로 연결(스트림 복사)했습니다. 겹친 구간은 잘라내지 않아 같은 장면이 두 번 나올 수 있고, 끊긴 구간은 채우지 않았습니다. <span id="join-caveat-time">순서와 끊김·겹침 판단은 장치가 기록한 시각을 근거로 하며, 장치 시계의 정확성은 검증하지 않았습니다. </span><span id="join-caveat-order" hidden>순서 근거가 파일명 순(filename-order)인 항목은 녹화 시각 없이 파일 이름 순서로만 이었으므로 끊김·겹침을 확인하지 못했습니다. </span>위치·데이터 스트림(GPS 등)은 포함되지 않았습니다.</div>
 
+  <h2>위치·텔레메트리 추출</h2>
+  <div id="telemetry"></div>
+
   <h2>리뷰 산출물</h2>
   <div id="derived-artifacts"></div>
 
@@ -252,7 +273,7 @@ pub fn render_case_report_with_chains(
 
   <h2>감사 로그 체인 검증</h2>
   <div id="audit-chains"></div>
-  <div class="note" id="audit-chain-note">integrity-keyed = 모든 항목이 설정된 키(HMAC)로 확인됨 — 키 없이 고친 항목은 드러납니다. 구조만 확인 = 항목 연결은 맞지만 서명이 없어, 파일에 접근할 수 있는 사람이 로그 전체를 다시 쓰면 탐지할 수 없습니다. 검증 실패 = 연결이 끊김 — 해당 로그의 내용을 그대로 믿으면 안 됩니다.</div>
+  <div class="note" id="audit-chain-note">integrity-keyed = 모든 항목이 설정된 키(HMAC)로 확인됨 — 키 없이 고친 항목은 드러납니다. 구조만 확인 = 항목 연결은 맞지만 서명이 없어, 파일에 접근할 수 있는 사람이 로그 전체를 다시 쓰면 탐지할 수 없습니다. 검증 실패 = 연결이 끊김 — 해당 로그의 내용을 그대로 믿으면 안 됩니다. 체인 검증만으로는 로그 끝부분을 항목 단위로 잘라낸 것(잘림)을 탐지하지 못합니다 — 잘림은 최종화 서명(v4)에 기록된 레인별 항목 수·마지막 해시(앵커)와 비교해야 드러나며, 그 결과는 위 검토자 줄에 표시됩니다.</div>
 <script>
 const auditChains = {audit_chains};
 const manifest = {manifest};
@@ -269,11 +290,16 @@ const joinLog = {join_lines};
 const audioLevels = {audio_levels};
 const scanRuns = {scan_runs};
 const annotations = {marks};
+const reviewWarnings = {review_warnings};
+const readErrors = {read_errors};
+const telemetry = {telemetry};
 const redaction = {{"applied": {}}};
 const videos = Array.isArray(scan.videos) ? scan.videos : [];
 const warnings = Array.isArray(scan.warnings) ? scan.warnings : [];
 const derivedLog = [...proxyLog, ...thumbnailLog];
 
+// B5: no inline handlers — the page qualifies for a strict script-src.
+document.getElementById("print-button").addEventListener?.("click", () => window.print());
 const escapeHtml = value => String(value ?? "")
   .replaceAll("&", "&amp;")
   .replaceAll("<", "&lt;")
@@ -331,6 +357,15 @@ const chainLabel = name => {{
   }}
 }};
 const chainCell = (name, hash) => `<code>${{escapeHtml(hash || "-")}}</code><br><span class="muted">${{escapeHtml(chainLabel(name))}}</span>`;
+
+// D11: an input that could not be read is said to be unreadable — never
+// rendered as an empty "없음" section.
+const readFailed = name => readErrors[name] ? `<p class="note"><strong>읽기 실패 — 이 항목은 확인되지 않았습니다:</strong> ${{escapeHtml(readErrors[name])}}</p>` : "";
+const emptyOr = (name, text) => readErrors[name] ? readFailed(name) : text;
+document.getElementById("read-errors").innerHTML = Object.keys(readErrors).length ? `<div class="note"><strong>보고서 생성 중 읽지 못한 입력 ${{Object.keys(readErrors).length}}건</strong> — 해당 표는 비어 있는 것이 아니라 확인되지 않은 것입니다.<br>${{Object.entries(readErrors).map(([name, err]) => `${{escapeHtml(name)}}: ${{escapeHtml(err)}}`).join("<br>")}}</div>` : "";
+// D9: marks still queued or save conflicts still open when the report was
+// made — the report may not show the latest review.
+document.getElementById("review-warnings").innerHTML = Array.isArray(reviewWarnings) && reviewWarnings.length ? `<div class="note"><strong>주의: 판독 기록이 아직 확정되지 않았습니다</strong><br>${{reviewWarnings.map(escapeHtml).join("<br>")}}</div>` : "";
 
 const sourceCounts = new Map();
 videos.forEach(video => {{
@@ -397,6 +432,8 @@ function audioText(video) {{
   if (level && level.r === "sound") return `소리 있음 — 측정: 최대 ${{fmtDb(level.max)}} dB, 평균 ${{fmtDb(level.mean)}} dB (dBFS, ffmpeg volumedetect)`;
   if (level && level.r === "silent") return `무음 트랙 — 측정: 최대 ${{fmtDb(level.max)}} dB (기준: −70 dB 이하)`;
   if (level && level.r === "stale") return "측정 후 파일 변경 — 미확인";
+  if (level && level.r === "unverified") return "측정 기록 검증 실패 — 표시 안 함";
+  if (level && level.r === "replayed") return "재개 시 재기록된 측정 — 다시 측정 전 미확인";
   if (level && level.r === "error") return "오디오 트랙 있음 — 소리 미측정 (측정 실패)";
   if (video.ffprobe_ok && video.audio_codec) return "오디오 트랙 있음 — 소리 미측정";
   if (video.ffprobe_ok) return "오디오 트랙 없음 (ffprobe)";
@@ -421,7 +458,7 @@ document.getElementById("videos").innerHTML = videos.length ? `<table>
       <td>${{escapeHtml(audioText(video))}}</td>
     </tr>`).join("")}}
   </tbody>
-</table>` : "<p>색인된 영상이 없습니다.</p>";
+</table>` : emptyOr("index", "<p>색인된 영상이 없습니다.</p>");
 
 document.getElementById("clip-exports").innerHTML = exportsLog.length ? `<table>
   <thead>
@@ -437,7 +474,7 @@ document.getElementById("clip-exports").innerHTML = exportsLog.length ? `<table>
       <td>${{chainCell("export", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
-</table>` : "<p>내보낸 클립이 없습니다.</p>";
+</table>` : emptyOr("export", "<p>내보낸 클립이 없습니다.</p>");
 
 
 document.getElementById("derived-artifacts").innerHTML = derivedLog.length ? `<table>
@@ -453,7 +490,7 @@ document.getElementById("derived-artifacts").innerHTML = derivedLog.length ? `<t
       <td>${{chainCell(item.kind === "proxy" ? "proxy" : "thumbnail", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
-</table>` : "<p>프록시 또는 썸네일 산출물이 없습니다.</p>";
+</table>` : (readErrors.proxy || readErrors.thumbnail ? readFailed(readErrors.proxy ? "proxy" : "thumbnail") : "<p>프록시 또는 썸네일 산출물이 없습니다.</p>");
 
 document.getElementById("carved-artifacts").innerHTML = carveLog.length ? `<table>
   <thead>
@@ -471,7 +508,7 @@ document.getElementById("carved-artifacts").innerHTML = carveLog.length ? `<tabl
       <td>${{chainCell("carve", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
-</table>` : "<p>Carving 후보가 없습니다.</p>";
+</table>` : emptyOr("carve", "<p>Carving 후보가 없습니다.</p>");
 
 // I5: the validation log is append-only across runs. Only the newest
 // validation of each target is "current"; superseded ones are history,
@@ -510,7 +547,7 @@ document.getElementById("validation-results").innerHTML = currentValidations.len
   <tbody>
     ${{currentValidations.map(item => validationRow(item, true)).join("")}}
   </tbody>
-</table>` : "<p>검증 기록이 없습니다.</p>";
+</table>` : emptyOr("validation", "<p>검증 기록이 없습니다.</p>");
 document.getElementById("validation-history").innerHTML = supersededValidations.length ? `<details><summary>이전 검증 이력 ${{supersededValidations.length}}건 — 같은 대상의 더 최근 검증으로 대체됨 (현재 결과 아님)</summary><table>
   ${{validationHead(true)}}
   <tbody>
@@ -571,14 +608,23 @@ const anomalyTable = rows => `<table>
     </tr>`).join("")}}
   </tbody>
 </table>`;
+// E8: index lines/records the scan did not examine, disclosed per run.
+const indexCoverageText = marker => {{
+  if (!marker) return "";
+  const parts = [];
+  if (marker.index_unparseable_lines) parts.push(`색인 손상 줄 ${{marker.index_unparseable_lines}}개 미검사`);
+  if (marker.index_rows_without_id) parts.push(`id 없는 색인 기록 ${{marker.index_rows_without_id}}개 미검사`);
+  if (marker.index_stale_rows) parts.push(`최근 스캔 때 없던 파일(stale) ${{marker.index_stale_rows}}개 제외`);
+  return parts.length ? " · " + parts.join(" · ") : "";
+}};
 const anomalyRunLine = run => {{
   const mode = run.run ? (run.run.hash_mode === "rehash" ? "해시 모드: 실시간 재해시" : "해시 모드: 색인에 저장된 해시") : "실행 기록 없음(완료 표시 없는 실행)";
-  return `실행 시각 ${{fmtUnix(run.ts)}} · ${{mode}} · 후보 ${{findingRows(run).length}}건${{run.run?.coverage_limited ? " · 일부 파일 재해시 못 함" : ""}}`;
+  return `실행 시각 ${{fmtUnix(run.ts)}} · ${{mode}} · 후보 ${{findingRows(run).length}}건${{run.run?.coverage_limited && run.run?.hash_mode === "rehash" && (run.run.skipped_no_hash || run.run.skipped_missing || run.run.skipped_error) ? " · 일부 파일 재해시 못 함" : ""}}${{indexCoverageText(run.run)}}`;
 }};
 const anomalyRows = currentAnomalyRun ? findingRows(currentAnomalyRun) : [];
 document.getElementById("anomaly-findings").innerHTML = currentAnomalyRun
   ? `${{anomalyInterruptedNotice}}<p class="muted">현재 결과 — ${{anomalyRunLine(currentAnomalyRun)}} · ${{escapeHtml(chainLabel("anomaly"))}}</p>${{anomalyRows.length ? anomalyTable(anomalyRows) : "<p>이 실행에서 이상 징후 후보가 없습니다.</p>"}}`
-  : "<p>이상 징후 후보가 없습니다.</p>";
+  : emptyOr("anomaly", "<p>이상 징후 후보가 없습니다.</p>");
 const pastAnomalyRuns = anomalyRuns.filter((_, index) => index !== currentAnomalyIndex).reverse();
 document.getElementById("anomaly-history").innerHTML = pastAnomalyRuns.length ? `<details><summary>이전 실행 ${{pastAnomalyRuns.length}}회 — 현재 결과 아님</summary>${{pastAnomalyRuns.map(run => `<p class="muted">${{anomalyRunLine(run)}}</p>${{findingRows(run).length ? anomalyTable(findingRows(run)) : "<p>후보 없음</p>"}}`).join("")}}</details>` : "";
 
@@ -598,7 +644,7 @@ document.getElementById("filesystem-recovery").innerHTML = filesystemLog.length 
       <td>${{chainCell("filesystem", item.entry_sha256)}}</td>
     </tr>`).join("")}}
   </tbody>
-</table>` : "<p>파일시스템 조사 또는 inode 복구 기록이 없습니다.</p>";
+</table>` : emptyOr("filesystem", "<p>파일시스템 조사 또는 inode 복구 기록이 없습니다.</p>");
 
 // `annotations` is {{marks:[...], tags:{{id:[...]}}}}; a bare marks array
 // (pre-I3 callers) is still accepted.
@@ -710,10 +756,29 @@ document.getElementById("techniques").innerHTML = techniqueRows().length ? `<tab
 // filename-order join never claims "끊김 0 / 겹침 0" (B2).
 const joinRecordId = item => item.record_id || (typeof item.output_sha256 === "string" && /^[0-9a-fA-F]{{16}}/.test(item.output_sha256) ? `join:${{item.output_sha256.slice(0, 16).toLowerCase()}}` : null);
 const joinLegacyId = item => `join:${{String(item.output_path || "").split(/[\\/]/).pop()}}`;
+// D18: the `join:<file name>` fallback is only for entries logged before
+// record ids existed (no record_id in the log line itself). A file name is
+// reused by later joins, so a newer entry must never pick up the old
+// join's annotations through it.
+const joinIsLegacy = item => item.record_id_derived === true || !item.record_id;
 function joinMarkCell(item) {{
   const id = joinRecordId(item);
   const cell = id ? markCell(id) : "-";
-  return cell === "-" ? markCell(joinLegacyId(item)) : cell;
+  return cell === "-" && joinIsLegacy(item) ? markCell(joinLegacyId(item)) : cell;
+}}
+// D3: the joined length as measured on the output against the planned
+// total, and the per-segment boundary check, when the log recorded them.
+function joinLengthText(item) {{
+  const check = item.duration_check && typeof item.duration_check === "object" ? item.duration_check : null;
+  const observed = check && Number.isFinite(check.observed) ? check.observed : (Number.isFinite(item.observed_duration_seconds) ? item.observed_duration_seconds : null);
+  const expected = check && Number.isFinite(check.expected) ? check.expected : item.duration_seconds;
+  const ok = check && typeof check.ok === "boolean" ? check.ok : (typeof item.duration_check_ok === "boolean" ? item.duration_check_ok : null);
+  const parts = [];
+  parts.push(observed === null ? "관측 길이 미기록" : `관측 ${{fmtDuration(observed)}} / 예상 ${{fmtDuration(expected)}}`);
+  parts.push(ok === null ? "길이 검사 결과 미기록" : (ok ? "길이 검사 통과" : "길이 검사 불일치"));
+  const boundary = item.boundary_check && typeof item.boundary_check === "object" ? item.boundary_check : null;
+  parts.push(boundary && typeof boundary.ok === "boolean" ? (boundary.ok ? `세그먼트 경계 검증 통과${{boundary.detail ? ` — ${{boundary.detail}}` : ""}}` : `세그먼트 경계 검증 실패${{boundary.detail ? ` — ${{boundary.detail}}` : ""}}`) : "세그먼트 경계 검증 미기록");
+  return parts.map(escapeHtml).join("<br>");
 }}
 function joinJunctionText(item) {{
   if (item.order_basis === "filename-order") return "끊김·겹침 확인 불가 — 파일명 순";
@@ -722,7 +787,7 @@ function joinJunctionText(item) {{
 }}
 document.getElementById("joined-videos").innerHTML = joinLog.length ? `<table>
   <thead>
-    <tr><th>산출물</th><th>SHA-256</th><th>원본 수</th><th>채널</th><th>순서 근거</th><th>총 길이</th><th>끊김·겹침</th><th>매니페스트 SHA-256</th><th>감사 체인</th><th>판독 (상태·메모·구간·태그)</th></tr>
+    <tr><th>산출물</th><th>SHA-256</th><th>원본 수</th><th>채널</th><th>순서 근거</th><th>총 길이</th><th>길이·경계 검사</th><th>끊김·겹침</th><th>매니페스트 SHA-256</th><th>감사 체인</th><th>판독 (상태·메모·구간·태그)</th></tr>
   </thead>
   <tbody>
     ${{joinLog.map(item => `<tr>
@@ -732,16 +797,42 @@ document.getElementById("joined-videos").innerHTML = joinLog.length ? `<table>
       <td>${{escapeHtml(item.channel || "미확인")}}</td>
       <td>${{escapeHtml(item.order_basis || "-")}}</td>
       <td>${{fmtDuration(item.duration_seconds)}}</td>
+      <td>${{joinLengthText(item)}}</td>
       <td>${{joinJunctionText(item)}}</td>
       <td><code>${{escapeHtml(item.manifest_sha256 || "-")}}</code></td>
       <td>${{chainCell("join", item.entry_sha256)}}</td>
       <td>${{joinMarkCell(item)}}</td>
     </tr>`).join("")}}
   </tbody>
-</table>` : "<p>이어붙인 영상이 없습니다.</p>";
+</table>` : emptyOr("join", "<p>이어붙인 영상이 없습니다.</p>");
 document.getElementById("join-caveat").hidden = joinLog.length === 0;
 document.getElementById("join-caveat-time").hidden = !joinLog.some(item => item.order_basis !== "filename-order");
 document.getElementById("join-caveat-order").hidden = !joinLog.some(item => item.order_basis === "filename-order");
+
+// E9: a telemetry track cut at the point cap is never shown as complete.
+{{
+  const items = Object.entries(telemetry).filter(([, t]) => t && typeof t === "object");
+  const pointsText = t => {{
+    const kept = Number.isFinite(t.point_count) ? t.point_count : null;
+    const total = Number.isFinite(t.total_points) ? t.total_points : null;
+    if (t.truncated === true) return `전체 ${{total ?? "?"}}점 중 ${{kept ?? "?"}}점만 기록 — 잘림 (시작·끝 시각과 최고 속도는 기록된 점 기준)`;
+    return `${{kept ?? total ?? "-"}}점`;
+  }};
+  document.getElementById("telemetry").innerHTML = items.length ? `<table>
+  <thead><tr><th>추출</th><th>원본</th><th>출처</th><th>점 수</th><th>시작</th><th>끝</th><th>메모</th></tr></thead>
+  <tbody>
+    ${{items.map(([name, t]) => `<tr>
+      <td><code>${{escapeHtml(name)}}</code></td>
+      <td><code>${{escapeHtml(t.selector || t.source_path || "-")}}</code></td>
+      <td>${{escapeHtml(t.source || "-")}}</td>
+      <td>${{escapeHtml(pointsText(t))}}</td>
+      <td>${{fmtUnix(t.first_ts_unix)}}</td>
+      <td>${{fmtUnix(t.last_ts_unix)}}</td>
+      <td>${{escapeHtml(t.note || "-")}}</td>
+    </tr>`).join("")}}
+  </tbody>
+</table>` : emptyOr("telemetry", "<p>위치·텔레메트리 추출 기록이 없습니다.</p>");
+}}
 
 const chainEvents = [];
 (Array.isArray(scanRuns) ? scanRuns : []).forEach(run => chainEvents.push({{
@@ -811,7 +902,8 @@ document.getElementById("chain").innerHTML = chainEvents.length ? `<table>
 const chainLogNames = [
   ["export", "클립 내보내기"], ["proxy", "검토용 프록시"], ["thumbnail", "썸네일"],
   ["carve", "carving"], ["filesystem", "파일시스템 조사·복구"], ["validation", "재생/컨테이너 검증"],
-  ["anomaly", "이상 징후 스캔"], ["batch", "일괄 처리"], ["join", "이어붙이기"]
+  ["anomaly", "이상 징후 스캔"], ["batch", "일괄 처리"], ["join", "이어붙이기"],
+  ["audio", "소리 측정"], ["signoff", "최종화 서명 기록"]
 ];
 const chainStatusText = chain => {{
   switch (chain?.status) {{
@@ -929,6 +1021,17 @@ pub fn signoff_currency(signoff_text: &str, current: &SignoffDigests) -> Signoff
         .get("schema_version")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    if schema >= SIGNOFF_SCHEMA_V4 {
+        // D13: a v4 record's content_sha256 also covers the evidence and
+        // lane anchors, which only `check_signoff` can recompute; the
+        // marks/tags/ranges part is its `annotations_sha256` (the v3
+        // digest). Callers holding only the digests get that part.
+        return match value.get("annotations_sha256").and_then(|v| v.as_str()) {
+            Some(annotations) if annotations == current.content => SignoffCurrency::Current,
+            Some(_) => SignoffCurrency::Changed,
+            None => SignoffCurrency::Unbound,
+        };
+    }
     if schema >= SIGNOFF_SCHEMA_VERSION {
         if recorded == current.content {
             SignoffCurrency::Current
@@ -998,6 +1101,567 @@ pub fn report_signoff_sha256(html: &str) -> Option<&str> {
         .then_some(hex)
 }
 
+/// D10 helper for `verify-package` check 5: whether a rendered report was
+/// rendered from exactly this sign-off record — the report's
+/// `frametrace:signoff-sha256` marker must equal the SHA-256 of the
+/// record's bytes (an examiner-name comparison alone accepts a swapped
+/// record). `Err` names what differs.
+pub fn report_matches_signoff(report_html: &str, signoff_text: &str) -> Result<(), String> {
+    let actual = crate::sha256::digest_bytes(signoff_text.as_bytes());
+    match report_signoff_sha256(report_html) {
+        Some(marker) if marker == actual => Ok(()),
+        Some(marker) => Err(format!(
+            "the report was rendered from sign-off record {marker}, not from this record ({actual})"
+        )),
+        None => Err(
+            "the report carries no sign-off record marker (rendered without a sign-off, or before markers existed)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Sign-off content schema v4 (D13, contract §8 / plan "§D4 as
+/// implemented"): the v3 binding (marks with IN-OUT ranges, tags) plus the
+/// SHA-256 of each annotated record's target file and the head of every
+/// audit lane at sign-off time (truncation anchors).
+pub const SIGNOFF_SCHEMA_V4: u64 = 4;
+
+/// The chained audit lane every sign-off is recorded in (D13).
+pub const SIGNOFF_LOG_REL_PATH: &str = "evidence/logs/signoff-log.jsonl";
+
+/// What a v4 sign-off binds besides the marks: record id → target file
+/// SHA-256 (`None` when the case had no hash for it), and lane → head.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignoffBindings {
+    pub evidence: std::collections::BTreeMap<String, Option<String>>,
+    pub lanes: std::collections::BTreeMap<String, crate::audit::LaneHead>,
+}
+
+/// Every record id → SHA-256 the case (or package) at `root` knows:
+/// indexed videos (`db/videos.jsonl`), carve candidates, recovered inodes
+/// (`inode:<offset>:<inode>`, the report's id) and joined outputs
+/// (`join:<hash16>`). Later log entries win. A missing source is empty; an
+/// unreadable one is an error.
+pub fn evidence_hashes(
+    root: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let read = |rel: &str| -> Result<String, String> {
+        match std::fs::read_to_string(root.join(rel)) {
+            Ok(text) => Ok(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(err) => Err(format!("{rel}을(를) 읽지 못했습니다: {err}")),
+        }
+    };
+    let rows = |text: &str| -> Vec<serde_json::Value> {
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    };
+    let field = |value: &serde_json::Value, key: &str| -> Option<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows(&read("db/videos.jsonl")?) {
+        if let (Some(id), Some(sha)) = (field(&row, "id"), field(&row, "sha256")) {
+            out.insert(id, sha.to_ascii_lowercase());
+        }
+    }
+    for row in rows(&read("artifacts/carved/carve-log.jsonl")?) {
+        if let (Some(id), Some(sha)) = (field(&row, "id"), field(&row, "sha256")) {
+            out.insert(id, sha.to_ascii_lowercase());
+        }
+    }
+    for row in rows(&read("evidence/logs/tsk-audit.jsonl")?) {
+        if field(&row, "event").as_deref() != Some("recover-inode") {
+            continue;
+        }
+        let offset = row
+            .get("partition_offset")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_else(|| "0".to_string());
+        let inode = row
+            .get("inode")
+            .filter(|v| !v.is_null() && v.as_str() != Some(""))
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .or_else(|| field(&row, "output_path"))
+            .unwrap_or_default();
+        if let Some(sha) = field(&row, "sha256") {
+            out.insert(format!("inode:{offset}:{inode}"), sha.to_ascii_lowercase());
+        }
+    }
+    for row in rows(&read("artifacts/joined/join-log.jsonl")?) {
+        let row = crate::join::with_record_id(row);
+        if let (Some(id), Some(sha)) = (field(&row, "record_id"), field(&row, "output_sha256")) {
+            out.insert(id, sha.to_ascii_lowercase());
+        }
+    }
+    Ok(out)
+}
+
+/// The bindings of `ids` at `root` now: each id's target SHA-256 and the
+/// head of every chained lane present ([`crate::audit::collect_chain_lanes`]).
+pub fn signoff_bindings<'a>(
+    root: &std::path::Path,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<SignoffBindings, String> {
+    let hashes = evidence_hashes(root)?;
+    let evidence = ids
+        .into_iter()
+        .map(|id| (id.to_string(), hashes.get(id).cloned()))
+        .collect();
+    let mut lanes = std::collections::BTreeMap::new();
+    for rel in crate::audit::collect_chain_lanes(root) {
+        if let Some(head) = crate::audit::lane_head(&root.join(&rel))
+            .map_err(|err| format!("감사 레인 {rel}의 앵커를 읽지 못했습니다: {err}"))?
+        {
+            lanes.insert(rel, head);
+        }
+    }
+    Ok(SignoffBindings { evidence, lanes })
+}
+
+fn json_str(text: &str) -> String {
+    format!("\"{}\"", crate::util::json_escape(text))
+}
+
+fn bindings_json(bindings: &SignoffBindings) -> (String, String) {
+    let evidence = bindings
+        .evidence
+        .iter()
+        .map(|(id, sha)| {
+            format!(
+                "{}:{}",
+                json_str(id),
+                sha.as_deref()
+                    .map(json_str)
+                    .unwrap_or_else(|| "null".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let lanes = bindings
+        .lanes
+        .iter()
+        .map(|(rel, head)| {
+            format!(
+                "{}:{{\"entries\":{},\"last_entry_sha256\":{}}}",
+                json_str(rel),
+                head.entries,
+                json_str(&head.last_entry_sha256)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    (format!("{{{evidence}}}"), format!("{{{lanes}}}"))
+}
+
+/// The canonical v4 content a sign-off's `content_sha256` covers:
+/// `{"schema":4,"annotations_sha256":"<v3 digest>","evidence":{…},"lanes":{…}}`
+/// with ids and lanes in byte order — the same inputs always give the same
+/// bytes.
+pub fn signoff_v4_content_json(annotations_sha256: &str, bindings: &SignoffBindings) -> String {
+    let (evidence, lanes) = bindings_json(bindings);
+    format!(
+        "{{\"schema\":{SIGNOFF_SCHEMA_V4},\"annotations_sha256\":{},\"evidence\":{evidence},\"lanes\":{lanes}}}",
+        json_str(annotations_sha256)
+    )
+}
+
+/// A finalize sign-off record (`review/signoff.json`), as written and as
+/// recorded in the sign-off audit lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signoff {
+    pub schema_version: u64,
+    pub examiner: String,
+    pub signed_unix: i64,
+    pub content_sha256: Option<String>,
+    /// The record's exact bytes (newline-terminated JSON object).
+    pub text: String,
+}
+
+impl Signoff {
+    /// Parses a record (any schema). `None` without an examiner.
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let (examiner, signed_unix) = parse_signoff(text)?;
+        Some(Self {
+            schema_version: value
+                .get("schema_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            examiner,
+            signed_unix,
+            content_sha256: value
+                .get("content_sha256")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            text: text.to_string(),
+        })
+    }
+
+    /// Builds a schema-v4 record for the case's current marks, tags,
+    /// evidence hashes and lane heads. Deterministic: the same case state,
+    /// examiner and time give the same bytes. A mark/tag read failure is
+    /// an error (finding 8: never sign an empty list by accident).
+    pub fn build_v4(
+        case_dir: &std::path::Path,
+        examiner: &str,
+        signed_unix: i64,
+    ) -> Result<Self, String> {
+        let marks = crate::case_db::load_review_marks(case_dir)
+            .map_err(|err| format!("판독 마크를 읽지 못했습니다: {err}"))?;
+        let tags = crate::case_db::load_review_tags(case_dir)
+            .map_err(|err| format!("판독 태그를 읽지 못했습니다: {err}"))?;
+        let annotations_sha256 = signoff_content_sha256(
+            &crate::cli::handlers::signoff_content_json_from(&marks, &tags),
+        );
+        let mut ids: std::collections::BTreeSet<&str> =
+            marks.iter().map(|mark| mark.record_id.as_str()).collect();
+        ids.extend(
+            tags.iter()
+                .filter(|entry| !entry.tags.is_empty())
+                .map(|entry| entry.id.as_str()),
+        );
+        let bindings = signoff_bindings(case_dir, ids)?;
+        let content_sha256 =
+            signoff_content_sha256(&signoff_v4_content_json(&annotations_sha256, &bindings));
+        let (evidence, lanes) = bindings_json(&bindings);
+        let text = format!(
+            "{{\"schema_version\":{SIGNOFF_SCHEMA_V4},\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks (status, note, IN-OUT range), tags, the SHA-256 of each annotated record's target file, and the head of every audit lane\",\"annotations_sha256\":{},\"evidence\":{evidence},\"lanes\":{lanes},\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+            json_str(examiner),
+            json_str(&annotations_sha256),
+            json_str(&content_sha256),
+        );
+        Ok(Self {
+            schema_version: SIGNOFF_SCHEMA_V4,
+            examiner: examiner.to_string(),
+            signed_unix,
+            content_sha256: Some(content_sha256),
+            text,
+        })
+    }
+
+    /// SHA-256 of the record's bytes — the identity the report marker and
+    /// the sign-off audit entry name.
+    pub fn record_sha256(&self) -> String {
+        crate::sha256::digest_bytes(self.text.as_bytes())
+    }
+}
+
+/// D13 (contract §8, called by finalize — B18): appends the sign-off to the
+/// chained audit lane [`SIGNOFF_LOG_REL_PATH`] (HMAC-keyed when an audit
+/// key is configured), naming the record by the SHA-256 of its bytes. A
+/// failure is an error: a sign-off that is not in the chain must not be
+/// presented as recorded.
+pub fn record_signoff_audit(case_dir: &std::path::Path, signoff: &Signoff) -> Result<(), String> {
+    let body = format!(
+        "{{\"schema_version\":1,\"event\":\"signoff\",\"signed_unix\":{},\"examiner\":{},\"signoff_schema_version\":{},\"content_sha256\":{},\"signoff_record_sha256\":{}}}",
+        signoff.signed_unix,
+        json_str(&signoff.examiner),
+        signoff.schema_version,
+        signoff
+            .content_sha256
+            .as_deref()
+            .map(json_str)
+            .unwrap_or_else(|| "null".to_string()),
+        json_str(&signoff.record_sha256()),
+    );
+    crate::audit::append_chained_jsonl(&case_dir.join(SIGNOFF_LOG_REL_PATH), &body)
+        .map_err(|err| format!("최종화 서명을 감사 체인에 기록하지 못했습니다: {err}"))
+}
+
+/// Whether the sign-off record `signoff_text` is in the sign-off audit
+/// lane under `root`: one line for the report banner / verify-package.
+pub fn signoff_audit_status(root: &std::path::Path, signoff_text: &str) -> (bool, String) {
+    let path = root.join(SIGNOFF_LOG_REL_PATH);
+    if !path.is_file() {
+        return (
+            false,
+            "이 서명은 감사 체인(signoff-log)에 기록되어 있지 않습니다".to_string(),
+        );
+    }
+    let verification = match crate::audit::verify_chained_jsonl(&path) {
+        Ok(verification) => verification,
+        Err(err) => return (false, format!("서명 감사 레인 검증 실패: {err}")),
+    };
+    let record = crate::sha256::digest_bytes(signoff_text.as_bytes());
+    let found = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("signoff_record_sha256")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s == record)
+                })
+                .unwrap_or(false)
+        });
+    if found {
+        (
+            true,
+            format!(
+                "서명 기록이 감사 체인(signoff-log, {})에 있음",
+                verification.integrity.label()
+            ),
+        )
+    } else {
+        (
+            false,
+            "감사 체인(signoff-log)에 이 서명 기록이 없습니다".to_string(),
+        )
+    }
+}
+
+/// Where a v4 sign-off is checked: the case itself, or a package whose
+/// manifest lists the files it holds (a lane the package never contained
+/// cannot be checked there and is reported as not verified, not changed).
+pub enum SignoffScope<'a> {
+    Case,
+    Package(&'a dyn Fn(&str) -> bool),
+}
+
+/// The full currency check of a sign-off record (D13): what the report
+/// banner and `verify-package` print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignoffCheck {
+    pub currency: SignoffCurrency,
+    /// Every change found since the sign-off (empty when current).
+    pub changes: Vec<String>,
+    /// What could not be checked here (evidence without a recorded hash,
+    /// lanes a package does not hold).
+    pub not_verified: Vec<String>,
+}
+
+/// Checks a sign-off record against the case/package at `root`: for a
+/// schema-v4 record the marks (`digests.content`), every annotated
+/// record's target SHA-256 and every anchored lane; older records keep
+/// their [`signoff_currency`] meaning (legacy binding).
+pub fn check_signoff(
+    root: &std::path::Path,
+    signoff_text: &str,
+    digests: &SignoffDigests,
+    scope: SignoffScope<'_>,
+) -> SignoffCheck {
+    let legacy = || SignoffCheck {
+        currency: signoff_currency(signoff_text, digests),
+        changes: Vec::new(),
+        not_verified: Vec::new(),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(signoff_text) else {
+        return legacy();
+    };
+    if value.get("schema_version").and_then(|v| v.as_u64()) != Some(SIGNOFF_SCHEMA_V4) {
+        return legacy();
+    }
+    let mut changes = Vec::new();
+    let mut not_verified = Vec::new();
+    let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let (Some(annotations), Some(content)) = (text("annotations_sha256"), text("content_sha256"))
+    else {
+        return SignoffCheck {
+            currency: SignoffCurrency::Changed,
+            changes: vec![
+                "v4 서명 기록에 annotations_sha256/content_sha256이 없습니다 — 기록이 손상됨"
+                    .to_string(),
+            ],
+            not_verified,
+        };
+    };
+    // Recorded bindings, parsed back from the record.
+    let mut recorded = SignoffBindings::default();
+    let mut malformed = false;
+    match value.get("evidence").and_then(|v| v.as_object()) {
+        Some(map) => {
+            for (id, sha) in map {
+                match sha {
+                    serde_json::Value::Null => {
+                        recorded.evidence.insert(id.clone(), None);
+                    }
+                    serde_json::Value::String(sha) => {
+                        recorded.evidence.insert(id.clone(), Some(sha.clone()));
+                    }
+                    _ => malformed = true,
+                }
+            }
+        }
+        None => malformed = true,
+    }
+    match value.get("lanes").and_then(|v| v.as_object()) {
+        Some(map) => {
+            for (rel, head) in map {
+                match (
+                    head.get("entries").and_then(|v| v.as_u64()),
+                    head.get("last_entry_sha256").and_then(|v| v.as_str()),
+                ) {
+                    (Some(entries), Some(last)) => {
+                        recorded.lanes.insert(
+                            rel.clone(),
+                            crate::audit::LaneHead {
+                                entries,
+                                last_entry_sha256: last.to_string(),
+                            },
+                        );
+                    }
+                    _ => malformed = true,
+                }
+            }
+        }
+        None => malformed = true,
+    }
+    if malformed
+        || signoff_content_sha256(&signoff_v4_content_json(&annotations, &recorded)) != content
+    {
+        changes.push(
+            "서명 기록의 결합 내용(content_sha256)이 기록된 증거 해시·감사 앵커와 맞지 않습니다 — 서명 기록이 변경됨"
+                .to_string(),
+        );
+    }
+    if annotations != digests.content {
+        changes.push("sign-off 이후 판독 마크·메모·IN-OUT 구간·태그가 변경됨".to_string());
+    }
+    match evidence_hashes(root) {
+        Ok(current) => {
+            for (id, sha) in &recorded.evidence {
+                match (sha, current.get(id)) {
+                    (Some(sha), Some(now)) if now.eq_ignore_ascii_case(sha) => {}
+                    (Some(sha), Some(now)) => changes.push(format!(
+                        "{id}: 대상 파일 SHA-256이 서명 후 바뀜 (서명 시 {sha}, 현재 {now})"
+                    )),
+                    (Some(sha), None) => changes.push(format!(
+                        "{id}: 서명 시 대상 파일 SHA-256 {sha}이 기록됐으나 현재 해시를 찾을 수 없음"
+                    )),
+                    (None, _) => not_verified.push(format!(
+                        "{id}: 서명 시 대상 파일 해시가 없어 파일 교체 여부를 확인할 수 없음"
+                    )),
+                }
+            }
+        }
+        Err(err) => changes.push(format!("대상 파일 해시를 확인하지 못했습니다: {err}")),
+    }
+    for (rel, head) in &recorded.lanes {
+        if let SignoffScope::Package(listed) = &scope
+            && !listed(rel)
+        {
+            not_verified.push(format!(
+                "{rel}: 패키지에 포함되지 않은 감사 레인 — 앵커(항목 {}개) 확인 불가",
+                head.entries
+            ));
+            continue;
+        }
+        match crate::audit::check_lane_anchor(&root.join(rel), head) {
+            crate::audit::AnchorStatus::Intact => {}
+            crate::audit::AnchorStatus::Missing => changes.push(format!(
+                "{rel}: 서명 시 항목 {}개였던 감사 레인이 없어짐",
+                head.entries
+            )),
+            crate::audit::AnchorStatus::Truncated { now } => changes.push(format!(
+                "{rel}: 감사 레인 끝부분이 삭제됨 (서명 시 항목 {}개, 현재 {now}개)",
+                head.entries
+            )),
+            crate::audit::AnchorStatus::Rewritten => changes.push(format!(
+                "{rel}: 서명 시 {}번째 항목이 다른 항목으로 바뀜 — 레인이 재작성됨",
+                head.entries
+            )),
+            crate::audit::AnchorStatus::Unreadable(err) => changes.push(format!(
+                "{rel}: 감사 레인을 읽지 못해 앵커 확인 실패 — {err}"
+            )),
+        }
+    }
+    SignoffCheck {
+        currency: if changes.is_empty() {
+            SignoffCurrency::Current
+        } else {
+            SignoffCurrency::Changed
+        },
+        changes,
+        not_verified,
+    }
+}
+
+/// The banner for a checked sign-off: [`signoff_banner_html`] plus, for a
+/// v4 record, what was compared, every change found, what could not be
+/// checked, and whether the record is in the sign-off audit lane.
+pub fn signoff_banner_checked_html(
+    examiner: &str,
+    signed_unix: i64,
+    check: &SignoffCheck,
+    v4: bool,
+    audit_note: &str,
+) -> String {
+    let mut banner = signoff_banner_html(examiner, signed_unix, check.currency);
+    let mut details = Vec::new();
+    if v4 && check.currency == SignoffCurrency::Current {
+        details.push(
+            "서명 형식 v4: 판독 내용과 함께 대상 파일 SHA-256과 감사 레인 앵커(항목 수·마지막 해시)까지 일치함 — 서명 후 로그 끝부분 삭제 없음"
+                .to_string(),
+        );
+    }
+    details.extend(check.changes.iter().map(|change| format!("변경: {change}")));
+    details.extend(
+        check
+            .not_verified
+            .iter()
+            .map(|item| format!("확인 불가: {item}")),
+    );
+    details.push(audit_note.to_string());
+    let list = details
+        .iter()
+        .map(|item| crate::util::html_escape(item))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    if let Some(close) = banner.rfind("</div>") {
+        banner.insert_str(
+            close,
+            &format!("<br><span style=\"font-size:12px\">{list}</span>"),
+        );
+    }
+    banner
+}
+
+/// [`inject_signoff_banner`] with a full [`check_signoff`] result.
+pub fn inject_signoff_banner_checked(
+    html: String,
+    signoff: &Signoff,
+    check: &SignoffCheck,
+    audit_note: &str,
+) -> String {
+    let banner = format!(
+        "{}{}",
+        signoff_source_marker(&signoff.text),
+        signoff_banner_checked_html(
+            &signoff.examiner,
+            signoff.signed_unix,
+            check,
+            signoff.schema_version >= SIGNOFF_SCHEMA_V4,
+            audit_note
+        )
+    );
+    match html.find("<body>") {
+        Some(index) => format!(
+            "{}{}{}",
+            &html[..index + "<body>".len()],
+            banner,
+            &html[index + "<body>".len()..]
+        ),
+        None => format!("{banner}{html}"),
+    }
+}
+
 /// Inserts the sign-off banner right after `<body>`, with the marker of the
 /// record (`signoff_text`) it was rendered from.
 pub fn inject_signoff_banner(
@@ -1030,6 +1694,14 @@ pub(crate) fn audio_levels_object(json: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(json.trim()) {
         Ok(value) if value.is_object() => value.to_string(),
         _ => "{}".to_string(),
+    }
+}
+
+/// A JSON array literal; anything else (empty input, garbage) is `[]`.
+fn json_array_or_empty(json: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(json.trim()) {
+        Ok(value) if value.is_array() => value.to_string(),
+        _ => "[]".to_string(),
     }
 }
 
@@ -1176,6 +1848,9 @@ mod tests {
         let audio_levels = lookup("audio_levels");
         let scan_runs = lookup("scan_runs");
         let marks = lookup("marks");
+        let review_warnings = lookup("review_warnings");
+        let read_errors = lookup("read_errors");
+        let telemetry = lookup("telemetry");
         render_case_report(&super::ReportInputs {
             manifest_json: &manifest,
             index_json: &index,
@@ -1194,6 +1869,9 @@ mod tests {
             redaction_applied: inputs
                 .iter()
                 .any(|(name, value)| *name == "redacted" && *value == "1"),
+            review_warnings_json: &review_warnings,
+            read_errors_json: &read_errors,
+            telemetry_json: &telemetry,
         })
     }
 
@@ -1938,6 +2616,9 @@ mod tests {
                     scan_runs_json: "[]",
                     marks_json: "[]",
                     redaction_applied: false,
+                    review_warnings_json: "",
+                    read_errors_json: "",
+                    telemetry_json: "",
                 },
                 chains,
             );
@@ -2002,5 +2683,357 @@ mod tests {
                 .unwrap()
                 .contains("&lt;img src=x")
         );
+    }
+
+    /// D1/D2: a measurement the report cannot vouch for is never shown as
+    /// sound or silence.
+    #[test]
+    fn unverified_and_replayed_sound_states_claim_no_level() {
+        let index = r#"{"videos":[{"id":"v1","source_path":"/e/a.mp4","ffprobe_ok":true,"audio_codec":"aac"},{"id":"v2","source_path":"/e/b.mp4","ffprobe_ok":true,"audio_codec":"aac"}]}"#;
+        let levels = r#"{"v1":{"r":"unverified","max":null,"mean":null,"sec":null,"t":1},"v2":{"r":"replayed","max":null,"mean":null,"sec":null,"t":1}}"#;
+        let elements = rendered_elements(&[("index", index), ("audio_levels", levels)]);
+        let videos = elements["videos"]["innerHTML"].as_str().unwrap();
+        assert!(
+            videos.contains("측정 기록 검증 실패 — 표시 안 함"),
+            "{videos}"
+        );
+        assert!(videos.contains("재개 시 재기록된 측정"), "{videos}");
+        assert!(
+            !videos.contains("무음") && !videos.contains("소리 있음"),
+            "{videos}"
+        );
+    }
+
+    /// D18: a join whose log line carries its own record id never shows the
+    /// annotations filed under `join:<file name>` (a reused name); a legacy
+    /// entry (derived id) still does. D3: the measured length and the
+    /// checks are shown, or said to be unrecorded.
+    #[test]
+    fn join_rows_use_legacy_name_lookup_only_for_legacy_entries() {
+        let entry = |record_id: Option<&str>, derived: bool, check: Option<serde_json::Value>| {
+            let mut value: serde_json::Value = serde_json::from_str(&join_entry()).unwrap();
+            match record_id {
+                Some(id) => value["record_id"] = id.into(),
+                None => {
+                    value.as_object_mut().unwrap().remove("record_id");
+                }
+            }
+            if derived {
+                value["record_id_derived"] = true.into();
+            }
+            if let Some(check) = check {
+                value["duration_check"] = check;
+            }
+            value.to_string()
+        };
+        let marks = serde_json::json!({"marks": [
+            {"id": "join:join_F_20260910-120000_n10.mp4", "status": "important", "marked_unix": 1}
+        ], "tags": {}})
+        .to_string();
+        let own = entry(
+            Some("join:aaaaaaaaaaaaaaaa"),
+            false,
+            Some(serde_json::json!({"expected": 600.0, "observed": 598.0, "ok": true})),
+        );
+        let html =
+            rendered_elements(&[("join", &own), ("marks", &marks)])["joined-videos"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert!(
+            !html.contains("중요"),
+            "own record id: no file-name fallback: {html}"
+        );
+        assert!(html.contains("관측 9:58 / 예상 10:00"), "{html}");
+        assert!(html.contains("길이 검사 통과"), "{html}");
+        assert!(html.contains("세그먼트 경계 검증 미기록"), "{html}");
+
+        let legacy = entry(Some("join:aaaaaaaaaaaaaaaa"), true, None);
+        let html = rendered_elements(&[("join", &legacy), ("marks", &marks)])["joined-videos"]
+            ["innerHTML"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            html.contains("중요"),
+            "legacy entry keeps its old annotations: {html}"
+        );
+        assert!(html.contains("관측 길이 미기록"), "{html}");
+        assert!(
+            html.contains("길이 검사 통과"),
+            "falls back to duration_check_ok: {html}"
+        );
+    }
+
+    /// D11: an input that could not be read is named — the section says
+    /// "읽기 실패", not "없습니다". D9: open review state is shown on top.
+    #[test]
+    fn unreadable_inputs_and_open_review_state_are_stated() {
+        let elements = rendered_elements(&[
+            (
+                "read_errors",
+                r#"{"carve":"artifacts/carved/carve-log.jsonl: Access is denied"}"#,
+            ),
+            ("review_warnings", r#"["저장 대기열 1건"]"#),
+        ]);
+        let carved = elements["carved-artifacts"]["innerHTML"].as_str().unwrap();
+        assert!(carved.contains("읽기 실패"), "{carved}");
+        assert!(!carved.contains("Carving 후보가 없습니다"), "{carved}");
+        assert!(
+            elements["read-errors"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("Access is denied")
+        );
+        assert!(
+            elements["review-warnings"]["innerHTML"]
+                .as_str()
+                .unwrap()
+                .contains("저장 대기열 1건")
+        );
+        let clean = rendered_elements(&[]);
+        assert_eq!(clean["read-errors"]["innerHTML"], "");
+        assert_eq!(clean["review-warnings"]["innerHTML"], "");
+    }
+
+    /// D14: the report never implies that the chain alone detects a removed
+    /// tail; it points at the sign-off anchors.
+    #[test]
+    fn audit_note_states_truncation_needs_anchors() {
+        let html = render(&[]);
+        assert!(
+            html.contains("(잘림)을 탐지하지 못합니다"),
+            "chain-only limit stated"
+        );
+        assert!(html.contains("최종화 서명(v4)에 기록된 레인별 항목 수·마지막 해시"));
+        assert!(html.contains("[\"audio\", \"소리 측정\"]"));
+        assert!(html.contains("[\"signoff\", \"최종화 서명 기록\"]"));
+    }
+
+    /// Determinism: the same inputs render the same report bytes.
+    #[test]
+    fn same_inputs_render_identical_report_bytes() {
+        let inputs = [
+            ("manifest", r#"{"case_id":"FT-1"}"#),
+            (
+                "index",
+                r#"{"videos":[{"id":"v1","source_path":"/e/a.mp4"}]}"#,
+            ),
+            ("join", "{\"output_path\":\"x.mp4\"}"),
+            ("read_errors", r#"{"batch":"denied"}"#),
+        ];
+        assert_eq!(render(&inputs), render(&inputs));
+    }
+
+    /// D10 helper: the report must have been rendered from these exact
+    /// record bytes.
+    #[test]
+    fn report_matches_only_its_own_signoff_record() {
+        let record = "{\"schema_version\":4,\"examiner\":\"A\",\"signed_unix\":5}\n";
+        let html = super::inject_signoff_banner(
+            "<html><body></body></html>".into(),
+            "A",
+            5,
+            super::SignoffCurrency::Current,
+            record,
+        );
+        assert!(super::report_matches_signoff(&html, record).is_ok());
+        let swapped = record.replace("\"signed_unix\":5", "\"signed_unix\":6");
+        let err = super::report_matches_signoff(&html, &swapped).unwrap_err();
+        assert!(err.contains("not from this record"), "{err}");
+        assert!(super::report_matches_signoff("<html></html>", record).is_err());
+    }
+
+    /// A minimal case/package tree for sign-off checks: one indexed video
+    /// with a hash, a two-entry chained lane, and the marks digests.
+    fn signoff_tree(name: &str) -> (std::path::PathBuf, super::SignoffDigests) {
+        let root = std::env::temp_dir().join(format!(
+            "frametrace-signoff-v4-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(
+            root.join("db/videos.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"id": "vid_000001", "sha256": "A".repeat(64)})
+            ),
+        )
+        .unwrap();
+        let lane = root.join("evidence/logs/validation-log.jsonl");
+        for n in 0..2 {
+            crate::audit::append_chained_jsonl_keyed(&lane, &format!(r#"{{"n":{n}}}"#), None)
+                .unwrap();
+        }
+        let digests = super::SignoffDigests {
+            content: super::signoff_content_sha256("{\"schema\":3,\"marks\":[1]}"),
+            legacy: super::signoff_content_sha256("[]"),
+        };
+        (root, digests)
+    }
+
+    /// Builds a v4 record over `root` for `vid_000001` (what
+    /// `Signoff::build_v4` writes, minus the database read).
+    fn v4_record(root: &std::path::Path, digests: &super::SignoffDigests) -> String {
+        let bindings = super::signoff_bindings(root, ["vid_000001", "join:nothing"]).unwrap();
+        let content = super::signoff_content_sha256(&super::signoff_v4_content_json(
+            &digests.content,
+            &bindings,
+        ));
+        let (evidence, lanes) = super::bindings_json(&bindings);
+        format!(
+            "{{\"schema_version\":4,\"examiner\":\"A\",\"signed_unix\":5,\"annotations_sha256\":\"{}\",\"evidence\":{evidence},\"lanes\":{lanes},\"content_sha256\":\"{content}\"}}\n",
+            digests.content
+        )
+    }
+
+    /// D13: a v4 sign-off reads "changed" when a marked record's target
+    /// hash changes, when an anchored lane loses its tail, or when the
+    /// record's own bindings are edited — and stays current across appends.
+    #[test]
+    fn v4_signoff_detects_target_hash_change_and_lane_truncation() {
+        use super::{SignoffCurrency, SignoffScope, check_signoff};
+        let (root, digests) = signoff_tree("detect");
+        let record = v4_record(&root, &digests);
+        assert!(
+            record.contains("\"vid_000001\":\"aaaa"),
+            "lowercased: {record}"
+        );
+        assert!(record.contains("\"join:nothing\":null"), "{record}");
+        assert!(
+            record.contains("\"evidence/logs/validation-log.jsonl\":{\"entries\":2"),
+            "{record}"
+        );
+        let check = check_signoff(&root, &record, &digests, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Current, "{check:?}");
+        assert!(
+            check
+                .not_verified
+                .iter()
+                .any(|item| item.contains("join:nothing"))
+        );
+        // The digests-only path (package.rs today) compares the marks part.
+        assert_eq!(
+            super::signoff_currency(&record, &digests),
+            SignoffCurrency::Current
+        );
+
+        // Appends after the sign-off are fine.
+        let lane = root.join("evidence/logs/validation-log.jsonl");
+        crate::audit::append_chained_jsonl_keyed(&lane, r#"{"n":9}"#, None).unwrap();
+        assert_eq!(
+            check_signoff(&root, &record, &digests, SignoffScope::Case).currency,
+            SignoffCurrency::Current
+        );
+
+        // Lane tail removed (still a valid chain): changed.
+        let text = std::fs::read_to_string(&lane).unwrap();
+        std::fs::write(&lane, format!("{}\n", text.lines().next().unwrap())).unwrap();
+        let check = check_signoff(&root, &record, &digests, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Changed);
+        assert!(
+            check.changes.iter().any(|c| c.contains("끝부분이 삭제됨")),
+            "{check:?}"
+        );
+        // In a package that never held the lane it is "not verified".
+        let unlisted = |_: &str| false;
+        let check = check_signoff(&root, &record, &digests, SignoffScope::Package(&unlisted));
+        assert!(
+            check
+                .not_verified
+                .iter()
+                .any(|c| c.contains("패키지에 포함되지 않은"))
+        );
+
+        // Target file hash changed (re-scanned with other bytes).
+        let (root2, digests2) = signoff_tree("target");
+        let record2 = v4_record(&root2, &digests2);
+        std::fs::write(
+            root2.join("db/videos.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"id": "vid_000001", "sha256": "b".repeat(64)})
+            ),
+        )
+        .unwrap();
+        let check = check_signoff(&root2, &record2, &digests2, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Changed);
+        assert!(
+            check
+                .changes
+                .iter()
+                .any(|c| c.contains("vid_000001: 대상 파일 SHA-256이 서명 후 바뀜")),
+            "{check:?}"
+        );
+
+        // Editing the record's anchors to match a truncated lane is caught
+        // by content_sha256.
+        let forged = record2.replace("\"entries\":2", "\"entries\":1");
+        let check = check_signoff(&root2, &forged, &digests2, SignoffScope::Case);
+        assert!(
+            check
+                .changes
+                .iter()
+                .any(|c| c.contains("서명 기록이 변경됨")),
+            "{check:?}"
+        );
+        // Marks changed.
+        let other = super::SignoffDigests {
+            content: super::signoff_content_sha256("other"),
+            legacy: digests2.legacy.clone(),
+        };
+        let check = check_signoff(&root2, &record2, &other, SignoffScope::Case);
+        assert!(
+            check.changes.iter().any(|c| c.contains("판독 마크")),
+            "{check:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    /// D13: records of older schemas keep their legacy meaning through the
+    /// full check (no new failure modes for existing sign-offs).
+    #[test]
+    fn legacy_signoff_schemas_keep_their_binding_meaning() {
+        use super::{SignoffCurrency, SignoffScope, check_signoff};
+        let (root, digests) = signoff_tree("legacy");
+        let v3 = format!(
+            r#"{{"schema_version":3,"examiner":"A","signed_unix":5,"content_sha256":"{}"}}"#,
+            digests.content
+        );
+        let check = check_signoff(&root, &v3, &digests, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Current);
+        assert!(check.changes.is_empty());
+        let v2 = format!(
+            r#"{{"schema_version":2,"examiner":"A","signed_unix":5,"content_sha256":"{}"}}"#,
+            digests.legacy
+        );
+        assert_eq!(
+            check_signoff(&root, &v2, &digests, SignoffScope::Case).currency,
+            SignoffCurrency::LegacyBinding
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// E9: a telemetry track cut at the point cap is shown as truncated
+    /// with its total, never as a complete track.
+    #[test]
+    fn truncated_telemetry_track_is_labelled() {
+        let telemetry = r#"{"t1":{"selector":"vid_1","source":"nmea-file-scan","point_count":20000,"total_points":51234,"truncated":true},"t2":{"selector":"vid_2","point_count":12,"total_points":12,"truncated":false}}"#;
+        let html = rendered_elements(&[("telemetry", telemetry)])["telemetry"]["innerHTML"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            html.contains("전체 51234점 중 20000점만 기록 — 잘림"),
+            "{html}"
+        );
+        assert!(html.contains("<td>12점</td>"), "{html}");
+        let empty = rendered_elements(&[])["telemetry"]["innerHTML"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(empty.contains("추출 기록이 없습니다"), "{empty}");
     }
 }

@@ -40,6 +40,12 @@ use std::sync::OnceLock;
 pub struct AuditKey {
     pub id: String,
     pub bytes: Vec<u8>,
+    /// D15: when this key was retired by a rotation (keyring `retired`
+    /// map). A retired key only authenticates entries that predate its
+    /// retirement. `Some(u64::MAX)` = retired at an unrecorded time (a
+    /// non-active key of a keyring written before retirement times were
+    /// kept); `None` = not retired.
+    pub retired_unix: Option<u64>,
 }
 
 impl AuditKey {
@@ -48,7 +54,14 @@ impl AuditKey {
         Self {
             id: id.to_string(),
             bytes: bytes.to_vec(),
+            retired_unix: None,
         }
+    }
+
+    /// The same key marked as retired at `unix` (tests and tools).
+    pub fn retired_at(mut self, unix: u64) -> Self {
+        self.retired_unix = Some(unix);
+        self
     }
 }
 
@@ -157,6 +170,7 @@ fn read_key_file(path: &Path) -> Result<AuditKey, String> {
     Ok(AuditKey {
         id: configured_key_id(),
         bytes,
+        retired_unix: None,
     })
 }
 
@@ -174,6 +188,7 @@ fn key_from_env(var: &str) -> Result<Option<AuditKey>, String> {
             Ok(Some(AuditKey {
                 id: configured_key_id(),
                 bytes,
+                retired_unix: None,
             }))
         }
         Ok(_) => Err(format!("{var} is set but empty")),
@@ -247,6 +262,11 @@ struct KeyringFile {
     version: u32,
     active: String,
     keys: BTreeMap<String, String>,
+    /// D15: retirement time (unix seconds) of every retired key id. Absent
+    /// in keyrings written before retirement times were recorded; their
+    /// non-active keys load as retired at an unrecorded time.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    retired: BTreeMap<String, u64>,
 }
 
 /// A loaded keyring for callers that need the active id alongside the keys.
@@ -312,9 +332,15 @@ pub fn load_keyring(path: &Path) -> Result<Option<Keyring>, String> {
     for (id, material) in &parsed.keys {
         let bytes = parse_key_material(material)
             .map_err(|err| format!("audit keyring {}: key \"{id}\": {err}", path.display()))?;
+        let retired_unix = if *id == parsed.active {
+            None
+        } else {
+            Some(parsed.retired.get(id).copied().unwrap_or(u64::MAX))
+        };
         keys.push(AuditKey {
             id: id.clone(),
             bytes,
+            retired_unix,
         });
     }
     Ok(Some(Keyring {
@@ -357,7 +383,21 @@ pub fn rotate_at(
     requested_id: Option<&str>,
     previous: Option<AuditKey>,
 ) -> Result<Rotation, String> {
-    let mut keys: BTreeMap<String, Vec<u8>> = load_keyring(keyring_path)?
+    let loaded = load_keyring(keyring_path)?;
+    let mut retired: BTreeMap<String, u64> = loaded
+        .as_ref()
+        .map(|kr| {
+            kr.keys
+                .iter()
+                .filter_map(|key| {
+                    key.retired_unix
+                        .filter(|at| *at != u64::MAX)
+                        .map(|at| (key.id.clone(), at))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut keys: BTreeMap<String, Vec<u8>> = loaded
         .map(|kr| kr.keys.into_iter().map(|key| (key.id, key.bytes)).collect())
         .unwrap_or_default();
 
@@ -402,6 +442,14 @@ pub fn rotate_at(
         }
     }
     keys.insert(id.clone(), bytes.to_vec());
+    // D15: every key but the new active one is retired now (an earlier
+    // recorded retirement time is kept — the earliest cut-off wins).
+    let now = crate::util::now_unix()?;
+    for key_id in keys.keys() {
+        if *key_id != id {
+            retired.entry(key_id.clone()).or_insert(now);
+        }
+    }
 
     write_keyring(
         keyring_path,
@@ -412,12 +460,14 @@ pub fn rotate_at(
                 .iter()
                 .map(|(id, bytes)| (id.clone(), hex_encode(bytes)))
                 .collect(),
+            retired,
         },
     )?;
     Ok(Rotation {
         new_key: AuditKey {
             id,
             bytes: bytes.to_vec(),
+            retired_unix: None,
         },
         previous_id,
         keyring_path: keyring_path.to_path_buf(),
@@ -682,6 +732,65 @@ mod tests {
         assert_eq!(verification.keyed_entries, 2);
         assert_eq!(verification.integrity, crate::audit::AuditIntegrity::Keyed);
         assert!(verification.warnings.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// D15: rotation records when each key was retired; the loaded keyring
+    /// hands verification that cut-off, and a pre-D15 keyring (no
+    /// `retired` map) loads its non-active keys as retired at an unknown
+    /// time. A retired key no longer signs entries dated after rotation.
+    #[test]
+    fn rotation_records_retirement_and_cuts_off_the_retired_key() {
+        let dir = test_dir("retired-cutoff");
+        let keyring_path = dir.join("audit-keys.json");
+        let old = AuditKey::new("2026-Q1", &[0x44; 32]);
+        rotate_at(&keyring_path, Some("2026-Q2"), Some(old.clone())).unwrap();
+        let keyring = load_keyring(&keyring_path).unwrap().unwrap();
+        let retired = keyring.keys.iter().find(|k| k.id == "2026-Q1").unwrap();
+        let active = keyring.keys.iter().find(|k| k.id == "2026-Q2").unwrap();
+        let now = crate::util::now_unix().unwrap();
+        let at = retired
+            .retired_unix
+            .expect("retired key carries its retirement time");
+        assert!(at <= now && at + 600 > now, "{at} vs {now}");
+        assert_eq!(active.retired_unix, None);
+        assert!(
+            fs::read_to_string(&keyring_path)
+                .unwrap()
+                .contains("\"retired\"")
+        );
+
+        // A forger holding the old key appends an entry dated after the
+        // rotation: refused under the keyring's key set.
+        let log = dir.join("audit.jsonl");
+        crate::audit::append_chained_jsonl_keyed(
+            &log,
+            &format!(r#"{{"kind":"forged","created_unix":{}}}"#, at + 3600),
+            Some(&old),
+        )
+        .unwrap();
+        let err = crate::audit::verify_chained_jsonl_keyed(&log, &keyring.keys).unwrap_err();
+        assert!(err.contains("retired"), "{err}");
+
+        // Pre-D15 keyring: non-active keys are retired at an unknown time.
+        let legacy = dir.join("legacy-keys.json");
+        fs::write(
+            &legacy,
+            format!(
+                "{{\"version\":1,\"active\":\"b\",\"keys\":{{\"a\":\"{}\",\"b\":\"{}\"}}}}",
+                "11".repeat(32),
+                "22".repeat(32)
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let keyring = load_keyring(&legacy).unwrap().unwrap();
+        let a = keyring.keys.iter().find(|k| k.id == "a").unwrap();
+        assert_eq!(a.retired_unix, Some(u64::MAX));
         let _ = fs::remove_dir_all(dir);
     }
 

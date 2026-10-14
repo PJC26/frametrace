@@ -2293,12 +2293,8 @@ thread_local! {
 /// &Signoff)` (D13: chains the sign-off into `signoff-log.jsonl`, keyed
 /// when an audit key is configured).
 ///
-/// INTEGRATION TODO(B18↔D13): D's function was not present when this was
-/// written. The integrator replaces the body below with
-/// `crate::<d module>::record_signoff_audit(case_dir, &parsed_signoff)`
-/// (parsing `signoff_json`, the exact pending `signoff.json` text, into
-/// D's `Signoff`). Until then this stub records nothing on disk and
-/// succeeds, so finalize keeps working.
+/// Parses `signoff_json` (the exact pending `signoff.json` text) into
+/// `report::Signoff` and appends it with `report::record_signoff_audit`.
 pub(crate) fn record_signoff_audit(case_dir: &Path, signoff_json: &str) -> Result<(), String> {
     #[cfg(test)]
     {
@@ -2311,8 +2307,11 @@ pub(crate) fn record_signoff_audit(case_dir: &Path, signoff_json: &str) -> Resul
             return Err(err);
         }
     }
-    let _ = (case_dir, signoff_json);
-    Ok(())
+    // D13: chain the exact record bytes (any schema) into
+    // `evidence/logs/signoff-log.jsonl` via track D's public function.
+    let signoff = crate::report::Signoff::parse(signoff_json)
+        .ok_or_else(|| "검토자 기록이 올바르지 않습니다 (검토자 이름 없음)".to_string())?;
+    crate::report::record_signoff_audit(case_dir, &signoff)
 }
 
 /// SHA-256 of the package's `manifest.sha256`: one value an examiner can

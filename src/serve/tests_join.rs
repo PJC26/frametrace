@@ -967,7 +967,9 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     });
     let log = case_dir.join(crate::audio_level::LOG_REL);
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-    std::fs::write(&log, format!("{entry}\n")).unwrap();
+    // D1: the lane is chain-verified before any level is shown, so the
+    // fixture is a real chained lane.
+    crate::audit::append_chained_jsonl_keyed(&log, &entry.to_string(), None).unwrap();
 
     let computed = || super::records::AUDIO_LEVELS_COMPUTED.with(|c| c.get());
     let before = computed();
@@ -998,7 +1000,7 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
         "ffmpeg_version": "test", "command_template": [],
         "results": [result(&rows[1], 10)],
     });
-    std::fs::write(&log, format!("{entry}\n{newer}\n")).unwrap();
+    crate::audit::append_chained_jsonl_keyed(&log, &newer.to_string(), None).unwrap();
     let updated = parse(&api_records_meta(&state));
     assert_eq!(updated["audioLevels"]["vid_2"]["r"], "sound", "{updated}");
     assert_eq!(computed(), before + 2);
