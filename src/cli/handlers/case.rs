@@ -464,6 +464,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         .map_err(|err| format!("failed to write carve report html: {err}"))?;
         println!("carve report written: {}", carve_report_path.display());
     }
+    record_generated_pages(case_dir)?;
     println!("review written: {}", review_path.display());
     println!(
         "evidence viewer written: {}",
@@ -915,6 +916,7 @@ pub fn make_report(
     };
     let report_path = case_dir.join("reports/case-report.html");
     write_text(&report_path, &html).map_err(|err| format!("failed to write report html: {err}"))?;
+    record_generated_pages(case_dir)?;
     println!("report written: {}", report_path.display());
     Ok(())
 }
@@ -1108,8 +1110,20 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
 pub fn make_custody(case_dir: &Path) -> Result<(), String> {
     ensure_case(case_dir)?;
     let path = crate::custody::generate(case_dir)?;
+    record_generated_pages(case_dir)?;
     println!("custody statement written: {}", path.display());
     Ok(())
+}
+
+/// B5: records the SHA-256 of every generated case page (review/, reports/)
+/// so the workstation serves them with their scripts allowed instead of
+/// sandboxed. Called after every page this module writes.
+fn record_generated_pages(case_dir: &Path) -> Result<(), String> {
+    crate::util::generated_pages::record_case_generated_pages(case_dir)
+        .map(|_| ())
+        .map_err(|err| {
+            format!("생성 페이지 신뢰 목록(review/.generated.json)을 기록하지 못했습니다: {err}")
+        })
 }
 
 /// The compact `audioLevels` map (`{id: {r,max,mean,sec,t}}`, plan §2.4)
@@ -2458,6 +2472,33 @@ mod report_output_tests {
                 .any(|c| c.status == crate::package::CheckStatus::Pass
                     && c.detail.contains("no unlisted files")),
             "contradictory PASS line kept"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// B5: CLI-built pages are recorded as generated (so the workstation
+    /// serves them with scripts, not sandboxed), and the report and review
+    /// pages carry no inline handlers (they qualify for a strict
+    /// hash-based script-src).
+    #[test]
+    fn cli_built_pages_are_recorded_and_free_of_inline_handlers() {
+        use crate::util::generated_pages::{inline_script_sources, page_is_trusted};
+        let (root, case_dir, _source) = scanned_case("generated-pages");
+        make_review(&case_dir, false, false).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        super::make_custody(&case_dir).unwrap();
+        for rel in [
+            "reports/case-report.html",
+            "review/index.html",
+            "review/evidence-viewer.html",
+            "reports/custody-statement.html",
+        ] {
+            assert!(page_is_trusted(&case_dir, rel), "{rel} not recorded");
+        }
+        let report = report_html(&case_dir);
+        assert!(
+            inline_script_sources(&report).is_some(),
+            "case report must not use inline handlers"
         );
         fs::remove_dir_all(root).unwrap();
     }

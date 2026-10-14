@@ -200,7 +200,7 @@ pub fn render_case_report_with_chains(
 </head>
 <body>
 <div class="print-bar">
-  <button onclick="window.print()" type="button">인쇄 / PDF로 저장</button>
+  <button id="print-button" type="button">인쇄 / PDF로 저장</button>
 </div>
 <main>
   <h1 id="title">FrameTrace 영상 포렌식 보고서</h1>
@@ -298,6 +298,8 @@ const videos = Array.isArray(scan.videos) ? scan.videos : [];
 const warnings = Array.isArray(scan.warnings) ? scan.warnings : [];
 const derivedLog = [...proxyLog, ...thumbnailLog];
 
+// B5: no inline handlers — the page qualifies for a strict script-src.
+document.getElementById("print-button").addEventListener?.("click", () => window.print());
 const escapeHtml = value => String(value ?? "")
   .replaceAll("&", "&amp;")
   .replaceAll("<", "&lt;")
