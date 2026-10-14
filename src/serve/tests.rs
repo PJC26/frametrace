@@ -1173,6 +1173,9 @@ fn untrusted_case_documents_are_sandboxed_and_downloaded() {
         "reports/package_1/review/index.html",
     ] {
         assert!(is_generated_page(&case_dir, &canon(trusted)), "{trusted}");
+        // R4-B5: location alone no longer trusts a page — FrameTrace's
+        // generators record what they wrote.
+        crate::util::generated_pages::record_generated_pages(&case_dir, &[trusted]).unwrap();
     }
     for untrusted in [
         "reports/package_1/artifacts/carved/x.html",

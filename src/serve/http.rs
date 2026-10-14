@@ -26,7 +26,52 @@ pub(crate) fn http_body_limit_for(path: &str) -> usize {
     }
 }
 
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// R4-B12: the whole header block must arrive within this (was 30 s): a
+/// slowloris client dripping one byte at a time holds a connection thread
+/// for at most this long.
+pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// R4-B12: connections from one peer address (any source port — every
+/// local process is 127.0.0.1) that may sit in the unauthenticated header
+/// phase at once. The rest of the 64-connection budget stays available to
+/// the examiner's own page.
+pub(crate) const MAX_PREAUTH_PER_PEER: usize = 16;
+
+/// A peer's slot in the unauthenticated phase; released on drop.
+pub(crate) struct PreauthSlot {
+    map: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    peer: std::net::IpAddr,
+}
+
+impl Drop for PreauthSlot {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = map.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Takes a pre-auth slot for `peer`, or `None` when it already holds
+/// [`MAX_PREAUTH_PER_PEER`].
+pub(crate) fn take_preauth_slot(
+    map: &Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    peer: std::net::IpAddr,
+) -> Option<PreauthSlot> {
+    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+    let count = guard.entry(peer).or_insert(0);
+    if *count >= MAX_PREAUTH_PER_PEER {
+        return None;
+    }
+    *count += 1;
+    Some(PreauthSlot {
+        map: Arc::clone(map),
+        peer,
+    })
+}
 
 /// Windows review item 11: the workstation URL carries `?token=` on first
 /// load, so no response may leak it (or any evidence path in a query) to a
@@ -185,14 +230,27 @@ pub(crate) fn drain_unread(stream: &mut TcpStream) {
     }
 }
 
-pub(crate) fn handle_connection(stream: TcpStream, state: SharedState) -> Result<(), String> {
-    handle_connection_timed(stream, state, HEADER_READ_TIMEOUT)
+/// The per-peer pre-auth counter map shared by a server's connections.
+pub(crate) type PreauthMap = Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>;
+
+#[cfg(test)]
+pub(crate) fn handle_connection_timed(
+    stream: TcpStream,
+    state: SharedState,
+    read_timeout: Duration,
+) -> Result<(), String> {
+    let preauth_map = Arc::clone(&state_lock(&state).preauth_conns);
+    handle_connection_with(stream, state, read_timeout, &preauth_map)
 }
 
-pub(crate) fn handle_connection_timed(
+/// [`handle_connection_timed`] with the pre-auth map handed in: the accept
+/// loop clones it once, so serving a connection that is refused before
+/// the auth gate (400/408/503) never waits for the state lock.
+pub(crate) fn handle_connection_with(
     mut stream: TcpStream,
     state: SharedState,
     read_timeout: Duration,
+    preauth_map: &PreauthMap,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(read_timeout))
@@ -202,6 +260,26 @@ pub(crate) fn handle_connection_timed(
         .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|err| format!("write timeout: {err}"))?;
     HEAD_ONLY.with(|flag| flag.set(false));
+    // R4-B12: bounded unauthenticated connections per peer address; the
+    // slot is held through the header phase and the auth gate only.
+    let preauth = match stream.peer_addr() {
+        Ok(addr) => match take_preauth_slot(preauth_map, addr.ip()) {
+            Some(slot) => Some(slot),
+            None => {
+                let _ = finish(
+                    &mut stream,
+                    &plain(
+                        503,
+                        b"too many unauthenticated connections from this address".to_vec(),
+                    ),
+                );
+                // Bounded discard so the close does not RST away the 503.
+                drain_unread(&mut stream);
+                return Err("pre-auth connection cap reached".into());
+            }
+        },
+        Err(_) => None,
+    };
     let refuse_read = |stream: &mut TcpStream, err: HttpReadError| {
         if err.status != 0 {
             let _ = finish(stream, &plain(err.status, err.message.clone().into_bytes()));
@@ -233,10 +311,29 @@ pub(crate) fn handle_connection_timed(
     // C2: cookies are scoped by host, not by port, so the auth cookies are
     // named after the port this server listens on.
     let port = stream.local_addr().ok().map(|addr| addr.port());
+    // R4-B2: `GET /?launch=<code>` is its own gate — a valid one-time code
+    // plants the auth cookie and redirects to `/`.
+    if request.method == "GET"
+        && request.path == "/"
+        && let Some(code) = query_value(&request.query, "launch")
+    {
+        drop(preauth);
+        let mut response = launch_response(&request, &state, &code, port);
+        if is_head && let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            response.truncate(end + 4);
+        }
+        let result = finish(&mut stream, &response);
+        if pending_body.has_unread() {
+            drain_unread(&mut stream);
+        }
+        return result;
+    }
     // S3: Origin/Host, token and nonce live in the header block, so the
     // gate runs before a single body byte is read — an unauthenticated
     // client can no longer make the server buffer a 16 MiB body first.
-    let plant_cookie = match authorize_on(&request, token.as_deref(), &instance, port) {
+    let authorized = authorize_on(&request, token.as_deref(), &instance, port);
+    drop(preauth);
+    let plant_cookie = match authorized {
         Ok(plant) => plant,
         Err(code) => {
             let message: &[u8] = if code == 403 {
@@ -938,6 +1035,59 @@ pub(crate) fn set_token_cookie(response: &mut Vec<u8>, token: &str, port: Option
     }
 }
 
+/// R4-B2: answer to `GET /?launch=<code>`.
+/// - valid, unexpired, unused code → `303 See Other` to `/` with the
+///   `ft_token_<port>` cookie (the code is consumed: single use);
+/// - otherwise, a request that already proves the token (cookie/header)
+///   is simply redirected to `/`;
+/// - otherwise `401` with an explanation (expired or reused link).
+///
+/// Without a configured token there is nothing to plant: redirect.
+pub(crate) fn launch_response(
+    request: &Request,
+    state: &SharedState,
+    code: &str,
+    port: Option<u16>,
+) -> Vec<u8> {
+    if !request_is_localhost_trusted(request) {
+        return plain(403, b"cross-origin request rejected".to_vec());
+    }
+    let redirect = || {
+        respond(
+            303,
+            "text/plain; charset=utf-8",
+            b"see /".to_vec(),
+            "no-store",
+            Some("Location: /\r\n"),
+        )
+    };
+    let (token, valid) = {
+        let mut guard = state_lock(state);
+        let valid = super::consume_launch_code(&mut guard, code.trim(), std::time::Instant::now());
+        (guard.token.clone(), valid)
+    };
+    let Some(token) = token else {
+        return redirect();
+    };
+    if valid {
+        let mut response = redirect();
+        set_token_cookie(&mut response, &token, port);
+        return response;
+    }
+    if request_authorized_on(request, &token, port) != AuthProof::Denied {
+        return redirect();
+    }
+    respond(
+        401,
+        "text/html; charset=utf-8",
+        "<!doctype html><meta charset=\"utf-8\"><title>FrameTrace</title><p>실행 링크가 만료되었거나 이미 사용되었습니다. FrameTrace를 다시 실행하면 새 링크로 열립니다.</p><p>This launch link expired or was already used; start FrameTrace again.</p>"
+            .as_bytes()
+            .to_vec(),
+        "no-store",
+        None,
+    )
+}
+
 /// Checks the instance-nonce proof for mutating requests in the no-token
 /// model. An empty configured nonce can never authenticate (entropy
 /// failure is fail-closed, matching the instance-file check).
@@ -1116,8 +1266,21 @@ pub(crate) fn serve_case_file_with(
         Ok(file) => file,
         Err(_) => return write_simple(stream, 404, b"file not found"),
     };
-    let trusted = is_generated_page(&case_dir, &path);
-    let safety = content_safety_headers(&path, trusted, false);
+    // R4-B5: a page at a generated location is trusted only when this
+    // user's HMAC'd manifest lists its exact bytes; an unlisted one renders
+    // sandboxed (no script) instead of running in the workstation origin.
+    let mut safety = if is_generated_page(&case_dir, &path) {
+        match verified_generated_page(&case_dir, &path, &meta) {
+            Some(script_src) => trusted_page_headers(script_src.as_deref()),
+            None => UNVERIFIED_PAGE_HEADERS.to_string(),
+        }
+    } else {
+        content_safety_headers(&path, false, false)
+    };
+    if mime_for(&path).starts_with("text/html") {
+        let frame = html_frame_headers(&safety);
+        safety.push_str(&frame);
+    }
     let (cache, etag_header) = if is_thumbnail_path(&case_dir, &path) {
         let etag = thumb_etag(&meta);
         let immutable = query_value(&request.query, "v").is_some_and(|v| !v.is_empty());
@@ -1291,6 +1454,70 @@ pub(crate) fn is_generated_page(case_dir: &Path, canonical: &Path) -> bool {
     }
 }
 
+/// R4-B5: headers for a page at a generated location whose bytes the
+/// manifest does not vouch for — rendered inline but sandboxed (opaque
+/// origin, no script), so it can neither run code nor reach the APIs.
+pub(crate) const UNVERIFIED_PAGE_HEADERS: &str = "Content-Security-Policy: sandbox; default-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'unsafe-inline'; frame-ancestors 'self'\r\n";
+
+/// R4-B5: headers for a verified generated page; `script_src` (inline
+/// script hashes + `'self'`) is added when the page allows it.
+pub(crate) fn trusted_page_headers(script_src: Option<&str>) -> String {
+    match script_src {
+        Some(sources) => format!(
+            "Content-Security-Policy: frame-ancestors 'self'; object-src 'none'; base-uri 'self'; script-src {sources}\r\n"
+        ),
+        None => content_safety_headers(Path::new("index.html"), true, false),
+    }
+}
+
+/// Verified-page cache: `(path, len, mtime, sha256, script-src)`.
+type VerifiedPageEntry = (PathBuf, u64, Option<SystemTime>, String, Option<String>);
+static VERIFIED_PAGES: Mutex<Vec<VerifiedPageEntry>> = Mutex::new(Vec::new());
+const VERIFIED_PAGES_CAP: usize = 64;
+/// Pages above this are never parsed for inline scripts (hash only).
+const SCRIPT_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// `Some(script_src)` when the generated page at `path` is listed in the
+/// case's verified manifest (R4-B5), `None` when it is not (or cannot be
+/// read). Runs outside the state lock (file hashing).
+pub(crate) fn verified_generated_page(
+    case_dir: &Path,
+    path: &Path,
+    meta: &std::fs::Metadata,
+) -> Option<Option<String>> {
+    let (len, mtime) = (meta.len(), meta.modified().ok());
+    let cached = VERIFIED_PAGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(p, l, m, _, _)| p == path && *l == len && *m == mtime)
+        .map(|(_, _, _, sha, script)| (sha.clone(), script.clone()));
+    let (sha, script) = match cached {
+        Some(hit) => hit,
+        None => {
+            let sha = crate::util::generated_pages::file_sha256(path)?;
+            let script = (len <= SCRIPT_SCAN_MAX_BYTES)
+                .then(|| std::fs::read(path).ok())
+                .flatten()
+                .and_then(|bytes| {
+                    crate::util::generated_pages::inline_script_sources(&String::from_utf8_lossy(
+                        &bytes,
+                    ))
+                });
+            let mut cache = VERIFIED_PAGES.lock().unwrap_or_else(|p| p.into_inner());
+            cache.retain(|(p, _, _, _, _)| p != path);
+            if cache.len() >= VERIFIED_PAGES_CAP {
+                cache.remove(0);
+            }
+            cache.push((path.to_path_buf(), len, mtime, sha.clone(), script.clone()));
+            (sha, script)
+        }
+    };
+    crate::util::generated_pages::trusted_hashes(case_dir)
+        .contains(&sha)
+        .then_some(script)
+}
+
 /// Security headers for streamed case/media files (SEC-02).
 /// - Generated pages: may only be framed by the workstation itself.
 /// - Everything else: CSP `sandbox` (no script, opaque origin, so the
@@ -1398,7 +1625,11 @@ pub(crate) fn serve_media(
     // Evidence is never trusted content: script-capable documents (html,
     // svg, xml) are always forced to download and sandboxed (SEC-02).
     let wants_download = query_value(&request.query, "download").is_some();
-    head.push_str(&content_safety_headers(&canonical, false, wants_download));
+    let safety = content_safety_headers(&canonical, false, wants_download);
+    if mime_for(&canonical).starts_with("text/html") {
+        head.push_str(&html_frame_headers(&safety));
+    }
+    head.push_str(&safety);
     if code == 206 {
         head.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
     }
@@ -1468,6 +1699,7 @@ pub(crate) fn respond(
     let status_text = match code {
         200 => "OK",
         206 => "Partial Content",
+        303 => "See Other",
         304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -1488,10 +1720,29 @@ pub(crate) fn respond(
     if let Some(extra) = extra {
         head.push_str(extra);
     }
+    if content_type.starts_with("text/html") {
+        head.push_str(&html_frame_headers(extra.unwrap_or_default()));
+    }
     head.push_str("\r\n");
     let mut bytes = head.into_bytes();
     bytes.extend_from_slice(&body);
     bytes
+}
+
+/// R4-B13: anti-framing headers every HTML response carries — a CSP
+/// `frame-ancestors 'self'` (unless `existing` headers already set one)
+/// and the legacy `X-Frame-Options: SAMEORIGIN` for older engines — so no
+/// other site can frame a workstation page (clickjacking the finalize or
+/// delete buttons).
+pub(crate) fn html_frame_headers(existing: &str) -> String {
+    let mut headers = String::new();
+    if !existing.contains("frame-ancestors") {
+        headers.push_str("Content-Security-Policy: frame-ancestors 'self'\r\n");
+    }
+    if !existing.contains("X-Frame-Options") {
+        headers.push_str("X-Frame-Options: SAMEORIGIN\r\n");
+    }
+    headers
 }
 
 /// Percent-encodes a value for RFC 5986/5987 ext-value (`filename*=`).

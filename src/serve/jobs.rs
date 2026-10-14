@@ -232,20 +232,44 @@ pub(crate) fn run_pipeline(state: SharedState, job: PipelineJob) {
 }
 
 pub(crate) fn run_e01_pipeline(state: SharedState, job: PipelineJob) {
+    match std::env::current_exe() {
+        Ok(exe) => run_e01_pipeline_with(state, job, &exe),
+        Err(err) => fail(
+            &state,
+            &format!("실행 파일 경로를 확인할 수 없습니다: {err}"),
+        ),
+    }
+}
+
+/// R4-B16: runs a filesystem-inspection step whose CLI may report a
+/// partial result (exit code 5). A partial run marks `step` as `partial`
+/// and records a job warning; the pipeline continues with what it got.
+fn run_inspection_step(
+    exe: &Path,
+    args: &[String],
+    state: &SharedState,
+    step: usize,
+) -> Result<String, String> {
+    let run = run_step_detailed(exe, args, &|| state_lock(state).cancel_requested, state)?;
+    if run.partial {
+        let message = partial_step_warning(args, &run.output);
+        let mut guard = state_lock(state);
+        guard.steps[step] = StepStatus::Partial;
+        guard.logs.push(format!("경고: {message}"));
+        guard.warnings.push((step, message));
+    } else {
+        state_lock(state).steps[step] = StepStatus::Done;
+    }
+    Ok(run.output)
+}
+
+/// [`run_e01_pipeline`] on an explicit CLI executable (tests run a fake).
+pub(crate) fn run_e01_pipeline_with(state: SharedState, job: PipelineJob, exe: &Path) {
     let log = |state: &SharedState, line: String| state_lock(state).logs.push(line);
     let set_step = |state: &SharedState, index: usize, status: StepStatus| {
         state_lock(state).steps[index] = status;
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            fail(
-                &state,
-                &format!("실행 파일 경로를 확인할 수 없습니다: {err}"),
-            );
-            return;
-        }
-    };
+    let exe = exe.to_path_buf();
     let case_text = job.case_dir.to_string_lossy().to_string();
     let source_text = job.source_path.to_string_lossy().to_string();
     let raw_path = job.case_dir.join("evidence/images/evidence.raw");
@@ -284,7 +308,7 @@ pub(crate) fn run_e01_pipeline(state: SharedState, job: PipelineJob) {
         // metadata plus mmls/fls straight off the segment set — no raw
         // export, so even a ~1 TB image is reviewable in minutes.
         set_step(&state, 1, StepStatus::Running);
-        match run_step(
+        match run_inspection_step(
             &exe,
             &[
                 "inspect-e01".into(),
@@ -293,11 +317,11 @@ pub(crate) fn run_e01_pipeline(state: SharedState, job: PipelineJob) {
                 "--filesystem".into(),
             ],
             &state,
+            2,
         ) {
             Ok(output) => {
                 log(&state, output);
                 set_step(&state, 1, StepStatus::Done);
-                set_step(&state, 2, StepStatus::Done);
             }
             Err(err) => {
                 set_step(&state, 1, StepStatus::Failed);
@@ -305,7 +329,7 @@ pub(crate) fn run_e01_pipeline(state: SharedState, job: PipelineJob) {
                 return;
             }
         }
-        run_e01_pipeline_tail(state, job);
+        run_e01_pipeline_tail(state, job, &exe);
         return;
     }
 
@@ -369,15 +393,13 @@ pub(crate) fn run_e01_pipeline(state: SharedState, job: PipelineJob) {
 
     // Step 3: partition table + file listing (auto-selects the partition).
     set_step(&state, 2, StepStatus::Running);
-    match run_step(
+    match run_inspection_step(
         &exe,
         &["inspect-image".into(), case_text.clone(), raw_text.clone()],
         &state,
+        2,
     ) {
-        Ok(output) => {
-            log(&state, output);
-            set_step(&state, 2, StepStatus::Done);
-        }
+        Ok(output) => log(&state, output),
         Err(err) => {
             set_step(&state, 2, StepStatus::Failed);
             fail(&state, &err);
@@ -385,26 +407,17 @@ pub(crate) fn run_e01_pipeline(state: SharedState, job: PipelineJob) {
         }
     }
 
-    run_e01_pipeline_tail(state, job);
+    run_e01_pipeline_tail(state, job, &exe);
 }
 
 /// Shared E01 tail: refresh the logical index over the case evidence
 /// tree, run the non-fatal anomaly scan, then emit the review bundle.
-pub(crate) fn run_e01_pipeline_tail(state: SharedState, job: PipelineJob) {
+pub(crate) fn run_e01_pipeline_tail(state: SharedState, job: PipelineJob, exe: &Path) {
     let log = |state: &SharedState, line: String| state_lock(state).logs.push(line);
     let set_step = |state: &SharedState, index: usize, status: StepStatus| {
         state_lock(state).steps[index] = status;
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            fail(
-                &state,
-                &format!("실행 파일 경로를 확인할 수 없습니다: {err}"),
-            );
-            return;
-        }
-    };
+    let exe = exe.to_path_buf();
     let case_text = job.case_dir.to_string_lossy().to_string();
     set_step(&state, 3, StepStatus::Running);
     let mut scan_args: Vec<String> = vec![
@@ -875,6 +888,91 @@ pub(crate) fn run_step(exe: &Path, args: &[String], state: &SharedState) -> Resu
     run_step_cancellable(exe, args, &|| state_lock(state).cancel_requested, state)
 }
 
+/// R4-B16 (contract with track C): a CLI child that exits with this code
+/// completed but produced a PARTIAL result (e.g. an fls listing cut off by
+/// its timeout). Never reported as a clean success.
+pub(crate) const PARTIAL_EXIT_CODE: i32 = 5;
+
+/// One finished CLI step: its retained output and whether the child
+/// reported a partial result ([`PARTIAL_EXIT_CODE`]).
+pub(crate) struct StepRun {
+    pub(crate) output: String,
+    pub(crate) partial: bool,
+}
+
+/// Job warning for a step that ended with [`PARTIAL_EXIT_CODE`].
+pub(crate) fn partial_step_warning(args: &[String], output: &str) -> String {
+    let program = args.first().map(String::as_str).unwrap_or("command");
+    let tail = output.lines().rev().find(|line| !line.trim().is_empty());
+    format!(
+        "{program}: 부분 결과로 끝났습니다 (종료 코드 {PARTIAL_EXIT_CODE}) — 일부 항목이 빠졌을 수 있으니 결과를 완전한 것으로 보지 마십시오.{}",
+        tail.map(|line| format!(" ({})", line.trim()))
+            .unwrap_or_default()
+    )
+}
+
+/// R4-B15: the argument vector a CLI child really gets — the workstation's
+/// `--key-source` (a global flag, so it may precede the subcommand) comes
+/// first unless the step already names one.
+pub(crate) fn child_command_args(key_source: Option<&str>, args: &[String]) -> Vec<String> {
+    let names_one = args
+        .iter()
+        .any(|arg| arg == "--key-source" || arg.starts_with("--key-source="));
+    match key_source.map(str::trim).filter(|spec| !spec.is_empty()) {
+        Some(spec) if !names_one => ["--key-source".to_string(), spec.to_string()]
+            .into_iter()
+            .chain(args.iter().cloned())
+            .collect(),
+        _ => args.to_vec(),
+    }
+}
+
+/// R4-B15: environment variable a CLI child compares its own resolved
+/// audit key against (`<key id>:<fingerprint>` or `none`), see
+/// [`crate::serve::key_source_mismatch_warning`].
+pub(crate) const EXPECTED_AUDIT_KEY_ENV: &str = "FRAMETRACE_EXPECTED_AUDIT_KEY";
+
+/// Subcommands that write pages under `review/` / `reports/` (R4-B5): after
+/// one of them succeeds the workstation records the generated pages so
+/// they are served as trusted FrameTrace pages.
+const PAGE_GENERATORS: &[&str] = &[
+    "make-review",
+    "make-report",
+    "make-custody",
+    "package-case",
+    "deepfake-scan",
+    "qa",
+];
+
+/// The case folder a generator step wrote into (its first argument that is
+/// a case folder), if `args` names a page generator.
+fn generator_case_dir(args: &[String]) -> Option<PathBuf> {
+    if !PAGE_GENERATORS.contains(&args.first()?.as_str()) {
+        return None;
+    }
+    args.iter()
+        .skip(1)
+        .take(2)
+        .map(PathBuf::from)
+        .find(|dir| dir.join("case.json").is_file())
+}
+
+/// Records the pages a successful generator step wrote (R4-B5). A failure
+/// is a visible job warning: the pages then open without script.
+fn record_generated_after(args: &[String], state: &SharedState) {
+    let Some(case_dir) = generator_case_dir(args) else {
+        return;
+    };
+    if let Err(err) = crate::util::generated_pages::record_case_generated_pages(&case_dir) {
+        report_process_warning(
+            state,
+            format!(
+                "생성 페이지 목록을 갱신하지 못했습니다 — 대시보드·보고서가 스크립트 없이 열립니다: {err}"
+            ),
+        );
+    }
+}
+
 /// P6: a step whose process tree could not be put in a Job object is
 /// reported as a job warning (log + `warnings` in /api/status), once per
 /// distinct message — the windowed app has no console for `eprintln!`.
@@ -903,15 +1001,40 @@ pub(crate) fn run_step_cancellable(
     cancelled: &dyn Fn() -> bool,
     state: &SharedState,
 ) -> Result<String, String> {
+    let run = run_step_detailed(exe, args, cancelled, state)?;
+    if run.partial {
+        // R4-B16: completed with a partial result — kept, never silent.
+        report_process_warning(state, partial_step_warning(args, &run.output));
+    }
+    Ok(run.output)
+}
+
+/// [`run_step_cancellable`] that reports a partial result (exit code
+/// [`PARTIAL_EXIT_CODE`]) to the caller instead of turning it into a
+/// generic warning, so a pipeline can mark the step `partial`.
+pub(crate) fn run_step_detailed(
+    exe: &Path,
+    args: &[String],
+    cancelled: &dyn Fn() -> bool,
+    state: &SharedState,
+) -> Result<StepRun, String> {
+    let (key_source, key_tag) = {
+        let guard = state_lock(state);
+        (guard.key_source.clone(), guard_key_tag(&guard))
+    };
+    let child_args = child_command_args(key_source.as_deref(), args);
+    let mut command = Command::new(exe);
+    command
+        .args(&child_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(tag) = key_tag {
+        command.env(EXPECTED_AUDIT_KEY_ENV, tag);
+    }
     // Spawned as a process tree (own group / Job object) so cancel reaches
     // the ffmpeg/ffprobe grandchildren, not just the direct child.
-    let mut tracked = super::proc::spawn_tracked(
-        Command::new(exe)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .map_err(|err| format!("{} 실행 실패: {err}", exe.display()))?;
+    let mut tracked = super::proc::spawn_tracked(&mut command)
+        .map_err(|err| format!("{} 실행 실패: {err}", exe.display()))?;
     if let Some(err) = tracked.tracking_error.take() {
         let program = args.first().map(String::as_str).unwrap_or("command");
         report_process_warning(state, super::proc::tracking_warning(program, &err));
@@ -949,7 +1072,8 @@ pub(crate) fn run_step_cancellable(
     if !stderr.trim().is_empty() {
         text.push_str(&stderr);
     }
-    if !status.success() {
+    let partial = status.code() == Some(PARTIAL_EXIT_CODE);
+    if !status.success() && !partial {
         let mut tail_lines: Vec<&str> = text.lines().rev().take(4).collect();
         tail_lines.reverse();
         let tail = tail_lines.join(" | ");
@@ -960,7 +1084,19 @@ pub(crate) fn run_step_cancellable(
             tail
         ));
     }
-    Ok(text.trim_end().to_string())
+    if !partial {
+        record_generated_after(args, state);
+    }
+    Ok(StepRun {
+        output: text.trim_end().to_string(),
+        partial,
+    })
+}
+
+/// `<id>:<fingerprint>` of the workstation's audit key (or `none`), set
+/// once at startup; `None` when it was never resolved (unit tests).
+fn guard_key_tag(guard: &JobState) -> Option<String> {
+    guard.audit_key_tag.clone()
 }
 
 /// Drains `pipe` to EOF, retaining only the last `STEP_OUTPUT_TAIL_BYTES`.
@@ -1049,11 +1185,57 @@ fn pending_marks_files(case_dir: &Path) -> Vec<PathBuf> {
     };
     let mut files: Vec<PathBuf> = entries
         .flatten()
+        // R4-B10: a zero-length file is a name claim whose write never
+        // finished (crash between claim and rename) — it holds no marks.
+        .filter(|entry| entry.metadata().is_ok_and(|meta| meta.len() > 0))
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
         .collect();
     files.sort();
     files
+}
+
+/// Arrival sequence of a queued file (`<digits>.json`), if its name is one.
+fn queued_sequence(path: &Path) -> Option<u128> {
+    path.file_stem()?.to_str()?.parse::<u128>().ok()
+}
+
+/// R4-B10: process-wide high-water mark of queue sequence numbers.
+static QUEUE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Claims the next queue file name in `dir` and returns it. Names are a
+/// monotonic sequence — strictly above every queued file already present
+/// (also those named by a wall clock in older builds) and above every name
+/// this process handed out — and are claimed with `create_new`, so neither
+/// a clock step backwards nor two saves in the same instant can reorder
+/// or overwrite queued marks. The caller replaces the empty claim with the
+/// body atomically. Callers hold the marks gate.
+pub(crate) fn claim_queue_file(dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let on_disk = std::fs::read_dir(dir)?
+        .flatten()
+        .filter_map(|entry| queued_sequence(&entry.path()))
+        .max()
+        .unwrap_or(0);
+    let mut next = on_disk
+        .max(u128::from(QUEUE_SEQUENCE.load(Ordering::SeqCst)))
+        .saturating_add(1);
+    for _ in 0..1024 {
+        let path = dir.join(format!("{next:032}.json"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => {
+                QUEUE_SEQUENCE.fetch_max(u64::try_from(next).unwrap_or(u64::MAX), Ordering::SeqCst);
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => next += 1,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::other("no free queue file name"))
 }
 
 /// Number of queued (accepted but not yet applied) marks imports.
@@ -1159,47 +1341,215 @@ fn record_queue_conflicts(
 /// entry for it, the highest server revision any of its open entries saw
 /// (what a resolving save must have seen), and how many open entries the
 /// journal holds for it.
-struct OpenQueueConflict {
+pub(crate) struct OpenQueueConflict {
     id: String,
     latest: serde_json::Value,
     server_revision: u64,
     entries: usize,
 }
 
-/// Unresolved queue conflicts: distinct ids whose last journal entry is a
-/// conflict (not a `resolved` line), in first-seen order.
-fn open_queue_conflicts(case_dir: &Path) -> Vec<OpenQueueConflict> {
-    let Ok(text) = crate::util::read_to_string(&pending_mark_conflicts_path(case_dir)) else {
-        return Vec::new();
-    };
-    let mut open: Vec<OpenQueueConflict> = Vec::new();
+/// Replays journal text into the open conflicts (first-seen order of the
+/// currently open run of each id). R4-B3: an id index keeps this linear —
+/// the old `Vec` scan per line was quadratic in the number of ids.
+fn replay_conflict_journal(text: &str) -> Vec<OpenQueueConflict> {
+    use std::collections::HashMap;
+    // One slot per open run; a resolved id's slot is emptied and a later
+    // conflict for it opens a new slot at the end.
+    let mut slots: Vec<Option<OpenQueueConflict>> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if let Some(id) = value.get("resolved").and_then(serde_json::Value::as_str) {
-            open.retain(|entry| entry.id != id);
+            if let Some(slot) = index.remove(id) {
+                slots[slot] = None;
+            }
         } else if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
             let revision = value
                 .get("server_revision")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
-            match open.iter_mut().find(|entry| entry.id == id) {
+            match index.get(id).and_then(|&slot| slots[slot].as_mut()) {
                 Some(entry) => {
                     entry.server_revision = entry.server_revision.max(revision);
                     entry.entries += 1;
                     entry.latest = value;
                 }
-                None => open.push(OpenQueueConflict {
-                    id: id.to_string(),
-                    latest: value,
-                    server_revision: revision,
-                    entries: 1,
-                }),
+                None => {
+                    index.insert(id.to_string(), slots.len());
+                    slots.push(Some(OpenQueueConflict {
+                        id: id.to_string(),
+                        latest: value,
+                        server_revision: revision,
+                        entries: 1,
+                    }));
+                }
             }
         }
     }
+    slots.into_iter().flatten().collect()
+}
+
+/// `(path, len, mtime)` → parsed open conflicts (R4-B3 count cache):
+/// `/api/status` polls every second, and the journal only changes by an
+/// append or a compaction — both change the key.
+type ConflictCacheEntry = (
+    PathBuf,
+    u64,
+    Option<SystemTime>,
+    Arc<Vec<OpenQueueConflict>>,
+);
+static CONFLICT_CACHE: Mutex<Vec<ConflictCacheEntry>> = Mutex::new(Vec::new());
+const CONFLICT_CACHE_CAP: usize = 8;
+
+thread_local! {
+    /// Journal parses performed on this thread (tests prove the cache).
+    pub(crate) static CONFLICT_JOURNAL_PARSES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Unresolved queue conflicts: distinct ids whose last journal entry is a
+/// conflict (not a `resolved` line), in first-seen order. Cached per
+/// journal file size + mtime (R4-B3).
+fn open_queue_conflicts(case_dir: &Path) -> Arc<Vec<OpenQueueConflict>> {
+    let path = pending_mark_conflicts_path(case_dir);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Arc::new(Vec::new());
+    };
+    let (len, mtime) = (meta.len(), meta.modified().ok());
+    let lock = || CONFLICT_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, _, _, hit)) = lock()
+        .iter()
+        .find(|(p, l, m, _)| *p == path && *l == len && *m == mtime)
+    {
+        return Arc::clone(hit);
+    }
+    let Ok(text) = crate::util::read_to_string(&path) else {
+        return Arc::new(Vec::new());
+    };
+    CONFLICT_JOURNAL_PARSES.with(|count| count.set(count.get() + 1));
+    let open = Arc::new(replay_conflict_journal(&text));
+    // Only cache what the key really describes: a write that landed while
+    // this read ran changed size/mtime and must not be cached as this one.
+    let unchanged = std::fs::metadata(&path)
+        .is_ok_and(|after| after.len() == len && after.modified().ok() == mtime)
+        && text.len() as u64 == len;
+    if unchanged {
+        let mut cache = lock();
+        cache.retain(|(p, _, _, _)| *p != path);
+        if cache.len() >= CONFLICT_CACHE_CAP {
+            cache.remove(0);
+        }
+        cache.push((path, len, mtime, Arc::clone(&open)));
+    }
     open
+}
+
+/// R4-B3: journal archive — compaction moves every line that no longer
+/// describes an open conflict here (appended, never rewritten), so the
+/// complete history stays on disk.
+pub(crate) const MARK_CONFLICTS_ARCHIVE_FILE: &str = "marks-pending/conflicts-archive.jsonl";
+
+/// Compaction threshold: at least this many lines, more than half closed.
+const CONFLICT_COMPACT_MIN_LINES: usize = 512;
+
+/// R4-B3: rewrites the journal down to the lines of conflicts that are
+/// still open (the ones after each open id's last `resolved` marker),
+/// after first appending every other line — verbatim, in order — to
+/// [`MARK_CONFLICTS_ARCHIVE_FILE`]. Archive first, then an atomic rewrite:
+/// a crash in between leaves duplicates in the archive, never a loss.
+/// Replaying the compacted journal yields exactly the same open set.
+/// Returns `(archived, kept)` line counts. Callers hold the marks gate.
+pub(crate) fn compact_conflict_journal(case_dir: &Path) -> Result<(usize, usize), String> {
+    use std::collections::HashMap;
+    let path = pending_mark_conflicts_path(case_dir);
+    let text = match crate::util::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let parsed: Vec<Option<serde_json::Value>> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l.trim()).ok())
+        .collect();
+    // Index of the last `resolved` marker per id.
+    let mut last_resolved: HashMap<String, usize> = HashMap::new();
+    for (at, value) in parsed.iter().enumerate() {
+        if let Some(id) = value
+            .as_ref()
+            .and_then(|v| v.get("resolved"))
+            .and_then(serde_json::Value::as_str)
+        {
+            last_resolved.insert(id.to_string(), at);
+        }
+    }
+    let mut keep = Vec::new();
+    let mut archive = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let open_entry = parsed[at]
+            .as_ref()
+            .filter(|v| v.get("resolved").is_none())
+            .and_then(|v| v.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| last_resolved.get(id).is_none_or(|&r| r < at));
+        if open_entry {
+            keep.push(line.to_string());
+        } else {
+            archive.push(line.to_string());
+        }
+    }
+    if archive.is_empty() {
+        return Ok((0, keep.len()));
+    }
+    append_jsonl_lines(&case_dir.join(MARK_CONFLICTS_ARCHIVE_FILE), &archive)?;
+    let mut body = keep.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    crate::util::write_text_atomic(&path, &body)
+        .map_err(|err| format!("failed to rewrite {}: {err}", path.display()))?;
+    Ok((archive.len(), keep.len()))
+}
+
+/// Compacts the journal once it is large and mostly history (R4-B3).
+fn maybe_compact_conflict_journal(case_dir: &Path) -> Result<(), String> {
+    let path = pending_mark_conflicts_path(case_dir);
+    let Ok(text) = crate::util::read_to_string(&path) else {
+        return Ok(());
+    };
+    let total = text.lines().filter(|l| !l.trim().is_empty()).count();
+    if total < CONFLICT_COMPACT_MIN_LINES {
+        return Ok(());
+    }
+    let open_lines: usize = replay_conflict_journal(&text)
+        .iter()
+        .map(|entry| entry.entries)
+        .sum();
+    if open_lines * 2 < total {
+        compact_conflict_journal(case_dir).map(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
+/// Default and maximum page size of `/api/mark-conflicts` and
+/// `/api/marks-pending` (R4-B3/B6).
+pub(crate) const API_PAGE_DEFAULT: usize = 500;
+pub(crate) const API_PAGE_MAX: usize = 5000;
+
+/// `(offset, limit)` from `?offset=&limit=` (defaults 0 / 500, limit
+/// clamped to 1..=5000; an unparsable value falls back to the default).
+pub(crate) fn page_params(query: &str) -> (usize, usize) {
+    let offset = query_value(query, "offset")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = query_value(query, "limit")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(API_PAGE_DEFAULT)
+        .clamp(1, API_PAGE_MAX);
+    (offset, limit)
 }
 
 /// Number of unresolved queue conflicts (distinct ids). `/api/finalize`
@@ -1217,19 +1567,44 @@ pub(crate) fn pending_mark_conflicts(case_dir: &Path) -> serde_json::Value {
     })
 }
 
-/// `GET /api/mark-conflicts` (contract §10.2): every unresolved queue
-/// conflict, one per record id (no cap), with the server value it met and
-/// the entry the window originally queued (`queued`, verbatim from the
-/// queued body: `{mark, tags, deleted, base_revision}`), so the viewer can
-/// show "my value" exactly as it was submitted.
+/// `GET /api/mark-conflicts?offset=&limit=` (contract §10.2; paginated by
+/// R4-B3): unresolved queue conflicts, one per record id in first-seen
+/// order, with the server value each met and the entry the window
+/// originally queued (`queued`, verbatim from the queued body: `{mark,
+/// tags, deleted, base_revision}`), so the viewer can show "my value"
+/// exactly as it was submitted. `count` is the total over all pages and
+/// `next_offset` is `null` on the last page.
+pub(crate) fn api_mark_conflicts_page(request: &Request, state: &SharedState) -> String {
+    let (offset, limit) = page_params(&request.query);
+    mark_conflicts_page(state, offset, limit)
+}
+
+/// The pre-R4 unpaginated shape (`{ok, count, conflicts}`, every open
+/// conflict), kept for the existing unit tests until track F ports them
+/// to [`api_mark_conflicts_page`].
+#[cfg(test)]
 pub(crate) fn api_mark_conflicts(state: &SharedState) -> String {
+    let mut body: serde_json::Value =
+        serde_json::from_str(&mark_conflicts_page(state, 0, usize::MAX)).unwrap_or_default();
+    if let Some(map) = body.as_object_mut() {
+        for key in ["offset", "limit", "next_offset"] {
+            map.remove(key);
+        }
+    }
+    body.to_string()
+}
+
+fn mark_conflicts_page(state: &SharedState, offset: usize, limit: usize) -> String {
     let case_dir = state_lock(state).case_dir.clone();
     let open = case_dir
         .as_deref()
         .map(open_queue_conflicts)
         .unwrap_or_default();
+    let total = open.len();
     let conflicts: Vec<serde_json::Value> = open
         .iter()
+        .skip(offset)
+        .take(limit)
         .map(|entry| {
             let field = |key: &str| {
                 entry
@@ -1249,12 +1624,154 @@ pub(crate) fn api_mark_conflicts(state: &SharedState) -> String {
             })
         })
         .collect();
+    let end = offset.saturating_add(conflicts.len());
     serde_json::json!({
         "ok": true,
-        "count": conflicts.len(),
+        "count": total,
+        "offset": offset,
+        "limit": limit,
+        "next_offset": (end < total).then_some(end),
         "conflicts": conflicts,
     })
     .to_string()
+}
+
+/// Total bytes `/api/marks-pending` reads from the queue in one request.
+const MARKS_PENDING_READ_CAP: u64 = 64 * 1024 * 1024;
+
+/// `GET /api/marks-pending?offset=&limit=` (R4-B6, for the viewer's A4
+/// reload path): what the durable queue holds, folded per record id in
+/// arrival order — the LATEST queued value of each id (`mark` — the
+/// queued mark object verbatim, `null` once a later body deleted it;
+/// `tags`; `deleted`; `base_revision`; `queued_file`). Read-only. Files
+/// that could not be read or parsed are listed in `unreadable` (never
+/// skipped silently).
+pub(crate) fn api_marks_pending(request: &Request, state: &SharedState) -> String {
+    let case_dir = state_lock(state).case_dir.clone();
+    let Some(case_dir) = case_dir else {
+        return api_err("열린 케이스가 없습니다.");
+    };
+    let (offset, limit) = page_params(&request.query);
+    marks_pending_json(&case_dir, offset, limit).to_string()
+}
+
+/// Pure part of [`api_marks_pending`].
+pub(crate) fn marks_pending_json(
+    case_dir: &Path,
+    offset: usize,
+    limit: usize,
+) -> serde_json::Value {
+    use std::collections::HashMap;
+    let files = pending_marks_files(case_dir);
+    let mut order: Vec<String> = Vec::new();
+    let mut entries: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
+    let mut unreadable: Vec<serde_json::Value> = Vec::new();
+    let mut read_bytes = 0u64;
+    let mut truncated = false;
+    for path in &files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if read_bytes.saturating_add(size) > MARKS_PENDING_READ_CAP {
+            truncated = true;
+            break;
+        }
+        read_bytes += size;
+        let body = match crate::util::read_to_string(path)
+            .map_err(|err| err.to_string())
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+            }) {
+            Ok(body) => body,
+            Err(err) => {
+                unreadable.push(serde_json::json!({"file": name, "error": err}));
+                continue;
+            }
+        };
+        let items = |key: &str| {
+            body.get(key)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let mut touch = |id: &str, fields: Vec<(&str, serde_json::Value)>| {
+            if !entries.contains_key(id) {
+                order.push(id.to_string());
+            }
+            let item = entries.entry(id.to_string()).or_insert_with(|| {
+                let mut map = serde_json::Map::new();
+                map.insert("id".into(), serde_json::Value::String(id.to_string()));
+                map.insert("mark".into(), serde_json::Value::Null);
+                map.insert("tags".into(), serde_json::Value::Null);
+                map.insert("deleted".into(), serde_json::Value::Bool(false));
+                map.insert("base_revision".into(), serde_json::Value::Null);
+                map
+            });
+            item.insert(
+                "queued_file".into(),
+                serde_json::Value::String(name.clone()),
+            );
+            if let Some(base) = body.get("base_revisions").and_then(|b| b.get(id)) {
+                item.insert("base_revision".into(), base.clone());
+            }
+            if let Some(client) = body.get("client_id") {
+                item.insert("client_id".into(), client.clone());
+            }
+            for (key, value) in fields {
+                item.insert(key.into(), value);
+            }
+        };
+        for mark in items("marks") {
+            if let Some(id) = mark.get("id").and_then(serde_json::Value::as_str) {
+                let id = id.to_string();
+                let mut fields = Vec::new();
+                if let Some(tags) = mark.get("tags") {
+                    fields.push(("tags", tags.clone()));
+                }
+                fields.push(("deleted", serde_json::Value::Bool(false)));
+                fields.push(("mark", mark));
+                touch(&id, fields);
+            }
+        }
+        for tags in items("tags") {
+            if let Some(id) = tags.get("id").and_then(serde_json::Value::as_str) {
+                let value = tags.get("tags").cloned().unwrap_or(serde_json::Value::Null);
+                touch(id, vec![("tags", value)]);
+            }
+        }
+        for id in items("deleted_ids") {
+            if let Some(id) = id.as_str() {
+                touch(
+                    id,
+                    vec![
+                        ("mark", serde_json::Value::Null),
+                        ("deleted", serde_json::Value::Bool(true)),
+                    ],
+                );
+            }
+        }
+    }
+    let total = order.len();
+    let page: Vec<serde_json::Value> = order
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .filter_map(|id| entries.remove(id).map(serde_json::Value::Object))
+        .collect();
+    let end = offset.saturating_add(page.len());
+    serde_json::json!({
+        "ok": true,
+        "files": files.len(),
+        "count": total,
+        "offset": offset,
+        "limit": limit,
+        "next_offset": (end < total).then_some(end),
+        "entries": page,
+        "unreadable": unreadable,
+        "truncated": truncated,
+    })
 }
 
 /// After a successful in-process import: an id with an open queue
@@ -1292,7 +1809,11 @@ fn resolve_queue_conflicts(
         })
         .collect();
     // Best effort: a failure here leaves the conflict visible (never hides it).
-    let _ = append_jsonl_lines(&pending_mark_conflicts_path(case_dir), &lines);
+    if append_jsonl_lines(&pending_mark_conflicts_path(case_dir), &lines).is_ok() {
+        // R4-B3: keep the journal small once most of it is history; a
+        // failed compaction leaves the complete journal as it was.
+        let _ = maybe_compact_conflict_journal(case_dir);
+    }
 }
 
 /// Applies every queued marks import in arrival order. A file is removed
@@ -1370,13 +1891,110 @@ fn import_marks_response(
 /// queue instead of refusing them: phase-2 enrichment (UX-02) and a
 /// background recover/carve job (UX-06), whose make-review re-runs until
 /// it has seen every queued mark.
+///
+/// R4-B4: exactly those two — an enrichment step in progress
+/// (`enrichment` set) or a running case job. `review-partial` alone is
+/// not enough: an index-only case opened for review is `review-partial`
+/// too, and a short busy job there (verify-sources, an advanced tool) used
+/// to strand saves in a queue nothing drained.
 pub(crate) fn marks_must_queue(guard: &JobState) -> bool {
     guard.busy
-        && (guard.phase == "review-partial"
+        && (guard.enrichment.is_some()
             || guard
                 .case_job
                 .as_ref()
                 .is_some_and(|job| job.state == "running"))
+}
+
+/// R4-B4: how long a save waits for a short busy job before it is told to
+/// retry (never queued: nothing would drain it).
+pub(crate) const MARKS_BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// Refusal when the busy job did not end within [`MARKS_BUSY_WAIT`]: the
+/// client keeps the edit dirty and retries (`retry: true`).
+pub(crate) fn marks_busy_retry_response() -> String {
+    serde_json::json!({
+        "ok": false,
+        "busy": true,
+        "retry": true,
+        "retry_after_ms": 1000,
+        "error": "다른 작업이 진행 중이라 지금 저장하지 못했습니다 — 편집은 그대로 두고 잠시 후 자동으로 다시 저장합니다.",
+    })
+    .to_string()
+}
+
+/// R4-B4 outcome of waiting for `busy` on behalf of a marks save.
+pub(crate) enum MarksBusy<'a> {
+    /// `busy` taken for this save.
+    Acquired(super::state::BusyGuard<'a>),
+    /// A job that queues marks started meanwhile: take the queue route.
+    Queue,
+    /// Still busy after the wait (or shutdown): refusal body.
+    Refused(String),
+}
+
+/// Takes `busy` for a marks save, waiting up to `wait` for a short busy
+/// job to end (polling, no state lock held while waiting).
+pub(crate) fn acquire_busy_for_marks(state: &SharedState, wait: Duration) -> MarksBusy<'_> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        {
+            let guard = state_lock(state);
+            if marks_must_queue(&guard) {
+                return MarksBusy::Queue;
+            }
+            if let Some(refusal) = shutdown_refusal(&guard) {
+                return MarksBusy::Refused(api_err(&refusal));
+            }
+        }
+        match try_acquire_busy(state) {
+            Ok(busy) => return MarksBusy::Acquired(busy),
+            Err(_) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return MarksBusy::Refused(marks_busy_retry_response()),
+        }
+    }
+}
+
+/// R4-B4: applies marks queued while a job held `busy`, right after
+/// `busy` is released (called by the busy guards on drop, outside the
+/// state lock). Skipped when another thread — or this one, further up the
+/// stack — holds the marks gate: that holder drains the queue itself.
+pub(crate) fn drain_after_busy_release(state: &SharedState) {
+    let case_dir = {
+        let guard = state_lock(state);
+        if guard.busy {
+            return;
+        }
+        guard.case_dir.clone()
+    };
+    let Some(case_dir) = case_dir else {
+        return;
+    };
+    if pending_marks_count(&case_dir) == 0 {
+        return;
+    }
+    let _gate = match MARKS_GATE.try_lock() {
+        Ok(gate) => gate,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    // Applied under `busy` so no job starts writing the case meanwhile; if
+    // one already did, it drains at its own end.
+    let Ok(_busy) = try_acquire_busy(state) else {
+        return;
+    };
+    if state_lock(state).case_dir.as_deref() != Some(case_dir.as_path()) {
+        return;
+    }
+    if let Err(err) = drain_pending_marks(state, &case_dir) {
+        let mut guard = state_lock(state);
+        if !guard.warnings.iter().any(|(_, known)| *known == err) {
+            guard.logs.push(format!("오류: {err}"));
+            guard.warnings.push((0, err));
+        }
+    }
 }
 
 /// Marks import while phase-2 enrichment is running (`review-partial` +
@@ -1393,10 +2011,19 @@ fn import_marks_during_enrichment(
 ) -> String {
     let _gate = marks_gate();
     // Re-checked under the gate: enrichment may have just finished.
-    let (partial, step) = {
+    let (partial, step, rebound) = {
         let guard = state_lock(state);
-        (marks_must_queue(&guard), guard.enrichment.map(|e| e.step))
+        (
+            marks_must_queue(&guard),
+            guard.enrichment.map(|e| e.step),
+            guard.case_dir.as_deref() != Some(case_dir),
+        )
     };
+    // R4-B11: the marks were checked against `case_dir`; a case switched
+    // meanwhile must not receive them.
+    if rebound {
+        return api_err(CASE_SWITCHED_ERROR);
+    }
     if !partial {
         return api_err("진행 중이던 작업이 방금 끝났습니다 — 잠시 후 다시 저장하십시오.");
     }
@@ -1404,15 +2031,15 @@ fn import_marks_during_enrichment(
         && pending_marks_count(case_dir) == 0;
     if !direct {
         let dir = case_dir.join(PENDING_MARKS_DIR);
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            return api_err(&format!("대기열 폴더를 만들 수 없습니다: {err}"));
-        }
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = dir.join(format!("{nanos:032}.json"));
+        // R4-B10: a monotonic, create_new-claimed name instead of the wall
+        // clock (which can step back or repeat and reorder the queue).
+        let path = match claim_queue_file(&dir) {
+            Ok(path) => path,
+            Err(err) => return api_err(&format!("대기열 폴더를 만들 수 없습니다: {err}")),
+        };
         if let Err(err) = crate::util::write_text_atomic(&path, marks_body) {
+            // The empty claim holds nothing; never leave it half-written.
+            let _ = std::fs::remove_file(&path);
             return api_err(&format!("대기열 저장 실패: {err}"));
         }
         state_lock(state).logs.push(
@@ -1463,6 +2090,23 @@ pub(crate) fn api_import_marks_with_runner(
     state: &SharedState,
     runner: &dyn Fn(&[String]) -> Result<String, String>,
 ) -> String {
+    import_marks_with_hooks(request, state, runner, &|| {})
+}
+
+/// Refusal when the bound case changed between reading it and taking
+/// `busy` (R4-B11).
+pub(crate) const CASE_SWITCHED_ERROR: &str =
+    "작업 대상 케이스가 방금 바뀌었습니다 — 화면을 새로 고친 뒤 다시 시도하십시오.";
+
+/// [`api_import_marks_with_runner`] with a hook that runs after the marks
+/// were checked against the bound case and before `busy` is taken (tests
+/// switch the case there, R4-B11).
+pub(crate) fn import_marks_with_hooks(
+    request: &Request,
+    state: &SharedState,
+    runner: &dyn Fn(&[String]) -> Result<String, String>,
+    before_busy: &dyn Fn(),
+) -> String {
     let marks_body = match body_value(&request.body, "marks_json") {
         Some(text) if !text.trim().is_empty() => text,
         _ => {
@@ -1487,14 +2131,21 @@ pub(crate) fn api_import_marks_with_runner(
             Ok(marks) => marks,
             Err(err) => return serde_json::json!({"ok": false, "error": err}).to_string(),
         };
-    let enriching = marks_must_queue(&state_lock(state));
-    if enriching {
-        return import_marks_during_enrichment(state, &case_dir, &marks_body, &marks);
-    }
-    let _busy = match try_acquire_busy(state) {
-        Ok(guard) => guard,
-        Err(err) => return api_err(&err),
+    before_busy();
+    // R4-B4: queue only while a job that drains the queue runs; any other
+    // busy job is waited for briefly, then the client is told to retry.
+    let _busy = match acquire_busy_for_marks(state, MARKS_BUSY_WAIT) {
+        MarksBusy::Acquired(busy) => busy,
+        MarksBusy::Queue => {
+            return import_marks_during_enrichment(state, &case_dir, &marks_body, &marks);
+        }
+        MarksBusy::Refused(body) => return body,
     };
+    // R4-B11: re-read under `busy` — open-case cannot switch the case any
+    // more, and these marks were validated for `case_dir`.
+    if state_lock(state).case_dir.as_deref() != Some(case_dir.as_path()) {
+        return api_err(CASE_SWITCHED_ERROR);
+    }
     // Anything queued during phase 2 is applied before this import.
     {
         let _gate = marks_gate();
@@ -1519,15 +2170,27 @@ pub(crate) fn api_import_marks_with_runner(
         }
     };
     let refresh_report = marks.batch.as_ref().is_none_or(|batch| batch.is_last());
+    let mut report_error: Option<String> = None;
     if refresh_report {
         let case_text = case_dir.to_string_lossy().to_string();
-        if let Err(err) = runner(&["make-report".into(), case_text]) {
-            return serde_json::json!({"ok": false, "error": err}).to_string();
-        }
+        let refreshed = runner(&["make-report".into(), case_text]);
         let mut guard = state_lock(state);
-        guard
-            .logs
-            .push("판독 마크를 반영해 보고서를 갱신했습니다.".into());
+        match refreshed {
+            Ok(_) => guard
+                .logs
+                .push("판독 마크를 반영해 보고서를 갱신했습니다.".into()),
+            // R4-B7: the marks ARE stored — reporting the save as failed
+            // made the viewer retry (and conflict with itself). The report
+            // failure is reported separately and stays visible.
+            Err(err) => {
+                let message = format!(
+                    "판독 마크는 저장했지만 보고서를 갱신하지 못했습니다 — 최종화 전에 다시 생성됩니다: {err}"
+                );
+                guard.logs.push(format!("경고: {message}"));
+                guard.warnings.push((4, message));
+                report_error = Some(err);
+            }
+        }
         if !outcome.conflicts.is_empty() {
             guard.logs.push(format!(
                 "판독 마크 {}건은 다른 창에서 먼저 바뀌어 적용하지 않았습니다 — 뷰어에서 확인하십시오.",
@@ -1535,7 +2198,17 @@ pub(crate) fn api_import_marks_with_runner(
             ));
         }
     }
-    import_marks_response(&marks, &outcome, None, refresh_report)
+    let mut body: serde_json::Value = serde_json::from_str(&import_marks_response(
+        &marks,
+        &outcome,
+        None,
+        refresh_report && report_error.is_none(),
+    ))
+    .unwrap_or_else(|_| serde_json::json!({"ok": true}));
+    if let Some(err) = report_error {
+        body["report_error"] = serde_json::Value::String(err);
+    }
+    body.to_string()
 }
 
 /// Reviewer name as typed in the finalize dialog: trimmed, control
@@ -1584,6 +2257,42 @@ pub(crate) fn write_signoff(
     Ok(signed_unix)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Sign-offs handed to the audit hook on this thread (tests, R4-B18).
+    pub(crate) static SIGNOFF_AUDIT_CALLS: std::cell::RefCell<Vec<(PathBuf, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Test override: the error the audit hook returns on this thread.
+    pub(crate) static SIGNOFF_AUDIT_FAIL: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// R4-B18 call site for track D's `record_signoff_audit(case_dir,
+/// &Signoff)` (D13: chains the sign-off into `signoff-log.jsonl`, keyed
+/// when an audit key is configured).
+///
+/// INTEGRATION TODO(B18↔D13): D's function was not present when this was
+/// written. The integrator replaces the body below with
+/// `crate::<d module>::record_signoff_audit(case_dir, &parsed_signoff)`
+/// (parsing `signoff_json`, the exact pending `signoff.json` text, into
+/// D's `Signoff`). Until then this stub records nothing on disk and
+/// succeeds, so finalize keeps working.
+pub(crate) fn record_signoff_audit(case_dir: &Path, signoff_json: &str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        SIGNOFF_AUDIT_CALLS.with(|calls| {
+            calls
+                .borrow_mut()
+                .push((case_dir.to_path_buf(), signoff_json.to_string()))
+        });
+        if let Some(err) = SIGNOFF_AUDIT_FAIL.with(|fail| fail.borrow().clone()) {
+            return Err(err);
+        }
+    }
+    let _ = (case_dir, signoff_json);
+    Ok(())
+}
+
 /// SHA-256 of the package's `manifest.sha256`: one value an examiner can
 /// write down to pin the whole packaged file list.
 pub(crate) fn package_manifest_sha256(package_dir: &Path) -> Option<String> {
@@ -1591,6 +2300,16 @@ pub(crate) fn package_manifest_sha256(package_dir: &Path) -> Option<String> {
 }
 
 pub(crate) fn api_finalize(request: &Request, state: &SharedState) -> String {
+    finalize_with_hooks(request, state, &|| {})
+}
+
+/// [`api_finalize`] with a hook between the first read of the bound case
+/// and taking `busy` (tests switch the case there, R4-B11).
+pub(crate) fn finalize_with_hooks(
+    request: &Request,
+    state: &SharedState,
+    before_busy: &dyn Fn(),
+) -> String {
     let case_dir = state_lock(state).case_dir.clone();
     let Some(case_dir) = case_dir else {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
@@ -1599,10 +2318,16 @@ pub(crate) fn api_finalize(request: &Request, state: &SharedState) -> String {
     if examiner.is_empty() {
         return api_err("검토자 이름을 입력하십시오 (보고서에 입력값 그대로 기록됩니다).");
     }
+    before_busy();
     let _busy = match try_acquire_busy(state) {
         Ok(guard) => guard,
         Err(err) => return api_err(&err),
     };
+    // R4-B11: the case the examiner confirmed must still be the bound one
+    // now that `busy` (which open-case respects) is held.
+    if state_lock(state).case_dir.as_deref() != Some(case_dir.as_path()) {
+        return api_err(CASE_SWITCHED_ERROR);
+    }
     // UX-09 / S1: clip exports, export-selected and frame captures run
     // without `busy`; sealing while one is still writing into the case
     // would package a torn or missing artifact. The check and the seal
@@ -1704,11 +2429,26 @@ pub(crate) fn finalize_with_exe(
         report.clone()
     };
     let promoted = match (&report, &packaging) {
-        (Ok(_), Ok(_)) => std::fs::rename(
-            &pending_signoff,
-            case_dir.join(crate::report::SIGNOFF_REL_PATH),
-        )
-        .map_err(|err| format!("검토자 기록 확정 실패: {err}")),
+        // R4-B18: the sign-off is chained into the audit trail before it
+        // is promoted; a failed audit append fails the finalize (a seal
+        // whose sign-off is not in the chain would claim more than it can
+        // prove).
+        (Ok(_), Ok(_)) => crate::util::read_to_string(&pending_signoff)
+            .map_err(|err| format!("검토자 기록을 읽지 못했습니다: {err}"))
+            .and_then(|signoff| {
+                record_signoff_audit(case_dir, &signoff)
+                    .map_err(|err| format!("검토자 기록을 감사 로그에 남기지 못했습니다: {err}"))
+            })
+            .and_then(|()| {
+                std::fs::rename(
+                    &pending_signoff,
+                    case_dir.join(crate::report::SIGNOFF_REL_PATH),
+                )
+                .map_err(|err| format!("검토자 기록 확정 실패: {err}"))
+            })
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&pending_signoff);
+            }),
         _ => {
             let _ = std::fs::remove_file(&pending_signoff);
             // The report on disk was rendered with the abandoned sign-off;
@@ -2006,18 +2746,31 @@ pub(crate) struct CaseJobSpec {
 /// Takes the busy lease, publishes the job in [`JobState::case_job`] and
 /// runs it on a worker thread. Returns the immediate API response.
 pub(crate) fn start_case_job(state: &SharedState, exe: &Path, spec: CaseJobSpec) -> String {
-    let lease = match try_lease_busy(state) {
-        Ok(lease) => lease,
-        Err(err) => return api_err(&err),
-    };
-    // A clip export writes into the case while make-review/recovery would
-    // rewrite it; recover/carve wait for exports like finalize does.
+    // Fast refusal without touching `busy`; re-checked (with export-selected
+    // and frame captures) under the lock below.
     if running_clip_job_count(state) > 0 {
         return api_err("내보내기·이어붙이기 작업이 진행 중입니다 — 끝난 뒤 다시 시도하십시오.");
     }
     let started_unix = crate::util::now_unix().unwrap_or(0);
-    let prior_phase = {
+    // R4-B17: busy, the side-work check and the case re-check share one
+    // critical section — the caller read `spec.case_dir` before busy.
+    let (lease, prior_phase) = {
         let mut guard = state_lock(state);
+        // A clip export, join, export-selected or frame capture writes into
+        // the case while make-review/recovery would rewrite it; case jobs
+        // wait for all of them like finalize does.
+        if let Some(refusal) = side_work_refusal(&guard, "다시 시도하십시오") {
+            return api_err(&refusal);
+        }
+        let lease = match lease_busy_locked(&mut guard, state) {
+            Ok(lease) => lease,
+            Err(err) => return api_err(&err),
+        };
+        if guard.case_dir.as_deref() != Some(spec.case_dir.as_path()) {
+            drop(guard);
+            drop(lease);
+            return api_err(CASE_SWITCHED_ERROR);
+        }
         // The phase stays what it was (finding 9): marks queue during a
         // case job, so a shell reloaded mid-job must still open the review
         // stage. The job itself is reported via `job` / `job_kind`, and
@@ -2035,7 +2788,7 @@ pub(crate) fn start_case_job(state: &SharedState, exe: &Path, spec: CaseJobSpec)
             error: None,
         });
         guard.logs.push(spec.start_log.clone());
-        prior
+        (lease, prior)
     };
     let kind = spec.kind;
     let worker_state = Arc::clone(state);
