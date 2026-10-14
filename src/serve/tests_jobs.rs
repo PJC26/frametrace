@@ -4,6 +4,17 @@
 
 use super::*;
 
+// Included per test file (no mod.rs line needed); see the helper's header.
+#[allow(clippy::duplicate_mod)]
+#[path = "tests_fake_tools.rs"]
+mod fake_tools;
+// mod.rs re-exports this only for unix (B-owned gate): reach it by path elsewhere.
+#[cfg(not(unix))]
+use super::media::exhibit_arg;
+use fake_tools::{
+    CMD_FIND_OUTPUT, cmd_grandchild_sleeper, cmd_sleep, cmd_wait_for_file, pid_alive, write_fake,
+};
+
 fn temp_case(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft-jobs-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -39,12 +50,10 @@ fn parse(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid JSON {err}: {text}"))
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn status(state: &SharedState) -> serde_json::Value {
     parse(&api_status(state))
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + timeout;
     while !check() {
@@ -53,18 +62,12 @@ fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     }
 }
 
-/// Writes an executable `/bin/sh` script standing in for the frametrace
-/// CLI; `$1` is the subcommand.
-#[cfg(unix)]
-fn fake_cli(dir: &Path, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("fake-frametrace.sh");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+/// Writes a fake CLI (`/bin/sh` on unix, `.cmd` on Windows); `$1` / `%1` is
+/// the subcommand.
+fn fake_cli(dir: &Path, unix_body: &str, cmd_body: &str) -> PathBuf {
+    write_fake(dir, unix_body, cmd_body)
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn write_inspection(case_dir: &Path) {
     let dir = case_dir.join("db/filesystem");
     std::fs::create_dir_all(&dir).unwrap();
@@ -75,7 +78,6 @@ fn write_inspection(case_dir: &Path) {
     .unwrap();
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn marks_request(id: &str) -> Request {
     let marks = serde_json::json!({
         "schema_version": 1,
@@ -653,16 +655,6 @@ fn records_meta_annotations_include_revisions() {
     let _ = std::fs::remove_dir_all(case_dir);
 }
 
-#[cfg(unix)]
-fn pid_alive(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(unix)]
 #[test]
 fn recover_returns_immediately_and_status_reaches_done() {
     let case_dir = temp_case("recover-done");
@@ -674,6 +666,10 @@ fn recover_returns_immediately_and_status_reaches_done() {
   make-review) echo "review rebuilt" ;;
   *) exit 9 ;;
 esac"#,
+        &format!(
+            "if \"%1\"==\"recover-batch\" (\n{}\necho recovered 3 candidates\nexit /b 0\n)\nif \"%1\"==\"make-review\" (\necho review rebuilt\nexit /b 0\n)\nexit /b 9",
+            cmd_sleep(1)
+        ),
     );
     let state = bound_state(&case_dir, "review-ready");
     let started = std::time::Instant::now();
@@ -708,7 +704,6 @@ esac"#,
     assert!(logs.contains("review rebuilt"), "{logs}");
 }
 
-#[cfg(unix)]
 #[test]
 fn cancel_kills_the_recover_step_tree() {
     let case_dir = temp_case("recover-cancel");
@@ -722,6 +717,10 @@ fn cancel_kills_the_recover_step_tree() {
   *) echo ok ;;
 esac"#,
             pid_file.display()
+        ),
+        &format!(
+            "if \"%1\"==\"recover-batch\" (\n{}\nexit /b 0\n)\necho ok",
+            cmd_grandchild_sleeper(&pid_file)
         ),
     );
     let state = bound_state(&case_dir, "review-partial");
@@ -766,12 +765,15 @@ fn recover_and_carve_reject_missing_inputs_without_taking_busy() {
     assert!(state_lock(&state).case_job.is_none());
 }
 
-#[cfg(unix)]
 #[test]
 fn a_failed_recover_step_is_reported_not_swallowed() {
     let case_dir = temp_case("recover-fail");
     write_inspection(&case_dir);
-    let exe = fake_cli(&case_dir, r#"echo "image unreadable" >&2; exit 3"#);
+    let exe = fake_cli(
+        &case_dir,
+        r#"echo "image unreadable" >&2; exit 3"#,
+        "echo image unreadable 1>&2\nexit /b 3",
+    );
     let state = bound_state(&case_dir, "review-ready");
     assert_eq!(parse(&recover_deleted_with_exe(&state, &exe))["ok"], true);
     wait_for("job failed", Duration::from_secs(10), || {
@@ -790,7 +792,6 @@ fn a_failed_recover_step_is_reported_not_swallowed() {
 
 /// Marks saved while a recover job runs are queued durably and applied
 /// before the job releases `busy` (make-review re-runs to include them).
-#[cfg(unix)]
 #[test]
 fn marks_saved_during_recover_are_queued_and_applied() {
     let case_dir = temp_case("recover-marks");
@@ -804,6 +805,10 @@ fn marks_saved_during_recover_are_queued_and_applied() {
   make-review) echo review ;;
 esac"#,
             gate.display()
+        ),
+        &format!(
+            "if \"%1\"==\"recover-batch\" (\n{}\necho recovered\nexit /b 0\n)\nif \"%1\"==\"make-review\" echo review\nexit /b 0",
+            cmd_wait_for_file(&gate)
         ),
     );
     let state = bound_state(&case_dir, "review-ready");
@@ -825,7 +830,6 @@ esac"#,
     assert_eq!(stored, vec!["vid_0042".to_string()]);
 }
 
-#[cfg(unix)]
 const FAKE_EXPORT: &str = r#"out=""; prev=""
 for a in "$@"; do
   printf '%s\n' "$a" >> "$(dirname "$0")/argv.txt"
@@ -837,15 +841,23 @@ case "$1" in
   *) exit 0 ;;
 esac"#;
 
+/// Batch twin of [`FAKE_EXPORT`]: the raw argument line goes to argv.txt
+/// (cmd splits `--exhibit=<v>` on `=`, so per-arg lines are not possible).
+fn fake_export_cmd() -> String {
+    format!(
+        "echo %* >> \"%~dp0argv.txt\"\nset first=%1\n{CMD_FIND_OUTPUT}\nif \"%first%\"==\"export-video\" (\n{}\necho clip-bytes-%out% > \"%out%\"\necho exported\nexit /b 0\n)\nexit /b 0",
+        cmd_sleep(1)
+    )
+}
+
 fn clip_body(extra: &str) -> String {
     format!(r#"{{"id":"vid_0001","start":"1.500","duration":"4.000"{extra}}}"#)
 }
 
-#[cfg(unix)]
 #[test]
 fn double_export_returns_the_same_job_and_clip_sha256() {
     let case_dir = temp_case("clip-dedupe");
-    let exe = fake_cli(&case_dir, FAKE_EXPORT);
+    let exe = fake_cli(&case_dir, FAKE_EXPORT, &fake_export_cmd());
     let state = bound_state(&case_dir, "review-ready");
     let req = request("POST", "/api/export-clip", "", &clip_body(""));
     let first = parse(&export_clip_with_exe(&req, &state, &exe));
@@ -900,11 +912,10 @@ fn double_export_returns_the_same_job_and_clip_sha256() {
 
 /// SEC-06: the exhibit label is one `--exhibit=<value>` argv token, so a
 /// value starting with `-` cannot become a separate flag.
-#[cfg(unix)]
 #[test]
 fn exhibit_label_travels_as_a_single_argv_token() {
     let case_dir = temp_case("clip-exhibit");
-    let exe = fake_cli(&case_dir, FAKE_EXPORT);
+    let exe = fake_cli(&case_dir, FAKE_EXPORT, &fake_export_cmd());
     let state = bound_state(&case_dir, "review-ready");
     let req = request(
         "POST",
@@ -922,7 +933,11 @@ fn exhibit_label_travels_as_a_single_argv_token() {
             .any(|job| job.id == id && job.state != "running")
     });
     let argv = std::fs::read_to_string(case_dir.join("argv.txt")).unwrap();
-    let lines: Vec<&str> = argv.lines().collect();
+    // Unix logs one argv per line, the batch twin the raw line: compare tokens.
+    let lines: Vec<&str> = argv
+        .split_whitespace()
+        .map(|token| token.trim_matches('"'))
+        .collect();
     assert!(lines.contains(&"--exhibit=--hash-source"), "{argv}");
     assert!(!lines.contains(&"--hash-source"), "{argv}");
     assert!(!lines.contains(&"--exhibit"), "{argv}");
@@ -931,7 +946,6 @@ fn exhibit_label_travels_as_a_single_argv_token() {
 
 /// UX-09: marks saving keeps working while an export runs, and finalize
 /// waits for the export instead of sealing a torn clip.
-#[cfg(unix)]
 #[test]
 fn marks_import_succeeds_while_an_export_runs() {
     let case_dir = temp_case("clip-marks");
@@ -944,6 +958,10 @@ for a in "$@"; do if [ "$prev" = "--output" ]; then out="$a"; fi; prev="$a"; don
 while [ ! -f "{}" ]; do sleep 0.05; done
 printf clip > "$out""#,
             gate.display()
+        ),
+        &format!(
+            "{CMD_FIND_OUTPUT}\n{}\necho clip> \"%out%\"",
+            cmd_wait_for_file(&gate)
         ),
     );
     let state = bound_state(&case_dir, "review-ready");
@@ -984,11 +1002,10 @@ printf clip > "$out""#,
     std::fs::write(&gate, b"go").unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn clip_cancel_endpoint_kills_only_that_export() {
     let case_dir = temp_case("clip-cancel");
-    let exe = fake_cli(&case_dir, "sleep 300");
+    let exe = fake_cli(&case_dir, "sleep 300", ":spin\ngoto spin");
     let state = bound_state(&case_dir, "review-ready");
     let started = parse(&export_clip_with_exe(
         &request("POST", "/api/export-clip", "", &clip_body("")),
@@ -1250,4 +1267,37 @@ fn media_is_confined_to_the_registered_source() {
         assert!(link.starts_with("HTTP/1.1 403"), "{link}");
     }
     state_lock(&state).request_shutdown();
+}
+
+/// R4 F11 (P12): `marks-imported.json` is replaced wholesale through the
+/// atomic temp+rename writer: a stale earlier import never survives and no
+/// `.tmp-` sibling is left behind. (Failure-path cleanup needs a writer seam
+/// from track B; see the F11 integration TODO.)
+#[test]
+fn marks_imported_json_is_rewritten_atomically_without_temp_leftovers() {
+    let case_dir = temp_case("marks-atomic");
+    let marks_path = case_dir.join("marks-imported.json");
+    std::fs::write(&marks_path, b"stale half-written import").unwrap();
+    let state = bound_state(&case_dir, "review-ready");
+    let saved = parse(&super::jobs::api_import_marks_with_runner(
+        &marks_request("vid_0007"),
+        &state,
+        &|_| Ok(String::new()),
+    ));
+    assert_eq!(saved["ok"], true, "{saved}");
+    let written = std::fs::read_to_string(&marks_path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&written)
+        .unwrap_or_else(|err| panic!("marks-imported.json is not whole JSON ({err}): {written}"));
+    assert_eq!(json["marks"][0]["id"], "vid_0007");
+    let leftovers: Vec<String> = std::fs::read_dir(&case_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(case_dir);
 }

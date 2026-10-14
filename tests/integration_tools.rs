@@ -6,6 +6,8 @@
 //! FRAMETRACE_IT=1 cargo test --test integration_tools -- --ignored
 //! ```
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,6 +60,7 @@ fn unique_dir(name: &str) -> PathBuf {
 fn run_binary(exe: &Path, args: &[&str]) {
     let output = Command::new(exe)
         .args(args)
+        .envs(common::isolated_env())
         .output()
         .expect("run frametrace");
     assert!(

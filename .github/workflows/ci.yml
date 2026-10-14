@@ -34,6 +34,12 @@ jobs:
         env:
           FRAMETRACE_IT: "1"
         run: cargo test --locked --test workstation_e2e -- --ignored
+      # R4 F1: real-ffmpeg join-video / measure-audio (ffmpeg installed above;
+      # with FRAMETRACE_IT=1 a missing tool fails instead of skipping).
+      - name: Join and audio integration tests (real ffmpeg)
+        env:
+          FRAMETRACE_IT: "1"
+        run: cargo test --locked --test join_audio_it -- --ignored
 
   screenshots:
     # Drives the real workstation UI with Playwright against a synthetic
