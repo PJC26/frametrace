@@ -1290,26 +1290,36 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
         }
         match audit::verify_chained_jsonl(&path) {
             Ok(result) => {
+                // R8 P0/P1/P2: the lane's trust under THIS PC's policy —
+                // with audit keys here, any line not authenticated here
+                // (stripped HMAC, another PC's key, an unproven retired
+                // key) makes the lane NOT VERIFIED, never PASS and never
+                // FAIL; without keys it passes as self-consistency only.
+                let trust = result.lane_trust();
                 let mut detail = format!(
                     "{}: {} entr{}, {}",
-                    if result.rewrite_not_excluded.is_some() {
-                        "audit chain structure intact but NOT VERIFIED (a re-written tail cannot be ruled out)"
-                    } else {
-                        "audit chain verified"
+                    match &trust {
+                        audit::LaneTrust::Authenticated =>
+                            "audit chain verified (every entry HMAC-authenticated on this PC)",
+                        audit::LaneTrust::SelfConsistentOnly(_) =>
+                            "audit chain verified (structure only) — self-consistency only, NOT authentication",
+                        audit::LaneTrust::NotVerified { .. } =>
+                            "audit chain structure intact but NOT VERIFIED on this PC",
                     },
                     result.entries,
                     if result.entries == 1 { "y" } else { "ies" },
-                    result.integrity.label()
+                    trust.label()
                 );
+                if !trust.reason().is_empty() {
+                    detail.push_str(&format!("; {}", trust.reason()));
+                }
                 for warning in &result.warnings {
                     detail.push_str(&format!("; warning: {warning}"));
                 }
-                // R7-I3: a possible tail rewrite under an invented key id
-                // is never a PASS.
-                let status = if result.rewrite_not_excluded.is_some() {
-                    CheckStatus::NotVerified
-                } else {
+                let status = if trust.passes() {
                     CheckStatus::Pass
+                } else {
+                    CheckStatus::NotVerified
                 };
                 out.push(status, rel, detail);
             }
@@ -1647,7 +1657,7 @@ fn verify_package_db_and_signoff(
             CheckStatus::Pass,
             signoff_rel,
             format!(
-                "content_sha256 matches the review marks (status, note, IN-OUT range) and tags in the packaged db/case.db (examiner recorded as typed: {examiner}; not an authenticated identity)"
+                "content_sha256 matches the review marks (status, note, IN-OUT range) and tags in the packaged db/case.db — self-consistency only, NOT authentication: an older-schema record anyone can recompute, shown as current only on a PC without audit keys (examiner recorded as typed: {examiner}; not an authenticated identity)"
             ),
         ),
         crate::report::SignoffCurrency::Changed => out.push(
@@ -3002,5 +3012,73 @@ mod tests {
         assert!(err.contains("unsupported symlink"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A package holding only `evidence/logs/scan-log.jsonl` (listed).
+    fn lane_only_package(
+        tag: &str,
+        bodies: &[(&str, Option<&crate::audit_key::AuditKey>)],
+    ) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ft-pkg-r8-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lane = dir.join("evidence/logs/scan-log.jsonl");
+        fs::create_dir_all(lane.parent().unwrap()).unwrap();
+        for (body, key) in bodies {
+            crate::audit::append_chained_jsonl_keyed(&lane, body, *key).unwrap();
+        }
+        fs::write(
+            dir.join("manifest.sha256"),
+            format!(
+                "{}  evidence/logs/scan-log.jsonl\n",
+                crate::audit::digest_file(&lane).unwrap()
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// R8 P0 for verify-package: a packaged lane re-chained with its HMACs
+    /// stripped PASSED in R7 on a PC holding the key (graded structural);
+    /// now it is NOT VERIFIED there. P2: a lane continued on another PC is
+    /// NOT VERIFIED naming that PC's key — never FAIL. P1: no keys → PASS
+    /// as self-consistency only.
+    #[test]
+    fn r8_verify_package_lane_trust_comes_from_keys_held() {
+        use super::{CheckStatus, verify_package};
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xb1; 32]);
+        let other = crate::audit_key::AuditKey::new("pc-b", &[0xb2; 32]);
+        let lane_check = |dir: &std::path::Path| {
+            verify_package(dir)
+                .unwrap()
+                .checks
+                .into_iter()
+                .find(|c| c.subject == "evidence/logs/scan-log.jsonl")
+                .unwrap()
+        };
+        let stripped = lane_only_package("strip", &[(r#"{"n":1}"#, None), (r#"{"n":2}"#, None)]);
+        let multi = lane_only_package(
+            "multi",
+            &[(r#"{"n":1}"#, Some(&mine)), (r#"{"n":2}"#, Some(&other))],
+        );
+        let genuine = lane_only_package("genuine", &[(r#"{"n":1}"#, Some(&mine))]);
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let check = lane_check(&stripped);
+            assert_eq!(check.status, CheckStatus::NotVerified, "{check:?}");
+            let check = lane_check(&multi);
+            assert_eq!(check.status, CheckStatus::NotVerified, "{check:?}");
+            assert!(
+                check.detail.contains("\"pc-b\" 보유 PC에서 확인"),
+                "{check:?}"
+            );
+            assert_eq!(lane_check(&genuine).status, CheckStatus::Pass);
+        });
+        crate::audit_key::with_test_keys(&[], || {
+            let check = lane_check(&stripped);
+            assert_eq!(check.status, CheckStatus::Pass);
+            assert!(check.detail.contains("self-consistency only"), "{check:?}");
+        });
+        for dir in [stripped, multi, genuine] {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }

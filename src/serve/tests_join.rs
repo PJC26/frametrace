@@ -998,7 +998,7 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     let levels = &meta["audioLevels"];
     assert_eq!(
         levels["vid_1"],
-        serde_json::json!({"r": "sound", "max": -12.5, "mean": -30.0, "sec": 10.0, "t": 77})
+        serde_json::json!({"r": "sound", "max": -12.5, "mean": -30.0, "sec": 10.0, "t": 77, "sc": true})
     );
     assert_eq!(levels["vid_2"]["r"], "stale", "{levels}");
     assert!(levels["vid_2"]["max"].is_null());

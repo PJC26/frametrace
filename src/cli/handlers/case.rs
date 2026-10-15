@@ -1221,20 +1221,24 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
             serde_json::json!({"path": rel, "status": "absent", "entries": 0})
         } else {
             match crate::audit::verify_chained_jsonl(&path) {
-                Ok(result) => serde_json::json!({
-                    "path": rel,
-                    // R7-I3: a line under a key this PC lacks, after lines it
-                    // authenticated, means a rewrite cannot be excluded here.
-                    "status": if result.rewrite_not_excluded.is_some() {
-                        "not-verified"
-                    } else if result.integrity == crate::audit::AuditIntegrity::Keyed {
-                        "keyed"
-                    } else {
-                        "structural"
-                    },
-                    "entries": result.entries,
-                    "detail": result.rewrite_not_excluded.iter().cloned().chain(result.warnings.iter().cloned()).collect::<Vec<_>>().join("; "),
-                }),
+                Ok(result) => {
+                    // R8 P0/P1/P2: the lane's trust under THIS PC's policy
+                    // (keys held → any line not authenticated here is NOT
+                    // VERIFIED, naming other PCs' keys; no keys →
+                    // self-consistency only).
+                    let trust = result.lane_trust();
+                    let detail = std::iter::once(trust.reason().to_string())
+                        .filter(|reason| !reason.is_empty())
+                        .chain(result.warnings.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    serde_json::json!({
+                        "path": rel,
+                        "status": trust.status(),
+                        "entries": result.entries,
+                        "detail": detail,
+                    })
+                }
                 Err(err) => serde_json::json!({
                     "path": rel,
                     "status": "failed",
@@ -2196,6 +2200,8 @@ mod report_output_tests {
             measured_unix: None,
             replayed_unverified: false,
             chain_unverified: None,
+            self_consistent_only: false,
+            other_pc_key: None,
         };
         let log = case_dir.join(crate::audio_level::LOG_REL);
         crate::audit::append_chained_jsonl_keyed(
@@ -2621,5 +2627,49 @@ mod report_output_tests {
             "refreshed custody statement not recorded"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// R8 P0/P1/P2 for the report's audit-chain table: a lane stripped of
+    /// its HMACs read "structural" on a PC holding the key in R7; now it is
+    /// "not-verified" there. A lane continued on another PC names that
+    /// PC's key and is not "failed". Without keys: structural, with the
+    /// self-consistency caveat.
+    #[test]
+    fn r8_report_chain_table_trust_comes_from_keys_held() {
+        let case = std::env::temp_dir().join(format!("ft-r8-chains-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&case);
+        let validation = case.join("evidence/logs/validation-log.jsonl");
+        let anomaly = case.join("evidence/logs/anomaly-log.jsonl");
+        fs::create_dir_all(validation.parent().unwrap()).unwrap();
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xe1; 32]);
+        let other = crate::audit_key::AuditKey::new("pc-b", &[0xe2; 32]);
+        crate::audit::append_chained_jsonl_keyed(&validation, r#"{"n":1}"#, None).unwrap();
+        crate::audit::append_chained_jsonl_keyed(&anomaly, r#"{"n":1}"#, Some(&mine)).unwrap();
+        crate::audit::append_chained_jsonl_keyed(&anomaly, r#"{"n":2}"#, Some(&other)).unwrap();
+        let chains = |keys: &[crate::audit_key::AuditKey]| -> serde_json::Value {
+            crate::audit_key::with_test_keys(keys, || {
+                serde_json::from_str(&super::report_audit_chains_json(&case)).unwrap()
+            })
+        };
+        let held = chains(std::slice::from_ref(&mine));
+        assert_eq!(held["validation"]["status"], "not-verified", "{held}");
+        assert_eq!(held["anomaly"]["status"], "not-verified", "{held}");
+        assert!(
+            held["anomaly"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("\"pc-b\" 보유 PC에서 확인"),
+            "{held}"
+        );
+        let keyless = chains(&[]);
+        assert_eq!(keyless["validation"]["status"], "structural", "{keyless}");
+        assert!(
+            keyless["validation"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("자기 일관성만 확인(인증 아님)"),
+            "{keyless}"
+        );
+        fs::remove_dir_all(&case).unwrap();
     }
 }

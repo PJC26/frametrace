@@ -7,6 +7,79 @@ carries in testimony; the code deliberately reports `integrity-structural-only`
 so unkeyed logs are never oversold. This document records the chain format, the
 residual threat, and the keyed format as shipped.
 
+## Trust policy (R8) — the governing rule
+
+Every "can this be relied on?" decision over audit entries follows ONE rule,
+implemented once in `src/audit.rs` (`trust_policy`, `AuthRequirement`,
+`AuditChainVerification::line_trust` / `lane_trust`) and used by every
+consumer — sound levels, sign-offs (any schema), E01 raw-image trust, lane
+verification (`verify-audit`, `verify-package`, the report's chain table,
+custody statement, `doctor`, the workstation `/api/verify-audit`):
+
+- **P0 — keys held here ⇒ only what is authenticated HERE is trusted.**
+  Whether authentication is required is decided by whether **this PC holds
+  audit keys** (the verification key set is non-empty; a key source that is
+  present but broken counts as keys held — fail closed). It is **never**
+  decided by signals inside the case files — a lane's presence, `entry_hmac_*`
+  fields, "this case is keyed" — because an attacker can delete or strip them
+  (R7's High findings were exactly that: strip every HMAC, delete the
+  sign-off lane, delete the E01 lane). With keys held, nothing that is not
+  HMAC-authenticated here is ever shown as trusted / current / measured /
+  reusable: an unkeyed (possibly stripped) line, a line under a retired key
+  nothing later proves, and a line under a key this PC does not hold are all
+  "not authenticated here".
+- **P1 — no keys here ⇒ self-consistency only, and every trust display says
+  so** ("자기 일관성만 확인(인증 아님)"): lanes grade
+  `integrity-structural-only` with that caveat, sound levels carry `"sc":
+  true`, legacy and keyless sign-offs say it in the banner and in
+  `verify-package`.
+- **P2 — legitimate multi-PC work ends as "not authenticable here — check on
+  the PC holding key <id>", never FAIL.** A FAIL needs a key **this PC
+  holds** that the entry names to refute it (a `kid-<sha8>` fingerprint id
+  this PC holds, or a held keyring id): that is a verification error. An
+  entry under any other key — including the legacy shared id `"default"`
+  that no held key verifies (R8-I7) — is `LineTrust::OtherPc`; a lane holding
+  one is NOT VERIFIED (not PASS, not FAIL) and lists the key ids.
+
+| Lane / entry state | Keys held here (P0) | No keys here (P1) |
+| --- | --- | --- |
+| Every entry HMAC-authenticated here | `Authenticated` → PASS, `integrity-keyed` | — |
+| Some entry unkeyed (incl. stripped), or retired-key-unproven | **NOT VERIFIED** (`integrity-not-verified`) | PASS, structural, self-consistency only |
+| Some entry under a key this PC does not hold | **NOT VERIFIED**, "키 <id> 보유 PC에서 확인" (P2) | PASS, structural, "키 <id> 보유 PC에서 확인" |
+| Unkeyed entries before an authenticated `audit-key-introduced` marker that is the lane's FIRST keyed entry (R8-I8), everything after authenticated | PASS, structural, "키 도입 이전 항목 N개는 자기 일관성만" | same as above |
+| Chain does not verify (structure, or a held key refutes an entry) | FAIL | FAIL (structure only) |
+
+Per consumer (R8 track I):
+
+- **Sound levels:** a line is a measurement only when `line_trust` allows it;
+  with keys held an unauthenticated line is `unverified` (another PC's line
+  carries `"pc": "<key id>"`), never a level, and never replaces a verified
+  one; a self-consistent level never replaces an authenticated one. A
+  continuation lane's marker that this PC cannot authenticate is **not
+  damage** (no new lane — R7's rule made two PCs open lanes for each other
+  forever); its lines are judged per line.
+- **Sign-offs:** a v4 record is Current only through a lane entry
+  authenticated here. With keys held a legacy (v<4) record is **never**
+  Current — at most amber "legacy binding, no authentication" — whether or
+  not the sign-off lane exists.
+- **E01 raw images:** with keys held a completion marker is Complete only
+  through an authenticated `import-e01` entry it names — the newest import of
+  that raw file from the marker's E01; a marker naming none, or a deleted E01
+  lane, means "re-verify". Before reuse the raw image is re-hashed once
+  (progress, cancel) against that entry's SHA-256.
+- **Lanes everywhere:** `lane_trust()` gives the status word
+  (`keyed`/`structural`/`not-verified`), label and reason every consumer
+  prints.
+
+Key introduction (R8-I8): `rotate-audit-key --log <case>` on a PC that had no
+key before stamps, into each lane holding only unkeyed entries, an
+`{"kind":"audit-key-introduced"}` marker signed by the new key instead of
+the rotation marker. Its HMAC covers the chain hash of everything before it,
+so that prefix cannot be extended later; those entries are self-consistency
+only (never authenticated) instead of "not authenticated". A PC that already
+held a key never introduces keying, so a lane stripped of its HMACs stays
+NOT VERIFIED there. Rotating without `--log <case>` prints a warning.
+
 **Implementation notes (what shipped):**
 
 - `src/hmac.rs` — HMAC-SHA-256 hand-assembled over the existing `sha2`
@@ -136,13 +209,13 @@ the key the entry names:
   id this PC loaded it under. A held key with that fingerprint that does
   not verify the entry → FAIL.
 - The legacy `"default"` names no particular key (every unnamed key used
-  it). It is bound per log by fingerprint comparison: when one of THIS
-  log's `"default"` entries verifies under a key this PC holds, a
-  `"default"` entry in the same log that no key verifies is a forgery
-  (FAIL); otherwise the log's `"default"` entries are another PC's
-  (not verifiable here). This PC's own old `"default"` logs therefore stay
-  verifiable — every configured key is tried as a fallback — and existing
-  keyrings (any ids, including `"default"`) load unchanged.
+  it). A `"default"` entry that a key this PC holds verifies is
+  authenticated (every configured key is tried as a fallback, so this PC's
+  own old `"default"` logs stay verifiable); one that no held key verifies
+  is another PC's legacy `"default"` key — not authenticable here, never a
+  FAIL (R8-I7: R7 made it a FAIL when another `"default"` entry of the same
+  log verified here, which broke logs two PCs continued). Existing keyrings
+  (any ids, including `"default"`) load unchanged.
 - Any other id (`2026-Q1`, `key-<sha8>`) is compared as text.
 
 Field order stays append-only at the tail of the object so
@@ -194,18 +267,22 @@ without the HMAC fields and no warning is emitted (keyed mode is opt-in).
 | --- | --- |
 | Entries without `entry_hmac_sha256` (all logs written before this feature, or written with no key configured) | Structural chain verified; report marks the log **"integrity-structural-only"** — the current documented limitation, made explicit in output. |
 | Entries with `entry_hmac_sha256`, key available | Structural + HMAC verified; report marks **"integrity-keyed"**. |
-| Entries with `entry_hmac_sha256`, key missing | Structural chain verified; report warns **"keyed entries present but key unavailable — authenticity unverified"** (still a pass with a loud caveat, so a log moved off its producing machine remains inspectable). |
+| Entries with `entry_hmac_sha256`, no key on this PC | Structural chain verified; report warns **"keyed entries present but key unavailable — authenticity unverified"** (still a pass with a loud caveat — P1 self-consistency only — so a log moved off its producing machine remains inspectable). |
 | Mixed keyed/unkeyed entries | Per-entry result; the log-level mark degrades to structural-only with a mixed-chain warning. |
-| Entries under a key id this PC does not hold (R6-I4), none after an entry this PC authenticated | Structural chain verified; warning "signed under audit key id(s) … that this PC does not hold — not a tampering verdict"; never graded keyed. |
+| Entries under a key id this PC does not hold (R6-I4), none after an entry this PC authenticated | Structural chain verified; warning "signed under audit key id(s) … that this PC does not hold — not a tampering verdict"; never graded keyed. R8 P0/P2: on a PC holding keys the lane is **NOT VERIFIED** ("이 PC에서 인증 불가 — 키 <id> 보유 PC에서 확인"), never FAIL. |
+| Unkeyed entries, keys held here (R8 P0) | Structural chain verified; **NOT VERIFIED** — an unkeyed entry may be a stripped one, so it is never trusted where keys are held (whether or not the lane holds keyed entries). |
 | An entry under a key id this PC does not hold AFTER an entry this PC authenticated (R7-I3) | **NOT VERIFIED** — "이 PC에 없는 키 — 재작성 배제 불가": this PC held the log's key, so the tail may have been re-chained under an invented key id. `verify-audit` exits non-zero, `verify-package` reports NOT VERIFIED, the report's chain status is `not-verified`, and a sign-off in such a lane is not verifiable. No in-log rotation marker excuses it — a marker naming the new id would be signed by that same unknown key. |
 
-**Per-entry use (R7-I1, R7-S10).** Where a single entry is relied on — a
-sound measurement, a sound-lane continuation marker, an E01 import record
-or the completion marker bound to it, a sign-off entry — and this PC holds
-audit keys in a keyed case, only an entry whose HMAC is
-**authenticated here** counts. An HMAC under an unknown key id, or under a
-retired key nothing later proves, is anyone's line. Without keys on this PC
-these are self-consistency only, and say so.
+**Per-entry use (R7-I1, R7-S10, R8 P0).** Where a single entry is relied on
+— a sound measurement, an E01 import record or the completion marker bound
+to it, a sign-off entry — and this PC holds audit keys (R8: whatever the
+case files say — "in a keyed case" is no longer a condition), only an entry
+whose HMAC is **authenticated here** counts. An unkeyed entry, an HMAC
+under a key this PC does not hold (P2: "check on the PC holding it"), or
+under a retired key nothing later proves, is not. Without keys on this PC
+these are self-consistency only, and say so (P1). A sound-lane continuation
+marker is judged for STRUCTURE only (R8-I6); its lane's lines are judged
+per line.
 
 The unkeyed fields are never removed: keyed logs still verify structurally on
 any machine, and the HMAC layer adds rather than replaces a check.
@@ -236,7 +313,12 @@ the rotation rules:
   also matters for older entries: an entry signed by a now-retired key is
   only authenticated when a newer key's entry follows it in the same log,
   so without the marker every earlier sign-off reads "cannot be verified"
-  after a rotation.
+  after a rotation. R8-I10: a lane named twice (a case folder and one of its
+  lanes, another spelling of the path) gets one marker; a lane that cannot
+  be appended to does not stop the others — every failure is listed and the
+  command exits non-zero saying the key WAS rotated. R8-I8: without any
+  `--log <case folder>` the command warns; on first keying, lanes holding
+  only unkeyed entries get the key-introduction marker (see "Trust policy").
 - Old keys are retained in the keyring for as long as the case lives;
   deleting a retired key downgrades verification of its entries to
   structural-only, never to failure.
@@ -281,7 +363,17 @@ rejected (Unbound / NOT VERIFIED, never read through a marks-only
 shortcut), and once the sign-off lane holds entries an older-schema record
 is at most Unbound / NOT VERIFIED — re-labelling a v4 record as v3 (whose
 `content_sha256` anyone can recompute from the marks) no longer skips the
-lane.
+lane. R8-I2 (P0): on a PC holding audit keys an older-schema record is
+never Current at all — deleting the sign-off lane no longer restores it.
+
+R8-I9: the position check is "this record's entry is the FIRST sign-off
+entry at or after line `signoff_log_entries + 1`" — other events appended
+in between (a rotation marker racing the finalize) no longer contradict it.
+A finalize that recorded its sign-off entry but then failed appends a
+`{"event":"signoff-abandoned","signoff_record_sha256":…}` entry
+(`report::record_signoff_abandoned`); a TRUSTED one (authenticated here when
+keys are held) makes that sign-off entry display-only: it does not make the
+previous sign-off "not the latest", nor cap an older-schema record.
 
 ## Retired keys
 

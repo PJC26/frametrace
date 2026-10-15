@@ -330,8 +330,26 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
         );
     };
     let (latest, entries) = (latest_run.run_unix, &latest_run.entries);
-    let chain = match audit::verify_chained_jsonl(&path) {
-        Ok(v) => format!("log chain: {} ({} entries)", v.integrity.label(), v.entries),
+    // R8-I10 (P0/P1): the re-hash results are only as good as the log
+    // they are read from. R7 printed a green "all re-hashed and equal"
+    // banner next to "log chain verification FAILED" or an unauthenticated
+    // log.
+    let verification = audit::verify_chained_jsonl(&path);
+    let trust = verification
+        .as_ref()
+        .ok()
+        .map(audit::AuditChainVerification::lane_trust);
+    let chain = match &verification {
+        Ok(v) => format!(
+            "log chain: {} ({} entries){}",
+            trust.as_ref().map_or("", |trust| trust.label()),
+            v.entries,
+            trust
+                .as_ref()
+                .filter(|trust| !trust.reason().is_empty())
+                .map(|trust| format!(" — {}", trust.reason()))
+                .unwrap_or_default()
+        ),
         Err(err) => format!("log chain verification FAILED: {err}"),
     };
     // Error text quotes the log's absolute path: escaped (and redacted).
@@ -377,7 +395,16 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
             dash(get("observed_sha256")),
         ));
     }
-    let banner = hash_verify_banner(matched, mismatched, other);
+    let banner = match (&verification, &trust) {
+        (Err(_), _) => "<p class=\"banner bad\">The live re-hash log (hash-verify.jsonl) does not verify as a chain — the results below are shown as recorded but are NOT relied on as a re-verification.</p>".to_string(),
+        (_, Some(audit::LaneTrust::NotVerified { .. })) => "<p class=\"banner warn\">The live re-hash results are recorded in log entries this PC cannot authenticate (this PC holds audit keys) — NOT VERIFIED here; the results below are shown as recorded only (entries signed under another PC's key: check them on the PC holding that key).</p>".to_string(),
+        (_, Some(audit::LaneTrust::SelfConsistentOnly(_))) => hash_verify_banner(matched, mismatched, other).replacen(
+            "</p>",
+            " (Self-consistency only, not authentication: the re-hash log is not HMAC-authenticated on this PC.)</p>",
+            1,
+        ),
+        _ => hash_verify_banner(matched, mismatched, other),
+    };
     format!(
         "{interrupted_html}<p class=note>Latest completed live re-hash run at {} (run {}, newest completed run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
         ts(latest),
@@ -620,26 +647,38 @@ fn render(
     let mut log_rows = String::new();
     let mut verified = 0usize;
     let mut structural_only = 0usize;
+    let mut not_verified = 0usize;
     let mut broken = 0usize;
     for l in logs {
         match &l.result {
             Ok(v) => {
-                verified += 1;
-                // R7-I3: a lane this PC cannot fully authenticate is never
-                // shown as keyed, even if its earlier lines verified.
-                let keyed =
-                    v.integrity == audit::AuditIntegrity::Keyed && v.rewrite_not_excluded.is_none();
-                if !keyed {
-                    structural_only += 1;
+                // R8 P0/P1/P2: the lane's trust under THIS PC's policy.
+                // Keys held + any line not authenticated here = NOT
+                // VERIFIED (never "verified", never "failed"); no keys =
+                // structural, self-consistency only.
+                let trust = v.lane_trust();
+                let keyed = trust == audit::LaneTrust::Authenticated;
+                match &trust {
+                    audit::LaneTrust::Authenticated => verified += 1,
+                    audit::LaneTrust::SelfConsistentOnly(_) => {
+                        verified += 1;
+                        structural_only += 1;
+                    }
+                    audit::LaneTrust::NotVerified { .. } => not_verified += 1,
                 }
                 let mut notes = v.warnings.clone();
-                if let Some(reason) = &v.rewrite_not_excluded {
-                    notes.insert(0, format!("not verifiable here: {reason}"));
-                } else if !keyed {
-                    notes.push(
-                        "structural only: detects partial edits, not a full rewrite by someone with file access"
-                            .to_string(),
-                    );
+                match &trust {
+                    audit::LaneTrust::NotVerified { reason, .. } => {
+                        notes.insert(0, format!("not verified on this PC: {reason}"));
+                    }
+                    audit::LaneTrust::SelfConsistentOnly(reason) => {
+                        notes.insert(0, reason.clone());
+                        notes.push(
+                            "structural only: detects partial edits, not a full rewrite by someone with file access"
+                                .to_string(),
+                        );
+                    }
+                    audit::LaneTrust::Authenticated => {}
                 }
                 let caveat = if notes.is_empty() {
                     String::new()
@@ -651,11 +690,7 @@ fn render(
                     esc(&l.rel_path),
                     v.entries,
                     if keyed { "ok" } else { "warn" },
-                    if v.rewrite_not_excluded.is_some() {
-                        "integrity-not-verified"
-                    } else {
-                        v.integrity.label()
-                    },
+                    trust.label(),
                     esc(&v.last_entry_sha256[..v.last_entry_sha256.len().min(16)]),
                     v.keyed_entries,
                     caveat,
@@ -677,6 +712,10 @@ fn render(
 
     let mut integrity_banner = if broken > 0 {
         "<p class=\"banner bad\">WARNING: one or more audit lanes failed verification — inspect the ledger below before relying on this package.</p>".to_string()
+    } else if not_verified > 0 {
+        format!(
+            "<p class=\"banner warn\">Audit lanes re-checked at statement generation time: {not_verified} lane(s) NOT VERIFIED on this PC — this PC holds audit keys and those lanes contain entries it cannot authenticate (entries signed under another PC's key: check them on the PC holding that key); {verified} other lane(s) passed.</p>"
+        )
     } else if verified > 0 && structural_only > 0 {
         format!(
             "<p class=\"banner warn\">Audit lanes re-checked at statement generation time: {verified} observed internally consistent; {structural_only} of them are structural-only (unsigned) and are not tamper-proof against a complete rewrite.</p>"
@@ -762,7 +801,10 @@ authenticated originals. Hash verification of any packaged file can be performed
 <p class=note>Integrity labels: <code>integrity-keyed</code> = every entry HMAC-verified against a
 configured key; <code>integrity-structural-only</code> = hash-chain structure observed consistent but
 entries are unsigned or unauthenticated, so a complete rewrite of the log by someone with file
-access would not be detected. A failed lane is disclosed in section 4 rather than omitted.</p>
+access would not be detected (self-consistency only, not authentication);
+<code>integrity-not-verified</code> = this PC holds audit keys and the lane contains entries it cannot
+authenticate (no HMAC, or signed under another PC's key — check those on the PC holding that key), so
+the lane is not relied on here. A failed lane is disclosed in section 4 rather than omitted.</p>
 </body></html>"#,
         case_id = field("case_id"),
         title = field("title"),
@@ -833,17 +875,29 @@ mod tests {
     }
 
     fn ok_lane(integrity: audit::AuditIntegrity) -> LogRow {
+        let keyed = integrity == audit::AuditIntegrity::Keyed;
         LogRow {
             rel_path: "evidence/logs/anomaly-log.jsonl".to_string(),
             result: Ok(audit::AuditChainVerification {
                 entries: 2,
                 last_entry_sha256: "ab".repeat(32),
-                keyed_entries: 0,
+                keyed_entries: if keyed { 2 } else { 0 },
                 unauthenticated_keyed_entries: 0,
-                entry_auth: Vec::new(),
+                entry_auth: if keyed {
+                    vec![audit::EntryAuth::Authenticated; 2]
+                } else {
+                    vec![audit::EntryAuth::Unkeyed; 2]
+                },
                 rewrite_not_excluded: None,
                 integrity,
                 warnings: Vec::new(),
+                requirement: if keyed {
+                    audit::AuthRequirement::Required
+                } else {
+                    audit::AuthRequirement::SelfConsistentOnly
+                },
+                entry_key_ids: vec![keyed.then(|| "k".to_string()); 2],
+                pre_key_entries: 0,
             }),
         }
     }
@@ -1052,8 +1106,16 @@ mod tests {
             now_unix().unwrap()
         ));
         std::fs::create_dir_all(dir.join("evidence/logs")).unwrap();
-        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        std::fs::write(dir.join(crate::anomaly::HASH_VERIFY_REL_PATH), text).unwrap();
+        // R8-I10: the real log is chained; a log that does not verify no
+        // longer gets a green re-verification banner.
+        for line in lines {
+            crate::audit::append_chained_jsonl_keyed(
+                &dir.join(crate::anomaly::HASH_VERIFY_REL_PATH),
+                &line.to_string(),
+                None,
+            )
+            .unwrap();
+        }
         dir
     }
 
@@ -1211,5 +1273,91 @@ mod tests {
         );
         assert!(!crate::redact::html_is_redacted(&plain));
         assert!(plain.contains("secret-case"));
+    }
+
+    fn r8_render_lane(lane: &std::path::Path, keys: &[crate::audit_key::AuditKey]) -> String {
+        render(
+            Path::new("/case"),
+            &serde_json::json!({"case_id": "FT-R8"}),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &Err("n/a".to_string()),
+            &[LogRow {
+                rel_path: "evidence/logs/scan-log.jsonl".to_string(),
+                result: audit::verify_chained_jsonl_keyed(lane, keys),
+            }],
+            "",
+            1_704_110_400,
+            None,
+        )
+    }
+
+    /// R8 P0/P2 for the custody statement: a lane stripped of its HMACs was
+    /// counted "observed internally consistent" (structural) on a PC
+    /// holding the key; now it is NOT VERIFIED there. A lane continued on
+    /// another PC names that PC's key and is not "failed".
+    #[test]
+    fn r8_custody_lane_trust_comes_from_keys_held() {
+        let dir = std::env::temp_dir().join(format!("ft-custody-r8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xc1; 32]);
+        let other = crate::audit_key::AuditKey::new("pc-b", &[0xc2; 32]);
+        let stripped = dir.join("stripped.jsonl");
+        audit::append_chained_jsonl_keyed(&stripped, r#"{"n":1}"#, None).unwrap();
+        let html = r8_render_lane(&stripped, std::slice::from_ref(&mine));
+        assert!(html.contains("class=warn>integrity-not-verified"), "{html}");
+        assert!(html.contains("NOT VERIFIED on this PC"), "{html}");
+        assert!(!html.contains("banner ok"), "{html}");
+        let multi = dir.join("multi.jsonl");
+        audit::append_chained_jsonl_keyed(&multi, r#"{"n":1}"#, Some(&mine)).unwrap();
+        audit::append_chained_jsonl_keyed(&multi, r#"{"n":2}"#, Some(&other)).unwrap();
+        let html = r8_render_lane(&multi, std::slice::from_ref(&mine));
+        assert!(html.contains("&quot;pc-b&quot; 보유 PC에서 확인"), "{html}");
+        assert!(
+            !html.contains("failed verification") && html.contains("NOT VERIFIED on this PC"),
+            "never failed: {html}"
+        );
+        // P1: without keys, structural — self-consistency only.
+        let html = r8_render_lane(&stripped, &[]);
+        assert!(
+            html.contains("class=warn>integrity-structural-only"),
+            "{html}"
+        );
+        assert!(html.contains("자기 일관성만 확인(인증 아님)"), "{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R8-I10: section 5 no longer prints a green "all re-hashed and equal"
+    /// banner over a re-hash log whose chain FAILED, or (keys held) over
+    /// entries this PC cannot authenticate.
+    #[test]
+    fn r8_rehash_clause_follows_the_log_trust() {
+        let lines = [
+            hv(300, Some("300-a"), "vid_a", "match"),
+            hv_done(300, Some("300-a")),
+        ];
+        let dir = hash_verify_case("r8-trust", &lines);
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xc3; 32]);
+        crate::audit_key::with_test_keys(&[], || {
+            let html = render_hash_verify(&dir, None);
+            assert!(html.contains("banner ok"), "{html}");
+            assert!(html.contains("Self-consistency only"), "{html}");
+        });
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let html = render_hash_verify(&dir, None);
+            assert!(!html.contains("banner ok"), "{html}");
+            assert!(html.contains("NOT VERIFIED here"), "{html}");
+        });
+        // A forged result line (chain not recomputed): never green.
+        let path = dir.join(crate::anomaly::HASH_VERIFY_REL_PATH);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"match\"", "\"match\" ")).unwrap();
+        crate::audit_key::with_test_keys(&[], || {
+            let html = render_hash_verify(&dir, None);
+            assert!(!html.contains("banner ok"), "{html}");
+            assert!(html.contains("banner bad"), "{html}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

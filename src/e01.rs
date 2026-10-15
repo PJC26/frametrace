@@ -373,10 +373,18 @@ fn import_entry_sha256(case_dir: &Path, raw_sha256: &str, imported_unix: u64) ->
 /// `Ok(())` when the lane verifies, holds that `import-e01` entry with
 /// `raw_sha256`, and — with audit keys on this PC — the entry is
 /// HMAC-authenticated here.
+///
+/// R8-I4: the entry must also be an import of THIS image (its
+/// `raw_output_path` names this file — compared by file name, so a moved
+/// case still matches), of the E01 the marker names (`e01_path` equal), and
+/// the NEWEST full import of this image in the lane — a marker bound to a
+/// superseded import is not this image's record.
 fn check_bound_import_entry(
     lane: &Path,
+    raw: &Path,
     entry_sha256: &str,
     raw_sha256: &str,
+    marker_e01: &str,
     keys: &[crate::audit_key::AuditKey],
 ) -> Result<(), String> {
     let text = match audit::read_log_locked(lane) {
@@ -386,8 +394,14 @@ fn check_bound_import_entry(
     };
     let verification = audit::verify_chained_jsonl_text(&text, "e01-audit.jsonl", keys)
         .map_err(|err| format!("E01 감사 기록의 체인 검증 실패: {err}"))?;
+    let name = raw
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let body = text.strip_suffix('\n').unwrap_or(&text);
-    for (index, line) in body.split('\n').enumerate() {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let newest = newest_full_import_of(&lines, &name).map(|(index, _)| index);
+    for (index, line) in lines.iter().enumerate() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -409,30 +423,77 @@ fn check_bound_import_entry(
                     .to_string(),
             );
         }
-        return import_entry_authenticated(&verification, index, keys);
+        if raw_output_name(&value).as_deref() != Some(name.as_str()) {
+            return Err(format!(
+                "완료 표식이 가리키는 E01 감사 항목은 다른 raw 파일({})의 임포트 기록입니다",
+                value
+                    .get("raw_output_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("기록 없음")
+            ));
+        }
+        if value.get("e01_path").and_then(serde_json::Value::as_str) != Some(marker_e01) {
+            return Err(
+                "완료 표식의 원본 E01과 E01 감사 항목의 원본 E01(e01_path)이 다릅니다".to_string(),
+            );
+        }
+        if newest != Some(index) {
+            return Err(
+                "완료 표식이 가리키는 E01 감사 항목이 이 raw 이미지의 최신 임포트 기록이 아닙니다 (이후 다시 임포트됨)"
+                    .to_string(),
+            );
+        }
+        return import_entry_authenticated(&verification, index);
     }
     Err("완료 표식이 가리키는 E01 감사 항목이 감사 기록에 없습니다".to_string())
 }
 
-/// R7-S10: with audit keys on this PC the import entry must be
-/// HMAC-authenticated here; without keys only self-consistency is checked.
+/// The file name an `import-e01` entry's `raw_output_path` names.
+fn raw_output_name(value: &serde_json::Value) -> Option<String> {
+    let logged = value.get("raw_output_path")?.as_str()?;
+    Some(
+        logged
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(logged)
+            .to_string(),
+    )
+}
+
+/// The newest full (non `--max-bytes`) `import-e01` entry of the lane whose
+/// raw output is named `name`: (line index, entry).
+fn newest_full_import_of(lines: &[&str], name: &str) -> Option<(usize, serde_json::Value)> {
+    lines.iter().enumerate().rev().find_map(|(index, line)| {
+        let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        if value.get("event").and_then(serde_json::Value::as_str) != Some("import-e01") {
+            return None;
+        }
+        // A capped (--max-bytes) export is not the whole image.
+        (raw_output_name(&value).as_deref() == Some(name)
+            && value.get("max_bytes").is_none_or(|v| v.is_null()))
+        .then_some((index, value))
+    })
+}
+
+/// R7-S10 / R8 P0: with audit keys on this PC the import entry must be
+/// HMAC-authenticated here (`line_trust`, decided by this PC holding keys
+/// — not by the lane carrying HMACs); without keys only self-consistency
+/// is checked (P1). P2: an entry signed under another PC's key is "not
+/// authenticable here — check on the PC holding key <id>".
 fn import_entry_authenticated(
     verification: &audit::AuditChainVerification,
     index: usize,
-    keys: &[crate::audit_key::AuditKey],
 ) -> Result<(), String> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    if let Some(reason) = &verification.rewrite_not_excluded {
-        return Err(format!("E01 감사 기록을 확인할 수 없습니다: {reason}"));
-    }
-    match verification.entry_auth.get(index) {
-        Some(audit::EntryAuth::Authenticated) => Ok(()),
-        _ => Err(
-            "E01 감사 기록의 임포트 항목이 이 PC의 감사 키로 인증되지 않았습니다 (키 없이 기록됐거나, 이 PC에 없는 키·은퇴한 키로만 서명됨) — 기록을 믿을 수 없습니다"
-                .to_string(),
-        ),
+    match verification.line_trust(index) {
+        audit::LineTrust::SelfConsistentOnly { .. } => Ok(()),
+        audit::LineTrust::Authenticated => match &verification.rewrite_not_excluded {
+            Some(reason) => Err(format!("E01 감사 기록을 확인할 수 없습니다: {reason}")),
+            None => Ok(()),
+        },
+        trust => Err(format!(
+            "E01 감사 기록의 임포트 항목이 이 PC의 감사 키로 인증되지 않았습니다 — {} — 기록을 믿을 수 없습니다 (raw 이미지를 다시 확인해야 합니다)",
+            trust.note()
+        )),
     }
 }
 
@@ -529,17 +590,35 @@ pub fn raw_import_status_with_keys(
         .and_then(|value| value.get("audit_entry_sha256"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let marker_e01 = marker
+        .as_ref()
+        .and_then(|value| value.get("e01_path"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     match bound {
-        Some(entry) => match check_bound_import_entry(&lane, &entry, sha256, keys) {
-            Ok(()) => status,
-            Err(why) => RawImportStatus::Unverified(format!(
-                "완료 표식을 E01 감사 기록으로 확인할 수 없습니다 — {why}"
-            )),
-        },
-        None if !keys.is_empty() && lane.is_file() => RawImportStatus::Unverified(
-            "완료 표식이 E01 감사 기록의 항목과 결합되어 있지 않습니다(이전 형식) — 감사 키가 있는 케이스에서는 인증된 임포트 기록으로 다시 확인해야 합니다"
-                .to_string(),
-        ),
+        Some(entry) => {
+            match check_bound_import_entry(&lane, raw, &entry, sha256, &marker_e01, keys) {
+                Ok(()) => status,
+                Err(why) => RawImportStatus::Unverified(format!(
+                    "완료 표식을 E01 감사 기록으로 확인할 수 없습니다 — {why}"
+                )),
+            }
+        }
+        // R8-I3 (P0): with audit keys on this PC a marker is Complete ONLY
+        // through an authenticated import entry it names. A marker naming
+        // none (written before R7, or a forged "legacy" marker) needs
+        // re-verification — whether or not the case still HAS an E01 lane:
+        // deleting the lane must not turn the marker back into trust.
+        None if audit::trust_policy(keys).keys_held() => {
+            RawImportStatus::Unverified(if lane.is_file() {
+                "완료 표식이 E01 감사 기록의 항목과 결합되어 있지 않습니다(이전 형식) — 이 PC에는 감사 키가 있어 인증된 임포트 기록으로 다시 확인해야 합니다 (재검증 필요)"
+                .to_string()
+            } else {
+                "완료 표식이 E01 감사 기록의 항목과 결합되어 있지 않고 케이스에 E01 감사 기록(e01-audit.jsonl)도 없습니다 — 이 PC에는 감사 키가 있어 인증되지 않은 표식을 믿지 않습니다 (재검증 필요: 다시 임포트하십시오)"
+                .to_string()
+            })
+        }
         None => status,
     }
 }
@@ -663,21 +742,10 @@ pub fn recorded_raw_import_with_keys(
         })?;
     let body = text.strip_suffix('\n').unwrap_or(&text);
     let lines: Vec<&str> = body.split('\n').collect();
-    let newest = lines.iter().enumerate().rev().find_map(|(index, line)| {
-        let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-        if value.get("event").and_then(serde_json::Value::as_str) != Some("import-e01") {
-            return None;
-        }
-        let logged = value.get("raw_output_path")?.as_str()?;
-        let logged_name = logged.rsplit(['/', '\\']).next().unwrap_or(logged);
-        // A capped (--max-bytes) export is not the whole image.
-        (logged_name == name && value.get("max_bytes").is_none_or(|v| v.is_null()))
-            .then_some((index, value))
-    });
-    let Some((index, value)) = newest else {
+    let Some((index, value)) = newest_full_import_of(&lines, &name) else {
         return Ok(None);
     };
-    import_entry_authenticated(&verification, index, keys)?;
+    import_entry_authenticated(&verification, index)?;
     let e01 = value
         .get("e01_path")
         .and_then(serde_json::Value::as_str)
@@ -705,7 +773,7 @@ pub fn recorded_raw_import_with_keys(
             .get("entry_sha256")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-        authenticated: !keys.is_empty(),
+        authenticated: audit::trust_policy(keys).keys_held(),
     }))
 }
 
@@ -781,23 +849,49 @@ fn digest_file_with_progress(
 /// different byte size is a mismatch without hashing (it used to hash
 /// hundreds of GB to learn nothing); the hash reports progress and can be
 /// cancelled ([`RehashHooks`]).
+///
+/// R8-I4 (P0): on a PC holding audit keys a Complete image of THIS E01 in
+/// the case is re-hashed once before it is reused — the marker's size and
+/// modification time are unauthenticated claims anyone can restore after
+/// swapping the bytes — and compared with the SHA-256 of the authenticated
+/// import entry the marker is bound to (progress and cancel as above).
 pub fn reconcile_raw(
     case_dir: &Path,
     raw: &Path,
     source: &Path,
     hooks: &RehashHooks<'_>,
 ) -> RawReuse {
-    let first = raw_reuse_decision(raw, source);
-    let RawImportStatus::Unverified(reason) = raw_import_status(raw) else {
-        return first;
-    };
     let keys = match crate::audit_key::verification_keys() {
         Ok(keys) => keys,
         Err(err) => {
+            if std::fs::metadata(raw).is_err() {
+                return RawReuse::Absent;
+            }
             return RawReuse::NeedsReimport(format!(
-                "기존 raw 이미지를 완료된 임포트로 확인할 수 없습니다 — {reason}; 감사 키를 읽지 못했습니다: {err}"
+                "기존 raw 이미지를 완료된 임포트로 확인할 수 없습니다 — 감사 키를 읽지 못했습니다: {err}"
             ));
         }
+    };
+    let status = raw_import_status_with_keys(raw, &keys);
+    let first = reuse_from_status(&status, source);
+    if let (RawImportStatus::Complete { sha256, .. }, RawReuse::Reuse) = (&status, &first)
+        && audit::trust_policy(&keys).keys_held()
+        && case_e01_lane(raw).is_some()
+    {
+        (hooks.on_rehash)(sha256);
+        return match digest_file_with_progress(raw, hooks) {
+            Ok(Some(current)) if current.eq_ignore_ascii_case(sha256) => RawReuse::Reuse,
+            Ok(Some(current)) => RawReuse::NeedsReimport(format!(
+                "raw 이미지의 SHA-256이 인증된 임포트 기록과 다릅니다 (기록 {sha256}, 현재 {current}) — 완료 표식의 크기·수정 시각은 같지만 내용이 바뀜"
+            )),
+            Ok(None) => RawReuse::Cancelled,
+            Err(err) => RawReuse::NeedsReimport(format!(
+                "재사용 전에 raw 이미지의 SHA-256을 다시 계산하지 못했습니다: {err}"
+            )),
+        };
+    }
+    let RawImportStatus::Unverified(reason) = status else {
+        return first;
     };
     // R7-S10: with audit keys on this PC the SHA-256 to compare with comes
     // from the AUTHENTICATED E01 audit entry only — the marker beside the
@@ -805,7 +899,7 @@ pub fn reconcile_raw(
     // (then the lane) is used, as before: self-consistency only.
     let from_marker = std::fs::read_to_string(raw_done_marker_path(raw))
         .ok()
-        .filter(|_| keys.is_empty())
+        .filter(|_| !audit::trust_policy(&keys).keys_held())
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|value| {
             let sha = value.get("sha256")?.as_str()?.to_ascii_lowercase();
@@ -895,11 +989,14 @@ pub fn reconcile_raw(
 /// Pure decision on top of [`raw_import_status`]. The E01 paths are
 /// compared canonically when possible.
 pub fn raw_reuse_decision(raw: &Path, source: &Path) -> RawReuse {
-    match raw_import_status(raw) {
+    reuse_from_status(&raw_import_status(raw), source)
+}
+
+/// Pure core of [`raw_reuse_decision`].
+fn reuse_from_status(status: &RawImportStatus, source: &Path) -> RawReuse {
+    match status {
         RawImportStatus::Missing => RawReuse::Absent,
-        RawImportStatus::Complete { e01_path, .. } if same_e01(&e01_path, source) => {
-            RawReuse::Reuse
-        }
+        RawImportStatus::Complete { e01_path, .. } if same_e01(e01_path, source) => RawReuse::Reuse,
         RawImportStatus::Complete { e01_path, .. } => RawReuse::NeedsReimport(format!(
             "기존 raw 이미지는 다른 E01({})에서 임포트된 것입니다",
             e01_path.display()
@@ -1666,7 +1763,9 @@ mod tests {
             raw_import_status_with_keys(&raw, keys),
             RawImportStatus::Complete { .. }
         ));
-        // Bound to the unkeyed entry: not trusted with keys, fine without.
+        // Bound to the unkeyed entry: not trusted with keys — and (R8-I4)
+        // not even without keys, because it is no longer this image's
+        // newest import (entry 9 superseded it).
         let unkeyed_entry = super::import_entry_sha256(&dir, &sha, 7).unwrap();
         write_raw_done_marker_bound(&raw, &sha, &e01, 7, Some(&unkeyed_entry)).unwrap();
         assert!(matches!(
@@ -1675,7 +1774,7 @@ mod tests {
         ));
         assert!(matches!(
             raw_import_status_with_keys(&raw, &[]),
-            RawImportStatus::Complete { .. }
+            RawImportStatus::Unverified(why) if why.contains("최신 임포트 기록이 아닙니다")
         ));
         // Bound to an entry the lane does not hold: never complete.
         write_raw_done_marker_bound(&raw, &sha, &e01, 9, Some(&"0".repeat(64))).unwrap();
@@ -1696,6 +1795,153 @@ mod tests {
             raw_import_status_with_keys(&raw, &[]),
             RawImportStatus::Complete { .. }
         ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn r8_import_entry(raw_name: &str, e01: &str, sha: &str, unix: u64) -> String {
+        serde_json::json!({"schema_version": 1, "event": "import-e01",
+            "imported_unix": unix, "e01_path": e01,
+            "raw_output_path": format!("C:/elsewhere/evidence/images/{raw_name}"),
+            "raw_sha256": sha, "max_bytes": null})
+        .to_string()
+    }
+
+    /// R8-I3 (P0): on a PC holding audit keys, deleting the case's E01
+    /// lane no longer turns a legacy (unbound) completion marker back into
+    /// trust — R7 only distrusted it while the lane existed. P2: an import
+    /// entry signed on another PC is "not authenticable here — check on the
+    /// PC holding key <id>"; that PC trusts it.
+    #[test]
+    fn r8_i3_deleted_lane_or_other_pcs_entry_is_never_complete_here() {
+        use super::{RawImportStatus, raw_import_status_with_keys, write_raw_done_marker};
+        let dir = c1_dir("r8-i3");
+        let e01 = dir.join("disk.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        let raw = dir.join("evidence/images/evidence.raw");
+        fs::write(&raw, b"complete-image").unwrap();
+        let sha = crate::audit::digest_file(&raw).unwrap();
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xa1; 32]);
+        let other = crate::audit_key::AuditKey::new("pc-b", &[0xa2; 32]);
+        // A legacy marker and NO E01 lane (deleted).
+        write_raw_done_marker(&raw, &sha, &e01, 9).unwrap();
+        assert!(!dir.join("evidence/logs/e01-audit.jsonl").exists());
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, std::slice::from_ref(&mine)),
+            RawImportStatus::Unverified(why) if why.contains("재검증 필요")
+        ));
+        // P1: without keys it is self-consistency only, as before.
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, &[]),
+            RawImportStatus::Complete { .. }
+        ));
+        // P2: the import was recorded on PC B.
+        let lane = dir.join("evidence/logs/e01-audit.jsonl");
+        crate::audit::append_chained_jsonl_keyed(
+            &lane,
+            &r8_import_entry("evidence.raw", &e01.to_string_lossy(), &sha, 9),
+            Some(&other),
+        )
+        .unwrap();
+        let entry = super::import_entry_sha256(&dir, &sha, 9).unwrap();
+        super::write_raw_done_marker_bound(&raw, &sha, &e01, 9, Some(&entry)).unwrap();
+        match raw_import_status_with_keys(&raw, std::slice::from_ref(&mine)) {
+            RawImportStatus::Unverified(why) => {
+                assert!(why.contains("\"pc-b\" 보유 PC에서 확인"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, std::slice::from_ref(&other)),
+            RawImportStatus::Complete { .. }
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R8-I4: the import entry a marker names must be an import of THIS
+    /// image (raw file name), of the marker's E01, and the newest one; and
+    /// with keys held a Complete image is re-hashed before reuse — bytes
+    /// swapped under a restored size and modification time were reused in
+    /// R7.
+    #[test]
+    fn r8_i4_marker_entry_binding_and_rehash_before_reuse() {
+        use super::{
+            RawImportStatus, RawReuse, raw_import_status_with_keys, reconcile_raw,
+            write_raw_done_marker_bound,
+        };
+        let dir = c1_dir("r8-i4");
+        let e01 = dir.join("disk.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        let raw = dir.join("evidence/images/evidence.raw");
+        fs::write(&raw, b"complete-image").unwrap();
+        let sha = crate::audit::digest_file(&raw).unwrap();
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xa3; 32]);
+        let keys = std::slice::from_ref(&mine);
+        let lane = dir.join("evidence/logs/e01-audit.jsonl");
+        let e01_text = e01.to_string_lossy().to_string();
+        // An authenticated import of ANOTHER raw file with the same bytes.
+        crate::audit::append_chained_jsonl_keyed(
+            &lane,
+            &r8_import_entry("other.raw", &e01_text, &sha, 5),
+            Some(&mine),
+        )
+        .unwrap();
+        let other_entry = super::import_entry_sha256(&dir, &sha, 5).unwrap();
+        write_raw_done_marker_bound(&raw, &sha, &e01, 5, Some(&other_entry)).unwrap();
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, keys),
+            RawImportStatus::Unverified(why) if why.contains("다른 raw 파일")
+        ));
+        // An import of this file but from another E01 than the marker's.
+        crate::audit::append_chained_jsonl_keyed(
+            &lane,
+            &r8_import_entry("evidence.raw", "D:/other.E01", &sha, 6),
+            Some(&mine),
+        )
+        .unwrap();
+        let wrong_e01 = super::import_entry_sha256(&dir, &sha, 6).unwrap();
+        write_raw_done_marker_bound(&raw, &sha, &e01, 6, Some(&wrong_e01)).unwrap();
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, keys),
+            RawImportStatus::Unverified(why) if why.contains("e01_path")
+        ));
+        // The newest import of this file from this E01: complete.
+        crate::audit::append_chained_jsonl_keyed(
+            &lane,
+            &r8_import_entry("evidence.raw", &e01_text, &sha, 7),
+            Some(&mine),
+        )
+        .unwrap();
+        let entry = super::import_entry_sha256(&dir, &sha, 7).unwrap();
+        write_raw_done_marker_bound(&raw, &sha, &e01, 7, Some(&entry)).unwrap();
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, keys),
+            RawImportStatus::Complete { .. }
+        ));
+        let rehashed = std::cell::Cell::new(false);
+        crate::audit_key::with_test_keys(keys, || {
+            assert_eq!(
+                reconcile_raw(&dir, &raw, &e01, &hooks(&|_| rehashed.set(true))),
+                RawReuse::Reuse
+            );
+            assert!(rehashed.get(), "hashed once before reuse");
+            // Same size, bytes swapped, modification time restored.
+            let modified = fs::metadata(&raw).unwrap().modified().unwrap();
+            fs::write(&raw, b"COMPLETE-IMAGE").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&raw)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            assert!(matches!(
+                raw_import_status_with_keys(&raw, keys),
+                RawImportStatus::Complete { .. }
+            ));
+            assert!(matches!(
+                reconcile_raw(&dir, &raw, &e01, &hooks(&|_| {})),
+                RawReuse::NeedsReimport(why) if why.contains("SHA-256")
+            ));
+        });
         let _ = fs::remove_dir_all(&dir);
     }
 }
