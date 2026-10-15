@@ -48,7 +48,7 @@ function viewerSaveState() { return finViewerSaveState(); }
 // Starts a save (or retry) now; true when a viewer accepted it.
 function retryViewerSave() {
   const v = finViewer();
-  if (v && typeof v.save === "function") { Promise.resolve(v.save()).catch(() => {}); return true; }
+  if (v && typeof v.save === "function") { Promise.resolve(v.save({ patient: true })).catch(() => {}); return true; }
   return false;
 }
 // Browser-only mark drafts of a case (any window): the viewer's per-id keys
@@ -190,7 +190,7 @@ async function finAttribute() {
     const v = finViewer();
     if (v && typeof v.save === "function" && FIN_UNSAVED.includes(finViewerSaveState())) {
       let saved = false;
-      try { saved = await v.save(); } catch (e) { saved = false; }
+      try { saved = await v.save({ patient: true }); } catch (e) { saved = false; }
       if (!saved) { msg = "뷰어의 미저장 변경을 먼저 저장하지 못했습니다 — ‘저장 다시 시도’ 후 다시 누르십시오."; return; }
     }
     propagateExaminerName(name, FIN.caseId);
@@ -281,7 +281,11 @@ async function gatherFinalizeChecks() {
   else if (!["review-ready", "done", "finalized"].includes(phase)) add("block", "완료된 분석 결과가 없습니다", "먼저 분석을 끝내십시오.");
   let meta = null;
   try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
-  const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
+  // R8 U1: the viewer's own storage key of the case (case.json's case_id;
+  // an unreadable case.json: a hash of the case folder — never "case").
+  const caseId = meta && meta.ok !== false && typeof FTViewer === "object" && FTViewer && FTViewer.caseStorageKey
+    ? FTViewer.caseStorageKey(meta.manifest, meta.caseDir)
+    : (meta && meta.manifest ? (meta.manifest.case_id || "case") : null);
   const summary = finViewerSummary();
 
   // Unsaved / queued marks block the finalize: sealing a package without
@@ -671,7 +675,7 @@ async function finRetrySave() {
   if (!v || typeof v.save !== "function") { toast("뷰어가 열려 있지 않습니다 — 검토 화면을 연 뒤 저장하십시오.", "warn"); return; }
   btn.disabled = true; btn.setAttribute("aria-busy", "true"); finHint("저장 중…");
   let ok = false;
-  try { ok = await v.save(); } catch (e) { ok = false; }
+  try { ok = await v.save({ patient: true }); } catch (e) { ok = false; }
   btn.removeAttribute("aria-busy"); btn.disabled = false; finHint(ok ? "" : "저장하지 못했습니다 — 뷰어의 저장 상태를 확인하십시오.");
   finRefresh();
 }

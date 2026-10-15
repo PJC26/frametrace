@@ -25,6 +25,9 @@
 //  13. R4 A15: hBeforeClose waits for the save in flight; a failing save →
 //      ok:false with "저장 안 된 편집 N건"
 //  14. R4 B2: ?launch= (and ?token=) leave the address bar — shell + /viewer/
+//  R8 U3: a real save conflict at 1366x768 — the conflict list opens as the
+//      notices row's sibling, Tab reaches its buttons (on screen, not
+//      covered, one scroll container), also with five long notices
 //
 // Checks 1-5 run at 1366x768 and 1920x1080 in light and dark; 6-8 once.
 // The viewer fragment must be hosted in the page (T5): a legacy frame in
@@ -242,6 +245,84 @@ try {
         });
         check(`${label}: R7 U9 five notices — the row stops at min(28vh, 216px) and scrolls`, !n9.missing && n9.h <= n9.cap + 0.5 && n9.scrolls && n9.lastVisible, JSON.stringify(n9));
         check(`${label}: R7 U9 five notices — the grid keeps >= 200px, the selection bar stays on screen, no sideways scroll`, !n9.missing && n9.gridH >= 200 && n9.selBottom <= n9.vh && !n9.hscroll, JSON.stringify(n9));
+      }
+
+      // R8 U3: the per-record conflict list is NOT inside the capped,
+      // scrolling notices row (a scroller in a scroller): a real conflict
+      // (another writer saved the record first) → open the list → Tab to
+      // its buttons. Each focused button is fully on screen and not
+      // covered, inside ONE scroll container (the list itself), the list
+      // is the notices row's sibling, the selection bar stays on screen,
+      // nothing scrolls sideways. Also with five long notices stacked.
+      if (!wide) {
+        const rid = await page.evaluate(() => document.querySelector('#recordGrid .card')?.dataset.id || null);
+        const meta = await getJson('/api/records-meta');
+        const caseId = meta.manifest && meta.manifest.case_id;
+        const rev = Number(((meta.annotations || {}).revisions || {})[rid]) || 0;
+        const other = await postJson('/api/import-marks', { marks_json: JSON.stringify({
+          schema_version: 2, protocol: 'patch-v2', case_id: caseId, examiner: 'other', client_id: 'w-layout-other', exported_unix: 1,
+          base_revisions: { [rid]: rev }, marks: [{ id: rid, status: 'important', marked_unix: 1, note: `layout ${label}`, examiner: 'other', tags: [], range: { in: null, out: null } }], tags: [], deleted_ids: [],
+        }) });
+        await page.click(`#recordGrid .card[data-id="${rid}"]`);
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.keyboard.press('1');
+        await page.evaluate(() => document.getElementById('saveState')?.click());
+        const banner = await page.waitForSelector('#markConflictBanner', { timeout: 20000 }).then(() => true).catch(() => false);
+        if (!check(`${label}: R8 U3 a real save conflict shows the conflict banner`, banner && other && other.ok !== false, JSON.stringify({ rid, rev, other: other && (other.applied || other.error) }))) {
+          // nothing to measure
+        } else {
+          await page.click('#markConflictList');
+          await page.waitForSelector('#markConflictPanel:not([hidden]) .conflict-item');
+          const measure = (expectFocusIn) => page.evaluate((want) => {
+            const el = document.activeElement;
+            const panel = document.getElementById('markConflictPanel');
+            const notices = document.querySelector('#ftViewer > .ft-notices');
+            const r = el.getBoundingClientRect();
+            const pr = panel.getBoundingClientRect();
+            const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+            const scrollers = [];
+            for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
+              const cs = getComputedStyle(n);
+              if (/(auto|scroll)/.test(cs.overflowY) && n.scrollHeight > n.clientHeight + 1) scrollers.push(n.id || n.className);
+            }
+            const sel = document.getElementById('selectionBar').getBoundingClientRect();
+            const grid = document.getElementById('recordGrid').getBoundingClientRect();
+            return {
+              focus: el.tagName + (el.dataset.side ? ':' + el.dataset.side : '') + (el.id ? '#' + el.id : ''),
+              inPanel: panel.contains(el), want,
+              onScreen: r.top >= -0.5 && r.bottom <= innerHeight + 0.5 && r.left >= -0.5 && r.right <= innerWidth + 0.5,
+              inPanelBox: r.top >= pr.top - 0.5 && r.bottom <= pr.bottom + 0.5,
+              covered: !(hit && (hit === el || el.contains(hit))), h: Math.round(r.height),
+              scrollers, sibling: panel.parentElement && panel.parentElement.id === 'ftViewer' && !notices.contains(panel) && notices.nextElementSibling === panel,
+              selBottom: Math.round(sel.bottom), vh: innerHeight, gridH: Math.round(grid.height), panelH: Math.round(pr.height), noticesH: Math.round(notices.getBoundingClientRect().height),
+              hscroll: document.documentElement.scrollWidth > innerWidth + 1,
+            };
+          }, expectFocusIn);
+          const tabs = [];
+          for (let i = 0; i < 2; i++) { await page.keyboard.press('Tab'); tabs.push(await measure(true)); }
+          const okTab = (m) => m.inPanel && /^BUTTON:(server|mine)/.test(m.focus) && m.onScreen && m.inPanelBox && !m.covered && m.h >= 24 && m.scrollers.length <= 1 && !m.scrollers.some((c) => /ft-notices/.test(c));
+          check(`${label}: R8 U3 conflict list opened — Tab reaches both per-record buttons, each on screen, not covered, >= 24px, inside one scroll container`, tabs.every(okTab), JSON.stringify(tabs));
+          check(`${label}: R8 U3 the conflict list is the notices row's sibling (not inside the capped row), the selection bar stays on screen, no sideways scroll`, tabs.every((m) => m.sibling && m.selBottom <= m.vh && !m.hscroll), JSON.stringify(tabs[0]));
+          // Five long notices stacked while the list is open.
+          await page.evaluate(() => {
+            const host = document.querySelector('#ftViewer > .ft-notices');
+            for (let i = 1; i <= 5; i++) {
+              const bar = document.createElement('div');
+              bar.className = 'ft-banner'; bar.dataset.layoutProbe = String(i);
+              bar.textContent = `${i}. ` + '레이아웃 확인용 긴 알림 — 충돌 목록이 열려 있어도 알림 행과 목록이 서로 가리지 않는지 확인합니다. '.repeat(4);
+              host.appendChild(bar);
+            }
+          });
+          await page.focus('#markConflictPanel .conflict-item button[data-side="server"]');
+          await page.keyboard.press('Tab');
+          const crowded = await measure(true);
+          await page.evaluate(() => document.querySelectorAll('[data-layout-probe]').forEach((b) => b.remove()));
+          check(`${label}: R8 U3 with five long notices too — the focused list button is on screen and not covered, the selection bar on screen, the grid keeps >= 120px`, okTab(crowded) && crowded.selBottom <= crowded.vh && crowded.gridH >= 120 && !crowded.hscroll, JSON.stringify(crowded));
+          if (shots) await page.screenshot({ path: join(shots, `conflicts-${w}-${theme}.png`) });
+          await page.click('#markConflictUseServer');
+          await page.waitForSelector('#markConflictBanner', { state: 'detached', timeout: 20000 }).catch(() => {});
+          await page.waitForFunction(() => FTViewer.saveState() === 'saved', null, { timeout: 20000 }).catch(() => {});
+        }
       }
 
       // 4. sheets

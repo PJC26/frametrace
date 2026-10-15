@@ -218,7 +218,7 @@ const viewerBridge = {
 // The descriptor of the active record plus why the bridge did nothing.
 function bridgeRefused(why) {
   const d = playerDescriptor();
-  const reason = why === "locked" ? t("player.refusedReadonly") : why === "undo" ? t("toast.nothingUndo") : why === "redo" ? t("toast.nothingRedo") : String(why || "");
+  const reason = why === "locked" ? t(lockKey("player.refusedReadonly")) : why === "undo" ? t("toast.nothingUndo") : why === "redo" ? t("toast.nothingRedo") : String(why || "");
   return d ? { ...d, refused: reason } : { refused: reason, none: true };
 }
 window.__ftBridge = viewerBridge;
@@ -228,7 +228,7 @@ window.__ftBridge = viewerBridge;
 // parent navigation), because the channel is name-addressed rather than
 // object-referenced. Requests carry a correlation seq; replies echo it.
 const playerChannel = ("BroadcastChannel" in window)
-  ? new BroadcastChannel(`ft-player:${manifest.case_id || "case"}`)
+  ? new BroadcastChannel(`ft-player:${CASE_KEY}`)
   : null;
 if (playerChannel) {
   playerChannel.addEventListener("message", (ev) => {
@@ -334,7 +334,7 @@ var RATES=[${RATES.join(",")}];
 var rate=document.getElementById("rate");
 var cur=null;
 v.playbackRate=${jsLit(rate)};
-var TOKEN=${jsLit(FTViewer.writerToken)};var seqN=0,pend={},chan=("BroadcastChannel" in window)?new BroadcastChannel(${jsLit(`ft-player:${manifest.case_id || "case"}`)}):null;
+var TOKEN=${jsLit(FTViewer.writerToken)};var seqN=0,pend={},chan=("BroadcastChannel" in window)?new BroadcastChannel(${jsLit(`ft-player:${CASE_KEY}`)}):null;
 if(chan){chan.onmessage=function(ev){var m=ev.data||{},f=m.seq&&pend[m.seq];if(f){delete pend[m.seq];f(m.payload);}};}
 function call(op,arg,cb,ms){
 var b=(window.opener&&!window.opener.closed&&window.opener.__ftBridge)||null;

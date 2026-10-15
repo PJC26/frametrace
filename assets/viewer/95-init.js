@@ -46,10 +46,10 @@ async function viewerReloadBlocker() {
 // as on any boot. Hosted: FTViewer.reload() hands it to the next init()
 // (opts.restore); standalone (a page reload): one sessionStorage entry that
 // the next boot of the same case consumes.
-const VIEW_STASH_KEY = "ft.viewer." + (manifest.case_id || "case") + ".reloadView";
+const VIEW_STASH_KEY = "ft.viewer." + CASE_KEY + ".reloadView";
 const VIEW_STRING_FIELDS = ["query", "kind", "status", "chip", "calMonth", "sortBy", "groupBy", "dateFrom", "dateTo", "recType", "audio"];
 function viewerViewState() {
-  const view = { v: 1, caseId: manifest.case_id || "", queryText: els.query ? els.query.value : "" };
+  const view = { v: 1, caseId: CASE_KEY, queryText: els.query ? els.query.value : "" };
   for (const field of VIEW_STRING_FIELDS) view[field] = String(state[field] || "");
   view.activeId = state.activeId;
   view.selectedIds = [...state.selectedIds];
@@ -62,7 +62,7 @@ function viewerViewState() {
   return view;
 }
 function viewerApplyViewState(view) {
-  if (!view || view.v !== 1 || view.caseId !== (manifest.case_id || "")) return false;
+  if (!view || view.v !== 1 || view.caseId !== CASE_KEY) return false;
   for (const field of VIEW_STRING_FIELDS) if (typeof view[field] === "string") state[field] = view[field];
   if (typeof view.chipsExpanded === "boolean") state.chipsExpanded = view.chipsExpanded;
   if (Number.isFinite(view.pageSize) && view.pageSize > 0) state.pageSize = view.pageSize;
@@ -129,6 +129,9 @@ function viewerSetLocale(locale) {
   state.locale = locale;
   storageSet(LOCALE_KEY, state.locale);
   render();
+  // R8 U6: the notices carry their i18n keys (render() re-labels them); the
+  // open conflict list is built from values, so it is rebuilt.
+  if (conflictPanelOpen && conflictIds.size) renderConflictBanner();
   syncThemeBtn();
   FTViewer._emit("locale", { locale });
 }
@@ -233,79 +236,9 @@ FTViewer._attach({
   focus: viewerFocus,
   summary: viewerSummary,
   saveState: () => (saveStateEl && saveStateEl.dataset.state) || null,
-  // Resolves true once nothing is pending (marks durably queued on the
-  // server count as saved: they reach the case DB when the job ends).
-  // An open save conflict is never "saved": it needs the examiner's choice;
-  // neither is an unread conflict lookup (A5) or a read-only mount (A3).
-  // A save already in flight is awaited first (A15: the shell's close path
-  // calls this and must get the answer of the request on the wire).
-  // R5 U15: read-only with NOTHING held here (no draft, no edit) has nothing
-  // to lose: true (the host warns, it does not ask to confirm a close).
-  // R5 U6: a "busy, retry" reply (R4 B4) is waited out — retry_after_ms,
-  // up to SAVE_BUSY_RETRIES replies — instead of answering false at once.
-  // R6 U5: how long is the CALLER's choice: save({ timeoutMs }) (or
-  // save(ms)), default SAVE_CALLER_WAIT_MS (5 s), never more than
-  // SAVE_BUSY_WAIT_MS — one caller's patience no longer holds every other
-  // save() for 20 s. The indicator shows the retry count meanwhile.
-  // R7 U1/U5: `timeoutMs` is the HARD TOTAL budget of this call's answer —
-  // the wait for a save already in flight, the conflict lookup, every send
-  // and every busy retry all count against one deadline (R6 bounded only
-  // the busy retries; the wait for the request on the wire was unbounded).
-  // Past it save() answers false (the requests themselves go on and their
-  // replies still settle the drafts) and sets `opts.timedOut = true` when
-  // the caller passed an options object. Default SAVE_CALLER_WAIT_MS (20 s,
-  // explicit saves: finalize retry, case switch, attribution); the close
-  // flush passes 4 s.
-  async save(opts) {
-    if (!viewerIsServed) return false;
-    if (annotationsReadOnly) return !Object.keys(state.drafts).length && !state.dirtyIds.size && !conflictIds.size;
-    const idle = () => localReviewIdle();
-    let busyWaits = 0;
-    const asked = Number(typeof opts === "number" ? opts : opts && opts.timeoutMs);
-    const budget = Number.isFinite(asked) && asked >= 0 ? asked : SAVE_CALLER_WAIT_MS;
-    const deadline = Date.now() + budget;
-    const TIMED_OUT = {};
-    let timer = 0;
-    const expired = new Promise(resolve => { timer = setTimeout(() => resolve(TIMED_OUT), budget); });
-    // Every wait of this call races the one deadline.
-    const within = (work) => Promise.race([Promise.resolve(work), expired]);
-    const timedOut = () => {
-      if (opts && typeof opts === "object") opts.timedOut = true;
-      return false;
-    };
-    try {
-      for (let attempt = 0; attempt < 4; attempt++) {
-        if ((await within(whenSaveSettled())) === TIMED_OUT) return timedOut();
-        if ((await within(whenConflictsChecked())) === TIMED_OUT) return timedOut();
-        if (idle()) return true;
-        if (conflictLookupFailed) {
-          const checked = await within(checkServerConflicts());
-          if (checked === TIMED_OUT) return timedOut();
-          if (!checked) return false;
-        }
-        if (!state.dirtyIds.size && !pendingReviewSync && conflictIds.size) return false;
-        if (!state.dirtyIds.size && !pendingReviewSync && !conflictIds.size) continue;
-        const result = await within(syncMarksNow());
-        if (result === TIMED_OUT) return timedOut();
-        if (!result.ok && result.busy && !ftSignal.aborted) {
-          const wait = Math.max(250, Number(result.retryAfterMs) || 1000);
-          if (busyWaits < SAVE_BUSY_RETRIES && Date.now() + wait <= deadline) {
-            busyWaits += 1;
-            await new Promise(resolve => setTimeout(resolve, wait));
-            attempt -= 1; // a busy reply is not one of the attempts
-            continue;
-          }
-          if (Date.now() + wait > deadline) return timedOut();
-        }
-        if (!result.ok && !result.queued) return false;
-      }
-      if ((await within(whenSaveSettled())) === TIMED_OUT) return timedOut();
-      if ((await within(whenConflictsChecked())) === TIMED_OUT) return timedOut();
-      return idle();
-    } finally {
-      clearTimeout(timer);
-    }
-  },
+  // The save contract (budgets: hard / patient / default) is viewerSave's
+  // (90-sync.js, R7 U1/U5, R8 U2).
+  save: (opts) => viewerSave(opts),
   // Host unmount (22-viewer-host.js): wait for the request in flight so
   // its reply settles the drafts before the mount goes.
   whenSaveSettled: () => whenSaveSettled(),
@@ -333,7 +266,7 @@ FTViewer._attach({
     FTViewer.setExaminer(name);
     const who = (state.examiner || "").trim();
     if (!who) return 0;
-    if (annotationsReadOnly) throw new Error(t("save.readonlyMsg"));
+    if (annotationsReadOnly) throw new Error(t(lockKey("save.readonlyMsg")));
     const ids = new Set([
       ...Object.keys(state.marks),
       ...Object.keys(state.notes).filter(id => (state.notes[id] || "").trim())
@@ -348,7 +281,7 @@ FTViewer._attach({
     // Other records' state (an unrelated open conflict) does not decide it:
     // only whether THESE records left the drafts without a conflict.
     // This caller waits for its own answer: the longest busy budget.
-    await FTViewer.save({ timeoutMs: SAVE_BUSY_WAIT_MS });
+    await FTViewer.save({ patient: true });
     const conflicted = touched.filter(id => conflictIds.has(id)).length;
     if (conflicted) throw new Error(tf("attr.conflict", { n: conflicted }));
     const unsaved = touched.filter(id => state.dirtyIds.has(id) || state.drafts[id]).length;
@@ -356,7 +289,7 @@ FTViewer._attach({
     return touched.length;
   },
   liveState: () => liveStateDetail(),
-  closeText: (key, vars) => tf(key, vars || {}),
+  closeText: (key, vars) => tf(lockKey(key), vars || {}),
   debugStats: () => ({ filterComputes: filterComputeCount, activeId: state.activeId, tallyFull: markTallyFullCount }),
   popout: () => openPlayerWindow(),
   // R7 U8: "warn" is its own kind (amber, never the error look).

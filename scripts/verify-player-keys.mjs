@@ -19,7 +19,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
-function buildViewer(annotations = {}, nullCase = false) {
+function buildViewer(annotations = {}, nullCase = false, opts = {}) {
   const dir = join(root, 'assets/viewer');
   let js = '';
   for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
@@ -33,7 +33,7 @@ function buildViewer(annotations = {}, nullCase = false) {
     ...(n === 'd' ? { ffprobe: { streams: [{ codec_type: 'audio' }, { codec_type: 'video', avg_frame_rate: '25/1', r_frame_rate: '25/1' }] } } : {}),
   }));
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
-    manifest: nullCase ? null : { case_id: 'FT-UNDO', title: 'undo' }, caseDir: '/case', scan: nullCase ? null : { videos },
+    manifest: nullCase || opts.nullManifest ? null : { case_id: 'FT-UNDO', title: 'undo' }, caseDir: opts.caseDir || '/case', scan: nullCase ? null : { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
     thumbs: {}, annotations, deepfake: {}, telemetry: {}, proxies: [],
   })};`;
@@ -52,6 +52,10 @@ const html = buildViewer();
 const htmlRo = buildViewer({ marks: [], tags: [], revisions: {}, error: 'database is locked' });
 // R7 (S ↔ U): make-review embeds null for an unreadable case.json / index.
 const htmlNull = buildViewer({}, true);
+// R8 U1: case.json alone unreadable (the index is fine: records exist),
+// two different case folders.
+const htmlNoCaseX = buildViewer({}, false, { nullManifest: true, caseDir: 'C:/cases/case-x' });
+const htmlNoCaseY = buildViewer({}, false, { nullManifest: true, caseDir: 'C:/cases/case-y' });
 let captures = 0;
 // '401' (R5 U8) | 'slow' (R6 U7: answers 200 after 1.5 s) | 'hang' (R7 U6).
 let capMode = '401';
@@ -75,7 +79,8 @@ const server = createServer((req, res) => {
     return;
   }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(req.url.startsWith('/ro') ? htmlRo : req.url.startsWith('/nullcase') ? htmlNull : html);
+  res.end(req.url.startsWith('/ro') ? htmlRo : req.url.startsWith('/nullcase') ? htmlNull
+    : req.url.startsWith('/nocase-x') ? htmlNoCaseX : req.url.startsWith('/nocase-y') ? htmlNoCaseY : html);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -372,6 +377,85 @@ try {
     check('R7 null case.json / index → role=alert "케이스 파일을 읽지 못했습니다" naming both, not a silent empty list',
       banner.role === 'alert' && /케이스 파일을 읽지 못했습니다/.test(banner.text || '') && /case\.json/.test(banner.text || '') && /증거 색인/.test(banner.text || '') && banner.problems === 'manifest scan' && banner.cards === 0, JSON.stringify(banner));
     await np.close();
+  }
+  // R8 U1: case.json unreadable but the index read (records listed). The
+  // viewer is READ-ONLY (the R5 read-only path: no edit, no save), says so
+  // in the one case-input alert, and its storage keys never collapse to
+  // "case": each case folder gets its own key.
+  {
+    const keysOf = async (path) => {
+      const pg = await browser.newPage();
+      pg.on('pageerror', (e) => errors.push(path + ': ' + String(e)));
+      await pg.goto(base + path);
+      await pg.waitForSelector('#recordGrid .card', { timeout: 15000 });
+      await pg.locator('#recordGrid .card').first().click();
+      await pg.evaluate(() => { document.activeElement?.blur(); document.getElementById('toastHost').textContent = ''; });
+      await pg.keyboard.press('1');
+      await pg.waitForTimeout(300);
+      const out = await pg.evaluate(() => ({
+        marked: FTViewer.summary().marked,
+        state: FTViewer.saveState(),
+        toast: document.getElementById('toastHost').textContent,
+        markBtnDisabled: !!document.getElementById('btnMarkReviewed')?.disabled,
+        banner: document.getElementById('caseInputErrorBanner')?.innerText || '',
+        problems: document.getElementById('caseInputErrorBanner')?.dataset.problems || '',
+        annBanner: !!document.getElementById('annotationsErrorBanner'),
+      }));
+      // U6 too: the language switch re-renders the case-input alert.
+      await pg.evaluate(() => document.getElementById('btnLang').click());
+      await pg.waitForTimeout(200);
+      out.bannerEn = await pg.evaluate(() => document.getElementById('caseInputErrorBanner')?.innerText || '');
+      out.keys = await pg.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('ft.')));
+      await pg.close();
+      return out;
+    };
+    const cx = await keysOf('nocase-x');
+    const cy = await keysOf('nocase-y');
+    check('R8 U1: case.json unreadable → read-only: key 1 marks nothing, the edit is refused with the case.json reason, save state "readonly"',
+      cx.marked === 0 && cx.state === 'readonly' && /case\.json/.test(cx.toast) && cx.markBtnDisabled, JSON.stringify(cx));
+    check('R8 U1: one alert (case input) says editing is blocked — no second read-only banner',
+      cx.problems === 'manifest' && /편집·저장이 막혀/.test(cx.banner) && !cx.annBanner, JSON.stringify(cx));
+    const caseOf = (keys) => [...new Set(keys.map((k) => (/^ft\.(?:viewer|draft)\.([^.]+)\./.exec(k) || /^ft\.alive:([^:]+):/.exec(k) || [])[1]).filter(Boolean))];
+    const kx = caseOf(cx.keys), ky = caseOf(cy.keys);
+    check('R8 U1: storage keys never use the literal "case" — a case-folder key, different per case folder',
+      kx.length === 1 && ky.length === 1 && /^nocase-[0-9a-f]{16}$/.test(kx[0]) && /^nocase-[0-9a-f]{16}$/.test(ky[0]) && kx[0] !== ky[0] && ![...cx.keys, ...cy.keys].some((k) => /^ft\.(viewer|draft)\.case\.|^ft\.alive:case:/.test(k)),
+      JSON.stringify({ kx, ky, keys: cx.keys }));
+    check('R8 U6: the case-input alert follows the language switch (English after EN)', /could not be read/.test(cx.bannerEn) && !/읽지 못했습니다/.test(cx.bannerEn), cx.bannerEn);
+  }
+  // R8 U6 / U7: the read-only page's notices row — one short notice is not
+  // a Tab stop (U7: only an overflowing row is), five long ones make it
+  // one; the read-only notice follows the language switch (U6).
+  {
+    const pg = await browser.newPage({ viewport: { width: 1366, height: 768 } });
+    pg.on('pageerror', (e) => errors.push('ro-notices: ' + String(e)));
+    await pg.goto(base + 'ro');
+    await pg.waitForSelector('#annotationsErrorBanner', { timeout: 15000 });
+    const frame = () => pg.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    await frame();
+    const one = await pg.evaluate(() => { const h = document.querySelector('#ftViewer > .ft-notices'); return { tab: h.getAttribute('tabindex'), overflow: h.scrollHeight > h.clientHeight + 1, role: h.getAttribute('role'), label: h.getAttribute('aria-label') }; });
+    check('R8 U7: one short notice — the notices row is no Tab stop (still a labelled region)', one.tab === null && !one.overflow && one.role === 'region' && !!one.label, JSON.stringify(one));
+    await pg.evaluate(() => {
+      const h = document.querySelector('#ftViewer > .ft-notices');
+      for (let i = 0; i < 5; i++) {
+        const b = document.createElement('div');
+        b.className = 'ft-banner'; b.dataset.probe = '1';
+        b.textContent = '긴 알림 '.repeat(80);
+        h.appendChild(b);
+      }
+    });
+    await frame();
+    const many = await pg.evaluate(() => { const h = document.querySelector('#ftViewer > .ft-notices'); return { tab: h.getAttribute('tabindex'), overflow: h.scrollHeight > h.clientHeight + 1 }; });
+    check('R8 U7: an overflowing notices row becomes a Tab stop (tabindex 0) so the keyboard can scroll it', many.tab === '0' && many.overflow, JSON.stringify(many));
+    await pg.evaluate(() => document.querySelectorAll('[data-probe]').forEach((b) => b.remove()));
+    await frame();
+    const back = await pg.evaluate(() => document.querySelector('#ftViewer > .ft-notices').getAttribute('tabindex'));
+    check('R8 U7: back to one notice — no Tab stop again', back === null, String(back));
+    const ko = await pg.evaluate(() => document.getElementById('annotationsErrorBanner').innerText);
+    await pg.evaluate(() => document.getElementById('btnLang').click());
+    await pg.waitForTimeout(200);
+    const en = await pg.evaluate(() => document.getElementById('annotationsErrorBanner').innerText);
+    check('R8 U6: the read-only notice follows the language switch', /판독 기록/.test(ko) && /could not be read/.test(en) && !/판독 기록/.test(en), `${ko} → ${en}`);
+    await pg.close();
   }
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

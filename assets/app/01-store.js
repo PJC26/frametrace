@@ -167,7 +167,7 @@ const hViewer = {
   save() {
     const v = hViewerApi();
     if (!v || !FTStore.state.viewer.mounted) return false;
-    try { Promise.resolve(v.save()).catch(() => {}); return true; } catch (e) { return false; }
+    try { Promise.resolve(v.save({ patient: true })).catch(() => {}); return true; } catch (e) { return false; }
   },
   summary() {
     const v = hViewerApi();

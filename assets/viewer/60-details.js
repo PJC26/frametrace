@@ -172,7 +172,7 @@ function renderDetails() {
   // R5 U1: read-only (annotations unreadable) — the annotation controls are
   // shown but disabled, each with the reason as its tooltip.
   const locked = annotationsLocked();
-  const lockAttr = locked ? ` disabled aria-disabled="true" title="${escapeHtml(t("save.readonlyEdit"))}"` : "";
+  const lockAttr = locked ? ` disabled aria-disabled="true" title="${escapeHtml(t(lockKey("save.readonlyEdit")))}"` : "";
   const tagEditorHtml = `<div class="tag-editor">
     ${tagPresets().map(preset => `<button type="button" class="quiet toggle tag-btn ${recordTags.includes(preset) ? "on" : ""}" aria-pressed="${recordTags.includes(preset)}" data-preset-tag="${escapeHtml(preset)}"${lockAttr}>${escapeHtml(preset)}</button>`).join("")}
     <input type="text" class="tag-input" id="customTagInput" placeholder="${t("tag.input")}" aria-label="${escapeHtml(t("tag.input"))}" style="width:104px;height:28px;font-size:12px;"${lockAttr}>
@@ -186,7 +186,7 @@ function renderDetails() {
   // one, so marking/tagging never needs a tab switch.
   const metaEl = els.summaryList;
   metaEl.insertAdjacentHTML("afterend", `<div class="tag-editor-wrap">${tagEditorHtml}
-    <textarea id="evidenceNote" class="note-input" rows="2" placeholder="${t("note.placeholder")}" aria-label="${escapeHtml(t("note.placeholder"))}"${locked ? ` readonly aria-readonly="true" title="${escapeHtml(t("save.readonlyEdit"))}"` : ""}>${escapeHtml(state.notes[record.id] || "")}</textarea>
+    <textarea id="evidenceNote" class="note-input" rows="2" placeholder="${t("note.placeholder")}" aria-label="${escapeHtml(t("note.placeholder"))}"${locked ? ` readonly aria-readonly="true" title="${escapeHtml(t(lockKey("save.readonlyEdit")))}"` : ""}>${escapeHtml(state.notes[record.id] || "")}</textarea>
   </div>`);
   document.getElementById("evidenceNote").addEventListener("input", e => {
     if (refuseLockedEdit()) { e.target.value = state.notes[record.id] || ""; return; } // R5 U1

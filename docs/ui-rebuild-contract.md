@@ -220,7 +220,8 @@ window.FTViewer = {
   focus() → boolean,                // 활성 카드(없으면 #recordGrid)에 포커스
   summary() → { total, byKind, byStatus, warned, marked, noted, pending },   // = __frametraceSummary() + pending(미저장 건수)
   saveState() → "saved"|"pending"|"saving"|"failed"|"queued"|"readonly"|"unknown"|"local"|null,   // readonly = 판독 기록 읽기 실패로 저장 차단(R4 A3), unknown = 저장 충돌 확인 실패(R4 A5) — 둘 다 "저장됨"이 아니다
-  save({ timeoutMs } = {}) → Promise<boolean>,   // 진행 중 저장의 응답을 먼저 기다리고 남은 것을 보낸다(R4 A15). true = 이 창에 미저장 없음(서버 대기열은 내구 저장이라 true), false = 실패·충돌·확인 실패·읽기 전용·시간 초과. timeoutMs = 이 호출의 응답 **전체 상한**(진행 중 저장 대기·충돌 조회·전송·busy 재시도 모두 포함, 기본 20 s, R7 §14.1) — 넘으면 false + `opts.timedOut = true`(요청은 계속 진행)
+  save({ timeoutMs } = {}) → Promise<boolean>,   // 진행 중 저장의 응답을 먼저 기다리고 남은 것을 보낸다(R4 A15). true = 이 창에 미저장 없음(서버 대기열은 내구 저장이라 true), false = 실패·충돌·확인 실패·읽기 전용·시간 초과. timeoutMs = 이 호출의 응답 **전체 상한**(진행 중 저장 대기·충돌 조회·전송·busy 재시도 모두 포함, R7 §14.1) — 넘으면 false + `opts.timedOut = true`(요청은 계속 진행). **R8 §15.2**: `{ patient: true }` = 명시적 저장(기본 20 s, 요청이 진행 중이면 연장), 인자 없는 `save()` = 4 s 고정
+  caseStorageKey(manifest, caseDir) → string,   // R8 §15.1: 저장소 키·채널의 케이스 부분(case_id, 없으면 "nocase-<케이스 폴더 해시>", 절대 "case" 아님)
   setExaminer(name), getExaminer() → string|null,   // 검토자(마크 귀속). 호스트 선택 바에는 입력란이 없고 41-finalize `#finalExaminer`가 호출
   attributeUnassignedMarks(name) → Promise<number>,   // R4 A9: 그 마크들의 저장 응답까지 기다린 뒤 건수로 resolve, 저장 실패·충돌이면 reject(성공 통보 금지).   // setExaminer(name) 후, 검토자가 비어 있는 마크·메모를 같은 드래프트→저장 경로로 재전송하고 건수를 돌려줌(0이면 무동작). 서버 upsert는 `examiner = COALESCE(excluded.examiner, 기존)`이라 비어 있지 않은 새 값이 기존 값을 덮고 `review_mark_history`에 update로 남는다(src/case_db/marks.rs). setExaminer만으로는 이미 저장된 마크가 바뀌지 않는다
   writerToken,                       // 이 창의 고유 토큰: 이 창이 연 팝아웃만 `ft-player:<case>` 메시지에 담아 보내고, 토큰이 다른 창(같은 케이스의 다른 셸 탭)은 응답하지 않는다(단일 writer)
@@ -628,7 +629,7 @@ const FTStore = {
 - `FTViewer._whenSaveSettled(ms)`(§3): 22-viewer-host 언마운트가 진행 중 저장의 응답을 기다린 뒤 destroy — 응답이 다음 마운트와 경합하지 않는다.
 
 ### 11.3 알림 행 (notices grid row)
-- `#ftViewer > .ft-notices`(grid-area `notice`, controls.css): 구간 불일치 배너 `#rangeDivergenceBanner`, 저장 충돌 배너 `#markConflictBanner` + 목록 `#markConflictPanel`, 다른 주소 드래프트 알림 `#originDraftsNotice`(§11.4)가 이 한 행에 쌓인다. 비면 `display:none`. 색은 `--warn-bg`/`--warn`/`--text`(두 테마 AA).
+- `#ftViewer > .ft-notices`(grid-area `notice`, controls.css): 구간 불일치 배너 `#rangeDivergenceBanner`, 저장 충돌 배너 `#markConflictBanner`(목록 `#markConflictPanel`은 R8 §15.3부터 이 행의 형제), 다른 주소 드래프트 알림 `#originDraftsNotice`(§11.4)가 이 한 행에 쌓인다. 비면 `display:none`. 색은 `--warn-bg`/`--warn`/`--text`(두 테마 AA).
 
 ### 11.4 포트(원점)가 바뀐 경우의 드래프트 (U9) — 한계 포함
 - 브라우저 저장소(localStorage)는 원점(scheme+host+**port**)마다 따로다. 브라우저 모드는 8477이 막히면 8478…으로, WebView2 창은 **실행마다 새 포트**(src/shell.rs `reserve_port`, 포트 0)를 쓴다 → 이전 실행의 저장 안 된 드래프트는 새 원점에서 보이지 않고, 어떤 브라우저 API로도 다른 원점의 저장소를 읽을 수 없다.
@@ -725,7 +726,7 @@ const FTStore = {
 ### 14.2 알림 행 (U2/U9)
 - `#queueUnreadableNotice`(대기 파일 N개 읽기 실패)는 대기열이 비면(`afterQueueDrained`) **같은 페이지에서** 사라진다(저장 상태 툴팁·`data-queue-unreadable`도). 문구는 한 번만: "대기 파일 {n}개 읽기 실패 — 그 파일의 값은 화면에 보이지 않습니다. …".
 - `readPagedList`의 `unreadable` 집계: 이름(`file`) 있는 항목은 이름으로 한 번, 이름 없는 항목은 페이지 안 순번(`#k`)으로 — 같은 목록이 페이지마다 반복돼도 한 번, 이름 없는 두 파일은 두 개(하나로 합치지 않음).
-- `.ft-viewer > .ft-notices`는 최대 높이 `min(28vh, 216px)`, 넘치면 세로 스크롤(`overscroll-behavior: contain`). 스크롤되는 영역이라 `tabindex=0`, `role=region`, `aria-label` i18n `notices.label`("알림"). verify-layout: 1366×768(두 테마)에서 긴 알림 5개 → 행 ≤ 상한·스크롤·마지막 알림 도달 가능, 그리드 높이 ≥ 200 px, 선택 바 화면 안, 가로 스크롤 없음.
+- `.ft-viewer > .ft-notices`는 최대 높이 `min(28vh, 216px)`, 넘치면 세로 스크롤(`overscroll-behavior: contain`). 스크롤되는 영역이라 `role=region`(R8 §15.5: `tabindex=0`은 넘칠 때만), `aria-label` i18n `notices.label`("알림"). verify-layout: 1366×768(두 테마)에서 긴 알림 5개 → 행 ≤ 상한·스크롤·마지막 알림 도달 가능, 그리드 높이 ≥ 200 px, 선택 바 화면 안, 가로 스크롤 없음.
 
 ### 14.3 팝아웃 캡처 (R6 U7 기록 + R7 U6)
 - 팝아웃의 모든 브리지 호출 `call(op, arg, cb, ms)`은 **두 경로 모두 시간 제한**: opener 직접 호출(`window.opener.__ftBridge`)이 Promise를 돌려주면 `ms`(기본 3 s, 캡처 `CAP_MS` 30 s) 뒤 `undefined`로 끝낸다(늦은 응답은 무시). BroadcastChannel 경로(`ft-player:<case>`, `token` 일치 창만 응답)도 같다.
@@ -746,3 +747,28 @@ const FTStore = {
 ### 14.7 읽지 못한 케이스 파일 (S ↔ U, R7 S6)
 - make-review 데이터 묶음·records-meta는 올바른 JSON이 아닌 `case.json`·증거 색인을 `null`로 싣는다(`util::json_for_script`, records.rs). 뷰어(10-boot.js `caseInputProblems`)는 `manifest`/`scan`이 객체가 아니면(API 경로는 99-loader가 `manifestUnreadable`/`scanUnreadable`로 전달) 알림 행 맨 위에 `#caseInputErrorBanner`(`role=alert`, `data-problems="manifest scan"`)로 "케이스 파일을 읽지 못했습니다 — …"를 보이고 `error`(stage `load`)를 낸다 — 빈 목록이 "증거 없음"으로 읽히지 않게. 인라인 묶음은 `manifest: null`이어도 그 묶음을 쓴다(다른 데이터 출처를 찾다가 "data-bundle.js 없음"으로 빠지지 않음). 하네스: verify-player-keys "R7 null case.json / index".
 - 하네스는 HEAD 요청에 기대지 않는다(서버는 스크립트를 GET으로 한 번 검증하기 전 HEAD에 403).
+
+## 15. R8 트랙 U 추가 계약 (2026-10-15, docs/PLAN_R8_2026-10-15.md)
+
+### 15.1 case.json을 읽지 못한 케이스 (U1)
+- 저장소 키·채널의 케이스 부분은 `FTViewer.caseStorageKey(manifest, caseDir)`(00-host.js) 하나로 만든다: `case.json`의 `case_id`, 읽지 못했거나 없으면 `"nocase-"` + 케이스 폴더(`caseDir`, 번들·records-meta가 싣는 값; 경로 구분자 `/`로 정규화) FNV-1a 64비트(정방향·역방향 32비트 두 개) 16진수. 가린 번들(`"<case>"`)·폴더 없음이면 이 페이지 주소의 해시. 문자 그대로의 `"case"`는 어디에도 쓰지 않는다 — `ft.viewer.<key>.*`, `ft.draft.<key>.*`, `ft.alive:<key>:*`, `ft-alive:<key>`, `ft-player:<key>`, 리로드 보기 사본, 다른 포트 쿠키 해시 모두. 셸(41-finalize 점검, 95-quit 종료 확인)의 드래프트 수도 같은 함수로 센다.
+- `case.json`을 읽지 못하면(10-boot `caseFileUnreadable`) 뷰어는 **읽기 전용**이다 — R5 §13.1 경로 그대로(`annotationsError` = `"case.json"`, 저장 상태 `readonly`, 편집 입구 거부, 요약·CSV·마크 내려받기·최종화 차단, 옛 구간 키 이관 없음). 문구는 원인별(`annotationsLockCause = "case"`, `lockKey(key)` → i18n `…Case` 변형: "케이스 정보(case.json)를 읽지 못해 편집할 수 없습니다 — …"). 알림은 하나: `#caseInputErrorBanner`(role=alert)에 "편집·저장이 막혀 있습니다"가 붙고 `#annotationsErrorBanner`는 만들지 않는다. 하네스: verify-player-keys "R8 U1".
+- 이미 읽힌 `case.json`에 `case_id`가 없던 케이스는 이전 빌드의 `"case"` 키 드래프트를 이어받지 않는다(그 키는 다른 케이스와 섞일 수 있어 의도적으로 버림).
+
+### 15.2 명시적 저장은 진행 중이면 기다림 (U2)
+- `FTViewer.save(opts)`(90-sync.js `viewerSave`) 예산 세 가지:
+  - `save(ms)` / `save({ timeoutMs })`: **고정 전체 상한**(닫기 `hBeforeClose`, R7 §14.1 그대로).
+  - `save({ patient: true[, timeoutMs] })`: 명시적 저장(최종화 재시도·저장 버튼 41-finalize, 케이스 전환 22-viewer-host·01-store, 작업 시트 32-jobs, 귀속 `attributeUnassignedMarks`). 기본 20 s(`SAVE_CALLER_WAIT_MS`)가 지나도 이 창의 저장 요청이 **진행 중**이면 기다린다 — 진행 = 요청 전송 또는 응답 수신(`saveProgressAt`, `pushMarksToCase`)이 `SAVE_STALL_MS`(30 s, 하네스는 `stallMs`로 줄임) 안에 있었음. 요청이 그동안 아무 응답도 없으면 정체 → false + `timedOut`.
+  - `save()`(예산·patient 없음): 셸 대체 경로(src/shell.rs FLUSH_SCRIPT가 `hBeforeClose` 없는 페이지에서 `FTViewer.save()`)의 상한 — 고정 `SAVE_DEFAULT_MS` 4 s.
+- 하네스: verify-review-batch --unit "R8 U2"(VM: 진행 중 연장, 고정 상한 유지, 정체 시간 초과, 무인자 ≤ 4 s), verify-range-sync ㉓(실제 페이지: 2.5 s 늦은 응답을 patient가 기다림, 고정 1 s는 false, 응답 없는 요청 정체, 무인자 ≤ 4 s), ⑳은 `{ patient: true }`.
+
+### 15.3 충돌 목록은 알림 행 밖 (U3)
+- `#markConflictPanel`은 `.ft-notices`의 **형제**(`#ftViewer` 직속, 그리드 영역 `conflicts` — 행 순서 head·notice·conflicts·top·work·bar). 상한 `min(30vh, 260px)` 하나의 스크롤. 열려 있는 동안 알림 행 상한은 `min(14vh, 108px)`(controls.css `:has`). verify-layout R8 U3: 1366×768 두 테마에서 실제 저장 충돌 → 목록 열기 → Tab으로 항목 버튼(서버 값/내 값) 도달, 각 버튼 화면 안·가려지지 않음·≥24 px·알림 행 스크롤 밖, 형제 관계, 선택 바 화면 안, 가로 스크롤 없음; 긴 알림 5개를 더해도 같고 그리드 ≥120 px.
+
+### 15.4 하네스 시간 검사 (U4) · 마크 집계 (U5/U8)
+- verify-virtual-grid R7 j/k 1만 번: 시간 **비율** 비교(기준 페이지) 삭제. 계수기(마크 맵 순회·큰 Map 재생성·전체 배열 순회·재집계·재필터 = 0)만 판정하고, 벽 한도는 키당 평균 40 ms(측정값 약 8 ms의 5배). 크기 변경 검사는 그리드의 실제 너비·`--card-min-w`·간격으로 기대 열 수를 계산해 그 수가 바뀌는 너비까지 줄이고, 다시 그려질 때까지 제한 시간 안에서 확인한다(Linux 글꼴·스크롤바 차이에 무관).
+- 마크 집계(30-records `markTallyBucket`): 케이스에 없는 id는 별도 표식 `MARK_TALLY_OFFCASE`, 상태가 비거나 없는 마크는 `""` 버킷으로 이 케이스의 마크(`n`)에 센다(R7은 둘을 같은 `""`로 묶어 빈 상태 마크가 검토 수에서 빠졌다). verify-review-batch --unit "R8 U5/U8": 씨앗 5개 무작위 실행(빈 상태·케이스 밖 id·지움·undo/redo·충돌 해결·수화·4096 초과 대량·레코드 증가)마다 증분 집계 = 전체 재계산.
+
+### 15.5 알림 언어·Tab (U6/U7)
+- 알림 행의 모든 문구(충돌 배너·버튼, 대기 파일·목록 일부·구버전 서버·이전 구간·다른 주소 드래프트·읽기 전용·케이스 파일 알림)는 `i18nText(el, key, subs)`(20-i18n.js: `data-i18n` + `data-i18n-args` JSON)로 넣고 `applyChromeI18n()`이 언어 전환 때 다시 그린다. 열린 충돌 목록은 언어 전환 때 다시 만든다. verify-player-keys R8 U6.
+- `.ft-notices`는 `role=region` + `aria-label`을 늘 갖지만 `tabindex=0`은 **넘칠 때만**(MutationObserver·ResizeObserver, 마운트 신호로 해제). 넘치지 않게 되면 tabindex를 지우고, 그때 포커스가 행에 있었으면 뷰어 활성 카드로. verify-player-keys R8 U7.

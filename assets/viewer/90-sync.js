@@ -319,6 +319,16 @@ const SAVE_BUSY_WAIT_MS = 20000;  // FTViewer.save(): longest total wait for "bu
 // save (finalize retry, case switch, attribution) keeps the full 20 s; only
 // the close flush (hBeforeClose) asks for less (4 s, a hard total).
 const SAVE_CALLER_WAIT_MS = SAVE_BUSY_WAIT_MS;
+// R8 U2: an explicit save ({ patient: true }: finalize retry, case switch,
+// attribution) does not give up while this window's save request is still
+// progressing — past its 20 s it keeps waiting as long as a request was
+// sent or answered within SAVE_STALL_MS; only a request left without a
+// reply that long (a genuine stall) times out. A call that names no budget
+// and is not patient — the desktop shell's fallback `FTViewer.save()` when
+// a page has no hBeforeClose — gets the close budget, a hard SAVE_DEFAULT_MS.
+const SAVE_STALL_MS = 30000;
+const SAVE_DEFAULT_MS = 4000;
+var saveProgressAt = 0; // last request sent / reply received (pushMarksToCase)
 var lastReportError = "";         // R4 B7 notice shown once per text
 var saveError = "";
 var saveAuthExpired = false; // the last attempt was refused with 401 (U8)
@@ -390,6 +400,94 @@ async function whenConflictsChecked() {
   return conflictChecks === 0;
 }
 
+// FTViewer.save(opts) (95-init.js). Resolves true once nothing is pending
+// here (marks durably queued on the server count as saved). A save already
+// in flight is awaited first (A15); a "busy, retry" reply is waited out
+// (R5 U6, up to SAVE_BUSY_RETRIES replies). Read-only with NOTHING held
+// here: true (R5 U15).
+// Budgets (R7 U1/U5, R8 U2):
+//   save(ms) / save({ timeoutMs })  a HARD TOTAL from the call (the close
+//       flush, hBeforeClose): the wait for the request on the wire, the
+//       conflict lookup, every send and busy retry count against it.
+//   save({ patient: true[, timeoutMs] })  an explicit save: timeoutMs
+//       (default SAVE_CALLER_WAIT_MS) and then on while this window's save
+//       request keeps progressing (sent / answered within `stallMs`,
+//       default SAVE_STALL_MS) — a slow but live save is never abandoned;
+//       a request without any reply for stallMs is a stall: false.
+//   save()  (no budget, not patient — the desktop shell's fallback when a
+//       page has no hBeforeClose): the hard SAVE_DEFAULT_MS (4 s).
+// Past the deadline: false and `opts.timedOut = true` (when an options
+// object was passed); the requests go on and their replies still settle
+// the drafts.
+async function viewerSave(opts) {
+  if (!viewerIsServed) return false;
+  if (annotationsReadOnly) return !Object.keys(state.drafts).length && !state.dirtyIds.size && !conflictIds.size;
+  const o = opts && typeof opts === "object" ? opts : null;
+  const patient = !!(o && o.patient);
+  const asked = typeof opts === "number" ? opts : o && o.timeoutMs != null ? Number(o.timeoutMs) : NaN;
+  const budget = Number.isFinite(asked) && asked >= 0 ? asked : (patient ? SAVE_CALLER_WAIT_MS : SAVE_DEFAULT_MS);
+  const stallAsked = Number(o && o.stallMs);
+  const stallMs = Number.isFinite(stallAsked) && stallAsked > 0 ? stallAsked : SAVE_STALL_MS;
+  const started = Date.now();
+  // The deadline NOW: the budget; patient, also as long as this window's
+  // save showed life (a request sent / answered) within stallMs.
+  const deadline = () => {
+    const base = started + budget;
+    if (!patient || !(saveInFlight || saveProgressAt >= started)) return base;
+    return Math.max(base, saveProgressAt + stallMs);
+  };
+  const idle = () => localReviewIdle();
+  let busyWaits = 0;
+  const TIMED_OUT = {};
+  let timer = 0;
+  const expired = new Promise(resolve => {
+    const tick = () => {
+      const left = deadline() - Date.now();
+      if (left <= 0) { resolve(TIMED_OUT); return; }
+      timer = setTimeout(tick, left);
+    };
+    tick();
+  });
+  // Every wait of this call races the one deadline.
+  const within = (work) => Promise.race([Promise.resolve(work), expired]);
+  const timedOut = () => {
+    if (o) o.timedOut = true;
+    return false;
+  };
+  try {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if ((await within(whenSaveSettled())) === TIMED_OUT) return timedOut();
+      if ((await within(whenConflictsChecked())) === TIMED_OUT) return timedOut();
+      if (idle()) return true;
+      if (conflictLookupFailed) {
+        const checked = await within(checkServerConflicts());
+        if (checked === TIMED_OUT) return timedOut();
+        if (!checked) return false;
+      }
+      if (!state.dirtyIds.size && !pendingReviewSync && conflictIds.size) return false;
+      if (!state.dirtyIds.size && !pendingReviewSync && !conflictIds.size) continue;
+      const result = await within(syncMarksNow());
+      if (result === TIMED_OUT) return timedOut();
+      if (!result.ok && result.busy && !ftSignal.aborted) {
+        const wait = Math.max(250, Number(result.retryAfterMs) || 1000);
+        if (busyWaits < SAVE_BUSY_RETRIES && Date.now() + wait <= deadline()) {
+          busyWaits += 1;
+          await new Promise(resolve => setTimeout(resolve, wait));
+          attempt -= 1; // a busy reply is not one of the attempts
+          continue;
+        }
+        if (Date.now() + wait > deadline()) return timedOut();
+      }
+      if (!result.ok && !result.queued) return false;
+    }
+    if ((await within(whenSaveSettled())) === TIMED_OUT) return timedOut();
+    if ((await within(whenConflictsChecked())) === TIMED_OUT) return timedOut();
+    return idle();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function renderSaveState() {
   if (!saveStateEl) return;
   const n = pendingSaveCount();
@@ -406,7 +504,7 @@ function renderSaveState() {
     kind = "readonly";
     cls = "failed";
     label = t("save.readonly");
-    title = tf("save.title.readonly", { err: annotationsError || "?", n: state.dirtyIds.size });
+    title = tf(lockKey("save.title.readonly"), { err: annotationsError || "?", n: state.dirtyIds.size });
   } else if (saveInFlight) {
     kind = "saving";
     cls = "candidate";
@@ -716,22 +814,63 @@ function noticesHost() {
     ftRoot.insertBefore(host, ftRoot.firstChild);
   }
   // R7 U9: the row has a maximum height and scrolls (controls.css): a
-  // labelled, focusable region so a keyboard can scroll it too.
-  if (!host.hasAttribute("tabindex")) {
-    host.tabIndex = 0;
+  // labelled region. R8 U7: a Tab stop ONLY while it actually overflows
+  // (a keyboard must be able to scroll it then) — one short notice is not
+  // an extra stop before the grid. Re-checked whenever its content or size
+  // changes (MutationObserver + ResizeObserver, tied to this mount).
+  if (!host.hasAttribute("role")) {
     host.setAttribute("role", "region");
     host.dataset.i18nAriaLabel = "notices.label";
     host.setAttribute("aria-label", t("notices.label"));
+    watchNoticesOverflow(host);
   }
   return host;
 }
-function noticeButton(id, label, onClick) {
+function syncNoticesTabStop(host) {
+  if (!host || !host.isConnected) return;
+  const overflows = host.scrollHeight > host.clientHeight + 1;
+  if (overflows) {
+    if (host.getAttribute("tabindex") !== "0") host.tabIndex = 0;
+  } else if (host.hasAttribute("tabindex")) {
+    if (document.activeElement === host && typeof viewerFocus === "function") viewerFocus();
+    host.removeAttribute("tabindex");
+  }
+}
+function watchNoticesOverflow(host) {
+  let queued = false;
+  const later = () => {
+    if (queued) return;
+    queued = true;
+    // After layout of the change (one frame), never synchronously inside it.
+    requestAnimationFrame(() => { queued = false; if (!ftSignal.aborted) syncNoticesTabStop(host); });
+  };
+  syncNoticesTabStop(host);
+  later();
+  try {
+    const mo = new MutationObserver(later);
+    mo.observe(host, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["hidden"] });
+    ftSignal.addEventListener("abort", () => mo.disconnect(), { once: true });
+  } catch (e) { /* no MutationObserver: the resize path still checks */ }
+  try {
+    const ro = new ResizeObserver(later);
+    ro.observe(host);
+    ftSignal.addEventListener("abort", () => ro.disconnect(), { once: true });
+  } catch (e) { window.addEventListener("resize", later, { signal: ftSignal }); }
+}
+// R8 U6: notice texts carry their i18n key (data-i18n / data-i18n-args), so
+// a language switch re-renders them (applyChromeI18n). `key` is an i18n key.
+function noticeButton(id, key, onClick) {
   const b = document.createElement("button");
   b.type = "button";
   b.id = id;
-  b.textContent = label;
+  i18nText(b, key);
   b.addEventListener("click", onClick);
   return b;
+}
+function noticeMessage(key, subs) {
+  const msg = document.createElement("span");
+  msg.className = "ft-banner-msg";
+  return i18nText(msg, key, subs);
 }
 const CONFLICT_LIST_MAX = 300;
 var conflictPanelOpen = false;
@@ -758,7 +897,7 @@ function renderConflictBanner() {
     const msg = document.createElement("span");
     msg.className = "ft-banner-msg conflict-msg";
     bar.appendChild(msg);
-    const toggle = noticeButton("markConflictList", t("conflict.list"), () => {
+    const toggle = noticeButton("markConflictList", "conflict.list", () => {
       conflictPanelOpen = !conflictPanelOpen;
       renderConflictBanner();
       if (conflictPanelOpen) document.getElementById("markConflictPanelTitle")?.focus();
@@ -766,13 +905,13 @@ function renderConflictBanner() {
     toggle.className = "toggle";
     toggle.setAttribute("aria-controls", "markConflictPanel");
     bar.appendChild(toggle);
-    bar.appendChild(noticeButton("markConflictUseServer", t("conflict.useServerAll"), () => resolveConflictsUseServer([...conflictIds.keys()])));
-    bar.appendChild(noticeButton("markConflictUseMine", t("conflict.useMineAll"), () => resolveConflictsUseMine([...conflictIds.keys()])));
+    bar.appendChild(noticeButton("markConflictUseServer", "conflict.useServerAll", () => resolveConflictsUseServer([...conflictIds.keys()])));
+    bar.appendChild(noticeButton("markConflictUseMine", "conflict.useMineAll", () => resolveConflictsUseMine([...conflictIds.keys()])));
     noticesHost().appendChild(bar);
   }
   const ids = [...conflictIds.keys()];
   const msg = bar.querySelector(".conflict-msg");
-  msg.textContent = tf("conflict.msg", { n: ids.length });
+  i18nText(msg, "conflict.msg", { n: ids.length });
   const toggle = document.getElementById("markConflictList");
   toggle.setAttribute("aria-expanded", conflictPanelOpen ? "true" : "false");
   if (!panel) {
@@ -802,7 +941,10 @@ function renderConflictBanner() {
       renderConflictBanner();
       document.getElementById("markConflictList")?.focus();
     });
-    bar.after(panel);
+    // R8 U3: the list is NOT inside the capped, scrolling notices row (a
+    // scroller inside a scroller): it is the row's sibling in the viewer
+    // grid (grid-area "conflicts", controls.css) with its own one scroll.
+    noticesHost().after(panel);
   }
   panel.hidden = !conflictPanelOpen;
   if (conflictPanelOpen) renderConflictList(panel, ids);
@@ -970,8 +1112,7 @@ async function conflictRouteMissing() {
 var conflictsTruncated = null;
 function noteConflictsTruncated(info) {
   conflictsTruncated = info && info.total > 0 ? info : null;
-  const text = conflictsTruncated ? tf("conflict.truncated", { m: conflictsTruncated.listed, n: conflictsTruncated.total }) : "";
-  const bar = statusNotice("conflictsTruncatedNotice", text);
+  const bar = statusNotice("conflictsTruncatedNotice", conflictsTruncated ? "conflict.truncated" : "", conflictsTruncated ? { m: conflictsTruncated.listed, n: conflictsTruncated.total } : null);
   if (bar) { bar.dataset.listed = String(conflictsTruncated.listed); bar.dataset.total = String(conflictsTruncated.total); }
 }
 // R6 U2: queue files the server could not read (GET /api/marks-pending
@@ -980,14 +1121,15 @@ function noteConflictsTruncated(info) {
 var queueUnreadableFiles = 0;
 function noteQueueUnreadable(n) {
   queueUnreadableFiles = Number(n) > 0 ? Number(n) : 0;
-  const bar = statusNotice("queueUnreadableNotice", queueUnreadableFiles ? tf("queue.unreadableFiles", { n: queueUnreadableFiles }) : "");
+  const bar = statusNotice("queueUnreadableNotice", queueUnreadableFiles ? "queue.unreadableFiles" : "", { n: queueUnreadableFiles });
   if (bar) bar.dataset.files = String(queueUnreadableFiles);
 }
 // One role=status line in the notices row (no button: it clears itself
-// once the condition is gone). Empty text removes it.
-function statusNotice(id, text) {
+// once the condition is gone). An empty key removes it. R8 U6: the text is
+// the i18n `key` with `subs` (follows the language switch).
+function statusNotice(id, key, subs) {
   const old = document.getElementById(id);
-  if (!text) {
+  if (!key) {
     if (old) old.remove();
     return null;
   }
@@ -996,12 +1138,10 @@ function statusNotice(id, text) {
     bar.id = id;
     bar.className = "ft-banner";
     bar.setAttribute("role", "status");
-    const msg = document.createElement("span");
-    msg.className = "ft-banner-msg";
-    bar.appendChild(msg);
+    bar.appendChild(noticeMessage(key, subs));
     noticesHost().appendChild(bar);
   }
-  if (bar.firstChild.textContent !== text) bar.firstChild.textContent = text;
+  i18nText(bar.firstChild, key, subs);
   return bar;
 }
 var conflictsUnlistedShown = false;
@@ -1012,11 +1152,8 @@ function noteConflictsUnlisted(n) {
   bar.id = "conflictsUnlistedNotice";
   bar.className = "ft-banner";
   bar.setAttribute("role", "status");
-  const msg = document.createElement("span");
-  msg.className = "ft-banner-msg";
-  msg.textContent = tf("conflict.unlisted", { n });
-  bar.appendChild(msg);
-  bar.appendChild(noticeButton("conflictsUnlistedDismiss", t("origin.dismiss"), () => {
+  bar.appendChild(noticeMessage("conflict.unlisted", { n }));
+  bar.appendChild(noticeButton("conflictsUnlistedDismiss", "origin.dismiss", () => {
     const hadFocus = bar.contains(document.activeElement);
     bar.remove();
     if (hadFocus && typeof viewerFocus === "function") viewerFocus();
@@ -1471,13 +1608,22 @@ async function holdUnsafeLocally(ids) {
 }
 
 async function pushMarksToCase(payload) {
-  const res = await fetch("/api/import-marks", {
-    method: "POST",
-    headers: { "Content-Type": "text/plain" },
-    body: JSON.stringify({ marks_json: JSON.stringify(payload) })
-  });
+  // R8 U2: every request sent and every reply received is a sign of life
+  // of this window's save (viewerSave's patient deadline follows it).
+  saveProgressAt = Date.now();
+  let res;
+  try {
+    res = await fetch("/api/import-marks", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ marks_json: JSON.stringify(payload) })
+    });
+  } finally {
+    saveProgressAt = Date.now();
+  }
   let data = null;
   try { data = await res.json(); } catch { data = null; }
+  saveProgressAt = Date.now();
   if (!data || typeof data !== "object") {
     return { ok: false, error: `HTTP ${res.status}`, status: res.status };
   }
@@ -1647,7 +1793,7 @@ if (saveStateEl) {
   // Clicking the indicator saves (or retries) right away.
   saveStateEl.addEventListener("click", () => {
     if (!viewerIsServed) { toast(t("save.title.local")); return; }
-    if (annotationsReadOnly) { toast(t("save.readonlyMsg")); return; }
+    if (annotationsReadOnly) { toast(t(lockKey("save.readonlyMsg"))); return; }
     if (conflictLookupFailed && !saveInFlight) { checkServerConflicts(); return; }
     if (reviewIdle() && !saveInFlight) { toast(t("save.title.saved")); return; }
     if (!state.dirtyIds.size && conflictIds.size && !saveInFlight) { toast(tf("conflict.msg", { n: conflictIds.size })); return; }
@@ -2118,9 +2264,7 @@ function rangeText(range) {
   bar.id = "legacyRangesNotice";
   bar.className = "ft-banner";
   bar.setAttribute("role", "status");
-  const msg = document.createElement("span");
-  msg.className = "ft-banner-msg";
-  msg.textContent = tf("range.legacyMsg", { n: left.count });
+  const msg = noticeMessage("range.legacyMsg", { n: left.count });
   msg.title = Object.entries(left.ranges).slice(0, 20).map(([id, r]) => `${recordLabelOf(id)}: ${rangeText(r)}`).join("\n");
   bar.appendChild(msg);
   const done = () => {
@@ -2128,10 +2272,10 @@ function rangeText(range) {
     bar.remove();
     if (hadFocus && typeof viewerFocus === "function") viewerFocus();
   };
-  bar.appendChild(noticeButton("legacyRangesSave", t("range.legacySave"), () => {
+  bar.appendChild(noticeButton("legacyRangesSave", "range.legacySave", () => {
     downloadJSON(`frametrace-browser-ranges-${safeFileName(manifest.case_id || "case")}.json`, { case_id: manifest.case_id || null, ranges: left.ranges });
   }));
-  bar.appendChild(noticeButton("legacyRangesDrop", t("range.legacyDrop"), () => {
+  bar.appendChild(noticeButton("legacyRangesDrop", "range.legacyDrop", () => {
     try { localStorage.removeItem(RANGES_KEY); } catch (e) { /* storage blocked */ }
     legacyRangesLeft = null;
     done();
@@ -2160,15 +2304,16 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
     btn.dataset.i18nTitle = key;
     btn.title = t(key);
   };
-  for (const id of ANNOTATION_GATED_CONTROLS) gate(id, "save.readonlyMsg");
-  for (const id of ANNOTATION_EDIT_CONTROLS) gate(id, "save.readonlyEdit");
+  for (const id of ANNOTATION_GATED_CONTROLS) gate(id, lockKey("save.readonlyMsg"));
+  for (const id of ANNOTATION_EDIT_CONTROLS) gate(id, lockKey("save.readonlyEdit"));
+  // R8 U1: locked because case.json was not read — the case-input banner
+  // (below, role=alert) says so and that editing is blocked; one alert.
+  if (annotationsLockCause === "case") return;
   const bar = document.createElement("div");
   bar.id = "annotationsErrorBanner";
   bar.className = "ft-banner";
   bar.setAttribute("role", "alert");
-  const msg = document.createElement("span");
-  msg.className = "ft-banner-msg";
-  msg.textContent = t("save.readonlyMsg");
+  const msg = noticeMessage("save.readonlyMsg");
   msg.title = annotationsError;
   bar.appendChild(msg);
   const host = noticesHost();
@@ -2182,8 +2327,10 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
 // not read, the same words as the review / carve pages.
 (function showCaseInputProblems() {
   if (!caseInputProblems.length) return;
-  const parts = caseInputProblems.map(what => t(what === "scan" ? "caseInput.scan" : "caseInput.manifest"));
-  const text = t("caseInput.title") + " — " + parts.join(" · ");
+  // R8 U6: each piece carries its i18n key (the language switch re-renders
+  // it); R8 U1: a case.json that was not read also locks editing — said here.
+  const keys = caseInputProblems.map(what => what === "scan" ? "caseInput.scan" : "caseInput.manifest");
+  if (annotationsLockCause === "case") keys.push("caseInput.readonly");
   const bar = document.createElement("div");
   bar.id = "caseInputErrorBanner";
   bar.className = "ft-banner";
@@ -2191,7 +2338,10 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
   bar.dataset.problems = caseInputProblems.join(" ");
   const msg = document.createElement("span");
   msg.className = "ft-banner-msg";
-  msg.textContent = text;
+  const piece = (key) => { const s = document.createElement("span"); i18nText(s, key); msg.appendChild(s); };
+  piece("caseInput.title");
+  keys.forEach((key, i) => { msg.appendChild(document.createTextNode(i ? " · " : " — ")); piece(key); });
+  const text = msg.textContent;
   bar.appendChild(msg);
   const host = noticesHost();
   host.insertBefore(bar, host.firstChild);
@@ -2220,7 +2370,7 @@ var ORIGIN_COOKIE = "ft_draft_ports";
 var ORIGIN_COOKIE_MAX = 24;
 var ORIGIN_COOKIE_AGE = 60 * 60 * 24 * 60; // 60 days
 function originCaseHash() {
-  const text = String(manifest.case_id || "case") + "|" + String(DATA.caseDir || "");
+  const text = String(CASE_KEY) + "|" + String(DATA.caseDir || "");
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
   return h.toString(16).padStart(8, "0");
@@ -2288,11 +2438,8 @@ function noteOriginDrafts() {
   bar.id = "originDraftsNotice";
   bar.className = "ft-banner";
   bar.setAttribute("role", "status");
-  const msg = document.createElement("span");
-  msg.className = "ft-banner-msg";
-  msg.textContent = tf("origin.draftsMsg", { where });
-  bar.appendChild(msg);
-  bar.appendChild(noticeButton("originDraftsDismiss", t("origin.dismiss"), () => {
+  bar.appendChild(noticeMessage("origin.draftsMsg", { where }));
+  bar.appendChild(noticeButton("originDraftsDismiss", "origin.dismiss", () => {
     const hadFocus = bar.contains(document.activeElement);
     writeOriginMarks(readOriginMarks().filter(m => !others.includes(m)));
     bar.remove();

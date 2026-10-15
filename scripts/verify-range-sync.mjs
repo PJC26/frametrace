@@ -59,6 +59,11 @@
 //  ⑳ U1 save({timeoutMs}) is a hard total in a busy spell (timedOut set)
 //  ㉒ U1/U10 a save request left on the wire: save({timeoutMs}) and
 //    hBeforeClose(2000) answer within their budget, in Korean
+// R8 track U (docs/PLAN_R8_2026-10-15.md):
+//  ㉓ U2 an explicit save ({ patient: true }) waits for a slow but live
+//    reply past its budget; a hard budget does not; a request without a
+//    reply (stall) times out; save() with no budget (the desktop shell's
+//    fallback) answers within 4 s
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -170,6 +175,11 @@ const server = createServer((req, res) => {
       if (mock.hang) {
         // R7 U1: the request stays on the wire until the harness lets it go.
         mock.hung.push(() => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(apply(payload))); });
+        return;
+      }
+      if (mock.delayMs > 0) {
+        // R8 U2: a slow but live server — the reply comes, late.
+        setTimeout(() => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(apply(payload))); }, mock.delayMs);
         return;
       }
       if (mock.busyReplies > 0) {
@@ -670,12 +680,12 @@ try {
   await select(A);
   await page.keyboard.press('3');
   const t20 = Date.now();
-  const p20 = page.evaluate(() => FTViewer.save());
+  const p20 = page.evaluate(() => FTViewer.save({ patient: true }));
   await page.waitForFunction(() => Number(document.getElementById('saveState').dataset.busyRetry) > 0, null, { timeout: 8000 }).catch(() => {});
   const ind20 = await page.evaluate(() => ({ n: document.getElementById('saveState').dataset.busyRetry || '', label: document.getElementById('saveState').innerText }));
   const saved20 = await p20;
   const ms20 = Date.now() - t20;
-  check('⑳ R7 U5: save() (default 20 s budget) waits out a 6 s+ busy spell (8 × 1.5 s replies) and lands', saved20 === true && row(A).status === 'needs_verification' && ms20 >= 5500, `${saved20} ${row(A).status} after ${ms20} ms`);
+  check('⑳ R7 U5 / R8 U2: save({ patient: true }) (explicit, 20 s budget) waits out a 6 s+ busy spell (8 × 1.5 s replies) and lands', saved20 === true && row(A).status === 'needs_verification' && ms20 >= 5500, `${saved20} ${row(A).status} after ${ms20} ms`);
   check('⑳ U5: the indicator shows the busy retries meanwhile ("서버 바쁨 · 재시도 n/10")', Number(ind20.n) > 0 && /서버 바쁨/.test(ind20.label), JSON.stringify(ind20));
   await waitState('saved', 15000);
   Object.assign(mock, { busyReplies: 1000, busyAfterMs: 1500 });
@@ -717,6 +727,39 @@ try {
   for (const release of mock.hung.splice(0)) release();
   await waitState('saved', 15000);
   check('㉒ the released request still settles the drafts ("saved", the mark stored)', row(A).status === 'reviewed', JSON.stringify(row(A)));
+
+  // ㉓ R8 U2: a slow but LIVE save (the reply comes after 2.5 s) is not
+  // abandoned by an explicit save at its budget; the close flush's hard
+  // budget still answers on time; a genuinely stalled request (no reply)
+  // times out after the stall window; save() with no budget is <= 4 s.
+  const timed = (expr) => page.evaluate(async (e) => {
+    const opts = e.opts;
+    const t0 = performance.now();
+    const saved = await (opts ? FTViewer.save(opts) : FTViewer.save());
+    return { saved, timedOut: !!(opts && opts.timedOut), ms: Math.round(performance.now() - t0) };
+  }, expr);
+  mock.delayMs = 2500;
+  await select(A);
+  await page.keyboard.press('2');
+  const r23a = await timed({ opts: { patient: true, timeoutMs: 1000, stallMs: 5000 } });
+  check('㉓ R8 U2: save({ patient: true, timeoutMs: 1000 }) waits for the slow reply (2.5 s) and lands', r23a.saved === true && r23a.ms >= 2300 && row(A).status === 'important', JSON.stringify({ r23a, A: row(A).status }));
+  await waitState('saved', 15000);
+  await select(A);
+  await page.keyboard.press('3');
+  const r23b = await timed({ opts: { timeoutMs: 1000 } });
+  check('㉓ R8 U2: the hard save({ timeoutMs: 1000 }) still answers false at its budget (timedOut)', r23b.saved === false && r23b.timedOut && r23b.ms < 1400, JSON.stringify(r23b));
+  await waitState('saved', 15000);
+  mock.delayMs = 0;
+  Object.assign(mock, { hang: true, hung: [] });
+  await select(A);
+  await page.keyboard.press('1');
+  const r23c = await timed({ opts: { patient: true, timeoutMs: 500, stallMs: 1500 } });
+  check('㉓ R8 U2: a stalled request (no reply) — the patient save times out after the stall window', r23c.saved === false && r23c.timedOut && r23c.ms >= 1300 && r23c.ms < 2600, JSON.stringify(r23c));
+  const r23d = await timed({ opts: null });
+  check("㉓ R8 U2: save() with no budget (the desktop shell's fallback) answers within 4 s while the request hangs", r23d.saved === false && r23d.ms <= 4300, JSON.stringify(r23d));
+  mock.hang = false;
+  for (const release of mock.hung.splice(0)) release();
+  await waitState('saved', 15000);
 
   // ㉑ U9: the base -1 body fails (its own error); the ordinary edit still goes out.
   rows.set(A, { status: 'important', note: 'srv', examiner: null, range: null, tags: [], rev: 9 });

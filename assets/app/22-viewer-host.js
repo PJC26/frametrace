@@ -165,7 +165,7 @@ async function hostViewerSwitch(openFn) {
       ? hViewerStateUnsaved(state, pending)
       : !!state && state !== "saved" && !(state === "local" && pending() === 0);
     if (unsaved) {
-      const saved = await window.FTViewer.save();
+      const saved = await window.FTViewer.save({ patient: true }); // R8 U2: explicit — waits while the save progresses
       if (!saved) return false;
     }
     await hostViewerUnmount();

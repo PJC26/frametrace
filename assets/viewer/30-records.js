@@ -981,6 +981,11 @@ var legacyRangesLeft = null;      // { count, ranges } | null
 // the viewer shows none of the server's marks, so it must never save over
 // them (90-sync: read-only banner, saves blocked).
 var annotationsError = "";
+// R8 U1: why the annotations are locked — "annotations" (records-meta could
+// not read them) or "case" (case.json was not read: which case this is is
+// unknown, so nothing may be written or kept under its keys). The texts
+// differ (lockKey), the read-only path is the same.
+var annotationsLockCause = "";
 // Ids whose mark row the server may hold (hydrated rows, rows this window
 // sent since, server values taken over). A record left with no mark, note
 // or range sends `deleted_ids` only when its id is here — a record that
@@ -1016,19 +1021,24 @@ function markTallyNote(id) {
   if (id == null || markTallyTouched.size >= 4096) { markTallyAll = true; markTallyTouched.clear(); }
   else if (!markTallyAll) markTallyTouched.add(id);
 }
+// R8 U5: the bucket of a mark is its status; a mark of an id this case does
+// not list gets its own marker (MARK_TALLY_OFFCASE) — never "", which is
+// also what a mark with an empty / missing status yields (that mark is a
+// mark of this case and counts in `n`, as the pre-R7 count did).
+var MARK_TALLY_OFFCASE = "\u0000offcase";
 function markTallyBucket(id) {
   const mark = state.marks[id];
   if (!mark) return null;
-  return recordById.has(id) ? String(mark.status || "") : "";   // "" = a mark of an id this case does not list
+  return recordById.has(id) ? String(mark.status || "") : MARK_TALLY_OFFCASE;
 }
 function markTallyMove(tally, from, to) {
   if (from !== null) {
     tally.all -= 1;
-    if (from !== "") { tally.n -= 1; tally.byStatus[from] = (tally.byStatus[from] || 0) - 1; }
+    if (from !== MARK_TALLY_OFFCASE) { tally.n -= 1; tally.byStatus[from] = (tally.byStatus[from] || 0) - 1; }
   }
   if (to !== null) {
     tally.all += 1;
-    if (to !== "") { tally.n += 1; tally.byStatus[to] = (tally.byStatus[to] || 0) + 1; }
+    if (to !== MARK_TALLY_OFFCASE) { tally.n += 1; tally.byStatus[to] = (tally.byStatus[to] || 0) + 1; }
   }
 }
 function markTallyNow() {
@@ -1058,8 +1068,8 @@ function markTallyNow() {
   return markTally;
 }
 const DRAFT_FLUSH_MS = 250;
-const DRAFT_PREFIX = "ft.draft." + (manifest.case_id || "case") + ".";
-const ALIVE_PREFIX = "ft.alive:" + (manifest.case_id || "case") + ":";
+const DRAFT_PREFIX = "ft.draft." + CASE_KEY + ".";
+const ALIVE_PREFIX = "ft.alive:" + CASE_KEY + ":";
 // Liveness of the other windows on this case (§10.3): each refreshes its
 // heartbeat every 5 s; pagehide (a real unload, not the back/forward cache)
 // replaces it with ALIVE_CLOSED. Another writer's drafts are adopted only
@@ -1259,9 +1269,14 @@ function annotationsLocked() {
   return typeof annotationsError !== "undefined" && !!annotationsError;
 }
 // True (and says why, once per attempt) when an edit must not happen now.
+// R8 U1: the i18n key of a read-only text for the current cause ("…Case"
+// variant when case.json was not read).
+function lockKey(key) {
+  return annotationsLockCause === "case" && typeof I18N !== "undefined" && I18N.ko[key + "Case"] ? key + "Case" : key;
+}
 function refuseLockedEdit() {
   if (!annotationsLocked()) return false;
-  if (typeof toast === "function") toast(t("save.readonlyEdit"));
+  if (typeof toast === "function") toast(t(lockKey("save.readonlyEdit")));
   return true;
 }
 
@@ -1474,6 +1489,13 @@ function hydrateAnnotations(annotations) {
   state.marks = {}; state.notes = {}; state.tags = {}; state.examiners = {}; state.ranges = {};
   state.revisions = {};
   annotationsError = annotations && annotations.error ? String(annotations.error) : "";
+  annotationsLockCause = annotationsError ? "annotations" : "";
+  // R8 U1: case.json unreadable — the same read-only path (no save, no
+  // edit, no migration of browser leftovers), its own texts.
+  if (!annotationsError && typeof caseFileUnreadable !== "undefined" && caseFileUnreadable) {
+    annotationsError = "case.json";
+    annotationsLockCause = "case";
+  }
   for (const [id, rev] of Object.entries(annotations.revisions || {})) {
     if (Number.isFinite(Number(rev))) state.revisions[id] = Number(rev);
   }
@@ -1528,7 +1550,7 @@ var aliveChannel = null;
 var alivePings = new Map(); // nonce -> Set of writers that answered
 function openAliveChannel() {
   if (aliveChannel || typeof BroadcastChannel !== "function" || ftSignal.aborted) return aliveChannel;
-  try { aliveChannel = new BroadcastChannel("ft-alive:" + (manifest.case_id || "case")); } catch (error) { aliveChannel = null; return null; }
+  try { aliveChannel = new BroadcastChannel("ft-alive:" + CASE_KEY); } catch (error) { aliveChannel = null; return null; }
   const channel = aliveChannel;
   channel.onmessage = event => {
     const msg = event.data || {};
