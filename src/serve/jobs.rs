@@ -2692,6 +2692,15 @@ thread_local! {
 ///
 /// Parses `signoff_json` (the exact pending `signoff.json` text) into
 /// `report::Signoff` and appends it with `report::record_signoff_audit`.
+/// R8-I9: records that a finalize abandoned the sign-off entry it had
+/// already chained. A failure to record is surfaced as a job log line (the
+/// finalize is already failing; the sign-off is simply never promoted).
+fn abandon_signoff(case_dir: &Path, signoff_text: &str, reason: &str, state: &SharedState) {
+    if let Err(err) = crate::report::record_signoff_abandoned(case_dir, signoff_text, reason) {
+        state_lock(state).logs.push(format!("경고: {err}"));
+    }
+}
+
 pub(crate) fn record_signoff_audit(case_dir: &Path, signoff_json: &str) -> Result<(), String> {
     #[cfg(test)]
     {
@@ -2870,10 +2879,20 @@ pub(crate) fn finalize_with_exe(
             case_dir.join(crate::report::SIGNOFF_REL_PATH),
         )
         .map_err(|err| format!("검토자 기록 확정 실패: {err}"))
-        .inspect_err(|_| {
+        .inspect_err(|err| {
+            abandon_signoff(case_dir, &signoff.text, err, state);
             let _ = std::fs::remove_file(&pending_signoff);
         }),
         _ => {
+            // R8-I9: the sign-off entry is already in the chain; mark it
+            // abandoned so it never reads as the case's latest sign-off.
+            let reason = report
+                .as_ref()
+                .err()
+                .or(packaging.as_ref().err())
+                .cloned()
+                .unwrap_or_default();
+            abandon_signoff(case_dir, &signoff.text, &reason, state);
             let _ = std::fs::remove_file(&pending_signoff);
             // The report on disk was rendered with the abandoned sign-off;
             // re-render it from the promoted state (best effort) so it does

@@ -397,6 +397,29 @@ fn failed_finalize_leaves_no_signoff() {
         "failed finalize must not record a sign-off"
     );
     assert!(!case.join(SIGNOFF_PENDING_REL_PATH).exists());
+    // R8-I9: the chained sign-off entry is followed by an abandon event
+    // naming the same record, so it never reads as the latest sign-off.
+    let lane = std::fs::read_to_string(case.join(crate::report::SIGNOFF_LOG_REL_PATH))
+        .expect("finalize chains its sign-off before packaging");
+    let events: Vec<serde_json::Value> = lane
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let signed = events
+        .iter()
+        .find(|e| e["event"] == "signoff")
+        .and_then(|e| e["signoff_record_sha256"].as_str())
+        .expect("sign-off entry");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == crate::report::SIGNOFF_ABANDONED_EVENT
+                && e["signoff_record_sha256"] == signed
+                && e["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("disk full"))),
+        "{lane}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
