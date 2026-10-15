@@ -551,6 +551,10 @@ pub fn resolve_video_source(case_dir: &Path, selector: &str) -> Result<PathBuf, 
             .map_err(|err| format!("failed to canonicalize source path: {err}"));
     }
 
+    if let Some(found) = resolve_through_records(case_dir, selector, id_shaped) {
+        return found;
+    }
+
     let index_path = case_dir.join("db/video_paths.tsv");
     let text = read_to_string(&index_path).map_err(|err| {
         format!(
@@ -587,6 +591,66 @@ pub fn resolve_video_source(case_dir: &Path, selector: &str) -> Result<PathBuf, 
     Err(format!(
         "video selector not found: {selector} (use an indexed id like vid_000001 or a source path)"
     ))
+}
+
+/// R6-I10: [`resolve_video_source`] through `db/videos.jsonl`, which keeps
+/// the lossless raw form of a non-Unicode name (`source_path_raw_hex`) —
+/// the path index (`video_paths.tsv`) only has the lossy display string,
+/// which names another (usually nonexistent) file. `None` when the records
+/// cannot be read (the TSV fallback then applies) or name no such record.
+/// A display/relative path shared by several records (non-Unicode twins)
+/// is ambiguous — refused, never resolved to the first.
+fn resolve_through_records(
+    case_dir: &Path,
+    selector: &str,
+    id_shaped: bool,
+) -> Option<Result<PathBuf, String>> {
+    let text = read_to_string(&case_dir.join("db/videos.jsonl")).ok()?;
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    let field = |row: &serde_json::Value, key: &str| {
+        row.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let found = match rows
+        .iter()
+        .find(|row| field(row, "id").as_deref() == Some(selector))
+    {
+        Some(row) => row,
+        None if id_shaped => return None,
+        None => {
+            let matches: Vec<&serde_json::Value> = rows
+                .iter()
+                .filter(|row| {
+                    field(row, "source_path").as_deref() == Some(selector)
+                        || field(row, "relative_path").as_deref() == Some(selector)
+                })
+                .collect();
+            match matches.as_slice() {
+                [] => return None,
+                [row] => *row,
+                _ => {
+                    return Some(Err(format!(
+                        "video selector {selector} names {} indexed files (names that differ only in non-Unicode characters) — use the record id (vid_…)",
+                        matches.len()
+                    )));
+                }
+            }
+        }
+    };
+    let path = crate::model::record_os_path(found)?;
+    Some(if path.is_file() {
+        crate::model::canonicalize_lossless(&path)
+            .map_err(|err| format!("failed to canonicalize source path: {err}"))
+    } else {
+        Err(format!(
+            "indexed source file no longer exists: {}",
+            path.display()
+        ))
+    })
 }
 
 fn write_export_log(
@@ -668,6 +732,46 @@ pub use crate::util::sanitize_filename;
 mod tests {
     use super::{ExportFormat, ExportOptions, ffmpeg_export_args, sanitize_filename, tsv_unescape};
     use std::path::Path;
+
+    /// R6-I10: an indexed non-Unicode name resolves to ITS file (the path
+    /// index's lossy display string named another, nonexistent one), and a
+    /// display path shared by twins is refused as ambiguous.
+    #[test]
+    fn resolves_non_unicode_records_losslessly() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-i10-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let one = dir.join(crate::audit::test_non_unicode_twin("clip", 0));
+        let two = dir.join(crate::audit::test_non_unicode_twin("clip", 1));
+        if std::fs::write(&two, b"two").is_err() {
+            eprintln!("filesystem refuses non-Unicode names; skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        std::fs::write(&one, b"one").unwrap();
+        let display = two.to_string_lossy().to_string();
+        let row = |id: &str, path: &Path| {
+            serde_json::json!({"id": id, "source_path": path.to_string_lossy(),
+                "relative_path": "clip", "source_path_raw_hex": crate::model::path_raw_hex(path)})
+            .to_string()
+        };
+        std::fs::write(
+            dir.join("db/videos.jsonl"),
+            format!("{}\n{}\n", row("vid_000001", &one), row("vid_000002", &two)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("db/video_paths.tsv"),
+            format!("id\tsource_path\trelative_path\nvid_000001\t{display}\tclip\nvid_000002\t{display}\tclip\n"),
+        )
+        .unwrap();
+        let resolved = super::resolve_video_source(&dir, "vid_000002").unwrap();
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"two");
+        let err = super::resolve_video_source(&dir, &display).unwrap_err();
+        assert!(err.contains("2 indexed files"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_export_formats() {

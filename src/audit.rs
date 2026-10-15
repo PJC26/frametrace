@@ -37,12 +37,42 @@ pub struct AuditChainVerification {
     /// Entries carrying `entry_hmac_sha256`/`entry_hmac_key_id`.
     pub keyed_entries: usize,
     /// Keyed entries whose HMAC could not be checked because no key was
-    /// configured (a subset of `keyed_entries`).
+    /// configured, or (R6-I4) because their key id is not on this PC (a
+    /// subset of `keyed_entries`).
     pub unauthenticated_keyed_entries: usize,
     /// Log-level mark per the design's verification matrix.
     pub integrity: AuditIntegrity,
     /// Caveats that keep the mark honest (mixed chain, missing key, ...).
     pub warnings: Vec<String>,
+    /// R6-I2/I3: what the keyed layer established for each entry, in line
+    /// order (`entry_auth[n]` is audit line `n + 1`).
+    pub entry_auth: Vec<EntryAuth>,
+}
+
+/// R6-I2/I3/I4: the keyed-layer result of one chained entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAuth {
+    /// No HMAC fields.
+    Unkeyed,
+    /// HMAC fields, but no audit key is configured on this PC.
+    NoKey,
+    /// R6-I4: HMAC under a key id none of this PC's keys has, and no
+    /// configured key verifies it — authenticity cannot be checked here
+    /// (not a forgery verdict).
+    UnknownKey,
+    /// HMAC verified under a key that is not retired, or under a retired
+    /// key with a newer key's entry later in the chain proving its age.
+    Authenticated,
+    /// HMAC verified only under a retired key and no newer key's entry
+    /// follows (R5-P7): not authenticated.
+    RetiredUnproven,
+}
+
+impl EntryAuth {
+    /// HMAC fields present (whether or not they could be checked here).
+    pub fn is_keyed(self) -> bool {
+        !matches!(self, Self::Unkeyed)
+    }
 }
 
 pub fn digest_file(path: &Path) -> Result<String, String> {
@@ -547,6 +577,10 @@ pub fn verify_chained_jsonl_text(
     // signature (or the rotation marker the new key signs) proves an entry
     // predates the retirement — entry time fields are never trusted for it.
     let mut unproven_retired: Vec<(usize, KeyGeneration)> = Vec::new();
+    let mut entry_auth: Vec<EntryAuth> = Vec::with_capacity(lines.len());
+    // R6-I4: keyed entries under key ids this PC does not hold.
+    let mut unknown_key_ids: std::collections::BTreeSet<String> = Default::default();
+    let mut unknown_key_entries = 0usize;
 
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -556,6 +590,7 @@ pub fn verify_chained_jsonl_text(
             Unkeyed,
             Verified(KeyGeneration),
             Unauthenticated,
+            UnknownKey(String),
         }
         let verify_line = || -> Result<Keyed, String> {
             if line.trim().is_empty() {
@@ -648,6 +683,13 @@ pub fn verify_chained_jsonl_text(
                             )
                         })
                         .collect();
+                    if matching.is_empty() && !keys.iter().any(|key| key.id == key_id) {
+                        // R6-I4: signed under a key this PC does not hold
+                        // (another workstation's key, a key removed from
+                        // the keyring): it cannot be checked here — not
+                        // verified, never "tampered".
+                        return Ok(Keyed::UnknownKey(key_id));
+                    }
                     if matching.is_empty() {
                         return Err(format!(
                             "audit line {line_number} HMAC verification failed (key_id \"{key_id}\"): the entry was re-written or signed under a different key"
@@ -692,18 +734,30 @@ pub fn verify_chained_jsonl_text(
                 if let Some(from) = rotation_marker_from(line) {
                     rotated_away.insert(from);
                 }
+                entry_auth.push(EntryAuth::Authenticated);
             }
             Ok(Keyed::Unauthenticated) => {
                 keyed_entries += 1;
                 unauthenticated_keyed += 1;
                 first_keyed_line.get_or_insert(line_number);
                 last_keyed_line = Some(line_number);
+                entry_auth.push(EntryAuth::NoKey);
+            }
+            Ok(Keyed::UnknownKey(key_id)) => {
+                keyed_entries += 1;
+                unauthenticated_keyed += 1;
+                first_keyed_line.get_or_insert(line_number);
+                last_keyed_line = Some(line_number);
+                unknown_key_ids.insert(key_id);
+                unknown_key_entries += 1;
+                entry_auth.push(EntryAuth::UnknownKey);
             }
             Ok(Keyed::Unkeyed) => {
                 if let Some(last_keyed) = last_keyed_line {
                     first_transition.get_or_insert((line_number, last_keyed));
                     unkeyed_after_keyed.push(line_number);
                 }
+                entry_auth.push(EntryAuth::Unkeyed);
             }
             Err(error) => {
                 if line_number == lines.len() && !complete_tail {
@@ -723,11 +777,28 @@ pub fn verify_chained_jsonl_text(
     // Log-level mark per the design's verification matrix.
     let mut warnings = Vec::new();
     let mut integrity = AuditIntegrity::StructuralOnly;
-    if keyed_entries > 0 && unauthenticated_keyed > 0 {
+    let no_key_entries = unauthenticated_keyed - unknown_key_entries;
+    if no_key_entries > 0 {
         warnings.push(format!(
-            "{unauthenticated_keyed} keyed entr{} present but no audit key is configured — authenticity unverified (structural chain verified)",
-            if unauthenticated_keyed == 1 { "y" } else { "ies" }
+            "{no_key_entries} keyed entr{} present but no audit key is configured — authenticity unverified (structural chain verified)",
+            if no_key_entries == 1 { "y" } else { "ies" }
         ));
+    }
+    if unknown_key_entries > 0 {
+        warnings.push(format!(
+            "{unknown_key_entries} keyed entr{} signed under audit key id(s) {} that this PC does not hold — authenticity cannot be checked here (not a tampering verdict; structural chain verified)",
+            if unknown_key_entries == 1 { "y" } else { "ies" },
+            unknown_key_ids
+                .iter()
+                .map(|id| format!("\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for (line, _) in &unproven_retired {
+        if let Some(auth) = entry_auth.get_mut(line - 1) {
+            *auth = EntryAuth::RetiredUnproven;
+        }
     }
     if keyed_entries > 0 && keyed_entries < entries {
         warnings.push(
@@ -778,6 +849,7 @@ pub fn verify_chained_jsonl_text(
         unauthenticated_keyed_entries: unauthenticated_keyed,
         integrity,
         warnings,
+        entry_auth,
     })
 }
 
@@ -852,22 +924,52 @@ fn recorded_entry_hash(line: &str) -> Option<String> {
     extract_json_string(line, "entry_sha256")
 }
 
+/// The indexed SHA-256 of the record `selector` names (an id, or — for a
+/// record whose display path is exact — its source/relative path), or of
+/// the record whose file IS `source_path`.
+///
+/// R6-I10: the file comparison is lossless (`model::record_os_path`, the
+/// raw OS form of a non-Unicode name), and a display string is only
+/// matched for a record whose display path is exact: two files whose names
+/// differ only in non-Unicode units share one lossy display string, and
+/// the old string match handed the first one's hash to the other.
 pub fn indexed_source_hash(case_dir: &Path, selector: &str, source_path: &Path) -> Option<String> {
-    let source = source_path.to_string_lossy();
     let text = read_to_string(&case_dir.join("db/videos.jsonl")).ok()?;
-    for line in text.lines() {
-        let id = extract_json_string(line, "id");
-        let indexed_source = extract_json_string(line, "source_path");
-        let relative_path = extract_json_string(line, "relative_path");
-        let matches_selector = id.as_deref() == Some(selector)
-            || indexed_source.as_deref() == Some(selector)
-            || relative_path.as_deref() == Some(selector)
-            || indexed_source.as_deref() == Some(source.as_ref());
-        if matches_selector {
-            return extract_json_string(line, "sha256");
-        }
-    }
-    None
+    // Callers pass the resolved (canonical) path and the index records
+    // canonical paths, so no filesystem call is made here.
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    let field = |row: &serde_json::Value, key: &str| {
+        row.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let names_file = |row: &serde_json::Value| {
+        crate::model::record_os_path(row).is_some_and(|path| path.as_path() == source_path)
+    };
+    let exact_display = |row: &serde_json::Value| {
+        row.get("source_path_raw_hex")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    };
+    // Strongest identity first: the id, then the file itself, then an
+    // exact display spelling.
+    let by_id = |row: &serde_json::Value| {
+        !selector.is_empty() && field(row, "id").as_deref() == Some(selector)
+    };
+    let by_display = |row: &serde_json::Value| {
+        !selector.is_empty()
+            && exact_display(row)
+            && (field(row, "source_path").as_deref() == Some(selector)
+                || field(row, "relative_path").as_deref() == Some(selector))
+    };
+    rows.iter()
+        .find(|row| by_id(row))
+        .or_else(|| rows.iter().find(|row| names_file(row)))
+        .or_else(|| rows.iter().find(|row| by_display(row)))
+        .and_then(|row| field(row, "sha256"))
 }
 
 pub fn json_string_array(values: &[String]) -> String {
@@ -909,10 +1011,30 @@ fn entry_without_recorded_hash(line: &str) -> Option<String> {
     Some(format!("{}}}", &line[..start]))
 }
 
+/// R6-I10 tests: a non-Unicode name `<stem><bad unit>` whose lossy display
+/// string is the same for every `variant` (each one a different file).
+#[cfg(test)]
+pub(crate) fn test_non_unicode_twin(stem: &str, variant: u8) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = stem.as_bytes().to_vec();
+        bytes.push(0xf8 + (variant % 8));
+        std::ffi::OsString::from_vec(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut units: Vec<u16> = stem.encode_utf16().collect();
+        units.push(0xD800 + u16::from(variant));
+        std::ffi::OsString::from_wide(&units)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditIntegrity, append_chained_jsonl, append_chained_jsonl_keyed, digest_file,
+        AuditIntegrity, EntryAuth, append_chained_jsonl, append_chained_jsonl_keyed, digest_file,
         verify_chained_jsonl, verify_chained_jsonl_keyed,
     };
     use crate::audit_key::AuditKey;
@@ -1133,6 +1255,88 @@ mod tests {
 
         let err = verify_chained_jsonl_keyed(&path, &[writer_key]).unwrap_err();
         assert!(err.contains("HMAC verification failed"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R6-I10: two indexed files whose names differ only in non-Unicode
+    /// units share a lossy display string; each one's hash is looked up by
+    /// its lossless path, never the first display match.
+    #[test]
+    fn indexed_source_hash_tells_non_unicode_twins_apart() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-twins-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("db")).unwrap();
+        let one = dir.join(super::test_non_unicode_twin("clip", 0));
+        let two = dir.join(super::test_non_unicode_twin("clip", 1));
+        assert_eq!(one.to_string_lossy(), two.to_string_lossy());
+        let row = |id: &str, path: &Path, sha: &str| {
+            serde_json::json!({"id": id, "source_path": path.to_string_lossy(),
+                "source_path_raw_hex": crate::model::path_raw_hex(path), "sha256": sha})
+            .to_string()
+        };
+        fs::write(
+            dir.join("db/videos.jsonl"),
+            format!(
+                "{}\n{}\n",
+                row("vid_000001", &one, &"1".repeat(64)),
+                row("vid_000002", &two, &"2".repeat(64))
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            super::indexed_source_hash(&dir, &two.to_string_lossy(), &two),
+            Some("2".repeat(64))
+        );
+        assert_eq!(
+            super::indexed_source_hash(&dir, "", &one),
+            Some("1".repeat(64))
+        );
+        assert_eq!(
+            super::indexed_source_hash(&dir, "vid_000002", &one),
+            Some("2".repeat(64)),
+            "an id names its record"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R6-I4: an entry signed under a key id this PC does not hold (another
+    /// workstation's key) cannot be checked here — "not verified", never a
+    /// tampering FAIL. A key this PC DOES hold under that id that fails is
+    /// still a FAIL (above). Per-entry results are reported.
+    #[test]
+    fn unknown_key_id_is_not_verifiable_not_tampered() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-unknown-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mine = test_key("mine", 0x11);
+        let theirs = test_key("other-pc", 0x12);
+        append_chained_jsonl_keyed(&path, r#"{"kind":"one"}"#, Some(&mine)).unwrap();
+        append_chained_jsonl_keyed(&path, r#"{"kind":"two"}"#, Some(&theirs)).unwrap();
+        append_chained_jsonl_keyed(&path, r#"{"kind":"three"}"#, None).unwrap();
+        let verification = verify_chained_jsonl_keyed(&path, std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
+        assert_eq!(verification.unauthenticated_keyed_entries, 1);
+        assert_eq!(
+            verification.entry_auth,
+            [
+                EntryAuth::Authenticated,
+                EntryAuth::UnknownKey,
+                EntryAuth::Unkeyed
+            ]
+        );
+        assert!(
+            verification
+                .warnings
+                .iter()
+                .any(|w| w.contains("\"other-pc\"") && w.contains("not a tampering verdict")),
+            "{:?}",
+            verification.warnings
+        );
+        let none = verify_chained_jsonl_keyed(&path, &[]).unwrap();
+        assert_eq!(none.entry_auth[..2], [EntryAuth::NoKey, EntryAuth::NoKey]);
         let _ = fs::remove_dir_all(&dir);
     }
 

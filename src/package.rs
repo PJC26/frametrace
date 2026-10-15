@@ -1516,7 +1516,23 @@ fn verify_package_db_and_signoff(
             CheckStatus::Pass,
             signoff_rel,
             format!(
-                "sign-off v4: marks, the case records' target hashes and audit-lane anchors match the package, and the sign-off audit lane records this sign-off (examiner recorded as typed: {examiner}; not an authenticated identity)"
+                "sign-off v4: marks, the case records' target hashes and audit-lane anchors match the package, and the sign-off audit lane records this sign-off as its latest{} (examiner recorded as typed: {examiner}; not an authenticated identity)",
+                if check.authenticated {
+                    ", HMAC-authenticated"
+                } else {
+                    // R6-I6: a keyless match is self-consistency only.
+                    " — self-consistency only, NOT authentication: the audit entry is not HMAC-verified here, so anyone holding the case folder could have recomputed it (configure an audit key and finalize again to authenticate)"
+                }
+            ),
+        ),
+        // R6-I1: every checked binding matches, but something could not be
+        // checked — the sign-off cannot be confirmed (the items follow).
+        crate::report::SignoffCurrency::PartiallyVerified => out.push(
+            CheckStatus::NotVerified,
+            signoff_rel,
+            format!(
+                "sign-off v4: the checked bindings match, but {} item(s) could not be verified — the sign-off cannot be confirmed to match this package",
+                check.not_verified.len()
             ),
         ),
         crate::report::SignoffCurrency::Changed if v4 => {

@@ -942,6 +942,7 @@ pub fn make_report(
                         .map(|c| redactor.text(c))
                         .collect(),
                     rehashed: check.rehashed,
+                    authenticated: check.authenticated,
                 }
             } else {
                 check
