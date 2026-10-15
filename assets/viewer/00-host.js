@@ -232,8 +232,20 @@ const FTViewer = (() => {
     get _root() { return root; },
     get _apiBase() { return apiBase; },
     _attach(methods) { impl = methods; },
-    // R6 U4: the read-only close warning, in the viewer's language.
-    _closeWarning() { return impl && impl.closeWarning ? impl.closeWarning() : "The review records could not be read — this window holds no unsaved edits."; },
+    // R7 U10: the close flush's texts (hBeforeClose message / warning) in
+    // the viewer's language (i18n "close.*", Korean by default); before a
+    // mount the Korean text.
+    _closeText(key, vars) {
+      if (impl && impl.closeText) return impl.closeText(key, vars);
+      const n = vars && vars.n != null ? vars.n : "";
+      return ({
+        "close.readonlyWarn": "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다.",
+        "close.unsaved": "저장 안 된 편집 " + n + "건",
+        "close.timeout": " (저장 응답 대기 시간 초과)",
+        "close.readonlyBlocked": "판독 기록을 읽지 못해 저장이 막혀 있습니다",
+        "close.notConfirmed": "모든 편집이 저장되었는지 확인하지 못했습니다",
+      })[key] || "";
+    },
     _emit: emit,
     _applyTheme: applyTheme,
     _listens(event) { return (counts.get(event) || 0) > 0; },
@@ -263,26 +275,38 @@ window.FTViewer = FTViewer;
 // { ok, pending, state, message, warning }, within `timeoutMs` (4 s: under
 // the shell's 5 s wait). Read-only with nothing held here closes without a
 // confirmation; `warning` says the records were unreadable (also toasted).
+// R7 U1/U8/U10: the same hard total budget as the shell's (the shell
+// calls hBeforeClose(4000)); `message`/`warning` are the viewer's i18n
+// texts (Korean by default — "저장 안 된 편집 N건", never English
+// fragments), and the read-only warning is a warning toast, not an error.
 if (!document.documentElement.hasAttribute("data-ft-host") && typeof window.hBeforeClose !== "function") {
   window.hBeforeClose = async (timeoutMs = 4000) => {
-    const ms = Math.max(0, Number(timeoutMs) || 0);
+    const started = Date.now();
+    const asked = Number(timeoutMs);
+    const ms = Math.max(0, Number.isFinite(asked) ? asked : 4000);
     let saved = false;
     let timedOut = false;
     let timer = 0;
+    const opts = { timeoutMs: Math.max(0, ms - 250) };
     try {
       saved = await Promise.race([
-        Promise.resolve(FTViewer.save({ timeoutMs: Math.max(0, ms - 250) })).then(v => v === true),
-        new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, ms); }),
+        Promise.resolve(FTViewer.save(opts)).then(v => v === true),
+        new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, Math.max(0, ms - (Date.now() - started) - 100)); }),
       ]);
     } catch (e) { saved = false; }
     clearTimeout(timer);
+    if (opts.timedOut) timedOut = true;
     let pending = 0;
     let state = null;
     try { pending = Number((FTViewer.summary() || {}).pending) || 0; state = FTViewer.saveState(); } catch (e) { pending = 0; }
     const ok = saved && (state !== "readonly" || pending === 0);
-    const warning = ok && state === "readonly" ? FTViewer._closeWarning() : "";
-    if (warning) FTViewer.toast(warning, "error");
-    const message = ok ? "" : (pending > 0 ? "unsaved " + pending : "not confirmed: " + String(state || "?")) + (timedOut ? " (timeout)" : "");
+    const warning = ok && state === "readonly" ? FTViewer._closeText("close.readonlyWarn") : "";
+    if (warning) FTViewer.toast(warning, "warn");
+    const late = timedOut ? FTViewer._closeText("close.timeout") : "";
+    const message = ok ? ""
+      : pending > 0 ? FTViewer._closeText("close.unsaved", { n: pending }) + late
+      : state === "readonly" ? FTViewer._closeText("close.readonlyBlocked")
+      : FTViewer._closeText("close.notConfirmed") + late;
     return { ok, pending, state, message, warning };
   };
 }

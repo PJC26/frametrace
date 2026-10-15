@@ -220,7 +220,7 @@ window.FTViewer = {
   focus() → boolean,                // 활성 카드(없으면 #recordGrid)에 포커스
   summary() → { total, byKind, byStatus, warned, marked, noted, pending },   // = __frametraceSummary() + pending(미저장 건수)
   saveState() → "saved"|"pending"|"saving"|"failed"|"queued"|"readonly"|"unknown"|"local"|null,   // readonly = 판독 기록 읽기 실패로 저장 차단(R4 A3), unknown = 저장 충돌 확인 실패(R4 A5) — 둘 다 "저장됨"이 아니다
-  save() → Promise<boolean>,         // 진행 중 저장의 응답을 먼저 기다리고 남은 것을 보낸다(R4 A15). true = 이 창에 미저장 없음(서버 대기열은 내구 저장이라 true), false = 실패·충돌·확인 실패·읽기 전용
+  save({ timeoutMs } = {}) → Promise<boolean>,   // 진행 중 저장의 응답을 먼저 기다리고 남은 것을 보낸다(R4 A15). true = 이 창에 미저장 없음(서버 대기열은 내구 저장이라 true), false = 실패·충돌·확인 실패·읽기 전용·시간 초과. timeoutMs = 이 호출의 응답 **전체 상한**(진행 중 저장 대기·충돌 조회·전송·busy 재시도 모두 포함, 기본 20 s, R7 §14.1) — 넘으면 false + `opts.timedOut = true`(요청은 계속 진행)
   setExaminer(name), getExaminer() → string|null,   // 검토자(마크 귀속). 호스트 선택 바에는 입력란이 없고 41-finalize `#finalExaminer`가 호출
   attributeUnassignedMarks(name) → Promise<number>,   // R4 A9: 그 마크들의 저장 응답까지 기다린 뒤 건수로 resolve, 저장 실패·충돌이면 reject(성공 통보 금지).   // setExaminer(name) 후, 검토자가 비어 있는 마크·메모를 같은 드래프트→저장 경로로 재전송하고 건수를 돌려줌(0이면 무동작). 서버 upsert는 `examiner = COALESCE(excluded.examiner, 기존)`이라 비어 있지 않은 새 값이 기존 값을 덮고 `review_mark_history`에 update로 남는다(src/case_db/marks.rs). setExaminer만으로는 이미 저장된 마크가 바뀌지 않는다
   writerToken,                       // 이 창의 고유 토큰: 이 창이 연 팝아웃만 `ft-player:<case>` 메시지에 담아 보내고, 토큰이 다른 창(같은 케이스의 다른 셸 탭)은 응답하지 않는다(단일 writer)
@@ -671,7 +671,7 @@ const FTStore = {
 - 작업 시트 단계 상태 `"partial"`(종료 코드 5, B16)은 경고 모습(`li.done.warned[data-step=partial]`, "부분 결과로 끝났습니다")이며 완료 단계로 센다.
 
 ### 12.3 셸 닫기 전 저장 (A15 ↔ C15)
-- 셸 JS `window.hBeforeClose(timeoutMs = 5000) → Promise<{ ok, pending, state, message }>`: `FTViewer.save()`(진행 중 저장의 응답 대기 포함)를 상한까지 기다린다. `ok:false`면 `message`가 확인창 문구("저장 안 된 편집 N건").
+- 셸 JS `window.hBeforeClose(timeoutMs = 5000) → Promise<{ ok, pending, state, message }>`: `FTViewer.save()`(진행 중 저장의 응답 대기 포함)를 상한까지 기다린다. `ok:false`면 `message`가 확인창 문구("저장 안 된 편집 N건"). **(R7 §14.1이 대체: 기본 4 s, 전체 상한, `warning` 추가, 독립 뷰어 페이지에도 있음)**
 - WebView2 경로(트랙 C 구현, src/shell.rs `FLUSH_SCRIPT`): WM_CLOSE 때 셸이 페이지에서 `FTViewer.save()`를 실행하고 결과 `{ft_close_save:1, ok, pending}`를 `chrome.webview.postMessage`로 받는다(대기 상한 5 s). `save()`는 진행 중 저장의 응답을 먼저 기다리며, 미저장·충돌·확인 실패·읽기 전용이면 false, 서버 대기열만 남았으면(내구 저장) true다.
 
 ### 12.4 기타
@@ -710,3 +710,35 @@ const FTStore = {
 - S13: 조인 차단 코드 `audio-only` 문구(80-review.js `JOIN_CODE_TEXT`; 서버 `message`가 있으면 그것이 우선).
 - S ↔ U14: launch 303은 `launch`만 빼고 나머지 쿼리·해시 유지. verify-layout 14번은 서버가 그렇게 답할 때 `?keep=1`까지 확인하고, 아니면 SKIP("awaits track S").
 - U17: 목록 안 위치는 `indexInList(list, id)`(목록마다 id→index 맵, 40-grid.js), 검토 진행 수는 `annotationGen`이 바뀔 때만 다시 센다. verify-virtual-grid가 5만 건에서 클릭·마크 지연 중앙값 < 200 ms를 확인.
+
+## 14. R7 트랙 U 추가 계약 (2026-10-15, docs/PLAN_R7_2026-10-15.md)
+
+### 14.1 저장·닫기 예산 (U1/U5/U10, S7 ↔ U)
+- `FTViewer.save({ timeoutMs })`(또는 `save(ms)`): `timeoutMs`는 **이 호출이 답하기까지의 전체 상한**이다 — 이미 전송 중인 저장의 응답 대기(`whenSaveSettled`), 충돌 조회 대기, 새 전송, busy 재시도(`retry_after_ms`) 모두 같은 마감 하나에 들어간다(R6은 busy 재시도만 묶고 진행 중 저장 대기는 무제한이었다). 마감이 지나면 `false`, 넘긴 옵션 객체에 `timedOut: true`. 요청 자체는 취소하지 않는다 — 늦게 온 응답도 드래프트를 정리한다.
+- 호출자별 예산: 명시적 저장(최종화 재시도 41-finalize, 케이스 전환 22-viewer-host·21-project, 귀속 `attributeUnassignedMarks`, 그 밖의 `save()` 무인자 호출)은 기본 **20 s**(`SAVE_CALLER_WAIT_MS` = `SAVE_BUSY_WAIT_MS`). 닫기(`hBeforeClose`)만 짧게 — 아래.
+- `window.hBeforeClose(timeoutMs = 4000) → Promise<{ ok, pending, state, message, warning }>`: 셸(src/shell.rs FLUSH_SCRIPT)은 `hBeforeClose(4000)`을 부르고 5 s까지 기다린다. `timeoutMs`는 **호출 시점부터의 전체 상한**: 뷰어 `save({ timeoutMs: timeoutMs − 250 })` + 백스톱 타이머(상한 − 100 ms, Windows 타이머 지연 여유)가 먼저 끝나는 쪽으로 답하고, 그 뒤는 동기 코드뿐이다. 시간 초과(백스톱 또는 `opts.timedOut`)면 `message` 끝에 " (저장 응답 대기 시간 초과)".
+  - 워크스테이션 셸 페이지: `assets/app/95-quit.js`(한국어 문구 고정).
+  - **독립 뷰어 페이지**(`/viewer/`, `/review/*.html`, `data-ft-host` 없음): `assets/viewer/00-host.js`가 같은 모양·같은 예산의 `window.hBeforeClose`를 정의한다. 문구는 뷰어 i18n `close.*`(`close.unsaved` "저장 안 된 편집 {n}건", `close.timeout`, `close.readonlyBlocked`, `close.notConfirmed`, `close.readonlyWarn`) — 기본 한국어, 영어 조각("unsaved N")은 없다. 마운트 전에는 한국어 고정 문구(`FTViewer._closeText`).
+  - `message`: `ok:false`일 때만(확인창 사유, 끝 마침표 없음). `warning`: 읽기 전용인데 이 창에 잃을 것이 없는 깨끗한 종료(`ok:true`)일 때 "판독 기록을 읽지 못한 상태였습니다 — …" — 페이지에도 **경고 토스트**(`warn`, 호박색 `toast-warn`; 오류 모습이 아님, U8)로 보인다.
+- 뷰어 토스트 종류: `FTViewer.toast(message, "info"|"warn"|"error")`, `toast` 이벤트 detail `kind`도 `"warn"`을 낸다(셸 01-store는 `"warn"`으로 옮김).
+
+### 14.2 알림 행 (U2/U9)
+- `#queueUnreadableNotice`(대기 파일 N개 읽기 실패)는 대기열이 비면(`afterQueueDrained`) **같은 페이지에서** 사라진다(저장 상태 툴팁·`data-queue-unreadable`도). 문구는 한 번만: "대기 파일 {n}개 읽기 실패 — 그 파일의 값은 화면에 보이지 않습니다. …".
+- `readPagedList`의 `unreadable` 집계: 이름(`file`) 있는 항목은 이름으로 한 번, 이름 없는 항목은 페이지 안 순번(`#k`)으로 — 같은 목록이 페이지마다 반복돼도 한 번, 이름 없는 두 파일은 두 개(하나로 합치지 않음).
+- `.ft-viewer > .ft-notices`는 최대 높이 `min(28vh, 216px)`, 넘치면 세로 스크롤(`overscroll-behavior: contain`). 스크롤되는 영역이라 `tabindex=0`, `role=region`, `aria-label` i18n `notices.label`("알림"). verify-layout: 1366×768(두 테마)에서 긴 알림 5개 → 행 ≤ 상한·스크롤·마지막 알림 도달 가능, 그리드 높이 ≥ 200 px, 선택 바 화면 안, 가로 스크롤 없음.
+
+### 14.3 팝아웃 캡처 (R6 U7 기록 + R7 U6)
+- 팝아웃의 모든 브리지 호출 `call(op, arg, cb, ms)`은 **두 경로 모두 시간 제한**: opener 직접 호출(`window.opener.__ftBridge`)이 Promise를 돌려주면 `ms`(기본 3 s, 캡처 `CAP_MS` 30 s) 뒤 `undefined`로 끝낸다(늦은 응답은 무시). BroadcastChannel 경로(`ft-player:<case>`, `token` 일치 창만 응답)도 같다.
+- 캡처: 먼저 `ping`(1.5 s). 답하면 `capture`를 요청 id `rid`(`<writerToken>-<시각>-<n>`)와 함께 브리지로 보내고, 답이 늦으면 다시 ping → 살아 있으면 **같은 `rid`로** 재요청(최대 5회; 뷰어는 창 단위 `window.__ftCaptureRids`(최근 32개)로 첫 요청의 결과를 그대로 돌려줌 — 프레임 하나에 파일 하나). ping이 처음부터 답이 없으면 그때만 직접 `POST /api/capture-frame`.
+- 문구 구분: 재요청이 끝나도 결과가 없을 때 — 뷰어가 ping에 **답함** → `player.capSlow`("캡처 응답이 늦습니다 — 메인 뷰어는 열려 있지만 …"), **답 없음** → `player.capUnsure`("… 메인 뷰어가 닫혔습니다 …"). 어느 쪽도 두 번째 POST를 보내지 않는다.
+
+### 14.4 원본 다시 가져오기 재확인 (U7)
+- `[원본 다시 가져오기]` 확인 대화상자에서 [삭제 후 다시 가져오기]를 누른 뒤 `GET /api/status`를 다시 읽는다: `busy`면, `raw_reimport`가 없거나 `raw_path`가 대화상자에 보인 것과 다르면, 상태를 읽지 못하면 POST 없이 취소하고 경고 토스트로 이유를 말한다. 대화상자가 열린 동안 두 번째 대화상자는 열리지 않는다.
+
+### 14.5 마크 수·필터 목록 (U4)
+- 검토 진행(`검토 n/m`), 판독 줄(`판독 x/m 완료 (중요 · 검증 대기)`), 선택 줄의 마크 수, `summary().marked`는 **증분 집계**(30-records.js `markTallyNow`): `bumpAnnotations(id)`가 바뀐 id를 모으고 다음 읽기에서 그 id만 반영. 수화(id 없는 bump)·`state.marks` 교체·4096건 초과 때만 전체 1회. j/k·클릭은 마크 맵을 돌지 않는다.
+- 마크·태그 칩 필터 목록(`filteredRecords`)은 주석만 바뀐 경우 바뀐 id(최대 256)만 필터에 다시 대 본다: 빠진 레코드는 옛 목록에서 잘라 내고(정렬은 주석을 읽지 않아 순서 유지), 옛 목록의 id→위치 맵을 잘린 위치 목록과 함께 재사용(`indexInListDerive`, 누적 512개까지) — 새 Map을 만들지 않는다. 새로 들어오는 레코드(정렬 위치 모름)·필터·정렬 변경·수화는 전체 계산. `_debugStats().filterComputes`는 두 경우 모두 1 증가(메모 무효화 계수).
+- verify-virtual-grid R7: 5만 건 중 4만 건 마크, `mark:important` 필터에서 j/k 1만 번 — 마크 맵 순회(`Object.keys/values/entries` ≥ 1만 키) 0, 1만 항목 이상 Map 생성 0, 1만 이상 배열 전체 순회 0, 시간 상한; 필터 안 마크 8번 — 다음 레코드로 이동, 마크 맵 순회·Map 재생성 0, 집계 일치.
+
+### 14.6 항진 검사 정리 (U3)
+- 소스 정규식으로 동작을 대신하던 검사(verify-review-batch: 대기 파일 표시, 독립 `hBeforeClose` 정의, 저장 예산 상수, 옵션 전달, base −1 독립 전송, 읽기 전용 `save()`)를 지우고 실제 페이지 검사(verify-range-sync ⑨·⑱·⑳·㉑·㉒, VM의 `hBeforeClose` 시간 검사)로 대신한다. verify-marks-sync ⑯은 S2 문자열 커서를 **요구**한다(숫자 커서 대체 분기 삭제).

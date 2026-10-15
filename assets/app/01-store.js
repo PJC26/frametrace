@@ -208,6 +208,6 @@ function hWireHostedViewer(v) {
   v.on("toast", e => {
     if (!FTStore.state.panels.finalize || !e || typeof e.preventDefault !== "function") return;
     e.preventDefault();
-    toast(String(d(e).message || ""), d(e).kind === "error" ? "err" : "info");
+    toast(String(d(e).message || ""), d(e).kind === "error" ? "err" : d(e).kind === "warn" ? "warn" : "info");
   });
 }

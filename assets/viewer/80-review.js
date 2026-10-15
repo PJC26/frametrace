@@ -322,13 +322,15 @@ function toast(message, opts) {
   const host = document.getElementById("toastHost");
   const text = String(message == null ? "" : message);
   const error = opts && opts.error != null ? !!opts.error : TOAST_ERROR_RE.test(text);
+  // R7 U8: a warning (amber) is neither an error nor plain information.
+  const warn = !error && !!(opts && opts.warn);
   // Host notification; a host that renders the message itself cancels it
   // (contract section 6.5: one toast host at a time, by default the viewer's).
-  if (FTViewer._emit("toast", { message: text, kind: error ? "error" : "info" }, true).defaultPrevented) return null;
+  if (FTViewer._emit("toast", { message: text, kind: error ? "error" : warn ? "warn" : "info" }, true).defaultPrevented) return null;
   ftAnnounce(text);
   if (!host) return null;
   const item = document.createElement("div");
-  item.className = error ? "toast toast-error" : "toast";
+  item.className = error ? "toast toast-error" : warn ? "toast toast-warn" : "toast";
   const body = document.createElement("span");
   body.className = "toast-text";
   body.textContent = text;
@@ -562,20 +564,12 @@ function setI18nTitle(el, key) {
   el.title = t(key);
 }
 
-var reviewedCount = null;
 function updateReviewMeta() {
   if (!reviewMeta) return;
   const total = records.length;
-  // R5 U17: recounted only when an annotation changed (annotationGen), not
-  // on every j/k or click (an O(n) pass over 50k records per render).
-  const gen = typeof annotationGen === "number" ? annotationGen : NaN;
-  if (!(reviewedCount && reviewedCount.gen === gen && reviewedCount.total === total)) {
-    // Marks are sparse: walk the mark map, not every record (R6 U8).
-    let n = 0;
-    for (const id of Object.keys(state.marks)) if (state.marks[id] && recordById.has(id)) n += 1;
-    reviewedCount = { gen, total, n };
-  }
-  const reviewed = reviewedCount.n;
+  // R7 U4: kept incrementally (30-records.js markTallyNow: by changed id) —
+  // a mark no longer walks the whole mark map (R6 recounted it per mark).
+  const reviewed = markTallyNow().n;
   reviewMeta.progressText.textContent = tf("progress.label", { n: reviewed, m: total });
   reviewMeta.meter.max = Math.max(1, total);
   reviewMeta.meter.value = reviewed;

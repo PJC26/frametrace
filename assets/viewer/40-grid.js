@@ -87,14 +87,53 @@ var filterComputeCount = 0;
 // Every FILTER input (no sort): the facet memo keys on this alone, so a
 // new filter dimension added here invalidates both memos and a sort change
 // never recomputes the facet counts (no positional slicing of the key).
-function filterStateKey() {
+function filterStateKey(withGen = true) {
   const chip = state.chip || "";
   const annotated = chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:");
-  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.audio, annotated ? "a" + annotationGen : ""].join("\u0001");
+  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.audio, annotated && withGen ? "a" + annotationGen : ""].join("\u0001");
 }
-function filterMemoKey() {
-  const base = filterStateKey();
+function filterMemoKey(withGen = true) {
+  const base = filterStateKey(withGen);
   return base === null ? null : base + "\u0001" + state.sortBy;
+}
+// R7 U4: the ids whose annotations changed since the memoised list was
+// made (30-records.js bumpAnnotations). Under a mark / tag chip a mark
+// used to re-filter and re-sort every record and rebuild the id → index
+// map; now only these ids are re-tested against the filter: a record that
+// left is cut out of the old list (same order — the sort never reads
+// annotations) and the old position map is reused with that shift. A
+// record that JOINS the list (its sorted place unknown) or a change of
+// everything (hydration, > 256 ids) still runs the full filter + sort.
+var filterTouched = new Set();
+var filterTouchedAll = true;
+function noteFilterTouched(id) {
+  if (!filterTouched) return; // boot hydration runs before this file: the first list is a full compute anyway
+  if (id == null || filterTouched.size >= 256) { filterTouchedAll = true; filterTouched.clear(); }
+  else if (!filterTouchedAll) filterTouched.add(id);
+}
+function recordPassesFilter(record, chip, query) {
+  return passesKind(record) && passesRecType(record) && passesDate(record) && passesAudio(record) && passesRest(record, chip, query);
+}
+// The new list from `old` when only the touched ids changed, or null (run
+// the full filter). Returns `old` itself when no touched id left or joined.
+function deriveFilteredList(old) {
+  if (filterTouchedAll || !Array.isArray(old)) return null;
+  const chip = state.chip || "";
+  const query = state.query || "";
+  const cut = [];
+  for (const id of filterTouched) {
+    const record = recordById.get(id);
+    const at = indexInList(old, id);
+    const passes = !!record && recordPassesFilter(record, chip, query);
+    if (at >= 0 && !passes) cut.push(at);
+    else if (at < 0 && passes) return null;
+  }
+  if (!cut.length) return old;
+  cut.sort((a, b) => a - b);
+  const list = old.slice();
+  for (let i = cut.length - 1; i >= 0; i--) list.splice(cut[i], 1);
+  indexInListDerive(list, old, cut);
+  return list;
 }
 
 // R5 U17: position of a record id in a list (the memoised filteredRecords()
@@ -103,6 +142,10 @@ function filterMemoKey() {
 // O(n) per key. One id → index map per list (built once, checked against
 // the list's length and the entry it points at, so a list changed in place
 // is re-indexed rather than misread).
+// R7 U4: an entry may be DERIVED from an older list's map (`cut`: sorted
+// positions, in that map's numbering, cut out since) — a position is the
+// mapped one minus the cuts before it, checked against the entry it points
+// at like any other.
 function indexInList(list, id) {
   if (!Array.isArray(list) || id == null) return -1;
   const listIndexCache = indexInList.cache || (indexInList.cache = new WeakMap()); // self-contained (VM harness)
@@ -110,21 +153,59 @@ function indexInList(list, id) {
   if (!entry || entry.len !== list.length) {
     const map = new Map();
     for (let i = 0; i < list.length; i++) if (list[i] && !map.has(list[i].id)) map.set(list[i].id, i);
-    entry = { len: list.length, map };
+    entry = { len: list.length, map, cut: null };
     listIndexCache.set(list, entry);
   }
-  const at = entry.map.get(id);
+  let at = entry.map.get(id);
   if (at === undefined) return -1;
+  if (entry.cut) {
+    const cut = entry.cut;
+    let lo = 0, hi = cut.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cut[mid] < at) lo = mid + 1; else hi = mid; }
+    if (lo < cut.length && cut[lo] === at) return -1; // cut out of this list
+    at -= lo;
+  }
   if (list[at] && list[at].id === id) return at;
   listIndexCache.delete(list);
   return list.findIndex(record => record && record.id === id);
 }
+// R7 U4: `list` = `old` minus the records at positions `cutNow` (old's
+// numbering, sorted) — it reuses old's map instead of building its own.
+// Past 512 accumulated cuts the next lookup rebuilds the map once instead.
+function indexInListDerive(list, old, cutNow) {
+  const listIndexCache = indexInList.cache || (indexInList.cache = new WeakMap());
+  const base = listIndexCache.get(old);
+  if (!base || base.len !== old.length) return;
+  let cut = cutNow;
+  if (base.cut) {
+    // old's position → the base map's position (the pos-th kept one).
+    const toBase = (pos) => {
+      let q = pos, k = 0;
+      for (;;) {
+        while (k < base.cut.length && base.cut[k] <= q) k++;
+        if (pos + k === q) return q;
+        q = pos + k;
+      }
+    };
+    cut = base.cut.concat(cutNow.map(toBase)).sort((a, b) => a - b);
+  }
+  if (cut.length > 512) return;
+  listIndexCache.set(list, { len: list.length, map: base.map, cut });
+}
 function filteredRecords() {
   const key = filterMemoKey();
-  if (key !== null && filteredMemo.key === key) return filteredMemo.list;
+  if (key !== null && filteredMemo.key === key) {
+    filterTouched.clear();
+    filterTouchedAll = false;
+    return filteredMemo.list;
+  }
   filterComputeCount += 1;
-  const list = computeFilteredRecords();
-  filteredMemo = { key, list };
+  const base = filterMemoKey(false);
+  const sameFilter = key !== null && Array.isArray(filteredMemo.list) && filteredMemo.base === base;
+  const list = (sameFilter && deriveFilteredList(filteredMemo.list)) || computeFilteredRecords();
+  filterTouched.clear();
+  filterTouchedAll = false;
+  filteredMemo = { key, base, list };
   return list;
 }
 
@@ -697,15 +778,10 @@ function renderGrid(filtered) {
   const rangeEnd = Math.min(filtered.length, start + pageRows.length);
   const rangeStart = filtered.length ? start + 1 : 0;
   els.pageStatus.textContent = `${rangeStart}–${rangeEnd} / ${filtered.length} · ${state.currentPage}/${pageCount}`;
-  // Marks are sparse: walk the mark map, not every record (PERF-03).
-  let reviewed = 0, important = 0, pending = 0;
-  for (const [id, mark] of Object.entries(state.marks)) {
-    if (!recordById.has(id)) continue;
-    const status = mark?.status;
-    if (status === "reviewed") reviewed += 1;
-    else if (status === "important") important += 1;
-    else if (status === "needs_verification") pending += 1;
-  }
+  // R7 U4: the incremental mark tally (30-records.js markTallyNow) — no
+  // walk of the mark map on every render (j/k re-render, a click).
+  const tally = markTallyNow().byStatus;
+  const reviewed = tally.reviewed || 0, important = tally.important || 0, pending = tally.needs_verification || 0;
   // Status texts are plain (non-live) — one polite region (#gridLive)
   // announces the result count, and only when the filter result changes,
   // never on j/k or a mark.

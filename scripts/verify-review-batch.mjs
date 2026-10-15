@@ -254,6 +254,8 @@ async function unitTests() {
   // Exercises the paged renderer; the virtual grid has its own Playwright check.
   const grid = { state, records, recordById: new Map(records.map(r => [r.id, r])), els, t: x => x, tf, escapeHtml: x => x, groupKeyFor: () => 'group', renderCard: r => `<card>${r.id}</card>`, groupHeaderHtml: key => `<hdr>${key}</hdr>`, announceResultCount: () => {}, virtualGridEnabled: () => false, document: { body: { classList: { toggle: () => {} } } } };
   runInNewContext(fn('indexInList'), grid); // R6 U8: renderGrid looks the active id up by its index map
+  // R7 U4: the triage line reads the incremental mark tally.
+  runInNewContext('var markTally = null, markTallyTouched = new Set(), markTallyAll = true, markTallyFullCount = 0;\n' + ['markTallyNote', 'markTallyBucket', 'markTallyMove', 'markTallyNow'].map(fn).join('\n'), grid);
   const selectedSource = source.match(/^function selectedRecord\(\).*$/m)[0];
   assert.equal(runInNewContext(selectedSource + '\nselectedRecord();', grid), records[0]);
   runInNewContext(fn('renderGrid') + '\nrenderGrid([]);', grid);
@@ -766,8 +768,19 @@ async function r6TrackU({ fn, source, runInNewContext, assert, ex }) {
   const got = await runInNewContext(fn('readPagedList') + '\nCONFLICT_PAGE=500;CONFLICT_PAGES_MAX=2000;\nreadPagedList(get, "/api/marks-pending", d => d.entries);', pg);
   assert.ok(got.length === 800 && new Set(got.map((e) => e.id)).size === 800 && !got.truncated && JSON.stringify(seen) === '["o0","a4:499"]', 'U1: 800 ids of one file across the page boundary by string cursor: ' + JSON.stringify(seen));
   assert.ok(Array.isArray(got.unreadable) && got.unreadable.length === 2, 'U2: unreadable queue files carried (once per file over 2 pages): ' + JSON.stringify(got.unreadable));
-  assert.ok(/noteQueueUnreadable\(items && items\.unreadable \? items\.unreadable\.length : 0\)/.test(source), 'U2: the queue load shows the unreadable files');
+  // (R7 U3: the source-regex check that the queue load shows them is gone —
+  // verify-range-sync ⑱ shows the notice in a real page and its drain.)
   console.log('PASS VM R6 U1/U2 string cursor across a file boundary, unreadable queue files kept');
+  // R7 U9: entries without a file name are not ONE file: two nameless
+  // entries (repeated on both pages) count two, a named one counts once.
+  const nl = { get: async (url) => {
+    const q = new URL(url, 'http://x').searchParams;
+    const second = q.has('after');
+    return { ok: true, count: 2, next_after: second ? null : 'c1', entries: [{ id: second ? 'b' : 'a', cursor: second ? 'c2' : 'c1' }], unreadable: [{ error: 'EOF' }, { file: '', error: 'utf-8' }, { file: '0009.json', error: 'x' }] };
+  } };
+  const gotNl = await runInNewContext(fn('readPagedList') + '\nCONFLICT_PAGE=500;CONFLICT_PAGES_MAX=2000;\nreadPagedList(get, "/api/marks-pending", d => d.entries);', nl);
+  assert.ok(Array.isArray(gotNl.unreadable) && gotNl.unreadable.length === 3, 'R7 U9: two nameless unreadable entries are two files (+1 named), not merged into one: ' + JSON.stringify(gotNl.unreadable));
+  console.log('PASS VM R7 U9 nameless unreadable queue entries are counted apart');
 
   // U3: [원본 다시 가져오기] only while the server names a waiting raw
   // (hRawReimport); a re-render keeps its in-progress state; a busy
@@ -791,6 +804,33 @@ async function r6TrackU({ fn, source, runInNewContext, assert, ex }) {
   assert.equal(ex.__calls.length, 0, 'U3: the handler refuses without a waiting raw');
   console.log('PASS VM R6 U3 reimport button: only with raw_reimport, state kept across re-renders, disabled while busy');
 
+  // R7 U7: the examiner confirms, but meanwhile a job started or the
+  // server's raw decision changed — re-read /api/status, cancel (said so),
+  // never POST the delete on a stale decision. Unchanged → it goes.
+  const waiting = { raw_path: 'C:/case/raw/e.raw', reason: 'marker mismatch', endpoint: '/api/reimport-raw' };
+  ex.__toasts7 = [];
+  ex.__status = null;
+  runInNewContext('toast = (m, k) => { __toasts7.push([m, k]); }; jget = async (u) => { if (u !== "/api/status") throw new Error(u); return __status; };', ex);
+  const reimport7 = async (status) => {
+    ex.__calls = [];
+    ex.__toasts7.length = 0;
+    ex.__status = status;
+    ex.__waiting = waiting;
+    runInNewContext('hStatusBusy = false; reimportRawBusy = false; hRawReimport = __waiting;', ex);
+    await runInNewContext('hReimportRaw(null)', ex);
+    return { posts: ex.__calls.length, toasts: ex.__toasts7.map(([m, k]) => k + ':' + m) };
+  };
+  const busy7 = await reimport7({ busy: true, raw_reimport: waiting });
+  assert.ok(busy7.posts === 0 && busy7.toasts.some((t) => /^warn:.*작업이 시작되어/.test(t)), 'R7 U7: a job started while the dialog was open → no POST, said so: ' + JSON.stringify(busy7));
+  const moved7 = await reimport7({ busy: false, raw_reimport: { ...waiting, raw_path: 'C:/case/raw/other.raw' } });
+  assert.ok(moved7.posts === 0 && moved7.toasts.some((t) => /^warn:.*상태가 바뀌어/.test(t)), 'R7 U7: the waiting raw changed → no POST: ' + JSON.stringify(moved7));
+  const gone7 = await reimport7({ busy: false, raw_reimport: null });
+  assert.ok(gone7.posts === 0 && gone7.toasts.some((t) => /^warn:.*상태가 바뀌어/.test(t)), 'R7 U7: no raw waits any more → no POST: ' + JSON.stringify(gone7));
+  const ok7 = await reimport7({ busy: false, raw_reimport: { ...waiting } });
+  assert.ok(ok7.posts === 1 && ex.__calls[0][0] === '/api/reimport-raw' && ex.__calls[0][1].raw_path === waiting.raw_path, 'R7 U7: unchanged → exactly one POST of the confirmed raw: ' + JSON.stringify(ok7));
+  runInNewContext('hRawReimport = null; hStatusBusy = false;', ex);
+  console.log('PASS VM R7 U7 reimport re-checks busy / raw_reimport after the confirmation');
+
   // U4 (S ↔ U): the shell's close flush prefers hBeforeClose() — it must
   // answer inside the shell's 5 s wait: default 4 s, the viewer's busy
   // budget passed down (FTViewer.save({timeoutMs})), the read-only warning
@@ -803,22 +843,38 @@ async function r6TrackU({ fn, source, runInNewContext, assert, ex }) {
   const r4 = await runInNewContext('hBeforeClose()', ex);
   assert.ok(asked.length === 1 && asked[0] && asked[0].timeoutMs > 0 && asked[0].timeoutMs < 4500, 'U4: hBeforeClose passes a busy budget below the shell\'s 5 s wait to FTViewer.save: ' + JSON.stringify(asked));
   assert.ok(r4.ok === true && r4.pending === 0 && /판독 기록을 읽지 못한/.test(r4.warning) && ex.__toasts.some(([m, k]) => /판독 기록을 읽지 못한/.test(m) && k === 'warn'), 'U4: read-only close → ok + warning, and the warning is shown: ' + JSON.stringify([r4, ex.__toasts]));
-  runInNewContext('FTStore.state.viewer.mounted = false;', ex);
-  // Standalone pages answer too (00-host.js): same shape, prefers the viewer's own hook.
-  assert.ok(/window\.hBeforeClose = async \(timeoutMs = 4000\)/.test(source) && /!document\.documentElement\.hasAttribute\("data-ft-host"\)/.test(source), 'U4: a standalone viewer page defines window.hBeforeClose (not on the shell page)');
+  // (R7 U3: the source-regex checks that stood for behaviour are gone — the
+  // standalone hBeforeClose (verify-range-sync ⑨/㉒), the per-caller save
+  // budget (⑳) and the independent base -1 body (㉑) run in a real page.)
   console.log('PASS VM R6 U4 hBeforeClose: prompt (4 s, budget passed down), read-only warning returned and shown');
 
-  // U5: FTViewer.save(opts) — the caller's busy budget (default 5 s), not a fixed 20 s for every caller.
-  const saveFn = source.match(/^ {2}async save\(opts\) \{[^]*?^ {2}\},/m)?.[0] || '';
-  assert.ok(/SAVE_CALLER_WAIT_MS/.test(saveFn) && /Math\.min\(SAVE_BUSY_WAIT_MS/.test(saveFn) && /const SAVE_CALLER_WAIT_MS = 5000;/.test(source), 'U5: save(opts) takes the caller\'s budget (default 5 s, capped at 20 s)');
-  assert.ok(/async save\(opts\) \{ return impl \? impl\.save\(opts\) : true; \}/.test(source), 'U5: FTViewer.save passes the options through');
-  console.log('PASS VM R6 U5 per-caller save budget');
-
-  // U9: the base -1 group's failure no longer stops the loop before the ordinary group.
-  const syncFn = fn('syncMarksNow') || '';
-  const unsafeBlock = syncFn.match(/if \(group\.unsafe\) \{[^]*?continue;\s*\}/)?.[0] || '';
-  assert.ok(unsafeBlock && !/break/.test(unsafeBlock) && !/if \(result && !result\.ok\) break;/.test(syncFn), 'U9: the unsafe body is sent independently of the ordinary edits');
-  console.log('PASS VM R6 U9 unsafe group sent independently');
+  // R7 U1 (S7 ↔ U): hBeforeClose(timeoutMs) is a HARD TOTAL from the call —
+  // a viewer save that never answers (a request left on the wire) gets
+  // the budget minus a margin, and the backstop answers BEFORE the budget
+  // is up (the shell's 4 s call leaves its own 5 s wait room); a save that
+  // reports its own deadline (opts.timedOut) is said as a timeout.
+  const realTimers = { setTimeout: ex.setTimeout, clearTimeout: ex.clearTimeout };
+  ex.setTimeout = setTimeout;
+  ex.clearTimeout = clearTimeout;
+  try {
+    const askedU1 = [];
+    ex.__api = { save: (opts) => { askedU1.push({ ...opts }); return new Promise(() => {}); }, summary: () => ({ pending: 2 }), saveState: () => 'saving' };
+    runInNewContext('FTStore.state.viewer.mounted = true;', ex);
+    let t0 = Date.now();
+    const hung = await runInNewContext('hBeforeClose(1000)', ex);
+    const hungMs = Date.now() - t0;
+    assert.ok(hungMs < 1000 && hung.ok === false && /^저장 안 된 편집 2건 \(저장 응답 대기 시간 초과\)$/.test(hung.message), `R7 U1: a hanging save → answered within the 1000 ms total (${hungMs} ms), Korean timeout message: ` + JSON.stringify(hung));
+    assert.ok(askedU1.length === 1 && askedU1[0].timeoutMs > 0 && askedU1[0].timeoutMs < 1000, 'R7 U1: the viewer save gets less than the total: ' + JSON.stringify(askedU1));
+    ex.__api = { save: async (opts) => { opts.timedOut = true; return false; }, summary: () => ({ pending: 0 }), saveState: () => 'saving' };
+    t0 = Date.now();
+    const own = await runInNewContext('hBeforeClose(1000)', ex);
+    assert.ok(Date.now() - t0 < 500 && own.ok === false && /시간 초과/.test(own.message), 'R7 U1: the viewer\'s own deadline (opts.timedOut) reads as a timeout: ' + JSON.stringify(own));
+  } finally {
+    ex.setTimeout = realTimers.setTimeout;
+    ex.clearTimeout = realTimers.clearTimeout;
+    runInNewContext('FTStore.state.viewer.mounted = false;', ex);
+  }
+  console.log('PASS VM R7 U1 hBeforeClose hard total budget (hanging save, viewer deadline)');
 
   // U11: the harness job's limit has a measured basis.
   const yml = readFileSync(new URL('../.github/workflows/harnesses.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
@@ -962,7 +1018,8 @@ async function r5TrackU({ fn, source, grid, state, runInNewContext, assert, appS
   api.summary = () => ({ pending: 2 });
   const c15b = await runInNewContext('hBeforeClose(1000)', ex);
   assert.ok(c15b.ok === false && /저장 안 된 편집 2건/.test(c15b.message), 'U15: read-only WITH drafts still asks');
-  assert.ok(/if \(annotationsReadOnly\) return !Object\.keys\(state\.drafts\)\.length && !state\.dirtyIds\.size && !conflictIds\.size;/.test(source), 'U15: FTViewer.save() is true read-only only when nothing is held here');
+  // (R7 U3: the source-regex stand-in for FTViewer.save()'s read-only rule
+  // is gone — verify-range-sync ⑨ checks it in a real page.)
   runInNewContext('FTStore.state.viewer.mounted = false;', ex);
   console.log('PASS VM R5 U15 read-only close without edits: no confirmation');
 
@@ -975,7 +1032,8 @@ async function r5TrackU({ fn, source, grid, state, runInNewContext, assert, appS
   // server named (/api/status.raw_reimport).
   ex.__calls = [];
   ex.__answer = false;
-  runInNewContext('hRawReimport = { raw_path: "C:/case/raw/e.raw", reason: "marker mismatch", endpoint: "/api/reimport-raw" }; askDialog = async () => __answer; jpost = async (u, b) => { __calls.push([u, b]); return { ok: true }; }; poll = () => {};', ex);
+  // (R7 U7: after the confirmation /api/status is read again — unchanged here.)
+  runInNewContext('hRawReimport = { raw_path: "C:/case/raw/e.raw", reason: "marker mismatch", endpoint: "/api/reimport-raw" }; askDialog = async () => __answer; jpost = async (u, b) => { __calls.push([u, b]); return { ok: true }; }; poll = () => {}; jget = async () => ({ busy: false, raw_reimport: { raw_path: "C:/case/raw/e.raw", reason: "marker mismatch", endpoint: "/api/reimport-raw" } });', ex);
   await runInNewContext('hReimportRaw(null)', ex);
   assert.equal(ex.__calls.length, 0, 'S6: cancelled confirmation → nothing posted');
   ex.__answer = true;

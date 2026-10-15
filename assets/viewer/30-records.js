@@ -990,7 +990,73 @@ var markRowMaybe = new Set();
 // replayed draft, hydration, a server value applied by 90-sync): the
 // filter memo of the mark/tag chips keys on it (40-grid filterStateKey, U7).
 var annotationGen = 0;
-function bumpAnnotations() { annotationGen += 1; }
+// R7 U4: `id` = the one record whose annotations changed (touchAnnotation,
+// a replayed draft, a server value); no id = everything may have changed
+// (hydration). The mark tally and the filtered-list memo use it to update
+// by the changed ids instead of walking every mark / record again.
+function bumpAnnotations(id) {
+  annotationGen += 1;
+  markTallyNote(id);
+  if (typeof noteFilterTouched === "function") noteFilterTouched(id);
+}
+
+// R7 U4: the mark counts shown on every render (검토 n/m, the triage line,
+// the selection line, summary().marked) kept INCREMENTALLY: a full walk of
+// the mark map only after hydration or a swapped map, otherwise O(changed
+// ids) — j/k and a click cost nothing here, a mark costs one id.
+//   all       — keys in state.marks (summary().marked, the selection line)
+//   n         — of those, records of this case (review progress)
+//   byStatus  — reviewed / important / needs_verification among n
+var markTally = null;
+var markTallyTouched = new Set();
+var markTallyAll = true;
+var markTallyFullCount = 0; // full walks of the mark map (FTViewer._debugStats().tallyFull, harness)
+function markTallyNote(id) {
+  if (!markTallyTouched) return; // before this file ran: the first tally is a full count anyway
+  if (id == null || markTallyTouched.size >= 4096) { markTallyAll = true; markTallyTouched.clear(); }
+  else if (!markTallyAll) markTallyTouched.add(id);
+}
+function markTallyBucket(id) {
+  const mark = state.marks[id];
+  if (!mark) return null;
+  return recordById.has(id) ? String(mark.status || "") : "";   // "" = a mark of an id this case does not list
+}
+function markTallyMove(tally, from, to) {
+  if (from !== null) {
+    tally.all -= 1;
+    if (from !== "") { tally.n -= 1; tally.byStatus[from] = (tally.byStatus[from] || 0) - 1; }
+  }
+  if (to !== null) {
+    tally.all += 1;
+    if (to !== "") { tally.n += 1; tally.byStatus[to] = (tally.byStatus[to] || 0) + 1; }
+  }
+}
+function markTallyNow() {
+  if (markTallyAll || !markTally || markTally.ref !== state.marks || markTally.records !== recordById.size) {
+    markTallyFullCount += 1;
+    const tally = { ref: state.marks, records: recordById.size, all: 0, n: 0, byStatus: {}, seen: new Map() };
+    for (const id in state.marks) {
+      if (!Object.prototype.hasOwnProperty.call(state.marks, id)) continue;
+      const bucket = markTallyBucket(id);
+      if (bucket === null) continue;
+      tally.seen.set(id, bucket);
+      markTallyMove(tally, null, bucket);
+    }
+    markTally = tally;
+    markTallyAll = false;
+    markTallyTouched.clear();
+    return markTally;
+  }
+  for (const id of markTallyTouched) {
+    const was = markTally.seen.has(id) ? markTally.seen.get(id) : null;
+    const now = markTallyBucket(id);
+    if (was === now) continue;
+    markTallyMove(markTally, was, now);
+    if (now === null) markTally.seen.delete(id); else markTally.seen.set(id, now);
+  }
+  markTallyTouched.clear();
+  return markTally;
+}
 const DRAFT_FLUSH_MS = 250;
 const DRAFT_PREFIX = "ft.draft." + (manifest.case_id || "case") + ".";
 const ALIVE_PREFIX = "ft.alive:" + (manifest.case_id || "case") + ":";
@@ -1212,7 +1278,7 @@ function refuseLockedEdit() {
 // wrote the stored revision (the same-window exception does not apply).
 // Only a conflict resolution (opts.base) clears the mark.
 function touchAnnotation(id, opts) {
-  if (typeof bumpAnnotations === "function") bumpAnnotations();
+  if (typeof bumpAnnotations === "function") bumpAnnotations(id);
   state.examiners[id] = (state.examiner || "").trim() || state.examiners[id] || null;
   const prev = state.drafts[id];
   const known = state.revisions && Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
@@ -1244,7 +1310,7 @@ function dropDraft(id) {
 
 // Replays one stored draft's values into the in-memory annotation maps.
 function applyDraftValues(id, draft) {
-  if (typeof bumpAnnotations === "function") bumpAnnotations();
+  if (typeof bumpAnnotations === "function") bumpAnnotations(id);
   if (draft.mark) state.marks[id] = draft.mark;
   else delete state.marks[id];
   state.notes[id] = draft.note || "";
@@ -1561,7 +1627,7 @@ window.__frametraceSummary = () => {
     byKind,
     byStatus,
     warned,
-    marked: Object.keys(state.marks).length,
+    marked: markTallyNow().all,
     noted: records.filter(r => (state.notes[r.id] || "").trim()).length
   };
 };

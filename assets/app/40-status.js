@@ -139,20 +139,53 @@ function errorHtml(raw) {
 // One delegated handler for every error box that shows the button. A
 // server without the route (older build) says so instead of failing silently.
 var reimportRawBusy = false;
+var reimportRawAsking = false;
+// R7 U7: the confirmation can stay open for a while — the pipeline may
+// have started a job, or the server may no longer wait for (or now wait
+// for a different) raw decision. Re-read /api/status after the examiner
+// confirms; anything changed cancels (said so), nothing is deleted on a
+// stale decision.
+async function hReimportRawStillValid(pending) {
+  let st = null;
+  try { st = await jget("/api/status"); } catch (e) { st = null; }
+  if (!st || typeof st !== "object" || st.ok === false || st.network) return "서버 상태를 다시 확인하지 못해 원본 다시 가져오기를 취소했습니다 — 잠시 후 다시 시도하십시오.";
+  hStatusBusy = !!st.busy;
+  hRawReimport = st.raw_reimport && typeof st.raw_reimport === "object" ? st.raw_reimport : null;
+  if (st.busy) return "그 사이 작업이 시작되어 원본 다시 가져오기를 취소했습니다 — 작업이 끝난 뒤 다시 누르십시오.";
+  const now = hRawReimport;
+  if (!now || String(now.raw_path || "") !== String((pending && pending.raw_path) || "")) {
+    return "그 사이 서버의 원본 결정 대기 상태가 바뀌어 원본 다시 가져오기를 취소했습니다 — 화면의 현재 상태를 확인하십시오.";
+  }
+  return "";
+}
 async function hReimportRaw(btn) {
-  if (reimportRawBusy || hStatusBusy || !hRawReimport) return;
+  if (reimportRawBusy || reimportRawAsking || hStatusBusy || !hRawReimport) return;
   const pending = hRawReimport;
   // It deletes the kept raw image and makes it again from the evidence: ask.
-  const go = await askDialog({
-    title: "원본 이미지 다시 가져오기",
-    html: `<p>보관된 원본 이미지(raw)가 기록과 다릅니다${pending && pending.reason ? ` (${esc(String(pending.reason))})` : ""}.</p>` +
-      (pending && pending.raw_path ? `<p><code>${esc(String(pending.raw_path))}</code></p>` : "") +
-      `<p>계속하면 이 raw 파일을 <b>삭제</b>하고(감사 로그에 기록) 증거 이미지(E01)에서 다시 만든 뒤 같은 분석을 다시 실행합니다.</p>`,
-    okLabel: "삭제 후 다시 가져오기",
-    cancelLabel: "취소",
-    danger: true,
-    focus: "dlgCancel",
-  });
+  reimportRawAsking = true;
+  let go = false;
+  try {
+    go = await askDialog({
+      title: "원본 이미지 다시 가져오기",
+      html: `<p>보관된 원본 이미지(raw)가 기록과 다릅니다${pending && pending.reason ? ` (${esc(String(pending.reason))})` : ""}.</p>` +
+        (pending && pending.raw_path ? `<p><code>${esc(String(pending.raw_path))}</code></p>` : "") +
+        `<p>계속하면 이 raw 파일을 <b>삭제</b>하고(감사 로그에 기록) 증거 이미지(E01)에서 다시 만든 뒤 같은 분석을 다시 실행합니다.</p>`,
+      okLabel: "삭제 후 다시 가져오기",
+      cancelLabel: "취소",
+      danger: true,
+      focus: "dlgCancel",
+    });
+    if (go) {
+      const stale = await hReimportRawStillValid(pending);
+      if (stale) {
+        go = false;
+        toast(stale, "warn");
+        if (typeof poll === "function") { clearTimeout(pollTimer); poll(); }
+      }
+    }
+  } finally {
+    reimportRawAsking = false;
+  }
   if (!go) return;
   reimportRawBusy = true;
   const live = () => (btn && btn.isConnected ? btn : document.querySelector("button[data-reimport-raw]"));

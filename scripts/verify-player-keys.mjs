@@ -51,13 +51,19 @@ const html = buildViewer();
 // R6 U6: the same page with unreadable review records (read-only).
 const htmlRo = buildViewer({ marks: [], tags: [], revisions: {}, error: 'database is locked' });
 let captures = 0;
-// '401' (R5 U8) | 'slow' (R6 U7: answers 200 after 1.5 s).
+// '401' (R5 U8) | 'slow' (R6 U7: answers 200 after 1.5 s) | 'hang' (R7 U6).
 let capMode = '401';
+const hungCaptures = [];
 const server = createServer((req, res) => {
   // R5 U8: the frame-capture POST is refused (401) like a stale cookie.
   if (req.url.startsWith('/api/capture-frame')) {
     captures += 1;
     res.setHeader('Content-Type', 'application/json');
+    if (capMode === 'hang') {
+      // R7 U6: the capture POST never answers (until released).
+      hungCaptures.push(res);
+      return;
+    }
     if (capMode === 'slow') {
       setTimeout(() => res.end(JSON.stringify({ ok: true, path: 'artifacts/captures/frame_' + captures + '.jpg' })), 1500);
       return;
@@ -270,9 +276,32 @@ try {
     const heard = await page.evaluate(() => window.__ftErr);
     check('U8: pop-out capture 401 → authorization refusal via the bridge (not "offline")', res && res.ok === false && res.auth === true && /인증 오류/.test(res.error) && captures === 1, JSON.stringify(res));
     check('U8: the host hears the 401 (auth error event)', heard.some((d) => d.auth === true && d.stage === 'request'), JSON.stringify(heard));
+    // R7 U6: through the OPENER (a direct __ftBridge call) a capture whose
+    // POST never answers used to leave the pop-out waiting forever (the
+    // opener path had no time limit). Now it times out like the channel
+    // path, re-asks with the same request id (one POST), and — the main
+    // viewer still answering the ping — says the reply is late, never
+    // "the main viewer closed".
+    capMode = 'hang';
+    const beforeHang = captures;
+    const hang = await popup.evaluate(async () => {
+      const viaOpener = !!(window.opener && window.opener.__ftBridge);
+      CAP_MS = 300;
+      document.getElementById('note').textContent = '';
+      const t0 = performance.now();
+      capture({ id: 'vid_a', image: 'AAAA', time: '0.00', rid: 'r-hang-1' });
+      for (let i = 0; i < 160 && !document.getElementById('note').textContent; i++) await new Promise((r) => setTimeout(r, 50));
+      return { viaOpener, ms: performance.now() - t0, note: document.getElementById('note').textContent };
+    }).catch((e) => ({ error: String(e) }));
+    check('R7 U6: opener path + a capture that never answers → the pop-out stops waiting (time limit), one POST', hang.viaOpener && !!hang.note && hang.ms < 7000 && captures - beforeHang === 1, JSON.stringify({ ...hang, posts: captures - beforeHang }));
+    check('R7 U6: the main viewer still answers → "응답이 늦습니다", not "메인 뷰어가 닫혔습니다"', /응답이 늦습니다/.test(hang.note || '') && !/닫혔습니다/.test(hang.note || ''), hang.note);
+    capMode = '401';
+    for (const res of hungCaptures.splice(0)) res.end('{"ok":false,"error":"released"}');
+    await popup.evaluate(() => { CAP_MS = 30000; });
     // R6 U7: the main viewer no longer answers (its channel token does not
     // match, no opener): the capture falls back to the direct POST after
     // the short ping — not after a 30 s wait.
+    const beforeDead = captures;
     const dead = await popup.evaluate(async () => {
       window.opener = null;
       window.__tok = TOKEN;
@@ -284,7 +313,7 @@ try {
       TOKEN = window.__tok;
       return { ms: performance.now() - t0, note: document.getElementById('note').textContent };
     }).catch((e) => ({ error: String(e) }));
-    check('U7: a dead main viewer → direct POST right after the ping (< 5 s, not 30 s)', dead.ms < 5000 && /인증 오류/.test(dead.note || '') && captures === 2, JSON.stringify({ ...dead, captures }));
+    check('U7: a dead main viewer → direct POST right after the ping (< 5 s, not 30 s)', dead.ms < 5000 && /인증 오류/.test(dead.note || '') && captures - beforeDead === 1, JSON.stringify({ ...dead, posts: captures - beforeDead }));
     // R6 U7: a capture whose reply is late (slow server) is asked for again
     // with the same request id — the main viewer answers the first request:
     // one POST, one frame file, the path shown. (Through the BroadcastChannel:

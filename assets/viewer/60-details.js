@@ -379,7 +379,7 @@ function renderMetrics() {
   if (els.metricAnomaly) {
     els.metricAnomaly.textContent = String(counts.anomaly);
   }
-  const markCount = Object.keys(state.marks).length;
+  const markCount = markTallyNow().all; // R7 U4: kept by changed id, not a walk of the mark map per render
   els.selectionCount.textContent = tf("sel.count", { n: state.selectedIds.size, m: markCount });
   if (typeof syncJoinButton === "function") syncJoinButton();
   if (els.caseWarnings) {
