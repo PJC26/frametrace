@@ -463,27 +463,41 @@ pub(crate) fn run_e01_pipeline_with(state: SharedState, job: PipelineJob, exe: &
     // case, a pre-marker case) is re-hashed against the recorded SHA-256
     // first; one that still cannot be confirmed is NOT deleted — the run
     // stops and the examiner decides (`/api/reimport-raw`).
-    let reuse_existing_raw =
-        match crate::e01::reconcile_raw(&job.case_dir, &raw_path, &job.source_path, &|_| {
+    // R6-S4: the re-hash reports progress (`/api/status.progress`,
+    // job_type `raw-rehash`) and stops on cancel.
+    let rehash_hooks = crate::e01::RehashHooks {
+        on_rehash: &|_| {
             log(
                 &state,
                 format!("기존 raw 이미지의 SHA-256을 임포트 기록과 다시 비교합니다: {raw_text}"),
             )
-        }) {
-            crate::e01::RawReuse::Reuse => true,
-            crate::e01::RawReuse::Absent => false,
-            crate::e01::RawReuse::NeedsReimport(reason) => {
-                set_step(&state, 1, StepStatus::Failed);
-                let message = raw_mismatch_error(&reason, &raw_path);
-                state_lock(&state).raw_reimport = Some(super::state::RawReimport {
-                    raw_path: raw_path.clone(),
-                    reason,
-                    job: job.clone(),
-                });
-                fail(&state, &message);
-                return;
-            }
-        };
+        },
+        progress: &|done, total| state_lock(&state).rehash_progress = Some((done, total)),
+        cancelled: &|| state_lock(&state).cancel_requested,
+    };
+    let reconciled =
+        crate::e01::reconcile_raw(&job.case_dir, &raw_path, &job.source_path, &rehash_hooks);
+    state_lock(&state).rehash_progress = None;
+    let reuse_existing_raw = match reconciled {
+        crate::e01::RawReuse::Reuse => true,
+        crate::e01::RawReuse::Absent => false,
+        crate::e01::RawReuse::Cancelled => {
+            set_step(&state, 1, StepStatus::Failed);
+            fail(&state, "사용자가 분석을 중단했습니다.");
+            return;
+        }
+        crate::e01::RawReuse::NeedsReimport(reason) => {
+            set_step(&state, 1, StepStatus::Failed);
+            let message = raw_mismatch_error(&reason, &raw_path);
+            state_lock(&state).raw_reimport = Some(super::state::RawReimport {
+                raw_path: raw_path.clone(),
+                reason,
+                job: job.clone(),
+            });
+            fail(&state, &message);
+            return;
+        }
+    };
     if reuse_existing_raw {
         log(&state, format!("기존 raw 이미지 재사용: {raw_text}"));
         set_step(&state, 1, StepStatus::Done);
@@ -1902,7 +1916,46 @@ pub(crate) fn api_marks_pending(request: &Request, state: &SharedState) -> Strin
         return api_err("열린 케이스가 없습니다.");
     };
     let (offset, limit) = page_params(&request.query);
-    marks_pending_json_at(&case_dir, offset, limit, page_after(&request.query)).to_string()
+    marks_pending_json_at(&case_dir, offset, limit, pending_page_after(&request.query)).to_string()
+}
+
+/// R6-S2: a `/api/marks-pending` cursor — the position `(file_seq,
+/// index)` of an id's FIRST appearance: the queued file's arrival number
+/// and the index of the item inside that file (marks, then tags, then
+/// deleted ids, counted together). Ordered lexicographically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PendingCursor {
+    pub(crate) seq: u64,
+    pub(crate) index: u64,
+}
+
+impl PendingCursor {
+    /// `"<seq>:<index>"`, the string the API hands out.
+    pub(crate) fn text(&self) -> String {
+        format!("{}:{}", self.seq, self.index)
+    }
+
+    /// Parses `"<seq>:<index>"`, or a bare `<seq>` (the R5 numeric
+    /// cursor: everything of that file counts as seen).
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        match text.split_once(':') {
+            Some((seq, index)) => Some(PendingCursor {
+                seq: seq.trim().parse().ok()?,
+                index: index.trim().parse().ok()?,
+            }),
+            None => Some(PendingCursor {
+                seq: text.parse().ok()?,
+                index: u64::MAX,
+            }),
+        }
+    }
+}
+
+/// `?after=` of `/api/marks-pending` (R6-S2): a string cursor or, from
+/// an R5 viewer, a number. `None` when absent or unparsable.
+pub(crate) fn pending_page_after(query: &str) -> Option<PendingCursor> {
+    query_value(query, "after").and_then(|v| PendingCursor::parse(&v))
 }
 
 /// Pure part of [`api_marks_pending`] (offset paging).
@@ -1915,21 +1968,24 @@ pub(crate) fn marks_pending_json(
     marks_pending_json_at(case_dir, offset, limit, None)
 }
 
-/// R5-S11: each folded entry's `seq` is the arrival number of the queued
-/// file the id FIRST appears in (files are numbered monotonically, B10);
-/// `after = Some(seq)` pages by it (offset ignored) and `next_after` is
-/// the next cursor. Draining a file between two requests can only move an
-/// id to a LATER number (seen twice, never skipped), and a new file always
-/// gets a larger number.
+/// R5-S11 / R6-S2: each folded entry carries `seq` (the arrival number of
+/// the queued file the id FIRST appears in) and `cursor` (`"<seq>:<index>"`,
+/// the item's position inside that file). `after = Some(cursor)` pages by
+/// it (offset ignored) and `next_after` is the next page's cursor STRING.
+/// The R5 cursor was the bare file number, so a page that ended in the
+/// middle of a big file (one save of 800 ids, limit 500) made the next
+/// page skip the rest of that file. Draining a file between two requests
+/// can only move an id to a LATER position (seen twice, never skipped),
+/// and a new file always gets a larger number.
 pub(crate) fn marks_pending_json_at(
     case_dir: &Path,
     offset: usize,
     limit: usize,
-    after: Option<u64>,
+    after: Option<PendingCursor>,
 ) -> serde_json::Value {
     use std::collections::HashMap;
     let files = pending_marks_files(case_dir);
-    let mut order: Vec<String> = Vec::new();
+    let mut order: Vec<(PendingCursor, String)> = Vec::new();
     let mut entries: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
     let mut unreadable: Vec<serde_json::Value> = Vec::new();
     let mut read_bytes = 0u64;
@@ -1965,13 +2021,20 @@ pub(crate) fn marks_pending_json_at(
         let file_seq = queued_sequence(path)
             .map(|n| u64::try_from(n).unwrap_or(u64::MAX))
             .unwrap_or(0);
+        let mut item_index = 0u64;
         let mut touch = |id: &str, fields: Vec<(&str, serde_json::Value)>| {
+            let position = PendingCursor {
+                seq: file_seq,
+                index: item_index,
+            };
+            item_index += 1;
             if !entries.contains_key(id) {
-                order.push(id.to_string());
+                order.push((position, id.to_string()));
             }
             let item = entries.entry(id.to_string()).or_insert_with(|| {
                 let mut map = serde_json::Map::new();
                 map.insert("seq".into(), serde_json::json!(file_seq));
+                map.insert("cursor".into(), serde_json::json!(position.text()));
                 map.insert("id".into(), serde_json::Value::String(id.to_string()));
                 map.insert("mark".into(), serde_json::Value::Null);
                 map.insert("tags".into(), serde_json::Value::Null);
@@ -2024,33 +2087,28 @@ pub(crate) fn marks_pending_json_at(
         }
     }
     let total = order.len();
-    let seq_of = |entry: &serde_json::Map<String, serde_json::Value>| {
-        entry
-            .get("seq")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-    };
-    // `order` is first-appearance order, i.e. ascending `seq`.
+    // `order` is first-appearance order, i.e. ascending cursor (files in
+    // arrival order, items in file order).
     let skip = match after {
         Some(after) => order
             .iter()
-            .take_while(|id| entries.get(*id).is_some_and(|e| seq_of(e) <= after))
+            .take_while(|(position, _)| *position <= after)
             .count(),
         None => offset,
     };
+    let mut last_cursor: Option<PendingCursor> = None;
     let page: Vec<serde_json::Value> = order
         .iter()
         .skip(skip)
         .take(limit)
-        .filter_map(|id| entries.remove(id).map(serde_json::Value::Object))
+        .filter_map(|(position, id)| {
+            last_cursor = Some(*position);
+            entries.remove(id).map(serde_json::Value::Object)
+        })
         .collect();
     let end = skip.saturating_add(page.len());
     let next_after = (end < total)
-        .then(|| {
-            page.last()
-                .and_then(|entry| entry.get("seq"))
-                .and_then(serde_json::Value::as_u64)
-        })
+        .then(|| last_cursor.map(|cursor| cursor.text()))
         .flatten();
     serde_json::json!({
         "ok": true,
@@ -2058,7 +2116,11 @@ pub(crate) fn marks_pending_json_at(
         "count": total,
         "offset": skip,
         "limit": limit,
-        "after": after,
+        "after": after.map(|cursor| if cursor.index == u64::MAX {
+            cursor.seq.to_string()
+        } else {
+            cursor.text()
+        }),
         "next_offset": (end < total).then_some(end),
         "next_after": next_after,
         "entries": page,

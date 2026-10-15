@@ -776,13 +776,47 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
+    /// Whether `pid` still runs. R6-S9: on Linux a zombie (`Z`, killed
+    /// but not yet reaped by its parent) or a dying task (`X`) is dead —
+    /// `kill -0` succeeds on a zombie, so a killed grandchild whose parent
+    /// had not reaped it yet looked alive.
     fn alive(pid: &str) -> bool {
-        Command::new("kill")
-            .args(["-0", pid])
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        #[cfg(target_os = "linux")]
+        {
+            !matches!(proc_state(pid).as_deref(), None | Some("Z") | Some("X"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    }
+
+    /// Linux `/proc/<pid>/stat` state letter (`None`: no such process).
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: &str) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).ok()?;
+        let (_, rest) = stat.rsplit_once(')')?;
+        rest.split_whitespace().next().map(str::to_string)
+    }
+
+    /// Process facts (state, process group) for assertion messages.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn describe_pid(pid: &str) -> String {
+        let out = Command::new("ps")
+            .args(["-o", "pid=,ppid=,pgid=,stat=,comm=", "-p", pid.trim()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|err| format!("<ps failed: {err}>"));
+        if out.is_empty() {
+            format!("pid {pid}: not listed by ps")
+        } else {
+            format!("pid {pid}: [{out}]")
+        }
     }
 
     #[test]
@@ -890,28 +924,64 @@ mod tests {
         panic!("step child {pid} survived its spawning thread");
     }
 
+    /// Env var naming the file the R5-S3 helper writes its grandchild's
+    /// pid to (its presence is what turns the helper on).
+    const PDEATH_PID_FILE_ENV: &str = "FT_R5_PDEATH_PID_FILE";
+
     /// R5-S3 helper, run as a re-executed copy of this test binary (a
     /// FrameTrace-like step child): installs the step-child side exactly
     /// like `main` does (`watch_parent_from_env`), starts a grandchild in
     /// its own process group, reports the grandchild's pid and waits.
-    /// Without `FT_R5_PDEATH_HELPER=1` (a normal test run) it does nothing.
+    /// Without [`PDEATH_PID_FILE_ENV`] (a normal test run) it does nothing.
+    ///
+    /// R6-CI2: the pid goes to a FILE (written, then renamed into place).
+    /// It used to be a `GRANDCHILD <pid>` line on stdout, but libtest with
+    /// `--test-threads=1` prints `test <name> ... ` WITHOUT a newline before
+    /// it runs the test, so the helper's line read `test serve::proc::tests::
+    /// r5_pdeath_helper_child ... GRANDCHILD <pid>` and never matched the
+    /// `GRANDCHILD ` prefix; the parent then read on until the helper's own
+    /// 300 s sleep ended (EOF) and reported "never reported".
     #[test]
     // The grandchild is deliberately never reaped here: the test that
     // re-executes this helper asserts the whole group gets killed.
     #[allow(clippy::zombie_processes)]
     fn r5_pdeath_helper_child() {
-        if std::env::var("FT_R5_PDEATH_HELPER").as_deref() != Ok("1") {
+        let Some(pid_file) = std::env::var_os(PDEATH_PID_FILE_ENV) else {
             return;
-        }
+        };
+        let pid_file = std::path::PathBuf::from(pid_file);
         watch_parent_from_env();
         let grandchild = Command::new("sleep")
             .arg("300")
             .spawn()
             .expect("spawn grandchild");
-        println!("GRANDCHILD {}", grandchild.id());
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+        let temp = pid_file.with_extension("tmp");
+        std::fs::write(&temp, grandchild.id().to_string()).expect("write grandchild pid");
+        std::fs::rename(&temp, &pid_file).expect("publish grandchild pid");
         std::thread::sleep(std::time::Duration::from_secs(300));
+    }
+
+    /// R6-CI2 (pure): the helper's libtest argument list. The filter is
+    /// the helper's full path without the crate name (`module_path!()` is
+    /// `<crate>::serve::proc::tests`), matched with `--exact`.
+    fn pdeath_helper_args(module: &str) -> Vec<String> {
+        let name = format!(
+            "{}::r5_pdeath_helper_child",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
+        vec![
+            name,
+            "--exact".to_string(),
+            "--nocapture".to_string(),
+            "--test-threads=1".to_string(),
+        ]
+    }
+
+    #[test]
+    fn pdeath_helper_filter_names_the_helper() {
+        let args = pdeath_helper_args(module_path!());
+        assert_eq!(args[0], "serve::proc::tests::r5_pdeath_helper_child");
+        assert!(args.contains(&"--exact".to_string()));
     }
 
     /// R5-S3 (Linux): when the thread that spawned a step child exits
@@ -925,44 +995,70 @@ mod tests {
     fn pdeathsig_takes_the_grandchildren_down() {
         let _serial = tree_test_serial();
         let exe = std::env::current_exe().expect("test binary");
-        let module = module_path!();
-        let name = format!(
-            "{}::r5_pdeath_helper_child",
-            module.split_once("::").map_or(module, |(_, rest)| rest)
-        );
-        let (child_pid, stdout) = std::thread::spawn(move || {
-            let mut command = Command::new(exe);
-            command
-                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-                .env("FT_R5_PDEATH_HELPER", "1")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            let mut tracked = spawn_tracked(&mut command).expect("spawn helper");
-            let stdout = tracked.child.stdout.take().unwrap();
-            let pid = tracked.child.id();
-            // Wait for the grandchild before the spawning thread exits.
-            let mut reader = BufReader::new(stdout);
-            let mut grandchild = String::new();
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
+        let scratch = std::env::temp_dir().join(format!(
+            "ft-r6-pdeath-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let pid_file = scratch.join("grandchild.pid");
+        let log_file = scratch.join("helper.log");
+        let args = pdeath_helper_args(module_path!());
+        let (child_pid, grandchild, waited, helper_exit) = {
+            let (pid_file, log_file, args) = (pid_file.clone(), log_file.clone(), args.clone());
+            std::thread::spawn(move || {
+                // The helper's output goes to a file: nothing here can
+                // block on a pipe, and a failure can quote it.
+                let log = std::fs::File::create(&log_file).expect("helper log");
+                let mut command = Command::new(exe);
+                command
+                    .args(&args)
+                    .env(PDEATH_PID_FILE_ENV, &pid_file)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(log.try_clone().expect("helper log handle")))
+                    .stderr(Stdio::from(log));
+                let mut tracked = spawn_tracked(&mut command).expect("spawn helper");
+                let pid = tracked.child.id();
+                // Wait for the grandchild before the spawning thread exits
+                // (that exit is what fires the parent-death signal).
+                let started = std::time::Instant::now();
+                let mut grandchild = String::new();
+                let mut exit = None;
+                while started.elapsed() < std::time::Duration::from_secs(60) {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        grandchild = text.trim().to_string();
+                        break;
+                    }
+                    if let Ok(Some(status)) = tracked.child.try_wait() {
+                        exit = Some(status);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                if let Some(rest) = line.trim().strip_prefix("GRANDCHILD ") {
-                    grandchild = rest.to_string();
-                    break;
+                if grandchild.is_empty() && exit.is_none() {
+                    tracked.kill_tree();
+                    exit = tracked.child.wait().ok();
                 }
-            }
-            // Dropping the handle neither kills nor waits on unix.
-            drop(tracked);
-            (pid, (reader, grandchild))
-        })
-        .join()
-        .unwrap();
-        let (_reader, grandchild) = stdout;
+                let waited = started.elapsed();
+                // Dropping the handle neither kills nor waits on unix.
+                drop(tracked);
+                (pid, grandchild, waited, exit)
+            })
+            .join()
+            .unwrap()
+        };
+        let helper_log = || {
+            std::fs::read_to_string(&log_file)
+                .unwrap_or_else(|err| format!("<helper log unreadable: {err}>"))
+        };
         assert!(
             !grandchild.is_empty(),
-            "helper never reported its grandchild"
+            "helper never reported its grandchild (waited {waited:?}; helper pid {child_pid}, exit {helper_exit:?}; args {args:?}; pid file {}). Helper output:\n{}",
+            pid_file.display(),
+            helper_log()
         );
         for _ in 0..200 {
             if !alive(&grandchild) {
@@ -975,15 +1071,24 @@ mod tests {
                 unsafe {
                     waitpid(child_pid as i32, &mut status, 0);
                 }
+                let _ = std::fs::remove_dir_all(&scratch);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        let facts = format!(
+            "{}; helper {}",
+            describe_pid(&grandchild),
+            describe_pid(&child_pid.to_string())
+        );
         let _ = Command::new("kill").args(["-9", &grandchild]).status();
         let _ = Command::new("kill")
             .args(["-9", &child_pid.to_string()])
             .status();
-        panic!("grandchild {grandchild} survived the step child's parent-death signal");
+        panic!(
+            "grandchild {grandchild} survived the step child's parent-death signal ({facts}). Helper output:\n{}",
+            helper_log()
+        );
     }
 
     /// Open file descriptors of a fresh `sh` started by `command`

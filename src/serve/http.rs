@@ -1086,11 +1086,32 @@ pub(crate) fn launch_redirect_target(query: &str) -> String {
     }
 }
 
+/// R6-S3: the `200` page a launch request answers with: it replaces itself
+/// (`location.replace`, keeping the address-bar hash) with `target` — a
+/// same-origin path from [`launch_redirect_target`]. `<noscript>` falls
+/// back to a meta refresh, plus a plain link. `no-store`, no referrer.
+pub(crate) fn launch_step_page(target: &str) -> Vec<u8> {
+    let script_target =
+        crate::util::script_json_value(&serde_json::Value::String(target.to_string()));
+    let safe = crate::util::html_escape(target);
+    let body = format!(
+        "<!doctype html>\n<html lang=\"ko\"><head><meta charset=\"utf-8\">\n<meta name=\"referrer\" content=\"no-referrer\">\n<title>FrameTrace</title>\n<noscript><meta http-equiv=\"refresh\" content=\"0;url={safe}\"></noscript>\n</head><body><p>FrameTrace 워크스테이션을 여는 중… / Opening the FrameTrace workstation…</p>\n<p><a href=\"{safe}\">열리지 않으면 여기를 누르십시오 / click here if nothing happens</a></p>\n<script>location.replace({script_target} + location.hash);</script>\n</body></html>\n"
+    );
+    respond(
+        200,
+        "text/html; charset=utf-8",
+        body.into_bytes(),
+        "no-store",
+        None,
+    )
+}
+
 /// R4-B2: answer to `GET /?launch=<code>`.
-/// - valid, unexpired, unused code → `303 See Other` to `/` with the
-///   `ft_token_<port>` cookie (the code is consumed: single use);
+/// - valid, unexpired, unused code → a same-origin step page
+///   ([`launch_step_page`], R6-S3) to `/` with the `ft_token_<port>`
+///   cookie (the code is consumed: single use);
 /// - otherwise, a request that already proves the token (cookie/header)
-///   is simply redirected to `/`;
+///   is simply sent on to `/`;
 /// - otherwise `401` with an explanation (expired or reused link).
 ///
 /// Without a configured token there is nothing to plant: redirect.
@@ -1106,16 +1127,14 @@ pub(crate) fn launch_response(
     // R5 (contract with U14): the redirect drops `launch` (and any
     // `token`) but keeps every other query parameter, so a launch URL such
     // as `/?launch=…&case=…` still lands where it pointed.
-    let location = format!("Location: {}\r\n", launch_redirect_target(&request.query));
-    let redirect = || {
-        respond(
-            303,
-            "text/plain; charset=utf-8",
-            b"see /".to_vec(),
-            "no-store",
-            Some(&location),
-        )
-    };
+    let target = launch_redirect_target(&request.query);
+    // R6-S3: a same-origin HTML step instead of `303`. A launch URL opened
+    // from a `file://` launch page (Linux/macOS) or another site is a
+    // cross-site navigation, and a redirect keeps that chain cross-site:
+    // the browser stored the `SameSite=Strict` token cookie but did not
+    // send it with the redirected `GET /` → 401. A navigation the
+    // workstation's own page starts is same-site, so the cookie goes.
+    let redirect = || launch_step_page(&target);
     let (token, valid) = {
         let mut guard = state_lock(state);
         let valid = super::consume_launch_code(&mut guard, code.trim(), std::time::Instant::now());
@@ -1316,33 +1335,56 @@ pub(crate) fn serve_case_file_with(
         Ok(meta) if meta.is_file() => meta,
         _ => return write_simple(stream, 404, b"file not found"),
     };
-    let total = meta.len();
+    let mut total = meta.len();
+    // R6-S7: scripts and generated pages are read ONCE; the verified
+    // bytes are the bytes served (no second open after the check).
+    let mut verified_body: Option<Vec<u8>> = None;
     // R5-S2: a script under the case folder runs in the workstation origin
     // when a trusted page loads it (`review/data-bundle.js`), so its bytes
     // must be pinned in the same HMAC'd manifest as the pages — an edited
     // or planted script is refused outright (a page's hash says nothing
     // about the sibling file it loads).
-    if is_script_path(&path) && !verified_case_script(&case_dir, &path, &meta) {
-        return write_simple(
-            stream,
-            403,
-            b"script not verified - regenerate the review pages on this computer",
-        );
+    if is_script_path(&path) {
+        match read_for_verification(&path, VERIFIED_SERVE_MAX_BYTES) {
+            Some(bytes) if verified_case_script(&case_dir, &bytes) => {
+                verified_body = Some(bytes);
+            }
+            _ => {
+                return write_simple(
+                    stream,
+                    403,
+                    b"script not verified - regenerate the review pages on this computer",
+                );
+            }
+        }
     }
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(_) => return write_simple(stream, 404, b"file not found"),
-    };
     // R4-B5: a page at a generated location is trusted only when this
     // user's HMAC'd manifest lists its exact bytes; an unlisted one renders
     // sandboxed (no script) instead of running in the workstation origin.
     let mut safety = if is_generated_page(&case_dir, &path) {
-        match verified_generated_page(&case_dir, &path, &meta) {
+        let bytes = read_for_verification(&path, VERIFIED_SERVE_MAX_BYTES);
+        let verdict = bytes
+            .as_deref()
+            .and_then(|bytes| verified_generated_page(&case_dir, bytes));
+        if bytes.is_some() {
+            verified_body = bytes;
+        }
+        match verdict {
             Some(script_src) => trusted_page_headers(script_src.as_deref()),
             None => UNVERIFIED_PAGE_HEADERS.to_string(),
         }
     } else {
         content_safety_headers(&path, false, false)
+    };
+    if let Some(bytes) = &verified_body {
+        total = bytes.len() as u64;
+    }
+    let mut file: Box<dyn Read> = match verified_body {
+        Some(bytes) => Box::new(std::io::Cursor::new(bytes)),
+        None => match std::fs::File::open(&path) {
+            Ok(file) => Box::new(file),
+            Err(_) => return write_simple(stream, 404, b"file not found"),
+        },
     };
     if mime_for(&path).starts_with("text/html") {
         let frame = html_frame_headers(&safety);
@@ -1537,52 +1579,53 @@ pub(crate) fn trusted_page_headers(script_src: Option<&str>) -> String {
     }
 }
 
-/// Verified-page cache: `(path, len, mtime, sha256, script-src)`.
-type VerifiedPageEntry = (PathBuf, u64, Option<SystemTime>, String, Option<String>);
-static VERIFIED_PAGES: Mutex<Vec<VerifiedPageEntry>> = Mutex::new(Vec::new());
-const VERIFIED_PAGES_CAP: usize = 64;
 /// Pages above this are never parsed for inline scripts (hash only).
 const SCRIPT_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// `Some(script_src)` when the generated page at `path` is listed in the
-/// case's verified manifest (R4-B5), `None` when it is not (or cannot be
-/// read). Runs outside the state lock (file hashing).
-pub(crate) fn verified_generated_page(
-    case_dir: &Path,
-    path: &Path,
-    meta: &std::fs::Metadata,
-) -> Option<Option<String>> {
-    let (len, mtime) = (meta.len(), meta.modified().ok());
-    let cached = VERIFIED_PAGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+/// R6-S7: generated pages and case scripts up to this size are read once,
+/// hashed, and served from those very bytes. A larger generated page is
+/// served sandboxed (never trusted); a larger script is refused.
+pub(crate) const VERIFIED_SERVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// R6-S7: the bytes of `path`, read once (at most `max` bytes; `None`
+/// when larger or unreadable). What gets verified is what gets served —
+/// the R5 code hashed the file (or trusted a `(size, mtime)` cache entry)
+/// and then opened it AGAIN to stream it, so a file swapped in between
+/// (or rewritten with the same size and a restored mtime) was served
+/// under the trusted headers.
+pub(crate) fn read_for_verification(path: &Path, max: u64) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max).then_some(bytes)
+}
+
+/// SHA-256 (hex) of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
         .iter()
-        .find(|(p, l, m, _, _)| p == path && *l == len && *m == mtime)
-        .map(|(_, _, _, sha, script)| (sha.clone(), script.clone()));
-    let (sha, script) = match cached {
-        Some(hit) => hit,
-        None => {
-            let sha = crate::util::generated_pages::file_sha256(path)?;
-            let script = (len <= SCRIPT_SCAN_MAX_BYTES)
-                .then(|| std::fs::read(path).ok())
-                .flatten()
-                .and_then(|bytes| {
-                    crate::util::generated_pages::inline_script_sources(&String::from_utf8_lossy(
-                        &bytes,
-                    ))
-                });
-            let mut cache = VERIFIED_PAGES.lock().unwrap_or_else(|p| p.into_inner());
-            cache.retain(|(p, _, _, _, _)| p != path);
-            if cache.len() >= VERIFIED_PAGES_CAP {
-                cache.remove(0);
-            }
-            cache.push((path.to_path_buf(), len, mtime, sha.clone(), script.clone()));
-            (sha, script)
-        }
-    };
-    crate::util::generated_pages::trusted_hashes(case_dir)
-        .contains(&sha)
-        .then_some(script)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `Some(script_src)` when `bytes` (a generated page's content, read once
+/// by the caller) are listed in the case's verified manifest (R4-B5),
+/// `None` when not. The manifest is re-verified on every call.
+pub(crate) fn verified_generated_page(case_dir: &Path, bytes: &[u8]) -> Option<Option<String>> {
+    let sha = sha256_hex(bytes);
+    if !crate::util::generated_pages::trusted_hashes(case_dir).contains(&sha) {
+        return None;
+    }
+    Some(
+        (bytes.len() as u64 <= SCRIPT_SCAN_MAX_BYTES)
+            .then(|| {
+                crate::util::generated_pages::inline_script_sources(&String::from_utf8_lossy(bytes))
+            })
+            .flatten(),
+    )
 }
 
 /// R5-S2: extensions a browser executes as a classic or module script.
@@ -1596,38 +1639,10 @@ pub(crate) fn is_script_path(path: &Path) -> bool {
     )
 }
 
-/// Verified-script cache: `(path, len, mtime, sha256)`.
-type VerifiedScriptEntry = (PathBuf, u64, Option<SystemTime>, String);
-static VERIFIED_SCRIPTS: Mutex<Vec<VerifiedScriptEntry>> = Mutex::new(Vec::new());
-
-/// R5-S2: whether the script at `path` (canonical, under the case) has
-/// bytes the case's verified generated-files manifest lists. The file
-/// hash is cached per (path, size, mtime); the manifest is re-verified on
-/// every call. Runs outside the state lock (file hashing).
-pub(crate) fn verified_case_script(case_dir: &Path, path: &Path, meta: &std::fs::Metadata) -> bool {
-    let (len, mtime) = (meta.len(), meta.modified().ok());
-    let cached = VERIFIED_SCRIPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .find(|(p, l, m, _)| p == path && *l == len && *m == mtime)
-        .map(|(_, _, _, sha)| sha.clone());
-    let sha = match cached {
-        Some(sha) => sha,
-        None => {
-            let Some(sha) = crate::util::generated_pages::file_sha256(path) else {
-                return false;
-            };
-            let mut cache = VERIFIED_SCRIPTS.lock().unwrap_or_else(|p| p.into_inner());
-            cache.retain(|(p, _, _, _)| p != path);
-            if cache.len() >= VERIFIED_PAGES_CAP {
-                cache.remove(0);
-            }
-            cache.push((path.to_path_buf(), len, mtime, sha.clone()));
-            sha
-        }
-    };
-    crate::util::generated_pages::trusted_hashes(case_dir).contains(&sha)
+/// R5-S2: whether `bytes` (a script under the case, read once by the
+/// caller) are listed in the case's verified generated-files manifest.
+pub(crate) fn verified_case_script(case_dir: &Path, bytes: &[u8]) -> bool {
+    crate::util::generated_pages::trusted_hashes(case_dir).contains(&sha256_hex(bytes))
 }
 
 /// Security headers for streamed case/media files (SEC-02).

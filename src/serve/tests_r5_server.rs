@@ -666,7 +666,8 @@ fn s11_marks_pending_pages_by_queue_sequence() {
     };
     let first = page("limit=2");
     assert_eq!(first["entries"][0]["seq"], 1);
-    assert_eq!(first["next_after"], 2);
+    // R6-S2: string cursors; the bare file number is still accepted.
+    assert_eq!(first["next_after"], "2:0");
     // Files 1–3 drain between the requests: nothing after the cursor is
     // skipped (offset=2 would now start at vid_000005).
     for n in 1..=3u32 {
