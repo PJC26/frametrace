@@ -38,12 +38,10 @@ const scan = DATA.scan && typeof DATA.scan === "object" ? DATA.scan : {};
 // the same id space, so earlier entries for an id are stale records of a
 // superseded run — keep the latest entry per id (the same rule the
 // standalone carve report applies) or the grid shows every generation of
-// artifacts that ever landed in the log.
-const carveLog = [...new Map(
-  (Array.isArray(DATA.carveLog) ? DATA.carveLog : [])
-    .filter(item => item && item.id)
-    .map(item => [String(item.id), item])
-).values()];
+// artifacts that ever landed in the log. R9 U1: an authenticated (or
+// legacy / self-consistent) entry is the current one; a later entry this
+// PC could not authenticate never replaces it (30-records currentLogEntries).
+const carveLog = currentLogEntries(Array.isArray(DATA.carveLog) ? DATA.carveLog : [], item => item.id ? String(item.id) : "");
 const filesystemLog = Array.isArray(DATA.filesystemLog) ? DATA.filesystemLog : [];
 const validationLog = Array.isArray(DATA.validationLog) ? DATA.validationLog : [];
 const anomalyLog = Array.isArray(DATA.anomalyLog) ? DATA.anomalyLog : [];

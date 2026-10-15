@@ -118,6 +118,14 @@ function hViewerStateUnsaved(ss, pendingCount) {
   if (ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued" || ss === "readonly" || ss === "unknown") return true;
   return ss === "local" && (typeof pendingCount === "function" ? pendingCount() : 0) > 0;
 }
+// R9 U6: a patient save ({ patient: true }) that answered false only
+// because its time ran out while the request is still on the wire is
+// "아직 저장 중", not a failed save: `opts.timedOut` + saveState "saving".
+const H_STILL_SAVING = "아직 저장 중입니다 — 끝나면 저장 상태가 ‘저장됨’으로 바뀝니다. 잠시 뒤 다시 시도하십시오.";
+function hSaveStillSaving(opts, api) {
+  if (!opts || !opts.timedOut) return false;
+  try { return !!api && api.saveState() === "saving"; } catch (e) { return false; }
+}
 let hHostedWired = false;
 // A mount that failed is not retried for the same case on every render
 // (that would spin); opening another case — or this one again — retries.

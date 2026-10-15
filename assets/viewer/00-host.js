@@ -106,7 +106,8 @@ const FTViewer = (() => {
     /** Channel names (contract §3.3). ft-review is the shell's (T2);
      *  ft-player:<case_id> is the popup-player bridge (70-player.js). */
     writerToken,
-    channels: Object.freeze({ review: "ft-review", player: caseId => `ft-player:${caseId || "case"}` }),
+    // R9 U8: no case key → this page's own key (caseStorageKey), never "case".
+    channels: Object.freeze({ review: "ft-review", player: caseId => `ft-player:${caseId || caseStorageKey(null, "")}` }),
 
     async init({ data = null, url = "", embed: wantEmbed = false, host = document, theme = null, locale = null, restore = null } = {}) {
       if (state !== "idle") throw new Error("FTViewer already mounted");

@@ -63,6 +63,7 @@ function renderDetails() {
   els.mediaTitle.textContent = record.originalName || record.name || record.id;
   els.mediaStatus.textContent = record.status;
   els.mediaStatus.className = `badge ${statusClass(record.status)}`;
+  els.mediaStatus.title = statusTitle(record);
   const dualMates = state.layout.dual ? matesOf(record) : [];
   const mediaSrc = mediaSrcFor(record);
   // PERF-04: the stage (and its <video>) is rebuilt only when what it
@@ -138,7 +139,7 @@ function renderDetails() {
     }
   }
   document.getElementById("detailBadges").innerHTML = [
-    `<span class="badge ${statusClass(record.status)}">${ftIcon(statusIcon(record.status))}${escapeHtml(statusLabel(record.status))}</span>`,
+    statusBadgeHtml(record.status, record),
     (record.warnings || []).length ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}">${tf("warn.count", { n: record.warnings.length })}</span>` : "",
     record.hasAnomaly ? `<span class="badge anomaly">${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}</span>` : "",
     record.dfl && record.dfl.band ? `<span class="badge dfl dfl-${escapeHtml(record.dfl.band)}">${escapeHtml(tf("dfl.badge", { band: record.dfl.band_label || record.dfl.band }))}</span>` : "",
@@ -228,7 +229,7 @@ function renderDetails() {
   }
   const related = validationLog.filter(item => normalizePath(item.target_path) === normalizePath(record.path) || item.selector === record.id);
   const anomalyRelated = (record.anomalies || []).map(item => `<div class="validation-item">
-    <strong>${escapeHtml(item.kind || "anomaly")}</strong>
+    <strong>${escapeHtml(item.kind || "anomaly")}</strong>${logTrustTagHtml(item)}
     <div class="muted">${escapeHtml(item.detail || "")}</div>
     <code>candidate-finding</code>
   </div>`);
@@ -251,7 +252,7 @@ function renderDetails() {
     ...joinItems,
     ...warningItems,
     ...related.map(item => `<div class="validation-item">
-    <strong>${escapeHtml(item.validation_status || "-")}</strong>
+    <strong>${escapeHtml(item.validation_status || "-")}</strong>${logTrustTagHtml(item)}
     <div class="muted">${escapeHtml(item.validation_note || item.ffprobe_error || "-")}</div>
     <code>${escapeHtml(item.target_sha256 || "-")}</code>
   </div>`),

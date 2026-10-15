@@ -285,7 +285,7 @@ await host.waitForTimeout(3000); // past the old mount's autosave delay
 await host.evaluate(() => FTViewer.init({ embed: true, host: document.getElementById('hViewerHost') }));
 await host.waitForSelector('#recordGrid .card', { timeout: 30000 });
 check('7 re-init: unsaved mark restored from drafts', /needs_verification/.test(await markOf(host, third)) && await host.evaluate(() => FTViewer.summary().pending > 0), await host.evaluate(() => JSON.stringify(FTViewer.summary())));
-check('7 save() resolves true and the indicator turns saved', await host.evaluate(() => FTViewer.save()) === true && await host.evaluate(() => FTViewer.saveState()) === 'saved');
+check('7 save() resolves true and the indicator turns saved', await host.evaluate(() => FTViewer.save({ patient: true })) === true && await host.evaluate(() => FTViewer.saveState()) === 'saved');
 const meta = await server.getJson('/api/records-meta');
 const dbMarks = (meta.annotations && meta.annotations.marks) || [];
 const byId = (id) => dbMarks.find((m) => (m.record_id || m.id) === id);

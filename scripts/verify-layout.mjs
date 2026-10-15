@@ -303,6 +303,14 @@ try {
           const okTab = (m) => m.inPanel && /^BUTTON:(server|mine)/.test(m.focus) && m.onScreen && m.inPanelBox && !m.covered && m.h >= 24 && m.scrollers.length <= 1 && !m.scrollers.some((c) => /ft-notices/.test(c));
           check(`${label}: R8 U3 conflict list opened — Tab reaches both per-record buttons, each on screen, not covered, >= 24px, inside one scroll container`, tabs.every(okTab), JSON.stringify(tabs));
           check(`${label}: R8 U3 the conflict list is the notices row's sibling (not inside the capped row), the selection bar stays on screen, no sideways scroll`, tabs.every((m) => m.sibling && m.selBottom <= m.vh && !m.hscroll), JSON.stringify(tabs[0]));
+          // R9 U10: in Tab order the open list comes right after its toggle
+          // (the toggle is the last button of the last banner of the row).
+          await page.focus('#markConflictList');
+          await page.keyboard.press('Tab');
+          const afterToggle = await measure(true);
+          await page.keyboard.press('Shift+Tab');
+          const backTo = await page.evaluate(() => document.activeElement?.id || document.activeElement?.tagName || '');
+          check(`${label}: R9 U10 Tab from the list toggle lands on the list's first button (on screen, >= 24px); Shift+Tab goes back to the toggle`, okTab(afterToggle) && /^BUTTON:server/.test(afterToggle.focus) && backTo === 'markConflictList', JSON.stringify({ focus: afterToggle.focus, backTo }));
           // Five long notices stacked while the list is open.
           await page.evaluate(() => {
             const host = document.querySelector('#ftViewer > .ft-notices');
@@ -623,7 +631,7 @@ try {
         const r13b = await page.evaluate(() => hBeforeClose(4000));
         check('A15: a failing save → ok:false, "저장 안 된 편집 N건" for the confirmation', r13b.ok === false && r13b.pending >= 1 && /저장 안 된 편집 \d+건/.test(r13b.message), JSON.stringify(r13b));
         await page.unroute('**/api/import-marks*');
-        await page.evaluate(() => FTViewer.save());
+        await page.evaluate(() => FTViewer.save({ patient: true })); // R9 U9: an explicit save, not the 4 s close budget
         await page.waitForFunction(() => FTViewer.saveState() === 'saved', null, { timeout: 60000 }).catch(() => {});
 
         // 14. R4 B2 contract: the one-time launch code (?launch=) leaves the

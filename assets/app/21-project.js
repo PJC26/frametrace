@@ -111,7 +111,9 @@ async function hSwitchProject(dir) {
     hSwitching = false;
   }
   if (!switched) {
-    toast("저장되지 않은 판독 내용이 있어 프로젝트를 바꾸지 않았습니다 — 뷰어의 저장 상태를 확인하십시오.", "warn");
+    toast(hostViewer.stillSaving
+      ? "판독 내용을 아직 저장 중이라 프로젝트를 바꾸지 않았습니다 — 저장이 끝난 뒤 다시 시도하십시오."
+      : "저장되지 않은 판독 내용이 있어 프로젝트를 바꾸지 않았습니다 — 뷰어의 저장 상태를 확인하십시오.", "warn");
     return false;
   }
   if (!opened) toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err");

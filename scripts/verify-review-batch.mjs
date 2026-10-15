@@ -748,6 +748,106 @@ async function unitTests() {
   await r5TrackU({ fn, source, grid, state, runInNewContext, assert, appSrc: exScript, ex, store, RK: 'ft.viewer.test.ranges', P: 'ft.draft.test.', hydrateSrc, touch });
   await r6TrackU({ fn, source, runInNewContext, assert, ex });
   await r8TrackU({ fn, source, runInNewContext, assert });
+  await r9TrackU({ fn, source, runInNewContext, assert, ex });
+}
+
+// ---- R9 track U (docs/PLAN_R9_2026-10-15.md) ------------------------------
+async function r9TrackU({ fn, source, runInNewContext, assert, ex }) {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  // U1 (track I P3 ↔ U): the status a record shows from its log entries.
+  const tctx = {
+    t: (k) => ({ 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가', 'status.tip.unauth': '인증 안 됨 — …', 'trust.sc': '자기 일관성만(인증 아님)' })[k] || k,
+    tf: (k, s) => (k === 'trust.otherPc' ? `이 PC에서 인증 불가(변조 판정 아님) — 키 ${s.key} 보유 PC에서 확인` : k),
+  };
+  runInNewContext(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
+    const src = fn(n);
+    assert.ok(src, `R9 U1: ${n} exists (30-records.js)`);
+    return src;
+  }).join('\n'), tctx);
+  const st = (own, valid, unvalid, fb) => JSON.parse(JSON.stringify(runInNewContext('recordStatusOf(own, valid, unvalid, fb)', Object.assign(tctx, { own, valid, unvalid, fb }))));
+  const ok = { validation_status: 'ffprobe-video-stream-confirmed' };
+  assert.deepEqual(st(null, { ...ok, trust: 'auth' }, null, 'x'), { status: 'ffprobe-video-stream-confirmed', trust: 'auth' });
+  assert.deepEqual(st(null, { ...ok, trust: 'sc' }, null, 'x'), { status: 'ffprobe-video-stream-confirmed', trust: 'sc' });
+  assert.deepEqual(st(null, ok, null, 'x'), { status: 'ffprobe-video-stream-confirmed', trust: '' }, 'legacy (no trust) as before');
+  assert.equal(st(null, null, { ...ok, trust: 'unauth' }, 'ffprobe-confirmed').status, 'unauthenticated', 'an unauthenticated validation never confirms (not even the index fallback)');
+  assert.deepEqual(st(null, null, { ...ok, trust: 'pc:k1' }, 'x'), { status: 'auth-other-pc', trust: 'pc:k1' });
+  assert.equal(st({ trust: 'unauth' }, null, null, 'derived').status, 'unauthenticated', 'an unauthenticated join line is never "derived"');
+  assert.equal(st({ trust: 'pc:k2' }, { ...ok, trust: 'auth' }, null, 'x').status, 'auth-other-pc', 'a record whose own line is not authenticated stays so, whatever validates its path');
+  assert.equal(st({ trust: 'weird' }, null, null, 'derived').status, 'unauthenticated', 'an unknown trust word fails closed');
+  const cur = runInNewContext('currentLogEntries(list, (i) => i.id)', Object.assign(tctx, { list: [{ id: 'a', v: 1, trust: 'auth' }, { id: 'b', v: 1, trust: 'unauth' }, { id: 'a', v: 2, trust: 'unauth' }, { id: 'a', v: 3 }, { id: 'b', v: 2, trust: 'pc:x' }] }));
+  assert.deepEqual(JSON.parse(JSON.stringify(cur.map((i) => `${i.id}${i.v}`))), ['a3', 'b2'], 'R9 U1: per key the latest usable entry; an unauthenticated one only when nothing usable exists');
+  assert.ok(/키 k9 보유 PC/.test(runInNewContext('statusTitle({ status: "auth-other-pc", statusTrust: "pc:k9" })', tctx)) && /자기 일관성만/.test(runInNewContext('statusTitle({ status: "ffprobe-confirmed", statusTrust: "sc" })', tctx)), 'R9 U1: badge tooltips');
+  assert.equal(runInNewContext('statusLabel("unauthenticated")', tctx), '인증 안 됨');
+  console.log('PASS VM R9 U1 log trust: unauth / other-PC lines never confirm, verify or derive; sc keeps the value; legacy as before');
+
+  // U8: the pop-out channel without a case key is the page's own key, never "ft-player:case".
+  const hostSrc = readFileSync(new URL('../assets/viewer/00-host.js', import.meta.url), 'utf8');
+  const hctx = { EventTarget, AbortController, CustomEvent: class extends Event { constructor(t, o) { super(t); this.detail = o && o.detail; } }, crypto: globalThis.crypto, Uint32Array, location: { origin: 'http://127.0.0.1:1', pathname: '/viewer/' }, document: { documentElement: { hasAttribute: () => true, dataset: {} } }, localStorage: { setItem() {} }, setInterval, clearInterval };
+  hctx.window = hctx;
+  runInNewContext(hostSrc, hctx);
+  const chan = runInNewContext('FTViewer.channels.player("")', hctx);
+  assert.ok(chan !== 'ft-player:case' && /^ft-player:nocase-[0-9a-f]{16}$/.test(chan) && runInNewContext('FTViewer.channels.player("C1")', hctx) === 'ft-player:C1', 'R9 U8: channels.player() without a key: ' + chan);
+  console.log('PASS VM R9 U8 channels.player uses caseStorageKey, never "case"');
+
+  // U2: the shell's close flush names the read-only cause (case.json vs the marks).
+  ex.__api = { save: async () => true, summary: () => ({ pending: 0, lockCause: 'case' }), saveState: () => 'readonly' };
+  ex.__toasts = [];
+  runInNewContext('hViewerApi = () => __api; FTStore.state.viewer.mounted = true; toast = (m, k) => { __toasts.push([m, k]); };', ex);
+  const c1 = await runInNewContext('hBeforeClose(1000)', ex);
+  assert.ok(c1.ok && /case\.json/.test(c1.warning) && !/판독 기록/.test(c1.warning), 'R9 U2: read-only by case.json → its own warning: ' + JSON.stringify(c1));
+  ex.__api = { save: async () => false, summary: () => ({ pending: 0, lockCause: 'case' }), saveState: () => 'readonly' };
+  const c2 = await runInNewContext('hBeforeClose(1000)', ex);
+  assert.ok(!c2.ok && /case\.json/.test(c2.message), 'R9 U2: blocked close names case.json: ' + JSON.stringify(c2));
+  ex.__api = { save: async () => true, summary: () => ({ pending: 0, lockCause: 'annotations' }), saveState: () => 'readonly' };
+  const c3 = await runInNewContext('hBeforeClose(1000)', ex);
+  assert.ok(c3.ok && /판독 기록/.test(c3.warning), 'R9 U2: the marks cause keeps its text');
+  console.log('PASS VM R9 U2 close flush: read-only cause in its own words');
+
+  // U6: a patient save that ran out of time while its request is still on
+  // the wire is "아직 저장 중", not "저장하지 못했습니다" (finalize retry,
+  // examiner attribution, project switch).
+  const stillApi = { save: async (o) => { o.timedOut = true; return false; }, saveState: () => 'saving', summary: () => ({ pending: 1 }), init() {} };
+  const failApi = { save: async () => false, saveState: () => 'failed', summary: () => ({ pending: 1 }), init() {} };
+  runInNewContext('finRefresh = () => {};', ex);
+  for (const [api, want, not] of [[stillApi, /아직 저장 중/, /저장하지 못했습니다/], [failApi, /저장하지 못했습니다/, /아직 저장 중/]]) {
+    ex.window.FTViewer = api;
+    ex.document.getElementById('finalHint').textContent = '';
+    await runInNewContext('finRetrySave()', ex);
+    const hint = ex.document.getElementById('finalHint').textContent;
+    assert.ok(want.test(hint) && !not.test(hint), 'R9 U6 finalize retry: ' + hint);
+  }
+  ex.window.FTViewer = stillApi;
+  ex.document.getElementById('finalExaminer').value = 'Kim';
+  runInNewContext('FIN.attributing = false; FIN.busy = false; finViewerSaveState = () => "pending"; finPaint = () => {};', ex);
+  await runInNewContext('finAttribute()', ex);
+  assert.ok(/아직 저장 중/.test(ex.document.getElementById('finalHint').textContent) || ex.__toasts.some(([m]) => /아직 저장 중/.test(m)), 'R9 U6 attribution says still saving: ' + JSON.stringify(ex.__toasts.slice(-2)));
+  ex.document.documentElement = { hasAttribute: (a) => a === 'data-ft-host' };
+  ex.FTViewer = stillApi;
+  runInNewContext('hostViewer.mounted = true;', ex);
+  const sw = await runInNewContext('hostViewerSwitch(async () => true)', ex);
+  assert.ok(sw === false && runInNewContext('hostViewer.stillSaving', ex) === true, 'R9 U6 project switch: refused, and known to be still saving');
+  ex.window.FTViewer = failApi;
+  ex.FTViewer = failApi;
+  const sw2 = await runInNewContext('hostViewerSwitch(async () => true)', ex);
+  assert.ok(sw2 === false && runInNewContext('hostViewer.stillSaving', ex) === false, 'R9 U6 project switch: a failed save is not "still saving"');
+  runInNewContext('hostViewer.mounted = false; FTStore.state.viewer.mounted = false;', ex);
+  delete ex.document.documentElement;
+  delete ex.FTViewer;
+  delete ex.window.FTViewer;
+  console.log('PASS VM R9 U6 patient save timed out while still on the wire reads "아직 저장 중"');
+
+  // U9: harness saves that wait for a real save are explicit ({ patient: true });
+  // a no-budget FTViewer.save() (the shell fallback's 4 s) only where that
+  // budget is what is tested, marked /* no-budget: … */.
+  const scriptsDir = new URL('./', import.meta.url);
+  const bare = [];
+  for (const f of readdirSync(scriptsDir).filter((n) => n.endsWith('.mjs'))) {
+    readFileSync(new URL(f, scriptsDir), 'utf8').split(/\r?\n/).forEach((line, i) => {
+      if (/FTViewer\.save\(\)/.test(line.replace(/\/\/.*$/, '')) && !/^\s*\/\//.test(line)) bare.push(`${f}:${i + 1}`);
+    });
+  }
+  assert.deepEqual(bare, [], 'R9 U9: a harness save with no budget (the 4 s hard close budget) — use { patient: true } or mark /* no-budget */: ' + bare.join(', '));
+  console.log('PASS R9 U9 harness saves are explicit (patient) unless the no-budget path is under test');
 }
 
 // ---- R8 track U (docs/PLAN_R8_2026-10-15.md) ------------------------------
@@ -922,7 +1022,8 @@ async function r8TrackU({ fn, source, runInNewContext, assert }) {
   // Track I (R8 P1/P2) <-> U: a level measured on a keyless PC (`sc: true`)
   // is shown but says "자기 일관성만(인증 아님)"; an unverified line signed by
   // another PC's key (`pc`) stays 미확인 and names that key.
-  const i18nKo = { 'audio.selfConsistent': '자기 일관성만(인증 아님)', 'audio.otherPc': '키 {key} 보유 PC에서 확인' };
+  // (R9 U3: another PC's key reads "이 PC에서 인증 불가(변조 판정 아님) — 키 <id> …", never "검증 실패".)
+  const i18nKo = { 'audio.selfConsistent': '자기 일관성만(인증 아님)', 'audio.otherPc': '키 {key} 보유 PC에서 확인', 'trust.otherPc': '이 PC에서 인증 불가(변조 판정 아님) — 키 {key} 보유 PC에서 확인', 'audio.tip.trackOtherPc': '오디오 트랙 있음 · 소리 미확인', 'audio.detail.trackOtherPc': '오디오 트랙 있음{codec} — 소리 미확인', 'audio.tip.trackUnverified': '오디오 트랙 있음 · 측정 기록 검증 실패 — 미확인' };
   const au = {
     audioLevels: {
       s1: { r: 'sound', max: -12, mean: -30, sc: true }, s2: { r: 'sound', max: -12, mean: -30 },
@@ -940,6 +1041,10 @@ async function r8TrackU({ fn, source, runInNewContext, assert }) {
   assert.ok(s2.state === 'sound' && !/자기 일관성/.test(s2.tip + s2.detail), 'R8: an authenticated level has no note: ' + JSON.stringify(s2));
   assert.ok(u1.state === 'track' && /키 pc-b 보유 PC에서 확인/.test(u1.tip) && /키 pc-b 보유 PC에서 확인/.test(u1.detail), 'R8: another PC\'s line stays 미확인 and names its key: ' + JSON.stringify(u1));
   assert.ok(u2.state === 'track' && !/보유 PC/.test(u2.tip), 'R8: a plain unverified line names no key: ' + JSON.stringify(u2));
+  assert.ok(!/검증 실패/.test(u1.tip + u1.detail) && /이 PC에서 인증 불가\(변조 판정 아님\)/.test(u1.tip) && /이 PC에서 인증 불가\(변조 판정 아님\)/.test(u1.detail), 'R9 U3: another PC\'s line is "이 PC에서 인증 불가(변조 판정 아님)", never "검증 실패": ' + JSON.stringify(u1));
+  au.audioLevels.n1 = { r: 'unverified', pc: 'pc-n' };
+  const n1 = runInNewContext('(() => { const r = { id: "n1", audioCodec: "", probeOk: false }; const a = audioInfoFor(r); Object.assign(r, { audioState: a.state, audioLevel: a.level, audioReason: a.reason, audioTrust: a.trust || "", audioPcKey: a.pcKey || "" }); return { state: a.state, tip: audioTipFor(r) }; })()', au);
+  assert.ok(n1.state === 'unknown' && /키 pc-n 보유 PC에서 확인/.test(n1.tip), 'R9 U3: shown for the unknown state too: ' + JSON.stringify(n1));
   console.log('PASS VM R8 (I <-> U) audio levels: sc = self-consistency only, pc = check on the PC holding that key');
 }
 

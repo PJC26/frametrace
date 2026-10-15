@@ -257,8 +257,27 @@ try {
     const toastCount = () => page.evaluate(() => document.querySelectorAll('#toastHost .toast:not(.clip-progress)').length);
     const theater = () => page.evaluate(() => document.getElementById('ftViewer').classList.contains('theater'));
     const modalOpen = () => page.evaluate(() => !document.getElementById('shortcutsModal').hidden);
+    // Isolate the toast layer (PR #4 Linux CI flake): this fixture's
+    // /api/import-marks never succeeds, so the viewer's autosave keeps
+    // retrying and adds a "케이스 DB 저장 실패" toast on its own schedule,
+    // and an info toast expires after 3.2 s — on a slower runner either
+    // lands between two Esc presses, so a count or "the newest toast" is
+    // not this test's. The viewer is right; the measurement was not. Here:
+    // start from an empty host, let only this test's toasts in while the
+    // Esc checks run (restored below), and use error toasts (no expiry).
+    await page.evaluate(() => {
+      const host = document.getElementById('toastHost');
+      host.querySelectorAll('.toast').forEach((el) => { clearTimeout(el._ftTimer); el.remove(); });
+      const own = /esc-layer|focus-older|focus-newer/;
+      const keep = (n) => !(n && n.classList && n.classList.contains('toast')) || own.test(n.textContent || '');
+      const ap = host.appendChild;
+      const ib = host.insertBefore;
+      host.appendChild = function (n) { return keep(n) ? ap.call(this, n) : n; };
+      host.insertBefore = function (n, r) { return keep(n) ? ib.call(this, n, r) : n; };
+      window.__ftToastIsolationEnd = () => { delete host.appendChild; delete host.insertBefore; };
+    });
     await page.keyboard.press('t');
-    await page.evaluate(() => FTViewer.toast('esc-layer-test'));
+    await page.evaluate(() => { FTViewer.toast('esc-layer-1', 'error'); FTViewer.toast('esc-layer-2', 'error'); });
     await page.keyboard.press('Shift+Slash');
     check('"?" opens the shortcut sheet over theater + a toast', (await modalOpen()) && (await theater()) && (await toastCount()) > 0);
     const a0 = await page.evaluate(() => document.querySelector('.card.active')?.dataset.id);
@@ -269,7 +288,8 @@ try {
     check('1st Esc closes only the shortcut sheet', !(await modalOpen()) && (await theater()) && (await toastCount()) === t0, `toasts ${t0} -> ${await toastCount()}`);
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.press('Escape');
-    check('2nd Esc dismisses one toast, theater stays', (await toastCount()) === t0 - 1 && (await theater()), `toasts ${t0} -> ${await toastCount()}`);
+    const texts = () => page.evaluate(() => [...document.querySelectorAll('#toastHost .toast:not(.clip-progress)')].map((el) => el.textContent));
+    check('2nd Esc dismisses one toast (the newest), theater stays', (await toastCount()) === t0 - 1 && (await theater()) && !(await texts()).some((s) => s.includes('esc-layer-2')) && (await texts()).some((s) => s.includes('esc-layer-1')), `toasts ${t0} -> ${await toastCount()} ${JSON.stringify(await texts())}`);
     for (let i = 0; i < 10 && (await toastCount()) > 0; i++) await page.keyboard.press('Escape');
     check('theater survives until the toasts are gone', await theater());
     await page.keyboard.press('Escape');
@@ -287,6 +307,7 @@ try {
     await page.keyboard.press('Escape');
     const f7b = await page.evaluate(() => ({ n: document.querySelectorAll('#toastHost .toast').length, onCard: !!document.activeElement?.closest('#recordGrid') }));
     check('Esc on the last focused toast returns focus to the grid', f7b.n === 0 && f7b.onCard, JSON.stringify(f7b));
+    await page.evaluate(() => window.__ftToastIsolationEnd && window.__ftToastIsolationEnd());
   }
   // --- A6: IME composition Enter is not a command -------------------------
   {

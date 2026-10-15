@@ -67,6 +67,14 @@ function unsavedDraftCount(caseId) {
   if (legacy && typeof legacy === "object") n += Object.keys(legacy).length;
   return n;
 }
+// R9 U2: the viewer's own lock cause (summary().lockCause); without it,
+// records-meta saying case.json was not read.
+function finLockCause(summary, meta) {
+  const own = summary && typeof summary.lockCause === "string" ? summary.lockCause : "";
+  if (own) return own;
+  if (meta && meta.ok !== false && (meta.manifest == null || meta.manifestUnreadable)) return "case";
+  return "";
+}
 function finViewerSummary() {
   const v = finViewer();
   try { return v && typeof v.summary === "function" ? v.summary() : null; } catch (e) { return null; }
@@ -77,7 +85,10 @@ function finViewerSummary() {
 //   markConflicts  /api/status.mark_conflicts.count — saves the server's
 //                  queue could not apply (a newer revision); the examiner
 //                  resolves them in the viewer's conflict list.
-function unsavedMarksChecks({ pendingMarks, saveState, drafts, markConflicts = 0 }) {
+//   lockCause      R9 U2: why a "readonly" viewer is locked — "case"
+//                  (case.json was not read) or "annotations" (the case's
+//                  marks were not read); the text names that cause.
+function unsavedMarksChecks({ pendingMarks, saveState, drafts, markConflicts = 0, lockCause = "" }) {
   const out = [];
   const add = (level, text, sub, retry) => out.push({ level, text, sub: sub || "", retry: !!retry });
   if (pendingMarks === null) add("block", "서버의 마크 저장 대기열을 확인할 수 없습니다", "연결이 복구된 뒤 '다시 확인'을 누르십시오.");
@@ -90,6 +101,8 @@ function unsavedMarksChecks({ pendingMarks, saveState, drafts, markConflicts = 0
   else if (saveState === "pending" || saveState === "saving") add("block", "뷰어에 아직 저장되지 않은 마크·메모 변경이 있습니다",
     "'저장 다시 시도'로 지금 저장한 뒤 '다시 확인'을 누르십시오.", true);
   else if (saveState === "queued") add("block", "마크가 서버 대기열에 있습니다 (보강 작업 중)", "보강 작업이 끝난 뒤 다시 확인하십시오.");
+  else if (saveState === "readonly" && lockCause === "case") add("block", "케이스 정보(case.json)를 읽지 못했습니다 — 편집 저장이 막혀 있습니다",
+    "case.json을 고친 뒤 뷰어를 새로 고치고 다시 확인하십시오.");
   else if (saveState === "readonly") add("block", "판독 기록을 읽지 못했습니다 — 편집 저장이 막혀 있습니다",
     "케이스의 마크·메모를 읽을 수 있게 된 뒤 뷰어를 새로 고치고 다시 확인하십시오.");
   else if (saveState === "unknown") add("block", "저장 충돌 확인에 실패했습니다 — 모두 저장되었는지 알 수 없습니다",
@@ -190,8 +203,9 @@ async function finAttribute() {
     const v = finViewer();
     if (v && typeof v.save === "function" && FIN_UNSAVED.includes(finViewerSaveState())) {
       let saved = false;
-      try { saved = await v.save({ patient: true }); } catch (e) { saved = false; }
-      if (!saved) { msg = "뷰어의 미저장 변경을 먼저 저장하지 못했습니다 — ‘저장 다시 시도’ 후 다시 누르십시오."; return; }
+      const so = { patient: true };
+      try { saved = await v.save(so); } catch (e) { saved = false; }
+      if (!saved) { msg = hSaveStillSaving(so, v) ? H_STILL_SAVING : "뷰어의 미저장 변경을 먼저 저장하지 못했습니다 — ‘저장 다시 시도’ 후 다시 누르십시오."; return; }
     }
     propagateExaminerName(name, FIN.caseId);
     // Preferred: the viewer owns the marks it shows — it stamps the name on
@@ -265,13 +279,42 @@ function auditVerdict(res) {
   const count = `(${res.verified}개 로그, ${res.entries}항목)`;
   const others = [...new Set(logs.flatMap(l => Array.isArray(l.other_pc_key_ids) ? l.other_pc_key_ids : []).map(String))];
   const title = logs.map(l => `${l.name}: ${l.integrity}, ${l.entries}항목${l.trust ? " — " + l.trust : ""}`).join("\n");
+  const where = others.length ? ` — 키 ${others.slice(0, 3).join(", ")}${others.length > 3 ? " 외" : ""} 보유 PC에서 확인` : "";
   if (res.integrity === "integrity-keyed") return { level: "ok", text: `감사 로그 인증됨 ${count}`, title };
   if (res.integrity === "integrity-not-verified") {
-    const where = others.length ? ` — 키 ${others.slice(0, 3).join(", ")}${others.length > 3 ? " 외" : ""} 보유 PC에서 확인` : "";
-    return { level: "warn", text: `감사 로그 이 PC에서 인증 불가${where} ${count}`, title };
+    // R9 U4: lines without a valid HMAC here come first ("인증 안 된 줄 N개");
+    // "check on the PC holding key <id>" only when other PCs' keys are the
+    // ONLY reason (R9 U3: never a failure, not a tampering verdict).
+    const c = auditNotHereCounts(logs);
+    if (c.unauth > 0) return { level: "warn", text: `감사 로그 인증 안 된 줄 ${c.unauth}개 ${count}`, title };
+    if (c.otherPc > 0 && !c.otherCause) return { level: "warn", text: `감사 로그 이 PC에서 인증 불가(변조 판정 아님)${where} ${count}`, title };
+    return { level: "warn", text: `감사 로그 이 PC에서 인증되지 않음 ${count}`, title };
   }
   if (res.integrity === "integrity-structural-only") return { level: "warn", text: `감사 로그 자기 일관성만 확인(인증 아님) ${count}`, title };
-  return { level: "warn", text: `감사 로그 상태 확인 불가 ${count}`, title: title || String(res.integrity || "") };
+  return { level: "warn", text: `감사 로그 상태 확인 불가${where} ${count}`, title: title || String(res.integrity || "") };
+}
+// R9 U4: per not-verified lane, how many lines are simply not authenticated
+// here (no HMAC / retired key only) and how many carry another PC's key.
+// Numeric fields when the server sends them (`unauthenticated_lines`,
+// `other_pc_lines`); otherwise read from the lane's reason text (the server's
+// own words, src/audit.rs lane_trust). A lane not-verified for any other
+// reason (rewrite not excluded, nothing counted) sets otherCause.
+function auditNotHereCounts(logs) {
+  const out = { unauth: 0, otherPc: 0, otherCause: false };
+  for (const l of Array.isArray(logs) ? logs : []) {
+    if (!l || (l.integrity !== "not-verified" && l.integrity !== "integrity-not-verified")) continue;
+    const why = String(l.trust || "");
+    const num = (k) => (l[k] != null && Number.isFinite(Number(l[k])) ? Number(l[k]) : null);
+    const grab = (re) => { const m = re.exec(why); return m ? Number(m[1]) : 0; };
+    let unauth = num("unauthenticated_lines");
+    if (unauth == null) unauth = grab(/HMAC 없는 줄 (\d+)개/) + grab(/현재 키 항목이 없는 줄 (\d+)개/);
+    let otherPc = num("other_pc_lines");
+    if (otherPc == null) otherPc = grab(/다른 PC 키로 서명된 줄 (\d+)개/);
+    if (l.rewrite_not_excluded || (!unauth && !otherPc)) out.otherCause = true;
+    out.unauth += unauth;
+    out.otherPc += otherPc;
+  }
+  return out;
 }
 async function finRunAudit() {
   try {
@@ -302,7 +345,7 @@ async function gatherFinalizeChecks() {
   // an unreadable case.json: a hash of the case folder — never "case").
   const caseId = meta && meta.ok !== false && typeof FTViewer === "object" && FTViewer && FTViewer.caseStorageKey
     ? FTViewer.caseStorageKey(meta.manifest, meta.caseDir)
-    : (meta && meta.manifest ? (meta.manifest.case_id || "case") : null);
+    : (meta && meta.manifest && meta.manifest.case_id ? String(meta.manifest.case_id) : null);
   const summary = finViewerSummary();
 
   // Unsaved / queued marks block the finalize: sealing a package without
@@ -313,6 +356,7 @@ async function gatherFinalizeChecks() {
     saveState: finViewerSaveState(),
     drafts,
     markConflicts: st && st.mark_conflicts ? Number(st.mark_conflicts.count) || 0 : 0,
+    lockCause: finLockCause(summary, meta),
   }).forEach(c => checks.push(c));
 
   const marks = meta && meta.annotations && Array.isArray(meta.annotations.marks) ? meta.annotations.marks : null;
@@ -692,8 +736,10 @@ async function finRetrySave() {
   if (!v || typeof v.save !== "function") { toast("뷰어가 열려 있지 않습니다 — 검토 화면을 연 뒤 저장하십시오.", "warn"); return; }
   btn.disabled = true; btn.setAttribute("aria-busy", "true"); finHint("저장 중…");
   let ok = false;
-  try { ok = await v.save({ patient: true }); } catch (e) { ok = false; }
-  btn.removeAttribute("aria-busy"); btn.disabled = false; finHint(ok ? "" : "저장하지 못했습니다 — 뷰어의 저장 상태를 확인하십시오.");
+  const so = { patient: true };
+  try { ok = await v.save(so); } catch (e) { ok = false; }
+  btn.removeAttribute("aria-busy"); btn.disabled = false;
+  finHint(ok ? "" : hSaveStillSaving(so, v) ? H_STILL_SAVING : "저장하지 못했습니다 — 뷰어의 저장 상태를 확인하십시오.");
   finRefresh();
 }
 async function finImportMarks() {
