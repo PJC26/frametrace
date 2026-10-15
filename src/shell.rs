@@ -1018,12 +1018,20 @@ pub(crate) fn close_notice_text(outcome: &FlushOutcome) -> Option<String> {
 /// Now a run with `?`/`!` keeps those marks (dots dropped), else a run
 /// with an ellipsis keeps one ellipsis (`…` or `...`), else its last
 /// `.`/`。`.
+///
+/// R9-S6: full-width `？`/`！`/`．` count as marks too (R8 kept `정말？.`
+/// as is), and spaces inside the trailing run are part of it (`정말? .`
+/// kept its dot and the space before it).
 pub(crate) fn as_sentence(text: &str) -> String {
-    const MARKS: [char; 5] = ['.', '…', '?', '!', '。'];
-    let trimmed = text.trim_end();
-    let body = trimmed.trim_end_matches(MARKS);
-    let run = &trimmed[body.len()..];
-    let asked: String = run.chars().filter(|c| matches!(c, '?' | '!')).collect();
+    const ASKED: [char; 4] = ['?', '!', '？', '！'];
+    const ENDS: [char; 4] = ['.', '…', '。', '．'];
+    let body = text
+        .trim_end_matches(|c: char| c.is_whitespace() || ASKED.contains(&c) || ENDS.contains(&c));
+    let run: String = text[body.len()..]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let asked: String = run.chars().filter(|c| ASKED.contains(c)).collect();
     if !asked.is_empty() {
         format!("{body}{asked}")
     } else if run.contains('…') {
@@ -2108,6 +2116,13 @@ mod tests {
         assert_eq!(as_sentence("기다리는 중…."), "기다리는 중…");
         assert_eq!(as_sentence("기다리는 중...."), "기다리는 중...");
         assert_eq!(as_sentence("끝。."), "끝.");
+        // R9-S6: full-width marks and spaces inside the trailing run.
+        assert_eq!(as_sentence("저장할까요？."), "저장할까요？");
+        assert_eq!(as_sentence("정말！ ."), "정말！");
+        assert_eq!(as_sentence("정말? . "), "정말?");
+        assert_eq!(as_sentence("끝 ."), "끝.");
+        assert_eq!(as_sentence("끝．"), "끝．");
+        assert_eq!(as_sentence("기다리는 중 … ."), "기다리는 중…");
         let report = parse_save_report(
             r#"{"ft_close_save":1,"ok":false,"pending":1,"message":"Save timed out.","warning":"읽기 전용이었습니다."}"#,
         )

@@ -1460,8 +1460,41 @@ pub(crate) enum VerifiedBody {
 pub(crate) struct VerifiedStream {
     file: std::fs::File,
     len: u64,
-    sha: String,
+    /// R9-S1: SHA-256 of every [`VERIFY_CHUNK`]-byte chunk the hashing
+    /// pass read (the last one may be shorter), in file order. At most
+    /// [`MAX_VERIFY_CHUNKS`] entries (32 bytes each: 256 KiB for a
+    /// 512 MiB file).
+    chunks: Vec<[u8; 32]>,
     identity: FileIdentity,
+}
+
+/// R9-S1: the unit both passes read, hash and compare.
+pub(crate) const VERIFY_CHUNK: usize = 64 * 1024;
+
+/// R9-S1: most chunks a verified file can have
+/// (`VERIFIED_SERVE_MAX_BYTES / VERIFY_CHUNK` = 8192).
+pub(crate) const MAX_VERIFY_CHUNKS: usize =
+    (VERIFIED_SERVE_MAX_BYTES as usize).div_ceil(VERIFY_CHUNK);
+
+/// R9-S1: fills `buf` from `file` until it is full or the file ends
+/// (`Interrupted` retried) - both passes cut the file at the same
+/// [`VERIFY_CHUNK`] boundaries whatever sizes the OS reads return.
+fn read_chunk(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
 }
 
 /// R7-S2: a file's identity as far as the platform tells it — size,
@@ -1635,13 +1668,15 @@ fn note_verify_read(_path: &Path, _bytes: usize) {
 /// - larger files are hashed in a streaming pass on EVERY GET (R8-S2: R7
 ///   skipped the pass when the cached [`FileIdentity`] matched, and that
 ///   identity can be restored after a rewrite); the result is cached for
-///   HEAD only. The body is then streamed from the same handle and
-///   re-hashed on the way; the
-///   last chunk is sent only after the hash and identity still match
-///   ([`stream_verified`]), else the connection is cut (the client never
-///   gets a complete response). Streamed pages always get a hash-list
-///   `script-src` ([`crate::util::generated_pages::InlineScriptScan`]), so
-///   bytes changed mid-transfer cannot run script while rendering;
+///   HEAD only. The pass also keeps the SHA-256 of each 64 KiB chunk
+///   (R9-S1). The body is then streamed from the same handle, every chunk
+///   compared with its first-pass hash BEFORE it is sent (the connection
+///   is cut at the first changed chunk, so no changed byte goes out), and
+///   the last chunk is sent only after the length and identity still
+///   match ([`stream_verified`]), else the connection is cut (the client
+///   never gets a complete response). Streamed pages always get a
+///   hash-list `script-src`
+///   ([`crate::util::generated_pages::InlineScriptScan`]);
 /// - HEAD reads no content: a cached verdict answers, otherwise
 ///   [`ServeVerdict::Unknown`] (scripts 403, pages sandboxed).
 pub(crate) fn verify_for_serving(
@@ -1714,7 +1749,13 @@ pub(crate) fn verify_for_serving(
     // rewrite with every timestamp restored matched the cache, and the
     // changed bytes went out (and rendered) before the re-hash at the end
     // of the transfer noticed.
-    let Some((sha, script_src, read)) = hash_file_streaming(path, &mut file, page) else {
+    let Some(HashedFile {
+        sha,
+        script_src,
+        read,
+        chunks,
+    }) = hash_file_streaming(path, &mut file, page)
+    else {
         return ServeVerdict::Untrusted;
     };
     if read != len || file_identity(&file).as_ref() != Some(&identity) {
@@ -1746,7 +1787,7 @@ pub(crate) fn verify_for_serving(
         body: VerifiedBody::Stream(VerifiedStream {
             file,
             len,
-            sha,
+            chunks,
             identity,
         }),
     }
@@ -1759,35 +1800,49 @@ fn trusted_sha(case_dir: &Path, sha: &str) -> bool {
         .any(|known| known == sha)
 }
 
-/// R7-S2: SHA-256 (hex) of `file` read to its end in 64 KiB chunks (at
-/// most [`VERIFIED_SERVE_MAX_BYTES`] + 1 bytes), the streamed page's
-/// `script-src` when `page`, and the byte count read. `path` names the
-/// file for the test hook only.
-fn hash_file_streaming(
-    path: &Path,
-    file: &mut std::fs::File,
-    page: bool,
-) -> Option<(String, Option<String>, u64)> {
+/// R7-S2 / R9-S1: what the hashing pass of [`verify_for_serving`] saw.
+struct HashedFile {
+    /// SHA-256 (hex) of the whole file, as the manifest lists it.
+    sha: String,
+    /// The streamed page's `script-src` (pages only).
+    script_src: Option<String>,
+    /// Bytes read.
+    read: u64,
+    /// R9-S1: SHA-256 of each [`VERIFY_CHUNK`]-byte chunk, in order.
+    chunks: Vec<[u8; 32]>,
+}
+
+/// R7-S2: SHA-256 (hex) of `file` read to its end in [`VERIFY_CHUNK`]
+/// chunks (at most [`VERIFIED_SERVE_MAX_BYTES`] + 1 bytes), the streamed
+/// page's `script-src` when `page`, and the byte count read. R9-S1: also
+/// the SHA-256 of each chunk, so the serving pass can compare every chunk
+/// BEFORE sending it ([`stream_verified`]); bounded by
+/// [`MAX_VERIFY_CHUNKS`] (a longer file is refused). `path` names the file
+/// for the test hook only.
+fn hash_file_streaming(path: &Path, file: &mut std::fs::File, page: bool) -> Option<HashedFile> {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     let mut scan = page.then(crate::util::generated_pages::InlineScriptScan::new);
-    let mut chunk = vec![0u8; 64 * 1024];
+    let mut chunk = vec![0u8; VERIFY_CHUNK];
+    let mut chunks: Vec<[u8; 32]> = Vec::new();
     let mut read_total = 0u64;
     loop {
-        let read = match file.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        };
+        let read = read_chunk(file, &mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
         note_verify_read(path, read);
+        read_total += read as u64;
+        if read_total > VERIFIED_SERVE_MAX_BYTES || chunks.len() >= MAX_VERIFY_CHUNKS {
+            return None;
+        }
         hasher.update(&chunk[..read]);
+        chunks.push(sha256_bytes(&chunk[..read]));
         if let Some(scan) = scan.as_mut() {
             scan.feed(&chunk[..read]);
         }
-        read_total += read as u64;
-        if read_total > VERIFIED_SERVE_MAX_BYTES {
-            return None;
+        if read < chunk.len() {
+            break;
         }
     }
     let sha = hasher
@@ -1795,38 +1850,59 @@ fn hash_file_streaming(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    Some((sha, scan.map(|scan| scan.finish()), read_total))
+    Some(HashedFile {
+        sha,
+        script_src: scan.map(|scan| scan.finish()),
+        read: read_total,
+        chunks,
+    })
 }
 
-/// R7-S2: streams a verified file, re-hashing what it sends. One chunk is
-/// always held back; it goes out only once every byte has been read and
-/// the hash, the length and the file's identity still match the verified
-/// ones. Otherwise the cached verdict is dropped and the connection is
-/// cut short of its `Content-Length` — the client never receives a
-/// complete response of bytes that were not verified (and a script that
-/// did not arrive whole does not run).
+/// R7-S2: streams a verified file. R9-S1: every [`VERIFY_CHUNK`]-byte
+/// chunk is read, hashed and compared with the hashing pass's hash of the
+/// same chunk BEFORE any of its bytes is sent; at the first mismatch the
+/// connection is cut, so not one changed byte reaches the client (R8 sent
+/// every chunk but the last and compared only the whole-file hash at the
+/// end, so a page rewritten between or during the passes had its changed
+/// middle delivered - rendered, if not scripted). One chunk is still held
+/// back; it goes out only once every byte has been read and the length,
+/// the end of file and the file's identity still match. Otherwise the
+/// cached verdict is dropped and the connection is cut short of its
+/// `Content-Length` - the client never receives a complete response of
+/// bytes that were not verified (and a script that did not arrive whole
+/// does not run).
 pub(crate) fn stream_verified(
     stream: &mut TcpStream,
     path: &Path,
     mut verified: VerifiedStream,
 ) -> Result<(), String> {
-    use sha2::Digest;
     if HEAD_ONLY.with(std::cell::Cell::get) {
         return Ok(());
     }
-    let mut hasher = sha2::Sha256::new();
-    let mut held: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut chunk = vec![0u8; 64 * 1024];
+    let cut = |stream: &mut TcpStream, why: &str| -> Result<(), String> {
+        cache_forget(path);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        Err(format!(
+            "{} changed while it was served ({why}) - transfer cut before the changed bytes",
+            path.display()
+        ))
+    };
+    let mut held: Vec<u8> = Vec::with_capacity(VERIFY_CHUNK);
+    let mut chunk = vec![0u8; VERIFY_CHUNK];
     let mut read_total = 0u64;
+    let mut index = 0usize;
     while read_total < verified.len {
-        let want = (verified.len - read_total).min(chunk.len() as u64) as usize;
-        let read = match verified.file.read(&mut chunk[..want]) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(format!("file read failed: {err}")),
-        };
-        hasher.update(&chunk[..read]);
+        let want = (verified.len - read_total).min(VERIFY_CHUNK as u64) as usize;
+        let read = read_chunk(&mut verified.file, &mut chunk[..want])
+            .map_err(|err| format!("file read failed: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        // R9-S1: compared before a byte of it leaves.
+        if verified.chunks.get(index) != Some(&sha256_bytes(&chunk[..read])) {
+            return cut(stream, &format!("chunk {index} differs"));
+        }
+        index += 1;
         if !held.is_empty() {
             stream
                 .write_all(&held)
@@ -1835,25 +1911,21 @@ pub(crate) fn stream_verified(
         held.clear();
         held.extend_from_slice(&chunk[..read]);
         read_total += read as u64;
+        #[cfg(test)]
+        STREAM_CHUNK_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(index);
+            }
+        });
     }
-    let sha: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
     let mut probe = [0u8; 1];
     let at_end = matches!(verified.file.read(&mut probe), Ok(0));
     if read_total != verified.len
+        || index != verified.chunks.len()
         || !at_end
-        || sha != verified.sha
         || file_identity(&verified.file).as_ref() != Some(&verified.identity)
     {
-        cache_forget(path);
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-        return Err(format!(
-            "{} changed while it was served - transfer cut before its last bytes",
-            path.display()
-        ));
+        return cut(stream, "length or identity");
     }
     stream
         .write_all(&held)
@@ -1861,6 +1933,19 @@ pub(crate) fn stream_verified(
     stream
         .flush()
         .map_err(|err| format!("file write failed: {err}"))
+}
+
+/// R9-S1 test hook type (see [`STREAM_CHUNK_HOOK`]).
+#[cfg(test)]
+pub(crate) type ChunkHook = Box<dyn FnMut(usize)>;
+
+#[cfg(test)]
+thread_local! {
+    /// R9-S1 test hook: called on the serving thread after each chunk of
+    /// [`stream_verified`] passed its comparison (argument: chunks
+    /// compared so far) - lets a test rewrite the file mid-transfer.
+    pub(crate) static STREAM_CHUNK_HOOK: std::cell::RefCell<Option<ChunkHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// True for the two spellings of the embedded viewer page itself.

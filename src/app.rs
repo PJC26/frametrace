@@ -100,6 +100,10 @@ fn run_workstation() -> Result<(), String> {
 }
 
 fn main() {
+    // R9-S7: keep the workstation's per-step token and drop it from the
+    // environment before any thread or tool exists (see `frametrace` main).
+    // SAFETY: first statement of `main`; no other thread exists yet.
+    unsafe { frametrace::util::adopt_step_warning_token() };
     // C8: a step child of the workstation dies with it (unix watch pipe).
     frametrace::serve::watch_parent_from_env();
     // P7: no modal loader/critical-error dialogs for this process or the

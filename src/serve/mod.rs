@@ -59,6 +59,8 @@ mod tests_r7_server;
 #[cfg(test)]
 mod tests_r8_server;
 #[cfg(test)]
+mod tests_r9_server;
+#[cfg(test)]
 mod tests_recent;
 #[cfg(test)]
 mod tests_review3;

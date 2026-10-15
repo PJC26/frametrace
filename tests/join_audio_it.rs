@@ -724,13 +724,14 @@ fn join_segment_check_catches_a_missing_segment() {
         .collect();
     let full = root.join("full.mp4");
     concat_copy(&[&paths[0], &paths[1], &paths[2]], &full);
-    let check = frametrace::join::verify_segments("ffprobe", &full, &plan, None).unwrap();
+    let check = frametrace::join::verify_segments("ffprobe", "ffmpeg", &full, &plan, None).unwrap();
     assert!(check.ok, "{:?}", check.problems);
     assert_eq!(check.video_packets_expected, check.video_packets_observed);
 
     let missing = root.join("missing.mp4");
     concat_copy(&[&paths[0], &paths[2]], &missing);
-    let check = frametrace::join::verify_segments("ffprobe", &missing, &plan, None).unwrap();
+    let check =
+        frametrace::join::verify_segments("ffprobe", "ffmpeg", &missing, &plan, None).unwrap();
     assert!(!check.ok, "a missing segment must fail the check");
     assert!(
         check.video_packets_observed < check.video_packets_expected,
@@ -985,6 +986,192 @@ fn join_accepts_an_edit_list_mp4_source() {
         // An ffmpeg that applies the edit list: nothing presented.
         Some("all-packets") | Some("edit-list-applied") => {}
         other => panic!("unexpected mode {other:?}: {check:#}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Real ffmpeg concat (stream copy, as `join-video` runs it) of `inputs`
+/// into `output` with muxer `format`.
+fn concat_to(inputs: &[&Path], output: &Path, format: &str) {
+    let list = output.with_extension("ffconcat");
+    let mut text = String::from("ffconcat version 1.0\n");
+    for input in inputs {
+        text.push_str(&format!(
+            "file '{}'\n",
+            input.to_string_lossy().replace('\\', "/")
+        ));
+    }
+    std::fs::write(&list, text).unwrap();
+    let list_arg = list.to_str().unwrap().to_string();
+    let output_arg = output.to_str().unwrap().to_string();
+    ffmpeg_fixture(&[
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        &list_arg,
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-f",
+        format,
+        &output_arg,
+    ]);
+}
+
+/// Rewrites the first (version 0) `elst` entry of an MP4 so its media time
+/// starts half a frame after frame 3 of a 10 fps stream: the demuxer then
+/// flags frame 3 discard (pre-roll) and drops frames 0-2.
+fn patch_edit_list(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let find = |bytes: &[u8], tag: &[u8]| bytes.windows(4).position(|w| w == tag).unwrap();
+    let mdhd = find(&bytes, b"mdhd");
+    assert_eq!(bytes[mdhd + 4], 0, "mdhd version 0 expected");
+    let timescale = u32::from_be_bytes(bytes[mdhd + 16..mdhd + 20].try_into().unwrap());
+    let elst = find(&bytes, b"elst");
+    assert_eq!(bytes[elst + 4], 0, "elst version 0 expected");
+    let duration = u32::from_be_bytes(bytes[elst + 12..elst + 16].try_into().unwrap());
+    let frame = timescale / 10;
+    bytes[elst + 12..elst + 16].copy_from_slice(&(duration - 350).to_be_bytes());
+    bytes[elst + 16..elst + 20].copy_from_slice(&(3 * frame + frame / 2).to_be_bytes());
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// R9-S2 (real ffmpeg): an all-intra H.264 source with an edit list.
+/// Stream copy rewrites every IDR frame - the concat demuxer converts to
+/// Annex B and parameter sets are re-inserted; an MPEG-TS output is Annex
+/// B with access unit delimiters - so NO output packet has a source
+/// payload. R8 took exactly that for "every key frame rewritten" and
+/// accepted on count and timing alone, so an output whose segment was
+/// shifted by one frame (pre-roll frame kept, last real frame lost: same
+/// count) passed. With normalized payload hashes (parameter sets and AUDs
+/// removed, Annex B framing) the correct output matches position by
+/// position in MP4, Matroska and MPEG-TS, and the shifted one is refused.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn all_intra_edit_list_output_is_compared_frame_by_frame() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_r9_s2");
+    let plain = root.join("plain.mp4");
+    ffmpeg_fixture(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x120:rate=10",
+        "-t",
+        "2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-g",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        plain.to_str().unwrap(),
+    ]);
+    let edited = root.join("edited.mp4");
+    ffmpeg_fixture(&[
+        "-i",
+        plain.to_str().unwrap(),
+        "-c",
+        "copy",
+        "-use_editlist",
+        "1",
+        edited.to_str().unwrap(),
+    ]);
+    patch_edit_list(&edited);
+    let flags = packet_fields(&edited, "flags");
+    assert!(
+        flags.lines().next().is_some_and(|f| f.contains('D')),
+        "fixture without edit-list pre-roll: {flags}"
+    );
+    assert!(
+        flags.lines().all(|f| f.contains('K')),
+        "not all-intra: {flags}"
+    );
+    // What an ffmpeg that applies the edit list produces: frames 4..19.
+    let applied_part = root.join("applied.mp4");
+    ffmpeg_fixture(&[
+        "-i",
+        plain.to_str().unwrap(),
+        "-ss",
+        "0.4",
+        "-c",
+        "copy",
+        applied_part.to_str().unwrap(),
+    ]);
+    // The pre-roll frame kept and the last real frame lost: frames 3..18.
+    let shifted_part = root.join("shifted.mp4");
+    ffmpeg_fixture(&[
+        "-i",
+        plain.to_str().unwrap(),
+        "-ss",
+        "0.3",
+        "-frames:v",
+        "16",
+        "-c",
+        "copy",
+        shifted_part.to_str().unwrap(),
+    ]);
+    let sources = [edited.clone(), plain.clone()];
+    let offsets = [0.0, 1.6];
+    let check = |output: &Path| {
+        frametrace::join::verify_segments_with(
+            &sources,
+            &offsets,
+            output,
+            &mut |path, hashes| {
+                if hashes {
+                    frametrace::join::normalized_video_packets("ffprobe", "ffmpeg", path, None)
+                } else {
+                    frametrace::join::video_packets("ffprobe", path, None, false)
+                }
+            },
+            &mut |path| frametrace::join::stream_packet_counts("ffprobe", path, None),
+        )
+        .unwrap()
+    };
+    let raw = |path: &Path| -> Vec<u64> {
+        frametrace::join::video_packets("ffprobe", path, None, true)
+            .unwrap()
+            .iter()
+            .map(|p| p.hash.unwrap())
+            .collect()
+    };
+    let source_raw: std::collections::HashSet<u64> =
+        raw(&edited).into_iter().chain(raw(&plain)).collect();
+    for (format, ext) in [("mp4", "mp4"), ("matroska", "mkv"), ("mpegts", "ts")] {
+        let good = root.join(format!("out-good.{ext}"));
+        concat_to(&[&applied_part, &plain], &good, format);
+        // Premise: stream copy rewrote every packet (no raw payload of
+        // any source survives) - R8's "rewritten" escape.
+        assert!(
+            raw(&good).iter().all(|h| !source_raw.contains(h)),
+            "{format}: some packets were copied byte for byte"
+        );
+        let verdict = check(&good);
+        assert!(verdict.ok, "{format}: {:?}", verdict.problems);
+        assert_eq!(verdict.mode, "edit-list-applied", "{format}");
+        let bad = root.join(format!("out-shifted.{ext}"));
+        concat_to(&[&shifted_part, &plain], &bad, format);
+        assert!(raw(&bad).iter().all(|h| !source_raw.contains(h)));
+        let verdict = check(&bad);
+        assert!(!verdict.ok, "{format}: a one-frame shift passed");
+        assert!(
+            verdict
+                .problems
+                .iter()
+                .any(|p| p.contains("유지 프레임") && p.contains("1번째 프레임부터")),
+            "{format}: {:?}",
+            verdict.problems
+        );
     }
     let _ = std::fs::remove_dir_all(&root);
 }
