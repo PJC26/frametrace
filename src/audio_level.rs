@@ -897,18 +897,24 @@ pub fn lane_rels(case_dir: &Path) -> Result<Vec<String>, String> {
 /// an error.
 fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Vec<LaneStatus>), String> {
     let keys = crate::audit_key::verification_keys()?;
+    read_logged_results_with_keys(case_dir, &keys)
+}
+
+/// [`read_logged_results`] with an explicit verification key set.
+fn read_logged_results_with_keys(
+    case_dir: &Path,
+    keys: &[crate::audit_key::AuditKey],
+) -> Result<(LoggedResults, Vec<LaneStatus>), String> {
     let lanes = read_lanes(case_dir)?;
-    let statuses = lane_statuses(&lanes, &keys);
     // R6-I3: a case measured under an audit key (any lane line carries an
     // HMAC) does not take measurements from lines written without one.
-    let keyed_case =
-        lanes
-            .iter()
-            .zip(&statuses)
-            .any(|((_, text), status)| match &status.verification {
-                Ok(verification) => verification.keyed_entries > 0,
-                Err(_) => text.contains("\"entry_hmac_sha256\""),
-            });
+    let keyed_case = is_keyed_case(&lanes);
+    // R7-I1: and when this PC holds audit keys, a line is a measurement
+    // only when its HMAC is AUTHENTICATED here — an HMAC under an invented
+    // key id (UnknownKey) or a retired key nothing later proves
+    // (RetiredUnproven) is any rewriter's line.
+    let require_auth = keyed_case && !keys.is_empty();
+    let statuses = lane_statuses(&lanes, keys, require_auth);
     let mut out: LoggedResults = BTreeMap::new();
     for ((rel, text), status) in lanes.iter().zip(&statuses) {
         let chain_error = status
@@ -925,6 +931,10 @@ fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Vec<LaneStatus
                 .as_ref()
                 .ok()
                 .and_then(|verification| verification.entry_auth.get(index).copied());
+            if require_auth {
+                return unauthenticated_line_reason(auth)
+                    .map(|why| format!("{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 {why}", index + 1));
+            }
             (keyed_case && !auth.is_some_and(audit::EntryAuth::is_keyed)).then(|| {
                 format!(
                     "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 감사 키로 기록된 케이스에서 키 없이 기록되어 측정값으로 쓰지 않습니다",
@@ -937,6 +947,33 @@ fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Vec<LaneStatus
         }
     }
     Ok((out, statuses))
+}
+
+/// R6-I3: whether any lane line carries an HMAC (the case was measured
+/// under an audit key). Read from the text so a damaged lane counts too.
+fn is_keyed_case(lanes: &[(String, String)]) -> bool {
+    lanes
+        .iter()
+        .any(|(_, text)| text.contains("\"entry_hmac_sha256\""))
+}
+
+/// R7-I1: why a line is not a measurement in a keyed case on a PC that
+/// holds audit keys, or `None` when its HMAC was authenticated here.
+fn unauthenticated_line_reason(auth: Option<audit::EntryAuth>) -> Option<&'static str> {
+    use audit::EntryAuth;
+    match auth {
+        Some(EntryAuth::Authenticated) => None,
+        Some(EntryAuth::Unkeyed) | None => {
+            Some("감사 키로 기록된 케이스에서 키 없이 기록되어 측정값으로 쓰지 않습니다")
+        }
+        Some(EntryAuth::UnknownKey) => Some(
+            "이 PC에 없는 감사 키 id로 서명되어 인증할 수 없어 측정값으로 쓰지 않습니다 (그 키를 가진 PC에서 확인)",
+        ),
+        Some(EntryAuth::RetiredUnproven) => Some(
+            "은퇴한 감사 키로만 서명되었고 그 뒤에 현재 키 항목이 없어 인증할 수 없으므로 측정값으로 쓰지 않습니다",
+        ),
+        Some(EntryAuth::NoKey) => Some("감사 키로 인증되지 않아 측정값으로 쓰지 않습니다"),
+    }
 }
 
 /// Every present lane's text, in continuation order (R5-P8).
@@ -962,22 +999,40 @@ fn read_lanes(case_dir: &Path) -> Result<Vec<(String, String)>, String> {
 /// planted next to an intact one, a marker for another lane, a lane edited
 /// after it was continued from — is reported as not verifying, so its
 /// results never replace verified measurements.
+///
+/// R7-I1: with `require_auth` (a keyed case on a PC holding audit keys)
+/// the marker itself must be HMAC-authenticated here — an unkeyed or
+/// unknown-key marker is anyone's. R7-I10: a previous lane REPAIRED by
+/// truncating it to its verifying prefix still matches, through the
+/// prefix hash the marker recorded (`previous_lane_verified_prefix_sha256`).
 fn lane_statuses(
     lanes: &[(String, String)],
     keys: &[crate::audit_key::AuditKey],
+    require_auth: bool,
 ) -> Vec<LaneStatus> {
     let mut statuses: Vec<LaneStatus> = Vec::with_capacity(lanes.len());
     for (index, (rel, text)) in lanes.iter().enumerate() {
         let mut verification = audit::verify_chained_jsonl_text(text, rel, keys);
         let number = audit::audio_level_lane_number(rel).unwrap_or(0);
-        if verification.is_ok() && number >= 1 {
+        if number >= 1
+            && let Ok(verified) = &verification
+        {
             let previous = index
                 .checked_sub(1)
                 .map(|p| (&lanes[p], &statuses[p]))
                 .filter(|((prev_rel, _), _)| {
                     audit::audio_level_lane_number(prev_rel) == Some(number - 1)
                 });
-            if let Err(why) = continuation_proof(text, previous) {
+            let marker_auth = verified.entry_auth.first().copied();
+            let proof = if require_auth && marker_auth != Some(audit::EntryAuth::Authenticated) {
+                Err(format!(
+                    "연속 표식이 이 PC의 감사 키로 인증되지 않았습니다 ({})",
+                    unauthenticated_line_reason(marker_auth).unwrap_or("인증 안 됨")
+                ))
+            } else {
+                continuation_proof(text, number, previous)
+            };
+            if let Err(why) = proof {
                 verification = Err(format!("연속 레인 연결 미검증 — {why}"));
             }
         }
@@ -989,15 +1044,31 @@ fn lane_statuses(
     statuses
 }
 
-/// Why `text` (a continuation lane) is not a proven continuation of
-/// `previous`, or `Ok` when it is (see [`lane_statuses`]).
+/// R7-I6: the newest sound-measurement lane when it is accepted (verifies
+/// and, for a continuation lane, is a proven continuation) — the only lane
+/// a rotation marker may be appended to. `None` without lanes or when the
+/// newest lane is not accepted.
+pub fn verified_active_lane(case_dir: &Path) -> Result<Option<String>, String> {
+    let lanes = read_lanes(case_dir)?;
+    let keys = crate::audit_key::verification_keys()?;
+    let require_auth = is_keyed_case(&lanes) && !keys.is_empty();
+    let statuses = lane_statuses(&lanes, &keys, require_auth);
+    Ok(statuses
+        .last()
+        .filter(|status| status.verification.is_ok())
+        .map(|status| status.rel.clone()))
+}
+
+/// R7-I10: the warning every damaged-lane message carries.
+pub const DO_NOT_REPAIR_LANE: &str = "손상된 측정 레인을 직접 고치지 마십시오 — 이어진 레인의 연속 표식은 손상 당시 해시로 연결을 확인합니다(끝부분을 검증되는 구간까지 잘라 낸 수리만 '수리 전 검증 구간' 해시로 인정됨)";
+
+/// Why `text` (continuation lane number `number`) is not a proven
+/// continuation of `previous`, or `Ok` when it is (see [`lane_statuses`]).
 fn continuation_proof(
     text: &str,
+    number: u32,
     previous: Option<(&(String, String), &LaneStatus)>,
 ) -> Result<(), String> {
-    let Some(((prev_rel, prev_text), prev_status)) = previous else {
-        return Err("바로 앞 번호의 측정 레인이 없습니다".to_string());
-    };
     let marker = text
         .lines()
         .next()
@@ -1008,6 +1079,27 @@ fn continuation_proof(
         .ok_or_else(|| {
             "첫 항목이 레인 연속 표식(audio-level-lane-continued)이 아닙니다".to_string()
         })?;
+    let prefix_sha = marker
+        .get("previous_lane_verified_prefix_sha256")
+        .and_then(Value::as_str);
+    let prefix_entries = marker
+        .get("previous_lane_verified_prefix_entries")
+        .and_then(Value::as_u64);
+    let Some(((prev_rel, prev_text), prev_status)) = previous else {
+        // R7-I10: a lane whose very first line was damaged has an empty
+        // verifying prefix; "repairing" it removes the lane altogether.
+        let expected = if number == 1 {
+            LOG_REL.to_string()
+        } else {
+            format!("evidence/logs/audio-level-log.{}.jsonl", number - 1)
+        };
+        if prefix_entries == Some(0)
+            && marker.get("previous_lane").and_then(Value::as_str) == Some(expected.as_str())
+        {
+            return Ok(());
+        }
+        return Err("바로 앞 번호의 측정 레인이 없습니다".to_string());
+    };
     if marker.get("previous_lane").and_then(Value::as_str) != Some(prev_rel.as_str()) {
         return Err(format!(
             "연속 표식이 앞 레인 {prev_rel}을 지목하지 않습니다"
@@ -1017,17 +1109,25 @@ fn continuation_proof(
         .get("previous_lane_sha256")
         .and_then(Value::as_str)
         .ok_or_else(|| "연속 표식에 앞 레인 해시(previous_lane_sha256)가 없습니다".to_string())?;
-    if !recorded.eq_ignore_ascii_case(&crate::sha256::digest_bytes(prev_text.as_bytes())) {
-        return Err(format!(
-            "앞 레인 {prev_rel}이 연속 표식 기록 후 바뀌었습니다(해시 불일치)"
-        ));
+    let now = crate::sha256::digest_bytes(prev_text.as_bytes());
+    if recorded.eq_ignore_ascii_case(&now) {
+        if prev_status.verification.is_ok() {
+            return Err(format!(
+                "앞 레인 {prev_rel}이 정상 검증되는데 새 레인이 시작되었습니다"
+            ));
+        }
+        return Ok(());
     }
-    if prev_status.verification.is_ok() {
-        return Err(format!(
-            "앞 레인 {prev_rel}이 정상 검증되는데 새 레인이 시작되었습니다"
-        ));
+    // R7-I10: the damaged lane was repaired by cutting it back to the
+    // prefix that verified when the continuation was opened.
+    if prefix_sha.is_some_and(|sha| sha.eq_ignore_ascii_case(&now))
+        && prev_status.verification.is_ok()
+    {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "앞 레인 {prev_rel}이 연속 표식 기록 후 바뀌었습니다(해시 불일치 — 손상 당시와도, 수리 전 검증 구간과도 다름). {DO_NOT_REPAIR_LANE}"
+    ))
 }
 
 /// The lane new measurement entries are appended to (R5-P8): the newest
@@ -1040,27 +1140,34 @@ fn continuation_proof(
 /// R6-I3: "verifies" means accepted by [`lane_statuses`] (a continuation
 /// lane must be a proven one), and the marker records the damaged lane's
 /// SHA-256 (`previous_lane_sha256`) so the continuation can be checked.
+/// R7-I10: it also records the damaged lane's verifying prefix (entries and
+/// SHA-256), so a lane later repaired by truncation still matches.
 pub fn active_lane_for_append(case_dir: &Path) -> Result<PathBuf, String> {
     let lanes = read_lanes(case_dir)?;
     let Some((last, last_text)) = lanes.last() else {
         return Ok(case_dir.join(LOG_REL));
     };
     let keys = crate::audit_key::verification_keys()?;
-    let statuses = lane_statuses(&lanes, &keys);
+    let require_auth = is_keyed_case(&lanes) && !keys.is_empty();
+    let statuses = lane_statuses(&lanes, &keys, require_auth);
     let Some(Err(reason)) = statuses.last().map(|status| status.verification.clone()) else {
         return Ok(case_dir.join(last));
     };
     let number = audit::audio_level_lane_number(last).unwrap_or(0) + 1;
     let rel = format!("evidence/logs/audio-level-log.{number}.jsonl");
     let next = case_dir.join(&rel);
+    let (prefix_entries, prefix_len) = audit::verified_prefix(last_text, &keys);
     let marker = json!({
         "schema_version": 1,
         "event": "audio-level-lane-continued",
         "logged_unix": now_unix()?,
         "previous_lane": last,
         "previous_lane_sha256": crate::sha256::digest_bytes(last_text.as_bytes()),
+        "previous_lane_verified_prefix_entries": prefix_entries,
+        "previous_lane_verified_prefix_sha256":
+            crate::sha256::digest_bytes(&last_text.as_bytes()[..prefix_len]),
         "previous_lane_error": reason,
-        "note": "the previous sound-measurement lane does not verify as a chain; it is kept unchanged and its results are not shown as levels — measurement continues in this lane",
+        "note": "the previous sound-measurement lane does not verify as a chain; it is kept unchanged and its results are not shown as levels — measurement continues in this lane (do not repair the previous lane: this marker checks it by hash)",
     });
     audit::append_chained_jsonl(&next, &marker.to_string())?;
     Ok(next)
@@ -1082,9 +1189,14 @@ pub fn chain_summary_json(case_dir: &Path) -> Value {
     };
     let mut details: Vec<String> = Vec::new();
     for status in &statuses[..statuses.len() - 1] {
+        if let Ok(verification) = &status.verification
+            && let Some(reason) = &verification.rewrite_not_excluded
+        {
+            details.push(format!("이전 측정 레인 {}: {reason}", status.rel));
+        }
         if let Err(err) = &status.verification {
             details.push(format!(
-                "이전 측정 레인 {} 체인 손상 — 그 레인에만 있는 측정은 표시하지 않음 (unverified): {err}",
+                "이전 측정 레인 {} 체인 손상 — 그 레인에만 있는 측정은 표시하지 않음 (unverified): {err}. {DO_NOT_REPAIR_LANE}",
                 status.rel
             ));
         }
@@ -1108,10 +1220,20 @@ pub fn chain_summary_json(case_dir: &Path) -> Value {
         Ok(verification) => {
             details.extend(verification.warnings.iter().cloned());
             let damaged = statuses.iter().any(|status| status.verification.is_err());
+            // R7-I3: a lane whose tail may have been re-written under an
+            // invented key id is never shown as passing.
+            let rewrite = statuses.iter().any(|status| {
+                status
+                    .verification
+                    .as_ref()
+                    .is_ok_and(|v| v.rewrite_not_excluded.is_some())
+            });
             json!({
                 "path": newest.rel,
                 "status": if damaged {
                     "failed"
+                } else if rewrite {
+                    "not-verified"
                 } else if verification.integrity == audit::AuditIntegrity::Keyed {
                     "keyed"
                 } else {
@@ -2419,5 +2541,152 @@ mod tests {
         let template = command_template();
         assert!(template.windows(2).any(|w| w == ["-af", "volumedetect"]));
         assert_eq!(template.last().map(String::as_str), Some("-"));
+    }
+
+    /// R7-I1: in a keyed case on a PC that holds audit keys, a forged
+    /// measurement line carrying an HMAC under an invented key id is not a
+    /// level (it used to count because any HMAC line "is keyed"), and a
+    /// continuation lane whose marker is not authenticated here is not a
+    /// proven continuation.
+    #[test]
+    fn forged_key_id_lines_and_markers_are_not_levels_in_a_keyed_case() {
+        let r1 = row("vid_1");
+        let dir = audio_case("r7-i1", &[]);
+        let mine = crate::audit_key::AuditKey::new("mine", &[0x41; 32]);
+        let bogus = crate::audit_key::AuditKey::new("bogus-id", &[0x42; 32]);
+        let keys = std::slice::from_ref(&mine);
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &log_entry_json(7, "ffmpeg x", &[result_for(&r1, Verdict::Sound, -12.0)]).to_string(),
+            Some(&mine),
+        )
+        .unwrap();
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            Some(&bogus),
+        )
+        .unwrap();
+        let (logged, statuses) = read_logged_results_with_keys(&dir, keys).unwrap();
+        let (result, at, ..) = &logged["vid_1"];
+        assert_eq!(*at, 7, "the authenticated measurement stays: {logged:?}");
+        assert!(result.chain_unverified.is_none(), "{logged:?}");
+        // The lane itself is NOT VERIFIED (R7-I3), never "keyed"/"structural".
+        assert!(
+            statuses[0]
+                .verification
+                .as_ref()
+                .unwrap()
+                .rewrite_not_excluded
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A damaged keyed lane continued by a lane whose marker is signed
+        // under an invented key id: not a proven continuation.
+        let dir = audio_case("r7-i1-marker", &[]);
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &log_entry_json(7, "ffmpeg x", &[result_for(&r1, Verdict::Sound, -12.0)]).to_string(),
+            Some(&mine),
+        )
+        .unwrap();
+        let lane0 = dir.join(LOG_REL);
+        let mut damaged = std::fs::read(&lane0).unwrap();
+        damaged.extend_from_slice(b"{\"torn\":");
+        std::fs::write(&lane0, &damaged).unwrap();
+        let planted = dir.join("evidence/logs/audio-level-log.1.jsonl");
+        audit::append_chained_jsonl_keyed(
+            &planted,
+            &json!({"event": "audio-level-lane-continued", "previous_lane": LOG_REL,
+                "previous_lane_sha256": crate::sha256::digest_bytes(&damaged)})
+            .to_string(),
+            Some(&bogus),
+        )
+        .unwrap();
+        audit::append_chained_jsonl_keyed(
+            &planted,
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            Some(&bogus),
+        )
+        .unwrap();
+        let (logged, statuses) = read_logged_results_with_keys(&dir, keys).unwrap();
+        let err = statuses[1].verification.as_ref().unwrap_err();
+        assert!(err.contains("인증되지 않았습니다"), "{err}");
+        assert!(logged["vid_1"].0.chain_unverified.is_some(), "{logged:?}");
+        // Authenticated marker + line: a proven continuation again.
+        std::fs::remove_file(&planted).unwrap();
+        audit::append_chained_jsonl_keyed(
+            &planted,
+            &json!({"event": "audio-level-lane-continued", "previous_lane": LOG_REL,
+                "previous_lane_sha256": crate::sha256::digest_bytes(&damaged)})
+            .to_string(),
+            Some(&mine),
+        )
+        .unwrap();
+        audit::append_chained_jsonl_keyed(
+            &planted,
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            Some(&mine),
+        )
+        .unwrap();
+        let (logged, statuses) = read_logged_results_with_keys(&dir, keys).unwrap();
+        assert!(statuses[1].verification.is_ok(), "{statuses:?}");
+        assert!(logged["vid_1"].0.chain_unverified.is_none(), "{logged:?}");
+        assert_eq!(logged["vid_1"].1, 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R7-I10: repairing a damaged lane by cutting it back to its verifying
+    /// prefix no longer invalidates the genuine continuation lane — the
+    /// marker recorded the prefix hash too. Any other edit still does.
+    #[test]
+    fn repaired_lane_keeps_its_continuation() {
+        let r1 = row("vid_1");
+        let dir = audio_case(
+            "r7-i10",
+            &[log_entry_json(
+                7,
+                "ffmpeg x",
+                &[result_for(&r1, Verdict::Sound, -12.0)],
+            )],
+        );
+        let lane0 = dir.join(LOG_REL);
+        let intact = std::fs::read(&lane0).unwrap();
+        let mut damaged = intact.clone();
+        damaged.extend_from_slice(b"{\"torn\":");
+        std::fs::write(&lane0, &damaged).unwrap();
+        let next = active_lane_for_append(&dir).unwrap();
+        let marker = std::fs::read_to_string(&next).unwrap();
+        assert!(
+            marker.contains("previous_lane_verified_prefix_sha256"),
+            "{marker}"
+        );
+        audit::append_chained_jsonl_keyed(
+            &next,
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(audio_levels_for_case(&dir).unwrap()["vid_1"].r, "silent");
+        // Repaired: the torn tail removed.
+        std::fs::write(&lane0, &intact).unwrap();
+        assert_eq!(audio_levels_for_case(&dir).unwrap()["vid_1"].r, "silent");
+        assert_ne!(chain_summary_json(&dir)["status"], "failed");
+        assert_eq!(active_lane_for_append(&dir).unwrap(), next);
+        // Any other change to the previous lane still breaks the link.
+        let mut edited = intact.clone();
+        edited.extend_from_slice(b"{}\n");
+        std::fs::write(&lane0, &edited).unwrap();
+        let summary = chain_summary_json(&dir);
+        assert_eq!(summary["status"], "failed");
+        assert!(
+            summary["detail"]
+                .as_str()
+                .unwrap()
+                .contains("직접 고치지 마십시오"),
+            "{summary}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

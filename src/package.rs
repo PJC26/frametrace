@@ -1260,7 +1260,12 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
         match audit::verify_chained_jsonl(&path) {
             Ok(result) => {
                 let mut detail = format!(
-                    "audit chain verified: {} entr{}, {}",
+                    "{}: {} entr{}, {}",
+                    if result.rewrite_not_excluded.is_some() {
+                        "audit chain structure intact but NOT VERIFIED (a re-written tail cannot be ruled out)"
+                    } else {
+                        "audit chain verified"
+                    },
                     result.entries,
                     if result.entries == 1 { "y" } else { "ies" },
                     result.integrity.label()
@@ -1268,7 +1273,14 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
                 for warning in &result.warnings {
                     detail.push_str(&format!("; warning: {warning}"));
                 }
-                out.push(CheckStatus::Pass, rel, detail);
+                // R7-I3: a possible tail rewrite under an invented key id
+                // is never a PASS.
+                let status = if result.rewrite_not_excluded.is_some() {
+                    CheckStatus::NotVerified
+                } else {
+                    CheckStatus::Pass
+                };
+                out.push(status, rel, detail);
             }
             Err(err) if known_lane => out.push(
                 CheckStatus::Fail,
@@ -1568,18 +1580,20 @@ fn verify_package_db_and_signoff(
         crate::report::SignoffScope::Package(&is_listed),
     );
     let v4 = crate::report::Signoff::parse(&text)
-        .is_some_and(|signoff| signoff.schema_version >= crate::report::SIGNOFF_SCHEMA_V4);
+        // R7-I2: exactly v4 — a higher schema is rejected by the check
+        // (Unbound with a reason), never treated as v4.
+        .is_some_and(|signoff| signoff.schema_version == crate::report::SIGNOFF_SCHEMA_V4);
     match check.currency {
         crate::report::SignoffCurrency::Current if v4 => out.push(
             CheckStatus::Pass,
             signoff_rel,
             format!(
-                "sign-off v4: marks, the case records' target hashes and audit-lane anchors match the package, and the sign-off audit lane records this sign-off as its latest{} (examiner recorded as typed: {examiner}; not an authenticated identity)",
+                "sign-off v4: marks, the case records' target hashes and audit-lane anchors match the package, and this sign-off is the newest sign-off entry in the sign-off audit lane as found{} (removing later entries by cutting the lane's tail is not detected; examiner recorded as typed: {examiner}; not an authenticated identity)",
                 if check.authenticated {
                     ", HMAC-authenticated"
                 } else {
                     // R6-I6: a keyless match is self-consistency only.
-                    " — self-consistency only, NOT authentication: the audit entry is not HMAC-verified here, so anyone holding the case folder could have recomputed it (configure an audit key and finalize again to authenticate)"
+                    " — self-consistency only, NOT authentication: the audit entry is not HMAC-verified here, so anyone holding the case folder could have recomputed it (see the evidence/logs/signoff-log.jsonl line below for how to authenticate it)"
                 }
             ),
         ),
@@ -1625,6 +1639,13 @@ fn verify_package_db_and_signoff(
             CheckStatus::NotVerified,
             signoff_rel,
             "sign-off uses an older binding (schema_version < 3) that covers mark status and notes only; those still match, but whether IN-OUT ranges or tags changed after the sign-off cannot be checked — finalize again to bind them",
+        ),
+        // R7-I2: an older-schema record in a case whose sign-off lane has
+        // entries, or an unsupported schema — the reasons follow.
+        crate::report::SignoffCurrency::Unbound if !check.not_verified.is_empty() => out.push(
+            CheckStatus::NotVerified,
+            signoff_rel,
+            "the sign-off record cannot be verified (reasons below)",
         ),
         crate::report::SignoffCurrency::Unbound => out.push(
             CheckStatus::NotVerified,
@@ -1982,6 +2003,52 @@ mod tests {
             let result = verify_package(&output).unwrap();
             assert!(
                 failing_subjects(&result).contains(&"evidence/logs/scan-log.jsonl".to_string())
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// R7-I2: once the sign-off lane holds entries, an older-schema
+        /// record (a v4 record re-labelled v3 to skip the lane) is NOT
+        /// VERIFIED, never PASS; a schema this build never writes is
+        /// rejected and never described as "sign-off v4"; and a lane whose
+        /// tail may have been re-written (R7-I3) is never a PASS either.
+        #[test]
+        fn downgraded_and_future_schema_signoffs_never_pass() {
+            let (root, case_dir, _output) = signed_package("verify-r7i2");
+            crate::audit::append_chained_jsonl_keyed(
+                &case_dir.join(crate::report::SIGNOFF_LOG_REL_PATH),
+                r#"{"schema_version":1,"event":"signoff","signoff_record_sha256":"x"}"#,
+                None,
+            )
+            .unwrap();
+            let output = root.join("package-v3");
+            package_case(&case_dir, Some(&output)).unwrap();
+            let result = verify_package(&output).unwrap();
+            let signoff = check(&result, "review/signoff.json").unwrap();
+            assert_eq!(signoff.status, CheckStatus::NotVerified, "{signoff:?}");
+            assert!(
+                result.checks.iter().any(|c| c.subject == "review/signoff.json"
+                    && c.detail.contains("signoff-log")),
+                "{:?}",
+                result.checks
+            );
+
+            let v5 = fs::read_to_string(output.join("review/signoff.json"))
+                .unwrap()
+                .replace("\"schema_version\":3", "\"schema_version\":5");
+            rewrite_listed(&output, "review/signoff.json", &v5);
+            let result = verify_package(&output).unwrap();
+            let signoff = check(&result, "review/signoff.json").unwrap();
+            assert_ne!(signoff.status, CheckStatus::Pass, "{signoff:?}");
+            assert!(!signoff.detail.contains("sign-off v4"), "{signoff:?}");
+            assert!(
+                result
+                    .checks
+                    .iter()
+                    .any(|c| c.subject == "review/signoff.json"
+                        && c.detail.contains("schema_version 5")),
+                "{:?}",
+                result.checks
             );
             fs::remove_dir_all(root).unwrap();
         }
