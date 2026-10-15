@@ -583,8 +583,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     }
     // R4-B15: a child started by the workstation checks that it signs with
     // the same audit key source as its parent and says so when it does not.
+    // R5-S9: with the machine-readable prefix the workstation promotes the
+    // line to a job warning (an examiner never sees a child's stderr).
     if let Some(warning) = crate::serve::key_source_mismatch_warning() {
-        eprintln!("warning: {warning}");
+        eprintln!("{}{warning}", crate::serve::KEY_MISMATCH_MARKER);
     }
 
     match cli.command {

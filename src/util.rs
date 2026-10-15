@@ -846,9 +846,12 @@ fn percent_encode_path(input: &str) -> String {
 /// (`<config>/frametrace/generated-pages.key`) — a foreign or edited case
 /// cannot forge the list. Everything else is served sandboxed (no script).
 ///
-/// Writers: make-review / make-report (CLI) and the workstation after
-/// every generator step it drives call [`record_generated_pages`] /
-/// [`record_case_generated_pages`].
+/// Writers: each generator (make-review, make-report, make-custody) calls
+/// [`record_generated_pages`] with exactly the files it just wrote
+/// (R5-S1 — nothing ever walks the folders and vouches for whatever HTML
+/// happens to be there). R5-S2: the list also pins the scripts generated
+/// pages load (`review/data-bundle.js`); the workstation serves a script
+/// from the case folder only when its bytes are listed.
 pub mod generated_pages {
     use std::path::{Path, PathBuf};
 
@@ -968,7 +971,13 @@ pub mod generated_pages {
     /// Whether the case-relative page exists and is listed in the verified
     /// manifest.
     pub fn page_is_trusted(case_dir: &Path, rel: &str) -> bool {
-        file_sha256(&case_dir.join(rel)).is_some_and(|sha| trusted_hashes(case_dir).contains(&sha))
+        file_is_trusted(case_dir, &case_dir.join(rel))
+    }
+
+    /// Whether the file at `path` (a page or script under the case) has
+    /// bytes the verified manifest lists (R5-S2).
+    pub fn file_is_trusted(case_dir: &Path, path: &Path) -> bool {
+        file_sha256(path).is_some_and(|sha| trusted_hashes(case_dir).contains(&sha))
     }
 
     /// SHA-256 (hex) of a file's bytes.
@@ -976,8 +985,8 @@ pub mod generated_pages {
         crate::audit::digest_file(path).ok()
     }
 
-    /// Records the listed case-relative pages (missing files are skipped)
-    /// as generated. Returns how many were recorded. A manifest that does
+    /// Records the listed case-relative pages and scripts (missing files
+    /// are skipped) as generated. Returns how many were recorded. A manifest that does
     /// not verify under this user's key is replaced, never extended — its
     /// hashes were never trusted.
     pub fn record_generated_pages(case_dir: &Path, rels: &[&str]) -> Result<usize, String> {
@@ -1012,54 +1021,6 @@ pub mod generated_pages {
         super::write_text_atomic(&case_dir.join(MANIFEST_REL), &format!("{body}\n"))
             .map_err(|err| format!("생성 페이지 목록 저장 실패: {err}"))?;
         Ok(recorded)
-    }
-
-    /// Every page at a generated location (`review/*.html`,
-    /// `reports/**/*.html` outside `package_*`), case-relative.
-    pub fn case_generated_page_rels(case_dir: &Path) -> Vec<String> {
-        let mut out = Vec::new();
-        let is_html = |path: &Path| {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"))
-        };
-        if let Ok(entries) = std::fs::read_dir(case_dir.join("review")) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && is_html(&path) {
-                    out.push(format!("review/{}", entry.file_name().to_string_lossy()));
-                }
-            }
-        }
-        let mut pending = vec![(case_dir.join("reports"), "reports".to_string(), 0usize)];
-        while let Some((dir, rel, depth)) = pending.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let path = entry.path();
-                let Ok(kind) = entry.file_type() else {
-                    continue;
-                };
-                if kind.is_dir() {
-                    if depth < 4 && !name.starts_with("package_") {
-                        pending.push((path, format!("{rel}/{name}"), depth + 1));
-                    }
-                } else if kind.is_file() && is_html(&path) {
-                    out.push(format!("{rel}/{name}"));
-                }
-            }
-        }
-        out.sort();
-        out
-    }
-
-    /// [`record_generated_pages`] over [`case_generated_page_rels`].
-    pub fn record_case_generated_pages(case_dir: &Path) -> Result<usize, String> {
-        let rels = case_generated_page_rels(case_dir);
-        let refs: Vec<&str> = rels.iter().map(String::as_str).collect();
-        record_generated_pages(case_dir, &refs)
     }
 
     /// CSP `script-src` sources for a verified page: `'self'` plus the
@@ -1115,6 +1076,147 @@ pub mod generated_pages {
             index = letters_start;
         }
         false
+    }
+}
+
+/// R5-S5: what can be learned about a process id right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessProbe {
+    /// No such process (or only a zombie): nothing of it can still write.
+    Gone,
+    /// A live process holds the id; `started` when its start time could be
+    /// read (Windows, Linux).
+    Running { started: Option<SystemTime> },
+    /// The platform cannot tell.
+    Unknown,
+}
+
+/// R5-S5: probes process `pid` (liveness and start time).
+pub fn probe_process(pid: u32) -> ProcessProbe {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+        // SAFETY: plain Win32 calls; the handle is closed below.
+        unsafe {
+            let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(handle) => handle,
+                // No process with that id.
+                Err(err) if err.code().0 & 0xFFFF == ERROR_INVALID_PARAMETER => {
+                    return ProcessProbe::Gone;
+                }
+                // Exists but not ours to inspect (another user, protected).
+                Err(_) => return ProcessProbe::Running { started: None },
+            };
+            let mut code = 0u32;
+            let alive = GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE;
+            let mut created = FILETIME::default();
+            let mut exited = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            let started =
+                GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user)
+                    .ok()
+                    .and_then(|_| {
+                        // 100 ns ticks since 1601-01-01.
+                        let ticks = (u64::from(created.dwHighDateTime) << 32)
+                            | u64::from(created.dwLowDateTime);
+                        const EPOCH_DIFF_TICKS: u64 = 116_444_736_000_000_000;
+                        ticks.checked_sub(EPOCH_DIFF_TICKS).map(|since| {
+                            std::time::UNIX_EPOCH + std::time::Duration::from_nanos(since * 100)
+                        })
+                    });
+            let _ = CloseHandle(handle);
+            if alive {
+                ProcessProbe::Running { started }
+            } else {
+                ProcessProbe::Gone
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/<pid>/stat: state is the field after the `(comm)`, the
+        // start time (clock ticks after boot) the 20th field after it.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return if std::path::Path::new("/proc/self/stat").exists() {
+                ProcessProbe::Gone
+            } else {
+                ProcessProbe::Unknown
+            };
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return ProcessProbe::Running { started: None };
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if matches!(fields.first(), Some(&"Z") | Some(&"X")) {
+            return ProcessProbe::Gone;
+        }
+        unsafe extern "C" {
+            fn sysconf(name: i32) -> i64;
+        }
+        const SC_CLK_TCK: i32 = 2;
+        // SAFETY: sysconf with a constant name.
+        let ticks_per_sec = unsafe { sysconf(SC_CLK_TCK) };
+        let boot = std::fs::read_to_string("/proc/stat").ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("btime "))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        });
+        let started = match (fields.get(19).and_then(|v| v.parse::<u64>().ok()), boot) {
+            (Some(ticks), Some(boot)) if ticks_per_sec > 0 => Some(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(boot)
+                    + std::time::Duration::from_millis(ticks * 1000 / ticks_per_sec as u64),
+            ),
+            _ => None,
+        };
+        ProcessProbe::Running { started }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let Ok(pid) = i32::try_from(pid) else {
+            return ProcessProbe::Unknown;
+        };
+        // SAFETY: signal 0 only checks for existence / permission.
+        if unsafe { kill(pid, 0) } == 0 {
+            return ProcessProbe::Running { started: None };
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(1) => ProcessProbe::Running { started: None }, // EPERM: exists
+            Some(3) => ProcessProbe::Gone,                      // ESRCH
+            _ => ProcessProbe::Unknown,
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        ProcessProbe::Unknown
+    }
+}
+
+/// Slack for clock granularity when comparing a process start time with a
+/// file's birth (R5-S5).
+const START_TIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// R5-S5 (pure): may the process `probe` describes still be the writer of
+/// a file born at `born`? A live process that started AFTER the file was
+/// born is a recycled pid, not the writer; one whose start time is unknown
+/// is assumed to be the writer (never delete a live job's file).
+pub fn writer_may_be_alive(probe: ProcessProbe, born: Option<SystemTime>) -> bool {
+    match probe {
+        ProcessProbe::Gone => false,
+        ProcessProbe::Unknown | ProcessProbe::Running { started: None } => true,
+        ProcessProbe::Running {
+            started: Some(started),
+        } => born.is_none_or(|born| started <= born + START_TIME_SLACK),
     }
 }
 

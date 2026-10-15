@@ -65,30 +65,54 @@ mod sys {
         // its ffmpeg/icat grandchildren) once the server's write end
         // closes — i.e. when the server dies for ANY reason, SIGKILL
         // included, when no handler of ours can run.
-        if let Some(fd) = parent_watch_read_fd() {
+        //
+        // R5-S4: BOTH ends of the pipe are close-on-exec in this process,
+        // so no other child (a browser started by xdg-open, an ffprobe
+        // probe) ever inherits them. Only a step child gets the read end:
+        // the `pre_exec` hook below clears FD_CLOEXEC on it in the forked
+        // child, between fork and exec, so the flag change never touches
+        // the parent's descriptor table (fd flags are per-process after
+        // fork; only the open file description is shared).
+        let watch_fd = parent_watch_read_fd();
+        if let Some(fd) = watch_fd {
             command.env(super::PARENT_WATCH_ENV, fd.to_string());
         }
         #[cfg(target_os = "linux")]
-        {
-            // C8: Linux also delivers SIGKILL to the direct child as soon
-            // as the spawning thread exits (the step's runner waits for
-            // the child, so that is the server dying), even before the
-            // child's own watcher thread runs.
-            let parent = std::process::id();
-            // SAFETY: only async-signal-safe syscalls run between fork
-            // and exec (prctl, getppid); no allocation (raw OS errors).
-            unsafe {
-                command.pre_exec(move || {
-                    if prctl(PR_SET_PDEATHSIG, SIGKILL as u64, 0, 0, 0) != 0 {
+        let parent = std::process::id();
+        // SAFETY: only async-signal-safe syscalls run between fork and
+        // exec (fcntl, prctl, getppid); no allocation (raw OS errors only).
+        unsafe {
+            command.pre_exec(move || {
+                if let Some(fd) = watch_fd
+                    && fcntl(fd, F_SETFD, 0) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // C8 / R5-S3 (Linux): the kernel delivers SIGTERM — not
+                // SIGKILL — to the direct child as soon as the spawning
+                // thread exits (the step's runner waits for the child, so
+                // that is the server dying). SIGKILL used to kill the step
+                // child before its own watcher thread could reach the
+                // grandchildren, which then lived on (they are in the
+                // child's process group but do not hold the watch fd).
+                // SIGTERM runs the step child's handler instead
+                // (`install_step_child_term_handler`), which SIGKILLs the
+                // child's whole process group — itself included. A child
+                // that is not a FrameTrace binary (no handler) simply
+                // takes SIGTERM's default action and terminates.
+                #[cfg(target_os = "linux")]
+                {
+                    if prctl(PR_SET_PDEATHSIG, SIGTERM as u64, 0, 0, 0) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    // The parent may have died between fork and prctl.
+                    // The parent may have died between fork and prctl (the
+                    // death signal would then never come).
                     if getppid() as u32 != parent {
                         return Err(std::io::Error::from_raw_os_error(3));
                     }
-                    Ok(())
-                });
-            }
+                }
+                Ok(())
+            });
         }
     }
 
@@ -96,29 +120,94 @@ mod sys {
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn getpgrp() -> i32;
         fn getpid() -> i32;
+        #[link_name = "kill"]
+        fn kill_pid(pid: i32, sig: i32) -> i32;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn pipe2(fds: *mut i32, flags: i32) -> i32;
     }
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
+    /// `O_CLOEXEC` on the Linux architectures FrameTrace ships for
+    /// (x86-64, aarch64: the generic value 02000000).
+    #[cfg(target_os = "linux")]
+    const O_CLOEXEC: i32 = 0o2_000_000;
 
-    /// The read end of this process's parent-watch pipe (created once).
-    /// The write end is close-on-exec and never closed: it disappears
-    /// only when this process exits. The read end is inherited by step
-    /// children (no close-on-exec), which watch it for EOF.
-    fn parent_watch_read_fd() -> Option<i32> {
-        static FDS: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
-        *FDS.get_or_init(|| {
-            let mut fds = [0i32; 2];
+    /// R5-S4: serializes "create a pipe and mark it close-on-exec" against
+    /// [`super::spawn_tracked`]'s fork where `pipe2` does not exist
+    /// (macOS): spawns take it shared, pipe creation takes it exclusively,
+    /// so no tracked fork can copy the descriptors in the gap between
+    /// `pipe()` and `fcntl(FD_CLOEXEC)`. Spawns outside `spawn_tracked`
+    /// do not take it; the pipes are therefore created once, early
+    /// (`install_process_guard`, before the server starts any worker), and
+    /// never again.
+    pub(super) static SPAWN_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// A pipe with both ends close-on-exec: atomically with `pipe2` on
+    /// Linux, under [`SPAWN_LOCK`] elsewhere.
+    pub(super) fn cloexec_pipe() -> Option<[i32; 2]> {
+        let mut fds = [0i32; 2];
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: pipe2(2) fills two ints.
+            if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
+                return None;
+            }
+            Some(fds)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _exclusive = SPAWN_LOCK.write().unwrap_or_else(|p| p.into_inner());
             // SAFETY: pipe(2) fills two ints; fcntl on our own fds.
             unsafe {
                 if pipe(fds.as_mut_ptr()) != 0 {
                     return None;
                 }
-                if fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0 {
+                if fcntl(fds[0], F_SETFD, FD_CLOEXEC) != 0
+                    || fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0
+                {
                     return None;
                 }
             }
-            Some(fds[0])
-        })
+            Some(fds)
+        }
+    }
+
+    /// Both ends of this process's parent-watch pipe `(read, write)`,
+    /// created once. Both are close-on-exec (R5-S4); the read end is
+    /// opened up for step children only, in their `pre_exec`. The write
+    /// end is never closed: it disappears only when this process exits.
+    pub(super) fn parent_watch_fds() -> Option<(i32, i32)> {
+        static FDS: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+        *FDS.get_or_init(|| cloexec_pipe().map(|fds| (fds[0], fds[1])))
+    }
+
+    fn parent_watch_read_fd() -> Option<i32> {
+        parent_watch_fds().map(|(read, _)| read)
+    }
+
+    /// R5-S3: SIGTERM handler of a step child that leads its own process
+    /// group: SIGKILL to the whole group (`kill(0, …)` = the caller's
+    /// group, the child itself included, so the process ends here).
+    /// `kill(2)` is async-signal-safe; nothing else runs.
+    extern "C" fn on_step_child_term(_signum: i32) {
+        // SAFETY: kill(2) with integer arguments.
+        unsafe {
+            kill_pid(0, SIGKILL);
+        }
+    }
+
+    /// R5-S3: installs [`on_step_child_term`] for SIGTERM. Only called by
+    /// a process that verified it leads its own group (never signals a
+    /// foreign group). Before this runs (between exec and `main`), SIGTERM
+    /// keeps its default action — the child dies, and it has no
+    /// grandchildren yet.
+    fn install_step_child_term_handler() {
+        // SAFETY: installing an async-signal-safe handler.
+        unsafe {
+            signal(SIGTERM, on_step_child_term as extern "C" fn(i32) as usize);
+        }
     }
 
     /// Child side of the parent-watch pipe (see [`prepare`]): when the
@@ -131,6 +220,9 @@ mod sys {
             // Not a group of our own: never signal someone else's group.
             return;
         }
+        // R5-S3: the Linux parent-death signal (SIGTERM) and any other
+        // SIGTERM take the whole step tree down, not just this process.
+        install_step_child_term_handler();
         // Our own children need not inherit the fd.
         // SAFETY: fcntl on an inherited fd number.
         unsafe {
@@ -214,6 +306,7 @@ mod sys {
 
     unsafe extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
+        #[cfg(not(target_os = "linux"))]
         fn pipe(fds: *mut i32) -> i32;
         fn write(fd: i32, buf: *const u8, count: usize) -> isize;
         fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
@@ -244,11 +337,11 @@ mod sys {
     /// This is the unix path; Windows uses a console-control handler plus
     /// job objects (see the `windows` module).
     pub(super) fn install_signal_handlers() -> Result<(), String> {
-        let mut fds = [0i32; 2];
-        // SAFETY: pipe(2) fills two ints.
-        if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+        // R5-S4: close-on-exec from birth, so no child inherits the
+        // self-pipe either.
+        let Some(fds) = cloexec_pipe() else {
             return Err(format!("pipe: {}", std::io::Error::last_os_error()));
-        }
+        };
         let (read_fd, write_fd) = (fds[0], fds[1]);
         PIPE_WRITE.store(write_fd, std::sync::atomic::Ordering::Relaxed);
         std::thread::Builder::new()
@@ -280,7 +373,17 @@ mod sys {
         Ok(())
     }
 
-    pub(super) fn init_process_guard() {}
+    /// R5-S4: the parent-watch pipe is created here, at server start and
+    /// before any worker thread spawns a child, so on macOS (no `pipe2`)
+    /// even spawns that bypass [`SPAWN_LOCK`] cannot race its creation.
+    pub(super) fn init_process_guard() {
+        let _ = parent_watch_fds();
+    }
+
+    /// Shared spawn guard (see [`SPAWN_LOCK`]).
+    pub(super) fn spawn_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        SPAWN_LOCK.read().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 #[cfg(windows)]
@@ -466,7 +569,14 @@ pub fn watch_parent_from_env() {
 /// console line the windowed app never shows.
 pub(crate) fn spawn_tracked(command: &mut Command) -> std::io::Result<TrackedChild> {
     sys::prepare(command);
-    let child = command.spawn()?;
+    // R5-S4 (unix): no tracked fork while a close-on-exec pipe is being
+    // set up on a platform without `pipe2`.
+    #[cfg(unix)]
+    let spawn_guard = sys::spawn_guard();
+    let child = command.spawn();
+    #[cfg(unix)]
+    drop(spawn_guard);
+    let child = child?;
     let (key, tracking_error) = match sys::attach(&child) {
         Ok(key) => (key, None),
         Err(err) => (0, Some(err)),
@@ -778,6 +888,145 @@ mod tests {
         }
         let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
         panic!("step child {pid} survived its spawning thread");
+    }
+
+    /// R5-S3 helper, run as a re-executed copy of this test binary (a
+    /// FrameTrace-like step child): installs the step-child side exactly
+    /// like `main` does (`watch_parent_from_env`), starts a grandchild in
+    /// its own process group, reports the grandchild's pid and waits.
+    /// Without `FT_R5_PDEATH_HELPER=1` (a normal test run) it does nothing.
+    #[test]
+    fn r5_pdeath_helper_child() {
+        if std::env::var("FT_R5_PDEATH_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        watch_parent_from_env();
+        let grandchild = Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn grandchild");
+        println!("GRANDCHILD {}", grandchild.id());
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(std::time::Duration::from_secs(300));
+    }
+
+    /// R5-S3 (Linux): when the thread that spawned a step child exits
+    /// (i.e. the server dies), the parent-death signal now reaches the
+    /// GRANDCHILDREN too. Before, `PR_SET_PDEATHSIG(SIGKILL)` killed the
+    /// step child outright, its watcher thread never ran, and the
+    /// grandchild (`sleep 300`, same process group, no watch fd) survived.
+    /// Now the signal is SIGTERM, whose handler SIGKILLs the whole group.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pdeathsig_takes_the_grandchildren_down() {
+        let _serial = tree_test_serial();
+        let exe = std::env::current_exe().expect("test binary");
+        let module = module_path!();
+        let name = format!(
+            "{}::r5_pdeath_helper_child",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
+        let (child_pid, stdout) = std::thread::spawn(move || {
+            let mut command = Command::new(exe);
+            command
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env("FT_R5_PDEATH_HELPER", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let mut tracked = spawn_tracked(&mut command).expect("spawn helper");
+            let stdout = tracked.child.stdout.take().unwrap();
+            let pid = tracked.child.id();
+            // Wait for the grandchild before the spawning thread exits.
+            let mut reader = BufReader::new(stdout);
+            let mut grandchild = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Some(rest) = line.trim().strip_prefix("GRANDCHILD ") {
+                    grandchild = rest.to_string();
+                    break;
+                }
+            }
+            // Dropping the handle neither kills nor waits on unix.
+            drop(tracked);
+            (pid, (reader, grandchild))
+        })
+        .join()
+        .unwrap();
+        let (_reader, grandchild) = stdout;
+        assert!(
+            !grandchild.is_empty(),
+            "helper never reported its grandchild"
+        );
+        for _ in 0..200 {
+            if !alive(&grandchild) {
+                // Reap the helper (we are its parent).
+                unsafe extern "C" {
+                    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+                }
+                let mut status = 0i32;
+                // SAFETY: plain syscall on our own child.
+                unsafe {
+                    waitpid(child_pid as i32, &mut status, 0);
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = Command::new("kill").args(["-9", &grandchild]).status();
+        let _ = Command::new("kill")
+            .args(["-9", &child_pid.to_string()])
+            .status();
+        panic!("grandchild {grandchild} survived the step child's parent-death signal");
+    }
+
+    /// Open file descriptors of a fresh `sh` started by `command`
+    /// (`/dev/fd` is per-process on Linux and macOS).
+    fn child_has_fd(command: &mut Command, fd: i32) -> bool {
+        let output = command
+            .args([
+                "-c",
+                &format!("[ -e /dev/fd/{fd} ] && echo OPEN || echo CLOSED"),
+            ])
+            .stdout(Stdio::piped())
+            .output()
+            .expect("run sh");
+        String::from_utf8_lossy(&output.stdout).contains("OPEN")
+    }
+
+    /// R5-S4: the parent-watch pipe is close-on-exec on both ends, so an
+    /// ordinary child (a browser, a probe) inherits neither — before, the
+    /// read end leaked into every child, and the write end leaked into any
+    /// child forked between `pipe()` and `fcntl()`. A step child gets the
+    /// read end only (cleared in its `pre_exec`), never the write end
+    /// (whose leak would keep the step children from ever seeing EOF).
+    #[test]
+    fn watch_pipe_reaches_step_children_only() {
+        let _serial = tree_test_serial();
+        let (read, write) = sys::parent_watch_fds().expect("watch pipe");
+        let mut plain = Command::new("sh");
+        assert!(!child_has_fd(&mut plain, read), "read end leaked");
+        let mut plain = Command::new("sh");
+        assert!(!child_has_fd(&mut plain, write), "write end leaked");
+        for (fd, expected) in [(read, true), (write, false)] {
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    &format!("[ -e /dev/fd/{fd} ] && echo OPEN || echo CLOSED"),
+                ])
+                .stdout(Stdio::piped());
+            let mut tracked = spawn_tracked(&mut command).expect("spawn");
+            let mut line = String::new();
+            BufReader::new(tracked.child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let _ = tracked.child.wait();
+            assert_eq!(line.trim() == "OPEN", expected, "fd {fd}: {line}");
+        }
     }
 
     /// C8: a step child is handed the parent-watch pipe (unix) through

@@ -902,6 +902,40 @@ const FLUSH_SCRIPT: &str = r#"(async () => {
   try { window.chrome.webview.postMessage(JSON.stringify(r)); } catch (e) {}
 })();"#;
 
+/// R5-S14 (pure): whether the page at `url` can host the evidence viewer
+/// (and so may hold unsaved edits): a loopback workstation page at `/`,
+/// the embedded `/viewer/`, or a generated `/review/*.html` page.
+/// Everything else — sandboxed case files and evidence (`/case/…`,
+/// `/media`), `about:`/error pages, other hosts — cannot run the save
+/// script and is not asked.
+pub(crate) fn page_may_host_viewer(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"))
+        .or_else(|| url.strip_prefix("http://[::1]:"))
+    else {
+        return false;
+    };
+    let Some(slash) = rest.find('/') else {
+        // `http://127.0.0.1:8477` — the root page.
+        return rest.bytes().all(|b| b.is_ascii_digit());
+    };
+    if !rest[..slash].bytes().all(|b| b.is_ascii_digit()) || slash == 0 {
+        return false;
+    }
+    let path = rest[slash..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/")
+        .to_ascii_lowercase();
+    matches!(
+        path.as_str(),
+        "/" | "/index.html" | "/viewer/" | "/viewer/index.html"
+    ) || (path.starts_with("/review/")
+        && !path["/review/".len()..].contains('/')
+        && (path.ends_with(".html") || path.ends_with(".htm")))
+}
+
 /// What the page reported after `FTViewer.save()`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SaveReport {
@@ -1019,6 +1053,18 @@ fn start_flush(hwnd: HWND) -> Option<FlushOutcome> {
     let Some(webview) = WEBVIEW.with(cell_clone) else {
         return Some(FlushOutcome::NoViewer);
     };
+    // R5-S14: only a page that can host the viewer is asked to save. A
+    // sandboxed evidence page (`/case/…`, `/media`), an error page or a
+    // foreign URL never runs the script, so asking it only cost a 5 s wait
+    // on every close.
+    let mut source = windows::core::PWSTR::null();
+    // SAFETY: COM getter on the UI thread; take_pwstr frees the string.
+    if unsafe { webview.Source(&mut source) }.is_ok() {
+        let url = webview2_com::take_pwstr(source);
+        if !page_may_host_viewer(&url) {
+            return Some(FlushOutcome::NoViewer);
+        }
+    }
     set_flush_phase(FlushPhase::Flushing(Instant::now()));
     let script = HSTRING::from(FLUSH_SCRIPT);
     // The script's completion value is a pending Promise; the real answer
@@ -1253,15 +1299,20 @@ fn smoke_after_load(port: u16) {
         .name("frametrace-smoke".into())
         .spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(60);
+            // R5-S14 / U13: no server port means no workstation answered —
+            // a failed smoke run, never a pass.
+            if port == 0 {
+                smoke_fail("no workstation port: the UI was not served by a server".into());
+                post_frame_message(WM_CLOSE);
+                return;
+            }
             loop {
-                if port == 0
-                    || status_ready(&shell_request_full(
-                        port,
-                        "GET",
-                        "/api/status",
-                        UI_REQUEST_TIMEOUT,
-                    ))
-                {
+                if status_ready(&shell_request_full(
+                    port,
+                    "GET",
+                    "/api/status",
+                    UI_REQUEST_TIMEOUT,
+                )) {
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -1831,6 +1882,38 @@ mod tests {
         assert!(!status_ready(&reply(0, "")));
         assert!(!status_ready(&Err(RequestFailure::NoAnswer)));
         assert!(!status_ready(&Err(RequestFailure::Unreachable)));
+    }
+
+    /// R5-S14: only pages that can host the viewer are asked to save
+    /// before close; sandboxed evidence pages, error pages and other hosts
+    /// cannot run the script, and asking them only cost a 5 s wait.
+    #[test]
+    fn close_flush_asks_only_viewer_pages() {
+        use super::page_may_host_viewer;
+        for url in [
+            "http://127.0.0.1:8477/",
+            "http://127.0.0.1:8477",
+            "http://127.0.0.1:8477/?launch=abc#x",
+            "http://localhost:8480/viewer/",
+            "http://127.0.0.1:8477/viewer/index.html",
+            "http://127.0.0.1:8477/review/evidence-viewer.html?x=1",
+            "http://[::1]:8477/review/index.html",
+        ] {
+            assert!(page_may_host_viewer(url), "{url}");
+        }
+        for url in [
+            "http://127.0.0.1:8477/case/reports/case-report.html",
+            "http://127.0.0.1:8477/media?path=C:/e/x.html",
+            "http://127.0.0.1:8477/review/thumbs/a.jpg",
+            "http://127.0.0.1:8477/review/sub/x.html",
+            "about:blank",
+            "file:///C:/x/review/index.html",
+            "https://example.com/",
+            "http://127.0.0.1.evil.com:8477/",
+            "",
+        ] {
+            assert!(!page_may_host_viewer(url), "{url}");
+        }
     }
 
     /// C15: the viewer's save report → close verdict. Anything but a

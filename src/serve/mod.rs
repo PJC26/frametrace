@@ -51,6 +51,8 @@ mod tests_r4_jobs;
 #[cfg(test)]
 mod tests_r4_server;
 #[cfg(test)]
+mod tests_r5_server;
+#[cfg(test)]
 mod tests_recent;
 #[cfg(test)]
 mod tests_review3;
@@ -175,8 +177,10 @@ fn examiner_page(legacy: bool) -> &'static str {
 /// In-flight connection bound: the accept loop spawns one thread per
 /// connection, so an unbounded accept would let any local process exhaust
 /// memory/handles by opening thousands of idle sockets. Overflow
-/// connections get an immediate 503 instead of a thread.
-pub(crate) const MAX_CONNECTIONS: usize = 64;
+/// connections get an immediate 503 instead of a thread. R5-S7: the
+/// budget is the header-phase pool plus the authenticated pool, each
+/// capped on its own (`http::MAX_PREAUTH`, `http::MAX_AUTHED`).
+pub(crate) const MAX_CONNECTIONS: usize = http::MAX_PREAUTH + http::MAX_AUTHED;
 
 /// How long the nonblocking accept loop sleeps when no connection is
 /// pending (also bounds how fast /api/shutdown ends the loop).
@@ -315,7 +319,13 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
     publish_local_server(port, token.as_deref());
     write_instance_file(port, &state_lock(&state).instance, token.as_deref());
     // R4-B2: printed and opened with a one-time launch code, not the token.
-    let code = token.as_ref().and_then(|_| mint_launch_code(&state));
+    // R5-S8: only when a browser (or the examiner) is meant to open it —
+    // the WebView2 shell (`open_browser: false`) hosts the UI itself and
+    // authenticates through the instance file, so a code minted for it
+    // would only sit there, valid, for its whole life.
+    let code = launch_code_wanted(&options, token.is_some())
+        .then(|| mint_launch_code(&state))
+        .flatten();
     let url = launch_url(port, code.as_deref());
     println!("FrameTrace examiner workstation is running.");
     println!("  {url}");
@@ -642,6 +652,12 @@ pub(crate) fn launch_url(port: u16, code: Option<&str>) -> String {
     }
 }
 
+/// R5-S8 (pure): whether startup mints a launch code — only with a token
+/// and when the URL is for a browser (not the shell, which never uses it).
+pub(crate) fn launch_code_wanted(options: &ServeOptions, has_token: bool) -> bool {
+    has_token && options.open_browser
+}
+
 /// Mints a one-time launch code (only meaningful while a token is
 /// configured; `None` otherwise or when entropy fails).
 pub(crate) fn mint_launch_code(state: &SharedState) -> Option<String> {
@@ -699,27 +715,27 @@ pub(crate) fn api_launch_code(state: &SharedState) -> String {
 
 // ---- R4-B15: audit key source handed to CLI children ----
 
-static KEY_SOURCE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
-
-/// Sets the `--key-source` spec the workstation runs with (the launcher
-/// calls this when started as `frametrace --key-source <spec>`). Without
-/// it `FRAMETRACE_KEY_SOURCE` is used.
-pub fn set_key_source(spec: Option<String>) {
-    *KEY_SOURCE_OVERRIDE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = spec;
-}
-
 /// The key source spec this workstation process runs with.
+///
+/// R5-S9: the workstation takes its audit key source from the
+/// `FRAMETRACE_KEY_SOURCE` environment variable only (same spec syntax as
+/// the CLI's global `--key-source`). The never-called
+/// `serve::set_key_source` hook is gone: neither launcher (`frametrace`
+/// without arguments, `frametrace-app`) parses CLI flags, so the variable
+/// is the one documented way. The spec is then handed to every CLI child
+/// as `--key-source`, and a child that still resolves another key says so
+/// on stderr ([`KEY_MISMATCH_MARKER`]) — the server turns that into a job
+/// warning.
 fn workstation_key_source() -> Option<String> {
-    KEY_SOURCE_OVERRIDE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-        .or_else(|| std::env::var("FRAMETRACE_KEY_SOURCE").ok())
+    std::env::var("FRAMETRACE_KEY_SOURCE")
+        .ok()
         .map(|spec| spec.trim().to_string())
         .filter(|spec| !spec.is_empty())
 }
+
+/// R5-S9: stderr line prefix of a child's audit-key mismatch warning
+/// (machine-readable; the server promotes such lines to job warnings).
+pub const KEY_MISMATCH_MARKER: &str = "FRAMETRACE-KEY-MISMATCH: ";
 
 /// `<key id>:<12-hex fingerprint>` of a resolved audit key, `none` without
 /// one, `error` when the configured source is unusable. The fingerprint
@@ -783,12 +799,9 @@ impl Drop for InFlightSlot {
 /// then refuses new connections outright).
 pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
     let in_flight = Arc::new(AtomicUsize::new(0));
-    let (shutdown, preauth) = {
+    let (shutdown, limits) = {
         let guard = state_lock(&state);
-        (
-            Arc::clone(&guard.shutdown),
-            Arc::clone(&guard.preauth_conns),
-        )
+        (Arc::clone(&guard.shutdown), Arc::clone(&guard.conn_limits))
     };
     let _ = listener.set_nonblocking(true);
     loop {
@@ -810,12 +823,24 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
+                // R5-S7: the header-phase slot is taken here, before a
+                // thread exists; a full pre-auth pool costs no thread.
+                let Some(preauth) = http::take_conn_slot(&limits, false) else {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let _ = write_simple(
+                        &mut stream,
+                        503,
+                        b"too many unauthenticated connections - retry shortly",
+                    );
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                };
                 // P11: the slot is released by a drop guard, so a handler
                 // that panics still frees it (a leak would eventually turn
                 // every connection into a 503 and stall shutdown's drain).
                 // A failed spawn drops the closure, and with it the guard.
                 let slot = InFlightSlot(Arc::clone(&in_flight));
-                let preauth = Arc::clone(&preauth);
+                let limits = Arc::clone(&limits);
                 let _ = thread::Builder::new()
                     .name("ft-http".into())
                     .spawn(move || {
@@ -824,7 +849,8 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
                             stream,
                             state,
                             http::HEADER_READ_TIMEOUT,
-                            &preauth,
+                            &limits,
+                            Some(preauth),
                         );
                     });
             }
@@ -983,12 +1009,121 @@ pub(crate) fn try_open_in_browser(url: &str) -> Result<(), String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        run_opener(
-            system_opener(std::env::consts::OS),
-            std::ffi::OsStr::new(url),
-        )
-        .map_err(|err| format!("could not open a browser for {url} ({err}); open it manually"))
+        // R5-S8: a one-time launch URL never goes on the opener's command
+        // line (`/proc/<pid>/cmdline` and `ps` show it to every local
+        // user for as long as xdg-open / open runs, well inside the code's
+        // 30 s life). The opener gets the path of a user-private (0600, in
+        // a 0700 folder) redirect page instead; the page is deleted once
+        // the code has expired.
+        let target = if url.contains("?launch=") {
+            match write_launcher_file(&launcher_dir(), url) {
+                Ok(path) => {
+                    schedule_launcher_removal(path.clone());
+                    path.into_os_string()
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "could not prepare a private launch page ({err}); open {url} manually"
+                    ));
+                }
+            }
+        } else {
+            std::ffi::OsString::from(url)
+        };
+        run_opener(system_opener(std::env::consts::OS), &target)
+            .map_err(|err| format!("could not open a browser for {url} ({err}); open it manually"))
     }
+}
+
+/// R5-S8: the redirect page handed to the system opener instead of a
+/// launch URL (pure). `url` is our own `http://127.0.0.1:<port>/?launch=`
+/// URL (hex code); it is HTML-escaped anyway.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn launcher_page_html(url: &str) -> String {
+    let safe = crate::util::html_escape(url);
+    let script_url = serde_json::to_string(url).unwrap_or_else(|_| "\"/\"".to_string());
+    format!(
+        "<!doctype html>\n<html lang=\"ko\"><head><meta charset=\"utf-8\">\n<meta name=\"referrer\" content=\"no-referrer\">\n<meta http-equiv=\"refresh\" content=\"0;url={safe}\">\n<title>FrameTrace</title></head>\n<body><p>FrameTrace 워크스테이션을 여는 중… / Opening the FrameTrace workstation…</p>\n<p><a href=\"{safe}\">열리지 않으면 여기를 누르십시오 / click here if nothing happens</a></p>\n<script>location.replace({script_url});</script>\n</body></html>\n"
+    )
+}
+
+/// R5-S8: where launch pages go — `<Documents or home>/FrameTrace/launch`
+/// (a NON-hidden folder in the examiner's home: sandboxed browsers such
+/// as snap/flatpak Firefox can read it, and neither `/tmp` nor a dot
+/// folder is reliably readable to them).
+#[cfg(not(target_os = "windows"))]
+fn launcher_dir() -> PathBuf {
+    let (root, _) = jobs::default_case_root(
+        false,
+        &|name| std::env::var_os(name),
+        &|path| path.is_dir(),
+        &std::env::temp_dir(),
+    );
+    root.join("FrameTrace").join("launch")
+}
+
+/// Launch pages older than this are removed by the next launch (a
+/// process that exited before its own removal timer ran).
+#[cfg_attr(windows, allow(dead_code))]
+const LAUNCHER_PAGE_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// R5-S8: writes a fresh user-private launch page into `dir` (created
+/// 0700; the file is created 0600 with `create_new`, so it never follows
+/// or reuses an existing name) and sweeps old ones. Returns its path.
+#[cfg(unix)]
+pub(crate) fn write_launcher_file(dir: &Path, url: &str) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|err| format!("{}: {err}", dir.display()))?;
+    // An existing folder keeps whatever mode it had; tighten it.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("{}: {err}", dir.display()))?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| now.duration_since(time).ok())
+                .is_some_and(|age| age >= LAUNCHER_PAGE_MAX_AGE);
+            if name.starts_with("open-") && name.ends_with(".html") && old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).map_err(|err| format!("entropy: {err}"))?;
+    let name: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("open-{name}.html"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    file.write_all(launcher_page_html(url).as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(path)
+}
+
+/// R5-S8: removes the launch page once its code can no longer be used
+/// (the code lives [`LAUNCH_CODE_TTL`] and opens once). Runs on its own
+/// thread; if this process exits first, the next launch sweeps the page.
+#[cfg(not(target_os = "windows"))]
+fn schedule_launcher_removal(path: PathBuf) {
+    let _ = thread::Builder::new()
+        .name("ft-launch-page".into())
+        .spawn(move || {
+            thread::sleep(LAUNCH_CODE_TTL + Duration::from_secs(5));
+            let _ = std::fs::remove_file(&path);
+        });
 }
 
 /// Opens a folder in the system file manager; `Err` when it could not be
@@ -1348,6 +1483,7 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("GET", "/api/marks-pending") => json(api_marks_pending(request, state)),
         ("POST", "/api/launch-code") => json(api_launch_code(state)),
         ("POST", "/api/start") => json(api_start(request, state)),
+        ("POST", "/api/reimport-raw") => json(jobs::api_reimport_raw(request, state)),
         ("POST", "/api/finalize") => json(api_finalize(request, state)),
         ("POST", "/api/recover-deleted") => json(api_recover_deleted(state)),
         ("POST", "/api/export-selected") => json(api_export_selected(request, state)),

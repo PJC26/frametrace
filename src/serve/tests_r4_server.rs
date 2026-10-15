@@ -506,7 +506,11 @@ fn b5_tampered_or_unlisted_generated_page_is_sandboxed() {
     );
     assert!(!unlisted.contains("Content-Disposition"), "{unlisted}");
     // Recorded by the generator: trusted, with a script-src hash list.
-    let recorded = crate::util::generated_pages::record_case_generated_pages(&case).unwrap();
+    let recorded = crate::util::generated_pages::record_generated_pages(
+        &case,
+        &["review/index.html", "reports/case-report.html"],
+    )
+    .unwrap();
     assert_eq!(recorded, 2);
     let trusted = get("/review/index.html");
     assert!(!trusted.contains("sandbox"), "{trusted}");
@@ -740,21 +744,22 @@ fn b11_finalize_and_import_refuse_when_the_case_switched_before_busy() {
 // ---- B12: slowloris bounds ----
 
 #[test]
-fn b12_unauthenticated_connections_per_peer_are_capped() {
+fn b12_unauthenticated_connections_are_capped() {
+    // R5-S7: the cap is server-wide (`MAX_PREAUTH`), not per peer.
     assert!(super::http::HEADER_READ_TIMEOUT <= Duration::from_secs(10));
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     let port = start_server(&state);
-    let map = Arc::clone(&state_lock(&state).preauth_conns);
-    let loopback: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
-    let idle: Vec<TcpStream> = (0..super::http::MAX_PREAUTH_PER_PEER)
+    let limits = Arc::clone(&state_lock(&state).conn_limits);
+    let preauth = || limits.preauth.load(Ordering::SeqCst);
+    let idle: Vec<TcpStream> = (0..super::http::MAX_PREAUTH)
         .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
         .collect();
     wait_until(
         "idle connections registered",
         Duration::from_secs(10),
-        || map.lock().unwrap().get(&loopback).copied() == Some(super::http::MAX_PREAUTH_PER_PEER),
+        || preauth() == super::http::MAX_PREAUTH,
     );
-    // The 17th connection is refused before a byte of it is read.
+    // One more is refused before a byte of it is read.
     let mut extra = TcpStream::connect(("127.0.0.1", port)).unwrap();
     extra
         .set_read_timeout(Some(Duration::from_secs(20)))
@@ -764,9 +769,7 @@ fn b12_unauthenticated_connections_per_peer_are_capped() {
     let refused = String::from_utf8_lossy(&refused);
     assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
     drop(idle);
-    wait_until("slots released", Duration::from_secs(10), || {
-        map.lock().unwrap().get(&loopback).is_none()
-    });
+    wait_until("slots released", Duration::from_secs(10), || preauth() == 0);
     let served = exchange(
         port,
         &format!("GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),

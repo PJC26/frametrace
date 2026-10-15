@@ -38,6 +38,7 @@ impl InputKind {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PipelineJob {
     pub(crate) kind: InputKind,
     pub(crate) case_dir: PathBuf,
@@ -189,10 +190,22 @@ pub(crate) struct JobState {
     /// opened as `/?launch=<code>` is consumed and plants the auth cookie,
     /// so the token itself never appears on a browser command line.
     pub(crate) launch_codes: Vec<(String, std::time::Instant)>,
-    /// R4-B12: connections per peer address still in the unauthenticated
-    /// header phase (shared with the connection threads; never held across
-    /// I/O).
-    pub(crate) preauth_conns: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    /// R5-S7: connection slots — the unauthenticated header phase and the
+    /// authenticated request phase are counted separately (shared with the
+    /// accept loop and the connection threads; atomics, no lock).
+    pub(crate) conn_limits: Arc<super::http::ConnLimits>,
+    /// R5-S6: an E01 analysis stopped because the existing raw image could
+    /// not be confirmed as this E01's complete import. Nothing was deleted;
+    /// `/api/reimport-raw` discards it and re-runs the same analysis.
+    pub(crate) raw_reimport: Option<RawReimport>,
+}
+
+/// R5-S6: the pending "raw 불일치 — 재임포트 필요" decision.
+#[derive(Clone)]
+pub(crate) struct RawReimport {
+    pub(crate) raw_path: PathBuf,
+    pub(crate) reason: String,
+    pub(crate) job: PipelineJob,
 }
 
 /// A background case job (UX-06) run under the busy lease.
@@ -346,7 +359,8 @@ impl JobState {
             key_source: None,
             audit_key_tag: None,
             launch_codes: Vec::new(),
-            preauth_conns: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            conn_limits: Arc::new(super::http::ConnLimits::default()),
+            raw_reimport: None,
         }
     }
 }

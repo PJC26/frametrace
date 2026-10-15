@@ -786,3 +786,204 @@ fn join_log_entry_carries_the_job_tag() {
     assert_eq!(entry["segment_check_ok"], true);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Runs ffmpeg with `args` (fixture generation); panics with its stderr.
+fn ffmpeg_fixture(args: &[&str]) {
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(args)
+        .output()
+        .expect("run ffmpeg");
+    assert!(
+        output.status.success(),
+        "ffmpeg fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// An H.264 test clip: `seconds` long, GOP `gop`, `bframes` B-frames,
+/// `audio` codec with tone `tone` Hz.
+fn bframe_clip(path: &Path, seconds: &str, gop: &str, bframes: &str, audio: &str, tone: u32) {
+    ffmpeg_fixture(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x120:rate=30",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("sine=frequency={tone}:sample_rate=48000"),
+        "-t",
+        seconds,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-g",
+        gop,
+        "-bf",
+        bframes,
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        audio,
+        path.to_str().unwrap(),
+    ]);
+}
+
+/// Video packet field values of `path` as ffprobe lists them.
+fn packet_fields(path: &Path, field: &str) -> String {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args([
+            "-show_entries",
+            &format!("packet={field}"),
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Joins every indexed file of `case` with the real CLI; returns the
+/// result JSON and the manifest.
+fn join_all(case: &Path, tag: &str) -> (Value, Value) {
+    let ids: Vec<String> = ids_by_name(case).values().cloned().collect();
+    let ids_arg = ids.join(",");
+    let result = last_json(&ok(
+        &frametrace(&[
+            "join-video",
+            case.to_str().unwrap(),
+            "--ids",
+            &ids_arg,
+            "--job-tag",
+            tag,
+        ]),
+        "join-video",
+    ));
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(result["manifest_path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    (result, manifest)
+}
+
+/// R5-S13: Matroska sources with B-frames (and PCM audio, so the output is
+/// Matroska too). ffprobe reports no dts (`N/A`) for the first packets of
+/// such a stream and decode order is not presentation order; the segment
+/// check now locates each segment by its earliest presentation time.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn join_bframe_mkv_sources_pass_the_segment_check() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_s13_mkv");
+    let source = root.join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    let names = [
+        ("20260910_120000_F.mkv", "2", 400),
+        ("20260910_120002_F.mkv", "2.5", 500),
+        ("20260910_120004_F.mkv", "2", 600),
+    ];
+    for (name, seconds, tone) in names {
+        bframe_clip(&source.join(name), seconds, "30", "3", "pcm_s16le", tone);
+    }
+    // The fixture really has what the check must cope with.
+    assert!(
+        packet_fields(&source.join(names[0].0), "dts_time").contains("N/A"),
+        "fixture without N/A dts"
+    );
+    let case = new_case(&root, &source, false);
+    let (result, manifest) = join_all(&case, "s13-mkv");
+    assert!(
+        result["output_path"].as_str().unwrap().ends_with(".mkv"),
+        "{result}"
+    );
+    let check = &manifest["segment_check"];
+    assert_eq!(check["ok"], true, "{check:#}");
+    let boundaries = check["boundaries"].as_array().unwrap();
+    assert_eq!(boundaries.len(), 3);
+    for boundary in boundaries {
+        let expected = boundary["expected_start_seconds"].as_f64().unwrap();
+        let observed = boundary["observed_start_seconds"].as_f64().unwrap();
+        assert!(
+            (observed - expected).abs() < 0.2,
+            "boundary off: {boundary}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// R5-S13: an MP4 cut by stream copy at a non-key frame carries an edit
+/// list — its first 1.5 s of packets are flagged discard. The concat
+/// output keeps them as visible frames, so the output is 1.5 s longer and
+/// every later segment starts 1.5 s later than the plan's sum of
+/// durations. The old check refused this complete join ("출력 길이 …
+/// 다릅니다", "2번째 원본이 … 시작하지 않습니다"); now the pre-roll is
+/// measured, accounted for and stated in the manifest.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn join_accepts_an_edit_list_mp4_source() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_s13_elst");
+    let source = root.join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    let long = root.join("long.mp4");
+    bframe_clip(&long, "4", "120", "2", "aac", 300);
+    let cut = source.join("20260910_120000_F.mp4");
+    ffmpeg_fixture(&[
+        "-ss",
+        "1.5",
+        "-i",
+        long.to_str().unwrap(),
+        "-c",
+        "copy",
+        cut.to_str().unwrap(),
+    ]);
+    // The fixture really has discarded (edit-list) packets.
+    assert!(
+        packet_fields(&cut, "flags").contains('D'),
+        "fixture without an edit list"
+    );
+    for (i, name) in ["20260910_120003_F.mp4", "20260910_120005_F.mp4"]
+        .iter()
+        .enumerate()
+    {
+        bframe_clip(
+            &source.join(name),
+            "2",
+            "30",
+            "2",
+            "aac",
+            700 + 100 * i as u32,
+        );
+    }
+    let case = new_case(&root, &source, false);
+    let (_result, manifest) = join_all(&case, "s13-elst");
+    let check = &manifest["segment_check"];
+    assert_eq!(check["ok"], true, "{check:#}");
+    assert_eq!(manifest["duration_check"]["ok"], true, "{manifest:#}");
+    let presented: f64 = check["boundaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["presented_edit_list_preroll_seconds"].as_f64().unwrap())
+        .sum();
+    match check["mode"].as_str() {
+        // The output kept the pre-roll frames: measured and stated.
+        Some("all-packets") if presented > 0.5 => {
+            assert!((presented - 1.5).abs() < 0.2, "{check:#}");
+            let caveats = manifest["caveats"].to_string();
+            assert!(caveats.contains("편집 목록"), "{caveats}");
+        }
+        // An ffmpeg that applies the edit list: nothing presented.
+        Some("all-packets") | Some("edit-list-applied") => {}
+        other => panic!("unexpected mode {other:?}: {check:#}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

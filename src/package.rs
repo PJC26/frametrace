@@ -146,18 +146,70 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
             final_dir.display()
         ));
     }
-    if let Err(err) = fs::rename(&work_dir, &final_dir) {
-        let _ = fs::remove_dir_all(&work_dir);
+    // R5-S12: a finished package is never thrown away because one rename
+    // failed (on Windows an antivirus scan or the indexer briefly holds a
+    // handle inside the fresh folder): the rename is retried with backoff,
+    // and if it still fails the complete work folder is KEPT, marked so
+    // no stale sweep removes it, and its path is reported.
+    let publish = |from: &Path, to: &Path| -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_PUBLISH_RENAMES.with(|left| {
+            let n = left.get();
+            left.set(n.saturating_sub(1));
+            n > 0
+        }) {
+            return Err(std::io::Error::other("injected rename failure"));
+        }
+        fs::rename(from, to)
+    };
+    if let Err(err) = rename_with_retry(&work_dir, &final_dir, &publish) {
+        let marker = work_dir.join(crate::join::PRESERVED_PART_MARKER);
+        let _ = fs::write(
+            &marker,
+            format!(
+                "FrameTrace: 이 폴더는 완성된 패키지입니다. 최종 이름({})으로 바꾸지 못해 그대로 두었습니다.\nThis folder is a complete package that could not be renamed to its final name; it was kept as is.\n",
+                final_dir.display()
+            ),
+        );
         return Err(format!(
-            "failed to publish package {} as {}: {err}",
-            work_dir.display(),
-            final_dir.display()
+            "완성된 패키지를 최종 이름 {}(으)로 바꾸지 못했습니다 ({err}) — 패키지는 지우지 않고 {}에 남겨 두었습니다. 다른 프로그램(백신·탐색기)이 폴더를 놓은 뒤 이름을 직접 바꾸거나 다시 패키징하십시오.",
+            final_dir.display(),
+            work_dir.display()
         ));
     }
     crate::util::sync_parent_directory(&final_dir);
     result.manifest_path = final_dir.join("package-manifest.json");
     result.output_dir = final_dir;
     Ok(result)
+}
+
+/// Delays between the R5-S12 rename attempts (5 attempts in all).
+const RENAME_BACKOFF_MS: [u64; 4] = [100, 250, 500, 1000];
+
+/// R5-S12: `rename(from, to)` retried up to 5 times with backoff. The
+/// last error is returned when every attempt failed.
+fn rename_with_retry(
+    from: &Path,
+    to: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut attempt = 0usize;
+    loop {
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt >= RENAME_BACKOFF_MS.len() => return Err(err),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(RENAME_BACKOFF_MS[attempt]));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: how many package publish renames fail before one works.
+    static FAIL_PUBLISH_RENAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn package_case_into(
@@ -2591,6 +2643,60 @@ mod tests {
         let manifest = fs::read_to_string(&result.manifest_path).unwrap();
         assert!(manifest.contains("\"missing_optional_files\""));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn minimal_packageable_case(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("frametrace-package-{tag}-{}", std::process::id()));
+        let case_dir = root.join("case");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(case_dir.join("db")).unwrap();
+        fs::create_dir_all(case_dir.join("reports")).unwrap();
+        fs::write(case_dir.join("case.json"), b"{}").unwrap();
+        let conn = crate::case_db::open_case_db(&case_dir).unwrap();
+        crate::case_db::init_schema(&conn).unwrap();
+        drop(conn);
+        fs::write(case_dir.join("db/video_index.json"), b"{}").unwrap();
+        fs::write(case_dir.join("db/videos.jsonl"), b"").unwrap();
+        fs::write(case_dir.join("db/video_paths.tsv"), b"id\tsource_path\n").unwrap();
+        fs::write(case_dir.join("reports/case-report.html"), b"<html></html>").unwrap();
+        (root, case_dir)
+    }
+
+    /// R5-S12: a transient rename failure (antivirus / indexer handle on
+    /// Windows) is retried; a persistent one keeps the complete package in
+    /// its work folder (marked, so no stale sweep deletes it) and names it
+    /// in the error. Before, one failed rename deleted the finished
+    /// package.
+    #[test]
+    fn package_publish_retries_and_never_deletes_a_finished_package() {
+        let (root, case_dir) = minimal_packageable_case("r5-rename");
+        super::FAIL_PUBLISH_RENAMES.with(|left| left.set(3));
+        let result = package_case(&case_dir, None).expect("published after retries");
+        assert!(result.output_dir.join("manifest.sha256").is_file());
+        super::FAIL_PUBLISH_RENAMES.with(|left| left.set(99));
+        let err = package_case(&case_dir, None).unwrap_err();
+        super::FAIL_PUBLISH_RENAMES.with(|left| left.set(0));
+        assert!(err.contains("남겨 두었습니다"), "{err}");
+        let kept: Vec<std::path::PathBuf> = fs::read_dir(case_dir.join("reports"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                crate::join::is_pid_part_name(
+                    &path.file_name().unwrap().to_string_lossy(),
+                    Some(std::process::id()),
+                )
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(
+            kept[0].join("manifest.sha256").is_file(),
+            "package kept whole"
+        );
+        assert!(kept[0].join(crate::join::PRESERVED_PART_MARKER).is_file());
+        assert!(err.contains(&kept[0].display().to_string()), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 

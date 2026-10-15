@@ -535,6 +535,13 @@ fn status_snapshot(guard: &JobState) -> serde_json::Value {
         "clips_running": guard.clip_jobs.iter().filter(|job| job.state == "running").count(),
         // S1: export-selected / capture-frame writes in flight.
         "writes_running": guard.write_ops,
+        // R5-S6: the last E01 run stopped on a raw image it could not
+        // confirm; `POST /api/reimport-raw` discards it and re-runs.
+        "raw_reimport": guard.raw_reimport.as_ref().map(|pending| serde_json::json!({
+            "raw_path": pending.raw_path.to_string_lossy(),
+            "reason": pending.reason,
+            "endpoint": "/api/reimport-raw",
+        })),
     })
 }
 
@@ -827,6 +834,7 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     // it, so "open package folder" offered the previous case's package and
     // /api/open-folder admitted it as an approved root).
     guard.package_dir = None;
+    guard.raw_reimport = None;
     guard.error = None;
     if has_review {
         guard.phase = "review-ready";
@@ -844,6 +852,7 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
             StepStatus::Pending,
         ];
         guard.package_dir = None;
+        guard.raw_reimport = None;
         guard.logs.push(format!(
             "케이스를 열었습니다 (색인만 있음 — 보강·리뷰 생성 전): {}",
             case_dir.display()
@@ -855,6 +864,7 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
         guard.phase = "idle";
         guard.steps = [StepStatus::Pending; 5];
         guard.package_dir = None;
+        guard.raw_reimport = None;
         guard.logs.push(format!(
             "케이스를 열었습니다 (검토 결과 없음): {}",
             case_dir.display()
