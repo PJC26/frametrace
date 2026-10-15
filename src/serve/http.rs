@@ -31,46 +31,63 @@ pub(crate) fn http_body_limit_for(path: &str) -> usize {
 /// for at most this long.
 pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// R4-B12: connections from one peer address (any source port — every
-/// local process is 127.0.0.1) that may sit in the unauthenticated header
-/// phase at once. The rest of the 64-connection budget stays available to
-/// the examiner's own page.
-pub(crate) const MAX_PREAUTH_PER_PEER: usize = 16;
+/// R5-S7: connections that may sit in the unauthenticated header phase at
+/// once, server-wide. R4-B12 counted them per peer ADDRESS, but every
+/// local process — the examiner's own page included — is 127.0.0.1, so
+/// the per-peer cap of 16 was in effect a global cap that a burst of the
+/// viewer's own parallel requests (thumbnails, records pages) could hit
+/// and get 503 for. The header phase is short for a real client; only a
+/// slow-drip client stays in it, for at most [`HEADER_READ_TIMEOUT`].
+pub(crate) const MAX_PREAUTH: usize = 48;
 
-/// A peer's slot in the unauthenticated phase; released on drop.
-pub(crate) struct PreauthSlot {
-    map: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
-    peer: std::net::IpAddr,
+/// R5-S7: authenticated requests in flight at once — a separate pool, so
+/// unauthenticated connections (up to [`MAX_PREAUTH`]) can never use up
+/// the slots of requests that already proved the token / nonce.
+pub(crate) const MAX_AUTHED: usize = 64;
+
+/// R5-S7: the two connection pools (lock-free counters).
+#[derive(Default, Debug)]
+pub(crate) struct ConnLimits {
+    pub(crate) preauth: std::sync::atomic::AtomicUsize,
+    pub(crate) authed: std::sync::atomic::AtomicUsize,
 }
 
-impl Drop for PreauthSlot {
+/// One taken slot of a [`ConnLimits`] pool; released on drop (also while
+/// a panicking handler unwinds).
+pub(crate) struct ConnSlot {
+    limits: Arc<ConnLimits>,
+    authed: bool,
+}
+
+impl ConnLimits {
+    fn pool(&self, authed: bool) -> &std::sync::atomic::AtomicUsize {
+        if authed { &self.authed } else { &self.preauth }
+    }
+}
+
+impl Drop for ConnSlot {
     fn drop(&mut self) {
-        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = map.get_mut(&self.peer) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                map.remove(&self.peer);
-            }
-        }
+        self.limits
+            .pool(self.authed)
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Takes a pre-auth slot for `peer`, or `None` when it already holds
-/// [`MAX_PREAUTH_PER_PEER`].
-pub(crate) fn take_preauth_slot(
-    map: &Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
-    peer: std::net::IpAddr,
-) -> Option<PreauthSlot> {
-    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
-    let count = guard.entry(peer).or_insert(0);
-    if *count >= MAX_PREAUTH_PER_PEER {
-        return None;
-    }
-    *count += 1;
-    Some(PreauthSlot {
-        map: Arc::clone(map),
-        peer,
-    })
+/// Takes a slot of the pre-auth (`authed == false`) or authenticated
+/// pool, or `None` when that pool is full.
+pub(crate) fn take_conn_slot(limits: &Arc<ConnLimits>, authed: bool) -> Option<ConnSlot> {
+    use std::sync::atomic::Ordering;
+    let cap = if authed { MAX_AUTHED } else { MAX_PREAUTH };
+    limits
+        .pool(authed)
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < cap).then_some(count + 1)
+        })
+        .ok()
+        .map(|_| ConnSlot {
+            limits: Arc::clone(limits),
+            authed,
+        })
 }
 
 /// Windows review item 11: the workstation URL carries `?token=` on first
@@ -230,27 +247,34 @@ pub(crate) fn drain_unread(stream: &mut TcpStream) {
     }
 }
 
-/// The per-peer pre-auth counter map shared by a server's connections.
-pub(crate) type PreauthMap = Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>;
-
 #[cfg(test)]
 pub(crate) fn handle_connection_timed(
     stream: TcpStream,
     state: SharedState,
     read_timeout: Duration,
 ) -> Result<(), String> {
-    let preauth_map = Arc::clone(&state_lock(&state).preauth_conns);
-    handle_connection_with(stream, state, read_timeout, &preauth_map)
+    let limits = Arc::clone(&state_lock(&state).conn_limits);
+    handle_connection_with(stream, state, read_timeout, &limits, None)
 }
 
-/// [`handle_connection_timed`] with the pre-auth map handed in: the accept
-/// loop clones it once, so serving a connection that is refused before
-/// the auth gate (400/408/503) never waits for the state lock.
+/// The 503 a full connection pool answers with (no thread, no state lock).
+pub(crate) fn refuse_busy(stream: &mut TcpStream, message: &[u8]) {
+    let _ = finish(stream, &plain(503, message.to_vec()));
+    // Bounded discard so the close does not RST away the 503.
+    drain_unread(stream);
+}
+
+/// [`handle_connection_timed`] with the connection pools handed in: the
+/// accept loop clones them once, so serving a connection that is refused
+/// before the auth gate (400/408/503) never waits for the state lock.
+/// `preauth` is the header-phase slot the accept loop already took
+/// (`None`: take one here).
 pub(crate) fn handle_connection_with(
     mut stream: TcpStream,
     state: SharedState,
     read_timeout: Duration,
-    preauth_map: &PreauthMap,
+    limits: &Arc<ConnLimits>,
+    preauth: Option<ConnSlot>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(read_timeout))
@@ -260,25 +284,17 @@ pub(crate) fn handle_connection_with(
         .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|err| format!("write timeout: {err}"))?;
     HEAD_ONLY.with(|flag| flag.set(false));
-    // R4-B12: bounded unauthenticated connections per peer address; the
-    // slot is held through the header phase and the auth gate only.
-    let preauth = match stream.peer_addr() {
-        Ok(addr) => match take_preauth_slot(preauth_map, addr.ip()) {
-            Some(slot) => Some(slot),
-            None => {
-                let _ = finish(
-                    &mut stream,
-                    &plain(
-                        503,
-                        b"too many unauthenticated connections from this address".to_vec(),
-                    ),
-                );
-                // Bounded discard so the close does not RST away the 503.
-                drain_unread(&mut stream);
-                return Err("pre-auth connection cap reached".into());
-            }
-        },
-        Err(_) => None,
+    // R5-S7: bounded unauthenticated connections server-wide; the slot is
+    // held through the header phase and the auth gate only.
+    let preauth = match preauth.or_else(|| take_conn_slot(limits, false)) {
+        Some(slot) => slot,
+        None => {
+            refuse_busy(
+                &mut stream,
+                b"too many unauthenticated connections - retry shortly",
+            );
+            return Err("pre-auth connection cap reached".into());
+        }
     };
     let refuse_read = |stream: &mut TcpStream, err: HttpReadError| {
         if err.status != 0 {
@@ -332,6 +348,20 @@ pub(crate) fn handle_connection_with(
     // gate runs before a single body byte is read — an unauthenticated
     // client can no longer make the server buffer a 16 MiB body first.
     let authorized = authorize_on(&request, token.as_deref(), &instance, port);
+    // R5-S7: an authorized request moves to its own pool BEFORE leaving
+    // the header-phase one, so a connection is always counted somewhere.
+    let _authed = if authorized.is_ok() {
+        match take_conn_slot(limits, true) {
+            Some(slot) => Some(slot),
+            None => {
+                drop(preauth);
+                refuse_busy(&mut stream, b"server busy - too many requests in flight");
+                return Err("authenticated connection cap reached".into());
+            }
+        }
+    } else {
+        None
+    };
     drop(preauth);
     let plant_cookie = match authorized {
         Ok(plant) => plant,
@@ -1035,6 +1065,27 @@ pub(crate) fn set_token_cookie(response: &mut Vec<u8>, token: &str, port: Option
     }
 }
 
+/// The `/` redirect target of a launch request: the query without its
+/// `launch` and `token` parameters (raw, still percent-encoded, order
+/// kept). A parameter holding a control character or a space is dropped
+/// rather than echoed into a header.
+pub(crate) fn launch_redirect_target(query: &str) -> String {
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            name != "launch" && name != "token"
+        })
+        .filter(|pair| !pair.chars().any(|c| c.is_control() || c == ' '))
+        .collect();
+    if kept.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{}", kept.join("&"))
+    }
+}
+
 /// R4-B2: answer to `GET /?launch=<code>`.
 /// - valid, unexpired, unused code → `303 See Other` to `/` with the
 ///   `ft_token_<port>` cookie (the code is consumed: single use);
@@ -1052,13 +1103,17 @@ pub(crate) fn launch_response(
     if !request_is_localhost_trusted(request) {
         return plain(403, b"cross-origin request rejected".to_vec());
     }
+    // R5 (contract with U14): the redirect drops `launch` (and any
+    // `token`) but keeps every other query parameter, so a launch URL such
+    // as `/?launch=…&case=…` still lands where it pointed.
+    let location = format!("Location: {}\r\n", launch_redirect_target(&request.query));
     let redirect = || {
         respond(
             303,
             "text/plain; charset=utf-8",
             b"see /".to_vec(),
             "no-store",
-            Some("Location: /\r\n"),
+            Some(&location),
         )
     };
     let (token, valid) = {
@@ -1262,6 +1317,18 @@ pub(crate) fn serve_case_file_with(
         _ => return write_simple(stream, 404, b"file not found"),
     };
     let total = meta.len();
+    // R5-S2: a script under the case folder runs in the workstation origin
+    // when a trusted page loads it (`review/data-bundle.js`), so its bytes
+    // must be pinned in the same HMAC'd manifest as the pages — an edited
+    // or planted script is refused outright (a page's hash says nothing
+    // about the sibling file it loads).
+    if is_script_path(&path) && !verified_case_script(&case_dir, &path, &meta) {
+        return write_simple(
+            stream,
+            403,
+            b"script not verified - regenerate the review pages on this computer",
+        );
+    }
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(_) => return write_simple(stream, 404, b"file not found"),
@@ -1518,6 +1585,51 @@ pub(crate) fn verified_generated_page(
         .then_some(script)
 }
 
+/// R5-S2: extensions a browser executes as a classic or module script.
+pub(crate) fn is_script_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("js" | "mjs" | "cjs")
+    )
+}
+
+/// Verified-script cache: `(path, len, mtime, sha256)`.
+type VerifiedScriptEntry = (PathBuf, u64, Option<SystemTime>, String);
+static VERIFIED_SCRIPTS: Mutex<Vec<VerifiedScriptEntry>> = Mutex::new(Vec::new());
+
+/// R5-S2: whether the script at `path` (canonical, under the case) has
+/// bytes the case's verified generated-files manifest lists. The file
+/// hash is cached per (path, size, mtime); the manifest is re-verified on
+/// every call. Runs outside the state lock (file hashing).
+pub(crate) fn verified_case_script(case_dir: &Path, path: &Path, meta: &std::fs::Metadata) -> bool {
+    let (len, mtime) = (meta.len(), meta.modified().ok());
+    let cached = VERIFIED_SCRIPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(p, l, m, _)| p == path && *l == len && *m == mtime)
+        .map(|(_, _, _, sha)| sha.clone());
+    let sha = match cached {
+        Some(sha) => sha,
+        None => {
+            let Some(sha) = crate::util::generated_pages::file_sha256(path) else {
+                return false;
+            };
+            let mut cache = VERIFIED_SCRIPTS.lock().unwrap_or_else(|p| p.into_inner());
+            cache.retain(|(p, _, _, _)| p != path);
+            if cache.len() >= VERIFIED_PAGES_CAP {
+                cache.remove(0);
+            }
+            cache.push((path.to_path_buf(), len, mtime, sha.clone()));
+            sha
+        }
+    };
+    crate::util::generated_pages::trusted_hashes(case_dir).contains(&sha)
+}
+
 /// Security headers for streamed case/media files (SEC-02).
 /// - Generated pages: may only be framed by the workstation itself.
 /// - Everything else: CSP `sandbox` (no script, opaque origin, so the
@@ -1615,10 +1727,17 @@ pub(crate) fn serve_media(
     if file.seek(SeekFrom::Start(start)).is_err() {
         return write_simple(stream, 500, b"seek failed");
     }
-    let mut head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: {}\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n",
-        if code == 206 { "Partial Content" } else { "OK" },
+    // R5-S2: evidence is never served with a script MIME type — with
+    // `nosniff`, `<script src="/media?path=…evil.js">` is then refused by
+    // the browser instead of running in the workstation origin.
+    let media_type = if is_script_path(&canonical) {
+        "application/octet-stream"
+    } else {
         mime_for(&canonical)
+    };
+    let mut head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: {media_type}\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n",
+        if code == 206 { "Partial Content" } else { "OK" },
     );
     // `?download=1` forces a browser save-as with the evidence filename
     // instead of inline playback. Same approved-roots containment applies.

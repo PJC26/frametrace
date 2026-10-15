@@ -436,7 +436,14 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     // Dedicated carve view: a raw-image carve can return hundreds of
     // artifacts that would drown the evidence grid, so carving results get
     // their own page beside the viewer.
+    // R5-S1: exactly the files this run wrote are recorded as generated.
+    let mut written: Vec<&str> = vec![
+        "review/index.html",
+        "review/data-bundle.js",
+        "review/evidence-viewer.html",
+    ];
     if !carve_log.trim().is_empty() {
+        written.push("review/carve-report.html");
         let carve_results =
             redact(&read_to_string(&case_dir.join("db/carve_results.json")).unwrap_or_default());
         // Redacted in-case outputs read `<case>/…`; handed to the carve page
@@ -463,7 +470,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         .map_err(|err| format!("failed to write carve report html: {err}"))?;
         println!("carve report written: {}", carve_report_path.display());
     }
-    record_generated_pages(case_dir)?;
+    record_generated_pages(case_dir, &written)?;
     println!("review written: {}", review_path.display());
     println!(
         "evidence viewer written: {}",
@@ -945,7 +952,7 @@ pub fn make_report(
     };
     let report_path = case_dir.join("reports/case-report.html");
     write_text(&report_path, &html).map_err(|err| format!("failed to write report html: {err}"))?;
-    record_generated_pages(case_dir)?;
+    record_generated_pages(case_dir, &["reports/case-report.html"])?;
     println!("report written: {}", report_path.display());
     Ok(())
 }
@@ -1213,16 +1220,19 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
 pub fn make_custody(case_dir: &Path) -> Result<(), String> {
     ensure_case(case_dir)?;
     let path = crate::custody::generate(case_dir)?;
-    record_generated_pages(case_dir)?;
+    record_generated_pages(case_dir, &[crate::custody::CUSTODY_REL_PATH])?;
     println!("custody statement written: {}", path.display());
     Ok(())
 }
 
-/// B5: records the SHA-256 of every generated case page (review/, reports/)
+/// B5: records the SHA-256 of the generated case pages (review/, reports/)
 /// so the workstation serves them with their scripts allowed instead of
-/// sandboxed. Called after every page this module writes.
-fn record_generated_pages(case_dir: &Path) -> Result<(), String> {
-    crate::util::generated_pages::record_case_generated_pages(case_dir)
+/// sandboxed. R5-S1: only the files the calling generator itself just
+/// wrote (`rels`, case-relative) — never every HTML in the folders, which
+/// let a planted page ride along with the next regeneration. R5-S2: the
+/// scripts those pages load (`review/data-bundle.js`) are listed too.
+fn record_generated_pages(case_dir: &Path, rels: &[&str]) -> Result<(), String> {
+    crate::util::generated_pages::record_generated_pages(case_dir, rels)
         .map(|_| ())
         .map_err(|err| {
             format!("생성 페이지 신뢰 목록(review/.generated.json)을 기록하지 못했습니다: {err}")
@@ -2392,7 +2402,7 @@ mod report_output_tests {
         assert!(
             details
                 .iter()
-                .any(|d| d.contains("sign-off v4: marks, evidence")),
+                .any(|d| d.contains("sign-off v4: marks, the case records' target hashes")),
             "{details:?}"
         );
         assert!(

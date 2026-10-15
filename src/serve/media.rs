@@ -2119,11 +2119,12 @@ pub(crate) fn begin_export_bundle(
     let note = format!(
         "FrameTrace 선별 증거 묶음 — 작성 중\n\n이 폴더는 아직 완성되지 않았습니다 (생성 시작 unix {stamp}, 항목 {items_total}개).\n이 파일이 남아 있다면 내보내기가 끝나지 못한 것이므로 묶음으로 사용하지 마십시오.\n"
     );
-    std::fs::write(export_dir.join(EXPORT_IN_PROGRESS_FILE), note)
+    // R5-S14: atomic (temp + rename) so a crash never leaves a torn file.
+    crate::util::write_text_atomic(&export_dir.join(EXPORT_IN_PROGRESS_FILE), &note)
         .and_then(|_| {
-            std::fs::write(
-                export_dir.join("manifest-audit.json"),
-                format!(
+            crate::util::write_text_atomic(
+                &export_dir.join("manifest-audit.json"),
+                &format!(
                     "{{\"state\":\"in-progress\",\"items_total\":{items_total},\"unix\":{stamp}}}\n"
                 ),
             )
@@ -2146,12 +2147,16 @@ pub(crate) fn mark_abandoned_exports() -> usize {
     let mut marked = 0;
     for dir in dirs {
         let note = "FrameTrace 선별 증거 묶음 — 중단됨\n\n프로그램이 종료되면서 이 내보내기는 끝나지 못했습니다.\n일부 파일만 들어 있을 수 있으며 manifest가 없거나 불완전합니다. 묶음으로 사용하지 말고 다시 내보내십시오.\n";
-        let written = std::fs::write(dir.join(EXPORT_INCOMPLETE_FILE), note).and_then(|_| {
-            std::fs::write(
-                dir.join("manifest-audit.json"),
-                "{\"state\":\"aborted\",\"reason\":\"process-exit\"}\n",
-            )
-        });
+        // R5-S14: the "aborted" manifest replaces the in-progress one
+        // atomically — a process killed mid-write (this runs on the forced
+        // exit path) leaves the old or the new file, never a torn one.
+        let written = crate::util::write_text_atomic(&dir.join(EXPORT_INCOMPLETE_FILE), note)
+            .and_then(|_| {
+                crate::util::write_text_atomic(
+                    &dir.join("manifest-audit.json"),
+                    "{\"state\":\"aborted\",\"reason\":\"process-exit\"}\n",
+                )
+            });
         if written.is_ok() {
             marked += 1;
         } else {
@@ -2366,6 +2371,31 @@ pub(crate) fn step_part_dirs(args: &[String]) -> Vec<std::path::PathBuf> {
 /// Returns one log line per removal (`Ok`) or failure (`Err`).
 pub(crate) fn sweep_killed_step(args: &[String], pid: u32) -> Vec<Result<String, String>> {
     let mut out = Vec::new();
+    // R5-S14: the killed package-case's own reservations, read off its
+    // work folders (`.package_<ts>.ft<pid>.part` reserves `package_<ts>`)
+    // BEFORE those are swept. Any other empty `package_*` folder may be a
+    // live package-case's reservation (a CLI run, another workstation) and
+    // is left alone.
+    let mut own_reservations: Vec<PathBuf> = Vec::new();
+    if args.first().map(String::as_str) == Some("package-case")
+        && let Some(case) = args.get(1)
+    {
+        let reports = std::path::Path::new(case).join("reports");
+        if let Ok(entries) = std::fs::read_dir(&reports) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if crate::join::is_pid_part_name(&name, Some(pid))
+                    && let Some(reserved) = name
+                        .strip_prefix('.')
+                        .and_then(|rest| rest.split_once(&format!(".ft{pid}.part")))
+                        .map(|(reserved, _)| reserved.to_string())
+                    && reserved.starts_with("package_")
+                {
+                    own_reservations.push(reports.join(reserved));
+                }
+            }
+        }
+    }
     for dir in step_part_dirs(args) {
         for (path, result) in crate::join::sweep_pid_parts(&dir, pid) {
             out.push(match result {
@@ -2377,23 +2407,14 @@ pub(crate) fn sweep_killed_step(args: &[String], pid: u32) -> Vec<Result<String,
             });
         }
     }
-    if args.first().map(String::as_str) == Some("package-case")
-        && let Some(case) = args.get(1)
-        && let Ok(entries) = std::fs::read_dir(std::path::Path::new(case).join("reports"))
-    {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // remove_dir only removes an EMPTY directory: a finished
-            // package is never touched.
-            if name.starts_with("package_")
-                && entry.path().is_dir()
-                && std::fs::remove_dir(entry.path()).is_ok()
-            {
-                out.push(Ok(format!(
-                    "중단된 패키지 생성의 빈 폴더를 지웠습니다: {}",
-                    entry.path().display()
-                )));
-            }
+    for reserved in own_reservations {
+        // remove_dir only removes an EMPTY directory: a finished package
+        // is never touched.
+        if reserved.is_dir() && std::fs::remove_dir(&reserved).is_ok() {
+            out.push(Ok(format!(
+                "중단된 패키지 생성의 빈 폴더를 지웠습니다: {}",
+                reserved.display()
+            )));
         }
     }
     out

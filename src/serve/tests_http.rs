@@ -84,6 +84,8 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/audio-measure"),
     ("GET", "/api/recent-cases"),
     ("POST", "/api/recent-cases/forget"),
+    // R5-S6.
+    ("POST", "/api/reimport-raw"),
 ];
 
 #[test]

@@ -367,8 +367,18 @@ pub struct SegmentCheck {
     /// `(1-based segment, expected start s, observed start s)` per
     /// boundary that could be located in the output.
     pub boundaries: Vec<(usize, f64, Option<f64>)>,
+    /// R5-S13: per segment, the seconds of edit-list pre-roll (frames the
+    /// source's edit list hides) that the output PRESENTS — stream copy
+    /// through the concat demuxer can keep those packets as visible frames.
+    pub presented_preroll_seconds: Vec<f64>,
+    /// R5-S13: how output packets were matched to the sources:
+    /// `all-packets` (every source packet, pre-roll included) or
+    /// `edit-list-applied` (the pre-roll packets were dropped).
+    pub mode: &'static str,
     pub ok: bool,
     pub problems: Vec<String>,
+    /// R5-S13: facts the manifest states next to a passing check.
+    pub notes: Vec<String>,
 }
 
 impl SegmentCheck {
@@ -378,14 +388,71 @@ impl SegmentCheck {
             "video_packets_observed": self.video_packets_observed,
             "audio_packets_expected": self.audio_packets_expected,
             "audio_packets_observed": self.audio_packets_observed,
-            "boundaries": self.boundaries.iter().map(|(index, expected, observed)| json!({
+            "mode": self.mode,
+            "boundaries": self.boundaries.iter().enumerate().map(|(at, (index, expected, observed))| json!({
                 "segment": index,
                 "expected_start_seconds": r3(*expected),
                 "observed_start_seconds": observed.map(r3),
+                "presented_edit_list_preroll_seconds": r3(self.presented_preroll_seconds.get(at).copied().unwrap_or(0.0)),
             })).collect::<Vec<_>>(),
             "ok": self.ok,
             "problems": self.problems,
+            "notes": self.notes,
         })
+    }
+
+    /// Seconds the output is longer than the plan because edit-list
+    /// pre-roll is presented (R5-S13).
+    pub fn presented_preroll_total(&self) -> f64 {
+        self.presented_preroll_seconds.iter().sum()
+    }
+}
+
+/// R5-S13: one video packet as ffprobe lists it (file order). `pts`/`dts`
+/// are `None` where ffprobe reports `N/A` (Matroska stores no dts for the
+/// first packets of a B-frame stream); `discard` is the `D` flag (outside
+/// the edit list).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VideoPacket {
+    pub pts: Option<f64>,
+    pub dts: Option<f64>,
+    pub discard: bool,
+}
+
+/// R5-S13: a source's packet facts for the segment check.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SourcePackets {
+    /// Every video packet in the file.
+    pub video_total: u64,
+    /// Video packets not flagged discard (inside the edit list).
+    pub video_kept: u64,
+    /// Per video packet (file order): flagged discard by the source's edit
+    /// list. Stream copy keeps packet order, so packet `i` of the source
+    /// is packet `start + i` of its output range.
+    pub discard_mask: Vec<bool>,
+    pub audio: Option<u64>,
+}
+
+impl SourcePackets {
+    /// Facts from a source's video packet list plus its audio count.
+    pub fn from_packets(packets: &[VideoPacket], audio: Option<u64>) -> Self {
+        let discard_mask: Vec<bool> = packets.iter().map(|p| p.discard).collect();
+        SourcePackets {
+            video_total: packets.len() as u64,
+            video_kept: discard_mask.iter().filter(|d| !**d).count() as u64,
+            discard_mask,
+            audio,
+        }
+    }
+
+    /// Plain counts (no edit list).
+    pub fn plain(video: u64, audio: Option<u64>) -> Self {
+        SourcePackets {
+            video_total: video,
+            video_kept: video,
+            discard_mask: vec![false; video as usize],
+            audio,
+        }
     }
 }
 
@@ -432,18 +499,54 @@ pub fn stream_packet_counts(
     Ok((video, first("audio")))
 }
 
-/// Decode timestamps (seconds) of the first video stream's packets, in
-/// file order; a packet without a dts repeats the previous value.
-pub fn video_packet_dts(
+/// R5-S13: parses ffprobe `-show_entries packet=pts_time,dts_time,flags
+/// -of compact=p=0` output (`pts_time=…|dts_time=…|flags=…` per line).
+pub fn parse_video_packets(text: &str) -> Vec<VideoPacket> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mut packet = VideoPacket::default();
+        let mut any = false;
+        for field in line.split('|') {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            let time = || value.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+            match key.trim() {
+                "pts_time" => {
+                    packet.pts = time();
+                    any = true;
+                }
+                "dts_time" => {
+                    packet.dts = time();
+                    any = true;
+                }
+                "flags" => {
+                    packet.discard = value.contains('D');
+                    any = true;
+                }
+                _ => {}
+            }
+        }
+        if any {
+            out.push(packet);
+        }
+    }
+    out
+}
+
+/// R5-S13: the first video stream's packets (pts, dts, discard flag) in
+/// file order.
+pub fn video_packets(
     ffprobe: &str,
     path: &Path,
     timeout_secs: Option<u64>,
-) -> Result<Vec<f64>, String> {
+) -> Result<Vec<VideoPacket>, String> {
     let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
     let mut command = Command::new(&binary);
     command
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "packet=dts_time", "-of", "csv=p=0"])
+        .args(["-show_entries", "packet=pts_time,dts_time,flags"])
+        .args(["-of", "compact=p=0"])
         .arg(path);
     let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
     if !output.status.success() {
@@ -453,52 +556,71 @@ pub fn video_packet_dts(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut out = Vec::new();
-    let mut last = 0.0f64;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let field = line.trim().trim_end_matches(',');
-        if field.is_empty() {
-            continue;
-        }
-        if let Ok(value) = field.parse::<f64>()
-            && value.is_finite()
-        {
-            last = value;
-        }
-        out.push(last);
-    }
-    Ok(out)
+    Ok(parse_video_packets(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
-/// Pure C14 decision. `sources`: per segment (output order) its
-/// `(video packets, audio packets)`; `offsets`: each segment's planned
-/// output start; `output_audio`: the output's audio packet count;
-/// `output_dts`: the output's video packet dts in file order.
+fn min_time(times: impl Iterator<Item = f64>) -> Option<f64> {
+    times.fold(None, |acc: Option<f64>, t| {
+        Some(acc.map_or(t, |a| a.min(t)))
+    })
+}
+
+/// Pure C14 decision. `sources`: per segment (output order) its packet
+/// facts; `offsets`: each segment's planned output start; `output_audio`:
+/// the output's audio packet count; `output`: the output's video packets
+/// in file order.
 ///
 /// Missing material shows up as a video packet deficit (stream copy moves
 /// every packet, so the counts must be equal) or as a segment that does
 /// not start where the plan puts it (± max(1 s, 0.2 %)). Audio is allowed
 /// one packet of slack per segment (encoder priming at a junction).
+///
+/// R5-S13 — what made it refuse correct joins:
+/// - A segment's start is now the EARLIEST PRESENTATION time (min pts) of
+///   its packets, not the dts of its first packet: Matroska reports no
+///   dts (`N/A`) for the first packets of a B-frame stream (they used to
+///   repeat the previous value), and decode order is not presentation
+///   order.
+/// - Packets a source's edit list discards (`D` flag) are accounted for:
+///   the output may carry every source packet (the concat demuxer keeps
+///   them, as visible frames — the following segments then start later by
+///   the pre-roll the output really presents, measured from the output)
+///   or only the kept ones (`edit-list-applied`). Either count is
+///   accepted; anything else is still a failure.
 pub fn evaluate_segment_check(
-    sources: &[(u64, Option<u64>)],
+    sources: &[SourcePackets],
     offsets: &[f64],
     output_audio: Option<u64>,
-    output_dts: &[f64],
+    output: &[VideoPacket],
 ) -> SegmentCheck {
+    let total: u64 = sources.iter().map(|s| s.video_total).sum();
+    let kept: u64 = sources.iter().map(|s| s.video_kept).sum();
+    let observed = output.len() as u64;
+    let dropped_mode = observed != total && observed == kept;
     let mut check = SegmentCheck {
-        video_packets_expected: sources.iter().map(|(v, _)| *v).sum(),
-        video_packets_observed: output_dts.len() as u64,
+        video_packets_expected: if dropped_mode { kept } else { total },
+        video_packets_observed: observed,
         audio_packets_observed: output_audio,
+        mode: if dropped_mode {
+            "edit-list-applied"
+        } else {
+            "all-packets"
+        },
         ..SegmentCheck::default()
     };
-    if sources.iter().all(|(_, a)| a.is_some()) && !sources.is_empty() {
-        check.audio_packets_expected = Some(sources.iter().filter_map(|(_, a)| *a).sum());
+    if sources.iter().all(|s| s.audio.is_some()) && !sources.is_empty() {
+        check.audio_packets_expected = Some(sources.iter().filter_map(|s| s.audio).sum());
     }
-    if check.video_packets_observed != check.video_packets_expected {
-        check.problems.push(format!(
-            "영상 패킷 수가 원본 합계와 다릅니다 (출력 {}, 원본 합계 {})",
-            check.video_packets_observed, check.video_packets_expected
-        ));
+    if observed != total && observed != kept {
+        check.problems.push(if kept == total {
+            format!("영상 패킷 수가 원본 합계와 다릅니다 (출력 {observed}, 원본 합계 {total})")
+        } else {
+            format!(
+                "영상 패킷 수가 원본 합계와 다릅니다 (출력 {observed}, 원본 합계 {total} — 편집 목록 제외 시 {kept})"
+            )
+        });
     }
     match (check.audio_packets_expected, output_audio) {
         (Some(expected), Some(observed)) => {
@@ -513,12 +635,51 @@ pub fn evaluate_segment_check(
         )),
         _ => {}
     }
-    let origin = output_dts.first().copied().unwrap_or(0.0);
+    // Each segment's packet range in the output: its earliest presented
+    // time (non-discard output packets; dts only where no pts exists at
+    // all) and the pre-roll it presents.
+    let mut starts: Vec<Option<f64>> = Vec::with_capacity(sources.len());
+    let mut start_index = 0usize;
+    for source in sources {
+        let count = if dropped_mode {
+            source.video_kept
+        } else {
+            source.video_total
+        } as usize;
+        let begin = start_index.min(output.len());
+        let end = start_index.saturating_add(count).min(output.len());
+        let range = &output[begin..end];
+        // In `all-packets` mode, output packet `i` of the range is source
+        // packet `i`: was it the source's edit-list pre-roll?
+        let pre_roll =
+            |i: usize| !dropped_mode && source.discard_mask.get(i).copied().unwrap_or(false);
+        let presented_start = min_time(range.iter().filter(|p| !p.discard).filter_map(|p| p.pts))
+            .or_else(|| min_time(range.iter().filter(|p| !p.discard).filter_map(|p| p.dts)));
+        let kept_start = min_time(
+            range
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| !p.discard && !pre_roll(*i))
+                .filter_map(|(_, p)| p.pts.or(p.dts)),
+        );
+        starts.push(presented_start);
+        // How much earlier than the source's first kept frame the
+        // segment's first visible frame is: the concat demuxer may keep
+        // pre-roll frames at their own times or squeeze them together —
+        // measured on the output, never assumed.
+        let presented = match (presented_start, kept_start) {
+            (Some(first), Some(kept)) if kept > first => kept - first,
+            _ => 0.0,
+        };
+        check.presented_preroll_seconds.push(presented);
+        start_index = start_index.saturating_add(count);
+    }
+    let origin = starts.first().copied().flatten().unwrap_or(0.0);
     let base = offsets.first().copied().unwrap_or(0.0);
-    let mut start_index = 0u64;
-    for (index, (packets, _)) in sources.iter().enumerate() {
-        let expected = offsets.get(index).copied().unwrap_or(0.0) - base;
-        let observed = output_dts.get(start_index as usize).map(|dts| dts - origin);
+    let mut shift = 0.0f64;
+    for (index, observed) in starts.iter().enumerate() {
+        let expected = offsets.get(index).copied().unwrap_or(0.0) - base + shift;
+        let observed = observed.map(|start| start - origin);
         check.boundaries.push((index + 1, expected, observed));
         match observed {
             Some(observed) if (observed - expected).abs() <= duration_tolerance(expected) => {}
@@ -527,11 +688,18 @@ pub fn evaluate_segment_check(
                 index + 1
             )),
             None => check.problems.push(format!(
-                "{}번째 원본의 영상 패킷이 출력에 없습니다",
+                "{}번째 원본의 영상 패킷이 출력에 없습니다 (또는 시각 정보가 없어 위치를 확인할 수 없습니다)",
                 index + 1
             )),
         }
-        start_index += packets;
+        let presented = check.presented_preroll_seconds[index];
+        if presented >= 0.001 {
+            check.notes.push(format!(
+                "{}번째 원본의 편집 목록(edit list)이 가리던 앞부분 {presented:.3}초가 출력에 그대로 들어갔습니다 — 이후 원본의 출력 내 위치는 이만큼 뒤로 밀리며, 정확한 위치는 segment_check.boundaries의 관측값입니다.",
+                index + 1
+            ));
+        }
+        shift += presented;
     }
     if sources.is_empty() {
         check.problems.push("검증할 원본이 없습니다".to_string());
@@ -540,9 +708,9 @@ pub fn evaluate_segment_check(
     check
 }
 
-/// C14: counts every source's packets and lists the output's video packet
-/// timestamps, then applies [`evaluate_segment_check`]. `Err` = the check
-/// itself could not run (which fails the join too — never published
+/// C14: lists every source's packets and the output's video packets,
+/// then applies [`evaluate_segment_check`]. `Err` = the check itself
+/// could not run (which fails the join too — never published
 /// unverified).
 pub fn verify_segments(
     ffprobe: &str,
@@ -553,8 +721,10 @@ pub fn verify_segments(
     let fail = |err: String| format!("이어붙인 결과물의 구간 검증을 실행하지 못했습니다: {err}");
     let mut sources = Vec::with_capacity(plan.segments.len());
     for segment in &plan.segments {
-        sources
-            .push(stream_packet_counts(ffprobe, &segment.source_path, timeout_secs).map_err(fail)?);
+        let (_, audio) =
+            stream_packet_counts(ffprobe, &segment.source_path, timeout_secs).map_err(fail)?;
+        let packets = video_packets(ffprobe, &segment.source_path, timeout_secs).map_err(fail)?;
+        sources.push(SourcePackets::from_packets(&packets, audio));
     }
     let offsets: Vec<f64> = plan
         .segments
@@ -562,12 +732,12 @@ pub fn verify_segments(
         .map(|segment| segment.output_offset_seconds)
         .collect();
     let (_, output_audio) = stream_packet_counts(ffprobe, output, timeout_secs).map_err(fail)?;
-    let dts = video_packet_dts(ffprobe, output, timeout_secs).map_err(fail)?;
+    let packets = video_packets(ffprobe, output, timeout_secs).map_err(fail)?;
     Ok(evaluate_segment_check(
         &sources,
         &offsets,
         output_audio,
-        &dts,
+        &packets,
     ))
 }
 
@@ -1436,9 +1606,28 @@ pub fn build_plan(inputs: Vec<SegmentInput>, tolerance: f64) -> JoinPlan {
         .map(|s| s.id.clone())
         .collect();
     if !no_video.is_empty() {
+        // R5-S13: said plainly at planning time — a sound-only file cannot
+        // be part of a lossless VIDEO join (and its output could not be
+        // verified packet by packet); before, the message read like a
+        // parameter mismatch and the join could run until the output check.
+        let audio_only = probed
+            .iter()
+            .filter(|s| s.probe.video.is_none() && !s.probe.audio.is_empty())
+            .count();
         blocking.push(Issue {
-            code: "stream-mismatch",
-            message: format!("영상 스트림이 없는 파일 {}개", no_video.len()),
+            code: if audio_only > 0 { "audio-only" } else { "stream-mismatch" },
+            message: if audio_only > 0 {
+                format!(
+                    "영상 없이 소리만 있는 파일 {audio_only}개 — 영상 이어붙이기에 넣을 수 없습니다 (선택에서 빼십시오){}",
+                    if no_video.len() > audio_only {
+                        format!(", 영상 스트림이 없는 파일 모두 {}개", no_video.len())
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                format!("영상 스트림이 없는 파일 {}개", no_video.len())
+            },
             ids: no_video,
         });
     }
@@ -2622,11 +2811,43 @@ fn newest_mtime(path: &Path) -> Option<std::time::SystemTime> {
     newest
 }
 
-/// Crash recovery for `.part` leftovers of OTHER processes in `dir`: an
-/// in-progress name whose newest write is at least [`STALE_TEMP_AGE_SECS`]
-/// old belongs to a dead writer (a live writer keeps touching it) and is
-/// removed. This process's own parts are never touched.
+/// The writer pid an in-progress name carries (`.….ft<pid>.part…`).
+pub fn part_name_pid(name: &str) -> Option<u32> {
+    if !is_pid_part_name(name, None) {
+        return None;
+    }
+    let pos = name.rfind(".ft")?;
+    let digits: String = name[pos + 3..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// R5-S12: a preserved package work folder (its publish failed) carries
+/// this file; the stale sweep never removes such a folder.
+pub const PRESERVED_PART_MARKER: &str = "FRAMETRACE-KEEP.txt";
+
+/// Crash recovery for `.part` leftovers of OTHER processes in `dir`.
+///
+/// R5-S5: an in-progress name is removed only when its newest write is at
+/// least [`STALE_TEMP_AGE_SECS`] old AND the writer its name carries is
+/// provably not running: no process with that pid, or one that started
+/// after the part was born (a recycled pid). Age alone used to delete the
+/// work file of a live job that simply had not written for an hour (a
+/// long hash or `ewfexport` stall). This process's own parts and folders
+/// marked [`PRESERVED_PART_MARKER`] are never touched.
 pub fn sweep_stale_parts(dir: &Path) -> Vec<(PathBuf, Result<(), String>)> {
+    sweep_stale_parts_with(dir, &crate::util::probe_process, STALE_TEMP_AGE_SECS)
+}
+
+/// [`sweep_stale_parts`] with the process probe and the minimum age
+/// injected (tests).
+pub fn sweep_stale_parts_with(
+    dir: &Path,
+    probe: &dyn Fn(u32) -> crate::util::ProcessProbe,
+    min_age_secs: u64,
+) -> Vec<(PathBuf, Result<(), String>)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -2634,16 +2855,24 @@ pub fn sweep_stale_parts(dir: &Path) -> Vec<(PathBuf, Result<(), String>)> {
     let now = std::time::SystemTime::now();
     entries
         .flatten()
-        .filter(|entry| {
+        .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            is_pid_part_name(&name, None) && !is_pid_part_name(&name, Some(own))
+            let pid = part_name_pid(&name)?;
+            (pid != own).then_some((entry, pid))
         })
-        .filter(|entry| {
+        .filter(|(entry, _)| {
             newest_mtime(&entry.path())
                 .and_then(|time| now.duration_since(time).ok())
-                .is_some_and(|age| age.as_secs() >= STALE_TEMP_AGE_SECS)
+                .is_some_and(|age| age.as_secs() >= min_age_secs)
         })
-        .map(|entry| {
+        .filter(|(entry, _)| !entry.path().join(PRESERVED_PART_MARKER).exists())
+        .filter(|(entry, pid)| {
+            let born = std::fs::symlink_metadata(entry.path())
+                .ok()
+                .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok());
+            !crate::util::writer_may_be_alive(probe(*pid), born)
+        })
+        .map(|(entry, _)| {
             let path = entry.path();
             let result = remove_path_retry(&path);
             (path, result)
@@ -2775,12 +3004,6 @@ fn run_inner(
     let Some(out_video) = probed.video.clone() else {
         return Err("joined output has no video stream".to_string());
     };
-    let expected = plan.totals.duration_seconds;
-    let observed = probed.duration_seconds;
-    // C14: max(1 s, 0.2 %) — the old max(1 s, 1 %) let a whole short
-    // segment go missing from a long join unnoticed.
-    let tolerance = duration_tolerance(expected);
-    let duration_check_ok = observed.is_some_and(|value| (value - expected).abs() <= tolerance);
     // C14: packet-level check of every segment boundary in the output.
     let segment_check = verify_segments(
         &options.tools.ffprobe,
@@ -2788,6 +3011,14 @@ fn run_inner(
         plan,
         options.timeout_secs,
     )?;
+    // R5-S13: edit-list pre-roll the output presents (measured by the
+    // segment check) makes it that much longer than the plan's sum.
+    let expected = plan.totals.duration_seconds + segment_check.presented_preroll_total();
+    let observed = probed.duration_seconds;
+    // C14: max(1 s, 0.2 %) — the old max(1 s, 1 %) let a whole short
+    // segment go missing from a long join unnoticed.
+    let tolerance = duration_tolerance(expected);
+    let duration_check_ok = observed.is_some_and(|value| (value - expected).abs() <= tolerance);
     if !duration_check_ok || !segment_check.ok {
         let mut problems = Vec::new();
         if !duration_check_ok {
@@ -2962,7 +3193,11 @@ fn run_inner(
         },
         "segment_check": segment_check.to_json(),
         "not_carried": not_carried,
-        "caveats": CAVEATS,
+        "caveats": CAVEATS
+            .iter()
+            .map(|text| text.to_string())
+            .chain(segment_check.notes.iter().cloned())
+            .collect::<Vec<_>>(),
     });
     let manifest_text = format!(
         "{}\n",
@@ -3960,8 +4195,17 @@ mod tests {
         assert!(30.0 > duration_tolerance(3600.0));
     }
 
-    fn dts_run(start: f64, count: u64) -> Vec<f64> {
-        (0..count).map(|i| start + i as f64 / 30.0).collect()
+    fn dts_run(start: f64, count: u64) -> Vec<VideoPacket> {
+        (0..count)
+            .map(|i| {
+                let t = start + i as f64 / 30.0;
+                VideoPacket {
+                    pts: Some(t),
+                    dts: Some(t),
+                    discard: false,
+                }
+            })
+            .collect()
     }
 
     /// C14: a complete output passes; a dropped segment (packet deficit and
@@ -3969,7 +4213,11 @@ mod tests {
     /// by one packet per segment.
     #[test]
     fn segment_check_table() {
-        let sources = [(63, Some(100)), (66, Some(105)), (69, Some(109))];
+        let sources = [
+            SourcePackets::plain(63, Some(100)),
+            SourcePackets::plain(66, Some(105)),
+            SourcePackets::plain(69, Some(109)),
+        ];
         let offsets = [0.0, 2.1, 4.3];
         let mut full = dts_run(-0.0007, 63);
         full.extend(dts_run(2.099, 66));
@@ -4005,6 +4253,106 @@ mod tests {
 
         // Truncated tail: last segment only partly present.
         let check = evaluate_segment_check(&sources, &offsets, Some(314), &full[..150]);
+        assert!(!check.ok);
+    }
+
+    /// R5-S13: Matroska B-frame output — the first packets have no dts
+    /// (`N/A`) and presentation order differs from decode order. The
+    /// boundary is the earliest pts of a segment's packets. Before, an
+    /// N/A dts repeated the previous value (0 at the very start), and a
+    /// segment whose first packets lacked a dts was placed wrongly.
+    #[test]
+    fn segment_check_uses_presentation_times() {
+        // Decode order I P B B … with pts reordered; dts N/A on the first
+        // two packets of every segment.
+        let segment = |start: f64, count: u64| -> Vec<VideoPacket> {
+            (0..count)
+                .map(|i| {
+                    let pts_index = match i % 3 {
+                        0 => i,
+                        1 => i + 1,
+                        _ => i - 1,
+                    };
+                    VideoPacket {
+                        pts: Some(start + pts_index as f64 / 30.0),
+                        dts: (i >= 2).then(|| start + (i as f64 - 2.0) / 30.0),
+                        discard: false,
+                    }
+                })
+                .collect()
+        };
+        let sources = [
+            SourcePackets::plain(60, None),
+            SourcePackets::plain(60, None),
+        ];
+        let mut output = segment(0.0, 60);
+        output.extend(segment(2.0, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &output);
+        assert!(check.ok, "{:?}", check.problems);
+        assert!((check.boundaries[1].2.unwrap() - 2.0).abs() < 1e-9);
+        // No timing at all for a segment: reported, never guessed.
+        let mut blind = segment(0.0, 60);
+        blind.extend((0..60).map(|_| VideoPacket::default()));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &blind);
+        assert!(!check.ok);
+        assert!(
+            check.problems.iter().any(|p| p.contains("2번째")),
+            "{:?}",
+            check.problems
+        );
+        let parsed = parse_video_packets(
+            "pts_time=0.066000|dts_time=N/A|flags=K__\npts_time=-0.5|dts_time=-0.566|flags=KD_\n",
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].dts, None);
+        assert!(parsed[1].discard);
+    }
+
+    /// R5-S13: an MP4 source with an edit list (a stream-copy cut at a
+    /// non-key frame: the lead-in packets carry the discard flag). The
+    /// concat output may keep those packets as visible frames — the later
+    /// segments then start later by the pre-roll it presents — or drop
+    /// them. Both are accepted; a missing segment still fails.
+    #[test]
+    fn segment_check_accounts_for_edit_list_preroll() {
+        // Source 1: 45 pre-roll packets (1.5 s) + 75 kept; source 2: 60.
+        let mut first: Vec<VideoPacket> = (0..120)
+            .map(|i| VideoPacket {
+                pts: Some(-1.5 + i as f64 / 30.0),
+                dts: Some(-1.5 + i as f64 / 30.0),
+                discard: i < 45,
+            })
+            .collect();
+        let sources = [
+            SourcePackets::from_packets(&first, None),
+            SourcePackets::plain(60, None),
+        ];
+        assert_eq!(sources[0].video_kept, 75);
+        // Output keeps every packet, pre-roll presented (no D flags).
+        for packet in &mut first {
+            packet.discard = false;
+            packet.pts = packet.pts.map(|t| t + 1.5);
+            packet.dts = packet.dts.map(|t| t + 1.5);
+        }
+        let mut output = first.clone();
+        output.extend(dts_run(4.0, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.5], None, &output);
+        assert!(check.ok, "{:?}", check.problems);
+        assert_eq!(check.mode, "all-packets");
+        assert!((check.presented_preroll_total() - 1.5).abs() < 1e-6);
+        assert!(!check.notes.is_empty());
+        // Output that applied the edit list: only the kept packets.
+        let mut applied: Vec<VideoPacket> = output[45..120].to_vec();
+        for packet in &mut applied {
+            packet.pts = packet.pts.map(|t| t - 1.5);
+        }
+        applied.extend(dts_run(2.5, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.5], None, &applied);
+        assert!(check.ok, "{:?}", check.problems);
+        assert_eq!(check.mode, "edit-list-applied");
+        assert_eq!(check.presented_preroll_total(), 0.0);
+        // A missing second segment still fails.
+        let check = evaluate_segment_check(&sources, &[0.0, 2.5], None, &output[..120]);
         assert!(!check.ok);
     }
 
@@ -4153,13 +4501,144 @@ mod tests {
         // Stale sweep: only old parts of other processes.
         assert!(sweep_stale_parts(&dir).is_empty(), "fresh part kept");
         age(&other);
-        let removed = sweep_stale_parts(&dir);
+        // (R5-S5: pid 7 is declared dead here; liveness has its own test.)
+        let dead = |_: u32| crate::util::ProcessProbe::Gone;
+        let removed = sweep_stale_parts_with(&dir, &dead, STALE_TEMP_AGE_SECS);
         assert_eq!(removed.len(), 1);
         assert!(!other.exists() && final_path.exists());
         let own = pid_part_path(&final_path, std::process::id());
         std::fs::write(&own, b"mine").unwrap();
         age(&own);
-        assert!(sweep_stale_parts(&dir).is_empty(), "own part never swept");
+        assert!(
+            sweep_stale_parts_with(&dir, &dead, STALE_TEMP_AGE_SECS).is_empty(),
+            "own part never swept"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5-S5: an hour-old `.part` whose writer is still running (a long
+    /// hash, a stalled ewfexport) is kept; a dead writer's, or a recycled
+    /// pid's (a process that started after the part was born), goes; a
+    /// preserved package folder is never swept. Before, age alone decided
+    /// and the live job's work file was deleted under it.
+    #[test]
+    fn stale_sweep_spares_parts_of_live_writers() {
+        use crate::util::ProcessProbe;
+        let dir = joined_case("r5-live");
+        // A real live writer: a child of this test.
+        let mut live = if cfg!(windows) {
+            let mut command = std::process::Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        let mut child = live
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live writer");
+        std::thread::sleep(Duration::from_millis(50));
+        let live_part = dir.join(format!(".evidence.raw.ft{}.part", child.id()));
+        std::fs::write(&live_part, b"hashing").unwrap();
+        age(&live_part);
+        assert!(
+            sweep_stale_parts(&dir).is_empty(),
+            "a live writer's part must survive the stale sweep"
+        );
+        assert!(live_part.exists());
+        let _ = child.kill();
+        let _ = child.wait();
+        // Same name, writer gone now: removed.
+        let removed = sweep_stale_parts(&dir);
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(!live_part.exists());
+        // Recycled pid: running, but started after the part was born.
+        let recycled = dir.join(".x.bin.ft55.part");
+        std::fs::write(&recycled, b"old").unwrap();
+        age(&recycled);
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        let started_later = |_: u32| ProcessProbe::Running {
+            started: Some(later),
+        };
+        assert_eq!(
+            sweep_stale_parts_with(&dir, &started_later, STALE_TEMP_AGE_SECS).len(),
+            1
+        );
+        // Started before the part (could be the writer) / unknown: kept.
+        std::fs::write(&recycled, b"old").unwrap();
+        age(&recycled);
+        let earlier = std::time::SystemTime::now() - Duration::from_secs(7200);
+        let started_before = |_: u32| ProcessProbe::Running {
+            started: Some(earlier),
+        };
+        assert!(sweep_stale_parts_with(&dir, &started_before, STALE_TEMP_AGE_SECS).is_empty());
+        assert!(
+            sweep_stale_parts_with(&dir, &|_| ProcessProbe::Unknown, STALE_TEMP_AGE_SECS)
+                .is_empty()
+        );
+        // R5-S12: a preserved package folder stays even with a dead writer.
+        let kept = dir.join(".package_9.ft56.part");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join(PRESERVED_PART_MARKER), b"keep").unwrap();
+        let removed = sweep_stale_parts_with(&dir, &|_| ProcessProbe::Gone, 0);
+        assert!(removed.iter().all(|(path, _)| path != &kept), "{removed:?}");
+        assert!(kept.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_liveness_table() {
+        use crate::util::{ProcessProbe, writer_may_be_alive};
+        let born = std::time::SystemTime::now();
+        let at = |secs: i64| {
+            if secs >= 0 {
+                born + Duration::from_secs(secs as u64)
+            } else {
+                born - Duration::from_secs((-secs) as u64)
+            }
+        };
+        assert!(!writer_may_be_alive(ProcessProbe::Gone, Some(born)));
+        assert!(writer_may_be_alive(ProcessProbe::Unknown, Some(born)));
+        assert!(writer_may_be_alive(
+            ProcessProbe::Running { started: None },
+            Some(born)
+        ));
+        assert!(writer_may_be_alive(
+            ProcessProbe::Running {
+                started: Some(at(-10))
+            },
+            Some(born)
+        ));
+        assert!(writer_may_be_alive(
+            ProcessProbe::Running {
+                started: Some(at(1))
+            },
+            Some(born)
+        ));
+        assert!(!writer_may_be_alive(
+            ProcessProbe::Running {
+                started: Some(at(30))
+            },
+            Some(born)
+        ));
+        assert!(writer_may_be_alive(
+            ProcessProbe::Running {
+                started: Some(at(30))
+            },
+            None
+        ));
+        // The probe itself: this process is running and started before now.
+        match crate::util::probe_process(std::process::id()) {
+            ProcessProbe::Running { started } => {
+                if let Some(started) = started {
+                    assert!(started <= std::time::SystemTime::now() + Duration::from_secs(2));
+                }
+            }
+            other => panic!("own process probed as {other:?}"),
+        }
+        assert_eq!(part_name_pid(".evidence.raw.ft4242.part.raw"), Some(4242));
+        assert_eq!(part_name_pid("evidence.raw"), None);
     }
 }
