@@ -19,7 +19,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
-function buildViewer(annotations = {}) {
+function buildViewer(annotations = {}, nullCase = false) {
   const dir = join(root, 'assets/viewer');
   let js = '';
   for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
@@ -33,7 +33,7 @@ function buildViewer(annotations = {}) {
     ...(n === 'd' ? { ffprobe: { streams: [{ codec_type: 'audio' }, { codec_type: 'video', avg_frame_rate: '25/1', r_frame_rate: '25/1' }] } } : {}),
   }));
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
-    manifest: { case_id: 'FT-UNDO', title: 'undo' }, caseDir: '/case', scan: { videos },
+    manifest: nullCase ? null : { case_id: 'FT-UNDO', title: 'undo' }, caseDir: '/case', scan: nullCase ? null : { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
     thumbs: {}, annotations, deepfake: {}, telemetry: {}, proxies: [],
   })};`;
@@ -50,6 +50,8 @@ const check = (name, ok, detail = '') => {
 const html = buildViewer();
 // R6 U6: the same page with unreadable review records (read-only).
 const htmlRo = buildViewer({ marks: [], tags: [], revisions: {}, error: 'database is locked' });
+// R7 (S ↔ U): make-review embeds null for an unreadable case.json / index.
+const htmlNull = buildViewer({}, true);
 let captures = 0;
 // '401' (R5 U8) | 'slow' (R6 U7: answers 200 after 1.5 s) | 'hang' (R7 U6).
 let capMode = '401';
@@ -73,7 +75,7 @@ const server = createServer((req, res) => {
     return;
   }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(req.url.startsWith('/ro') ? htmlRo : html);
+  res.end(req.url.startsWith('/ro') ? htmlRo : req.url.startsWith('/nullcase') ? htmlNull : html);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -354,6 +356,22 @@ try {
     check('U6: read-only → pop-out mark is refused and says so (nothing marked)', /읽기 전용/.test(markNote) && marked === 0, `${markNote} marked=${marked}`);
     await popup.close();
     await ro.close();
+  }
+  // R7 (S ↔ U): case.json and the index were not valid JSON — the bundle
+  // carries null for both. The viewer boots (no crash, no "data-bundle.js
+  // not found") and says the case files were not read, instead of an
+  // unexplained empty list.
+  {
+    const np = await browser.newPage();
+    np.on('pageerror', (e) => errors.push('nullcase: ' + String(e)));
+    await np.goto(base + 'nullcase');
+    const banner = await np.waitForSelector('#caseInputErrorBanner', { timeout: 15000 }).then(() => np.evaluate(() => {
+      const b = document.getElementById('caseInputErrorBanner');
+      return { role: b.getAttribute('role'), text: b.innerText, problems: b.dataset.problems, cards: document.querySelectorAll('#recordGrid .card').length, overlay: !!document.querySelector('.ft-loader-error, .loader-error') };
+    })).catch((e) => ({ error: String(e).split('\n')[0] }));
+    check('R7 null case.json / index → role=alert "케이스 파일을 읽지 못했습니다" naming both, not a silent empty list',
+      banner.role === 'alert' && /케이스 파일을 읽지 못했습니다/.test(banner.text || '') && /case\.json/.test(banner.text || '') && /증거 색인/.test(banner.text || '') && banner.problems === 'manifest scan' && banner.cards === 0, JSON.stringify(banner));
+    await np.close();
   }
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

@@ -18,8 +18,16 @@ const ftHosted = !!opts.hosted;
 const DATA = opts.data && opts.data.manifest ? opts.data : await loadViewerData({ root: ftRoot, signal: ftSignal, url: opts.url || "" });
 // destroy() while the list was still loading: this mount is void.
 if (!opts.isCurrent()) return;
-const manifest = DATA.manifest || {};
-const scan = DATA.scan || {};
+// R7 (S ↔ U): make-review / records-meta embed `null` for a case.json or
+// evidence index that is not valid JSON (util::json_for_script). An empty
+// list would read as "no evidence": say the case files were not read
+// (90-sync.js showCaseInputProblems, role=alert) — like the review / carve
+// pages' "케이스 파일을 읽지 못했습니다".
+const caseInputProblems = [];
+if (!DATA.manifest || typeof DATA.manifest !== "object" || DATA.manifestUnreadable) caseInputProblems.push("manifest");
+if (!DATA.scan || typeof DATA.scan !== "object" || DATA.scanUnreadable) caseInputProblems.push("scan");
+const manifest = DATA.manifest && typeof DATA.manifest === "object" ? DATA.manifest : {};
+const scan = DATA.scan && typeof DATA.scan === "object" ? DATA.scan : {};
 // The carve audit log is append-only across runs: a re-carve re-emits
 // the same id space, so earlier entries for an id are stale records of a
 // superseded run — keep the latest entry per id (the same rule the

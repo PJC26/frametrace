@@ -2176,6 +2176,28 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
   FTViewer._emit("error", { message: t("save.readonlyMsg"), detail: annotationsError, stage: "load" });
 })();
 
+// R7 (S ↔ U): case.json or the evidence index was not valid JSON — the data
+// bundle / records-meta carry null for it (10-boot.js caseInputProblems).
+// Never an unexplained empty case: one role=alert banner naming what was
+// not read, the same words as the review / carve pages.
+(function showCaseInputProblems() {
+  if (!caseInputProblems.length) return;
+  const parts = caseInputProblems.map(what => t(what === "scan" ? "caseInput.scan" : "caseInput.manifest"));
+  const text = t("caseInput.title") + " — " + parts.join(" · ");
+  const bar = document.createElement("div");
+  bar.id = "caseInputErrorBanner";
+  bar.className = "ft-banner";
+  bar.setAttribute("role", "alert");
+  bar.dataset.problems = caseInputProblems.join(" ");
+  const msg = document.createElement("span");
+  msg.className = "ft-banner-msg";
+  msg.textContent = text;
+  bar.appendChild(msg);
+  const host = noticesHost();
+  host.insertBefore(bar, host.firstChild);
+  FTViewer._emit("error", { message: text, detail: caseInputProblems.join(","), stage: "load" });
+})();
+
 // --- U9: drafts left under another origin ---------------------------------
 // localStorage is per origin (scheme + host + PORT). When the workstation
 // comes up on another port (browser mode falls back from 8477 to 8478…;

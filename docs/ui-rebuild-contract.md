@@ -742,3 +742,7 @@ const FTStore = {
 
 ### 14.6 항진 검사 정리 (U3)
 - 소스 정규식으로 동작을 대신하던 검사(verify-review-batch: 대기 파일 표시, 독립 `hBeforeClose` 정의, 저장 예산 상수, 옵션 전달, base −1 독립 전송, 읽기 전용 `save()`)를 지우고 실제 페이지 검사(verify-range-sync ⑨·⑱·⑳·㉑·㉒, VM의 `hBeforeClose` 시간 검사)로 대신한다. verify-marks-sync ⑯은 S2 문자열 커서를 **요구**한다(숫자 커서 대체 분기 삭제).
+
+### 14.7 읽지 못한 케이스 파일 (S ↔ U, R7 S6)
+- make-review 데이터 묶음·records-meta는 올바른 JSON이 아닌 `case.json`·증거 색인을 `null`로 싣는다(`util::json_for_script`, records.rs). 뷰어(10-boot.js `caseInputProblems`)는 `manifest`/`scan`이 객체가 아니면(API 경로는 99-loader가 `manifestUnreadable`/`scanUnreadable`로 전달) 알림 행 맨 위에 `#caseInputErrorBanner`(`role=alert`, `data-problems="manifest scan"`)로 "케이스 파일을 읽지 못했습니다 — …"를 보이고 `error`(stage `load`)를 낸다 — 빈 목록이 "증거 없음"으로 읽히지 않게. 인라인 묶음은 `manifest: null`이어도 그 묶음을 쓴다(다른 데이터 출처를 찾다가 "data-bundle.js 없음"으로 빠지지 않음). 하네스: verify-player-keys "R7 null case.json / index".
+- 하네스는 HEAD 요청에 기대지 않는다(서버는 스크립트를 GET으로 한 번 검증하기 전 HEAD에 403).
