@@ -34,8 +34,8 @@
 //  ⑯ R6 U1/U2 (S2): GET /api/marks-pending of the real server, read by the
 //    viewer's own readPagedList: one queue file of 800 ids is read in full
 //    across the page boundary (string cursor "<seq>:<idx>"), an unreadable
-//    queue file is reported. A server before S2 (numeric cursor) must at
-//    least flag the short read as truncated — reported as AWAITS track S.
+//    queue file is reported. R7 U3: the string cursor is required (the R6
+//    numeric-cursor fallback passed a regressed server).
 //  ⑮ R4 A1/A2: an older browser range (retired RANGES_KEY) vs a range another
 //    window stored → an ordinary conflict; i/o, a tag and a cleared mark
 //    meanwhile send nothing and never read "saved"; the server keeps its
@@ -668,14 +668,12 @@ try {
       const page1 = await srv.getJson('/api/marks-pending?offset=0&limit=500');
       const stringCursor = typeof page1.next_after === 'string';
       check('⑯ U2: the cut-short queue file is reported unreadable (carried by the viewer\'s reader)', unread.some((u) => String(u.file || '').endsWith(seqName(900000002))), JSON.stringify(unread).slice(0, 200));
-      if (stringCursor) {
-        check('⑯ U1 (S2): 800 ids of ONE queue file read in full across the page boundary (string cursor)', got.size === 800 && !list.truncated && queries.length >= 2, `${got.size} ids, queries ${JSON.stringify(queries)}`);
-      } else {
-        // Before track S2: the numeric cursor skips the rest of that file — the
-        // viewer must not pass the short read off as the whole queue.
-        check('⑯ U1 (pre-S2 server): the short read is flagged truncated, never silent', got.size === 800 || list.truncated === true, `${got.size} ids, truncated=${list && list.truncated}`);
-        console.log(`AWAITS track S2  ⑯ full 800-id read needs the string cursor (server answered next_after=${JSON.stringify(page1.next_after)}; read ${got.size}/800)`);
-      }
+      // R7 U3: S2 is merged — the string cursor is REQUIRED. (R6 accepted a
+      // numeric cursor as long as the short read was flagged — a fallback
+      // that let a regressed server pass; it is a failure now.)
+      const cursors = (page1.entries || []).map((e) => e && e.cursor);
+      check('⑯ R7 U3 (S2): the server pages marks-pending by the "<seq>:<idx>" string cursor', stringCursor && /^\d+:\d+$/.test(page1.next_after) && cursors.length > 0 && cursors.every((c) => typeof c === 'string' && /^\d+:\d+$/.test(c)), `next_after=${JSON.stringify(page1.next_after)} cursors ${JSON.stringify(cursors.slice(0, 3))}`);
+      check('⑯ U1 (S2): 800 ids of ONE queue file read in full across the page boundary (string cursor, sent back URL-encoded)', got.size === 800 && !list.truncated && queries.length >= 2 && queries.slice(1).every((q) => /[?&]after=\d+%3A\d+&/.test(q)), `${got.size} ids, truncated=${list && list.truncated}, queries ${JSON.stringify(queries)}`);
     } finally {
       rmSync(big, { force: true });
       rmSync(bad, { force: true });

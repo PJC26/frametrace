@@ -338,7 +338,8 @@ var TOKEN=${jsLit(FTViewer.writerToken)};var seqN=0,pend={},chan=("BroadcastChan
 if(chan){chan.onmessage=function(ev){var m=ev.data||{},f=m.seq&&pend[m.seq];if(f){delete pend[m.seq];f(m.payload);}};}
 function call(op,arg,cb,ms){
 var b=(window.opener&&!window.opener.closed&&window.opener.__ftBridge)||null;
-if(b){try{var r=b[op](arg);if(r&&typeof r.then==="function")r.then(cb,function(){cb(undefined);});else cb(r);}catch(e){cb(undefined);}return;}
+if(b){var done=false,fin=function(x){if(done)return;done=true;cb(x);};
+try{var r=b[op](arg);if(r&&typeof r.then==="function"){r.then(fin,function(){fin(undefined);});setTimeout(function(){fin(undefined);},ms||3000);}else fin(r);}catch(e){fin(undefined);}return;}
 if(!chan){cb(undefined);return;}
 var s=++seqN;pend[s]=cb;
 chan.postMessage({type:op,seq:s,arg:arg,token:TOKEN});
@@ -396,6 +397,11 @@ var du=c.toDataURL("image/jpeg",0.92);
 var arg={id:cur?cur.id:"unknown",image:du.slice(du.indexOf(",")+1),time:v.currentTime.toFixed(2),rid:TOKEN+"-"+Date.now().toString(36)+"-"+(++capN)};
 capture(arg);
 };
+// R7 U6: the opener path (a direct __ftBridge call) has the same time
+// limit as the channel path — a capture promise that never settles no
+// longer leaves the pop-out waiting forever — and a viewer that still
+// answers the ping but never sent the capture result says so (capSlow),
+// not "the main viewer closed" (capUnsure: the ping got no answer).
 // R6 U7: the capture goes through the main viewer when it still answers
 // (a short ping first); only a viewer that is gone means the direct POST —
 // at once, not after a 30 s wait. A capture reply that is late is asked
@@ -407,7 +413,7 @@ function shown(d){note(d.ok?${jsLit(t("player.savedPfx"))}+" "+d.path:d.auth?Str
 function alive(cb){call("ping",null,function(d){cb(!!(d&&d.alive));},PING_MS);}
 function capDirect(arg){var body={id:arg.id,image:arg.image,time:arg.time};
 fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify(body)}).then(function(r){if(r.status===401)return{ok:false,auth:true,error:${jsLit(t("net.authRefused"))}};return r.json().catch(function(){return{ok:false,error:"HTTP "+r.status};});}).then(shown).catch(function(){note(${jsLit(t("player.capOffline"))})});}
-function capVia(arg,tries){call("capture",arg,function(d){if(d){shown(d);return;}alive(function(ok){if(ok&&tries<4)capVia(arg,tries+1);else note(${jsLit(t("player.capUnsure"))});});},CAP_MS);}
+function capVia(arg,tries){call("capture",arg,function(d){if(d){shown(d);return;}alive(function(ok){if(ok&&tries<4)capVia(arg,tries+1);else note(ok?${jsLit(t("player.capSlow"))}:${jsLit(t("player.capUnsure"))});});},CAP_MS);}
 function capture(arg){alive(function(ok){if(ok)capVia(arg,0);else capDirect(arg);});}
 v.addEventListener("ended",function(){nav(1,true);});
 var NAV={ArrowUp:1,ArrowDown:1,ArrowLeft:1,ArrowRight:1,Home:1,End:1,PageUp:1,PageDown:1," ":1,Enter:1,Tab:1};

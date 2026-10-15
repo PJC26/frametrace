@@ -19,7 +19,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
-function buildViewer(annotations = {}) {
+function buildViewer(annotations = {}, nullCase = false) {
   const dir = join(root, 'assets/viewer');
   let js = '';
   for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
@@ -33,7 +33,7 @@ function buildViewer(annotations = {}) {
     ...(n === 'd' ? { ffprobe: { streams: [{ codec_type: 'audio' }, { codec_type: 'video', avg_frame_rate: '25/1', r_frame_rate: '25/1' }] } } : {}),
   }));
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
-    manifest: { case_id: 'FT-UNDO', title: 'undo' }, caseDir: '/case', scan: { videos },
+    manifest: nullCase ? null : { case_id: 'FT-UNDO', title: 'undo' }, caseDir: '/case', scan: nullCase ? null : { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
     thumbs: {}, annotations, deepfake: {}, telemetry: {}, proxies: [],
   })};`;
@@ -50,14 +50,22 @@ const check = (name, ok, detail = '') => {
 const html = buildViewer();
 // R6 U6: the same page with unreadable review records (read-only).
 const htmlRo = buildViewer({ marks: [], tags: [], revisions: {}, error: 'database is locked' });
+// R7 (S ↔ U): make-review embeds null for an unreadable case.json / index.
+const htmlNull = buildViewer({}, true);
 let captures = 0;
-// '401' (R5 U8) | 'slow' (R6 U7: answers 200 after 1.5 s).
+// '401' (R5 U8) | 'slow' (R6 U7: answers 200 after 1.5 s) | 'hang' (R7 U6).
 let capMode = '401';
+const hungCaptures = [];
 const server = createServer((req, res) => {
   // R5 U8: the frame-capture POST is refused (401) like a stale cookie.
   if (req.url.startsWith('/api/capture-frame')) {
     captures += 1;
     res.setHeader('Content-Type', 'application/json');
+    if (capMode === 'hang') {
+      // R7 U6: the capture POST never answers (until released).
+      hungCaptures.push(res);
+      return;
+    }
     if (capMode === 'slow') {
       setTimeout(() => res.end(JSON.stringify({ ok: true, path: 'artifacts/captures/frame_' + captures + '.jpg' })), 1500);
       return;
@@ -67,7 +75,7 @@ const server = createServer((req, res) => {
     return;
   }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(req.url.startsWith('/ro') ? htmlRo : html);
+  res.end(req.url.startsWith('/ro') ? htmlRo : req.url.startsWith('/nullcase') ? htmlNull : html);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -270,9 +278,32 @@ try {
     const heard = await page.evaluate(() => window.__ftErr);
     check('U8: pop-out capture 401 → authorization refusal via the bridge (not "offline")', res && res.ok === false && res.auth === true && /인증 오류/.test(res.error) && captures === 1, JSON.stringify(res));
     check('U8: the host hears the 401 (auth error event)', heard.some((d) => d.auth === true && d.stage === 'request'), JSON.stringify(heard));
+    // R7 U6: through the OPENER (a direct __ftBridge call) a capture whose
+    // POST never answers used to leave the pop-out waiting forever (the
+    // opener path had no time limit). Now it times out like the channel
+    // path, re-asks with the same request id (one POST), and — the main
+    // viewer still answering the ping — says the reply is late, never
+    // "the main viewer closed".
+    capMode = 'hang';
+    const beforeHang = captures;
+    const hang = await popup.evaluate(async () => {
+      const viaOpener = !!(window.opener && window.opener.__ftBridge);
+      CAP_MS = 300;
+      document.getElementById('note').textContent = '';
+      const t0 = performance.now();
+      capture({ id: 'vid_a', image: 'AAAA', time: '0.00', rid: 'r-hang-1' });
+      for (let i = 0; i < 160 && !document.getElementById('note').textContent; i++) await new Promise((r) => setTimeout(r, 50));
+      return { viaOpener, ms: performance.now() - t0, note: document.getElementById('note').textContent };
+    }).catch((e) => ({ error: String(e) }));
+    check('R7 U6: opener path + a capture that never answers → the pop-out stops waiting (time limit), one POST', hang.viaOpener && !!hang.note && hang.ms < 7000 && captures - beforeHang === 1, JSON.stringify({ ...hang, posts: captures - beforeHang }));
+    check('R7 U6: the main viewer still answers → "응답이 늦습니다", not "메인 뷰어가 닫혔습니다"', /응답이 늦습니다/.test(hang.note || '') && !/닫혔습니다/.test(hang.note || ''), hang.note);
+    capMode = '401';
+    for (const res of hungCaptures.splice(0)) res.end('{"ok":false,"error":"released"}');
+    await popup.evaluate(() => { CAP_MS = 30000; });
     // R6 U7: the main viewer no longer answers (its channel token does not
     // match, no opener): the capture falls back to the direct POST after
     // the short ping — not after a 30 s wait.
+    const beforeDead = captures;
     const dead = await popup.evaluate(async () => {
       window.opener = null;
       window.__tok = TOKEN;
@@ -284,7 +315,7 @@ try {
       TOKEN = window.__tok;
       return { ms: performance.now() - t0, note: document.getElementById('note').textContent };
     }).catch((e) => ({ error: String(e) }));
-    check('U7: a dead main viewer → direct POST right after the ping (< 5 s, not 30 s)', dead.ms < 5000 && /인증 오류/.test(dead.note || '') && captures === 2, JSON.stringify({ ...dead, captures }));
+    check('U7: a dead main viewer → direct POST right after the ping (< 5 s, not 30 s)', dead.ms < 5000 && /인증 오류/.test(dead.note || '') && captures - beforeDead === 1, JSON.stringify({ ...dead, posts: captures - beforeDead }));
     // R6 U7: a capture whose reply is late (slow server) is asked for again
     // with the same request id — the main viewer answers the first request:
     // one POST, one frame file, the path shown. (Through the BroadcastChannel:
@@ -325,6 +356,22 @@ try {
     check('U6: read-only → pop-out mark is refused and says so (nothing marked)', /읽기 전용/.test(markNote) && marked === 0, `${markNote} marked=${marked}`);
     await popup.close();
     await ro.close();
+  }
+  // R7 (S ↔ U): case.json and the index were not valid JSON — the bundle
+  // carries null for both. The viewer boots (no crash, no "data-bundle.js
+  // not found") and says the case files were not read, instead of an
+  // unexplained empty list.
+  {
+    const np = await browser.newPage();
+    np.on('pageerror', (e) => errors.push('nullcase: ' + String(e)));
+    await np.goto(base + 'nullcase');
+    const banner = await np.waitForSelector('#caseInputErrorBanner', { timeout: 15000 }).then(() => np.evaluate(() => {
+      const b = document.getElementById('caseInputErrorBanner');
+      return { role: b.getAttribute('role'), text: b.innerText, problems: b.dataset.problems, cards: document.querySelectorAll('#recordGrid .card').length, overlay: !!document.querySelector('.ft-loader-error, .loader-error') };
+    })).catch((e) => ({ error: String(e).split('\n')[0] }));
+    check('R7 null case.json / index → role=alert "케이스 파일을 읽지 못했습니다" naming both, not a silent empty list',
+      banner.role === 'alert' && /케이스 파일을 읽지 못했습니다/.test(banner.text || '') && /case\.json/.test(banner.text || '') && /증거 색인/.test(banner.text || '') && banner.problems === 'manifest scan' && banner.cards === 0, JSON.stringify(banner));
+    await np.close();
   }
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

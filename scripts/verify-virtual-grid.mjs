@@ -19,7 +19,7 @@ const { chromium } = require('playwright');
 const ROWS = 50_000;
 const MAX_CARDS = 400;
 
-function buildViewer() {
+function buildViewer(annotations = {}) {
   const dir = join(root, 'assets/viewer');
   let js = '';
   for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
@@ -36,7 +36,7 @@ function buildViewer() {
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
     manifest: { case_id: 'FT-VGRID', title: 'vgrid' }, caseDir: '/case', scan: { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
-    thumbs: {}, annotations: {}, deepfake: {}, telemetry: {}, proxies: [],
+    thumbs: {}, annotations, deepfake: {}, telemetry: {}, proxies: [],
   })};`;
   // Standalone page exactly as build.rs assembles it (shared fragment included).
   return viewerPageHtml({ data, js: js, root });
@@ -49,9 +49,16 @@ const check = (name, ok, detail = '') => {
 };
 
 const html = buildViewer();
+// R7 U4: the same 50k records with 40 000 of them already marked 중요
+// (important) — the mark map is as large as the list.
+const MARKED = 40_000;
+const htmlMarked = buildViewer({
+  marks: Array.from({ length: MARKED }, (_, i) => ({ id: `vid_${String(i).padStart(6, '0')}`, status: 'important', marked_unix: 1, note: '', examiner: 'q' })),
+  tags: [], revisions: {},
+});
 const server = createServer((req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(html);
+  res.end(req.url.startsWith('/marked') ? htmlMarked : html);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -337,6 +344,117 @@ try {
   await page.waitForTimeout(300);
   check('no page errors', !errors.length, errors.join(' | '));
   await page.close();
+
+  // R7 U4: the R6 counter saw Array methods only — a for loop, an
+  // Object.keys/entries over the mark map, or a rebuilt id → index Map
+  // slipped past it. With 40 000 of 50 000 records marked and the
+  // "중요" (mark:important) filter on, 10 000 j/k must cost no pass over
+  // the mark map (Object.keys/values/entries returning ≥ 10 000 keys), no
+  // Map grown to ≥ 10 000 entries, no whole-list Array pass — and stay
+  // under a time cap. A mark (key 1 → leaves the filter) must reuse the
+  // list's position map (no Map rebuilt) and land on the next record.
+  // The time cap: a dispatched key costs ~8 ms here, almost all of it the
+  // detail pane and the grid layout of the new card — so the cap is on
+  // SCRIPT time (CDP Performance ScriptDuration) per key relative to the
+  // same keys on the unmarked 50k page in this run (≤ 1.5×), plus a wall
+  // limit; the counters above catch the O(n) passes themselves, and
+  // _debugStats().tallyFull / filterComputes must not move on j/k.
+  const jkRun = async (pg, n) => {
+    const cdp = await pg.context().newCDPSession(pg);
+    await cdp.send('Performance.enable');
+    const metric = async () => Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map((x) => [x.name, x.value]));
+    const a = await metric();
+    const out = await pg.evaluate(async (count) => {
+      const p = window.__probe;
+      if (p) { p.on = true; p.objKeys = 0; p.bigMaps = 0; p.arrays = 0; p.where = {}; }
+      const s0 = FTViewer._debugStats();
+      const t0 = performance.now();
+      for (let i = 0; i < count; i++) document.dispatchEvent(new KeyboardEvent('keydown', { key: i % 4 === 3 ? 'k' : 'j', bubbles: true }));
+      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+      const ms = performance.now() - t0;
+      if (p) p.on = false;
+      const s1 = FTViewer._debugStats();
+      return { ms: Math.round(ms), objKeys: p ? p.objKeys : 0, bigMaps: p ? p.bigMaps : 0, arrays: p ? p.arrays : 0, where: p ? p.where : {}, active: s1.activeId, tallyFull: s1.tallyFull - s0.tallyFull, filterRuns: s1.filterComputes - s0.filterComputes };
+    }, n);
+    const b = await metric();
+    await cdp.detach();
+    return { ...out, scriptPerKey: ((b.ScriptDuration - a.ScriptDuration) * 1000) / n };
+  };
+  let baseline = null;
+  {
+    const bp = await browser.newPage({ viewport: { width: 1500, height: 900 } });
+    await bp.goto(base);
+    await bp.waitForSelector('#recordGrid .card', { timeout: 60_000 });
+    await bp.locator('#recordGrid .card').first().click();
+    await bp.evaluate(() => document.activeElement?.blur());
+    baseline = await jkRun(bp, 1000);
+    await bp.close();
+  }
+  {
+    const mp = await browser.newPage({ viewport: { width: 1500, height: 900 } });
+    const mErrors = [];
+    mp.on('pageerror', (e) => mErrors.push(String(e)));
+    await mp.goto(base + 'marked');
+    await mp.waitForSelector('#recordGrid .card', { timeout: 60_000 });
+    await mp.evaluate(() => document.querySelector('[data-chip="mark:important"]')?.click());
+    await mp.waitForFunction(() => document.querySelector('[data-chip="mark:important"]')?.getAttribute('aria-pressed') === 'true' && document.getElementById('resultCount').textContent === '40000', null, { timeout: 30_000 });
+    await mp.locator('#recordGrid .card').first().click();
+    await mp.evaluate(() => document.activeElement?.blur());
+    const probe = `
+      window.__probe = (() => {
+        const BIG = 10000;
+        const p = { on: false, objKeys: 0, bigMaps: 0, arrays: 0, where: {} };
+        const note = (k) => { p.where[k] = (p.where[k] || 0) + 1; };
+        for (const name of ['keys', 'values', 'entries']) {
+          const orig = Object[name];
+          Object[name] = function (o) { const r = orig.call(Object, o); if (p.on && r.length >= BIG) { p.objKeys += 1; note('Object.' + name); } return r; };
+        }
+        const origSet = Map.prototype.set;
+        Map.prototype.set = function (k, v) { const r = origSet.call(this, k, v); if (p.on && this.size === BIG) { p.bigMaps += 1; note('Map grew to ' + BIG); } return r; };
+        for (const name of ['some', 'find', 'findIndex', 'filter', 'reduce', 'forEach', 'map', 'indexOf', 'includes', 'every', 'sort']) {
+          const orig = Array.prototype[name];
+          Array.prototype[name] = function (...a) { if (p.on && this && this.length >= BIG) { p.arrays += 1; note('Array.' + name); } return orig.apply(this, a); };
+        }
+        return p;
+      })();`;
+    await mp.evaluate(probe);
+    const jk = await jkRun(mp, 10_000);
+    const jkInfo = JSON.stringify({ ...jk, scriptPerKey: +jk.scriptPerKey.toFixed(2), baselineScriptPerKey: +baseline.scriptPerKey.toFixed(2), baselineMs: baseline.ms });
+    // 10 000 keys, net 5 000 steps forward: vid_005000.
+    check('R7 U4: 10 000 j/k under the mark filter moved the active card (net +5 000)', jk.active === 'vid_005000', jkInfo);
+    check('R7 U4: 10 000 j/k (40 000 marks): no pass over the mark map, no Map rebuilt, no whole-list Array pass, no recount, no re-filter', jk.objKeys === 0 && jk.bigMaps === 0 && jk.arrays === 0 && jk.tallyFull === 0 && jk.filterRuns === 0, jkInfo);
+    check('R7 U4: 10 000 j/k under the mark filter — script time per key ≤ 1.5 × the unmarked page\'s, wall < 600 s', jk.scriptPerKey <= baseline.scriptPerKey * 1.5 && jk.ms < 600_000, jkInfo);
+    const mk = await mp.evaluate(async () => {
+      const p = window.__probe;
+      const out = { objKeys: 0, bigMaps: 0, where: {}, miss: [] };
+      const tally0 = FTViewer._debugStats().tallyFull;
+      for (let i = 0; i < 8; i++) {
+        const id = FTViewer._debugStats().activeId;
+        const count0 = Number(document.getElementById('resultCount').textContent);
+        const list0 = [...document.querySelectorAll('#recordGrid .card')].map((c) => c.dataset.id);
+        const want = list0[list0.indexOf(id) + 1];
+        const reviewed0 = document.getElementById('reviewProgress')?.textContent;
+        p.on = true; p.objKeys = 0; p.bigMaps = 0; p.where = {};
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: '1', bubbles: true }));
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+        p.on = false;
+        out.objKeys += p.objKeys; out.bigMaps += p.bigMaps; Object.assign(out.where, p.where);
+        const count1 = Number(document.getElementById('resultCount').textContent);
+        const now = FTViewer._debugStats().activeId;
+        if (count1 !== count0 - 1 || now !== want || document.querySelector('#recordGrid .card.active')?.dataset.id !== want || document.querySelector(`#recordGrid .card[data-id="${CSS.escape(id)}"]`)) out.miss.push({ id, want, now, count0, count1 });
+        out.progress = [reviewed0, document.getElementById('reviewProgress')?.textContent];
+      }
+      out.tallyFull = FTViewer._debugStats().tallyFull - tally0;
+      out.summary = FTViewer.summary().marked;
+      out.triage = document.getElementById('triageStatus')?.textContent || '';
+      return out;
+    });
+    check('R7 U4: a mark under the filter drops that record and lands on the next one (8/8)', mk.miss.length === 0, JSON.stringify(mk.miss));
+    check('R7 U4: 8 marks under the filter: no pass over the mark map (no full recount), the position map reused (no Map rebuilt)', mk.objKeys === 0 && mk.bigMaps === 0 && mk.tallyFull === 0, JSON.stringify(mk));
+    check('R7 U4: the counts follow the marks (40 000 marked, 검토 40000/50000, 판독 8 · 중요 39 992)', mk.summary === 40000 && /40000\s*\/\s*50000/.test(mk.progress[1] || '') && /(판독|·) 8\/50000/.test(mk.triage) && /39992/.test(mk.triage), JSON.stringify(mk));
+    check('R7 U4: no page errors', !mErrors.length, mErrors.join(' | '));
+    await mp.close();
+  }
 
   // Fallback: ?grid=paged keeps the old paged renderer.
   const paged = await browser.newPage({ viewport: { width: 1500, height: 900 } });

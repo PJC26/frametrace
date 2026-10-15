@@ -247,36 +247,64 @@ FTViewer._attach({
   // save(ms)), default SAVE_CALLER_WAIT_MS (5 s), never more than
   // SAVE_BUSY_WAIT_MS — one caller's patience no longer holds every other
   // save() for 20 s. The indicator shows the retry count meanwhile.
+  // R7 U1/U5: `timeoutMs` is the HARD TOTAL budget of this call's answer —
+  // the wait for a save already in flight, the conflict lookup, every send
+  // and every busy retry all count against one deadline (R6 bounded only
+  // the busy retries; the wait for the request on the wire was unbounded).
+  // Past it save() answers false (the requests themselves go on and their
+  // replies still settle the drafts) and sets `opts.timedOut = true` when
+  // the caller passed an options object. Default SAVE_CALLER_WAIT_MS (20 s,
+  // explicit saves: finalize retry, case switch, attribution); the close
+  // flush passes 4 s.
   async save(opts) {
     if (!viewerIsServed) return false;
     if (annotationsReadOnly) return !Object.keys(state.drafts).length && !state.dirtyIds.size && !conflictIds.size;
     const idle = () => localReviewIdle();
     let busyWaits = 0;
     const asked = Number(typeof opts === "number" ? opts : opts && opts.timeoutMs);
-    const budget = Math.min(SAVE_BUSY_WAIT_MS, Number.isFinite(asked) && asked >= 0 ? asked : SAVE_CALLER_WAIT_MS);
-    const busyDeadline = Date.now() + budget;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      await whenSaveSettled();
-      await whenConflictsChecked();
-      if (idle()) return true;
-      if (conflictLookupFailed && !(await checkServerConflicts())) return false;
-      if (!state.dirtyIds.size && !pendingReviewSync && conflictIds.size) return false;
-      if (!state.dirtyIds.size && !pendingReviewSync && !conflictIds.size) continue;
-      const result = await syncMarksNow();
-      if (!result.ok && result.busy && !ftSignal.aborted) {
-        const wait = Math.max(250, Number(result.retryAfterMs) || 1000);
-        if (busyWaits < SAVE_BUSY_RETRIES && Date.now() + wait <= busyDeadline) {
-          busyWaits += 1;
-          await new Promise(resolve => setTimeout(resolve, wait));
-          attempt -= 1; // a busy reply is not one of the attempts
-          continue;
+    const budget = Number.isFinite(asked) && asked >= 0 ? asked : SAVE_CALLER_WAIT_MS;
+    const deadline = Date.now() + budget;
+    const TIMED_OUT = {};
+    let timer = 0;
+    const expired = new Promise(resolve => { timer = setTimeout(() => resolve(TIMED_OUT), budget); });
+    // Every wait of this call races the one deadline.
+    const within = (work) => Promise.race([Promise.resolve(work), expired]);
+    const timedOut = () => {
+      if (opts && typeof opts === "object") opts.timedOut = true;
+      return false;
+    };
+    try {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if ((await within(whenSaveSettled())) === TIMED_OUT) return timedOut();
+        if ((await within(whenConflictsChecked())) === TIMED_OUT) return timedOut();
+        if (idle()) return true;
+        if (conflictLookupFailed) {
+          const checked = await within(checkServerConflicts());
+          if (checked === TIMED_OUT) return timedOut();
+          if (!checked) return false;
         }
+        if (!state.dirtyIds.size && !pendingReviewSync && conflictIds.size) return false;
+        if (!state.dirtyIds.size && !pendingReviewSync && !conflictIds.size) continue;
+        const result = await within(syncMarksNow());
+        if (result === TIMED_OUT) return timedOut();
+        if (!result.ok && result.busy && !ftSignal.aborted) {
+          const wait = Math.max(250, Number(result.retryAfterMs) || 1000);
+          if (busyWaits < SAVE_BUSY_RETRIES && Date.now() + wait <= deadline) {
+            busyWaits += 1;
+            await new Promise(resolve => setTimeout(resolve, wait));
+            attempt -= 1; // a busy reply is not one of the attempts
+            continue;
+          }
+          if (Date.now() + wait > deadline) return timedOut();
+        }
+        if (!result.ok && !result.queued) return false;
       }
-      if (!result.ok && !result.queued) return false;
+      if ((await within(whenSaveSettled())) === TIMED_OUT) return timedOut();
+      if ((await within(whenConflictsChecked())) === TIMED_OUT) return timedOut();
+      return idle();
+    } finally {
+      clearTimeout(timer);
     }
-    await whenSaveSettled();
-    await whenConflictsChecked();
-    return idle();
   },
   // Host unmount (22-viewer-host.js): wait for the request in flight so
   // its reply settles the drafts before the mount goes.
@@ -328,10 +356,11 @@ FTViewer._attach({
     return touched.length;
   },
   liveState: () => liveStateDetail(),
-  closeWarning: () => t("close.readonlyWarn"),
-  debugStats: () => ({ filterComputes: filterComputeCount, activeId: state.activeId }),
+  closeText: (key, vars) => tf(key, vars || {}),
+  debugStats: () => ({ filterComputes: filterComputeCount, activeId: state.activeId, tallyFull: markTallyFullCount }),
   popout: () => openPlayerWindow(),
-  toast: (message, kind) => (kind === "error" ? toastError(message) : toast(message)),
+  // R7 U8: "warn" is its own kind (amber, never the error look).
+  toast: (message, kind) => (kind === "error" ? toastError(message) : kind === "warn" ? toast(message, { error: false, warn: true }) : toast(message)),
   beforeDestroy() {
     clearTimeout(autosaveTimer);
     if (queueWatchTimer) clearInterval(queueWatchTimer);

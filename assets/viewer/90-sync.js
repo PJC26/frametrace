@@ -315,7 +315,10 @@ var saveFailures = 0;
 var saveBusyRetries = 0;          // consecutive "busy, retry" replies (R4 B4)
 const SAVE_BUSY_RETRIES = 10;
 const SAVE_BUSY_WAIT_MS = 20000;  // FTViewer.save(): longest total wait for "busy, retry" (R5 U6)
-const SAVE_CALLER_WAIT_MS = 5000; // FTViewer.save() default busy budget per caller (R6 U5)
+// R7 U5: FTViewer.save() default answer budget per caller — an explicit
+// save (finalize retry, case switch, attribution) keeps the full 20 s; only
+// the close flush (hBeforeClose) asks for less (4 s, a hard total).
+const SAVE_CALLER_WAIT_MS = SAVE_BUSY_WAIT_MS;
 var lastReportError = "";         // R4 B7 notice shown once per text
 var saveError = "";
 var saveAuthExpired = false; // the last attempt was refused with 401 (U8)
@@ -574,7 +577,7 @@ function annotationText(a) {
 }
 // Writes an annotation value into the in-memory maps (no draft, no save).
 function applyAnnotationToState(id, a) {
-  if (typeof bumpAnnotations === "function") bumpAnnotations();
+  if (typeof bumpAnnotations === "function") bumpAnnotations(id);
   if (a && (a.status || (a.note || "").trim() || rangeValid(a.range))) markRowMaybe.add(id);
   if (a && a.status && a.status !== "noted") state.marks[id] = { status: a.status, marked_unix: Number.isFinite(a.marked_unix) ? a.marked_unix : Math.floor(Date.now() / 1000) };
   else delete state.marks[id];
@@ -711,6 +714,14 @@ function noticesHost() {
     host = document.createElement("div");
     host.className = "ft-notices";
     ftRoot.insertBefore(host, ftRoot.firstChild);
+  }
+  // R7 U9: the row has a maximum height and scrolls (controls.css): a
+  // labelled, focusable region so a keyboard can scroll it too.
+  if (!host.hasAttribute("tabindex")) {
+    host.tabIndex = 0;
+    host.setAttribute("role", "region");
+    host.dataset.i18nAriaLabel = "notices.label";
+    host.setAttribute("aria-label", t("notices.label"));
   }
   return host;
 }
@@ -870,9 +881,15 @@ async function readPagedList(get, path, pick) {
     all.push(...items);
     if (data.truncated === true) truncated = true;
     if (Array.isArray(data.unreadable)) {
+      // R7 U9: a named file counts once over every page; entries WITHOUT a
+      // name are not one file — the k-th nameless entry of a page is keyed
+      // "#k" (the same list repeated on each page still counts once, two
+      // nameless files count two).
+      let nameless = 0;
       for (const u of data.unreadable) {
         const name = u && typeof u === "object" ? String(u.file || "") : String(u || "");
-        if (!unreadable.has(name)) unreadable.set(name, u);
+        const key = name ? "f:" + name : "#" + nameless++;
+        if (!unreadable.has(key)) unreadable.set(key, u);
       }
     } else if (Number(data.unreadable) > 0 && !unreadable.size) {
       for (let i = 0; i < Number(data.unreadable); i++) unreadable.set("#" + i, { file: "", error: "" });
@@ -1226,6 +1243,9 @@ async function afterQueueDrained(st) {
   queuedIds.clear();
   serverQueuedIds.clear();
   queueValuesState = "";
+  // R7 U2: the queue is empty — so are its unreadable files: the notice
+  // (and the indicator's note) go now, not at the next page load.
+  noteQueueUnreadable(0);
   await pending;
   if (typeof requestRender === "function") requestRender();
   renderSaveState();
@@ -2154,6 +2174,28 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
   const host = noticesHost();
   host.insertBefore(bar, host.firstChild);
   FTViewer._emit("error", { message: t("save.readonlyMsg"), detail: annotationsError, stage: "load" });
+})();
+
+// R7 (S ↔ U): case.json or the evidence index was not valid JSON — the data
+// bundle / records-meta carry null for it (10-boot.js caseInputProblems).
+// Never an unexplained empty case: one role=alert banner naming what was
+// not read, the same words as the review / carve pages.
+(function showCaseInputProblems() {
+  if (!caseInputProblems.length) return;
+  const parts = caseInputProblems.map(what => t(what === "scan" ? "caseInput.scan" : "caseInput.manifest"));
+  const text = t("caseInput.title") + " — " + parts.join(" · ");
+  const bar = document.createElement("div");
+  bar.id = "caseInputErrorBanner";
+  bar.className = "ft-banner";
+  bar.setAttribute("role", "alert");
+  bar.dataset.problems = caseInputProblems.join(" ");
+  const msg = document.createElement("span");
+  msg.className = "ft-banner-msg";
+  msg.textContent = text;
+  bar.appendChild(msg);
+  const host = noticesHost();
+  host.insertBefore(bar, host.firstChild);
+  FTViewer._emit("error", { message: text, detail: caseInputProblems.join(","), stage: "load" });
 })();
 
 // --- U9: drafts left under another origin ---------------------------------

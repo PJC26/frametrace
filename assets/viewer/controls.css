@@ -160,6 +160,8 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
 #toastHost .toast-text { flex: 1 1 auto; min-width: 0; padding-top: 3px; overflow-wrap: anywhere; }
 #toastHost .toast-error { border-left-color: #ff8a80; }
 #toastHost .toast-error::before { content: "!"; flex: none; display: grid; place-items: center; width: 20px; height: 20px; margin-top: 2px; border-radius: 50%; background: #ff8a80; color: #1f2724; font-weight: 800; font-size: var(--fs-xs); }
+#toastHost .toast-warn { border-left-color: #e6b450; }
+#toastHost .toast-warn::before { content: "!"; flex: none; display: grid; place-items: center; width: 20px; height: 20px; margin-top: 2px; border-radius: 50%; background: #e6b450; color: #1f2724; font-weight: 800; font-size: var(--fs-xs); }
 #toastHost .toast button { pointer-events: auto; flex: none; min-width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: #d8e4df; font: inherit; font-size: var(--fs-xs); cursor: pointer; padding: 0 8px; }
 #toastHost .toast button:hover { background: rgba(255,255,255,.14); }
 #toastHost .toast button:focus-visible { outline: 2px solid #7fd6c7; outline-offset: 1px; }
@@ -218,7 +220,12 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
    buttons keep the kit's secondary look (own --surface background).
    ====================================================================== */
 .ft-viewer { grid-template-rows: auto auto auto minmax(0, 1fr) auto; grid-template-areas: "head" "notice" "top" "work" "bar"; }
-.ft-viewer > .ft-notices { grid-area: notice; min-width: 0; display: flex; flex-direction: column; }
+/* R7 U9: five stacked notices must not squeeze the work area at 1366x768 —
+   the row stops at 28vh (≤ 216px) and scrolls; keyboard reachable
+   (tabindex 0, labelled region, see 90-sync.js noticesHost). */
+.ft-viewer > .ft-notices { grid-area: notice; min-width: 0; display: flex; flex-direction: column; max-height: min(28vh, 216px); overflow-y: auto; overscroll-behavior: contain; }
+.ft-viewer > .ft-notices > * { flex: none; }
+.ft-viewer > .ft-notices:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
 .ft-notices:empty { display: none; }
 .ft-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 12px; background: var(--warn-bg); color: var(--text); border-bottom: 2px solid var(--warn); font-size: var(--fs-sm); }
 .ft-banner .ft-banner-msg { font-weight: 700; color: var(--text); margin-right: 4px; min-width: 0; }

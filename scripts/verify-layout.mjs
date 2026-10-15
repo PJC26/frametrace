@@ -198,6 +198,51 @@ try {
       // 1/2. regions
       checkRegions(label, await page.evaluate(probe), wide);
       if (shots) { mkdirSync(shots, { recursive: true }); await page.screenshot({ path: join(shots, `project-${w}-${theme}.png`) }); }
+      // R7 U9: five long notices stacked in the viewer's notices row (save
+      // conflicts, unreadable queue files, truncated lists, …) must not
+      // squeeze the work area: the row stops at min(28vh, 216px) and
+      // scrolls, the grid keeps its height, the selection bar stays on
+      // screen, nothing scrolls sideways, the last notice is reachable.
+      if (!wide) {
+        const n9 = await page.evaluate(() => {
+          const root = document.getElementById('ftViewer');
+          if (!root) return { missing: true };
+          let host = root.querySelector(':scope > .ft-notices');
+          const made = !host;
+          if (made) { host = document.createElement('div'); host.className = 'ft-notices'; root.insertBefore(host, root.firstChild); }
+          const long = '레이아웃 확인용 알림 — 저장 충돌, 읽지 못한 대기 파일, 일부만 읽은 목록처럼 알림이 여러 개 겹쳐도 작업 영역을 밀어내지 않는지 확인합니다. '.repeat(4);
+          const added = [];
+          for (let i = 1; i <= 5; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'ft-banner';
+            bar.setAttribute('role', 'status');
+            bar.dataset.layoutProbe = String(i);
+            const msg = document.createElement('span');
+            msg.className = 'ft-banner-msg';
+            msg.textContent = `${i}. ${long}`;
+            bar.appendChild(msg);
+            host.appendChild(bar);
+            added.push(bar);
+          }
+          const r = host.getBoundingClientRect();
+          const grid = document.getElementById('recordGrid').getBoundingClientRect();
+          const sel = document.getElementById('selectionBar').getBoundingClientRect();
+          host.scrollTop = host.scrollHeight;
+          const last = added[4].getBoundingClientRect();
+          const hostAfter = host.getBoundingClientRect();
+          const out = {
+            h: Math.round(r.height), cap: Math.min(innerHeight * 0.28, 216), scrolls: host.scrollHeight > host.clientHeight + 1,
+            gridH: Math.round(grid.height), selBottom: Math.round(sel.bottom), vh: innerHeight,
+            lastVisible: last.bottom <= hostAfter.bottom + 1 && last.top >= hostAfter.top - 1,
+            hscroll: document.documentElement.scrollWidth > innerWidth + 1,
+          };
+          for (const bar of added) bar.remove();
+          if (made) host.remove();
+          return out;
+        });
+        check(`${label}: R7 U9 five notices — the row stops at min(28vh, 216px) and scrolls`, !n9.missing && n9.h <= n9.cap + 0.5 && n9.scrolls && n9.lastVisible, JSON.stringify(n9));
+        check(`${label}: R7 U9 five notices — the grid keeps >= 200px, the selection bar stays on screen, no sideways scroll`, !n9.missing && n9.gridH >= 200 && n9.selBottom <= n9.vh && !n9.hscroll, JSON.stringify(n9));
+      }
 
       // 4. sheets
       for (const [which, opener, sheetId] of [['jobs', '#hBtnJobs', '#hJobsSheet'], ['finalize', '#hBtnFinalize', '#hFinalizeSheet']]) {

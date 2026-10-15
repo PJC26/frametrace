@@ -41,22 +41,33 @@ async function hPendingChanges() {
 // budget is capped below it (FTViewer.save({ timeoutMs })). A read-only
 // close with nothing held here answers ok + `warning` at once; the
 // warning is shown here too (toast) and carried for the shell's dialog.
+// R7 U1 (S7 ↔ U): the shell calls hBeforeClose(4000) and `timeoutMs` is a
+// HARD TOTAL budget measured from the call: the wait for a save already
+// on the wire, the conflict lookup, the send and any busy retry all fit in
+// it (FTViewer.save({timeoutMs}) is itself a total deadline now, given a
+// little less), and a backstop timer answers at the budget whatever the
+// viewer does. Everything after the race is synchronous.
 const H_CLOSE_TIMEOUT_MS = 4000;
+const H_CLOSE_MARGIN_MS = 250;
 async function hBeforeClose(timeoutMs = H_CLOSE_TIMEOUT_MS) {
+  const started = Date.now();
+  const asked = Number(timeoutMs);
+  const ms = Math.max(0, Number.isFinite(asked) ? asked : H_CLOSE_TIMEOUT_MS);
   const api = hViewerApi();
   const mounted = !!(api && FTStore.state.viewer && FTStore.state.viewer.mounted);
   if (!mounted) return { ok: true, pending: 0, state: null, message: "", warning: "" };
-  const ms = Math.max(0, Number(timeoutMs) || 0);
   let saved = false;
   let timedOut = false;
   let timer = 0;
+  const opts = { timeoutMs: Math.max(0, ms - H_CLOSE_MARGIN_MS) };
   try {
     saved = await Promise.race([
-      Promise.resolve(api.save({ timeoutMs: Math.max(0, ms - 250) })).then(v => v === true),
-      new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, ms); }),
+      Promise.resolve(api.save(opts)).then(v => v === true),
+      new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, Math.max(0, ms - (Date.now() - started) - 100)); }),
     ]);
   } catch (e) { saved = false; }
   clearTimeout(timer);
+  if (opts.timedOut) timedOut = true;
   let pending = 0;
   let state = null;
   try { pending = Number((api.summary() || {}).pending) || 0; state = api.saveState(); } catch (e) { pending = 0; }
@@ -65,10 +76,11 @@ async function hBeforeClose(timeoutMs = H_CLOSE_TIMEOUT_MS) {
   // draft, no edit) loses nothing by closing — no confirmation, a warning only.
   const readonlyClean = saved && state === "readonly" && pending === 0;
   const ok = readonlyClean || (saved && !hViewerStateUnsaved(state === "queued" ? "saved" : state, () => pending));
+  const late = timedOut ? " (저장 응답 대기 시간 초과)" : "";
   const message = ok ? ""
-    : pending > 0 ? `저장 안 된 편집 ${pending}건` + (timedOut ? " (저장 응답 대기 시간 초과)" : "")
+    : pending > 0 ? `저장 안 된 편집 ${pending}건` + late
     : state === "readonly" ? "판독 기록을 읽지 못해 저장이 막혀 있습니다"
-    : "모든 편집이 저장되었는지 확인하지 못했습니다";
+    : "모든 편집이 저장되었는지 확인하지 못했습니다" + late;
   const warning = readonlyClean ? "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다." : "";
   if (warning && typeof toast === "function") toast(warning, "warn");
   return { ok, pending, state, message, warning };

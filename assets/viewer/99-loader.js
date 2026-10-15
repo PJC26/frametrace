@@ -242,10 +242,14 @@ async function loadViewerDataFromApi(first, ui) {
       (meta && meta.error) || "/api/records-meta"
     );
   }
-  const scan = (meta && meta.scan) || {};
+  const scan = (meta && meta.scan && typeof meta.scan === "object") ? meta.scan : {};
   scan.videos = paged.videos;
   const data = {
     manifest: meta.manifest || {},
+    // R7: case.json / the scan summary came back null (not valid JSON on
+    // disk) — the viewer says so instead of an unexplained empty case.
+    manifestUnreadable: !meta.manifest || typeof meta.manifest !== "object",
+    scanUnreadable: Object.prototype.hasOwnProperty.call(meta, "scan") && (!meta.scan || typeof meta.scan !== "object"),
     caseDir: meta.caseDir || "",
     scan,
     carveLog: meta.carveLog,
@@ -341,8 +345,12 @@ async function loadViewerDataOnce(ui) {
 
 async function loadViewerData(mount) {
   const { root = null, signal = null } = mount || {};
-  if (window.__FRAMETRACE_DATA__ && window.__FRAMETRACE_DATA__.manifest) {
-    return window.__FRAMETRACE_DATA__;
+  // R7: an inline bundle whose case.json / index was unreadable carries
+  // `manifest: null` / `scan: null` — it is still THE data (the viewer says
+  // the case files were not read), not a reason to look for another source.
+  const inline = window.__FRAMETRACE_DATA__;
+  if (inline && typeof inline === "object" && (inline.manifest || "manifest" in inline || "scan" in inline)) {
+    return inline;
   }
   const ui = loaderOverlay(root);
   for (;;) {
