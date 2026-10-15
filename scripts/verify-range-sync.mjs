@@ -93,7 +93,8 @@ function apply(body) {
     const changed = valueOf(next) !== valueOf(cur);
     if (v2) {
       const base = Number((body.base_revisions || {})[id]) || 0;
-      const forced = mock.forceConflict && mock.forceConflict.has(id);
+      // Track P contract: base -1 is ALWAYS a conflict (mock.minusOne).
+      const forced = (mock.forceConflict && mock.forceConflict.has(id)) || base === -1;
       if ((base !== cur.rev && changed) || forced) {
         conflicts.push({ id, server_revision: cur.rev, server: cur.status || cur.tags.length || cur.range ? { status: cur.status, note: cur.note, examiner: cur.examiner, range: cur.range, tags: cur.tags } : null });
         continue;
@@ -132,6 +133,14 @@ const server = createServer((req, res) => {
     req.on('end', () => {
       const payload = JSON.parse(JSON.parse(body).marks_json);
       imports.push(payload);
+      // The current server parses base_revisions as u64: a -1 refuses the
+      // whole body (nothing applied). mock.minusOne = a track-P server.
+      const minus = Object.entries(payload.base_revisions || {}).find(([, v]) => v === -1);
+      if (minus && !mock.minusOne) {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: false, error: `marks file marks-imported.json (patch-v2): base_revisions[${JSON.stringify(minus[0])}] must be a non-negative integer` }));
+        return;
+      }
       if (mock.busyReplies > 0) {
         // R4 B4: briefly busy outside enrichment — nothing queued, retry.
         mock.busyReplies -= 1;
@@ -148,7 +157,9 @@ const server = createServer((req, res) => {
   const json = (code, body) => { res.statusCode = code; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(body)); };
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/api/status') {
-    return json(200, { ok: true, pending_marks: mock.pending, mark_conflicts: { count: mock.conflicts.length, ids: mock.conflicts.map((c) => c.id) } });
+    // mock.oldConflicts: a pre-R4 server — a count, no ids, no route.
+    const mc = mock.oldConflicts ? { count: mock.oldConflicts } : { count: mock.conflicts.length, ids: mock.conflicts.map((c) => c.id) };
+    return json(200, { ok: true, pending_marks: mock.pending, mark_conflicts: mc });
   }
   if (url.pathname === '/api/records-meta') {
     if (mock.metaFail) return json(500, { ok: false, error: 'meta down' });
@@ -159,9 +170,10 @@ const server = createServer((req, res) => {
     const offset = Number(url.searchParams.get('offset')) || 0;
     // Shape of the real route (docs/PLAN_R4 §B4 as implemented): count, next_offset (null at the end), entries.
     const end = offset + mock.pageCap;
-    return json(200, { ok: true, count: mock.pendingItems.length, offset, limit: 500, next_offset: end < mock.pendingItems.length ? end : null, entries: mock.pendingItems.slice(offset, end) });
+    return json(200, { ok: true, count: mock.pendingItems.length + (mock.pendingCountExtra || 0), offset, limit: 500, next_offset: end < mock.pendingItems.length ? end : null, entries: mock.pendingItems.slice(offset, end) });
   }
   if (url.pathname === '/api/mark-conflicts') {
+    if (mock.oldConflicts) return json(404, { ok: false, error: 'not found' });
     if (mock.conflictsFail) return json(500, { ok: false, error: 'down' });
     const offset = Number(url.searchParams.get('offset')) || 0;
     const limit = Number(url.searchParams.get('limit')) || 500;
@@ -191,14 +203,16 @@ try {
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
   // Loads the page with exactly `ls` in localStorage (null = nothing).
-  async function open(ls) {
+  async function open(ls, raw) {
     // Storage is set on a blank page of the same origin: a viewer page would
-    // flush its drafts back on pagehide, after the clear.
+    // flush its drafts back on pagehide, after the clear. `raw` values are
+    // stored as given (not JSON-encoded).
     await page.goto(base + 'blank');
-    await page.evaluate((entries) => {
+    await page.evaluate(([entries, rawEntries]) => {
       localStorage.clear();
       for (const [k, v] of Object.entries(entries || {})) localStorage.setItem(k, JSON.stringify(v));
-    }, ls);
+      for (const [k, v] of Object.entries(rawEntries || {})) localStorage.setItem(k, v);
+    }, [ls, raw]);
     await page.goto(base);
     await page.waitForSelector('#recordGrid .card');
   }
@@ -355,12 +369,34 @@ try {
     /판독 기록을 읽지 못했습니다/.test(await page.locator('#annotationsErrorBanner').innerText()) &&
     await page.locator('#annotationsErrorBanner').getAttribute('role') === 'alert' && await state() === 'readonly', await state());
   await select(B);
+  const markBefore = await chipOf(B);
   await page.keyboard.press('2');
   await saveNow();
   await page.waitForFunction(() => FTViewer.saveState() === 'readonly');
-  check('⑨ an edit is never sent, the state stays "readonly", save() resolves false',
-    imports.length === 0 && await page.evaluate(() => FTViewer.save()) === false && await state() === 'readonly');
+  // R5 U1: editing is refused while read-only (it used to be accepted, kept
+  // as a draft built on values never seen, and later overwrote / deleted marks).
+  const draftCount = () => page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('ft.draft.')).length);
+  const r9 = await page.evaluate(() => ({
+    toast: document.getElementById('toastHost').innerText,
+    buttons: ['btnMarkReviewed', 'btnMarkImportant', 'btnMarkVerify', 'btnMarkClear', 'btnTagMenu', 'btnSetIn', 'btnSetOut'].map((b) => { const el = document.getElementById(b); return el.disabled && /편집할 수 없습니다/.test(el.title); }),
+    note: (() => { const n = document.getElementById('evidenceNote'); return !!n && n.readOnly && /편집할 수 없습니다/.test(n.title); })(),
+    tagBtns: [...document.querySelectorAll('.tag-editor .tag-btn, #btnAddCustomTag, #customTagInput')].every((el) => el.disabled),
+    pending: FTViewer.summary().pending,
+  }));
+  check('⑨ U1: key 2 while read-only changes nothing (no mark, no draft) and says why',
+    await chipOf(B) === markBefore && await draftCount() === 0 && r9.pending === 0 && /편집할 수 없습니다/.test(r9.toast), JSON.stringify(r9));
+  check('⑨ U1: mark / tag / IN-OUT buttons, tag editor and note field disabled with the reason', r9.buttons.every(Boolean) && r9.note && r9.tagBtns, JSON.stringify(r9));
+  await page.evaluate(() => { const n = document.getElementById('evidenceNote'); n.value = 'typed'; n.dispatchEvent(new Event('input', { bubbles: true })); });
+  await page.keyboard.press('Control+z');
+  check('⑨ U1: input reaching the note field, and Ctrl+Z, are refused (no draft)', await draftCount() === 0 && await page.evaluate(() => FTViewer.summary().pending) === 0);
+  check('⑨ an edit is never sent, the state stays "readonly"', imports.length === 0 && await state() === 'readonly');
+  check('⑨ U15: read-only with nothing held here → save() true (closing needs no confirmation)', await page.evaluate(() => FTViewer.save()) === true && await state() === 'readonly');
   check('⑨ summary report / CSV disabled', await page.evaluate(() => ['btnSummary', 'btnDownloadCsv'].every((id) => document.getElementById(id).disabled)));
+  // A draft held from before (a closed earlier window): kept, save() false.
+  const seeded = { mark: { status: 'important', marked_unix: 1 }, note: '', tags: [], examiner: null, range: null, seq: 1, base: 0 };
+  await open({ [`ft.draft.${CASE}.wdead.${C}`]: seeded }, { [`ft.alive:${CASE}:wdead`]: 'closed' });
+  await page.waitForSelector('#annotationsErrorBanner');
+  check('⑨ U15: read-only WITH a held draft → save() false (the close asks)', await page.evaluate(() => FTViewer.save()) === false && imports.length === 0);
   mock.annError = null;
 
   // ⑩ A4: marks in the server's queue across a reload.
@@ -435,6 +471,77 @@ try {
   await waitState('saved', 15000);
   seen13.push(...await page.evaluate(() => window.__ss13));
   check('⑬ busy/retry replies: retried until saved, never shown as failed', imports.length >= 3 && !seen13.includes('failed') && row(A).status === 'needs_verification', `${imports.length} posts, states ${seen13.join(',')}`);
+
+  // ---- R5 track U ---------------------------------------------------------
+  // ⑭ U1: a stored draft made while read-only (unsafe_base) whose base even
+  // MATCHES the server's revision is never applied: it goes out with base -1.
+  rows.set(A, { status: 'important', note: 'srv', examiner: null, range: null, tags: [], rev: 7 });
+  const unsafeDraft = { mark: { status: 'reviewed', marked_unix: 1 }, note: '', tags: [], examiner: null, range: null, seq: 1, base: 7, unsafe_base: true };
+  for (const minusOne of [false, true]) {
+    mock.minusOne = minusOne;
+    imports.length = 0;
+    await open({ [`ft.draft.${CASE}.wold.${A}`]: unsafeDraft }, { [`ft.alive:${CASE}:wold`]: 'closed' });
+    await page.waitForSelector('#markConflictBanner', { timeout: 15000 });
+    const sentMinus = imports.some((b) => (b.base_revisions || {})[A] === -1);
+    const item14 = await conflictItem(A);
+    check(`⑭ U1 (${minusOne ? 'server knows -1' : 'current server refuses -1'}): unsafe draft sent with base -1, shown as a conflict, server unchanged`,
+      sentMinus && row(A).status === 'important' && row(A).rev === 7 && /srv/.test(item14) && await state() === 'pending', JSON.stringify({ sentMinus, row: row(A), item14: item14.replace(/\s+/g, ' ') }));
+  }
+  await page.click('#markConflictUseServer');
+  await waitState('saved');
+  check('⑭ U1: [서버 값 사용] resolves it; the server keeps its value', row(A).status === 'important' && row(A).rev === 7);
+  mock.minusOne = false;
+
+  // ⑮ U4: a queued value shown over the server's goes back to the case DB
+  // value when the queue drains without applying it (here: unchanged row).
+  rows.set(C, { status: 'reviewed', note: '', examiner: null, range: null, tags: [], rev: 2 });
+  mock.pending = 1;
+  mock.pageCap = 2;
+  mock.pendingItems = [{ id: C, mark: { id: C, status: 'important', note: 'q', marked_unix: 5 }, tags: null, deleted: false, base_revision: 1, client_id: 'w-x' }];
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 10000 });
+  const overlay = await chipOf(C);
+  mock.pending = 0; // drained — the body met a newer revision and was not applied
+  await waitState('saved', 15000);
+  await page.waitForFunction((id) => !/important/.test(document.querySelector(`#recordGrid .card[data-id="${CSS.escape(id)}"] .mark-chip`)?.className || ''), C, { timeout: 5000 }).catch(() => {});
+  check('⑮ U4: after the drain the queued overlay gives way to the case DB value', /important/.test(overlay) && /reviewed/.test(await chipOf(C)), `${overlay} → ${await chipOf(C)}`);
+  // Unreadable / truncated queued values are named, never silently missing.
+  mock.pending = 1;
+  mock.pendingRoute = false;
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 10000 });
+  const unread = await page.evaluate(() => ({ v: document.getElementById('saveState').dataset.queueValues, title: document.getElementById('saveState').title }));
+  check('⑮ U4: queued values unreadable → said in the indicator', unread.v === 'unreadable' && /읽지 못해/.test(unread.title), JSON.stringify(unread));
+  mock.pendingRoute = true;
+  mock.pendingCountExtra = 3;
+  mock.pendingItems = [C, A, B].map((id) => ({ id, mark: { id, status: 'important', note: '', marked_unix: 5 }, tags: null, deleted: false, base_revision: 0 }));
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 10000 });
+  const trunc = await page.evaluate(() => ({ v: document.getElementById('saveState').dataset.queueValues, title: document.getElementById('saveState').title }));
+  check('⑮ U4: fewer queued entries than the server counts → "truncated" said', trunc.v === 'truncated' && /일부만/.test(trunc.title), JSON.stringify(trunc));
+  mock.pendingCountExtra = 0;
+  mock.pendingItems = [];
+  mock.pending = 0;
+  await waitState('saved', 15000);
+
+  // ⑯ U5: an old server reports conflicts with neither ids nor a list route.
+  mock.oldConflicts = 2;
+  await open(null);
+  await page.waitForSelector('#conflictsUnlistedNotice', { timeout: 10000 });
+  await waitState('saved', 10000);
+  check('⑯ U5: old server (count, no ids, no route) → notice "구버전 서버", state not stuck at "unknown"',
+    /구버전 서버/.test(await page.locator('#conflictsUnlistedNotice').innerText()) && await state() === 'saved');
+  mock.oldConflicts = 0;
+
+  // ⑰ U6: FTViewer.save() waits out "busy, retry" replies instead of false.
+  mock.busyReplies = 2;
+  imports.length = 0;
+  await open(null);
+  await waitState('saved');
+  await select(B);
+  await page.keyboard.press('3');
+  const saved17 = await page.evaluate(() => FTViewer.save());
+  check('⑰ U6: save() through two busy replies resolves true, the mark landed', saved17 === true && row(B).status === 'needs_verification' && imports.length >= 3, `${saved17}, ${imports.length} posts, ${row(B).status}`);
 
   check('no page errors', !errors.length, errors.join(' | '));
 } catch (err) {

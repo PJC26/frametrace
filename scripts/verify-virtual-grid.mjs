@@ -125,6 +125,31 @@ try {
   const clicked = await page.evaluate(() => document.querySelector('#recordGrid .card.active')?.dataset.id);
   check('click activates a virtual card', clicked === clickedTarget, `${clicked} vs ${clickedTarget}`);
 
+  // R5 U17: per-interaction latency budget on 50k records — a card click
+  // and a mark (key 1), each timed from the event to the next painted frame
+  // (handler + render + layout). Median < 200 ms; any O(n)-per-click work
+  // (a findIndex over every record, a full recount, a storage scan) shows.
+  const lat = await page.evaluate(async () => {
+    const frame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+    const out = { click: [], mark: [] };
+    for (let i = 0; i < 15; i++) {
+      const cards = [...document.querySelectorAll('#recordGrid .card')];
+      const card = cards[(i * 3 + 1) % cards.length];
+      let t0 = performance.now();
+      card.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await frame();
+      out.click.push(performance.now() - t0);
+      document.activeElement?.blur();
+      t0 = performance.now();
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: '1', bubbles: true }));
+      await frame();
+      out.mark.push(performance.now() - t0);
+    }
+    const med = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
+    return { click: med(out.click), mark: med(out.mark), maxClick: Math.max(...out.click), maxMark: Math.max(...out.mark) };
+  });
+  check('U17: card click median < 200 ms on 50k records', lat.click < 200, JSON.stringify(lat));
+  check('U17: mark (key 1) median < 200 ms on 50k records', lat.mark < 200, JSON.stringify(lat));
   // Grouping: headers render, collapse works, DOM bounded.
   await setGroup(page, 'prefix');
   await page.waitForTimeout(300);

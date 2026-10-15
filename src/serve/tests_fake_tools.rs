@@ -6,8 +6,11 @@
 //!
 //! A fake tool is written twice: a `/bin/sh` body for unix and a batch body
 //! for Windows (`.cmd`). Windows rules baked into the batch bodies:
-//! - no child process for an infinite wait (`goto spin`): a killed `cmd.exe`
-//!   must not leave a grandchild holding the stdout/stderr pipes open;
+//! - an infinite wait never busy-spins (R5 U10: a bare `goto spin` loop
+//!   pinned a CPU core per fake tool and starved the runner): it sleeps in
+//!   `ping -n 2` steps ([`CMD_SPIN`], [`cmd_wait_for_file`]). Each `ping`
+//!   lives about one second, so one left behind by a killed `cmd.exe`
+//!   holds the inherited stdout/stderr pipes for a second at most;
 //! - cmd splits arguments on `=` and `,`, so values are located by flag with
 //!   a `shift` loop (see [`CMD_FIND_OUTPUT`]) and the raw line is `%*`.
 #![allow(dead_code)]
@@ -47,10 +50,15 @@ pub const CMD_FIND_OUTPUT: &str = "set out=\n:findout\nif \"%~1\"==\"\" goto got
 /// `/bin/sh` equivalent of [`CMD_FIND_OUTPUT`].
 pub const SH_FIND_OUTPUT: &str = "out=\"\"; prev=\"\"\nfor a in \"$@\"; do if [ \"$prev\" = \"--output\" ]; then out=\"$a\"; fi; prev=\"$a\"; done";
 
-/// Batch snippet that waits (spinning, no child process) until `gate` exists.
+/// Batch snippet: wait forever, one ~1 s `ping` step at a time (never a
+/// busy spin, R5 U10).
+pub const CMD_SPIN: &str = ":spin\nping -n 2 127.0.0.1 >nul 2>&1\ngoto spin";
+
+/// Batch snippet that waits until `gate` exists, polling every ~1 s with a
+/// `ping` step (never a busy spin, R5 U10).
 pub fn cmd_wait_for_file(gate: &Path) -> String {
     format!(
-        ":waitgate\nif not exist \"{}\" goto waitgate",
+        ":waitgate\nif exist \"{}\" goto gateopen\nping -n 2 127.0.0.1 >nul 2>&1\ngoto waitgate\n:gateopen",
         gate.display()
     )
 }

@@ -8,6 +8,7 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 60 # R5 U13: bounded, never the 6 h default
     defaults:
       run:
         working-directory: fuzz

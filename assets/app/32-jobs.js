@@ -704,7 +704,7 @@ function renderJobsSheet() {
   if (err) {
     let html = "";
     if (pv.state === "failed" || (pv.state === "stopped" && p.error)) html = errorHtml(p.error);
-    else if (cj && cj.outcome === "failed") html = `<div>오류: ${esc(cj.message)}</div>`;
+    else if (cj && cj.outcome === "failed") html = rawMismatchError(cj.message) ? errorHtml(cj.message) : `<div>오류: ${esc(cj.message)}</div>`;
     jobsErrWrite(err, html);
     err.hidden = !html;
   }

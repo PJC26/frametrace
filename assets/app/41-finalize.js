@@ -166,6 +166,18 @@ function propagateExaminerName(name, caseId) {
 // marked_unix are re-sent as stored), and review_mark_history records the
 // update with this name as actor. Done only once the viewer has nothing
 // unsaved, so a pending viewer edit cannot be overtaken by stale values.
+// R5 U7: the direct attribution patch carries a random client id of THIS
+// tab (made once per page). A fixed id ("shell-attribute") let one shell
+// run inherit the server's same-window exception for a revision another
+// run — another tab, another day — had written, so a stale base passed as
+// "this window's own consecutive edit" instead of coming back as a conflict.
+const FIN_CLIENT_ID = (() => {
+  try {
+    const a = new Uint32Array(3);
+    crypto.getRandomValues(a);
+    return "shell-" + Array.from(a, n => n.toString(36)).join("");
+  } catch (e) { return "shell-" + String(Math.random()).slice(2) + Date.now().toString(36); }
+})();
 async function finAttribute() {
   if (FIN.attributing || FIN.busy) return;
   const name = (finEl("finalExaminer").value || "").trim();
@@ -211,7 +223,7 @@ async function finAttribute() {
       schema_version: 2, protocol: "patch-v2",
       case_id: (meta.manifest && meta.manifest.case_id) || null,
       examiner: name,
-      client_id: "shell-attribute",
+      client_id: FIN_CLIENT_ID,
       exported_unix: Math.floor(Date.now() / 1000),
       base_revisions: Object.fromEntries(ids.map(id => [id, Number(revisions[id]) || 0])),
       marks: todo.map(m => {

@@ -1,4 +1,5 @@
 mod common;
+use common::IsolatedCommand;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,9 +21,59 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 fn run(args: &[&str]) -> Output {
     Command::new(frametrace())
         .args(args)
-        .envs(common::isolated_env())
+        .isolated()
         .output()
         .expect("frametrace binary should run")
+}
+
+/// R5 U11: a spawned binary never inherits the runner's `FRAMETRACE_*`
+/// variables (only what `isolated()` / the test sets explicitly).
+#[test]
+fn isolated_children_drop_inherited_frametrace_vars() {
+    let picked = common::inherited_frametrace_vars([
+        "PATH",
+        "FRAMETRACE_AUDIT_KEY",
+        "frametrace_token",
+        "XFRAMETRACE_UI",
+        "FRAMETRACE_UI",
+    ]);
+    assert_eq!(
+        picked,
+        vec![
+            std::ffi::OsString::from("FRAMETRACE_AUDIT_KEY"),
+            std::ffi::OsString::from("frametrace_token"),
+            std::ffi::OsString::from("FRAMETRACE_UI"),
+        ]
+    );
+    let mut command = Command::new("frametrace-env-probe");
+    command.isolated();
+    let envs: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().to_string(),
+                v.map(|v| v.to_string_lossy().to_string()),
+            )
+        })
+        .collect();
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy().to_string();
+        if !name.to_ascii_uppercase().starts_with("FRAMETRACE_")
+            || name.eq_ignore_ascii_case("FRAMETRACE_INSTANCE_FILE")
+        {
+            continue;
+        }
+        assert!(
+            envs.iter().any(|(k, v)| k == &name && v.is_none()),
+            "{name} is removed from the child: {envs:?}"
+        );
+    }
+    // The isolation itself is set, never inherited.
+    assert!(
+        envs.iter()
+            .any(|(k, v)| k == "FRAMETRACE_INSTANCE_FILE" && v.is_some())
+    );
+    assert!(envs.iter().any(|(k, v)| k == "APPDATA" && v.is_some()));
 }
 
 fn assert_success(output: &Output) {
@@ -719,7 +770,7 @@ fn rotate_audit_key_round_trips_through_verify() {
     let framed = |args: &[&str]| {
         Command::new(frametrace())
             .args(args)
-            .envs(common::isolated_env())
+            .isolated()
             .env("FRAMETRACE_AUDIT_KEYRING_FILE", &keyring)
             .env_remove("FRAMETRACE_AUDIT_KEY")
             .env_remove("FRAMETRACE_AUDIT_KEY_FILE")

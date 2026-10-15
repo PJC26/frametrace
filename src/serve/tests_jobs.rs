@@ -12,7 +12,8 @@ mod fake_tools;
 #[cfg(not(unix))]
 use super::media::exhibit_arg;
 use fake_tools::{
-    CMD_FIND_OUTPUT, cmd_grandchild_sleeper, cmd_sleep, cmd_wait_for_file, pid_alive, write_fake,
+    CMD_FIND_OUTPUT, CMD_SPIN, cmd_grandchild_sleeper, cmd_sleep, cmd_wait_for_file, pid_alive,
+    write_fake,
 };
 
 fn temp_case(tag: &str) -> PathBuf {
@@ -1008,7 +1009,7 @@ printf clip > "$out""#,
 #[test]
 fn clip_cancel_endpoint_kills_only_that_export() {
     let case_dir = temp_case("clip-cancel");
-    let exe = fake_cli(&case_dir, "sleep 300", ":spin\ngoto spin");
+    let exe = fake_cli(&case_dir, "sleep 300", CMD_SPIN);
     let state = bound_state(&case_dir, "review-ready");
     let started = parse(&export_clip_with_exe(
         &request("POST", "/api/export-clip", "", &clip_body("")),

@@ -103,13 +103,66 @@ function errorHint(msg) {
     return "입력 이미지가 손상되었거나 형식이 다릅니다 — 원본을 다시 확인하거나 다른 소스로 시도하십시오.";
   return "로그에서 실패한 단계를 확인하십시오 — 입력을 바로잡은 뒤 '분석 시작'으로 재시도할 수 있습니다.";
 }
+// R5 (S6 ↔ U): a raw image whose completion marker no longer matches (an
+// old case, a moved case) is NOT deleted any more — the server stops with
+// "raw 불일치 — 재임포트 필요" and the examiner decides. The error box then
+// carries the one action that resolves it: POST /api/reimport-raw.
+// /api/status.raw_reimport = {raw_path, reason, endpoint} while one waits (else null).
+let hRawReimport = null;
+function rawMismatchError(text) {
+  return /raw\s*불일치|재임포트|reimport[-_ ]?raw|raw[-_ ]mismatch/i.test(String(text || ""));
+}
 // Action hint first (what to do now), raw CLI output behind a disclosure.
 function errorHtml(raw) {
   const text = String(raw || "");
   const first = text.split(/\r?\n/)[0].slice(0, 240);
-  return `<div>오류: ${esc(first)}</div><div class="hintline">${esc(errorHint(text))}</div>` +
+  const rawWait = rawMismatchError(text) || (!!hRawReimport && /raw/i.test(text));
+  const hint = rawWait
+    ? "보관된 원본 이미지(raw)가 기록과 다릅니다 — 지우지 않았습니다. ‘원본 다시 가져오기’를 누르면 증거 이미지에서 다시 만듭니다."
+    : errorHint(text);
+  return `<div>오류: ${esc(first)}</div><div class="hintline">${esc(hint)}</div>` +
+    (rawWait ? `<div class="err-acts"><button type="button" data-reimport-raw>원본 다시 가져오기</button></div>` : "") +
     (text.length > first.length ? `<details><summary>자세한 오류 내용</summary><pre>${esc(text)}</pre></details>` : "");
 }
+// One delegated handler for every error box that shows the button. A
+// server without the route (older build) says so instead of failing silently.
+let reimportRawBusy = false;
+async function hReimportRaw(btn) {
+  if (reimportRawBusy) return;
+  const pending = hRawReimport;
+  // It deletes the kept raw image and makes it again from the evidence: ask.
+  const go = await askDialog({
+    title: "원본 이미지 다시 가져오기",
+    html: `<p>보관된 원본 이미지(raw)가 기록과 다릅니다${pending && pending.reason ? ` (${esc(String(pending.reason))})` : ""}.</p>` +
+      (pending && pending.raw_path ? `<p><code>${esc(String(pending.raw_path))}</code></p>` : "") +
+      `<p>계속하면 이 raw 파일을 <b>삭제</b>하고(감사 로그에 기록) 증거 이미지(E01)에서 다시 만든 뒤 같은 분석을 다시 실행합니다.</p>`,
+    okLabel: "삭제 후 다시 가져오기",
+    cancelLabel: "취소",
+    danger: true,
+    focus: "dlgCancel",
+  });
+  if (!go) return;
+  reimportRawBusy = true;
+  if (btn) { btn.disabled = true; btn.setAttribute("aria-busy", "true"); btn.textContent = "다시 가져오는 중…"; }
+  let res = null;
+  const body = pending && pending.raw_path ? { raw_path: String(pending.raw_path) } : {};
+  const endpoint = pending && pending.endpoint === "/api/reimport-raw" ? pending.endpoint : "/api/reimport-raw";
+  try { res = await jpost(endpoint, body); } catch (e) { res = { ok: false, error: String((e && e.message) || e) }; }
+  reimportRawBusy = false;
+  if (btn && btn.isConnected) { btn.disabled = false; btn.removeAttribute("aria-busy"); btn.textContent = "원본 다시 가져오기"; }
+  if (res && res.ok) {
+    toast("원본 이미지를 다시 가져오는 작업을 시작했습니다 — 작업 시트(Alt+J)에서 진행을 볼 수 있습니다.", "ok");
+    if (typeof poll === "function") { clearTimeout(pollTimer); poll(); }
+  } else if (res && (Number(res.status) === 404 || Number(res.status) === 405)) {
+    toast("이 서버 버전은 원본 다시 가져오기를 지원하지 않습니다 — FrameTrace를 업데이트한 뒤 다시 시도하십시오.", "err");
+  } else {
+    toast("원본 다시 가져오기 실패: " + ((res && res.error) || "알 수 없는 오류"), "err");
+  }
+}
+document.addEventListener("click", ev => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest("button[data-reimport-raw]") : null;
+  if (btn) hReimportRaw(btn);
+});
 
 // ---- server-lost banner (UX-05) ----
 // A lost server is a connection state, not a phase: the store keeps the
@@ -436,6 +489,8 @@ function applyStatus(st) {
   setCaseToolsVisible(!!caseDir && (REVIEW_PHASES.includes(st.phase) || st.phase === "finalizing"));
   setCaseJobButtons(!!st.busy || (typeof caseJob !== "undefined" && !!caseJob && !caseJob.outcome));
 
+  // R5 (S6): the server names a raw image waiting for the examiner's decision.
+  hRawReimport = st.raw_reimport && typeof st.raw_reimport === "object" ? st.raw_reimport : null;
   const errEl = $("startErr");
   if (errEl) {
     if (st.error && st.phase !== "review-partial" && st.phase !== "review-ready" && st.phase !== "done" && st.phase !== "finalized") {

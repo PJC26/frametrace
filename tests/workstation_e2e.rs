@@ -11,6 +11,7 @@
 //! ```
 
 mod common;
+use common::IsolatedCommand;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -175,7 +176,7 @@ fn workstation_full_pipeline_over_http() {
     let app = env!("CARGO_BIN_EXE_frametrace-app");
     let mut child: Child = Command::new(app)
         .arg(port.to_string())
-        .envs(common::isolated_env())
+        .isolated()
         .env("FRAMETRACE_NO_BROWSER", "1")
         // Never read or overwrite the user's ~/.frametrace/server.json.
         .env("FRAMETRACE_INSTANCE_FILE", work.join("server.json"))
@@ -327,7 +328,7 @@ fn workstation_csrf_and_unc_hardening_over_http() {
     let app = env!("CARGO_BIN_EXE_frametrace-app");
     let mut child: Child = Command::new(app)
         .arg(port.to_string())
-        .envs(common::isolated_env())
+        .isolated()
         .env("FRAMETRACE_NO_BROWSER", "1")
         .env("FRAMETRACE_INSTANCE_FILE", work.join("server.json"))
         .env("XDG_CONFIG_HOME", work.join("config"))
@@ -416,7 +417,7 @@ fn boot_isolated(port: u16, work: &std::path::Path) -> Child {
     let app = env!("CARGO_BIN_EXE_frametrace-app");
     let mut child: Child = Command::new(app)
         .arg(port.to_string())
-        .envs(common::isolated_env())
+        .isolated()
         .env("FRAMETRACE_NO_BROWSER", "1")
         .env("FRAMETRACE_INSTANCE_FILE", work.join("server.json"))
         .env("XDG_CONFIG_HOME", work.join("config"))

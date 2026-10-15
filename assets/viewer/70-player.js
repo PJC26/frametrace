@@ -170,6 +170,19 @@ const viewerBridge = {
     redoJournal();
     return playerDescriptor();
   },
+  // R5 U8: the pop-out's frame capture goes through the viewer's common
+  // POST door (viewerPost) like every other request: a 401 reads as the
+  // authorization refusal (and reaches the host banner), not "offline".
+  // Resolves { ok, path?, error?, auth? } — never rejects.
+  async capture(arg) {
+    try {
+      const body = arg && typeof arg === "object" ? { id: String(arg.id || "unknown"), image: String(arg.image || ""), time: String(arg.time || "") } : {};
+      const data = await viewerPost("/api/capture-frame", body);
+      return data && typeof data === "object" ? data : { ok: false, error: "?" };
+    } catch (err) {
+      return err && err.ftAuth ? { ok: false, auth: true, error: err.message } : { ok: false, offline: true, error: t("player.capOffline") };
+    }
+  },
   // Filtered list for the popup's quick-jump sidebar — mirrors the main
   // grid order so popup position always matches what the examiner sees.
   list() {
@@ -207,6 +220,7 @@ if (playerChannel) {
     else if (m.type === "list") reply(viewerBridge.list());
     else if (m.type === "undo") reply(viewerBridge.undo());
     else if (m.type === "redo") reply(viewerBridge.redo());
+    else if (m.type === "capture") viewerBridge.capture(m.arg).then(reply);
   }, { signal: ftSignal });
   // One channel per mount: closing it on destroy() means a stale mount can
   // never answer (or write) for the popup.
@@ -296,13 +310,13 @@ var cur=null;
 v.playbackRate=${jsLit(rate)};
 var TOKEN=${jsLit(FTViewer.writerToken)};var seqN=0,pend={},chan=("BroadcastChannel" in window)?new BroadcastChannel(${jsLit(`ft-player:${manifest.case_id || "case"}`)}):null;
 if(chan){chan.onmessage=function(ev){var m=ev.data||{},f=m.seq&&pend[m.seq];if(f){delete pend[m.seq];f(m.payload);}};}
-function call(op,arg,cb){
+function call(op,arg,cb,ms){
 var b=(window.opener&&!window.opener.closed&&window.opener.__ftBridge)||null;
-if(b){try{cb(b[op](arg));}catch(e){cb(undefined);}return;}
+if(b){try{var r=b[op](arg);if(r&&typeof r.then==="function")r.then(cb,function(){cb(undefined);});else cb(r);}catch(e){cb(undefined);}return;}
 if(!chan){cb(undefined);return;}
 var s=++seqN;pend[s]=cb;
 chan.postMessage({type:op,seq:s,arg:arg,token:TOKEN});
-setTimeout(function(){if(pend[s]){delete pend[s];cb(undefined);}},3000);
+setTimeout(function(){if(pend[s]){delete pend[s];cb(undefined);}},ms||3000);
 }
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]});}
 function note(t){document.getElementById("note").textContent=t||"";}
@@ -352,7 +366,12 @@ if(!v.videoWidth){note(${jsLit(t("player.noVideo"))});return;}
 var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
 c.getContext("2d").drawImage(v,0,0);
 var du=c.toDataURL("image/jpeg",0.92);
-fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify({id:cur?cur.id:"unknown",image:du.slice(du.indexOf(",")+1),time:v.currentTime.toFixed(2)})}).then(function(r){return r.json()}).then(function(d){note(d.ok?${jsLit(t("player.savedPfx"))}+" "+d.path:${jsLit(t("player.capFailPfx"))}+" "+(d.error||""))}).catch(function(){note(${jsLit(t("player.capOffline"))})});
+var arg={id:cur?cur.id:"unknown",image:du.slice(du.indexOf(",")+1),time:v.currentTime.toFixed(2)};
+function shown(d){note(d.ok?${jsLit(t("player.savedPfx"))}+" "+d.path:d.auth?String(d.error||${jsLit(t("net.authRefused"))}):${jsLit(t("player.capFailPfx"))}+" "+(d.error||""));}
+call("capture",arg,function(d){
+if(d){shown(d);return;}
+fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify(arg)}).then(function(r){if(r.status===401)return{ok:false,auth:true,error:${jsLit(t("net.authRefused"))}};return r.json().catch(function(){return{ok:false,error:"HTTP "+r.status};});}).then(shown).catch(function(){note(${jsLit(t("player.capOffline"))})});
+},30000);
 };
 v.addEventListener("ended",function(){nav(1,true);});
 var NAV={ArrowUp:1,ArrowDown:1,ArrowLeft:1,ArrowRight:1,Home:1,End:1,PageUp:1,PageDown:1," ":1,Enter:1,Tab:1};

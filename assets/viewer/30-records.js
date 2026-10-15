@@ -577,6 +577,12 @@ function audioDetailFor(record) {
   }
 }
 
+// R5 U16: the server's per-record proxy (`proxy_path` on the row; null or
+// "" = it has none). undefined when the row does not carry the field.
+function serverProxyOf(row) {
+  if (!row || !Object.prototype.hasOwnProperty.call(row, "proxy_path")) return undefined;
+  return typeof row.proxy_path === "string" ? row.proxy_path : "";
+}
 const records = [
   ...videos.map(video => {
     const validation = validationsByPath.get(normalizePath(video.source_path));
@@ -602,6 +608,7 @@ const records = [
       modifiedUnix: video.modified_unix,
       inode: video.inode,
       fps: videoFps(video),
+      serverProxy: serverProxyOf(video),
       validation
     };
   }),
@@ -630,6 +637,7 @@ const records = [
       note: validation?.validation_note || item.validation_note || "-",
       offset: item.offset,
       indexStatus: "active",
+      serverProxy: serverProxyOf(item),
       validation
     };
   }),
@@ -688,6 +696,7 @@ const records = [
       originalPath: original?.path || "",
       warnings: Array.isArray(item.warnings) ? item.warnings : [],
       indexStatus: "active",
+      serverProxy: serverProxyOf(item),
       validation
     };
   }),
@@ -804,28 +813,68 @@ records.forEach(record => {
 // first listing position per prefix. Each record then resolves with Map
 // lookups — the earliest-listed match wins, exactly as the former
 // per-record linear find did, without the O(records x proxies) scan.
-const proxyFiles = Array.isArray(DATA.proxies) ? DATA.proxies : [];
-const proxyIndexByPrefix = new Map();
-proxyFiles.forEach((path, index) => {
-  const name = String(path).split(/[\\\/]/).pop() || "";
-  if (!name.endsWith(".mp4")) return;
-  // R4 D5: current proxies are path-free — proxy_<sanitized id>_<hash8>(_NNN).mp4.
-  const fresh = /^proxy_(.+)_[0-9a-f]{8}(?:_\d{3})?\.mp4$/.exec(name);
-  if (fresh && !proxyIndexByPrefix.has(fresh[1])) proxyIndexByPrefix.set(fresh[1], index);
-  // Older "<sanitized id or path>_proxy_…" names keep working.
-  for (let at = name.indexOf("_proxy_"); at >= 0; at = name.indexOf("_proxy_", at + 1)) {
-    const prefix = name.slice(0, at);
-    if (!proxyIndexByPrefix.has(prefix)) proxyIndexByPrefix.set(prefix, index);
+// R5 U16 (P9/S15): a name match cannot tell two records apart whose
+// sanitized keys collide (a legacy carve id and an indexed id, an id that
+// is a prefix of another). When the server says per record which proxy is
+// whose — records-meta `proxy_paths` {id: path} (also `proxyPaths`), proxy
+// entries given as objects {record_id|id, proxy_path|path}, or a
+// `proxy_path` on the record rows themselves — that answer is the ONLY one
+// used (an id it does not name has no proxy). A server without it (older
+// builds) keeps the file-name match below.
+function resolveProxyPaths(list, data) {
+  const files = Array.isArray(data.proxies) ? data.proxies : [];
+  let byId = null;
+  const own = (map, id, path) => {
+    if (typeof id !== "string" || !id) return;
+    if (!map.has(id)) map.set(id, typeof path === "string" ? path : "");
+  };
+  const given = data.proxyPaths || data.proxy_paths;
+  const mapObj = given && typeof given === "object" && !Array.isArray(given) ? given : null;
+  if (mapObj) {
+    byId = new Map();
+    for (const [id, path] of Object.entries(mapObj)) own(byId, id, path);
   }
-});
-records.forEach(record => {
-  let best = -1;
-  for (const key of [record.id, record.path].filter(Boolean).map(sanitizeSelector)) {
-    const index = proxyIndexByPrefix.get(key);
-    if (index != null && (best < 0 || index < best)) best = index;
+  if (files.some(item => item && typeof item === "object")) {
+    byId = byId || new Map();
+    for (const item of files) if (item && typeof item === "object") own(byId, item.record_id || item.id, item.proxy_path ?? item.path);
   }
-  record.proxyPath = best >= 0 ? proxyFiles[best] : "";
-});
+  if (list.some(record => record.serverProxy !== undefined)) {
+    byId = byId || new Map();
+    for (const record of list) if (record.serverProxy !== undefined) own(byId, record.id, record.serverProxy || "");
+  }
+  if (byId) {
+    for (const record of list) {
+      const path = byId.get(record.id) || "";
+      // Absolute paths as given (like the `proxies` listing); a relative one
+      // is the case's artifacts path.
+      record.proxyPath = !path ? "" : /^(?:[A-Za-z]:[\\\/]|[\\\/])/.test(path) ? path : absolutizeArtifactPath(path);
+    }
+    return "server";
+  }
+  const proxyIndexByPrefix = new Map();
+  files.forEach((path, index) => {
+    const name = String(path).split(/[\\\/]/).pop() || "";
+    if (!name.endsWith(".mp4")) return;
+    // R4 D5: current proxies are path-free — proxy_<sanitized id>_<hash8>(_NNN).mp4.
+    const fresh = /^proxy_(.+)_[0-9a-f]{8}(?:_\d{3})?\.mp4$/.exec(name);
+    if (fresh && !proxyIndexByPrefix.has(fresh[1])) proxyIndexByPrefix.set(fresh[1], index);
+    // Older "<sanitized id or path>_proxy_…" names keep working.
+    for (let at = name.indexOf("_proxy_"); at >= 0; at = name.indexOf("_proxy_", at + 1)) {
+      const prefix = name.slice(0, at);
+      if (!proxyIndexByPrefix.has(prefix)) proxyIndexByPrefix.set(prefix, index);
+    }
+  });
+  for (const record of list) {
+    let best = -1;
+    for (const key of [record.id, record.path].filter(Boolean).map(sanitizeSelector)) {
+      const index = proxyIndexByPrefix.get(key);
+      if (index != null && (best < 0 || index < best)) best = index;
+    }
+    record.proxyPath = best >= 0 ? files[best] : "";
+  }
+  return "names";
+}
+resolveProxyPaths(records, DATA);
 
 // O(1) lookups for the hot paths (selectedRecord, selectedRecords,
 // dual-channel pairing) — records never change after load.
@@ -1133,18 +1182,44 @@ function flushDraftsNow(quiet) {
   if (!quiet && typeof renderSaveState === "function") renderSaveState();
 }
 
+// R5 U1: while the case's annotations could not be read (A3, read-only),
+// every annotation edit is refused at its entry point (marks, tags, notes,
+// IN/OUT, undo/redo — the controls are disabled with the reason): an edit
+// made on top of values this window never saw would later overwrite (or
+// delete) the case's real marks. `annotationsReadOnly` (90-sync) is the
+// switch once that part ran; before it, the load error itself.
+function annotationsLocked() {
+  if (typeof annotationsReadOnly !== "undefined") return !!annotationsReadOnly;
+  return typeof annotationsError !== "undefined" && !!annotationsError;
+}
+// True (and says why, once per attempt) when an edit must not happen now.
+function refuseLockedEdit() {
+  if (!annotationsLocked()) return false;
+  if (typeof toast === "function") toast(t("save.readonlyEdit"));
+  return true;
+}
+
 // Records a mutation of `id` (call AFTER the mutation: the draft snapshots
 // the resulting state). The base revision stays the one the first unsaved
 // edit was made on; opts.base overrides it (a conflict resolution moves it
 // to the server's revision). An id with an open conflict stays in conflict
 // (its "mine" follows the edit) until the examiner resolves it.
+// R5 U1: a draft written while the annotations were unreadable (it cannot
+// happen through the UI any more, but a stored one from an older build or
+// a path that slipped through can) is marked `unsafe_base`: it was made on
+// values this window never saw, so it is sent with base_revision -1 — the
+// server treats that as a conflict ALWAYS, even when this same window
+// wrote the stored revision (the same-window exception does not apply).
+// Only a conflict resolution (opts.base) clears the mark.
 function touchAnnotation(id, opts) {
   if (typeof bumpAnnotations === "function") bumpAnnotations();
   state.examiners[id] = (state.examiner || "").trim() || state.examiners[id] || null;
   const prev = state.drafts[id];
   const known = state.revisions && Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
-  const base = opts && Number.isFinite(opts.base) ? opts.base : (prev && Number.isFinite(prev.base) ? prev.base : known);
+  const resolved = !!(opts && Number.isFinite(opts.base));
+  const base = resolved ? opts.base : (prev && Number.isFinite(prev.base) ? prev.base : known);
   const draft = { ...draftValuesOf(id), seq: nextDraftSeq(), base };
+  if (annotationsLocked() || (!resolved && prev && prev.unsafe_base === true)) draft.unsafe_base = true;
   const conflicted = typeof conflictIds !== "undefined" && conflictIds.has(id);
   if (conflicted && prev && prev.conflict) draft.conflict = prev.conflict;
   state.drafts[id] = draft;
@@ -1198,6 +1273,8 @@ function adoptDraft(id, draft, writer, key) {
     base: Number.isFinite(draft.base) ? draft.base : 0
   };
   if (draft.conflict && typeof draft.conflict === "object") adopted.conflict = draft.conflict;
+  // R5 U1: made while the annotations were unreadable — always a conflict.
+  if (draft.unsafe_base === true) adopted.unsafe_base = true;
   state.drafts[id] = adopted;
   if (!mine && key) {
     let stored = false;
@@ -1253,24 +1330,43 @@ function noteOrphanDraft(entry) {
 // deleted range never comes back on its own. The key goes once every
 // entry is stored. Standalone (file://): the bundle is the reference — the
 // leftovers are never applied, only reported (legacyRangesLeft).
+// R5 U2: nothing is migrated while the annotations could not be read (the
+//   "server" side of the comparison would be the empty read-only view and
+//   a migrated draft would carry values this window never saw); the key
+//   stays for a boot that can read them.
+// R5 U3: an id this case does not list (yet: a live index still growing)
+//   is moved to RANGES_HELD_KEY — never dropped with the retired key — and
+//   every later boot re-checks the held entries.
 function migrateLegacyRanges(annotations) {
+  if (typeof annotationsError !== "undefined" && annotationsError) return 0;
   let raw = null;
-  try { raw = localStorage.getItem(RANGES_KEY); } catch (error) { return 0; }
-  if (raw == null) return 0;
-  let stored = null;
-  try { stored = JSON.parse(raw); } catch (error) { stored = null; }
-  const entries = Object.entries(stored && typeof stored === "object" ? stored : {})
-    .map(([id, r]) => [id, draftNormRange(r)]).filter(([, r]) => r);
+  let heldRaw = null;
+  try {
+    raw = localStorage.getItem(RANGES_KEY);
+    heldRaw = typeof RANGES_HELD_KEY === "string" ? localStorage.getItem(RANGES_HELD_KEY) : null;
+  } catch (error) { return 0; }
+  if (raw == null && heldRaw == null) return 0;
+  const parseMap = text => {
+    if (text == null) return {};
+    try { const v = JSON.parse(text); return v && typeof v === "object" ? v : {}; } catch (error) { return {}; }
+  };
+  const entries = Object.entries(parseMap(raw)).map(([id, r]) => [id, draftNormRange(r)]).filter(([, r]) => r);
   const served = location.protocol === "http:" || location.protocol === "https:";
   if (!served) {
+    if (raw == null) return 0;
     if (entries.length) legacyRangesLeft = { count: entries.length, ranges: Object.fromEntries(entries) };
     else { try { localStorage.removeItem(RANGES_KEY); } catch (error) { /* harmless */ } }
     return 0;
   }
+  // Held entries first; a value of the same id still in RANGES_KEY wins.
+  const all = new Map(Object.entries(parseMap(heldRaw)).map(([id, r]) => [id, draftNormRange(r)]).filter(([, r]) => r));
+  for (const [id, range] of entries) all.set(id, range);
+  const stillHeld = {};
   let moved = 0;
   let complete = true;
-  for (const [id, range] of entries) {
-    if (state.drafts[id] || !recordById.has(id)) continue; // a draft is newer; an unknown id has nothing to show
+  for (const [id, range] of all) {
+    if (!recordById.has(id)) { stillHeld[id] = range; continue; } // U3: held, re-checked next boot
+    if (state.drafts[id]) continue; // a draft is newer
     const server = serverDraftValues(annotations, id);
     if (JSON.stringify(server.range) === JSON.stringify(range)) continue;
     const known = Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
@@ -1295,7 +1391,15 @@ function migrateLegacyRanges(annotations) {
     restoredConflictIds.push(id);
     moved += 1;
   }
-  if (complete) { try { localStorage.removeItem(RANGES_KEY); } catch (error) { /* retried next boot */ } }
+  if (!complete) return moved; // both keys stay: retried next boot
+  try {
+    if (Object.keys(stillHeld).length) localStorage.setItem(RANGES_HELD_KEY, JSON.stringify(stillHeld));
+    else if (heldRaw != null) localStorage.removeItem(RANGES_HELD_KEY);
+  } catch (error) {
+    reportStorageError(error);
+    return moved; // the unknown ids could not be held: RANGES_KEY stays
+  }
+  if (raw != null) { try { localStorage.removeItem(RANGES_KEY); } catch (error) { /* retried next boot */ } }
   return moved;
 }
 
