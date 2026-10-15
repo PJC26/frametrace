@@ -2686,21 +2686,51 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// R8-I9: records that a finalize abandoned the sign-off entry it had
+/// already chained (the finalize is already failing; the sign-off is
+/// simply never promoted).
+///
+/// R9-S5: a failure to record it was only a job log line, and the error
+/// the finalize returned did not say that the audit trail now shows an
+/// unfinished finalize's sign-off as the latest one. It returns that
+/// explanation (also logged) for the caller to append to its error.
+fn abandon_signoff(
+    case_dir: &Path,
+    signoff_text: &str,
+    reason: &str,
+    state: &SharedState,
+) -> Option<String> {
+    let err = crate::report::record_signoff_abandoned(case_dir, signoff_text, reason).err()?;
+    let note = abandon_failure_note(&err);
+    state_lock(state).logs.push(format!("경고: {note}"));
+    Some(note)
+}
+
+/// R9-S5: what a failed abandon record means for the examiner.
+fn abandon_failure_note(err: &str) -> String {
+    format!(
+        "또한 이 검토자 기록을 감사 로그에 '완료되지 않음'으로 남기지 못했습니다 ({err}). 감사 로그(evidence/logs/signoff-log.jsonl)에는 끝나지 않은 이 최종화의 검토자 기록이 마지막 기록으로 남아 있어, 이후 보고서·검증이 그것을 최신 검토자 기록으로 볼 수 있습니다. 감사 로그 폴더를 쓸 수 있는지 확인한 뒤 최종화를 다시 실행하면 새 검토자 기록이 그 뒤에 남습니다."
+    )
+}
+
+/// R9-S4: beside a package published by a finalize that then failed to
+/// promote its sign-off (outside the package, so verify-package still
+/// sees exactly the files it lists - R6-S5).
+pub(crate) fn finalize_incomplete_marker(package_dir: &Path) -> PathBuf {
+    let mut name = package_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".finalize-incomplete.txt");
+    package_dir.with_file_name(name)
+}
+
 /// R4-B18 call site for track D's `record_signoff_audit(case_dir,
 /// &Signoff)` (D13: chains the sign-off into `signoff-log.jsonl`, keyed
 /// when an audit key is configured).
 ///
 /// Parses `signoff_json` (the exact pending `signoff.json` text) into
 /// `report::Signoff` and appends it with `report::record_signoff_audit`.
-/// R8-I9: records that a finalize abandoned the sign-off entry it had
-/// already chained. A failure to record is surfaced as a job log line (the
-/// finalize is already failing; the sign-off is simply never promoted).
-fn abandon_signoff(case_dir: &Path, signoff_text: &str, reason: &str, state: &SharedState) {
-    if let Err(err) = crate::report::record_signoff_abandoned(case_dir, signoff_text, reason) {
-        state_lock(state).logs.push(format!("경고: {err}"));
-    }
-}
-
 pub(crate) fn record_signoff_audit(case_dir: &Path, signoff_json: &str) -> Result<(), String> {
     #[cfg(test)]
     {
@@ -2873,14 +2903,43 @@ pub(crate) fn finalize_with_exe(
     } else {
         report.clone()
     };
+    // R9-S5: why the abandon record could not be written, if it failed.
+    let mut abandon_note: Option<String> = None;
     let promoted = match (&report, &packaging) {
         (Ok(_), Ok(_)) => std::fs::rename(
             &pending_signoff,
             case_dir.join(crate::report::SIGNOFF_REL_PATH),
         )
-        .map_err(|err| format!("검토자 기록 확정 실패: {err}"))
+        .map_err(|err| {
+            // R9-S4: the package is already published at this point; R8
+            // reported only "검토자 기록 확정 실패" while a complete-looking
+            // package (carrying this sign-off) sat in reports/.
+            let package = super::media::newest_package_dir(case_dir);
+            let marked = package.as_deref().and_then(|dir| {
+                let marker = finalize_incomplete_marker(dir);
+                std::fs::write(
+                    &marker,
+                    format!(
+                        "FrameTrace: 최종화 미완료 — 이 패키지({})는 만들어졌지만 검토자 기록을 확정하지 못해 최종화가 끝나지 않았습니다 ({err}). 이 패키지를 최종 결과로 쓰지 말고 최종화를 다시 실행하십시오.\nFinalize incomplete: this package was written but the sign-off could not be promoted; do not use it as the final result, finalize again.\n",
+                        dir.display()
+                    ),
+                )
+                .ok()
+                .map(|()| marker)
+            });
+            match package {
+                Some(dir) => format!(
+                    "검토자 기록 확정 실패: {err} — 패키지는 이미 {}에 만들어졌지만 최종화는 끝나지 않았습니다(최종화 미완료). {}이 패키지를 최종 결과로 쓰지 말고, 원인(파일을 잡고 있는 프로그램 등)을 해결한 뒤 최종화를 다시 실행하십시오.",
+                    dir.display(),
+                    marked
+                        .map(|marker| format!("패키지 옆에 표식 {}을(를) 남겼습니다. ", marker.display()))
+                        .unwrap_or_else(|| "표식 파일도 남기지 못했습니다. ".to_string())
+                ),
+                None => format!("검토자 기록 확정 실패: {err} — 최종화는 끝나지 않았습니다."),
+            }
+        })
         .inspect_err(|err| {
-            abandon_signoff(case_dir, &signoff.text, err, state);
+            abandon_note = abandon_signoff(case_dir, &signoff.text, err, state);
             let _ = std::fs::remove_file(&pending_signoff);
         }),
         _ => {
@@ -2892,7 +2951,7 @@ pub(crate) fn finalize_with_exe(
                 .or(packaging.as_ref().err())
                 .cloned()
                 .unwrap_or_default();
-            abandon_signoff(case_dir, &signoff.text, &reason, state);
+            abandon_note = abandon_signoff(case_dir, &signoff.text, &reason, state);
             let _ = std::fs::remove_file(&pending_signoff);
             // The report on disk was rendered with the abandoned sign-off;
             // re-render it from the promoted state (best effort) so it does
@@ -2939,7 +2998,10 @@ pub(crate) fn finalize_with_exe(
             )
         }
         (report, packaging) => {
-            let error = report.err().or_else(|| packaging.err()).unwrap_or_default();
+            let mut error = report.err().or_else(|| packaging.err()).unwrap_or_default();
+            if let Some(note) = abandon_note {
+                error = format!("{error} {note}");
+            }
             guard.phase = "review-ready";
             guard.error = Some(error.clone());
             serde_json::json!({"ok": false, "error": error}).to_string()

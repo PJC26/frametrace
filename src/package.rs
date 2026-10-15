@@ -231,6 +231,15 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
 /// folder for a candidate FIRST and the (empty) final-name reservation
 /// second. Returns `(final, work)`; both exist.
 fn reserve_package_dirs(base: &Path, pid: u32) -> Result<(PathBuf, PathBuf), String> {
+    reserve_package_dirs_with(base, pid, &reservation_rename)
+}
+
+/// [`reserve_package_dirs`] with the placing rename injected (tests).
+fn reserve_package_dirs_with(
+    base: &Path,
+    pid: u32,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(PathBuf, PathBuf), String> {
     let parent = base.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
@@ -284,13 +293,26 @@ fn reserve_package_dirs(base: &Path, pid: u32) -> Result<(PathBuf, PathBuf), Str
                 candidate.display()
             ));
         }
-        if place_reservation(&staging, &candidate) {
-            return Ok((candidate, work));
+        match place_reservation_with(&staging, &candidate, rename) {
+            Placement::Placed => return Ok((candidate, work)),
+            // Taken meanwhile (another package-case): next name.
+            Placement::Taken => {
+                let _ = fs::remove_dir_all(&staging);
+                let _ = fs::remove_dir(&work);
+            }
+            // R9-S3: any other failure fails the reservation now. R8 went
+            // on to the next name, so a rename that kept failing for every
+            // name (no permission to rename in the folder, a filter
+            // driver) cost 10,000 names x the 1.85 s backoff - hours.
+            Placement::Failed(err) => {
+                let _ = fs::remove_dir_all(&staging);
+                let _ = fs::remove_dir(&work);
+                return Err(format!(
+                    "패키지 폴더 이름 {}을(를) 예약하지 못했습니다 ({err}) — 폴더의 쓰기·이름 바꾸기 권한과 백신·동기화 프로그램을 확인한 뒤 다시 패키징하십시오.",
+                    candidate.display()
+                ));
+            }
         }
-        // Taken meanwhile (another package-case), or the rename kept
-        // failing: next name.
-        let _ = fs::remove_dir_all(&staging);
-        let _ = fs::remove_dir(&work);
     }
     Err(format!(
         "no free package folder name next to {}",
@@ -298,17 +320,43 @@ fn reserve_package_dirs(base: &Path, pid: u32) -> Result<(PathBuf, PathBuf), Str
     ))
 }
 
-/// R8-S6: renames the marked `staging` folder onto `reserved`. `false`
-/// when the name exists (taken — never replaced: [`reservation_rename`]
-/// refuses an existing target) or the rename still fails after the
-/// R5-S12 backoff (a fresh folder briefly held by an antivirus scan).
+/// R9-S3: what placing a reservation came to.
+#[derive(Debug)]
+enum Placement {
+    Placed,
+    /// The name exists (taken - never replaced).
+    Taken,
+    /// The rename still failed after the R5-S12 backoff.
+    Failed(std::io::Error),
+}
+
+/// R8-S6: renames the marked `staging` folder onto `reserved`.
+#[cfg(test)]
 fn place_reservation(staging: &Path, reserved: &Path) -> bool {
+    matches!(
+        place_reservation_with(staging, reserved, &reservation_rename),
+        Placement::Placed
+    )
+}
+
+/// R8-S6: renames the marked `staging` folder onto `reserved` with
+/// `rename`: [`Placement::Taken`] when the name exists
+/// ([`reservation_rename`] refuses an existing target), else retried with
+/// the R5-S12 backoff (a fresh folder briefly held by an antivirus scan)
+/// and [`Placement::Failed`] with the last error when it never succeeds.
+fn place_reservation_with(
+    staging: &Path,
+    reserved: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Placement {
     let mut attempt = 0usize;
     loop {
-        match reservation_rename(staging, reserved) {
-            Ok(()) => return true,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return false,
-            Err(_) if attempt >= RENAME_BACKOFF_MS.len() => return false,
+        match rename(staging, reserved) {
+            Ok(()) => return Placement::Placed,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Placement::Taken;
+            }
+            Err(err) if attempt >= RENAME_BACKOFF_MS.len() => return Placement::Failed(err),
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_millis(RENAME_BACKOFF_MS[attempt]));
                 attempt += 1;
@@ -3094,6 +3142,45 @@ mod tests {
         .unwrap();
         crate::join::sweep_stale_parts_with(&reports, &|_| crate::util::ProcessProbe::Gone, 0);
         assert!(!crate::join::reservation_staging_path(&reports.join("package_8"), 4243).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R9-S3: a placing rename that fails for a reason other than "the
+    /// name exists" fails the reservation after the one backoff (5
+    /// attempts) - R8 moved on to the next of 10,000 names, each with the
+    /// full backoff, so a persistent failure kept package-case busy for
+    /// hours. Nothing is left behind, and a taken name still moves on.
+    #[test]
+    fn r9_s3_persistent_reservation_failure_fails_fast() {
+        let root = std::env::temp_dir().join(format!("ft-r9-s3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let reports = root.join("reports");
+        fs::create_dir_all(&reports).unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let denied = |_: &std::path::Path, _: &std::path::Path| -> std::io::Result<()> {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "access denied",
+            ))
+        };
+        let started = std::time::Instant::now();
+        let err = super::reserve_package_dirs_with(&reports.join("package_5"), 4242, &denied)
+            .expect_err("a persistent failure must fail the reservation");
+        assert_eq!(calls.get(), 5, "one name, one backoff");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            err.contains("access denied") && err.contains("package_5"),
+            "{err}"
+        );
+        let left: Vec<_> = fs::read_dir(&reports).unwrap().flatten().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+        // A taken name still moves on to the next one.
+        fs::create_dir_all(reports.join("package_5")).unwrap();
+        let (reserved, work) =
+            super::reserve_package_dirs(&reports.join("package_5"), 4242).expect("reserve");
+        assert_eq!(reserved, reports.join("package_5_001"));
+        assert!(work.is_dir());
         let _ = fs::remove_dir_all(root);
     }
 

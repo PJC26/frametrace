@@ -988,11 +988,51 @@ pub const STEP_WARNING_MARKER: &str = "FRAMETRACE-STEP-WARNING: ";
 pub const STEP_WARNING_ENV: &str = "FRAMETRACE_STEP_WARNINGS";
 
 /// R8-S7: the per-step token in [`STEP_WARNING_ENV`], when it is one
-/// (16–64 ASCII hex digits).
+/// (16–64 ASCII hex digits). R9-S7: the token this process adopted at
+/// start ([`adopt_step_warning_token`]); the environment only when it
+/// adopted none (library callers, tests).
 pub fn step_warning_token() -> Option<String> {
-    let token = std::env::var(STEP_WARNING_ENV).ok()?;
+    if let Some(adopted) = ADOPTED_STEP_TOKEN.get() {
+        return adopted.clone();
+    }
+    valid_step_token(std::env::var(STEP_WARNING_ENV).ok()?)
+}
+
+fn valid_step_token(token: String) -> Option<String> {
     let valid = (16..=64).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_hexdigit());
     valid.then_some(token)
+}
+
+/// R9-S7: the step token read (and removed from the environment) at
+/// process start.
+static ADOPTED_STEP_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// R9-S7: keeps this step's token for [`step_warning_token`] and removes
+/// [`STEP_WARNING_ENV`] from the process environment, so the tools the
+/// step runs (ffmpeg, ffprobe, Sleuth Kit, libewf, python, ...) never
+/// inherit it. R8 left it in the environment: every grandchild held the
+/// token that makes a stderr line a job warning, and its output reaches
+/// the same stderr.
+///
+/// # Safety
+/// Removes an environment variable: call it first thing in `main`, before
+/// any other thread exists (no concurrent environment access).
+pub unsafe fn adopt_step_warning_token() {
+    // SAFETY: forwarded to the caller (single-threaded process start).
+    let token = unsafe { take_env_var(STEP_WARNING_ENV) };
+    let _ = ADOPTED_STEP_TOKEN.set(token.and_then(valid_step_token));
+}
+
+/// R9-S7: reads `name` and removes it from this process's environment.
+///
+/// # Safety
+/// As [`std::env::remove_var`]: no other thread may access the
+/// environment at the same time.
+pub unsafe fn take_env_var(name: &str) -> Option<String> {
+    let value = std::env::var_os(name)?;
+    // SAFETY: forwarded to the caller.
+    unsafe { std::env::remove_var(name) };
+    value.into_string().ok()
 }
 
 /// R8-S7: `marker` (`"NAME: "`) bound to a step token: `"NAME[token]: "`.

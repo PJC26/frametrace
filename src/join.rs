@@ -607,6 +607,137 @@ pub fn video_packet_args(with_hashes: bool) -> Vec<&'static str> {
     args
 }
 
+/// R9-S2: the bitstream filters that make a packet payload comparable
+/// across what stream copy does to it: Annex B framing (the concat
+/// demuxer's `auto_convert` runs `h264_mp4toannexb`, a TS output is Annex
+/// B, an MP4 output length-prefixes again) and parameter sets / access
+/// unit delimiters (re-inserted before IDR frames, added by the TS muxer).
+/// The picture data (slices, SEI) is untouched. `None` for codecs stream
+/// copy does not rewrite (their raw payloads are compared).
+pub fn normalizing_bsf(codec: Option<&str>) -> Option<&'static str> {
+    match codec {
+        Some("h264") => Some("h264_mp4toannexb,filter_units=remove_types=7|8|9"),
+        Some("hevc") => Some("hevc_mp4toannexb,filter_units=remove_types=32|33|34|35"),
+        _ => None,
+    }
+}
+
+/// R9-S2: the ffmpeg arguments that print one SHA-256 per video packet of
+/// `path` (stream copy through [`normalizing_bsf`], `framehash` muxer).
+pub fn normalized_hash_args(path: &Path, bsf: Option<&str>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-v", "error", "-nostdin", "-i"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    args.push(path.as_os_str().to_os_string());
+    for arg in ["-map", "0:v:0", "-c", "copy"] {
+        args.push(arg.into());
+    }
+    if let Some(bsf) = bsf {
+        args.push("-bsf:v".into());
+        args.push(bsf.into());
+    }
+    for arg in ["-f", "framehash", "-hash", "sha256", "-"] {
+        args.push(arg.into());
+    }
+    args
+}
+
+/// R9-S2: the first 64 bits of each packet hash of `framehash` output
+/// (`stream, dts, pts, duration, size, hash[, side data…]` per line;
+/// `#` lines are headers). `None` when a line has no readable hash.
+pub fn parse_framehash(text: &str) -> Option<Vec<u64>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let hash = line.split(',').nth(5)?.trim();
+            hash.get(..16).and_then(|h| u64::from_str_radix(h, 16).ok())
+        })
+        .collect()
+}
+
+/// R9-S2: [`video_packets`] with each packet's hash taken from its
+/// NORMALIZED payload ([`normalizing_bsf`]) instead of its raw bytes.
+///
+/// R8 compared raw payload hashes, which stream copy changes for every
+/// IDR frame (parameter sets re-inserted, Annex B framing), so an
+/// all-intra segment could only be judged "rewritten" (no comparison —
+/// and a first packet that was no source packet passed unchecked) or
+/// compared raw (a mix of rewritten IDR frames and untouched frames was
+/// refused). Normalized, the same picture data compares equal whatever
+/// the muxer did, and every position is compared exactly.
+pub fn normalized_video_packets(
+    ffprobe: &str,
+    ffmpeg: &str,
+    path: &Path,
+    timeout_secs: Option<u64>,
+) -> Result<Vec<VideoPacket>, String> {
+    let mut packets = video_packets(ffprobe, path, timeout_secs, false)?;
+    let codec = video_codec_name(ffprobe, path, timeout_secs)?;
+    let binary = resolve_tool_binary(ffmpeg, &["ffmpeg"])?;
+    let mut command = Command::new(&binary);
+    command.args(normalized_hash_args(
+        path,
+        normalizing_bsf(codec.as_deref()),
+    ));
+    let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg packet hashing failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let hashes = parse_framehash(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        format!(
+            "ffmpeg packet hashing of {} printed an unreadable line",
+            path.display()
+        )
+    })?;
+    if hashes.len() != packets.len() {
+        return Err(format!(
+            "ffmpeg hashed {} video packets of {} but ffprobe lists {}",
+            hashes.len(),
+            path.display(),
+            packets.len()
+        ));
+    }
+    for (packet, hash) in packets.iter_mut().zip(hashes) {
+        packet.hash = Some(hash);
+    }
+    Ok(packets)
+}
+
+/// R9-S2: the first video stream's codec name (`None` when ffprobe names
+/// none).
+fn video_codec_name(
+    ffprobe: &str,
+    path: &Path,
+    timeout_secs: Option<u64>,
+) -> Result<Option<String>, String> {
+    let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
+    let mut command = Command::new(&binary);
+    command
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+        .arg(path);
+    let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe codec query failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string))
+}
+
 fn min_time(times: impl Iterator<Item = f64>) -> Option<f64> {
     times.fold(None, |acc: Option<f64>, t| {
         Some(acc.map_or(t, |a| a.min(t)))
@@ -817,20 +948,18 @@ fn edit_list_applied_mismatch(sources: &[SourcePackets], output: &[VideoPacket])
 /// are all key frames: the empty non-key fingerprints compare equal, and
 /// the key frames themselves are compared.
 ///
-/// R8-S1: R7 compared position by position and accepted when the output
-/// agreed with NEITHER the kept packets NOR the packets from the start —
-/// meant for "the muxer rewrote every key frame", it also accepted an
-/// output shifted part-way into the pre-roll (pre-roll frames kept, as
-/// many real frames lost at the end, agreeing with neither alignment).
-/// Whether the output was rewritten is now decided by SET membership:
-/// - no output packet's payload is any packet of the source → rewritten,
-///   the payloads cannot tell; accepted on count and timing like any
-///   other segment;
-/// - otherwise the output must carry exactly the kept packets, in order,
-///   one per position. Only the segment's first packet may differ (stream
-///   copy may re-insert parameter sets there), and only when it is not a
-///   source packet at all — so a one-frame segment is checked too (R7
-///   skipped the first packet and compared nothing).
+/// R8-S1 decided by set membership whether the muxer had rewritten the
+/// key frames: an output with no source payload at all was accepted on
+/// count and timing, and the segment's first packet was exempt whenever
+/// it was no source packet — so one wrong frame in that place (a pre-roll
+/// frame with its parameter sets re-inserted, a one-frame segment) passed,
+/// while an output where only the IDR frames were rewritten (a mix) was
+/// refused.
+///
+/// R9-S2: the hashes are of NORMALIZED payloads
+/// ([`normalized_video_packets`]): parameter sets and framing no longer
+/// differ, so the output must carry exactly the kept packets, in order,
+/// at EVERY position — no exemption, no "rewritten" escape.
 fn all_key_segment_mismatch(
     index: usize,
     source: &SourcePackets,
@@ -860,24 +989,17 @@ fn all_key_segment_mismatch(
         .filter(|(_, discard)| !**discard)
         .map(|(hash, _)| *hash)
         .collect();
-    let differs = || {
-        Some(format!(
-            "{}번째 구간의 출력 프레임이 원본의 유지 프레임과 다릅니다",
-            index + 1
-        ))
-    };
-    if observed.len() != kept.len() {
-        return differs();
-    }
-    let source_set: std::collections::HashSet<u64> = all.iter().copied().collect();
-    if observed.iter().all(|hash| !source_set.contains(hash)) {
-        return None;
-    }
-    for (position, (seen, wanted)) in observed.iter().zip(&kept).enumerate() {
-        if seen == wanted || (position == 0 && !source_set.contains(seen)) {
-            continue;
-        }
-        return differs();
+    if observed != kept {
+        let at = observed
+            .iter()
+            .zip(&kept)
+            .position(|(seen, wanted)| seen != wanted)
+            .unwrap_or(observed.len().min(kept.len()));
+        return Some(format!(
+            "{}번째 구간의 출력 프레임이 원본의 유지 프레임과 다릅니다 (구간 안 {}번째 프레임부터)",
+            index + 1,
+            at + 1
+        ));
     }
     None
 }
@@ -888,6 +1010,7 @@ fn all_key_segment_mismatch(
 /// unverified).
 pub fn verify_segments(
     ffprobe: &str,
+    ffmpeg: &str,
     output: &Path,
     plan: &JoinPlan,
     timeout_secs: Option<u64>,
@@ -907,7 +1030,14 @@ pub fn verify_segments(
         &sources,
         &offsets,
         output,
-        &mut |path, hashes| video_packets(ffprobe, path, timeout_secs, hashes),
+        // R9-S2: hashes are of normalized payloads (ffmpeg).
+        &mut |path, hashes| {
+            if hashes {
+                normalized_video_packets(ffprobe, ffmpeg, path, timeout_secs)
+            } else {
+                video_packets(ffprobe, path, timeout_secs, false)
+            }
+        },
         &mut |path| stream_packet_counts(ffprobe, path, timeout_secs),
     )
     .map_err(fail)
@@ -3444,6 +3574,7 @@ fn run_inner(
     // C14: packet-level check of every segment boundary in the output.
     let segment_check = verify_segments(
         &options.tools.ffprobe,
+        &options.tools.ffmpeg,
         &temps.part,
         plan,
         options.timeout_secs,
@@ -4861,14 +4992,15 @@ mod tests {
         let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &applied);
         assert!(check.ok, "{:?}", check.problems);
         assert_eq!(check.mode, "edit-list-applied");
-        // Every key frame rewritten by the muxer: nothing to compare, the
-        // empty fingerprints are equal.
+        // R9-S2: hashes are of normalized payloads, so a muxer rewrite
+        // (parameter sets, framing) no longer changes them: an output
+        // whose frames are all different is different, and refused.
         let mut rewritten = applied.clone();
         for (i, packet) in rewritten.iter_mut().take(60).enumerate() {
             packet.hash = Some(9_000_000 + i as u64);
         }
         let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &rewritten);
-        assert!(check.ok, "{:?}", check.problems);
+        assert!(!check.ok, "{:?}", check.problems);
         // Pre-roll kept, the last 30 real frames lost: same count, refused.
         let mut lost = rebase(&source[..60], 1.0);
         lost.extend(dts_run(2.0, 60));
@@ -4921,14 +5053,15 @@ mod tests {
             check.problems.iter().any(|p| p.contains("유지 프레임")),
             "partial shift passed: {check:?}"
         );
-        // The exact kept packets still pass; so does a rewritten first
-        // packet (parameter sets re-inserted) and a fully rewritten one.
+        // The exact kept packets still pass. R9-S2: a different first
+        // packet no longer does (normalized hashes; see
+        // `all_intra_first_packet_and_foreign_frames_are_refused`).
         let mut applied = presented(&source[30..]);
         applied.extend(dts_run(2.0, 60));
         assert!(evaluate_segment_check(&sources, &[0.0, 2.0], None, &applied).ok);
         let mut first_rewritten = applied.clone();
         first_rewritten[0].hash = Some(42);
-        assert!(evaluate_segment_check(&sources, &[0.0, 2.0], None, &first_rewritten).ok);
+        assert!(!evaluate_segment_check(&sources, &[0.0, 2.0], None, &first_rewritten).ok);
         // A source packet in the wrong place is never "rewritten".
         let mut first_moved = applied.clone();
         first_moved[0].hash = Some(5000);
@@ -4951,6 +5084,109 @@ mod tests {
         );
         let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &one_kept(&single[2]));
         assert!(check.ok, "{check:?}");
+    }
+
+    /// R9-S2: R8 exempted an all-intra segment's first output packet when
+    /// it was no source packet (meant for re-inserted parameter sets) and
+    /// accepted a segment none of whose packets was a source packet
+    /// ("every key frame rewritten"). One wrong frame in the first place —
+    /// a pre-roll frame kept as the only "kept" frame, rewritten by the
+    /// muxer — therefore passed, and so did entirely foreign frames. With
+    /// normalized payload hashes every position is compared exactly.
+    #[test]
+    fn all_intra_first_packet_and_foreign_frames_are_refused() {
+        let all_key = |count: u64, discarded: u64, base: u64| -> Vec<VideoPacket> {
+            (0..count)
+                .map(|i| VideoPacket {
+                    pts: Some(-1.0 + i as f64 / 30.0),
+                    dts: Some(-1.0 + i as f64 / 30.0),
+                    discard: i < discarded,
+                    key: true,
+                    hash: Some(base + i),
+                })
+                .collect()
+        };
+        let presented = |packets: &[VideoPacket]| -> Vec<VideoPacket> {
+            packets
+                .iter()
+                .map(|p| VideoPacket {
+                    discard: false,
+                    ..*p
+                })
+                .collect()
+        };
+        let source = all_key(90, 30, 5000);
+        let sources = [
+            SourcePackets::from_packets(&source, None),
+            SourcePackets::plain(60, None),
+        ];
+        let mut applied = presented(&source[30..]);
+        applied.extend(dts_run(2.0, 60));
+        assert!(evaluate_segment_check(&sources, &[0.0, 2.0], None, &applied).ok);
+        // The first kept frame replaced by a frame that is no source frame.
+        let mut first_foreign = applied.clone();
+        first_foreign[0].hash = Some(77);
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &first_foreign);
+        assert!(
+            check
+                .problems
+                .iter()
+                .any(|p| p.contains("1번째 프레임부터")),
+            "a wrong first frame passed: {check:?}"
+        );
+        // Every frame foreign: no longer "rewritten by the muxer".
+        let mut all_foreign = applied.clone();
+        for (i, packet) in all_foreign.iter_mut().take(60).enumerate() {
+            packet.hash = Some(1_000 + i as u64);
+        }
+        assert!(!evaluate_segment_check(&sources, &[0.0, 2.0], None, &all_foreign).ok);
+        // One kept frame, replaced by a foreign one (R8: exempt as "first").
+        let single = all_key(3, 2, 8000);
+        let sources = [
+            SourcePackets::from_packets(&single, None),
+            SourcePackets::plain(60, None),
+        ];
+        let mut one = presented(&single[2..]);
+        one[0].hash = Some(4242);
+        one.extend(dts_run(single[2].pts.unwrap() + 2.0, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &one);
+        assert!(!check.ok, "a foreign single kept frame passed: {check:?}");
+    }
+
+    /// R9-S2: the normalizing hash pipeline's pieces.
+    #[test]
+    fn normalized_hash_pipeline_parts() {
+        assert_eq!(
+            normalizing_bsf(Some("h264")),
+            Some("h264_mp4toannexb,filter_units=remove_types=7|8|9")
+        );
+        assert!(
+            normalizing_bsf(Some("hevc"))
+                .unwrap()
+                .contains("32|33|34|35")
+        );
+        assert_eq!(normalizing_bsf(Some("mjpeg")), None);
+        let args: Vec<String> =
+            normalized_hash_args(Path::new("in.mp4"), normalizing_bsf(Some("h264")))
+                .iter()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+        assert!(args.windows(2).any(|w| w == ["-c", "copy"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "-bsf:v"), "{args:?}");
+        assert!(args.ends_with(&[
+            "-f".into(),
+            "framehash".into(),
+            "-hash".into(),
+            "sha256".into(),
+            "-".into()
+        ]));
+        // Side-data columns (MPEG-TS) come after the packet hash.
+        let text = "#format: frame checksums\n#hash: SHA256\n#stream#, dts, pts, duration, size, hash\n0, 0, 0, 9000, 1671, db74c93919c9d461efce4de1047319601cc2d060889fd1edce1ba8813836f88f, S=1, 1, 7d8c5da7\n0, 1024, 1024, 1024, 1647, 0123456789abcdef00\n";
+        assert_eq!(
+            parse_framehash(text),
+            Some(vec![0xdb74c93919c9d461, 0x0123456789abcdef])
+        );
+        assert_eq!(parse_framehash("0, 0, 0, 1, 2\n"), None);
     }
 
     /// R7-S3: the segment check lists packets without payload hashes and
