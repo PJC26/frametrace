@@ -452,7 +452,7 @@ try {
   await page.keyboard.press('Control+z');
   check('⑨ U1: input reaching the note field, and Ctrl+Z, are refused (no draft)', await draftCount() === 0 && await page.evaluate(() => FTViewer.summary().pending) === 0);
   check('⑨ an edit is never sent, the state stays "readonly"', imports.length === 0 && await state() === 'readonly');
-  check('⑨ U15: read-only with nothing held here → save() true (closing needs no confirmation)', await page.evaluate(() => FTViewer.save()) === true && await state() === 'readonly');
+  check('⑨ U15: read-only with nothing held here → save() true (closing needs no confirmation)', await page.evaluate(() => FTViewer.save(/* no-budget: read-only answers at once */)) === true && await state() === 'readonly');
   // R6 U4: the desktop shell's close flush prefers window.hBeforeClose():
   // a standalone page has one too, answers at once and carries (and shows)
   // the read-only warning.
@@ -471,7 +471,7 @@ try {
   const seeded = { mark: { status: 'important', marked_unix: 1 }, note: '', tags: [], examiner: null, range: null, seq: 1, base: 0 };
   await open({ [`ft.draft.${CASE}.wdead.${C}`]: seeded }, { [`ft.alive:${CASE}:wdead`]: 'closed' });
   await page.waitForSelector('#annotationsErrorBanner');
-  check('⑨ U15: read-only WITH a held draft → save() false (the close asks)', await page.evaluate(() => FTViewer.save()) === false && imports.length === 0);
+  check('⑨ U15: read-only WITH a held draft → save() false (the close asks)', await page.evaluate(() => FTViewer.save(/* no-budget: read-only answers at once */)) === false && imports.length === 0);
   const close9b = await page.evaluate(() => window.hBeforeClose && window.hBeforeClose());
   check('⑨ U4: standalone hBeforeClose() with a held draft → ok false, no "nothing unsaved" warning', !!close9b && close9b.ok === false && !close9b.warning, JSON.stringify(close9b));
   check('⑨ R7 U10: its message is Korean (i18n "저장 안 된 편집 N건"), not "unsaved N"', !!close9b && /^저장 안 된 편집 \d+건$/.test(close9b.message || ''), JSON.stringify(close9b));
@@ -486,7 +486,7 @@ try {
   check('⑩ after a reload the queued value shows (important) and the state is "queued"', /important/.test(await chipOf(C)) && await state() === 'queued', await chipOf(C));
   const warns = await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented; });
   check('⑩ leaving the page warns while the server queue holds marks', warns === true);
-  check('⑩ FTViewer.save() is true (the queue is durable), the indicator is not "saved"', await page.evaluate(() => FTViewer.save()) === true && await state() === 'queued');
+  check('⑩ FTViewer.save({ patient: true }) is true (the queue is durable), the indicator is not "saved"', await page.evaluate(() => FTViewer.save({ patient: true })) === true && await state() === 'queued');
   // The queue drains: the value lands in the case DB.
   rows.set(C, { status: 'important', note: 'queued note', examiner: null, range: null, tags: ['현장'], rev: 1 });
   mock.pending = 0;
@@ -508,7 +508,7 @@ try {
   await open(null);
   await page.waitForFunction(() => FTViewer.saveState() === 'unknown', null, { timeout: 10000 });
   check('⑪ conflicts unreadable (both routes fail) → "unknown" ("충돌 확인 실패"), never "saved"',
-    /충돌 확인 실패/.test(await page.locator('#saveState').innerText()) && await page.evaluate(() => FTViewer.save()) === false);
+    /충돌 확인 실패/.test(await page.locator('#saveState').innerText()) && await page.evaluate(() => FTViewer.save(/* no-budget: the lookup failure answers at once */)) === false);
   mock.conflictsFail = false;
   mock.metaFail = false;
   mock.conflictPages = [];
@@ -618,7 +618,7 @@ try {
   await waitState('saved');
   await select(B);
   await page.keyboard.press('3');
-  const saved17 = await page.evaluate(() => FTViewer.save());
+  const saved17 = await page.evaluate(() => FTViewer.save({ patient: true })); // R9 U9
   check('⑰ U6: save() through two busy replies resolves true, the mark landed', saved17 === true && row(B).status === 'needs_verification' && imports.length >= 3, `${saved17}, ${imports.length} posts, ${row(B).status}`);
 
   // ---- R6 track U ---------------------------------------------------------
@@ -735,7 +735,7 @@ try {
   const timed = (expr) => page.evaluate(async (e) => {
     const opts = e.opts;
     const t0 = performance.now();
-    const saved = await (opts ? FTViewer.save(opts) : FTViewer.save());
+    const saved = await (opts ? FTViewer.save(opts) : FTViewer.save(/* no-budget: the shell fallback under test */));
     return { saved, timedOut: !!(opts && opts.timedOut), ms: Math.round(performance.now() - t0) };
   }, expr);
   mock.delayMs = 2500;

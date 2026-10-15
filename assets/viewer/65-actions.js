@@ -181,7 +181,9 @@ function exportItem(record) {
     rec_time_basis: record.recTime == null ? "" : record.recSource === "mtime" ? "file-mtime" : record.recSource === "name-date" ? "device-clock-date" : "device-clock-naive",
     original_path: record.originalPath || "",
     note: record.note && record.note !== "-" ? record.note : "",
-    ...audioExportFields(record)
+    ...audioExportFields(record),
+    // R9 U1/U5: what the status rests on ("" legacy | auth | sc | unauth | pc:<id>).
+    status_trust: record.statusTrust || ""
   };
 }
 
@@ -196,8 +198,20 @@ function audioExportFields(record) {
   return {
     audio_state: record.audioState || "unknown",
     audio_max_db: level ? audioDbValue(level.max) : "",
-    audio_mean_db: level ? audioDbValue(level.mean) : ""
+    audio_mean_db: level ? audioDbValue(level.mean) : "",
+    audio_trust: audioTrustValue(record)
   };
+}
+// R9 U5: what the sound state rests on, in the log-trust words (track I):
+// "sc" (keyless PC: self-consistency only), "pc:<id>" (another PC's key),
+// "unauth" (not authenticated here), the level's own `trust` when the
+// server sends one; "" when nothing says (never "auth" by assumption).
+function audioTrustValue(record) {
+  if (record.audioPcKey) return "pc:" + record.audioPcKey;
+  if (record.audioTrust === "sc") return "sc";
+  if (record.audioReason === "unverified") return "unauth";
+  const level = record.audioLevel;
+  return level && typeof level === "object" && level.trust != null ? logTrustOf(level) : "";
 }
 
 // Selection is usually far smaller than the case: resolve ids through the

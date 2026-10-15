@@ -868,7 +868,8 @@ function announceResultCount(n) {
 // colour alone.
 const AUDIO_FLAG_ICON = { sound: "audio", silent: "audio-silent", none: "mute", track: "audio-track" };
 function audioFlag(record) {
-  const icon = AUDIO_FLAG_ICON[record.audioState];
+  // R9 U3: an unknown state signed by another PC's key still says so.
+  const icon = AUDIO_FLAG_ICON[record.audioState] || (record.audioPcKey ? "lock" : "");
   if (!icon) return "";
   const tip = escapeHtml(audioTipFor(record));
   return `<span class="audio-flag ${escapeHtml(record.audioState)}" role="img" aria-label="${tip}" title="${tip}">${ftIcon(icon)}</span>`;
@@ -879,16 +880,28 @@ function audioFlag(record) {
 const thumbRetried = new Set();
 const thumbDead = new Set();
 
+// R9 U1: the trust of one log entry shown next to it (details lists):
+// nothing for authenticated / legacy entries.
+function logTrustTagHtml(item) {
+  const trust = logTrustOf(item);
+  if (trust === "sc") return ` <span class="badge candidate">${escapeHtml(t("trust.sc"))}</span>`;
+  if (logTrustUsable(trust)) return "";
+  const pc = logTrustPcKey(trust);
+  return ` <span class="badge candidate" title="${escapeHtml(pc ? tf("trust.otherPc", { key: pc }) : t("status.tip.unauth"))}">${ftIcon("lock")}${escapeHtml(pc ? t("status.otherPc") : t("trust.unauth"))}</span>`;
+}
+
 // Status is never colour alone: every status badge carries an icon + text.
 function statusIcon(status) {
+  if (status === "unauthenticated" || status === "auth-other-pc") return "lock";
   if (status === "ffprobe-video-stream-confirmed" || status === "ffprobe-confirmed") return "check";
   if (status === "validation-failed") return "x";
   if (status === "duplicate-candidate") return "copy";
   if (status === "derived") return "clip";
   return "question";
 }
-function statusBadgeHtml(status) {
-  return `<span class="badge ${statusClass(status)}" title="${escapeHtml(status)}">${ftIcon(statusIcon(status))}${escapeHtml(statusLabel(status))}</span>`;
+// R9 U1: `record` (optional) adds what the status rests on to the tooltip.
+function statusBadgeHtml(status, record) {
+  return `<span class="badge ${statusClass(status)}" title="${escapeHtml(record ? statusTitle(record) : status)}">${ftIcon(statusIcon(status))}${escapeHtml(statusLabel(status))}</span>`;
 }
 
 // While the workstation is still scanning/enriching (live index), a record
@@ -957,7 +970,7 @@ function renderCard(record) {
     <div class="meta">
       <div class="name-row"><span class="name" title="${escapeHtml(displayName)}">${highlightEscape(displayName, state.query)}</span>${record.channel ? `<span class="channel-badge">${escapeHtml(record.channel)}</span>` : ""}</div>
       <div class="time-row"><span class="time-text">${recTime ? escapeHtml(recTime) : t("time.unknown")}</span><span class="sub">${fmtBytes(record.size)}${audioFlag(record)}${staleTag}</span></div>
-      <div class="badge-row">${statusBadgeHtml(record.status)}${markChip}${anomalyChip}${warnChip}${dflChip}</div>
+      <div class="badge-row">${statusBadgeHtml(record.status, record)}${markChip}${anomalyChip}${warnChip}${dflChip}</div>
       ${tagsHtml}
     </div>
   </div>`;

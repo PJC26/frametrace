@@ -437,7 +437,7 @@ async function hostedShellFlow(browser, backend) {
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.press('2');
     await page.waitForFunction((id) => !!document.querySelector(`#recordGrid .card[data-id="${CSS.escape(id)}"] .mark-chip`), expectId, { timeout: 5000 }).catch(() => {});
-    const saved = await page.evaluate(() => FTViewer.save());
+    const saved = await page.evaluate(() => FTViewer.save({ patient: true })); // R9 U9
     const body = saves.filter(Boolean).find((b) => (b.marks || []).some((m) => m.id === expectId)) || null;
     check('hosted: the joined-record mark saves (FTViewer.save → true)', saved === true && (await page.evaluate(() => FTViewer.saveState())) === 'saved', String(saved));
     check('hosted: the save is a patch-v2 body carrying the joined id', !!body && body.protocol === 'patch-v2' && body.schema_version === 2, JSON.stringify(body).slice(0, 300));

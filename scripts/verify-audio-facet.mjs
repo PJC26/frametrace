@@ -72,7 +72,32 @@ const check = (name, ok, detail = '') => {
 // records-meta could not read the measurement log: an empty map beside
 // audioLevelsError (served at /err).
 const errHtml = viewerPageHtml({ data: `window.__FRAMETRACE_DATA__ = ${JSON.stringify({ ...DATA, audioLevels: {}, audioLevelsError: '소리 측정 로그 체인이 손상되었습니다 (line 3)' })};`, js: viewerBundleJs(root), root });
-const server = createServer((req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(req.url.startsWith('/err') ? errHtml : html); });
+// R9 U1/U3/U5 (track I P3 ↔ U): every log entry carries `trust` ("auth" |
+// "sc" | "unauth" | "pc:<key id>"; absent = an older server). Served at /trust.
+const tv = (id, extra) => vid(id, '20260913', { ffprobe_ok: true, relative_path: `DCIM/20260913_${id.slice(-2)}0000_F.mp4`, ...extra });
+const vl = (id, status, trust) => ({ target_path: `/case/DCIM/${id}.mp4`, validation_status: status, target_sha256: 'e'.repeat(64), ...(trust === undefined ? {} : { trust }) });
+const TRUST = {
+  ...DATA,
+  manifest: { case_id: 'FT-TRUST', title: 'trust' },
+  scan: { videos: [tv('t_auth'), tv('t_sc'), tv('t_legacy'), tv('t_unauth'), tv('t_otherpc'), tv('t_newer'), tv('t_audiopc', { ffprobe_ok: false, audio_codec: '' })] },
+  validationLog: [
+    vl('t_auth', 'ffprobe-video-stream-confirmed', 'auth'),
+    vl('t_sc', 'ffprobe-video-stream-confirmed', 'sc'),
+    vl('t_legacy', 'ffprobe-video-stream-confirmed'),
+    vl('t_unauth', 'ffprobe-video-stream-confirmed', 'unauth'),
+    vl('t_otherpc', 'ffprobe-video-stream-confirmed', 'pc:pc-b'),
+    vl('t_newer', 'validation-failed', 'auth'),
+    vl('t_newer', 'ffprobe-video-stream-confirmed', 'unauth'),
+  ],
+  carveLog: [
+    { id: 'carve_t', output_path: 'artifacts/carved/carve_t.mp4', size_bytes: 10, validation_status: 'candidate-unvalidated', trust: 'auth' },
+    { id: 'carve_t', output_path: 'artifacts/carved/carve_t_forged.mp4', size_bytes: 99, validation_status: 'ffprobe-video-stream-confirmed', trust: 'unauth' },
+  ],
+  joinLog: [{ ...DATA.joinLog[0], trust: 'unauth' }],
+  audioLevels: { t_audiopc: { r: 'unverified', pc: 'pc-z' } },
+};
+const trustHtml = viewerPageHtml({ data: `window.__FRAMETRACE_DATA__ = ${JSON.stringify(TRUST)};`, js: viewerBundleJs(root), root });
+const server = createServer((req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(req.url.startsWith('/err') ? errHtml : req.url.startsWith('/trust') ? trustHtml : html); });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch();
@@ -315,6 +340,69 @@ try {
   await epage.waitForTimeout(300);
   check('audioLevelsError: the notice is not repeated after a reload', (await errToasts()).length === 0, JSON.stringify(await errToasts()));
   await epage.close();
+
+  // R9 U1: an entry this PC could not authenticate never makes a record
+  // verified / derived, nor counts in 검증됨; "sc" keeps the value with
+  // "자기 일관성만"; a later unauthenticated line never replaces an
+  // authenticated one. U3: another PC's key is "이 PC에서 인증 불가(변조
+  // 판정 아님)", also for a record without a probed track. U5: exports
+  // carry audio_trust / status_trust. U7: "case"-key drafts of an older
+  // build are announced once, never adopted.
+  const tpage = await ctx.newPage();
+  tpage.on('pageerror', (e) => errors.push('trust page: ' + String(e)));
+  await tpage.addInitScript(() => {
+    if (sessionStorage.getItem('seeded')) return;
+    sessionStorage.setItem('seeded', '1');
+    localStorage.setItem('ft.draft.case.w-old.vid_x', JSON.stringify({ v: 1, mark: { status: 'important' } }));
+    localStorage.setItem('ft.draft.case.w-old.vid_y', JSON.stringify({ v: 1, note: 'old' }));
+  });
+  await tpage.goto(base + 'trust');
+  await tpage.waitForSelector('.card');
+  const badges = await tpage.evaluate(() => Object.fromEntries([...document.querySelectorAll('.card[data-id]')].map((c) => {
+    const b = c.querySelector('.badge-row .badge');
+    return [c.dataset.id, b ? { text: b.textContent, title: b.getAttribute('title') || '', icon: b.querySelector('use')?.getAttribute('href') } : null];
+  })));
+  check('R9 U1: authenticated validation → 검증됨', badges.t_auth?.text === '검증됨' && !/자기 일관성/.test(badges.t_auth.title), JSON.stringify(badges.t_auth));
+  check('R9 U1: sc validation → 검증됨, tooltip 자기 일관성만(인증 아님)', badges.t_sc?.text === '검증됨' && /자기 일관성만\(인증 아님\)/.test(badges.t_sc.title), JSON.stringify(badges.t_sc));
+  check('R9 U1: legacy (no trust field) → as before, 검증됨, nothing called authenticated', badges.t_legacy?.text === '검증됨' && !/인증/.test(badges.t_legacy.title), JSON.stringify(badges.t_legacy));
+  check('R9 U1: unauth validation → 인증 안 됨 (lock), never 검증됨', badges.t_unauth?.text === '인증 안 됨' && badges.t_unauth.icon === '#i-lock', JSON.stringify(badges.t_unauth));
+  check('R9 U1/U3: another PC\'s key → 이 PC에서 인증 불가, tooltip names the key (not a tampering verdict)', badges.t_otherpc?.text === '이 PC에서 인증 불가' && /변조 판정 아님/.test(badges.t_otherpc.title) && /키 pc-b 보유 PC에서 확인/.test(badges.t_otherpc.title), JSON.stringify(badges.t_otherpc));
+  check('R9 U1: a later unauthenticated line does not replace the authenticated result (검증 실패 stays)', badges.t_newer?.text === '검증 실패', JSON.stringify(badges.t_newer));
+  check('R9 U1: carve id — the authenticated entry is the record (not the later unauthenticated one)', badges.carve_t?.text === '미검증 후보' && await tpage.evaluate(() => ((t) => /carve_t\.mp4/.test(t) && !/forged/.test(t))(document.querySelector('.card[data-id="carve_t"]')?.title || '')), JSON.stringify(badges.carve_t));
+  check('R9 U1: an unauthenticated join line → 인증 안 됨, never 파생물', badges[jid]?.text === '인증 안 됨', JSON.stringify(badges[jid]));
+  const metric = await tpage.evaluate(() => document.getElementById('metricVerified')?.textContent);
+  check('R9 U1: 검증됨 counts auth + sc + legacy only (3), not unauth / other-PC lines', metric === '3', String(metric));
+  await tpage.locator('.card[data-id="t_newer"]').click();
+  const vitems = await tpage.evaluate(() => [...document.querySelectorAll('#validationList .validation-item')].map((i) => i.textContent.replace(/\s+/g, ' ').trim()));
+  check('R9 U1: the detail list shows the unauthenticated line marked 인증 안 됨', vitems.some((t) => /ffprobe-video-stream-confirmed/.test(t) && /인증 안 됨/.test(t)) && vitems.some((t) => /validation-failed/.test(t) && !/인증 안 됨/.test(t)), JSON.stringify(vitems));
+  const apc = await tpage.evaluate(() => {
+    const f = document.querySelector('.card[data-id="t_audiopc"] .audio-flag');
+    return f ? { href: f.querySelector('use')?.getAttribute('href'), label: f.getAttribute('aria-label') } : null;
+  });
+  check('R9 U3: an unknown sound state signed by another PC\'s key says so on the card', !!apc && apc.href === '#i-lock' && /이 PC에서 인증 불가\(변조 판정 아님\)/.test(apc.label) && /키 pc-z 보유 PC에서 확인/.test(apc.label) && !/검증 실패/.test(apc.label), JSON.stringify(apc));
+  await tpage.locator('.card[data-id="t_audiopc"]').click();
+  const apcDetail = await tpage.evaluate(() => {
+    const dt = [...document.querySelectorAll('#summaryList dt')].find((d) => d.textContent === '소리');
+    return dt ? dt.nextElementSibling.textContent : null;
+  });
+  check('R9 U3: the detail says 이 PC에서 인증 불가(변조 판정 아님) — 키 pc-z', /이 PC에서 인증 불가\(변조 판정 아님\) — 키 pc-z 보유 PC에서 확인/.test(apcDetail || ''), String(apcDetail));
+  for (const id of ['t_sc', 't_unauth', 't_audiopc']) await tpage.locator(`.card[data-id="${id}"] input[data-check]`).check();
+  const tdlWait = tpage.waitForEvent('download', { timeout: 15000 }).catch(() => null);
+  await tpage.evaluate(() => document.getElementById('btnDownloadCsv').click());
+  const tdl = await tdlWait;
+  const tcsv = tdl ? readFileSync(await tdl.path(), 'utf8').replace(/^﻿/, '').split(/\r?\n/) : [];
+  const th = (tcsv[0] || '').split(',');
+  const tcell = (id, col) => ((tcsv.find((l) => l.startsWith(id + ',')) || '').split(','))[th.indexOf(col)];
+  check('R9 U5: CSV has audio_trust and status_trust columns', th.includes('audio_trust') && th.includes('status_trust'), tcsv[0] || '');
+  check('R9 U5: CSV trust values (sc / unauth / pc:<id>)', tcell('t_sc', 'status_trust') === 'sc' && tcell('t_unauth', 'status_trust') === 'unauth' && tcell('t_unauth', 'status') === 'unauthenticated' && tcell('t_audiopc', 'audio_trust') === 'pc:pc-z', JSON.stringify(tcsv.slice(0, 4)));
+  const legacyNotice = await tpage.evaluate(() => document.getElementById('legacyCaseDraftsNotice')?.textContent || '');
+  check('R9 U7: drafts kept under the old "case" key are announced (count, not applied)', /임시 편집 2건/.test(legacyNotice) && /반영하지 않았습니다/.test(legacyNotice), legacyNotice);
+  const adopted = await tpage.evaluate(() => !!document.querySelector('.card[data-id="vid_x"], .card .mark-chip'));
+  check('R9 U7: none of them adopted', !adopted);
+  await tpage.reload();
+  await tpage.waitForSelector('.card');
+  check('R9 U7: said once — not again after a reload', await tpage.evaluate(() => !document.getElementById('legacyCaseDraftsNotice')));
+  await tpage.close();
 
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

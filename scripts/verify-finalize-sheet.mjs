@@ -162,10 +162,30 @@ await check('1 pure rows: unsavedMarksChecks / verifySourcesVerdict / finSummari
     auSelf: auditVerdict({ ok: true, integrity: 'integrity-structural-only', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'integrity-structural-only', entries: 3, trust: '자기 일관성만 확인(인증 아님)', keys_held: false, other_pc_key_ids: [] }] }),
     auOther: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'not-verified', entries: 3, trust: '키 pc-b 보유 PC에서 확인', keys_held: true, other_pc_key_ids: ['pc-b'] }] }),
     auFail: auditVerdict({ ok: false, error: 'chain broken' }),
+    // R9 U3/U4: the server's own reason texts (src/audit.rs lane_trust).
+    auOnlyOther: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'not-verified', entries: 3, trust: '이 PC에서 인증되지 않은 줄 2개 (전체 3개 중) — NOT VERIFIED; 다른 PC 키로 서명된 줄 2개 — 이 PC에서 인증 불가, 키 "pc-b" 보유 PC에서 확인 (변조 판정 아님)', keys_held: true, other_pc_key_ids: ['pc-b'] }] }),
+    auMixed: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 2, entries: 9, logs: [
+      { name: 'a.jsonl', integrity: 'not-verified', entries: 5, trust: '이 PC에서 인증되지 않은 줄 3개 (전체 5개 중) — NOT VERIFIED; HMAC 없는 줄 1개 (HMAC이 제거됐거나 키 없이 추가됐을 수 있음); 다른 PC 키로 서명된 줄 2개 — 이 PC에서 인증 불가, 키 "pc-b" 보유 PC에서 확인 (변조 판정 아님)', keys_held: true, other_pc_key_ids: ['pc-b'] },
+      { name: 'b.jsonl', integrity: 'not-verified', entries: 4, trust: '…; 은퇴한 키로만 서명되고 이후 현재 키 항목이 없는 줄 2개', keys_held: true, other_pc_key_ids: [] }] }),
+    auNumeric: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'not-verified', entries: 3, trust: '', unauthenticated_lines: 3, other_pc_lines: 0, keys_held: true, other_pc_key_ids: ['pc-c'] }] }),
+    auRewrite: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'not-verified', entries: 3, trust: '다른 PC 키로 서명된 줄 1개', rewrite_not_excluded: 'rewrite not excluded', keys_held: true, other_pc_key_ids: ['pc-b'] }] }),
+    auUnknownState: auditVerdict({ ok: true, integrity: 'integrity-something-new', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'x', entries: 3, other_pc_key_ids: ['pc-d'] }] }),
+    // R9 U2: the read-only row names its cause.
+    roCase: unsavedMarksChecks({ pendingMarks: 0, saveState: 'readonly', drafts: 0, lockCause: 'case' }).map((c) => c.text).join(' | '),
+    roAnn: unsavedMarksChecks({ pendingMarks: 0, saveState: 'readonly', drafts: 0, lockCause: 'annotations' }).map((c) => c.text).join(' | '),
+    lockFromMeta: typeof finLockCause === 'function' ? [finLockCause(null, { ok: true, manifest: null }), finLockCause({ lockCause: 'annotations' }, { ok: true, manifest: null }), finLockCause(null, { ok: true, manifest: { case_id: 'c' } })] : null,
   }));
   assert.equal(r.auKeyed.level, 'ok');
   assert.ok(r.auSelf.level === 'warn' && /자기 일관성만 확인\(인증 아님\)/.test(r.auSelf.text), JSON.stringify(r.auSelf));
-  assert.ok(r.auOther.level === 'warn' && /이 PC에서 인증 불가 — 키 pc-b 보유 PC에서 확인/.test(r.auOther.text) && /pc-b/.test(r.auOther.title), JSON.stringify(r.auOther));
+  // R9 U3: another PC's key is never a failure: "이 PC에서 인증 불가(변조 판정 아님) — 키 <id> 보유 PC에서 확인".
+  assert.ok(r.auOnlyOther.level === 'warn' && /이 PC에서 인증 불가\(변조 판정 아님\) — 키 pc-b 보유 PC에서 확인/.test(r.auOnlyOther.text) && /pc-b/.test(r.auOnlyOther.title), 'R9 U3: ' + JSON.stringify(r.auOnlyOther));
+  // R9 U4: unsigned / retired-key lines come first; the other-PC hint only when it is the ONLY cause.
+  assert.ok(r.auMixed.level === 'warn' && /인증 안 된 줄 3개/.test(r.auMixed.text) && !/보유 PC/.test(r.auMixed.text), 'R9 U4 mixed: ' + JSON.stringify(r.auMixed));
+  assert.ok(/인증 안 된 줄 3개/.test(r.auNumeric.text) && !/pc-c/.test(r.auNumeric.text), 'R9 U4 numeric fields: ' + JSON.stringify(r.auNumeric));
+  assert.ok(!/보유 PC/.test(r.auRewrite.text) && !/인증 안 된 줄/.test(r.auRewrite.text) && /인증되지 않음/.test(r.auRewrite.text), 'R9 U4 another cause too: ' + JSON.stringify(r.auRewrite));
+  assert.ok(r.auUnknownState.level === 'warn' && /키 pc-d 보유 PC에서 확인/.test(r.auUnknownState.text), 'R9 U3 unknown state names the key too: ' + JSON.stringify(r.auUnknownState));
+  assert.ok(/case\.json/.test(r.roCase) && !/판독 기록을 읽지 못했습니다/.test(r.roCase) && /판독 기록을 읽지 못했습니다/.test(r.roAnn), 'R9 U2 finalize read-only row by cause: ' + r.roCase + ' || ' + r.roAnn);
+  assert.deepEqual(r.lockFromMeta, ['case', 'annotations', ''], 'R9 U2 lock cause: the viewer\'s first, else records-meta');
   assert.equal(r.auFail.level, 'bad');
   assert.deepEqual(r.saved, ['ok']);
   assert.deepEqual(r.failed, [['block', true]]);

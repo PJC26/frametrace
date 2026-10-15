@@ -826,6 +826,17 @@ function noticesHost() {
   }
   return host;
 }
+// R9 U10: the conflict banner stays the LAST banner of the row and its
+// list toggle the last button in it, so in Tab order the toggle is
+// directly followed by the conflict list (#markConflictPanel, the row's
+// next sibling). Every other banner is added before it.
+function noticeAppend(bar) {
+  const host = noticesHost();
+  const conflict = host.querySelector(":scope > #markConflictBanner");
+  if (conflict && conflict !== bar) host.insertBefore(bar, conflict);
+  else host.appendChild(bar);
+  return bar;
+}
 function syncNoticesTabStop(host) {
   if (!host || !host.isConnected) return;
   const overflows = host.scrollHeight > host.clientHeight + 1;
@@ -904,9 +915,10 @@ function renderConflictBanner() {
     });
     toggle.className = "toggle";
     toggle.setAttribute("aria-controls", "markConflictPanel");
-    bar.appendChild(toggle);
     bar.appendChild(noticeButton("markConflictUseServer", "conflict.useServerAll", () => resolveConflictsUseServer([...conflictIds.keys()])));
     bar.appendChild(noticeButton("markConflictUseMine", "conflict.useMineAll", () => resolveConflictsUseMine([...conflictIds.keys()])));
+    // R9 U10: the toggle last — Tab goes from it straight into the list.
+    bar.appendChild(toggle);
     noticesHost().appendChild(bar);
   }
   const ids = [...conflictIds.keys()];
@@ -1139,7 +1151,7 @@ function statusNotice(id, key, subs) {
     bar.className = "ft-banner";
     bar.setAttribute("role", "status");
     bar.appendChild(noticeMessage(key, subs));
-    noticesHost().appendChild(bar);
+    noticeAppend(bar);
   }
   i18nText(bar.firstChild, key, subs);
   return bar;
@@ -1158,7 +1170,7 @@ function noteConflictsUnlisted(n) {
     bar.remove();
     if (hadFocus && typeof viewerFocus === "function") viewerFocus();
   }));
-  noticesHost().appendChild(bar);
+  noticeAppend(bar);
 }
 async function loadQueueConflicts(ids, get = fetchJsonOrNull) {
   // The status reports conflicts but names none: nothing to read them by.
@@ -1923,7 +1935,7 @@ document.getElementById("btnDownloadCsv").addEventListener("click", () => {
   if (!selected.length) { toast(t("toast.selectFirst")); return; }
   const header = ["id", "kind", "name", "status", "mark", "examiner_note", "tags", "sha256", "size_bytes",
     "recorded_time", "channel", "rec_type", "inode", "original_path", "source_path",
-    "warnings", "note", "anomalies", "audio_state", "audio_max_db", "audio_mean_db"];
+    "warnings", "note", "anomalies", "audio_state", "audio_max_db", "audio_mean_db", "audio_trust", "status_trust"];
   const rows = selected.map(record => [
     record.id,
     KIND_LABELS[record.kind] || record.kind,
@@ -1943,7 +1955,8 @@ document.getElementById("btnDownloadCsv").addEventListener("click", () => {
     (record.warnings || []).join("; "),
     record.note && record.note !== "-" ? record.note : "",
     (record.anomalies || []).map(item => item.kind).join("; "),
-    ...Object.values(audioExportFields(record))
+    ...Object.values(audioExportFields(record)),
+    record.statusTrust || ""
   ].map(csvCell).join(","));
   downloadText(
     `frametrace-selection-${manifest.case_id || "case"}.csv`,
@@ -2280,7 +2293,7 @@ function rangeText(range) {
     legacyRangesLeft = null;
     done();
   }));
-  noticesHost().appendChild(bar);
+  noticeAppend(bar);
 })();
 
 // A3: records-meta could not read the case's annotations. The marks, notes,
@@ -2445,5 +2458,45 @@ function noteOriginDrafts() {
     bar.remove();
     if (hadFocus && typeof viewerFocus === "function") viewerFocus();
   }));
-  noticesHost().appendChild(bar);
+  noticeAppend(bar);
+})();
+
+// R9 U7: drafts an earlier build kept under the literal case key "case"
+// (a case.json without case_id, or one it could not read) may belong to
+// ANY such case: never adopted (R8 U1). Said once per browser (and again
+// only when their number changes): how many, and that they were not
+// applied. Nothing is deleted.
+var LEGACY_CASE_DRAFTS_SEEN = "ft.viewer.legacyCaseDrafts.noticed";
+function legacyCaseDraftCount() {
+  let n = 0;
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith("ft.draft.case.")) n += 1;
+    }
+    const raw = localStorage.getItem("ft.viewer.case.annotations.v1");
+    const old = raw ? JSON.parse(raw) : null;
+    if (old && typeof old === "object") n += Object.keys(old).length;
+  } catch (e) { /* storage blocked or unreadable: nothing to say */ }
+  return n;
+}
+(function showLegacyCaseDrafts() {
+  if (CASE_KEY === "case") return; // a case whose case_id really is "case": they are its own
+  const n = legacyCaseDraftCount();
+  if (!n) return;
+  try {
+    if (localStorage.getItem(LEGACY_CASE_DRAFTS_SEEN) === String(n)) return;
+    localStorage.setItem(LEGACY_CASE_DRAFTS_SEEN, String(n));
+  } catch (e) { /* storage blocked: say it on every mount rather than never */ }
+  const bar = document.createElement("div");
+  bar.id = "legacyCaseDraftsNotice";
+  bar.className = "ft-banner";
+  bar.setAttribute("role", "status");
+  bar.appendChild(noticeMessage("legacyDrafts.msg", { n }));
+  bar.appendChild(noticeButton("legacyCaseDraftsDismiss", "legacyDrafts.dismiss", () => {
+    const hadFocus = bar.contains(document.activeElement);
+    bar.remove();
+    if (hadFocus && typeof viewerFocus === "function") viewerFocus();
+  }));
+  noticeAppend(bar);
 })();

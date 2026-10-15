@@ -16,7 +16,7 @@
 // scope with the viewer bundle; scripts/check-js.mjs).
 const HOST_VIEWER_NODE = "hViewerHost";
 const HOST_VIEWER_EMPTY = "inputCard";
-const hostViewer = { mounted: false, pending: null, unmounting: null, bridged: false, seq: 0 };
+const hostViewer = { mounted: false, pending: null, unmounting: null, bridged: false, seq: 0, stillSaving: false };
 
 function hostViewerAvailable() {
   const html = document.documentElement;
@@ -164,9 +164,12 @@ async function hostViewerSwitch(openFn) {
     const unsaved = typeof hViewerStateUnsaved === "function"
       ? hViewerStateUnsaved(state, pending)
       : !!state && state !== "saved" && !(state === "local" && pending() === 0);
+    hostViewer.stillSaving = false;
     if (unsaved) {
-      const saved = await window.FTViewer.save({ patient: true }); // R8 U2: explicit — waits while the save progresses
-      if (!saved) return false;
+      const so = { patient: true };
+      const saved = await window.FTViewer.save(so); // R8 U2: explicit — waits while the save progresses
+      // R9 U6: the caller says "still saving" rather than "not saved".
+      if (!saved) { hostViewer.stillSaving = typeof hSaveStillSaving === "function" && hSaveStillSaving(so, api); return false; }
     }
     await hostViewerUnmount();
   }

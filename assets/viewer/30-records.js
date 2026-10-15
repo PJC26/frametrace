@@ -401,7 +401,78 @@ function fmtDuration(value) {
   return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
 }
 
+// R9 U1 (track I P3 ↔ U): every entry of the audit-lane logs the bundle /
+// records-meta carry (validationLog, carveLog, filesystemLog, joinLog,
+// anomalyLog, …) has `trust`: "auth" (authenticated here), "sc" (no audit
+// keys on this PC: self-consistency only), "unauth" (keys held, line not
+// authenticated) or "pc:<key id>" (signed by another PC's key). Absent =
+// an older server: shown as before, never called authenticated. Anything
+// else is read as "unauth" (fail closed).
+//   -> "" (legacy) | "auth" | "sc" | "unauth" | "pc:<id>"
+function logTrustOf(item) {
+  if (!item || typeof item !== "object" || item.trust == null) return "";
+  const v = String(item.trust).trim();
+  if (v === "auth" || v === "sc") return v;
+  if (/^pc:\S/.test(v)) return v;
+  return "unauth";
+}
+// May an entry of this trust make a record confirmed / derived / verified?
+function logTrustUsable(trust) {
+  return trust === "" || trust === "auth" || trust === "sc";
+}
+function logTrustPcKey(trust) {
+  return typeof trust === "string" && trust.startsWith("pc:") ? trust.slice(3) : "";
+}
+// The pseudo status of a record whose result comes only from a line this
+// PC could not authenticate: never confirmed / derived / verified.
+function untrustedStatusOf(trust) {
+  return logTrustPcKey(trust) ? "auth-other-pc" : "unauthenticated";
+}
+// Per key: the latest usable entry, and the latest one that is not.
+function logSlots(list, keyOf) {
+  const slots = new Map();
+  for (const item of Array.isArray(list) ? list : []) {
+    if (!item || typeof item !== "object") continue;
+    const key = keyOf(item);
+    if (!key) continue;
+    let slot = slots.get(key);
+    if (!slot) { slot = { usable: null, untrusted: null }; slots.set(key, slot); }
+    if (logTrustUsable(logTrustOf(item))) slot.usable = item; else slot.untrusted = item;
+  }
+  return slots;
+}
+// The current entry per key (first-seen key order): the latest usable one;
+// an entry this PC could not authenticate only when the key has no usable
+// entry at all (shown, with its own status — never as the result).
+function currentLogEntries(list, keyOf) {
+  return [...logSlots(list, keyOf).values()].map(slot => slot.usable || slot.untrusted);
+}
+// The status a record shows and the trust it rests on.
+//   own        the record's own log entry (carve / recovery / join; null
+//              for an indexed video)
+//   valid      the usable validation entry of its path (or null)
+//   unvalid    the latest validation entry this PC could not authenticate
+//   fallback   the status without any validation
+function recordStatusOf(own, valid, unvalid, fallback) {
+  const ownTrust = own ? logTrustOf(own) : "";
+  if (own && !logTrustUsable(ownTrust)) return { status: untrustedStatusOf(ownTrust), trust: ownTrust };
+  if (valid && valid.validation_status) return { status: valid.validation_status, trust: logTrustOf(valid) || ownTrust };
+  if (unvalid) { const tr = logTrustOf(unvalid); return { status: untrustedStatusOf(tr), trust: tr }; }
+  return { status: fallback, trust: ownTrust };
+}
+// Tooltip of a record's status badge: the raw status plus what its trust means.
+function statusTitle(record) {
+  const status = String(record && record.status || "");
+  const trust = String(record && record.statusTrust || "");
+  if (status === "auth-other-pc") return tf("trust.otherPc", { key: logTrustPcKey(trust) || "?" });
+  if (status === "unauthenticated") return t("status.tip.unauth");
+  if (trust === "sc") return status + " · " + t("trust.sc");
+  return status;
+}
+
 function statusLabel(status) {
+  if (status === "unauthenticated") return t("status.unauth");
+  if (status === "auth-other-pc") return t("status.otherPc");
   if (status === "ffprobe-video-stream-confirmed") return t("status.verified");
   if (status === "ffprobe-confirmed") return t("status.confirmed");
   if (status === "validation-failed") return t("status.failed");
@@ -488,8 +559,15 @@ function videoFps(video) {
   return parseRate(stream.avg_frame_rate) || parseRate(stream.r_frame_rate);
 }
 
-const validationsByPath = new Map(validationLog.map(item => [normalizePath(item.target_path), item]));
-const recoveredFilesystemLog = filesystemLog.filter(item => item.event === "recover-inode" && item.output_path);
+// R9 U1: a validation this PC could not authenticate never confirms a
+// record: `validationsByPath` holds the latest USABLE entry per path,
+// `untrustedValidationsByPath` the latest one that is not.
+const validationSlots = logSlots(validationLog, item => normalizePath(item.target_path));
+const validationsByPath = new Map([...validationSlots].filter(([, s]) => s.usable).map(([k, s]) => [k, s.usable]));
+const untrustedValidationsByPath = new Map([...validationSlots].filter(([, s]) => s.untrusted).map(([k, s]) => [k, s.untrusted]));
+const recoveredFilesystemLog = currentLogEntries(
+  filesystemLog.filter(item => item && item.event === "recover-inode" && item.output_path),
+  item => `${item.partition_offset ?? 0}:${item.inode || normalizePath(item.output_path)}`);
 // Case-level warnings recorded on inspection events (e.g. a truncated
 // fls listing means the deleted-file list is incomplete) — the reviewer
 // must see them, not just the CLI.
@@ -500,11 +578,8 @@ const inspectionWarnings = filesystemLog
 // Lossless joins (artifacts/joined/join-log.jsonl, docs/PLAN_PHASE2_JOIN_AUDIO
 // §1.5/§1.8): one derived record per output file; a later entry for the same
 // output path supersedes an earlier one.
-const joinLog = [...new Map(
-  (Array.isArray(DATA.joinLog) ? DATA.joinLog : [])
-    .filter(item => item && item.output_path)
-    .map(item => [normalizePath(item.output_path), item])
-).values()];
+// R9 U1: an unauthenticated later entry never replaces a usable one.
+const joinLog = currentLogEntries(Array.isArray(DATA.joinLog) ? DATA.joinLog : [], item => item.output_path ? normalizePath(item.output_path) : "");
 
 // Gaps/overlaps of a join (log entry, plan or manifest totals) are not
 // determinable when it was ordered by file name only: the server counts
@@ -562,13 +637,16 @@ function fmtDb(value, digits) {
   return (v < 0 && Number(text) !== 0 ? "−" : "") + text;
 }
 // R8: the trust note of a sound shown (sc) / not shown (another PC's key).
+// R9 U3: a line signed by another PC's key is "이 PC에서 인증 불가(변조
+// 판정 아님) — 키 <id> 보유 PC에서 확인", never "검증 실패", and is said for
+// a record without a probed track (state unknown) too.
 function audioTrustNote(record) {
   if (record.audioTrust === "sc" && (record.audioState === "sound" || record.audioState === "silent")) return " · " + t("audio.selfConsistent");
-  if (record.audioPcKey) return " — " + tf("audio.otherPc", { key: record.audioPcKey });
+  if (record.audioPcKey) return " · " + tf("trust.otherPc", { key: record.audioPcKey });
   return "";
 }
 function audioTipFor(record) {
-  const text = audioTipBase(record);
+  const text = audioTipBase(record) || (record.audioPcKey ? t("audio.unknown") : "");
   return text ? text + audioTrustNote(record) : text;
 }
 function audioTipBase(record) {
@@ -577,7 +655,8 @@ function audioTipBase(record) {
     case "sound": return tf("audio.tip.sound", { max: fmtDb(level.max, 0) });
     case "silent": return tf("audio.tip.silent", { max: fmtDb(level.max, 0) });
     case "none": return t("audio.tip.none");
-    case "track": return t(record.audioReason === "error" ? "audio.tip.trackError" : record.audioReason === "stale" ? "audio.tip.trackStale" : record.audioReason === "unread" ? "audio.tip.trackUnread" : record.audioReason === "unverified" ? "audio.tip.trackUnverified" : record.audioReason === "replayed" ? "audio.tip.trackReplayed" : "audio.tip.track");
+    case "track": if (record.audioPcKey) return t("audio.tip.trackOtherPc");
+      return t(record.audioReason === "error" ? "audio.tip.trackError" : record.audioReason === "stale" ? "audio.tip.trackStale" : record.audioReason === "unread" ? "audio.tip.trackUnread" : record.audioReason === "unverified" ? "audio.tip.trackUnverified" : record.audioReason === "replayed" ? "audio.tip.trackReplayed" : "audio.tip.track");
     default: return "";
   }
 }
@@ -591,7 +670,8 @@ function audioDetailBase(record) {
     case "sound": return tf("audio.detail.sound", { max: fmtDb(level.max, 1), mean: fmtDb(level.mean, 1), codec });
     case "silent": return tf("audio.detail.silent", { max: fmtDb(level.max, 1) });
     case "none": return t("audio.detail.none");
-    case "track": return tf(record.audioReason === "error" ? "audio.detail.trackError" : record.audioReason === "stale" ? "audio.detail.trackStale" : record.audioReason === "unread" ? "audio.detail.trackUnread" : record.audioReason === "unverified" ? "audio.detail.trackUnverified" : record.audioReason === "replayed" ? "audio.detail.trackReplayed" : "audio.detail.track", { codec });
+    case "track": if (record.audioPcKey) return tf("audio.detail.trackOtherPc", { codec });
+      return tf(record.audioReason === "error" ? "audio.detail.trackError" : record.audioReason === "stale" ? "audio.detail.trackStale" : record.audioReason === "unread" ? "audio.detail.trackUnread" : record.audioReason === "unverified" ? "audio.detail.trackUnverified" : record.audioReason === "replayed" ? "audio.detail.trackReplayed" : "audio.detail.track", { codec });
     default: return t("audio.unknown");
   }
 }
@@ -605,6 +685,7 @@ function serverProxyOf(row) {
 const records = [
   ...videos.map(video => {
     const validation = validationsByPath.get(normalizePath(video.source_path));
+    const st = recordStatusOf(null, validation, untrustedValidationsByPath.get(normalizePath(video.source_path)), video.ffprobe_ok ? "ffprobe-confirmed" : "candidate-unvalidated");
     return {
       id: video.id,
       kind: "video",
@@ -613,7 +694,8 @@ const records = [
       fileUrl: video.file_url,
       parser: video.source_profile?.parser || "-",
       vendor: video.source_profile?.vendor || "-",
-      status: validation?.validation_status || (video.ffprobe_ok ? "ffprobe-confirmed" : "candidate-unvalidated"),
+      status: st.status,
+      statusTrust: st.trust,
       sha256: validation?.target_sha256 || video.sha256 || video.hash_status || "-",
       duration: validation?.duration_seconds ?? video.duration_seconds,
       codec: validation?.video_codec || video.video_codec || "-",
@@ -633,6 +715,7 @@ const records = [
   }),
   ...carveLog.map(item => {
     const validation = validationsByPath.get(normalizePath(item.output_path));
+    const st = recordStatusOf(item, validation, untrustedValidationsByPath.get(normalizePath(item.output_path)), item.validation_status || "candidate-unvalidated");
     return {
       id: item.id || item.output_path,
       kind: "carved",
@@ -641,7 +724,8 @@ const records = [
       fileUrl: fileUrl(absolutizeArtifactPath(item.output_path)),
       parser: item.signature || "carve",
       vendor: "Recovered candidate",
-      status: validation?.validation_status || item.validation_status || "candidate-unvalidated",
+      status: st.status,
+      statusTrust: st.trust,
       sha256: validation?.target_sha256 || item.sha256 || "-",
       duration: validation?.duration_seconds,
       // An extension is not a codec — falling back to it marks carved
@@ -693,6 +777,7 @@ const records = [
   ...recoveredFilesystemLog.map(item => {
     const original = item.inode && flsEntryByInode.get(String(item.inode));
     const validation = validationsByPath.get(normalizePath(item.output_path));
+    const st = recordStatusOf(item, validation, untrustedValidationsByPath.get(normalizePath(item.output_path)), item.validation_status || "candidate-unvalidated");
     return {
       id: `inode:${item.partition_offset ?? 0}:${item.inode || item.output_path}`,
       kind: "filesystem",
@@ -701,7 +786,8 @@ const records = [
       fileUrl: fileUrl(absolutizeArtifactPath(item.output_path)),
       parser: "tsk/icat",
       vendor: "Filesystem recovery",
-      status: validation?.validation_status || item.validation_status || "candidate-unvalidated",
+      status: st.status,
+      statusTrust: st.trust,
       sha256: validation?.target_sha256 || item.sha256 || "-",
       duration: validation?.duration_seconds,
       codec: validation?.video_codec || "-",
@@ -727,6 +813,8 @@ const records = [
     // marks saved on it survive a rename of the output; logs written before
     // record_id existed fall back to the output file name.
     const serverId = typeof item.record_id === "string" ? item.record_id.trim() : "";
+    // R9 U1: "derived" only from a usable join-log line.
+    const st = recordStatusOf(item, null, null, "derived");
     return {
       id: serverId || `join:${name}`,
       kind: "joined",
@@ -735,7 +823,8 @@ const records = [
       fileUrl: fileUrl(path),
       parser: "ffmpeg concat (stream copy)",
       vendor: t("joined.vendor"),
-      status: "derived",
+      status: st.status,
+      statusTrust: st.trust,
       sha256: item.output_sha256 || "-",
       duration: Number.isFinite(item.duration_seconds) ? item.duration_seconds : null,
       codec: "-",

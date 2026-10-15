@@ -213,7 +213,8 @@ syncThemeBtn();
 // ---- host API (docs/ui-rebuild-contract.md §3) ----------------------------
 function viewerSummary() {
   const base = window.__frametraceSummary();
-  return { ...base, pending: pendingSaveCount() };
+  // R9 U2: why a read-only viewer is locked ("case" | "annotations" | "").
+  return { ...base, pending: pendingSaveCount(), lockCause: annotationsReadOnly ? (annotationsLockCause || "annotations") : "" };
 }
 function viewerFocus() {
   const card = state.activeId != null
@@ -281,10 +282,13 @@ FTViewer._attach({
     // Other records' state (an unrelated open conflict) does not decide it:
     // only whether THESE records left the drafts without a conflict.
     // This caller waits for its own answer: the longest busy budget.
-    await FTViewer.save({ patient: true });
+    const so = { patient: true };
+    await FTViewer.save(so);
     const conflicted = touched.filter(id => conflictIds.has(id)).length;
     if (conflicted) throw new Error(tf("attr.conflict", { n: conflicted }));
     const unsaved = touched.filter(id => state.dirtyIds.has(id) || state.drafts[id]).length;
+    // R9 U6: timed out while the request is still on the wire — still saving.
+    if (unsaved && so.timedOut && saveInFlight) throw new Error(t("attr.stillSaving"));
     if (unsaved) throw new Error(tf("attr.unsaved", { n: unsaved, err: saveError || "" }));
     return touched.length;
   },

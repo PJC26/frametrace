@@ -218,7 +218,7 @@ window.FTViewer = {
   setLocale("ko"|"en"), getLocale() → "ko"|"en",
   setTheme("light"|"dark"), getTheme(),
   focus() → boolean,                // 활성 카드(없으면 #recordGrid)에 포커스
-  summary() → { total, byKind, byStatus, warned, marked, noted, pending },   // = __frametraceSummary() + pending(미저장 건수)
+  summary() → { total, byKind, byStatus, warned, marked, noted, pending, lockCause },   // = __frametraceSummary() + pending(미저장 건수) + lockCause(R9 U2: 읽기 전용 원인 "case" | "annotations" | "")
   saveState() → "saved"|"pending"|"saving"|"failed"|"queued"|"readonly"|"unknown"|"local"|null,   // readonly = 판독 기록 읽기 실패로 저장 차단(R4 A3), unknown = 저장 충돌 확인 실패(R4 A5) — 둘 다 "저장됨"이 아니다
   save({ timeoutMs } = {}) → Promise<boolean>,   // 진행 중 저장의 응답을 먼저 기다리고 남은 것을 보낸다(R4 A15). true = 이 창에 미저장 없음(서버 대기열은 내구 저장이라 true), false = 실패·충돌·확인 실패·읽기 전용·시간 초과. timeoutMs = 이 호출의 응답 **전체 상한**(진행 중 저장 대기·충돌 조회·전송·busy 재시도 모두 포함, R7 §14.1) — 넘으면 false + `opts.timedOut = true`(요청은 계속 진행). **R8 §15.2**: `{ patient: true }` = 명시적 저장(기본 20 s, 요청이 진행 중이면 연장), 인자 없는 `save()` = 4 s 고정
   caseStorageKey(manifest, caseDir) → string,   // R8 §15.1: 저장소 키·채널의 케이스 부분(case_id, 없으면 "nocase-<케이스 폴더 해시>", 절대 "case" 아님)
@@ -775,4 +775,27 @@ const FTStore = {
 
 ### 15.6 신뢰 표시 (트랙 I P0/P1/P2 ↔ U)
 - 소리 수준(`audioLevels`): `"sc": true`(감사 키 없는 PC의 측정) — 수준은 보이되 툴팁·상세에 "자기 일관성만(인증 아님)"(i18n `audio.selfConsistent`). `r: "unverified"`에 `"pc": "<key id>"` — 미확인 그대로, "키 <id> 보유 PC에서 확인"(`audio.otherPc`). 30-records `audioInfoFor`/`audioTrustNote`. verify-review-batch --unit "R8 (I <-> U)".
-- `/api/verify-audit`(41-finalize `auditVerdict`, 환경 배지 `#auditBadge`·결과물 시트 감사 로그 줄): 초록(`ok`)은 `integrity-keyed`일 때만. `integrity-structural-only` = "감사 로그 자기 일관성만 확인(인증 아님)", `integrity-not-verified` = "감사 로그 이 PC에서 인증 불가 — 키 <other_pc_key_ids> 보유 PC에서 확인" — 둘 다 호박색(`warn`). 로그별 `trust` 사유는 툴팁. 검증 실패 = `bad`. verify-finalize-sheet 1·2.
+- `/api/verify-audit`(41-finalize `auditVerdict`, 환경 배지 `#auditBadge`·결과물 시트 감사 로그 줄): 초록(`ok`)은 `integrity-keyed`일 때만. `integrity-structural-only` = "감사 로그 자기 일관성만 확인(인증 아님)", `integrity-not-verified` = "감사 로그 이 PC에서 인증 불가 — 키 <other_pc_key_ids> 보유 PC에서 확인" — 둘 다 호박색(`warn`). 로그별 `trust` 사유는 툴팁. 검증 실패 = `bad`. verify-finalize-sheet 1·2. (R9 U4: §16.2가 `integrity-not-verified` 문구를 대신한다.)
+
+## 16. R9 트랙 U 추가 계약 (2026-10-15, docs/PLAN_R9_2026-10-15.md)
+
+### 16.1 감사 레인 줄의 신뢰 (U1, 트랙 I P3 ↔ U)
+- 번들·`/api/records-meta`의 모든 로그 항목(`validationLog`, `carveLog`, `filesystemLog`, `joinLog`, `anomalyLog` …)은 `trust`를 싣는다: `"auth"`(이 PC에서 인증) · `"sc"`(키 없는 PC, 자기 일관성만) · `"unauth"`(키가 있는데 인증 안 됨) · `"pc:<key id>"`(다른 PC 키). 없으면 이전 서버(레거시) — 지금처럼 보이되 "인증됨"이라고 하지 않는다. 그 밖의 값은 `"unauth"`로 읽는다(30-records `logTrustOf`).
+- 쓸 수 있는 줄 = `auth` · `sc` · 레거시. 키별 현재 항목(`currentLogEntries`/`logSlots`)은 **마지막 쓸 수 있는 줄**이고, 인증 안 된 줄은 쓸 수 있는 줄이 하나도 없을 때만 그 기록으로 보인다(카빙 id, 복구 inode, 조인 출력 경로, 검증 대상 경로 모두).
+- 기록 상태(`recordStatusOf`): 자기 줄(카빙·복구·조인)이 인증 안 됨이면, 또는 경로의 검증이 인증 안 된 줄뿐이면 상태는 `unauthenticated`("인증 안 됨") / `auth-other-pc`("이 PC에서 인증 불가", 툴팁 "이 PC에서 인증 불가(변조 판정 아님) — 키 <id> 보유 PC에서 확인") — 확인됨·검증됨·파생물이 되지 않고 `검증됨` 지표·요약 보고서 수에서 빠진다. 아이콘 `lock`. `sc`는 값을 그대로 보이고 배지 툴팁에 "자기 일관성만(인증 아님)". 상세의 검증·이상 목록은 줄마다 신뢰 표시(`logTrustTagHtml`).
+- 내보내기(U5): CSV·JSON에 `audio_trust`(`sc` / `pc:<id>` / `unauth` / 수준의 `trust` / `""`)와 `status_trust`(상태가 기댄 줄의 `trust`, 레거시 `""`).
+- 하네스: verify-audio-facet `/trust`(실제 페이지: 배지·지표·상세 목록·최신 인증 줄 우선·조인·CSV), verify-review-batch --unit "R9 U1".
+
+### 16.2 다른 PC 줄 · 감사 배지 (U3/U4)
+- 다른 PC 키로 서명된 소리 측정(`pc`)은 "검증 실패"가 아니라 "이 PC에서 인증 불가(변조 판정 아님) — 키 <id> 보유 PC에서 확인". 트랙 없는(unknown) 기록도 카드에 `lock` 표시와 같은 문구.
+- `auditVerdict`(41-finalize): `integrity-not-verified`면 HMAC 없는 줄·은퇴 키 줄(`unauthenticated_lines`, 없으면 서버 사유 문구에서 셈)을 먼저 "감사 로그 인증 안 된 줄 N개", 다른 PC 키 줄(`other_pc_lines`)만이 원인일 때만 "이 PC에서 인증 불가(변조 판정 아님) — 키 … 보유 PC에서 확인", 그 밖의 원인은 "이 PC에서 인증되지 않음". 알 수 없는 상태도 다른 PC 키를 적는다. verify-finalize-sheet 1.
+
+### 16.3 원인별 읽기 전용 문구 (U2) · 아직 저장 중 (U6)
+- `summary().lockCause`가 읽기 전용 원인을 준다. 셸 닫기(95-quit `hBeforeClose`)·최종화 점검(41-finalize `unsavedMarksChecks({ lockCause })`; 뷰어 값이 없으면 records-meta의 `manifest` 없음 = `"case"`)은 `"case"`면 "케이스 정보(case.json)를 읽지 못해…", 아니면 "판독 기록을 읽지 못해…".
+- `save({ patient: true })`가 false + `timedOut`이고 저장 상태가 `saving`(요청이 아직 진행 중)이면 호출자는 실패가 아니라 "아직 저장 중"(01-store `hSaveStillSaving`): 최종화 '저장 다시 시도'·검토자 기록, 프로젝트 전환(`hostViewer.stillSaving`), 뷰어 `attributeUnassignedMarks`(`attr.stillSaving`). verify-review-batch --unit "R9 U2/U6".
+
+### 16.4 "case" 키 (U7/U8) · 하네스 저장 (U9) · 충돌 목록 Tab (U10)
+- 이전 빌드가 문자 그대로의 `"case"` 키로 남긴 드래프트(`ft.draft.case.*`, `ft.viewer.case.annotations.v1`)는 채택하지 않고, 알림 행에 한 번(`#legacyCaseDraftsNotice`; 건수가 바뀔 때만 다시, `ft.viewer.legacyCaseDrafts.noticed`) "케이스를 알 수 없는 이전 버전의 임시 편집 N건 — 반영하지 않았습니다". 지우지 않는다. `case_id`가 실제로 `"case"`인 케이스에서는 알리지 않는다. verify-audio-facet `/trust`.
+- `FTViewer.channels.player(key)`는 키가 없으면 `caseStorageKey(null, "")`(이 페이지 주소의 해시) — `"case"` 없음.
+- 하네스에서 실제 저장을 기다리는 `FTViewer.save`는 `{ patient: true }`. 4 s 무예산 경로를 시험하는 곳만 `FTViewer.save(/* no-budget: … */)`로 표시(verify-review-batch --unit "R9 U9"가 scripts/*.mjs 검사).
+- 충돌 배너는 알림 행의 **마지막** 배너(다른 알림은 `noticeAppend`로 그 앞), 목록 토글은 배너의 마지막 버튼 — Tab 순서가 토글 → 목록 첫 버튼, Shift+Tab은 토글로. verify-layout "R9 U10".

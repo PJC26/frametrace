@@ -27,7 +27,7 @@ async function hPendingChanges() {
     // an unreadable case.json: a hash of the case folder — never "case").
     const caseId = meta && meta.ok !== false && typeof FTViewer === "object" && FTViewer && FTViewer.caseStorageKey
       ? FTViewer.caseStorageKey(meta.manifest, meta.caseDir)
-      : (meta && meta.manifest ? (meta.manifest.case_id || "case") : null);
+      : (meta && meta.manifest && meta.manifest.case_id ? String(meta.manifest.case_id) : null);
     // Per-id draft keys (ft.draft.<case>.<writer>.<id>) plus any legacy
     // single-key drafts not yet migrated; null = storage unreadable.
     return caseId ? (unsavedDraftCount(caseId) || 0) : 0;
@@ -74,7 +74,13 @@ async function hBeforeClose(timeoutMs = H_CLOSE_TIMEOUT_MS) {
   if (opts.timedOut) timedOut = true;
   let pending = 0;
   let state = null;
-  try { pending = Number((api.summary() || {}).pending) || 0; state = api.saveState(); } catch (e) { pending = 0; }
+  let cause = "";
+  try {
+    const sm = api.summary() || {};
+    pending = Number(sm.pending) || 0;
+    cause = typeof sm.lockCause === "string" ? sm.lockCause : "";
+    state = api.saveState();
+  } catch (e) { pending = 0; }
   // A durable server queue counts as saved (it reaches the case DB when the job ends).
   // R5 U15: read-only with nothing pending here (FTViewer.save() true: no
   // draft, no edit) loses nothing by closing — no confirmation, a warning only.
@@ -83,9 +89,12 @@ async function hBeforeClose(timeoutMs = H_CLOSE_TIMEOUT_MS) {
   const late = timedOut ? " (저장 응답 대기 시간 초과)" : "";
   const message = ok ? ""
     : pending > 0 ? `저장 안 된 편집 ${pending}건` + late
-    : state === "readonly" ? "판독 기록을 읽지 못해 저장이 막혀 있습니다"
+    : state === "readonly" ? (cause === "case" ? "케이스 정보(case.json)를 읽지 못해 저장이 막혀 있습니다" : "판독 기록을 읽지 못해 저장이 막혀 있습니다")
     : "모든 편집이 저장되었는지 확인하지 못했습니다" + late;
-  const warning = readonlyClean ? "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다." : "";
+  // R9 U2: the read-only cause in the words of the viewer (case.json vs the marks).
+  const warning = !readonlyClean ? ""
+    : cause === "case" ? "케이스 정보(case.json)를 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다."
+    : "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다.";
   if (warning && typeof toast === "function") toast(warning, "warn");
   return { ok, pending, state, message, warning };
 }
