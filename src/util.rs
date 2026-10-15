@@ -784,46 +784,146 @@ pub fn sanitize_filename(input: &str) -> String {
 /// The literal a generated page embeds in a `<script>` block for the JSON
 /// text `input`.
 ///
-/// R6-S1: `input` must be ONE JSON value. It is parsed and re-serialized
-/// (key order is kept — serde_json `preserve_order`), so whatever reaches
-/// the script is data and nothing else. Before, the text was only escaped
-/// for `<`/`>`/`&` and embedded verbatim: a crafted `case.json` such as
+/// R6-S1: `input` must be ONE JSON value — whatever reaches the script is
+/// data and nothing else. Before, the text was only escaped for
+/// `<`/`>`/`&` and embedded verbatim: a crafted `case.json` such as
 /// `{"case_id":"x"};fetch(…);//` ran in the workstation origin from a
 /// page the generated-pages list vouches for. Input that is not exactly
 /// one JSON value becomes `null` (callers that read files say so — see
 /// [`script_json_input`]).
+///
+/// R7-S1: the input is VALIDATED, not parsed into a tree: serde_json's
+/// [`serde_json::value::RawValue`] checks the whole grammar (one value,
+/// only whitespace after it) without building a `Value`, and
+/// [`script_safe_json`] then copies it once (insignificant whitespace
+/// dropped; `<`, `>`, `&`, U+2028/U+2029 escaped). R6 built a `Value` of
+/// a file list that can be hundreds of MB and copied it six more times
+/// (`to_string` plus one `replace` per character). The value's text is
+/// kept as written (numbers, escapes, key order).
 pub fn json_for_script(input: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(input) {
-        Ok(value) => script_json_value(&value),
-        Err(_) => "null".to_string(),
+    match validated_json(input) {
+        Some(raw) => script_safe_json(raw, true),
+        None => "null".to_string(),
     }
 }
 
-/// [`json_for_script`] for an already parsed value: compact JSON with
-/// `<`, `>`, `&` and the JS line terminators U+2028/U+2029 escaped (they
-/// can only occur inside strings, where `\uXXXX` means the same).
+#[cfg(test)]
+thread_local! {
+    /// R7-S1 test hook: inputs [`validated_json`] accepted on this thread.
+    pub(crate) static RAW_JSON_VALIDATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// R7-S1: `input`'s single JSON value (outer whitespace trimmed) when
+/// `input` is exactly one JSON value, else `None`. Grammar check only —
+/// no tree is built, nothing is allocated for the value.
+fn validated_json(input: &str) -> Option<&str> {
+    let raw = serde_json::from_str::<&serde_json::value::RawValue>(input).ok()?;
+    #[cfg(test)]
+    RAW_JSON_VALIDATIONS.with(|count| count.set(count.get() + 1));
+    Some(raw.get())
+}
+
+/// R7-S1: one pass over VALID JSON text: whitespace outside strings is
+/// dropped and, with `escape`, `<`, `>`, `&` and the JS line terminators
+/// U+2028/U+2029 are written as `\uXXXX` (they can only occur inside
+/// strings, where the escape means the same character). Not a parser —
+/// `json` must already be valid JSON.
+fn script_safe_json(json: &str, escape: bool) -> String {
+    let bytes = json.as_bytes();
+    let mut out = String::with_capacity(json.len() + 16);
+    let mut run_start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        // (replacement, bytes consumed) when this byte is not copied as is.
+        let mut replace: Option<(&str, usize)> = None;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else {
+                match byte {
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    b'<' if escape => replace = Some(("\\u003c", 1)),
+                    b'>' if escape => replace = Some(("\\u003e", 1)),
+                    b'&' if escape => replace = Some(("\\u0026", 1)),
+                    0xE2 if escape && bytes.get(index + 1) == Some(&0x80) => {
+                        match bytes.get(index + 2) {
+                            Some(0xA8) => replace = Some(("\\u2028", 3)),
+                            Some(0xA9) => replace = Some(("\\u2029", 3)),
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b' ' | b'\t' | b'\n' | b'\r' => replace = Some(("", 1)),
+                _ => {}
+            }
+        }
+        match replace {
+            Some((text, consumed)) => {
+                out.push_str(&json[run_start..index]);
+                out.push_str(text);
+                index += consumed;
+                run_start = index;
+            }
+            None => index += 1,
+        }
+    }
+    out.push_str(&json[run_start..]);
+    out
+}
+
+/// [`json_for_script`] for an already built value (program-made data,
+/// nothing to validate): compact JSON escaped in the same single pass.
 pub fn script_json_value(value: &serde_json::Value) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "null".to_string())
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    match serde_json::to_string(value) {
+        Ok(text) => script_safe_json(&text, true),
+        Err(_) => "null".to_string(),
+    }
 }
 
 /// R6-S1: validates an input file's text (`label` names it) before a
 /// generator embeds it: `Ok(compact JSON)` when it is exactly one JSON
 /// value, else `Err(warning)` — the caller embeds `null` and prints the
-/// warning (never a silent blank page).
+/// warning (never a silent blank page). R7-S1: validated without a tree,
+/// like [`json_for_script`].
 pub fn script_json_input(label: &str, text: &str) -> Result<String, String> {
-    serde_json::from_str::<serde_json::Value>(text)
-        .map(|value| value.to_string())
-        .map_err(|err| {
-            format!(
-                "{label}이(가) 올바른 JSON이 아니어서 페이지에 넣지 않았습니다 (null로 대체) / {label} is not valid JSON and was embedded as null: {err}"
-            )
-        })
+    match serde_json::from_str::<&serde_json::value::RawValue>(text) {
+        Ok(raw) => Ok(script_safe_json(raw.get(), false)),
+        Err(err) => Err(format!(
+            "{label}이(가) 올바른 JSON이 아니어서 페이지에 넣지 않았습니다 (null로 대체) / {label} is not valid JSON and was embedded as null: {err}"
+        )),
+    }
+}
+
+/// R7-S6: stderr prefix of a warning a CLI child wants the workstation to
+/// show as a JOB warning (status `warnings`, log) — the windowed app has
+/// no console, so a plain `warning:` line of a step was never seen.
+pub const STEP_WARNING_MARKER: &str = "FRAMETRACE-STEP-WARNING: ";
+
+/// R7-S6: environment variable the workstation sets on its CLI children:
+/// they print warnings with [`STEP_WARNING_MARKER`] (see
+/// [`print_step_warning`]).
+pub const STEP_WARNING_ENV: &str = "FRAMETRACE_STEP_WARNINGS";
+
+/// R7-S6: prints a warning on stderr — `warning: …` for a person at a
+/// console, [`STEP_WARNING_MARKER`]`…` when the workstation runs this
+/// process as a step (it promotes such lines to job warnings).
+pub fn print_step_warning(message: &str) {
+    let message = message.replace(['\r', '\n'], " ");
+    if std::env::var_os(STEP_WARNING_ENV).is_some_and(|value| value == "1") {
+        eprintln!("{STEP_WARNING_MARKER}{message}");
+    } else {
+        eprintln!("warning: {message}");
+    }
 }
 
 pub fn path_to_file_url(path: &Path) -> String {
@@ -1151,6 +1251,150 @@ pub mod generated_pages {
         Some(sources.join(" "))
     }
 
+    /// R7-S2: [`inline_script_sources`] over a page read in chunks — the
+    /// SHA-256 of every inline `<script>` body, without the page in
+    /// memory. It always yields a hash list (`'self'` + hashes): inline
+    /// event handlers and `javascript:` URLs are not looked for, so a page
+    /// that uses them gets them blocked rather than allowed — the strict
+    /// side. A page served while being streamed must never get the
+    /// "no script-src" answer: bytes changed after verification could
+    /// render (and run) before the transfer is cut off.
+    #[derive(Default)]
+    pub struct InlineScriptScan {
+        state: ScanState,
+        /// Bytes of `<script` / `</script` matched so far.
+        matched: usize,
+        /// Lower-cased attributes of the open tag (bounded).
+        tag: Vec<u8>,
+        tag_overflow: bool,
+        inline: bool,
+        hasher: Option<sha2::Sha256>,
+        /// Original bytes of a partial `</script` match inside a body.
+        pending: Vec<u8>,
+        sources: Vec<String>,
+    }
+
+    #[derive(Default, PartialEq)]
+    enum ScanState {
+        #[default]
+        Text,
+        Tag,
+        Body,
+    }
+
+    const OPEN: &[u8] = b"<script";
+    const CLOSE: &[u8] = b"</script";
+    /// Longest `<script …>` attribute text kept; a longer tag is treated
+    /// as external (its body is not hashed — the script is blocked).
+    const TAG_MAX: usize = 4096;
+
+    impl InlineScriptScan {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn feed(&mut self, chunk: &[u8]) {
+            use sha2::Digest;
+            let mut index = 0usize;
+            while index < chunk.len() {
+                match self.state {
+                    ScanState::Text => {
+                        if self.matched == 0 {
+                            match chunk[index..].iter().position(|b| *b == b'<') {
+                                Some(at) => index += at,
+                                None => return,
+                            }
+                        }
+                        let byte = chunk[index].to_ascii_lowercase();
+                        index += 1;
+                        if byte == OPEN[self.matched] {
+                            self.matched += 1;
+                            if self.matched == OPEN.len() {
+                                self.state = ScanState::Tag;
+                                self.matched = 0;
+                                self.tag.clear();
+                                self.tag_overflow = false;
+                            }
+                        } else {
+                            self.matched = usize::from(byte == b'<');
+                        }
+                    }
+                    ScanState::Tag => {
+                        let byte = chunk[index];
+                        index += 1;
+                        if byte == b'>' {
+                            let attrs = String::from_utf8_lossy(&self.tag);
+                            self.inline = !self.tag_overflow
+                                && !attrs.contains(" src=")
+                                && !attrs.contains(" src =");
+                            self.state = ScanState::Body;
+                            self.hasher = Some(sha2::Sha256::new());
+                            self.pending.clear();
+                            self.matched = 0;
+                        } else if self.tag.len() < TAG_MAX {
+                            self.tag.push(byte.to_ascii_lowercase());
+                        } else {
+                            self.tag_overflow = true;
+                        }
+                    }
+                    ScanState::Body => {
+                        let hasher = self.hasher.get_or_insert_with(sha2::Sha256::new);
+                        if self.matched == 0 {
+                            let end = chunk[index..]
+                                .iter()
+                                .position(|b| *b == b'<')
+                                .map_or(chunk.len(), |at| index + at);
+                            hasher.update(&chunk[index..end]);
+                            index = end;
+                            if index == chunk.len() {
+                                return;
+                            }
+                        }
+                        let raw = chunk[index];
+                        let byte = raw.to_ascii_lowercase();
+                        index += 1;
+                        if byte == CLOSE[self.matched] {
+                            self.matched += 1;
+                            self.pending.push(raw);
+                            if self.matched == CLOSE.len() {
+                                let digest = self.hasher.take().map(|h| h.finalize());
+                                if self.inline
+                                    && let Some(digest) = digest
+                                {
+                                    self.sources.push(format!(
+                                        "'sha256-{}'",
+                                        super::base64_encode(&digest)
+                                    ));
+                                }
+                                self.pending.clear();
+                                self.matched = 0;
+                                self.state = ScanState::Text;
+                            }
+                        } else {
+                            hasher.update(&self.pending);
+                            self.pending.clear();
+                            if byte == b'<' {
+                                self.pending.push(raw);
+                                self.matched = 1;
+                            } else {
+                                hasher.update([raw]);
+                                self.matched = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The CSP `script-src` sources: `'self'` plus every complete
+        /// inline script's hash.
+        pub fn finish(self) -> String {
+            let mut sources = vec!["'self'".to_string()];
+            sources.extend(self.sources);
+            sources.join(" ")
+        }
+    }
+
     /// ` on<letters>=` inside a tag (approximate; a false positive only
     /// drops the optional script-src, never trusts more).
     fn has_inline_handler(lower: &str) -> bool {
@@ -1365,6 +1609,87 @@ mod tests {
         );
         assert!(script_json_input("case.json", "{} x").is_err());
         assert_eq!(script_json_input("case.json", " [1, 2] ").unwrap(), "[1,2]");
+        // R7-S1: whitespace inside strings stays, outside goes; the
+        // script escapes apply inside strings only.
+        assert_eq!(
+            json_for_script("{ \"a b\" : [ \"x <y>\\u0041\\\"&\" , 2 ] ,\n\"c\":\"\u{2029}\" }"),
+            "{\"a b\":[\"x \\u003cy\\u003e\\u0041\\\"\\u0026\",2],\"c\":\"\\u2029\"}"
+        );
+        assert_eq!(json_for_script("[1] [2]"), "null");
+        assert_eq!(json_for_script("\"\u{1}\""), "null");
+    }
+
+    /// R7-S2: the streaming inline-script scan gives the same `script-src`
+    /// as the whole-page scan for a handler-free page, however the page is
+    /// cut into chunks (tags and `</script` split across chunk edges,
+    /// upper case, external scripts, a `<` inside a body).
+    #[test]
+    fn streaming_inline_script_scan_matches_the_page_scan() {
+        use super::generated_pages::{InlineScriptScan, inline_script_sources};
+        let page = "<html><head><SCRIPT>let a = 1 < 2;</SCRIPT><script src=\"x.js\"></script>\
+            <script type=\"module\">if (a </ 3) {}</script ></head><body><p>x</p>\
+            <script>\nconst s = \"</scr\" + \"ipt>\";\n</sCrIpT><scriptx>y</script>\
+            <script>never closed";
+        let whole = inline_script_sources(page).unwrap();
+        assert_eq!(whole.matches("'sha256-").count(), 4, "{whole}");
+        for size in [1usize, 2, 3, 5, 7, 8, 9, 13, 64, page.len()] {
+            let mut scan = InlineScriptScan::new();
+            for chunk in page.as_bytes().chunks(size) {
+                scan.feed(chunk);
+            }
+            assert_eq!(scan.finish(), whole, "chunk size {size}");
+        }
+    }
+
+    /// R7-S1: a multi-MB input is validated without a `Value` tree (the
+    /// raw path accepted it, and numbers keep the text they were written
+    /// with — a tree turns `1e2` into `100.0` and a 30-digit integer into a
+    /// float) and gives the same embedding the R6 tree path gave for
+    /// ordinary JSON.
+    #[test]
+    fn json_for_script_validates_large_inputs_without_a_tree() {
+        use super::{RAW_JSON_VALIDATIONS, json_for_script};
+        let videos: Vec<serde_json::Value> = (0..40_000)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("vid_{i:06}"),
+                    "relative_path": format!("CH1/</script><b>{i}</b> & \u{2028}.mp4"),
+                    "size_bytes": i * 1024,
+                    "duration_seconds": 1.5 + i as f64,
+                    "ok": i % 2 == 0,
+                    "nested": {"tags": ["a", "b"], "none": null},
+                })
+            })
+            .collect();
+        let pretty =
+            serde_json::to_string_pretty(&serde_json::json!({ "videos": videos })).unwrap();
+        assert!(pretty.len() > 8 * 1024 * 1024, "{}", pretty.len());
+        // The R6 embedding: parse into a tree, re-serialize, escape.
+        let tree: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        let r6 = serde_json::to_string(&tree)
+            .unwrap()
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e")
+            .replace('&', "\\u0026")
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029");
+        let before = RAW_JSON_VALIDATIONS.with(std::cell::Cell::get);
+        let embedded = json_for_script(&pretty);
+        assert_eq!(RAW_JSON_VALIDATIONS.with(std::cell::Cell::get), before + 1);
+        assert!(
+            embedded == r6,
+            "multi-MB output differs from the R6 embedding"
+        );
+        assert!(!embedded.contains("</script"));
+        // The raw path keeps number text a tree would rewrite.
+        let numbers = format!(
+            "{{\"n\":1e2,\"big\":123456789012345678901234567890,\"pad\":\"{}\"}}",
+            "x".repeat(2 << 20)
+        );
+        let embedded = json_for_script(&numbers);
+        assert!(embedded.starts_with("{\"n\":1e2,\"big\":123456789012345678901234567890,"));
+        // A crafted tail after a multi-MB value is still refused.
+        assert_eq!(json_for_script(&format!("{pretty};alert(1)")), "null");
     }
 
     /// R5 (P3): a non-Unicode name keeps its exact UTF-16 units when the

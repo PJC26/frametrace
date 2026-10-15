@@ -2409,8 +2409,16 @@ pub(crate) fn sweep_killed_step(args: &[String], pid: u32) -> Vec<Result<String,
     }
     for reserved in own_reservations {
         // remove_dir only removes an EMPTY directory: a finished package
-        // is never touched.
-        if reserved.is_dir() && std::fs::remove_dir(&reserved).is_ok() {
+        // is never touched. R7-S5: and only a reservation whose marker
+        // names the killed pid (or that is still empty: killed before
+        // the marker was written) — the name a work folder carries may be
+        // another package-case's live reservation it lost the race for.
+        let removed = match crate::join::reservation_owner(&reserved) {
+            Some(Some(owner)) => owner == pid && crate::join::release_reservation(&reserved, pid),
+            Some(None) => std::fs::remove_dir(&reserved).is_ok(),
+            None => false,
+        };
+        if removed {
             out.push(Ok(format!(
                 "중단된 패키지 생성의 빈 폴더를 지웠습니다: {}",
                 reserved.display()

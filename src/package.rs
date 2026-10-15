@@ -137,7 +137,7 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     let result = package_case_into(case_dir, output_dir, &work_dir, created_unix);
     let release_reservation = || {
         if reserved_default {
-            let _ = fs::remove_dir(&final_dir);
+            crate::join::release_reservation(&final_dir, pid);
         }
     };
     let mut result = match result {
@@ -150,6 +150,22 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     };
     // The final name holds at most an empty directory (our reservation or
     // an empty explicit output); it is replaced by the finished package.
+    // R7-S5: our reservation is released through its marker — one that no
+    // longer names this process is not ours to replace.
+    // The finished package is kept (marked, never swept) when the name
+    // is held by something else now.
+    if reserved_default && final_dir.exists() && !crate::join::release_reservation(&final_dir, pid)
+    {
+        let _ = fs::write(
+            crate::join::preserved_part_marker(&work_dir),
+            "FrameTrace: 이 폴더는 완성된 패키지입니다. 예약한 이름을 다른 것이 쓰고 있어 그대로 두었습니다.\nThis folder is a complete package; its reserved name is in use by something else, so it was kept as is.\n",
+        );
+        return Err(format!(
+            "패키지 이름 {}의 예약이 더 이상 이 실행의 것이 아닙니다 — 완성된 패키지는 {}에 남겨 두었습니다.",
+            final_dir.display(),
+            work_dir.display()
+        ));
+    }
     if final_dir.exists()
         && let Err(err) = fs::remove_dir(&final_dir)
     {
@@ -228,7 +244,22 @@ fn reserve_package_dirs(base: &Path, pid: u32) -> Result<(PathBuf, PathBuf), Str
         fs::create_dir(&work)
             .map_err(|err| format!("failed to create {}: {err}", work.display()))?;
         match fs::create_dir(&candidate) {
-            Ok(()) => return Ok((candidate, work)),
+            Ok(()) => {
+                // R7-S5: the reservation names its owner; sweeps release
+                // it only for this pid (the work folder alone cannot
+                // prove the name is ours — see `join::RESERVATION_MARKER`).
+                let marker = candidate.join(crate::join::RESERVATION_MARKER);
+                if let Err(err) = fs::write(&marker, crate::join::reservation_marker_text(pid)) {
+                    let _ = fs::remove_file(&marker);
+                    let _ = fs::remove_dir(&candidate);
+                    let _ = fs::remove_dir(&work);
+                    return Err(format!(
+                        "failed to mark package reservation {}: {err}",
+                        candidate.display()
+                    ));
+                }
+                return Ok((candidate, work));
+            }
             Err(_) => {
                 // Taken meanwhile (another package-case): next name.
                 let _ = fs::remove_dir(&work);

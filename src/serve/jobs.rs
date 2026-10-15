@@ -1129,7 +1129,10 @@ pub(crate) fn run_step_detailed(
     command
         .args(&child_args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // R7-S6: the child prints its warnings as STEP_WARNING_MARKER
+        // lines, promoted to job warnings below.
+        .env(crate::util::STEP_WARNING_ENV, "1");
     if let Some(tag) = key_tag {
         command.env(EXPECTED_AUDIT_KEY_ENV, tag);
     }
@@ -1151,7 +1154,10 @@ pub(crate) fn run_step_detailed(
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
     let stdout_reader = thread::spawn(move || drain_capped(&mut stdout_pipe));
     let stderr_reader = thread::spawn(move || {
-        drain_capped_collecting(&mut stderr_pipe, Some(super::KEY_MISMATCH_MARKER))
+        drain_capped_collecting(
+            &mut stderr_pipe,
+            &[super::KEY_MISMATCH_MARKER, crate::util::STEP_WARNING_MARKER],
+        )
     });
     let mut killed = false;
     let status = loop {
@@ -1180,7 +1186,8 @@ pub(crate) fn run_step_detailed(
     let (stderr_tail, key_warnings) = stderr_tail.unwrap_or_default();
     // R5-S9: the child said it signs with another audit key than this
     // workstation — a job warning (status `warnings`, log), not just a
-    // stderr line nobody sees in the windowed app.
+    // stderr line nobody sees in the windowed app. R7-S6: so is any
+    // warning the child printed as a step warning.
     for warning in key_warnings {
         let program = args.first().map(String::as_str).unwrap_or("command");
         report_process_warning(state, format!("{program}: {warning}"));
@@ -1231,19 +1238,20 @@ fn guard_key_tag(guard: &JobState) -> Option<String> {
 /// output, while the drain itself keeps the child's write end from ever
 /// blocking on a full pipe.
 pub(crate) fn drain_capped(pipe: &mut impl std::io::Read) -> Vec<u8> {
-    drain_capped_collecting(pipe, None).0
+    drain_capped_collecting(pipe, &[]).0
 }
 
 /// Most marker lines one step may raise (R5-S9).
 const MAX_MARKER_LINES: usize = 8;
 
 /// [`drain_capped`] that also returns every complete line starting with
-/// `marker` (marker stripped, at most [`MAX_MARKER_LINES`]) wherever it
-/// appeared — R5-S9: a child's audit-key mismatch warning is printed first
-/// and would otherwise fall out of the retained tail of a chatty step.
+/// one of `markers` (marker stripped, at most [`MAX_MARKER_LINES`])
+/// wherever it appeared — R5-S9: a child's audit-key mismatch warning is
+/// printed first and would otherwise fall out of the retained tail of a
+/// chatty step.
 pub(crate) fn drain_capped_collecting(
     pipe: &mut impl std::io::Read,
-    marker: Option<&str>,
+    markers: &[&str],
 ) -> (Vec<u8>, Vec<String>) {
     let mut buffer = Vec::new();
     let mut found: Vec<String> = Vec::new();
@@ -1251,11 +1259,10 @@ pub(crate) fn drain_capped_collecting(
     let mut line: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     let take_line = |line: &mut Vec<u8>, found: &mut Vec<String>| {
-        if let Some(marker) = marker
-            && found.len() < MAX_MARKER_LINES
-        {
+        if !markers.is_empty() && found.len() < MAX_MARKER_LINES {
             let text = String::from_utf8_lossy(line);
-            if let Some(rest) = text.trim_end_matches('\r').strip_prefix(marker) {
+            let text = text.trim_end_matches('\r');
+            if let Some(rest) = markers.iter().find_map(|marker| text.strip_prefix(marker)) {
                 found.push(rest.trim().to_string());
             }
         }
@@ -1265,7 +1272,7 @@ pub(crate) fn drain_capped_collecting(
         match pipe.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(read) => {
-                if marker.is_some() {
+                if !markers.is_empty() {
                     for &byte in &chunk[..read] {
                         if byte == b'\n' {
                             take_line(&mut line, &mut found);
