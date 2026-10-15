@@ -5,14 +5,55 @@
 //! instance file, so a test can never read or write the examiner's real
 //! `~/.config/frametrace`, `%APPDATA%\frametrace` or `~/.frametrace`.
 //!
+//! R5 U11: on top of that, every `FRAMETRACE_*` variable of the test
+//! runner's own environment is removed from the child first (an examiner's
+//! `FRAMETRACE_AUDIT_KEY`, `FRAMETRACE_TOKEN`, `FRAMETRACE_UI`, … used to
+//! leak into the IT processes); a test sets the ones it needs explicitly,
+//! after `.isolated()`.
+//!
 //! ```ignore
-//! Command::new(exe).args(args).envs(common::isolated_env())
+//! use common::IsolatedCommand;
+//! Command::new(exe).args(args).isolated()
 //! ```
 #![allow(dead_code)]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::OnceLock;
+
+/// The inherited variables a test child must not see: every `FRAMETRACE_*`
+/// name among `names` (the runner's environment).
+pub fn inherited_frametrace_vars<I, S>(names: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    names
+        .into_iter()
+        .filter(|name| {
+            name.as_ref()
+                .to_str()
+                .is_some_and(|text| text.to_ascii_uppercase().starts_with("FRAMETRACE_"))
+        })
+        .map(|name| name.as_ref().to_os_string())
+        .collect()
+}
+
+/// `Command` extension: scrub the inherited `FRAMETRACE_*` variables, then
+/// apply [`isolated_env`]. Later `.env(..)` calls still win.
+pub trait IsolatedCommand {
+    fn isolated(&mut self) -> &mut Self;
+}
+
+impl IsolatedCommand for Command {
+    fn isolated(&mut self) -> &mut Self {
+        for name in inherited_frametrace_vars(std::env::vars_os().map(|(name, _)| name)) {
+            self.env_remove(name);
+        }
+        self.envs(isolated_env())
+    }
+}
 
 /// One scratch config root per test process (removed at OS temp cleanup).
 fn config_root() -> &'static PathBuf {

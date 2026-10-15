@@ -48,7 +48,16 @@ const check = (name, ok, detail = '') => {
 };
 
 const html = buildViewer();
+let captures = 0;
 const server = createServer((req, res) => {
+  // R5 U8: the frame-capture POST is refused (401) like a stale cookie.
+  if (req.url.startsWith('/api/capture-frame')) {
+    captures += 1;
+    res.statusCode = 401;
+    res.setHeader('Content-Type', 'application/json');
+    res.end('{"ok":false,"error":"unauthorized"}');
+    return;
+  }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.end(html);
 });
@@ -241,6 +250,19 @@ try {
       const g1 = await time();
       check(`${label} steps ${want.toFixed(4)} s`, Math.abs(g1 - g0 - want) < 0.005, `${g0} -> ${g1}`);
     }
+  }
+  // R5 U8: the pop-out's capture goes through the viewer's common POST door:
+  // a 401 reads as the authorization refusal (and tells the host), never
+  // as "server unreachable".
+  {
+    await page.evaluate(() => { window.__ftErr = []; FTViewer.on('error', (e) => window.__ftErr.push(e.detail)); });
+    const [popup] = await Promise.all([page.waitForEvent('popup'), page.evaluate(() => FTViewer.popout())]);
+    await popup.waitForFunction(() => typeof call === 'function');
+    const res = await popup.evaluate(() => new Promise((r) => call('capture', { id: 'vid_a', image: 'AAAA', time: '0.00' }, r, 10000)));
+    const heard = await page.evaluate(() => window.__ftErr);
+    check('U8: pop-out capture 401 → authorization refusal via the bridge (not "offline")', res && res.ok === false && res.auth === true && /인증 오류/.test(res.error) && captures === 1, JSON.stringify(res));
+    check('U8: the host hears the 401 (auth error event)', heard.some((d) => d.auth === true && d.stage === 'request'), JSON.stringify(heard));
+    await popup.close();
   }
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

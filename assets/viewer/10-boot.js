@@ -55,6 +55,10 @@ const ANNOTATIONS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".annotati
 // RANGES_KEY: the pre-R4 whole-map range store — retired (A2), only read once
 // at boot to migrate (30-records migrateLegacyRanges).
 const RANGES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".ranges";
+// R5 U3: RANGES_KEY entries of ids this case does not (yet) list are held
+// here instead of being dropped with the retired key; every boot re-checks
+// them (a growing live index may list the id later).
+const RANGES_HELD_KEY = RANGES_KEY + ".held";
 const PROXIES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".proxies";
 const EXAMINER_KEY = "ft.viewer." + (manifest.case_id || "case") + ".examiner";
 const MARK_STATUSES = ["reviewed", "important", "needs_verification"];

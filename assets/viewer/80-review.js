@@ -1,7 +1,7 @@
 function moveActive(step) {
   const filtered = filteredRecords();
   if (!filtered.length) return;
-  const index = filtered.findIndex(record => record.id === state.activeId);
+  const index = indexInList(filtered, state.activeId);
   const next = Math.max(0, Math.min(filtered.length - 1, (index < 0 ? 0 : index + step)));
   const nextId = filtered[next].id;
   const nextPage = Math.floor(next / state.pageSize) + 1;
@@ -401,11 +401,12 @@ function journaled(label, ids, mutate, message) {
 function focusRecordId(id) {
   if (!id || !records.some(record => record.id === id)) return;
   state.activeId = id;
-  const index = filteredRecords().findIndex(record => record.id === id);
+  const index = indexInList(filteredRecords(), id);
   if (index >= 0) state.currentPage = Math.floor(index / state.pageSize) + 1;
 }
 
 function undoJournal() {
+  if (refuseLockedEdit()) return false; // R5 U1
   const entry = undoStack.pop();
   if (!entry) { toast(t("toast.nothingUndo")); return false; }
   const res = applyJournalSide(journalUnpack(entry), "before");
@@ -419,6 +420,7 @@ function undoJournal() {
 }
 
 function redoJournal() {
+  if (refuseLockedEdit()) return false; // R5 U1
   const entry = redoStack.pop();
   if (!entry) { toast(t("toast.nothingRedo")); return false; }
   const res = applyJournalSide(journalUnpack(entry), "after");
@@ -448,6 +450,7 @@ function markStatusLabel(status) {
 // Selection-bar mark buttons. Clearing a mark keeps the examiner's note —
 // notes are only ever edited in the note field.
 function applyMarkJournaled(status) {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   const label = markStatusLabel(status);
@@ -465,12 +468,14 @@ function applyMarkJournaled(status) {
 }
 
 function applyTagJournaled(tag) {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag)); return; }
   confirmThen(ids, tf("journal.tag", { tag }), () => journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag)));
 }
 
 function clearTagsJournaled() {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { journaled(t("journal.tagClear"), ids, () => clearTags()); return; }
   confirmThen(ids, t("journal.tagClear"), () => journaled(t("journal.tagClear"), ids, () => clearTags()));
@@ -480,8 +485,9 @@ function clearTagsJournaled() {
 // can clear a review queue without touching the mouse. Key 0 removes the
 // mark only — the note survives — and every mark is undoable.
 function markActive(status) {
+  if (refuseLockedEdit()) return; // R5 U1: read-only — no mark, no advance
   const before = filteredRecords();
-  const index = before.findIndex(record => record.id === state.activeId);
+  const index = indexInList(before, state.activeId);
   if (index < 0) return;
   const id = state.activeId;
   const label = markStatusLabel(status);
@@ -493,7 +499,7 @@ function markActive(status) {
   const after = filteredRecords();
   const next = before.slice(index + 1).find(record => after.some(item => item.id === record.id));
   state.activeId = next?.id || after[Math.min(index, after.length - 1)]?.id || null;
-  state.currentPage = Math.max(1, Math.floor(after.findIndex(record => record.id === state.activeId) / state.pageSize) + 1);
+  state.currentPage = Math.max(1, Math.floor(indexInList(after, state.activeId) / state.pageSize) + 1);
   render();
 }
 
@@ -505,7 +511,7 @@ function isReviewed(record) { return !!state.marks[record.id]; }
 function moveToUnreviewed(step) {
   const filtered = filteredRecords();
   if (!filtered.length) return;
-  const start = filtered.findIndex(record => record.id === state.activeId);
+  const start = indexInList(filtered, state.activeId);
   const base = start < 0 ? (step > 0 ? -1 : 0) : start;
   const total = filtered.length;
   for (let offset = 1; offset <= total; offset += 1) {
@@ -551,10 +557,17 @@ function setI18nTitle(el, key) {
   el.title = t(key);
 }
 
+var reviewedCount = null;
 function updateReviewMeta() {
   if (!reviewMeta) return;
   const total = records.length;
-  const reviewed = records.reduce((n, record) => n + (isReviewed(record) ? 1 : 0), 0);
+  // R5 U17: recounted only when an annotation changed (annotationGen), not
+  // on every j/k or click (an O(n) pass over 50k records per render).
+  const gen = typeof annotationGen === "number" ? annotationGen : NaN;
+  if (!(reviewedCount && reviewedCount.gen === gen && reviewedCount.total === total)) {
+    reviewedCount = { gen, total, n: records.reduce((n, record) => n + (isReviewed(record) ? 1 : 0), 0) };
+  }
+  const reviewed = reviewedCount.n;
   reviewMeta.progressText.textContent = tf("progress.label", { n: reviewed, m: total });
   reviewMeta.meter.max = Math.max(1, total);
   reviewMeta.meter.value = reviewed;
@@ -911,6 +924,7 @@ function updateRangeLabel() {
 // put every toast in this function into its TDZ (UX-01). A point that
 // would make OUT <= IN is rejected and the existing range kept intact.
 function setRangePoint(which) {
+  if (refuseLockedEdit()) return; // R5 U1
   const video = currentVideo();
   const record = selectedRecord();
   const now = video ? Number(video.currentTime) : NaN;
@@ -1203,6 +1217,8 @@ const JOIN_CODE_TEXT = {
   "channel-mixed": "채널이 섞여 있습니다",
   "stream-mismatch": "영상 스트림 설정이 서로 다릅니다",
   "audio-presence": "오디오 트랙이 일부에만 있습니다",
+  // R5 (S13): a file with sound but no video stream is refused at planning.
+  "audio-only": "영상 스트림이 없는(소리만 있는) 파일은 이어붙일 수 없습니다",
   "unknown-duration": "길이를 알 수 없는 파일이 있습니다 — 손상 의심",
   "duplicate-file": "같은 파일이 두 번 선택되었습니다",
   "same-start": "시작 시각이 같은 영상이 있습니다",

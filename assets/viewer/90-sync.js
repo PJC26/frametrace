@@ -60,7 +60,11 @@ function marksPayload(opts) {
     // The base is the revision the unsaved edit was made on (the draft's,
     // also for a draft adopted from a dead window), else the last one seen.
     const draft = state.drafts && state.drafts[id];
-    baseRevisions[id] = draft && Number.isFinite(draft.base) ? draft.base
+    // R5 U1: a draft made while the annotations were unreadable goes out
+    // with base -1 — the server always answers it with a conflict (no
+    // same-window exception), so it can never overwrite what it never saw.
+    baseRevisions[id] = draft && draft.unsafe_base === true ? -1
+      : draft && Number.isFinite(draft.base) ? draft.base
       : (Number.isFinite(state.revisions && state.revisions[id]) ? state.revisions[id] : 0);
     if (!mark && !note && !range) {
       // Nothing left of the mark row: delete it — but only when the server
@@ -230,6 +234,11 @@ async function sendPayloadChunks(payload, post, opts) {
       // Exactly the pre-v2 parser's refusal: any other error that mentions
       // a protocol must not downgrade the session to last-write-wins.
       if (!out.legacy && String(res.error || "") === "unsupported marks protocol") {
+        // R5 U1: a body that must stay revision-checked (base -1 drafts) is
+        // never downgraded to last-write-wins — the caller holds it instead.
+        if (opts && opts.noLegacy) {
+          return Object.assign(out, { ok: false, error: String(res.error), status: Number(res.status) || 0, legacyRefused: true });
+        }
         out.legacy = true; // pre-v2 workstation: resend this chunk as patch-v1
         continue;
       }
@@ -305,6 +314,7 @@ var saveRevision = 0;       // bumps on every change; detects edits mid-flight
 var saveFailures = 0;
 var saveBusyRetries = 0;          // consecutive "busy, retry" replies (R4 B4)
 const SAVE_BUSY_RETRIES = 10;
+const SAVE_BUSY_WAIT_MS = 20000;  // FTViewer.save(): longest total wait for "busy, retry" (R5 U6)
 var lastReportError = "";         // R4 B7 notice shown once per text
 var saveError = "";
 var saveAuthExpired = false; // the last attempt was refused with 401 (U8)
@@ -331,6 +341,13 @@ var annotationsReadOnly = !!annotationsError;
 // A4: ids the server holds in its marks queue (from /api/marks-pending at
 // boot, or this window's own deferred saves): shown with the queued value.
 var serverQueuedIds = new Set();
+// R5 U4: ids whose queued value is SHOWN over the server's (an overlay).
+// When the queue drains, every one of them goes back to what the case DB
+// then holds — a queued body the drain did not apply (a conflict, a
+// refusal) must not keep showing as if it had landed.
+var queueOverlayIds = new Set();
+// "" | "unreadable" | "truncated": the queued values could not all be shown.
+var queueValuesState = "";
 var conflictLookupRetryAt = 0;
 const AUTOSAVE_DEBOUNCE_MS = 2500;
 const AUTOSAVE_RETRY_BASE_MS = 2000;
@@ -418,6 +435,9 @@ function renderSaveState() {
     cls = "candidate";
     label = t("save.queuedServer");
     title = tf("save.title.queuedServer", { n: queuedOnServer });
+    // R5 U4: the queued values could not (all) be read — say so.
+    if (queueValuesState === "unreadable") title += " " + t("save.title.queueUnreadable");
+    else if (queueValuesState === "truncated") title += " " + t("save.title.queueTruncated");
   } else if (conflictChecks > 0) {
     // "saved" is never claimed before the server's conflict journal was
     // read (a queued save may have met a newer revision at drain time).
@@ -435,6 +455,8 @@ function renderSaveState() {
   saveStateEl.className = `quiet save-ind ${cls}`;
   saveStateEl.style.fontWeight = kind === "failed" || kind === "pending" || kind === "readonly" || kind === "unknown" ? "700" : "";
   saveStateEl.dataset.state = kind;
+  if (queueValuesState && queuedOnServer > 0) saveStateEl.dataset.queueValues = queueValuesState;
+  else delete saveStateEl.dataset.queueValues;
   saveStateEl.innerHTML = `${ftIcon(kind === "failed" || kind === "readonly" || kind === "unknown" ? "warning" : kind === "saved" ? "check" : kind === "saving" ? "spinner" : "save")}<span class="save-label"></span>`;
   saveStateEl.lastElementChild.textContent = label;
   saveStateEl.title = title;
@@ -809,29 +831,51 @@ async function fetchJsonOrNull(url) {
 // items (null = not this route's shape). Resolves null when the FIRST page
 // is unreadable (route missing / down); throws when a later one is (a
 // partial list must not pass for the whole).
+// R5 (S11): a server with stable cursors answers `next_after` (the seq to
+// continue after; null on the last page) and is then read with
+// `?after=<seq>&limit` — an entry added or removed meanwhile can no longer
+// shift a page under the reader. Older servers page by offset
+// (`next_offset`, or `total`/`count`). The returned array carries
+// `truncated: true` when the server said so (`truncated`), when fewer
+// entries came back than its count, or when the page cap was hit.
 async function readPagedList(get, path, pick) {
   const all = [];
   let offset = 0;
+  let after = null;
+  let total = NaN;
+  let truncated = false;
+  let finished = false;
   for (let page = 0; page < CONFLICT_PAGES_MAX; page++) {
-    const data = await get(`${path}?offset=${offset}&limit=${CONFLICT_PAGE}`);
+    const query = after != null ? `after=${encodeURIComponent(after)}&limit=${CONFLICT_PAGE}` : `offset=${offset}&limit=${CONFLICT_PAGE}`;
+    const data = await get(`${path}?${query}`);
     const items = data && data.ok !== false ? pick(data) : null;
     if (!items) {
       if (page === 0) return null;
-      throw new Error(`${path}: page at ${offset} unreadable`);
+      throw new Error(`${path}: page at ${after != null ? "after " + after : offset} unreadable`);
     }
     all.push(...items);
+    if (data.truncated === true) truncated = true;
+    const count = Number(data.total ?? data.count);
+    if (Number.isFinite(count)) total = count;
+    if (Object.prototype.hasOwnProperty.call(data, "next_after")) {
+      const next = data.next_after;
+      if (next == null || String(next) === String(after)) { finished = true; break; }
+      after = next;
+      continue;
+    }
     // R4 B3/B6 as implemented: `next_offset` (null on the last page).
     if (Object.prototype.hasOwnProperty.call(data, "next_offset")) {
       const next = data.next_offset;
-      if (next == null || !Number.isFinite(Number(next)) || Number(next) <= offset) break;
+      if (next == null || !Number.isFinite(Number(next)) || Number(next) <= offset) { finished = true; break; }
       offset = Number(next);
       continue;
     }
     // Otherwise a `total` / `count`, or a server without paging (whole list).
-    const total = Number(data.total ?? data.count);
     offset += items.length;
-    if (!items.length || !Number.isFinite(total) || offset >= total || items.length > CONFLICT_PAGE) break;
+    if (!items.length || !Number.isFinite(count) || offset >= count || items.length > CONFLICT_PAGE) { finished = true; break; }
   }
+  if (!finished || (Number.isFinite(total) && all.length < total)) truncated = true;
+  if (truncated) all.truncated = true;
   return all;
 }
 async function loadServerConflicts(st, get = fetchJsonOrNull) {
@@ -842,6 +886,15 @@ async function loadServerConflicts(st, get = fetchJsonOrNull) {
   if (!conflicts) {
     // A workstation without the route: ids from /api/status, values from records-meta.
     const ids = Array.isArray(mc.ids) ? mc.ids.filter(id => typeof id === "string") : [];
+    // R5 U5: an old server that has neither the route nor the ids cannot
+    // ever list them — retrying forever ("unknown" for good) helps nobody.
+    // Say so once (notices row) and let the state go; a route that merely
+    // failed (5xx, network) still counts as "unknown" and is retried.
+    if (!ids.length && await conflictRouteMissing()) {
+      if (ftSignal.aborted) return 0;
+      noteConflictsUnlisted(Number(mc.count) || 0);
+      return 0;
+    }
     return loadQueueConflicts(ids, get);
   }
   const list = [];
@@ -854,6 +907,37 @@ async function loadServerConflicts(st, get = fetchJsonOrNull) {
   const n = registerConflicts(list, { queued: true });
   if (n) { renderSaveState(); emitDirty(); }
   return n;
+}
+// The server does not have GET /api/mark-conflicts at all (404/405/501, or
+// an answer that is not that route's JSON) — not a failure of it.
+async function conflictRouteMissing() {
+  try {
+    const res = await fetch(`/api/mark-conflicts?offset=0&limit=1`, { cache: "no-store" });
+    if (res.status === 404 || res.status === 405 || res.status === 501) return true;
+    if (!res.ok) return false;
+    let data = null;
+    try { data = await res.json(); } catch (e) { return true; }
+    return !data || typeof data !== "object" || !Array.isArray(data.conflicts);
+  } catch (e) { return false; }
+}
+var conflictsUnlistedShown = false;
+function noteConflictsUnlisted(n) {
+  if (conflictsUnlistedShown || document.getElementById("conflictsUnlistedNotice")) return;
+  conflictsUnlistedShown = true;
+  const bar = document.createElement("div");
+  bar.id = "conflictsUnlistedNotice";
+  bar.className = "ft-banner";
+  bar.setAttribute("role", "status");
+  const msg = document.createElement("span");
+  msg.className = "ft-banner-msg";
+  msg.textContent = tf("conflict.unlisted", { n });
+  bar.appendChild(msg);
+  bar.appendChild(noticeButton("conflictsUnlistedDismiss", t("origin.dismiss"), () => {
+    const hadFocus = bar.contains(document.activeElement);
+    bar.remove();
+    if (hadFocus && typeof viewerFocus === "function") viewerFocus();
+  }));
+  noticesHost().appendChild(bar);
 }
 async function loadQueueConflicts(ids, get = fetchJsonOrNull) {
   // The status reports conflicts but names none: nothing to read them by.
@@ -967,6 +1051,10 @@ async function loadServerQueue(st, get = fetchJsonOrNull) {
       Array.isArray(data.entries) ? data.entries : Array.isArray(data.items) ? data.items : Array.isArray(data.pending) ? data.pending : null);
   } catch (e) { items = null; }
   if (ftSignal.aborted) return 0;
+  // R5 U4: say when the queued values are not (all) shown — the route is
+  // missing or failed ("unreadable"), or the list came back short
+  // ("truncated"). The indicator's title names it; never a silent gap.
+  queueValuesState = !items ? "unreadable" : items.truncated ? "truncated" : "";
   let shown = 0;
   if (items) {
     const serverById = serverAnnotationMap(DATA.annotations || {});
@@ -979,6 +1067,7 @@ async function loadServerQueue(st, get = fetchJsonOrNull) {
       if (state.drafts[id] || conflictIds.has(id)) continue;
       const value = pendingAnnotation(item.value && typeof item.value === "object" ? item.value : item, serverById.get(id) || null);
       applyAnnotationToState(id, value);
+      queueOverlayIds.add(id);
       shown += 1;
     }
     if (shown) {
@@ -1038,6 +1127,19 @@ async function reconcileWithServer() {
     }
     conflicts.push({ id, server_revision: rev, server: serverById.get(id) || null });
   }
+  // R5 U4: queued values shown over the server's go back to the case DB's
+  // value now that the queue drained — also when the revision did not move
+  // (the drain did not apply that body). Ids conflicted or edited here meanwhile
+  // keep what they have (the conflict list / the draft decides).
+  const reconciled = new Set(conflicts.map(c => c.id));
+  for (const id of queueOverlayIds) {
+    if (reconciled.has(id) || conflictIds.has(id) || state.drafts[id] || state.dirtyIds.has(id)) continue;
+    applyAnnotationToState(id, serverById.get(id) || null);
+    const rev = Number(ann.revisions[id]);
+    if (Number.isFinite(rev)) state.revisions[id] = rev;
+    changed = true;
+  }
+  queueOverlayIds.clear();
   if (conflicts.length) registerConflicts(conflicts);
   if (draftFlushKeys.size) scheduleDraftFlush();
   if (changed) {
@@ -1055,6 +1157,7 @@ async function afterQueueDrained(st) {
   queuedOnServer = 0;
   queuedIds.clear();
   serverQueuedIds.clear();
+  queueValuesState = "";
   await pending;
   if (typeof requestRender === "function") requestRender();
   renderSaveState();
@@ -1208,6 +1311,77 @@ window.addEventListener("ft-viewer-late-save", event => {
   emitDirty();
 }, { signal: ftSignal });
 
+// Folds one send outcome into the save's running result (first one as is).
+function mergeSaveResult(result, r) {
+  if (!result) return r;
+  Object.assign(result.applied, r.applied || {});
+  result.conflicts.push(...(r.conflicts || []));
+  result.queuedIds.push(...(r.queuedIds || []));
+  result.posts += r.posts || 0;
+  result.deferred = result.deferred || !!r.deferred;
+  result.pending = Math.max(result.pending || 0, r.pending || 0);
+  if (r.maxIds) result.maxIds = r.maxIds;
+  if (r.legacy) result.legacy = r.legacy;
+  if (r.reportError) result.reportError = r.reportError;
+  if (!r.ok) Object.assign(result, { ok: false, error: r.error, status: r.status, offline: r.offline, busy: r.busy, retryAfterMs: r.retryAfterMs });
+  return result;
+}
+
+// R5 U1: the ids whose draft is `unsafe_base` (base_revisions -1) travel in
+// a body of their own, so a server that refuses that body (no support for
+// -1 yet: track P) never takes the ordinary edits down with it.
+//   -> [{ body, unsafe }]   (the unsafe group first, then the rest if any)
+function splitUnsafeBase(payload) {
+  const unsafe = new Set(Object.keys(payload.base_revisions || {}).filter(id => payload.base_revisions[id] === -1));
+  if (!unsafe.size) return [{ body: payload, unsafe: false }];
+  const pick = keep => ({
+    ...payload,
+    marks: payload.marks.filter(m => unsafe.has(m.id) === keep),
+    tags: (payload.tags || []).filter(e => unsafe.has(e.id) === keep),
+    deleted_ids: (payload.deleted_ids || []).filter(id => unsafe.has(id) === keep),
+    base_revisions: Object.fromEntries(Object.entries(payload.base_revisions).filter(([id]) => unsafe.has(id) === keep))
+  });
+  const out = [{ body: pick(true), unsafe: true }];
+  const rest = pick(false);
+  if (!payloadEmpty(rest)) out.push({ body: rest, unsafe: false });
+  return out;
+}
+// A server that predates base -1 refuses the body while parsing it
+// ("base_revisions[…] must be a non-negative integer"; nothing applied).
+function unsafeBaseRefused(r) {
+  return !!r && !r.ok && (!!r.legacyRefused || /base_revisions/.test(String(r.error || "")));
+}
+// Sends the unsafe group; where the server cannot take base -1 (an older
+// build, or a patch-v1 workstation) the same outcome is produced here: each
+// id becomes a conflict against the case's current value (records-meta) —
+// the examiner picks a side, nothing is written meanwhile.
+async function sendUnsafeGroup(body) {
+  const ids = payloadIds(body);
+  if (saveLegacyProtocol) return holdUnsafeLocally(ids);
+  let result = null;
+  for (const part of splitByExaminer(body)) {
+    const r = await sendPayloadChunks(part, pushMarksToCase, { maxIds: saveChunkIds, noLegacy: true });
+    if (unsafeBaseRefused(r)) {
+      const done = new Set([...Object.keys((result && result.applied) || {}), ...((result && result.conflicts) || []).map(c => c.id)]);
+      return mergeSaveResult(result, await holdUnsafeLocally(ids.filter(id => !done.has(id))));
+    }
+    result = mergeSaveResult(result, r);
+    if (r.maxIds) saveChunkIds = r.maxIds;
+    if (!r.ok) break;
+  }
+  return result;
+}
+async function holdUnsafeLocally(ids) {
+  const out = { ok: true, error: "", status: 0, applied: {}, conflicts: [], queuedIds: [], deferred: false, pending: 0, posts: 0 };
+  if (!ids.length) return out;
+  const meta = await fetchJsonOrNull("/api/records-meta");
+  const ann = meta && meta.annotations;
+  if (!ann || ann.error) return { ...out, ok: false, error: t("save.unsafeHoldFail") };
+  const serverById = serverAnnotationMap(ann);
+  for (const id of ids) out.conflicts.push({ id, server_revision: Number((ann.revisions || {})[id]) || 0, server: serverById.get(id) || null });
+  return out;
+}
+
 async function pushMarksToCase(payload) {
   const res = await fetch("/api/import-marks", {
     method: "POST",
@@ -1254,24 +1428,21 @@ async function syncMarksNow() {
   renderSaveState();
   let result;
   try {
-    for (const part of splitByExaminer(payload)) {
-      const r = await sendPayloadChunks(part, pushMarksToCase, { maxIds: saveChunkIds, legacy: saveLegacyProtocol });
-      if (!result) result = r;
-      else {
-        Object.assign(result.applied, r.applied);
-        result.conflicts.push(...r.conflicts);
-        result.queuedIds.push(...r.queuedIds);
-        result.posts += r.posts;
-        result.deferred = result.deferred || r.deferred;
-        result.pending = Math.max(result.pending, r.pending);
-        result.maxIds = r.maxIds;
-        result.legacy = r.legacy;
-        if (r.reportError) result.reportError = r.reportError;
-        if (!r.ok) Object.assign(result, { ok: false, error: r.error, status: r.status, offline: r.offline, busy: r.busy, retryAfterMs: r.retryAfterMs });
+    for (const group of splitUnsafeBase(payload)) {
+      if (group.unsafe) {
+        // R5 U1: base -1 drafts in a body of their own, never downgraded.
+        result = mergeSaveResult(result, await sendUnsafeGroup(group.body));
+        if (!result.ok) break;
+        continue;
       }
-      if (r.maxIds) saveChunkIds = r.maxIds;
-      if (r.legacy) saveLegacyProtocol = true;
-      if (!r.ok) break;
+      for (const part of splitByExaminer(group.body)) {
+        const r = await sendPayloadChunks(part, pushMarksToCase, { maxIds: saveChunkIds, legacy: saveLegacyProtocol });
+        result = mergeSaveResult(result, r);
+        if (r.maxIds) saveChunkIds = r.maxIds;
+        if (r.legacy) saveLegacyProtocol = true;
+        if (!r.ok) break;
+      }
+      if (result && !result.ok) break;
     }
   } catch (error) {
     result = { ok: false, offline: true, error: t("save.offlineErr"), applied: {}, conflicts: [], queuedIds: [] };
@@ -1885,16 +2056,22 @@ function rangeText(range) {
 // the "readonly" save state. Edits made meanwhile stay in this browser's
 // drafts and go out with their base once the annotations read again.
 const ANNOTATION_GATED_CONTROLS = ["btnSummary", "btnDownloadCsv", "btnDownloadMarks", "btnApplyMarks"];
+// R5 U1: the edit controls too — an edit made now would be built on values
+// this window never saw (refuseLockedEdit also stops the keys 1/2/3/0/i/o,
+// Ctrl+Z/Y, the tag menu, the note field and the pop-out player).
+const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMarkVerify", "btnMarkClear", "btnTagMenu", "btnSetIn", "btnSetOut"];
 (function showAnnotationsReadOnly() {
   if (!annotationsReadOnly) return;
-  for (const id of ANNOTATION_GATED_CONTROLS) {
+  const gate = (id, key) => {
     const btn = document.getElementById(id);
-    if (!btn) continue;
+    if (!btn) return;
     btn.disabled = true;
     btn.setAttribute("aria-disabled", "true");
-    btn.dataset.i18nTitle = "save.readonlyMsg";
-    btn.title = t("save.readonlyMsg");
-  }
+    btn.dataset.i18nTitle = key;
+    btn.title = t(key);
+  };
+  for (const id of ANNOTATION_GATED_CONTROLS) gate(id, "save.readonlyMsg");
+  for (const id of ANNOTATION_EDIT_CONTROLS) gate(id, "save.readonlyEdit");
   const bar = document.createElement("div");
   bar.id = "annotationsErrorBanner";
   bar.className = "ft-banner";

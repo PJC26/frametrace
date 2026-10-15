@@ -479,12 +479,16 @@ try {
         await page.locator('#recordGrid .card').nth(2).click();
         await page.evaluate(() => document.activeElement?.blur());
         await page.keyboard.press('3');
-        const t0 = Date.now();
-        const closing = page.evaluate(() => hBeforeClose(20000));
+        // R5 U14: the check used to compare Date.now() - t0 with the 1.5 s it
+        // had just slept itself (always true). What matters: hBeforeClose
+        // resolved only AFTER the held save's reply was let through.
+        let closedAt = 0;
+        const closing = page.evaluate(() => hBeforeClose(20000)).then((r) => { closedAt = Date.now(); return r; });
         await sleep(1500);
+        const earlyClose = closedAt;
         release();
         const r13 = await closing;
-        check('A15: hBeforeClose waits for the save in flight, then ok (nothing pending)', r13.ok === true && r13.pending === 0 && replied > 0 && Date.now() - t0 >= 1500, JSON.stringify(r13));
+        check('A15: hBeforeClose waits for the save in flight, then ok (nothing pending)', r13.ok === true && r13.pending === 0 && replied > 0 && earlyClose === 0 && closedAt >= replied, JSON.stringify({ r13, earlyClose, replied, closedAt }));
         await page.unroute('**/api/import-marks*');
         await page.route('**/api/import-marks*', (route) => route.fulfill({ status: 503, contentType: 'application/json', body: '{"ok":false,"error":"busy"}' }));
         await page.locator('#recordGrid .card').nth(2).click();
@@ -498,12 +502,22 @@ try {
 
         // 14. R4 B2 contract: the one-time launch code (?launch=) leaves the
         //     address bar like ?token= — the shell and the served viewer.
+        // R5 U14: the old check waited for "no launch" and then asserted "no
+        // launch" (always true) while the 303 silently dropped every other
+        // query parameter. Contract (S ↔ U): the 303 removes ONLY launch.
+        // Asked with this browser's cookies (page.request), not followed.
+        const redirect = await page.request.get(`${base}/?launch=a4test&keep=1`, { maxRedirects: 0 }).catch(() => null);
+        const location303 = redirect ? redirect.headers()['location'] || '' : '';
+        const serverKeeps = !!redirect && redirect.status() === 303 && /[?&]keep=1(&|$)/.test(location303) && !/launch/.test(location303);
         await page.goto(`${base}/?launch=a4test&keep=1#frag`);
         await until(() => page.evaluate(() => !location.search.includes('launch')), 10000);
         const shellUrl = await page.evaluate(() => ({ search: location.search, hash: location.hash }));
-        // The server answers /?launch= with 303 → "/" (§B4); the shell's own
-        // strip (99-init.js) is the fallback — either way no code remains.
-        check('B2: no ?launch= left in the shell address bar (hash kept)', !/launch/.test(shellUrl.search) && shellUrl.hash === '#frag', JSON.stringify(shellUrl));
+        if (serverKeeps) {
+          check('B2/U14: launch 303 keeps the other query (?keep=1) and the hash, drops only launch', shellUrl.search === '?keep=1' && shellUrl.hash === '#frag', JSON.stringify({ shellUrl, location303 }));
+        } else {
+          check('B2: no ?launch= left in the shell address bar (hash kept)', !/launch/.test(shellUrl.search) && shellUrl.hash === '#frag', JSON.stringify(shellUrl));
+          skip('B2/U14: launch 303 keeps the other query', `awaits track S — this server answers ${redirect ? redirect.status() : 'no response'} → ${JSON.stringify(location303)}`);
+        }
         await page.goto(`${base}/viewer/?token=${token}&launch=a4test&keep=2`);
         await until(() => page.evaluate(() => !/launch|token/.test(location.search)), 15000);
         const viewerUrl = await page.evaluate(() => location.search);

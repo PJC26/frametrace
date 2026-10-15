@@ -138,6 +138,53 @@ fn instance_file_records_token_and_discovery_probe_sends_it() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// R5 U9: how long the unix grandchild sleeps, and the elapsed bound of
+/// the cancel test below. The sleeper MUST outlive the bound: with the old
+/// `sleep 30` under a 90 s bound, a cancel that killed nothing simply waited
+/// for the sleeper to exit on its own, found it gone and passed.
+const GRANDCHILD_SLEEP_SECS: u64 = 300;
+const CANCEL_ELAPSED_BOUND_SECS: u64 = 90;
+
+#[test]
+fn cancel_test_sleeper_outlives_its_elapsed_bound() {
+    const { assert!(GRANDCHILD_SLEEP_SECS > CANCEL_ELAPSED_BOUND_SECS) };
+    let unix_body = grandchild_sleeper_unix(Path::new("/tmp/x.pid"));
+    assert!(
+        unix_body.contains(&format!("sleep {GRANDCHILD_SLEEP_SECS} &")),
+        "{unix_body}"
+    );
+    // The Windows sleeper (`ping -n 300`) is bounded the same way.
+    assert!(cmd_grandchild_sleeper(Path::new("x.pid")).contains("'-n','300'"));
+}
+
+/// R5 U10: no Windows fake tool waits by busy-spinning (`:spin` straight
+/// into `goto spin`, or a `goto` gate loop without a sleep step).
+#[test]
+fn windows_fake_tools_never_busy_spin() {
+    let bare_spin = [":spin", "\\n", "goto spin"].concat();
+    for (name, src) in [
+        ("tests_jobs.rs", include_str!("tests_jobs.rs")),
+        ("tests_review3.rs", include_str!("tests_review3.rs")),
+        ("tests_hardening.rs", include_str!("tests_hardening.rs")),
+        ("tests_fake_tools.rs", include_str!("tests_fake_tools.rs")),
+    ] {
+        assert!(!src.contains(&bare_spin), "{name}: busy-spin wait loop");
+    }
+    let gate = fake_tools::cmd_wait_for_file(Path::new("gate"));
+    assert!(
+        gate.contains("ping -n 2"),
+        "cmd_wait_for_file sleeps: {gate}"
+    );
+    assert!(fake_tools::CMD_SPIN.contains("ping -n 2"));
+}
+
+fn grandchild_sleeper_unix(pidfile: &Path) -> String {
+    format!(
+        "sleep {GRANDCHILD_SLEEP_SECS} & echo $! > '{}'; wait",
+        pidfile.display()
+    )
+}
+
 #[test]
 fn run_step_cancel_kills_the_grandchildren_too() {
     let dir = scratch("tree");
@@ -158,15 +205,16 @@ fn run_step_cancel_kills_the_grandchildren_too() {
     };
     let script = write_fake(
         &dir,
-        &format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()),
+        &grandchild_sleeper_unix(&pidfile),
         &cmd_grandchild_sleeper(&pidfile),
     );
     let started = std::time::Instant::now();
     let result = run_step(&script, &[], &state);
     canceller.join().unwrap();
     assert!(result.is_err(), "cancelled step reports an error");
-    // PowerShell start-up dominates on a loaded runner; a missed kill would hang for 30 s+ (sleep) or 300 s (ping).
-    assert!(started.elapsed() < Duration::from_secs(90));
+    // PowerShell start-up dominates on a loaded runner; a missed kill hangs
+    // for the sleeper's 300 s (sleep or ping), well past this bound.
+    assert!(started.elapsed() < Duration::from_secs(CANCEL_ELAPSED_BOUND_SECS));
     let pid: String = std::fs::read_to_string(&pidfile)
         .expect("grandchild pid recorded")
         .trim()

@@ -266,12 +266,12 @@ async function unitTests() {
   Object.assign(state, { drafts: {}, dirtyIds: new Set(), revisions: {}, examiners: {}, notes: {}, tags: {}, ranges: {} });
   // Save protocol v2 (docs/FIX_PLAN_R1_2026-10-13.md §1.6): touchAnnotation
   // only records the draft in memory + dirtyIds; storage is a debounced flush.
-  const draftsSrc = [fn('writerId'), fn('nextDraftSeq'), fn('draftNormRange'), fn('draftRangeOf'), fn('draftValuesOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
+  const draftsSrc = [fn('annotationsLocked'), fn('refuseLockedEdit'), fn('writerId'), fn('nextDraftSeq'), fn('draftNormRange'), fn('draftRangeOf'), fn('draftValuesOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
   const touch = 'draftSeq=0;draftFlushKeys=new Set();draftRangesDirty=false;\n' + draftsSrc;
   let flushes = 0;
   Object.assign(grid, { FTViewer: { writerToken: 'w1' }, scheduleDraftFlush: () => { flushes += 1; }, markLabel: s => s, document: { getElementById: () => null, body: { classList: { toggle: () => {} } } }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
   const journalSrc = [fn('snapshotIds'), fn('journalDiff'), fn('journalPack'), fn('journalEntry'), fn('journalIdCount'), fn('trimJournal'), fn('toastUndo'), fn('journaled'), fn('markStatusLabel')].join('\n');
-  runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;JOURNAL_ID_CAP=200000;JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalSrc + '\n' + touch + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
+  runInNewContext('undoStack=[];redoStack=[];JOURNAL_LIMIT=200;JOURNAL_ID_CAP=200000;JOURNAL_FIELDS=["mark","note","tags","range"];\n' + journalSrc + '\n' + touch + '\n' + fn('indexInList') + '\n' + fn('markActive') + '\nmarkActive("reviewed");', grid);
   assert.equal(state.activeId, 'b');
   assert.ok(state.dirtyIds.has('a') && state.drafts.a.seq === 1 && state.drafts.a.base === 0 && !('writer' in state.drafts.a), 'draft carries seq + base (the writer is in its storage key)');
   assert.equal(flushes, 1, 'one debounced flush scheduled, no synchronous storage write');
@@ -486,7 +486,7 @@ async function unitTests() {
   // cleared annotations (or drops new ones) after hydration.
   Object.assign(state, { marks: {}, notes: {}, tags: {}, drafts: {}, dirtyIds: new Set(), selectedIds: new Set(['a']) });
   Object.assign(grid, { toast: () => {}, requestRender: () => {}, storageSet: () => {}, MARKS_KEY: 'marks', markLabel: s => s, NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
-  const ops = [fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags')].join('\n');
+  const ops = [fn('annotationsLocked'), fn('refuseLockedEdit'), fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags')].join('\n');
   runInNewContext(ops + '\napplyMark("important");', grid);
   assert.equal(state.drafts.a.mark.status, 'important');
   runInNewContext(ops + '\napplyMark(null);', grid);
@@ -523,7 +523,7 @@ async function unitTests() {
   store.clear();
   const RK = 'ft.viewer.test.ranges';
   store.set(RK, JSON.stringify({ a: { in: 3, out: 4 }, b: { in: 7, out: 8 }, zz: { in: 1, out: 2 } }));
-  Object.assign(grid, { RANGES_KEY: RK, recordById: new Map(['a', 'b', 'c'].map(id => [id, { id }])), location: { protocol: 'http:' } });
+  Object.assign(grid, { RANGES_KEY: RK, RANGES_HELD_KEY: RK + '.held', recordById: new Map(['a', 'b', 'c'].map(id => [id, { id }])), location: { protocol: 'http:' } });
   grid.annotations = { marks: [{ record_id: 'a', status: 'important', note: '', range: { in: 1, out: 2 } }, { record_id: 'b', status: 'noted', note: '', range: { in: 7, out: 8 } }], tags: [{ id: 'a', tags: ['현장'] }], revisions: { a: 5, b: 2 } };
   const a2Src = [fn('draftNormRange'), fn('draftSameValues'), fn('serverDraftValues'), fn('noteOrphanDraft'), fn('migrateLegacyRanges')].join('\n');
   runInNewContext('orphanDrafts=new Map();legacyRangesLeft=null;annotationsError="";markRowMaybe=new Set();\n' + a2Src + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
@@ -532,6 +532,7 @@ async function unitTests() {
   assert.ok(!state.drafts.b && !state.dirtyIds.has('b'), 'A2: an equal stored range is no edit');
   assert.ok(!store.has(RK) && store.has(P + 'w1.a'), 'A2: the retired key is gone once every entry is stored');
   assert.ok(!state.drafts.zz, 'A2: an id this case no longer lists is not invented');
+  assert.ok(JSON.parse(store.get(RK + '.held') || '{}').zz?.in === 1, 'R5 U3: ...but its range is held (RANGES_HELD_KEY), not dropped with the retired key');
   // A14: hydrated tag lists are copies — a tag edit never rewrites the case data.
   state.tags.a.push('local');
   assert.deepEqual(grid.annotations.tags[0].tags, ['현장'], 'A14: the server tag list stays the server\'s');
@@ -740,6 +741,179 @@ async function unitTests() {
     'http download uses /media',
   );
   console.log('PASS VM unplayable gate, proxy preference, file:// fallback');
+
+  await r5TrackU({ fn, source, grid, state, runInNewContext, assert, appSrc: exScript, ex, store, RK: 'ft.viewer.test.ranges', P: 'ft.draft.test.', hydrateSrc, touch });
+}
+
+// ---- R5 track U (docs/PLAN_R5_2026-10-14.md) ------------------------------
+async function r5TrackU({ fn, source, grid, state, runInNewContext, assert, appSrc, ex, store, RK, P, hydrateSrc, touch }) {
+  const { readFileSync } = await import('node:fs');
+  // U1: a draft made while the annotations were unreadable is marked
+  // unsafe_base and travels with base_revisions -1 (always a conflict).
+  Object.assign(state, { marks: {}, notes: {}, tags: {}, ranges: {}, drafts: {}, dirtyIds: new Set(), revisions: { u1: 6 }, examiners: {} });
+  delete grid.markRowMaybe;
+  runInNewContext('var annotationsReadOnly = true;\n' + touch + '\nstate.marks.u1 = { status: "important", marked_unix: 1 }; touchAnnotation("u1");', grid);
+  assert.ok(state.drafts.u1.unsafe_base === true && state.dirtyIds.has('u1'), 'U1: an edit while read-only marks the draft unsafe_base');
+  runInNewContext('annotationsReadOnly = false;\ntouchAnnotation("u1");', grid);
+  assert.ok(state.drafts.u1.unsafe_base === true, 'U1: a later edit keeps the mark (the draft still rests on unseen values)');
+  const payloadSrc = [fn('marksPayload'), fn('payloadIds'), fn('payloadEmpty')].join('\n');
+  const pu = runInNewContext(payloadSrc + '\nmarksPayload();', grid);
+  assert.equal(pu.base_revisions.u1, -1, 'U1: an unsafe_base draft is sent with base_revisions -1, not its stored base');
+  runInNewContext('touchAnnotation("u1", { base: 6 });', grid);
+  assert.ok(!state.drafts.u1.unsafe_base && runInNewContext(payloadSrc + '\nmarksPayload().base_revisions.u1', grid) === 6, 'U1: a conflict resolution (explicit base) clears it');
+  // U1: every edit entry point refuses while read-only — nothing changes.
+  let toasts = 0;
+  Object.assign(state, { marks: {}, tags: {}, drafts: {}, dirtyIds: new Set(), selectedIds: new Set(['u2']), activeId: 'u2' });
+  Object.assign(grid, { toast: () => { toasts += 1; }, t: k => k });
+  const ops = [fn('annotationsLocked'), fn('refuseLockedEdit'), fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags'), fn('addTag'), fn('removeTag')].join('\n');
+  runInNewContext('annotationsReadOnly = true;\n' + ops + '\napplyMark("important"); applyTag("x"); clearTags(); addTag("u2", "y"); removeTag("u2", "y");', grid);
+  assert.ok(!state.marks.u2 && !state.tags.u2 && !state.drafts.u2 && !state.dirtyIds.size && toasts === 5, `U1: read-only refuses mark/tag edits with the reason (${toasts} toasts)`);
+  runInNewContext('annotationsReadOnly = false;', grid);
+  for (const name of ['applyMarkJournaled', 'applyTagJournaled', 'clearTagsJournaled', 'markActive', 'setRangePoint', 'undoJournal', 'redoJournal']) {
+    assert.ok(/^\s+if \(refuseLockedEdit\(\)\) return/m.test(fn(name).split('\n')[1]), `U1: ${name} refuses first while read-only`);
+  }
+  assert.ok(/refuseLockedEdit\(\)/.test(source.match(/getElementById\("evidenceNote"\)\.addEventListener\("input"[^]*?\}\);/)[0]), 'U1: the note field refuses while read-only');
+  console.log('PASS VM R5 U1 read-only edits refused, unsafe_base drafts sent with base -1');
+
+  // U1 transport: the unsafe group goes alone; a server that predates -1
+  // (parse refusal, or patch-v1) never applies it — each id becomes a
+  // conflict against the case's current value instead.
+  const sendSrc = [fn('splitUnsafeBase'), fn('unsafeBaseRefused'), fn('sendUnsafeGroup'), fn('holdUnsafeLocally'), fn('mergeSaveResult'), fn('splitByExaminer'),
+    fn('splitPayloadChunks'), fn('legacyPayloadBody'), fn('sendPayloadChunks'), fn('serverAnnotationMap'), fn('annotationMarkId'), fn('normRange'), fn('rangeValid'), payloadSrc].join('\n') +
+    '\nPAYLOAD_CHUNK_IDS=2000;PAYLOAD_CHUNK_BYTES=1048576;PAYLOAD_CHUNK_MIN_IDS=50;saveChunkIds=2000;saveLegacyProtocol=false;';
+  const body = { schema_version: 2, protocol: 'patch-v2', case_id: 'c', examiner: 'x', client_id: 'w1', exported_unix: 1,
+    base_revisions: { s1: -1, n1: 3 }, marks: [{ id: 's1', status: 'reviewed', marked_unix: 1, note: '', examiner: 'x', tags: [], range: { in: null, out: null } }, { id: 'n1', status: 'important', marked_unix: 1, note: '', examiner: 'x', tags: [], range: { in: null, out: null } }], tags: [], deleted_ids: [] };
+  const posts = [];
+  const u = { posts, body, t: k => k,
+    fetchJsonOrNull: async () => ({ ok: true, annotations: { marks: [{ record_id: 's1', status: 'important', note: 'srv' }], tags: [], revisions: { s1: 4 } } }) };
+  u.pushMarksToCase = async b => { posts.push(b); if (Object.values(b.base_revisions).includes(-1)) return { ok: false, error: 'marks file x (patch-v2): base_revisions["s1"] must be a non-negative integer' }; return { ok: true, protocol: 'patch-v2', applied: Object.fromEntries(b.marks.map(m => [m.id, 4])), conflicts: [] }; };
+  runInNewContext(sendSrc, u);
+  const groups = runInNewContext('splitUnsafeBase(body)', u);
+  assert.ok(groups.length === 2 && groups[0].unsafe && groups[0].body.marks.map(m => m.id).join() === 's1' && groups[1].body.marks.map(m => m.id).join() === 'n1' && !('s1' in groups[1].body.base_revisions), 'U1: the base -1 ids go in a body of their own');
+  const held = await runInNewContext('sendUnsafeGroup(splitUnsafeBase(body)[0].body)', u);
+  assert.ok(held.ok && !Object.keys(held.applied).length && held.conflicts.length === 1 && held.conflicts[0].id === 's1' && held.conflicts[0].server_revision === 4 && held.conflicts[0].server.note === 'srv',
+    'U1: a server without base -1 → the id is a conflict against the case value (nothing written)');
+  u.pushMarksToCase = async b => { posts.push(b); return b.protocol === 'patch-v2' ? { ok: false, error: 'unsupported marks protocol' } : { ok: true }; };
+  posts.length = 0;
+  const v1 = await runInNewContext('sendUnsafeGroup(splitUnsafeBase(body)[0].body)', u);
+  assert.ok(v1.ok && v1.conflicts.length === 1 && posts.every(b => b.protocol === 'patch-v2'), 'U1: an unsafe body is never downgraded to patch-v1 (last write wins)');
+  u.pushMarksToCase = async b => ({ ok: true, protocol: 'patch-v2', applied: {}, conflicts: Object.keys(b.base_revisions).map(id => ({ id, server_revision: 4, server: { status: 'important' } })) });
+  const tp = await runInNewContext('sendUnsafeGroup(splitUnsafeBase(body)[0].body)', u);
+  assert.ok(tp.ok && tp.conflicts.length === 1 && tp.conflicts[0].id === 's1', 'U1: a server that knows -1 (track P) answers the conflict itself');
+  console.log('PASS VM R5 U1 base -1 transport: own body, never downgraded, local conflict on an older server');
+
+  // S11 ↔ U: cursor paging (next_after → ?after=), truncation flag (U4).
+  const seenQ = [];
+  const pg = { get: async url => { const q = new URL(url, 'http://x').searchParams; seenQ.push(q.has('after') ? 'a' + q.get('after') : 'o' + q.get('offset'));
+    const after = q.has('after') ? Number(q.get('after')) : 0; const ids = [after + 1, after + 2].filter(n => n <= 5);
+    return { ok: true, count: 5, next_after: ids.at(-1) < 5 ? ids.at(-1) : null, entries: ids.map(n => ({ id: 'q' + n })) }; } };
+  const cur = await runInNewContext(fn('readPagedList') + '\nCONFLICT_PAGE=500;CONFLICT_PAGES_MAX=2000;\nreadPagedList(get, "/api/marks-pending", d => d.entries);', pg);
+  assert.equal(JSON.stringify([cur.map(e => e.id), seenQ, !!cur.truncated]), '[["q1","q2","q3","q4","q5"],["o0","a2","a4"],false]', 'S11: next_after cursors are followed with ?after=');
+  pg.get = async () => ({ ok: true, count: 5, next_offset: null, entries: [{ id: 'q1' }, { id: 'q2' }] });
+  const short = await runInNewContext('readPagedList(get, "/api/marks-pending", d => d.entries);', pg);
+  assert.ok(short.truncated === true, 'U4: fewer entries than the count → flagged truncated');
+  console.log('PASS VM R5 cursor paging (after/next_after) + truncation flag');
+
+  // U2/U3: RANGES_KEY is left alone while read-only; an id the case does not
+  // list is held (RANGES_HELD_KEY), never dropped, and migrated once listed.
+  store.clear();
+  store.set(RK, JSON.stringify({ a: { in: 3, out: 4 }, zz: { in: 1, out: 2 } }));
+  Object.assign(grid, { RANGES_KEY: RK, RANGES_HELD_KEY: RK + '.held', recordById: new Map(['a', 'b', 'c'].map(id => [id, { id }])), location: { protocol: 'http:' } });
+  grid.annotations = { marks: [], tags: [], revisions: {}, error: 'database is locked' };
+  runInNewContext('orphanDrafts=new Map();legacyRangesLeft=null;markRowMaybe=new Set();\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
+  assert.ok(store.has(RK) && !state.drafts.a && !store.has(RK + '.held'), 'U2: read-only boot migrates nothing and keeps RANGES_KEY');
+  grid.annotations = { marks: [{ record_id: 'a', status: 'important', note: '', range: { in: 1, out: 2 } }], tags: [], revisions: { a: 5 } };
+  runInNewContext('hydrateAnnotations(annotations);', grid);
+  assert.ok(!store.has(RK) && JSON.parse(store.get(RK + '.held') || '{}').zz?.out === 2 && state.drafts.a?.conflict?.legacy, 'U3: the unknown id is held, the known one migrated, the retired key gone');
+  grid.recordById.set('zz', { id: 'zz' });
+  runInNewContext('hydrateAnnotations(annotations);', grid);
+  assert.ok(!store.has(RK + '.held') && state.drafts.zz?.range?.in === 1 && state.drafts.zz.conflict, 'U3: once the case lists the id, the held range is migrated (conflict) and the hold key goes');
+  console.log('PASS VM R5 U2/U3 range migration: none while read-only, unknown ids held');
+
+  // U16 (S15): the server's per-record proxy is the only one used.
+  const px = { sanitizeSelector: v => String(v || '').replace(/[^A-Za-z0-9_-]/g, '_') || 'clip', absolutizeArtifactPath: p => 'C:\\case\\' + p };
+  runInNewContext(fn('resolveProxyPaths'), px);
+  const recs = () => [{ id: 'carve:1', path: 'X' }, { id: 'carve_1', path: 'Y' }];
+  const files = ['C:\\case\\artifacts\\proxies\\carve_1_proxy_1.mp4'];
+  px.list = recs();
+  px.data = { proxies: files };
+  runInNewContext('resolveProxyPaths(list, data)', px);
+  assert.ok(px.list[0].proxyPath === files[0] && px.list[1].proxyPath === files[0], 'U16 baseline: a name match cannot tell carve:1 from carve_1');
+  px.list = recs();
+  px.data = { proxies: files, proxyPaths: { carve_1: files[0] } };
+  assert.equal(runInNewContext('resolveProxyPaths(list, data)', px), 'server');
+  assert.ok(px.list[0].proxyPath === '' && px.list[1].proxyPath === files[0], 'U16: records-meta proxy_paths decide — carve:1 gets none');
+  px.list = recs().map((r, i) => ({ ...r, serverProxy: i ? 'artifacts/proxies/p.mp4' : '' }));
+  px.data = { proxies: files };
+  runInNewContext('resolveProxyPaths(list, data)', px);
+  assert.ok(px.list[0].proxyPath === '' && px.list[1].proxyPath === 'C:\\case\\artifacts/proxies/p.mp4', 'U16: a per-row proxy_path is used as given (relative → case path)');
+  assert.ok(/proxyPaths: meta\.proxy_paths \|\| meta\.proxyPaths/.test(source), 'U16: the loader carries records-meta proxy_paths');
+  console.log('PASS VM R5 U16 per-record proxy_path wins over the name match');
+
+  // U7: the shell's direct attribution patch carries a per-tab random client id.
+  assert.ok(!/client_id: "shell-attribute"/.test(appSrc) && /client_id: FIN_CLIENT_ID,/.test(appSrc), 'U7: no fixed shell client_id');
+  const idSrc = appSrc.match(/^const FIN_CLIENT_ID = [^]*?^\}\)\(\);/m)[0];
+  const ids2 = [0, 1].map(() => runInNewContext(idSrc + '\nFIN_CLIENT_ID;', { crypto: globalThis.crypto, Uint32Array, Math, Date, String, Array }));
+  assert.ok(ids2.every(id => /^shell-[0-9a-z]{6,}$/.test(id)) && ids2[0] !== ids2[1], `U7: per-tab random ids (${ids2.join(', ')})`);
+  console.log('PASS VM R5 U7 per-tab shell client id');
+
+  // U15: read-only with nothing pending closes without a confirmation (warning only).
+  const api = { save: async () => true, summary: () => ({ pending: 0 }), saveState: () => 'readonly' };
+  ex.__api = api;
+  runInNewContext('hViewerApi = () => __api; FTStore.state.viewer.mounted = true;', ex);
+  const c15 = await runInNewContext('hBeforeClose(1000)', ex);
+  assert.ok(c15.ok === true && c15.pending === 0 && /저장 안 된 편집이 없습니다/.test(c15.warning), 'U15: read-only + nothing pending → ok, warning only: ' + JSON.stringify(c15));
+  api.save = async () => false;
+  api.summary = () => ({ pending: 2 });
+  const c15b = await runInNewContext('hBeforeClose(1000)', ex);
+  assert.ok(c15b.ok === false && /저장 안 된 편집 2건/.test(c15b.message), 'U15: read-only WITH drafts still asks');
+  assert.ok(/if \(annotationsReadOnly\) return !Object\.keys\(state\.drafts\)\.length && !state\.dirtyIds\.size && !conflictIds\.size;/.test(source), 'U15: FTViewer.save() is true read-only only when nothing is held here');
+  runInNewContext('FTStore.state.viewer.mounted = false;', ex);
+  console.log('PASS VM R5 U15 read-only close without edits: no confirmation');
+
+  // S6 ↔ U: a raw-mismatch error carries the [원본 다시 가져오기] action.
+  const eh = runInNewContext('errorHtml("raw 불일치 — 재임포트 필요: case/raw/evidence.raw")', ex);
+  assert.ok(/data-reimport-raw/.test(eh) && !/data-reimport-raw/.test(runInNewContext('errorHtml("ffmpeg not found")', ex)), 'S6: the reimport button only on a raw mismatch');
+  // The button deletes the kept raw: it asks first, and sends the raw_path the
+  // server named (/api/status.raw_reimport).
+  ex.__calls = [];
+  ex.__answer = false;
+  runInNewContext('hRawReimport = { raw_path: "C:/case/raw/e.raw", reason: "marker mismatch", endpoint: "/api/reimport-raw" }; askDialog = async () => __answer; jpost = async (u, b) => { __calls.push([u, b]); return { ok: true }; }; poll = () => {};', ex);
+  await runInNewContext('hReimportRaw(null)', ex);
+  assert.equal(ex.__calls.length, 0, 'S6: cancelled confirmation → nothing posted');
+  ex.__answer = true;
+  await runInNewContext('hReimportRaw(null)', ex);
+  assert.ok(ex.__calls.length === 1 && ex.__calls[0][0] === '/api/reimport-raw' && ex.__calls[0][1].raw_path === 'C:/case/raw/e.raw', 'S6: confirmed → POST /api/reimport-raw {raw_path}: ' + JSON.stringify(ex.__calls));
+  runInNewContext('hRawReimport = null;', ex);
+  // S13: the new join blocking code has its own text.
+  assert.ok(/"audio-only": "/.test(source), 'S13: audio-only join block code is labelled');
+  console.log('PASS VM R5 raw-mismatch error offers /api/reimport-raw');
+
+  // U12: the live-server guard covers the whole workstation range 8477–8486.
+  const { isWorkstationPort } = await import('./lib/real-server-guard.mjs');
+  assert.ok(['8477', '8480', '8486'].every(p => isWorkstationPort(`http://127.0.0.1:${p}`)) && !isWorkstationPort('http://127.0.0.1:8487') && !isWorkstationPort('http://127.0.0.1:51234'), 'U12: 8477..8486 refused, others allowed');
+  console.log('PASS R5 U12 real-server guard range');
+
+  // U13: CI shell smoke waits longer than the shell's own deadline, prints
+  // the shell's logs on failure; every workflow job has a time limit.
+  const root = new URL('../', import.meta.url);
+  const shellRs = readFileSync(new URL('src/shell.rs', root), 'utf8');
+  const deadline = Number((shellRs.match(/const SMOKE_DEADLINE: Duration = Duration::from_secs\((\d+)\)/) || [])[1]);
+  const win = readFileSync(new URL('.github/workflows/windows-ci.yml', root), 'utf8');
+  const waitMs = Number((win.match(/WaitForExit\((\d+)\)/) || [])[1]);
+  assert.ok(deadline > 0 && waitMs > deadline * 1000, `U13: CI waits ${waitMs} ms > shell deadline ${deadline} s`);
+  assert.ok(/-RedirectStandardError/.test(win) && /Get-Content \$log/.test(win), 'U13: the shell smoke prints its stderr/stdout on failure');
+  const { readdirSync } = await import('node:fs');
+  for (const f of readdirSync(new URL('.github/workflows/', root)).filter(n => n.endsWith('.yml'))) {
+    const text = readFileSync(new URL('.github/workflows/' + f, root), 'utf8').replace(/\r\n/g, '\n');
+    const jobs = text.split('\njobs:\n')[1] || '';
+    const names = [...jobs.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map(m => m[1]);
+    for (const name of names) {
+      const block = jobs.split(new RegExp(`^  ${name}:$`, 'm'))[1].split(/^  [A-Za-z0-9_-]+:$/m)[0];
+      assert.ok(/^    timeout-minutes: \d+/m.test(block), `U13: ${f} job ${name} has timeout-minutes`);
+    }
+  }
+  console.log('PASS R5 U13 CI smoke wait > shell deadline, logs on failure, bounded jobs');
 }
 
 (process.argv.includes('--unit') ? unitTests() : main()).catch(err => { console.error('DRIVER ERROR:', err); process.exit(2); });

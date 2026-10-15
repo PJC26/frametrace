@@ -9,7 +9,7 @@ use super::*;
 #[allow(clippy::duplicate_mod)]
 #[path = "tests_fake_tools.rs"]
 mod fake_tools;
-use fake_tools::{CMD_FIND_OUTPUT, cmd_sleep, write_fake};
+use fake_tools::{CMD_FIND_OUTPUT, CMD_SPIN, cmd_sleep, write_fake};
 
 fn scratch(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft-rev3-{label}-{}", std::process::id()));
@@ -543,8 +543,9 @@ esac"#,
             marker.display()
         ),
         &format!(
-            "if \"%1\"==\"make-custody\" (\necho x> \"{}\"\ngoto spin\n)\nexit /b 0\n:spin\ngoto spin",
-            marker.display()
+            "if \"%1\"==\"make-custody\" (\necho x> \"{}\"\ngoto spin\n)\nexit /b 0\n{}",
+            marker.display(),
+            CMD_SPIN
         ),
     );
     let state = bound(&case, "review-ready");

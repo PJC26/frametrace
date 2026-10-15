@@ -97,6 +97,28 @@ function filterMemoKey() {
   return base === null ? null : base + "\u0001" + state.sortBy;
 }
 
+// R5 U17: position of a record id in a list (the memoised filteredRecords()
+// array, the virtual grid's copy). j/k, a click, a mark and every
+// gridEnsureActiveVisible used to findIndex() through all 50k records —
+// O(n) per key. One id → index map per list (built once, checked against
+// the list's length and the entry it points at, so a list changed in place
+// is re-indexed rather than misread).
+function indexInList(list, id) {
+  if (!Array.isArray(list) || id == null) return -1;
+  const listIndexCache = indexInList.cache || (indexInList.cache = new WeakMap()); // self-contained (VM harness)
+  let entry = listIndexCache.get(list);
+  if (!entry || entry.len !== list.length) {
+    const map = new Map();
+    for (let i = 0; i < list.length; i++) if (list[i] && !map.has(list[i].id)) map.set(list[i].id, i);
+    entry = { len: list.length, map };
+    listIndexCache.set(list, entry);
+  }
+  const at = entry.map.get(id);
+  if (at === undefined) return -1;
+  if (list[at] && list[at].id === id) return at;
+  listIndexCache.delete(list);
+  return list.findIndex(record => record && record.id === id);
+}
 function filteredRecords() {
   const key = filterMemoKey();
   if (key !== null && filteredMemo.key === key) return filteredMemo.list;
@@ -582,7 +604,7 @@ function groupHeaderHtml(key, kind, count, collapsed) {
 // Scroll the active record's row into view (nearest edge), then paint it.
 function gridEnsureActiveVisible() {
   if (!vg || state.activeId == null) return;
-  const idx = vg.filtered.findIndex(record => record.id === state.activeId);
+  const idx = indexInList(vg.filtered, state.activeId);
   if (idx < 0) return;
   const rowIndex = vg.model.rowOfIndex(idx);
   if (rowIndex < 0) return;
@@ -622,7 +644,7 @@ if (typeof ResizeObserver === "function") {
   const moveActiveByPage = moveActive;
   moveActive = function moveActiveVirtual(step) {
     if (vg && vg.filtered.length) {
-      const index = vg.filtered.findIndex(record => record.id === state.activeId);
+      const index = indexInList(vg.filtered, state.activeId);
       const next = Math.max(0, Math.min(vg.filtered.length - 1, index < 0 ? 0 : index + step));
       state.currentPage = Math.floor(next / state.pageSize) + 1;
     }

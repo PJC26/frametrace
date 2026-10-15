@@ -258,6 +258,9 @@ async function loadViewerDataFromApi(first, ui) {
     deepfake: meta.deepfake,
     telemetry: meta.telemetry,
     proxies: meta.proxies,
+    // R5 U16 (S15): per-record proxy paths {id: path} when the server names
+    // them; the viewer then uses only those (30-records resolveProxyPaths).
+    proxyPaths: meta.proxy_paths || meta.proxyPaths || null,
     joinLog: meta.joinLog,
     audioLevels: meta.audioLevels,
     // A failed read of the measurement log (records-meta reports it beside

@@ -681,3 +681,32 @@ const FTStore = {
 - A14: 검색 강조는 원문에서 찾고 조각별로 이스케이프한다. 태그 목록은 제자리 수정 없이 교체한다.
 - B2 계약: 셸(99-init.js)과 서비스 독립 뷰어(99-loader.js)는 `?token=`과 1회용 `?launch=`를 주소창·기록에서 지운다.
 
+
+## 13. R5 트랙 U 추가 계약 (2026-10-14, docs/PLAN_R5_2026-10-14.md)
+
+### 13.1 읽기 전용(판독 기록 읽기 실패) 동안의 편집 (U1/U2/U15)
+- `annotations.error`로 읽기 전용이면 주석 편집은 **입구에서 거부**된다(`refuseLockedEdit`, 30-records.js): 마크 버튼·1/2/3/0, 태그 메뉴·태그 편집기, 메모 칸(readonly), IN/OUT(i/o), Ctrl+Z/Y, 팝아웃 플레이어. 버튼은 비활성 + 툴팁 `save.readonlyEdit`, 키 입력은 같은 문구 토스트.
+- 그래도 읽기 전용 중에 만들어진 드래프트(이전 빌드·우회 경로)는 `unsafe_base: true`를 달고, 저장 때 `base_revisions[id] = -1`로 **자기만의 본문**에 실려 간다(`splitUnsafeBase`). 서버(트랙 P)는 -1을 같은 창 예외 없이 **항상 충돌**로 답한다. -1을 모르는 서버(파싱 거부 `base_revisions… non-negative`, 또는 patch-v1)는 그 본문을 적용하지 않으므로, 뷰어가 records-meta의 현재 값으로 같은 충돌을 직접 만든다 — patch-v1로 내려가는 일은 없다. 충돌 해결(`touchAnnotation(id, {base})`)만 표식을 지운다.
+- 읽기 전용 부팅은 옛 구간 키(`RANGES_KEY`) 이관을 하지 않고 키를 그대로 둔다(U2).
+- `FTViewer.save()`: 읽기 전용이어도 이 창에 드래프트·미저장·충돌이 하나도 없으면 `true`(닫기 확인 없음). `hBeforeClose`는 그때 `{ok:true, warning}`(U15). 최종화 차단은 그대로(`readonly`는 FIN_UNSAVED).
+
+### 13.2 구간 키 보류 (U3)
+- 이관 때 케이스가 모르는 id의 구간은 `ft.viewer.<case>.ranges.held`(`RANGES_HELD_KEY`)로 옮기고 지우지 않는다. 매 부팅 다시 확인해 그 id가 생기면 일반 이관(충돌 표식 "이 브라우저의 이전 구간").
+
+### 13.3 서버 대기열 표시 (U4) · 옛 서버 충돌 (U5) · busy (U6)
+- 부팅 때 대기열 값으로 덮어 보인 id(`queueOverlayIds`)는 대기열이 비면 **모두** 케이스 DB 값으로 되돌린다(리비전이 안 바뀌었어도 — 적용되지 않은 본문). 그 사이 편집·충돌된 id는 제외.
+- 대기 값을 못 읽음/일부만 읽음: `#saveState[data-queue-values="unreadable"|"truncated"]` + 툴팁 문구. `truncated` = 서버 `truncated:true`, 받은 수 < `count`, 또는 페이지 상한.
+- `/api/status.mark_conflicts`에 `ids`가 없고 `GET /api/mark-conflicts`가 없는(404/405/501, 그 모양이 아닌 JSON) 옛 서버: 알림 `#conflictsUnlistedNotice`(role=status, "구버전 서버 — 충돌 목록 불가") 후 상태를 풀어 준다. 라우트가 5xx·네트워크로 실패한 것은 여전히 `unknown`·재시도.
+- `FTViewer.save()`는 `busy/retry` 응답이면 `retry_after_ms`를 기다려 다시 보낸다(최대 10회·합계 20 s), 바로 false가 아니다.
+
+### 13.4 페이지 커서 (S11 ↔ U)
+- `readPagedList`: 응답에 `next_after`가 있으면 다음 페이지는 `?after=<값>&limit=500`, `null`이면 끝. 없으면 예전 `next_offset`/`count` 방식.
+
+### 13.5 기타
+- U7: 셸의 직접 귀속 패치 `client_id`는 탭(페이지)마다 난수 `shell-<rand>`(`FIN_CLIENT_ID`).
+- U8: 팝아웃의 프레임 캡처는 브리지 `capture`(→ `viewerPost`)로 보낸다. 401이면 `net.authRefused`와 호스트 `error`(auth). 브리지가 없을 때만 직접 POST(401도 인증 문구).
+- U16(S15): records-meta `proxy_paths` {id: path}(또는 `proxyPaths`, 객체형 `proxies` 항목, 레코드 행의 `proxy_path`)가 있으면 **그 값만** 쓴다(없는 id = 프록시 없음). 없으면 예전 파일 이름 매칭.
+- S6 ↔ U: 오류 문구가 raw 불일치("raw 불일치 — 재임포트 필요", "재임포트", "reimport-raw", "raw mismatch")이거나 `/api/status.raw_reimport = {raw_path, reason, endpoint}`가 있으면 오류 상자에 `[원본 다시 가져오기]`(`button[data-reimport-raw]`). 누르면 확인 대화상자("raw 파일을 삭제하고 E01에서 다시 만든 뒤 같은 분석 재실행", 위험 버튼) 후 `POST /api/reimport-raw {raw_path}`; 404/405면 "이 서버 버전은 지원하지 않습니다".
+- S13: 조인 차단 코드 `audio-only` 문구(80-review.js `JOIN_CODE_TEXT`; 서버 `message`가 있으면 그것이 우선).
+- S ↔ U14: launch 303은 `launch`만 빼고 나머지 쿼리·해시 유지. verify-layout 14번은 서버가 그렇게 답할 때 `?keep=1`까지 확인하고, 아니면 SKIP("awaits track S").
+- U17: 목록 안 위치는 `indexInList(list, id)`(목록마다 id→index 맵, 40-grid.js), 검토 진행 수는 `annotationGen`이 바뀔 때만 다시 센다. verify-virtual-grid가 5만 건에서 클릭·마크 지연 중앙값 < 200 ms를 확인.

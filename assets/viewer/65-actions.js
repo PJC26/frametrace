@@ -93,6 +93,7 @@ function setupGridDelegation() {
 }
 
 function applyTag(tag) {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   ids.forEach(id => {
@@ -108,6 +109,7 @@ function applyTag(tag) {
 // Dropping the id from state.tags makes the draft carry tags: [] — the
 // v2 payload sends that explicitly, so "all tags removed" reaches the DB.
 function clearTags() {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   ids.forEach(id => { delete state.tags[id]; touchAnnotation(id); });

@@ -51,12 +51,16 @@ async function hBeforeClose(timeoutMs = 5000) {
   let state = null;
   try { pending = Number((api.summary() || {}).pending) || 0; state = api.saveState(); } catch (e) { pending = 0; }
   // A durable server queue counts as saved (it reaches the case DB when the job ends).
-  const ok = saved && !hViewerStateUnsaved(state === "queued" ? "saved" : state, () => pending);
+  // R5 U15: read-only with nothing pending here (FTViewer.save() true: no
+  // draft, no edit) loses nothing by closing — no confirmation, a warning only.
+  const readonlyClean = saved && state === "readonly" && pending === 0;
+  const ok = readonlyClean || (saved && !hViewerStateUnsaved(state === "queued" ? "saved" : state, () => pending));
   const message = ok ? ""
     : pending > 0 ? `저장 안 된 편집 ${pending}건` + (timedOut ? " (저장 응답 대기 시간 초과)" : "")
     : state === "readonly" ? "판독 기록을 읽지 못해 저장이 막혀 있습니다"
     : "모든 편집이 저장되었는지 확인하지 못했습니다";
-  return { ok, pending, state, message };
+  const warning = readonlyClean ? "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다." : "";
+  return { ok, pending, state, message, warning };
 }
 window.hBeforeClose = hBeforeClose;
 $("hBtnQuit").addEventListener("click", async () => {

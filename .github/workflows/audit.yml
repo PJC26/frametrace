@@ -11,6 +11,7 @@ on:
 jobs:
   cargo-audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # R5 U13: bounded, never the 6 h default
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # Prebuilt binary: `cargo install cargo-audit` builds with the pinned

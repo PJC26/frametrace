@@ -8,6 +8,8 @@ on:
 jobs:
   windows-msvc:
     runs-on: windows-latest
+    # R5 U13: a hung step must fail the job in bounded time (the default is 6 h).
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; toolchain pinned via input
@@ -57,11 +59,15 @@ jobs:
         run: cargo build --locked
       # R4 F2: the real WebView2 shell (frametrace-app.exe, no arguments).
       # FRAMETRACE_SHELL_SMOKE=1 (provided by the shell, track C) makes it
-      # close itself with exit code 0 once the page has loaded; a hang is
-      # killed after 90 s and fails the job. Config dirs are isolated.
+      # close itself with exit code 0 once the page has loaded. R5 U13: the
+      # shell fails itself (with a reason on stderr) after its own 120 s
+      # SMOKE_DEADLINE (src/shell.rs), so this step waits LONGER than that
+      # (180 s) — killing it first threw the shell's diagnosis away — and
+      # prints the shell's stdout/stderr whenever the smoke fails. Config
+      # dirs are isolated.
       - name: WebView2 shell smoke (FRAMETRACE_SHELL_SMOKE=1)
         shell: pwsh
-        timeout-minutes: 5
+        timeout-minutes: 6
         env:
           FRAMETRACE_SHELL_SMOKE: "1"
         run: |
@@ -72,12 +78,23 @@ jobs:
           $env:FRAMETRACE_INSTANCE_FILE = Join-Path $smoke 'server.json'
           $exe = Join-Path $env:GITHUB_WORKSPACE 'target/debug/frametrace-app.exe'
           if (-not (Test-Path $exe)) { throw "missing $exe" }
-          $proc = Start-Process -FilePath $exe -PassThru
-          if (-not $proc.WaitForExit(90000)) {
+          $out = Join-Path $smoke 'stdout.log'
+          $err = Join-Path $smoke 'stderr.log'
+          $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          $failure = $null
+          if (-not $proc.WaitForExit(180000)) {
             Stop-Process -Id $proc.Id -Force
-            throw 'shell smoke: frametrace-app.exe did not exit within 90 s'
+            $failure = 'shell smoke: frametrace-app.exe did not exit within 180 s (its own deadline is 120 s)'
+          } elseif ($proc.ExitCode -ne 0) {
+            $failure = "shell smoke: exit code $($proc.ExitCode)"
           }
-          if ($proc.ExitCode -ne 0) { throw "shell smoke: exit code $($proc.ExitCode)" }
+          if ($failure) {
+            foreach ($log in @($err, $out)) {
+              Write-Host "---- $(Split-Path $log -Leaf) ----"
+              if (Test-Path $log) { Get-Content $log } else { Write-Host '(none)' }
+            }
+            throw $failure
+          }
       - name: Install Playwright and harness dependencies
         run: |
           npm install --no-save --no-package-lock playwright@1.56.1 axe-core@4.10.2 pngjs pixelmatch

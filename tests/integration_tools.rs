@@ -7,6 +7,7 @@
 //! ```
 
 mod common;
+use common::IsolatedCommand;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,7 +61,7 @@ fn unique_dir(name: &str) -> PathBuf {
 fn run_binary(exe: &Path, args: &[&str]) {
     let output = Command::new(exe)
         .args(args)
-        .envs(common::isolated_env())
+        .isolated()
         .output()
         .expect("run frametrace");
     assert!(

@@ -239,9 +239,17 @@ FTViewer._attach({
   // neither is an unread conflict lookup (A5) or a read-only mount (A3).
   // A save already in flight is awaited first (A15: the shell's close path
   // calls this and must get the answer of the request on the wire).
+  // R5 U15: read-only with NOTHING held here (no draft, no edit) has nothing
+  // to lose: true (the host warns, it does not ask to confirm a close).
+  // R5 U6: a "busy, retry" reply (R4 B4) is waited out — retry_after_ms,
+  // up to SAVE_BUSY_RETRIES replies and SAVE_BUSY_WAIT_MS in all — instead of
+  // answering false at once.
   async save() {
-    if (!viewerIsServed || annotationsReadOnly) return false;
+    if (!viewerIsServed) return false;
+    if (annotationsReadOnly) return !Object.keys(state.drafts).length && !state.dirtyIds.size && !conflictIds.size;
     const idle = () => localReviewIdle();
+    let busyWaits = 0;
+    const busyDeadline = Date.now() + SAVE_BUSY_WAIT_MS;
     for (let attempt = 0; attempt < 4; attempt++) {
       await whenSaveSettled();
       await whenConflictsChecked();
@@ -250,6 +258,15 @@ FTViewer._attach({
       if (!state.dirtyIds.size && !pendingReviewSync && conflictIds.size) return false;
       if (!state.dirtyIds.size && !pendingReviewSync && !conflictIds.size) continue;
       const result = await syncMarksNow();
+      if (!result.ok && result.busy && !ftSignal.aborted) {
+        const wait = Math.max(250, Number(result.retryAfterMs) || 1000);
+        if (busyWaits < SAVE_BUSY_RETRIES && Date.now() + wait <= busyDeadline) {
+          busyWaits += 1;
+          await new Promise(resolve => setTimeout(resolve, wait));
+          attempt -= 1; // a busy reply is not one of the attempts
+          continue;
+        }
+      }
       if (!result.ok && !result.queued) return false;
     }
     await whenSaveSettled();

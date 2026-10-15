@@ -159,6 +159,8 @@ a.h-mi:focus-visible, button.h-mi:focus-visible { outline-offset: -2px; }
 #inputCard .err { display: none; margin-top: 10px; padding: 8px 12px; border-radius: var(--radius); background: var(--failed-bg); color: var(--failed-fg); font-size: var(--fs-sm); }
 #inputCard .err.show { display: block; }
 #inputCard .err .hintline { margin-top: 4px; font-size: var(--fs-xs); }
+/* R5: the one action an error box may carry ("원본 다시 가져오기", /api/reimport-raw). */
+.err-acts { margin-top: 8px; }
 #inputCard .err details { margin-top: 6px; font-size: var(--fs-xs); }
 #inputCard .err details pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-all; font-family: var(--font-mono); font-size: var(--fs-xs); }
 details.opts { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--border); }

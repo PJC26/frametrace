@@ -8,6 +8,7 @@
 //! silently skips); without it the ignored tests return early.
 
 mod common;
+use common::IsolatedCommand;
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -61,7 +62,7 @@ fn unique_dir(name: &str) -> PathBuf {
 fn frametrace(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_frametrace"))
         .args(args)
-        .envs(common::isolated_env())
+        .isolated()
         .output()
         .expect("run frametrace")
 }
