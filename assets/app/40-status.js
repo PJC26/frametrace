@@ -109,26 +109,38 @@ function errorHint(msg) {
 // carries the one action that resolves it: POST /api/reimport-raw.
 // /api/status.raw_reimport = {raw_path, reason, endpoint} while one waits (else null).
 let hRawReimport = null;
+// R6 U3: the pipeline is busy (/api/status.busy) — the button is disabled.
+let hStatusBusy = false;
 function rawMismatchError(text) {
   return /raw\s*불일치|재임포트|reimport[-_ ]?raw|raw[-_ ]mismatch/i.test(String(text || ""));
 }
 // Action hint first (what to do now), raw CLI output behind a disclosure.
+// R6 U3: the [원본 다시 가져오기] button only while the server names a raw
+// image waiting for that decision (hRawReimport) — an error text alone gets
+// the hint, not an action the server would refuse. Its state is part of the
+// markup, so a re-render (poll) keeps "다시 가져오는 중…" and a busy
+// pipeline keeps it disabled.
 function errorHtml(raw) {
   const text = String(raw || "");
   const first = text.split(/\r?\n/)[0].slice(0, 240);
-  const rawWait = rawMismatchError(text) || (!!hRawReimport && /raw/i.test(text));
-  const hint = rawWait
+  const action = !!hRawReimport && (rawMismatchError(text) || /raw/i.test(text));
+  const rawWait = action || rawMismatchError(text);
+  const hint = action
     ? "보관된 원본 이미지(raw)가 기록과 다릅니다 — 지우지 않았습니다. ‘원본 다시 가져오기’를 누르면 증거 이미지에서 다시 만듭니다."
+    : rawWait ? "보관된 원본 이미지(raw)가 기록과 다릅니다 — 지우지 않았습니다. 분석을 다시 시작하면 서버가 다시 확인합니다."
     : errorHint(text);
+  const busy = reimportRawBusy;
+  const disabled = busy || hStatusBusy;
+  const btn = `<button type="button" data-reimport-raw${disabled ? " disabled" : ""}${busy ? ' aria-busy="true"' : ""}${hStatusBusy && !busy ? ' title="작업이 진행 중입니다 — 끝난 뒤 누를 수 있습니다"' : ""}>${busy ? "다시 가져오는 중…" : "원본 다시 가져오기"}</button>`;
   return `<div>오류: ${esc(first)}</div><div class="hintline">${esc(hint)}</div>` +
-    (rawWait ? `<div class="err-acts"><button type="button" data-reimport-raw>원본 다시 가져오기</button></div>` : "") +
+    (action ? `<div class="err-acts">${btn}</div>` : "") +
     (text.length > first.length ? `<details><summary>자세한 오류 내용</summary><pre>${esc(text)}</pre></details>` : "");
 }
 // One delegated handler for every error box that shows the button. A
 // server without the route (older build) says so instead of failing silently.
-let reimportRawBusy = false;
+var reimportRawBusy = false;
 async function hReimportRaw(btn) {
-  if (reimportRawBusy) return;
+  if (reimportRawBusy || hStatusBusy || !hRawReimport) return;
   const pending = hRawReimport;
   // It deletes the kept raw image and makes it again from the evidence: ask.
   const go = await askDialog({
@@ -143,13 +155,16 @@ async function hReimportRaw(btn) {
   });
   if (!go) return;
   reimportRawBusy = true;
-  if (btn) { btn.disabled = true; btn.setAttribute("aria-busy", "true"); btn.textContent = "다시 가져오는 중…"; }
+  const live = () => (btn && btn.isConnected ? btn : document.querySelector("button[data-reimport-raw]"));
+  const b0 = live();
+  if (b0) { b0.disabled = true; b0.setAttribute("aria-busy", "true"); b0.textContent = "다시 가져오는 중…"; }
   let res = null;
   const body = pending && pending.raw_path ? { raw_path: String(pending.raw_path) } : {};
   const endpoint = pending && pending.endpoint === "/api/reimport-raw" ? pending.endpoint : "/api/reimport-raw";
   try { res = await jpost(endpoint, body); } catch (e) { res = { ok: false, error: String((e && e.message) || e) }; }
   reimportRawBusy = false;
-  if (btn && btn.isConnected) { btn.disabled = false; btn.removeAttribute("aria-busy"); btn.textContent = "원본 다시 가져오기"; }
+  const b1 = live();
+  if (b1) { b1.disabled = hStatusBusy; b1.removeAttribute("aria-busy"); b1.textContent = "원본 다시 가져오기"; }
   if (res && res.ok) {
     toast("원본 이미지를 다시 가져오는 작업을 시작했습니다 — 작업 시트(Alt+J)에서 진행을 볼 수 있습니다.", "ok");
     if (typeof poll === "function") { clearTimeout(pollTimer); poll(); }
@@ -491,15 +506,20 @@ function applyStatus(st) {
 
   // R5 (S6): the server names a raw image waiting for the examiner's decision.
   hRawReimport = st.raw_reimport && typeof st.raw_reimport === "object" ? st.raw_reimport : null;
+  hStatusBusy = !!st.busy;
   const errEl = $("startErr");
   if (errEl) {
     if (st.error && st.phase !== "review-partial" && st.phase !== "review-ready" && st.phase !== "done" && st.phase !== "finalized") {
-      // Re-render only when something else replaced the box, so an
-      // expanded details block (and any selection in it) survives polls.
-      if (shownStatusError !== st.error || errEl.innerHTML !== shownStatusHtml || !/\bshow\b/.test(errEl.className)) {
+      // Re-render only when the markup would change or something else
+      // replaced the box, so an expanded details block (and any selection
+      // in it) survives polls. R6 U3: the markup includes the reimport
+      // button's state (shown / busy / disabled), so a change re-renders.
+      const html = errorHtml(st.error);
+      if (shownStatusSrc !== html || errEl.innerHTML !== shownStatusHtml || !/\bshow\b/.test(errEl.className)) {
         errEl.classList.add("show");
-        errEl.innerHTML = errorHtml(st.error);
+        errEl.innerHTML = html;
         shownStatusError = st.error;
+        shownStatusSrc = html;
         shownStatusHtml = errEl.innerHTML;
       }
     } else {
@@ -508,4 +528,4 @@ function applyStatus(st) {
     }
   }
 }
-let shownStatusError = null, shownStatusHtml = "";
+let shownStatusError = null, shownStatusHtml = "", shownStatusSrc = "";

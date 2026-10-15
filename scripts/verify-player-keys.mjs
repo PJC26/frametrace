@@ -19,7 +19,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
-function buildViewer() {
+function buildViewer(annotations = {}) {
   const dir = join(root, 'assets/viewer');
   let js = '';
   for (const part of readdirSync(dir).filter((f) => f.endsWith('.js')).sort()) {
@@ -35,7 +35,7 @@ function buildViewer() {
   const data = `window.__FRAMETRACE_DATA__ = ${JSON.stringify({
     manifest: { case_id: 'FT-UNDO', title: 'undo' }, caseDir: '/case', scan: { videos },
     carveLog: [], filesystemLog: [], validationLog: [], anomalyLog: [], flsEntries: [],
-    thumbs: {}, annotations: {}, deepfake: {}, telemetry: {}, proxies: [],
+    thumbs: {}, annotations, deepfake: {}, telemetry: {}, proxies: [],
   })};`;
   // Standalone page exactly as build.rs assembles it (shared fragment included).
   return viewerPageHtml({ data, js: js, root });
@@ -48,18 +48,26 @@ const check = (name, ok, detail = '') => {
 };
 
 const html = buildViewer();
+// R6 U6: the same page with unreadable review records (read-only).
+const htmlRo = buildViewer({ marks: [], tags: [], revisions: {}, error: 'database is locked' });
 let captures = 0;
+// '401' (R5 U8) | 'slow' (R6 U7: answers 200 after 1.5 s).
+let capMode = '401';
 const server = createServer((req, res) => {
   // R5 U8: the frame-capture POST is refused (401) like a stale cookie.
   if (req.url.startsWith('/api/capture-frame')) {
     captures += 1;
-    res.statusCode = 401;
     res.setHeader('Content-Type', 'application/json');
+    if (capMode === 'slow') {
+      setTimeout(() => res.end(JSON.stringify({ ok: true, path: 'artifacts/captures/frame_' + captures + '.jpg' })), 1500);
+      return;
+    }
+    res.statusCode = 401;
     res.end('{"ok":false,"error":"unauthorized"}');
     return;
   }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(html);
+  res.end(req.url.startsWith('/ro') ? htmlRo : html);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -262,7 +270,61 @@ try {
     const heard = await page.evaluate(() => window.__ftErr);
     check('U8: pop-out capture 401 → authorization refusal via the bridge (not "offline")', res && res.ok === false && res.auth === true && /인증 오류/.test(res.error) && captures === 1, JSON.stringify(res));
     check('U8: the host hears the 401 (auth error event)', heard.some((d) => d.auth === true && d.stage === 'request'), JSON.stringify(heard));
+    // R6 U7: the main viewer no longer answers (its channel token does not
+    // match, no opener): the capture falls back to the direct POST after
+    // the short ping — not after a 30 s wait.
+    const dead = await popup.evaluate(async () => {
+      window.opener = null;
+      window.__tok = TOKEN;
+      TOKEN = 'nobody-answers';
+      document.getElementById('note').textContent = '';
+      const t0 = performance.now();
+      capture({ id: 'vid_a', image: 'AAAA', time: '0.00', rid: 'r-dead-1' });
+      for (let i = 0; i < 200 && !document.getElementById('note').textContent; i++) await new Promise((r) => setTimeout(r, 50));
+      TOKEN = window.__tok;
+      return { ms: performance.now() - t0, note: document.getElementById('note').textContent };
+    }).catch((e) => ({ error: String(e) }));
+    check('U7: a dead main viewer → direct POST right after the ping (< 5 s, not 30 s)', dead.ms < 5000 && /인증 오류/.test(dead.note || '') && captures === 2, JSON.stringify({ ...dead, captures }));
+    // R6 U7: a capture whose reply is late (slow server) is asked for again
+    // with the same request id — the main viewer answers the first request:
+    // one POST, one frame file, the path shown. (Through the BroadcastChannel:
+    // the opener reference is already severed above.)
+    capMode = 'slow';
+    const before = captures;
+    const late = await popup.evaluate(async () => {
+      CAP_MS = 400;
+      document.getElementById('note').textContent = '';
+      capture({ id: 'vid_a', image: 'AAAA', time: '0.00', rid: 'r-late-1' });
+      for (let i = 0; i < 160 && !/frame_/.test(document.getElementById('note').textContent); i++) await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 1800)); // a duplicate would land meanwhile
+      return { note: document.getElementById('note').textContent };
+    }).catch((e) => ({ error: String(e) }));
+    check('U7: a late capture reply is re-asked with the same request id — exactly one POST, the saved path shown', captures - before === 1 && /frame_/.test(late.note || ''), JSON.stringify({ ...late, posts: captures - before }));
+    capMode = '401';
     await popup.close();
+  }
+  // R6 U6: in a read-only viewer the pop-out never claims "실행 취소됨" or
+  // a mark that did not happen: the bridge's refusal reaches it.
+  {
+    const ro = await browser.newPage();
+    ro.on('pageerror', (e) => errors.push(String(e)));
+    await ro.goto(base + 'ro');
+    await ro.waitForSelector('.card');
+    await ro.locator('.card').first().click();
+    const [popup] = await Promise.all([ro.waitForEvent('popup'), ro.evaluate(() => FTViewer.popout())]);
+    await popup.waitForFunction(() => typeof call === 'function' && !!cur);
+    const note = () => popup.evaluate(() => document.getElementById('note').textContent);
+    await popup.evaluate(() => { document.getElementById('note').textContent = ''; doHist('undo'); });
+    await popup.waitForFunction(() => !!document.getElementById('note').textContent, null, { timeout: 5000 }).catch(() => {});
+    const undoNote = await note();
+    check('U6: read-only → pop-out Ctrl+Z says the refusal, not "실행 취소됨"', /읽기 전용/.test(undoNote) && !/실행 취소됨/.test(undoNote), undoNote);
+    await popup.evaluate(() => { document.getElementById('note').textContent = ''; doMark('important'); });
+    await popup.waitForFunction(() => !!document.getElementById('note').textContent, null, { timeout: 5000 }).catch(() => {});
+    const markNote = await note();
+    const marked = await ro.evaluate(() => FTViewer.summary().marked);
+    check('U6: read-only → pop-out mark is refused and says so (nothing marked)', /읽기 전용/.test(markNote) && marked === 0, `${markNote} marked=${marked}`);
+    await popup.close();
+    await ro.close();
   }
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

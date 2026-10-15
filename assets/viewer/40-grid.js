@@ -681,7 +681,8 @@ function renderVirtualGrid(filtered) {
 }
 
 function renderGrid(filtered) {
-  if (!filtered.some(record => record.id === state.activeId)) {
+  // R6 U8: the id → index map, not a scan of the whole list per render.
+  if (indexInList(filtered, state.activeId) < 0) {
     state.activeId = filtered[0]?.id || null;
   }
   gridRenderedOnce = true;

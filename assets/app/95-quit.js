@@ -35,18 +35,28 @@ async function hPendingChanges() {
 // edits in its confirmation. hBeforeClose is the same flush for the page
 // itself (and the harness): FTViewer.save() awaits a save already in flight
 // and pushes what is left; ok:false comes with "저장 안 된 편집 N건".
-async function hBeforeClose(timeoutMs = 5000) {
+// R6 U4 (S ↔ U contract): the desktop shell's FLUSH_SCRIPT prefers
+// window.hBeforeClose() over FTViewer.save() — so the answer must come
+// within the shell's 5 s wait: default 4 s, and the viewer's own busy
+// budget is capped below it (FTViewer.save({ timeoutMs })). A read-only
+// close with nothing held here answers ok + `warning` at once; the
+// warning is shown here too (toast) and carried for the shell's dialog.
+const H_CLOSE_TIMEOUT_MS = 4000;
+async function hBeforeClose(timeoutMs = H_CLOSE_TIMEOUT_MS) {
   const api = hViewerApi();
   const mounted = !!(api && FTStore.state.viewer && FTStore.state.viewer.mounted);
-  if (!mounted) return { ok: true, pending: 0, state: null, message: "" };
+  if (!mounted) return { ok: true, pending: 0, state: null, message: "", warning: "" };
+  const ms = Math.max(0, Number(timeoutMs) || 0);
   let saved = false;
   let timedOut = false;
+  let timer = 0;
   try {
     saved = await Promise.race([
-      Promise.resolve(api.save()).then(v => v === true),
-      new Promise(resolve => setTimeout(() => { timedOut = true; resolve(false); }, Math.max(0, Number(timeoutMs) || 0))),
+      Promise.resolve(api.save({ timeoutMs: Math.max(0, ms - 250) })).then(v => v === true),
+      new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, ms); }),
     ]);
   } catch (e) { saved = false; }
+  clearTimeout(timer);
   let pending = 0;
   let state = null;
   try { pending = Number((api.summary() || {}).pending) || 0; state = api.saveState(); } catch (e) { pending = 0; }
@@ -60,6 +70,7 @@ async function hBeforeClose(timeoutMs = 5000) {
     : state === "readonly" ? "판독 기록을 읽지 못해 저장이 막혀 있습니다"
     : "모든 편집이 저장되었는지 확인하지 못했습니다";
   const warning = readonlyClean ? "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다." : "";
+  if (warning && typeof toast === "function") toast(warning, "warn");
   return { ok, pending, state, message, warning };
 }
 window.hBeforeClose = hBeforeClose;

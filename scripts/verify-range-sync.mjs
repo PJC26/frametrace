@@ -40,6 +40,17 @@
 //    of GET /api/mark-conflicts?offset&limit (R4 B3)
 //  ⑫ A9 attributeUnassignedMarks resolves only after its save landed, and
 //    rejects (no success to report) when the save met a conflict
+// R6 track U (docs/PLAN_R6_2026-10-15.md):
+//  ⑱ U1/U2 marks-pending with the S2 string cursor "<seq>:<idx>": one queue
+//    file of 800 ids is read across the page boundary (?after=7%3A499), and
+//    the server's `unreadable` files are shown ("대기 파일 N개 읽기 실패");
+//    an older numeric-cursor server that skips inside a file → "truncated"
+//  ⑲ U10 a conflict list the server cut short (`truncated`) is said so
+//  ⑳ U5 FTViewer.save() waits out "busy, retry" only for the caller's
+//    budget (default 5 s, save({timeoutMs}) longer) and shows the retries
+//  ㉑ U9 a failing base -1 body does not keep the ordinary edits from going out
+//  ⑨ U4 the standalone page answers window.hBeforeClose() at once with the
+//    read-only warning (the shell's close flush prefers it)
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -66,7 +77,7 @@ const IDS = ['vid_a', 'vid_b', 'vid_c'];
 const rows = new Map();
 const imports = [];
 // Server switches for ⑨–⑪.
-const mock = { annError: null, pending: 0, pendingRoute: true, pendingItems: [], conflicts: [], conflictsFail: false, metaFail: false, pageCap: 2, conflictPages: [] };
+const mock = { annError: null, pending: 0, pendingRoute: true, pendingItems: [], pendingQueries: [], conflicts: [], conflictsFail: false, metaFail: false, pageCap: 2, conflictPages: [] };
 const row = (id) => rows.get(id) || { status: null, note: '', examiner: null, range: null, tags: [], rev: 0 };
 const valueOf = (r) => JSON.stringify([r.status, r.note || '', r.examiner || null, r.range || null, [...(r.tags || [])]]);
 function apply(body) {
@@ -136,9 +147,16 @@ const server = createServer((req, res) => {
       // The current server parses base_revisions as u64: a -1 refuses the
       // whole body (nothing applied). mock.minusOne = a track-P server.
       const minus = Object.entries(payload.base_revisions || {}).find(([, v]) => v === -1);
-      if (minus && !mock.minusOne) {
+      if (minus && !mock.minusOne && !mock.failUnsafe) {
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ ok: false, error: `marks file marks-imported.json (patch-v2): base_revisions[${JSON.stringify(minus[0])}] must be a non-negative integer` }));
+        return;
+      }
+      if (minus && mock.failUnsafe) {
+        // R6 U9: the base -1 body fails for a reason of its own (not the parse refusal).
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: false, error: 'disk full while journaling' }));
         return;
       }
       if (mock.busyReplies > 0) {
@@ -146,7 +164,7 @@ const server = createServer((req, res) => {
         mock.busyReplies -= 1;
         res.statusCode = 503;
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ ok: false, busy: true, retry: true, retry_after_ms: 300, error: '다른 작업이 진행 중입니다' }));
+        res.end(JSON.stringify({ ok: false, busy: true, retry: true, retry_after_ms: mock.busyAfterMs || 300, error: '다른 작업이 진행 중입니다' }));
         return;
       }
       res.setHeader('Content-Type', 'application/json');
@@ -167,6 +185,25 @@ const server = createServer((req, res) => {
   }
   if (url.pathname === '/api/marks-pending') {
     if (!mock.pendingRoute) return json(404, { ok: false, error: 'not found' });
+    mock.pendingQueries.push(url.search);
+    if (mock.pendingCursor) {
+      // R6 S2 contract: every entry carries cursor "<file seq>:<index>"; the
+      // page after "<s>:<i>" starts right behind that entry; next_after is
+      // the last entry's cursor (a string), null on the last page. With
+      // pendingCursor === 'seq' the server is the R5 one: next_after is the
+      // file seq alone and ?after=<seq> skips the rest of that file (S2 bug).
+      const items = mock.pendingItems.map((e, i) => ({ ...e, seq: 7, cursor: `7:${i}` }));
+      const after = url.searchParams.get('after');
+      let start = 0;
+      if (after != null) {
+        const m = /^(\d+):(\d+)$/.exec(after);
+        start = m ? items.findIndex((e) => e.cursor === after) + 1 : items.filter((e) => e.seq <= Number(after)).length;
+      }
+      const page = items.slice(start, start + 500);
+      const more = start + page.length < items.length;
+      const next = more ? (mock.pendingCursor === 'seq' ? 7 : page.at(-1).cursor) : null;
+      return json(200, { ok: true, files: 3, count: items.length, offset: start, limit: 500, after, next_offset: more ? start + page.length : null, next_after: next, entries: page, unreadable: mock.pendingUnreadable || [], truncated: false });
+    }
     const offset = Number(url.searchParams.get('offset')) || 0;
     // Shape of the real route (docs/PLAN_R4 §B4 as implemented): count, next_offset (null at the end), entries.
     const end = offset + mock.pageCap;
@@ -180,6 +217,8 @@ const server = createServer((req, res) => {
     mock.conflictPages.push([offset, limit]);
     // The server caps a page (mock: 2) below the asked limit: the client pages on.
     const cEnd = offset + Math.min(limit, mock.pageCap);
+    // R6 U10: mock.conflictsCut — the server stops listing (its own cap) and says truncated.
+    if (mock.conflictsCut) return json(200, { ok: true, count: mock.conflicts.length, offset, limit, next_offset: null, truncated: true, conflicts: mock.conflicts.slice(0, mock.conflictsCut) });
     return json(200, { ok: true, count: mock.conflicts.length, offset, limit, next_offset: cEnd < mock.conflicts.length ? cEnd : null, conflicts: mock.conflicts.slice(offset, cEnd) });
   }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -391,12 +430,25 @@ try {
   check('⑨ U1: input reaching the note field, and Ctrl+Z, are refused (no draft)', await draftCount() === 0 && await page.evaluate(() => FTViewer.summary().pending) === 0);
   check('⑨ an edit is never sent, the state stays "readonly"', imports.length === 0 && await state() === 'readonly');
   check('⑨ U15: read-only with nothing held here → save() true (closing needs no confirmation)', await page.evaluate(() => FTViewer.save()) === true && await state() === 'readonly');
+  // R6 U4: the desktop shell's close flush prefers window.hBeforeClose():
+  // a standalone page has one too, answers at once and carries (and shows)
+  // the read-only warning.
+  const close9 = await page.evaluate(async () => {
+    if (typeof window.hBeforeClose !== 'function') return { missing: true };
+    const t0 = performance.now();
+    const r = await window.hBeforeClose();
+    return { ...r, ms: performance.now() - t0, toast: document.getElementById('toastHost').innerText };
+  });
+  check('⑨ U4: standalone hBeforeClose() → ok, the read-only warning (also shown), answered at once',
+    close9.ok === true && close9.pending === 0 && /판독 기록을 읽지 못한/.test(close9.warning || '') && /판독 기록을 읽지 못한/.test(close9.toast || '') && close9.ms < 1000, JSON.stringify(close9));
   check('⑨ summary report / CSV disabled', await page.evaluate(() => ['btnSummary', 'btnDownloadCsv'].every((id) => document.getElementById(id).disabled)));
   // A draft held from before (a closed earlier window): kept, save() false.
   const seeded = { mark: { status: 'important', marked_unix: 1 }, note: '', tags: [], examiner: null, range: null, seq: 1, base: 0 };
   await open({ [`ft.draft.${CASE}.wdead.${C}`]: seeded }, { [`ft.alive:${CASE}:wdead`]: 'closed' });
   await page.waitForSelector('#annotationsErrorBanner');
   check('⑨ U15: read-only WITH a held draft → save() false (the close asks)', await page.evaluate(() => FTViewer.save()) === false && imports.length === 0);
+  const close9b = await page.evaluate(() => window.hBeforeClose && window.hBeforeClose());
+  check('⑨ U4: standalone hBeforeClose() with a held draft → ok false, no "nothing unsaved" warning', !!close9b && close9b.ok === false && !close9b.warning, JSON.stringify(close9b));
   mock.annError = null;
 
   // ⑩ A4: marks in the server's queue across a reload.
@@ -542,6 +594,84 @@ try {
   await page.keyboard.press('3');
   const saved17 = await page.evaluate(() => FTViewer.save());
   check('⑰ U6: save() through two busy replies resolves true, the mark landed', saved17 === true && row(B).status === 'needs_verification' && imports.length >= 3, `${saved17}, ${imports.length} posts, ${row(B).status}`);
+
+  // ---- R6 track U ---------------------------------------------------------
+  // ⑱ U1/U2: one queue file of 800 ids, string cursors across the page
+  // boundary; the last id is C (so a missed second page would show).
+  rows.set(C, { status: 'reviewed', note: '', examiner: null, range: null, tags: [], rev: 2 });
+  const many = Array.from({ length: 799 }, (_, i) => ({ id: `vid_q${String(i).padStart(4, '0')}`, mark: { status: 'reviewed', marked_unix: 5 }, tags: null, deleted: false, base_revision: 0 }));
+  many.push({ id: C, mark: { id: C, status: 'important', note: 'page 2', marked_unix: 5 }, tags: null, deleted: false, base_revision: 2 });
+  Object.assign(mock, { pending: 3, pendingCursor: true, pendingItems: many, pendingQueries: [], pendingUnreadable: [{ file: '00000000000000000000000000000005.json', error: 'EOF while parsing' }, { file: '00000000000000000000000000000006.json', error: 'invalid utf-8' }] });
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 10000 });
+  const q18 = await page.evaluate(() => ({ v: document.getElementById('saveState').dataset.queueValues || '', u: document.getElementById('saveState').dataset.queueUnreadable || '', title: document.getElementById('saveState').title,
+    notice: document.getElementById('queueUnreadableNotice')?.innerText || '', role: document.getElementById('queueUnreadableNotice')?.getAttribute('role') }));
+  check('⑱ U1: 800 ids in one queue file read across the page boundary with the string cursor (?after=7%3A499)',
+    mock.pendingQueries.length === 2 && /after=7%3A499&/.test(mock.pendingQueries[1]) && /important/.test(await chipOf(C)) && q18.v === '', JSON.stringify({ q: mock.pendingQueries, chip: await chipOf(C), v: q18.v }));
+  check('⑱ U2: the server\'s unreadable queue files are shown ("대기 파일 2개 읽기 실패", role=status, indicator title)',
+    /대기 파일 2개 읽기 실패/.test(q18.notice) && q18.role === 'status' && q18.u === '2' && /대기 파일 2개 읽기 실패/.test(q18.title), JSON.stringify(q18));
+  // The R5 numeric cursor (?after=<seq> skips the rest of that file): never a silent gap.
+  Object.assign(mock, { pendingCursor: 'seq', pendingQueries: [], pendingUnreadable: [] });
+  await open(null);
+  await page.waitForFunction(() => FTViewer.saveState() === 'queued', null, { timeout: 10000 });
+  const q18b = await page.evaluate(() => ({ v: document.getElementById('saveState').dataset.queueValues || '', notice: !!document.getElementById('queueUnreadableNotice') }));
+  check('⑱ U1: an R5 numeric-cursor server that skips inside the file → "truncated" said, no unreadable notice', q18b.v === 'truncated' && !q18b.notice && /after=7&/.test(mock.pendingQueries[1] || ''), JSON.stringify({ q18b, q: mock.pendingQueries }));
+  Object.assign(mock, { pending: 0, pendingCursor: false, pendingItems: [] });
+  await waitState('saved', 15000);
+  check('⑱ U2: the queue drained → the unreadable notice is gone', !(await page.locator('#queueUnreadableNotice').count()));
+
+  // ⑲ U10: the server lists 2 of its 3 conflicts and says truncated.
+  mock.conflicts = [A, B, C].map((id) => ({ id, server_revision: row(id).rev, server: { status: 'reviewed', note: 'srv', tags: [] }, queued: { mark: { id, status: 'important', note: 'q' }, tags: null, deleted: false } }));
+  mock.conflictsCut = 2;
+  await open(null);
+  await page.waitForSelector('#markConflictBanner', { timeout: 10000 });
+  const c19 = await page.evaluate(() => ({ notice: document.getElementById('conflictsTruncatedNotice')?.innerText || '', role: document.getElementById('conflictsTruncatedNotice')?.getAttribute('role'), banner: document.querySelector('#markConflictBanner .conflict-msg')?.innerText || '' }));
+  check('⑲ U10: a truncated conflict list is said (2/3, role=status), the 2 listed are shown',
+    /2\/3/.test(c19.notice) && c19.role === 'status' && /2건/.test(c19.banner), JSON.stringify(c19));
+  mock.conflictsCut = 0;
+  mock.conflicts = [];
+  await page.click('#markConflictUseServer');
+  await waitState('saved', 15000);
+  check('⑲ U10: once the listed ones are decided the list is read again — the notice goes', !(await page.locator('#conflictsTruncatedNotice').count()));
+
+  // ⑳ U5: a long busy spell (1.5 s per retry, 10 retries = 15 s) — the
+  // default caller budget is 5 s, the indicator shows the retries.
+  await waitState('saved');
+  Object.assign(mock, { busyReplies: 1000, busyAfterMs: 1500 });
+  await select(A);
+  await page.keyboard.press('3');
+  const t20 = Date.now();
+  const p20 = page.evaluate(() => FTViewer.save());
+  await page.waitForFunction(() => Number(document.getElementById('saveState').dataset.busyRetry) > 0, null, { timeout: 8000 }).catch(() => {});
+  const ind20 = await page.evaluate(() => ({ n: document.getElementById('saveState').dataset.busyRetry || '', label: document.getElementById('saveState').innerText }));
+  const saved20 = await p20;
+  const ms20 = Date.now() - t20;
+  check('⑳ U5: save() (default budget) gives up after ~5 s of busy replies, not 15–20 s', saved20 === false && ms20 < 7500, `${saved20} after ${ms20} ms`);
+  check('⑳ U5: the indicator shows the busy retries meanwhile ("서버 바쁨 · 재시도 n/10")', Number(ind20.n) > 0 && /서버 바쁨/.test(ind20.label), JSON.stringify(ind20));
+  Object.assign(mock, { busyReplies: 3, busyAfterMs: 1500 });
+  const t20b = Date.now();
+  const saved20b = await page.evaluate(() => FTViewer.save({ timeoutMs: 20000 }));
+  check('⑳ U5: save({ timeoutMs: 20000 }) waits out 3 × 1.5 s and lands', saved20b === true && row(A).status === 'needs_verification', `${saved20b} ${row(A).status} ${Date.now() - t20b} ms`);
+  Object.assign(mock, { busyReplies: 0, busyAfterMs: 0 });
+  await waitState('saved', 15000);
+
+  // ㉑ U9: the base -1 body fails (its own error); the ordinary edit still goes out.
+  rows.set(A, { status: 'important', note: 'srv', examiner: null, range: null, tags: [], rev: 9 });
+  rows.set(B, { status: null, note: '', examiner: null, range: null, tags: [], rev: 0 });
+  mock.failUnsafe = true;
+  await open({ [`ft.draft.${CASE}.wold9.${A}`]: { ...unsafeDraft, base: 9 } }, { [`ft.alive:${CASE}:wold9`]: 'closed' });
+  await page.waitForFunction(() => FTViewer.saveState() === 'failed', null, { timeout: 15000 }).catch(() => {});
+  imports.length = 0;
+  await select(B);
+  await page.keyboard.press('2');
+  await saveNow();
+  await page.waitForFunction(() => FTViewer.saveState() !== 'saving', null, { timeout: 10000 });
+  await page.waitForFunction(() => FTViewer.saveState() !== 'saving');
+  const sentB = imports.some((b) => (b.marks || []).some((m) => m.id === B) && (b.base_revisions || {})[B] !== -1);
+  check('㉑ U9: the failing base -1 body did not block the ordinary edit — B sent and stored, A still held',
+    sentB && row(B).status === 'important' && row(A).status === 'important' && row(A).rev === 9 && await page.evaluate((id) => !!Object.keys(localStorage).find((k) => k.endsWith('.' + id) && k.startsWith('ft.draft.')), A),
+    JSON.stringify({ sentB, B: row(B), A: row(A), posts: imports.map((b) => Object.entries(b.base_revisions || {})) }));
+  mock.failUnsafe = false;
 
   check('no page errors', !errors.length, errors.join(' | '));
 } catch (err) {
