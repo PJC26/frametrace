@@ -1383,48 +1383,275 @@ pub fn record_signoff_audit(case_dir: &std::path::Path, signoff: &Signoff) -> Re
         .map_err(|err| format!("최종화 서명을 감사 체인에 기록하지 못했습니다: {err}"))
 }
 
-/// Whether the sign-off record `signoff_text` is in the sign-off audit
-/// lane under `root`: one line for the report banner / verify-package.
-pub fn signoff_audit_status(root: &std::path::Path, signoff_text: &str) -> (bool, String) {
+/// R5-P1: what the sign-off audit lane says about one sign-off record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignoffAuditRecord {
+    /// The lane verifies and holds an entry naming exactly this record
+    /// (record SHA-256 and `content_sha256`), authenticated by HMAC when an
+    /// audit key is configured. `integrity` is the lane's grade label.
+    Verified { integrity: &'static str },
+    /// Nothing to check against (no sign-off lane, or a package that does
+    /// not carry it, or a keyed check that cannot be made): the record
+    /// cannot be confirmed — never presented as current.
+    NotVerifiable(String),
+    /// The lane contradicts the record: its chain does not verify, or it
+    /// records sign-offs but none naming this record (a swapped or
+    /// re-computed record), or the entry for it names another content
+    /// digest.
+    Contradicted(String),
+}
+
+impl SignoffAuditRecord {
+    /// The one line the report banner and `verify-package` show.
+    pub fn note(&self) -> String {
+        match self {
+            Self::Verified { integrity } => {
+                format!("서명 기록이 감사 체인(signoff-log, {integrity})에 있음")
+            }
+            Self::NotVerifiable(why) => format!("서명 확인 불가 — {why}"),
+            Self::Contradicted(why) => format!("서명 기록 불일치 — {why}"),
+        }
+    }
+}
+
+/// R5-P1: checks `signoff_text` against the sign-off audit lane under
+/// `root`. `lane_listed` is `false` when a package does not carry the lane.
+pub fn signoff_audit_record(
+    root: &std::path::Path,
+    signoff_text: &str,
+    lane_listed: bool,
+) -> SignoffAuditRecord {
+    let keys = match crate::audit_key::verification_keys() {
+        Ok(keys) => keys,
+        Err(err) => {
+            return SignoffAuditRecord::NotVerifiable(format!(
+                "감사 키를 읽지 못해 서명 감사 기록을 확인할 수 없습니다: {err}"
+            ));
+        }
+    };
+    signoff_audit_record_with_keys(root, signoff_text, lane_listed, &keys)
+}
+
+/// [`signoff_audit_record`] with an explicit verification key set.
+pub fn signoff_audit_record_with_keys(
+    root: &std::path::Path,
+    signoff_text: &str,
+    lane_listed: bool,
+    keys: &[crate::audit_key::AuditKey],
+) -> SignoffAuditRecord {
     let path = root.join(SIGNOFF_LOG_REL_PATH);
-    if !path.is_file() {
-        return (
-            false,
-            "이 서명은 감사 체인(signoff-log)에 기록되어 있지 않습니다".to_string(),
+    if !lane_listed {
+        return SignoffAuditRecord::NotVerifiable(
+            "패키지에 서명 감사 레인(signoff-log)이 없어 이 서명이 기록된 것인지 확인할 수 없습니다"
+                .to_string(),
         );
     }
-    let verification = match crate::audit::verify_chained_jsonl(&path) {
-        Ok(verification) => verification,
-        Err(err) => return (false, format!("서명 감사 레인 검증 실패: {err}")),
+    let text = match crate::audit::read_log_locked(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            return SignoffAuditRecord::NotVerifiable(
+                "감사 체인(signoff-log)에 서명 기록이 없습니다 — 이 서명이 최종화로 기록된 것인지 확인할 수 없습니다"
+                    .to_string(),
+            );
+        }
+        Err(err) => {
+            return SignoffAuditRecord::NotVerifiable(format!(
+                "서명 감사 레인을 읽지 못했습니다: {err}"
+            ));
+        }
     };
+    let verification =
+        match crate::audit::verify_chained_jsonl_text(&text, SIGNOFF_LOG_REL_PATH, keys) {
+            Ok(verification) => verification,
+            Err(err) => {
+                return SignoffAuditRecord::Contradicted(format!(
+                    "서명 감사 레인 검증 실패: {err}"
+                ));
+            }
+        };
     let record = crate::sha256::digest_bytes(signoff_text.as_bytes());
-    let found = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .any(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|v| {
-                    v.get("signoff_record_sha256")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s == record)
-                })
-                .unwrap_or(false)
-        });
-    if found {
-        (
-            true,
-            format!(
-                "서명 기록이 감사 체인(signoff-log, {})에 있음",
-                verification.integrity.label()
-            ),
-        )
-    } else {
-        (
-            false,
-            "감사 체인(signoff-log)에 이 서명 기록이 없습니다".to_string(),
-        )
+    let content = Signoff::parse(signoff_text).and_then(|signoff| signoff.content_sha256);
+    let mut signoff_entries = 0usize;
+    let mut matching: Option<bool> = None;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("event").and_then(|v| v.as_str()) != Some("signoff") {
+            continue;
+        }
+        signoff_entries += 1;
+        if value.get("signoff_record_sha256").and_then(|v| v.as_str()) == Some(record.as_str()) {
+            let entry_content = value.get("content_sha256").and_then(|v| v.as_str());
+            if entry_content != content.as_deref() {
+                return SignoffAuditRecord::Contradicted(format!(
+                    "감사 체인의 이 서명 항목은 다른 결합 내용(content_sha256 {})을 기록합니다",
+                    entry_content.unwrap_or("null")
+                ));
+            }
+            matching = Some(
+                value
+                    .get("entry_hmac_sha256")
+                    .is_some_and(|v| v.is_string()),
+            );
+        }
     }
+    let Some(keyed) = matching else {
+        return if signoff_entries == 0 {
+            SignoffAuditRecord::NotVerifiable(
+                "감사 체인(signoff-log)에 서명 항목이 없습니다 — 이 서명이 최종화로 기록된 것인지 확인할 수 없습니다"
+                    .to_string(),
+            )
+        } else {
+            SignoffAuditRecord::Contradicted(format!(
+                "감사 체인(signoff-log)에는 서명 {signoff_entries}건이 기록되어 있으나 이 서명 기록(sha256 {record})은 없습니다 — 서명 기록이 교체되었거나 다시 계산되었습니다"
+            ))
+        };
+    };
+    // A configured key means a genuine finalize HMAC-signed the entry; an
+    // unkeyed (or unauthenticated) matching entry proves nothing then.
+    if !keys.is_empty() && !keyed {
+        return SignoffAuditRecord::NotVerifiable(
+            "감사 키가 설정되어 있으나 이 서명의 감사 항목에 HMAC 서명이 없습니다 — 키 없이 추가된 항목일 수 있어 서명을 확인할 수 없습니다"
+                .to_string(),
+        );
+    }
+    if keys.is_empty() && keyed {
+        return SignoffAuditRecord::Verified {
+            integrity: "HMAC 항목이나 이 PC에 키가 없어 구조만 확인",
+        };
+    }
+    SignoffAuditRecord::Verified {
+        integrity: verification.integrity.label(),
+    }
+}
+
+/// Whether the sign-off record `signoff_text` is in the sign-off audit
+/// lane under `root`: one line for the report banner / verify-package.
+/// R5-P1: `true` only for a verified entry naming exactly this record.
+pub fn signoff_audit_status(root: &std::path::Path, signoff_text: &str) -> (bool, String) {
+    let record = signoff_audit_record(root, signoff_text, true);
+    (
+        matches!(record, SignoffAuditRecord::Verified { .. }),
+        record.note(),
+    )
+}
+
+/// R5-P2: a signed target file hashed again for this check, or why it
+/// could not be (missing, locked, read error) — the latter is "not
+/// verified", never "changed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveHash {
+    Hashed(String),
+    Unavailable(String),
+}
+
+/// R5-P2: the file each annotated record id names under `root`: indexed
+/// videos (lossless path, R5-P3), carve outputs, recovered inodes and
+/// joined outputs (later log entries win). Unreadable logs contribute
+/// nothing (the id then reads "not verified").
+pub fn evidence_target_paths(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    let rows = |rel: &str| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(root.join(rel))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    };
+    let text = |value: &serde_json::Value, key: &str| -> Option<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows("db/videos.jsonl") {
+        if let (Some(id), Some(path)) = (text(&row, "id"), crate::model::record_os_path(&row)) {
+            out.insert(id, path);
+        }
+    }
+    for row in rows("artifacts/carved/carve-log.jsonl") {
+        if let (Some(id), Some(path)) = (text(&row, "id"), text(&row, "output_path")) {
+            out.insert(id, crate::util::resolve_case_artifact_path(root, &path));
+        }
+    }
+    for row in rows("evidence/logs/tsk-audit.jsonl") {
+        if text(&row, "event").as_deref() != Some("recover-inode") {
+            continue;
+        }
+        let offset = row
+            .get("partition_offset")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_else(|| "0".to_string());
+        let inode = row
+            .get("inode")
+            .filter(|v| !v.is_null() && v.as_str() != Some(""))
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .or_else(|| text(&row, "output_path"))
+            .unwrap_or_default();
+        if let Some(path) = text(&row, "output_path") {
+            out.insert(
+                format!("inode:{offset}:{inode}"),
+                crate::util::resolve_case_artifact_path(root, &path),
+            );
+        }
+    }
+    for row in rows("artifacts/joined/join-log.jsonl") {
+        let row = crate::join::with_record_id(row);
+        if let (Some(id), Some(path)) = (text(&row, "record_id"), text(&row, "output_path")) {
+            out.insert(id, crate::util::resolve_case_artifact_path(root, &path));
+        }
+    }
+    out
+}
+
+/// R5-P2: hashes again every target file a sign-off record bound with a
+/// recorded SHA-256 (ids with `null` were never bound). `reuse` holds hashes
+/// this run already computed (finalize's rehash of the indexed originals)
+/// and is used instead of reading those files twice.
+pub fn rehash_signed_targets(
+    root: &std::path::Path,
+    signoff_text: &str,
+    reuse: &std::collections::BTreeMap<String, LiveHash>,
+) -> std::collections::BTreeMap<String, LiveHash> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(signoff_text) else {
+        return out;
+    };
+    let Some(evidence) = value.get("evidence").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    let targets = evidence_target_paths(root);
+    for (id, sha) in evidence {
+        if !sha.is_string() {
+            continue;
+        }
+        if let Some(known) = reuse.get(id) {
+            out.insert(id.clone(), known.clone());
+            continue;
+        }
+        let live = match targets.get(id) {
+            None => LiveHash::Unavailable("대상 파일 위치가 케이스 기록에 없음".to_string()),
+            Some(path) => match crate::audit::digest_file(path) {
+                Ok(sha) => LiveHash::Hashed(sha),
+                Err(err) => LiveHash::Unavailable(err),
+            },
+        };
+        out.insert(id.clone(), live);
+    }
+    out
 }
 
 /// Where a v4 sign-off is checked: the case itself, or a package whose
@@ -1445,6 +1672,9 @@ pub struct SignoffCheck {
     /// What could not be checked here (evidence without a recorded hash,
     /// lanes a package does not hold).
     pub not_verified: Vec<String>,
+    /// R5-P2: how many signed target files were hashed again for this
+    /// check (0 = the bindings were compared with the case's records only).
+    pub rehashed: usize,
 }
 
 /// Checks a sign-off record against the case/package at `root`: for a
@@ -1457,10 +1687,30 @@ pub fn check_signoff(
     digests: &SignoffDigests,
     scope: SignoffScope<'_>,
 ) -> SignoffCheck {
+    check_signoff_with(root, signoff_text, digests, scope, None)
+}
+
+/// [`check_signoff`] plus R5-P2's live re-hash of the signed target files
+/// (`live`, from [`rehash_signed_targets`]): a re-hash that differs from
+/// the signed SHA-256 is a change; a file that could not be read is "not
+/// verified".
+///
+/// R5-P1: a v4 record is `Current` only when, besides every binding
+/// matching, the sign-off audit lane holds a verified entry naming exactly
+/// this record ([`signoff_audit_record`]); without one it is `Unbound`
+/// (not verifiable), and a lane that contradicts it is a change.
+pub fn check_signoff_with(
+    root: &std::path::Path,
+    signoff_text: &str,
+    digests: &SignoffDigests,
+    scope: SignoffScope<'_>,
+    live: Option<&std::collections::BTreeMap<String, LiveHash>>,
+) -> SignoffCheck {
     let legacy = || SignoffCheck {
         currency: signoff_currency(signoff_text, digests),
         changes: Vec::new(),
         not_verified: Vec::new(),
+        rehashed: 0,
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(signoff_text) else {
         return legacy();
@@ -1480,6 +1730,7 @@ pub fn check_signoff(
                     .to_string(),
             ],
             not_verified,
+            rehashed: 0,
         };
     };
     // Recorded bindings, parsed back from the record.
@@ -1534,16 +1785,20 @@ pub fn check_signoff(
     if annotations != digests.content {
         changes.push("sign-off 이후 판독 마크·메모·IN-OUT 구간·태그가 변경됨".to_string());
     }
+    // R5-P2: these compare the hash the CASE RECORDS for each target now
+    // with the one signed — not the file's bytes (see `live` below).
+    // R5-P5: a record without a hash, or a log that cannot be read, is
+    // "not verified" — never "changed".
     match evidence_hashes(root) {
         Ok(current) => {
             for (id, sha) in &recorded.evidence {
                 match (sha, current.get(id)) {
                     (Some(sha), Some(now)) if now.eq_ignore_ascii_case(sha) => {}
                     (Some(sha), Some(now)) => changes.push(format!(
-                        "{id}: 대상 파일 SHA-256이 서명 후 바뀜 (서명 시 {sha}, 현재 {now})"
+                        "{id}: 케이스 기록의 대상 파일 해시가 서명 후 바뀜 (서명 시 {sha}, 현재 기록 {now})"
                     )),
-                    (Some(sha), None) => changes.push(format!(
-                        "{id}: 서명 시 대상 파일 SHA-256 {sha}이 기록됐으나 현재 해시를 찾을 수 없음"
+                    (Some(sha), None) => not_verified.push(format!(
+                        "{id}: 서명 시 대상 파일 SHA-256 {sha}이 기록됐으나 현재 케이스 기록에서 해시를 찾을 수 없어 확인 불가"
                     )),
                     (None, _) => not_verified.push(format!(
                         "{id}: 서명 시 대상 파일 해시가 없어 파일 교체 여부를 확인할 수 없음"
@@ -1551,7 +1806,32 @@ pub fn check_signoff(
                 }
             }
         }
-        Err(err) => changes.push(format!("대상 파일 해시를 확인하지 못했습니다: {err}")),
+        Err(err) => not_verified.push(format!(
+            "케이스 기록의 대상 파일 해시를 읽지 못해 확인 불가: {err}"
+        )),
+    }
+    let mut rehashed = 0usize;
+    if let Some(live) = live {
+        for (id, sha) in &recorded.evidence {
+            let Some(sha) = sha else {
+                continue;
+            };
+            match live.get(id) {
+                Some(LiveHash::Hashed(now)) if now.eq_ignore_ascii_case(sha) => rehashed += 1,
+                Some(LiveHash::Hashed(now)) => {
+                    rehashed += 1;
+                    changes.push(format!(
+                        "{id}: 대상 파일을 다시 해시한 값이 서명 시 해시와 다름 (서명 시 {sha}, 재해시 {now}) — 서명 후 파일이 바뀜"
+                    ));
+                }
+                Some(LiveHash::Unavailable(why)) => not_verified.push(format!(
+                    "{id}: 대상 파일을 다시 해시하지 못해 파일 자체는 확인 불가 — {why}"
+                )),
+                None => not_verified.push(format!(
+                    "{id}: 대상 파일을 다시 해시하지 않음 — 파일 자체는 확인 불가"
+                )),
+            }
+        }
     }
     for (rel, head) in &recorded.lanes {
         if let SignoffScope::Package(listed) = &scope
@@ -1577,19 +1857,37 @@ pub fn check_signoff(
                 "{rel}: 서명 시 {}번째 항목이 다른 항목으로 바뀜 — 레인이 재작성됨",
                 head.entries
             )),
-            crate::audit::AnchorStatus::Unreadable(err) => changes.push(format!(
-                "{rel}: 감사 레인을 읽지 못해 앵커 확인 실패 — {err}"
+            // R5-P5: unreadable (locked, I/O error) is not verified.
+            crate::audit::AnchorStatus::Unreadable(err) => not_verified.push(format!(
+                "{rel}: 감사 레인을 읽지 못해 앵커 확인 불가 — {err}"
             )),
         }
     }
+    // R5-P1: the record must be the one the sign-off lane recorded.
+    let lane_listed = match &scope {
+        SignoffScope::Case => true,
+        SignoffScope::Package(listed) => listed(SIGNOFF_LOG_REL_PATH),
+    };
+    let mut unrecorded = false;
+    match signoff_audit_record(root, signoff_text, lane_listed) {
+        SignoffAuditRecord::Verified { .. } => {}
+        SignoffAuditRecord::NotVerifiable(why) => {
+            unrecorded = true;
+            not_verified.push(format!("서명 감사 기록 없음 — 서명 확인 불가: {why}"));
+        }
+        SignoffAuditRecord::Contradicted(why) => changes.push(why),
+    }
     SignoffCheck {
-        currency: if changes.is_empty() {
-            SignoffCurrency::Current
-        } else {
+        currency: if !changes.is_empty() {
             SignoffCurrency::Changed
+        } else if unrecorded {
+            SignoffCurrency::Unbound
+        } else {
+            SignoffCurrency::Current
         },
         changes,
         not_verified,
+        rehashed,
     }
 }
 
@@ -1603,13 +1901,32 @@ pub fn signoff_banner_checked_html(
     v4: bool,
     audit_note: &str,
 ) -> String {
-    let mut banner = signoff_banner_html(examiner, signed_unix, check.currency);
+    let mut banner = if v4 && check.currency == SignoffCurrency::Unbound {
+        // R5-P1: a v4 record the sign-off lane does not confirm.
+        signoff_banner_html(examiner, signed_unix, check.currency).replace(
+            " — 이 기록에는 대상 내용의 해시가 없어 이후 판독 마크 변경 여부를 확인할 수 없습니다.",
+            " — <strong>서명 확인 불가: 이 서명 기록이 감사 체인(signoff-log)에서 확인되지 않아, 최종화 때 기록된 서명인지 보증할 수 없습니다.</strong>",
+        )
+    } else {
+        signoff_banner_html(examiner, signed_unix, check.currency)
+    };
     let mut details = Vec::new();
     if v4 && check.currency == SignoffCurrency::Current {
-        details.push(
-            "서명 형식 v4: 판독 내용과 함께 대상 파일 SHA-256과 감사 레인 앵커(항목 수·마지막 해시)까지 일치함 — 서명 후 로그 끝부분 삭제 없음"
-                .to_string(),
-        );
+        // R5-P2: say exactly what was compared.
+        details.push(format!(
+            "서명 형식 v4: 판독 내용, 케이스 기록의 대상 파일 해시, 감사 레인 앵커(항목 수·마지막 해시)가 서명 시와 일치함 — 서명 후 로그 끝부분 삭제 없음. {}",
+            if check.rehashed > 0 {
+                format!("대상 파일 {}개는 이번에 다시 해시해 서명 시 값과 일치함을 확인함", check.rehashed)
+            } else {
+                "대상 파일 자체는 이번에 다시 해시하지 않음(케이스 기록의 해시와 비교)".to_string()
+            }
+        ));
+        if !check.not_verified.is_empty() {
+            details.push(format!(
+                "다만 아래 {}개 항목은 확인 불가",
+                check.not_verified.len()
+            ));
+        }
     }
     details.extend(check.changes.iter().map(|change| format!("변경: {change}")));
     details.extend(
@@ -2874,8 +3191,9 @@ mod tests {
     }
 
     /// Builds a v4 record over `root` for `vid_000001` (what
-    /// `Signoff::build_v4` writes, minus the database read).
-    fn v4_record(root: &std::path::Path, digests: &super::SignoffDigests) -> String {
+    /// `Signoff::build_v4` writes, minus the database read) WITHOUT
+    /// recording it in the sign-off lane.
+    fn v4_record_unrecorded(root: &std::path::Path, digests: &super::SignoffDigests) -> String {
         let bindings = super::signoff_bindings(root, ["vid_000001", "join:nothing"]).unwrap();
         let content = super::signoff_content_sha256(&super::signoff_v4_content_json(
             &digests.content,
@@ -2886,6 +3204,14 @@ mod tests {
             "{{\"schema_version\":4,\"examiner\":\"A\",\"signed_unix\":5,\"annotations_sha256\":\"{}\",\"evidence\":{evidence},\"lanes\":{lanes},\"content_sha256\":\"{content}\"}}\n",
             digests.content
         )
+    }
+
+    /// [`v4_record_unrecorded`] recorded in the sign-off audit lane, as a
+    /// finalize does (R5-P1: only such a record can read current).
+    fn v4_record(root: &std::path::Path, digests: &super::SignoffDigests) -> String {
+        let record = v4_record_unrecorded(root, digests);
+        super::record_signoff_audit(root, &super::Signoff::parse(&record).unwrap()).unwrap();
+        record
     }
 
     /// D13: a v4 sign-off reads "changed" when a marked record's target
@@ -2963,7 +3289,7 @@ mod tests {
             check
                 .changes
                 .iter()
-                .any(|c| c.contains("vid_000001: 대상 파일 SHA-256이 서명 후 바뀜")),
+                .any(|c| c.contains("vid_000001: 케이스 기록의 대상 파일 해시가 서명 후 바뀜")),
             "{check:?}"
         );
 
@@ -2990,6 +3316,167 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    /// R5-P1: a v4 record forged consistently (marks changed, every hash
+    /// recomputed) is not "current": the sign-off lane does not name it.
+    /// Without any sign-off lane the record is "not verifiable"; a lane
+    /// that records other sign-offs contradicts it.
+    #[test]
+    fn v4_signoff_is_current_only_with_its_audit_entry() {
+        use super::{SignoffCurrency, SignoffScope, check_signoff};
+        let (root, digests) = signoff_tree("p1-forged");
+        // Not finalized through the workstation: no lane at all.
+        let unrecorded = v4_record_unrecorded(&root, &digests);
+        let check = check_signoff(&root, &unrecorded, &digests, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Unbound, "{check:?}");
+        assert!(
+            check
+                .not_verified
+                .iter()
+                .any(|c| c.contains("서명 확인 불가")),
+            "{check:?}"
+        );
+        let (recorded, note) = super::signoff_audit_status(&root, &unrecorded);
+        assert!(!recorded && note.contains("서명 확인 불가"), "{note}");
+        // The genuine finalize records it: current.
+        let genuine = v4_record(&root, &digests);
+        assert_eq!(genuine, unrecorded);
+        let check = check_signoff(&root, &genuine, &digests, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Current, "{check:?}");
+        // A forger changes the marks and recomputes a self-consistent v4
+        // record (annotations_sha256 and content_sha256 both match).
+        let forged_digests = super::SignoffDigests {
+            content: super::signoff_content_sha256("{\"schema\":3,\"marks\":[2]}"),
+            legacy: digests.legacy.clone(),
+        };
+        let forged = v4_record_unrecorded(&root, &forged_digests);
+        let check = check_signoff(&root, &forged, &forged_digests, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Changed, "{check:?}");
+        assert!(
+            check.changes.iter().any(|c| c.contains("교체")),
+            "{check:?}"
+        );
+        // Package without the lane: not verifiable, never a pass.
+        let only_record = |rel: &str| rel != super::SIGNOFF_LOG_REL_PATH;
+        let check = check_signoff(
+            &root,
+            &genuine,
+            &digests,
+            SignoffScope::Package(&only_record),
+        );
+        assert_eq!(check.currency, SignoffCurrency::Unbound, "{check:?}");
+        // The banner says so in words.
+        let banner = super::signoff_banner_checked_html("A", 5, &check, true, "x");
+        assert!(banner.contains("서명 확인 불가"), "{banner}");
+        // With an audit key configured, an unkeyed entry proves nothing.
+        let key = crate::audit_key::AuditKey::new("k", &[7; 32]);
+        let record = super::signoff_audit_record_with_keys(&root, &genuine, true, &[key]);
+        assert!(
+            matches!(record, super::SignoffAuditRecord::NotVerifiable(_)),
+            "{record:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R5-P2: the bindings say what they compare ("케이스 기록의 해시"), and
+    /// a live re-hash catches a target whose bytes changed while the case
+    /// records still carry the signed hash; a file that cannot be read is
+    /// "not verified", not changed.
+    #[test]
+    fn v4_signoff_rehash_compares_the_files_themselves() {
+        use super::{LiveHash, SignoffCurrency, SignoffScope, check_signoff, check_signoff_with};
+        let (root, digests) = signoff_tree("p2-rehash");
+        let media = root.join("clip.mp4");
+        std::fs::write(&media, b"signed bytes").unwrap();
+        let sha = crate::sha256::digest_bytes(b"signed bytes");
+        std::fs::write(
+            root.join("db/videos.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"id": "vid_000001", "sha256": sha, "source_path": media.to_string_lossy()})
+            ),
+        )
+        .unwrap();
+        let record = v4_record(&root, &digests);
+        let none = std::collections::BTreeMap::new();
+        let live = super::rehash_signed_targets(&root, &record, &none);
+        assert_eq!(live.get("vid_000001"), Some(&LiveHash::Hashed(sha.clone())));
+        let check = check_signoff_with(&root, &record, &digests, SignoffScope::Case, Some(&live));
+        assert_eq!(check.currency, SignoffCurrency::Current, "{check:?}");
+        assert_eq!(check.rehashed, 1);
+        let banner = super::signoff_banner_checked_html("A", 5, &check, true, "x");
+        assert!(banner.contains("케이스 기록의 대상 파일 해시"), "{banner}");
+        assert!(banner.contains("다시 해시"), "{banner}");
+        // The file is replaced; the index still records the signed hash.
+        std::fs::write(&media, b"other bytes!").unwrap();
+        assert_eq!(
+            check_signoff(&root, &record, &digests, SignoffScope::Case).currency,
+            SignoffCurrency::Current,
+            "records alone cannot see it"
+        );
+        let live = super::rehash_signed_targets(&root, &record, &none);
+        let check = check_signoff_with(&root, &record, &digests, SignoffScope::Case, Some(&live));
+        assert_eq!(check.currency, SignoffCurrency::Changed, "{check:?}");
+        assert!(
+            check.changes.iter().any(|c| c.contains("다시 해시한 값")),
+            "{check:?}"
+        );
+        // Reused results (finalize's rehash of the originals) are used.
+        let reuse = std::collections::BTreeMap::from([(
+            "vid_000001".to_string(),
+            LiveHash::Unavailable("잠김".into()),
+        )]);
+        let live = super::rehash_signed_targets(&root, &record, &reuse);
+        let check = check_signoff_with(&root, &record, &digests, SignoffScope::Case, Some(&live));
+        assert_eq!(check.currency, SignoffCurrency::Current, "{check:?}");
+        assert!(
+            check
+                .not_verified
+                .iter()
+                .any(|c| c.contains("vid_000001") && c.contains("잠김")),
+            "{check:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R5-P5: a hash the case no longer records and a lane that cannot be
+    /// read are "not verified" — only real differences are "changed".
+    #[test]
+    fn v4_signoff_unreadable_inputs_are_not_verified_not_changed() {
+        use super::{SignoffCurrency, SignoffScope, check_signoff};
+        let (root, digests) = signoff_tree("p5");
+        let record = v4_record(&root, &digests);
+        // The index lost the hash (re-scan without hashing).
+        std::fs::write(
+            root.join("db/videos.jsonl"),
+            format!("{}\n", serde_json::json!({"id": "vid_000001"})),
+        )
+        .unwrap();
+        // The anchored lane cannot be read (a directory in its place).
+        let lane = root.join("evidence/logs/validation-log.jsonl");
+        std::fs::remove_file(&lane).unwrap();
+        std::fs::create_dir_all(&lane).unwrap();
+        let check = check_signoff(&root, &record, &digests, SignoffScope::Case);
+        assert!(check.changes.is_empty(), "{check:?}");
+        assert_eq!(check.currency, SignoffCurrency::Current, "{check:?}");
+        assert!(
+            check
+                .not_verified
+                .iter()
+                .any(|c| c.contains("vid_000001") && c.contains("확인 불가")),
+            "{check:?}"
+        );
+        assert!(
+            check
+                .not_verified
+                .iter()
+                .any(|c| c.contains("validation-log") && c.contains("확인 불가")),
+            "{check:?}"
+        );
+        let banner = super::signoff_banner_checked_html("A", 5, &check, true, "x");
+        assert!(banner.contains("확인 불가"), "{banner}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// D13: records of older schemas keep their legacy meaning through the

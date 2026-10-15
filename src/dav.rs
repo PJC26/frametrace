@@ -348,7 +348,20 @@ pub fn extract_video_es(
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create ES output directory: {err}"))?;
     }
-    let result = copy_pinned_channel(walk, dav_path, es_output);
+    // R5-P12: the output is created here, never truncated or replaced —
+    // an existing file at that name is refused — so the cleanup below can
+    // only ever remove the file this call made.
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(es_output)
+        .map_err(|err| {
+            format!(
+                "failed to create ES output {} (an existing file is never overwritten): {err}",
+                es_output.display()
+            )
+        })?;
+    let result = copy_pinned_channel(walk, dav_path, output);
     if result.is_err() {
         let _ = std::fs::remove_file(es_output);
     }
@@ -358,12 +371,10 @@ pub fn extract_video_es(
 fn copy_pinned_channel(
     walk: DavFrames,
     dav_path: &Path,
-    es_output: &Path,
+    mut output: File,
 ) -> Result<(u64, usize, Option<u16>), String> {
     let mut input =
         BufReader::new(File::open(dav_path).map_err(|err| format!("failed to open DAV: {err}"))?);
-    let mut output =
-        File::create(es_output).map_err(|err| format!("failed to create ES output: {err}"))?;
     let mut channel: Option<u16> = None;
     let mut copied_frames = 0usize;
     let mut written = 0u64;
@@ -430,7 +441,8 @@ pub fn remux_dav_to_mp4(
     let native_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let _ = std::fs::remove_file(mp4_output);
 
-    let es_path = mp4_output.with_extension("es.bin");
+    // R5-P12: a fresh name next to the output (never an existing file).
+    let es_path = crate::util::unique_available_path(&mp4_output.with_extension("es.bin"));
     let _ = extract_video_es(dav_path, &es_path)?;
     remux_es_to_mp4(&es_path, mp4_output, timeout_secs).map_err(|err| {
         format!("ffmpeg native demux failed ({native_err}); ES remux also failed: {err}")
@@ -632,6 +644,28 @@ mod tests {
         assert!(extract_video_es(&path, &es).is_err());
         assert!(!es.exists(), "partial ES output must be removed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// R5-P12: ES extraction never deletes or truncates a file it did not
+    /// create — an existing file at the output name is refused and kept.
+    #[test]
+    fn es_extract_never_removes_an_existing_file() {
+        let mut bytes = fixture_bytes();
+        let last_magic = bytes.len() - 8;
+        bytes[last_magic] = 0xFF; // walk fails mid-file
+        let path = std::env::temp_dir().join(format!("ft-dav-keep-{}", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let es = std::env::temp_dir().join(format!("ft-dav-keep-es-{}.bin", std::process::id()));
+        std::fs::write(&es, b"examiner's own file").unwrap();
+        assert!(extract_video_es(&path, &es).is_err());
+        assert_eq!(std::fs::read(&es).unwrap(), b"examiner's own file");
+        // Same for a walk that would succeed: refused, not overwritten.
+        let good = fixture_path("ft-dav-keep-good");
+        assert!(extract_video_es(&good, &es).is_err());
+        assert_eq!(std::fs::read(&es).unwrap(), b"examiner's own file");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&es);
+        let _ = std::fs::remove_file(&good);
     }
 
     #[test]

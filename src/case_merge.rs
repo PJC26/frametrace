@@ -98,7 +98,8 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
         .map(|(i, line)| {
             let value: serde_json::Value =
                 serde_json::from_str(line).expect("validated target record");
-            (string_field(&value, "source_path"), i)
+            // R5-P3: lossless file identity (raw form of a non-Unicode name).
+            (crate::model::record_path_key(&value), i)
         })
         .collect();
 
@@ -173,7 +174,10 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
             if original_id.is_empty() || source_path.is_empty() {
                 continue;
             }
-            if let Some(&position) = positions_by_path.get(&source_path) {
+            // R5-P3: two distinct non-Unicode names share one lossy display
+            // spelling; only the lossless key tells them apart.
+            let path_key = crate::model::record_path_key(&value);
+            if let Some(&position) = positions_by_path.get(&path_key) {
                 let mut kept: serde_json::Value =
                     serde_json::from_str(&existing_lines[position])
                         .map_err(|err| format!("invalid merged record: {err}"))?;
@@ -238,7 +242,7 @@ pub fn merge_cases(case_dir: &Path, source_case_dirs: &[PathBuf]) -> Result<Merg
                 new_id: new_id.clone(),
                 source_path: source_path.clone(),
             });
-            positions_by_path.insert(source_path, existing_lines.len());
+            positions_by_path.insert(path_key, existing_lines.len());
             existing_lines.push(merged_line);
             merged += 1;
         }
@@ -406,14 +410,16 @@ pub(crate) fn load_target_lines(case_dir: &Path) -> Result<Vec<String>, String> 
         if id.is_empty() || path.is_empty() {
             return Err("merge refuses target records without id/source_path".into());
         }
-        if let Some(prior) = paths_by_id.insert(id.clone(), path.clone())
-            && prior != path
+        // R5-P3: records are told apart by their lossless file identity.
+        let key = crate::model::record_path_key(&value);
+        if let Some(prior) = paths_by_id.insert(id.clone(), key.clone())
+            && prior != key
         {
             return Err(format!(
                 "merge refuses conflicting target id {id}; repair stores and marks first"
             ));
         }
-        if let Some(prior) = records_by_path.get(&path) {
+        if let Some(prior) = records_by_path.get(&key) {
             if string_field(prior, "id") != id {
                 return Err(format!(
                     "merge refuses conflicting target path {path}; repair stores and marks first"
@@ -425,7 +431,7 @@ pub(crate) fn load_target_lines(case_dir: &Path) -> Result<Vec<String>, String> 
                 ));
             }
         } else {
-            records_by_path.insert(path, value);
+            records_by_path.insert(key, value);
             lines.push(line);
         }
     }
@@ -822,6 +828,45 @@ mod tests {
                 .unwrap();
         assert_eq!(verification.entries, 1);
 
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// R5-P3: two source records whose non-Unicode names share one lossy
+    /// display spelling are two files — the merge key is the lossless one.
+    #[test]
+    fn non_unicode_twins_with_one_display_path_stay_two_records() {
+        let with_raw = |id: &str, raw: &str, size: u64| -> String {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&row(id, "/ev/\u{FFFD}.mp4", size, None)).unwrap();
+            value["source_path_raw_hex"] = serde_json::json!(raw);
+            format!("{value}\n")
+        };
+        let target = temp_case(
+            "twins-t",
+            Some(&row("vid_000001", "/ev/a.mp4", 10, Some("aa"))),
+        );
+        let source = temp_case(
+            "twins-s",
+            Some(&format!(
+                "{}{}",
+                with_raw("vid_000001", "unix:2f65762fff2e6d7034", 20),
+                with_raw("vid_000002", "unix:2f65762ffe2e6d7034", 30),
+            )),
+        );
+        let result = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(result.merged_records, 2, "{result:?}");
+        assert_eq!(result.total_records, 3);
+        let rows = jsonl_ids(&target);
+        let raws: Vec<_> = rows
+            .iter()
+            .filter_map(|r| r["source_path_raw_hex"].as_str())
+            .collect();
+        assert_eq!(raws.len(), 2, "{rows:?}");
+        // Merging again recognises both by their lossless key (no growth).
+        let again = merge_cases(&target, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(again.merged_records, 0);
+        assert_eq!(again.total_records, 3);
         let _ = fs::remove_dir_all(&target);
         let _ = fs::remove_dir_all(&source);
     }

@@ -502,8 +502,8 @@ type PatchV2Fields = (
     Option<MarksBatch>,
 );
 
-/// patch-v2 envelope: `base_revisions` (object of non-negative integers;
-/// absent/null = empty), `client_id` (non-empty string when present) and
+/// patch-v2 envelope: `base_revisions` (object of non-negative integers,
+/// or -1 for an unsafe base; absent/null = empty), `client_id` (non-empty string when present) and
 /// `batch` (`{id, index, total}` with `index < total`).
 fn parse_patch_v2_fields(value: &serde_json::Value, path: &Path) -> Result<PatchV2Fields, String> {
     let bad = |what: String| format!("marks file {} (patch-v2): {what}", path.display());
@@ -512,10 +512,18 @@ fn parse_patch_v2_fields(value: &serde_json::Value, path: &Path) -> Result<Patch
         None | Some(serde_json::Value::Null) => {}
         Some(serde_json::Value::Object(map)) => {
             for (id, rev) in map {
-                let Some(rev) = rev.as_u64() else {
-                    return Err(bad(format!(
-                        "base_revisions[{id:?}] must be a non-negative integer"
-                    )));
+                // R5 (U1 ↔ P): -1 marks a draft made while the viewer could
+                // not trust its view; it always conflicts (see
+                // `case_db::UNSAFE_BASE_REVISION`). Any other negative or
+                // non-integer value is still refused.
+                let rev = match rev.as_u64() {
+                    Some(rev) => rev,
+                    None if rev.as_i64() == Some(-1) => crate::case_db::UNSAFE_BASE_REVISION,
+                    None => {
+                        return Err(bad(format!(
+                            "base_revisions[{id:?}] must be a non-negative integer or -1"
+                        )));
+                    }
                 };
                 if id.trim().is_empty() {
                     return Err(bad("base_revisions has an empty id".into()));
@@ -688,7 +696,8 @@ mod tests {
             (r#""batch":{"id":"b","index":0,"total":0},"#, "batch.total"),
             (r#""batch":{"id":"","index":0,"total":1},"#, "batch.id"),
             (r#""batch":[],"#, "batch must be an object"),
-            (r#""base_revisions":{"a":-1},"#, "base_revisions"),
+            (r#""base_revisions":{"a":-2},"#, "base_revisions"),
+            (r#""base_revisions":{"a":-1.0},"#, "base_revisions"),
             (r#""base_revisions":{"a":1.5},"#, "base_revisions"),
             (r#""base_revisions":{"a":"1"},"#, "base_revisions"),
             (
@@ -701,6 +710,13 @@ mod tests {
             let err = parse_marks_text(&body(extra), p).unwrap_err();
             assert!(err.contains(what), "{extra}: {err}");
         }
+        // R5: -1 is the unsafe-base marker (always a conflict server-side).
+        let unsafe_body = body(r#""base_revisions":{"a":-1},"#);
+        let file = parse_marks_text(&unsafe_body, p).unwrap();
+        assert_eq!(
+            file.base_revisions.unwrap().get("a"),
+            Some(&crate::case_db::UNSAFE_BASE_REVISION)
+        );
         // Same id tagged inline and in the list is ambiguous.
         let twice = r#"{"protocol":"patch-v2","marks":[{"id":"a","status":"noted","tags":["x"]}],"tags":[{"id":"a","tags":["y"]}]}"#;
         assert!(
