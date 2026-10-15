@@ -496,11 +496,13 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
 /// R6-S1: an input file's text as compact JSON for a generated page's
 /// script, or `"null"` with a printed warning when it is not exactly one
 /// JSON value (a tampered `case.json` can no longer inject script).
+/// R7-S6: run by the workstation, the warning becomes a job warning (the
+/// pages also say the file could not be read instead of going blank).
 fn page_json_input(label: &str, text: &str) -> String {
     match crate::util::script_json_input(label, text) {
         Ok(json) => json,
         Err(warning) => {
-            eprintln!("warning: {warning}");
+            crate::util::print_step_warning(&warning);
             "null".to_string()
         }
     }
@@ -1239,8 +1241,18 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
 
 pub fn make_custody(case_dir: &Path) -> Result<(), String> {
     ensure_case(case_dir)?;
-    // R6-S7: rendered and written here (as `custody::generate` does) so
-    // the bytes written are the bytes recorded.
+    let path = write_custody_statement(case_dir)?;
+    println!("custody statement written: {}", path.display());
+    Ok(())
+}
+
+/// Renders and writes the custody statement and records the bytes written
+/// in the generated-pages list (R6-S7: rendered and written here, as
+/// `custody::generate` does, so the bytes written are the bytes
+/// recorded). R7-S8: `package-case` refreshes the statement through this
+/// too — it used `custody::generate`, which rewrote the page without
+/// recording it, so the workstation served the fresh statement sandboxed.
+fn write_custody_statement(case_dir: &Path) -> Result<std::path::PathBuf, String> {
     let html = crate::custody::render_statement(case_dir, false)?;
     let path = case_dir.join(crate::custody::CUSTODY_REL_PATH);
     write_text(&path, &html).map_err(|err| {
@@ -1253,8 +1265,7 @@ pub fn make_custody(case_dir: &Path) -> Result<(), String> {
         case_dir,
         &[(crate::custody::CUSTODY_REL_PATH, html.as_bytes())],
     )?;
-    println!("custody statement written: {}", path.display());
-    Ok(())
+    Ok(path)
 }
 
 /// B5: records the SHA-256 of the generated case pages (review/, reports/)
@@ -1359,7 +1370,7 @@ pub fn package_case_with_pending(
     // best-effort so a stale statement can't be sealed into a checksum
     // manifest. Generation failure must not block packaging — the missing
     // file is itself disclosed by the package README.
-    if let Err(err) = crate::custody::generate(case_dir) {
+    if let Err(err) = write_custody_statement(case_dir) {
         eprintln!("warning: custody statement not refreshed: {err}");
     }
     let result = package::package_case(case_dir, options.output_dir.as_deref())?;
@@ -2575,6 +2586,31 @@ mod report_output_tests {
         assert!(
             inline_script_sources(&report).is_some(),
             "case report must not use inline handlers"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// R7-S8: package-case refreshes the custody statement before sealing
+    /// it; the refreshed page is recorded as generated. Before, it was
+    /// rewritten through `custody::generate` without a record, so the
+    /// workstation served the case's custody page sandboxed afterwards.
+    #[test]
+    fn package_case_records_the_refreshed_custody_statement() {
+        use crate::util::generated_pages::page_is_trusted;
+        let (root, case_dir, _source) = scanned_case("s8-custody");
+        let custody = case_dir.join(crate::custody::CUSTODY_REL_PATH);
+        assert!(!custody.exists());
+        super::package_case(
+            &case_dir,
+            super::PackageOptions {
+                output_dir: Some(root.join("package")),
+            },
+        )
+        .unwrap();
+        assert!(custody.is_file(), "package-case writes the statement");
+        assert!(
+            page_is_trusted(&case_dir, crate::custody::CUSTODY_REL_PATH),
+            "refreshed custody statement not recorded"
         );
         fs::remove_dir_all(root).unwrap();
     }

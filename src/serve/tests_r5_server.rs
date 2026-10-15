@@ -484,12 +484,39 @@ fn s9_key_mismatch_line_becomes_a_job_warning() {
     // The collector itself: found even far outside the retained tail.
     let mut text = format!("{line}\n").into_bytes();
     text.extend(std::iter::repeat_n(b'x', 3 * super::STEP_OUTPUT_TAIL_BYTES));
-    let (tail, found) = super::jobs::drain_capped_collecting(
-        &mut text.as_slice(),
-        Some(super::KEY_MISMATCH_MARKER),
-    );
+    let (tail, found) =
+        super::jobs::drain_capped_collecting(&mut text.as_slice(), &[super::KEY_MISMATCH_MARKER]);
     assert!(tail.len() <= super::STEP_OUTPUT_TAIL_BYTES);
     assert_eq!(found, ["audit key differs (r5-test)"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R7-S6: a step's warning (make-review embedding an unreadable
+/// `case.json` as null) was a stderr `warning:` line nobody saw in the
+/// windowed app. The workstation now tells its children to print warnings
+/// as step-warning lines and shows them as job warnings.
+#[test]
+fn r7_s6_step_warning_lines_become_job_warnings() {
+    let dir = scratch("r7-s6");
+    let env_ref = if cfg!(windows) {
+        format!("%{}%", crate::util::STEP_WARNING_ENV)
+    } else {
+        // fake_cli single-quotes the line: no expansion, checked below.
+        "1".to_string()
+    };
+    let line = format!(
+        "{}case.json is not valid JSON env={env_ref}",
+        crate::util::STEP_WARNING_MARKER
+    );
+    let exe = fake_cli(&dir, Some(&line));
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    run_step(&exe, &["make-review".into(), "x".into()], &state).unwrap();
+    let status = parse(&api_status(&state));
+    let warnings = status["warnings"].to_string();
+    assert!(
+        warnings.contains("make-review: case.json is not valid JSON env=1"),
+        "{status}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -713,6 +740,63 @@ fn s14_killed_package_step_removes_only_its_own_reservation() {
         "another process's reservation was removed"
     );
     assert!(reports.join(".package_200.ft777.part").is_dir());
+    let _ = std::fs::remove_dir_all(case);
+}
+
+/// R7-S5: a work folder only names the reservation its writer TRIED.
+/// Process 4242 lost the race for `package_300` to process 777 (whose
+/// marker is inside) and was killed before removing its work folder: R6
+/// removed 777's live reservation with it. The marker now decides — in
+/// the kill sweep and in the stale sweep — and a reservation whose dead
+/// owner left no work folder is released by its marker.
+#[test]
+fn r7_s5_reservation_cleanup_needs_the_owner_marker() {
+    let case = temp_case("r7-s5");
+    let reports = case.join("reports");
+    let reserve = |name: &str, pid: u32| {
+        let dir = reports.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::join::RESERVATION_MARKER),
+            crate::join::reservation_marker_text(pid),
+        )
+        .unwrap();
+        dir
+    };
+    let winner = reserve("package_300", 777);
+    std::fs::create_dir_all(reports.join(".package_300.ft777.part")).unwrap();
+    std::fs::create_dir_all(reports.join(".package_300.ft4242.part")).unwrap();
+    let own = reserve("package_400", 4242);
+    std::fs::create_dir_all(reports.join(".package_400.ft4242.part")).unwrap();
+    let args = vec![
+        "package-case".to_string(),
+        case.to_string_lossy().to_string(),
+    ];
+    let lines = super::media::sweep_killed_step(&args, 4242);
+    assert!(lines.iter().all(Result::is_ok), "{lines:?}");
+    assert!(!own.exists(), "the killed pid's own reservation stays");
+    assert!(
+        winner.join(crate::join::RESERVATION_MARKER).is_file(),
+        "another process's reservation was removed"
+    );
+    // Stale sweep: 4242's work folder for package_300 (dead writer) goes,
+    // 777's reservation stays while 777 lives.
+    std::fs::create_dir_all(reports.join(".package_300.ft4242.part")).unwrap();
+    let alive_777 = |pid: u32| {
+        if pid == 777 {
+            crate::util::ProcessProbe::Unknown
+        } else {
+            crate::util::ProcessProbe::Gone
+        }
+    };
+    crate::join::sweep_stale_parts_with(&reports, &alive_777, 0);
+    assert!(!reports.join(".package_300.ft4242.part").exists());
+    assert!(winner.join(crate::join::RESERVATION_MARKER).is_file());
+    // An orphan reservation (owner 555 dead, no work folder) is released.
+    let orphan = reserve("package_500", 555);
+    let swept = crate::join::sweep_stale_parts_with(&reports, &alive_777, 0);
+    assert!(!orphan.exists(), "{swept:?}");
+    assert!(winner.is_dir());
     let _ = std::fs::remove_dir_all(case);
 }
 

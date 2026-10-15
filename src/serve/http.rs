@@ -1336,52 +1336,52 @@ pub(crate) fn serve_case_file_with(
         _ => return write_simple(stream, 404, b"file not found"),
     };
     let mut total = meta.len();
-    // R6-S7: scripts and generated pages are read ONCE; the verified
-    // bytes are the bytes served (no second open after the check).
-    let mut verified_body: Option<Vec<u8>> = None;
     // R5-S2: a script under the case folder runs in the workstation origin
     // when a trusted page loads it (`review/data-bundle.js`), so its bytes
     // must be pinned in the same HMAC'd manifest as the pages — an edited
     // or planted script is refused outright (a page's hash says nothing
-    // about the sibling file it loads).
-    if is_script_path(&path) {
-        match read_for_verification(&path, VERIFIED_SERVE_MAX_BYTES) {
-            Some(bytes) if verified_case_script(&case_dir, &bytes) => {
-                verified_body = Some(bytes);
+    // about the sibling file it loads). R4-B5: a page at a generated
+    // location is trusted only when the manifest lists its exact bytes;
+    // an unlisted one renders sandboxed (no script).
+    // R6-S7 / R7-S2: what is served under the trusted answer is exactly
+    // what was verified — see [`verify_for_serving`].
+    let is_script = is_script_path(&path);
+    let is_page = !is_script && is_generated_page(&case_dir, &path);
+    let head_only = HEAD_ONLY.with(std::cell::Cell::get);
+    let mut verified_stream: Option<VerifiedStream> = None;
+    let mut memory_body: Option<Vec<u8>> = None;
+    let mut safety = content_safety_headers(&path, false, false);
+    if is_script || is_page {
+        match verify_for_serving(&case_dir, &path, total, is_page, head_only) {
+            ServeVerdict::Trusted { script_src, body } => {
+                if is_page {
+                    safety = trusted_page_headers(script_src.as_deref());
+                }
+                match body {
+                    VerifiedBody::Memory(bytes) => {
+                        total = bytes.len() as u64;
+                        memory_body = Some(bytes);
+                    }
+                    VerifiedBody::Stream(verified) => verified_stream = Some(verified),
+                    VerifiedBody::HeadOnly => {}
+                }
             }
-            _ => {
+            ServeVerdict::Untrusted | ServeVerdict::Unknown if is_script => {
                 return write_simple(
                     stream,
                     403,
                     b"script not verified - regenerate the review pages on this computer",
                 );
             }
+            ServeVerdict::Untrusted | ServeVerdict::Unknown => {
+                safety = UNVERIFIED_PAGE_HEADERS.to_string();
+            }
         }
     }
-    // R4-B5: a page at a generated location is trusted only when this
-    // user's HMAC'd manifest lists its exact bytes; an unlisted one renders
-    // sandboxed (no script) instead of running in the workstation origin.
-    let mut safety = if is_generated_page(&case_dir, &path) {
-        let bytes = read_for_verification(&path, VERIFIED_SERVE_MAX_BYTES);
-        let verdict = bytes
-            .as_deref()
-            .and_then(|bytes| verified_generated_page(&case_dir, bytes));
-        if bytes.is_some() {
-            verified_body = bytes;
-        }
-        match verdict {
-            Some(script_src) => trusted_page_headers(script_src.as_deref()),
-            None => UNVERIFIED_PAGE_HEADERS.to_string(),
-        }
-    } else {
-        content_safety_headers(&path, false, false)
-    };
-    if let Some(bytes) = &verified_body {
-        total = bytes.len() as u64;
-    }
-    let mut file: Box<dyn Read> = match verified_body {
-        Some(bytes) => Box::new(std::io::Cursor::new(bytes)),
-        None => match std::fs::File::open(&path) {
+    let mut file: Box<dyn Read> = match (memory_body, verified_stream.is_some()) {
+        (Some(bytes), _) => Box::new(std::io::Cursor::new(bytes)),
+        (None, true) => Box::new(std::io::empty()),
+        (None, false) => match std::fs::File::open(&path) {
             Ok(file) => Box::new(file),
             Err(_) => return write_simple(stream, 404, b"file not found"),
         },
@@ -1421,7 +1421,438 @@ pub(crate) fn serve_case_file_with(
     stream
         .write_all(head.as_bytes())
         .map_err(|err| format!("write failed: {err}"))?;
-    stream_body(stream, &mut file, total)
+    match verified_stream {
+        Some(verified) => stream_verified(stream, &path, verified),
+        None => stream_body(stream, &mut file, total),
+    }
+}
+
+/// R7-S2: files up to this size are verified by reading them into memory
+/// and served from those bytes (the R6-S7 rule); larger ones are hashed
+/// in a streaming pass and streamed (see [`verify_for_serving`]), so a
+/// request never holds more than this much of a file in memory.
+pub(crate) const IN_MEMORY_VERIFY_MAX: u64 = 4 * 1024 * 1024;
+
+/// R7-S2: what [`verify_for_serving`] decided.
+pub(crate) enum ServeVerdict {
+    /// The manifest lists the bytes; `script_src` for a page's CSP.
+    Trusted {
+        script_src: Option<String>,
+        body: VerifiedBody,
+    },
+    /// Not listed, unreadable, too large, or changed while hashed.
+    Untrusted,
+    /// HEAD without a cached verdict: nothing was read.
+    Unknown,
+}
+
+/// R7-S2: how the verified bytes are delivered.
+pub(crate) enum VerifiedBody {
+    /// Read once into memory and served as read (small files).
+    Memory(Vec<u8>),
+    /// Streamed from the verified handle and re-hashed on the way.
+    Stream(VerifiedStream),
+    /// HEAD: no body.
+    HeadOnly,
+}
+
+/// R7-S2: an open, verified file to stream with [`stream_verified`].
+pub(crate) struct VerifiedStream {
+    file: std::fs::File,
+    len: u64,
+    sha: String,
+    identity: FileIdentity,
+}
+
+/// R7-S2: a file's identity as far as the platform tells it — size,
+/// modification time, file id (volume + index / device + inode) and
+/// change time (ctime / NTFS `ChangeTime`: updated by every write and not
+/// settable through the APIs that restore a modification time). Two
+/// equal identities mean "same file, not rewritten" for the verification
+/// cache; the served bytes are re-hashed anyway ([`stream_verified`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    len: u64,
+    modified_nanos: Option<u128>,
+    file_id: Option<(u64, u64)>,
+    changed: Option<i128>,
+}
+
+/// R7-S2: [`FileIdentity`] of an open file (`None` when its metadata
+/// cannot be read).
+pub(crate) fn file_identity(file: &std::fs::File) -> Option<FileIdentity> {
+    let meta = file.metadata().ok()?;
+    let modified_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    #[cfg(unix)]
+    let (file_id, changed) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            Some((meta.dev(), meta.ino())),
+            Some(i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())),
+        )
+    };
+    #[cfg(windows)]
+    let (file_id, changed) = windows_file_identity(file);
+    #[cfg(not(any(unix, windows)))]
+    let (file_id, changed) = (None, None);
+    Some(FileIdentity {
+        len: meta.len(),
+        modified_nanos,
+        file_id,
+        changed,
+    })
+}
+
+/// Volume serial + file index and the NTFS change time of an open file.
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> (Option<(u64, u64)>, Option<i128>) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is the open file's handle (borrowed for the call);
+    // `info` is a properly sized out-structure.
+    let id = unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .ok()
+        .map(|()| {
+            (
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            )
+        });
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: as above; the buffer size is the structure's size.
+    let changed = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .ok()
+    .map(|()| i128::from(basic.ChangeTime));
+    (id, changed)
+}
+
+/// R7-S2: a verification result for one file identity.
+#[derive(Clone)]
+struct CachedVerdict {
+    identity: FileIdentity,
+    sha: String,
+    script_src: Option<String>,
+}
+
+/// Most cached verdicts kept (the map is cleared when it is full).
+const VERIFY_CACHE_MAX: usize = 512;
+
+/// R7-S2: verdicts by canonical path. Its own lock — never `state_lock`
+/// — and held only for the map operation, never during disk work.
+fn verify_cache() -> &'static Mutex<std::collections::HashMap<PathBuf, CachedVerdict>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, CachedVerdict>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cache_lookup(path: &Path, identity: &FileIdentity) -> Option<CachedVerdict> {
+    let cache = verify_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .get(path)
+        .filter(|entry| entry.identity == *identity)
+        .cloned()
+}
+
+fn cache_store(path: &Path, entry: CachedVerdict) {
+    let mut cache = verify_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= VERIFY_CACHE_MAX && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), entry);
+}
+
+fn cache_forget(path: &Path) {
+    verify_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
+}
+
+/// R7-S2 test hook: content bytes read for verification per path (hash
+/// passes and in-memory reads; not the serving pass).
+#[cfg(test)]
+pub(crate) fn verify_read_bytes(path: &Path) -> u64 {
+    verify_reads()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn verify_reads() -> &'static Mutex<std::collections::HashMap<PathBuf, u64>> {
+    static READS: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, u64>>> =
+        std::sync::OnceLock::new();
+    READS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_verify_read(_path: &Path, _bytes: usize) {
+    #[cfg(test)]
+    {
+        *verify_reads()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(_path.to_path_buf())
+            .or_default() += _bytes as u64;
+    }
+}
+
+/// R7-S2: decides whether a script or generated page (`page`) of `len`
+/// bytes (the size from its metadata) may be served under the trusted
+/// answer, and how.
+///
+/// R6-S7 read every such file whole (up to 512 MiB) into memory and hashed
+/// it on EVERY request, HEAD included. Now:
+/// - `len` above [`VERIFIED_SERVE_MAX_BYTES`] is refused before anything
+///   is read;
+/// - files up to [`IN_MEMORY_VERIFY_MAX`] are read once, hashed and served
+///   from those bytes (unchanged rule);
+/// - larger files are hashed in a streaming pass, the result cached by
+///   (path, [`FileIdentity`]); a cached identity skips the pass. The body
+///   is then streamed from the same handle and re-hashed on the way; the
+///   last chunk is sent only after the hash and identity still match
+///   ([`stream_verified`]), else the connection is cut (the client never
+///   gets a complete response). Streamed pages always get a hash-list
+///   `script-src` ([`crate::util::generated_pages::InlineScriptScan`]), so
+///   bytes changed mid-transfer cannot run script while rendering;
+/// - HEAD reads no content: a cached verdict answers, otherwise
+///   [`ServeVerdict::Unknown`] (scripts 403, pages sandboxed).
+pub(crate) fn verify_for_serving(
+    case_dir: &Path,
+    path: &Path,
+    len: u64,
+    page: bool,
+    head_only: bool,
+) -> ServeVerdict {
+    if len > VERIFIED_SERVE_MAX_BYTES {
+        return ServeVerdict::Untrusted;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return ServeVerdict::Untrusted;
+    };
+    let Some(identity) = file_identity(&file).filter(|identity| identity.len == len) else {
+        return ServeVerdict::Untrusted;
+    };
+    let cached = cache_lookup(path, &identity);
+    if head_only {
+        return match cached {
+            Some(entry) if trusted_sha(case_dir, &entry.sha) => ServeVerdict::Trusted {
+                script_src: entry.script_src,
+                body: VerifiedBody::HeadOnly,
+            },
+            Some(_) => ServeVerdict::Untrusted,
+            None => ServeVerdict::Unknown,
+        };
+    }
+    if len <= IN_MEMORY_VERIFY_MAX {
+        let mut bytes = Vec::with_capacity(len as usize);
+        if (&file)
+            .take(IN_MEMORY_VERIFY_MAX + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > IN_MEMORY_VERIFY_MAX
+        {
+            return ServeVerdict::Untrusted;
+        }
+        note_verify_read(path, bytes.len());
+        let sha = sha256_hex(&bytes);
+        if !trusted_sha(case_dir, &sha) {
+            return ServeVerdict::Untrusted;
+        }
+        let script_src = if page {
+            crate::util::generated_pages::inline_script_sources(&String::from_utf8_lossy(&bytes))
+        } else {
+            None
+        };
+        if bytes.len() as u64 == len && file_identity(&file).as_ref() == Some(&identity) {
+            cache_store(
+                path,
+                CachedVerdict {
+                    identity,
+                    sha,
+                    script_src: script_src.clone(),
+                },
+            );
+        }
+        return ServeVerdict::Trusted {
+            script_src,
+            body: VerifiedBody::Memory(bytes),
+        };
+    }
+    let (sha, script_src) = match cached {
+        Some(entry) => (entry.sha, entry.script_src),
+        None => {
+            let Some((sha, script_src, read)) = hash_file_streaming(path, &mut file, page) else {
+                return ServeVerdict::Untrusted;
+            };
+            if read != len || file_identity(&file).as_ref() != Some(&identity) {
+                // Changed while it was hashed: nothing to vouch for.
+                return ServeVerdict::Untrusted;
+            }
+            cache_store(
+                path,
+                CachedVerdict {
+                    identity: identity.clone(),
+                    sha: sha.clone(),
+                    script_src: script_src.clone(),
+                },
+            );
+            (sha, script_src)
+        }
+    };
+    if !trusted_sha(case_dir, &sha) {
+        return ServeVerdict::Untrusted;
+    }
+    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return ServeVerdict::Untrusted;
+    }
+    ServeVerdict::Trusted {
+        // A streamed page always gets a hash list (never "no script-src").
+        script_src: if page {
+            script_src.or_else(|| Some("'self'".to_string()))
+        } else {
+            script_src
+        },
+        body: VerifiedBody::Stream(VerifiedStream {
+            file,
+            len,
+            sha,
+            identity,
+        }),
+    }
+}
+
+/// Whether the case's verified manifest lists `sha`.
+fn trusted_sha(case_dir: &Path, sha: &str) -> bool {
+    crate::util::generated_pages::trusted_hashes(case_dir)
+        .iter()
+        .any(|known| known == sha)
+}
+
+/// R7-S2: SHA-256 (hex) of `file` read to its end in 64 KiB chunks (at
+/// most [`VERIFIED_SERVE_MAX_BYTES`] + 1 bytes), the streamed page's
+/// `script-src` when `page`, and the byte count read. `path` names the
+/// file for the test hook only.
+fn hash_file_streaming(
+    path: &Path,
+    file: &mut std::fs::File,
+    page: bool,
+) -> Option<(String, Option<String>, u64)> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut scan = page.then(crate::util::generated_pages::InlineScriptScan::new);
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut read_total = 0u64;
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        note_verify_read(path, read);
+        hasher.update(&chunk[..read]);
+        if let Some(scan) = scan.as_mut() {
+            scan.feed(&chunk[..read]);
+        }
+        read_total += read as u64;
+        if read_total > VERIFIED_SERVE_MAX_BYTES {
+            return None;
+        }
+    }
+    let sha = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some((sha, scan.map(|scan| scan.finish()), read_total))
+}
+
+/// R7-S2: streams a verified file, re-hashing what it sends. One chunk is
+/// always held back; it goes out only once every byte has been read and
+/// the hash, the length and the file's identity still match the verified
+/// ones. Otherwise the cached verdict is dropped and the connection is
+/// cut short of its `Content-Length` — the client never receives a
+/// complete response of bytes that were not verified (and a script that
+/// did not arrive whole does not run).
+pub(crate) fn stream_verified(
+    stream: &mut TcpStream,
+    path: &Path,
+    mut verified: VerifiedStream,
+) -> Result<(), String> {
+    use sha2::Digest;
+    if HEAD_ONLY.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    let mut hasher = sha2::Sha256::new();
+    let mut held: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut read_total = 0u64;
+    while read_total < verified.len {
+        let want = (verified.len - read_total).min(chunk.len() as u64) as usize;
+        let read = match verified.file.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(format!("file read failed: {err}")),
+        };
+        hasher.update(&chunk[..read]);
+        if !held.is_empty() {
+            stream
+                .write_all(&held)
+                .map_err(|err| format!("file write failed: {err}"))?;
+        }
+        held.clear();
+        held.extend_from_slice(&chunk[..read]);
+        read_total += read as u64;
+    }
+    let sha: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut probe = [0u8; 1];
+    let at_end = matches!(verified.file.read(&mut probe), Ok(0));
+    if read_total != verified.len
+        || !at_end
+        || sha != verified.sha
+        || file_identity(&verified.file).as_ref() != Some(&verified.identity)
+    {
+        cache_forget(path);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Err(format!(
+            "{} changed while it was served - transfer cut before its last bytes",
+            path.display()
+        ));
+    }
+    stream
+        .write_all(&held)
+        .map_err(|err| format!("file write failed: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("file write failed: {err}"))
 }
 
 /// True for the two spellings of the embedded viewer page itself.
@@ -1579,28 +2010,11 @@ pub(crate) fn trusted_page_headers(script_src: Option<&str>) -> String {
     }
 }
 
-/// Pages above this are never parsed for inline scripts (hash only).
-const SCRIPT_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
-
-/// R6-S7: generated pages and case scripts up to this size are read once,
-/// hashed, and served from those very bytes. A larger generated page is
-/// served sandboxed (never trusted); a larger script is refused.
+/// R6-S7: generated pages and case scripts up to this size can be trusted
+/// (R7-S2: checked against the metadata size before anything is read). A
+/// larger generated page is served sandboxed (never trusted); a larger
+/// script is refused.
 pub(crate) const VERIFIED_SERVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
-
-/// R6-S7: the bytes of `path`, read once (at most `max` bytes; `None`
-/// when larger or unreadable). What gets verified is what gets served —
-/// the R5 code hashed the file (or trusted a `(size, mtime)` cache entry)
-/// and then opened it AGAIN to stream it, so a file swapped in between
-/// (or rewritten with the same size and a restored mtime) was served
-/// under the trusted headers.
-pub(crate) fn read_for_verification(path: &Path, max: u64) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= max).then_some(bytes)
-}
 
 /// SHA-256 (hex) of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1609,23 +2023,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// `Some(script_src)` when `bytes` (a generated page's content, read once
-/// by the caller) are listed in the case's verified manifest (R4-B5),
-/// `None` when not. The manifest is re-verified on every call.
-pub(crate) fn verified_generated_page(case_dir: &Path, bytes: &[u8]) -> Option<Option<String>> {
-    let sha = sha256_hex(bytes);
-    if !crate::util::generated_pages::trusted_hashes(case_dir).contains(&sha) {
-        return None;
-    }
-    Some(
-        (bytes.len() as u64 <= SCRIPT_SCAN_MAX_BYTES)
-            .then(|| {
-                crate::util::generated_pages::inline_script_sources(&String::from_utf8_lossy(bytes))
-            })
-            .flatten(),
-    )
 }
 
 /// R5-S2: extensions a browser executes as a classic or module script.
@@ -1637,12 +2034,6 @@ pub(crate) fn is_script_path(path: &Path) -> bool {
             .as_deref(),
         Some("js" | "mjs" | "cjs")
     )
-}
-
-/// R5-S2: whether `bytes` (a script under the case, read once by the
-/// caller) are listed in the case's verified generated-files manifest.
-pub(crate) fn verified_case_script(case_dir: &Path, bytes: &[u8]) -> bool {
-    crate::util::generated_pages::trusted_hashes(case_dir).contains(&sha256_hex(bytes))
 }
 
 /// Security headers for streamed case/media files (SEC-02).

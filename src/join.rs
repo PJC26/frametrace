@@ -442,6 +442,12 @@ pub struct SourcePackets {
     /// (ffmpeg re-inserts parameter sets), every other packet is copied
     /// byte for byte. `None` when a hash is missing (cannot confirm).
     pub kept_fingerprint: Option<Vec<u64>>,
+    /// R7-S4: payload hashes of EVERY video packet in file order (key
+    /// frames and pre-roll included), `None` when one is missing. An
+    /// all-intra source has no non-key packets — its kept fingerprint is
+    /// empty — and only these tell an applied edit list from a kept
+    /// pre-roll.
+    pub packet_hashes: Option<Vec<u64>>,
 }
 
 impl SourcePackets {
@@ -454,6 +460,7 @@ impl SourcePackets {
             discard_mask,
             audio,
             kept_fingerprint: nonkey_hashes(packets.iter().filter(|p| !p.discard)),
+            packet_hashes: packets.iter().map(|p| p.hash).collect(),
         }
     }
 
@@ -465,6 +472,7 @@ impl SourcePackets {
             discard_mask: vec![false; video as usize],
             audio,
             kept_fingerprint: None,
+            packet_hashes: None,
         }
     }
 }
@@ -560,21 +568,18 @@ pub fn parse_video_packets(text: &str) -> Vec<VideoPacket> {
 }
 
 /// R5-S13: the first video stream's packets (pts, dts, discard flag) in
-/// file order.
+/// file order. R7-S3: payload hashes only `with_hashes` — hashing every
+/// packet of every source and of the output on each join read all the
+/// material once more for a check that rarely needs it.
 pub fn video_packets(
     ffprobe: &str,
     path: &Path,
     timeout_secs: Option<u64>,
+    with_hashes: bool,
 ) -> Result<Vec<VideoPacket>, String> {
     let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
     let mut command = Command::new(&binary);
-    command
-        .args(["-v", "error", "-select_streams", "v:0"])
-        // R6-S6: payload hashes confirm an edit-list-applied output.
-        .args(["-show_data_hash", "sha256"])
-        .args(["-show_entries", "packet=pts_time,dts_time,flags,data_hash"])
-        .args(["-of", "compact=p=0"])
-        .arg(path);
+    command.args(video_packet_args(with_hashes)).arg(path);
     let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
     if !output.status.success() {
         return Err(format!(
@@ -586,6 +591,20 @@ pub fn video_packets(
     Ok(parse_video_packets(&String::from_utf8_lossy(
         &output.stdout,
     )))
+}
+
+/// R7-S3: the ffprobe arguments (before the path) of [`video_packets`].
+pub fn video_packet_args(with_hashes: bool) -> Vec<&'static str> {
+    let mut args = vec!["-v", "error", "-select_streams", "v:0"];
+    if with_hashes {
+        // R6-S6: payload hashes confirm an edit-list-applied output.
+        args.extend(["-show_data_hash", "sha256"]);
+        args.extend(["-show_entries", "packet=pts_time,dts_time,flags,data_hash"]);
+    } else {
+        args.extend(["-show_entries", "packet=pts_time,dts_time,flags"]);
+    }
+    args.extend(["-of", "compact=p=0"]);
+    args
 }
 
 fn min_time(times: impl Iterator<Item = f64>) -> Option<f64> {
@@ -763,12 +782,21 @@ fn edit_list_applied_mismatch(sources: &[SourcePackets], output: &[VideoPacket])
         if source.video_kept == source.video_total {
             continue;
         }
-        let Some(expected) = source.kept_fingerprint.as_ref().filter(|f| !f.is_empty()) else {
+        let Some(expected) = source.kept_fingerprint.as_ref() else {
             return Some(format!(
                 "{}번째 원본의 패킷 해시를 얻지 못했습니다",
                 index + 1
             ));
         };
+        if expected.is_empty() {
+            // R7-S4: every kept packet is a key frame (all-intra). R6
+            // refused this as "no hashes", so a correct join of such a
+            // source always failed.
+            if let Some(why) = all_key_segment_mismatch(index, source, range) {
+                return Some(why);
+            }
+            continue;
+        }
         let Some(observed) = nonkey_hashes(range.iter()) else {
             return Some(format!(
                 "{}번째 구간 출력 패킷의 해시를 얻지 못했습니다",
@@ -785,6 +813,68 @@ fn edit_list_applied_mismatch(sources: &[SourcePackets], output: &[VideoPacket])
     None
 }
 
+/// R7-S4: [`edit_list_applied_mismatch`] for a segment whose kept packets
+/// are all key frames: the empty non-key fingerprints compare equal, and
+/// the key frames themselves are compared (skipping the segment's first
+/// packet, where stream copy may re-insert parameter sets):
+/// - the output range carries the source's kept packets → confirmed;
+/// - it carries the source's packets FROM THE START (pre-roll kept, as
+///   many real frames lost at the end — the R6-S6 failure) or agrees
+///   only in part → refused;
+/// - no packet agrees with either (the muxer rewrote every key frame) →
+///   the payloads cannot tell; equal empty fingerprints, accepted on
+///   count and timing like any other segment.
+fn all_key_segment_mismatch(
+    index: usize,
+    source: &SourcePackets,
+    range: &[VideoPacket],
+) -> Option<String> {
+    if range.iter().any(|p| !p.key) {
+        return Some(format!(
+            "{}번째 구간의 출력에 원본에 없는 비키프레임이 있습니다",
+            index + 1
+        ));
+    }
+    let Some(all) = source.packet_hashes.as_ref() else {
+        return Some(format!(
+            "{}번째 원본의 패킷 해시를 얻지 못했습니다",
+            index + 1
+        ));
+    };
+    let Some(observed) = range.iter().map(|p| p.hash).collect::<Option<Vec<u64>>>() else {
+        return Some(format!(
+            "{}번째 구간 출력 패킷의 해시를 얻지 못했습니다",
+            index + 1
+        ));
+    };
+    let kept: Vec<u64> = all
+        .iter()
+        .zip(&source.discard_mask)
+        .filter(|(_, discard)| !**discard)
+        .map(|(hash, _)| *hash)
+        .collect();
+    let agreeing = |expected: &[u64]| {
+        observed
+            .iter()
+            .zip(expected)
+            .skip(1)
+            .filter(|(a, b)| a == b)
+            .count()
+    };
+    let compared = observed.len().min(kept.len()).saturating_sub(1);
+    let with_kept = agreeing(&kept);
+    if with_kept == compared {
+        return None;
+    }
+    if with_kept == 0 && agreeing(all) == 0 {
+        return None;
+    }
+    Some(format!(
+        "{}번째 구간의 출력 프레임이 원본의 유지 프레임과 다릅니다",
+        index + 1
+    ))
+}
+
 /// C14: lists every source's packets and the output's video packets,
 /// then applies [`evaluate_segment_check`]. `Err` = the check itself
 /// could not run (which fails the join too — never published
@@ -796,23 +886,67 @@ pub fn verify_segments(
     timeout_secs: Option<u64>,
 ) -> Result<SegmentCheck, String> {
     let fail = |err: String| format!("이어붙인 결과물의 구간 검증을 실행하지 못했습니다: {err}");
-    let mut sources = Vec::with_capacity(plan.segments.len());
-    for segment in &plan.segments {
-        let (_, audio) =
-            stream_packet_counts(ffprobe, &segment.source_path, timeout_secs).map_err(fail)?;
-        let packets = video_packets(ffprobe, &segment.source_path, timeout_secs).map_err(fail)?;
-        sources.push(SourcePackets::from_packets(&packets, audio));
-    }
+    let sources: Vec<PathBuf> = plan
+        .segments
+        .iter()
+        .map(|segment| segment.source_path.clone())
+        .collect();
     let offsets: Vec<f64> = plan
         .segments
         .iter()
         .map(|segment| segment.output_offset_seconds)
         .collect();
-    let (_, output_audio) = stream_packet_counts(ffprobe, output, timeout_secs).map_err(fail)?;
-    let packets = video_packets(ffprobe, output, timeout_secs).map_err(fail)?;
-    Ok(evaluate_segment_check(
+    verify_segments_with(
         &sources,
         &offsets,
+        output,
+        &mut |path, hashes| video_packets(ffprobe, path, timeout_secs, hashes),
+        &mut |path| stream_packet_counts(ffprobe, path, timeout_secs),
+    )
+    .map_err(fail)
+}
+
+/// `list(path, with_hashes)` of [`verify_segments_with`].
+pub type PacketLister<'a> = dyn FnMut(&Path, bool) -> Result<Vec<VideoPacket>, String> + 'a;
+/// `count(path)` → (video, audio) packet counts, of [`verify_segments_with`].
+pub type PacketCounter<'a> = dyn FnMut(&Path) -> Result<(u64, Option<u64>), String> + 'a;
+
+/// [`verify_segments`] with the ffprobe calls injected: `list(path,
+/// with_hashes)` lists video packets, `count(path)` counts packets.
+///
+/// R7-S3: packets are listed WITHOUT payload hashes first. Hashes only
+/// decide `edit-list-applied` — a source has edit-list pre-roll and the
+/// output's packet count equals the kept total — and only then are the
+/// edited sources and the output listed again, with hashes.
+pub fn verify_segments_with(
+    sources: &[PathBuf],
+    offsets: &[f64],
+    output: &Path,
+    list: &mut PacketLister<'_>,
+    count: &mut PacketCounter<'_>,
+) -> Result<SegmentCheck, String> {
+    let mut facts = Vec::with_capacity(sources.len());
+    for source in sources {
+        let (_, audio) = count(source)?;
+        let packets = list(source, false)?;
+        facts.push(SourcePackets::from_packets(&packets, audio));
+    }
+    let (_, output_audio) = count(output)?;
+    let mut packets = list(output, false)?;
+    let total: u64 = facts.iter().map(|s| s.video_total).sum();
+    let kept: u64 = facts.iter().map(|s| s.video_kept).sum();
+    if kept != total && packets.len() as u64 == kept {
+        for (source, fact) in sources.iter().zip(facts.iter_mut()) {
+            if fact.video_kept != fact.video_total {
+                let hashed = list(source, true)?;
+                *fact = SourcePackets::from_packets(&hashed, fact.audio);
+            }
+        }
+        packets = list(output, true)?;
+    }
+    Ok(evaluate_segment_check(
+        &facts,
+        offsets,
         output_audio,
         &packets,
     ))
@@ -2939,6 +3073,48 @@ pub fn package_reservation_of(name: &str) -> Option<String> {
         .then(|| reserved.to_string())
 }
 
+/// R7-S5: the file inside a reserved (still empty) default package folder
+/// that names the package-case owning the reservation (`pid=<pid>`). A
+/// work folder `.package_<ts>.ft<pid>.part` only says which name its
+/// writer TRIED: when two package-cases race for one name, the loser's
+/// work folder names the winner's reservation — and R6 swept that live
+/// reservation along with the loser's dead work folder.
+pub const RESERVATION_MARKER: &str = ".frametrace-reservation";
+
+/// R7-S5: the text of [`RESERVATION_MARKER`] for `pid`.
+pub fn reservation_marker_text(pid: u32) -> String {
+    format!("pid={pid}\n")
+}
+
+/// R7-S5: who holds the reservation `dir`: `Some(Some(pid))` when it
+/// holds only a marker naming `pid`, `Some(None)` when it is empty (no
+/// marker yet — or a pre-R7 reservation), `None` when it is not a bare
+/// reservation (missing, not a folder, other content, unreadable or
+/// foreign marker text) and must be left alone.
+pub fn reservation_owner(dir: &Path) -> Option<Option<u32>> {
+    let mut entries = std::fs::read_dir(dir).ok()?;
+    let Some(first) = entries.next() else {
+        return Some(None);
+    };
+    let first = first.ok()?;
+    if entries.next().is_some() || first.file_name() != RESERVATION_MARKER {
+        return None;
+    }
+    let text = std::fs::read_to_string(first.path()).ok()?;
+    let pid = text.trim().strip_prefix("pid=")?.parse().ok()?;
+    Some(Some(pid))
+}
+
+/// R7-S5: removes the reservation `dir` only when its marker names `pid`
+/// (marker first, then the then-empty folder — `remove_dir` never removes
+/// a folder with content). `true` when it was removed.
+pub fn release_reservation(dir: &Path, pid: u32) -> bool {
+    if reservation_owner(dir) != Some(Some(pid)) {
+        return false;
+    }
+    std::fs::remove_file(dir.join(RESERVATION_MARKER)).is_ok() && std::fs::remove_dir(dir).is_ok()
+}
+
 /// Crash recovery for `.part` leftovers of OTHER processes in `dir`.
 ///
 /// R5-S5: an in-progress name is removed only when its newest write is at
@@ -2964,39 +3140,72 @@ pub fn sweep_stale_parts_with(
     };
     let own = std::process::id();
     let now = std::time::SystemTime::now();
-    entries
+    let old_enough = |path: &Path| {
+        newest_mtime(path)
+            .and_then(|time| now.duration_since(time).ok())
+            .is_some_and(|age| age.as_secs() >= min_age_secs)
+    };
+    let writer_gone = |path: &Path, pid: u32| {
+        let born = std::fs::symlink_metadata(path)
+            .ok()
+            .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok());
+        !crate::util::writer_may_be_alive(probe(pid), born)
+    };
+    let mut swept: Vec<(PathBuf, Result<(), String>)> = entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
             let pid = part_name_pid(&name)?;
             (pid != own).then_some((entry, pid))
         })
-        .filter(|(entry, _)| {
-            newest_mtime(&entry.path())
-                .and_then(|time| now.duration_since(time).ok())
-                .is_some_and(|age| age.as_secs() >= min_age_secs)
-        })
+        .filter(|(entry, _)| old_enough(&entry.path()))
         .filter(|(entry, _)| !part_is_preserved(&entry.path()))
-        .filter(|(entry, pid)| {
-            let born = std::fs::symlink_metadata(entry.path())
-                .ok()
-                .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok());
-            !crate::util::writer_may_be_alive(probe(*pid), born)
-        })
-        .map(|(entry, _)| {
+        .filter(|(entry, pid)| writer_gone(&entry.path(), *pid))
+        .map(|(entry, pid)| {
             let path = entry.path();
             let result = remove_path_retry(&path);
             // R6-S8: the dead package-case's empty name reservation goes
-            // with its work folder (`remove_dir` never removes a folder
-            // with content — a finished package is never touched).
+            // with its work folder. R7-S5: only when the reservation's
+            // marker names that writer (or it is still empty — the writer
+            // died before writing the marker): the name a work folder
+            // carries may be another, live package-case's reservation.
             if result.is_ok()
                 && let Some(reserved) = package_reservation_of(&entry.file_name().to_string_lossy())
             {
-                let _ = std::fs::remove_dir(dir.join(reserved));
+                let reserved = dir.join(reserved);
+                match reservation_owner(&reserved) {
+                    Some(Some(owner)) if owner == pid => {
+                        release_reservation(&reserved, pid);
+                    }
+                    Some(None) => {
+                        let _ = std::fs::remove_dir(&reserved);
+                    }
+                    _ => {}
+                }
             }
             (path, result)
         })
-        .collect()
+        .collect();
+    // R7-S5: a reservation whose owner died after removing its work
+    // folder (failed run, killed before releasing the name) is named by
+    // no work folder; its marker identifies the dead owner.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_name().to_string_lossy().starts_with("package_") {
+                continue;
+            }
+            if let Some(Some(owner)) = reservation_owner(&path)
+                && owner != own
+                && old_enough(&path)
+                && writer_gone(&path, owner)
+                && release_reservation(&path, owner)
+            {
+                swept.push((path, Ok(())));
+            }
+        }
+    }
+    swept
 }
 
 fn run_ffmpeg(
@@ -4504,6 +4713,151 @@ mod tests {
         // A missing second segment still fails.
         let check = evaluate_segment_check(&sources, &[0.0, 2.5], None, &output[..120]);
         assert!(!check.ok);
+    }
+
+    /// R7-S4: an all-intra source (every packet a key frame) with an edit
+    /// list has an EMPTY non-key fingerprint; R6 took that for "no hashes"
+    /// and failed every correct join of it. The key frames now decide.
+    #[test]
+    fn all_intra_edit_list_source_joins() {
+        // 30 pre-roll + 60 kept, all key frames.
+        let source: Vec<VideoPacket> = (0..90)
+            .map(|i| VideoPacket {
+                pts: Some(-1.0 + i as f64 / 30.0),
+                dts: Some(-1.0 + i as f64 / 30.0),
+                discard: i < 30,
+                key: true,
+                hash: Some(5000 + i),
+            })
+            .collect();
+        let sources = [
+            SourcePackets::from_packets(&source, None),
+            SourcePackets::plain(60, None),
+        ];
+        assert_eq!(sources[0].kept_fingerprint, Some(Vec::new()));
+        let rebase = |packets: &[VideoPacket], by: f64| -> Vec<VideoPacket> {
+            packets
+                .iter()
+                .map(|p| VideoPacket {
+                    pts: p.pts.map(|t| t + by),
+                    dts: p.dts.map(|t| t + by),
+                    discard: false,
+                    ..*p
+                })
+                .collect()
+        };
+        // The edit list applied: the kept packets, byte for byte.
+        let mut applied = rebase(&source[30..], 0.0);
+        applied.extend(dts_run(2.0, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &applied);
+        assert!(check.ok, "{:?}", check.problems);
+        assert_eq!(check.mode, "edit-list-applied");
+        // Every key frame rewritten by the muxer: nothing to compare, the
+        // empty fingerprints are equal.
+        let mut rewritten = applied.clone();
+        for (i, packet) in rewritten.iter_mut().take(60).enumerate() {
+            packet.hash = Some(9_000_000 + i as u64);
+        }
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &rewritten);
+        assert!(check.ok, "{:?}", check.problems);
+        // Pre-roll kept, the last 30 real frames lost: same count, refused.
+        let mut lost = rebase(&source[..60], 1.0);
+        lost.extend(dts_run(2.0, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &lost);
+        assert!(!check.ok, "missing frames passed: {check:?}");
+        // Partly different frames: refused.
+        let mut partial = applied.clone();
+        partial[10].hash = Some(1);
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &partial);
+        assert!(!check.ok);
+    }
+
+    /// R7-S3: the segment check lists packets without payload hashes and
+    /// asks for hashes only for an edited source whose output count
+    /// equals the kept total (and for the output then). R6 hashed every
+    /// packet of every source and of the output on every join.
+    #[test]
+    fn segment_check_hashes_only_when_an_edit_list_needs_it() {
+        assert!(!video_packet_args(false).contains(&"-show_data_hash"));
+        assert!(video_packet_args(true).contains(&"-show_data_hash"));
+        let plain_a: Vec<VideoPacket> = dts_run(0.0, 60);
+        let plain_b: Vec<VideoPacket> = dts_run(2.0, 60);
+        let edited: Vec<VideoPacket> = (0..90)
+            .map(|i| VideoPacket {
+                pts: Some(-1.0 + i as f64 / 30.0),
+                dts: Some(-1.0 + i as f64 / 30.0),
+                discard: i < 30,
+                key: i % 30 == 0,
+                hash: Some(7000 + i),
+            })
+            .collect();
+        let run = |sources: Vec<(&str, Vec<VideoPacket>)>, output: Vec<VideoPacket>| {
+            let mut calls: Vec<(String, bool)> = Vec::new();
+            let paths: Vec<PathBuf> = sources.iter().map(|(n, _)| PathBuf::from(n)).collect();
+            let offsets: Vec<f64> = (0..sources.len()).map(|i| i as f64 * 2.0).collect();
+            let check = verify_segments_with(
+                &paths,
+                &offsets,
+                Path::new("out"),
+                &mut |path, hashes| {
+                    calls.push((path.display().to_string(), hashes));
+                    let mut packets = if path == Path::new("out") {
+                        output.clone()
+                    } else {
+                        sources
+                            .iter()
+                            .find(|(n, _)| Path::new(n) == path)
+                            .unwrap()
+                            .1
+                            .clone()
+                    };
+                    if !hashes {
+                        for packet in &mut packets {
+                            packet.hash = None;
+                        }
+                    }
+                    Ok(packets)
+                },
+                &mut |_| Ok((0, None)),
+            )
+            .unwrap();
+            (check, calls)
+        };
+        // No edit list: no hashes at all.
+        let mut output = plain_a.clone();
+        output.extend(plain_b.clone());
+        let (check, calls) = run(vec![("a", plain_a.clone()), ("b", plain_b.clone())], output);
+        assert!(check.ok, "{:?}", check.problems);
+        assert!(calls.iter().all(|(_, hashes)| !hashes), "{calls:?}");
+        // Edit list, output keeps every packet: still no hashes.
+        let mut all = edited.clone();
+        for packet in &mut all {
+            packet.discard = false;
+            packet.pts = packet.pts.map(|t| t + 1.0);
+            packet.dts = packet.dts.map(|t| t + 1.0);
+        }
+        let mut output = all.clone();
+        output.extend(dts_run(3.0, 60));
+        let (check, calls) = run(vec![("e", edited.clone()), ("b", plain_b.clone())], output);
+        assert!(check.ok, "{:?}", check.problems);
+        assert!(calls.iter().all(|(_, hashes)| !hashes), "{calls:?}");
+        // Edit list applied (count = kept): hashes for "e" and the output
+        // only, and the payloads confirm it.
+        let mut output = all[30..].to_vec();
+        for packet in &mut output {
+            packet.pts = packet.pts.map(|t| t - 1.0);
+            packet.dts = packet.dts.map(|t| t - 1.0);
+        }
+        output.extend(dts_run(2.0, 60));
+        let (check, calls) = run(vec![("e", edited.clone()), ("b", plain_b.clone())], output);
+        assert!(check.ok, "{:?}", check.problems);
+        assert_eq!(check.mode, "edit-list-applied");
+        let hashed: Vec<&str> = calls
+            .iter()
+            .filter(|(_, hashes)| *hashes)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(hashed, ["e", "out"]);
     }
 
     fn joined_case(tag: &str) -> PathBuf {

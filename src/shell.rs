@@ -895,7 +895,7 @@ const FLUSH_SCRIPT: &str = r#"(async () => {
   const r = { ft_close_save: 1, ok: true, pending: 0, message: "", warning: "" };
   try {
     if (typeof window.hBeforeClose === "function") {
-      const h = (await window.hBeforeClose(4500)) || {};
+      const h = (await window.hBeforeClose(4000)) || {};
       r.ok = h.ok !== false;
       r.pending = Number(h.pending) || 0;
       r.message = String(h.message || "");
@@ -987,7 +987,8 @@ pub(crate) fn close_question_text(verdict: &FlushVerdict, outcome: &FlushOutcome
     };
     match (verdict, reason) {
         (_, Some(reason)) => format!(
-            "{reason}.\n지금 종료하면 저장되지 않은 편집을 잃을 수 있습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 확인"
+            "{}\n지금 종료하면 저장되지 않은 편집을 잃을 수 있습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 확인",
+            as_sentence(&reason)
         ),
         (FlushVerdict::Unsaved(count), None) => format!(
             "저장 안 된 편집 {count}건이 있습니다.\n지금 종료하면 이 편집은 저장되지 않습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 저장"
@@ -1000,8 +1001,27 @@ pub(crate) fn close_question_text(verdict: &FlushVerdict, outcome: &FlushOutcome
 /// (the read-only viewer's warning).
 pub(crate) fn close_notice_text(outcome: &FlushOutcome) -> Option<String> {
     match outcome {
-        FlushOutcome::Report(report) if !report.warning.is_empty() => Some(report.warning.clone()),
+        FlushOutcome::Report(report) if !report.warning.is_empty() => {
+            Some(as_sentence(&report.warning))
+        }
         _ => None,
+    }
+}
+
+/// R7-S7 (pure): `text` ending in exactly one sentence mark. The page's
+/// reason often already ends in `.` (or `…`, `?`, `!`, `。`); R6 appended
+/// another `.` and showed `….`/`..`. Trailing whitespace and repeated
+/// marks are trimmed; a missing mark becomes `.`.
+pub(crate) fn as_sentence(text: &str) -> String {
+    const MARKS: [char; 5] = ['.', '…', '?', '!', '。'];
+    let trimmed = text.trim_end();
+    let body = trimmed.trim_end_matches(MARKS);
+    match trimmed[body.len()..].chars().next_back() {
+        // `…` and `...` keep their ellipsis; any other run becomes its
+        // last mark.
+        Some('.') if trimmed[body.len()..].starts_with("...") => format!("{body}..."),
+        Some(mark) => format!("{body}{mark}"),
+        None => format!("{body}."),
     }
 }
 
@@ -2047,6 +2067,42 @@ mod tests {
         assert!(super::FLUSH_SCRIPT.contains("save()"));
     }
 
+    /// R7-S7: the page's close flush gets 4 s (`hBeforeClose(4000)`) of the
+    /// shell's 5 s wait — R6 asked for 4.5 s, leaving 0.5 s for the page
+    /// to post its answer — and a reason that already ends in a sentence
+    /// mark is not given a second one (`…다..`).
+    #[test]
+    fn close_flush_budget_and_sentence_marks() {
+        use super::{
+            CLOSE_FLUSH_WAIT, FLUSH_SCRIPT, FlushOutcome, FlushVerdict, as_sentence,
+            close_notice_text, close_question_text, parse_save_report,
+        };
+        assert!(
+            FLUSH_SCRIPT.contains("window.hBeforeClose(4000)"),
+            "{FLUSH_SCRIPT}"
+        );
+        assert!(Duration::from_millis(4000) + Duration::from_secs(1) <= CLOSE_FLUSH_WAIT);
+        assert_eq!(as_sentence("저장하지 못했습니다."), "저장하지 못했습니다.");
+        assert_eq!(as_sentence("저장하지 못했습니다 "), "저장하지 못했습니다.");
+        assert_eq!(as_sentence("저장하지 못했습니다.."), "저장하지 못했습니다.");
+        assert_eq!(as_sentence("기다리는 중..."), "기다리는 중...");
+        assert_eq!(as_sentence("기다리는 중…"), "기다리는 중…");
+        assert_eq!(as_sentence("저장할까요?"), "저장할까요?");
+        assert_eq!(as_sentence(""), ".");
+        let report = parse_save_report(
+            r#"{"ft_close_save":1,"ok":false,"pending":1,"message":"Save timed out.","warning":"읽기 전용이었습니다."}"#,
+        )
+        .unwrap();
+        let outcome = FlushOutcome::Report(report);
+        let text = close_question_text(&FlushVerdict::Unknown, &outcome);
+        assert!(text.starts_with("Save timed out.\n"), "{text}");
+        assert!(!text.contains(".."), "{text}");
+        assert_eq!(
+            close_notice_text(&outcome).as_deref(),
+            Some("읽기 전용이었습니다.")
+        );
+    }
+
     /// R6 (contract S↔U4): the shell's close flush asks the page's own
     /// `hBeforeClose()` first and carries its reason and its read-only
     /// warning to the close dialogs. Before, it called `FTViewer.save()`
@@ -2073,7 +2129,7 @@ mod tests {
         assert_eq!(flush_verdict(&outcome), FlushVerdict::Clean);
         assert_eq!(
             close_notice_text(&outcome).as_deref(),
-            Some("판독 기록을 읽지 못한 상태였습니다")
+            Some("판독 기록을 읽지 못한 상태였습니다.")
         );
         let blocked = parse_save_report(
             r#"{"ft_close_save":1,"ok":false,"pending":0,"message":"판독 기록을 읽지 못해 저장이 막혀 있습니다\u0007"}"#,
