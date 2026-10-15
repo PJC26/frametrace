@@ -897,27 +897,137 @@ pub fn lane_rels(case_dir: &Path) -> Result<Vec<String>, String> {
 /// an error.
 fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Vec<LaneStatus>), String> {
     let keys = crate::audit_key::verification_keys()?;
+    let lanes = read_lanes(case_dir)?;
+    let statuses = lane_statuses(&lanes, &keys);
+    // R6-I3: a case measured under an audit key (any lane line carries an
+    // HMAC) does not take measurements from lines written without one.
+    let keyed_case =
+        lanes
+            .iter()
+            .zip(&statuses)
+            .any(|((_, text), status)| match &status.verification {
+                Ok(verification) => verification.keyed_entries > 0,
+                Err(_) => text.contains("\"entry_hmac_sha256\""),
+            });
     let mut out: LoggedResults = BTreeMap::new();
-    let mut statuses = Vec::new();
-    for rel in lane_rels(case_dir)? {
-        let path = case_dir.join(&rel);
-        let text = match audit::read_log_locked(&path) {
-            Ok(Some(text)) => text,
-            Ok(None) => continue,
-            Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
-        };
-        let verification = audit::verify_chained_jsonl_text(&text, &rel, &keys);
-        let chain_error = verification
+    for ((rel, text), status) in lanes.iter().zip(&statuses) {
+        let chain_error = status
+            .verification
             .as_ref()
             .err()
             .map(|err| format!("{UNVERIFIED_ERROR}: {rel}: {err}"));
-        for (selector, (mut result, at, method, threshold)) in parse_logged_results(&text) {
-            result.chain_unverified = chain_error.clone();
-            out.insert(selector, (result, at, method, threshold));
+        let line_flag = |index: usize| -> Option<String> {
+            if let Some(error) = &chain_error {
+                return Some(error.clone());
+            }
+            let auth = status
+                .verification
+                .as_ref()
+                .ok()
+                .and_then(|verification| verification.entry_auth.get(index).copied());
+            (keyed_case && !auth.is_some_and(audit::EntryAuth::is_keyed)).then(|| {
+                format!(
+                    "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 감사 키로 기록된 케이스에서 키 없이 기록되어 측정값으로 쓰지 않습니다",
+                    index + 1
+                )
+            })
+        };
+        for (selector, entry) in parse_logged_results_lines(text, &line_flag) {
+            insert_logged_result(&mut out, selector, entry);
         }
-        statuses.push(LaneStatus { rel, verification });
     }
     Ok((out, statuses))
+}
+
+/// Every present lane's text, in continuation order (R5-P8).
+fn read_lanes(case_dir: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut lanes = Vec::new();
+    for rel in lane_rels(case_dir)? {
+        let path = case_dir.join(&rel);
+        match audit::read_log_locked(&path) {
+            Ok(Some(text)) => lanes.push((rel, text)),
+            Ok(None) => continue,
+            Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+        }
+    }
+    Ok(lanes)
+}
+
+/// R6-I3: each lane's verification, with a continuation lane (`.<n>.`,
+/// n ≥ 1) accepted only when it is a PROVEN continuation: its first entry
+/// is an `audio-level-lane-continued` marker naming exactly the lane before
+/// it (`previous_lane`, `previous_lane_sha256` = SHA-256 of that lane's
+/// bytes now), and that lane is itself not accepted (its chain does not
+/// verify, or it is an unproven continuation). Anything else — a lane
+/// planted next to an intact one, a marker for another lane, a lane edited
+/// after it was continued from — is reported as not verifying, so its
+/// results never replace verified measurements.
+fn lane_statuses(
+    lanes: &[(String, String)],
+    keys: &[crate::audit_key::AuditKey],
+) -> Vec<LaneStatus> {
+    let mut statuses: Vec<LaneStatus> = Vec::with_capacity(lanes.len());
+    for (index, (rel, text)) in lanes.iter().enumerate() {
+        let mut verification = audit::verify_chained_jsonl_text(text, rel, keys);
+        let number = audit::audio_level_lane_number(rel).unwrap_or(0);
+        if verification.is_ok() && number >= 1 {
+            let previous = index
+                .checked_sub(1)
+                .map(|p| (&lanes[p], &statuses[p]))
+                .filter(|((prev_rel, _), _)| {
+                    audit::audio_level_lane_number(prev_rel) == Some(number - 1)
+                });
+            if let Err(why) = continuation_proof(text, previous) {
+                verification = Err(format!("연속 레인 연결 미검증 — {why}"));
+            }
+        }
+        statuses.push(LaneStatus {
+            rel: rel.clone(),
+            verification,
+        });
+    }
+    statuses
+}
+
+/// Why `text` (a continuation lane) is not a proven continuation of
+/// `previous`, or `Ok` when it is (see [`lane_statuses`]).
+fn continuation_proof(
+    text: &str,
+    previous: Option<(&(String, String), &LaneStatus)>,
+) -> Result<(), String> {
+    let Some(((prev_rel, prev_text), prev_status)) = previous else {
+        return Err("바로 앞 번호의 측정 레인이 없습니다".to_string());
+    };
+    let marker = text
+        .lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| {
+            entry.get("event").and_then(Value::as_str) == Some("audio-level-lane-continued")
+        })
+        .ok_or_else(|| {
+            "첫 항목이 레인 연속 표식(audio-level-lane-continued)이 아닙니다".to_string()
+        })?;
+    if marker.get("previous_lane").and_then(Value::as_str) != Some(prev_rel.as_str()) {
+        return Err(format!(
+            "연속 표식이 앞 레인 {prev_rel}을 지목하지 않습니다"
+        ));
+    }
+    let recorded = marker
+        .get("previous_lane_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "연속 표식에 앞 레인 해시(previous_lane_sha256)가 없습니다".to_string())?;
+    if !recorded.eq_ignore_ascii_case(&crate::sha256::digest_bytes(prev_text.as_bytes())) {
+        return Err(format!(
+            "앞 레인 {prev_rel}이 연속 표식 기록 후 바뀌었습니다(해시 불일치)"
+        ));
+    }
+    if prev_status.verification.is_ok() {
+        return Err(format!(
+            "앞 레인 {prev_rel}이 정상 검증되는데 새 레인이 시작되었습니다"
+        ));
+    }
+    Ok(())
 }
 
 /// The lane new measurement entries are appended to (R5-P8): the newest
@@ -926,18 +1036,19 @@ fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Vec<LaneStatus
 /// whose first entry names the damaged lane and why — the damaged lane is
 /// left exactly as found (never repaired or rewritten), so nothing it holds
 /// is lost and every later measurement is still chained.
+///
+/// R6-I3: "verifies" means accepted by [`lane_statuses`] (a continuation
+/// lane must be a proven one), and the marker records the damaged lane's
+/// SHA-256 (`previous_lane_sha256`) so the continuation can be checked.
 pub fn active_lane_for_append(case_dir: &Path) -> Result<PathBuf, String> {
-    let lanes = lane_rels(case_dir)?;
-    let Some(last) = lanes.last() else {
+    let lanes = read_lanes(case_dir)?;
+    let Some((last, last_text)) = lanes.last() else {
         return Ok(case_dir.join(LOG_REL));
     };
-    let path = case_dir.join(last);
     let keys = crate::audit_key::verification_keys()?;
-    let text = audit::read_log_locked(&path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?
-        .unwrap_or_default();
-    let Err(reason) = audit::verify_chained_jsonl_text(&text, last, &keys) else {
-        return Ok(path);
+    let statuses = lane_statuses(&lanes, &keys);
+    let Some(Err(reason)) = statuses.last().map(|status| status.verification.clone()) else {
+        return Ok(case_dir.join(last));
     };
     let number = audit::audio_level_lane_number(last).unwrap_or(0) + 1;
     let rel = format!("evidence/logs/audio-level-log.{number}.jsonl");
@@ -947,6 +1058,7 @@ pub fn active_lane_for_append(case_dir: &Path) -> Result<PathBuf, String> {
         "event": "audio-level-lane-continued",
         "logged_unix": now_unix()?,
         "previous_lane": last,
+        "previous_lane_sha256": crate::sha256::digest_bytes(last_text.as_bytes()),
         "previous_lane_error": reason,
         "note": "the previous sound-measurement lane does not verify as a chain; it is kept unchanged and its results are not shown as levels — measurement continues in this lane",
     });
@@ -1044,12 +1156,17 @@ pub fn levels_cache_key(case_dir: &Path) -> String {
 pub const UNVERIFIED_ERROR: &str =
     "소리 측정 기록 검증 실패 — 측정 기록(audio-level-log)의 체인이 맞지 않아 표시하지 않습니다";
 
-/// Parses every `audio-level` entry of the lane text (no verification).
+/// Parses every `audio-level` entry of the lane text (no verification);
+/// `line_flag(index)` is the `chain_unverified` reason of the results on
+/// line `index` (0-based; R6-I3).
 /// Results of entries replayed from a crash checkpoint are flagged
 /// `replayed_unverified` (D2).
-fn parse_logged_results(text: &str) -> LoggedResults {
+fn parse_logged_results_lines(
+    text: &str,
+    line_flag: &dyn Fn(usize) -> Option<String>,
+) -> LoggedResults {
     let mut out = BTreeMap::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    for (index, line) in text.lines().enumerate() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -1079,15 +1196,31 @@ fn parse_logged_results(text: &str) -> LoggedResults {
         {
             if let Some(mut result) = FileResult::from_json(item) {
                 result.replayed_unverified = replayed;
+                result.chain_unverified = line_flag(index);
                 let at = result.measured_unix.unwrap_or(measured);
-                out.insert(
-                    result.selector.clone(),
-                    (result, at, method.clone(), threshold),
-                );
+                let selector = result.selector.clone();
+                insert_logged_result(&mut out, selector, (result, at, method.clone(), threshold));
             }
         }
     }
     out
+}
+
+/// Later results win — except that (R6-I3) a result that is not verified
+/// never replaces a verified one: a planted lane or an unkeyed line can
+/// add an unverified result, never overwrite a genuine measurement.
+fn insert_logged_result(
+    out: &mut LoggedResults,
+    selector: String,
+    entry: (FileResult, u64, String, f64),
+) {
+    let keeps_verified = entry.0.chain_unverified.is_some()
+        && out
+            .get(&selector)
+            .is_some_and(|(existing, ..)| existing.chain_unverified.is_none());
+    if !keeps_verified {
+        out.insert(selector, entry);
+    }
 }
 
 /// The per-record state handed to the viewer / report (§2.4).
@@ -2062,6 +2195,109 @@ mod tests {
         )
         .unwrap();
         assert_ne!(levels_cache_key(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R6-I3: a continuation lane counts only when it is a proven
+    /// continuation of a lane that does not verify. A lane planted next to
+    /// an intact lane (fresh chain, marker naming lane 0) cannot replace
+    /// its measurements; a damaged lane edited after it was continued from
+    /// voids the continuation.
+    #[test]
+    fn continuation_lanes_must_prove_their_link() {
+        let r1 = row("vid_1");
+        let dir = audio_case(
+            "i3-planted",
+            &[log_entry_json(
+                7,
+                "ffmpeg x",
+                &[result_for(&r1, Verdict::Sound, -12.0)],
+            )],
+        );
+        let planted = dir.join("evidence/logs/audio-level-log.1.jsonl");
+        let lane0 = std::fs::read_to_string(dir.join(LOG_REL)).unwrap();
+        audit::append_chained_jsonl_keyed(
+            &planted,
+            &json!({"event": "audio-level-lane-continued", "previous_lane": LOG_REL,
+                "previous_lane_sha256": crate::sha256::digest_bytes(lane0.as_bytes())})
+            .to_string(),
+            None,
+        )
+        .unwrap();
+        audit::append_chained_jsonl_keyed(
+            &planted,
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            None,
+        )
+        .unwrap();
+        let levels = audio_levels_for_case(&dir).unwrap();
+        assert_eq!(levels["vid_1"].r, "sound", "planted lane ignored");
+        assert_eq!(chain_summary_json(&dir)["status"], "failed");
+        // New measurements never go into the unproven lane.
+        assert_eq!(
+            active_lane_for_append(&dir).unwrap(),
+            dir.join("evidence/logs/audio-level-log.2.jsonl")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A genuine continuation, then the damaged lane is edited again.
+        let dir = audio_case(
+            "i3-edited",
+            &[log_entry_json(
+                7,
+                "ffmpeg x",
+                &[result_for(&r1, Verdict::Sound, -12.0)],
+            )],
+        );
+        let lane0 = dir.join(LOG_REL);
+        let mut damaged = std::fs::read(&lane0).unwrap();
+        damaged.extend_from_slice(b"{\"torn\":");
+        std::fs::write(&lane0, &damaged).unwrap();
+        let next = active_lane_for_append(&dir).unwrap();
+        assert!(
+            std::fs::read_to_string(&next)
+                .unwrap()
+                .contains("previous_lane_sha256")
+        );
+        audit::append_chained_jsonl_keyed(
+            &next,
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(audio_levels_for_case(&dir).unwrap()["vid_1"].r, "silent");
+        damaged.extend_from_slice(b"more");
+        std::fs::write(&lane0, &damaged).unwrap();
+        assert_eq!(
+            audio_levels_for_case(&dir).unwrap()["vid_1"].r,
+            "unverified"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R6-I3: in a case measured under an audit key, a measurement line
+    /// written without one is not used as a level (and cannot replace the
+    /// keyed measurement of the same record).
+    #[test]
+    fn unkeyed_lines_in_a_keyed_case_are_not_levels() {
+        let r1 = row("vid_1");
+        let dir = audio_case("i3-keyed", &[]);
+        let key = crate::audit_key::AuditKey::new("i3-test-key", &[9; 32]);
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &log_entry_json(7, "ffmpeg x", &[result_for(&r1, Verdict::Sound, -12.0)]).to_string(),
+            Some(&key),
+        )
+        .unwrap();
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            None,
+        )
+        .unwrap();
+        let logged = latest_logged_results(&dir).unwrap();
+        assert!(logged["vid_1"].0.chain_unverified.is_none(), "{logged:?}");
+        assert_eq!(audio_levels_for_case(&dir).unwrap()["vid_1"].r, "sound");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

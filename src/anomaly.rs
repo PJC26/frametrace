@@ -558,7 +558,10 @@ fn mtime_unavailable_count(rows: &[IndexedRow]) -> usize {
 }
 
 fn timestamp_findings(rows: &[IndexedRow]) -> Vec<Finding> {
-    let mut by_parent: std::collections::BTreeMap<String, Vec<(&IndexedRow, u64)>> =
+    // R6-I10: grouped and ordered by the lossless OS path — two folders
+    // whose names differ only in non-Unicode units share one lossy display
+    // string and must not be merged into one sequence.
+    let mut by_parent: std::collections::BTreeMap<std::path::PathBuf, Vec<(&IndexedRow, u64)>> =
         std::collections::BTreeMap::new();
     for row in rows {
         let Some(mtime) = usable_mtime(row) else {
@@ -567,14 +570,18 @@ fn timestamp_findings(rows: &[IndexedRow]) -> Vec<Finding> {
         let parent = row
             .os_path()
             .parent()
-            .map(|path| path.to_string_lossy().to_string())
+            .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         by_parent.entry(parent).or_default().push((row, mtime));
     }
 
     let mut out = Vec::new();
     for (_parent, mut group) in by_parent {
-        group.sort_by(|a, b| a.0.source_path.cmp(&b.0.source_path));
+        group.sort_by(|a, b| {
+            a.0.source_path
+                .cmp(&b.0.source_path)
+                .then_with(|| a.0.os_path().cmp(&b.0.os_path()))
+        });
         for window in group.windows(2) {
             let (left, left_ts) = window[0];
             let (right, right_ts) = window[1];
@@ -1121,6 +1128,41 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, "timestamp-regression");
         assert_eq!(findings[0].selector, "vid_2");
+    }
+
+    /// R6-I10: two folders whose names differ only in non-Unicode units are
+    /// two sequences — merged under their shared lossy spelling, a later
+    /// file of one folder read as a "timestamp regression" of the other.
+    #[test]
+    fn timestamp_groups_use_the_lossless_folder() {
+        let base = std::path::PathBuf::from(if cfg!(windows) { r"C:\ev" } else { "/ev" });
+        let row = |id: &str, folder: u8, name: &str, mtime: u64| {
+            let path = base
+                .join(crate::audit::test_non_unicode_twin("cam", folder))
+                .join(name);
+            IndexedRow {
+                id: id.into(),
+                source_path: path.to_string_lossy().to_string(),
+                sha256: None,
+                size_bytes: None,
+                modified_unix: Some(mtime),
+                duration_seconds: None,
+                format_name: None,
+                video_codec: None,
+                ffprobe_ok: None,
+                raw_path: Some(path),
+            }
+        };
+        let rows = vec![row("vid_1", 0, "a.mp4", 200), row("vid_2", 1, "b.mp4", 100)];
+        assert_eq!(
+            rows[0].source_path[..rows[0].source_path.len() - 5],
+            rows[1].source_path[..rows[1].source_path.len() - 5]
+        );
+        assert!(
+            timestamp_findings(&rows).is_empty(),
+            "{:?}",
+            timestamp_findings(&rows).len()
+        );
     }
 
     /// R5-P3: re-hashing opens the record's lossless path. A non-Unicode

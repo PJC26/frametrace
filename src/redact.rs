@@ -118,8 +118,9 @@ impl Redactor {
     pub fn with_known_roots(case_dir: &Path, roots: &[&str]) -> Self {
         let mut redactor = Self::new(case_dir);
         for root in roots {
-            redactor.add_flattened_root(root);
+            redactor.add_root(root);
         }
+        redactor.collapse_flattened_roots();
         redactor
     }
 
@@ -163,10 +164,46 @@ impl Redactor {
             cache: RefCell::new(HashMap::new()),
             canonicalize,
         };
-        for root in known_roots(case_dir, &redactor.case_roots) {
-            redactor.add_flattened_root(&root);
+        let roots = known_roots(case_dir, &redactor.case_roots);
+        for root in &roots.explicit {
+            redactor.add_root(root);
         }
+        for path in &roots.recorded {
+            for candidate in flattened_root_candidates(path) {
+                redactor.add_flattened_root(&candidate);
+            }
+        }
+        redactor.collapse_flattened_roots();
         redactor
+    }
+
+    /// An explicit root (case, evidence source, home, a caller's extra
+    /// root): registered as given, plus its folder ancestors (R6-I9).
+    fn add_root(&mut self, root: &str) {
+        self.add_flattened_root(root);
+        for candidate in flattened_root_candidates(root) {
+            self.add_flattened_root(&candidate);
+        }
+    }
+
+    /// R6-I9: drops every flattened root another (shorter) one already
+    /// covers — a word starting with `_tmp_x_src` starts with `_tmp_x` —
+    /// so a case with thousands of source folders keeps a short list.
+    fn collapse_flattened_roots(&mut self) {
+        let mut roots = std::mem::take(&mut self.flattened_roots);
+        roots.sort_by_key(|root| root.len());
+        let mut kept: Vec<String> = Vec::new();
+        for root in roots {
+            let covered = kept.iter().any(|shorter| {
+                root.len() > shorter.len()
+                    && root.as_bytes()[..shorter.len()].eq_ignore_ascii_case(shorter.as_bytes())
+                    && matches!(root.as_bytes()[shorter.len()], b'_' | b'-')
+            });
+            if !covered {
+                kept.push(root);
+            }
+        }
+        self.flattened_roots = kept;
     }
 
     /// [`redact_json_text`] with this pass's roots and cache.
@@ -414,35 +451,171 @@ pub fn host_token(host: &str) -> String {
     )
 }
 
-/// R5-P6: every root a flattened path in this case may start with — the
-/// case directory, registered evidence sources, the source folders scans
-/// recorded, and the examiner's home directory. Best effort: an unreadable
-/// source contributes nothing (the drive-letter rule still applies).
-fn known_roots(case_dir: &Path, case_roots: &[PathBuf]) -> Vec<String> {
-    let mut roots: Vec<String> = case_roots
+/// R5-P6/R6-I9: the roots a flattened path in this case may start with.
+/// `explicit`: the case directory, registered evidence sources and the
+/// examiner's home directory (registered as given). `recorded`: every
+/// absolute path the case's own records name — the index
+/// (`db/videos.jsonl`, `db/video_index.json`, scan-run snapshots), the
+/// case manifest (`case.json`) and the chained audit/artifact logs
+/// (source paths, selectors, output paths, and so the case's earlier
+/// location when it was moved) — whose folder ancestors
+/// [`flattened_root_candidates`] expands. Best effort: an unreadable file
+/// contributes nothing (the drive-letter rule still applies).
+struct KnownRoots {
+    explicit: Vec<String>,
+    recorded: Vec<String>,
+}
+
+fn known_roots(case_dir: &Path, case_roots: &[PathBuf]) -> KnownRoots {
+    let mut explicit: Vec<String> = case_roots
         .iter()
         .map(|root| root.to_string_lossy().to_string())
         .collect();
-    roots.extend(crate::case_db::evidence_source_paths(case_dir).unwrap_or_default());
-    if let Ok(text) = std::fs::read_to_string(case_dir.join("evidence/logs/scan-log.jsonl")) {
-        for line in text.lines() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
-                && let Some(source) = value.get("source_path").and_then(|v| v.as_str())
-            {
-                roots.push(source.to_string());
-            }
-        }
-    }
+    explicit.extend(crate::case_db::evidence_source_paths(case_dir).unwrap_or_default());
     for var in ["HOME", "USERPROFILE"] {
         if let Ok(home) = std::env::var(var)
             && !home.trim().is_empty()
         {
-            roots.push(home);
+            explicit.push(home);
         }
     }
-    roots.sort();
-    roots.dedup();
-    roots
+    let mut recorded = Vec::new();
+    for rel in ROOT_SOURCE_FILES {
+        collect_recorded_paths(&case_dir.join(rel), &mut recorded);
+    }
+    if let Ok(entries) = std::fs::read_dir(case_dir.join("db/scan_runs")) {
+        for entry in entries.flatten() {
+            collect_recorded_paths(&entry.path(), &mut recorded);
+        }
+    }
+    for rel in crate::audit::KNOWN_CHAIN_LANES {
+        collect_recorded_paths(&case_dir.join(rel), &mut recorded);
+    }
+    if let Ok(lanes) = crate::audio_level::lane_rels(case_dir) {
+        for rel in lanes {
+            collect_recorded_paths(&case_dir.join(rel), &mut recorded);
+        }
+    }
+    explicit.sort();
+    explicit.dedup();
+    recorded.sort();
+    recorded.dedup();
+    KnownRoots { explicit, recorded }
+}
+
+/// R6-I9: case files whose absolute paths name roots (besides the audit
+/// lanes and scan-run snapshots, which are enumerated separately).
+const ROOT_SOURCE_FILES: &[&str] = &["case.json", "db/videos.jsonl", "db/video_index.json"];
+
+/// R6-I9: a recorded file larger than this is not scanned for roots (a
+/// pathological log must not make every redaction pass read gigabytes).
+const ROOT_SOURCE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// R6-I9: every absolute path written anywhere in the JSON / JSONL file at
+/// `path` (string values and object keys, mid-string paths included).
+fn collect_recorded_paths(path: &Path, out: &mut Vec<String>) {
+    if std::fs::metadata(path).map_or(true, |meta| meta.len() > ROOT_SOURCE_MAX_BYTES) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    collect_paths_in_json_text(&text, out);
+}
+
+/// R6-I9: [`collect_recorded_paths`] over text (whole JSON first, then
+/// line by line).
+fn collect_paths_in_json_text(text: &str, out: &mut Vec<String>) {
+    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => out.extend(embedded_absolute_paths(text)),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    out.extend(embedded_absolute_paths(key));
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        walk(&value, out);
+        return;
+    }
+    for line in text.lines() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            walk(&value, out);
+        }
+    }
+}
+
+/// R6-I9: the absolute paths [`Redactor::text`] treats as paths in `text`
+/// (not flattened names, not URLs).
+fn embedded_absolute_paths(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match path_start(text, i, &[]) {
+            Some(StartKind::Path) => {
+                let end = path_end(bytes, i);
+                if end > i && text.is_char_boundary(end) {
+                    out.push(text[i..end].to_string());
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+            Some(StartKind::Url) => i = token_end(bytes, i, true).max(i + 1),
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// R6-I9/CI1: the roots one recorded absolute path contributes, worked out
+/// on the TEXT — never through `Path` — so a POSIX path is recognised on
+/// Windows and a Windows/UNC path on Linux/macOS alike: every folder
+/// ancestor with at least two components below the root, and the path
+/// itself (`/tmp/x`, `/tmp/x/src`, `//nas/share`; never `/tmp` or `/home`
+/// alone, which would match identifiers such as `_tmp_value`). A macOS
+/// `/private/var/…` path also yields its `/var/…` spelling (the same
+/// folder through the system symlink). Drive paths (`C:\…`) yield nothing
+/// — the drive-letter rule covers them — and so do relative paths.
+fn flattened_root_candidates(path: &str) -> Vec<String> {
+    let text = path.trim();
+    let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.to_string()
+    };
+    let unc = text.starts_with(r"\\") || text.starts_with("//");
+    let lead = if unc {
+        "//"
+    } else if text.starts_with('/') {
+        "/"
+    } else {
+        return Vec::new();
+    };
+    let components: Vec<&str> = text
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .take_while(|part| *part != "..")
+        .collect();
+    let mut spellings = vec![components.clone()];
+    if !unc && components.len() > 3 && components[0] == "private" {
+        spellings.push(components[1..].to_vec());
+    }
+    let mut out = Vec::new();
+    for parts in spellings {
+        for depth in 2..=parts.len() {
+            out.push(format!("{lead}{}", parts[..depth].join("/")));
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -898,6 +1071,108 @@ mod tests {
             )
         );
         let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// R6-CI1/I9: on Linux/macOS a scanned source folder (under `/tmp`,
+    /// `/var/folders/…`) is not a registered evidence source and no scan-log
+    /// line names it (only resumed scans write one), so a proxy named after
+    /// its flattened path leaked. The roots now come from the case's own
+    /// records — the index, the artifact/audit logs (selectors, UNC
+    /// sources, the case's earlier location) — worked out on the text, so
+    /// this test is platform independent (POSIX paths are injected as
+    /// strings and recognised on Windows too).
+    #[test]
+    fn recorded_posix_and_unc_paths_are_flattened_roots() {
+        let case_dir = temp_case("r6-i9");
+        fs::create_dir_all(case_dir.join("db")).unwrap();
+        fs::write(
+            case_dir.join("db/videos.jsonl"),
+            [
+                serde_json::json!({"id": "vid_000001", "source_path": "/tmp/frametrace-report-out-redact-4242/SourceSecretDir/a.mp4", "relative_path": "a.mp4"}),
+                serde_json::json!({"id": "vid_000002", "source_path": "/private/var/folders/ab/cd/T/ft-x/MacSecret/b.mp4", "relative_path": "b.mp4"}),
+            ]
+            .map(|v| v.to_string())
+            .join("\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(case_dir.join("artifacts/proxies")).unwrap();
+        fs::write(
+            case_dir.join("artifacts/proxies/proxy-log.jsonl"),
+            serde_json::json!({"event": "make-proxy", "selector": r"\\nas02\cam\UncSecret\x.mp4"})
+                .to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(case_dir.join("artifacts/clips")).unwrap();
+        fs::write(
+            case_dir.join("artifacts/clips/export-log.jsonl"),
+            serde_json::json!({"event": "export", "output_path": "/mnt/old/MovedSecret/c1/artifacts/clips/a.mp4"})
+                .to_string(),
+        )
+        .unwrap();
+        let redactor = Redactor::new(&case_dir);
+        for (name, secret) in [
+            (
+                "_tmp_frametrace-report-out-redact-4242_SourceSecretDir_a_mp4_proxy_1700000000.mp4",
+                "SourceSecretDir",
+            ),
+            // An unregistered sibling folder of the source (same parent).
+            (
+                "_tmp_frametrace-report-out-redact-4242_OtherSecret_c_mp4_proxy_2.mp4",
+                "OtherSecret",
+            ),
+            // macOS: the index records /private/var/…, the proxy was named
+            // after the /var/… spelling.
+            (
+                "_var_folders_ab_cd_T_ft-x_MacSecret_b_mp4_proxy_1.mp4",
+                "MacSecret",
+            ),
+            ("__nas02_cam_UncSecret_x_mp4_proxy_3.mp4", "UncSecret"),
+            (
+                "_mnt_old_MovedSecret_c1_artifacts_clips_a_mp4_thumb_1.jpg",
+                "MovedSecret",
+            ),
+        ] {
+            let out = redactor.text(&format!("built {name}."));
+            assert!(!out.contains(secret), "{name} -> {out}");
+            assert!(out.starts_with("built <redacted:"), "{out}");
+        }
+        for kept in [
+            "_tmp_value",
+            "_run_id",
+            "_var_value",
+            "_mnt_point",
+            "__init__",
+        ] {
+            assert_eq!(redactor.text(kept), kept, "{kept}");
+        }
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// R6-I9: root candidates are computed on the text, for every OS.
+    #[test]
+    fn flattened_root_candidates_are_textual_ancestors() {
+        assert_eq!(
+            super::flattened_root_candidates("/tmp/x/src/a.mp4"),
+            ["/tmp/x", "/tmp/x/src", "/tmp/x/src/a.mp4"]
+        );
+        assert_eq!(
+            super::flattened_root_candidates(r"\\?\UNC\nas\share\d"),
+            ["//nas/share", "//nas/share/d"]
+        );
+        assert_eq!(
+            super::flattened_root_candidates("/private/var/folders/a"),
+            [
+                "/private/var",
+                "/private/var/folders",
+                "/private/var/folders/a",
+                "/var/folders",
+                "/var/folders/a"
+            ]
+        );
+        assert!(super::flattened_root_candidates("/tmp").is_empty());
+        assert!(super::flattened_root_candidates(r"C:\Users\kim").is_empty());
+        assert!(super::flattened_root_candidates("rel/a/b").is_empty());
+        assert_eq!(super::flattened_root_candidates("/a/b/../c"), ["/a/b"]);
     }
 
     /// D12: the bundle redaction marker is a first-line comment only a
