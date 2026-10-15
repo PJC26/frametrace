@@ -932,20 +932,33 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
         match audit::verify_chained_jsonl(path) {
             Ok(result) => {
                 total_entries += result.entries;
-                if result.integrity == audit::AuditIntegrity::StructuralOnly {
-                    any_structural_only = true;
+                // R8 P0/P1/P2: one mapping for every lane consumer — keys
+                // held here + any line not authenticated here = NOT
+                // VERIFIED (naming other PCs' keys); no keys = structural
+                // (self-consistency only).
+                let trust = result.lane_trust();
+                match &trust {
+                    audit::LaneTrust::Authenticated => {}
+                    audit::LaneTrust::SelfConsistentOnly(_) => any_structural_only = true,
+                    audit::LaneTrust::NotVerified { .. } => any_not_verified = true,
                 }
-                if result.rewrite_not_excluded.is_some() {
-                    any_not_verified = true;
-                }
+                let other_pc_key_ids = match &trust {
+                    audit::LaneTrust::NotVerified {
+                        other_pc_key_ids, ..
+                    } => other_pc_key_ids.clone(),
+                    _ => Vec::new(),
+                };
                 logs_json.push(serde_json::json!({
                     "name": name,
                     "entries": result.entries,
-                    "integrity": if result.rewrite_not_excluded.is_some() {
-                        "not-verified"
+                    "integrity": if trust.passes() {
+                        trust.label()
                     } else {
-                        result.integrity.label()
+                        "not-verified"
                     },
+                    "trust": trust.reason(),
+                    "keys_held": result.requirement.keys_held(),
+                    "other_pc_key_ids": other_pc_key_ids,
                     "rewrite_not_excluded": result.rewrite_not_excluded,
                     "keyed_entries": result.keyed_entries,
                     "unauthenticated_keyed_entries": result.unauthenticated_keyed_entries,
@@ -1441,4 +1454,69 @@ fn sample_source_tree(
     }
     sample.pending_dirs = pending.len() as u64;
     sample
+}
+
+#[cfg(test)]
+mod tests_r8_audit_api {
+    use super::*;
+
+    fn audit_case(
+        tag: &str,
+        bodies: &[(&str, Option<&crate::audit_key::AuditKey>)],
+    ) -> SharedState {
+        let case = std::env::temp_dir().join(format!("ft-r8-api-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case);
+        let lane = case.join("evidence/logs/scan-log.jsonl");
+        std::fs::create_dir_all(lane.parent().unwrap()).unwrap();
+        for (body, key) in bodies {
+            crate::audit::append_chained_jsonl_keyed(&lane, body, *key).unwrap();
+        }
+        let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+        state_lock(&state).case_dir = Some(case);
+        state
+    }
+
+    /// R8 P0/P1/P2 for the workstation audit API: a lane stripped of its
+    /// HMACs read "integrity-structural-only" (a pass) on a PC holding the
+    /// key in R7; now it is "integrity-not-verified" there. A lane
+    /// continued on another PC names that PC's key and is not "failed".
+    #[test]
+    fn r8_audit_api_trust_comes_from_keys_held() {
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xd1; 32]);
+        let other = crate::audit_key::AuditKey::new("pc-b", &[0xd2; 32]);
+        let stripped = audit_case("strip", &[(r#"{"n":1}"#, None)]);
+        let multi = audit_case(
+            "multi",
+            &[(r#"{"n":1}"#, Some(&mine)), (r#"{"n":2}"#, Some(&other))],
+        );
+        let parse = |state: &SharedState| -> serde_json::Value {
+            serde_json::from_str(&api_verify_audit(state)).unwrap()
+        };
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let body = parse(&stripped);
+            assert_eq!(body["integrity"], "integrity-not-verified", "{body}");
+            assert_eq!(body["logs"][0]["keys_held"], true, "{body}");
+            let body = parse(&multi);
+            assert_eq!(body["ok"], true, "not failed: {body}");
+            assert_eq!(body["integrity"], "integrity-not-verified", "{body}");
+            assert_eq!(body["logs"][0]["other_pc_key_ids"][0], "pc-b", "{body}");
+        });
+        crate::audit_key::with_test_keys(&[], || {
+            let body = parse(&stripped);
+            assert_eq!(body["integrity"], "integrity-structural-only", "{body}");
+            assert!(
+                body["logs"][0]["trust"]
+                    .as_str()
+                    .unwrap()
+                    .contains("자기 일관성만 확인(인증 아님)"),
+                "{body}"
+            );
+        });
+        for state in [stripped, multi] {
+            let case = state_lock(&state).case_dir.clone();
+            if let Some(case) = case {
+                let _ = std::fs::remove_dir_all(case);
+            }
+        }
+    }
 }

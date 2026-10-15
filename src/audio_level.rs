@@ -250,6 +250,15 @@ pub struct FileResult {
     /// (the record reads `unverified`) and is measured again. Set by the
     /// log reader, never serialized.
     pub chain_unverified: Option<String>,
+    /// R8 P1 / I8: the result's line was not authenticated by an audit key
+    /// — this PC holds none (P1), or the line predates the lane's key
+    /// introduction — so the level is shown with "자기 일관성만 확인(인증
+    /// 아님)". Set by the log reader, never serialized.
+    pub self_consistent_only: bool,
+    /// R8 P2: the result's line is signed under this key id, which this PC
+    /// does not hold — not authenticable here (`chain_unverified` says so;
+    /// check it on the PC holding the key). Set by the log reader.
+    pub other_pc_key: Option<String>,
 }
 
 fn finite(value: f64) -> Option<f64> {
@@ -323,6 +332,8 @@ impl FileResult {
             measured_unix: value.get("measured_unix").and_then(Value::as_u64),
             replayed_unverified: false,
             chain_unverified: None,
+            self_consistent_only: false,
+            other_pc_key: None,
         })
     }
 }
@@ -732,6 +743,8 @@ pub fn measure_row(ffmpeg: &str, ffprobe: &str, row: &IndexRow) -> FileResult {
         measured_unix: None,
         replayed_unverified: false,
         chain_unverified: None,
+        self_consistent_only: false,
+        other_pc_key: None,
     };
     let bound = row.size_bytes.map(|size| (size, row.modified_unix));
     let os_path = row.os_path();
@@ -906,15 +919,17 @@ fn read_logged_results_with_keys(
     keys: &[crate::audit_key::AuditKey],
 ) -> Result<(LoggedResults, Vec<LaneStatus>), String> {
     let lanes = read_lanes(case_dir)?;
-    // R6-I3: a case measured under an audit key (any lane line carries an
-    // HMAC) does not take measurements from lines written without one.
+    // R8 P0 (I1): whether a line must be authenticated is decided by THIS
+    // PC holding audit keys (`audit::trust_policy(keys)`, recorded in each
+    // lane's verification and applied by `line_trust`) — never by the
+    // lanes carrying HMAC fields, which an attacker can strip from every
+    // line (R7 used "any lane line carries an HMAC" here).
+    // R6-I3: on a PC WITHOUT keys, a case measured under an audit key (a
+    // lane line carries an HMAC) still does not take measurements from
+    // lines written without one. This only ever adds a restriction (P1:
+    // everything there is self-consistency only anyway).
     let keyed_case = is_keyed_case(&lanes);
-    // R7-I1: and when this PC holds audit keys, a line is a measurement
-    // only when its HMAC is AUTHENTICATED here — an HMAC under an invented
-    // key id (UnknownKey) or a retired key nothing later proves
-    // (RetiredUnproven) is any rewriter's line.
-    let require_auth = keyed_case && !keys.is_empty();
-    let statuses = lane_statuses(&lanes, keys, require_auth);
+    let statuses = lane_statuses(&lanes, keys);
     let mut out: LoggedResults = BTreeMap::new();
     for ((rel, text), status) in lanes.iter().zip(&statuses) {
         let chain_error = status
@@ -922,25 +937,52 @@ fn read_logged_results_with_keys(
             .as_ref()
             .err()
             .map(|err| format!("{UNVERIFIED_ERROR}: {rel}: {err}"));
-        let line_flag = |index: usize| -> Option<String> {
+        let line_flag = |index: usize| -> LineFlag {
             if let Some(error) = &chain_error {
-                return Some(error.clone());
+                return LineFlag::unverified(error.clone());
             }
-            let auth = status
-                .verification
-                .as_ref()
-                .ok()
-                .and_then(|verification| verification.entry_auth.get(index).copied());
-            if require_auth {
-                return unauthenticated_line_reason(auth)
-                    .map(|why| format!("{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 {why}", index + 1));
+            let Ok(verification) = status.verification.as_ref() else {
+                return LineFlag::unverified(format!("{UNVERIFIED_ERROR}: {rel}"));
+            };
+            match verification.line_trust(index) {
+                audit::LineTrust::Authenticated => LineFlag::default(),
+                audit::LineTrust::PreKey => LineFlag {
+                    self_consistent_only: true,
+                    ..LineFlag::default()
+                },
+                audit::LineTrust::SelfConsistentOnly { key_id } => {
+                    if keyed_case && key_id.is_none() {
+                        LineFlag::unverified(format!(
+                            "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 감사 키로 기록된 케이스에서 키 없이 기록되어 측정값으로 쓰지 않습니다",
+                            index + 1
+                        ))
+                    } else {
+                        LineFlag {
+                            self_consistent_only: true,
+                            ..LineFlag::default()
+                        }
+                    }
+                }
+                trust @ audit::LineTrust::OtherPc { .. } => {
+                    let audit::LineTrust::OtherPc { key_id } = &trust else {
+                        unreachable!()
+                    };
+                    LineFlag {
+                        unverified: Some(format!(
+                            "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 측정값으로 쓰지 않습니다 — {}",
+                            index + 1,
+                            trust.note()
+                        )),
+                        self_consistent_only: false,
+                        other_pc_key: Some(key_id.clone()),
+                    }
+                }
+                trust @ audit::LineTrust::NotAuthenticated { .. } => LineFlag::unverified(format!(
+                    "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 측정값으로 쓰지 않습니다 — {}",
+                    index + 1,
+                    trust.note()
+                )),
             }
-            (keyed_case && !auth.is_some_and(audit::EntryAuth::is_keyed)).then(|| {
-                format!(
-                    "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 감사 키로 기록된 케이스에서 키 없이 기록되어 측정값으로 쓰지 않습니다",
-                    index + 1
-                )
-            })
         };
         for (selector, entry) in parse_logged_results_lines(text, &line_flag) {
             insert_logged_result(&mut out, selector, entry);
@@ -949,31 +991,34 @@ fn read_logged_results_with_keys(
     Ok((out, statuses))
 }
 
+/// R8: what the reader attaches to every result of one lane line.
+#[derive(Debug, Clone, Default)]
+struct LineFlag {
+    /// Why the line is not a measurement (`FileResult::chain_unverified`).
+    unverified: Option<String>,
+    /// P1 / I8: a level, but self-consistency only.
+    self_consistent_only: bool,
+    /// P2: the key the line is signed under, held by another PC.
+    other_pc_key: Option<String>,
+}
+
+impl LineFlag {
+    fn unverified(reason: String) -> Self {
+        Self {
+            unverified: Some(reason),
+            ..Self::default()
+        }
+    }
+}
+
 /// R6-I3: whether any lane line carries an HMAC (the case was measured
 /// under an audit key). Read from the text so a damaged lane counts too.
+/// R8: only ever used to ADD a restriction on a PC without keys — never
+/// to decide whether authentication is required.
 fn is_keyed_case(lanes: &[(String, String)]) -> bool {
     lanes
         .iter()
         .any(|(_, text)| text.contains("\"entry_hmac_sha256\""))
-}
-
-/// R7-I1: why a line is not a measurement in a keyed case on a PC that
-/// holds audit keys, or `None` when its HMAC was authenticated here.
-fn unauthenticated_line_reason(auth: Option<audit::EntryAuth>) -> Option<&'static str> {
-    use audit::EntryAuth;
-    match auth {
-        Some(EntryAuth::Authenticated) => None,
-        Some(EntryAuth::Unkeyed) | None => {
-            Some("감사 키로 기록된 케이스에서 키 없이 기록되어 측정값으로 쓰지 않습니다")
-        }
-        Some(EntryAuth::UnknownKey) => Some(
-            "이 PC에 없는 감사 키 id로 서명되어 인증할 수 없어 측정값으로 쓰지 않습니다 (그 키를 가진 PC에서 확인)",
-        ),
-        Some(EntryAuth::RetiredUnproven) => Some(
-            "은퇴한 감사 키로만 서명되었고 그 뒤에 현재 키 항목이 없어 인증할 수 없으므로 측정값으로 쓰지 않습니다",
-        ),
-        Some(EntryAuth::NoKey) => Some("감사 키로 인증되지 않아 측정값으로 쓰지 않습니다"),
-    }
 }
 
 /// Every present lane's text, in continuation order (R5-P8).
@@ -1000,15 +1045,22 @@ fn read_lanes(case_dir: &Path) -> Result<Vec<(String, String)>, String> {
 /// after it was continued from — is reported as not verifying, so its
 /// results never replace verified measurements.
 ///
-/// R7-I1: with `require_auth` (a keyed case on a PC holding audit keys)
-/// the marker itself must be HMAC-authenticated here — an unkeyed or
-/// unknown-key marker is anyone's. R7-I10: a previous lane REPAIRED by
-/// truncating it to its verifying prefix still matches, through the
-/// prefix hash the marker recorded (`previous_lane_verified_prefix_sha256`).
+/// R8-I6 (supersedes R7-I1's marker rule): whether a lane is DAMAGED is
+/// structure only — chain verification plus this continuation proof. A
+/// marker this PC cannot authenticate (signed on another PC, or written
+/// without a key) is NOT damage: treating it as damage made two PCs open a
+/// new lane for each other's lane forever (ping-pong). Trust is decided
+/// per LINE instead (`AuditChainVerification::line_trust`, P0): with keys
+/// held, every line of such a lane that is not authenticated here is not a
+/// measurement, whatever lane it sits in. For the same reason "the previous
+/// lane verifies here" only contradicts a marker THIS PC authenticated —
+/// the PC that wrote any other marker may hold a key that refuted the
+/// previous lane (P2). R7-I10: a previous lane REPAIRED by truncating it to
+/// its verifying prefix still matches, through the prefix hash the marker
+/// recorded (`previous_lane_verified_prefix_sha256`).
 fn lane_statuses(
     lanes: &[(String, String)],
     keys: &[crate::audit_key::AuditKey],
-    require_auth: bool,
 ) -> Vec<LaneStatus> {
     let mut statuses: Vec<LaneStatus> = Vec::with_capacity(lanes.len());
     for (index, (rel, text)) in lanes.iter().enumerate() {
@@ -1023,15 +1075,14 @@ fn lane_statuses(
                 .filter(|((prev_rel, _), _)| {
                     audit::audio_level_lane_number(prev_rel) == Some(number - 1)
                 });
-            let marker_auth = verified.entry_auth.first().copied();
-            let proof = if require_auth && marker_auth != Some(audit::EntryAuth::Authenticated) {
-                Err(format!(
-                    "연속 표식이 이 PC의 감사 키로 인증되지 않았습니다 ({})",
-                    unauthenticated_line_reason(marker_auth).unwrap_or("인증 안 됨")
-                ))
-            } else {
-                continuation_proof(text, number, previous)
-            };
+            // Signed under a key this PC does not hold: the PC that wrote
+            // it could see damage this PC cannot (a refuting key).
+            let marker_from_key_not_held = matches!(
+                verified.line_trust(0),
+                audit::LineTrust::OtherPc { .. }
+                    | audit::LineTrust::SelfConsistentOnly { key_id: Some(_) }
+            );
+            let proof = continuation_proof(text, number, previous, marker_from_key_not_held);
             if let Err(why) = proof {
                 verification = Err(format!("연속 레인 연결 미검증 — {why}"));
             }
@@ -1051,8 +1102,7 @@ fn lane_statuses(
 pub fn verified_active_lane(case_dir: &Path) -> Result<Option<String>, String> {
     let lanes = read_lanes(case_dir)?;
     let keys = crate::audit_key::verification_keys()?;
-    let require_auth = is_keyed_case(&lanes) && !keys.is_empty();
-    let statuses = lane_statuses(&lanes, &keys, require_auth);
+    let statuses = lane_statuses(&lanes, &keys);
     Ok(statuses
         .last()
         .filter(|status| status.verification.is_ok())
@@ -1068,6 +1118,7 @@ fn continuation_proof(
     text: &str,
     number: u32,
     previous: Option<(&(String, String), &LaneStatus)>,
+    marker_from_key_not_held: bool,
 ) -> Result<(), String> {
     let marker = text
         .lines()
@@ -1111,7 +1162,13 @@ fn continuation_proof(
         .ok_or_else(|| "연속 표식에 앞 레인 해시(previous_lane_sha256)가 없습니다".to_string())?;
     let now = crate::sha256::digest_bytes(prev_text.as_bytes());
     if recorded.eq_ignore_ascii_case(&now) {
-        if prev_status.verification.is_ok() {
+        // R8-I6/P2: a marker signed under a key this PC does not hold was
+        // written by a PC that may hold a key refuting the previous lane —
+        // its "damaged" verdict is not a contradiction here (its lines are
+        // not trusted here anyway, P0). Any other marker (authenticated
+        // here, or unkeyed: a keyless PC sees no more damage than this one)
+        // next to a previous lane that verifies is a planted lane.
+        if prev_status.verification.is_ok() && !marker_from_key_not_held {
             return Err(format!(
                 "앞 레인 {prev_rel}이 정상 검증되는데 새 레인이 시작되었습니다"
             ));
@@ -1148,8 +1205,7 @@ pub fn active_lane_for_append(case_dir: &Path) -> Result<PathBuf, String> {
         return Ok(case_dir.join(LOG_REL));
     };
     let keys = crate::audit_key::verification_keys()?;
-    let require_auth = is_keyed_case(&lanes) && !keys.is_empty();
-    let statuses = lane_statuses(&lanes, &keys, require_auth);
+    let statuses = lane_statuses(&lanes, &keys);
     let Some(Err(reason)) = statuses.last().map(|status| status.verification.clone()) else {
         return Ok(case_dir.join(last));
     };
@@ -1190,9 +1246,9 @@ pub fn chain_summary_json(case_dir: &Path) -> Value {
     let mut details: Vec<String> = Vec::new();
     for status in &statuses[..statuses.len() - 1] {
         if let Ok(verification) = &status.verification
-            && let Some(reason) = &verification.rewrite_not_excluded
+            && let trust @ audit::LaneTrust::NotVerified { .. } = verification.lane_trust()
         {
-            details.push(format!("이전 측정 레인 {}: {reason}", status.rel));
+            details.push(format!("이전 측정 레인 {}: {}", status.rel, trust.reason()));
         }
         if let Err(err) = &status.verification {
             details.push(format!(
@@ -1218,23 +1274,27 @@ pub fn chain_summary_json(case_dir: &Path) -> Value {
         .sum();
     match &newest.verification {
         Ok(verification) => {
+            let newest_trust = verification.lane_trust();
+            if !newest_trust.reason().is_empty() {
+                details.insert(0, newest_trust.reason().to_string());
+            }
             details.extend(verification.warnings.iter().cloned());
             let damaged = statuses.iter().any(|status| status.verification.is_err());
-            // R7-I3: a lane whose tail may have been re-written under an
-            // invented key id is never shown as passing.
-            let rewrite = statuses.iter().any(|status| {
-                status
-                    .verification
-                    .as_ref()
-                    .is_ok_and(|v| v.rewrite_not_excluded.is_some())
-            });
+            // R8 P0/P2 (and R7-I3): with keys held, a lane holding any line
+            // not authenticated here is never shown as passing — NOT
+            // VERIFIED, naming the other PCs' keys; never "failed".
+            let trusts: Vec<audit::LaneTrust> = statuses
+                .iter()
+                .filter_map(|status| status.verification.as_ref().ok())
+                .map(audit::AuditChainVerification::lane_trust)
+                .collect();
             json!({
                 "path": newest.rel,
                 "status": if damaged {
                     "failed"
-                } else if rewrite {
+                } else if trusts.iter().any(|trust| !trust.passes()) {
                     "not-verified"
-                } else if verification.integrity == audit::AuditIntegrity::Keyed {
+                } else if trusts.iter().all(|trust| *trust == audit::LaneTrust::Authenticated) {
                     "keyed"
                 } else {
                     "structural"
@@ -1283,10 +1343,7 @@ pub const UNVERIFIED_ERROR: &str =
 /// line `index` (0-based; R6-I3).
 /// Results of entries replayed from a crash checkpoint are flagged
 /// `replayed_unverified` (D2).
-fn parse_logged_results_lines(
-    text: &str,
-    line_flag: &dyn Fn(usize) -> Option<String>,
-) -> LoggedResults {
+fn parse_logged_results_lines(text: &str, line_flag: &dyn Fn(usize) -> LineFlag) -> LoggedResults {
     let mut out = BTreeMap::new();
     for (index, line) in text.lines().enumerate() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -1318,7 +1375,10 @@ fn parse_logged_results_lines(
         {
             if let Some(mut result) = FileResult::from_json(item) {
                 result.replayed_unverified = replayed;
-                result.chain_unverified = line_flag(index);
+                let flag = line_flag(index);
+                result.chain_unverified = flag.unverified;
+                result.self_consistent_only = flag.self_consistent_only;
+                result.other_pc_key = flag.other_pc_key;
                 let at = result.measured_unix.unwrap_or(measured);
                 let selector = result.selector.clone();
                 insert_logged_result(&mut out, selector, (result, at, method.clone(), threshold));
@@ -1336,11 +1396,17 @@ fn insert_logged_result(
     selector: String,
     entry: (FileResult, u64, String, f64),
 ) {
-    let keeps_verified = entry.0.chain_unverified.is_some()
-        && out
-            .get(&selector)
-            .is_some_and(|(existing, ..)| existing.chain_unverified.is_none());
-    if !keeps_verified {
+    // R8-I8: and a self-consistent-only result (pre-key / no keys) never
+    // replaces one authenticated here.
+    let rank = |result: &FileResult| match (&result.chain_unverified, result.self_consistent_only) {
+        (Some(_), _) => 0,
+        (None, true) => 1,
+        (None, false) => 2,
+    };
+    let keeps_existing = out
+        .get(&selector)
+        .is_some_and(|(existing, ..)| rank(existing) > rank(&entry.0));
+    if !keeps_existing {
         out.insert(selector, entry);
     }
 }
@@ -1366,18 +1432,39 @@ pub struct AudioLevelState {
     pub codec: Option<String>,
     /// True when the loudest stream's peak was `-inf` (digital zero).
     pub max_is_neg_inf: bool,
+    /// R8 P1 / I8: the level's measurement line is self-consistency only
+    /// (no audit key on this PC, or written before the lane's key
+    /// introduction). Compact JSON `"sc": true` — shown with
+    /// "자기 일관성만 확인(인증 아님)".
+    pub self_consistent_only: bool,
+    /// R8 P2: an `unverified` state whose line is signed under this key id,
+    /// held by another PC. Compact JSON `"pc": "<key id>"` — shown as "이
+    /// PC에서 인증 불가 — 키 <id> 보유 PC에서 확인".
+    pub other_pc_key: Option<String>,
 }
 
 impl AudioLevelState {
     pub fn to_json(&self) -> Value {
-        json!({"r": self.r, "max": self.max, "mean": self.mean, "sec": self.sec, "t": self.t})
+        let mut value =
+            json!({"r": self.r, "max": self.max, "mean": self.mean, "sec": self.sec, "t": self.t});
+        if let Some(map) = value.as_object_mut() {
+            if self.self_consistent_only {
+                map.insert("sc".to_string(), json!(true));
+            }
+            if let Some(key) = &self.other_pc_key {
+                map.insert("pc".to_string(), json!(key));
+            }
+        }
+        value
     }
 }
 
 fn state_from(result: &FileResult, measured: u64) -> Option<AudioLevelState> {
     if let Some(reason) = &result.chain_unverified {
         // D1/R5-P8: read from a lane whose chain does not verify.
-        return Some(unconfirmed_state("unverified", measured, reason));
+        let mut state = unconfirmed_state("unverified", measured, reason);
+        state.other_pc_key = result.other_pc_key.clone();
+        return Some(state);
     }
     if result.replayed_unverified {
         // D2: never a level — say why instead.
@@ -1427,6 +1514,8 @@ fn state_from(result: &FileResult, measured: u64) -> Option<AudioLevelState> {
         error: result.error.clone(),
         codec: result.streams.first().and_then(|s| s.codec.clone()),
         max_is_neg_inf: neg_inf,
+        self_consistent_only: result.self_consistent_only,
+        other_pc_key: None,
     })
 }
 
@@ -1441,6 +1530,8 @@ fn unconfirmed_state(r: &'static str, measured: u64, why: &str) -> AudioLevelSta
         error: Some(why.to_string()),
         codec: None,
         max_is_neg_inf: false,
+        self_consistent_only: false,
+        other_pc_key: None,
     }
 }
 
@@ -1488,6 +1579,8 @@ pub fn apply_levels(
                     error: Some("측정 후 파일 변경 — 미확인".to_string()),
                     codec: None,
                     max_is_neg_inf: false,
+                    self_consistent_only: false,
+                    other_pc_key: None,
                 },
             );
             continue;
@@ -1925,6 +2018,8 @@ mod tests {
             measured_unix: None,
             replayed_unverified: false,
             chain_unverified: None,
+            self_consistent_only: false,
+            other_pc_key: None,
         }
     }
 
@@ -2611,9 +2706,14 @@ mod tests {
         )
         .unwrap();
         let (logged, statuses) = read_logged_results_with_keys(&dir, keys).unwrap();
-        let err = statuses[1].verification.as_ref().unwrap_err();
-        assert!(err.contains("인증되지 않았습니다"), "{err}");
-        assert!(logged["vid_1"].0.chain_unverified.is_some(), "{logged:?}");
+        // R8-I6: a marker under a key this PC does not hold is not DAMAGE
+        // (no new lane, no ping-pong) — but every line of the lane that is
+        // not authenticated here is still not a measurement (P0), named as
+        // another PC's (P2).
+        assert!(statuses[1].verification.is_ok(), "{statuses:?}");
+        let result = &logged["vid_1"].0;
+        assert!(result.chain_unverified.is_some(), "{logged:?}");
+        assert_eq!(result.other_pc_key.as_deref(), Some("bogus-id"));
         // Authenticated marker + line: a proven continuation again.
         std::fs::remove_file(&planted).unwrap();
         audit::append_chained_jsonl_keyed(
@@ -2687,6 +2787,153 @@ mod tests {
                 .contains("직접 고치지 마십시오"),
             "{summary}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R8-I1 (P0): a keyed case whose lanes were re-chained with every HMAC
+    /// stripped (and forged levels) no longer reads as an "unkeyed case"
+    /// on a PC holding audit keys — R7 decided "keyed case?" from the lane
+    /// text, so the stripped lane's levels were shown as measured. P1: on a
+    /// PC without keys the same levels show, marked self-consistency only.
+    #[test]
+    fn r8_i1_stripped_hmacs_never_yield_levels_where_keys_are_held() {
+        let r1 = row("vid_1");
+        let dir = audio_case(
+            "r8-i1",
+            &[log_entry_json(
+                9,
+                "ffmpeg x",
+                &[result_for(&r1, Verdict::Silent, -91.0)],
+            )],
+        );
+        let mine = crate::audit_key::AuditKey::new("mine", &[0x81; 32]);
+        let keys = std::slice::from_ref(&mine);
+        let (logged, _) = read_logged_results_with_keys(&dir, keys).unwrap();
+        let reason = logged["vid_1"].0.chain_unverified.as_deref().unwrap_or("");
+        assert!(reason.contains("이 PC에서 인증되지 않음"), "{logged:?}");
+        crate::audit_key::with_test_keys(keys, || {
+            assert_eq!(
+                audio_levels_for_case(&dir).unwrap()["vid_1"].r,
+                "unverified"
+            );
+            assert_eq!(chain_summary_json(&dir)["status"], "not-verified");
+        });
+        // P1: no keys here — a level, flagged self-consistency only.
+        crate::audit_key::with_test_keys(&[], || {
+            let levels = audio_levels_for_case(&dir).unwrap();
+            assert_eq!(levels["vid_1"].r, "silent");
+            assert_eq!(levels["vid_1"].to_json()["sc"], true);
+            assert_eq!(chain_summary_json(&dir)["status"], "structural");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R8-I6 (P2): a continuation lane opened on ANOTHER PC (marker and
+    /// lines under its key) is not damage here: no new lane is started
+    /// (R7 started one, and the other PC then started one for that —
+    /// ping-pong), and its lines read "not authenticable here — check on
+    /// the PC holding key <id>", never as measured.
+    #[test]
+    fn r8_i6_other_pcs_continuation_lane_is_not_damage_here() {
+        let r1 = row("vid_1");
+        let dir = audio_case(
+            "r8-i6",
+            &[log_entry_json(
+                7,
+                "ffmpeg x",
+                &[result_for(&r1, Verdict::Sound, -12.0)],
+            )],
+        );
+        let here = crate::audit_key::AuditKey::new("pc-a", &[0x82; 32]);
+        let there = crate::audit_key::AuditKey::new("pc-b", &[0x83; 32]);
+        let lane0 = dir.join(LOG_REL);
+        let mut damaged = std::fs::read(&lane0).unwrap();
+        damaged.extend_from_slice(b"{\"torn\":");
+        std::fs::write(&lane0, &damaged).unwrap();
+        // PC B continued the damaged lane under its own key.
+        let lane1 = dir.join("evidence/logs/audio-level-log.1.jsonl");
+        audit::append_chained_jsonl_keyed(
+            &lane1,
+            &json!({"event": "audio-level-lane-continued", "previous_lane": LOG_REL,
+                "previous_lane_sha256": crate::sha256::digest_bytes(&damaged)})
+            .to_string(),
+            Some(&there),
+        )
+        .unwrap();
+        audit::append_chained_jsonl_keyed(
+            &lane1,
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            Some(&there),
+        )
+        .unwrap();
+        crate::audit_key::with_test_keys(std::slice::from_ref(&here), || {
+            assert_eq!(active_lane_for_append(&dir).unwrap(), lane1);
+            let levels = audio_levels_for_case(&dir).unwrap();
+            assert_eq!(levels["vid_1"].r, "unverified");
+            assert_eq!(levels["vid_1"].to_json()["pc"], "pc-b");
+            let summary = chain_summary_json(&dir);
+            assert!(
+                summary["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"pc-b\" 보유 PC에서 확인"),
+                "{summary}"
+            );
+        });
+        assert!(
+            !dir.join("evidence/logs/audio-level-log.2.jsonl").exists(),
+            "no new lane"
+        );
+        // PC B itself authenticates its lane and measurement.
+        crate::audit_key::with_test_keys(std::slice::from_ref(&there), || {
+            assert_eq!(active_lane_for_append(&dir).unwrap(), lane1);
+            assert_eq!(audio_levels_for_case(&dir).unwrap()["vid_1"].r, "silent");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R8-I8: measurements written before audit keying was introduced for
+    /// the lane (an authenticated `audit-key-introduced` marker follows
+    /// them) stay levels — marked self-consistency only — instead of every
+    /// earlier measurement turning "unverified" at the first rotation; and
+    /// such a level never replaces one authenticated here.
+    #[test]
+    fn r8_i8_pre_key_measurements_stay_self_consistent_levels() {
+        let r1 = row("vid_1");
+        let r2 = row("vid_2");
+        let dir = audio_case(
+            "r8-i8",
+            &[log_entry_json(
+                7,
+                "ffmpeg x",
+                &[
+                    result_for(&r1, Verdict::Sound, -12.0),
+                    result_for(&r2, Verdict::Sound, -20.0),
+                ],
+            )],
+        );
+        let mine = crate::audit_key::AuditKey::new("mine", &[0x84; 32]);
+        let keys = std::slice::from_ref(&mine);
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &json!({"kind": audit::KEY_INTRODUCED_KIND, "to": "mine"}).to_string(),
+            Some(&mine),
+        )
+        .unwrap();
+        let (logged, _) = read_logged_results_with_keys(&dir, keys).unwrap();
+        assert!(logged["vid_1"].0.chain_unverified.is_none(), "{logged:?}");
+        assert!(logged["vid_1"].0.self_consistent_only);
+        // A later authenticated measurement of vid_2 wins over the pre-key
+        // one and is not flagged.
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r2, Verdict::Silent, -91.0)]).to_string(),
+            Some(&mine),
+        )
+        .unwrap();
+        let (logged, _) = read_logged_results_with_keys(&dir, keys).unwrap();
+        assert_eq!(logged["vid_2"].1, 9);
+        assert!(!logged["vid_2"].0.self_consistent_only);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
