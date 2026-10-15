@@ -94,6 +94,16 @@ function clipJobsTitle(list) {
   if (!joins) return "클립 내보내기";
   return joins === list.length ? "영상 이어붙이기" : "내보내기·이어붙이기";
 }
+// R6 (S4): /api/status.progress job_type "raw-rehash" = the kept raw image
+// is re-verified (hashed) before reuse — bytes done / total, cancellable
+// with the job's [중단]. -> "원본 재검증 12.3 GB / 40 GB (31%)" | "".
+function rawRehashText(progress) {
+  if (!progress || progress.job_type !== "raw-rehash") return "";
+  const total = Number(progress.total) || 0;
+  const done = Math.min(total || Infinity, Number(progress.done) || 0);
+  if (!(total > 0)) return "원본 재검증 중";
+  return `원본 재검증 ${fmtBytes(done)} / ${fmtBytes(total)} (${Math.min(100, Math.floor(done * 100 / total))}%)`;
+}
 function hasProject(S) {
   return !!(S.project && S.project.caseDir) && S.phase !== "empty";
 }
@@ -114,7 +124,7 @@ function chipModel(S, now) {
       detail = [e ? `${e.label} ${e.stage}/${e.stages}` + (e.unit === "units" && e.total > 0 ? ` ${fmtCount(e.done)}/${fmtCount(e.total)}` : "") : "해시·검증", idx].filter(Boolean).join(JOIN);
     } else {
       title = "분석 중";
-      detail = [idx, `단계 ${pv.stepNo}/${pv.stepCount} ${pv.stepName}`].filter(Boolean).join(JOIN);
+      detail = [idx, rawRehashText(p.progress) || `단계 ${pv.stepNo}/${pv.stepCount} ${pv.stepName}`].filter(Boolean).join(JOIN);
     }
     const server = p.progress && Number(p.progress.elapsed_secs) || 0;
     const client = pipeStartedAt ? Math.max(0, (now - pipeStartedAt) / 1000) : 0;

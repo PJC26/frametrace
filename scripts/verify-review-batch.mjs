@@ -828,6 +828,16 @@ async function r6TrackU({ fn, source, runInNewContext, assert, ex }) {
   const sh = readFileSync(new URL('./ci-harnesses.sh', import.meta.url), 'utf8');
   assert.ok(/durations/.test(sh), 'U11: ci-harnesses.sh prints the per-harness durations summary');
   console.log('PASS R6 U11 harness CI limit 60 min with measured durations');
+
+  // S4 ↔ U: progress job_type "raw-rehash" (bytes) reads as raw re-verification.
+  const rh = { job_type: 'raw-rehash', done: 3 * 1024 ** 3, total: 12 * 1024 ** 3, elapsed_secs: 0, eta_secs: 0 };
+  ex.__rh = rh;
+  const rhText = runInNewContext('rawRehashText(__rh)', ex);
+  assert.ok(/^원본 재검증 3(\.0)? GB \/ 12(\.0)? GB \(25%\)$/.test(rhText), 'S4: raw-rehash progress text: ' + rhText);
+  ex.renderTrack(['done', 'running', 'pending', 'pending', 'pending'], null, rh, []);
+  const trk = ex.document.getElementById('track').innerHTML;
+  assert.ok(/원본 재검증/.test(trk) && /aria-valuenow="25"/.test(trk) && !/raw-rehash/.test(trk), 'S4: the running step shows the re-verification bar, not the raw job_type: ' + trk.slice(0, 300));
+  console.log('PASS VM R6 S4 raw-rehash progress shown as 원본 재검증');
 }
 
 // ---- R5 track U (docs/PLAN_R5_2026-10-14.md) ------------------------------
