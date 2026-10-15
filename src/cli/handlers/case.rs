@@ -1221,9 +1221,17 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
             match crate::audit::verify_chained_jsonl(&path) {
                 Ok(result) => serde_json::json!({
                     "path": rel,
-                    "status": if result.integrity == crate::audit::AuditIntegrity::Keyed { "keyed" } else { "structural" },
+                    // R7-I3: a line under a key this PC lacks, after lines it
+                    // authenticated, means a rewrite cannot be excluded here.
+                    "status": if result.rewrite_not_excluded.is_some() {
+                        "not-verified"
+                    } else if result.integrity == crate::audit::AuditIntegrity::Keyed {
+                        "keyed"
+                    } else {
+                        "structural"
+                    },
                     "entries": result.entries,
-                    "detail": result.warnings.join("; "),
+                    "detail": result.rewrite_not_excluded.iter().cloned().chain(result.warnings.iter().cloned()).collect::<Vec<_>>().join("; "),
                 }),
                 Err(err) => serde_json::json!({
                     "path": rel,

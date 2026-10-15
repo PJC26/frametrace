@@ -921,6 +921,7 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
     let mut logs_json = Vec::new();
     let mut failed = 0usize;
     let mut any_structural_only = false;
+    let mut any_not_verified = false;
     let mut total_entries = 0usize;
     for path in &log_paths {
         let name = path
@@ -934,10 +935,18 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
                 if result.integrity == audit::AuditIntegrity::StructuralOnly {
                     any_structural_only = true;
                 }
+                if result.rewrite_not_excluded.is_some() {
+                    any_not_verified = true;
+                }
                 logs_json.push(serde_json::json!({
                     "name": name,
                     "entries": result.entries,
-                    "integrity": result.integrity.label(),
+                    "integrity": if result.rewrite_not_excluded.is_some() {
+                        "not-verified"
+                    } else {
+                        result.integrity.label()
+                    },
+                    "rewrite_not_excluded": result.rewrite_not_excluded,
                     "keyed_entries": result.keyed_entries,
                     "unauthenticated_keyed_entries": result.unauthenticated_keyed_entries,
                     "warnings": result.warnings,
@@ -957,6 +966,8 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
     }
     let overall = if failed > 0 {
         "integrity-failed"
+    } else if any_not_verified {
+        "integrity-not-verified"
     } else if any_structural_only {
         "integrity-structural-only"
     } else {

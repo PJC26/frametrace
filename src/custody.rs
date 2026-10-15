@@ -625,12 +625,17 @@ fn render(
         match &l.result {
             Ok(v) => {
                 verified += 1;
-                let keyed = v.integrity == audit::AuditIntegrity::Keyed;
+                // R7-I3: a lane this PC cannot fully authenticate is never
+                // shown as keyed, even if its earlier lines verified.
+                let keyed =
+                    v.integrity == audit::AuditIntegrity::Keyed && v.rewrite_not_excluded.is_none();
                 if !keyed {
                     structural_only += 1;
                 }
                 let mut notes = v.warnings.clone();
-                if !keyed {
+                if let Some(reason) = &v.rewrite_not_excluded {
+                    notes.insert(0, format!("not verifiable here: {reason}"));
+                } else if !keyed {
                     notes.push(
                         "structural only: detects partial edits, not a full rewrite by someone with file access"
                             .to_string(),
@@ -646,7 +651,11 @@ fn render(
                     esc(&l.rel_path),
                     v.entries,
                     if keyed { "ok" } else { "warn" },
-                    v.integrity.label(),
+                    if v.rewrite_not_excluded.is_some() {
+                        "integrity-not-verified"
+                    } else {
+                        v.integrity.label()
+                    },
                     esc(&v.last_entry_sha256[..v.last_entry_sha256.len().min(16)]),
                     v.keyed_entries,
                     caveat,
