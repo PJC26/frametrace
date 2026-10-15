@@ -220,8 +220,12 @@ fn b2_launch_code_plants_the_cookie_once_and_expires() {
     };
     let first = get(&format!("/?launch={code}"), None);
     let head = head_of(&first);
-    assert!(head.starts_with("HTTP/1.1 303"), "{head}");
-    assert!(head.contains("\r\nLocation: /"), "{head}");
+    // R6-S3: a same-origin step page (200) instead of a 303 redirect.
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        first.contains("location.replace(\"/\" + location.hash)"),
+        "{first}"
+    );
     assert!(
         head.contains(&format!(
             "Set-Cookie: ft_token_{port}={token}; HttpOnly; SameSite=Strict"
@@ -246,7 +250,7 @@ fn b2_launch_code_plants_the_cookie_once_and_expires() {
         Some(&format!("ft_token_{port}={token}")),
     );
     assert!(
-        head_of(&with_cookie).starts_with("HTTP/1.1 303"),
+        head_of(&with_cookie).starts_with("HTTP/1.1 200"),
         "{with_cookie}"
     );
     assert!(

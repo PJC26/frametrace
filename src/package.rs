@@ -98,29 +98,42 @@ fn package_redaction_mode(case_dir: &Path) -> Result<bool, String> {
 /// — the server sweeps the `.part` directory of the killed step.
 pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<PackageResult, String> {
     let created_unix = now_unix()?;
-    let final_dir = match output_dir {
-        Some(path) => path.to_path_buf(),
-        None => crate::util::unique_dir(
-            &case_dir
-                .join("reports")
-                .join(format!("package_{created_unix}")),
-        ),
-    };
-    // `unique_dir` reserved the default name by creating it; an explicit
-    // output may exist only as an empty directory (checked below).
-    let reserved_default = output_dir.is_none();
-    if let Some(parent) = final_dir.parent() {
+    let pid = std::process::id();
+    let reports = case_dir.join("reports");
+    let sweep = |parent: &Path| {
         for (path, result) in crate::join::sweep_stale_parts(parent) {
             if let Err(err) = result {
                 eprintln!("warning: {err} ({})", path.display());
             }
         }
-    }
-    let work_dir = crate::join::pid_part_path(&final_dir, std::process::id());
-    if work_dir.exists() {
-        fs::remove_dir_all(&work_dir)
-            .map_err(|err| format!("failed to clear {}: {err}", work_dir.display()))?;
-    }
+    };
+    let (final_dir, work_dir) = match output_dir {
+        Some(path) => {
+            let final_dir = path.to_path_buf();
+            if let Some(parent) = final_dir.parent() {
+                sweep(parent);
+            }
+            let work_dir = crate::join::pid_part_path(&final_dir, pid);
+            if work_dir.exists() {
+                fs::remove_dir_all(&work_dir)
+                    .map_err(|err| format!("failed to clear {}: {err}", work_dir.display()))?;
+            }
+            (final_dir, work_dir)
+        }
+        None => {
+            sweep(&reports);
+            // R6-S8: the pid-tagged work folder exists BEFORE the default
+            // name is reserved, so a package-case killed at any point
+            // leaves a `.package_<ts>.ft<pid>.part` naming its reservation
+            // — the server's kill sweep and the next run's stale sweep
+            // remove both. Reserving first leaked an empty `package_<ts>`
+            // when the process died before the work folder existed.
+            reserve_package_dirs(&reports.join(format!("package_{created_unix}")), pid)?
+        }
+    };
+    // The default name was reserved by creating it; an explicit output
+    // may exist only as an empty directory (checked below).
+    let reserved_default = output_dir.is_none();
     let result = package_case_into(case_dir, output_dir, &work_dir, created_unix);
     let release_reservation = || {
         if reserved_default {
@@ -163,7 +176,10 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
         fs::rename(from, to)
     };
     if let Err(err) = rename_with_retry(&work_dir, &final_dir, &publish) {
-        let marker = work_dir.join(crate::join::PRESERVED_PART_MARKER);
+        // R6-S5: the marker sits BESIDE the kept folder, never inside it:
+        // a file inside made the finished package fail verify-package
+        // (an unlisted file), so keeping it "safe" broke it.
+        let marker = crate::join::preserved_part_marker(&work_dir);
         let _ = fs::write(
             &marker,
             format!(
@@ -181,6 +197,48 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     result.manifest_path = final_dir.join("package-manifest.json");
     result.output_dir = final_dir;
     Ok(result)
+}
+
+/// R6-S8: reserves a default package name under `base`'s parent —
+/// `base`, then `base_001`, … — creating this process's pid-tagged work
+/// folder for a candidate FIRST and the (empty) final-name reservation
+/// second. Returns `(final, work)`; both exist.
+fn reserve_package_dirs(base: &Path, pid: u32) -> Result<(PathBuf, PathBuf), String> {
+    let parent = base.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "package".to_string());
+    for attempt in 0..10_000u32 {
+        let candidate = if attempt == 0 {
+            base.to_path_buf()
+        } else {
+            parent.join(format!("{name}_{attempt:03}"))
+        };
+        if candidate.exists() {
+            continue;
+        }
+        let work = crate::join::pid_part_path(&candidate, pid);
+        if work.exists() {
+            fs::remove_dir_all(&work)
+                .map_err(|err| format!("failed to clear {}: {err}", work.display()))?;
+        }
+        fs::create_dir(&work)
+            .map_err(|err| format!("failed to create {}: {err}", work.display()))?;
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok((candidate, work)),
+            Err(_) => {
+                // Taken meanwhile (another package-case): next name.
+                let _ = fs::remove_dir(&work);
+            }
+        }
+    }
+    Err(format!(
+        "no free package folder name next to {}",
+        base.display()
+    ))
 }
 
 /// Delays between the R5-S12 rename attempts (5 attempts in all).
@@ -2706,8 +2764,62 @@ mod tests {
             kept[0].join("manifest.sha256").is_file(),
             "package kept whole"
         );
-        assert!(kept[0].join(crate::join::PRESERVED_PART_MARKER).is_file());
+        // R6-S5: the marker is BESIDE the kept folder, so the kept
+        // package verifies as delivered (a marker inside was an unlisted
+        // file: verify-package failed), and no sweep removes it.
+        assert!(crate::join::preserved_part_marker(&kept[0]).is_file());
+        assert!(!kept[0].join(crate::join::PRESERVED_PART_MARKER).exists());
+        let verification = super::verify_package(&kept[0]).expect("verify kept package");
+        assert_eq!(
+            verification.failures().count(),
+            0,
+            "{:?}",
+            verification
+                .failures()
+                .map(|c| c.subject.clone())
+                .collect::<Vec<_>>()
+        );
         assert!(err.contains(&kept[0].display().to_string()), "{err}");
+        let swept = crate::join::sweep_pid_parts(&case_dir.join("reports"), std::process::id());
+        assert!(swept.is_empty(), "a kept package is never swept: {swept:?}");
+        assert!(kept[0].is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R6-S8: the default name was reserved (an empty `package_<ts>`)
+    /// BEFORE the pid-tagged work folder existed, so a package-case that
+    /// died in between leaked the empty folder for good — nothing named
+    /// it. Now the work folder comes first, and the stale sweep of a dead
+    /// writer's work folder removes the reservation it names.
+    #[test]
+    fn s8_reservation_follows_the_work_folder() {
+        let root = std::env::temp_dir().join(format!("ft-r6-s8-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let reports = root.join("reports");
+        fs::create_dir_all(&reports).unwrap();
+        let (final_dir, work) =
+            super::reserve_package_dirs(&reports.join("package_5"), 4242).expect("reserve");
+        assert_eq!(final_dir, reports.join("package_5"));
+        assert_eq!(work, reports.join(".package_5.ft4242.part"));
+        assert!(final_dir.is_dir() && work.is_dir());
+        // Taken name: the next candidate, its own work folder.
+        let (second, second_work) =
+            super::reserve_package_dirs(&reports.join("package_5"), 4242).unwrap();
+        assert_eq!(second, reports.join("package_5_001"));
+        assert_eq!(second_work, reports.join(".package_5_001.ft4242.part"));
+        // pid 4242 is dead: the stale sweep removes work folder AND
+        // reservation (old enough: min age 0).
+        let swept =
+            crate::join::sweep_stale_parts_with(&reports, &|_| crate::util::ProcessProbe::Gone, 0);
+        assert_eq!(swept.len(), 2, "{swept:?}");
+        assert!(!final_dir.exists() && !work.exists());
+        assert!(!second.exists() && !second_work.exists());
+        // A finished package with the same name is never touched.
+        fs::create_dir_all(reports.join(".package_9.ft4242.part")).unwrap();
+        fs::create_dir_all(reports.join("package_9")).unwrap();
+        fs::write(reports.join("package_9/manifest.sha256"), b"x").unwrap();
+        crate::join::sweep_stale_parts_with(&reports, &|_| crate::util::ProcessProbe::Gone, 0);
+        assert!(reports.join("package_9/manifest.sha256").is_file());
         let _ = fs::remove_dir_all(root);
     }
 

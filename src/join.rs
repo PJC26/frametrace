@@ -417,6 +417,11 @@ pub struct VideoPacket {
     pub pts: Option<f64>,
     pub dts: Option<f64>,
     pub discard: bool,
+    /// R6-S6: the `K` flag (key frame).
+    pub key: bool,
+    /// R6-S6: the first 64 bits of the packet payload's SHA-256
+    /// (`-show_data_hash sha256`), `None` when ffprobe gave none.
+    pub hash: Option<u64>,
 }
 
 /// R5-S13: a source's packet facts for the segment check.
@@ -431,6 +436,12 @@ pub struct SourcePackets {
     /// is packet `start + i` of its output range.
     pub discard_mask: Vec<bool>,
     pub audio: Option<u64>,
+    /// R6-S6: payload hashes of the KEPT, non-key packets in file order —
+    /// what an output that applied the edit list must carry for this
+    /// segment. Key frames are left out: stream copy may rewrite them
+    /// (ffmpeg re-inserts parameter sets), every other packet is copied
+    /// byte for byte. `None` when a hash is missing (cannot confirm).
+    pub kept_fingerprint: Option<Vec<u64>>,
 }
 
 impl SourcePackets {
@@ -442,6 +453,7 @@ impl SourcePackets {
             video_kept: discard_mask.iter().filter(|d| !**d).count() as u64,
             discard_mask,
             audio,
+            kept_fingerprint: nonkey_hashes(packets.iter().filter(|p| !p.discard)),
         }
     }
 
@@ -452,8 +464,15 @@ impl SourcePackets {
             video_kept: video,
             discard_mask: vec![false; video as usize],
             audio,
+            kept_fingerprint: None,
         }
     }
+}
+
+/// R6-S6: hashes of the non-key packets, in order (`None` if any lacks
+/// one).
+fn nonkey_hashes<'a>(packets: impl Iterator<Item = &'a VideoPacket>) -> Option<Vec<u64>> {
+    packets.filter(|p| !p.key).map(|p| p.hash).collect()
 }
 
 /// Packet counts of the first video and first audio stream
@@ -522,7 +541,13 @@ pub fn parse_video_packets(text: &str) -> Vec<VideoPacket> {
                 }
                 "flags" => {
                     packet.discard = value.contains('D');
+                    packet.key = value.contains('K');
                     any = true;
+                }
+                "data_hash" => {
+                    // `SHA256:<hex>`: the first 16 hex digits.
+                    let hex = value.trim().rsplit(':').next().unwrap_or("");
+                    packet.hash = hex.get(..16).and_then(|h| u64::from_str_radix(h, 16).ok());
                 }
                 _ => {}
             }
@@ -545,7 +570,9 @@ pub fn video_packets(
     let mut command = Command::new(&binary);
     command
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "packet=pts_time,dts_time,flags"])
+        // R6-S6: payload hashes confirm an edit-list-applied output.
+        .args(["-show_data_hash", "sha256"])
+        .args(["-show_entries", "packet=pts_time,dts_time,flags,data_hash"])
         .args(["-of", "compact=p=0"])
         .arg(path);
     let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
@@ -598,7 +625,18 @@ pub fn evaluate_segment_check(
     let total: u64 = sources.iter().map(|s| s.video_total).sum();
     let kept: u64 = sources.iter().map(|s| s.video_kept).sum();
     let observed = output.len() as u64;
-    let dropped_mode = observed != total && observed == kept;
+    // R6-S6: a count equal to "every packet minus the edit-list pre-roll"
+    // is not proof by itself — an output that KEPT the pre-roll and lost
+    // as many real frames elsewhere has the same count (and, rebased to
+    // zero, the same timing). `edit-list-applied` is accepted only when
+    // each edited segment's output packets carry exactly the source's
+    // kept packets (payload hashes of the non-key packets, in order —
+    // the first output frame of the segment is the first kept frame).
+    let mut unconfirmed_applied: Option<String> = None;
+    if observed != total && observed == kept {
+        unconfirmed_applied = edit_list_applied_mismatch(sources, output);
+    }
+    let dropped_mode = observed != total && observed == kept && unconfirmed_applied.is_none();
     let mut check = SegmentCheck {
         video_packets_expected: if dropped_mode { kept } else { total },
         video_packets_observed: observed,
@@ -613,7 +651,11 @@ pub fn evaluate_segment_check(
     if sources.iter().all(|s| s.audio.is_some()) && !sources.is_empty() {
         check.audio_packets_expected = Some(sources.iter().filter_map(|s| s.audio).sum());
     }
-    if observed != total && observed != kept {
+    if let Some(why) = unconfirmed_applied {
+        check.problems.push(format!(
+            "출력 영상 패킷 수({observed})가 편집 목록 제외 합계와 같지만, 출력이 원본의 유지 프레임을 그대로 담았는지 확인하지 못했습니다 ({why}) — 실제 누락일 수 있어 통과시키지 않습니다"
+        ));
+    } else if observed != total && observed != kept {
         check.problems.push(if kept == total {
             format!("영상 패킷 수가 원본 합계와 다릅니다 (출력 {observed}, 원본 합계 {total})")
         } else {
@@ -706,6 +748,41 @@ pub fn evaluate_segment_check(
     }
     check.ok = check.problems.is_empty();
     check
+}
+
+/// R6-S6: why an output whose packet count equals the kept total is NOT
+/// confirmed as edit-list-applied (`None` = confirmed): per segment in
+/// output order, its `video_kept` output packets must carry the source's
+/// kept non-key payloads, in order.
+fn edit_list_applied_mismatch(sources: &[SourcePackets], output: &[VideoPacket]) -> Option<String> {
+    let mut start = 0usize;
+    for (index, source) in sources.iter().enumerate() {
+        let count = source.video_kept as usize;
+        let range = &output[start.min(output.len())..start.saturating_add(count).min(output.len())];
+        start = start.saturating_add(count);
+        if source.video_kept == source.video_total {
+            continue;
+        }
+        let Some(expected) = source.kept_fingerprint.as_ref().filter(|f| !f.is_empty()) else {
+            return Some(format!(
+                "{}번째 원본의 패킷 해시를 얻지 못했습니다",
+                index + 1
+            ));
+        };
+        let Some(observed) = nonkey_hashes(range.iter()) else {
+            return Some(format!(
+                "{}번째 구간 출력 패킷의 해시를 얻지 못했습니다",
+                index + 1
+            ));
+        };
+        if &observed != expected {
+            return Some(format!(
+                "{}번째 구간의 출력 프레임이 원본의 유지 프레임과 다릅니다",
+                index + 1
+            ));
+        }
+    }
+    None
 }
 
 /// C14: lists every source's packets and the output's video packets,
@@ -2739,7 +2816,7 @@ pub fn pid_part_path(final_path: &Path, pid: u32) -> PathBuf {
 /// Whether `name` is an in-progress name (file or directory) of `pid`
 /// (`None` = any pid).
 pub fn is_pid_part_name(name: &str, pid: Option<u32>) -> bool {
-    if !name.starts_with('.') {
+    if !name.starts_with('.') || name.ends_with(PRESERVED_PART_SUFFIX) {
         return false;
     }
     let Some(pos) = name.rfind(".ft") else {
@@ -2785,6 +2862,9 @@ pub fn sweep_pid_parts(dir: &Path, pid: u32) -> Vec<(PathBuf, Result<(), String>
     entries
         .flatten()
         .filter(|entry| is_pid_part_name(&entry.file_name().to_string_lossy(), Some(pid)))
+        // R6-S5: a kept (finished but unrenamed) package is never swept,
+        // not even right after its own step was killed.
+        .filter(|entry| !part_is_preserved(&entry.path()))
         .map(|entry| {
             let path = entry.path();
             let result = remove_path_retry(&path);
@@ -2824,9 +2904,40 @@ pub fn part_name_pid(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// R5-S12: a preserved package work folder (its publish failed) carries
-/// this file; the stale sweep never removes such a folder.
+/// R5-S12: the marker a preserved package work folder (its publish
+/// failed) carried INSIDE it — still honoured for folders kept by R5.
 pub const PRESERVED_PART_MARKER: &str = "FRAMETRACE-KEEP.txt";
+
+/// R6-S5: suffix of the marker BESIDE a preserved work folder
+/// (`.package_<ts>.ft<pid>.part.FRAMETRACE-KEEP.txt`). A marker inside
+/// the folder became part of the finished package and failed its
+/// verification; beside it, it starts with `.` and is never packaged.
+pub const PRESERVED_PART_SUFFIX: &str = ".FRAMETRACE-KEEP.txt";
+
+/// R6-S5: the marker path that keeps `part` (a work folder) from sweeps.
+pub fn preserved_part_marker(part: &Path) -> PathBuf {
+    let mut name = part.as_os_str().to_os_string();
+    name.push(PRESERVED_PART_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Whether `part` is marked preserved (beside it, or the R5 marker inside).
+pub fn part_is_preserved(part: &Path) -> bool {
+    preserved_part_marker(part).exists() || part.join(PRESERVED_PART_MARKER).exists()
+}
+
+/// R6-S8: the default package name a work folder `.package_<ts>.ft<pid>
+/// .part` reserved (`package_<ts>`), if `name` is one.
+pub fn package_reservation_of(name: &str) -> Option<String> {
+    let pid = part_name_pid(name)?;
+    let reserved = name
+        .strip_prefix('.')?
+        .split_once(&format!(".ft{pid}.part"))?
+        .0;
+    reserved
+        .starts_with("package_")
+        .then(|| reserved.to_string())
+}
 
 /// Crash recovery for `.part` leftovers of OTHER processes in `dir`.
 ///
@@ -2865,7 +2976,7 @@ pub fn sweep_stale_parts_with(
                 .and_then(|time| now.duration_since(time).ok())
                 .is_some_and(|age| age.as_secs() >= min_age_secs)
         })
-        .filter(|(entry, _)| !entry.path().join(PRESERVED_PART_MARKER).exists())
+        .filter(|(entry, _)| !part_is_preserved(&entry.path()))
         .filter(|(entry, pid)| {
             let born = std::fs::symlink_metadata(entry.path())
                 .ok()
@@ -2875,6 +2986,14 @@ pub fn sweep_stale_parts_with(
         .map(|(entry, _)| {
             let path = entry.path();
             let result = remove_path_retry(&path);
+            // R6-S8: the dead package-case's empty name reservation goes
+            // with its work folder (`remove_dir` never removes a folder
+            // with content — a finished package is never touched).
+            if result.is_ok()
+                && let Some(reserved) = package_reservation_of(&entry.file_name().to_string_lossy())
+            {
+                let _ = std::fs::remove_dir(dir.join(reserved));
+            }
             (path, result)
         })
         .collect()
@@ -4203,6 +4322,7 @@ mod tests {
                     pts: Some(t),
                     dts: Some(t),
                     discard: false,
+                    ..VideoPacket::default()
                 }
             })
             .collect()
@@ -4277,6 +4397,7 @@ mod tests {
                         pts: Some(start + pts_index as f64 / 30.0),
                         dts: (i >= 2).then(|| start + (i as f64 - 2.0) / 30.0),
                         discard: false,
+                        ..VideoPacket::default()
                     }
                 })
                 .collect()
@@ -4321,6 +4442,9 @@ mod tests {
                 pts: Some(-1.5 + i as f64 / 30.0),
                 dts: Some(-1.5 + i as f64 / 30.0),
                 discard: i < 45,
+                // R6-S6: payload hashes (one key frame per second).
+                key: i % 30 == 0,
+                hash: Some(1000 + i),
             })
             .collect();
         let sources = [
@@ -4351,6 +4475,32 @@ mod tests {
         assert!(check.ok, "{:?}", check.problems);
         assert_eq!(check.mode, "edit-list-applied");
         assert_eq!(check.presented_preroll_total(), 0.0);
+        // R6-S6: the same packet count as the kept total, but the output
+        // KEPT the pre-roll and lost the last 45 real frames — rebased to
+        // zero its timing is identical to an applied edit list. Before,
+        // it passed as `edit-list-applied`; the payloads now say no.
+        let mut lost: Vec<VideoPacket> = output[..75].to_vec();
+        lost.extend(dts_run(2.5, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.5], None, &lost);
+        assert!(!check.ok, "missing frames passed: {check:?}");
+        assert_ne!(check.mode, "edit-list-applied");
+        assert!(
+            check.problems.iter().any(|p| p.contains("유지 프레임")),
+            "{:?}",
+            check.problems
+        );
+        // No payload hashes (an older ffprobe): never assumed applied.
+        let mut unhashed = applied.clone();
+        for packet in &mut unhashed {
+            packet.hash = None;
+        }
+        let check = evaluate_segment_check(&sources, &[0.0, 2.5], None, &unhashed);
+        assert!(!check.ok);
+        let parsed = parse_video_packets(
+            "pts_time=0.1|dts_time=0.1|flags=___|data_hash=SHA256:00000000000000ffabcdef\n",
+        );
+        assert_eq!(parsed[0].hash, Some(0xff));
+        assert!(!parsed[0].key);
         // A missing second segment still fails.
         let check = evaluate_segment_check(&sources, &[0.0, 2.5], None, &output[..120]);
         assert!(!check.ok);

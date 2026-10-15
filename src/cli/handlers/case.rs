@@ -333,6 +333,10 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let manifest_path = case_dir.join("case.json");
     let manifest_json = read_to_string(&manifest_path)
         .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
+    // R6-S1: both files are embedded into scripts of trusted pages; only
+    // a JSON value ever gets there (re-serialized), anything else is null.
+    let index_json = page_json_input("db/video_index.json", &index_json);
+    let manifest_json = page_json_input("case.json", &manifest_json);
     let redactor = crate::redact::Redactor::new(case_dir);
     let redact = |text: &str| -> String {
         if redact_paths {
@@ -356,7 +360,8 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let index_json = redact(&index_json);
     let html = html_report::render_review_html(&manifest_json, &index_json);
     let review_path = case_dir.join("review/index.html");
-    write_text(&review_path, &inject_redaction_banner(html, redact_paths))
+    let review_html = inject_redaction_banner(html, redact_paths);
+    write_text(&review_path, &review_html)
         .map_err(|err| format!("failed to write review html: {err}"))?;
     let carve_log_raw =
         read_to_string(&case_dir.join("artifacts/carved/carve-log.jsonl")).unwrap_or_default();
@@ -428,22 +433,21 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         .map_err(|err| format!("failed to write review data bundle: {err}"))?;
     let evidence_viewer = html_report::render_evidence_viewer_html_slim();
     let evidence_viewer_path = case_dir.join("review/evidence-viewer.html");
-    write_text(
-        &evidence_viewer_path,
-        &inject_redaction_banner(evidence_viewer, redact_paths),
-    )
-    .map_err(|err| format!("failed to write evidence viewer html: {err}"))?;
+    let evidence_viewer = inject_redaction_banner(evidence_viewer, redact_paths);
+    write_text(&evidence_viewer_path, &evidence_viewer)
+        .map_err(|err| format!("failed to write evidence viewer html: {err}"))?;
     // Dedicated carve view: a raw-image carve can return hundreds of
     // artifacts that would drown the evidence grid, so carving results get
     // their own page beside the viewer.
     // R5-S1: exactly the files this run wrote are recorded as generated.
-    let mut written: Vec<&str> = vec![
-        "review/index.html",
-        "review/data-bundle.js",
-        "review/evidence-viewer.html",
+    // R6-S7: by the bytes written, not by re-reading the files.
+    let mut written: Vec<(&str, &[u8])> = vec![
+        ("review/index.html", review_html.as_bytes()),
+        ("review/data-bundle.js", data_bundle.as_bytes()),
+        ("review/evidence-viewer.html", evidence_viewer.as_bytes()),
     ];
+    let carve_report_page: String;
     if !carve_log.trim().is_empty() {
-        written.push("review/carve-report.html");
         let carve_results =
             redact(&read_to_string(&case_dir.join("db/carve_results.json")).unwrap_or_default());
         // Redacted in-case outputs read `<case>/…`; handed to the carve page
@@ -463,14 +467,13 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
             &index_json,
         );
         let carve_report_path = case_dir.join("review/carve-report.html");
-        write_text(
-            &carve_report_path,
-            &inject_redaction_banner(carve_report, redact_paths),
-        )
-        .map_err(|err| format!("failed to write carve report html: {err}"))?;
+        carve_report_page = inject_redaction_banner(carve_report, redact_paths);
+        write_text(&carve_report_path, &carve_report_page)
+            .map_err(|err| format!("failed to write carve report html: {err}"))?;
+        written.push(("review/carve-report.html", carve_report_page.as_bytes()));
         println!("carve report written: {}", carve_report_path.display());
     }
-    record_generated_pages(case_dir, &written)?;
+    record_generated_contents(case_dir, &written)?;
     println!("review written: {}", review_path.display());
     println!(
         "evidence viewer written: {}",
@@ -488,6 +491,19 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         }
     );
     Ok(())
+}
+
+/// R6-S1: an input file's text as compact JSON for a generated page's
+/// script, or `"null"` with a printed warning when it is not exactly one
+/// JSON value (a tampered `case.json` can no longer inject script).
+fn page_json_input(label: &str, text: &str) -> String {
+    match crate::util::script_json_input(label, text) {
+        Ok(json) => json,
+        Err(warning) => {
+            eprintln!("warning: {warning}");
+            "null".to_string()
+        }
+    }
 }
 
 /// Rewrites redacted `<case>/rel` output paths of a JSONL log back to the
@@ -736,6 +752,9 @@ pub fn make_report(
     let manifest_path = case_dir.join("case.json");
     let manifest_json = read_to_string(&manifest_path)
         .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
+    // R6-S1: embedded into the report's script — JSON values only.
+    let index_json = page_json_input("db/video_index.json", &index_json);
+    let manifest_json = page_json_input("case.json", &manifest_json);
     // D11: a log that exists but cannot be read is named in the report
     // (and on stderr) — never rendered as an empty "none" section.
     let mut read_errors: std::collections::BTreeMap<String, String> = Default::default();
@@ -952,7 +971,7 @@ pub fn make_report(
     };
     let report_path = case_dir.join("reports/case-report.html");
     write_text(&report_path, &html).map_err(|err| format!("failed to write report html: {err}"))?;
-    record_generated_pages(case_dir, &["reports/case-report.html"])?;
+    record_generated_contents(case_dir, &[("reports/case-report.html", html.as_bytes())])?;
     println!("report written: {}", report_path.display());
     Ok(())
 }
@@ -1219,8 +1238,20 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
 
 pub fn make_custody(case_dir: &Path) -> Result<(), String> {
     ensure_case(case_dir)?;
-    let path = crate::custody::generate(case_dir)?;
-    record_generated_pages(case_dir, &[crate::custody::CUSTODY_REL_PATH])?;
+    // R6-S7: rendered and written here (as `custody::generate` does) so
+    // the bytes written are the bytes recorded.
+    let html = crate::custody::render_statement(case_dir, false)?;
+    let path = case_dir.join(crate::custody::CUSTODY_REL_PATH);
+    write_text(&path, &html).map_err(|err| {
+        format!(
+            "failed to write custody statement {}: {err}",
+            path.display()
+        )
+    })?;
+    record_generated_contents(
+        case_dir,
+        &[(crate::custody::CUSTODY_REL_PATH, html.as_bytes())],
+    )?;
     println!("custody statement written: {}", path.display());
     Ok(())
 }
@@ -1231,8 +1262,8 @@ pub fn make_custody(case_dir: &Path) -> Result<(), String> {
 /// wrote (`rels`, case-relative) — never every HTML in the folders, which
 /// let a planted page ride along with the next regeneration. R5-S2: the
 /// scripts those pages load (`review/data-bundle.js`) are listed too.
-fn record_generated_pages(case_dir: &Path, rels: &[&str]) -> Result<(), String> {
-    crate::util::generated_pages::record_generated_pages(case_dir, rels)
+fn record_generated_contents(case_dir: &Path, files: &[(&str, &[u8])]) -> Result<(), String> {
+    crate::util::generated_pages::record_generated_contents(case_dir, files)
         .map(|_| ())
         .map_err(|err| {
             format!("생성 페이지 신뢰 목록(review/.generated.json)을 기록하지 못했습니다: {err}")
@@ -1854,6 +1885,53 @@ mod report_output_tests {
         let text = path.to_string_lossy().to_string();
         let escaped = serde_json::to_string(&text).unwrap();
         [text, escaped.trim_matches('"').to_string()]
+    }
+
+    /// R6-S1: `case.json` and `db/video_index.json` were embedded into the
+    /// scripts of the review pages and `review/data-bundle.js` as raw text
+    /// (only `<>&` escaped), and the generated-pages list then vouched for
+    /// those files — a crafted case ran script in the workstation origin.
+    /// Now every embedded input is parsed and re-serialized; text that is
+    /// not one JSON value becomes `null`.
+    #[test]
+    fn s1_crafted_case_json_and_index_never_reach_a_script() {
+        let (root, case_dir, _source) = scanned_case("s1-inject");
+        let payload = "globalThis.__ft_pwned=1";
+        fs::write(
+            case_dir.join("case.json"),
+            format!("{{\"case_id\":\"FT-s1\"}};{payload};//"),
+        )
+        .unwrap();
+        let index = case_dir.join("db/video_index.json");
+        let original_index = fs::read_to_string(&index).unwrap();
+        fs::write(&index, format!("{original_index};{payload};0")).unwrap();
+        make_review(&case_dir, false, false).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        for rel in [
+            "review/data-bundle.js",
+            "review/index.html",
+            "reports/case-report.html",
+        ] {
+            let text = fs::read_to_string(case_dir.join(rel)).unwrap();
+            assert!(!text.contains(payload), "{rel} embeds the injected script");
+        }
+        let bundle = fs::read_to_string(case_dir.join("review/data-bundle.js")).unwrap();
+        assert!(bundle.contains("manifest:null"), "{bundle}");
+        assert!(bundle.contains("scan:null"));
+        // A valid file is re-serialized, never copied: the same case.json
+        // with a `</script>` inside a value stays one escaped string.
+        fs::write(
+            case_dir.join("case.json"),
+            r#"{"case_id":"FT-s1","note":"</script><script>alert(1)</script>"}"#,
+        )
+        .unwrap();
+        fs::write(&index, &original_index).unwrap();
+        make_review(&case_dir, false, false).unwrap();
+        let bundle = fs::read_to_string(case_dir.join("review/data-bundle.js")).unwrap();
+        assert!(bundle.contains("\"case_id\":\"FT-s1\""), "{bundle}");
+        assert!(!bundle.contains("</script>"));
+        assert!(!bundle.contains("scan:null"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// I14: the report is replaced through a temp file + rename — a failed

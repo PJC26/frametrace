@@ -411,12 +411,13 @@ pub(crate) fn api_status(state: &SharedState) -> String {
     // runs AFTER the state lock is released. Holding the global lock across
     // those reads stalled every other endpoint for seconds while a carve
     // job was writing (measured: up to 4 s per /api/status poll).
-    let (mut body, case_dir, byte_progress, enrichment_step, recent_clips) = {
+    let (mut body, case_dir, byte_progress, rehash_progress, enrichment_step, recent_clips) = {
         let guard = state_lock(state);
         (
             status_snapshot(&guard),
             guard.case_dir.clone(),
             guard.byte_progress.clone(),
+            guard.rehash_progress,
             guard.enrichment,
             // Cloned here, rendered below: a job's JSON stats its growing
             // output / `.part` and reads the join progress file.
@@ -435,7 +436,17 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         .map(clip_job_json)
         .collect::<Vec<_>>()
         .into();
-    let progress = progress_json(case_dir.as_deref(), byte_progress.as_ref());
+    let progress = match rehash_progress {
+        // R6-S4: an existing raw image is being re-hashed in-process.
+        Some((done, total)) => serde_json::json!({
+            "job_type": "raw-rehash",
+            "done": done,
+            "total": total,
+            "elapsed_secs": 0,
+            "eta_secs": 0,
+        }),
+        None => progress_json(case_dir.as_deref(), byte_progress.as_ref()),
+    };
     // UX-02: which phase-2 step is enriching the partial index. `done` /
     // `total` are the running job's unit progress when the step reports
     // one (files hashed), else the step position within the plan.
