@@ -811,7 +811,11 @@ pub fn make_report(
     // I9: re-verify every audit log the report quotes, so its chain columns
     // state what was checked instead of implying tamper-evidence.
     let audit_chains_json = redact(report_audit_chains_json(case_dir));
-    let manifest_json = redact(manifest_json);
+    let manifest_json = redact(if redact_paths {
+        redact_manifest_host(&manifest_json)
+    } else {
+        manifest_json
+    });
     let index_json = redact(index_json);
     let export_log = redact(export_log);
     let proxy_log = redact(proxy_log);
@@ -882,13 +886,35 @@ pub fn make_report(
             // D13: a v4 record is checked against the evidence hashes and
             // the audit-lane anchors too; older records keep their legacy
             // binding meaning.
-            let check = report::check_signoff(
+            // R5-P2: with --rehash (finalize passes it) the signed target
+            // files are hashed again; the originals reuse this run's
+            // anomaly re-hash instead of being read twice.
+            let live = rehash.then(|| {
+                let reuse: std::collections::BTreeMap<String, report::LiveHash> = anomaly_scan
+                    .checks
+                    .iter()
+                    .map(|check| {
+                        let live = match (check.status, &check.observed) {
+                            ("match" | "mismatch", Some(observed)) => {
+                                report::LiveHash::Hashed(observed.clone())
+                            }
+                            (status, _) => {
+                                report::LiveHash::Unavailable(format!("원본 재해시 결과: {status}"))
+                            }
+                        };
+                        (check.id.clone(), live)
+                    })
+                    .collect();
+                report::rehash_signed_targets(case_dir, &signoff.text, &reuse)
+            });
+            let check = report::check_signoff_with(
                 case_dir,
                 &signoff.text,
                 &signoff_digests,
                 report::SignoffScope::Case,
+                live.as_ref(),
             );
-            let (_, audit_note) = report::signoff_audit_status(case_dir, &signoff.text);
+            let audit_note = report::signoff_audit_record(case_dir, &signoff.text, true).note();
             println!(
                 "검토자: {} (최종화 시 입력된 이름, 신원 미인증) — {}",
                 signoff.examiner,
@@ -915,6 +941,7 @@ pub fn make_report(
                         .iter()
                         .map(|c| redactor.text(c))
                         .collect(),
+                    rehashed: check.rehashed,
                 }
             } else {
                 check
@@ -928,6 +955,26 @@ pub fn make_report(
     record_generated_pages(case_dir, &["reports/case-report.html"])?;
     println!("report written: {}", report_path.display());
     Ok(())
+}
+
+/// R5-P6: a redacted report shows the case host as the same
+/// `<redacted-host:…>` token the redacted custody statement uses (a host
+/// name is not a path, so the path redactor never touched it). A manifest
+/// that does not parse is returned unchanged (the path redactor still
+/// runs over it).
+fn redact_manifest_host(manifest_json: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(manifest_json) else {
+        return manifest_json.to_string();
+    };
+    if let Some(host) = value
+        .get("host")
+        .and_then(|v| v.as_str())
+        .filter(|h| !h.is_empty())
+        .map(crate::redact::host_token)
+    {
+        value["host"] = serde_json::Value::String(host);
+    }
+    value.to_string()
 }
 
 /// The audit logs the case report quotes, by the report's lane name. D1:
@@ -1139,6 +1186,14 @@ fn review_state_warnings(case_dir: &Path) -> Vec<String> {
 pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
     let mut map = serde_json::Map::new();
     for (name, rel) in REPORT_AUDIT_LOGS {
+        if *name == "audio" {
+            // R5-P8: every sound-measurement lane, damaged ones named.
+            map.insert(
+                (*name).to_string(),
+                crate::audio_level::chain_summary_json(case_dir),
+            );
+            continue;
+        }
         let path = case_dir.join(rel);
         let entry = if !path.is_file() {
             serde_json::json!({"path": rel, "status": "absent", "entries": 0})
@@ -1944,6 +1999,33 @@ mod report_output_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// R5-P6: a redacted report shows the host as the custody token, the
+    /// unredacted one as recorded.
+    #[test]
+    fn redacted_report_tokenizes_the_host() {
+        let (root, case_dir, _source) = scanned_case("redact-host");
+        let manifest = case_dir.join("case.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        value["host"] = serde_json::json!("SECRET-LAPTOP");
+        fs::write(&manifest, value.to_string()).unwrap();
+        make_report(&case_dir, false, true, None).unwrap();
+        let html = report_html(&case_dir);
+        assert!(
+            !html.contains("SECRET-LAPTOP"),
+            "redacted report leaks the host"
+        );
+        let token = crate::redact::host_token("SECRET-LAPTOP");
+        assert!(
+            html.contains(&token)
+                || html.contains(&token.replace('<', "\\u003c").replace('>', "\\u003e")),
+            "host token missing"
+        );
+        make_report(&case_dir, false, false, None).unwrap();
+        assert!(report_html(&case_dir).contains("SECRET-LAPTOP"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// I10: without `--signoff`, a leftover pending record is not the
     /// report's sign-off; the report names the promoted record it used.
     #[test]
@@ -2015,6 +2097,7 @@ mod report_output_tests {
             error: None,
             measured_unix: None,
             replayed_unverified: false,
+            chain_unverified: None,
         };
         let log = case_dir.join(crate::audio_level::LOG_REL);
         crate::audit::append_chained_jsonl_keyed(
@@ -2222,8 +2305,42 @@ mod report_output_tests {
         let html = report_html(&case_dir);
         assert!(html.contains("변경되었습니다"));
         assert!(
-            html.contains(&format!("{id}: 대상 파일 SHA-256이 서명 후 바뀜")),
+            html.contains(&format!(
+                "{id}: 케이스 기록의 대상 파일 해시가 서명 후 바뀜"
+            )),
             "target change named"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// R5-P2: with `--rehash` (what finalize runs) the signed original is
+    /// hashed again; bytes replaced behind an unchanged index read
+    /// "changed". Without it the banner says only the case records were
+    /// compared.
+    #[test]
+    fn report_rehash_catches_a_replaced_signed_original() {
+        let (root, case_dir, id) = signed_case("v4-rehash");
+        let html = report_html(&case_dir);
+        assert!(html.contains("다시 해시하지 않음"), "records-only wording");
+        make_report(&case_dir, true, false, None).unwrap();
+        let html = report_html(&case_dir);
+        assert!(
+            html.contains("변경되지 않았습니다"),
+            "unchanged file is current"
+        );
+        assert!(html.contains("다시 해시해"), "rehash stated");
+        fs::write(root.join("src/a.mp4"), b"\0\0\0\x18ftypmp42two").unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        assert!(
+            report_html(&case_dir).contains("변경되지 않았습니다"),
+            "the records alone cannot see the swap"
+        );
+        make_report(&case_dir, true, false, None).unwrap();
+        let html = report_html(&case_dir);
+        assert!(html.contains("변경되었습니다"), "rehash flags it");
+        assert!(
+            html.contains(&format!("{id}: 대상 파일을 다시 해시한 값")),
+            "the changed file is named"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -2322,7 +2439,7 @@ mod report_output_tests {
         assert!(
             failed_subjects(&result)
                 .iter()
-                .any(|f| f.contains(&format!("{id}: 대상 파일 SHA-256"))),
+                .any(|f| f.contains(&format!("{id}: 케이스 기록의 대상 파일 해시"))),
             "{:?}",
             failed_subjects(&result)
         );

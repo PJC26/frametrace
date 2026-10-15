@@ -25,6 +25,15 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+/// R5 contract (U1 ↔ P): the base a viewer sends for a draft it made while
+/// it could not trust its own view (read-only state, `unsafe_base`) — the
+/// wire value `-1`, which the patch-v2 parser maps here. Such a draft is
+/// ALWAYS a conflict, even from the window that wrote the stored revision
+/// (§10.1.2 does not apply), unless its content is identical to the stored
+/// value (§10.1.3: then it changes nothing and is applied at the current
+/// revision). No stored revision ever reaches this value.
+pub const UNSAFE_BASE_REVISION: u64 = u64::MAX;
+
 /// One patch body as the server applies it. `base_revisions = None` is a
 /// legacy (patch-v1 / schema 1·2) body: no conflict check. `Some(map)` is
 /// a v2 body; an id missing from the map has base 0, so a v2 body that
@@ -452,11 +461,15 @@ pub fn patch_review_annotations_v2(
         let (current, last_writer) = read_revision_row(&tx, id)?;
         if let Some(base) = patch.base_revisions {
             let base_revision = base.get(id).copied().unwrap_or(0);
+            // R5: an unsafe base (-1) never matches and is never exempt.
+            let unsafe_base = base_revision == UNSAFE_BASE_REVISION;
             // §10.1.1: any mismatch (older OR newer base) is a conflict,
             // except §10.1.2 — this same window wrote the current revision
             // (its own consecutive edit, also across a deferred queue chain).
-            let same_window = request_client.is_some() && last_writer.as_deref() == request_client;
-            if base_revision != current && !same_window {
+            let same_window = !unsafe_base
+                && request_client.is_some()
+                && last_writer.as_deref() == request_client;
+            if unsafe_base || (base_revision != current && !same_window) {
                 // §10.1.3: content identical to the stored value (a resend
                 // whose response was lost, a re-imported queue body) is
                 // applied at the current revision — no bump, no history.
@@ -1476,6 +1489,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(anonymous.conflicts.len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// R5 (U1 ↔ P contract): a draft sent with base -1 (made while the
+    /// viewer was read-only) always conflicts — even from the window that
+    /// wrote the stored revision, and even for an id the server never
+    /// revised — unless its content equals the stored value (no-op).
+    #[test]
+    fn patch_v2_unsafe_base_always_conflicts_unless_identical() {
+        let dir = case("v2-unsafe-base");
+        let unsafe_base = |id: &str| base(&[(id, UNSAFE_BASE_REVISION)]);
+        let first = v2(
+            &dir,
+            &[mark("reviewed", Some("server"), None)],
+            &[],
+            &[],
+            &base(&[]),
+            "w-a",
+        );
+        assert_eq!(first.applied, vec![("vid_1".to_string(), 1)]);
+        // Same window, different content: still a conflict (no §10.1.2).
+        let same_window = v2(
+            &dir,
+            &[mark("important", Some("read-only draft"), None)],
+            &[],
+            &[],
+            &unsafe_base("vid_1"),
+            "w-a",
+        );
+        assert!(same_window.applied.is_empty(), "{same_window:?}");
+        assert_eq!(same_window.conflicts.len(), 1);
+        assert_eq!(same_window.conflicts[0].server_revision, 1);
+        assert_eq!(
+            load_review_marks(&dir).unwrap()[0].note.as_deref(),
+            Some("server"),
+            "the stored mark is untouched"
+        );
+        // A deletion with an unsafe base never deletes.
+        let delete = [String::from("vid_1")];
+        let gone = v2(&dir, &[], &[], &delete, &unsafe_base("vid_1"), "w-a");
+        assert_eq!(gone.conflicts.len(), 1);
+        assert_eq!(load_review_marks(&dir).unwrap().len(), 1);
+        // An id without any revision row conflicts too (server: none).
+        let mut fresh = mark("reviewed", None, None);
+        fresh.record_id = "vid_7".into();
+        let new_id = v2(&dir, &[fresh], &[], &[], &unsafe_base("vid_7"), "w-a");
+        assert!(new_id.applied.is_empty());
+        assert_eq!(new_id.conflicts[0].server, None);
+        // Identical content is a no-op: applied at the current revision.
+        let identical = v2(
+            &dir,
+            &[mark("reviewed", Some("server"), None)],
+            &[],
+            &[],
+            &unsafe_base("vid_1"),
+            "w-b",
+        );
+        assert_eq!(identical.applied, vec![("vid_1".to_string(), 1)]);
+        assert!(identical.conflicts.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

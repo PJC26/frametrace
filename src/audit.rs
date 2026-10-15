@@ -252,18 +252,35 @@ pub const KNOWN_CHAIN_LANES: &[&str] = &[
     "evidence/logs/validation-log.jsonl",
 ];
 
-/// D16: whether a root-relative (`/`-separated) path is a chained audit
-/// lane by NAME: a [`KNOWN_CHAIN_LANES`] entry, or a `*log.jsonl` /
-/// `*-audit.jsonl` file under `artifacts/` or `evidence/logs/` (the
-/// naming every lane follows).
+/// D16/R5-P10: whether a root-relative (`/`-separated) path is a chained
+/// audit lane: a [`KNOWN_CHAIN_LANES`] entry, or a continuation lane of
+/// the sound-measurement log (`evidence/logs/audio-level-log.<n>.jsonl`,
+/// R5-P8). Never "any `*log.jsonl` under `artifacts/`": a file that merely
+/// ends in `log.jsonl` is not an audit log FrameTrace wrote and must not be
+/// anchored by a sign-off or verified as one.
 pub fn is_known_chain_lane(rel: &str) -> bool {
     let rel = rel.replace('\\', "/");
-    if KNOWN_CHAIN_LANES.contains(&rel.as_str()) {
-        return true;
+    KNOWN_CHAIN_LANES.contains(&rel.as_str()) || audio_level_lane_number(&rel).is_some()
+}
+
+/// R5-P8: the continuation number of a sound-measurement lane —
+/// `Some(0)` for `evidence/logs/audio-level-log.jsonl`, `Some(n)` (n ≥ 1)
+/// for `evidence/logs/audio-level-log.<n>.jsonl`, `None` otherwise. Only
+/// the canonical spelling counts (`.1.`, never `.01.`).
+pub fn audio_level_lane_number(rel: &str) -> Option<u32> {
+    let rest = rel.strip_prefix("evidence/logs/audio-level-log.")?;
+    if rest == "jsonl" {
+        return Some(0);
     }
-    let name = rel.rsplit('/').next().unwrap_or_default();
-    (rel.starts_with("artifacts/") || rel.starts_with("evidence/logs/"))
-        && (name.ends_with("log.jsonl") || name.ends_with("-audit.jsonl"))
+    let digits = rest.strip_suffix(".jsonl")?;
+    if digits.is_empty()
+        || digits.len() > 6
+        || digits.starts_with('0')
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    digits.parse::<u32>().ok()
 }
 
 /// Every chained audit lane present under `root` (a case or package
@@ -488,6 +505,8 @@ pub fn verify_chained_jsonl_text(
     source_name: &str,
     keys: &[AuditKey],
 ) -> Result<AuditChainVerification, String> {
+    let normalized = crate::audit_key::normalize_retired_aliases(keys);
+    let keys = normalized.as_slice();
     let complete_tail = text.is_empty() || text.ends_with('\n');
     // Split on '\n' only: `str::lines` would also swallow a trailing '\r',
     // letting CR bytes be inserted without any hash noticing. Every line,
@@ -523,6 +542,11 @@ pub fn verify_chained_jsonl_text(
     // key signing after either is refused.
     let mut newest_generation: Option<KeyGeneration> = None;
     let mut rotated_away: std::collections::BTreeSet<String> = Default::default();
+    // R5-P7: entries authenticated only by a retired key, not yet followed
+    // in the chain by an entry of a newer key generation. Only such a later
+    // signature (or the rotation marker the new key signs) proves an entry
+    // predates the retirement — entry time fields are never trusted for it.
+    let mut unproven_retired: Vec<(usize, KeyGeneration)> = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -629,14 +653,17 @@ pub fn verify_chained_jsonl_text(
                             "audit line {line_number} HMAC verification failed (key_id \"{key_id}\"): the entry was re-written or signed under a different key"
                         ));
                     }
-                    // D15: a retired key only authenticates entries that
-                    // predate its retirement. The first key that may sign
-                    // this entry wins; when only retired keys match and the
-                    // entry is provably later than their retirement, the
-                    // entry fails like any other forged HMAC.
+                    // D15/R5-P7: a retired key only authenticates entries
+                    // the chain order places before its retirement. The
+                    // first key that may sign this entry wins; when only
+                    // retired keys match and the order shows the entry is
+                    // later, it fails like any other forged HMAC. (Keys are
+                    // normalized by material first, so the same secret
+                    // supplied again under another id or source is still
+                    // the retired key.)
                     let mut refusal = None;
                     for key in &matching {
-                        match retired_key_refusal(key, line, newest_generation, &rotated_away) {
+                        match retired_key_refusal(key, newest_generation, &rotated_away) {
                             None => return Ok(Keyed::Verified(key_generation(key))),
                             Some(reason) => {
                                 refusal.get_or_insert(reason);
@@ -652,6 +679,12 @@ pub fn verify_chained_jsonl_text(
         };
         match verify_line() {
             Ok(Keyed::Verified(generation)) => {
+                // A newer generation's signature chains over (and so
+                // proves the age of) every earlier retired-key entry.
+                unproven_retired.retain(|(_, earlier)| *earlier >= generation);
+                if matches!(generation, KeyGeneration::Retired(_)) {
+                    unproven_retired.push((line_number, generation));
+                }
                 keyed_entries += 1;
                 first_keyed_line.get_or_insert(line_number);
                 last_keyed_line = Some(line_number);
@@ -717,9 +750,24 @@ pub fn verify_chained_jsonl_text(
                 .to_string(),
         );
     }
+    if let Some((first, _)) = unproven_retired.first() {
+        warnings.push(format!(
+            "{} entr{} from audit line {first} on {} signed only by a retired audit key and not followed by any entry of a newer key — the chain cannot show {} written before the key was retired (entry times are not trusted for this), so {} not authenticated; log not graded keyed",
+            unproven_retired.len(),
+            if unproven_retired.len() == 1 { "y" } else { "ies" },
+            if unproven_retired.len() == 1 { "is" } else { "are" },
+            if unproven_retired.len() == 1 { "it was" } else { "they were" },
+            if unproven_retired.len() == 1 { "it is" } else { "they are" },
+        ));
+    }
     // A keyed→unkeyed transition implies keyed_entries < entries, so such
-    // a log can never reach the keyed grade.
-    if keyed_entries == entries && entries > 0 && unauthenticated_keyed == 0 {
+    // a log can never reach the keyed grade; neither can a log whose tail
+    // is signed only by a retired key (R5-P7).
+    if keyed_entries == entries
+        && entries > 0
+        && unauthenticated_keyed == 0
+        && unproven_retired.is_empty()
+    {
         integrity = AuditIntegrity::Keyed;
     }
 
@@ -749,36 +797,6 @@ fn key_generation(key: &AuditKey) -> KeyGeneration {
     }
 }
 
-/// Top-level fields that carry the time an audit entry was written. The
-/// newest present one dates the entry for the retired-key cut-off (device
-/// or file times — `modified_unix` and friends — are deliberately not used).
-const ENTRY_TIME_FIELDS: &[&str] = &[
-    "created_unix",
-    "logged_unix",
-    "measured_unix",
-    "scanned_unix",
-    "validated_unix",
-    "exported_unix",
-    "joined_unix",
-    "recovered_unix",
-    "inspected_unix",
-    "run_unix",
-    "signed_unix",
-    "registered_unix",
-    "recorded_unix",
-    "rotated_unix",
-    "unix",
-];
-
-/// The newest event time an entry carries (see [`ENTRY_TIME_FIELDS`]).
-fn entry_event_unix(line: &str) -> Option<u64> {
-    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    ENTRY_TIME_FIELDS
-        .iter()
-        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_u64))
-        .max()
-}
-
 /// `from` of a `{"kind":"audit-key-rotate","from":"<id>",...}` marker.
 fn rotation_marker_from(line: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
@@ -787,15 +805,16 @@ fn rotation_marker_from(line: &str) -> Option<String> {
         .flatten()
 }
 
-/// Why `key` may not authenticate this entry (D15), or `None` when it may.
-/// Only retired keys are ever refused: after the log recorded the key's
-/// rotation, after a newer key generation already signed an earlier entry
-/// of the same log, or when the entry is dated after the retirement. An
-/// entry with no event time that precedes every newer signature is
-/// accepted — nothing in the log says it is late.
+/// Why `key` may not authenticate an entry (D15, R5-P7), or `None` when it
+/// may. Only retired keys are ever refused, and only by chain ORDER: after
+/// the log recorded the key's rotation marker, or after a newer key
+/// generation already signed an earlier entry of the same log. Entry time
+/// fields are deliberately ignored — they are written by whoever holds the
+/// key, so a forger could back-date them. A retired-key entry that no
+/// newer signature follows is accepted structurally but never graded
+/// keyed (see `unproven_retired` in [`verify_chained_jsonl_text`]).
 fn retired_key_refusal(
     key: &AuditKey,
-    line: &str,
     newest_generation: Option<KeyGeneration>,
     rotated_away: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
@@ -808,17 +827,11 @@ fn retired_key_refusal(
     }
     if newest_generation.is_some_and(|newest| newest > KeyGeneration::Retired(retired)) {
         return Some(format!(
-            "a newer audit key already signed an earlier entry of this log (\"{}\" was retired at unix {retired})",
+            "a newer audit key already signed an earlier entry of this log (\"{}\" is retired)",
             key.id
         ));
     }
-    match entry_event_unix(line) {
-        Some(at) if at > retired => Some(format!(
-            "the entry is dated unix {at}, after \"{}\" was retired at unix {retired}",
-            key.id
-        )),
-        _ => None,
-    }
+    None
 }
 
 /// Hex-decodes a recorded `entry_hmac_sha256` into a fixed-size tag.
@@ -1331,9 +1344,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// D15: a retired key only authenticates entries that predate its
-    /// retirement — dated later, after a newer key signed the log, or after
-    /// the log's own rotation marker, its HMAC is refused.
+    /// D15/R5-P7: a retired key only authenticates entries the chain order
+    /// places before its retirement — after a newer key signed the log, or
+    /// after the log's own rotation marker, its HMAC is refused; a tail it
+    /// alone signed is never graded keyed. Entry times are ignored.
     #[test]
     fn retired_key_cannot_authenticate_entries_after_its_retirement() {
         use super::verify_chained_jsonl_text;
@@ -1352,24 +1366,58 @@ mod tests {
             read_to_string(&path).unwrap()
         };
 
-        // Signed before the retirement: still authentic.
-        let before = log(
-            "before.jsonl",
-            &[(r#"{"kind":"a","created_unix":900}"#, &old)],
+        // R5-P7: order, never time. An entry signed by the retired key and
+        // FOLLOWED by an entry of the newer key is proven to predate the
+        // retirement — whatever time fields it carries.
+        let proven = log(
+            "proven.jsonl",
+            &[
+                (r#"{"kind":"a","created_unix":2000}"#, &old),
+                (r#"{"kind":"b"}"#, &new),
+            ],
         );
-        let verification = verify_chained_jsonl_text(&before, "t", &keys).unwrap();
+        let verification = verify_chained_jsonl_text(&proven, "t", &keys).unwrap();
         assert_eq!(verification.integrity, AuditIntegrity::Keyed);
-
-        // Dated after the retirement: refused.
-        let late = log(
-            "late.jsonl",
-            &[(r#"{"kind":"a","created_unix":2000}"#, &old)],
-        );
-        let err = verify_chained_jsonl_text(&late, "t", &keys).unwrap_err();
-        assert!(err.contains("retired") && err.contains("2000"), "{err}");
+        // A retired-key tail no newer signature follows cannot be shown to
+        // predate the retirement: a back-dated time no longer buys the
+        // keyed grade (it did before R5: `created_unix` 900 < 1000 passed).
+        for (name, body) in [
+            ("backdated.jsonl", r#"{"kind":"a","created_unix":900}"#),
+            ("undated.jsonl", r#"{"kind":"a"}"#),
+            ("late.jsonl", r#"{"kind":"a","created_unix":2000}"#),
+        ] {
+            let tail = log(name, &[(body, &old)]);
+            let verification = verify_chained_jsonl_text(&tail, "t", &keys).unwrap();
+            assert_eq!(
+                verification.integrity,
+                AuditIntegrity::StructuralOnly,
+                "{name}"
+            );
+            assert!(
+                verification
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("retired audit key") && w.contains("line 1")),
+                "{name}: {:?}",
+                verification.warnings
+            );
+        }
         // A verifier that does not know about the retirement still accepts
-        // it (no keyring retirement time = no cut-off).
-        assert!(verify_chained_jsonl_text(&late, "t", std::slice::from_ref(&old)).is_ok());
+        // it as keyed (no keyring retirement = an ordinary key).
+        let late = log("late2.jsonl", &[(r#"{"kind":"a"}"#, &old)]);
+        assert_eq!(
+            verify_chained_jsonl_text(&late, "t", std::slice::from_ref(&old))
+                .unwrap()
+                .integrity,
+            AuditIntegrity::Keyed
+        );
+        // The retired secret supplied again under another id (a
+        // `--key-source` / env alias, not marked retired) is still the
+        // retired key: no keyed grade, and refused after the marker.
+        let alias = test_key("default", 0x61);
+        let aliased = [alias.clone(), old.clone().retired_at(1_000), new.clone()];
+        let verification = verify_chained_jsonl_text(&late, "t", &aliased).unwrap();
+        assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
 
         // Undated, but after the newer key already signed this log.
         let after_new = log(
@@ -1403,6 +1451,11 @@ mod tests {
         assert!(
             err.contains("audit line 3") && err.contains("audit-key-rotate"),
             "{err}"
+        );
+        let err = verify_chained_jsonl_text(&marked, "t", &aliased).unwrap_err();
+        assert!(
+            err.contains("audit line 3") && err.contains("audit-key-rotate"),
+            "alias of the retired key must be refused after the marker: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1464,7 +1517,8 @@ mod tests {
             "evidence/logs/signoff-log.jsonl",
             "evidence/logs/e01-audit.jsonl",
             "artifacts/joined/join-log.jsonl",
-            "artifacts/some/new-lane-log.jsonl",
+            "evidence/logs/audio-level-log.1.jsonl",
+            "evidence/logs/audio-level-log.12.jsonl",
         ] {
             assert!(is_known_chain_lane(rel), "{rel}");
         }
@@ -1474,6 +1528,13 @@ mod tests {
             "marks-pending/conflicts.jsonl",
             "review/signoff.json",
             "evidence/logs/notes.jsonl",
+            // R5-P10: a name that merely ends in log.jsonl is not a lane.
+            "artifacts/some/new-lane-log.jsonl",
+            "artifacts/clips/my-catalog.jsonl",
+            "artifacts/exports/2026/backlog.jsonl",
+            "evidence/logs/user-audit.jsonl",
+            "evidence/logs/audio-level-log.01.jsonl",
+            "evidence/logs/audio-level-log.x.jsonl",
         ] {
             assert!(!is_known_chain_lane(rel), "{rel}");
         }
@@ -1486,6 +1547,7 @@ mod tests {
             "artifacts/carved/carve-log.jsonl",
             "evidence/logs/notes.jsonl",
             "db/progress.jsonl",
+            "artifacts/exports/backlog.jsonl",
         ] {
             fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
             fs::write(dir.join(rel), "{}\n").unwrap();

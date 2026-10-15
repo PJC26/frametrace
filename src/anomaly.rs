@@ -31,6 +31,21 @@ pub struct IndexedRow {
     pub format_name: Option<String>,
     pub video_codec: Option<String>,
     pub ffprobe_ok: Option<bool>,
+    /// R5-P3: the lossless OS path when the record carries
+    /// `source_path_raw_hex` (a non-Unicode name); `None` = `source_path`
+    /// names the file exactly.
+    pub raw_path: Option<std::path::PathBuf>,
+}
+
+impl IndexedRow {
+    /// The file this record names, losslessly (`model::record_os_path`
+    /// rule): every open, stat and hash goes through this, never through
+    /// the lossy display string.
+    pub fn os_path(&self) -> std::path::PathBuf {
+        self.raw_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(&self.source_path))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +69,10 @@ pub struct AnomalyScanResult {
     pub coverage: RehashCoverage,
     /// What of the index the scan did not cover (E8 counted reader).
     pub index: IndexCoverage,
+    /// R5-P2: the per-record re-hash results of a `--rehash` scan (empty
+    /// otherwise), so finalize's sign-off check reuses them instead of
+    /// reading every original twice.
+    pub checks: Vec<HashCheck>,
 }
 
 /// Index lines and records an anomaly scan did not examine (E8): lines
@@ -206,6 +225,7 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         scanned_unix,
         coverage,
         index: index_coverage,
+        checks,
     })
 }
 
@@ -420,7 +440,8 @@ fn hash_revalidation_findings(
             checks.push(check);
             continue;
         };
-        let path = Path::new(&row.source_path);
+        let os_path = row.os_path();
+        let path = os_path.as_path();
         match std::fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -472,7 +493,8 @@ fn index_staleness_findings(rows: &[IndexedRow]) -> Vec<Finding> {
         let Some(indexed) = row.sha256.as_deref() else {
             continue; // no stored hash: nothing to be stale about
         };
-        let path = Path::new(&row.source_path);
+        let os_path = row.os_path();
+        let path = os_path.as_path();
         let Ok(metadata) = std::fs::metadata(path) else {
             out.push(Finding {
                 kind: "index-record-stale",
@@ -542,7 +564,8 @@ fn timestamp_findings(rows: &[IndexedRow]) -> Vec<Finding> {
         let Some(mtime) = usable_mtime(row) else {
             continue;
         };
-        let parent = Path::new(&row.source_path)
+        let parent = row
+            .os_path()
             .parent()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -636,7 +659,8 @@ fn dav_frame_gap_findings(case_dir: &Path, rows: &[IndexedRow]) -> Vec<Finding> 
     let _ = case_dir;
     let mut out = Vec::new();
     for row in rows {
-        let path = Path::new(&row.source_path);
+        let os_path = row.os_path();
+        let path = os_path.as_path();
         if !path.is_file() {
             continue;
         }
@@ -798,6 +822,10 @@ pub fn read_indexed_rows(case_dir: &Path) -> Result<Vec<IndexedRow>, String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
             ffprobe_ok: value.get("ffprobe_ok").and_then(serde_json::Value::as_bool),
+            raw_path: value
+                .get("source_path_raw_hex")
+                .and_then(serde_json::Value::as_str)
+                .and_then(crate::model::path_from_raw_hex),
         })
         .filter(|row| !row.id.is_empty())
         .collect())
@@ -827,6 +855,7 @@ mod tests {
             format_name: None,
             video_codec: None,
             ffprobe_ok: None,
+            raw_path: None,
         }];
         let findings = dav_frame_gap_findings(&dir, &rows);
         assert_eq!(findings.len(), 1);
@@ -850,6 +879,7 @@ mod tests {
             format_name: None,
             video_codec: None,
             ffprobe_ok: None,
+            raw_path: None,
         }];
         assert!(dav_frame_gap_findings(&dir, &steady_rows).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -874,6 +904,7 @@ mod tests {
             format_name: None,
             video_codec: None,
             ffprobe_ok: None,
+            raw_path: None,
         };
         let mut broken = dav_fixture_with_dates(0, 1);
         let second_frame = broken.len() / 2;
@@ -963,6 +994,7 @@ mod tests {
             format_name: None,
             video_codec: None,
             ffprobe_ok: None,
+            raw_path: None,
         }
     }
 
@@ -1044,6 +1076,7 @@ mod tests {
             format_name: None,
             video_codec: None,
             ffprobe_ok: None,
+            raw_path: None,
         };
         let rows = vec![
             row("vid_1", "C:/ev/a.mp4", Some(1_700_000_000)),
@@ -1069,6 +1102,7 @@ mod tests {
                 format_name: None,
                 video_codec: None,
                 ffprobe_ok: None,
+                raw_path: None,
             },
             IndexedRow {
                 id: "vid_2".into(),
@@ -1080,12 +1114,45 @@ mod tests {
                 format_name: None,
                 video_codec: None,
                 ffprobe_ok: None,
+                raw_path: None,
             },
         ];
         let findings = timestamp_findings(&rows);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, "timestamp-regression");
         assert_eq!(findings[0].selector, "vid_2");
+    }
+
+    /// R5-P3: re-hashing opens the record's lossless path. A non-Unicode
+    /// file name (display spelling has U+FFFD) is hashed and matches — it
+    /// is not "missing".
+    #[test]
+    fn rehash_opens_the_lossless_path_of_non_unicode_names() {
+        let dir = std::env::temp_dir().join(format!("frametrace-p3-rehash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let media = dir.join(crate::model::test_non_unicode_name("clip"));
+        if std::fs::write(&media, b"payload").is_err() {
+            eprintln!("skipped: this filesystem refuses non-Unicode names");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let sha = crate::sha256::digest_bytes(b"payload");
+        let row = serde_json::json!({
+            "id": "vid_000001",
+            "source_path": media.to_string_lossy(),
+            "source_path_raw_hex": crate::model::path_raw_hex(&media).unwrap(),
+            "sha256": sha,
+        });
+        std::fs::write(dir.join("db/videos.jsonl"), format!("{row}\n")).unwrap();
+        let rows = read_indexed_rows(&dir).unwrap();
+        let mut coverage = RehashCoverage::default();
+        let mut checks = Vec::new();
+        let findings = hash_revalidation_findings(&rows, &mut coverage, &mut checks);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(checks[0].status, "match", "{checks:?}");
+        assert_eq!(checks[0].observed.as_deref(), Some(sha.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1114,6 +1181,7 @@ mod tests {
             format_name: None,
             video_codec: None,
             ffprobe_ok: None,
+            raw_path: None,
         };
 
         // Recorded metadata still matches: stored hash is treated as current.
@@ -1157,6 +1225,7 @@ mod tests {
             format_name: Some("mov,mp4,m4a,3gp,3g2,mj2".into()),
             video_codec: Some("h264".into()),
             ffprobe_ok: Some(true),
+            raw_path: None,
         }];
         let findings = container_stream_findings(&rows);
         assert_eq!(findings.len(), 1);

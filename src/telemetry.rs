@@ -344,6 +344,16 @@ fn le_i32(b: &[u8], off: usize) -> i32 {
 const CAMM_CASE5_LEN: usize = 4 + 24;
 const CAMM_CASE6_LEN: usize = 4 + 56;
 
+/// R5-P11: a camm position worth a track point — finite, in range, and
+/// not the (0, 0) "null island" a recorder writes before it has a fix.
+fn plausible_fix(lat: f64, lon: f64) -> bool {
+    lat.is_finite()
+        && lon.is_finite()
+        && lat.abs() <= 90.0
+        && lon.abs() <= 180.0
+        && !(lat == 0.0 && lon == 0.0)
+}
+
 /// Parses one camm sample (4-byte header + type-specific payload).
 /// Cases 5 and 6 produce track points; the other spec cases only bump
 /// counters — a packet shorter than the spec size is counted unknown
@@ -358,7 +368,7 @@ fn parse_camm_packet(packet: &[u8], points: &mut PointSink, stats: &mut CammStat
     match ty {
         5 if packet.len() >= CAMM_CASE5_LEN => {
             let (lat, lon, alt) = (le_f64(packet, 4), le_f64(packet, 12), le_f64(packet, 20));
-            if lat.abs() <= 90.0 && lon.abs() <= 180.0 {
+            if plausible_fix(lat, lon) {
                 points.push(TelemetryPoint {
                     lat,
                     lon,
@@ -382,14 +392,13 @@ fn parse_camm_packet(packet: &[u8], points: &mut PointSink, stats: &mut CammStat
                 return;
             }
             let (lat, lon) = (le_f64(packet, 16), le_f64(packet, 24));
-            if lat.abs() > 90.0 || lon.abs() > 180.0 {
+            if !plausible_fix(lat, lon) {
                 stats.unknown_packets += 1;
                 return;
             }
-            let speed_ms = (le_f32(packet, 44).powi(2)
-                + le_f32(packet, 48).powi(2)
-                + le_f32(packet, 52).powi(2))
-            .sqrt();
+            // R5-P11: ground speed is the HORIZONTAL velocity (east, north);
+            // velocity_up (offset 52) is climb rate, not road speed.
+            let speed_ms = (le_f32(packet, 44).powi(2) + le_f32(packet, 48).powi(2)).sqrt();
             let gps_seconds = le_f64(packet, 4);
             points.push(TelemetryPoint {
                 lat,
@@ -820,6 +829,43 @@ mod tests {
         assert_eq!(p.alt_m, Some(25.0));
         assert!((p.speed_kmh.unwrap() - 18.0).abs() < 0.01);
         assert!((p.ts_unix.unwrap() - (1_400_000_000.0 + 315_964_800.0)).abs() < 1.0);
+    }
+
+    /// R5-P11: speed is horizontal (a 3 m/s climb adds nothing), and a
+    /// (0, 0) or non-finite position is no track point.
+    #[test]
+    fn camm_speed_is_horizontal_and_null_island_is_dropped() {
+        let mut points = PointSink::default();
+        let mut stats = CammStats {
+            packets: 0,
+            gps_points: 0,
+            gps_no_fix: 0,
+            imu_packets: 0,
+            unknown_packets: 0,
+        };
+        let climbing = camm_case6(1_400_000_000.0, 3, 37.5, 127.0, 25.0, 3.0, 4.0, 12.0);
+        parse_camm_packet(&climbing, &mut points, &mut stats);
+        assert_eq!(points.points.len(), 1);
+        assert!(
+            (points.points[0].speed_kmh.unwrap() - 18.0).abs() < 0.01,
+            "{:?}",
+            points.points[0].speed_kmh
+        );
+        for (lat, lon) in [(0.0, 0.0), (f64::NAN, 127.0), (37.5, f64::INFINITY)] {
+            parse_camm_packet(
+                &camm_case6(1_400_000_000.0, 3, lat, lon, 0.0, 1.0, 1.0, 0.0),
+                &mut points,
+                &mut stats,
+            );
+        }
+        let mut case5 = vec![0u8, 0, 5, 0];
+        case5.extend_from_slice(&0.0f64.to_le_bytes());
+        case5.extend_from_slice(&0.0f64.to_le_bytes());
+        case5.extend_from_slice(&10.0f64.to_le_bytes());
+        parse_camm_packet(&case5, &mut points, &mut stats);
+        assert_eq!(points.points.len(), 1, "no (0,0)/non-finite points");
+        assert_eq!(stats.unknown_packets, 4);
+        assert_eq!(stats.gps_points, 1);
     }
 
     #[test]
