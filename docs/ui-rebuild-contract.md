@@ -772,3 +772,7 @@ const FTStore = {
 ### 15.5 알림 언어·Tab (U6/U7)
 - 알림 행의 모든 문구(충돌 배너·버튼, 대기 파일·목록 일부·구버전 서버·이전 구간·다른 주소 드래프트·읽기 전용·케이스 파일 알림)는 `i18nText(el, key, subs)`(20-i18n.js: `data-i18n` + `data-i18n-args` JSON)로 넣고 `applyChromeI18n()`이 언어 전환 때 다시 그린다. 열린 충돌 목록은 언어 전환 때 다시 만든다. verify-player-keys R8 U6.
 - `.ft-notices`는 `role=region` + `aria-label`을 늘 갖지만 `tabindex=0`은 **넘칠 때만**(MutationObserver·ResizeObserver, 마운트 신호로 해제). 넘치지 않게 되면 tabindex를 지우고, 그때 포커스가 행에 있었으면 뷰어 활성 카드로. verify-player-keys R8 U7.
+
+### 15.6 신뢰 표시 (트랙 I P0/P1/P2 ↔ U)
+- 소리 수준(`audioLevels`): `"sc": true`(감사 키 없는 PC의 측정) — 수준은 보이되 툴팁·상세에 "자기 일관성만(인증 아님)"(i18n `audio.selfConsistent`). `r: "unverified"`에 `"pc": "<key id>"` — 미확인 그대로, "키 <id> 보유 PC에서 확인"(`audio.otherPc`). 30-records `audioInfoFor`/`audioTrustNote`. verify-review-batch --unit "R8 (I <-> U)".
+- `/api/verify-audit`(41-finalize `auditVerdict`, 환경 배지 `#auditBadge`·결과물 시트 감사 로그 줄): 초록(`ok`)은 `integrity-keyed`일 때만. `integrity-structural-only` = "감사 로그 자기 일관성만 확인(인증 아님)", `integrity-not-verified` = "감사 로그 이 PC에서 인증 불가 — 키 <other_pc_key_ids> 보유 PC에서 확인" — 둘 다 호박색(`warn`). 로그별 `trust` 사유는 툴팁. 검증 실패 = `bad`. verify-finalize-sheet 1·2.

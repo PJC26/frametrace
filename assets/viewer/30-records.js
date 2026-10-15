@@ -533,12 +533,18 @@ function audioInfoFor(record) {
   const hasTrack = !!codec && codec !== "none" && codec !== "-";
   const level = Object.prototype.hasOwnProperty.call(audioLevels, record.id) ? audioLevels[record.id] : null;
   const r = level && typeof level === "object" ? String(level.r || "") : "";
-  if (r === "sound" || r === "silent") return { state: r, level, reason: "" };
+  // R8 (track I P1/P2): `sc: true` = measured on a PC without audit keys —
+  // the level is shown, labelled "자기 일관성만(인증 아님)"; `pc: "<key id>"`
+  // on an unverified line = authenticated by another PC's key — 미확인 here,
+  // "키 <id> 보유 PC에서 확인".
+  const trust = level && typeof level === "object" && level.sc === true ? "sc" : "";
+  const pcKey = level && typeof level === "object" && level.pc != null && String(level.pc) ? String(level.pc) : "";
+  if (r === "sound" || r === "silent") return { state: r, level, reason: "", trust, pcKey: "" };
   // R4 D1/D2: "unverified" (the measurement log failed its chain check) and
   // "replayed" (a checkpoint result recorded without re-measuring) are never
   // sound/silent — the track reads 미확인 with the reason.
-  if (hasTrack) return { state: "track", level: null, reason: ["error", "stale", "unverified", "replayed"].includes(r) ? r : audioLevelsError ? "unread" : "" };
-  if (r === "unverified" || r === "replayed") return { state: "unknown", level: null, reason: r };
+  if (hasTrack) return { state: "track", level: null, reason: ["error", "stale", "unverified", "replayed"].includes(r) ? r : audioLevelsError ? "unread" : "", trust: "", pcKey: r === "unverified" ? pcKey : "" };
+  if (r === "unverified" || r === "replayed") return { state: "unknown", level: null, reason: r, trust: "", pcKey: r === "unverified" ? pcKey : "" };
   if (record.probeOk === true) return { state: "none", level: null, reason: "" };
   return { state: "unknown", level: null, reason: "" };
 }
@@ -555,7 +561,17 @@ function fmtDb(value, digits) {
   const text = Math.abs(v).toFixed(digits);
   return (v < 0 && Number(text) !== 0 ? "−" : "") + text;
 }
+// R8: the trust note of a sound shown (sc) / not shown (another PC's key).
+function audioTrustNote(record) {
+  if (record.audioTrust === "sc" && (record.audioState === "sound" || record.audioState === "silent")) return " · " + t("audio.selfConsistent");
+  if (record.audioPcKey) return " — " + tf("audio.otherPc", { key: record.audioPcKey });
+  return "";
+}
 function audioTipFor(record) {
+  const text = audioTipBase(record);
+  return text ? text + audioTrustNote(record) : text;
+}
+function audioTipBase(record) {
   const level = record.audioLevel || {};
   switch (record.audioState) {
     case "sound": return tf("audio.tip.sound", { max: fmtDb(level.max, 0) });
@@ -566,6 +582,9 @@ function audioTipFor(record) {
   }
 }
 function audioDetailFor(record) {
+  return audioDetailBase(record) + audioTrustNote(record);
+}
+function audioDetailBase(record) {
   const level = record.audioLevel || {};
   const codec = record.audioCodec ? ` (${record.audioCodec})` : "";
   switch (record.audioState) {
@@ -766,6 +785,8 @@ records.forEach(record => {
   record.audioState = audio.state;
   record.audioLevel = audio.level;
   record.audioReason = audio.reason;
+  record.audioTrust = audio.trust || "";
+  record.audioPcKey = audio.pcKey || "";
   record.audioFacet = audioFacetOf(audio.state);
   record.prefix = prefixFor(record);
   record.recType = recTypeFor(record);

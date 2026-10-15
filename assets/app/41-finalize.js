@@ -252,15 +252,32 @@ async function finAttribute() {
   }
 }
 
+// R8 (track I P0/P1/P2 ↔ U): one reading of POST /api/verify-audit for the
+// env badge and the finalize sheet. Green ("ok") ONLY when every lane is
+// authenticated here (integrity-keyed); a keyless PC (structural-only) is
+// "자기 일관성만 확인(인증 아님)", lines this PC cannot authenticate are
+// "이 PC에서 인증 불가" naming the PCs' key ids to check on — both amber
+// ("warn"), never green; a failed chain is "bad".
+//   -> { level: "ok"|"warn"|"bad", text, title }
+function auditVerdict(res) {
+  if (!res || !res.ok) return { level: "bad", text: "감사 로그 검증 실패", title: (res && (res.error || "")) || "" };
+  const logs = Array.isArray(res.logs) ? res.logs : [];
+  const count = `(${res.verified}개 로그, ${res.entries}항목)`;
+  const others = [...new Set(logs.flatMap(l => Array.isArray(l.other_pc_key_ids) ? l.other_pc_key_ids : []).map(String))];
+  const title = logs.map(l => `${l.name}: ${l.integrity}, ${l.entries}항목${l.trust ? " — " + l.trust : ""}`).join("\n");
+  if (res.integrity === "integrity-keyed") return { level: "ok", text: `감사 로그 인증됨 ${count}`, title };
+  if (res.integrity === "integrity-not-verified") {
+    const where = others.length ? ` — 키 ${others.slice(0, 3).join(", ")}${others.length > 3 ? " 외" : ""} 보유 PC에서 확인` : "";
+    return { level: "warn", text: `감사 로그 이 PC에서 인증 불가${where} ${count}`, title };
+  }
+  if (res.integrity === "integrity-structural-only") return { level: "warn", text: `감사 로그 자기 일관성만 확인(인증 아님) ${count}`, title };
+  return { level: "warn", text: `감사 로그 상태 확인 불가 ${count}`, title: title || String(res.integrity || "") };
+}
 async function finRunAudit() {
   try {
-    const res = await jpost("/api/verify-audit", {});
-    if (!res.ok) { FIN.audit = { level: "warn", text: "감사 로그 검증에 실패했습니다", title: res.error || "" }; return; }
-    const keyed = res.integrity === "integrity-keyed";
-    FIN.audit = {
-      level: "ok", text: `감사 로그 ${keyed ? "키 서명 검증됨" : "구조 검증됨"} (${res.verified}개 로그, ${res.entries}항목)`,
-      title: (res.logs || []).map(l => `${l.name}: ${l.integrity}, ${l.entries}항목`).join("\n"),
-    };
+    // R8: green only when authenticated here (auditVerdict above).
+    const v = auditVerdict(await jpost("/api/verify-audit", {}));
+    FIN.audit = { level: v.level === "ok" ? "ok" : "warn", text: v.level === "bad" ? "감사 로그 검증에 실패했습니다" : v.text, title: v.title };
   } catch (e) { FIN.audit = { level: "warn", text: "감사 로그 검증 불가", title: String((e && e.message) || e) }; }
 }
 

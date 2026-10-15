@@ -918,6 +918,29 @@ async function r8TrackU({ fn, source, runInNewContext, assert }) {
   const dflt = await run(vm, 'viewerSave()');
   assert.ok(dflt.out === false && dflt.ms >= defaultMs - 100 && dflt.ms <= 4100, 'R8 U2: save() with no budget answers within 4 s while a request hangs: ' + JSON.stringify(dflt));
   console.log('PASS VM R8 U2 patient save follows progress, stalls time out, hard budgets stay hard, save() <= 4 s');
+
+  // Track I (R8 P1/P2) <-> U: a level measured on a keyless PC (`sc: true`)
+  // is shown but says "자기 일관성만(인증 아님)"; an unverified line signed by
+  // another PC's key (`pc`) stays 미확인 and names that key.
+  const i18nKo = { 'audio.selfConsistent': '자기 일관성만(인증 아님)', 'audio.otherPc': '키 {key} 보유 PC에서 확인' };
+  const au = {
+    audioLevels: {
+      s1: { r: 'sound', max: -12, mean: -30, sc: true }, s2: { r: 'sound', max: -12, mean: -30 },
+      u1: { r: 'unverified', pc: 'pc-b' }, u2: { r: 'unverified' },
+    },
+    audioLevelsError: '',
+    t: (k) => i18nKo[k] || k,
+    tf: (k, subs) => Object.entries(subs || {}).reduce((x, [n, v]) => x.split('{' + n + '}').join(String(v)), i18nKo[k] || k),
+  };
+  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map(fn).join('\n') +
+    '\nthis.view = (id) => { const r = { id, audioCodec: "aac", probeOk: true }; const a = audioInfoFor(r); Object.assign(r, { audioState: a.state, audioLevel: a.level, audioReason: a.reason, audioTrust: a.trust || "", audioPcKey: a.pcKey || "" }); return { state: a.state, tip: audioTipFor(r), detail: audioDetailFor(r) }; };', au);
+  const v = (id) => runInNewContext(`view(${JSON.stringify(id)})`, au);
+  const s1 = v('s1'), s2 = v('s2'), u1 = v('u1'), u2 = v('u2');
+  assert.ok(s1.state === 'sound' && /자기 일관성만\(인증 아님\)/.test(s1.tip) && /자기 일관성만\(인증 아님\)/.test(s1.detail), 'R8: sc level shown with the self-consistency note: ' + JSON.stringify(s1));
+  assert.ok(s2.state === 'sound' && !/자기 일관성/.test(s2.tip + s2.detail), 'R8: an authenticated level has no note: ' + JSON.stringify(s2));
+  assert.ok(u1.state === 'track' && /키 pc-b 보유 PC에서 확인/.test(u1.tip) && /키 pc-b 보유 PC에서 확인/.test(u1.detail), 'R8: another PC\'s line stays 미확인 and names its key: ' + JSON.stringify(u1));
+  assert.ok(u2.state === 'track' && !/보유 PC/.test(u2.tip), 'R8: a plain unverified line names no key: ' + JSON.stringify(u2));
+  console.log('PASS VM R8 (I <-> U) audio levels: sc = self-consistency only, pc = check on the PC holding that key');
 }
 
 // ---- R6 track U (docs/PLAN_R6_2026-10-15.md) ------------------------------

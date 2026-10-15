@@ -69,16 +69,16 @@ function fmtClock(secs) {
 // handler below read them before 40-finalize.js loads.
 let finalizing = false;
 let auditVerified = false;
+// auditVerdict (R8, the one reading of /api/verify-audit) lives in
+// 41-finalize.js — called at run time, after every part loaded.
 async function verifyAudit() {
   const badge = $("auditBadge");
   if (!badge) return;
   try {
-    const res = await jpost("/api/verify-audit", {});
-    if (!res.ok) { badge.className = "badge bad"; badge.textContent = "감사 로그 검증 실패"; if (typeof syncToolsBtn === "function") syncToolsBtn(); return; }
-    const keyed = res.integrity === "integrity-keyed";
-    badge.className = "badge ok";
-    badge.textContent = `감사 로그 ${keyed ? "키 서명 검증됨" : "구조 검증됨"} (${res.verified}개 로그, ${res.entries}항목)`;
-    badge.title = (res.logs || []).map(l => `${l.name}: ${l.integrity}, ${l.entries}항목`).join("\n");
+    const v = auditVerdict(await jpost("/api/verify-audit", {}));
+    badge.className = "badge " + v.level;
+    badge.textContent = v.text;
+    badge.title = v.title;
   } catch (e) { badge.className = "badge bad"; badge.textContent = "감사 로그 검증 불가"; }
   if (typeof syncToolsBtn === "function") syncToolsBtn();
 }
