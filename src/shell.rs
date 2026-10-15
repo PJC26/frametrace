@@ -883,17 +883,30 @@ const CLOSE_FLUSH_WAIT: Duration = Duration::from_secs(5);
 /// Timer id of the flush wait.
 const FLUSH_TIMER_ID: usize = 0xF7_15;
 
-/// Runs in the page: awaits `FTViewer.save()` (which resolves once every
-/// pending edit is saved or durably queued — A15) and posts the result
-/// back. Never throws; a page without a viewer reports a clean save.
+/// Runs in the page and posts the result back. R6 (contract S↔U4): the
+/// page's own close flush `hBeforeClose()` is preferred — it knows the
+/// read-only and timed-out cases and returns `{ok, pending, message,
+/// warning}` (the read-only close warning used to be lost because the
+/// shell called `FTViewer.save()` directly); `FTViewer.save()` (resolves
+/// once every pending edit is saved or durably queued — A15) remains the
+/// fallback for a page without it. Never throws; a page without a viewer
+/// reports a clean save.
 const FLUSH_SCRIPT: &str = r#"(async () => {
-  const r = { ft_close_save: 1, ok: true, pending: 0 };
+  const r = { ft_close_save: 1, ok: true, pending: 0, message: "", warning: "" };
   try {
-    const v = window.FTViewer;
-    if (v && typeof v.save === "function") {
-      r.ok = (await v.save()) !== false;
-      const s = typeof v.summary === "function" ? v.summary() : null;
-      r.pending = (s && Number(s.pending)) || 0;
+    if (typeof window.hBeforeClose === "function") {
+      const h = (await window.hBeforeClose(4500)) || {};
+      r.ok = h.ok !== false;
+      r.pending = Number(h.pending) || 0;
+      r.message = String(h.message || "");
+      r.warning = String(h.warning || "");
+    } else {
+      const v = window.FTViewer;
+      if (v && typeof v.save === "function") {
+        r.ok = (await v.save()) !== false;
+        const s = typeof v.summary === "function" ? v.summary() : null;
+        r.pending = (s && Number(s.pending)) || 0;
+      }
     }
   } catch (e) {
     r.ok = false;
@@ -936,11 +949,60 @@ pub(crate) fn page_may_host_viewer(url: &str) -> bool {
         && (path.ends_with(".html") || path.ends_with(".htm")))
 }
 
-/// What the page reported after `FTViewer.save()`.
-#[derive(Debug, Clone, PartialEq)]
+/// What the page reported after its close flush.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SaveReport {
     pub(crate) ok: bool,
     pub(crate) pending: u64,
+    /// R6: the page's own reason when not ok (`hBeforeClose().message`).
+    pub(crate) message: String,
+    /// R6: a note for a clean close (`hBeforeClose().warning`, e.g. the
+    /// viewer was read-only).
+    pub(crate) warning: String,
+}
+
+/// Longest page-supplied text the shell shows (characters).
+const PAGE_TEXT_MAX_CHARS: usize = 300;
+
+fn page_text(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(|text| {
+            text.chars()
+                .filter(|c| !c.is_control() || *c == '\n')
+                .take(PAGE_TEXT_MAX_CHARS)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// R6 (pure): the close question for `verdict`, quoting the page's own
+/// reason when it gave one.
+pub(crate) fn close_question_text(verdict: &FlushVerdict, outcome: &FlushOutcome) -> String {
+    let reason = match outcome {
+        FlushOutcome::Report(report) if !report.message.is_empty() => Some(report.message.clone()),
+        _ => None,
+    };
+    match (verdict, reason) {
+        (_, Some(reason)) => format!(
+            "{reason}.\n지금 종료하면 저장되지 않은 편집을 잃을 수 있습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 확인"
+        ),
+        (FlushVerdict::Unsaved(count), None) => format!(
+            "저장 안 된 편집 {count}건이 있습니다.\n지금 종료하면 이 편집은 저장되지 않습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 저장"
+        ),
+        _ => "편집 저장을 확인하지 못했습니다 (5초 안에 응답 없음).\n저장 안 된 편집이 있을 수 있습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 확인".to_string(),
+    }
+}
+
+/// R6 (pure): the note shown before a CLEAN close, when the page gave one
+/// (the read-only viewer's warning).
+pub(crate) fn close_notice_text(outcome: &FlushOutcome) -> Option<String> {
+    match outcome {
+        FlushOutcome::Report(report) if !report.warning.is_empty() => Some(report.warning.clone()),
+        _ => None,
+    }
 }
 
 /// Parses a web message posted by [`FLUSH_SCRIPT`] (None for any other
@@ -965,6 +1027,8 @@ pub(crate) fn parse_save_report(message: &str) -> Option<SaveReport> {
             .filter(|n| n.is_finite() && *n > 0.0)
             .map(|n| n as u64)
             .unwrap_or(0),
+        message: page_text(value.get("message")),
+        warning: page_text(value.get("warning")),
     })
 }
 
@@ -1117,14 +1181,32 @@ unsafe fn install_web_message_handler(webview: &ICoreWebView2, hwnd: HWND) -> Re
 }
 
 /// Asked when the viewer still holds unsaved edits (C15 / A15).
-fn confirm_unsaved_dialog(hwnd: HWND, verdict: FlushVerdict) -> bool {
-    let text = match verdict {
-        FlushVerdict::Unsaved(count) => format!(
-            "저장 안 된 편집 {count}건이 있습니다.\n지금 종료하면 이 편집은 저장되지 않습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 저장"
-        ),
-        _ => "편집 저장을 확인하지 못했습니다 (5초 안에 응답 없음).\n저장 안 된 편집이 있을 수 있습니다. 그래도 종료할까요?\n\n예: 종료    아니요: 돌아가서 확인".to_string(),
-    };
-    confirm_dialog(hwnd, &text)
+fn confirm_unsaved_dialog(hwnd: HWND, verdict: FlushVerdict, outcome: &FlushOutcome) -> bool {
+    confirm_dialog(hwnd, &close_question_text(&verdict, outcome))
+}
+
+/// R6: an information box (OK only) before a clean close. Smoke mode
+/// has nobody to read it: printed instead.
+fn notice_dialog(hwnd: HWND, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+    if smoke_mode() {
+        eprintln!(
+            "frametrace-shell: close notice: {}",
+            text.replace('\n', " ")
+        );
+        return;
+    }
+    let text = HSTRING::from(text);
+    let caption = HSTRING::from("FrameTrace");
+    // SAFETY: live null-terminated UTF-16 strings; modal to our own window.
+    unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR::from_raw(text.as_ptr()),
+            PCWSTR::from_raw(caption.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1815,9 +1897,11 @@ unsafe extern "system" fn frame_window_proc(
             if verdict != FlushVerdict::Clean {
                 if smoke_mode() {
                     smoke_fail(format!("viewer flush before close: {outcome:?}"));
-                } else if !confirm_unsaved_dialog(hwnd, verdict) {
+                } else if !confirm_unsaved_dialog(hwnd, verdict, &outcome) {
                     return LRESULT(0);
                 }
+            } else if let Some(notice) = close_notice_text(&outcome) {
+                notice_dialog(hwnd, &notice);
             }
             let port = OWNED_PORT.load(Ordering::SeqCst);
             // A foreign (attached) server is not shut down on close, so
@@ -1925,19 +2009,27 @@ mod tests {
             parse_save_report(r#"{"ft_close_save":1,"ok":true,"pending":0}"#),
             Some(SaveReport {
                 ok: true,
-                pending: 0
+                pending: 0,
+                ..SaveReport::default()
             })
         );
         assert_eq!(
             parse_save_report(r#"{"ft_close_save":1,"ok":false,"pending":3}"#),
             Some(SaveReport {
                 ok: false,
-                pending: 3
+                pending: 3,
+                ..SaveReport::default()
             })
         );
         assert_eq!(parse_save_report(r#"{"ok":true}"#), None, "foreign message");
         assert_eq!(parse_save_report("not json"), None);
-        let report = |ok, pending| FlushOutcome::Report(SaveReport { ok, pending });
+        let report = |ok, pending| {
+            FlushOutcome::Report(SaveReport {
+                ok,
+                pending,
+                ..SaveReport::default()
+            })
+        };
         let cases = [
             (FlushOutcome::NoViewer, FlushVerdict::Clean),
             (report(true, 0), FlushVerdict::Clean),
@@ -1953,6 +2045,58 @@ mod tests {
         assert_eq!(super::CLOSE_FLUSH_WAIT, Duration::from_secs(5));
         assert!(super::FLUSH_SCRIPT.contains("FTViewer"));
         assert!(super::FLUSH_SCRIPT.contains("save()"));
+    }
+
+    /// R6 (contract S↔U4): the shell's close flush asks the page's own
+    /// `hBeforeClose()` first and carries its reason and its read-only
+    /// warning to the close dialogs. Before, it called `FTViewer.save()`
+    /// directly: a read-only viewer's "nothing unsaved, but read-only"
+    /// warning never reached the examiner, and the question was generic.
+    #[test]
+    fn close_flush_prefers_hbeforeclose_and_keeps_its_texts() {
+        use super::{
+            FLUSH_SCRIPT, FlushOutcome, FlushVerdict, close_notice_text, close_question_text,
+            flush_verdict, parse_save_report,
+        };
+        let prefer = FLUSH_SCRIPT
+            .find("hBeforeClose")
+            .expect("asks hBeforeClose");
+        let fallback = FLUSH_SCRIPT
+            .find("v.save()")
+            .expect("FTViewer.save fallback");
+        assert!(prefer < fallback, "hBeforeClose comes first");
+        let readonly = parse_save_report(
+            r#"{"ft_close_save":1,"ok":true,"pending":0,"message":"","warning":"판독 기록을 읽지 못한 상태였습니다"}"#,
+        )
+        .unwrap();
+        let outcome = FlushOutcome::Report(readonly);
+        assert_eq!(flush_verdict(&outcome), FlushVerdict::Clean);
+        assert_eq!(
+            close_notice_text(&outcome).as_deref(),
+            Some("판독 기록을 읽지 못한 상태였습니다")
+        );
+        let blocked = parse_save_report(
+            r#"{"ft_close_save":1,"ok":false,"pending":0,"message":"판독 기록을 읽지 못해 저장이 막혀 있습니다\u0007"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            blocked.message,
+            "판독 기록을 읽지 못해 저장이 막혀 있습니다"
+        );
+        let outcome = FlushOutcome::Report(blocked);
+        let verdict = flush_verdict(&outcome);
+        assert_eq!(verdict, FlushVerdict::Unknown);
+        let text = close_question_text(&verdict, &outcome);
+        assert!(
+            text.starts_with("판독 기록을 읽지 못해 저장이 막혀 있습니다."),
+            "{text}"
+        );
+        assert!(close_notice_text(&outcome).is_none());
+        // Without a page reason the old texts stay.
+        assert!(
+            close_question_text(&FlushVerdict::Unsaved(2), &FlushOutcome::TimedOut)
+                .contains("저장 안 된 편집 2건")
+        );
     }
 
     /// C9: session end (restart / shutdown / logoff) is blocked while work

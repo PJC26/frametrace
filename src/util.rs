@@ -781,11 +781,49 @@ pub fn sanitize_filename(input: &str) -> String {
     out
 }
 
+/// The literal a generated page embeds in a `<script>` block for the JSON
+/// text `input`.
+///
+/// R6-S1: `input` must be ONE JSON value. It is parsed and re-serialized
+/// (key order is kept — serde_json `preserve_order`), so whatever reaches
+/// the script is data and nothing else. Before, the text was only escaped
+/// for `<`/`>`/`&` and embedded verbatim: a crafted `case.json` such as
+/// `{"case_id":"x"};fetch(…);//` ran in the workstation origin from a
+/// page the generated-pages list vouches for. Input that is not exactly
+/// one JSON value becomes `null` (callers that read files say so — see
+/// [`script_json_input`]).
 pub fn json_for_script(input: &str) -> String {
-    input
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(value) => script_json_value(&value),
+        Err(_) => "null".to_string(),
+    }
+}
+
+/// [`json_for_script`] for an already parsed value: compact JSON with
+/// `<`, `>`, `&` and the JS line terminators U+2028/U+2029 escaped (they
+/// can only occur inside strings, where `\uXXXX` means the same).
+pub fn script_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "null".to_string())
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// R6-S1: validates an input file's text (`label` names it) before a
+/// generator embeds it: `Ok(compact JSON)` when it is exactly one JSON
+/// value, else `Err(warning)` — the caller embeds `null` and prints the
+/// warning (never a silent blank page).
+pub fn script_json_input(label: &str, text: &str) -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .map(|value| value.to_string())
+        .map_err(|err| {
+            format!(
+                "{label}이(가) 올바른 JSON이 아니어서 페이지에 넣지 않았습니다 (null로 대체) / {label} is not valid JSON and was embedded as null: {err}"
+            )
+        })
 }
 
 pub fn path_to_file_url(path: &Path) -> String {
@@ -1023,20 +1061,44 @@ pub mod generated_pages {
     /// not verify under this user's key is replaced, never extended — its
     /// hashes were never trusted.
     pub fn record_generated_pages(case_dir: &Path, rels: &[&str]) -> Result<usize, String> {
+        let hashes: Vec<String> = rels
+            .iter()
+            .map(|rel| case_dir.join(rel))
+            .filter(|path| path.is_file())
+            .filter_map(|path| file_sha256(&path))
+            .collect();
+        record_hashes(case_dir, hashes)
+    }
+
+    /// R6-S7: records the generator's OWN bytes — `(case-relative path,
+    /// content it wrote)` — so what is vouched for is exactly what the
+    /// generator produced. Hashing the file on disk afterwards vouched for
+    /// whatever another process had swapped in between write and record.
+    pub fn record_generated_contents(
+        case_dir: &Path,
+        files: &[(&str, &[u8])],
+    ) -> Result<usize, String> {
+        use sha2::Digest;
+        let hashes: Vec<String> = files
+            .iter()
+            .map(|(_, bytes)| {
+                sha2::Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect()
+            })
+            .collect();
+        record_hashes(case_dir, hashes)
+    }
+
+    fn record_hashes(case_dir: &Path, new_hashes: Vec<String>) -> Result<usize, String> {
         let key = key(true).ok_or_else(|| {
             "생성 페이지 키를 만들 수 없습니다 (설정 폴더 확인) / generated-page key unavailable"
                 .to_string()
         })?;
         let mut hashes = read_verified(case_dir, &key);
         let mut recorded = 0usize;
-        for rel in rels {
-            let path = case_dir.join(rel);
-            if !path.is_file() {
-                continue;
-            }
-            let Some(hash) = file_sha256(&path) else {
-                continue;
-            };
+        for hash in new_hashes {
             hashes.retain(|known| *known != hash);
             hashes.push(hash);
             recorded += 1;
@@ -1286,6 +1348,24 @@ mod tests {
         csv_safe_cell, run_with_timeout, sanitize_filename, unique_dir, unique_path,
         write_text_atomic,
     };
+
+    /// R6-S1: only one JSON value ever reaches a generated script; text
+    /// around it (or anything that is not JSON) becomes `null`, and
+    /// string content cannot close the script element.
+    #[test]
+    fn json_for_script_embeds_json_values_only() {
+        use super::{json_for_script, script_json_input};
+        assert_eq!(json_for_script(r#"{"a":1}"#), r#"{"a":1}"#);
+        assert_eq!(json_for_script(r#"{"a":1};alert(1)//"#), "null");
+        assert_eq!(json_for_script("1,alert(1)"), "null");
+        assert_eq!(json_for_script(""), "null");
+        assert_eq!(
+            json_for_script("{\"z\":1,\"a\":\"</script>&\u{2028}\"}"),
+            "{\"z\":1,\"a\":\"\\u003c/script\\u003e\\u0026\\u2028\"}"
+        );
+        assert!(script_json_input("case.json", "{} x").is_err());
+        assert_eq!(script_json_input("case.json", " [1, 2] ").unwrap(), "[1,2]");
+    }
 
     /// R5 (P3): a non-Unicode name keeps its exact UTF-16 units when the
     /// verbatim prefix is removed (before: `to_string_lossy` turned the

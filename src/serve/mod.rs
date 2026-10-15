@@ -53,6 +53,8 @@ mod tests_r4_server;
 #[cfg(test)]
 mod tests_r5_server;
 #[cfg(test)]
+mod tests_r6_server;
+#[cfg(test)]
 mod tests_recent;
 #[cfg(test)]
 mod tests_review3;
@@ -1018,7 +1020,15 @@ pub(crate) fn try_open_in_browser(url: &str) -> Result<(), String> {
         // a 0700 folder) redirect page instead; the page is deleted once
         // the code has expired.
         let target = if url.contains("?launch=") {
-            match write_launcher_file(&launcher_dir(), url) {
+            // R6-S3: without a home folder there is no user-private place
+            // a sandboxed browser can read (the temp folder is shared):
+            // no launch page — the examiner opens the printed URL.
+            let Some(dir) = launcher_dir() else {
+                return Err(format!(
+                    "no home folder (HOME) for a private launch page; open {url} manually"
+                ));
+            };
+            match write_launcher_file(&dir, url) {
                 Ok(path) => {
                     schedule_launcher_removal(path.clone());
                     path.into_os_string()
@@ -1052,16 +1062,21 @@ pub(crate) fn launcher_page_html(url: &str) -> String {
 /// R5-S8: where launch pages go — `<Documents or home>/FrameTrace/launch`
 /// (a NON-hidden folder in the examiner's home: sandboxed browsers such
 /// as snap/flatpak Firefox can read it, and neither `/tmp` nor a dot
-/// folder is reliably readable to them).
+/// folder is reliably readable to them). R6-S3: `None` without a home
+/// folder (the fallback would be the shared temp folder).
 #[cfg(not(target_os = "windows"))]
-fn launcher_dir() -> PathBuf {
-    let (root, _) = jobs::default_case_root(
-        false,
-        &|name| std::env::var_os(name),
-        &|path| path.is_dir(),
-        &std::env::temp_dir(),
-    );
-    root.join("FrameTrace").join("launch")
+fn launcher_dir() -> Option<PathBuf> {
+    launcher_dir_from(&|name| std::env::var_os(name), &|path| path.is_dir())
+}
+
+/// [`launcher_dir`] with the environment injected (pure, tests).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn launcher_dir_from(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let (root, temp_fallback) = jobs::default_case_root(false, env, is_dir, Path::new(""));
+    (!temp_fallback).then(|| root.join("FrameTrace").join("launch"))
 }
 
 /// Launch pages older than this are removed by the next launch (a
@@ -1072,16 +1087,22 @@ const LAUNCHER_PAGE_MAX_AGE: Duration = Duration::from_secs(120);
 /// R5-S8: writes a fresh user-private launch page into `dir` (created
 /// 0700; the file is created 0600 with `create_new`, so it never follows
 /// or reuses an existing name) and sweeps old ones. Returns its path.
+/// R6-S3: only `dir` itself is made 0700 — its parents (the examiner's
+/// `~/Documents/FrameTrace`, which also holds cases) are created with the
+/// default mode and never re-permissioned.
 #[cfg(unix)]
 pub(crate) fn write_launcher_file(dir: &Path, url: &str) -> Result<PathBuf, String> {
     use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|err| format!("{}: {err}", dir.display()))?;
-    // An existing folder keeps whatever mode it had; tighten it.
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(format!("{}: {err}", dir.display())),
+    }
+    // An existing launch folder keeps whatever mode it had; tighten it.
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|err| format!("{}: {err}", dir.display()))?;
     if let Ok(entries) = std::fs::read_dir(dir) {

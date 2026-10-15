@@ -119,6 +119,9 @@ pub(crate) struct JobState {
     /// a thread that stats the growing output file and stores its size
     /// here. `None` when the DB `jobs` row is the progress source.
     pub(crate) byte_progress: Option<(PathBuf, Option<u64>)>,
+    /// R6-S4: `(bytes hashed, total)` while an existing raw image is
+    /// re-hashed against its import record (`/api/status.progress`).
+    pub(crate) rehash_progress: Option<(u64, u64)>,
     /// Optional shared-secret gate from FRAMETRACE_TOKEN. `None` keeps the
     /// documented loopback-trust model; when set, every request must prove
     /// the token via header, query, or the planted `ft_token_<port>` cookie (C2).
@@ -341,6 +344,7 @@ impl JobState {
             sealing: false,
             cancel_requested: false,
             byte_progress: None,
+            rehash_progress: None,
             token: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             instance: new_instance_id(),

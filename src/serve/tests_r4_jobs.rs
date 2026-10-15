@@ -359,11 +359,59 @@ fn c3_next_join_sweeps_a_dead_jobs_claimed_outputs() {
 // C10: bounded reader joins
 // ---------------------------------------------------------------------------
 
+/// R6-CI3: argument prefix carrying the straggler pid file to the C10
+/// helper (a libtest filter that matches no test under `--exact`; the
+/// helper reads it back from its own argv — `run_step_cancellable` takes
+/// no per-child environment).
+const C10_PID_FILE_ARG: &str = "ft-c10-pid-file=";
+
+/// R6-CI3 helper, run as a re-executed copy of this test binary (the
+/// "step"): starts `sleep 40` in its OWN process group with the step's
+/// stdout/stderr inherited, records its pid and returns — the step exits,
+/// the straggler keeps the pipes open. Does nothing in a normal run.
+///
+/// The old fixture was `/bin/sh -c "set -m; sleep 40 & …"`. On Linux CI
+/// `/bin/sh` is dash, which turns job control off when it has no
+/// terminal ("can't access tty"), so the `sleep` stayed in the step's own
+/// group, the leader-exit sweep killed it, the pipe closed, and the test
+/// saw no warning (`[]`). `process_group(0)` does not depend on a tty.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::zombie_processes)] // the straggler outlives this process on purpose
+fn c10_straggler_helper() {
+    use std::os::unix::process::CommandExt;
+    let Some(pid_file) = std::env::args().find_map(|arg| {
+        arg.strip_prefix(C10_PID_FILE_ARG)
+            .map(std::path::PathBuf::from)
+    }) else {
+        return;
+    };
+    let straggler = Command::new("sleep")
+        .arg("40")
+        .process_group(0)
+        .spawn()
+        .expect("spawn straggler");
+    let temp = pid_file.with_extension("tmp");
+    std::fs::write(&temp, straggler.id().to_string()).expect("write straggler pid");
+    std::fs::rename(&temp, &pid_file).expect("publish straggler pid");
+    println!("started");
+}
+
+/// Process group of `pid` as `ps` reports it (diagnostics, unix).
+#[cfg(unix)]
+fn process_group_of(pid: &str) -> String {
+    Command::new("ps")
+        .args(["-o", "pgid=", "-p", pid.trim()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|err| format!("<ps failed: {err}>"))
+}
+
 /// C10: a step whose grandchild escaped and keeps the step's stdout pipe
 /// open used to hang `run_step_cancellable` until the grandchild exited
 /// (40 s here, forever in the field). Unix: the straggler sits in its own
-/// process group (`set -m`), so only the bounded join saves the caller —
-/// with a visible warning. Windows: the leader-exit job sweep kills it.
+/// process group, so only the bounded join saves the caller — with a
+/// visible warning. Windows: the leader-exit job sweep kills it.
 #[test]
 fn c10_a_straggler_holding_the_pipe_cannot_hang_the_step() {
     let _serial = super::proc::tree_test_serial();
@@ -379,14 +427,19 @@ fn c10_a_straggler_holding_the_pipe_cannot_hang_the_step() {
             ],
         )
     } else {
+        let module = module_path!();
+        let helper = format!(
+            "{}::c10_straggler_helper",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
         (
-            PathBuf::from("/bin/sh"),
+            std::env::current_exe().expect("test binary"),
             vec![
-                "-c".into(),
-                format!(
-                    "set -m; sleep 40 & echo $! > \"{}\"; echo started",
-                    pid_file.display()
-                ),
+                helper,
+                "--exact".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+                format!("{C10_PID_FILE_ARG}{}", pid_file.display()),
             ],
         )
     };
@@ -398,17 +451,32 @@ fn c10_a_straggler_holding_the_pipe_cannot_hang_the_step() {
         elapsed < Duration::from_secs(30),
         "the step waited {elapsed:?} for the straggler"
     );
-    if cfg!(unix) {
+    #[cfg(unix)]
+    {
+        let straggler = std::fs::read_to_string(&pid_file).unwrap_or_default();
         let warnings = state_lock(&state).warnings.clone();
+        let facts = || {
+            format!(
+                "straggler pid {:?} (pid file {}), its process group {:?}, step output {:?}, elapsed {elapsed:?}, warnings {warnings:?}",
+                straggler.trim(),
+                pid_file.display(),
+                process_group_of(&straggler),
+                result.as_deref().unwrap_or_default(),
+            )
+        };
+        assert!(
+            !straggler.trim().is_empty(),
+            "the helper never started its straggler: {}",
+            facts()
+        );
         assert!(
             warnings
                 .iter()
                 .any(|(_, message)| message.contains("출력 파이프")),
-            "{warnings:?}"
+            "no abandoned-pipe warning: {}",
+            facts()
         );
-        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            let _ = Command::new("kill").args(["-9", pid.trim()]).status();
-        }
+        let _ = Command::new("kill").args(["-9", straggler.trim()]).status();
     }
     let _ = std::fs::remove_dir_all(case_dir);
 }

@@ -253,12 +253,15 @@ pub fn import_e01(
     append_e01_audit(
         case_dir,
         &format!(
-            "{{\"schema_version\":1,\"event\":\"import-e01\",\"imported_unix\":{},\"e01_path\":\"{}\",\"e01_sha256\":{},\"raw_output_path\":\"{}\",\"raw_sha256\":\"{}\",\"max_bytes\":{},\"verified\":{},\"is_corrupted\":{},\"ewfinfo_version\":\"{}\",\"ewfverify_version\":\"{}\",\"ewfexport_version\":\"{}\",\"ewfinfo_log_path\":\"{}\",\"ewfverify_log_path\":{},\"ewfexport_log_path\":\"{}\",\"command\":\"{}\",\"command_args\":{}}}",
+            "{{\"schema_version\":1,\"event\":\"import-e01\",\"imported_unix\":{},\"e01_path\":\"{}\",\"e01_sha256\":{},\"raw_output_path\":\"{}\",\"raw_sha256\":\"{}\",\"raw_size_bytes\":{},\"max_bytes\":{},\"verified\":{},\"is_corrupted\":{},\"ewfinfo_version\":\"{}\",\"ewfverify_version\":\"{}\",\"ewfexport_version\":\"{}\",\"ewfinfo_log_path\":\"{}\",\"ewfverify_log_path\":{},\"ewfexport_log_path\":\"{}\",\"command\":\"{}\",\"command_args\":{}}}",
             imported_unix,
             json_escape(&e01_path.to_string_lossy()),
             audit::optional_string(e01_sha256.as_deref()),
             json_escape(&raw_output_path.to_string_lossy()),
             json_escape(&raw_sha256),
+            std::fs::metadata(&raw_output_path)
+                .map(|meta| meta.len().to_string())
+                .unwrap_or_else(|_| "null".to_string()),
             options
                 .max_bytes
                 .map(|value| value.to_string())
@@ -413,40 +416,140 @@ pub enum RawReuse {
     /// automatically — the examiner decides (`/api/reimport-raw`); the
     /// text says why.
     NeedsReimport(String),
+    /// R6-S4: the re-hash was cancelled; nothing was decided or changed.
+    Cancelled,
 }
 
-/// R5-S6: the newest SHA-256 (and E01 path, import time) the case's
-/// chained E01 audit lane recorded for a raw image named like `raw` —
-/// the evidence an old (pre-marker) or moved case still has.
-pub fn recorded_raw_import(case_dir: &Path, raw: &Path) -> Option<(String, PathBuf, u64)> {
-    let name = raw.file_name()?.to_string_lossy().to_string();
-    let text = crate::util::read_to_string(&case_dir.join("evidence/logs/e01-audit.jsonl")).ok()?;
-    text.lines().rev().find_map(|line| {
+/// What a raw image's import record says (marker or E01 audit lane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawImportRecord {
+    pub sha256: String,
+    pub e01_path: PathBuf,
+    pub imported_unix: u64,
+    /// Byte size of the raw image, when the record has it.
+    pub size_bytes: Option<u64>,
+}
+
+/// R5-S6: the newest import record the case's chained E01 audit lane has
+/// for a raw image named like `raw` — the evidence an old (pre-marker)
+/// or moved case still has.
+///
+/// R6-S10: the lane is trusted only when its chain verifies
+/// (`Err(reason)` otherwise — a hand-edited line can no longer supply the
+/// hash a raw image is "confirmed" against), and the newest matching
+/// record must name its E01 (`Err` when `e01_path` is missing or empty —
+/// it used to be replaced by the CURRENT source, so any E01 inherited an
+/// old image). `Ok(None)`: no log, or no matching full (non `--max-bytes`)
+/// import.
+pub fn recorded_raw_import(case_dir: &Path, raw: &Path) -> Result<Option<RawImportRecord>, String> {
+    let Some(name) = raw.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        return Ok(None);
+    };
+    let log = case_dir.join("evidence/logs/e01-audit.jsonl");
+    if !log.is_file() {
+        return Ok(None);
+    }
+    audit::verify_chained_jsonl(&log).map_err(|err| {
+        format!("E01 감사 기록(e01-audit.jsonl)의 체인 검증 실패 — 기록을 믿을 수 없습니다: {err}")
+    })?;
+    let text = crate::util::read_to_string(&log)
+        .map_err(|err| format!("E01 감사 기록을 읽지 못했습니다: {err}"))?;
+    let newest = text.lines().rev().find_map(|line| {
         let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
         if value.get("event").and_then(serde_json::Value::as_str) != Some("import-e01") {
             return None;
         }
         let logged = value.get("raw_output_path")?.as_str()?;
         let logged_name = logged.rsplit(['/', '\\']).next().unwrap_or(logged);
-        if logged_name != name {
-            return None;
-        }
         // A capped (--max-bytes) export is not the whole image.
-        if value.get("max_bytes").is_some_and(|v| !v.is_null()) {
-            return None;
+        (logged_name == name && value.get("max_bytes").is_none_or(|v| v.is_null())).then_some(value)
+    });
+    let Some(value) = newest else {
+        return Ok(None);
+    };
+    let e01 = value
+        .get("e01_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|e01| !e01.trim().is_empty())
+        .ok_or_else(|| {
+            "E01 감사 기록의 임포트 항목에 원본 E01 경로(e01_path)가 없습니다 — 어느 E01의 이미지인지 확인할 수 없습니다".to_string()
+        })?;
+    let sha = value
+        .get("raw_sha256")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .filter(|sha| sha.len() == 64)
+        .ok_or_else(|| "E01 감사 기록의 임포트 항목에 raw SHA-256이 없습니다".to_string())?;
+    Ok(Some(RawImportRecord {
+        sha256: sha,
+        e01_path: PathBuf::from(e01),
+        imported_unix: value
+            .get("imported_unix")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        size_bytes: value
+            .get("raw_size_bytes")
+            .and_then(serde_json::Value::as_u64),
+    }))
+}
+
+/// R6-S4: hooks of [`reconcile_raw`]'s (possibly hours-long) re-hash.
+pub struct RehashHooks<'a> {
+    /// Told the recorded SHA-256 right before hashing starts.
+    pub on_rehash: &'a dyn Fn(&str),
+    /// `(bytes hashed, total bytes)`, at most a few times per second.
+    pub progress: &'a dyn Fn(u64, u64),
+    /// Polled while hashing; `true` stops it ([`RawReuse::Cancelled`]).
+    pub cancelled: &'a dyn Fn() -> bool,
+}
+
+/// Same E01 path (canonical when both resolve).
+fn same_e01(a: &Path, b: &Path) -> bool {
+    let a = canonicalize_display(a).unwrap_or_else(|_| a.to_path_buf());
+    let b = canonicalize_display(b).unwrap_or_else(|_| b.to_path_buf());
+    a == b
+}
+
+/// SHA-256 (lowercase hex) of `path` with progress and cancel (R6-S4).
+/// `Ok(None)` when cancelled.
+fn digest_file_with_progress(
+    path: &Path,
+    hooks: &RehashHooks<'_>,
+) -> Result<Option<String>, String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let total = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut done = 0u64;
+    let mut last_report = std::time::Instant::now();
+    (hooks.progress)(0, total);
+    loop {
+        if (hooks.cancelled)() {
+            return Ok(None);
         }
-        let sha = value.get("raw_sha256")?.as_str()?.to_ascii_lowercase();
-        (sha.len() == 64).then(|| {
-            (
-                sha,
-                PathBuf::from(value.get("e01_path").and_then(|v| v.as_str()).unwrap_or("")),
-                value
-                    .get("imported_unix")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
-    })
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
+        hasher.update(&buffer[..read]);
+        done += read as u64;
+        if last_report.elapsed() >= std::time::Duration::from_millis(250) {
+            (hooks.progress)(done, total);
+            last_report = std::time::Instant::now();
+        }
+    }
+    (hooks.progress)(done, total);
+    Ok(Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    ))
 }
 
 /// R5-S6: [`raw_reuse_decision`] that re-verifies instead of giving up.
@@ -456,13 +559,17 @@ pub fn recorded_raw_import(case_dir: &Path, raw: &Path) -> Option<(String, PathB
 /// recorded; when it matches, the marker is rewritten and the image is
 /// judged again (same E01 → reuse). Nothing is ever deleted here: a
 /// mismatch or a missing record is [`RawReuse::NeedsReimport`] for the
-/// examiner to decide. `on_rehash` is told before the (possibly long)
-/// re-hash starts. Runs outside any server lock (file hashing).
+/// examiner to decide. Runs outside any server lock (file hashing).
+///
+/// R6-S4: the cheap checks come first — a record of ANOTHER E01 or of a
+/// different byte size is a mismatch without hashing (it used to hash
+/// hundreds of GB to learn nothing); the hash reports progress and can be
+/// cancelled ([`RehashHooks`]).
 pub fn reconcile_raw(
     case_dir: &Path,
     raw: &Path,
     source: &Path,
-    on_rehash: &dyn Fn(&str),
+    hooks: &RehashHooks<'_>,
 ) -> RawReuse {
     let first = raw_reuse_decision(raw, source);
     let RawImportStatus::Unverified(reason) = raw_import_status(raw) else {
@@ -474,39 +581,72 @@ pub fn reconcile_raw(
         .and_then(|value| {
             let sha = value.get("sha256")?.as_str()?.to_ascii_lowercase();
             let e01 = value.get("e01_path")?.as_str()?.to_string();
-            let unix = value
-                .get("imported_unix")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            (sha.len() == 64 && !e01.is_empty()).then(|| (sha, PathBuf::from(e01), unix))
+            (sha.len() == 64 && !e01.trim().is_empty()).then(|| RawImportRecord {
+                sha256: sha,
+                e01_path: PathBuf::from(e01),
+                imported_unix: value
+                    .get("imported_unix")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                size_bytes: value.get("size_bytes").and_then(serde_json::Value::as_u64),
+            })
         });
-    let Some((recorded_sha, e01_path, imported_unix)) =
-        from_marker.or_else(|| recorded_raw_import(case_dir, raw))
-    else {
-        return RawReuse::NeedsReimport(format!(
-            "기존 raw 이미지를 완료된 임포트로 확인할 수 없습니다 — {reason}; 비교할 SHA-256 기록도 없습니다"
-        ));
+    let record = match from_marker {
+        Some(record) => record,
+        None => match recorded_raw_import(case_dir, raw) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return RawReuse::NeedsReimport(format!(
+                    "기존 raw 이미지를 완료된 임포트로 확인할 수 없습니다 — {reason}; 비교할 SHA-256 기록도 없습니다"
+                ));
+            }
+            Err(err) => {
+                return RawReuse::NeedsReimport(format!(
+                    "기존 raw 이미지를 완료된 임포트로 확인할 수 없습니다 — {reason}; {err}"
+                ));
+            }
+        },
     };
-    on_rehash(&recorded_sha);
-    let current = match audit::digest_file(raw) {
-        Ok(digest) => digest.to_ascii_lowercase(),
+    if !same_e01(&record.e01_path, source) {
+        return RawReuse::NeedsReimport(format!(
+            "기존 raw 이미지는 다른 E01({})에서 임포트된 것입니다 (다시 해시하지 않음)",
+            record.e01_path.display()
+        ));
+    }
+    let current_size = match std::fs::metadata(raw) {
+        Ok(meta) => meta.len(),
+        Err(err) => {
+            return RawReuse::NeedsReimport(format!(
+                "기존 raw 이미지의 크기를 읽지 못했습니다: {err}"
+            ));
+        }
+    };
+    if let Some(recorded_size) = record.size_bytes
+        && recorded_size != current_size
+    {
+        return RawReuse::NeedsReimport(format!(
+            "raw 이미지의 크기가 임포트 기록과 다릅니다 (기록 {recorded_size}바이트, 현재 {current_size}바이트 — 다시 해시하지 않음)"
+        ));
+    }
+    (hooks.on_rehash)(&record.sha256);
+    let current = match digest_file_with_progress(raw, hooks) {
+        Ok(Some(digest)) => digest,
+        Ok(None) => return RawReuse::Cancelled,
         Err(err) => {
             return RawReuse::NeedsReimport(format!(
                 "기존 raw 이미지의 SHA-256을 다시 계산하지 못했습니다: {err}"
             ));
         }
     };
-    if current != recorded_sha {
+    if current != record.sha256 {
         return RawReuse::NeedsReimport(format!(
-            "raw 이미지의 SHA-256이 임포트 기록과 다릅니다 (기록 {recorded_sha}, 현재 {current})"
+            "raw 이미지의 SHA-256이 임포트 기록과 다릅니다 (기록 {}, 현재 {current})",
+            record.sha256
         ));
     }
-    let e01_for_marker = if e01_path.as_os_str().is_empty() {
-        source.to_path_buf()
-    } else {
-        e01_path
-    };
-    if let Err(err) = write_raw_done_marker(raw, &recorded_sha, &e01_for_marker, imported_unix) {
+    if let Err(err) =
+        write_raw_done_marker(raw, &record.sha256, &record.e01_path, record.imported_unix)
+    {
         return RawReuse::NeedsReimport(format!(
             "raw 이미지는 기록과 같지만 완료 표식을 갱신하지 못했습니다: {err}"
         ));
@@ -517,14 +657,11 @@ pub fn reconcile_raw(
 /// Pure decision on top of [`raw_import_status`]. The E01 paths are
 /// compared canonically when possible.
 pub fn raw_reuse_decision(raw: &Path, source: &Path) -> RawReuse {
-    let same = |a: &Path, b: &Path| {
-        let a = canonicalize_display(a).unwrap_or_else(|_| a.to_path_buf());
-        let b = canonicalize_display(b).unwrap_or_else(|_| b.to_path_buf());
-        a == b
-    };
     match raw_import_status(raw) {
         RawImportStatus::Missing => RawReuse::Absent,
-        RawImportStatus::Complete { e01_path, .. } if same(&e01_path, source) => RawReuse::Reuse,
+        RawImportStatus::Complete { e01_path, .. } if same_e01(&e01_path, source) => {
+            RawReuse::Reuse
+        }
         RawImportStatus::Complete { e01_path, .. } => RawReuse::NeedsReimport(format!(
             "기존 raw 이미지는 다른 E01({})에서 임포트된 것입니다",
             e01_path.display()
@@ -963,6 +1100,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Re-hash hooks for the tests: `on_rehash` as given, no progress
+    /// sink, never cancelled.
+    fn hooks<'a>(on_rehash: &'a dyn Fn(&str)) -> super::RehashHooks<'a> {
+        super::RehashHooks {
+            on_rehash,
+            progress: &|_, _| {},
+            cancelled: &|| false,
+        }
+    }
+
     /// R5-S6: a moved/copied case (marker mtime no longer matches) or a
     /// pre-marker case is re-hashed against the recorded SHA-256 instead
     /// of being thrown away: a match refreshes the marker and reuses the
@@ -987,20 +1134,20 @@ mod tests {
             .set_modified(later)
             .unwrap();
         let rehashed = std::cell::Cell::new(false);
-        let decision = reconcile_raw(&dir, &raw, &e01, &|_| rehashed.set(true));
+        let decision = reconcile_raw(&dir, &raw, &e01, &hooks(&|_| rehashed.set(true)));
         assert_eq!(decision, RawReuse::Reuse);
         assert!(rehashed.get());
         assert!(raw.is_file(), "never deleted");
         // The marker was refreshed: the next decision needs no re-hash.
         let rehashed = std::cell::Cell::new(false);
         assert_eq!(
-            reconcile_raw(&dir, &raw, &e01, &|_| rehashed.set(true)),
+            reconcile_raw(&dir, &raw, &e01, &hooks(&|_| rehashed.set(true))),
             RawReuse::Reuse
         );
         assert!(!rehashed.get());
-        // Changed bytes: the examiner decides; the image stays.
+        // Changed bytes (same size): the examiner decides; the image stays.
         fs::write(&raw, b"complete-imagX").unwrap();
-        match reconcile_raw(&dir, &raw, &e01, &|_| {}) {
+        match reconcile_raw(&dir, &raw, &e01, &hooks(&|_| {})) {
             RawReuse::NeedsReimport(reason) => assert!(reason.contains("SHA-256"), "{reason}"),
             other => panic!("{other:?}"),
         }
@@ -1009,7 +1156,7 @@ mod tests {
         fs::remove_file(raw_done_marker_path(&raw)).unwrap();
         fs::write(&raw, b"old-case-image").unwrap();
         let old_sha = crate::audit::digest_file(&raw).unwrap();
-        match reconcile_raw(&dir, &raw, &e01, &|_| {}) {
+        match reconcile_raw(&dir, &raw, &e01, &hooks(&|_| {})) {
             RawReuse::NeedsReimport(reason) => assert!(reason.contains("기록"), "{reason}"),
             other => panic!("{other:?}"),
         }
@@ -1026,8 +1173,115 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(reconcile_raw(&dir, &raw, &e01, &|_| {}), RawReuse::Reuse);
+        assert_eq!(
+            reconcile_raw(&dir, &raw, &e01, &hooks(&|_| {})),
+            RawReuse::Reuse
+        );
         assert!(raw_done_marker_path(&raw).is_file(), "marker written");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R6-S4: a record of another E01 or of another byte size is a
+    /// mismatch WITHOUT hashing (it used to hash the whole image first —
+    /// hours for a large disk — to report what the record already said);
+    /// the hash itself reports progress and stops on cancel.
+    #[test]
+    fn s4_reconcile_checks_size_and_e01_before_hashing() {
+        use super::{RawReuse, reconcile_raw, write_raw_done_marker};
+        let dir = c1_dir("s4");
+        let e01 = dir.join("disk.E01");
+        let other = dir.join("other.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        fs::write(&other, b"ewf2").unwrap();
+        let raw = dir.join("evidence/images/evidence.raw");
+        fs::write(&raw, b"complete-image").unwrap();
+        let sha = crate::audit::digest_file(&raw).unwrap();
+        write_raw_done_marker(&raw, &sha, &e01, 7).unwrap();
+        // Grow the image: the marker's size no longer matches.
+        fs::write(&raw, b"complete-image-and-more").unwrap();
+        let rehashed = std::cell::Cell::new(false);
+        match reconcile_raw(&dir, &raw, &e01, &hooks(&|_| rehashed.set(true))) {
+            RawReuse::NeedsReimport(reason) => assert!(reason.contains("크기"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !rehashed.get(),
+            "a size mismatch is decided without hashing"
+        );
+        // Same size, but the marker names another E01: no hash either.
+        fs::write(&raw, b"complete-imagX").unwrap();
+        match reconcile_raw(&dir, &raw, &other, &hooks(&|_| rehashed.set(true))) {
+            RawReuse::NeedsReimport(reason) => assert!(reason.contains("다른 E01"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!rehashed.get(), "another E01 is decided without hashing");
+        // Progress is reported and a cancel stops the hash.
+        let seen = std::cell::Cell::new(0u64);
+        let cancelled = super::RehashHooks {
+            on_rehash: &|_| {},
+            progress: &|_, total| seen.set(total),
+            cancelled: &|| true,
+        };
+        assert_eq!(
+            reconcile_raw(&dir, &raw, &e01, &cancelled),
+            RawReuse::Cancelled
+        );
+        assert_eq!(seen.get(), 14, "total bytes reported before hashing");
+        assert!(raw.is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R6-S10: the E01 audit lane vouches for a raw image only when its
+    /// chain verifies, and only with the E01 it names. Before, a line
+    /// edited into the log was trusted as is, and a record without
+    /// `e01_path` was bound to whatever E01 was being opened now.
+    #[test]
+    fn s10_audit_lane_must_verify_and_name_its_e01() {
+        use super::{RawReuse, reconcile_raw};
+        let dir = c1_dir("s10");
+        let e01 = dir.join("disk.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        let raw = dir.join("evidence/images/evidence.raw");
+        fs::write(&raw, b"old-case-image").unwrap();
+        let sha = crate::audit::digest_file(&raw).unwrap();
+        let log = dir.join("evidence/logs/e01-audit.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        // A record without e01_path: refused, never bound to `e01`.
+        crate::audit::append_chained_jsonl_keyed(
+            &log,
+            &serde_json::json!({
+                "schema_version": 1, "event": "import-e01", "imported_unix": 3,
+                "raw_output_path": "/x/evidence/images/evidence.raw",
+                "raw_sha256": sha, "max_bytes": null,
+            })
+            .to_string(),
+            None,
+        )
+        .unwrap();
+        match reconcile_raw(&dir, &raw, &e01, &hooks(&|_| {})) {
+            RawReuse::NeedsReimport(reason) => assert!(reason.contains("e01_path"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!super::raw_done_marker_path(&raw).exists());
+        // A hand-written line (no chain fields) after it: the lane no
+        // longer verifies, so nothing in it is trusted.
+        let mut text = fs::read_to_string(&log).unwrap();
+        text.push_str(
+            &serde_json::json!({
+                "schema_version": 1, "event": "import-e01", "imported_unix": 4,
+                "e01_path": e01.to_string_lossy(),
+                "raw_output_path": "/x/evidence/images/evidence.raw",
+                "raw_sha256": sha, "max_bytes": null,
+            })
+            .to_string(),
+        );
+        text.push('\n');
+        fs::write(&log, text).unwrap();
+        match reconcile_raw(&dir, &raw, &e01, &hooks(&|_| {})) {
+            RawReuse::NeedsReimport(reason) => assert!(reason.contains("체인"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!super::raw_done_marker_path(&raw).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

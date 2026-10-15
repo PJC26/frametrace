@@ -831,6 +831,7 @@ mod tests {
                 last_entry_sha256: "ab".repeat(32),
                 keyed_entries: 0,
                 unauthenticated_keyed_entries: 0,
+                entry_auth: Vec::new(),
                 integrity,
                 warnings: Vec::new(),
             }),
