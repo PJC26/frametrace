@@ -295,6 +295,11 @@ pub struct HashVerifyRun {
     pub entries: Vec<serde_json::Value>,
     /// True when the run's `hash-verify-run` completion marker is present.
     pub completed: bool,
+    /// R9 P3: entries of this run (records or its completion marker) that
+    /// may not feed a result here — not authenticated on a PC holding
+    /// audit keys, another PC's, or past a chain break. They are left out
+    /// of `entries` / `completed` and only counted.
+    pub unauthenticated: usize,
 }
 
 /// Every run in `hash-verify.jsonl`, in first-appearance order. Entries are
@@ -304,21 +309,16 @@ pub struct HashVerifyRun {
 /// error, never "no run" (D11).
 pub fn hash_verify_runs(case_dir: &Path) -> Result<Vec<HashVerifyRun>, String> {
     let path = case_dir.join(HASH_VERIFY_REL_PATH);
-    let text = match read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(format!(
-                "원본 재검증 기록을 읽지 못했습니다 {}: {err}",
-                path.display()
-            ));
-        }
-    };
+    // R9 P3: rows come through the one lane reader, each with its trust.
+    let lane = audit::read_lane_rows(&path).map_err(|err| {
+        format!(
+            "원본 재검증 기록을 읽지 못했습니다 {}: {err}",
+            path.display()
+        )
+    })?;
     let mut runs: Vec<HashVerifyRun> = Vec::new();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
+    for row in &lane.rows {
+        let value = &row.value;
         let event = value.get("event").and_then(|e| e.as_str());
         if !matches!(event, Some("hash-verify" | "hash-verify-run")) {
             continue;
@@ -337,14 +337,17 @@ pub fn hash_verify_runs(case_dir: &Path) -> Result<Vec<HashVerifyRun>, String> {
                     run_unix,
                     entries: Vec::new(),
                     completed: false,
+                    unauthenticated: 0,
                 });
                 runs.len() - 1
             }
         };
-        if event == Some("hash-verify-run") {
+        if !row.usable() {
+            runs[index].unauthenticated += 1;
+        } else if event == Some("hash-verify-run") {
             runs[index].completed = true;
         } else {
-            runs[index].entries.push(value);
+            runs[index].entries.push(row.value_with_trust());
         }
     }
     Ok(runs)

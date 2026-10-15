@@ -71,6 +71,96 @@ Per consumer (R8 track I):
   (`keyed`/`structural`/`not-verified`), label and reason every consumer
   prints.
 
+### Row-level trust, full-case scope, fail-closed keys (R9)
+
+R8 applied P0 per LANE; consumers that read a lane's ROWS (report
+sections, viewer bundle, `/api/records-meta`, sign-off targets, timeline,
+QA, custody re-hash table, artifact lookups) still used every row. R9:
+
+- **P3 — one reader.** Every non-test reader of a chained lane's rows goes
+  through `audit::read_lane_rows(path)` (or `read_lane_rows_with_keys`):
+  `LaneRows { present, rows: [LaneRow { index, raw, value, trust:
+  LineTrust }], lane: LaneTrust, failure, key_error,
+  unbound_authenticated, verification }`. `LaneRow::usable()` = the entry
+  may feed a "current / confirmed / passed" claim or a path / hash used
+  for re-verification: authenticated here, the R8-I8 pre-key prefix, or
+  (no keys here, P1) self-consistency only. Entries past a chain break are
+  `LineTrust::ChainBroken` (unusable on any PC). Unusable entries are
+  shown, if at all, distinguished as "인증 안 됨" — the report lists them in
+  their own table above the chain table and never counts them; the
+  timeline emits them as `audit-entry-unauthenticated`; custody counts
+  them beside the re-hash table; artifact / validation / proxy / screening
+  lookups ignore them; a sign-off's re-hash target path and bound hash are
+  the LAST usable entry's (none → "확인 불가"). Restriction-only readers
+  (the join log protecting files from deletion, "the carve log has
+  entries", sign-off-lane caps) count every entry — the safe direction.
+  A source-scan test (`audit::tests_r9::r9_p3_every_lane_row_reader_
+  goes_through_read_lane_rows`) fails when a non-test function names a
+  lane and reads files raw without the reader. Its limits: it is
+  name-based (a lane path built far from where it is read, in a function
+  that also calls the reader, is not caught), and the sound-measurement
+  lanes keep their own reader (`audio_level::read_lanes`, allow-listed:
+  the continuation proof hashes the raw lane bytes; every line is judged
+  by `line_trust`, R8-I1).
+- **Per-entry `trust` (viewer contract).** Each log entry the viewer bundle
+  (`data-bundle.js`) and `/api/records-meta` (`carveLog`, `filesystemLog`,
+  `validationLog`, `anomalyLog`, `joinLog`) carry has `"trust"`: `"auth"`
+  (authenticated here), `"sc"` (self-consistency only — no keys here, or
+  the pre-key prefix), `"unauth"` (keys held and not authenticated, or past
+  a chain break; with `"trust_note"`), `"pc:<key id>"` (another PC's key —
+  check it there; not a tamper verdict). `/api/records-meta` adds
+  `logChains: {<array name>: {path, status, entries, unauthenticated,
+  detail}}`; `audioLevels` entries carry the same `trust`.
+- **P4 — full-case scope.** `verify-audit <case>`, `doctor` and the
+  workstation `/api/verify-audit` (badge) check `audit::case_lane_paths`:
+  every known lane under `artifacts/**` and `evidence/logs/**`
+  (`collect_chain_lanes`) plus any other `*.jsonl` in `evidence/logs`.
+  `/api/verify-audit` per-log entries add `path` (case-relative),
+  `unauthenticated_lines` and `other_pc_lines`.
+- **P5 — fail closed on unreadable key configuration.** A key path that is
+  configured explicitly (`FRAMETRACE_AUDIT_KEY_FILE`,
+  `FRAMETRACE_AUDIT_KEYRING_FILE`) but missing, or any key path (default
+  or explicit) that is a directory, a broken link or not a regular file,
+  is an error starting `키 설정을 읽지 못함` (`audit_key::
+  KEY_CONFIG_UNREADABLE`) — R8 read these as "no key", silently relaxing
+  P0 to P1. Every `verification_keys()` error carries that prefix.
+  Readers treat it as keys held with nothing authenticated
+  (`LaneRows::key_error`, lane NOT VERIFIED); `verify-audit`, `doctor`,
+  `verify-package`, custody, QA and `/api/verify-audit` show it as NOT
+  VERIFIED with that wording (I9) — never "chain broken" / FAIL.
+  Rotation still creates a keyring at an explicit path that does not
+  exist yet.
+- **I10.** Unkeyed entries before ANOTHER PC's key-introduction marker
+  (the lane's first keyed entry, signed under a key this PC does not hold)
+  are `OtherPc { key_id }` — "키 <id> 보유 PC에서 확인" — not "HMAC 없는 줄".
+- **QA (I5).** `qa` grades lanes with `lane_trust`; a lane this PC cannot
+  authenticate is NOT VERIFIED (the run fails, not a tamper verdict) and
+  its anchor keeps the last state it passed with.
+- **Sign-offs (I6).** A record that a trusted `signoff-abandoned` entry
+  names is never Current, even restored as `review/signoff.json`.
+
+### Lane and case binding (R9-I11)
+
+A keyed append to a known lane adds, inside the bytes `entry_sha256` and
+the HMAC cover, `"audit_lane":"<case-relative lane path>"` and — when the
+case root's `case.json` names one — `"audit_case_id":"<case_id>"`
+(`audit::ENTRY_LANE_FIELD` / `ENTRY_CASE_FIELD`). Unkeyed appends are
+unchanged (byte-identical, no binding). Path-aware verification
+(`verify_chained_jsonl`, `read_lane_rows`) checks every authenticated
+entry that carries a binding against where it was found: another lane, or
+another `case_id`, is a verification FAIL ("다른 레인 / 다른 케이스의 항목을
+옮긴 것"). Authenticated entries without a binding (written before R9)
+still verify and are reported as legacy ("레인·케이스 결합이 없는 이전 형식"
+/ a `legacy` warning). Remaining limits:
+
+- The case binding is only as strong as `case.json`'s `case_id`, which is
+  not keyed: copying a lane into another case AND editing that case's
+  `case.json` to the source's id passes. The lane binding has no such gap.
+- Legacy (pre-R9) entries cannot be checked for moves at all.
+- A lane moved to a path that is not a known lane is never read as one;
+  if read as a lane file anyway, a bound entry there fails.
+- Truncation and rollback limits ("Non-goals") are unchanged.
+
 Key introduction (R8-I8): `rotate-audit-key --log <case>` on a PC that had no
 key before stamps, into each lane holding only unkeyed entries, an
 `{"kind":"audit-key-introduced"}` marker signed by the new key instead of

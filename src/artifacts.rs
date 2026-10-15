@@ -261,12 +261,11 @@ pub fn artifact_record_id(case_dir: &Path, selector: &str, source_path: &Path) -
         resolved == source_path
             || audit::canonical_or_original(&resolved) == audit::canonical_or_original(source_path)
     };
+    // R9 P3: only entries usable here name an artifact's record.
     let log_entries = |rel: &str| -> Vec<serde_json::Value> {
-        crate::util::read_to_string(&case_dir.join(rel))
+        audit::read_lane_rows(&case_dir.join(rel))
+            .map(|lane| lane.usable_values())
             .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .collect()
     };
     let text = |value: &serde_json::Value, key: &str| {
         value.get(key).and_then(|v| v.as_str()).map(str::to_string)
@@ -520,12 +519,12 @@ mod tests {
         );
         // A carved output is filed under its carve id.
         std::fs::create_dir_all(case_dir.join("artifacts/carved")).unwrap();
-        std::fs::write(
-            case_dir.join("artifacts/carved/carve-log.jsonl"),
-            format!(
-                "{}\n",
-                serde_json::json!({"id": "carve_7", "output_path": selector})
-            ),
+        // R9 P3: a real (chained) lane — lane rows come through
+        // `audit::read_lane_rows`, which trusts nothing past a chain break.
+        crate::audit::append_chained_jsonl_keyed(
+            &case_dir.join("artifacts/carved/carve-log.jsonl"),
+            &serde_json::json!({"id": "carve_7", "output_path": selector}).to_string(),
+            None,
         )
         .unwrap();
         assert_eq!(

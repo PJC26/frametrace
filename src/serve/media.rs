@@ -955,20 +955,16 @@ struct JoinDone {
     duration_check: serde_json::Value,
 }
 
-/// Every parseable `join-log.jsonl` entry (missing log → empty).
+/// Every `join-log.jsonl` entry usable here (missing log → empty). R9 P3:
+/// read through `audit::read_lane_rows` — an entry this PC cannot
+/// authenticate (keys held) never reports a job's output.
 fn read_join_log(case_dir: &Path) -> Result<Vec<serde_json::Value>, String> {
     let path = case_dir
         .join(crate::join::JOINED_DIR)
         .join(crate::join::LOG_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(text
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(format!("{} 읽기 실패: {err}", path.display())),
-    }
+    crate::audit::read_lane_rows(&path)
+        .map(|lane| lane.usable_values())
+        .map_err(|err| format!("{} 읽기 실패: {err}", path.display()))
 }
 
 /// C13: the log entry THIS job's CLI wrote — matched by its unique

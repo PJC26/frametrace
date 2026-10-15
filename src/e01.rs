@@ -344,20 +344,27 @@ fn write_raw_done_marker(
 /// The E01 audit lane of the case an imported raw image belongs to
 /// (`<case>/evidence/images/<raw>` → `<case>/evidence/logs/e01-audit.jsonl`),
 /// or `None` for an image outside a case's `evidence/images`.
+///
+/// R9-I8: at ANY depth below `evidence/images` — the same scope
+/// [`require_complete_case_raw`] judges. R8 only looked at direct
+/// children, so a raw image in a subfolder of `evidence/images` was judged
+/// as a case image but its trust check (lane binding, P0) was skipped.
 fn case_e01_lane(raw: &Path) -> Option<PathBuf> {
-    let images = raw.parent()?;
-    let evidence = images.parent()?;
-    (images.file_name()? == "images" && evidence.file_name()? == "evidence")
-        .then(|| evidence.join("logs/e01-audit.jsonl"))
+    raw.ancestors().skip(1).find_map(|images| {
+        let evidence = images.parent()?;
+        (images.file_name()? == "images" && evidence.file_name()? == "evidence")
+            .then(|| evidence.join("logs").join("e01-audit.jsonl"))
+    })
 }
 
 /// R7-S10: the `entry_sha256` of the newest `import-e01` entry of the
 /// case's E01 lane recording `raw_sha256` at `imported_unix` (the entry an
 /// import just appended). `None` when it cannot be found.
 fn import_entry_sha256(case_dir: &Path, raw_sha256: &str, imported_unix: u64) -> Option<String> {
-    let text = crate::util::read_to_string(&case_dir.join("evidence/logs/e01-audit.jsonl")).ok()?;
-    text.lines().rev().find_map(|line| {
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    // R9 P3: only an entry usable here is bound to.
+    let lane = audit::read_lane_rows(&case_dir.join("evidence/logs/e01-audit.jsonl")).ok()?;
+    lane.usable().rev().find_map(|row| {
+        let value = &row.value;
         (value.get("event").and_then(serde_json::Value::as_str) == Some("import-e01")
             && value.get("raw_sha256").and_then(serde_json::Value::as_str) == Some(raw_sha256)
             && value
@@ -387,24 +394,28 @@ fn check_bound_import_entry(
     marker_e01: &str,
     keys: &[crate::audit_key::AuditKey],
 ) -> Result<(), String> {
-    let text = match audit::read_log_locked(lane) {
-        Ok(Some(text)) => text,
-        Ok(None) => return Err("E01 감사 기록(e01-audit.jsonl)이 없습니다".to_string()),
+    // R9 P3: the lane's rows through the one lane reader.
+    let rows = match audit::read_lane_rows_with_keys(lane, keys) {
+        Ok(rows) if !rows.present => {
+            return Err("E01 감사 기록(e01-audit.jsonl)이 없습니다".to_string());
+        }
+        Ok(rows) => rows,
         Err(err) => return Err(format!("E01 감사 기록을 읽지 못했습니다: {err}")),
     };
-    let verification = audit::verify_chained_jsonl_text(&text, "e01-audit.jsonl", keys)
-        .map_err(|err| format!("E01 감사 기록의 체인 검증 실패: {err}"))?;
+    if let Some(err) = &rows.failure {
+        return Err(format!("E01 감사 기록의 체인 검증 실패: {err}"));
+    }
+    let Some(verification) = rows.verification.as_ref() else {
+        return Err("E01 감사 기록을 확인하지 못했습니다".to_string());
+    };
     let name = raw
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let body = text.strip_suffix('\n').unwrap_or(&text);
-    let lines: Vec<&str> = body.split('\n').collect();
+    let lines: Vec<&str> = rows.rows.iter().map(|row| row.raw.as_str()).collect();
     let newest = newest_full_import_of(&lines, &name).map(|(index, _)| index);
-    for (index, line) in lines.iter().enumerate() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
+    for row in &rows.rows {
+        let (index, value) = (row.index, &row.value);
         if value
             .get("entry_sha256")
             .and_then(serde_json::Value::as_str)
@@ -423,7 +434,7 @@ fn check_bound_import_entry(
                     .to_string(),
             );
         }
-        if raw_output_name(&value).as_deref() != Some(name.as_str()) {
+        if raw_output_name(value).as_deref() != Some(name.as_str()) {
             return Err(format!(
                 "완료 표식이 가리키는 E01 감사 항목은 다른 raw 파일({})의 임포트 기록입니다",
                 value
@@ -443,7 +454,7 @@ fn check_bound_import_entry(
                     .to_string(),
             );
         }
-        return import_entry_authenticated(&verification, index);
+        return import_entry_authenticated(verification, index);
     }
     Err("완료 표식이 가리키는 E01 감사 항목이 감사 기록에 없습니다".to_string())
 }
@@ -729,23 +740,25 @@ pub fn recorded_raw_import_with_keys(
         return Ok(None);
     };
     let log = case_dir.join("evidence/logs/e01-audit.jsonl");
-    let text = match audit::read_log_locked(&log) {
-        Ok(Some(text)) => text,
-        Ok(None) => return Ok(None),
+    // R9 P3: the lane's rows through the one lane reader.
+    let rows = match audit::read_lane_rows_with_keys(&log, keys) {
+        Ok(rows) if !rows.present => return Ok(None),
+        Ok(rows) => rows,
         Err(err) => return Err(format!("E01 감사 기록을 읽지 못했습니다: {err}")),
     };
-    let verification =
-        audit::verify_chained_jsonl_text(&text, "e01-audit.jsonl", keys).map_err(|err| {
-            format!(
-                "E01 감사 기록(e01-audit.jsonl)의 체인 검증 실패 — 기록을 믿을 수 없습니다: {err}"
-            )
-        })?;
-    let body = text.strip_suffix('\n').unwrap_or(&text);
-    let lines: Vec<&str> = body.split('\n').collect();
+    if let Some(err) = &rows.failure {
+        return Err(format!(
+            "E01 감사 기록(e01-audit.jsonl)의 체인 검증 실패 — 기록을 믿을 수 없습니다: {err}"
+        ));
+    }
+    let Some(verification) = rows.verification.as_ref() else {
+        return Ok(None);
+    };
+    let lines: Vec<&str> = rows.rows.iter().map(|row| row.raw.as_str()).collect();
     let Some((index, value)) = newest_full_import_of(&lines, &name) else {
         return Ok(None);
     };
-    import_entry_authenticated(&verification, index)?;
+    import_entry_authenticated(verification, index)?;
     let e01 = value
         .get("e01_path")
         .and_then(serde_json::Value::as_str)
@@ -1853,6 +1866,33 @@ mod tests {
         assert!(matches!(
             raw_import_status_with_keys(&raw, std::slice::from_ref(&other)),
             RawImportStatus::Complete { .. }
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R9-I8: a raw image in a SUBFOLDER of `evidence/images` is judged
+    /// like one directly in it (the scope `require_complete_case_raw`
+    /// uses). R8 resolved no E01 lane for it and returned the legacy
+    /// marker's Complete unchecked, even on a PC holding keys.
+    #[test]
+    fn r9_i8_subfolder_raw_gets_the_same_trust_check() {
+        use super::{RawImportStatus, raw_import_status_with_keys, write_raw_done_marker};
+        let dir = c1_dir("r9-i8");
+        let e01 = dir.join("disk.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        fs::create_dir_all(dir.join("evidence/images/sub")).unwrap();
+        let raw = dir.join("evidence/images/sub/evidence.raw");
+        fs::write(&raw, b"complete-image").unwrap();
+        let sha = crate::audit::digest_file(&raw).unwrap();
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xa9; 32]);
+        write_raw_done_marker(&raw, &sha, &e01, 9).unwrap();
+        assert_eq!(
+            super::case_e01_lane(&raw),
+            Some(dir.join("evidence").join("logs").join("e01-audit.jsonl"))
+        );
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, std::slice::from_ref(&mine)),
+            RawImportStatus::Unverified(why) if why.contains("재검증 필요")
         ));
         let _ = fs::remove_dir_all(&dir);
     }

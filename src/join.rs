@@ -2346,14 +2346,15 @@ fn write_join_claim(path: &Path, claim: &JoinClaim, job_tag: &str) -> Result<(),
 /// (a logged artifact is never deleted from under its record).
 pub fn logged_join_artifacts(case_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let path = case_dir.join(JOINED_DIR).join(LOG_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(format!("{} 읽기 실패: {err}", path.display())),
-    };
-    Ok(text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    // R9 P3: through the one lane reader. EVERY entry counts here, usable
+    // or not — this list only protects files from deletion, so the safe
+    // direction is to protect whatever any entry names.
+    let lane = audit::read_lane_rows(&path)
+        .map_err(|err| format!("{} 읽기 실패: {err}", path.display()))?;
+    Ok(lane
+        .rows
+        .into_iter()
+        .map(|row| row.value)
         .flat_map(|entry| {
             ["output_path", "manifest_path"]
                 .into_iter()

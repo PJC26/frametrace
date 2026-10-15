@@ -977,7 +977,8 @@ fn read_logged_results_with_keys(
                         other_pc_key: Some(key_id.clone()),
                     }
                 }
-                trust @ audit::LineTrust::NotAuthenticated { .. } => LineFlag::unverified(format!(
+                trust @ (audit::LineTrust::NotAuthenticated { .. }
+                | audit::LineTrust::ChainBroken) => LineFlag::unverified(format!(
                     "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 측정값으로 쓰지 않습니다 — {}",
                     index + 1,
                     trust.note()
@@ -1454,8 +1455,26 @@ impl AudioLevelState {
             if let Some(key) = &self.other_pc_key {
                 map.insert("pc".to_string(), json!(key));
             }
+            // R9 P3 (contract with track U): the same per-entry `trust`
+            // code every other log entry carries.
+            map.insert("trust".to_string(), json!(self.trust_code()));
         }
         value
+    }
+
+    /// R9 P3: `"pc:<key id>"` (another PC's key), `"unauth"` (the state
+    /// is `unverified` — not a measurement here), `"sc"` (self-consistency
+    /// only), otherwise `"auth"` (authenticated here).
+    pub fn trust_code(&self) -> String {
+        if let Some(key) = &self.other_pc_key {
+            format!("pc:{key}")
+        } else if self.r == "unverified" {
+            "unauth".to_string()
+        } else if self.self_consistent_only {
+            "sc".to_string()
+        } else {
+            "auth".to_string()
+        }
     }
 }
 
@@ -2233,7 +2252,7 @@ mod tests {
         assert_eq!(levels["vid_1"].max, Some(-12.3));
         assert_eq!(
             audio_levels_json(&levels).to_string(),
-            r#"{"vid_1":{"r":"sound","max":-12.3,"mean":-32.3,"sec":1.0,"t":10}}"#
+            r#"{"vid_1":{"r":"sound","max":-12.3,"mean":-32.3,"sec":1.0,"t":10,"trust":"auth"}}"#
         );
     }
 

@@ -273,6 +273,7 @@ pub fn render_case_report_with_chains(
   <div class="note">스캔·검증·내보내기·복구 이벤트를 시간순으로 정렬한 처리 이력입니다. 체인 해시는 감사 로그 항목을 앞 항목과 잇는 해시 값이며, 각 로그를 보고서 생성 시 다시 검증한 결과는 아래 표에 있습니다.</div>
 
   <h2>감사 로그 체인 검증</h2>
+  <div id="unauthenticated-entries"></div>
   <div id="audit-chains"></div>
   <div class="note" id="audit-chain-note">integrity-keyed = 모든 항목이 설정된 키(HMAC)로 확인됨 — 키 없이 고친 항목은 드러납니다. 구조만 확인 = 항목 연결은 맞지만 서명이 없어, 파일에 접근할 수 있는 사람이 로그 전체를 다시 쓰면 탐지할 수 없습니다. 검증 실패 = 연결이 끊김 — 해당 로그의 내용을 그대로 믿으면 안 됩니다. 체인 검증만으로는 로그 끝부분을 항목 단위로 잘라낸 것(잘림)을 탐지하지 못합니다 — 잘림은 최종화 서명(v4)에 기록된 레인별 항목 수·마지막 해시(앵커)와 비교해야 드러나며, 그 결과는 위 검토자 줄에 표시됩니다.</div>
 <script>
@@ -285,15 +286,27 @@ const scanInput = objectOrNull({index});
 const unreadableInputs = [[manifestInput, "케이스 파일(case.json)"], [scanInput, "색인 파일(db/video_index.json)"]].filter(([value]) => !value).map(([, name]) => name);
 const manifest = manifestInput || {{}};
 const scan = scanInput || {{}};
-const exportsLog = {export_lines};
-const proxyLog = {proxy_lines};
-const thumbnailLog = {thumbnail_lines};
-const carveLog = {carve_lines};
-const filesystemLog = {filesystem_lines};
-const validationLog = {validation_lines};
-const anomalyLog = {anomaly_lines};
-const batchLog = {batch_lines};
-const joinLog = {join_lines};
+// R9 P3: every log entry carries `trust` ("auth" | "sc" | "unauth" |
+// "pc:<key id>", from audit::read_lane_rows). Only "auth"/"sc" entries are
+// current results; the rest are listed separately as "인증 안 됨" and never
+// counted, confirmed or derived from. (An entry without `trust` comes from
+// a caller that did not classify it and is shown as before.)
+const usableEntry = item => !item || typeof item !== "object" || item.trust === undefined || item.trust === "auth" || item.trust === "sc";
+const unauthenticatedEntries = [];
+const usableLog = (name, rows) => (Array.isArray(rows) ? rows : []).filter(item => {{
+  if (usableEntry(item)) return true;
+  unauthenticatedEntries.push({{ name, item }});
+  return false;
+}});
+const exportsLog = usableLog("export", {export_lines});
+const proxyLog = usableLog("proxy", {proxy_lines});
+const thumbnailLog = usableLog("thumbnail", {thumbnail_lines});
+const carveLog = usableLog("carve", {carve_lines});
+const filesystemLog = usableLog("filesystem", {filesystem_lines});
+const validationLog = usableLog("validation", {validation_lines});
+const anomalyLog = usableLog("anomaly", {anomaly_lines});
+const batchLog = usableLog("batch", {batch_lines});
+const joinLog = usableLog("join", {join_lines});
 const audioLevels = {audio_levels};
 const scanRuns = {scan_runs};
 const annotations = {marks};
@@ -354,13 +367,18 @@ const fmtUnix = value => {{
 }};
 
 // I9: what re-verifying each quoted audit log at report time found.
+// R9-I7: the reason is the one the reader gave (`detail` — chain break,
+// unreadable key configuration (not tampering), unauthenticated entries,
+// another PC's key), never one fixed sentence for every cause.
 const chainLabel = name => {{
   const chain = auditChains[name];
+  const why = chain?.detail ? ` — ${{chain.detail}}` : "";
   switch (chain?.status) {{
     case "keyed": return "체인 검증: integrity-keyed (HMAC 키로 확인)";
-    case "structural": return "체인 검증: 구조만 확인 (서명 없음 — 전체 재작성은 탐지 못함)";
-    case "failed": return "체인 검증 실패 — 이 로그를 그대로 믿으면 안 됨";
-    case "not-verified": return "체인 확인 불가 (NOT VERIFIED) — 이 PC가 인증한 줄 뒤에 이 PC에 없는 키의 줄이 있어 재작성을 배제할 수 없음";
+    case "structural": return `체인 검증: 구조만 확인 — 자기 일관성만 확인(인증 아님)${{why}}`;
+    case "failed": return `체인 검증 실패 — 이 로그를 그대로 믿으면 안 됨${{why}}`;
+    case "not-verified": return `체인 확인 불가 (NOT VERIFIED)${{why}}`;
+    case "absent": return "로그 없음";
     default: return "체인 미검증";
   }}
 }};
@@ -927,6 +945,22 @@ const chainStatusText = chain => {{
     default: return "미검증 (이 보고서 생성 시 검증하지 않음)";
   }}
 }};
+// R9 P3: entries this PC could not authenticate — listed, never results.
+const unauthTrustText = trust => typeof trust === "string" && trust.startsWith("pc:") ? `이 PC에서 인증 불가 — 키 "${{trust.slice(3)}}" 보유 PC에서 확인 (변조 판정 아님)` : "인증 안 됨";
+const unauthSubject = item => item?.output_path || item?.target_path || item?.source_path || item?.selector || item?.record_id || item?.id || "-";
+document.getElementById("unauthenticated-entries").innerHTML = unauthenticatedEntries.length ? `<div class="note"><strong>인증 안 된 감사 항목 ${{unauthenticatedEntries.length}}건</strong> — 이 PC에서 인증되지 않아 위 표·집계·검증 결과에 쓰지 않았습니다 (결과·근거로 보지 마십시오).</div><table>
+  <thead><tr><th>로그</th><th>항목</th><th>대상</th><th>신뢰</th><th>사유</th></tr></thead>
+  <tbody>
+    ${{unauthenticatedEntries.map(({{ name, item }}) => `<tr>
+      <td>${{escapeHtml(name)}}</td>
+      <td>${{escapeHtml(item?.event || item?.kind || "-")}}</td>
+      <td><code>${{escapeHtml(unauthSubject(item))}}</code></td>
+      <td>${{escapeHtml(unauthTrustText(item?.trust))}}</td>
+      <td>${{escapeHtml(item?.trust_note || "-")}}</td>
+    </tr>`).join("")}}
+  </tbody>
+</table>` : "";
+
 document.getElementById("audit-chains").innerHTML = `<table>
   <thead>
     <tr><th>로그</th><th>경로</th><th>항목 수</th><th>검증 결과</th><th>상세</th></tr>
@@ -1171,20 +1205,30 @@ pub struct SignoffBindings {
 /// (`inode:<offset>:<inode>`, the report's id) and joined outputs
 /// (`join:<hash16>`). Later log entries win. A missing source is empty; an
 /// unreadable one is an error.
+/// The parseable rows of the case index `db/videos.jsonl` (plain data, not
+/// a chained lane). Missing = empty; unreadable = error.
+fn index_rows(root: &std::path::Path) -> Result<Vec<serde_json::Value>, String> {
+    match std::fs::read_to_string(root.join("db/videos.jsonl")) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(format!("db/videos.jsonl을(를) 읽지 못했습니다: {err}")),
+    }
+}
+
 pub fn evidence_hashes(
     root: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let read = |rel: &str| -> Result<String, String> {
-        match std::fs::read_to_string(root.join(rel)) {
-            Ok(text) => Ok(text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(err) => Err(format!("{rel}을(를) 읽지 못했습니다: {err}")),
-        }
-    };
-    let rows = |text: &str| -> Vec<serde_json::Value> {
-        text.lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .collect()
+    // R9 P3/I3: a hash a sign-off binds or is compared with comes only from
+    // a lane entry usable here — the LAST such entry per id. An id whose
+    // only entries are not authenticated (keys held) has no hash here
+    // ("확인 불가"), never the unauthenticated value.
+    let lane_rows = |rel: &str| -> Result<Vec<serde_json::Value>, String> {
+        crate::audit::read_lane_rows(&root.join(rel))
+            .map(|lane| lane.usable_values())
+            .map_err(|err| format!("{rel}을(를) 읽지 못했습니다: {err}"))
     };
     let field = |value: &serde_json::Value, key: &str| -> Option<String> {
         value
@@ -1194,17 +1238,17 @@ pub fn evidence_hashes(
             .map(str::to_string)
     };
     let mut out = std::collections::BTreeMap::new();
-    for row in rows(&read("db/videos.jsonl")?) {
+    for row in index_rows(root)? {
         if let (Some(id), Some(sha)) = (field(&row, "id"), field(&row, "sha256")) {
             out.insert(id, sha.to_ascii_lowercase());
         }
     }
-    for row in rows(&read("artifacts/carved/carve-log.jsonl")?) {
+    for row in lane_rows("artifacts/carved/carve-log.jsonl")? {
         if let (Some(id), Some(sha)) = (field(&row, "id"), field(&row, "sha256")) {
             out.insert(id, sha.to_ascii_lowercase());
         }
     }
-    for row in rows(&read("evidence/logs/tsk-audit.jsonl")?) {
+    for row in lane_rows("evidence/logs/tsk-audit.jsonl")? {
         if field(&row, "event").as_deref() != Some("recover-inode") {
             continue;
         }
@@ -1231,7 +1275,7 @@ pub fn evidence_hashes(
             out.insert(format!("inode:{offset}:{inode}"), sha.to_ascii_lowercase());
         }
     }
-    for row in rows(&read("artifacts/joined/join-log.jsonl")?) {
+    for row in lane_rows("artifacts/joined/join-log.jsonl")? {
         let row = crate::join::with_record_id(row);
         if let (Some(id), Some(sha)) = (field(&row, "record_id"), field(&row, "output_sha256")) {
             out.insert(id, sha.to_ascii_lowercase());
@@ -1528,29 +1572,29 @@ pub fn signoff_audit_record_with_keys(
                 .to_string(),
         );
     }
-    let text = match crate::audit::read_log_locked(&path) {
-        Ok(Some(text)) => text,
-        Ok(None) => {
+    // R9 P3: the lane's rows through the one lane reader.
+    let lane = match crate::audit::read_lane_rows_with_keys(&path, keys) {
+        Ok(lane) if !lane.present => {
             return SignoffAuditRecord::NotVerifiable(
                 "감사 체인(signoff-log)에 서명 기록이 없습니다 — 이 서명이 최종화로 기록된 것인지 확인할 수 없습니다"
                     .to_string(),
             );
         }
+        Ok(lane) => lane,
         Err(err) => {
             return SignoffAuditRecord::NotVerifiable(format!(
                 "서명 감사 레인을 읽지 못했습니다: {err}"
             ));
         }
     };
-    let verification =
-        match crate::audit::verify_chained_jsonl_text(&text, SIGNOFF_LOG_REL_PATH, keys) {
-            Ok(verification) => verification,
-            Err(err) => {
-                return SignoffAuditRecord::Contradicted(format!(
-                    "서명 감사 레인 검증 실패: {err}"
-                ));
-            }
-        };
+    if let Some(err) = &lane.failure {
+        return SignoffAuditRecord::Contradicted(format!("서명 감사 레인 검증 실패: {err}"));
+    }
+    let Some(verification) = lane.verification.as_ref() else {
+        return SignoffAuditRecord::NotVerifiable(
+            "서명 감사 레인을 확인하지 못했습니다".to_string(),
+        );
+    };
     let record = crate::sha256::digest_bytes(signoff_text.as_bytes());
     let parsed = Signoff::parse(signoff_text);
     let schema = parsed.as_ref().map_or(0, |signoff| signoff.schema_version);
@@ -1566,15 +1610,10 @@ pub fn signoff_audit_record_with_keys(
         .ok()
         .and_then(|value| value.get("signoff_log_entries").and_then(|v| v.as_u64()));
     let content = parsed.and_then(|signoff| signoff.content_sha256);
-    let lines: Vec<&str> = text
-        .strip_suffix('\n')
-        .unwrap_or(&text)
-        .split('\n')
-        .collect();
     // R8-I9: sign-off entries of finalize attempts that FAILED after
     // recording (a trusted `signoff-abandoned` entry names them) are shown,
     // never counted as newer sign-offs.
-    let abandoned = abandoned_signoff_records(&lines, &verification);
+    let abandoned = abandoned_signoff_records(&lane.rows);
     let mut signoff_entries = 0usize;
     let mut abandoned_entries = 0usize;
     // Line index of the LAST entry naming this record, and the live
@@ -1585,12 +1624,9 @@ pub fn signoff_audit_record_with_keys(
     // position the record names (other events — rotation markers,
     // abandonment notes — are ignored for the position check).
     let mut first_signoff_from_expected: Option<usize> = None;
-    // `split('\n')` (not `lines()`) keeps indices aligned with
-    // `verification.entry_auth`, which the verifier built the same way.
-    for (index, line) in lines.iter().enumerate() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
+    // Row indices are the verifier's (`LaneRow::index`).
+    for row in &lane.rows {
+        let (index, value) = (row.index, &row.value);
         if value.get("event").and_then(|v| v.as_str()) != Some("signoff") {
             continue;
         }
@@ -1644,6 +1680,15 @@ pub fn signoff_audit_record_with_keys(
             ))
         };
     };
+    // R9-I6: a record a trusted `signoff-abandoned` entry names belongs to a
+    // finalize that FAILED after recording it. Restoring that record (e.g.
+    // from a leftover pending file) must never make it Current.
+    if abandoned.contains(&record) {
+        return SignoffAuditRecord::NotVerifiable(
+            "이 서명 기록은 완료되지 않은(포기된) 최종화 시도의 기록입니다 — 감사 체인의 포기 이벤트가 이 기록을 가리키므로 현재 서명으로 보지 않습니다 (다시 최종화하십시오)"
+                .to_string(),
+        );
+    }
     // R6-I7: a genuine but OLDER sign-off restored over a newer one (or one
     // whose re-finalize never completed) is not the latest sign-off — when
     // the newer entries are still in the lane. R7-I7: removing them by
@@ -1754,17 +1799,12 @@ pub fn record_signoff_abandoned(
 /// P0: with audit keys on this PC only an AUTHENTICATED entry counts (an
 /// unauthenticated one would let anyone hide a newer sign-off); without
 /// keys everything is self-consistency only anyway (P1).
-fn abandoned_signoff_records(
-    lines: &[&str],
-    verification: &crate::audit::AuditChainVerification,
-) -> std::collections::BTreeSet<String> {
-    lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+fn abandoned_signoff_records(rows: &[crate::audit::LaneRow]) -> std::collections::BTreeSet<String> {
+    rows.iter()
+        .filter_map(|row| {
+            let value = &row.value;
             let trusted = matches!(
-                verification.line_trust(index),
+                row.trust,
                 crate::audit::LineTrust::Authenticated
                     | crate::audit::LineTrust::SelfConsistentOnly { .. }
             );
@@ -1808,12 +1848,15 @@ pub enum LiveHash {
 pub fn evidence_target_paths(
     root: &std::path::Path,
 ) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    // `db/videos.jsonl` is the index (not a chained lane); every other
+    // source is a lane read through `audit::read_lane_rows` — R9 P3/I3: a
+    // path re-hashed for a sign-off check comes only from the last entry
+    // usable here, never from one this PC cannot authenticate (then the
+    // id has no target here: "확인 불가").
     let rows = |rel: &str| -> Vec<serde_json::Value> {
-        std::fs::read_to_string(root.join(rel))
+        crate::audit::read_lane_rows(&root.join(rel))
+            .map(|lane| lane.usable_values())
             .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .collect()
     };
     let text = |value: &serde_json::Value, key: &str| -> Option<String> {
         value
@@ -1823,7 +1866,7 @@ pub fn evidence_target_paths(
             .map(str::to_string)
     };
     let mut out = std::collections::BTreeMap::new();
-    for row in rows("db/videos.jsonl") {
+    for row in index_rows(root).unwrap_or_default() {
         if let (Some(id), Some(path)) = (text(&row, "id"), crate::model::record_os_path(&row)) {
             out.insert(id, path);
         }
@@ -1948,25 +1991,23 @@ fn signoff_lane_has_entries(
     root: &std::path::Path,
     keys: &[crate::audit_key::AuditKey],
 ) -> Option<String> {
-    let text = match crate::audit::read_log_locked(&root.join(SIGNOFF_LOG_REL_PATH)) {
-        Ok(None) => return None,
-        Ok(Some(text)) => text,
+    // R9 P3: through the one lane reader. Every sign-off entry counts here,
+    // trusted or not — this only ever ADDS a restriction (caps an older
+    // record); only a trusted abandonment note lifts one.
+    let lane = match crate::audit::read_lane_rows_with_keys(&root.join(SIGNOFF_LOG_REL_PATH), keys)
+    {
+        Ok(lane) if !lane.present => return None,
+        Ok(lane) => lane,
         Err(err) => return Some(format!("레인을 읽지 못함: {err}")),
     };
-    let verification =
-        match crate::audit::verify_chained_jsonl_text(&text, SIGNOFF_LOG_REL_PATH, keys) {
-            Ok(verification) => verification,
-            Err(err) => return Some(format!("레인 검증 실패: {err}")),
-        };
-    let lines: Vec<&str> = text
-        .strip_suffix('\n')
-        .unwrap_or(&text)
-        .split('\n')
-        .collect();
-    let abandoned = abandoned_signoff_records(&lines, &verification);
-    let live = lines
+    if let Some(err) = &lane.failure {
+        return Some(format!("레인 검증 실패: {err}"));
+    }
+    let abandoned = abandoned_signoff_records(&lane.rows);
+    let live = lane
+        .rows
         .iter()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|row| &row.value)
         .filter(|value| value.get("event").and_then(|v| v.as_str()) == Some("signoff"))
         .filter(|value| {
             !value
@@ -4497,6 +4538,43 @@ mod tests {
                 SignoffCurrency::Current
             );
         });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R9-I6: the record of an ABANDONED finalize (a trusted
+    /// `signoff-abandoned` entry names it) restored as `review/signoff.json`
+    /// is never Current — R8 skipped the abandonment only for OTHER records,
+    /// so the abandoned record itself still verified.
+    #[test]
+    fn r9_i6_abandoned_record_restored_is_never_current() {
+        use super::SignoffAuditRecord;
+        let mine = crate::audit_key::AuditKey::new("mine", &[0x9b; 32]);
+        let keys = std::slice::from_ref(&mine);
+        let (root, digests) = signoff_tree("r9-i6");
+        let a = v4_record_for(&root, &digests, &["vid_000001"], 5);
+        record_with_key(&root, &a, Some(&mine));
+        let b = v4_record_for(&root, &digests, &["vid_000001"], 6);
+        record_with_key(&root, &b, Some(&mine));
+        crate::audit::append_chained_jsonl_keyed(
+            &root.join(super::SIGNOFF_LOG_REL_PATH),
+            &serde_json::json!({"event": super::SIGNOFF_ABANDONED_EVENT,
+                "signoff_record_sha256": crate::sha256::digest_bytes(b.as_bytes())})
+            .to_string(),
+            Some(&mine),
+        )
+        .unwrap();
+        match super::signoff_audit_record_with_keys(&root, &b, true, keys) {
+            SignoffAuditRecord::NotVerifiable(why) => assert!(why.contains("포기"), "{why}"),
+            other => panic!("an abandoned record must not verify: {other:?}"),
+        }
+        // The previous (completed) sign-off is still the current one.
+        assert!(matches!(
+            super::signoff_audit_record_with_keys(&root, &a, true, keys),
+            SignoffAuditRecord::Verified {
+                authenticated: true,
+                ..
+            }
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

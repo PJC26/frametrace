@@ -363,27 +363,27 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let review_html = inject_redaction_banner(html, redact_paths);
     write_text(&review_path, &review_html)
         .map_err(|err| format!("failed to write review html: {err}"))?;
-    let carve_log_raw =
-        read_to_string(&case_dir.join("artifacts/carved/carve-log.jsonl")).unwrap_or_default();
-    let filesystem_log_raw =
-        read_to_string(&case_dir.join("evidence/logs/tsk-audit.jsonl")).unwrap_or_default();
+    // R9 P3 (contract with the viewer, track U): every log entry the
+    // bundle embeds is read through `audit::read_lane_rows` and carries its
+    // `trust` code ("auth" | "sc" | "unauth" | "pc:<key id>"); proxies are
+    // only pre-built for entries usable here.
+    let carve_lane = review_lane(case_dir, "artifacts/carved/carve-log.jsonl");
+    let filesystem_lane = review_lane(case_dir, "evidence/logs/tsk-audit.jsonl");
+    let carve_log_raw = carve_lane.0;
+    let filesystem_log_raw = filesystem_lane.0;
     let carve_log = redact(&carve_log_raw);
     let filesystem_log = redact(&filesystem_log_raw);
-    let validation_log = redact(
-        &read_to_string(&case_dir.join("evidence/logs/validation-log.jsonl")).unwrap_or_default(),
-    );
+    let validation_log = redact(&review_lane(case_dir, "evidence/logs/validation-log.jsonl").0);
     // Prefer an existing anomaly log; scan on demand so make-review stays usable
     // without forcing a full-case digest pass (make-report / qa anomalies refresh).
-    let anomaly_log = redact(
-        &read_to_string(&case_dir.join("evidence/logs/anomaly-log.jsonl")).unwrap_or_default(),
-    );
+    let anomaly_log = redact(&review_lane(case_dir, "evidence/logs/anomaly-log.jsonl").0);
     let fls_entries = redact(&latest_fls_entries_jsonl(case_dir));
     // Optional proxy pre-build: browser-unplayable containers (AVI, DAV,
     // proprietary recorder exports) can't decode in the review page at all,
     // so an examiner who needs the standalone bundle to just play asks for
     // proxies up front instead of per-file through the workstation button.
     if build_proxies {
-        build_unplayable_proxies(case_dir, &carve_log_raw, &filesystem_log_raw)?;
+        build_unplayable_proxies(case_dir, &carve_lane.1, &filesystem_lane.1)?;
     }
     let (thumbs_json, thumb_stats) = generate_review_thumbnails(case_dir, &videos)?;
     // I4: notes, tags and reports can quote paths mid-string; redacted too.
@@ -398,7 +398,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     // U2: each entry carries the joined record's `record_id` (the id the
     // viewer files marks/tags under), also for entries logged before it.
     let join_log = redact(&crate::join::join_log_with_record_ids(
-        &read_to_string(&case_dir.join("artifacts/joined/join-log.jsonl")).unwrap_or_default(),
+        &review_lane(case_dir, "artifacts/joined/join-log.jsonl").0,
     ));
     let audio_levels_json = measured_audio_levels_json(case_dir)?;
     // The viewer page stays slim; the (potentially huge) record payload
@@ -760,9 +760,13 @@ pub fn make_report(
     // D11: a log that exists but cannot be read is named in the report
     // (and on stderr) — never rendered as an empty "none" section.
     let mut read_errors: std::collections::BTreeMap<String, String> = Default::default();
+    // R9 P3: every quoted lane is read through `audit::read_lane_rows`;
+    // each entry carries its `trust` code and the report shows only
+    // "auth"/"sc" entries as current results (the rest separately, as
+    // "인증 안 됨").
     let mut lane = |name: &str, rel: &str| -> String {
-        match read_optional_text(&case_dir.join(rel)) {
-            Ok(text) => text,
+        match crate::audit::read_lane_rows(&case_dir.join(rel)) {
+            Ok(lane) => lane.jsonl_with_trust(),
             Err(err) => {
                 eprintln!("warning: {rel} could not be read: {err}");
                 read_errors.insert(name.to_string(), format!("{rel}: {err}"));
@@ -1016,6 +1020,25 @@ const REPORT_AUDIT_LOGS: &[(&str, &str)] = &[
     ("signoff", report::SIGNOFF_LOG_REL_PATH),
 ];
 
+/// R9 P3: a lane for the review bundle — every entry with its `trust`
+/// code (JSONL), and only the entries usable here (JSONL). Unreadable =
+/// empty (the bundle has no error slot; make-report names read errors).
+fn review_lane(case_dir: &Path, rel: &str) -> (String, String) {
+    match crate::audit::read_lane_rows(&case_dir.join(rel)) {
+        Ok(lane) => {
+            let usable = lane
+                .usable()
+                .map(|row| format!("{}\n", row.value_with_trust()))
+                .collect();
+            (lane.jsonl_with_trust(), usable)
+        }
+        Err(err) => {
+            eprintln!("warning: {rel} could not be read: {err}");
+            (String::new(), String::new())
+        }
+    }
+}
+
 /// The text of an optional file: `""` when it does not exist, an error
 /// when it exists but cannot be read (D11).
 fn read_optional_text(path: &Path) -> Result<String, String> {
@@ -1217,34 +1240,20 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
             continue;
         }
         let path = case_dir.join(rel);
-        let entry = if !path.is_file() {
-            serde_json::json!({"path": rel, "status": "absent", "entries": 0})
-        } else {
-            match crate::audit::verify_chained_jsonl(&path) {
-                Ok(result) => {
-                    // R8 P0/P1/P2: the lane's trust under THIS PC's policy
-                    // (keys held → any line not authenticated here is NOT
-                    // VERIFIED, naming other PCs' keys; no keys →
-                    // self-consistency only).
-                    let trust = result.lane_trust();
-                    let detail = std::iter::once(trust.reason().to_string())
-                        .filter(|reason| !reason.is_empty())
-                        .chain(result.warnings.iter().cloned())
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    serde_json::json!({
-                        "path": rel,
-                        "status": trust.status(),
-                        "entries": result.entries,
-                        "detail": detail,
-                    })
-                }
-                Err(err) => serde_json::json!({
-                    "path": rel,
-                    "status": "failed",
-                    "detail": err,
-                }),
-            }
+        // R8 P0/P1/P2: the lane's trust under THIS PC's policy (keys held
+        // → any line not authenticated here is NOT VERIFIED, naming other
+        // PCs' keys; no keys → self-consistency only). R9 P3/P5/I7: read
+        // through the same `read_lane_rows` the sections use, so the
+        // status and the cause-specific `detail` (chain break, key
+        // configuration unreadable — not tampering —, unauthenticated
+        // entries, legacy unbound entries) describe exactly those rows.
+        let entry = match crate::audit::read_lane_rows(&path) {
+            Ok(lane) => lane.chain_json(rel),
+            Err(err) => serde_json::json!({
+                "path": rel,
+                "status": "failed",
+                "detail": format!("레인을 읽지 못함: {err}"),
+            }),
         };
         map.insert((*name).to_string(), entry);
     }

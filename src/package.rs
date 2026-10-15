@@ -1389,6 +1389,11 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
                 };
                 out.push(status, rel, detail);
             }
+            // R9 P5/I9: the audit key configuration exists but cannot be
+            // read — NOT VERIFIED (fail closed), never "audit chain broken".
+            Err(err) if audit::is_key_config_error(&err) => {
+                out.push(CheckStatus::NotVerified, rel, err)
+            }
             Err(err) if known_lane => out.push(
                 CheckStatus::Fail,
                 rel,
@@ -1449,8 +1454,10 @@ fn verify_review_siblings(
         }
     }
     let carve_log_has_entries = listed.contains_key(CARVE_LOG_REL)
-        && fs::read_to_string(package_dir.join(CARVE_LOG_REL))
-            .map(|text| text.lines().any(|line| !line.trim().is_empty()))
+        // R9 P3: through the one lane reader; ANY entry (trusted or not)
+        // asks for the carve report — this only adds a "not verified".
+        && crate::audit::read_lane_rows(&package_dir.join(CARVE_LOG_REL))
+            .map(|lane| !lane.rows.is_empty())
             .unwrap_or(true);
     if carve_log_has_entries && !listed.contains_key(CARVE_REPORT_REL) {
         out.push(

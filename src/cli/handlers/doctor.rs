@@ -22,30 +22,15 @@ pub fn benchmark_db(output_dir: &Path, options: BenchmarkOptions) -> Result<(), 
 
 pub fn verify_audit(log_path: &Path) -> Result<(), String> {
     // Examiners naturally point this at the case directory; discover the
-    // standard chained logs under evidence/logs instead of dying on the
-    // directory read.
+    // case's chained lanes instead of dying on the directory read. R9 P4:
+    // the WHOLE case (`audit::case_lane_paths` — artifacts/** lanes too),
+    // R8 only checked evidence/logs.
     if log_path.is_dir() {
-        let logs_dir = log_path.join("evidence/logs");
-        let mut logs: Vec<PathBuf> = Vec::new();
-        let entries = std::fs::read_dir(&logs_dir).map_err(|err| {
-            format!(
-                "{} is a directory but has no readable evidence/logs: {err}",
-                log_path.display()
-            )
-        })?;
-        for entry in entries {
-            let path = entry
-                .map_err(|err| format!("failed to list {}: {err}", logs_dir.display()))?
-                .path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-                logs.push(path);
-            }
-        }
-        logs.sort();
+        let logs = audit::case_lane_paths(log_path);
         if logs.is_empty() {
             return Err(format!(
-                "no audit .jsonl logs found under {}",
-                logs_dir.display()
+                "no audit .jsonl logs found under {} (evidence/logs, artifacts)",
+                log_path.display()
             ));
         }
         let mut failures = Vec::new();
@@ -78,6 +63,12 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
                         not_verified.push(log.display().to_string());
                     }
                 }
+                // R9 P5/I9: an unreadable key configuration is NOT
+                // VERIFIED (fail closed), never a FAIL / tamper verdict.
+                Err(err) if audit::is_key_config_error(&err) => {
+                    println!("audit NOT VERIFIED: {}: {err}", log.display());
+                    not_verified.push(log.display().to_string());
+                }
                 Err(err) => {
                     println!("audit FAILED: {}: {err}", log.display());
                     failures.push(log.display().to_string());
@@ -98,7 +89,17 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
         }
         return Ok(());
     }
-    let result = audit::verify_chained_jsonl(log_path)?;
+    let result = audit::verify_chained_jsonl(log_path).map_err(|err| {
+        if audit::is_key_config_error(&err) {
+            println!("audit NOT VERIFIED: {}", log_path.display());
+            format!(
+                "audit log {} could not be verified on this PC: {err}",
+                log_path.display()
+            )
+        } else {
+            err
+        }
+    })?;
     let trust = result.lane_trust();
     if !trust.passes() {
         println!("audit NOT VERIFIED: {}", log_path.display());
@@ -262,10 +263,11 @@ fn dedup_lanes(targets: Vec<PathBuf>) -> Vec<PathBuf> {
 
 /// R8-I8: the lane holds entries and none of them carries an HMAC.
 fn lane_is_keyless(lane: &Path) -> bool {
-    audit::read_log_locked(lane)
+    // Structure only (no keys): does any entry carry an HMAC?
+    audit::read_lane_rows_with_keys(lane, &[])
         .ok()
-        .flatten()
-        .and_then(|text| audit::verify_chained_jsonl_text(&text, "lane", &[]).ok())
+        .filter(|rows| rows.failure.is_none())
+        .and_then(|rows| rows.verification)
         .is_some_and(|result| result.entries > 0 && result.keyed_entries == 0)
 }
 
@@ -548,19 +550,10 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
             ));
         }
 
-        for log_dir in [
-            case_dir.join("evidence/logs"),
-            case_dir.join("artifacts/logs"),
-            case_dir.join("artifacts/clips"),
-        ] {
-            let Ok(entries) = fs::read_dir(&log_dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
+        // R9 P4: every chained lane of the case (`audit::case_lane_paths` —
+        // all of artifacts/**, not three folders).
+        {
+            for path in audit::case_lane_paths(case_dir) {
                 let name = format!(
                     "audit log {}",
                     path.strip_prefix(case_dir).unwrap_or(&path).display()
@@ -591,6 +584,10 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
                         } else {
                             DoctorCheck::warn(&name, detail)
                         });
+                    }
+                    // R9 P5/I9: not a broken chain — the key configuration.
+                    Err(err) if audit::is_key_config_error(&err) => {
+                        checks.push(DoctorCheck::warn(&name, err))
                     }
                     Err(err) => checks.push(DoctorCheck::fail(&name, err)),
                 }
@@ -790,6 +787,27 @@ mod tests {
         let rotated = audit::verify_chained_jsonl_keyed(&second, keys).unwrap();
         assert_eq!(rotated.pre_key_entries, 0);
         assert!(!rotated.lane_trust().passes());
+        let _ = fs::remove_dir_all(&case);
+    }
+
+    /// R9-I2/P4: `verify-audit <case>` covers every lane of the case — a
+    /// tampered artifacts/** lane fails it (R8 looked at evidence/logs only
+    /// and passed).
+    #[test]
+    fn r9_i2_verify_audit_case_covers_artifact_lanes() {
+        let case = std::env::temp_dir().join(format!("ft-doctor-r9-i2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&case);
+        let scan = case.join("evidence/logs/scan-log.jsonl");
+        let carve = case.join("artifacts/carved/carve-log.jsonl");
+        audit::append_chained_jsonl_keyed(&scan, r#"{"n":1}"#, None).unwrap();
+        audit::append_chained_jsonl_keyed(&carve, r#"{"id":"c1","sha256":"aa"}"#, None).unwrap();
+        crate::audit_key::with_test_keys(&[], || {
+            super::verify_audit(&case).unwrap();
+            let text = fs::read_to_string(&carve).unwrap();
+            fs::write(&carve, text.replace("\"aa\"", "\"bb\"")).unwrap();
+            let err = super::verify_audit(&case).unwrap_err();
+            assert!(err.contains("failed verification"), "{err}");
+        });
         let _ = fs::remove_dir_all(&case);
     }
 }

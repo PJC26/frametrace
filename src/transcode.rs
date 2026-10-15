@@ -197,11 +197,13 @@ pub fn run_queue(
 }
 
 /// Latest queue summary for status display.
+/// R9 P3: the newest entry usable here (read through
+/// `audit::read_lane_rows`), with its `trust` code.
 pub fn latest_summary(case_dir: &Path) -> Option<serde_json::Value> {
-    let text = read_to_string(&case_dir.join(QUEUE_LOG)).ok()?;
-    text.lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    let lane = crate::audit::read_lane_rows(&case_dir.join(QUEUE_LOG)).ok()?;
+    lane.usable()
+        .next_back()
+        .map(crate::audit::LaneRow::value_with_trust)
         .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("transcode-queue"))
 }
 

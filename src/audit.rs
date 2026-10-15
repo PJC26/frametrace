@@ -71,6 +71,11 @@ pub struct AuditChainVerification {
     /// of everything before it, so this prefix cannot be extended later —
     /// but it was never authenticated, so it is self-consistency only.
     pub pre_key_entries: usize,
+    /// R9-I10: the lane's first keyed entry is a key-introduction marker
+    /// signed under a key this PC does NOT hold: `(entries before it, that
+    /// key id)`. Those unkeyed entries are another PC's pre-key prefix —
+    /// "check on the PC holding key <id>" (P2), not "HMAC stripped".
+    pub pre_key_other_pc: Option<(usize, String)>,
 }
 
 /// R8 §0 — THE governing rule (docs/audit-hmac-design.md "Trust policy"):
@@ -132,11 +137,32 @@ pub enum LineTrust {
     /// possibly stripped — or signed only by a retired key nothing later
     /// proves).
     NotAuthenticated { retired_unproven: bool },
+    /// R9 P3: the entry sits at or after the point where the lane's chain
+    /// stops verifying (an edited / torn line, or an authenticated entry
+    /// bound to another lane or case, R9-I11) — nothing vouches for it, on
+    /// any PC.
+    ChainBroken,
 }
 
 impl LineTrust {
     pub fn is_authenticated(&self) -> bool {
         matches!(self, Self::Authenticated)
+    }
+
+    /// R9 P3: the per-entry trust code carried to the viewer (bundle and
+    /// `/api/records-meta` log arrays, field `trust`) and the report:
+    /// `"auth"` (authenticated here), `"sc"` (self-consistency only — no
+    /// keys here, or the documented pre-key prefix), `"pc:<key id>"`
+    /// (another PC's key — check it there, not a tamper verdict),
+    /// `"unauth"` (keys held here and not authenticated, or after a chain
+    /// break).
+    pub fn code(&self) -> String {
+        match self {
+            Self::Authenticated => "auth".to_string(),
+            Self::SelfConsistentOnly { .. } | Self::PreKey => "sc".to_string(),
+            Self::OtherPc { key_id } => format!("pc:{key_id}"),
+            Self::NotAuthenticated { .. } | Self::ChainBroken => "unauth".to_string(),
+        }
     }
 
     /// May the entry be shown at all as a (caveated) result? True for
@@ -173,6 +199,9 @@ impl LineTrust {
                 retired_unproven: false,
             } => "이 PC에서 인증되지 않음 — 감사 키가 있는 PC에서 HMAC 없는 항목은 믿지 않음 (HMAC이 제거됐거나 키 없이 추가된 항목일 수 있음)"
                 .to_string(),
+            Self::ChainBroken => {
+                "감사 체인 검증이 실패한 지점 이후의 항목 — 믿을 수 없음".to_string()
+            }
         }
     }
 }
@@ -247,10 +276,42 @@ impl AuditChainVerification {
                 retired_unproven: true,
             },
             Some(EntryAuth::Unkeyed) if index < self.pre_key_entries => LineTrust::PreKey,
+            // R9-I10: another PC's pre-key prefix — P2 wording, never
+            // "stripped". Still not usable here (NOT VERIFIED).
+            Some(EntryAuth::Unkeyed)
+                if self
+                    .pre_key_other_pc
+                    .as_ref()
+                    .is_some_and(|(len, _)| index < *len) =>
+            {
+                LineTrust::OtherPc {
+                    key_id: self
+                        .pre_key_other_pc
+                        .as_ref()
+                        .map(|(_, id)| id.clone())
+                        .unwrap_or_default(),
+                }
+            }
             Some(EntryAuth::Unkeyed | EntryAuth::NoKey) | None => LineTrust::NotAuthenticated {
                 retired_unproven: false,
             },
         }
+    }
+
+    /// R9 (contract with track U): `(unauthenticated, other_pc)` line
+    /// counts under this PC's policy — lines not authenticated here (no
+    /// HMAC, possibly stripped, or a retired key nothing later proves) and
+    /// lines signed under another PC's key. Both 0 without keys here.
+    pub fn trust_counts(&self) -> (usize, usize) {
+        let (mut unauthenticated, mut other_pc) = (0, 0);
+        for index in 0..self.entries {
+            match self.line_trust(index) {
+                LineTrust::NotAuthenticated { .. } | LineTrust::ChainBroken => unauthenticated += 1,
+                LineTrust::OtherPc { .. } => other_pc += 1,
+                _ => {}
+            }
+        }
+        (unauthenticated, other_pc)
     }
 
     /// R8: the trust of the whole lane under this PC's policy — the one
@@ -272,7 +333,8 @@ impl AuditChainVerification {
                 } => retired += 1,
                 LineTrust::NotAuthenticated {
                     retired_unproven: false,
-                } => unkeyed += 1,
+                }
+                | LineTrust::ChainBroken => unkeyed += 1,
             }
         }
         let quoted = |ids: Vec<&String>| {
@@ -342,6 +404,450 @@ impl AuditChainVerification {
     }
 }
 
+/// R9 P3: one entry of a chained lane as read through [`read_lane_rows`].
+#[derive(Debug, Clone)]
+pub struct LaneRow {
+    /// Index of the entry in the lane (`0` = audit line 1).
+    pub index: usize,
+    /// The line exactly as recorded.
+    pub raw: String,
+    /// The parsed entry (`Null` when the line is not JSON — only possible
+    /// past a chain break).
+    pub value: serde_json::Value,
+    /// What this entry may be relied on for under this PC's policy.
+    pub trust: LineTrust,
+}
+
+impl LaneRow {
+    /// R9 P3: may this entry feed a "current / confirmed / passed" claim,
+    /// or a path / hash used for re-verification? Authenticated here, the
+    /// documented pre-key prefix, or — on a PC without keys —
+    /// self-consistency only (every display says so, P1). Never another
+    /// PC's entry, an unauthenticated one where keys are held, or anything
+    /// after a chain break.
+    pub fn usable(&self) -> bool {
+        self.trust.is_usable()
+    }
+
+    /// The entry with its per-entry `trust` code (the viewer/report
+    /// contract, [`LineTrust::code`]) and, when it is not usable, a
+    /// `trust_note` saying why.
+    pub fn value_with_trust(&self) -> serde_json::Value {
+        let mut value = match &self.value {
+            serde_json::Value::Object(map) => serde_json::Value::Object(map.clone()),
+            _ => serde_json::json!({}),
+        };
+        value["trust"] = serde_json::Value::String(self.trust.code());
+        if !self.usable() {
+            value["trust_note"] = serde_json::Value::String(self.trust.note());
+        }
+        value
+    }
+}
+
+/// R9 P3: every entry of a chained lane with its [`LineTrust`], plus the
+/// lane's trust — THE way code reads rows of a chained lane
+/// ([`read_lane_rows`]).
+#[derive(Debug, Clone)]
+pub struct LaneRows {
+    /// The lane file exists.
+    pub present: bool,
+    /// Every entry in lane order (`rows[n].index == n`).
+    pub rows: Vec<LaneRow>,
+    /// The lane's trust under this PC's policy (for a broken chain or an
+    /// unreadable key configuration: NOT VERIFIED with that reason).
+    pub lane: LaneTrust,
+    /// The chain does not verify (FAIL): why. Entries from the break on
+    /// are [`LineTrust::ChainBroken`].
+    pub failure: Option<String>,
+    /// R9 P5: the audit key configuration exists but could not be read —
+    /// treated as "keys held" (fail closed) with nothing authenticated;
+    /// NOT a tamper verdict.
+    pub key_error: Option<String>,
+    /// R9-I11: authenticated entries written before lane/case binding
+    /// existed (no `audit_lane`) — whether they were moved here from
+    /// another lane or case cannot be checked.
+    pub unbound_authenticated: usize,
+    /// The verification of the verifying prefix (all of it when
+    /// `failure` is `None`).
+    pub verification: Option<AuditChainVerification>,
+}
+
+impl LaneRows {
+    fn absent(requirement: AuthRequirement, key_error: Option<String>) -> Self {
+        let lane = match (&key_error, requirement) {
+            (Some(err), _) => LaneTrust::NotVerified {
+                reason: err.clone(),
+                other_pc_key_ids: Vec::new(),
+            },
+            _ => LaneTrust::SelfConsistentOnly("항목 없음 — 레인이 없습니다".to_string()),
+        };
+        Self {
+            present: false,
+            rows: Vec::new(),
+            lane,
+            failure: None,
+            key_error,
+            unbound_authenticated: 0,
+            verification: None,
+        }
+    }
+
+    /// Entries that may feed claims ([`LaneRow::usable`]).
+    pub fn usable(&self) -> impl DoubleEndedIterator<Item = &LaneRow> {
+        self.rows.iter().filter(|row| row.usable())
+    }
+
+    /// Entries that may NOT feed claims — shown, if at all, as
+    /// "인증 안 됨".
+    pub fn unusable(&self) -> impl DoubleEndedIterator<Item = &LaneRow> {
+        self.rows.iter().filter(|row| !row.usable())
+    }
+
+    /// Parsed values of the usable entries, in lane order.
+    pub fn usable_values(&self) -> Vec<serde_json::Value> {
+        self.usable().map(|row| row.value.clone()).collect()
+    }
+
+    /// Every entry with its `trust` code ([`LaneRow::value_with_trust`]).
+    /// Lines that are not a JSON object (only possible past a chain break,
+    /// e.g. a torn final line) are left out, as the readers always did.
+    pub fn values_with_trust(&self) -> Vec<serde_json::Value> {
+        self.rows
+            .iter()
+            .filter(|row| row.value.is_object())
+            .map(LaneRow::value_with_trust)
+            .collect()
+    }
+
+    /// [`Self::values_with_trust`] as JSONL text (one object per line).
+    pub fn jsonl_with_trust(&self) -> String {
+        self.values_with_trust()
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect()
+    }
+
+    /// The report's chain status word: `absent`, `failed`, or
+    /// [`LaneTrust::status`].
+    pub fn status(&self) -> &'static str {
+        if !self.present {
+            "absent"
+        } else if self.failure.is_some() {
+            "failed"
+        } else {
+            self.lane.status()
+        }
+    }
+
+    /// Why the lane has its status (empty when authenticated and bound).
+    pub fn detail(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(failure) = &self.failure {
+            parts.push(format!("체인 검증 실패: {failure}"));
+        }
+        if !self.lane.reason().is_empty() && self.failure.is_none() {
+            parts.push(self.lane.reason().to_string());
+        }
+        let unusable = self.unusable().count();
+        if unusable > 0 {
+            parts.push(format!(
+                "인증 안 된 항목 {unusable}개는 결과·근거로 쓰지 않고 \"인증 안 됨\"으로 따로 표시"
+            ));
+        }
+        if self.unbound_authenticated > 0 {
+            parts.push(format!(
+                "레인·케이스 결합이 없는 이전 형식의 인증 항목 {}개 (다른 레인·케이스에서 옮겨 왔는지 확인 불가 — 레거시)",
+                self.unbound_authenticated
+            ));
+        }
+        if let Some(verification) = &self.verification {
+            parts.extend(verification.warnings.iter().cloned());
+        }
+        parts.join("; ")
+    }
+
+    /// The report / API chain object: `{"path", "status", "entries",
+    /// "unauthenticated", "detail"}`.
+    pub fn chain_json(&self, rel: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": rel,
+            "status": self.status(),
+            "entries": self.rows.len(),
+            "unauthenticated": self.unusable().count(),
+            "detail": self.detail(),
+        })
+    }
+}
+
+/// R9 P3: reads every entry of the chained lane at `path` with its
+/// [`LineTrust`] under THIS PC's key set. A missing lane is `present:
+/// false`; a lane that exists but cannot be read is an error (D11). A key
+/// configuration that exists but cannot be read (P5) does not fail the
+/// read: it is "keys held" with nothing authenticated, and `key_error`
+/// says so (not a tamper verdict).
+pub fn read_lane_rows(path: &Path) -> Result<LaneRows, String> {
+    match crate::audit_key::verification_keys() {
+        Ok(keys) => read_lane_rows_inner(path, &keys, None),
+        Err(err) => read_lane_rows_inner(path, &[], Some(key_config_error_note(&err))),
+    }
+}
+
+/// Test hook: [`read_lane_rows`] as it runs when the key configuration
+/// could not be read (`err`).
+#[cfg(test)]
+pub(crate) fn read_lane_rows_with_key_error(path: &Path, err: &str) -> Result<LaneRows, String> {
+    read_lane_rows_inner(path, &[], Some(key_config_error_note(err)))
+}
+
+/// [`read_lane_rows`] with an explicit verification key set.
+pub fn read_lane_rows_with_keys(path: &Path, keys: &[AuditKey]) -> Result<LaneRows, String> {
+    read_lane_rows_inner(path, keys, None)
+}
+
+/// R9 P5/I9: the wording for an audit key configuration that exists but
+/// cannot be read — never a tamper verdict.
+pub fn key_config_error_note(err: &str) -> String {
+    if err.starts_with(crate::audit_key::KEY_CONFIG_UNREADABLE) {
+        err.to_string()
+    } else {
+        format!(
+            "{}: {err} — 감사 키가 있는 것으로 보고 아무 항목도 인증하지 않음 (변조 판정 아님; 키 설정을 고친 뒤 다시 확인)",
+            crate::audit_key::KEY_CONFIG_UNREADABLE
+        )
+    }
+}
+
+/// R9 P5/I9: whether a verification error is "the audit key configuration
+/// could not be read" — NOT VERIFIED (fail closed), never a FAIL / tamper
+/// verdict.
+pub fn is_key_config_error(err: &str) -> bool {
+    err.starts_with(crate::audit_key::KEY_CONFIG_UNREADABLE)
+}
+
+/// R9 P4: every chained lane of a case for a case-wide check — the known
+/// lanes anywhere under `artifacts/` and `evidence/logs/`
+/// ([`collect_chain_lanes`]) plus any other `*.jsonl` directly in
+/// `evidence/logs/` (verified as before, never skipped), as sorted
+/// absolute paths.
+pub fn case_lane_paths(case_dir: &Path) -> Vec<PathBuf> {
+    let mut rels = collect_chain_lanes(case_dir);
+    if let Ok(entries) = std::fs::read_dir(case_dir.join("evidence").join("logs")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().is_ok_and(|kind| kind.is_file()) && name.ends_with(".jsonl") {
+                rels.push(format!("evidence/logs/{name}"));
+            }
+        }
+    }
+    rels.sort();
+    rels.dedup();
+    rels.iter()
+        .map(|rel| {
+            rel.split('/')
+                .fold(case_dir.to_path_buf(), |path, part| path.join(part))
+        })
+        .collect()
+}
+
+fn read_lane_rows_inner(
+    path: &Path,
+    keys: &[AuditKey],
+    key_error: Option<String>,
+) -> Result<LaneRows, String> {
+    let forced = key_error.is_some();
+    let requirement = if forced {
+        AuthRequirement::Required
+    } else {
+        trust_policy(keys)
+    };
+    let Some(text) = read_log_locked(path)? else {
+        return Ok(LaneRows::absent(requirement, key_error));
+    };
+    let source = path.display().to_string();
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    let lines: Vec<&str> = if text.is_empty() {
+        Vec::new()
+    } else {
+        body.split('\n').collect()
+    };
+    let (mut verification, mut failure) = match verify_chained_jsonl_text(&text, &source, keys) {
+        Ok(verification) => (verification, None),
+        Err(err) => {
+            let (count, bytes) = verified_prefix(&text, keys);
+            let prefix = verify_chained_jsonl_text(&text[..bytes], &source, keys)
+                .map_err(|err| format!("audit lane {source}: verified prefix: {err}"))?;
+            debug_assert_eq!(prefix.entries, count);
+            (prefix, Some(err))
+        }
+    };
+    if forced {
+        verification.requirement = AuthRequirement::Required;
+    }
+    // R9-I11: an authenticated entry bound to another lane or case.
+    let binding = lane_binding_of(path);
+    let mut unbound_authenticated = 0usize;
+    let mut verified = verification.entries;
+    for (index, line) in lines.iter().enumerate().take(verification.entries) {
+        if !verification.line_trust(index).is_authenticated() {
+            continue;
+        }
+        match check_entry_binding(line, binding.as_ref()) {
+            Ok(true) => {}
+            Ok(false) => unbound_authenticated += 1,
+            Err(err) => {
+                failure = Some(format!("audit line {}: {err}", index + 1));
+                verified = index;
+                break;
+            }
+        }
+    }
+    let rows = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| LaneRow {
+            index,
+            raw: (*line).to_string(),
+            value: serde_json::from_str(line).unwrap_or(serde_json::Value::Null),
+            trust: if index < verified {
+                verification.line_trust(index)
+            } else {
+                LineTrust::ChainBroken
+            },
+        })
+        .collect();
+    let lane = if let Some(err) = &key_error {
+        LaneTrust::NotVerified {
+            reason: err.clone(),
+            other_pc_key_ids: Vec::new(),
+        }
+    } else if let Some(failure) = &failure {
+        LaneTrust::NotVerified {
+            reason: format!("체인 검증 실패: {failure}"),
+            other_pc_key_ids: Vec::new(),
+        }
+    } else {
+        verification.lane_trust()
+    };
+    Ok(LaneRows {
+        present: true,
+        rows,
+        lane,
+        failure,
+        key_error,
+        unbound_authenticated,
+        verification: Some(verification),
+    })
+}
+
+/// R9-I11: the field naming, inside the HMAC-covered bytes, the lane an
+/// entry was appended to (case-relative, `/`-separated).
+pub const ENTRY_LANE_FIELD: &str = "audit_lane";
+/// R9-I11: the field naming the `case_id` (from `case.json`) of the case
+/// an entry was appended in.
+pub const ENTRY_CASE_FIELD: &str = "audit_case_id";
+
+/// R9-I11: where a lane file sits — its case (or package) root, its
+/// root-relative lane name, and that root's `case_id` when `case.json`
+/// names one. `None` for a file that is not a known lane under any
+/// ancestor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneBinding {
+    pub rel: String,
+    pub case_id: Option<String>,
+}
+
+pub fn lane_binding_of(path: &Path) -> Option<LaneBinding> {
+    for root in path.ancestors().skip(1) {
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if is_known_chain_lane(&rel) {
+            let case_id = read_to_string(&root.join("case.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|value| {
+                    value
+                        .get("case_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|id| !id.is_empty());
+            return Some(LaneBinding { rel, case_id });
+        }
+    }
+    None
+}
+
+/// R9-I11: checks an authenticated entry's lane/case binding against
+/// where it was found. `Ok(true)` bound and matching, `Ok(false)` no
+/// binding (a legacy entry), `Err` bound elsewhere.
+fn check_entry_binding(line: &str, here: Option<&LaneBinding>) -> Result<bool, String> {
+    let lane = extract_json_string(line, ENTRY_LANE_FIELD);
+    let case = extract_json_string(line, ENTRY_CASE_FIELD);
+    if lane.is_none() && case.is_none() {
+        return Ok(false);
+    }
+    let Some(here) = here else {
+        // A bound entry in a file that is not a known lane: it was moved
+        // out of its lane.
+        return Err(format!(
+            "인증된 항목이 레인 {}에 결합되어 있으나 알려진 레인 위치가 아닌 곳에 있음 — 레인이 옮겨짐",
+            lane.unwrap_or_default()
+        ));
+    };
+    if let Some(lane) = &lane
+        && *lane != here.rel
+    {
+        return Err(format!(
+            "인증된 항목이 레인 {lane}에 결합되어 있으나 {}에 있음 — 다른 레인의 항목을 옮긴 것",
+            here.rel
+        ));
+    }
+    if let Some(case) = &case {
+        match &here.case_id {
+            Some(id) if id == case => {}
+            Some(id) => {
+                return Err(format!(
+                    "인증된 항목이 케이스 {case}에 결합되어 있으나 이 케이스는 {id} — 다른 케이스의 레인을 옮긴 것"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "인증된 항목이 케이스 {case}에 결합되어 있으나 이 위치에 case.json의 case_id가 없음 — 결합을 확인할 수 없음"
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// R9-I11: the binding fields a keyed append adds to `body` for the lane
+/// at `path` (none for a file that is not a known lane, or when the body
+/// already names them).
+fn bind_body(path: &Path, body: &str) -> String {
+    if body.contains(&format!("\"{ENTRY_LANE_FIELD}\"")) {
+        return body.to_string();
+    }
+    let Some(binding) = lane_binding_of(path) else {
+        return body.to_string();
+    };
+    let mut fields = format!("\"{ENTRY_LANE_FIELD}\":\"{}\"", json_escape(&binding.rel));
+    if let Some(case_id) = &binding.case_id {
+        fields.push_str(&format!(
+            ",\"{ENTRY_CASE_FIELD}\":\"{}\"",
+            json_escape(case_id)
+        ));
+    }
+    let inner = body[1..body.len() - 1].trim();
+    if inner.is_empty() {
+        format!("{{{fields}}}")
+    } else {
+        format!("{},{fields}}}", &body[..body.len() - 1])
+    }
+}
+
 /// R8-I8: the `kind` of the marker `rotate-audit-key --log <case>` signs
 /// into a lane that holds entries but no keyed entry yet (instead of the
 /// rotation marker): the entries before it were written before audit
@@ -405,6 +911,16 @@ pub fn append_chained_jsonl_keyed(
     if !body.starts_with('{') || !body.ends_with('}') {
         return Err("audit log body must be a JSON object".to_string());
     }
+    // R9-I11: a keyed entry names, inside the HMAC-covered bytes, the lane
+    // and case it was appended to, so an authenticated lane copied to
+    // another lane or case no longer verifies there.
+    let bound;
+    let body = if key.is_some() {
+        bound = bind_body(path, body);
+        bound.as_str()
+    } else {
+        body
+    };
     let was_new = !path.exists();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -741,8 +1257,40 @@ pub fn modified_nanos(meta: &std::fs::Metadata) -> Option<u128> {
 
 pub fn verify_chained_jsonl(path: &Path) -> Result<AuditChainVerification, String> {
     let keys = crate::audit_key::verification_keys()?;
-    let text = read_log_for_verification(path)?;
-    verify_chained_jsonl_text(&text, &path.display().to_string(), &keys)
+    verify_chained_jsonl_keyed(path, &keys)
+}
+
+/// R9-I11: the lane/case binding of every authenticated entry of the lane
+/// at `path` (`text` its content): an entry bound to another lane or case
+/// fails verification; entries without a binding (written before R9) are
+/// reported in a warning as legacy.
+fn apply_lane_binding(
+    path: &Path,
+    text: &str,
+    mut verification: AuditChainVerification,
+) -> Result<AuditChainVerification, String> {
+    let binding = lane_binding_of(path);
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut unbound = 0usize;
+    if !text.is_empty() {
+        for (index, line) in body.split('\n').enumerate() {
+            if verification.entry_auth.get(index) != Some(&EntryAuth::Authenticated) {
+                continue;
+            }
+            if !check_entry_binding(line, binding.as_ref())
+                .map_err(|err| format!("audit line {}: {err}", index + 1))?
+            {
+                unbound += 1;
+            }
+        }
+    }
+    if unbound > 0 && binding.is_some() {
+        verification.warnings.push(format!(
+            "{unbound} authenticated entr{} carry no lane/case binding (written before R9) — legacy: whether they were moved here from another lane or case cannot be checked",
+            if unbound == 1 { "y" } else { "ies" }
+        ));
+    }
+    Ok(verification)
 }
 
 /// Reads the audit log for verification under the same exclusive lock the
@@ -822,7 +1370,8 @@ pub fn verify_chained_jsonl_keyed(
     keys: &[AuditKey],
 ) -> Result<AuditChainVerification, String> {
     let text = read_log_for_verification(path)?;
-    verify_chained_jsonl_text(&text, &path.display().to_string(), keys)
+    let verification = verify_chained_jsonl_text(&text, &path.display().to_string(), keys)?;
+    apply_lane_binding(path, &text, verification)
 }
 
 /// In-memory form of `verify_chained_jsonl` over the raw log text, so the
@@ -1214,7 +1763,35 @@ pub fn verify_chained_jsonl_text(
     }
 
     let pre_key_entries = pre_key_of(&entry_auth);
+    // R9-I10: the introduction marker of another PC's key.
+    let pre_key_other_pc = match entry_auth
+        .iter()
+        .position(|auth| *auth != EntryAuth::Unkeyed)
+    {
+        Some(first)
+            if first > 0
+                && entry_auth[first] == EntryAuth::UnknownKey
+                && serde_json::from_str::<serde_json::Value>(lines[first])
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some(KEY_INTRODUCED_KIND) =>
+        {
+            entry_key_ids
+                .get(first)
+                .cloned()
+                .flatten()
+                .map(|key_id| (first, key_id))
+        }
+        _ => None,
+    };
     Ok(AuditChainVerification {
+        pre_key_other_pc,
         entries,
         last_entry_sha256,
         keyed_entries,
@@ -1436,6 +2013,18 @@ fn entry_without_recorded_hash(line: &str) -> Option<String> {
 
 /// R6-I10 tests: a non-Unicode name `<stem><bad unit>` whose lossy display
 /// string is the same for every `variant` (each one a different file).
+/// Test helper (R9 P3): writes `jsonl` (one JSON object per line) as a
+/// real chained lane at `path`, unkeyed — fixtures for consumers that now
+/// read rows through [`read_lane_rows`], which trusts nothing past a
+/// chain break. Replaces any existing file.
+#[cfg(test)]
+pub(crate) fn test_write_lane(path: &Path, jsonl: &str) {
+    let _ = std::fs::remove_file(path);
+    for line in jsonl.lines().filter(|line| !line.trim().is_empty()) {
+        append_chained_jsonl_keyed(path, line, None).unwrap();
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_non_unicode_twin(stem: &str, variant: u8) -> std::ffi::OsString {
     #[cfg(unix)]
@@ -2565,3 +3154,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "tests_audit_r9.rs"]
+mod tests_r9;

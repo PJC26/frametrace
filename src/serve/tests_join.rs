@@ -177,10 +177,18 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
         for step in steps {
             body.push_str(&match step {
                 Step::Copy(src, dst) => format!("cp \"{}\" \"{}\"\n", src.display(), dst.display()),
+                // R9 P3: appended as a real CHAINED entry (the server
+                // reads the join log through `audit::read_lane_rows`).
                 Step::Append(src, dst) => format!(
-                    "sed \"s/@TAG@/$tag/g\" \"{}\" >> \"{}\"\n",
-                    src.display(),
-                    dst.display()
+                    "body=$(sed \"s/@TAG@/$tag/g\" \"{src}\")\n\
+                     h() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }}\n\
+                     prev=GENESIS\n\
+                     if [ -s \"{dst}\" ]; then prev=$(printf '%s' \"$(tail -n 1 \"{dst}\")\" | h); fi\n\
+                     chained=\"${{body%\\}}}},\\\"previous_entry_sha256\\\":\\\"$prev\\\"}}\"\n\
+                     entry=$(printf '%s' \"$chained\" | h)\n\
+                     printf '%s\\n' \"${{chained%\\}}}},\\\"entry_sha256\\\":\\\"$entry\\\"}}\" >> \"{dst}\"\n",
+                    src = src.display(),
+                    dst = dst.display()
                 ),
                 Step::Stderr(text) => format!("echo \"{text}\" >&2\n"),
                 Step::TaggedTemps(dir, progress) => {
@@ -224,10 +232,13 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
                     dst.display()
                 ),
                 // C13: staged log lines carry `@TAG@` for the job tag.
+                // R9 P3: appended as a real CHAINED entry (the server
+                // reads the join log through `audit::read_lane_rows`).
                 Step::Append(src, dst) => format!(
-                    "powershell -NoProfile -Command \"[IO.File]::AppendAllText('{}', [IO.File]::ReadAllText('{}').Replace('@TAG@','%tag%'))\"\r\n",
-                    dst.display(),
-                    src.display()
+                    "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" \"{}\" \"{}\" \"%tag%\"\r\n",
+                    append_helper_ps1(dir).display(),
+                    src.display(),
+                    dst.display()
                 ),
                 Step::Stderr(text) => format!("echo {text} 1>&2\r\n"),
                 Step::TaggedTemps(dir, progress) => {
@@ -259,6 +270,27 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
         std::fs::write(&path, body).unwrap();
         path
     }
+}
+
+/// Windows: a PowerShell helper the fake CLI's `Append` step runs — reads
+/// the staged JSON body, substitutes the job tag, and appends it as a
+/// chained audit entry (`previous_entry_sha256` = SHA-256 of the last
+/// line, `entry_sha256` over the line through it), like
+/// `audit::append_chained_jsonl` (unkeyed).
+#[cfg(windows)]
+fn append_helper_ps1(dir: &Path) -> PathBuf {
+    let path = dir.join("fake-append.ps1");
+    let script = r#"param($src, $dst, $tag)
+function Get-LineSha($s) { $sha = [Security.Cryptography.SHA256]::Create(); ([BitConverter]::ToString($sha.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($s)))).Replace('-', '').ToLower() }
+$body = [IO.File]::ReadAllText($src).Replace('@TAG@', $tag).TrimEnd("`r", "`n")
+$prev = 'GENESIS'
+if ((Test-Path $dst) -and ((Get-Item $dst).Length -gt 0)) { $prev = Get-LineSha (([IO.File]::ReadAllText($dst).TrimEnd("`n")).Split("`n")[-1]) }
+$chained = $body.Substring(0, $body.Length - 1) + ',"previous_entry_sha256":"' + $prev + '"}'
+$entry = Get-LineSha $chained
+[IO.File]::AppendAllText($dst, $chained.Substring(0, $chained.Length - 1) + ',"entry_sha256":"' + $entry + '"}' + "`n", [Text.UTF8Encoding]::new($false))
+"#;
+    std::fs::write(&path, script).unwrap();
+    path
 }
 
 fn now() -> u64 {
@@ -943,14 +975,20 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     assert!(empty["audioLevelsError"].is_null());
 
     let joined = case_dir.join(crate::join::JOINED_DIR);
-    std::fs::write(
-        joined.join(crate::join::LOG_FILE),
-        format!(
-            "{{\"event\":\"join-video\",\"plan_id\":\"p\",\"segment_count\":2,\"output_sha256\":\"{}\"}}\n{{\"torn\":\n",
+    // R9 P3: a real chained entry, then a torn line.
+    let join_lane = joined.join(crate::join::LOG_FILE);
+    crate::audit::test_write_lane(
+        &join_lane,
+        &format!(
+            "{{\"event\":\"join-video\",\"plan_id\":\"p\",\"segment_count\":2,\"output_sha256\":\"{}\"}}\n",
             "AB".repeat(32)
         ),
-    )
-    .unwrap();
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&join_lane)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b"{\"torn\":\n"))
+        .unwrap();
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(case_dir.join("db/videos.jsonl"))
         .unwrap()
         .lines()
@@ -990,6 +1028,9 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     assert_eq!(join_log[0]["event"], "join-video");
     // U2: the derived record id, from the output bytes (not the name).
     assert_eq!(join_log[0]["record_id"], "join:abababababababab");
+    // R9 P3 (contract with track U): every log entry carries `trust`.
+    assert_eq!(join_log[0]["trust"], "sc", "{meta}");
+    assert_eq!(meta["logChains"]["joinLog"]["status"], "failed", "{meta}");
     assert_eq!(computed(), before + 1);
     // B9: unchanged lane + index → the cached map, not a recomputation.
     let again = parse(&api_records_meta(&state));
@@ -998,7 +1039,7 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     let levels = &meta["audioLevels"];
     assert_eq!(
         levels["vid_1"],
-        serde_json::json!({"r": "sound", "max": -12.5, "mean": -30.0, "sec": 10.0, "t": 77, "sc": true})
+        serde_json::json!({"r": "sound", "max": -12.5, "mean": -30.0, "sec": 10.0, "t": 77, "sc": true, "trust": "sc"})
     );
     assert_eq!(levels["vid_2"]["r"], "stale", "{levels}");
     assert!(levels["vid_2"]["max"].is_null());

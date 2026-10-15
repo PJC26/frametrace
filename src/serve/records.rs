@@ -688,16 +688,58 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // U2: every joinLog entry carries the derived record's `record_id`
     // (`join:<first 16 hex of output_sha256>`), also for entries logged
     // before the field existed.
-    let join_log: Vec<serde_json::Value> = match read_jsonl(
+    // R9 P3 (contract with the viewer, track U): every log array entry is
+    // read through `audit::read_lane_rows` and carries `trust` — "auth"
+    // (authenticated here), "sc" (self-consistency only), "unauth" (keys
+    // held here and not authenticated, or past a chain break; with a
+    // `trust_note`), "pc:<key id>" (another PC's key — check it there).
+    // Only "auth"/"sc" entries may be shown as confirmed / derived
+    // results. `logChains` carries each lane's status for the same arrays.
+    let mut log_chains = serde_json::Map::new();
+    let mut lane_values = |name: &str, path: PathBuf| -> Vec<serde_json::Value> {
+        let rel = path
+            .strip_prefix(&case_dir)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        match crate::audit::read_lane_rows(&path) {
+            Ok(lane) => {
+                log_chains.insert(name.to_string(), lane.chain_json(&rel));
+                lane.values_with_trust()
+            }
+            Err(err) => {
+                log_chains.insert(
+                    name.to_string(),
+                    serde_json::json!({"path": rel, "status": "unreadable", "detail": err}),
+                );
+                Vec::new()
+            }
+        }
+    };
+    let join_log: Vec<serde_json::Value> = lane_values(
+        "joinLog",
         case_dir
             .join(crate::join::JOINED_DIR)
             .join(crate::join::LOG_FILE),
-    ) {
-        serde_json::Value::Array(items) => {
-            items.into_iter().map(crate::join::with_record_id).collect()
-        }
-        _ => Vec::new(),
-    };
+    )
+    .into_iter()
+    .map(crate::join::with_record_id)
+    .collect();
+    let carve_log = lane_values(
+        "carveLog",
+        case_dir.join("artifacts/carved/carve-log.jsonl"),
+    );
+    let filesystem_log = lane_values(
+        "filesystemLog",
+        case_dir.join("evidence/logs/tsk-audit.jsonl"),
+    );
+    let validation_log = lane_values(
+        "validationLog",
+        case_dir.join("evidence/logs/validation-log.jsonl"),
+    );
+    let anomaly_log = lane_values(
+        "anomalyLog",
+        case_dir.join("evidence/logs/anomaly-log.jsonl"),
+    );
     let body = serde_json::json!({
         "ok": true,
         "manifest": read_json(case_dir.join("case.json")),
@@ -705,10 +747,11 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         // against this — same field name as the standalone data bundle.
         "caseDir": crate::audit::path_string(&case_dir),
         "scan": scan,
-        "carveLog": read_jsonl(case_dir.join("artifacts/carved/carve-log.jsonl")),
-        "filesystemLog": read_jsonl(case_dir.join("evidence/logs/tsk-audit.jsonl")),
-        "validationLog": read_jsonl(case_dir.join("evidence/logs/validation-log.jsonl")),
-        "anomalyLog": read_jsonl(case_dir.join("evidence/logs/anomaly-log.jsonl")),
+        "carveLog": carve_log,
+        "filesystemLog": filesystem_log,
+        "validationLog": validation_log,
+        "anomalyLog": anomaly_log,
+        "logChains": log_chains,
         "flsEntries": fls_entries,
         "thumbs": thumbs,
         "annotations": annotations,
@@ -836,12 +879,11 @@ pub(crate) fn record_proxy_paths(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
+    // R9 P3: only entries usable here map a record to a proxy.
     let read_lines = |rel: &str| -> Vec<serde_json::Value> {
-        crate::util::read_to_string(&case_dir.join(rel))
+        crate::audit::read_lane_rows(&case_dir.join(rel))
+            .map(|lane| lane.usable_values())
             .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
-            .collect()
     };
     if let Some(videos) = index
         .and_then(|index| index.get("videos"))

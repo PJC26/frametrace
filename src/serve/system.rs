@@ -901,20 +901,17 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
     };
     let logs_dir = case_dir.join("evidence/logs");
-    let mut log_paths: Vec<PathBuf> = match std::fs::read_dir(&logs_dir) {
-        Ok(read_dir) => read_dir
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-            .collect(),
-        Err(err) => {
-            return serde_json::json!({
-                "ok": false,
-                "error": format!("감사 로그 디렉터리를 읽지 못했습니다: {err}"),
-            })
-            .to_string();
-        }
-    };
-    log_paths.sort();
+    if let Err(err) = std::fs::read_dir(&logs_dir) {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("감사 로그 디렉터리를 읽지 못했습니다: {err}"),
+        })
+        .to_string();
+    }
+    // R9 P4: the WHOLE case — every chained lane under artifacts/** as well
+    // as evidence/logs (R8 checked evidence/logs only, so a tampered
+    // artifacts lane never reached the workstation badge).
+    let log_paths: Vec<PathBuf> = audit::case_lane_paths(&case_dir);
     if log_paths.is_empty() {
         return "{\"ok\":false,\"error\":\"검증할 감사 로그가 없습니다.\"}".to_string();
     }
@@ -929,9 +926,14 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
+        let rel = path
+            .strip_prefix(&case_dir)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| name.clone());
         match audit::verify_chained_jsonl(path) {
             Ok(result) => {
                 total_entries += result.entries;
+                let (unauthenticated_lines, other_pc_lines) = result.trust_counts();
                 // R8 P0/P1/P2: one mapping for every lane consumer — keys
                 // held here + any line not authenticated here = NOT
                 // VERIFIED (naming other PCs' keys); no keys = structural
@@ -950,6 +952,13 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
                 };
                 logs_json.push(serde_json::json!({
                     "name": name,
+                    // R9 P4: case-relative path (artifacts lanes share file
+                    // names with evidence/logs lanes, e.g. export-log.jsonl).
+                    "path": rel,
+                    // R9 (contract with track U): numeric counts so the
+                    // badge never parses the reason text.
+                    "unauthenticated_lines": unauthenticated_lines,
+                    "other_pc_lines": other_pc_lines,
                     "entries": result.entries,
                     "integrity": if trust.passes() {
                         trust.label()
@@ -965,10 +974,30 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
                     "warnings": result.warnings,
                 }));
             }
+            // R9 P5/I9: an audit key configuration that exists but cannot
+            // be read is NOT VERIFIED (fail closed) — never "failed"
+            // (a tamper verdict).
+            Err(err) if audit::is_key_config_error(&err) => {
+                any_not_verified = true;
+                logs_json.push(serde_json::json!({
+                    "name": name,
+                    "path": rel,
+                    "entries": 0,
+                    "integrity": "not-verified",
+                    "trust": err,
+                    "keys_held": true,
+                    "key_config_error": true,
+                    "other_pc_key_ids": Vec::<String>::new(),
+                    "unauthenticated_lines": 0,
+                    "other_pc_lines": 0,
+                    "warnings": Vec::<String>::new(),
+                }));
+            }
             Err(err) => {
                 failed += 1;
                 logs_json.push(serde_json::json!({
                     "name": name,
+                    "path": rel,
                     "entries": 0,
                     "integrity": "failed",
                     "error": err,

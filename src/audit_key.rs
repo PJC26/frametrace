@@ -72,6 +72,10 @@ impl AuditKey {
 /// single-key file, env var, and any `--key-source` override — deduplicated
 /// on (id, material).
 pub fn verification_keys() -> Result<Vec<AuditKey>, String> {
+    verification_keys_raw().map_err(|err| crate::audit::key_config_error_note(&err))
+}
+
+fn verification_keys_raw() -> Result<Vec<AuditKey>, String> {
     #[cfg(test)]
     if let Some(keys) = TEST_KEYS.with(|keys| keys.borrow().clone()) {
         return Ok(normalize_retired_aliases(&keys));
@@ -179,6 +183,10 @@ fn refuse_retired_key(key: AuditKey, keyring: &[AuditKey]) -> Result<AuditKey, S
 /// material, wrong length) is, so a misconfigured key never silently
 /// degrades an intended-keyed log to unkeyed.
 pub fn configured() -> Result<Option<AuditKey>, String> {
+    configured_with(false)
+}
+
+fn configured_with(missing_explicit_keyring_ok: bool) -> Result<Option<AuditKey>, String> {
     #[cfg(test)]
     if let Some(keys) = TEST_KEYS.with(|keys| keys.borrow().clone()) {
         return Ok(keys.into_iter().find(|key| key.retired_unix.is_none()));
@@ -186,7 +194,7 @@ pub fn configured() -> Result<Option<AuditKey>, String> {
     if let Some(key) = SOURCE_OVERRIDE.get() {
         return refuse_retired_append_key(key.clone()).map(Some);
     }
-    if let Some(key) = keyring_active()? {
+    if let Some(key) = keyring_active_with(missing_explicit_keyring_ok)? {
         return Ok(Some(key));
     }
     if let Some(key) = from_key_file()? {
@@ -311,7 +319,7 @@ fn from_key_file() -> Result<Option<AuditKey>, String> {
     let Some(path) = key_file_path() else {
         return Ok(None);
     };
-    if !path.is_file() {
+    if !probe_key_path(&path, "감사 키 파일", explicit_var(KEY_FILE_ENV))? {
         return Ok(None);
     }
     read_key_file(&path).map(Some)
@@ -511,15 +519,89 @@ fn keyring_keys() -> Result<Vec<AuditKey>, String> {
     let Some(path) = keyring_path() else {
         return Ok(Vec::new());
     };
+    if !probe_key_path(&path, "감사 키링", explicit_var(KEYRING_ENV))? {
+        return Ok(Vec::new());
+    }
     Ok(load_keyring(&path)?.map(|kr| kr.keys).unwrap_or_default())
 }
 
-fn keyring_active() -> Result<Option<AuditKey>, String> {
+/// `missing_explicit_ok`: rotation creates the keyring an explicit
+/// `FRAMETRACE_AUDIT_KEYRING_FILE` names, so it may not exist yet there.
+fn keyring_active_with(missing_explicit_ok: bool) -> Result<Option<AuditKey>, String> {
     let Some(path) = keyring_path() else {
         return Ok(None);
     };
+    let explicit = if missing_explicit_ok {
+        None
+    } else {
+        explicit_var(KEYRING_ENV)
+    };
+    if !probe_key_path(&path, "감사 키링", explicit)? {
+        return Ok(None);
+    }
     // load_keyring guarantees `active` names a contained id.
     Ok(load_keyring(&path)?.and_then(|kr| kr.keys.into_iter().find(|key| key.id == kr.active)))
+}
+
+/// R9 P5/I9: the prefix of every error about an audit key configuration
+/// that exists but cannot be read. It is NOT a tamper verdict — consumers
+/// show it as "키 설정을 읽지 못함" and fail closed (keys held, nothing
+/// authenticated), never as a broken chain.
+pub const KEY_CONFIG_UNREADABLE: &str = "키 설정을 읽지 못함";
+
+const KEY_FILE_ENV: &str = "FRAMETRACE_AUDIT_KEY_FILE";
+const KEYRING_ENV: &str = "FRAMETRACE_AUDIT_KEYRING_FILE";
+
+/// The variable when it is set (non-blank) — the path was configured
+/// explicitly, so its absence is an error, not "no key".
+fn explicit_var(var: &'static str) -> Option<&'static str> {
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|_| var)
+}
+
+/// R9 P5: whether a key path holds a key file to read. `Ok(false)` only
+/// when nothing is there and the path was NOT configured explicitly (the
+/// default location, "no key"); a path configured through `explicit_var`
+/// that does not exist, a directory, a broken link, or anything else that
+/// cannot be read is an error (fail closed) — R8 read these as "no key",
+/// silently relaxing P0 to P1.
+pub(crate) fn probe_key_path(
+    path: &Path,
+    what: &str,
+    explicit_var: Option<&'static str>,
+) -> Result<bool, String> {
+    let shown = path.display();
+    let fail = |why: String| {
+        Err(format!(
+            "{KEY_CONFIG_UNREADABLE}: {what} {shown} — {why} (변조 판정 아님; 감사 키 설정을 고친 뒤 다시 확인하십시오)"
+        ))
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match explicit_var {
+            Some(var) => fail(format!("{var}로 지정된 경로에 파일이 없습니다")),
+            None => Ok(false),
+        },
+        Err(err) => fail(format!("확인할 수 없습니다: {err}")),
+        Ok(meta) => {
+            let target = if meta.file_type().is_symlink() {
+                match std::fs::metadata(path) {
+                    Ok(target) => target,
+                    Err(err) => return fail(format!("끊긴 링크입니다: {err}")),
+                }
+            } else {
+                meta
+            };
+            if target.is_dir() {
+                fail("파일이 아니라 폴더입니다".to_string())
+            } else if !target.is_file() {
+                fail("일반 파일이 아닙니다".to_string())
+            } else {
+                Ok(true)
+            }
+        }
+    }
 }
 
 /// Generates a new audit key, registers it as the keyring's active key, and
@@ -530,7 +612,7 @@ pub fn rotate(requested_id: Option<&str>) -> Result<Rotation, String> {
         "cannot rotate the audit key: no config directory resolved; set FRAMETRACE_AUDIT_KEYRING_FILE"
             .to_string()
     })?;
-    rotate_at(&path, requested_id, configured()?)
+    rotate_at(&path, requested_id, configured_with(true)?)
 }
 
 /// `rotate` against an explicit keyring path and an explicit previous key,

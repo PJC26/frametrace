@@ -2,7 +2,7 @@ use crate::audit;
 use crate::ffprobe;
 use crate::model::ProbeSummary;
 use crate::tool_policy::command_version;
-use crate::util::{canonicalize_display, json_escape, now_unix, read_to_string};
+use crate::util::{canonicalize_display, json_escape, now_unix};
 use crate::video_export::resolve_video_source;
 use std::path::{Path, PathBuf};
 
@@ -143,13 +143,12 @@ pub fn resolve_artifact_pair(
 ) -> Result<PathBuf, String> {
     let wanted = output_path.to_string_lossy();
     for rel_log in ARTIFACT_LOGS {
-        let Ok(text) = read_to_string(&case_dir.join(rel_log)) else {
+        // R9 P3: only entries usable here resolve a target to validate.
+        let Ok(lane) = audit::read_lane_rows(&case_dir.join(rel_log)) else {
             continue;
         };
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
+        for row in lane.usable() {
+            let value = &row.value;
             let field = |key: &str| value.get(key).and_then(serde_json::Value::as_str);
             let id_matches = field("id") == Some(id)
                 || field("inode") == Some(id)
@@ -173,12 +172,14 @@ pub fn resolve_artifact_pair(
 
 /// Every distinct output path a log maps `selector` to, in log order.
 fn resolve_all_from_log(log_path: &Path, selector: &str) -> Vec<PathBuf> {
-    let Ok(text) = read_to_string(log_path) else {
+    // R9 P3: through the one lane reader; an entry this PC cannot
+    // authenticate (keys held) never names a validation target.
+    let Ok(lane) = audit::read_lane_rows(log_path) else {
         return Vec::new();
     };
     let mut out: Vec<PathBuf> = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let Some(path) = match_line(line, selector) else {
+    for row in lane.usable() {
+        let Some(path) = match_line(&row.raw, selector) else {
             continue;
         };
         if !out.contains(&path) {
@@ -488,11 +489,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("log.jsonl");
-        fs::write(
+        crate::audit::test_write_lane(
             &log,
             r#"{"id":"carve_000001","output_path":"/tmp/out.mp4"}"#,
-        )
-        .unwrap();
+        );
         assert_eq!(
             resolve_from_log(&log, "carve_000001")
                 .unwrap()
@@ -522,11 +522,10 @@ mod tests {
             serde_json::json!({"event": "carve-file", "id": "carve_000001", "output_path": path.to_string_lossy()})
                 .to_string()
         };
-        fs::write(
-            carved.join("carve-log.jsonl"),
-            format!("{}\n{}\n{}\n", line(&run1), line(&run2), line(&run2)),
-        )
-        .unwrap();
+        crate::audit::test_write_lane(
+            &carved.join("carve-log.jsonl"),
+            &format!("{}\n{}\n{}\n", line(&run1), line(&run2), line(&run2)),
+        );
         let err = resolve_artifact_path(&dir, "carve_000001").unwrap_err();
         assert!(err.contains("ambiguous selector"), "{err}");
         let chosen = resolve_artifact_pair(&dir, "carve_000001", &run2).unwrap();

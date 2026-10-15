@@ -850,17 +850,17 @@ fn s15_records_meta_names_each_records_own_proxy() {
     std::fs::create_dir_all(&carved).unwrap();
     let new_output = carved.join("carve_000001_run2.mp4");
     std::fs::write(&new_output, b"run 2 bytes").unwrap();
-    std::fs::write(
-        carved.join("carve-log.jsonl"),
-        serde_json::json!({"id": "carve_000001", "output_path": new_output.to_string_lossy(),
+    // R9 P3: a real chained lane (rows come through audit::read_lane_rows).
+    crate::audit::test_write_lane(
+        &carved.join("carve-log.jsonl"),
+        &(serde_json::json!({"id": "carve_000001", "output_path": new_output.to_string_lossy(),
             "size_bytes": 11})
         .to_string()
             + "\n"
             + &serde_json::json!({"output_path": "artifacts/carved/legacy.mp4", "size_bytes": 3})
                 .to_string()
-            + "\n",
-    )
-    .unwrap();
+            + "\n"),
+    );
     std::fs::write(carved.join("legacy.mp4"), b"leg").unwrap();
     let proxies = case.join("artifacts/proxies");
     std::fs::create_dir_all(&proxies).unwrap();

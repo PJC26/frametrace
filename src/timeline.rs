@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 /// Candidate-grade label: timestamps are recorded metadata, not truth.
 pub const LABEL: &str = "candidate-timeline";
 
+/// R9 P3: the kind of an event taken from an audit-lane entry that may not
+/// be relied on here (not authenticated on a PC holding audit keys,
+/// another PC's key, or past a chain break) — shown, never as what it
+/// claims.
+pub const UNAUTHENTICATED_KIND: &str = "audit-entry-unauthenticated";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEvent {
     pub ts_unix: u64,
@@ -242,25 +248,23 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
         snapshot_artifacts.iter().map(key_of).collect();
 
     let log_path = case_dir.join("artifacts/carved/carve-log.jsonl");
-    let log_text = match read_to_string(&log_path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(format!(
-                "failed to read carve log {}: {err}",
-                log_path.display()
-            ));
-        }
-    };
+    // R9 P3: rows through the one lane reader, each with its trust.
+    let lane = audit::read_lane_rows(&log_path)
+        .map_err(|err| format!("failed to read carve log {}: {err}", log_path.display()))?;
     let mut skipped = 0usize;
     let mut seen = std::collections::HashSet::new();
-    let mut emit = |artifact: &serde_json::Value, ts: Option<u64>, skipped: &mut usize| {
+    let mut emit = |artifact: &serde_json::Value,
+                    ts: Option<u64>,
+                    unauthenticated: Option<String>,
+                    skipped: &mut usize| {
         let (id, output_path) = key_of(artifact);
         if output_path.is_empty() {
             *skipped += 1;
             return;
         }
-        if !seen.insert((id.clone(), output_path.clone())) {
+        // An unauthenticated entry never claims the artifact's slot (the
+        // snapshot or a usable entry still shows it as a candidate).
+        if unauthenticated.is_none() && !seen.insert((id.clone(), output_path.clone())) {
             return; // the same artifact logged again by a resumed run
         }
         let Some(ts_unix) = ts else {
@@ -273,33 +277,43 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             .and_then(serde_json::Value::as_u64)
             .map(|offset| offset.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        events.push(TimelineEvent {
-            ts_unix,
-            source: "carve",
-            kind: "carved-candidate",
-            path: output_path,
-            detail: format!("carved candidate {id} from {source} at offset {offset}"),
+        let detail = format!("carved candidate {id} from {source} at offset {offset}");
+        events.push(match unauthenticated {
+            None => TimelineEvent {
+                ts_unix,
+                source: "carve",
+                kind: "carved-candidate",
+                path: output_path,
+                detail,
+            },
+            // R9 P3: shown, but distinguished — never a carved candidate.
+            Some(note) => TimelineEvent {
+                ts_unix,
+                source: "carve",
+                kind: UNAUTHENTICATED_KIND,
+                path: output_path,
+                detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
+            },
         });
     };
-    for line in log_text.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue; // torn/foreign lines are counted by audit_log_events
-        };
+    for row in &lane.rows {
+        let value = &row.value;
         if value.get("event").and_then(serde_json::Value::as_str) != Some("carve-file") {
             continue;
         }
         let ts = value
             .get("carved_unix")
             .and_then(serde_json::Value::as_u64)
-            .or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(&value))));
-        emit(&value, ts, &mut skipped);
+            .or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(value))));
+        let unauthenticated = (!row.usable()).then(|| row.trust.note());
+        emit(value, ts, unauthenticated, &mut skipped);
     }
     for artifact in &snapshot_artifacts {
         let ts = artifact
             .get("carved_unix")
             .and_then(serde_json::Value::as_u64)
             .or(snapshot_unix);
-        emit(artifact, ts, &mut skipped);
+        emit(artifact, ts, None, &mut skipped);
     }
     Ok(skipped)
 }
@@ -332,26 +346,47 @@ fn audit_log_events(
         {
             continue;
         }
-        let text = match read_to_string(&file) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(format!(
-                    "failed to read audit log {}: {err}",
-                    file.display()
-                ));
-            }
-        };
         let rel = file
             .strip_prefix(case_dir)
             .unwrap_or(&file)
             .to_string_lossy()
             .to_string();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                skipped += 1;
-                continue;
+        // R9 P3: a known chained lane is read through the one lane reader
+        // (each entry with its trust); any other `*.jsonl` is plain data
+        // with nothing to authenticate.
+        let rows: Vec<(serde_json::Value, Option<String>)> =
+            if audit::is_known_chain_lane(&rel.replace('\\', "/")) {
+                let lane = audit::read_lane_rows(&file)
+                    .map_err(|err| format!("failed to read audit log {}: {err}", file.display()))?;
+                lane.rows
+                    .into_iter()
+                    .map(|row| {
+                        let note = (!row.usable()).then(|| row.trust.note());
+                        (row.value, note)
+                    })
+                    .collect()
+            } else {
+                let text = match read_to_string(&file) {
+                    Ok(text) => text,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to read audit log {}: {err}",
+                            file.display()
+                        ));
+                    }
+                };
+                text.lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| {
+                        (
+                            serde_json::from_str(line).unwrap_or(serde_json::Value::Null),
+                            None,
+                        )
+                    })
+                    .collect()
             };
+        for (value, unauthenticated) in rows {
             let Some(object) = value.as_object() else {
                 skipped += 1;
                 continue;
@@ -384,12 +419,22 @@ fn audit_log_events(
             .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
             .map(str::to_string)
             .unwrap_or_else(|| rel.clone());
-            events.push(TimelineEvent {
-                ts_unix: ts,
-                source: "audit-log",
-                kind: "audit-event",
-                path,
-                detail: format!("audit event '{event}' recorded in {rel} ({ts_key})"),
+            let detail = format!("audit event '{event}' recorded in {rel} ({ts_key})");
+            events.push(match unauthenticated {
+                None => TimelineEvent {
+                    ts_unix: ts,
+                    source: "audit-log",
+                    kind: "audit-event",
+                    path,
+                    detail,
+                },
+                Some(note) => TimelineEvent {
+                    ts_unix: ts,
+                    source: "audit-log",
+                    kind: UNAUTHENTICATED_KIND,
+                    path,
+                    detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
+                },
             });
         }
     }
@@ -600,8 +645,8 @@ mod tests {
         let case_dir = temp_case("allruns");
         fs::write(case_dir.join("case.json"), "{}").unwrap();
         fs::create_dir_all(case_dir.join("artifacts/carved")).unwrap();
-        fs::write(
-            case_dir.join("artifacts/carved/carve-log.jsonl"),
+        crate::audit::test_write_lane(
+            &case_dir.join("artifacts/carved/carve-log.jsonl"),
             concat!(
                 // legacy run 1: no carved_unix, not in the snapshot → skipped
                 "{\"event\":\"carve-file\",\"id\":\"carve_000001\",\"output_path\":\"/c/old.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":1}\n",
@@ -610,8 +655,7 @@ mod tests {
                 // run 3, also the latest snapshot
                 "{\"event\":\"carve-file\",\"id\":\"carve_200-ef01_000001\",\"output_path\":\"/c/r3.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":3,\"run_id\":\"200-ef01\",\"carved_unix\":250}\n",
             ),
-        )
-        .unwrap();
+        );
         fs::write(
             case_dir.join("db/carve_results.json"),
             "{\"carved_unix\":260,\"artifacts\":[{\"id\":\"carve_200-ef01_000001\",\"output_path\":\"/c/r3.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":3,\"carved_unix\":250}]}",
@@ -743,20 +787,18 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(case_dir.join("evidence/logs")).unwrap();
-        fs::write(
-            case_dir.join("evidence/logs/validation-log.jsonl"),
+        crate::audit::test_write_lane(
+            &case_dir.join("evidence/logs/validation-log.jsonl"),
             concat!(
                 "{\"event\":\"validate-artifact\",\"validated_unix\":400,\"target_path\":\"/ev/a.mp4\",\"validation_status\":\"ok\"}\n",
                 "{\"event\":\"no-timestamp-here\",\"selector\":\"vid_9\"}\n",
             ),
-        )
-        .unwrap();
+        );
         fs::create_dir_all(case_dir.join("artifacts/clips")).unwrap();
-        fs::write(
-            case_dir.join("artifacts/clips/export-log.jsonl"),
+        crate::audit::test_write_lane(
+            &case_dir.join("artifacts/clips/export-log.jsonl"),
             "{\"event\":\"export-video\",\"exported_unix\":500,\"source_path\":\"/ev/a.mp4\",\"output_path\":\"/case/artifacts/clips/a.mp4\"}\n",
-        )
-        .unwrap();
+        );
 
         let output = case_dir.join("db/timeline.jsonl");
         let result = generate_timeline(&case_dir, &output).unwrap();

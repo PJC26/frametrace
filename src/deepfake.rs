@@ -298,15 +298,23 @@ pub fn artifact_name(id: &str) -> String {
 /// `scan-folder`.
 pub fn collect_targets(case_dir: &Path) -> Vec<ScreenTarget> {
     let mut out = Vec::new();
+    // A torn tail line (documented crash-survivability mode) is not
+    // valid JSON — skipped rather than aborting the pass.
+    let index_rows: Vec<serde_json::Value> = fs::read_to_string(case_dir.join("db/videos.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line.trim()).ok())
+        .collect();
+    collect_jsonl_targets(&index_rows, "id", "source_path", "index", &mut out);
+    // R9 P3: lane rows through the one reader — only entries usable here
+    // name a target to screen.
+    let lane_rows = |rel: &str| -> Vec<serde_json::Value> {
+        crate::audit::read_lane_rows(&case_dir.join(rel))
+            .map(|lane| lane.usable_values())
+            .unwrap_or_default()
+    };
     collect_jsonl_targets(
-        &case_dir.join("db/videos.jsonl"),
-        "id",
-        "source_path",
-        "index",
-        &mut out,
-    );
-    collect_jsonl_targets(
-        &case_dir.join("artifacts/carved/carve-log.jsonl"),
+        &lane_rows("artifacts/carved/carve-log.jsonl"),
         "id",
         "output_path",
         "carve",
@@ -314,11 +322,8 @@ pub fn collect_targets(case_dir: &Path) -> Vec<ScreenTarget> {
     );
     // Filesystem recovery records use the viewer's composite id
     // (`inode:<partition_offset>:<inode>`) so the badge maps correctly.
-    if let Ok(text) = fs::read_to_string(case_dir.join("evidence/logs/tsk-audit.jsonl")) {
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-                continue;
-            };
+    {
+        for v in lane_rows("evidence/logs/tsk-audit.jsonl") {
             if v.get("event").and_then(|e| e.as_str()) != Some("recover-inode") {
                 continue;
             }
@@ -342,15 +347,12 @@ pub fn collect_targets(case_dir: &Path) -> Vec<ScreenTarget> {
 }
 
 fn collect_jsonl_targets(
-    path: &Path,
+    rows: &[serde_json::Value],
     id_key: &str,
     path_key: &str,
     origin: &'static str,
     out: &mut Vec<ScreenTarget>,
 ) {
-    let Ok(text) = fs::read_to_string(path) else {
-        return;
-    };
     // One target per id, the LAST logged path winning — the record the
     // viewer shows for a reused legacy id is the latest run's (E4). Every
     // distinct path an id was logged with is remembered so a report
@@ -358,12 +360,7 @@ fn collect_jsonl_targets(
     let mut order: Vec<String> = Vec::new();
     let mut latest: std::collections::HashMap<String, (String, usize)> =
         std::collections::HashMap::new();
-    for line in text.lines() {
-        // A torn tail line (documented crash-survivability mode) is not
-        // valid JSON — skip it rather than aborting the pass.
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
-        };
+    for v in rows {
         let (Some(id), Some(file)) = (
             v.get(id_key).and_then(|x| x.as_str()),
             v.get(path_key).and_then(|x| x.as_str()),
@@ -760,11 +757,10 @@ mod tests {
         let dir = temp_dir();
         let carved = dir.join("artifacts/carved");
         fs::create_dir_all(&carved).unwrap();
-        fs::write(
-            carved.join("carve-log.jsonl"),
+        crate::audit::test_write_lane(
+            &carved.join("carve-log.jsonl"),
             "{\"id\":\"carve_000001\",\"output_path\":\"/run1/a.mp4\"}\n{\"id\":\"carve_000001\",\"output_path\":\"/run2/a.mp4\"}\n{\"id\":\"carve_9-abcd_000001\",\"output_path\":\"/run3/b.mp4\"}\n",
-        )
-        .unwrap();
+        );
         let targets = collect_targets(&dir);
         let carve: Vec<(&str, &Path, bool)> = targets
             .iter()
@@ -814,18 +810,16 @@ mod tests {
         .unwrap();
         let carved = dir.join("artifacts/carved");
         fs::create_dir_all(&carved).unwrap();
-        fs::write(
-            carved.join("carve-log.jsonl"),
+        crate::audit::test_write_lane(
+            &carved.join("carve-log.jsonl"),
             "{\"id\":\"carve_1\",\"output_path\":\"/tmp/b.mp4\"}\n",
-        )
-        .unwrap();
+        );
         let logs = dir.join("evidence/logs");
         fs::create_dir_all(&logs).unwrap();
-        fs::write(
-            logs.join("tsk-audit.jsonl"),
+        crate::audit::test_write_lane(
+            &logs.join("tsk-audit.jsonl"),
             "{\"event\":\"recover-inode\",\"output_path\":\"/tmp/c.mp4\",\"partition_offset\":2048,\"inode\":\"1304\"}\n",
-        )
-        .unwrap();
+        );
         let targets = collect_targets(&dir);
         let ids: Vec<&str> = targets.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["vid_1", "carve_1", "inode:2048:1304"]);
