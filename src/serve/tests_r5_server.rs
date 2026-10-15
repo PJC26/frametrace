@@ -94,7 +94,8 @@ fn fake_cli(dir: &Path, stderr_line: Option<&str>) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let mut body = String::from("#!/bin/sh\n");
         if let Some(line) = stderr_line {
-            body.push_str(&format!("echo '{line}' >&2\n"));
+            // Double quotes: R8-S7 lines carry `${FRAMETRACE_STEP_WARNINGS}`.
+            body.push_str(&format!("echo \"{line}\" >&2\n"));
             body.push_str("i=0; while [ $i -lt 3000 ]; do echo \"noise line $i ................................\" >&2; i=$((i+1)); done\n");
         }
         body.push_str("echo \"ARGS: $*\"\nexit 0\n");
@@ -473,7 +474,12 @@ fn s8_launch_page_is_user_private() {
 fn s9_key_mismatch_line_becomes_a_job_warning() {
     let dir = scratch("s9");
     let line = format!("{}audit key differs (r5-test)", super::KEY_MISMATCH_MARKER);
-    let exe = fake_cli(&dir, Some(&line));
+    // R8-S7: the child binds the line to its step token.
+    let child_line = format!(
+        "{}audit key differs (r5-test)",
+        crate::util::tokened_marker(super::KEY_MISMATCH_MARKER, &step_token_ref())
+    );
+    let exe = fake_cli(&dir, Some(&child_line));
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     let output = run_step(&exe, &["verify-audit".into(), "x".into()], &state).unwrap();
     assert!(output.contains("ARGS:"), "{output}");
@@ -498,15 +504,11 @@ fn s9_key_mismatch_line_becomes_a_job_warning() {
 #[test]
 fn r7_s6_step_warning_lines_become_job_warnings() {
     let dir = scratch("r7-s6");
-    let env_ref = if cfg!(windows) {
-        format!("%{}%", crate::util::STEP_WARNING_ENV)
-    } else {
-        // fake_cli single-quotes the line: no expansion, checked below.
-        "1".to_string()
-    };
+    // R8-S7: the line carries the step token the server put in the
+    // environment (R7: the variable was `1`).
     let line = format!(
-        "{}case.json is not valid JSON env={env_ref}",
-        crate::util::STEP_WARNING_MARKER
+        "{}case.json is not valid JSON",
+        crate::util::tokened_marker(crate::util::STEP_WARNING_MARKER, &step_token_ref())
     );
     let exe = fake_cli(&dir, Some(&line));
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
@@ -514,10 +516,20 @@ fn r7_s6_step_warning_lines_become_job_warnings() {
     let status = parse(&api_status(&state));
     let warnings = status["warnings"].to_string();
     assert!(
-        warnings.contains("make-review: case.json is not valid JSON env=1"),
+        warnings.contains("make-review: case.json is not valid JSON"),
         "{status}"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R8-S7: the step-token environment variable as the fake CLI's shell
+/// expands it.
+fn step_token_ref() -> String {
+    if cfg!(windows) {
+        format!("%{}%", crate::util::STEP_WARNING_ENV)
+    } else {
+        format!("${{{}}}", crate::util::STEP_WARNING_ENV)
+    }
 }
 
 // ---- S10: a save queued while the job ends is applied ----

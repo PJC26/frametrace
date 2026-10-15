@@ -815,15 +815,22 @@ fn edit_list_applied_mismatch(sources: &[SourcePackets], output: &[VideoPacket])
 
 /// R7-S4: [`edit_list_applied_mismatch`] for a segment whose kept packets
 /// are all key frames: the empty non-key fingerprints compare equal, and
-/// the key frames themselves are compared (skipping the segment's first
-/// packet, where stream copy may re-insert parameter sets):
-/// - the output range carries the source's kept packets → confirmed;
-/// - it carries the source's packets FROM THE START (pre-roll kept, as
-///   many real frames lost at the end — the R6-S6 failure) or agrees
-///   only in part → refused;
-/// - no packet agrees with either (the muxer rewrote every key frame) →
-///   the payloads cannot tell; equal empty fingerprints, accepted on
-///   count and timing like any other segment.
+/// the key frames themselves are compared.
+///
+/// R8-S1: R7 compared position by position and accepted when the output
+/// agreed with NEITHER the kept packets NOR the packets from the start —
+/// meant for "the muxer rewrote every key frame", it also accepted an
+/// output shifted part-way into the pre-roll (pre-roll frames kept, as
+/// many real frames lost at the end, agreeing with neither alignment).
+/// Whether the output was rewritten is now decided by SET membership:
+/// - no output packet's payload is any packet of the source → rewritten,
+///   the payloads cannot tell; accepted on count and timing like any
+///   other segment;
+/// - otherwise the output must carry exactly the kept packets, in order,
+///   one per position. Only the segment's first packet may differ (stream
+///   copy may re-insert parameter sets there), and only when it is not a
+///   source packet at all — so a one-frame segment is checked too (R7
+///   skipped the first packet and compared nothing).
 fn all_key_segment_mismatch(
     index: usize,
     source: &SourcePackets,
@@ -853,26 +860,26 @@ fn all_key_segment_mismatch(
         .filter(|(_, discard)| !**discard)
         .map(|(hash, _)| *hash)
         .collect();
-    let agreeing = |expected: &[u64]| {
-        observed
-            .iter()
-            .zip(expected)
-            .skip(1)
-            .filter(|(a, b)| a == b)
-            .count()
+    let differs = || {
+        Some(format!(
+            "{}번째 구간의 출력 프레임이 원본의 유지 프레임과 다릅니다",
+            index + 1
+        ))
     };
-    let compared = observed.len().min(kept.len()).saturating_sub(1);
-    let with_kept = agreeing(&kept);
-    if with_kept == compared {
+    if observed.len() != kept.len() {
+        return differs();
+    }
+    let source_set: std::collections::HashSet<u64> = all.iter().copied().collect();
+    if observed.iter().all(|hash| !source_set.contains(hash)) {
         return None;
     }
-    if with_kept == 0 && agreeing(all) == 0 {
-        return None;
+    for (position, (seen, wanted)) in observed.iter().zip(&kept).enumerate() {
+        if seen == wanted || (position == 0 && !source_set.contains(seen)) {
+            continue;
+        }
+        return differs();
     }
-    Some(format!(
-        "{}번째 구간의 출력 프레임이 원본의 유지 프레임과 다릅니다",
-        index + 1
-    ))
+    None
 }
 
 /// C14: lists every source's packets and the output's video packets,
@@ -3109,10 +3116,111 @@ pub fn reservation_owner(dir: &Path) -> Option<Option<u32>> {
 /// (marker first, then the then-empty folder — `remove_dir` never removes
 /// a folder with content). `true` when it was removed.
 pub fn release_reservation(dir: &Path, pid: u32) -> bool {
-    if reservation_owner(dir) != Some(Some(pid)) {
-        return false;
+    matches!(
+        release_own_reservation(dir, pid),
+        ReservationRelease::Released
+    )
+}
+
+/// R8-S5: how releasing a reservation ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationRelease {
+    /// The marker named `pid`; marker and folder are gone.
+    Released,
+    /// Not this pid's reservation (another marker, other content, or
+    /// missing before anything was removed): left alone.
+    NotOurs,
+    /// It was this pid's, but removing it kept failing (on Windows an
+    /// antivirus scan or the indexer briefly holds a handle) — the folder
+    /// may remain, empty or still marked. NOT a sign that someone else
+    /// took the name.
+    Failed(String),
+}
+
+/// Delays between the R8-S5 release attempts (5 attempts in all).
+const RELEASE_BACKOFF_MS: [u64; 4] = [100, 250, 500, 1000];
+
+#[cfg(test)]
+thread_local! {
+    /// R8-S5 test hook: how many reservation removals (marker or folder)
+    /// fail before one works.
+    pub(crate) static FAIL_RESERVATION_REMOVALS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn reservation_remove(remove: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_RESERVATION_REMOVALS.with(|left| {
+        let n = left.get();
+        left.set(n.saturating_sub(1));
+        n > 0
+    }) {
+        return Err(std::io::Error::other("injected removal failure"));
     }
-    std::fs::remove_file(dir.join(RESERVATION_MARKER)).is_ok() && std::fs::remove_dir(dir).is_ok()
+    remove()
+}
+
+/// R8-S5: [`release_reservation`] that says why it did not release. R7
+/// tried the removal once and reported any failure as "not ours", so a
+/// transient removal failure at publish time made package-case keep the
+/// finished package aside as if its name had been stolen. Removal is now
+/// retried with backoff; after the marker is gone, an EMPTY folder is
+/// still this release's to remove.
+pub fn release_own_reservation(dir: &Path, pid: u32) -> ReservationRelease {
+    let mut marker_removed = false;
+    let mut last_error = String::new();
+    for attempt in 0..=RELEASE_BACKOFF_MS.len() {
+        let owner = reservation_owner(dir);
+        let step = match owner {
+            Some(Some(owner)) if owner == pid && !marker_removed => {
+                reservation_remove(|| std::fs::remove_file(dir.join(RESERVATION_MARKER)))
+                    .map(|()| marker_removed = true)
+                    .and_then(|()| reservation_remove(|| std::fs::remove_dir(dir)))
+            }
+            Some(None) if marker_removed => reservation_remove(|| std::fs::remove_dir(dir)),
+            None if marker_removed && !dir.exists() => return ReservationRelease::Released,
+            _ => return ReservationRelease::NotOurs,
+        };
+        match step {
+            Ok(()) => return ReservationRelease::Released,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && marker_removed => {
+                return ReservationRelease::Released;
+            }
+            Err(err) => last_error = err.to_string(),
+        }
+        if let Some(delay) = RELEASE_BACKOFF_MS.get(attempt) {
+            std::thread::sleep(Duration::from_millis(*delay));
+        }
+    }
+    ReservationRelease::Failed(format!(
+        "예약 폴더 {}를 지우지 못했습니다: {last_error}",
+        dir.display()
+    ))
+}
+
+/// R8-S5: what is left of THIS process's reservation at `dir` after a
+/// failed release is cleared before publishing over it: its marker (when
+/// it still names `pid`), then the folder when it is empty. Best effort —
+/// the publish rename that follows decides.
+pub fn clear_own_reservation_remnant(dir: &Path, pid: u32) {
+    if reservation_owner(dir) == Some(Some(pid)) {
+        let _ = std::fs::remove_file(dir.join(RESERVATION_MARKER));
+    }
+    if reservation_owner(dir) == Some(None) {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// R8-S6: the staging folder a reservation is prepared in (marker
+/// written) before it is renamed onto the reserved name — a pid-tagged
+/// in-progress name, so a kill sweep or stale sweep removes it when the
+/// writer died in between.
+pub fn reservation_staging_path(reserved: &Path, pid: u32) -> PathBuf {
+    let name = reserved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "package".to_string());
+    pid_part_path(&reserved.with_file_name(format!("{name}.reserve")), pid)
 }
 
 /// Crash recovery for `.part` leftovers of OTHER processes in `dir`.
@@ -4770,6 +4878,78 @@ mod tests {
         partial[10].hash = Some(1);
         let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &partial);
         assert!(!check.ok);
+    }
+
+    /// R8-S1: an all-intra output shifted PART-way into the pre-roll (10 of
+    /// 30 pre-roll frames kept, 10 real frames lost at the end) agrees
+    /// with neither position-wise alignment R7 compared — and R7 took
+    /// that for "every key frame rewritten" and passed it. A one-frame
+    /// kept segment carrying a pre-roll frame passed too (R7 skipped the
+    /// first packet and compared nothing).
+    #[test]
+    fn all_intra_partial_shift_and_single_kept_frame_are_refused() {
+        let all_key = |count: u64, discarded: u64, base: u64| -> Vec<VideoPacket> {
+            (0..count)
+                .map(|i| VideoPacket {
+                    pts: Some(-1.0 + i as f64 / 30.0),
+                    dts: Some(-1.0 + i as f64 / 30.0),
+                    discard: i < discarded,
+                    key: true,
+                    hash: Some(base + i),
+                })
+                .collect()
+        };
+        let presented = |packets: &[VideoPacket]| -> Vec<VideoPacket> {
+            packets
+                .iter()
+                .map(|p| VideoPacket {
+                    discard: false,
+                    ..*p
+                })
+                .collect()
+        };
+        let source = all_key(90, 30, 5000);
+        let sources = [
+            SourcePackets::from_packets(&source, None),
+            SourcePackets::plain(60, None),
+        ];
+        let mut shifted = presented(&source[10..70]);
+        shifted.extend(dts_run(2.0, 60));
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &shifted);
+        assert!(
+            check.problems.iter().any(|p| p.contains("유지 프레임")),
+            "partial shift passed: {check:?}"
+        );
+        // The exact kept packets still pass; so does a rewritten first
+        // packet (parameter sets re-inserted) and a fully rewritten one.
+        let mut applied = presented(&source[30..]);
+        applied.extend(dts_run(2.0, 60));
+        assert!(evaluate_segment_check(&sources, &[0.0, 2.0], None, &applied).ok);
+        let mut first_rewritten = applied.clone();
+        first_rewritten[0].hash = Some(42);
+        assert!(evaluate_segment_check(&sources, &[0.0, 2.0], None, &first_rewritten).ok);
+        // A source packet in the wrong place is never "rewritten".
+        let mut first_moved = applied.clone();
+        first_moved[0].hash = Some(5000);
+        assert!(!evaluate_segment_check(&sources, &[0.0, 2.0], None, &first_moved).ok);
+        // One kept frame: a pre-roll frame in its place is refused.
+        let single = all_key(3, 2, 8000);
+        let sources = [
+            SourcePackets::from_packets(&single, None),
+            SourcePackets::plain(60, None),
+        ];
+        let one_kept = |frame: &VideoPacket| -> Vec<VideoPacket> {
+            let mut out = presented(std::slice::from_ref(frame));
+            out.extend(dts_run(frame.pts.unwrap() + 2.0, 60));
+            out
+        };
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &one_kept(&single[0]));
+        assert!(
+            check.problems.iter().any(|p| p.contains("유지 프레임")),
+            "pre-roll frame as the kept frame passed: {check:?}"
+        );
+        let check = evaluate_segment_check(&sources, &[0.0, 2.0], None, &one_kept(&single[2]));
+        assert!(check.ok, "{check:?}");
     }
 
     /// R7-S3: the segment check lists packets without payload hashes and

@@ -1012,16 +1012,28 @@ pub(crate) fn close_notice_text(outcome: &FlushOutcome) -> Option<String> {
 /// reason often already ends in `.` (or `…`, `?`, `!`, `。`); R6 appended
 /// another `.` and showed `….`/`..`. Trailing whitespace and repeated
 /// marks are trimmed; a missing mark becomes `.`.
+///
+/// R8-S8: R7 kept only the LAST mark of the trailing run, so `저장할까요?.`
+/// or `정말?...` lost the question (and `기다리는 중….` its ellipsis).
+/// Now a run with `?`/`!` keeps those marks (dots dropped), else a run
+/// with an ellipsis keeps one ellipsis (`…` or `...`), else its last
+/// `.`/`。`.
 pub(crate) fn as_sentence(text: &str) -> String {
     const MARKS: [char; 5] = ['.', '…', '?', '!', '。'];
     let trimmed = text.trim_end();
     let body = trimmed.trim_end_matches(MARKS);
-    match trimmed[body.len()..].chars().next_back() {
-        // `…` and `...` keep their ellipsis; any other run becomes its
-        // last mark.
-        Some('.') if trimmed[body.len()..].starts_with("...") => format!("{body}..."),
-        Some(mark) => format!("{body}{mark}"),
-        None => format!("{body}."),
+    let run = &trimmed[body.len()..];
+    let asked: String = run.chars().filter(|c| matches!(c, '?' | '!')).collect();
+    if !asked.is_empty() {
+        format!("{body}{asked}")
+    } else if run.contains('…') {
+        format!("{body}…")
+    } else if run.contains("...") {
+        format!("{body}...")
+    } else if let Some(mark) = run.chars().next_back() {
+        format!("{body}{mark}")
+    } else {
+        format!("{body}.")
     }
 }
 
@@ -2089,6 +2101,13 @@ mod tests {
         assert_eq!(as_sentence("기다리는 중…"), "기다리는 중…");
         assert_eq!(as_sentence("저장할까요?"), "저장할까요?");
         assert_eq!(as_sentence(""), ".");
+        // R8-S8: a question or exclamation is never lost to trailing dots.
+        assert_eq!(as_sentence("저장할까요?."), "저장할까요?");
+        assert_eq!(as_sentence("정말?... "), "정말?");
+        assert_eq!(as_sentence("왜?!"), "왜?!");
+        assert_eq!(as_sentence("기다리는 중…."), "기다리는 중…");
+        assert_eq!(as_sentence("기다리는 중...."), "기다리는 중...");
+        assert_eq!(as_sentence("끝。."), "끝.");
         let report = parse_save_report(
             r#"{"ft_close_save":1,"ok":false,"pending":1,"message":"Save timed out.","warning":"읽기 전용이었습니다."}"#,
         )

@@ -587,7 +587,11 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     // R5-S9: with the machine-readable prefix the workstation promotes the
     // line to a job warning (an examiner never sees a child's stderr).
     if let Some(warning) = crate::serve::key_source_mismatch_warning() {
-        eprintln!("{}{warning}", crate::serve::KEY_MISMATCH_MARKER);
+        // R8-S7: bound to the step's token (forged lines do not count).
+        eprintln!(
+            "{}",
+            crate::util::step_marker_line(crate::serve::KEY_MISMATCH_MARKER, &warning)
+        );
     }
 
     match cli.command {

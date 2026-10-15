@@ -829,17 +829,61 @@ fn validated_json(input: &str) -> Option<&str> {
 /// U+2028/U+2029 are written as `\uXXXX` (they can only occur inside
 /// strings, where the escape means the same character). Not a parser —
 /// `json` must already be valid JSON.
+///
+/// R8-S3: with `escape` (the text goes into a script as a JS object
+/// literal) an object key whose value is `__proto__` is written as the
+/// computed key `["__proto__"]`. In an object literal a plain
+/// `"__proto__":` (escaped spellings included) is the prototype setter,
+/// not a property, and two of them in one object are a SyntaxError — a
+/// crafted `case.json` with a duplicate `__proto__` key blanked the page.
+/// A computed key defines an own data property exactly as `JSON.parse`
+/// does (duplicates allowed, the last value wins), so the literal still
+/// means the same JSON value. Without `escape` the output stays JSON.
 fn script_safe_json(json: &str, escape: bool) -> String {
     let bytes = json.as_bytes();
     let mut out = String::with_capacity(json.len() + 16);
     let mut run_start = 0usize;
     let mut in_string = false;
     let mut escaped = false;
+    // R8-S3: open containers (true = object; depth is bounded by the
+    // validating parser's recursion limit) and whether the next string
+    // is an object key.
+    let mut containers: Vec<bool> = Vec::new();
+    let mut expect_key = false;
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         // (replacement, bytes consumed) when this byte is not copied as is.
         let mut replace: Option<(&str, usize)> = None;
+        if !in_string && escape {
+            match byte {
+                b'{' => {
+                    containers.push(true);
+                    expect_key = true;
+                }
+                b'[' => {
+                    containers.push(false);
+                    expect_key = false;
+                }
+                b'}' | b']' => {
+                    containers.pop();
+                    expect_key = false;
+                }
+                b',' => expect_key = containers.last() == Some(&true),
+                b':' => expect_key = false,
+                b'"' if expect_key => {
+                    expect_key = false;
+                    if let Some(end) = proto_key_end(bytes, index) {
+                        out.push_str(&json[run_start..index]);
+                        out.push_str("[\"__proto__\"]");
+                        index = end;
+                        run_start = index;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
         if in_string {
             if escaped {
                 escaped = false;
@@ -881,6 +925,29 @@ fn script_safe_json(json: &str, escape: bool) -> String {
     out
 }
 
+/// R8-S3: when the JSON string starting at `bytes[open]` (a `"`) reads
+/// `__proto__` once unescaped, the index just past its closing quote.
+/// Only short strings are decoded: `__proto__` written with every
+/// character as `\uXXXX` is 54 bytes between the quotes.
+fn proto_key_end(bytes: &[u8], open: usize) -> Option<usize> {
+    const LONGEST: usize = 9 * 6;
+    let mut escaped = false;
+    let mut close = None;
+    for (offset, &byte) in bytes.get(open + 1..)?.iter().enumerate().take(LONGEST + 1) {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            close = Some(open + 1 + offset);
+            break;
+        }
+    }
+    let close = close?;
+    let literal = std::str::from_utf8(&bytes[open..=close]).ok()?;
+    (serde_json::from_str::<String>(literal).ok()? == "__proto__").then_some(close + 1)
+}
+
 /// [`json_for_script`] for an already built value (program-made data,
 /// nothing to validate): compact JSON escaped in the same single pass.
 pub fn script_json_value(value: &serde_json::Value) -> String {
@@ -912,17 +979,48 @@ pub const STEP_WARNING_MARKER: &str = "FRAMETRACE-STEP-WARNING: ";
 /// R7-S6: environment variable the workstation sets on its CLI children:
 /// they print warnings with [`STEP_WARNING_MARKER`] (see
 /// [`print_step_warning`]).
+///
+/// R8-S7: its value is a random per-step token (R7: `1`). Any stderr line
+/// that merely STARTS with a marker was promoted — and a step's stderr
+/// carries text it does not control (ffmpeg/ffprobe messages quoting
+/// evidence names and metadata), so evidence could forge a job warning.
+/// Only lines carrying the step's token ([`tokened_marker`]) count now.
 pub const STEP_WARNING_ENV: &str = "FRAMETRACE_STEP_WARNINGS";
 
-/// R7-S6: prints a warning on stderr — `warning: …` for a person at a
-/// console, [`STEP_WARNING_MARKER`]`…` when the workstation runs this
-/// process as a step (it promotes such lines to job warnings).
-pub fn print_step_warning(message: &str) {
+/// R8-S7: the per-step token in [`STEP_WARNING_ENV`], when it is one
+/// (16–64 ASCII hex digits).
+pub fn step_warning_token() -> Option<String> {
+    let token = std::env::var(STEP_WARNING_ENV).ok()?;
+    let valid = (16..=64).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_hexdigit());
+    valid.then_some(token)
+}
+
+/// R8-S7: `marker` (`"NAME: "`) bound to a step token: `"NAME[token]: "`.
+pub fn tokened_marker(marker: &str, token: &str) -> String {
+    format!("{}[{token}]: ", marker.trim_end_matches(": "))
+}
+
+/// R8-S7: one machine-readable stderr line for the workstation: `marker`
+/// bound to this step's token, or the plain `marker` line when no step
+/// token was given (a person at a console). Line breaks in `message`
+/// become spaces (one line per warning).
+pub fn step_marker_line(marker: &str, message: &str) -> String {
     let message = message.replace(['\r', '\n'], " ");
-    if std::env::var_os(STEP_WARNING_ENV).is_some_and(|value| value == "1") {
-        eprintln!("{STEP_WARNING_MARKER}{message}");
+    match step_warning_token() {
+        Some(token) => format!("{}{message}", tokened_marker(marker, &token)),
+        None => format!("{marker}{message}"),
+    }
+}
+
+/// R7-S6: prints a warning on stderr — `warning: …` for a person at a
+/// console, [`STEP_WARNING_MARKER`]`…` (R8-S7: bound to the step token)
+/// when the workstation runs this process as a step (it promotes such
+/// lines to job warnings).
+pub fn print_step_warning(message: &str) {
+    if step_warning_token().is_some() {
+        eprintln!("{}", step_marker_line(STEP_WARNING_MARKER, message));
     } else {
-        eprintln!("warning: {message}");
+        eprintln!("warning: {}", message.replace(['\r', '\n'], " "));
     }
 }
 
@@ -1617,6 +1715,51 @@ mod tests {
         );
         assert_eq!(json_for_script("[1] [2]"), "null");
         assert_eq!(json_for_script("\"\u{1}\""), "null");
+    }
+
+    /// R8-S3: a `__proto__` key (any spelling) is the prototype setter in
+    /// a JS object literal, and a duplicate one is a SyntaxError — a
+    /// crafted `case.json` blanked every generated page. Such keys are now
+    /// computed keys: the page script still parses, and evaluates to the
+    /// same value `JSON.parse` gives (own properties, last value wins,
+    /// plain prototype). `script_json_input` output stays JSON.
+    #[test]
+    fn json_for_script_neutralises_proto_keys() {
+        use super::{json_for_script, script_json_input};
+        let input = r#"{"__proto__":{"x":1},"a":[{"__proto__":2,"__proto__":3}],"b":"__proto__","__proto__x":4,"c":{"k":"__proto__"},"__proto__":[5]}"#;
+        let embedded = json_for_script(input);
+        assert_eq!(
+            embedded,
+            r#"{["__proto__"]:{"x":1},"a":[{["__proto__"]:2,["__proto__"]:3}],"b":"__proto__","__proto__x":4,"c":{"k":"__proto__"},["__proto__"]:[5]}"#
+        );
+        assert_eq!(
+            script_json_input("case.json", input).unwrap(),
+            input,
+            "the intermediate form stays JSON"
+        );
+        assert_eq!(json_for_script(r#"["__proto__"]"#), r#"["__proto__"]"#);
+        // Same JSON value as JSON.parse, and a script that parses.
+        let probe = format!(
+            "const v = {embedded};\nconst p = JSON.parse({});\nconst plain = o => o === null || typeof o !== 'object' || (Object.getPrototypeOf(o) === (Array.isArray(o) ? Array.prototype : Object.prototype) && Object.values(o).every(plain));\nprocess.stdout.write(JSON.stringify([JSON.stringify(v) === JSON.stringify(p), plain(v), Object.keys(v).join(',')]));",
+            serde_json::to_string(input).unwrap()
+        );
+        let Ok(output) = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&probe)
+            .output()
+        else {
+            eprintln!("node not found; script evaluation skipped");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            r#"[true,true,"__proto__,a,b,__proto__x,c"]"#
+        );
     }
 
     /// R7-S2: the streaming inline-script scan gives the same `script-src`

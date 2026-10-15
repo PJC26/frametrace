@@ -86,14 +86,15 @@ fn big_script(case: &Path, name: &str, size: usize) -> (PathBuf, Vec<u8>) {
     (path.canonicalize().unwrap(), bytes)
 }
 
-/// R7-S2: a large verified script is hashed once (a streaming pass) and
-/// then served from a verification cached by its identity; the body is
-/// exactly the verified bytes. HEAD reads no content: before any GET it
-/// cannot vouch for the script (403), after one it answers from the cache.
-/// R6 read the whole file into memory and hashed it on every request,
-/// HEAD included.
+/// R7-S2: a large verified script is hashed in a streaming pass (never
+/// read whole into memory) and the body is exactly the verified bytes.
+/// HEAD reads no content: before any GET it cannot vouch for the script
+/// (403), after one it answers from the cached verdict. R6 read the whole
+/// file into memory and hashed it on every request, HEAD included.
+/// R8-S2: every GET hashes again (one pass per GET) — the cached identity
+/// is no shortcut for content (`tests_r8_server`).
 #[test]
-fn r7_s2_large_script_is_hashed_once_and_head_reads_nothing() {
+fn r7_s2_large_script_streams_and_head_reads_nothing() {
     let case = temp_case("s2-cache");
     let size = (IN_MEMORY_VERIFY_MAX as usize) + 3 * 64 * 1024 + 17;
     let (path, bytes) = big_script(&case, "data-bundle.js", size);
@@ -110,14 +111,18 @@ fn r7_s2_large_script_is_hashed_once_and_head_reads_nothing() {
     }
     assert_eq!(
         verify_read_bytes(&path),
-        size as u64,
-        "the second GET must not hash again"
+        2 * size as u64,
+        "one hash pass per GET"
     );
     let (head, body) = split_response(&request_raw(port, "HEAD", "/review/data-bundle.js"));
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert!(head.contains(&format!("Content-Length: {size}")), "{head}");
     assert!(body.is_empty());
-    assert_eq!(verify_read_bytes(&path), size as u64, "HEAD read content");
+    assert_eq!(
+        verify_read_bytes(&path),
+        2 * size as u64,
+        "HEAD read content"
+    );
     state_lock(&state).request_shutdown();
     let _ = std::fs::remove_dir_all(case);
 }
