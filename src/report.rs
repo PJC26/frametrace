@@ -53,7 +53,8 @@ pub fn render_case_report(inputs: &ReportInputs<'_>) -> String {
 /// [`render_case_report`] with the chain verification of each audit log the
 /// report quotes (I9): `{"export"|"proxy"|"thumbnail"|"carve"|"filesystem"|
 /// "validation"|"anomaly"|"batch"|"join": {"path", "status":
-/// "keyed"|"structural"|"failed"|"absent", "entries", "detail"}}`. A log
+/// "keyed"|"structural"|"not-verified"|"failed"|"absent", "entries",
+/// "detail"}}` (R7-I3: "not-verified" = `rewrite_not_excluded`). A log
 /// missing from the map is shown as not verified — the report never calls a
 /// chain hash tamper-evident unless that log passed keyed verification.
 pub fn render_case_report_with_chains(
@@ -353,6 +354,7 @@ const chainLabel = name => {{
     case "keyed": return "체인 검증: integrity-keyed (HMAC 키로 확인)";
     case "structural": return "체인 검증: 구조만 확인 (서명 없음 — 전체 재작성은 탐지 못함)";
     case "failed": return "체인 검증 실패 — 이 로그를 그대로 믿으면 안 됨";
+    case "not-verified": return "체인 확인 불가 (NOT VERIFIED) — 이 PC가 인증한 줄 뒤에 이 PC에 없는 키의 줄이 있어 재작성을 배제할 수 없음";
     default: return "체인 미검증";
   }}
 }};
@@ -910,6 +912,7 @@ const chainStatusText = chain => {{
     case "keyed": return "integrity-keyed — 모든 항목이 설정된 키(HMAC)로 확인됨";
     case "structural": return "구조만 확인 (integrity-structural-only) — 항목 연결은 맞으나 서명이 없어 로그 전체 재작성은 탐지 못함";
     case "failed": return "검증 실패";
+    case "not-verified": return "확인 불가 (NOT VERIFIED) — 이 PC에 없는 키 — 재작성 배제 불가";
     case "absent": return "로그 없음";
     default: return "미검증 (이 보고서 생성 시 검증하지 않음)";
   }}
@@ -1027,7 +1030,11 @@ pub fn signoff_currency(signoff_text: &str, current: &SignoffDigests) -> Signoff
         .get("schema_version")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    if schema >= SIGNOFF_SCHEMA_V4 {
+    if schema > SIGNOFF_SCHEMA_V4 {
+        // R7-I2: a schema this build never writes is never "current".
+        return SignoffCurrency::Unbound;
+    }
+    if schema == SIGNOFF_SCHEMA_V4 {
         // D13: a v4 record's content_sha256 also covers the evidence and
         // lane anchors, which only `check_signoff` can recompute; the
         // marks/tags/ranges part is its `annotations_sha256` (the v3
@@ -1351,8 +1358,13 @@ impl Signoff {
         let content_sha256 =
             signoff_content_sha256(&signoff_v4_content_json(&annotations_sha256, &bindings));
         let (evidence, lanes) = bindings_json(&bindings);
+        // R7-I7: the sign-off lane's entry count now — this record's own
+        // entry will be the next one (checked by `signoff_audit_record`).
+        let signoff_log_entries = crate::audit::lane_head(&case_dir.join(SIGNOFF_LOG_REL_PATH))
+            .map_err(|err| format!("서명 감사 레인을 읽지 못했습니다: {err}"))?
+            .map_or(0, |head| head.entries);
         let text = format!(
-            "{{\"schema_version\":{SIGNOFF_SCHEMA_V4},\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks (status, note, IN-OUT range), tags, the SHA-256 of each annotated record's target file, and the head of every audit lane\",\"annotations_sha256\":{},\"evidence\":{evidence},\"lanes\":{lanes},\"content_sha256\":{},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
+            "{{\"schema_version\":{SIGNOFF_SCHEMA_V4},\"examiner\":{},\"signed_unix\":{signed_unix},\"content\":\"review marks (status, note, IN-OUT range), tags, the SHA-256 of each annotated record's target file, and the head of every audit lane\",\"annotations_sha256\":{},\"evidence\":{evidence},\"lanes\":{lanes},\"content_sha256\":{},\"signoff_log_entries\":{signoff_log_entries},\"note\":\"examiner name recorded as typed at finalize; not an authenticated identity\"}}\n",
             json_str(examiner),
             json_str(&annotations_sha256),
             json_str(&content_sha256),
@@ -1414,6 +1426,10 @@ pub enum SignoffAuditRecord {
     Verified {
         integrity: &'static str,
         authenticated: bool,
+        /// R7-I5: the entry IS HMAC-signed (under this key id) but this PC
+        /// holds no audit key to check it — the remedy is checking it on a
+        /// PC that holds that key, not re-finalizing.
+        unchecked_key_id: Option<String>,
     },
     /// Nothing to check against (no sign-off lane, or a package that does
     /// not carry it, or a keyed check that cannot be made): the record
@@ -1433,14 +1449,23 @@ impl SignoffAuditRecord {
             Self::Verified {
                 integrity,
                 authenticated: true,
+                ..
             } => {
                 format!("서명 기록이 감사 체인(signoff-log, {integrity})에 있음 — HMAC으로 인증됨")
             }
             Self::Verified {
                 integrity,
                 authenticated: false,
+                unchecked_key_id: Some(key_id),
             } => format!(
-                "서명 기록이 감사 체인(signoff-log, {integrity})에 있음 — {SELF_CONSISTENT_ONLY}"
+                "서명 기록이 감사 체인(signoff-log, {integrity})에 있음 — {SELF_CONSISTENT_ONLY} 이 항목은 감사 키 \"{key_id}\"로 HMAC 서명되어 있으나 이 PC에는 감사 키가 없습니다 — 키 \"{key_id}\"를 가진 PC에서 확인하십시오"
+            ),
+            Self::Verified {
+                integrity,
+                authenticated: false,
+                unchecked_key_id: None,
+            } => format!(
+                "서명 기록이 감사 체인(signoff-log, {integrity})에 있음 — {SELF_CONSISTENT_ONLY} {REFINALIZE_TO_AUTHENTICATE}"
             ),
             Self::NotVerifiable(why) => format!("서명 확인 불가 — {why}"),
             Self::Contradicted(why) => format!("서명 기록 불일치 — {why}"),
@@ -1450,7 +1475,12 @@ impl SignoffAuditRecord {
 
 /// R6-I6: what a match in a keyless (or key-less-here) sign-off lane
 /// proves — anyone with the case folder can recompute such an entry.
-pub const SELF_CONSISTENT_ONLY: &str = "자기 일관성만 확인(인증 아님): 감사 키 HMAC으로 확인되지 않은 항목이라 케이스 폴더를 가진 누구나 다시 계산할 수 있습니다. 인증하려면 감사 키를 설정한 뒤 다시 최종화하십시오";
+pub const SELF_CONSISTENT_ONLY: &str = "자기 일관성만 확인(인증 아님): 감사 키 HMAC으로 확인되지 않은 항목이라 케이스 폴더를 가진 누구나 다시 계산할 수 있습니다.";
+
+/// R7-I5: the remedy for a keyless sign-off — only when the entry carries
+/// no HMAC at all. An HMAC-signed entry on a PC without the key is checked
+/// on the key's PC instead (see [`SignoffAuditRecord::note`]).
+pub const REFINALIZE_TO_AUTHENTICATE: &str = "인증하려면 감사 키를 설정한 뒤 다시 최종화하십시오";
 
 /// R6-I8: the remedy for a sign-off finalized without a key in a case
 /// that is now keyed.
@@ -1514,11 +1544,23 @@ pub fn signoff_audit_record_with_keys(
     let record = crate::sha256::digest_bytes(signoff_text.as_bytes());
     let parsed = Signoff::parse(signoff_text);
     let schema = parsed.as_ref().map_or(0, |signoff| signoff.schema_version);
+    if schema > SIGNOFF_SCHEMA_V4 {
+        // R7-I2: a schema this build never writes is never confirmed.
+        return SignoffAuditRecord::NotVerifiable(format!(
+            "지원하지 않는 서명 형식(schema_version {schema})이라 감사 체인으로 확인할 수 없습니다"
+        ));
+    }
+    // R7-I7: how many entries the sign-off lane held when this record was
+    // signed (v4 records written from R7 on).
+    let signed_lane_entries = serde_json::from_str::<serde_json::Value>(signoff_text)
+        .ok()
+        .and_then(|value| value.get("signoff_log_entries").and_then(|v| v.as_u64()));
     let content = parsed.and_then(|signoff| signoff.content_sha256);
     let mut signoff_entries = 0usize;
     // (line index, sign-off entries recorded after it) of the LAST entry
     // naming this record.
     let mut matching: Option<usize> = None;
+    let mut matching_key_id: Option<String> = None;
     let mut later_signoffs = 0usize;
     // `split('\n')` (not `lines()`) keeps indices aligned with
     // `verification.entry_auth`, which the verifier built the same way.
@@ -1544,6 +1586,10 @@ pub fn signoff_audit_record_with_keys(
                 ));
             }
             matching = Some(index);
+            matching_key_id = value
+                .get("entry_hmac_key_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             later_signoffs = 0;
         } else if matching.is_some() {
             later_signoffs += 1;
@@ -1570,10 +1616,24 @@ pub fn signoff_audit_record_with_keys(
         };
     };
     // R6-I7: a genuine but OLDER sign-off restored over a newer one (or one
-    // whose re-finalize never completed) is not the latest sign-off.
+    // whose re-finalize never completed) is not the latest sign-off — when
+    // the newer entries are still in the lane. R7-I7: removing them by
+    // truncating the lane is NOT detected here (truncation of the lane's
+    // own tail is a documented non-goal; see docs/audit-hmac-design.md).
     if later_signoffs > 0 {
         return SignoffAuditRecord::NotVerifiable(format!(
             "더 최신 서명 존재 — 이 기록은 최신이 아님: 감사 체인(signoff-log)에 이 서명 뒤로 서명 {later_signoffs}건이 더 기록되어 있습니다 (이전 서명 기록으로 되돌려졌거나, 이후 최종화가 완료되지 않음 — 다시 최종화하십시오)"
+        ));
+    }
+    // R7-I7: the record names how many entries the lane held when it was
+    // signed; its own entry must sit right after them. Anything else means
+    // the lane before it was cut or re-written.
+    if let Some(expected) = signed_lane_entries
+        && expected != index as u64
+    {
+        return SignoffAuditRecord::Contradicted(format!(
+            "서명 시 서명 감사 레인(signoff-log)에는 항목 {expected}개가 있었으나 이 서명의 항목은 {}번째에 있습니다 — 레인이 잘렸거나 재작성됨",
+            index + 1
         ));
     }
     let auth = verification
@@ -1590,7 +1650,18 @@ pub fn signoff_audit_record_with_keys(
                 verification.integrity.label()
             },
             authenticated: false,
+            unchecked_key_id: if auth.is_keyed() {
+                matching_key_id
+            } else {
+                None
+            },
         };
+    }
+    // R7-I3: this PC authenticated part of the lane and a later part is
+    // signed under a key id it does not hold — a re-written tail (e.g. the
+    // newer sign-offs removed) cannot be ruled out.
+    if let Some(reason) = &verification.rewrite_not_excluded {
+        return SignoffAuditRecord::NotVerifiable(format!("서명 감사 레인(signoff-log): {reason}"));
     }
     // A configured key means a genuine finalize HMAC-signed the entry with
     // a key this PC can check; anything less proves nothing (R5-P1, R6-I2).
@@ -1598,6 +1669,7 @@ pub fn signoff_audit_record_with_keys(
         EntryAuth::Authenticated => SignoffAuditRecord::Verified {
             integrity: verification.integrity.label(),
             authenticated: true,
+            unchecked_key_id: None,
         },
         EntryAuth::RetiredUnproven => SignoffAuditRecord::NotVerifiable(
             "이 서명의 감사 항목은 은퇴한 감사 키로만 서명되었고 그 뒤에 현재 키의 항목이 없어, 은퇴 전에 기록된 것인지 보일 수 없습니다 — 서명 확인 불가 (현재 키로 다시 최종화하십시오)"
@@ -1767,6 +1839,20 @@ pub struct SignoffCheck {
     pub authenticated: bool,
 }
 
+/// R7-I2: `Some(description)` when the sign-off lane under `root` holds at
+/// least one entry (or cannot be read — then it is assumed to), `None`
+/// when it is absent or empty.
+fn signoff_lane_has_entries(root: &std::path::Path) -> Option<String> {
+    match crate::audit::read_log_locked(&root.join(SIGNOFF_LOG_REL_PATH)) {
+        Ok(None) => None,
+        Ok(Some(text)) => {
+            let entries = text.lines().filter(|line| !line.trim().is_empty()).count();
+            (entries > 0).then(|| format!("{entries}건"))
+        }
+        Err(err) => Some(format!("레인을 읽지 못함: {err}")),
+    }
+}
+
 /// Checks a sign-off record against the case/package at `root`: for a
 /// schema-v4 record the marks (`digests.content`), every annotated
 /// record's target SHA-256 and every anchored lane; older records keep
@@ -1796,18 +1882,53 @@ pub fn check_signoff_with(
     scope: SignoffScope<'_>,
     live: Option<&std::collections::BTreeMap<String, LiveHash>>,
 ) -> SignoffCheck {
-    let legacy = || SignoffCheck {
-        currency: signoff_currency(signoff_text, digests),
-        changes: Vec::new(),
-        not_verified: Vec::new(),
-        rehashed: 0,
-        authenticated: false,
+    // R7-I2: a record below v4 is never recorded in the sign-off lane, so
+    // its legacy binding is all that can be compared — but once the lane
+    // holds entries, this case was finalized as v4 and an older-schema
+    // record is exactly what a forger would produce by re-labelling a v4
+    // record (`schema_version` 3 + `content_sha256` = the marks digest) to
+    // skip the lane. Such a record is at most Unbound (NOT VERIFIED).
+    let legacy = || {
+        let mut check = SignoffCheck {
+            currency: signoff_currency(signoff_text, digests),
+            changes: Vec::new(),
+            not_verified: Vec::new(),
+            rehashed: 0,
+            authenticated: false,
+        };
+        if check.currency != SignoffCurrency::Changed
+            && let Some(entries) = signoff_lane_has_entries(root)
+        {
+            check.currency = SignoffCurrency::Unbound;
+            check.not_verified.push(format!(
+                "이전 형식(v{}) 서명 기록이지만 서명 감사 레인(signoff-log)에 항목이 있습니다({entries}) — 이 케이스는 v4로 최종화된 적이 있어 이전 형식 기록은 감사 체인으로 확인할 수 없습니다(v4 기록을 이전 형식으로 바꾼 것일 수 있음). 다시 최종화하십시오",
+                serde_json::from_str::<serde_json::Value>(signoff_text)
+                    .ok()
+                    .and_then(|value| value.get("schema_version").and_then(|v| v.as_u64()))
+                    .unwrap_or(0)
+            ));
+        }
+        check
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(signoff_text) else {
         return legacy();
     };
-    if value.get("schema_version").and_then(|v| v.as_u64()) != Some(SIGNOFF_SCHEMA_V4) {
-        return legacy();
+    match value.get("schema_version").and_then(|v| v.as_u64()) {
+        Some(SIGNOFF_SCHEMA_V4) => {}
+        // R7-I2: a schema this build never writes is rejected — never read
+        // through the v4 marks-only shortcut of `signoff_currency`.
+        Some(schema) if schema > SIGNOFF_SCHEMA_V4 => {
+            return SignoffCheck {
+                currency: SignoffCurrency::Unbound,
+                changes: Vec::new(),
+                not_verified: vec![format!(
+                    "지원하지 않는 서명 형식(schema_version {schema}) — 이 버전이 쓰는 형식은 v{SIGNOFF_SCHEMA_V4}까지라 서명 기록을 확인할 수 없습니다 (기록이 바뀌었거나 더 새 버전에서 만든 기록)"
+                )],
+                rehashed: 0,
+                authenticated: false,
+            };
+        }
+        _ => return legacy(),
     }
     let mut changes = Vec::new();
     let mut not_verified = Vec::new();
@@ -2002,8 +2123,11 @@ pub fn signoff_banner_checked_html(
     v4: bool,
     audit_note: &str,
 ) -> String {
-    let mut banner = if v4 && check.currency == SignoffCurrency::Unbound {
-        // R5-P1: a v4 record the sign-off lane does not confirm.
+    let mut banner = if (v4 || !check.not_verified.is_empty())
+        && check.currency == SignoffCurrency::Unbound
+    {
+        // R5-P1: a v4 record the sign-off lane does not confirm (R7-I2: or an
+        // older / unsupported-schema record capped at Unbound, with reasons).
         signoff_banner_html(examiner, signed_unix, check.currency).replace(
             " — 이 기록에는 대상 내용의 해시가 없어 이후 판독 마크 변경 여부를 확인할 수 없습니다.",
             " — <strong>서명 확인 불가: 감사 체인(signoff-log)으로 이 서명 기록을 확인할 수 없어(아래 사유), 최종화 때 기록된 최신 서명인지 보증할 수 없습니다.</strong>",
@@ -2095,7 +2219,7 @@ pub fn inject_signoff_banner_checked(
             &signoff.examiner,
             signoff.signed_unix,
             check,
-            signoff.schema_version >= SIGNOFF_SCHEMA_V4,
+            signoff.schema_version == SIGNOFF_SCHEMA_V4,
             audit_note
         )
     );
@@ -3869,5 +3993,166 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(empty.contains("추출 기록이 없습니다"), "{empty}");
+    }
+
+    /// R7-I2: a genuine v4 sign-off re-labelled `schema_version` 3 (with
+    /// `content_sha256` = the marks digest anyone can compute) or 5 used to
+    /// read Current without the sign-off lane; now a v<4 record in a case
+    /// whose lane has entries is at most Unbound, and v>4 is rejected.
+    #[test]
+    fn downgraded_or_future_schema_signoff_is_never_current() {
+        use super::{SignoffCurrency, SignoffScope, check_signoff, signoff_currency};
+        let (root, digests) = signoff_tree("r7-i2");
+        let genuine = v4_record_for(&root, &digests, &["vid_000001"], 5);
+        super::record_signoff_audit(&root, &super::Signoff::parse(&genuine).unwrap()).unwrap();
+        assert_eq!(
+            check_signoff(&root, &genuine, &digests, SignoffScope::Case).currency,
+            SignoffCurrency::Current
+        );
+        let v3 = format!(
+            r#"{{"schema_version":3,"examiner":"A","signed_unix":5,"content_sha256":"{}"}}"#,
+            digests.content
+        );
+        let check = check_signoff(&root, &v3, &digests, SignoffScope::Case);
+        assert_eq!(check.currency, SignoffCurrency::Unbound, "{check:?}");
+        assert!(
+            check
+                .not_verified
+                .iter()
+                .any(|item| item.contains("signoff-log")),
+            "{check:?}"
+        );
+        let banner = super::signoff_banner_checked_html("A", 5, &check, false, "x");
+        assert!(banner.contains("서명 확인 불가"), "{banner}");
+        assert!(!banner.contains("대상 내용의 해시가 없어"), "{banner}");
+        // A changed legacy record still reads changed.
+        let v3_changed = v3.replace(&digests.content, &"0".repeat(64));
+        assert_eq!(
+            check_signoff(&root, &v3_changed, &digests, SignoffScope::Case).currency,
+            SignoffCurrency::Changed
+        );
+        for schema in [5, 99] {
+            let future = genuine.replace(
+                "\"schema_version\":4",
+                &format!("\"schema_version\":{schema}"),
+            );
+            let check = check_signoff(&root, &future, &digests, SignoffScope::Case);
+            assert_eq!(check.currency, SignoffCurrency::Unbound, "{check:?}");
+            assert!(
+                check.not_verified[0].contains(&format!("schema_version {schema}")),
+                "{check:?}"
+            );
+            assert_eq!(
+                signoff_currency(&future, &digests),
+                SignoffCurrency::Unbound
+            );
+            assert!(matches!(
+                super::signoff_audit_record_with_keys(&root, &future, true, &[]),
+                super::SignoffAuditRecord::NotVerifiable(_)
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R7-I5: a sign-off entry HMAC-signed under a key this (reviewer) PC
+    /// does not have is checked on the PC holding that key — the note no
+    /// longer tells the reviewer to configure a key and re-finalize.
+    #[test]
+    fn keyed_entry_on_a_keyless_pc_points_to_the_key_holder() {
+        use super::SignoffAuditRecord;
+        let (root, digests) = signoff_tree("r7-i5");
+        let record = v4_record_for(&root, &digests, &["vid_000001"], 5);
+        let key = crate::audit_key::AuditKey::new("kid-0123abcd", &[7; 32]);
+        record_with_key(&root, &record, Some(&key));
+        let audit = super::signoff_audit_record_with_keys(&root, &record, true, &[]);
+        assert!(
+            matches!(
+                &audit,
+                SignoffAuditRecord::Verified {
+                    authenticated: false,
+                    unchecked_key_id: Some(id),
+                    ..
+                } if id == "kid-0123abcd"
+            ),
+            "{audit:?}"
+        );
+        let note = audit.note();
+        assert!(
+            note.contains("\"kid-0123abcd\"를 가진 PC에서 확인"),
+            "{note}"
+        );
+        assert!(!note.contains("다시 최종화"), "{note}");
+        // A keyless (unkeyed) entry keeps the re-finalize remedy.
+        let (root2, digests2) = signoff_tree("r7-i5-unkeyed");
+        let record2 = v4_record_for(&root2, &digests2, &["vid_000001"], 5);
+        record_with_key(&root2, &record2, None);
+        let note = super::signoff_audit_record_with_keys(&root2, &record2, true, &[]).note();
+        assert!(note.contains("다시 최종화"), "{note}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    /// R7-I3/I7: a sign-off lane whose tail was re-written under an
+    /// invented key id after lines this PC authenticated is not verifiable;
+    /// a v4 record names the lane's entry count at signing and its entry
+    /// must sit right after them.
+    #[test]
+    fn signoff_lane_rewrite_and_position_are_checked() {
+        use super::SignoffAuditRecord;
+        let (root, digests) = signoff_tree("r7-i3");
+        let mine = crate::audit_key::AuditKey::new("mine", &[5; 32]);
+        let bogus = crate::audit_key::AuditKey::new("bogus-id", &[6; 32]);
+        let record = v4_record_for(&root, &digests, &["vid_000001"], 5);
+        record_with_key(&root, &record, Some(&mine));
+        crate::audit::append_chained_jsonl_keyed(
+            &root.join(super::SIGNOFF_LOG_REL_PATH),
+            r#"{"event":"note"}"#,
+            Some(&bogus),
+        )
+        .unwrap();
+        let audit = super::signoff_audit_record_with_keys(
+            &root,
+            &record,
+            true,
+            std::slice::from_ref(&mine),
+        );
+        assert!(
+            matches!(&audit, SignoffAuditRecord::NotVerifiable(why) if why.contains("재작성 배제 불가")),
+            "{audit:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // I7: the record says the lane held 1 entry at signing, but its
+        // entry is the first line.
+        let (root, digests) = signoff_tree("r7-i7");
+        let record = v4_record_for(&root, &digests, &["vid_000001"], 5).replace(
+            "\"content_sha256\"",
+            "\"signoff_log_entries\":1,\"content_sha256\"",
+        );
+        record_with_key(&root, &record, None);
+        let audit = super::signoff_audit_record_with_keys(&root, &record, true, &[]);
+        assert!(
+            matches!(&audit, SignoffAuditRecord::Contradicted(why) if why.contains("잘렸거나")),
+            "{audit:?}"
+        );
+        let at_zero = record.replace("\"signoff_log_entries\":1", "\"signoff_log_entries\":0");
+        record_with_key(&root, &at_zero, None);
+        // `at_zero` is the 2nd line: still contradicted (expected index 0).
+        assert!(matches!(
+            super::signoff_audit_record_with_keys(&root, &at_zero, true, &[]),
+            SignoffAuditRecord::Contradicted(_)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (root, digests) = signoff_tree("r7-i7b");
+        let record = v4_record_for(&root, &digests, &["vid_000001"], 5).replace(
+            "\"content_sha256\"",
+            "\"signoff_log_entries\":0,\"content_sha256\"",
+        );
+        record_with_key(&root, &record, None);
+        assert!(matches!(
+            super::signoff_audit_record_with_keys(&root, &record, true, &[]),
+            SignoffAuditRecord::Verified { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

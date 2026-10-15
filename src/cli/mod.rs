@@ -349,10 +349,11 @@ pub enum Commands {
     /// entries stay verifiable
     RotateAuditKey {
         /// Key id stamped as entry_hmac_key_id on new entries
-        /// (default: key-<key fingerprint prefix>)
+        /// (default: kid-<sha8 of the key>, matched by fingerprint)
         #[arg(long)]
         key_id: Option<String>,
-        /// Append a signed audit-key-rotate marker entry to this audit log
+        /// Append a signed audit-key-rotate marker entry to this audit log,
+        /// or to every verifying lane of a case when given a case folder
         /// (repeatable; the marker is keyed under the NEW key)
         #[arg(long)]
         log: Vec<PathBuf>,

@@ -178,9 +178,12 @@ impl Redactor {
     }
 
     /// An explicit root (case, evidence source, home, a caller's extra
-    /// root): registered as given, plus its folder ancestors (R6-I9).
+    /// root): the root and its folder ancestors (R6-I9) — R7-I8: only those
+    /// at least two components below the filesystem root, exactly like a
+    /// recorded path. A depth-1 root (`HOME=/root`, a source at `/mnt`)
+    /// flattens to `_root` / `_mnt`, which would swallow identifiers such
+    /// as `_root_cause` or `_mnt_point`.
     fn add_root(&mut self, root: &str) {
-        self.add_flattened_root(root);
         for candidate in flattened_root_candidates(root) {
             self.add_flattened_root(&candidate);
         }
@@ -1433,6 +1436,21 @@ mod tests {
         let case_dir = temp_case("keys");
         let out = redact_json_text(r#"{"/e/secret/a.mp4":{"r":"sound"}}"#, &case_dir);
         assert!(!out.contains("secret"), "{out}");
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// R7-I8: an explicit depth-1 root (`HOME=/root`, a source at `/mnt`)
+    /// is not a flattened root — `_root_cause` / `_mnt_point` are ordinary
+    /// identifiers — while a depth-2 explicit root still is.
+    #[test]
+    fn depth_one_explicit_roots_are_not_flattened_roots() {
+        let case_dir = temp_case("r7-i8");
+        let redactor = Redactor::with_known_roots(&case_dir, &["/root", "/mnt", "/srv/kim"]);
+        for kept in ["_root_cause", "_mnt_point_x", "see _root_value now"] {
+            assert_eq!(redactor.text(kept), kept, "{kept}");
+        }
+        let out = redactor.text("built _srv_kim_cam1_mp4_proxy_1.mp4.");
+        assert!(!out.contains("kim"), "{out}");
         let _ = fs::remove_dir_all(case_dir);
     }
 }

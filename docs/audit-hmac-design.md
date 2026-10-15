@@ -20,8 +20,12 @@ residual threat, and the keyed format as shipped.
   `FRAMETRACE_AUDIT_KEY` (hex- or base64-encoded 32-byte material). A present
   but unusable source — world/group-readable file on Unix, malformed or
   wrong-length material — is an error, never a silent downgrade.
-- `FRAMETRACE_AUDIT_KEY_ID` names the loaded key (default `"default"`) and is
-  stamped as `entry_hmac_key_id`.
+- `FRAMETRACE_AUDIT_KEY_ID` names the loaded key and is stamped as
+  `entry_hmac_key_id`. Its default is the key's **fingerprint id**
+  `kid-<first 8 hex of SHA-256(material)>` (R7-I4). It used to default to
+  the shared literal `"default"`, so two PCs' different keys claimed the
+  same id and one PC's genuine entries read as forged on the other. See
+  "Key ids" below for how old `"default"` entries are still verified.
 - `verify-audit` prints the log-level mark (`integrity-keyed` /
   `integrity-structural-only`), keyed-entry counts, and per-log warnings
   (mixed chain, missing key).
@@ -31,9 +35,13 @@ residual threat, and the keyed format as shipped.
   `FRAMETRACE_AUDIT_KEYRING_FILE` overrides the path), and records the
   previously configured key — whichever source supplied it — as a retired
   keyring entry so its audit entries stay verifiable. `--key-id` names the
-  new key (default `key-<sha256 fingerprint prefix>`); `--log PATH`
+  new key (default: its fingerprint id `kid-<sha8>`; keyrings written with
+  the older `key-<sha8>` default keep their ids); `--log PATH`
   (repeatable) appends the signed `audit-key-rotate` marker entry keyed
-  under the NEW key.
+  under the NEW key. R7-I6: a `--log` that is a **case directory** stamps
+  the marker into every known chain lane of that case that verifies now
+  (the sign-off lane included; for sound measurements only the active
+  lane); lanes that do not verify are listed and left untouched.
 - `--key-source env:VAR_NAME` / `--key-source file:PATH` (global flag)
   overrides every ambient key source for one invocation. `env:` is the
   documented hand-off from an external secret store — the key is injected
@@ -114,9 +122,28 @@ Opt-in, versioned by field presence — no schema flag file needed:
   `entry_sha256` covers (the line through `previous_entry_sha256` + closing
   `}`). Hashing the same signed region means the HMAC is a pure additive
   field; the unkeyed verification rules are untouched.
-- `entry_hmac_key_id` — short opaque identifier (`"default"`, `"2026-Q1"`,
-  a key fingerprint prefix). It names the key, never contains key material,
-  and enables rotation lookups.
+- `entry_hmac_key_id` — short opaque identifier (`kid-<sha8>` fingerprint
+  id by default, `"2026-Q1"`, or the legacy `"default"`). It names the key,
+  never contains key material, and enables rotation lookups.
+
+### Key ids (R7-I4)
+
+Whether a mismatching HMAC is a **forgery** (FAIL) or an entry from
+**another PC's key** (not verifiable here) depends on whether this PC holds
+the key the entry names:
+
+- `kid-<sha8>` names exactly the material with that fingerprint, whatever
+  id this PC loaded it under. A held key with that fingerprint that does
+  not verify the entry → FAIL.
+- The legacy `"default"` names no particular key (every unnamed key used
+  it). It is bound per log by fingerprint comparison: when one of THIS
+  log's `"default"` entries verifies under a key this PC holds, a
+  `"default"` entry in the same log that no key verifies is a forgery
+  (FAIL); otherwise the log's `"default"` entries are another PC's
+  (not verifiable here). This PC's own old `"default"` logs therefore stay
+  verifiable — every configured key is tried as a fallback — and existing
+  keyrings (any ids, including `"default"`) load unchanged.
+- Any other id (`2026-Q1`, `key-<sha8>`) is compared as text.
 
 Field order stays append-only at the tail of the object so
 `entry_without_recorded_hash` style byte-surgery on the signed region keeps
@@ -169,6 +196,16 @@ without the HMAC fields and no warning is emitted (keyed mode is opt-in).
 | Entries with `entry_hmac_sha256`, key available | Structural + HMAC verified; report marks **"integrity-keyed"**. |
 | Entries with `entry_hmac_sha256`, key missing | Structural chain verified; report warns **"keyed entries present but key unavailable — authenticity unverified"** (still a pass with a loud caveat, so a log moved off its producing machine remains inspectable). |
 | Mixed keyed/unkeyed entries | Per-entry result; the log-level mark degrades to structural-only with a mixed-chain warning. |
+| Entries under a key id this PC does not hold (R6-I4), none after an entry this PC authenticated | Structural chain verified; warning "signed under audit key id(s) … that this PC does not hold — not a tampering verdict"; never graded keyed. |
+| An entry under a key id this PC does not hold AFTER an entry this PC authenticated (R7-I3) | **NOT VERIFIED** — "이 PC에 없는 키 — 재작성 배제 불가": this PC held the log's key, so the tail may have been re-chained under an invented key id. `verify-audit` exits non-zero, `verify-package` reports NOT VERIFIED, the report's chain status is `not-verified`, and a sign-off in such a lane is not verifiable. No in-log rotation marker excuses it — a marker naming the new id would be signed by that same unknown key. |
+
+**Per-entry use (R7-I1, R7-S10).** Where a single entry is relied on — a
+sound measurement, a sound-lane continuation marker, an E01 import record
+or the completion marker bound to it, a sign-off entry — and this PC holds
+audit keys in a keyed case, only an entry whose HMAC is
+**authenticated here** counts. An HMAC under an unknown key id, or under a
+retired key nothing later proves, is anyone's line. Without keys on this PC
+these are self-consistency only, and say so.
 
 The unkeyed fields are never removed: keyed logs still verify structurally on
 any machine, and the HMAC layer adds rather than replaces a check.
@@ -194,7 +231,12 @@ the rotation rules:
   (`{"kind":"audit-key-rotate","from":"<old id>","to":"<new id>"}`) keyed
   under the **new** key, so a gap between last-old-key and first-new-key
   entries is explainable in-log. Audit logs are per-case, so the flag is
-  repeatable — pass every log that grows across the boundary.
+  repeatable — pass every log that grows across the boundary, or the case
+  directory itself (R7-I6: every verifying lane of the case). The marker
+  also matters for older entries: an entry signed by a now-retired key is
+  only authenticated when a newer key's entry follows it in the same log,
+  so without the marker every earlier sign-off reads "cannot be verified"
+  after a rotation.
 - Old keys are retained in the keyring for as long as the case lives;
   deleting a retired key downgrades verification of its entries to
   structural-only, never to failure.
@@ -210,6 +252,12 @@ the rotation rules:
   reveal it. The sign-off anchors below reveal truncation of anything
   recorded before the sign-off; package-level manifests (`manifest.sha256`)
   and external timestamping remain the controls for the rest.
+- **Not rollback detection (R7-I7).** An older genuine sign-off record
+  restored over a newer one is reported "not the latest" only while the
+  newer sign-off entries are still in `signoff-log.jsonl`. Cutting the
+  lane's tail back to the older entry is truncation, and truncation of the
+  sign-off lane after the restored record is NOT detected; the wording
+  ("newest sign-off entry in the lane as found") claims no more.
 
 ## Truncation anchors (sign-off schema v4)
 
@@ -221,6 +269,19 @@ that position (later appends are fine). A removed tail, a rewritten prefix
 or a deleted lane reads "changed since the sign-off". The sign-off itself is
 appended to `evidence/logs/signoff-log.jsonl` (HMAC-keyed when a key is
 configured), naming the record by the SHA-256 of its bytes.
+
+R7-I7: a v4 record also states `signoff_log_entries` — how many entries the
+sign-off lane held when it was signed. Its own lane entry must sit right
+after them (line `signoff_log_entries + 1`); anything else (the lane before
+it cut or re-written) is a contradiction → "changed". Records written
+before R7 lack the field and are not position-checked.
+
+R7-I2: only `schema_version` 4 is checked as v4. A higher schema is
+rejected (Unbound / NOT VERIFIED, never read through a marks-only
+shortcut), and once the sign-off lane holds entries an older-schema record
+is at most Unbound / NOT VERIFIED — re-labelling a v4 record as v3 (whose
+`content_sha256` anyone can recompute from the marks) no longer skips the
+lane.
 
 ## Retired keys
 

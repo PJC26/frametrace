@@ -235,8 +235,15 @@ pub fn render_review_html(manifest_json: &str, index_json: &str) -> String {
     </section>
   </main>
   <script>
-    const manifest = {manifest};
-    const scan = {index};
+    // R7-S6: an input that was not one JSON value is embedded as null —
+    // say so instead of failing on `null.title` (a blank page).
+    const manifestInput = {manifest};
+    const scanInput = {index};
+    const manifest = manifestInput && typeof manifestInput === "object" ? manifestInput : {{}};
+    const scan = scanInput && typeof scanInput === "object" ? scanInput : {{}};
+    const inputProblems = [];
+    if (manifest !== manifestInput) inputProblems.push("케이스 파일(case.json)을 읽지 못했습니다 — 올바른 JSON이 아닙니다. / The case file could not be read.");
+    if (scan !== scanInput) inputProblems.push("색인 파일(db/video_index.json)을 읽지 못했습니다 — 올바른 JSON이 아닙니다. / The case index could not be read.");
     const videos = Array.isArray(scan.videos) ? scan.videos : [];
     const warnings = Array.isArray(scan.warnings) ? scan.warnings : [];
 
@@ -303,6 +310,12 @@ pub fn render_review_html(manifest_json: &str, index_json: &str) -> String {
     document.getElementById("warnings").innerHTML = warnings.length
       ? `<div class="warnings"><strong>Scan warnings</strong><table><thead><tr><th>Severity</th><th>Message</th><th>Status</th></tr></thead><tbody>${{warnings.map(warning => `<tr><td>${{warningSeverity(warning)}}</td><td>${{escapeHtml(warning)}}</td><td>Review required</td></tr>`).join("")}}</tbody></table></div>`
       : "";
+    if (inputProblems.length) {{
+      document.getElementById("warnings").insertAdjacentHTML(
+        "afterbegin",
+        `<div class="warnings" role="alert" id="input-problems"><strong>케이스 파일을 읽지 못했습니다</strong>${{inputProblems.map(problem => `<p>${{escapeHtml(problem)}}</p>`).join("")}}</div>`
+      );
+    }}
 
     let currentPage = 1;
     const pageSize = 100;
@@ -688,7 +701,9 @@ pub fn render_carve_report_html(
   <div class="detail" id="detail" hidden></div>
 </main>
 <script>
-const MANIFEST = {manifest};
+// R7-S6: null when case.json was not one JSON value (shown in the title).
+const MANIFEST_INPUT = {manifest};
+const MANIFEST = MANIFEST_INPUT && typeof MANIFEST_INPUT === "object" ? MANIFEST_INPUT : {{}};
 const ARTIFACTS = {artifacts};
 const RESULTS = {results};
 const PROXIES = {proxies};
@@ -768,7 +783,9 @@ document.getElementById("btnTheme").addEventListener("click", () => {{
   document.documentElement.dataset.theme = next;
   try {{ localStorage.setItem("ft-theme", next); }} catch (e) {{}}
 }});
-document.getElementById("caseTitle").textContent = MANIFEST.case_id ? "— " + MANIFEST.case_id : "";
+document.getElementById("caseTitle").textContent = MANIFEST !== MANIFEST_INPUT
+  ? "— 케이스 파일(case.json)을 읽지 못했습니다"
+  : (MANIFEST.case_id ? "— " + MANIFEST.case_id : "");
 const R = RESULTS || {{}};
 // I6: carve time in UTC (the custody statement's basis) plus the viewing
 // PC's local time with its UTC offset, never a bare browser-local string.
@@ -1201,6 +1218,60 @@ mod tests {
             Path::new("C:\\case"),
         );
         assert!(bundle.contains("joinLog:[{") && bundle.contains("audioLevels:{\"vid_1\""));
+    }
+
+    /// R7-S6: a `case.json` / index that is not one JSON value is
+    /// embedded as `null` (R6-S1); the review page then threw on
+    /// `manifest.title` and stayed blank. It now runs and says which file
+    /// could not be read. (Runs the page script under node with a stub
+    /// DOM; skipped without node, like the syntax checks.)
+    #[test]
+    fn review_page_says_when_its_inputs_were_unreadable() {
+        let html = crate::html_report::render_review_html("{} x", "not json");
+        assert!(html.contains("const manifestInput = null;"));
+        assert!(html.contains("const scanInput = null;"));
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let blocks = extract_script_blocks(&html);
+        let main = blocks
+            .iter()
+            .find(|block| block.contains("manifestInput"))
+            .expect("main script");
+        let stub = r#"
+const shown = [];
+const el = () => new Proxy(function () {}, {
+  get: (_, key) => {
+    if (key === "insertAdjacentHTML") return (_where, html) => shown.push(String(html));
+    if (key === "value") return "";
+    if (key === Symbol.toPrimitive) return () => "";
+    if (key === Symbol.iterator) return [][Symbol.iterator];
+    return el();
+  },
+  set: () => true,
+  apply: () => el(),
+});
+globalThis.document = el();
+globalThis.localStorage = el();
+globalThis.matchMedia = () => ({ matches: false });
+process.on("exit", code => { if (code === 0) console.log("SHOWN:" + JSON.stringify(shown)); });
+"#;
+        let path =
+            std::env::temp_dir().join(format!("frametrace-r7-s6-review-{}.js", std::process::id()));
+        std::fs::write(&path, format!("{stub}\n{main}")).unwrap();
+        let output = Command::new("node").arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "review page script failed on null inputs:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("case.json"), "{stdout}");
+        assert!(stdout.contains("video_index.json"), "{stdout}");
     }
 
     fn extract_script_blocks(html: &str) -> Vec<String> {
