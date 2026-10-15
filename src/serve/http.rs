@@ -1466,10 +1466,13 @@ pub(crate) struct VerifiedStream {
 
 /// R7-S2: a file's identity as far as the platform tells it — size,
 /// modification time, file id (volume + index / device + inode) and
-/// change time (ctime / NTFS `ChangeTime`: updated by every write and not
-/// settable through the APIs that restore a modification time). Two
-/// equal identities mean "same file, not rewritten" for the verification
-/// cache; the served bytes are re-hashed anyway ([`stream_verified`]).
+/// change time (ctime / NTFS `ChangeTime`, updated by every write).
+///
+/// R8-S2: NOT proof that the bytes are unchanged — NTFS `ChangeTime` is
+/// settable with `SetFileInformationByHandle(FileBasicInfo)`, so a
+/// same-size rewrite can restore the whole identity. It only detects a
+/// change DURING one verification or transfer, and answers HEAD (no body)
+/// from the last GET's verdict; content is hashed before every GET.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileIdentity {
     len: u64,
@@ -1629,9 +1632,11 @@ fn note_verify_read(_path: &Path, _bytes: usize) {
 ///   is read;
 /// - files up to [`IN_MEMORY_VERIFY_MAX`] are read once, hashed and served
 ///   from those bytes (unchanged rule);
-/// - larger files are hashed in a streaming pass, the result cached by
-///   (path, [`FileIdentity`]); a cached identity skips the pass. The body
-///   is then streamed from the same handle and re-hashed on the way; the
+/// - larger files are hashed in a streaming pass on EVERY GET (R8-S2: R7
+///   skipped the pass when the cached [`FileIdentity`] matched, and that
+///   identity can be restored after a rewrite); the result is cached for
+///   HEAD only. The body is then streamed from the same handle and
+///   re-hashed on the way; the
 ///   last chunk is sent only after the hash and identity still match
 ///   ([`stream_verified`]), else the connection is cut (the client never
 ///   gets a complete response). Streamed pages always get a hash-list
@@ -1655,9 +1660,10 @@ pub(crate) fn verify_for_serving(
     let Some(identity) = file_identity(&file).filter(|identity| identity.len == len) else {
         return ServeVerdict::Untrusted;
     };
-    let cached = cache_lookup(path, &identity);
     if head_only {
-        return match cached {
+        // Headers only: no content byte leaves, so the cached verdict of
+        // the last GET may answer without reading the file.
+        return match cache_lookup(path, &identity) {
             Some(entry) if trusted_sha(case_dir, &entry.sha) => ServeVerdict::Trusted {
                 script_src: entry.script_src,
                 body: VerifiedBody::HeadOnly,
@@ -1701,27 +1707,29 @@ pub(crate) fn verify_for_serving(
             body: VerifiedBody::Memory(bytes),
         };
     }
-    let (sha, script_src) = match cached {
-        Some(entry) => (entry.sha, entry.script_src),
-        None => {
-            let Some((sha, script_src, read)) = hash_file_streaming(path, &mut file, page) else {
-                return ServeVerdict::Untrusted;
-            };
-            if read != len || file_identity(&file).as_ref() != Some(&identity) {
-                // Changed while it was hashed: nothing to vouch for.
-                return ServeVerdict::Untrusted;
-            }
-            cache_store(
-                path,
-                CachedVerdict {
-                    identity: identity.clone(),
-                    sha: sha.clone(),
-                    script_src: script_src.clone(),
-                },
-            );
-            (sha, script_src)
-        }
+    // R8-S2: a GET always hashes the file before its first byte is sent —
+    // the cached verdict is never a shortcut for content. Its identity
+    // (size, mtime, file id, change time) can be forged: NTFS `ChangeTime`
+    // is settable through `SetFileInformationByHandle`, so a same-size
+    // rewrite with every timestamp restored matched the cache, and the
+    // changed bytes went out (and rendered) before the re-hash at the end
+    // of the transfer noticed.
+    let Some((sha, script_src, read)) = hash_file_streaming(path, &mut file, page) else {
+        return ServeVerdict::Untrusted;
     };
+    if read != len || file_identity(&file).as_ref() != Some(&identity) {
+        // Changed while it was hashed: nothing to vouch for.
+        cache_forget(path);
+        return ServeVerdict::Untrusted;
+    }
+    cache_store(
+        path,
+        CachedVerdict {
+            identity: identity.clone(),
+            sha: sha.clone(),
+            script_src: script_src.clone(),
+        },
+    );
     if !trusted_sha(case_dir, &sha) {
         return ServeVerdict::Untrusted;
     }

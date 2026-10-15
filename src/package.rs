@@ -153,8 +153,14 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
     // R7-S5: our reservation is released through its marker — one that no
     // longer names this process is not ours to replace.
     // The finished package is kept (marked, never swept) when the name
-    // is held by something else now.
-    if reserved_default && final_dir.exists() && !crate::join::release_reservation(&final_dir, pid)
+    // is held by something else now. R8-S5: a release that only FAILED
+    // (removal kept failing — an antivirus or indexer handle) is not a
+    // stolen name: publishing goes on, and the publish rename (retried,
+    // clearing what is left of our reservation first) decides.
+    if reserved_default
+        && final_dir.exists()
+        && crate::join::release_own_reservation(&final_dir, pid)
+            == crate::join::ReservationRelease::NotOurs
     {
         let _ = fs::write(
             crate::join::preserved_part_marker(&work_dir),
@@ -166,7 +172,8 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
             work_dir.display()
         ));
     }
-    if final_dir.exists()
+    if !reserved_default
+        && final_dir.exists()
         && let Err(err) = fs::remove_dir(&final_dir)
     {
         let _ = fs::remove_dir_all(&work_dir);
@@ -188,6 +195,10 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
             n > 0
         }) {
             return Err(std::io::Error::other("injected rename failure"));
+        }
+        if reserved_default {
+            // R8-S5: what a failed release left of OUR reservation.
+            crate::join::clear_own_reservation_remnant(to, pid);
         }
         fs::rename(from, to)
     };
@@ -243,33 +254,88 @@ fn reserve_package_dirs(base: &Path, pid: u32) -> Result<(PathBuf, PathBuf), Str
         }
         fs::create_dir(&work)
             .map_err(|err| format!("failed to create {}: {err}", work.display()))?;
-        match fs::create_dir(&candidate) {
-            Ok(()) => {
-                // R7-S5: the reservation names its owner; sweeps release
-                // it only for this pid (the work folder alone cannot
-                // prove the name is ours — see `join::RESERVATION_MARKER`).
-                let marker = candidate.join(crate::join::RESERVATION_MARKER);
-                if let Err(err) = fs::write(&marker, crate::join::reservation_marker_text(pid)) {
-                    let _ = fs::remove_file(&marker);
-                    let _ = fs::remove_dir(&candidate);
-                    let _ = fs::remove_dir(&work);
-                    return Err(format!(
-                        "failed to mark package reservation {}: {err}",
-                        candidate.display()
-                    ));
-                }
-                return Ok((candidate, work));
+        // R7-S5: the reservation names its owner; sweeps release it only
+        // for this pid (the work folder alone cannot prove the name is
+        // ours — see `join::RESERVATION_MARKER`).
+        // R8-S6: R7 created the folder and wrote the marker after it, so
+        // for a moment the reservation was an EMPTY folder — which a
+        // sweep treats as "owner died before marking" and removes, and
+        // which a unix `rename` (another package-case publishing) silently
+        // replaces. The marker is now written into a pid-tagged staging
+        // folder that is renamed onto the name: the reservation appears
+        // already marked, never empty; a rename onto an existing folder
+        // fails on Windows and, the reservation being non-empty, on unix.
+        let staging = crate::join::reservation_staging_path(&candidate, pid);
+        let marked = (|| {
+            if staging.exists() {
+                fs::remove_dir_all(&staging)?;
             }
-            Err(_) => {
-                // Taken meanwhile (another package-case): next name.
-                let _ = fs::remove_dir(&work);
-            }
+            fs::create_dir(&staging)?;
+            fs::write(
+                staging.join(crate::join::RESERVATION_MARKER),
+                crate::join::reservation_marker_text(pid),
+            )
+        })();
+        if let Err(err) = marked {
+            let _ = fs::remove_dir_all(&staging);
+            let _ = fs::remove_dir(&work);
+            return Err(format!(
+                "failed to mark package reservation {}: {err}",
+                candidate.display()
+            ));
         }
+        if place_reservation(&staging, &candidate) {
+            return Ok((candidate, work));
+        }
+        // Taken meanwhile (another package-case), or the rename kept
+        // failing: next name.
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir(&work);
     }
     Err(format!(
         "no free package folder name next to {}",
         base.display()
     ))
+}
+
+/// R8-S6: renames the marked `staging` folder onto `reserved`. `false`
+/// when the name exists (taken — never replaced: [`reservation_rename`]
+/// refuses an existing target) or the rename still fails after the
+/// R5-S12 backoff (a fresh folder briefly held by an antivirus scan).
+fn place_reservation(staging: &Path, reserved: &Path) -> bool {
+    let mut attempt = 0usize;
+    loop {
+        match reservation_rename(staging, reserved) {
+            Ok(()) => return true,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return false,
+            Err(_) if attempt >= RENAME_BACKOFF_MS.len() => return false,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(RENAME_BACKOFF_MS[attempt]));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// R8-S6: `rename(from, to)` that never replaces an existing `to`. The
+/// existence check covers an empty pre-R8 reservation (a unix `rename`
+/// would replace an empty folder); a reservation made by this code is
+/// never empty, so a rename racing past the check fails on it (Windows:
+/// the target exists; unix: the target is not empty).
+fn reservation_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists", to.display()),
+        ));
+    }
+    match fs::rename(from, to) {
+        Err(_) if fs::symlink_metadata(to).is_ok() => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists", to.display()),
+        )),
+        other => other,
+    }
 }
 
 /// Delays between the R5-S12 rename attempts (5 attempts in all).
@@ -2897,6 +2963,120 @@ mod tests {
         let swept = crate::join::sweep_pid_parts(&case_dir.join("reports"), std::process::id());
         assert!(swept.is_empty(), "a kept package is never swept: {swept:?}");
         assert!(kept[0].is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R8-S5: releasing our reservation at publish time failed once (a
+    /// transient removal failure) and R7 took that for "the name is not
+    /// ours any more": the finished package was set aside with an error.
+    /// Removal is now retried; a release that keeps failing still
+    /// publishes (the publish step clears what is left of OUR reservation).
+    #[test]
+    fn r8_s5_reservation_release_failures_do_not_strand_the_package() {
+        let (root, case_dir) = minimal_packageable_case("r8-s5");
+        // Two failed removals, then success: retried, published.
+        crate::join::FAIL_RESERVATION_REMOVALS.with(|left| left.set(2));
+        let result = package_case(&case_dir, None).expect("published after retried release");
+        assert!(result.output_dir.join("manifest.sha256").is_file());
+        assert!(
+            !result
+                .output_dir
+                .join(crate::join::RESERVATION_MARKER)
+                .exists()
+        );
+        // Every release attempt fails: still published under the name.
+        crate::join::FAIL_RESERVATION_REMOVALS.with(|left| left.set(5));
+        let result = package_case(&case_dir, None);
+        crate::join::FAIL_RESERVATION_REMOVALS.with(|left| left.set(0));
+        let result = result.expect("a failed release is not a stolen name");
+        assert!(result.output_dir.join("manifest.sha256").is_file());
+        let verification = super::verify_package(&result.output_dir).expect("verify");
+        assert_eq!(verification.failures().count(), 0);
+        // Another pid's reservation is still never ours.
+        let other = case_dir.join("reports/package_other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join(crate::join::RESERVATION_MARKER),
+            crate::join::reservation_marker_text(4242),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::join::release_own_reservation(&other, std::process::id()),
+            crate::join::ReservationRelease::NotOurs
+        );
+        assert!(other.join(crate::join::RESERVATION_MARKER).is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R8-S5 (Windows): a marker briefly held open without delete sharing
+    /// (an antivirus scan) made R7's single removal attempt fail, and the
+    /// release reported the reservation as not ours.
+    #[cfg(windows)]
+    #[test]
+    fn r8_s5_briefly_locked_marker_is_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("ft-r8-s5-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let reserved = root.join("package_7");
+        fs::create_dir_all(&reserved).unwrap();
+        let marker = reserved.join(crate::join::RESERVATION_MARKER);
+        fs::write(&marker, crate::join::reservation_marker_text(777)).unwrap();
+        // FILE_SHARE_READ only: deleting fails while the handle is open.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&marker)
+            .unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        assert!(crate::join::release_reservation(&reserved, 777));
+        holder.join().unwrap();
+        assert!(!reserved.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R8-S6: a reservation is born marked (staged, then renamed onto the
+    /// name) — never an empty folder a sweep would take for "owner died
+    /// before marking", or that a unix rename would replace — and placing
+    /// it never replaces an existing folder, even an empty one.
+    #[test]
+    fn r8_s6_reservation_is_placed_marked_and_never_replaces() {
+        let root = std::env::temp_dir().join(format!("ft-r8-s6-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let reports = root.join("reports");
+        fs::create_dir_all(&reports).unwrap();
+        let (reserved, work) =
+            super::reserve_package_dirs(&reports.join("package_5"), 4242).expect("reserve");
+        assert_eq!(crate::join::reservation_owner(&reserved), Some(Some(4242)));
+        assert!(work.is_dir());
+        let staging = crate::join::reservation_staging_path(&reserved, 4242);
+        assert!(!staging.exists(), "no staging folder is left behind");
+        assert!(crate::join::is_pid_part_name(
+            &staging.file_name().unwrap().to_string_lossy(),
+            Some(4242)
+        ));
+        // A name that appears between the existence check and the rename
+        // (here: an empty folder) is never replaced.
+        let from = reports.join(".staged");
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join(crate::join::RESERVATION_MARKER), "pid=1\n").unwrap();
+        let taken = reports.join("package_6");
+        fs::create_dir_all(&taken).unwrap();
+        let err = super::reservation_rename(&from, &taken).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(crate::join::reservation_owner(&taken), Some(None));
+        assert!(from.join(crate::join::RESERVATION_MARKER).is_file());
+        assert!(!super::place_reservation(&from, &taken));
+        // A leftover staging folder of a dead writer is swept.
+        fs::create_dir_all(crate::join::reservation_staging_path(
+            &reports.join("package_8"),
+            4243,
+        ))
+        .unwrap();
+        crate::join::sweep_stale_parts_with(&reports, &|_| crate::util::ProcessProbe::Gone, 0);
+        assert!(!crate::join::reservation_staging_path(&reports.join("package_8"), 4243).exists());
         let _ = fs::remove_dir_all(root);
     }
 

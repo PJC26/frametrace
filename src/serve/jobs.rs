@@ -1125,6 +1125,13 @@ pub(crate) fn run_step_detailed(
         (guard.key_source.clone(), guard_key_tag(&guard))
     };
     let child_args = child_command_args(key_source.as_deref(), args);
+    // R8-S7: a fresh random token per step; only marker lines carrying it
+    // are promoted (text the step merely relays cannot forge one).
+    let token = step_marker_token()?;
+    let markers = [
+        crate::util::tokened_marker(super::KEY_MISMATCH_MARKER, &token),
+        crate::util::tokened_marker(crate::util::STEP_WARNING_MARKER, &token),
+    ];
     let mut command = Command::new(exe);
     command
         .args(&child_args)
@@ -1132,7 +1139,7 @@ pub(crate) fn run_step_detailed(
         .stderr(Stdio::piped())
         // R7-S6: the child prints its warnings as STEP_WARNING_MARKER
         // lines, promoted to job warnings below.
-        .env(crate::util::STEP_WARNING_ENV, "1");
+        .env(crate::util::STEP_WARNING_ENV, &token);
     if let Some(tag) = key_tag {
         command.env(EXPECTED_AUDIT_KEY_ENV, tag);
     }
@@ -1154,10 +1161,8 @@ pub(crate) fn run_step_detailed(
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
     let stdout_reader = thread::spawn(move || drain_capped(&mut stdout_pipe));
     let stderr_reader = thread::spawn(move || {
-        drain_capped_collecting(
-            &mut stderr_pipe,
-            &[super::KEY_MISMATCH_MARKER, crate::util::STEP_WARNING_MARKER],
-        )
+        let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+        drain_capped_collecting(&mut stderr_pipe, &markers)
     });
     let mut killed = false;
     let status = loop {
@@ -1241,29 +1246,47 @@ pub(crate) fn drain_capped(pipe: &mut impl std::io::Read) -> Vec<u8> {
     drain_capped_collecting(pipe, &[]).0
 }
 
-/// Most marker lines one step may raise (R5-S9).
+/// R8-S7: a fresh random token (32 hex digits) binding one step's marker
+/// lines to that step.
+pub(crate) fn step_marker_token() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| format!("단계 경고 토큰을 만들지 못했습니다 (entropy): {err}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Most marker lines one step may raise PER MARKER (R5-S9; R8-S7: the cap
+/// was shared, so a flood of step warnings hid an audit-key mismatch).
 const MAX_MARKER_LINES: usize = 8;
 
 /// [`drain_capped`] that also returns every complete line starting with
-/// one of `markers` (marker stripped, at most [`MAX_MARKER_LINES`])
-/// wherever it appeared — R5-S9: a child's audit-key mismatch warning is
-/// printed first and would otherwise fall out of the retained tail of a
-/// chatty step.
+/// one of `markers` (marker stripped, at most [`MAX_MARKER_LINES`] per
+/// marker, then one line saying how many more were left out) wherever it
+/// appeared — R5-S9: a child's audit-key mismatch warning is printed first
+/// and would otherwise fall out of the retained tail of a chatty step.
 pub(crate) fn drain_capped_collecting(
     pipe: &mut impl std::io::Read,
     markers: &[&str],
 ) -> (Vec<u8>, Vec<String>) {
     let mut buffer = Vec::new();
     let mut found: Vec<String> = Vec::new();
+    let mut per_marker = vec![0usize; markers.len()];
     // Bytes of the current, not yet terminated line (bounded).
     let mut line: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
-    let take_line = |line: &mut Vec<u8>, found: &mut Vec<String>| {
-        if !markers.is_empty() && found.len() < MAX_MARKER_LINES {
+    let mut take_line = |line: &mut Vec<u8>, found: &mut Vec<String>| {
+        if !markers.is_empty() {
             let text = String::from_utf8_lossy(line);
             let text = text.trim_end_matches('\r');
-            if let Some(rest) = markers.iter().find_map(|marker| text.strip_prefix(marker)) {
-                found.push(rest.trim().to_string());
+            if let Some((which, rest)) = markers
+                .iter()
+                .enumerate()
+                .find_map(|(which, marker)| text.strip_prefix(marker).map(|rest| (which, rest)))
+            {
+                per_marker[which] += 1;
+                if per_marker[which] <= MAX_MARKER_LINES {
+                    found.push(rest.trim().to_string());
+                }
             }
         }
         line.clear();
@@ -1291,6 +1314,15 @@ pub(crate) fn drain_capped_collecting(
     }
     if !line.is_empty() {
         take_line(&mut line, &mut found);
+    }
+    for count in per_marker {
+        if count > MAX_MARKER_LINES {
+            found.push(format!(
+                "같은 종류의 경고 {}건을 더 생략했습니다 / {} more warning(s) of this kind omitted",
+                count - MAX_MARKER_LINES,
+                count - MAX_MARKER_LINES
+            ));
+        }
     }
     (buffer, found)
 }

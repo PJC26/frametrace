@@ -277,8 +277,14 @@ pub fn render_case_report_with_chains(
   <div class="note" id="audit-chain-note">integrity-keyed = 모든 항목이 설정된 키(HMAC)로 확인됨 — 키 없이 고친 항목은 드러납니다. 구조만 확인 = 항목 연결은 맞지만 서명이 없어, 파일에 접근할 수 있는 사람이 로그 전체를 다시 쓰면 탐지할 수 없습니다. 검증 실패 = 연결이 끊김 — 해당 로그의 내용을 그대로 믿으면 안 됩니다. 체인 검증만으로는 로그 끝부분을 항목 단위로 잘라낸 것(잘림)을 탐지하지 못합니다 — 잘림은 최종화 서명(v4)에 기록된 레인별 항목 수·마지막 해시(앵커)와 비교해야 드러나며, 그 결과는 위 검토자 줄에 표시됩니다.</div>
 <script>
 const auditChains = {audit_chains};
-const manifest = {manifest};
-const scan = {index};
+// R8-S4: an unreadable case.json / db/video_index.json is embedded as
+// null (R6-S1); `manifest.title` then threw and the report stayed blank.
+const objectOrNull = value => value && typeof value === "object" && !Array.isArray(value) ? value : null;
+const manifestInput = objectOrNull({manifest});
+const scanInput = objectOrNull({index});
+const unreadableInputs = [[manifestInput, "케이스 파일(case.json)"], [scanInput, "색인 파일(db/video_index.json)"]].filter(([value]) => !value).map(([, name]) => name);
+const manifest = manifestInput || {{}};
+const scan = scanInput || {{}};
 const exportsLog = {export_lines};
 const proxyLog = {proxy_lines};
 const thumbnailLog = {thumbnail_lines};
@@ -364,7 +370,7 @@ const chainCell = (name, hash) => `<code>${{escapeHtml(hash || "-")}}</code><br>
 // rendered as an empty "없음" section.
 const readFailed = name => readErrors[name] ? `<p class="note"><strong>읽기 실패 — 이 항목은 확인되지 않았습니다:</strong> ${{escapeHtml(readErrors[name])}}</p>` : "";
 const emptyOr = (name, text) => readErrors[name] ? readFailed(name) : text;
-document.getElementById("read-errors").innerHTML = Object.keys(readErrors).length ? `<div class="note"><strong>보고서 생성 중 읽지 못한 입력 ${{Object.keys(readErrors).length}}건</strong> — 해당 표는 비어 있는 것이 아니라 확인되지 않은 것입니다.<br>${{Object.entries(readErrors).map(([name, err]) => `${{escapeHtml(name)}}: ${{escapeHtml(err)}}`).join("<br>")}}</div>` : "";
+document.getElementById("read-errors").innerHTML = (unreadableInputs.length ? `<div class="note" role="alert"><strong>${{unreadableInputs.map(escapeHtml).join(", ")}}을(를) 읽지 못했습니다</strong> — 이 보고서의 케이스 정보·영상 목록은 비어 있는 것이 아니라 확인되지 않은 것입니다. 파일을 확인한 뒤 보고서를 다시 만드십시오.</div>` : "") + (Object.keys(readErrors).length ? `<div class="note"><strong>보고서 생성 중 읽지 못한 입력 ${{Object.keys(readErrors).length}}건</strong> — 해당 표는 비어 있는 것이 아니라 확인되지 않은 것입니다.<br>${{Object.entries(readErrors).map(([name, err]) => `${{escapeHtml(name)}}: ${{escapeHtml(err)}}`).join("<br>")}}</div>` : "");
 // D9: marks still queued or save conflicts still open when the report was
 // made — the report may not show the latest review.
 document.getElementById("review-warnings").innerHTML = Array.isArray(reviewWarnings) && reviewWarnings.length ? `<div class="note"><strong>주의: 판독 기록이 아직 확정되지 않았습니다</strong><br>${{reviewWarnings.map(escapeHtml).join("<br>")}}</div>` : "";
