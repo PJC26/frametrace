@@ -832,6 +832,7 @@ mod tests {
                 keyed_entries: 0,
                 unauthenticated_keyed_entries: 0,
                 entry_auth: Vec::new(),
+                rewrite_not_excluded: None,
                 integrity,
                 warnings: Vec::new(),
             }),

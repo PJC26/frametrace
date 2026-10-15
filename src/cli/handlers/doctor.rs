@@ -49,8 +49,19 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
             ));
         }
         let mut failures = Vec::new();
+        let mut not_verified = Vec::new();
         for log in &logs {
             match audit::verify_chained_jsonl(log) {
+                // R7-I3: a possible tail rewrite is never "verified".
+                Ok(result) if result.rewrite_not_excluded.is_some() => {
+                    println!(
+                        "audit NOT VERIFIED: {} (entries: {}): {}",
+                        log.display(),
+                        result.entries,
+                        result.rewrite_not_excluded.as_deref().unwrap_or_default()
+                    );
+                    not_verified.push(log.display().to_string());
+                }
                 Ok(result) => {
                     println!(
                         "audit verified: {} (entries: {}, integrity: {})",
@@ -71,9 +82,26 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
                 failures.len()
             ));
         }
+        if !not_verified.is_empty() {
+            return Err(format!(
+                "{} audit log(s) could not be verified (NOT VERIFIED — not a tampering verdict, but a re-write cannot be ruled out)",
+                not_verified.len()
+            ));
+        }
         return Ok(());
     }
     let result = audit::verify_chained_jsonl(log_path)?;
+    if let Some(reason) = &result.rewrite_not_excluded {
+        println!("audit NOT VERIFIED: {}", log_path.display());
+        println!("entries: {}", result.entries);
+        for warning in &result.warnings {
+            println!("warning: {warning}");
+        }
+        return Err(format!(
+            "audit log {} could not be verified: {reason}",
+            log_path.display()
+        ));
+    }
     println!("audit verified: {}", log_path.display());
     println!("entries: {}", result.entries);
     println!("last entry sha256: {}", result.last_entry_sha256);
@@ -91,9 +119,29 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
 }
 
 /// `rotate-audit-key`: generate a fresh key, make it the keyring's active
-/// key, retire the previously configured key, and optionally stamp signed
-/// marker entries into the logs that grow across the boundary.
+/// key, retire the previous key, and optionally stamp signed marker entries
+/// into the logs that grow across the boundary.
+///
+/// R7-I6: a `--log` that is a CASE DIRECTORY stamps the marker into every
+/// known chain lane of that case ([`rotation_marker_lanes`]) — the
+/// sign-off lane above all: an entry signed by the now-retired key is only
+/// authenticated when a newer key's entry follows it, so without the marker
+/// every earlier sign-off would read "cannot be verified" after rotation.
 pub fn rotate_audit_key(key_id: Option<&str>, marker_logs: &[PathBuf]) -> Result<(), String> {
+    // Resolve the lanes BEFORE rotating, so a bad --log path fails without
+    // changing the keyring.
+    let mut targets: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for log in marker_logs {
+        if log.is_dir() {
+            let (lanes, skip) = rotation_marker_lanes(log)?;
+            targets.extend(lanes);
+            skipped.extend(skip);
+        } else {
+            targets.push(log.clone());
+        }
+    }
+    targets.dedup();
     let rotation = crate::audit_key::rotate(key_id)?;
     println!("audit key rotated");
     println!("new key id: {}", rotation.new_key.id);
@@ -104,7 +152,10 @@ pub fn rotate_audit_key(key_id: Option<&str>, marker_logs: &[PathBuf]) -> Result
         None => println!("no previous key configured — audit keying enabled"),
     }
     println!("keyring: {}", rotation.keyring_path.display());
-    for log in marker_logs {
+    for note in &skipped {
+        println!("marker skipped: {note}");
+    }
+    for log in &targets {
         let marker = format!(
             "{{\"kind\":\"audit-key-rotate\",\"from\":{},\"to\":{}}}",
             audit::optional_string(rotation.previous_id.as_deref()),
@@ -117,6 +168,47 @@ pub fn rotate_audit_key(key_id: Option<&str>, marker_logs: &[PathBuf]) -> Result
         println!("marker appended: {}", log.display());
     }
     Ok(())
+}
+
+/// R7-I6: the lanes of the case at `case_dir` that get a rotation marker:
+/// every known chain lane present with at least one entry whose chain
+/// verifies now — for the sound measurements only the lane new entries go
+/// to. A lane that does not verify is left exactly as found (named in the
+/// second list): appending to it would not prove anything and a damaged
+/// sound lane must never be written to (R5-P8).
+pub(crate) fn rotation_marker_lanes(
+    case_dir: &Path,
+) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    if !case_dir.join("evidence/logs").is_dir() {
+        return Err(format!(
+            "--log {}: a directory must be a case directory (no evidence/logs)",
+            case_dir.display()
+        ));
+    }
+    let active_audio = crate::audio_level::verified_active_lane(case_dir)?;
+    let mut lanes = Vec::new();
+    let mut skipped = Vec::new();
+    for rel in audit::collect_chain_lanes(case_dir) {
+        let path = case_dir.join(&rel);
+        if audit::audio_level_lane_number(&rel).is_some() {
+            if active_audio.as_deref() == Some(rel.as_str()) {
+                lanes.push(path);
+            } else {
+                skipped.push(format!(
+                    "{rel} (not the verified active sound-measurement lane — left unchanged)"
+                ));
+            }
+            continue;
+        }
+        match audit::verify_chained_jsonl(&path) {
+            Ok(result) if result.entries > 0 => lanes.push(path),
+            Ok(_) => skipped.push(format!("{rel} (empty)")),
+            Err(err) => skipped.push(format!(
+                "{rel} (chain does not verify — left unchanged: {err})"
+            )),
+        }
+    }
+    Ok((lanes, skipped))
 }
 
 /// Screen one file with the deepfake-lens sidecar and emit its JSON report.
@@ -424,5 +516,62 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
         Err(format!("doctor: {fails} blocking problem(s) found"))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::audit;
+    use crate::audit_key::AuditKey;
+    use std::fs;
+
+    /// R7-I6: `rotate-audit-key --log <case dir>` stamps the rotation
+    /// marker into every verifying chain lane of the case — the sign-off
+    /// lane included — and leaves damaged lanes untouched. With the marker
+    /// (signed by the new key) after it, a sign-off entry signed by the now
+    /// retired key is authenticated again instead of "cannot be verified".
+    #[test]
+    fn rotation_markers_reach_every_verifying_case_lane() {
+        let case = std::env::temp_dir().join(format!("ft-r7-i6-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&case);
+        fs::create_dir_all(case.join("evidence/logs")).unwrap();
+        let old = AuditKey::new("old", &[0x61; 32]);
+        let signoff = case.join(crate::report::SIGNOFF_LOG_REL_PATH);
+        audit::append_chained_jsonl_keyed(&signoff, r#"{"event":"signoff"}"#, Some(&old)).unwrap();
+        let scan = case.join("evidence/logs/scan-log.jsonl");
+        audit::append_chained_jsonl_keyed(&scan, r#"{"kind":"one"}"#, Some(&old)).unwrap();
+        let damaged = case.join("evidence/logs/anomaly-log.jsonl");
+        fs::write(&damaged, b"{\"torn\":").unwrap();
+        let damaged_before = fs::read(&damaged).unwrap();
+
+        let (lanes, skipped) = super::rotation_marker_lanes(&case).unwrap();
+        assert!(lanes.contains(&signoff), "{lanes:?}");
+        assert!(lanes.contains(&scan), "{lanes:?}");
+        assert!(!lanes.contains(&damaged), "{lanes:?}");
+        assert!(
+            skipped.iter().any(|s| s.contains("anomaly-log")),
+            "{skipped:?}"
+        );
+        assert!(super::rotation_marker_lanes(&case.join("evidence")).is_err());
+
+        // After rotation `old` is retired; the marker under the new key
+        // proves the earlier entry's age.
+        let retired = old.clone().retired_at(100);
+        let new = AuditKey::new("new", &[0x62; 32]);
+        let keys = [new.clone(), retired];
+        let before = audit::verify_chained_jsonl_keyed(&signoff, &keys).unwrap();
+        assert_eq!(before.entry_auth, [audit::EntryAuth::RetiredUnproven]);
+        for lane in &lanes {
+            audit::append_chained_jsonl_keyed(
+                lane,
+                r#"{"kind":"audit-key-rotate","from":"old","to":"new"}"#,
+                Some(&new),
+            )
+            .unwrap();
+        }
+        let after = audit::verify_chained_jsonl_keyed(&signoff, &keys).unwrap();
+        assert_eq!(after.entry_auth[0], audit::EntryAuth::Authenticated);
+        assert_eq!(fs::read(&damaged).unwrap(), damaged_before);
+        let _ = fs::remove_dir_all(&case);
     }
 }

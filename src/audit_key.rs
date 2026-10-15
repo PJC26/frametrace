@@ -25,8 +25,8 @@
 //! 4. `FRAMETRACE_AUDIT_KEY` — the same encodings, documented as the
 //!    weakest source: any process running as the examiner can read it.
 //!
-//! `FRAMETRACE_AUDIT_KEY_ID` names whichever key was loaded (default
-//! `"default"`) and is stamped as `entry_hmac_key_id`. The key never
+//! `FRAMETRACE_AUDIT_KEY_ID` names whichever key was loaded (default: its
+//! fingerprint id `kid-<sha8>`, R7-I4) and is stamped as `entry_hmac_key_id`. The key never
 //! lives inside the case directory — that would defeat the control
 //! entirely.
 
@@ -224,12 +224,54 @@ fn resolve_key_source(spec: &str) -> Result<AuditKey, String> {
     }
 }
 
-fn configured_key_id() -> String {
+/// R7-I4: the id a key file / env key is stamped with —
+/// `FRAMETRACE_AUDIT_KEY_ID` when set, otherwise the key's fingerprint id
+/// ([`fingerprint_id`]). It used to default to the shared literal
+/// `"default"`, so two PCs' different keys claimed the same id and one
+/// PC's entries read as forged on the other.
+fn configured_key_id(bytes: &[u8]) -> String {
     std::env::var("FRAMETRACE_AUDIT_KEY_ID")
         .ok()
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| "default".to_string())
+        .unwrap_or_else(|| fingerprint_id(bytes))
+}
+
+/// R7-I4: the legacy default key id every unnamed key used to carry. It
+/// names no particular key; verification binds it per log by fingerprint
+/// (see `audit::verify_chained_jsonl_text`).
+pub const LEGACY_DEFAULT_KEY_ID: &str = "default";
+
+/// R7-I4: `kid-<first 8 hex of SHA-256(material)>` — a non-secret id
+/// derived from the key itself, so different keys never share an id by
+/// accident.
+pub fn fingerprint_id(bytes: &[u8]) -> String {
+    format!("kid-{}", &crate::sha256::digest_bytes(bytes)[..8])
+}
+
+/// R7-I4: whether `key` is the key an entry's declared `key_id` names —
+/// i.e. a mismatch under it is a forgery, not "another PC's key". A
+/// fingerprint id (`kid-…`) names exactly the material with that
+/// fingerprint (whatever id this PC loaded it under); the legacy
+/// `"default"` names no key at all; any other id is compared as text
+/// (keyring ids such as `2026-Q1`).
+pub fn key_answers_to(key: &AuditKey, declared: &str) -> bool {
+    if declared == LEGACY_DEFAULT_KEY_ID {
+        return false;
+    }
+    if is_fingerprint_id(declared) {
+        return fingerprint_id(&key.bytes) == declared;
+    }
+    key.id == declared
+}
+
+fn is_fingerprint_id(id: &str) -> bool {
+    id.strip_prefix("kid-").is_some_and(|hex| {
+        hex.len() == 8
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 fn from_key_file() -> Result<Option<AuditKey>, String> {
@@ -251,7 +293,7 @@ fn read_key_file(path: &Path) -> Result<AuditKey, String> {
     let bytes = parse_key_material(text.trim())
         .map_err(|err| format!("audit key file {}: {err}", path.display()))?;
     Ok(AuditKey {
-        id: configured_key_id(),
+        id: configured_key_id(&bytes),
         bytes,
         retired_unix: None,
     })
@@ -269,7 +311,7 @@ fn key_from_env(var: &str) -> Result<Option<AuditKey>, String> {
         Ok(raw) if !raw.trim().is_empty() => {
             let bytes = parse_key_material(raw.trim()).map_err(|err| format!("{var}: {err}"))?;
             Ok(Some(AuditKey {
-                id: configured_key_id(),
+                id: configured_key_id(&bytes),
                 bytes,
                 retired_unix: None,
             }))
@@ -501,7 +543,7 @@ pub fn rotate_at(
             id.to_string()
         }
         // Default id is a key-fingerprint prefix — stable, non-secret.
-        None => format!("key-{}", &crate::sha256::digest_bytes(&bytes)[..8]),
+        None => fingerprint_id(&bytes),
     };
     if keys.contains_key(&id) {
         return Err(format!(
@@ -928,11 +970,16 @@ mod tests {
         let keyring_path = dir.join("audit-keys.json");
         let rotation = rotate_at(&keyring_path, None, None).unwrap();
         assert!(rotation.previous_id.is_none());
-        assert!(
-            rotation.new_key.id.starts_with("key-"),
-            "{}",
-            rotation.new_key.id
+        // R7-I4: the fingerprint id of the new material.
+        assert_eq!(
+            rotation.new_key.id,
+            super::fingerprint_id(&rotation.new_key.bytes)
         );
+        assert!(super::key_answers_to(
+            &rotation.new_key,
+            &rotation.new_key.id
+        ));
+        assert!(!super::key_answers_to(&rotation.new_key, "default"));
         let keyring = load_keyring(&keyring_path).unwrap().unwrap();
         assert_eq!(keyring.keys.len(), 1);
         let _ = fs::remove_dir_all(dir);
@@ -1057,6 +1104,12 @@ mod tests {
         }
         let key = resolve_key_source(&format!("file:{}", path.display())).unwrap();
         assert_eq!(key.bytes, vec![0x22; 32]);
+        // R7-I4: no shared "default" id — the key's own fingerprint id
+        // (unless FRAMETRACE_AUDIT_KEY_ID names it).
+        if std::env::var_os("FRAMETRACE_AUDIT_KEY_ID").is_none() {
+            assert_eq!(key.id, super::fingerprint_id(&[0x22; 32]));
+            assert!(key.id.starts_with("kid-"), "{}", key.id);
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }

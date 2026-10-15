@@ -285,8 +285,17 @@ pub fn import_e01(
     )?;
     // C1: written last (after the audit entry), and its failure is the
     // import's failure — a raw without a matching marker is never reused
-    // or carved.
-    write_raw_done_marker(&raw_output_path, &raw_sha256, &e01_path, imported_unix)?;
+    // or carved. R7-S10: the marker names the audit entry it completes
+    // (`audit_entry_sha256`), so a marker cannot be written for bytes no
+    // audit entry recorded.
+    let audit_entry = import_entry_sha256(case_dir, &raw_sha256, imported_unix);
+    write_raw_done_marker_bound(
+        &raw_output_path,
+        &raw_sha256,
+        &e01_path,
+        imported_unix,
+        audit_entry.as_deref(),
+    )?;
 
     Ok(E01ImportResult {
         e01_path,
@@ -322,14 +331,126 @@ fn modified_nanos(meta: &std::fs::Metadata) -> Option<u64> {
         .and_then(|d| u64::try_from(d.as_nanos()).ok())
 }
 
+#[cfg(test)]
 fn write_raw_done_marker(
     raw: &Path,
     raw_sha256: &str,
     e01_path: &Path,
     imported_unix: u64,
 ) -> Result<(), String> {
+    write_raw_done_marker_bound(raw, raw_sha256, e01_path, imported_unix, None)
+}
+
+/// The E01 audit lane of the case an imported raw image belongs to
+/// (`<case>/evidence/images/<raw>` → `<case>/evidence/logs/e01-audit.jsonl`),
+/// or `None` for an image outside a case's `evidence/images`.
+fn case_e01_lane(raw: &Path) -> Option<PathBuf> {
+    let images = raw.parent()?;
+    let evidence = images.parent()?;
+    (images.file_name()? == "images" && evidence.file_name()? == "evidence")
+        .then(|| evidence.join("logs/e01-audit.jsonl"))
+}
+
+/// R7-S10: the `entry_sha256` of the newest `import-e01` entry of the
+/// case's E01 lane recording `raw_sha256` at `imported_unix` (the entry an
+/// import just appended). `None` when it cannot be found.
+fn import_entry_sha256(case_dir: &Path, raw_sha256: &str, imported_unix: u64) -> Option<String> {
+    let text = crate::util::read_to_string(&case_dir.join("evidence/logs/e01-audit.jsonl")).ok()?;
+    text.lines().rev().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        (value.get("event").and_then(serde_json::Value::as_str) == Some("import-e01")
+            && value.get("raw_sha256").and_then(serde_json::Value::as_str) == Some(raw_sha256)
+            && value
+                .get("imported_unix")
+                .and_then(serde_json::Value::as_u64)
+                == Some(imported_unix))
+        .then(|| value.get("entry_sha256")?.as_str().map(str::to_string))
+        .flatten()
+    })
+}
+
+/// R7-S10: what the E01 audit lane says about the entry `entry_sha256`:
+/// `Ok(())` when the lane verifies, holds that `import-e01` entry with
+/// `raw_sha256`, and — with audit keys on this PC — the entry is
+/// HMAC-authenticated here.
+fn check_bound_import_entry(
+    lane: &Path,
+    entry_sha256: &str,
+    raw_sha256: &str,
+    keys: &[crate::audit_key::AuditKey],
+) -> Result<(), String> {
+    let text = match audit::read_log_locked(lane) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Err("E01 감사 기록(e01-audit.jsonl)이 없습니다".to_string()),
+        Err(err) => return Err(format!("E01 감사 기록을 읽지 못했습니다: {err}")),
+    };
+    let verification = audit::verify_chained_jsonl_text(&text, "e01-audit.jsonl", keys)
+        .map_err(|err| format!("E01 감사 기록의 체인 검증 실패: {err}"))?;
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    for (index, line) in body.split('\n').enumerate() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value
+            .get("entry_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(entry_sha256)
+        {
+            continue;
+        }
+        if value.get("event").and_then(serde_json::Value::as_str) != Some("import-e01")
+            || !value
+                .get("raw_sha256")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(raw_sha256))
+        {
+            return Err(
+                "완료 표식이 가리키는 E01 감사 항목이 이 raw 이미지의 임포트 기록이 아닙니다"
+                    .to_string(),
+            );
+        }
+        return import_entry_authenticated(&verification, index, keys);
+    }
+    Err("완료 표식이 가리키는 E01 감사 항목이 감사 기록에 없습니다".to_string())
+}
+
+/// R7-S10: with audit keys on this PC the import entry must be
+/// HMAC-authenticated here; without keys only self-consistency is checked.
+fn import_entry_authenticated(
+    verification: &audit::AuditChainVerification,
+    index: usize,
+    keys: &[crate::audit_key::AuditKey],
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    if let Some(reason) = &verification.rewrite_not_excluded {
+        return Err(format!("E01 감사 기록을 확인할 수 없습니다: {reason}"));
+    }
+    match verification.entry_auth.get(index) {
+        Some(audit::EntryAuth::Authenticated) => Ok(()),
+        _ => Err(
+            "E01 감사 기록의 임포트 항목이 이 PC의 감사 키로 인증되지 않았습니다 (키 없이 기록됐거나, 이 PC에 없는 키·은퇴한 키로만 서명됨) — 기록을 믿을 수 없습니다"
+                .to_string(),
+        ),
+    }
+}
+
+/// R7-S10: what a completion marker's lane check rests on.
+const SELF_CONSISTENT_ONLY: &str =
+    "e01-audit.jsonl (자기 일관성만 확인 — 감사 키가 없어 인증 아님)";
+const HMAC_AUTHENTICATED: &str = "e01-audit.jsonl (감사 키 HMAC으로 인증됨)";
+
+fn write_raw_done_marker_bound(
+    raw: &Path,
+    raw_sha256: &str,
+    e01_path: &Path,
+    imported_unix: u64,
+    audit_entry_sha256: Option<&str>,
+) -> Result<(), String> {
     let meta = std::fs::metadata(raw)
         .map_err(|err| format!("failed to stat imported raw {}: {err}", raw.display()))?;
+    let keyed = crate::audit_key::verification_keys().is_ok_and(|keys| !keys.is_empty());
     let body = serde_json::json!({
         "schema_version": 1,
         "kind": "frametrace-e01-raw-complete",
@@ -340,6 +461,10 @@ fn write_raw_done_marker(
         "e01_path": e01_path.to_string_lossy(),
         "e01_size_bytes": std::fs::metadata(e01_path).map(|m| m.len()).ok(),
         "imported_unix": imported_unix,
+        "audit_entry_sha256": audit_entry_sha256,
+        "audit_basis": audit_entry_sha256.map(|_| {
+            if keyed { HMAC_AUTHENTICATED } else { SELF_CONSISTENT_ONLY }
+        }),
     });
     crate::util::write_text_atomic(&raw_done_marker_path(raw), &format!("{body:#}\n")).map_err(
         |err| {
@@ -364,7 +489,63 @@ pub enum RawImportStatus {
 }
 
 /// Reads `raw`'s completion marker and compares it with the file.
+///
+/// R7-S10: for an image inside a case's `evidence/images`, a marker that
+/// names its audit entry (`audit_entry_sha256`) must name an `import-e01`
+/// entry of the case's verified E01 lane recording the same SHA-256 —
+/// HMAC-authenticated when this PC holds audit keys. With keys, a marker
+/// that names no entry (written before R7) is not trusted while the case
+/// has an E01 lane: [`reconcile_raw`] re-hashes it against the
+/// authenticated lane record and rewrites a bound marker.
 pub fn raw_import_status(raw: &Path) -> RawImportStatus {
+    match crate::audit_key::verification_keys() {
+        Ok(keys) => raw_import_status_with_keys(raw, &keys),
+        Err(err) => {
+            if std::fs::metadata(raw).is_err() {
+                return RawImportStatus::Missing;
+            }
+            RawImportStatus::Unverified(format!("감사 키를 읽지 못했습니다: {err}"))
+        }
+    }
+}
+
+/// [`raw_import_status`] with an explicit verification key set.
+pub fn raw_import_status_with_keys(
+    raw: &Path,
+    keys: &[crate::audit_key::AuditKey],
+) -> RawImportStatus {
+    let status = raw_marker_status(raw);
+    let RawImportStatus::Complete { sha256, .. } = &status else {
+        return status;
+    };
+    let Some(lane) = case_e01_lane(raw) else {
+        return status;
+    };
+    let marker = std::fs::read_to_string(raw_done_marker_path(raw))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let bound = marker
+        .as_ref()
+        .and_then(|value| value.get("audit_entry_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    match bound {
+        Some(entry) => match check_bound_import_entry(&lane, &entry, sha256, keys) {
+            Ok(()) => status,
+            Err(why) => RawImportStatus::Unverified(format!(
+                "완료 표식을 E01 감사 기록으로 확인할 수 없습니다 — {why}"
+            )),
+        },
+        None if !keys.is_empty() && lane.is_file() => RawImportStatus::Unverified(
+            "완료 표식이 E01 감사 기록의 항목과 결합되어 있지 않습니다(이전 형식) — 감사 키가 있는 케이스에서는 인증된 임포트 기록으로 다시 확인해야 합니다"
+                .to_string(),
+        ),
+        None => status,
+    }
+}
+
+/// The marker-only part of [`raw_import_status`] (size, mtime, fields).
+fn raw_marker_status(raw: &Path) -> RawImportStatus {
     let Ok(meta) = std::fs::metadata(raw) else {
         return RawImportStatus::Missing;
     };
@@ -428,6 +609,12 @@ pub struct RawImportRecord {
     pub imported_unix: u64,
     /// Byte size of the raw image, when the record has it.
     pub size_bytes: Option<u64>,
+    /// R7-S10: the `entry_sha256` of the E01 audit entry the record came
+    /// from (`None` for a record read from a marker without one).
+    pub audit_entry_sha256: Option<String>,
+    /// R7-S10: the audit entry was HMAC-authenticated on this PC; `false`
+    /// = self-consistency only (no audit key here, or read from a marker).
+    pub authenticated: bool,
 }
 
 /// R5-S6: the newest import record the case's chained E01 audit lane has
@@ -442,19 +629,41 @@ pub struct RawImportRecord {
 /// old image). `Ok(None)`: no log, or no matching full (non `--max-bytes`)
 /// import.
 pub fn recorded_raw_import(case_dir: &Path, raw: &Path) -> Result<Option<RawImportRecord>, String> {
+    let keys = crate::audit_key::verification_keys()
+        .map_err(|err| format!("감사 키를 읽지 못해 E01 감사 기록을 확인할 수 없습니다: {err}"))?;
+    recorded_raw_import_with_keys(case_dir, raw, &keys)
+}
+
+/// [`recorded_raw_import`] with an explicit verification key set.
+///
+/// R7-S10: chain linkage alone is not enough when this PC holds audit
+/// keys — the matching entry must be HMAC-authenticated here (an entry
+/// re-chained without a key, or under an invented key id, is anyone's).
+/// Without keys the record is self-consistency only
+/// ([`RawImportRecord::authenticated`] false).
+pub fn recorded_raw_import_with_keys(
+    case_dir: &Path,
+    raw: &Path,
+    keys: &[crate::audit_key::AuditKey],
+) -> Result<Option<RawImportRecord>, String> {
     let Some(name) = raw.file_name().map(|n| n.to_string_lossy().to_string()) else {
         return Ok(None);
     };
     let log = case_dir.join("evidence/logs/e01-audit.jsonl");
-    if !log.is_file() {
-        return Ok(None);
-    }
-    audit::verify_chained_jsonl(&log).map_err(|err| {
-        format!("E01 감사 기록(e01-audit.jsonl)의 체인 검증 실패 — 기록을 믿을 수 없습니다: {err}")
-    })?;
-    let text = crate::util::read_to_string(&log)
-        .map_err(|err| format!("E01 감사 기록을 읽지 못했습니다: {err}"))?;
-    let newest = text.lines().rev().find_map(|line| {
+    let text = match audit::read_log_locked(&log) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(None),
+        Err(err) => return Err(format!("E01 감사 기록을 읽지 못했습니다: {err}")),
+    };
+    let verification =
+        audit::verify_chained_jsonl_text(&text, "e01-audit.jsonl", keys).map_err(|err| {
+            format!(
+                "E01 감사 기록(e01-audit.jsonl)의 체인 검증 실패 — 기록을 믿을 수 없습니다: {err}"
+            )
+        })?;
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    let lines: Vec<&str> = body.split('\n').collect();
+    let newest = lines.iter().enumerate().rev().find_map(|(index, line)| {
         let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
         if value.get("event").and_then(serde_json::Value::as_str) != Some("import-e01") {
             return None;
@@ -462,11 +671,13 @@ pub fn recorded_raw_import(case_dir: &Path, raw: &Path) -> Result<Option<RawImpo
         let logged = value.get("raw_output_path")?.as_str()?;
         let logged_name = logged.rsplit(['/', '\\']).next().unwrap_or(logged);
         // A capped (--max-bytes) export is not the whole image.
-        (logged_name == name && value.get("max_bytes").is_none_or(|v| v.is_null())).then_some(value)
+        (logged_name == name && value.get("max_bytes").is_none_or(|v| v.is_null()))
+            .then_some((index, value))
     });
-    let Some(value) = newest else {
+    let Some((index, value)) = newest else {
         return Ok(None);
     };
+    import_entry_authenticated(&verification, index, keys)?;
     let e01 = value
         .get("e01_path")
         .and_then(serde_json::Value::as_str)
@@ -490,6 +701,11 @@ pub fn recorded_raw_import(case_dir: &Path, raw: &Path) -> Result<Option<RawImpo
         size_bytes: value
             .get("raw_size_bytes")
             .and_then(serde_json::Value::as_u64),
+        audit_entry_sha256: value
+            .get("entry_sha256")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        authenticated: !keys.is_empty(),
     }))
 }
 
@@ -575,8 +791,21 @@ pub fn reconcile_raw(
     let RawImportStatus::Unverified(reason) = raw_import_status(raw) else {
         return first;
     };
+    let keys = match crate::audit_key::verification_keys() {
+        Ok(keys) => keys,
+        Err(err) => {
+            return RawReuse::NeedsReimport(format!(
+                "기존 raw 이미지를 완료된 임포트로 확인할 수 없습니다 — {reason}; 감사 키를 읽지 못했습니다: {err}"
+            ));
+        }
+    };
+    // R7-S10: with audit keys on this PC the SHA-256 to compare with comes
+    // from the AUTHENTICATED E01 audit entry only — the marker beside the
+    // image is an unkeyed file anyone can write. Without keys the marker
+    // (then the lane) is used, as before: self-consistency only.
     let from_marker = std::fs::read_to_string(raw_done_marker_path(raw))
         .ok()
+        .filter(|_| keys.is_empty())
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|value| {
             let sha = value.get("sha256")?.as_str()?.to_ascii_lowercase();
@@ -589,11 +818,16 @@ pub fn reconcile_raw(
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
                 size_bytes: value.get("size_bytes").and_then(serde_json::Value::as_u64),
+                audit_entry_sha256: value
+                    .get("audit_entry_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                authenticated: false,
             })
         });
     let record = match from_marker {
         Some(record) => record,
-        None => match recorded_raw_import(case_dir, raw) {
+        None => match recorded_raw_import_with_keys(case_dir, raw, &keys) {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return RawReuse::NeedsReimport(format!(
@@ -644,9 +878,13 @@ pub fn reconcile_raw(
             record.sha256
         ));
     }
-    if let Err(err) =
-        write_raw_done_marker(raw, &record.sha256, &record.e01_path, record.imported_unix)
-    {
+    if let Err(err) = write_raw_done_marker_bound(
+        raw,
+        &record.sha256,
+        &record.e01_path,
+        record.imported_unix,
+        record.audit_entry_sha256.as_deref(),
+    ) {
         return RawReuse::NeedsReimport(format!(
             "raw 이미지는 기록과 같지만 완료 표식을 갱신하지 못했습니다: {err}"
         ));
@@ -1371,5 +1609,93 @@ mod tests {
             ewf_command_version("frametrace-missing-ewf-binary", &["ewfinfo"])
                 .contains("unavailable")
         );
+    }
+
+    /// R7-S10: with audit keys on this PC, the E01 lane's import record is
+    /// trusted only when its entry is HMAC-authenticated here (chain
+    /// linkage alone is anyone's), and a completion marker bound to an
+    /// audit entry must name an authenticated import entry recording the
+    /// same SHA-256. Without keys both are self-consistency only.
+    #[test]
+    fn e01_import_record_and_marker_need_an_authenticated_entry() {
+        use super::{
+            RawImportStatus, raw_done_marker_path, raw_import_status_with_keys,
+            recorded_raw_import_with_keys, write_raw_done_marker, write_raw_done_marker_bound,
+        };
+        let dir = c1_dir("r7-s10");
+        let e01 = dir.join("disk.E01");
+        fs::write(&e01, b"ewf").unwrap();
+        let raw = dir.join("evidence/images/evidence.raw");
+        fs::write(&raw, b"complete-image").unwrap();
+        let sha = crate::audit::digest_file(&raw).unwrap();
+        let lane = dir.join("evidence/logs/e01-audit.jsonl");
+        let entry = |unix: u64| {
+            serde_json::json!({"schema_version": 1, "event": "import-e01",
+                "imported_unix": unix, "e01_path": e01.to_string_lossy(),
+                "raw_output_path": raw.to_string_lossy(), "raw_sha256": sha,
+                "max_bytes": null})
+            .to_string()
+        };
+        let mine = crate::audit_key::AuditKey::new("mine", &[0x51; 32]);
+        let keys = std::slice::from_ref(&mine);
+
+        // Unkeyed import entry: fine without keys, refused with keys.
+        crate::audit::append_chained_jsonl_keyed(&lane, &entry(7), None).unwrap();
+        let record = recorded_raw_import_with_keys(&dir, &raw, &[])
+            .unwrap()
+            .unwrap();
+        assert!(!record.authenticated);
+        let err = recorded_raw_import_with_keys(&dir, &raw, keys).unwrap_err();
+        assert!(err.contains("인증되지 않았습니다"), "{err}");
+        // Keyed under an invented key id: refused too.
+        let bogus = crate::audit_key::AuditKey::new("bogus-id", &[0x52; 32]);
+        crate::audit::append_chained_jsonl_keyed(&lane, &entry(8), Some(&bogus)).unwrap();
+        assert!(recorded_raw_import_with_keys(&dir, &raw, keys).is_err());
+        // Authenticated entry: trusted, and it names its entry hash.
+        crate::audit::append_chained_jsonl_keyed(&lane, &entry(9), Some(&mine)).unwrap();
+        let record = recorded_raw_import_with_keys(&dir, &raw, keys)
+            .unwrap()
+            .unwrap();
+        assert!(record.authenticated);
+        assert_eq!(record.imported_unix, 9);
+        let entry_sha = record.audit_entry_sha256.clone().unwrap();
+
+        // Marker bound to the authenticated entry: complete.
+        write_raw_done_marker_bound(&raw, &sha, &e01, 9, Some(&entry_sha)).unwrap();
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, keys),
+            RawImportStatus::Complete { .. }
+        ));
+        // Bound to the unkeyed entry: not trusted with keys, fine without.
+        let unkeyed_entry = super::import_entry_sha256(&dir, &sha, 7).unwrap();
+        write_raw_done_marker_bound(&raw, &sha, &e01, 7, Some(&unkeyed_entry)).unwrap();
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, keys),
+            RawImportStatus::Unverified(_)
+        ));
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, &[]),
+            RawImportStatus::Complete { .. }
+        ));
+        // Bound to an entry the lane does not hold: never complete.
+        write_raw_done_marker_bound(&raw, &sha, &e01, 9, Some(&"0".repeat(64))).unwrap();
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, &[]),
+            RawImportStatus::Unverified(_)
+        ));
+        // A legacy marker (no entry named) is not trusted with keys while
+        // the case has an E01 lane; without keys it still is.
+        write_raw_done_marker(&raw, &sha, &e01, 9).unwrap();
+        let marker = fs::read_to_string(raw_done_marker_path(&raw)).unwrap();
+        assert!(marker.contains("\"audit_entry_sha256\": null"), "{marker}");
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, keys),
+            RawImportStatus::Unverified(_)
+        ));
+        assert!(matches!(
+            raw_import_status_with_keys(&raw, &[]),
+            RawImportStatus::Complete { .. }
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

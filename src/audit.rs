@@ -47,6 +47,12 @@ pub struct AuditChainVerification {
     /// R6-I2/I3: what the keyed layer established for each entry, in line
     /// order (`entry_auth[n]` is audit line `n + 1`).
     pub entry_auth: Vec<EntryAuth>,
+    /// R7-I3: set when an entry signed under a key id this PC does not
+    /// hold FOLLOWS an entry this PC authenticated: the log's tail may have
+    /// been re-written under an invented key id. The chain still verifies
+    /// structurally, but the lane must never read PASS — it is NOT
+    /// VERIFIED, with this reason.
+    pub rewrite_not_excluded: Option<String>,
 }
 
 /// R6-I2/I3/I4: the keyed-layer result of one chained entry.
@@ -581,6 +587,36 @@ pub fn verify_chained_jsonl_text(
     // R6-I4: keyed entries under key ids this PC does not hold.
     let mut unknown_key_ids: std::collections::BTreeSet<String> = Default::default();
     let mut unknown_key_entries = 0usize;
+    // R7-I3: the first line this PC authenticated, and every unknown-key
+    // line after it (line, key id) — a possible tail rewrite.
+    let mut first_authenticated: Option<usize> = None;
+    let mut unknown_after_authenticated: Vec<(usize, String)> = Vec::new();
+    // R7-I4: the legacy shared id `"default"` names no particular key (every
+    // PC defaulted to it). It is bound to a key only when one of THIS log's
+    // "default" entries verifies under a key this PC holds; then a
+    // "default" entry no key verifies is a forgery, otherwise it is an
+    // entry from another PC's "default" key (not verifiable here).
+    let legacy_default_bound = !keys.is_empty()
+        && text.contains("\"entry_hmac_key_id\":\"default\"")
+        && lines.iter().any(|line| {
+            extract_json_string(line, "entry_hmac_key_id").as_deref()
+                == Some(crate::audit_key::LEGACY_DEFAULT_KEY_ID)
+                && match (
+                    extract_json_string(line, "entry_hmac_sha256"),
+                    entry_without_recorded_hash(line),
+                ) {
+                    (Some(recorded), Some(signed)) => {
+                        let tag = decode_hex_tag(&recorded).unwrap_or([0xff; 32]);
+                        keys.iter().any(|key| {
+                            crate::hmac::tags_equal(
+                                &crate::hmac::hmac_sha256(&key.bytes, signed.as_bytes()),
+                                &tag,
+                            )
+                        })
+                    }
+                    _ => false,
+                }
+        });
 
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -672,10 +708,11 @@ pub fn verify_chained_jsonl_text(
                     // renamed id must not brick old entries (rotation
                     // rules in the design doc).
                     let tag = decode_hex_tag(&recorded).unwrap_or([0xff; 32]);
+                    let answers = |key: &AuditKey| crate::audit_key::key_answers_to(key, &key_id);
                     let matching: Vec<&AuditKey> = keys
                         .iter()
-                        .filter(|key| key.id == key_id)
-                        .chain(keys.iter().filter(|key| key.id != key_id))
+                        .filter(|key| answers(key))
+                        .chain(keys.iter().filter(|key| !answers(key)))
                         .filter(|key| {
                             crate::hmac::tags_equal(
                                 &crate::hmac::hmac_sha256(&key.bytes, signed_entry.as_bytes()),
@@ -683,11 +720,15 @@ pub fn verify_chained_jsonl_text(
                             )
                         })
                         .collect();
-                    if matching.is_empty() && !keys.iter().any(|key| key.id == key_id) {
+                    let held_here = keys.iter().any(answers)
+                        || (key_id == crate::audit_key::LEGACY_DEFAULT_KEY_ID
+                            && legacy_default_bound);
+                    if matching.is_empty() && !held_here {
                         // R6-I4: signed under a key this PC does not hold
                         // (another workstation's key, a key removed from
                         // the keyring): it cannot be checked here — not
-                        // verified, never "tampered".
+                        // authenticated (R7-I3 decides whether a rewrite
+                        // can be ruled out).
                         return Ok(Keyed::UnknownKey(key_id));
                     }
                     if matching.is_empty() {
@@ -734,6 +775,7 @@ pub fn verify_chained_jsonl_text(
                 if let Some(from) = rotation_marker_from(line) {
                     rotated_away.insert(from);
                 }
+                first_authenticated.get_or_insert(line_number);
                 entry_auth.push(EntryAuth::Authenticated);
             }
             Ok(Keyed::Unauthenticated) => {
@@ -748,6 +790,9 @@ pub fn verify_chained_jsonl_text(
                 unauthenticated_keyed += 1;
                 first_keyed_line.get_or_insert(line_number);
                 last_keyed_line = Some(line_number);
+                if first_authenticated.is_some() {
+                    unknown_after_authenticated.push((line_number, key_id.clone()));
+                }
                 unknown_key_ids.insert(key_id);
                 unknown_key_entries += 1;
                 entry_auth.push(EntryAuth::UnknownKey);
@@ -784,7 +829,25 @@ pub fn verify_chained_jsonl_text(
             if no_key_entries == 1 { "y" } else { "ies" }
         ));
     }
-    if unknown_key_entries > 0 {
+    // R7-I3: an unknown key id AFTER a line this PC authenticated is not
+    // "another PC's log" — this PC held the log's key, so the tail may
+    // have been re-written (re-chained) under an invented key id. No
+    // in-log rotation marker can excuse it: a marker naming the new id
+    // would itself be signed by that unknown key, i.e. forgeable by the
+    // same rewriter.
+    let rewrite_not_excluded = unknown_after_authenticated.first().map(|(line, key_id)| {
+        format!(
+            "이 PC에 없는 키 — 재작성 배제 불가: audit line {line} (and {} more) is signed under key id \"{key_id}\" that this PC does not hold, after audit line {} that this PC authenticated — the log's tail may have been re-written under an invented key id; NOT VERIFIED (check it on the PC that holds that key)",
+            unknown_after_authenticated.len() - 1,
+            first_authenticated.unwrap_or(0)
+        )
+    });
+    if let Some(reason) = &rewrite_not_excluded {
+        warnings.push(reason.clone());
+    }
+    let plain_unknown = unknown_key_entries - unknown_after_authenticated.len();
+    if plain_unknown > 0 {
+        let unknown_key_entries = plain_unknown;
         warnings.push(format!(
             "{unknown_key_entries} keyed entr{} signed under audit key id(s) {} that this PC does not hold — authenticity cannot be checked here (not a tampering verdict; structural chain verified)",
             if unknown_key_entries == 1 { "y" } else { "ies" },
@@ -850,7 +913,38 @@ pub fn verify_chained_jsonl_text(
         integrity,
         warnings,
         entry_auth,
+        rewrite_not_excluded,
     })
+}
+
+/// R7-I10: the longest prefix of `text` that verifies as a chain under
+/// `keys`, as (entries, byte length incl. the final newline). A lane whose
+/// tail was torn or edited is "repaired" by truncating it to this prefix;
+/// a continuation marker records the prefix's SHA-256 so the repaired lane
+/// can still be matched against what the marker saw.
+pub fn verified_prefix(text: &str, keys: &[AuditKey]) -> (usize, usize) {
+    let mut ends: Vec<usize> = Vec::new();
+    for (offset, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            ends.push(offset + 1);
+        }
+    }
+    // Verification of a prefix is monotone (a verifying prefix's own
+    // prefixes verify), so binary search the line count.
+    let verifies = |count: usize| {
+        let bytes = if count == 0 { 0 } else { ends[count - 1] };
+        verify_chained_jsonl_text(&text[..bytes], "prefix", keys).is_ok()
+    };
+    let (mut low, mut high) = (0usize, ends.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if verifies(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    (low, if low == 0 { 0 } else { ends[low - 1] })
 }
 
 /// Which generation of audit key signed an entry (D15): a retired key
@@ -959,17 +1053,34 @@ pub fn indexed_source_hash(case_dir: &Path, selector: &str, source_path: &Path) 
     let by_id = |row: &serde_json::Value| {
         !selector.is_empty() && field(row, "id").as_deref() == Some(selector)
     };
-    let by_display = |row: &serde_json::Value| {
+    let shows_selector = |row: &serde_json::Value| {
         !selector.is_empty()
-            && exact_display(row)
             && (field(row, "source_path").as_deref() == Some(selector)
                 || field(row, "relative_path").as_deref() == Some(selector))
     };
-    rows.iter()
+    if let Some(row) = rows
+        .iter()
         .find(|row| by_id(row))
         .or_else(|| rows.iter().find(|row| names_file(row)))
-        .or_else(|| rows.iter().find(|row| by_display(row)))
-        .and_then(|row| field(row, "sha256"))
+    {
+        return field(row, "sha256");
+    }
+    // R7-I9: the display-string fallback is used only when it is
+    // unambiguous — every record showing that string is an exact-display
+    // record and they all carry the same hash. Two different records (or
+    // a non-Unicode record whose lossy display collides with it) leave the
+    // hash unknown rather than handing over the first one's.
+    let candidates: Vec<&serde_json::Value> =
+        rows.iter().filter(|row| shows_selector(row)).collect();
+    let first = candidates.first()?;
+    if !candidates.iter().all(|row| exact_display(row)) {
+        return None;
+    }
+    let sha = field(first, "sha256")?;
+    candidates
+        .iter()
+        .all(|row| field(row, "sha256").is_some_and(|other| other.eq_ignore_ascii_case(&sha)))
+        .then_some(sha)
 }
 
 pub fn json_string_array(values: &[String]) -> String {
@@ -1243,8 +1354,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("audit.jsonl");
-        let writer_key = test_key("default", 0x01);
-        let attacker_key = test_key("default", 0x02);
+        let writer_key = test_key("case-key", 0x01);
+        let attacker_key = test_key("case-key", 0x02);
 
         append_chained_jsonl_keyed(&path, r#"{"kind":"one"}"#, Some(&writer_key)).unwrap();
         // Attacker rewrites the log under their own key: structure is
@@ -1313,17 +1424,18 @@ mod tests {
         let path = dir.join("audit.jsonl");
         let mine = test_key("mine", 0x11);
         let theirs = test_key("other-pc", 0x12);
-        append_chained_jsonl_keyed(&path, r#"{"kind":"one"}"#, Some(&mine)).unwrap();
         append_chained_jsonl_keyed(&path, r#"{"kind":"two"}"#, Some(&theirs)).unwrap();
+        append_chained_jsonl_keyed(&path, r#"{"kind":"one"}"#, Some(&mine)).unwrap();
         append_chained_jsonl_keyed(&path, r#"{"kind":"three"}"#, None).unwrap();
         let verification = verify_chained_jsonl_keyed(&path, std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(verification.rewrite_not_excluded, None);
         assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
         assert_eq!(verification.unauthenticated_keyed_entries, 1);
         assert_eq!(
             verification.entry_auth,
             [
-                EntryAuth::Authenticated,
                 EntryAuth::UnknownKey,
+                EntryAuth::Authenticated,
                 EntryAuth::Unkeyed
             ]
         );
@@ -1812,6 +1924,164 @@ mod tests {
         assert!(verify_chained_jsonl_text(&keyed, "t", std::slice::from_ref(&key)).is_ok());
         let keyed_extra = keyed.replace("\"}\n", "\",\"x\":1}\n");
         assert!(verify_chained_jsonl_text(&keyed_extra, "t", std::slice::from_ref(&key)).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R7-I3: a keyed lane whose tail was re-written under an invented key
+    /// id after lines this PC authenticated is NOT VERIFIED ("재작성 배제
+    /// 불가"), never covered by the "not a tampering verdict" wording.
+    #[test]
+    fn unknown_key_after_authenticated_lines_is_rewrite_not_excluded() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-r7i3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mine = test_key("mine", 0x21);
+        let bogus = test_key("bogus-id", 0x22);
+        append_chained_jsonl_keyed(&path, r#"{"kind":"one"}"#, Some(&mine)).unwrap();
+        append_chained_jsonl_keyed(&path, r#"{"kind":"forged"}"#, Some(&bogus)).unwrap();
+        let verification = verify_chained_jsonl_keyed(&path, std::slice::from_ref(&mine)).unwrap();
+        let reason = verification.rewrite_not_excluded.clone().expect("flagged");
+        assert!(reason.contains("재작성 배제 불가"), "{reason}");
+        assert!(reason.contains("\"bogus-id\""), "{reason}");
+        assert!(
+            !verification
+                .warnings
+                .iter()
+                .any(|w| w.contains("not a tampering verdict")),
+            "{:?}",
+            verification.warnings
+        );
+        assert_eq!(verification.integrity, AuditIntegrity::StructuralOnly);
+        // Even an in-log rotation marker naming the new id does not excuse
+        // it (the marker is signed by the same unknown key).
+        append_chained_jsonl_keyed(
+            &path,
+            r#"{"kind":"audit-key-rotate","from":"mine","to":"bogus-id"}"#,
+            Some(&bogus),
+        )
+        .unwrap();
+        let verification = verify_chained_jsonl_keyed(&path, std::slice::from_ref(&mine)).unwrap();
+        assert!(verification.rewrite_not_excluded.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R7-I4: the legacy shared id "default" names no particular key. A
+    /// "default" entry from ANOTHER PC (whose key also defaulted to
+    /// "default") is not verifiable here — not a FAIL — while a "default"
+    /// entry this PC's key cannot verify in a log whose other "default"
+    /// entries it DID verify is still a forgery. New ids are fingerprints.
+    #[test]
+    fn legacy_default_key_id_is_compared_by_fingerprint() {
+        use super::verify_chained_jsonl_text;
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-r7i4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // This PC's key, now loaded under its fingerprint id.
+        let mine = AuditKey::new(&crate::audit_key::fingerprint_id(&[0x31; 32]), &[0x31; 32]);
+        assert!(
+            mine.id.starts_with("kid-") && mine.id.len() == 12,
+            "{}",
+            mine.id
+        );
+        let other_pc = test_key("default", 0x32);
+        let foreign = dir.join("foreign.jsonl");
+        append_chained_jsonl_keyed(&foreign, r#"{"kind":"one"}"#, Some(&other_pc)).unwrap();
+        let verification =
+            verify_chained_jsonl_keyed(&foreign, std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(verification.entry_auth, [EntryAuth::UnknownKey]);
+        // Even a key literally named "default" here (an old keyring) does
+        // not make another PC's "default" entry a FAIL.
+        let mine_named_default = test_key("default", 0x31);
+        let verification =
+            verify_chained_jsonl_keyed(&foreign, std::slice::from_ref(&mine_named_default))
+                .unwrap();
+        assert_eq!(verification.entry_auth, [EntryAuth::UnknownKey]);
+        // This PC's own old "default" log stays verifiable by fingerprint.
+        let own = dir.join("own.jsonl");
+        let mine_old = test_key("default", 0x31);
+        append_chained_jsonl_keyed(&own, r#"{"kind":"one"}"#, Some(&mine_old)).unwrap();
+        append_chained_jsonl_keyed(&own, r#"{"kind":"two"}"#, Some(&mine_old)).unwrap();
+        let verification = verify_chained_jsonl_keyed(&own, std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(verification.integrity, AuditIntegrity::Keyed);
+        // ...and a forged "default" line in it is still a FAIL.
+        let text = read_to_string(&own).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let start = lines[1].find("\"entry_hmac_sha256\":\"").unwrap() + 21;
+        lines[1].replace_range(start..start + 64, &"0".repeat(64));
+        let forged = format!("{}\n", lines.join("\n"));
+        let err = verify_chained_jsonl_text(&forged, "t", std::slice::from_ref(&mine)).unwrap_err();
+        assert!(err.contains("HMAC verification failed"), "{err}");
+        // A fingerprint id names exactly that material.
+        let fp = dir.join("fp.jsonl");
+        append_chained_jsonl_keyed(
+            &fp,
+            r#"{"kind":"one"}"#,
+            Some(&AuditKey::new(&mine.id, &[0x33; 32])),
+        )
+        .unwrap();
+        let err = verify_chained_jsonl_keyed(&fp, std::slice::from_ref(&mine)).unwrap_err();
+        assert!(err.contains("HMAC verification failed"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R7-I9: the display-string fallback refuses an ambiguous match (two
+    /// records showing the same path with different hashes) instead of
+    /// taking the first one's hash.
+    #[test]
+    fn indexed_source_hash_refuses_ambiguous_display_paths() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-r7i9-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("db")).unwrap();
+        let row = |id: &str, path: &str, sha: &str| {
+            serde_json::json!({"id": id, "source_path": path, "relative_path": "cam/a.mp4",
+                "sha256": sha})
+            .to_string()
+        };
+        fs::write(
+            dir.join("db/videos.jsonl"),
+            format!(
+                "{}\n{}\n",
+                row("vid_000001", "/media/sd1/cam/a.mp4", &"1".repeat(64)),
+                row("vid_000002", "/media/sd2/cam/a.mp4", &"2".repeat(64))
+            ),
+        )
+        .unwrap();
+        let elsewhere = Path::new("/nowhere/a.mp4");
+        assert_eq!(
+            super::indexed_source_hash(&dir, "cam/a.mp4", elsewhere),
+            None,
+            "two records share the display path"
+        );
+        assert_eq!(
+            super::indexed_source_hash(&dir, "/media/sd2/cam/a.mp4", elsewhere),
+            Some("2".repeat(64))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R7-I10: the longest verifying prefix of a lane with a torn tail or
+    /// an edited line.
+    #[test]
+    fn verified_prefix_stops_before_the_damage() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-audit-r7i10-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        for n in 0..3 {
+            append_chained_jsonl_keyed(&path, &format!(r#"{{"n":{n}}}"#), None).unwrap();
+        }
+        let good = read_to_string(&path).unwrap();
+        assert_eq!(super::verified_prefix(&good, &[]), (3, good.len()));
+        let torn = format!("{good}{{\"n\":3,\"previous");
+        assert_eq!(super::verified_prefix(&torn, &[]), (3, good.len()));
+        let edited = good.replacen("\"n\":1", "\"n\":9", 1);
+        let first_len = good.find('\n').unwrap() + 1;
+        assert_eq!(super::verified_prefix(&edited, &[]), (1, first_len));
         let _ = fs::remove_dir_all(&dir);
     }
 }
