@@ -896,6 +896,9 @@ mod tests {
     /// its own process group, reports the grandchild's pid and waits.
     /// Without `FT_R5_PDEATH_HELPER=1` (a normal test run) it does nothing.
     #[test]
+    // The grandchild is deliberately never reaped here: the test that
+    // re-executes this helper asserts the whole group gets killed.
+    #[allow(clippy::zombie_processes)]
     fn r5_pdeath_helper_child() {
         if std::env::var("FT_R5_PDEATH_HELPER").as_deref() != Ok("1") {
             return;

@@ -874,6 +874,8 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
 /// crashed session's drafts reachable).
 pub(crate) const PREFERRED_PORTS: std::ops::RangeInclusive<u16> = 8477..=8486;
 
+// Only the Windows WebView2 shell claims a preferred port this way.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn first_free_port() -> Option<TcpListener> {
     first_free_port_noting().map(|(listener, _)| listener)
 }
