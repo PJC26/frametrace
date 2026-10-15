@@ -269,7 +269,7 @@ async function unitTests() {
   Object.assign(state, { drafts: {}, dirtyIds: new Set(), revisions: {}, examiners: {}, notes: {}, tags: {}, ranges: {} });
   // Save protocol v2 (docs/FIX_PLAN_R1_2026-10-13.md §1.6): touchAnnotation
   // only records the draft in memory + dirtyIds; storage is a debounced flush.
-  const draftsSrc = [fn('annotationsLocked'), fn('refuseLockedEdit'), fn('writerId'), fn('nextDraftSeq'), fn('draftNormRange'), fn('draftRangeOf'), fn('draftValuesOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
+  const draftsSrc = [fn('annotationsLocked'), fn('lockKey'), fn('refuseLockedEdit'), fn('writerId'), fn('nextDraftSeq'), fn('draftNormRange'), fn('draftRangeOf'), fn('draftValuesOf'), fn('touchAnnotation'), fn('dropDraft')].join('\n');
   const touch = 'draftSeq=0;draftFlushKeys=new Set();draftRangesDirty=false;\n' + draftsSrc;
   let flushes = 0;
   Object.assign(grid, { FTViewer: { writerToken: 'w1' }, scheduleDraftFlush: () => { flushes += 1; }, markLabel: s => s, document: { getElementById: () => null, body: { classList: { toggle: () => {} } } }, toast: () => {}, RANGES_KEY: 'ranges', NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
@@ -489,7 +489,7 @@ async function unitTests() {
   // cleared annotations (or drops new ones) after hydration.
   Object.assign(state, { marks: {}, notes: {}, tags: {}, drafts: {}, dirtyIds: new Set(), selectedIds: new Set(['a']) });
   Object.assign(grid, { toast: () => {}, requestRender: () => {}, storageSet: () => {}, MARKS_KEY: 'marks', markLabel: s => s, NOTES_KEY: 'notes', TAGS_KEY: 'tags' });
-  const ops = [fn('annotationsLocked'), fn('refuseLockedEdit'), fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags')].join('\n');
+  const ops = [fn('annotationsLocked'), fn('lockKey'), fn('refuseLockedEdit'), fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags')].join('\n');
   runInNewContext(ops + '\napplyMark("important");', grid);
   assert.equal(state.drafts.a.mark.status, 'important');
   runInNewContext(ops + '\napplyMark(null);', grid);
@@ -747,6 +747,200 @@ async function unitTests() {
 
   await r5TrackU({ fn, source, grid, state, runInNewContext, assert, appSrc: exScript, ex, store, RK: 'ft.viewer.test.ranges', P: 'ft.draft.test.', hydrateSrc, touch });
   await r6TrackU({ fn, source, runInNewContext, assert, ex });
+  await r8TrackU({ fn, source, runInNewContext, assert });
+}
+
+// ---- R8 track U (docs/PLAN_R8_2026-10-15.md) ------------------------------
+async function r8TrackU({ fn, source, runInNewContext, assert }) {
+  // U5 + U8: the incremental mark tally (30-records.js markTallyNow) against
+  // a brute-force recount after every few steps of seeded random runs:
+  // marks with a status, an EMPTY / missing status (U5: R7 bucketed those
+  // with the "id not in this case" marker, so they fell out of `n`), ids
+  // this case does not list, clears, undo / redo of earlier steps, a
+  // conflict resolved to the server's value, hydration (a new mark map),
+  // bulk runs past the 4096-id touch cap, records appearing (live index).
+  const tallySrc = [
+    'var markTally = null, markTallyTouched = new Set(), markTallyAll = true, markTallyFullCount = 0;',
+    (source.match(/^var MARK_TALLY_OFFCASE = .*$/m) || [''])[0],
+    ...['markTallyNote', 'markTallyBucket', 'markTallyMove', 'markTallyNow'].map(fn),
+    'function bump(id) { markTallyNote(id); }',
+  ].join('\n');
+  const STATUSES = ['reviewed', 'important', 'needs_verification', '', undefined];
+  for (const seed of [1, 7, 42, 1234, 99991]) {
+    let x = seed >>> 0;
+    const rnd = (n) => { x = (Math.imul(x ^ (x >>> 15), 2246822507) + 0x9e3779b9) >>> 0; x ^= x >>> 13; return x % n; };
+    const recordById = new Map();
+    for (let i = 0; i < 300; i++) recordById.set('r' + i, { id: 'r' + i });
+    const vm = { state: { marks: {} }, recordById };
+    runInNewContext(tallySrc, vm);
+    const idOf = () => (rnd(10) === 0 ? 'x' + rnd(40) : 'r' + rnd(360)); // x… and r300+ are not (yet) records
+    const server = {};
+    const undo = [], redo = [];
+    const setMark = (id, value, journal) => {
+      const before = vm.state.marks[id] ? { ...vm.state.marks[id] } : null;
+      if (value) vm.state.marks[id] = value; else delete vm.state.marks[id];
+      if (journal) journal.push({ id, before });
+      runInNewContext(`bump(${JSON.stringify(id)})`, vm);
+    };
+    const brute = () => {
+      const out = { all: 0, n: 0, byStatus: {} };
+      for (const [id, m] of Object.entries(vm.state.marks)) {
+        if (!m) continue;
+        out.all += 1;
+        if (!recordById.has(id)) continue;
+        out.n += 1;
+        const s = String(m.status || '');
+        out.byStatus[s] = (out.byStatus[s] || 0) + 1;
+      }
+      return out;
+    };
+    const ops = { mark: 0, clear: 0, undo: 0, redo: 0, conflict: 0, hydrate: 0, bulk: 0, grow: 0, empty: 0 };
+    for (let step = 0; step < 1500; step++) {
+      const r = rnd(100);
+      if (r < 40) {
+        const status = STATUSES[rnd(STATUSES.length)];
+        if (!status) ops.empty += 1;
+        setMark(idOf(), status === undefined ? { marked_unix: 1 } : { status, marked_unix: 1 }, undo);
+        redo.length = 0;
+        ops.mark += 1;
+      } else if (r < 52) {
+        setMark(idOf(), null, undo); redo.length = 0; ops.clear += 1;
+      } else if (r < 64 && undo.length) {
+        const e = undo.pop();
+        setMark(e.id, e.before, redo); ops.undo += 1;
+      } else if (r < 72 && redo.length) {
+        const e = redo.pop();
+        setMark(e.id, e.before, undo); ops.redo += 1;
+      } else if (r < 82) {
+        // A conflict resolved to the server's value (or a server value applied).
+        const id = idOf();
+        server[id] = rnd(3) ? { status: STATUSES[rnd(STATUSES.length)] || '', marked_unix: 2 } : null;
+        setMark(id, server[id], null); ops.conflict += 1;
+      } else if (r < 86) {
+        // Hydration: a new map, bump without an id.
+        const next = {};
+        for (const [id, m] of Object.entries(server)) if (m) next[id] = { ...m };
+        for (let i = 0; i < 20; i++) next[idOf()] = { status: STATUSES[rnd(STATUSES.length)], marked_unix: 3 };
+        vm.state.marks = next;
+        runInNewContext('bump()', vm);
+        undo.length = 0; redo.length = 0; ops.hydrate += 1;
+      } else if (r < 88) {
+        // Bulk: more touched ids than the touch set keeps (4096) before a read.
+        for (let i = 0; i < 4200; i++) {
+          const id = 'r' + rnd(360);
+          const st = STATUSES[rnd(STATUSES.length)];
+          if (rnd(5) === 0) delete vm.state.marks[id]; else vm.state.marks[id] = { status: st, marked_unix: 4 };
+          runInNewContext(`bump(${JSON.stringify(id)})`, vm);
+        }
+        undo.length = 0; redo.length = 0; ops.bulk += 1;
+      } else if (r < 90) {
+        // A growing live index lists ids that were marked before.
+        const n = recordById.size;
+        for (let i = n; i < n + 5; i++) recordById.set('r' + i, { id: 'r' + i });
+        ops.grow += 1;
+      }
+      if (rnd(3) === 0 || step === 1499) {
+        const got = runInNewContext('(() => { const t = markTallyNow(); return { all: t.all, n: t.n, byStatus: { ...t.byStatus } }; })()', vm);
+        const want = brute();
+        const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v));
+        assert.deepEqual({ all: got.all, n: got.n, byStatus: clean(got.byStatus) }, { all: want.all, n: want.n, byStatus: clean(want.byStatus) },
+          `R8 U8: incremental tally = recount (seed ${seed}, step ${step}, ops ${JSON.stringify(ops)})`);
+      }
+    }
+    assert.ok(ops.empty > 0 && ops.undo > 0 && ops.redo > 0 && ops.hydrate > 0 && ops.bulk > 0 && ops.grow > 0, 'R8 U8: the run exercised every kind of step: ' + JSON.stringify(ops));
+  }
+  console.log('PASS VM R8 U5/U8 mark tally = recount over 5 seeded random runs (empty status, off-case ids, undo/redo, conflicts, hydrate, bulk, growth)');
+
+  // U2: an explicit save ({ patient: true }) keeps waiting while its request
+  // progresses (chunks answered) and times out only on a genuine stall; a
+  // hard budget ({ timeoutMs }) is not extended; save() with no budget is
+  // the shell fallback's hard <= 4 s.
+  const saveSrc = fn('viewerSave');
+  assert.ok(saveSrc, 'R8 U2: viewerSave (90-sync.js) holds the save budgets');
+  const defaultMs = Number(((source.match(/^const SAVE_DEFAULT_MS = (\d+);/m) || [])[1]));
+  assert.ok(defaultMs > 0 && defaultMs <= 4000, 'R8 U2: the no-budget save() is a hard <= 4 s (the shell fallback path): ' + defaultMs);
+  const mkSave = () => {
+    const vm = {
+      setTimeout, clearTimeout,
+      viewerIsServed: true, annotationsReadOnly: false, ftSignal: { aborted: false },
+      state: { drafts: {}, dirtyIds: new Set(['a']) }, conflictIds: new Map(), pendingReviewSync: false,
+      conflictLookupFailed: false, checkServerConflicts: async () => true,
+      saveInFlight: false, saveProgressAt: 0, waiters: [],
+      SAVE_BUSY_RETRIES: 10, SAVE_CALLER_WAIT_MS: 20000, SAVE_STALL_MS: 30000, SAVE_DEFAULT_MS: defaultMs,
+    };
+    runInNewContext(`
+      function localReviewIdle() { return !state.dirtyIds.size && !saveInFlight; }
+      function whenSaveSettled() { return saveInFlight ? new Promise(r => waiters.push(r)) : Promise.resolve(true); }
+      async function whenConflictsChecked() { return true; }
+      function settle() { saveInFlight = false; const w = waiters; waiters = []; w.forEach(r => r(true)); }
+      // n chunk replies, ms apart (each one a sign of life); n = 0: never answers.
+      function syncWith(n, ms) {
+        syncMarksNow = () => new Promise(resolve => {
+          saveInFlight = true; saveProgressAt = Date.now();
+          if (!n) return;
+          let left = n;
+          const next = () => setTimeout(() => {
+            saveProgressAt = Date.now();
+            if (--left > 0) return next();
+            state.dirtyIds.clear(); settle(); resolve({ ok: true });
+          }, ms);
+          next();
+        });
+      }
+    ` + saveSrc, vm);
+    return vm;
+  };
+  const run = async (vm, expr) => { const t0 = Date.now(); const out = await runInNewContext(expr, vm); return { out, ms: Date.now() - t0 }; };
+  const call = (opts) => `(async () => { const o = ${opts}; const r = await viewerSave(o); return { r, timedOut: !!o.timedOut }; })()`;
+  // Progressing: 4 chunks x 350 ms (1.4 s) against a 300 ms budget, 700 ms stall window.
+  let vm = mkSave();
+  runInNewContext('syncWith(4, 350)', vm);
+  const prog = await run(vm, call('{ patient: true, timeoutMs: 300, stallMs: 700 }'));
+  assert.ok(prog.out.r === true && !prog.out.timedOut && prog.ms >= 1300, 'R8 U2: a patient save waits while its chunks keep answering (1.4 s past a 300 ms budget) and lands: ' + JSON.stringify(prog));
+  // The same progress under a HARD budget: not extended.
+  vm = mkSave();
+  runInNewContext('syncWith(4, 350)', vm);
+  const hard = await run(vm, call('{ timeoutMs: 300 }'));
+  assert.ok(hard.out.r === false && hard.out.timedOut && hard.ms < 650, 'R8 U2: save({ timeoutMs }) stays a hard total (close flush): ' + JSON.stringify(hard));
+  // A request already on the wire (another caller's) that keeps answering chunks.
+  vm = mkSave();
+  runInNewContext('syncWith(5, 300); syncMarksNow();', vm);
+  const wire = await run(vm, call('{ patient: true, timeoutMs: 200, stallMs: 600 }'));
+  assert.ok(wire.out.r === true && wire.ms >= 1300, 'R8 U2: a patient save waits out a progressing save already in flight (not abandoned at its budget): ' + JSON.stringify(wire));
+  // A genuine stall: sent, never answered -> false once stallMs passed without a sign of life.
+  vm = mkSave();
+  runInNewContext('syncWith(0, 0)', vm);
+  const stall = await run(vm, call('{ patient: true, timeoutMs: 200, stallMs: 600 }'));
+  assert.ok(stall.out.r === false && stall.out.timedOut && stall.ms >= 550 && stall.ms < 1100, 'R8 U2: a stalled request (no reply for stallMs) times out: ' + JSON.stringify(stall));
+  // save() with no budget: the shell fallback path — hard, <= 4 s, even while a request hangs.
+  vm = mkSave();
+  runInNewContext('syncWith(0, 0)', vm);
+  const dflt = await run(vm, 'viewerSave()');
+  assert.ok(dflt.out === false && dflt.ms >= defaultMs - 100 && dflt.ms <= 4100, 'R8 U2: save() with no budget answers within 4 s while a request hangs: ' + JSON.stringify(dflt));
+  console.log('PASS VM R8 U2 patient save follows progress, stalls time out, hard budgets stay hard, save() <= 4 s');
+
+  // Track I (R8 P1/P2) <-> U: a level measured on a keyless PC (`sc: true`)
+  // is shown but says "자기 일관성만(인증 아님)"; an unverified line signed by
+  // another PC's key (`pc`) stays 미확인 and names that key.
+  const i18nKo = { 'audio.selfConsistent': '자기 일관성만(인증 아님)', 'audio.otherPc': '키 {key} 보유 PC에서 확인' };
+  const au = {
+    audioLevels: {
+      s1: { r: 'sound', max: -12, mean: -30, sc: true }, s2: { r: 'sound', max: -12, mean: -30 },
+      u1: { r: 'unverified', pc: 'pc-b' }, u2: { r: 'unverified' },
+    },
+    audioLevelsError: '',
+    t: (k) => i18nKo[k] || k,
+    tf: (k, subs) => Object.entries(subs || {}).reduce((x, [n, v]) => x.split('{' + n + '}').join(String(v)), i18nKo[k] || k),
+  };
+  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map(fn).join('\n') +
+    '\nthis.view = (id) => { const r = { id, audioCodec: "aac", probeOk: true }; const a = audioInfoFor(r); Object.assign(r, { audioState: a.state, audioLevel: a.level, audioReason: a.reason, audioTrust: a.trust || "", audioPcKey: a.pcKey || "" }); return { state: a.state, tip: audioTipFor(r), detail: audioDetailFor(r) }; };', au);
+  const v = (id) => runInNewContext(`view(${JSON.stringify(id)})`, au);
+  const s1 = v('s1'), s2 = v('s2'), u1 = v('u1'), u2 = v('u2');
+  assert.ok(s1.state === 'sound' && /자기 일관성만\(인증 아님\)/.test(s1.tip) && /자기 일관성만\(인증 아님\)/.test(s1.detail), 'R8: sc level shown with the self-consistency note: ' + JSON.stringify(s1));
+  assert.ok(s2.state === 'sound' && !/자기 일관성/.test(s2.tip + s2.detail), 'R8: an authenticated level has no note: ' + JSON.stringify(s2));
+  assert.ok(u1.state === 'track' && /키 pc-b 보유 PC에서 확인/.test(u1.tip) && /키 pc-b 보유 PC에서 확인/.test(u1.detail), 'R8: another PC\'s line stays 미확인 and names its key: ' + JSON.stringify(u1));
+  assert.ok(u2.state === 'track' && !/보유 PC/.test(u2.tip), 'R8: a plain unverified line names no key: ' + JSON.stringify(u2));
+  console.log('PASS VM R8 (I <-> U) audio levels: sc = self-consistency only, pc = check on the PC holding that key');
 }
 
 // ---- R6 track U (docs/PLAN_R6_2026-10-15.md) ------------------------------
@@ -916,7 +1110,7 @@ async function r5TrackU({ fn, source, grid, state, runInNewContext, assert, appS
   let toasts = 0;
   Object.assign(state, { marks: {}, tags: {}, drafts: {}, dirtyIds: new Set(), selectedIds: new Set(['u2']), activeId: 'u2' });
   Object.assign(grid, { toast: () => { toasts += 1; }, t: k => k });
-  const ops = [fn('annotationsLocked'), fn('refuseLockedEdit'), fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags'), fn('addTag'), fn('removeTag')].join('\n');
+  const ops = [fn('annotationsLocked'), fn('lockKey'), fn('refuseLockedEdit'), fn('targetIds'), fn('touchAnnotation'), fn('applyMark'), fn('applyTag'), fn('clearTags'), fn('addTag'), fn('removeTag')].join('\n');
   runInNewContext('annotationsReadOnly = true;\n' + ops + '\napplyMark("important"); applyTag("x"); clearTags(); addTag("u2", "y"); removeTag("u2", "y");', grid);
   assert.ok(!state.marks.u2 && !state.tags.u2 && !state.drafts.u2 && !state.dirtyIds.size && toasts === 5, `U1: read-only refuses mark/tag edits with the reason (${toasts} toasts)`);
   runInNewContext('annotationsReadOnly = false;', grid);

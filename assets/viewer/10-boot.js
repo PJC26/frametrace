@@ -27,6 +27,12 @@ const caseInputProblems = [];
 if (!DATA.manifest || typeof DATA.manifest !== "object" || DATA.manifestUnreadable) caseInputProblems.push("manifest");
 if (!DATA.scan || typeof DATA.scan !== "object" || DATA.scanUnreadable) caseInputProblems.push("scan");
 const manifest = DATA.manifest && typeof DATA.manifest === "object" ? DATA.manifest : {};
+// R8 U1: case.json was not read — the case's identity is unknown, so the
+// viewer is read-only (30-records hydrateAnnotations: the R5 read-only
+// path) and its storage keys come from the case folder, never "case"
+// (00-host.js caseStorageKey).
+const caseFileUnreadable = caseInputProblems.includes("manifest");
+const CASE_KEY = FTViewer.caseStorageKey(caseFileUnreadable ? null : manifest, DATA.caseDir);
 const scan = DATA.scan && typeof DATA.scan === "object" ? DATA.scan : {};
 // The carve audit log is append-only across runs: a re-carve re-emits
 // the same id space, so earlier entries for an id are stale records of a
@@ -53,22 +59,22 @@ for (const item of anomalyFindings) {
 const BS = String.fromCharCode(92);
 const EXT_PREFIX = BS + BS + "?" + BS;
 const EXT_UNC = EXT_PREFIX + "unc" + BS;
-const LAYOUT_KEY = "ft.viewer." + (manifest.case_id || "case") + ".layout.v2";
+const LAYOUT_KEY = "ft.viewer." + CASE_KEY + ".layout.v2";
 // MARKS_KEY / NOTES_KEY / TAGS_KEY: pre-v2 whole-map stores, no longer read or
 // written (drafts are per id, §10.3). ANNOTATIONS_KEY: the pre-§10.3 single-key
 // drafts, migrated once at boot (30-records migrateLegacyDrafts).
-const MARKS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".marks";
-const NOTES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".notes";
-const ANNOTATIONS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".annotations.v1";
+const MARKS_KEY = "ft.viewer." + CASE_KEY + ".marks";
+const NOTES_KEY = "ft.viewer." + CASE_KEY + ".notes";
+const ANNOTATIONS_KEY = "ft.viewer." + CASE_KEY + ".annotations.v1";
 // RANGES_KEY: the pre-R4 whole-map range store — retired (A2), only read once
 // at boot to migrate (30-records migrateLegacyRanges).
-const RANGES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".ranges";
+const RANGES_KEY = "ft.viewer." + CASE_KEY + ".ranges";
 // R5 U3: RANGES_KEY entries of ids this case does not (yet) list are held
 // here instead of being dropped with the retired key; every boot re-checks
 // them (a growing live index may list the id later).
 const RANGES_HELD_KEY = RANGES_KEY + ".held";
-const PROXIES_KEY = "ft.viewer." + (manifest.case_id || "case") + ".proxies";
-const EXAMINER_KEY = "ft.viewer." + (manifest.case_id || "case") + ".examiner";
+const PROXIES_KEY = "ft.viewer." + CASE_KEY + ".proxies";
+const EXAMINER_KEY = "ft.viewer." + CASE_KEY + ".examiner";
 const MARK_STATUSES = ["reviewed", "important", "needs_verification"];
 // Tag presets are the quick-apply taxonomy for the tag menu, the tag
 // filter, the detail editor, and the popup player. The defaults cover
@@ -79,5 +85,5 @@ const MARK_STATUSES = ["reviewed", "important", "needs_verification"];
 // personal, while applied tags stay per case (case DB + per-id drafts).
 const DEFAULT_TAG_PRESETS = ["핵심증거", "현장", "관련인", "동선·위치", "시간대확인", "조작의심", "출처불명", "참고자료", "보존요청", "제외", "사고", "과속", "신호위반", "차선변경", "보행자", "음주의심"];
 const TAG_PRESETS_KEY = "ft.viewer.tag_presets";
-const TAGS_KEY = "ft.viewer." + (manifest.case_id || "case") + ".tags";
-const LOCALE_KEY = "ft.viewer." + (manifest.case_id || "case") + ".locale";
+const TAGS_KEY = "ft.viewer." + CASE_KEY + ".tags";
+const LOCALE_KEY = "ft.viewer." + CASE_KEY + ".locale";

@@ -62,7 +62,7 @@ const freshState = () => ({
     { id: 'c', status: 'needs_verification', examiner: 'kim' }, { id: 'd', status: 'important', note: 'x', examiner: 'kim' },
   ] } },
   env: { ok: true, deepfake: false },
-  audit: { ok: true, integrity: 'integrity-structural', verified: 2, entries: 14, logs: [] },
+  audit: { ok: true, integrity: 'integrity-keyed', verified: 2, entries: 14, logs: [] },
   verifySources: { ok: true, matched: 3, mismatched: 0, not_comparable: 1 },
   finalize: { ok: true, examiner: 'Hong', manifest_sha256: 'a'.repeat(64), package_dir: '/case/package-1', package_url: 'package-1/' },
   posts: [],
@@ -157,7 +157,16 @@ await check('1 pure rows: unsavedMarksChecks / verifySourcesVerdict / finSummari
     sumBlocked: finSummarize([{ level: 'block', text: 'T', sub: 'S' }, { level: 'warn', text: 'w' }], { name: 'x' }),
     sumNoName: finSummarize([{ level: 'ok', text: 'ok' }], { name: '  ' }),
     sumReady: finSummarize([{ level: 'ok', text: 'ok' }, { level: 'warn', text: 'w' }], { name: 'x' }),
+    // R8 (track I ↔ U): /api/verify-audit is green ONLY when authenticated here.
+    auKeyed: auditVerdict({ ok: true, integrity: 'integrity-keyed', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'integrity-keyed', entries: 3, trust: '' }] }),
+    auSelf: auditVerdict({ ok: true, integrity: 'integrity-structural-only', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'integrity-structural-only', entries: 3, trust: '자기 일관성만 확인(인증 아님)', keys_held: false, other_pc_key_ids: [] }] }),
+    auOther: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'not-verified', entries: 3, trust: '키 pc-b 보유 PC에서 확인', keys_held: true, other_pc_key_ids: ['pc-b'] }] }),
+    auFail: auditVerdict({ ok: false, error: 'chain broken' }),
   }));
+  assert.equal(r.auKeyed.level, 'ok');
+  assert.ok(r.auSelf.level === 'warn' && /자기 일관성만 확인\(인증 아님\)/.test(r.auSelf.text), JSON.stringify(r.auSelf));
+  assert.ok(r.auOther.level === 'warn' && /이 PC에서 인증 불가 — 키 pc-b 보유 PC에서 확인/.test(r.auOther.text) && /pc-b/.test(r.auOther.title), JSON.stringify(r.auOther));
+  assert.equal(r.auFail.level, 'bad');
   assert.deepEqual(r.saved, ['ok']);
   assert.deepEqual(r.failed, [['block', true]]);
   assert.deepEqual(r.queue, ['block']);
@@ -180,7 +189,7 @@ await check('2 checklist: 미검토 · 검증 대기 · 검토자 · 원본 재�
   assert.ok(has(/검증 대기 2건/, 'warn'), JSON.stringify(rs));
   assert.ok(has(/미검토 6건 \(전체 10건\)/, 'warn'), JSON.stringify(rs));
   assert.ok(has(/원본 재검증: 아직 실행하지 않음/, 'info'), 'verification is not claimed');
-  assert.ok(has(/감사 로그 구조 검증됨/, 'ok'));
+  assert.ok(has(/감사 로그 인증됨/, 'ok'));
   assert.ok(has(/마크·메모가 모두 케이스에 반영되었습니다/, 'ok'));
   assert.equal(await page.inputValue('#finalExaminer'), 'Hong', 'examiner prefilled from prefs');
   assert.ok(/보고서를 낼 수 있습니다 — 확인할 항목 \d+건/.test(await page.textContent('#finalVerdict')));

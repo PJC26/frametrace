@@ -467,6 +467,13 @@ const I18N = {
     "close.readonlyBlocked": "판독 기록을 읽지 못해 저장이 막혀 있습니다",
     "close.notConfirmed": "모든 편집이 저장되었는지 확인하지 못했습니다",
     "player.refusedReadonly": "읽기 전용 — 판독 기록을 읽지 못해 편집할 수 없습니다",
+    "player.refusedReadonlyCase": "읽기 전용 — 케이스 정보(case.json)를 읽지 못해 편집할 수 없습니다",
+    "save.readonlyMsgCase": "케이스 정보(case.json)를 읽지 못했습니다 — 편집 저장이 막혀 있습니다",
+    "save.readonlyEditCase": "케이스 정보(case.json)를 읽지 못해 편집할 수 없습니다 — 어느 케이스인지 확인하지 못한 상태에서 고친 값은 다른 케이스의 기록과 섞이거나 나중에 덮어쓸 수 있습니다. case.json을 고친 뒤 새로 고치십시오.",
+    "save.title.readonlyCase": "케이스 정보(case.json)를 읽지 못했습니다 — 어느 케이스인지 확인할 수 없어 저장·요약 보고서·CSV·최종화가 막혀 있습니다(이 창의 변경 {n}건). case.json을 고친 뒤 새로 고치십시오.",
+    "close.readonlyWarnCase": "케이스 정보(case.json)를 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다.",
+    "close.readonlyBlockedCase": "케이스 정보(case.json)를 읽지 못해 저장이 막혀 있습니다",
+    "caseInput.readonly": "편집·저장이 막혀 있습니다",
     "player.capUnsure": "캡처 응답이 없습니다 — 메인 뷰어가 닫혔습니다. 결과물 폴더에서 저장 여부를 확인하십시오.",
     "player.capSlow": "캡처 응답이 늦습니다 — 메인 뷰어는 열려 있지만 저장 결과를 받지 못했습니다. 결과물 폴더에서 저장 여부를 확인하십시오.",
     "toast.storageQuota": "브라우저 저장소가 가득 찼습니다 — 변경 내용은 서버에 저장될 때까지 이 창에만 있습니다. 창을 닫지 마십시오.",
@@ -566,6 +573,8 @@ const I18N = {
     "audio.f.none": "트랙 없음",
     "audio.f.unknown": "미확인",
     "audio.tip.sound": "소리 있음 · 측정 최대 {max} dB",
+    "audio.selfConsistent": "자기 일관성만(인증 아님)",
+    "audio.otherPc": "키 {key} 보유 PC에서 확인",
     "audio.tip.silent": "무음 트랙 · 측정 최대 {max} dB",
     "audio.tip.none": "오디오 트랙 없음",
     "audio.tip.track": "오디오 트랙 있음 · 소리 미측정",
@@ -1109,6 +1118,13 @@ const I18N = {
     "close.readonlyBlocked": "The review records could not be read — saving is blocked",
     "close.notConfirmed": "Could not confirm that every edit was saved",
     "player.refusedReadonly": "Read-only — the review records could not be read, editing is off",
+    "player.refusedReadonlyCase": "Read-only — case information (case.json) could not be read, editing is off",
+    "save.readonlyMsgCase": "Case information (case.json) could not be read — saving edits is blocked",
+    "save.readonlyEditCase": "Editing is off — case information (case.json) could not be read. Values edited without knowing which case this is could mix with another case's records or overwrite them later. Fix case.json, then reload.",
+    "save.title.readonlyCase": "Case information (case.json) could not be read — which case this is cannot be confirmed, so saving, the summary report, CSV and finalizing are blocked ({n} change(s) in this window). Fix case.json, then reload.",
+    "close.readonlyWarnCase": "Case information (case.json) could not be read — this window holds no unsaved edits.",
+    "close.readonlyBlockedCase": "Case information (case.json) could not be read — saving is blocked",
+    "caseInput.readonly": "editing and saving are blocked",
     "player.capUnsure": "No capture reply — the main viewer closed. Check the case output folder for the frame.",
     "player.capSlow": "The capture reply is late — the main viewer is open but no result arrived. Check the case output folder for the frame.",
     "toast.storageQuota": "Browser storage is full — changes exist only in this window until they reach the server. Do not close the window.",
@@ -1208,6 +1224,8 @@ const I18N = {
     "audio.f.none": "No track",
     "audio.f.unknown": "Unknown",
     "audio.tip.sound": "Sound present · measured peak {max} dB",
+    "audio.selfConsistent": "self-consistency only (not authenticated)",
+    "audio.otherPc": "check on the PC holding key {key}",
     "audio.tip.silent": "Silent track · measured peak {max} dB",
     "audio.tip.none": "No audio track",
     "audio.tip.track": "Audio track present · sound not measured",
@@ -1305,10 +1323,27 @@ function tf(key, subs) {
   return s;
 }
 
+// R8 U6: a text that follows the language switch — the key (and its {name}
+// values, data-i18n-args JSON) ride on the element; applyChromeI18n()
+// (every render, the language button) re-renders it. Notices built at run
+// time (90-sync notices row) use it instead of a one-off textContent.
+function i18nText(el, key, subs) {
+  if (!el) return el;
+  el.dataset.i18n = key;
+  if (subs) el.dataset.i18nArgs = JSON.stringify(subs);
+  else delete el.dataset.i18nArgs;
+  const text = subs ? tf(key, subs) : t(key);
+  if (el.textContent !== text) el.textContent = text;
+  return el;
+}
+
 function applyChromeI18n() {
   document.documentElement.lang = state.locale;
   ftRoot.querySelectorAll("[data-i18n]").forEach(el => {
-    el.textContent = t(el.dataset.i18n);
+    let subs = null;
+    if (el.dataset.i18nArgs) { try { subs = JSON.parse(el.dataset.i18nArgs); } catch (e) { subs = null; } }
+    const text = subs ? tf(el.dataset.i18n, subs) : t(el.dataset.i18n);
+    if (el.textContent !== text) el.textContent = text;
   });
   ftRoot.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
     el.setAttribute("placeholder", t(el.dataset.i18nPlaceholder));

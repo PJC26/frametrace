@@ -219,17 +219,24 @@ html:root .tag-add button { width: auto; justify-content: center; border: 1px so
    theme tokens only: --text on --warn-bg holds AA in both themes; the
    buttons keep the kit's secondary look (own --surface background).
    ====================================================================== */
-.ft-viewer { grid-template-rows: auto auto auto minmax(0, 1fr) auto; grid-template-areas: "head" "notice" "top" "work" "bar"; }
+.ft-viewer { grid-template-rows: auto auto auto auto minmax(0, 1fr) auto; grid-template-areas: "head" "notice" "conflicts" "top" "work" "bar"; }
 /* R7 U9: five stacked notices must not squeeze the work area at 1366x768 —
    the row stops at 28vh (≤ 216px) and scrolls; keyboard reachable
-   (tabindex 0, labelled region, see 90-sync.js noticesHost). */
+   (a labelled region; a Tab stop only while it overflows — R8 U7, see
+   90-sync.js noticesHost). */
 .ft-viewer > .ft-notices { grid-area: notice; min-width: 0; display: flex; flex-direction: column; max-height: min(28vh, 216px); overflow-y: auto; overscroll-behavior: contain; }
 .ft-viewer > .ft-notices > * { flex: none; }
 .ft-viewer > .ft-notices:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
 .ft-notices:empty { display: none; }
 .ft-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 12px; background: var(--warn-bg); color: var(--text); border-bottom: 2px solid var(--warn); font-size: var(--fs-sm); }
 .ft-banner .ft-banner-msg { font-weight: 700; color: var(--text); margin-right: 4px; min-width: 0; }
-.conflict-panel { max-height: min(30vh, 320px); overflow: auto; padding: 8px 12px; background: var(--surface); color: var(--text); border-bottom: 1px solid var(--border-strong); }
+/* R8 U3: the per-record conflict list is the notices row's SIBLING (grid
+   row "conflicts"), not inside the capped, scrolling row — one scroll
+   only. While it is open the notices row keeps a smaller cap so the work
+   area keeps its height at 1366x768. */
+.ft-viewer > .conflict-panel { grid-area: conflicts; min-width: 0; overscroll-behavior: contain; }
+.ft-viewer > .ft-notices:has(+ .conflict-panel:not([hidden])) { max-height: min(14vh, 108px); }
+.conflict-panel { max-height: min(30vh, 260px); overflow: auto; padding: 8px 12px; background: var(--surface); color: var(--text); border-bottom: 1px solid var(--border-strong); }
 .conflict-panel[hidden] { display: none; }
 .conflict-title { margin: 0 0 6px; font-size: var(--fs-sm); font-weight: 700; }
 .conflict-title:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }

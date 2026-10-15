@@ -533,12 +533,18 @@ function audioInfoFor(record) {
   const hasTrack = !!codec && codec !== "none" && codec !== "-";
   const level = Object.prototype.hasOwnProperty.call(audioLevels, record.id) ? audioLevels[record.id] : null;
   const r = level && typeof level === "object" ? String(level.r || "") : "";
-  if (r === "sound" || r === "silent") return { state: r, level, reason: "" };
+  // R8 (track I P1/P2): `sc: true` = measured on a PC without audit keys —
+  // the level is shown, labelled "자기 일관성만(인증 아님)"; `pc: "<key id>"`
+  // on an unverified line = authenticated by another PC's key — 미확인 here,
+  // "키 <id> 보유 PC에서 확인".
+  const trust = level && typeof level === "object" && level.sc === true ? "sc" : "";
+  const pcKey = level && typeof level === "object" && level.pc != null && String(level.pc) ? String(level.pc) : "";
+  if (r === "sound" || r === "silent") return { state: r, level, reason: "", trust, pcKey: "" };
   // R4 D1/D2: "unverified" (the measurement log failed its chain check) and
   // "replayed" (a checkpoint result recorded without re-measuring) are never
   // sound/silent — the track reads 미확인 with the reason.
-  if (hasTrack) return { state: "track", level: null, reason: ["error", "stale", "unverified", "replayed"].includes(r) ? r : audioLevelsError ? "unread" : "" };
-  if (r === "unverified" || r === "replayed") return { state: "unknown", level: null, reason: r };
+  if (hasTrack) return { state: "track", level: null, reason: ["error", "stale", "unverified", "replayed"].includes(r) ? r : audioLevelsError ? "unread" : "", trust: "", pcKey: r === "unverified" ? pcKey : "" };
+  if (r === "unverified" || r === "replayed") return { state: "unknown", level: null, reason: r, trust: "", pcKey: r === "unverified" ? pcKey : "" };
   if (record.probeOk === true) return { state: "none", level: null, reason: "" };
   return { state: "unknown", level: null, reason: "" };
 }
@@ -555,7 +561,17 @@ function fmtDb(value, digits) {
   const text = Math.abs(v).toFixed(digits);
   return (v < 0 && Number(text) !== 0 ? "−" : "") + text;
 }
+// R8: the trust note of a sound shown (sc) / not shown (another PC's key).
+function audioTrustNote(record) {
+  if (record.audioTrust === "sc" && (record.audioState === "sound" || record.audioState === "silent")) return " · " + t("audio.selfConsistent");
+  if (record.audioPcKey) return " — " + tf("audio.otherPc", { key: record.audioPcKey });
+  return "";
+}
 function audioTipFor(record) {
+  const text = audioTipBase(record);
+  return text ? text + audioTrustNote(record) : text;
+}
+function audioTipBase(record) {
   const level = record.audioLevel || {};
   switch (record.audioState) {
     case "sound": return tf("audio.tip.sound", { max: fmtDb(level.max, 0) });
@@ -566,6 +582,9 @@ function audioTipFor(record) {
   }
 }
 function audioDetailFor(record) {
+  return audioDetailBase(record) + audioTrustNote(record);
+}
+function audioDetailBase(record) {
   const level = record.audioLevel || {};
   const codec = record.audioCodec ? ` (${record.audioCodec})` : "";
   switch (record.audioState) {
@@ -766,6 +785,8 @@ records.forEach(record => {
   record.audioState = audio.state;
   record.audioLevel = audio.level;
   record.audioReason = audio.reason;
+  record.audioTrust = audio.trust || "";
+  record.audioPcKey = audio.pcKey || "";
   record.audioFacet = audioFacetOf(audio.state);
   record.prefix = prefixFor(record);
   record.recType = recTypeFor(record);
@@ -981,6 +1002,11 @@ var legacyRangesLeft = null;      // { count, ranges } | null
 // the viewer shows none of the server's marks, so it must never save over
 // them (90-sync: read-only banner, saves blocked).
 var annotationsError = "";
+// R8 U1: why the annotations are locked — "annotations" (records-meta could
+// not read them) or "case" (case.json was not read: which case this is is
+// unknown, so nothing may be written or kept under its keys). The texts
+// differ (lockKey), the read-only path is the same.
+var annotationsLockCause = "";
 // Ids whose mark row the server may hold (hydrated rows, rows this window
 // sent since, server values taken over). A record left with no mark, note
 // or range sends `deleted_ids` only when its id is here — a record that
@@ -1016,19 +1042,24 @@ function markTallyNote(id) {
   if (id == null || markTallyTouched.size >= 4096) { markTallyAll = true; markTallyTouched.clear(); }
   else if (!markTallyAll) markTallyTouched.add(id);
 }
+// R8 U5: the bucket of a mark is its status; a mark of an id this case does
+// not list gets its own marker (MARK_TALLY_OFFCASE) — never "", which is
+// also what a mark with an empty / missing status yields (that mark is a
+// mark of this case and counts in `n`, as the pre-R7 count did).
+var MARK_TALLY_OFFCASE = "\u0000offcase";
 function markTallyBucket(id) {
   const mark = state.marks[id];
   if (!mark) return null;
-  return recordById.has(id) ? String(mark.status || "") : "";   // "" = a mark of an id this case does not list
+  return recordById.has(id) ? String(mark.status || "") : MARK_TALLY_OFFCASE;
 }
 function markTallyMove(tally, from, to) {
   if (from !== null) {
     tally.all -= 1;
-    if (from !== "") { tally.n -= 1; tally.byStatus[from] = (tally.byStatus[from] || 0) - 1; }
+    if (from !== MARK_TALLY_OFFCASE) { tally.n -= 1; tally.byStatus[from] = (tally.byStatus[from] || 0) - 1; }
   }
   if (to !== null) {
     tally.all += 1;
-    if (to !== "") { tally.n += 1; tally.byStatus[to] = (tally.byStatus[to] || 0) + 1; }
+    if (to !== MARK_TALLY_OFFCASE) { tally.n += 1; tally.byStatus[to] = (tally.byStatus[to] || 0) + 1; }
   }
 }
 function markTallyNow() {
@@ -1058,8 +1089,8 @@ function markTallyNow() {
   return markTally;
 }
 const DRAFT_FLUSH_MS = 250;
-const DRAFT_PREFIX = "ft.draft." + (manifest.case_id || "case") + ".";
-const ALIVE_PREFIX = "ft.alive:" + (manifest.case_id || "case") + ":";
+const DRAFT_PREFIX = "ft.draft." + CASE_KEY + ".";
+const ALIVE_PREFIX = "ft.alive:" + CASE_KEY + ":";
 // Liveness of the other windows on this case (§10.3): each refreshes its
 // heartbeat every 5 s; pagehide (a real unload, not the back/forward cache)
 // replaces it with ALIVE_CLOSED. Another writer's drafts are adopted only
@@ -1259,9 +1290,14 @@ function annotationsLocked() {
   return typeof annotationsError !== "undefined" && !!annotationsError;
 }
 // True (and says why, once per attempt) when an edit must not happen now.
+// R8 U1: the i18n key of a read-only text for the current cause ("…Case"
+// variant when case.json was not read).
+function lockKey(key) {
+  return annotationsLockCause === "case" && typeof I18N !== "undefined" && I18N.ko[key + "Case"] ? key + "Case" : key;
+}
 function refuseLockedEdit() {
   if (!annotationsLocked()) return false;
-  if (typeof toast === "function") toast(t("save.readonlyEdit"));
+  if (typeof toast === "function") toast(t(lockKey("save.readonlyEdit")));
   return true;
 }
 
@@ -1474,6 +1510,13 @@ function hydrateAnnotations(annotations) {
   state.marks = {}; state.notes = {}; state.tags = {}; state.examiners = {}; state.ranges = {};
   state.revisions = {};
   annotationsError = annotations && annotations.error ? String(annotations.error) : "";
+  annotationsLockCause = annotationsError ? "annotations" : "";
+  // R8 U1: case.json unreadable — the same read-only path (no save, no
+  // edit, no migration of browser leftovers), its own texts.
+  if (!annotationsError && typeof caseFileUnreadable !== "undefined" && caseFileUnreadable) {
+    annotationsError = "case.json";
+    annotationsLockCause = "case";
+  }
   for (const [id, rev] of Object.entries(annotations.revisions || {})) {
     if (Number.isFinite(Number(rev))) state.revisions[id] = Number(rev);
   }
@@ -1528,7 +1571,7 @@ var aliveChannel = null;
 var alivePings = new Map(); // nonce -> Set of writers that answered
 function openAliveChannel() {
   if (aliveChannel || typeof BroadcastChannel !== "function" || ftSignal.aborted) return aliveChannel;
-  try { aliveChannel = new BroadcastChannel("ft-alive:" + (manifest.case_id || "case")); } catch (error) { aliveChannel = null; return null; }
+  try { aliveChannel = new BroadcastChannel("ft-alive:" + CASE_KEY); } catch (error) { aliveChannel = null; return null; }
   const channel = aliveChannel;
   channel.onmessage = event => {
     const msg = event.data || {};

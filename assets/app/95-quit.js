@@ -23,7 +23,11 @@ async function hPendingChanges() {
   if (!FTStore.hasProject()) return 0;
   try {
     const meta = await jget("/api/records-meta");
-    const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
+    // R8 U1: the viewer's own storage key of the case (case.json's case_id;
+    // an unreadable case.json: a hash of the case folder — never "case").
+    const caseId = meta && meta.ok !== false && typeof FTViewer === "object" && FTViewer && FTViewer.caseStorageKey
+      ? FTViewer.caseStorageKey(meta.manifest, meta.caseDir)
+      : (meta && meta.manifest ? (meta.manifest.case_id || "case") : null);
     // Per-id draft keys (ft.draft.<case>.<writer>.<id>) plus any legacy
     // single-key drafts not yet migrated; null = storage unreadable.
     return caseId ? (unsavedDraftCount(caseId) || 0) : 0;

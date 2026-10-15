@@ -48,7 +48,7 @@ function viewerSaveState() { return finViewerSaveState(); }
 // Starts a save (or retry) now; true when a viewer accepted it.
 function retryViewerSave() {
   const v = finViewer();
-  if (v && typeof v.save === "function") { Promise.resolve(v.save()).catch(() => {}); return true; }
+  if (v && typeof v.save === "function") { Promise.resolve(v.save({ patient: true })).catch(() => {}); return true; }
   return false;
 }
 // Browser-only mark drafts of a case (any window): the viewer's per-id keys
@@ -190,7 +190,7 @@ async function finAttribute() {
     const v = finViewer();
     if (v && typeof v.save === "function" && FIN_UNSAVED.includes(finViewerSaveState())) {
       let saved = false;
-      try { saved = await v.save(); } catch (e) { saved = false; }
+      try { saved = await v.save({ patient: true }); } catch (e) { saved = false; }
       if (!saved) { msg = "뷰어의 미저장 변경을 먼저 저장하지 못했습니다 — ‘저장 다시 시도’ 후 다시 누르십시오."; return; }
     }
     propagateExaminerName(name, FIN.caseId);
@@ -252,15 +252,32 @@ async function finAttribute() {
   }
 }
 
+// R8 (track I P0/P1/P2 ↔ U): one reading of POST /api/verify-audit for the
+// env badge and the finalize sheet. Green ("ok") ONLY when every lane is
+// authenticated here (integrity-keyed); a keyless PC (structural-only) is
+// "자기 일관성만 확인(인증 아님)", lines this PC cannot authenticate are
+// "이 PC에서 인증 불가" naming the PCs' key ids to check on — both amber
+// ("warn"), never green; a failed chain is "bad".
+//   -> { level: "ok"|"warn"|"bad", text, title }
+function auditVerdict(res) {
+  if (!res || !res.ok) return { level: "bad", text: "감사 로그 검증 실패", title: (res && (res.error || "")) || "" };
+  const logs = Array.isArray(res.logs) ? res.logs : [];
+  const count = `(${res.verified}개 로그, ${res.entries}항목)`;
+  const others = [...new Set(logs.flatMap(l => Array.isArray(l.other_pc_key_ids) ? l.other_pc_key_ids : []).map(String))];
+  const title = logs.map(l => `${l.name}: ${l.integrity}, ${l.entries}항목${l.trust ? " — " + l.trust : ""}`).join("\n");
+  if (res.integrity === "integrity-keyed") return { level: "ok", text: `감사 로그 인증됨 ${count}`, title };
+  if (res.integrity === "integrity-not-verified") {
+    const where = others.length ? ` — 키 ${others.slice(0, 3).join(", ")}${others.length > 3 ? " 외" : ""} 보유 PC에서 확인` : "";
+    return { level: "warn", text: `감사 로그 이 PC에서 인증 불가${where} ${count}`, title };
+  }
+  if (res.integrity === "integrity-structural-only") return { level: "warn", text: `감사 로그 자기 일관성만 확인(인증 아님) ${count}`, title };
+  return { level: "warn", text: `감사 로그 상태 확인 불가 ${count}`, title: title || String(res.integrity || "") };
+}
 async function finRunAudit() {
   try {
-    const res = await jpost("/api/verify-audit", {});
-    if (!res.ok) { FIN.audit = { level: "warn", text: "감사 로그 검증에 실패했습니다", title: res.error || "" }; return; }
-    const keyed = res.integrity === "integrity-keyed";
-    FIN.audit = {
-      level: "ok", text: `감사 로그 ${keyed ? "키 서명 검증됨" : "구조 검증됨"} (${res.verified}개 로그, ${res.entries}항목)`,
-      title: (res.logs || []).map(l => `${l.name}: ${l.integrity}, ${l.entries}항목`).join("\n"),
-    };
+    // R8: green only when authenticated here (auditVerdict above).
+    const v = auditVerdict(await jpost("/api/verify-audit", {}));
+    FIN.audit = { level: v.level === "ok" ? "ok" : "warn", text: v.level === "bad" ? "감사 로그 검증에 실패했습니다" : v.text, title: v.title };
   } catch (e) { FIN.audit = { level: "warn", text: "감사 로그 검증 불가", title: String((e && e.message) || e) }; }
 }
 
@@ -281,7 +298,11 @@ async function gatherFinalizeChecks() {
   else if (!["review-ready", "done", "finalized"].includes(phase)) add("block", "완료된 분석 결과가 없습니다", "먼저 분석을 끝내십시오.");
   let meta = null;
   try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
-  const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
+  // R8 U1: the viewer's own storage key of the case (case.json's case_id;
+  // an unreadable case.json: a hash of the case folder — never "case").
+  const caseId = meta && meta.ok !== false && typeof FTViewer === "object" && FTViewer && FTViewer.caseStorageKey
+    ? FTViewer.caseStorageKey(meta.manifest, meta.caseDir)
+    : (meta && meta.manifest ? (meta.manifest.case_id || "case") : null);
   const summary = finViewerSummary();
 
   // Unsaved / queued marks block the finalize: sealing a package without
@@ -671,7 +692,7 @@ async function finRetrySave() {
   if (!v || typeof v.save !== "function") { toast("뷰어가 열려 있지 않습니다 — 검토 화면을 연 뒤 저장하십시오.", "warn"); return; }
   btn.disabled = true; btn.setAttribute("aria-busy", "true"); finHint("저장 중…");
   let ok = false;
-  try { ok = await v.save(); } catch (e) { ok = false; }
+  try { ok = await v.save({ patient: true }); } catch (e) { ok = false; }
   btn.removeAttribute("aria-busy"); btn.disabled = false; finHint(ok ? "" : "저장하지 못했습니다 — 뷰어의 저장 상태를 확인하십시오.");
   finRefresh();
 }

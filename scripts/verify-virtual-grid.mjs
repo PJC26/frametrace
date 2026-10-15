@@ -236,12 +236,58 @@ try {
   await setGroup(page, 'none');
   await page.waitForTimeout(200);
 
-  // Resize re-layouts the column count.
-  const colsBefore = await page.evaluate(() => document.querySelector('#recordGrid .vrow')?.children.length);
+  // Resize re-layouts the column count. Platform-independent (CI Linux:
+  // other fonts / scrollbar width): the column count a grid width MUST give
+  // is computed from the grid's own metrics (client width minus padding,
+  // --card-min-w, the row gap) — the same formula as 40-grid gridMetrics —
+  // and the viewport is narrowed until that expected count differs from
+  // the current one. Then the painted count is polled (bounded) until the
+  // ResizeObserver re-render lands, instead of one fixed wait.
+  const colState = () => page.evaluate(() => {
+    const grid = document.getElementById('recordGrid');
+    const cs = getComputedStyle(grid);
+    const inner = grid.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+    const minW = parseFloat(cs.getPropertyValue('--card-min-w')) || 132;
+    const row = grid.querySelector('.vrow');
+    const gap = row ? (parseFloat(getComputedStyle(row).columnGap) || 7) : 7;
+    const rows = [...grid.querySelectorAll('.vrow')];
+    return {
+      width: grid.clientWidth,
+      expected: Math.max(1, Math.floor((inner + gap) / (minW + gap))),
+      vcols: Number(grid.style.getPropertyValue('--vcols')) || 0,
+      painted: rows.length ? Math.max(...rows.map((r) => r.children.length)) : 0,
+    };
+  });
+  const colsBefore = await colState();
+  let colsAfter = colsBefore;
+  let target = null;
+  for (const width of [1100, 900, 760, 640, 520]) {
+    await page.setViewportSize({ width, height: 900 });
+    // The layout has settled when the grid width stops moving.
+    let prevW = -1;
+    const settleEnd = Date.now() + 3000;
+    for (;;) {
+      await page.waitForTimeout(80);
+      const now = await colState();
+      if (now.width === prevW || Date.now() > settleEnd) { colsAfter = now; break; }
+      prevW = now.width;
+    }
+    if (colsAfter.expected !== colsBefore.expected) { target = width; break; }
+  }
+  if (target != null) {
+    const want = colsAfter.expected;
+    const end = Date.now() + 5000;
+    while (Date.now() < end) {
+      colsAfter = await colState();
+      if (colsAfter.vcols === want && colsAfter.painted === want) break;
+      await page.waitForTimeout(100);
+    }
+  }
+  check('resize recomputes columns (painted = the count the new grid width must give)', target != null && colsBefore.vcols === colsBefore.expected && colsAfter.vcols === colsAfter.expected && colsAfter.painted === colsAfter.expected && colsAfter.expected !== colsBefore.expected,
+    JSON.stringify({ target, colsBefore, colsAfter }));
+  // The rest of this page ran at 800 px wide before (R8: unchanged).
   await page.setViewportSize({ width: 800, height: 900 });
-  await page.waitForTimeout(400);
-  const colsAfter = await page.evaluate(() => document.querySelector('#recordGrid .vrow')?.children.length);
-  check('resize recomputes columns', colsAfter > 0 && colsAfter < colsBefore, `${colsBefore} -> ${colsAfter}`);
+  await page.waitForTimeout(300);
 
   // U14: grid > rowgroup (the spacer) > row > gridcell, with aria-rowcount
   // on the grid and aria-rowindex on every painted row.
@@ -353,17 +399,17 @@ try {
   // Map grown to ≥ 10 000 entries, no whole-list Array pass — and stay
   // under a time cap. A mark (key 1 → leaves the filter) must reuse the
   // list's position map (no Map rebuilt) and land on the next record.
-  // The time cap: a dispatched key costs ~8 ms here, almost all of it the
-  // detail pane and the grid layout of the new card — so the cap is on
-  // SCRIPT time (CDP Performance ScriptDuration) per key relative to the
-  // same keys on the unmarked 50k page in this run (≤ 1.5×), plus a wall
-  // limit; the counters above catch the O(n) passes themselves, and
-  // _debugStats().tallyFull / filterComputes must not move on j/k.
+  // R8 U4: no timing RATIO any more (R7 compared script time per key with
+  // an unmarked baseline page — noisy across machines and runs, it failed
+  // and passed by chance). The O(n) passes are caught by the COUNTERS
+  // (mark-map walks, big Map rebuilds, whole-list Array passes, tally
+  // recounts, re-filters must all stay 0); the wall limit only says "no
+  // pathological slowdown": a key costs ~8 ms here (detail pane + layout
+  // of the new card), the limit allows 40 ms per key on average (400 s
+  // for 10 000 — ~5x the measured time; an O(n) pass over 40 000 marks
+  // per key, the regression this guards, costs far more).
+  const JK_WALL_MS_PER_KEY = 40;
   const jkRun = async (pg, n) => {
-    const cdp = await pg.context().newCDPSession(pg);
-    await cdp.send('Performance.enable');
-    const metric = async () => Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map((x) => [x.name, x.value]));
-    const a = await metric();
     const out = await pg.evaluate(async (count) => {
       const p = window.__probe;
       if (p) { p.on = true; p.objKeys = 0; p.bigMaps = 0; p.arrays = 0; p.where = {}; }
@@ -376,20 +422,8 @@ try {
       const s1 = FTViewer._debugStats();
       return { ms: Math.round(ms), objKeys: p ? p.objKeys : 0, bigMaps: p ? p.bigMaps : 0, arrays: p ? p.arrays : 0, where: p ? p.where : {}, active: s1.activeId, tallyFull: s1.tallyFull - s0.tallyFull, filterRuns: s1.filterComputes - s0.filterComputes };
     }, n);
-    const b = await metric();
-    await cdp.detach();
-    return { ...out, scriptPerKey: ((b.ScriptDuration - a.ScriptDuration) * 1000) / n };
+    return out;
   };
-  let baseline = null;
-  {
-    const bp = await browser.newPage({ viewport: { width: 1500, height: 900 } });
-    await bp.goto(base);
-    await bp.waitForSelector('#recordGrid .card', { timeout: 60_000 });
-    await bp.locator('#recordGrid .card').first().click();
-    await bp.evaluate(() => document.activeElement?.blur());
-    baseline = await jkRun(bp, 1000);
-    await bp.close();
-  }
   {
     const mp = await browser.newPage({ viewport: { width: 1500, height: 900 } });
     const mErrors = [];
@@ -419,11 +453,11 @@ try {
       })();`;
     await mp.evaluate(probe);
     const jk = await jkRun(mp, 10_000);
-    const jkInfo = JSON.stringify({ ...jk, scriptPerKey: +jk.scriptPerKey.toFixed(2), baselineScriptPerKey: +baseline.scriptPerKey.toFixed(2), baselineMs: baseline.ms });
+    const jkInfo = JSON.stringify({ ...jk, msPerKey: +(jk.ms / 10_000).toFixed(2) });
     // 10 000 keys, net 5 000 steps forward: vid_005000.
     check('R7 U4: 10 000 j/k under the mark filter moved the active card (net +5 000)', jk.active === 'vid_005000', jkInfo);
     check('R7 U4: 10 000 j/k (40 000 marks): no pass over the mark map, no Map rebuilt, no whole-list Array pass, no recount, no re-filter', jk.objKeys === 0 && jk.bigMaps === 0 && jk.arrays === 0 && jk.tallyFull === 0 && jk.filterRuns === 0, jkInfo);
-    check('R7 U4: 10 000 j/k under the mark filter — script time per key ≤ 1.5 × the unmarked page\'s, wall < 600 s', jk.scriptPerKey <= baseline.scriptPerKey * 1.5 && jk.ms < 600_000, jkInfo);
+    check(`R8 U4: 10 000 j/k under the mark filter — wall < ${JK_WALL_MS_PER_KEY} ms per key on average (no ratio; the counters above catch O(n) passes)`, jk.ms < JK_WALL_MS_PER_KEY * 10_000, jkInfo);
     const mk = await mp.evaluate(async () => {
       const p = window.__probe;
       const out = { objKeys: 0, bigMaps: 0, where: {}, miss: [] };

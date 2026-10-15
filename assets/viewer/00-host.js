@@ -78,8 +78,31 @@ const FTViewer = (() => {
     popupTimer = 0;
   }
 
+  // R8 U1: the case part of every per-case storage key / channel name
+  // (ft.viewer.<key>.*, ft.draft.<key>.*, ft.alive:<key>:*, ft-player:<key>).
+  // case.json's case_id when it was read; otherwise NEVER the literal
+  // "case" (two unreadable cases would share drafts, layout and the pop-out
+  // bridge): "nocase-" + a 64-bit FNV-1a hash of the case folder the server
+  // / bundle names (caseDir), or — a redacted bundle ("<case>") or none —
+  // of this page's address. Pure: the shell (41-finalize / 95-quit draft
+  // counts) derives the same key from records-meta.
+  function caseStorageKey(manifest, caseDir) {
+    const id = manifest && typeof manifest === "object" ? manifest.case_id : null;
+    if ((typeof id === "string" && id.trim()) || (typeof id === "number" && Number.isFinite(id))) return String(id);
+    const dir = typeof caseDir === "string" ? caseDir.trim() : "";
+    let seed = dir && dir !== "<case>" ? "dir|" + dir.replace(/\\/g, "/").replace(/\/+$/, "") : "";
+    if (!seed) { try { seed = "page|" + location.origin + location.pathname; } catch (e) { seed = "page|?"; } }
+    const fnv = (text, h) => {
+      for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+      return h.toString(16).padStart(8, "0");
+    };
+    // Two independent 32-bit halves: the text forwards and backwards.
+    return "nocase-" + fnv(seed, 0x811c9dc5) + fnv([...seed].reverse().join(""), 0x050c5d1f);
+  }
+
   const api = {
     version: 2,
+    caseStorageKey,
     /** Channel names (contract §3.3). ft-review is the shell's (T2);
      *  ft-player:<case_id> is the popup-player bridge (70-player.js). */
     writerToken,
@@ -181,7 +204,9 @@ const FTViewer = (() => {
     focus() { return impl ? impl.focus() : false; },
     summary() { return impl ? impl.summary() : null; },
     saveState() { return impl ? impl.saveState() : null; },
-    /** R6 U5: save({ timeoutMs }) — the caller's cap on "busy, retry" waits (default 5 s). */
+    /** save({ timeoutMs }) = hard total; save({ patient: true }) = explicit
+     *  save, 20 s and on while its request progresses; save() = 4 s
+     *  (R7 U1/U5, R8 U2 — 90-sync.js viewerSave). */
     async save(opts) { return impl ? impl.save(opts) : true; },
     /** Internal (22-viewer-host.js unmount): resolves true once no marks
      *  save request is in flight, false after `timeoutMs` (default 15 s). */
