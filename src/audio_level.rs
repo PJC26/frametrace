@@ -245,6 +245,11 @@ pub struct FileResult {
     /// result is never shown as sound/silent — it is re-measured instead.
     /// Set by the log reader, never serialized into a result.
     pub replayed_unverified: bool,
+    /// R5-P8: the result was read from a measurement lane whose chain does
+    /// not verify — the reason. Such a result is never shown as a level
+    /// (the record reads `unverified`) and is measured again. Set by the
+    /// log reader, never serialized.
+    pub chain_unverified: Option<String>,
 }
 
 fn finite(value: f64) -> Option<f64> {
@@ -317,6 +322,7 @@ impl FileResult {
             error: s(value, "error"),
             measured_unix: value.get("measured_unix").and_then(Value::as_u64),
             replayed_unverified: false,
+            chain_unverified: None,
         })
     }
 }
@@ -428,6 +434,9 @@ pub struct IndexRow {
     /// `ffprobe_ok` — without a probe "no audio codec" means "unknown".
     pub probed: bool,
     pub audio_streams: Vec<AudioStreamInfo>,
+    /// R5-P3: the lossless OS path when the record carries
+    /// `source_path_raw_hex`; `None` = `source_path` names the file.
+    pub raw_path: Option<PathBuf>,
 }
 
 fn num(value: &Value) -> Option<u64> {
@@ -461,7 +470,18 @@ impl IndexRow {
             stale: s("index_status").as_deref() == Some("stale"),
             probed: row.get("ffprobe_ok").and_then(Value::as_bool) == Some(true),
             audio_streams,
+            raw_path: s("source_path_raw_hex")
+                .as_deref()
+                .and_then(crate::model::path_from_raw_hex),
         })
+    }
+
+    /// R5-P3: the file this record names, losslessly — what is stat'ed,
+    /// probed and decoded (never the lossy display string).
+    pub fn os_path(&self) -> PathBuf {
+        self.raw_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&self.source_path))
     }
 }
 
@@ -573,7 +593,7 @@ pub fn coverage_error(
 
 fn run_stream(
     ffmpeg: &str,
-    path: &str,
+    path: &Path,
     ordinal: usize,
     info: &AudioStreamInfo,
     container_duration: Option<f64>,
@@ -590,8 +610,17 @@ fn run_stream(
         verdict: Verdict::Error,
         error: None,
     };
+    // The template with the real path as its own OS argument (R5-P3: a
+    // non-Unicode name is passed exactly, never as a lossy string).
     let mut command = Command::new(ffmpeg);
-    command.args(stream_args(path, &ordinal.to_string()));
+    let template = stream_args("<src>", &ordinal.to_string());
+    for arg in &template {
+        if arg == "<src>" {
+            command.arg(path);
+        } else {
+            command.arg(arg);
+        }
+    }
     let output = match crate::util::run_with_timeout(&mut command, Some(timeout_secs)) {
         Ok(output) => output,
         Err(err) => {
@@ -663,7 +692,7 @@ impl FileStamp {
 
 /// `path`'s size and nanosecond mtime right now; `None` when it cannot be
 /// stat'ed.
-pub fn stat_stamp(path: &str) -> Option<FileStamp> {
+pub fn stat_stamp(path: impl AsRef<Path>) -> Option<FileStamp> {
     let meta = std::fs::metadata(path).ok()?;
     Some(FileStamp {
         size: meta.len(),
@@ -702,15 +731,17 @@ pub fn measure_row(ffmpeg: &str, ffprobe: &str, row: &IndexRow) -> FileResult {
         error: None,
         measured_unix: None,
         replayed_unverified: false,
+        chain_unverified: None,
     };
     let bound = row.size_bytes.map(|size| (size, row.modified_unix));
-    let before = stat_stamp(&row.source_path);
+    let os_path = row.os_path();
+    let before = stat_stamp(&os_path);
     if bound.is_none() || before.as_ref().map(FileStamp::binding) != bound {
         result.error = Some(CHANGED_ERROR.to_string());
         return result;
     }
     let streams = if row.audio_streams.is_empty() {
-        match probe_audio_streams(ffprobe, Path::new(&row.source_path)) {
+        match probe_audio_streams(ffprobe, &os_path) {
             Ok(streams) if streams.is_empty() => {
                 result.error = Some(
                     "색인에는 오디오 코덱이 있지만 ffprobe가 오디오 스트림을 찾지 못했습니다"
@@ -744,7 +775,7 @@ pub fn measure_row(ffmpeg: &str, ffprobe: &str, row: &IndexRow) -> FileResult {
         .iter()
         .take(MAX_STREAMS)
         .enumerate()
-        .map(|(k, info)| run_stream(ffmpeg, &row.source_path, k, info, container, timeout))
+        .map(|(k, info)| run_stream(ffmpeg, &os_path, k, info, container, timeout))
         .collect();
     let mut verdict = record_verdict(&results);
     let mut error = results.iter().find_map(|s| s.error.clone());
@@ -758,7 +789,7 @@ pub fn measure_row(ffmpeg: &str, ffprobe: &str, row: &IndexRow) -> FileResult {
     }
     // D17: before/after compare the full-resolution mtime, so a rewrite
     // within the same second as the measurement is still caught.
-    if stamp_changed(before, stat_stamp(&row.source_path)) {
+    if stamp_changed(before, stat_stamp(&os_path)) {
         verdict = Verdict::Error;
         error = Some(CHANGED_ERROR.to_string());
     }
@@ -813,34 +844,200 @@ pub fn replayed_log_entry_json(
 pub type LoggedResults = BTreeMap<String, (FileResult, u64, String, f64)>;
 
 /// Latest logged result per selector with its entry's `measured_unix`,
-/// method and threshold. Later lines (and later results within a line)
-/// win. A missing log is empty.
+/// method and threshold, over every measurement lane in continuation order
+/// (R5-P8: `audio-level-log.jsonl`, then `audio-level-log.1.jsonl`, …).
+/// Later lanes (and later lines, and later results within a line) win. A
+/// missing log is empty.
 ///
-/// D1: the lane is chain-verified first; a log whose chain does not verify
-/// (an edited line, a torn tail) is an error — no sound/silence is ever
-/// read out of an unverified measurement log.
+/// D1/R5-P8: each lane is chain-verified; a result read from a lane whose
+/// chain does not verify carries `chain_unverified` (the reason) and is
+/// never read out as sound/silence — a later verified lane's measurement of
+/// the same record replaces it. Only a read failure is an error.
 pub fn latest_logged_results(case_dir: &Path) -> Result<LoggedResults, String> {
-    let (logged, chain_error) = read_logged_results(case_dir)?;
-    match chain_error {
-        Some(err) => Err(err),
-        None => Ok(logged),
+    Ok(read_logged_results(case_dir)?.0)
+}
+
+/// One sound-measurement lane as the reader found it (R5-P8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaneStatus {
+    /// Case-relative path (`evidence/logs/audio-level-log[.<n>].jsonl`).
+    pub rel: String,
+    /// The verification, or why the chain does not verify.
+    pub verification: Result<audit::AuditChainVerification, String>,
+}
+
+/// Every sound-measurement lane present in the case, in continuation
+/// order (R5-P8). An unreadable log directory is an error.
+pub fn lane_rels(case_dir: &Path) -> Result<Vec<String>, String> {
+    let dir = case_dir.join("evidence/logs");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("failed to list {}: {err}", dir.display())),
+    };
+    let mut lanes: Vec<(u32, String)> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to list {}: {err}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let rel = format!("evidence/logs/{name}");
+        if let Some(number) = audit::audio_level_lane_number(&rel)
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            lanes.push((number, rel));
+        }
+    }
+    lanes.sort();
+    Ok(lanes.into_iter().map(|(_, rel)| rel).collect())
+}
+
+/// Reads, verifies and parses every lane (R5-P8). Results of a lane whose
+/// chain does not verify are flagged `chain_unverified`; a read failure is
+/// an error.
+fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Vec<LaneStatus>), String> {
+    let keys = crate::audit_key::verification_keys()?;
+    let mut out: LoggedResults = BTreeMap::new();
+    let mut statuses = Vec::new();
+    for rel in lane_rels(case_dir)? {
+        let path = case_dir.join(&rel);
+        let text = match audit::read_log_locked(&path) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+        };
+        let verification = audit::verify_chained_jsonl_text(&text, &rel, &keys);
+        let chain_error = verification
+            .as_ref()
+            .err()
+            .map(|err| format!("{UNVERIFIED_ERROR}: {rel}: {err}"));
+        for (selector, (mut result, at, method, threshold)) in parse_logged_results(&text) {
+            result.chain_unverified = chain_error.clone();
+            out.insert(selector, (result, at, method, threshold));
+        }
+        statuses.push(LaneStatus { rel, verification });
+    }
+    Ok((out, statuses))
+}
+
+/// The lane new measurement entries are appended to (R5-P8): the newest
+/// lane while its chain verifies. When it does not (an edited line, a torn
+/// tail), measurement continues in a NEW lane `audio-level-log.<n+1>.jsonl`
+/// whose first entry names the damaged lane and why — the damaged lane is
+/// left exactly as found (never repaired or rewritten), so nothing it holds
+/// is lost and every later measurement is still chained.
+pub fn active_lane_for_append(case_dir: &Path) -> Result<PathBuf, String> {
+    let lanes = lane_rels(case_dir)?;
+    let Some(last) = lanes.last() else {
+        return Ok(case_dir.join(LOG_REL));
+    };
+    let path = case_dir.join(last);
+    let keys = crate::audit_key::verification_keys()?;
+    let text = audit::read_log_locked(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?
+        .unwrap_or_default();
+    let Err(reason) = audit::verify_chained_jsonl_text(&text, last, &keys) else {
+        return Ok(path);
+    };
+    let number = audit::audio_level_lane_number(last).unwrap_or(0) + 1;
+    let rel = format!("evidence/logs/audio-level-log.{number}.jsonl");
+    let next = case_dir.join(&rel);
+    let marker = json!({
+        "schema_version": 1,
+        "event": "audio-level-lane-continued",
+        "logged_unix": now_unix()?,
+        "previous_lane": last,
+        "previous_lane_error": reason,
+        "note": "the previous sound-measurement lane does not verify as a chain; it is kept unchanged and its results are not shown as levels — measurement continues in this lane",
+    });
+    audit::append_chained_jsonl(&next, &marker.to_string())?;
+    Ok(next)
+}
+
+/// R5-P8: one entry for the report's audit-chain table covering every
+/// sound-measurement lane: the newest lane's verification, and — named in
+/// `detail` — every earlier lane whose chain is damaged (its results are
+/// shown as `unverified`).
+pub fn chain_summary_json(case_dir: &Path) -> Value {
+    let statuses = match read_logged_results(case_dir) {
+        Ok((_, statuses)) => statuses,
+        Err(err) => {
+            return json!({"path": LOG_REL, "status": "failed", "detail": err});
+        }
+    };
+    let Some(newest) = statuses.last() else {
+        return json!({"path": LOG_REL, "status": "absent", "entries": 0});
+    };
+    let mut details: Vec<String> = Vec::new();
+    for status in &statuses[..statuses.len() - 1] {
+        if let Err(err) = &status.verification {
+            details.push(format!(
+                "이전 측정 레인 {} 체인 손상 — 그 레인에만 있는 측정은 표시하지 않음 (unverified): {err}",
+                status.rel
+            ));
+        }
+    }
+    if statuses.len() > 1 {
+        details.push(format!(
+            "측정 레인 {}개: {}",
+            statuses.len(),
+            statuses
+                .iter()
+                .map(|status| status.rel.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let entries: usize = statuses
+        .iter()
+        .filter_map(|status| status.verification.as_ref().ok().map(|v| v.entries))
+        .sum();
+    match &newest.verification {
+        Ok(verification) => {
+            details.extend(verification.warnings.iter().cloned());
+            let damaged = statuses.iter().any(|status| status.verification.is_err());
+            json!({
+                "path": newest.rel,
+                "status": if damaged {
+                    "failed"
+                } else if verification.integrity == audit::AuditIntegrity::Keyed {
+                    "keyed"
+                } else {
+                    "structural"
+                },
+                "entries": entries,
+                "detail": details.join("; "),
+            })
+        }
+        Err(err) => {
+            details.insert(0, err.clone());
+            json!({"path": newest.rel, "status": "failed", "detail": details.join("; ")})
+        }
     }
 }
 
-/// Reads and parses the lane, reporting a chain-verification failure
-/// separately (`Ok((parsed, Some(reason)))`) from a read failure (`Err`).
-fn read_logged_results(case_dir: &Path) -> Result<(LoggedResults, Option<String>), String> {
-    let path = case_dir.join(LOG_REL);
-    let text = match audit::read_log_locked(&path) {
-        Ok(Some(text)) => text,
-        Ok(None) => return Ok((BTreeMap::new(), None)),
-        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
-    };
-    let keys = crate::audit_key::verification_keys()?;
-    let chain_error = audit::verify_chained_jsonl_text(&text, LOG_REL, &keys)
-        .err()
-        .map(|err| format!("{UNVERIFIED_ERROR}: {err}"));
-    Ok((parse_logged_results(&text), chain_error))
+/// R5-P8: what a cached `audioLevels` map depends on besides the index —
+/// every measurement lane's size and full-resolution mtime, and the
+/// verification key set (a key added, removed or retired changes which
+/// lanes verify, so a map computed under another keyring is stale).
+pub fn levels_cache_key(case_dir: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match lane_rels(case_dir) {
+        Ok(lanes) => {
+            for rel in lanes {
+                let stamp = std::fs::metadata(case_dir.join(&rel))
+                    .map(|meta| format!("{}:{:?}", meta.len(), audit::modified_nanos(&meta)))
+                    .unwrap_or_else(|err| format!("err:{err}"));
+                parts.push(format!("{rel}={stamp}"));
+            }
+        }
+        Err(err) => parts.push(format!("lanes-err:{err}")),
+    }
+    parts.push(format!(
+        "keys={}",
+        crate::audit_key::verification_fingerprint()
+    ));
+    parts.join("|")
 }
 
 /// Error prefix for a measurement log whose chain did not verify (D1).
@@ -923,6 +1120,10 @@ impl AudioLevelState {
 }
 
 fn state_from(result: &FileResult, measured: u64) -> Option<AudioLevelState> {
+    if let Some(reason) = &result.chain_unverified {
+        // D1/R5-P8: read from a lane whose chain does not verify.
+        return Some(unconfirmed_state("unverified", measured, reason));
+    }
     if result.replayed_unverified {
         // D2: never a level — say why instead.
         return Some(unconfirmed_state(
@@ -998,19 +1199,7 @@ fn unconfirmed_state(r: &'static str, measured: u64, why: &str) -> AudioLevelSta
 /// could not be trusted instead of claiming sound or silence.
 pub fn audio_levels_for_case(case_dir: &Path) -> Result<BTreeMap<String, AudioLevelState>, String> {
     let rows = read_index(case_dir)?;
-    let (logged, chain_error) = read_logged_results(case_dir)?;
-    if let Some(err) = chain_error {
-        return Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let (_, measured, _, _) = logged.get(&row.id)?;
-                Some((
-                    row.id.clone(),
-                    unconfirmed_state("unverified", *measured, &err),
-                ))
-            })
-            .collect());
-    }
+    let logged = latest_logged_results(case_dir)?;
     Ok(apply_levels(&rows, &logged))
 }
 
@@ -1024,6 +1213,14 @@ pub fn apply_levels(
         let Some((result, measured, _, _)) = logged.get(&row.id) else {
             continue;
         };
+        if result.chain_unverified.is_some() {
+            // Read from a damaged lane: its size/mtime binding is no more
+            // trustworthy than its level (R5-P8).
+            if let Some(state) = state_from(result, *measured) {
+                out.insert(row.id.clone(), state);
+            }
+            continue;
+        }
         if !measurement_is_current(row, result) {
             out.insert(
                 row.id.clone(),
@@ -1133,13 +1330,10 @@ pub fn measure_case(
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<MeasureSummary, String> {
     let rows = read_index(case_dir)?;
-    // D1: a log whose chain does not verify vouches for nothing — every
-    // target is measured again (the fresh entries are what a report may
-    // quote once the lane is repaired).
-    let logged = match read_logged_results(case_dir)? {
-        (logged, None) => logged,
-        (_, Some(_)) => BTreeMap::new(),
-    };
+    // D1/R5-P8: a result from a lane whose chain does not verify vouches
+    // for nothing — its record is measured again (into a new lane, see
+    // `active_lane_for_append`).
+    let logged = latest_logged_results(case_dir)?;
     let mut summary = MeasureSummary::default();
 
     let selected: Vec<&IndexRow> = match &options.selectors {
@@ -1181,6 +1375,7 @@ pub fn measure_case(
             && *threshold == SILENT_MAX_DBFS
             && result.result != Verdict::Error
             && !result.replayed_unverified
+            && result.chain_unverified.is_none()
             && measurement_is_current(row, result)
         {
             summary.skipped_valid += 1;
@@ -1227,12 +1422,15 @@ pub fn measure_case(
     let mut done = 0usize;
     progress(done, total);
 
+    // R5-P8: a damaged newest lane is never appended to (that refused
+    // every later measurement); a new lane continues the record.
+    let lane_path = active_lane_for_append(case_dir)?;
     let flush_entry = |entry: Value,
                        buffer: &mut Vec<FileResult>,
                        checkpoint: &mut RunCheckpoint,
                        summary: &mut MeasureSummary|
      -> Result<(), String> {
-        audit::append_chained_jsonl(&case_dir.join(LOG_REL), &entry.to_string())?;
+        audit::append_chained_jsonl(&lane_path, &entry.to_string())?;
         summary.log_entries += 1;
         let ids: Vec<&str> = buffer.iter().map(|r| r.selector.as_str()).collect();
         checkpoint.append_line(&json!({ "logged": ids }).to_string())?;
@@ -1455,6 +1653,7 @@ mod tests {
             stale: false,
             probed: true,
             audio_streams: Vec::new(),
+            raw_path: None,
         }
     }
 
@@ -1470,6 +1669,7 @@ mod tests {
             error: None,
             measured_unix: None,
             replayed_unverified: false,
+            chain_unverified: None,
         }
     }
 
@@ -1553,6 +1753,53 @@ mod tests {
         assert!(
             result.error.as_deref().unwrap().contains("오디오 트랙 수"),
             "{result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5-P3: a record whose name is not valid Unicode is stat'ed (and
+    /// probed/decoded) through its lossless path — read from the index
+    /// row's `source_path_raw_hex` — not reported "changed" because the
+    /// U+FFFD display spelling names no file.
+    #[test]
+    fn non_unicode_names_are_measured_through_the_lossless_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-audio-p3-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(crate::model::test_non_unicode_name("a"));
+        if std::fs::write(&file, b"0123456789").is_err() {
+            eprintln!("skipped: this filesystem refuses non-Unicode names");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let meta = std::fs::metadata(&file).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let json = serde_json::json!({
+            "id": "vid_1",
+            "relative_path": "a.mp4",
+            "source_path": file.to_string_lossy(),
+            "source_path_raw_hex": crate::model::path_raw_hex(&file).unwrap(),
+            "size_bytes": meta.len(),
+            "modified_unix": mtime,
+            "audio_codec": "aac",
+            "ffprobe_ok": true,
+        });
+        let r = IndexRow::from_json(&json).unwrap();
+        assert_eq!(r.os_path(), file);
+        let result = measure_row("no-such-ffmpeg", "no-such-ffprobe", &r);
+        assert_eq!(result.result, Verdict::Error);
+        assert_ne!(result.error.as_deref(), Some(CHANGED_ERROR), "{result:?}");
+        assert!(
+            result.error.as_deref().unwrap().contains("오디오 트랙 수"),
+            "the file was found and the probe step reached: {result:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1739,9 +1986,100 @@ mod tests {
             "{:?}",
             levels["vid_1"].error
         );
-        let err = latest_logged_results(&dir).unwrap_err();
-        assert!(err.starts_with(UNVERIFIED_ERROR), "{err}");
+        // R5-P8: the reader flags the lane's results instead of failing,
+        // so a later verified lane can still be read.
+        let logged = latest_logged_results(&dir).unwrap();
+        let reason = logged["vid_1"].0.chain_unverified.as_deref().unwrap();
+        assert!(reason.starts_with(UNVERIFIED_ERROR), "{reason}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5-P8: a damaged lane no longer blocks measurement forever. The next
+    /// append goes to a new lane (`audio-level-log.1.jsonl`) that names the
+    /// damage; the damaged lane is kept byte for byte, its records read
+    /// `unverified`, and a record measured again in the new lane reads its
+    /// new level. The report's chain entry names the damaged lane.
+    #[test]
+    fn damaged_lane_continues_in_a_new_lane_and_is_named() {
+        let r1 = row("vid_1");
+        let mut r2 = row("vid_2");
+        r2.source_path = "/e/vid_2.mp4".into();
+        let dir = audio_case(
+            "lanes",
+            &[log_entry_json(
+                7,
+                "ffmpeg x",
+                &[
+                    result_for(&r1, Verdict::Sound, -12.0),
+                    result_for(&r2, Verdict::Sound, -20.0),
+                ],
+            )],
+        );
+        let row2 = json!({
+            "id": "vid_2", "relative_path": "vid_2.mp4", "source_path": "/e/vid_2.mp4",
+            "size_bytes": 100, "modified_unix": 5, "sha256": "aa", "audio_codec": "aac"
+        });
+        let index = std::fs::read_to_string(dir.join("db/videos.jsonl")).unwrap();
+        std::fs::write(dir.join("db/videos.jsonl"), format!("{index}{row2}\n")).unwrap();
+        // Torn tail: before R5 every later append was refused.
+        let lane0 = dir.join(LOG_REL);
+        let mut damaged = std::fs::read(&lane0).unwrap();
+        damaged.extend_from_slice(b"{\"torn\":");
+        std::fs::write(&lane0, &damaged).unwrap();
+        assert!(audit::append_chained_jsonl_keyed(&lane0, "{\"x\":1}", None).is_err());
+        let next = active_lane_for_append(&dir).unwrap();
+        assert_eq!(next, dir.join("evidence/logs/audio-level-log.1.jsonl"));
+        assert_eq!(std::fs::read(&lane0).unwrap(), damaged, "damaged lane kept");
+        let marker = std::fs::read_to_string(&next).unwrap();
+        assert!(marker.contains("audio-level-lane-continued"), "{marker}");
+        assert!(marker.contains(LOG_REL), "{marker}");
+        // The new lane is now the append target (it verifies).
+        assert_eq!(active_lane_for_append(&dir).unwrap(), next);
+        audit::append_chained_jsonl_keyed(
+            &next,
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            None,
+        )
+        .unwrap();
+        let levels = audio_levels_for_case(&dir).unwrap();
+        assert_eq!(levels["vid_1"].r, "silent", "re-measured in the new lane");
+        assert_eq!(levels["vid_2"].r, "unverified", "only in the damaged lane");
+        assert_eq!(levels["vid_2"].max, None);
+        let summary = chain_summary_json(&dir);
+        assert_eq!(summary["path"], "evidence/logs/audio-level-log.1.jsonl");
+        assert_eq!(summary["status"], "failed", "{summary}");
+        let detail = summary["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(LOG_REL) && detail.contains("손상"),
+            "{detail}"
+        );
+        // The cache key moves with every lane (a new lane, a new append).
+        let before = levels_cache_key(&dir);
+        audit::append_chained_jsonl_keyed(
+            &next,
+            &log_entry_json(10, "ffmpeg x", &[]).to_string(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(levels_cache_key(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5-P8: the key-set fingerprint in the cache key changes when a key
+    /// is retired or added, and does not depend on order.
+    #[test]
+    fn key_set_fingerprint_tracks_retirement_and_membership() {
+        use crate::audit_key::{AuditKey, key_set_fingerprint};
+        let a = AuditKey::new("a", &[1; 32]);
+        let b = AuditKey::new("b", &[2; 32]);
+        let base = key_set_fingerprint(&[a.clone(), b.clone()]);
+        assert_eq!(base, key_set_fingerprint(&[b.clone(), a.clone()]));
+        assert_ne!(base, key_set_fingerprint(std::slice::from_ref(&a)));
+        assert_ne!(
+            base,
+            key_set_fingerprint(&[a.clone().retired_at(5), b.clone()])
+        );
+        assert_ne!(base, key_set_fingerprint(&[]));
     }
 
     /// D2: a result logged from a crash checkpoint (never re-measured) is

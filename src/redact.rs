@@ -88,6 +88,12 @@ pub const REDACTION_NOTE: &str = "path redaction applied: absolute source paths 
 /// cached (the same path appears in many records).
 pub struct Redactor {
     case_roots: Vec<PathBuf>,
+    /// R5-P6: `sanitize_filename` forms of every known root (the case
+    /// directory, registered evidence sources, scanned source folders and
+    /// the examiner's home directory). A flattened path is recognised only
+    /// by one of these prefixes (or a drive letter + `__`), never by a
+    /// fixed list of directory names.
+    flattened_roots: Vec<String>,
     cache: RefCell<HashMap<String, String>>,
     /// Resolves a candidate path (`Path::canonicalize` in production,
     /// injected by tests). Only ever called for local paths that textually
@@ -107,6 +113,37 @@ impl Redactor {
         Self::with_canonicalizer(case_dir, fs_canonicalize)
     }
 
+    /// [`Redactor::new`] with extra known roots (tests; a caller that knows
+    /// more source folders than the case records).
+    pub fn with_known_roots(case_dir: &Path, roots: &[&str]) -> Self {
+        let mut redactor = Self::new(case_dir);
+        for root in roots {
+            redactor.add_flattened_root(root);
+        }
+        redactor
+    }
+
+    /// R5-P6: registers the flattened (`sanitize_filename`) form of a root.
+    /// Roots too short to be specific (`/`, `C:\`, `/a`) are ignored — they
+    /// would match ordinary identifiers.
+    fn add_flattened_root(&mut self, root: &str) {
+        let trimmed = root.trim().trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return;
+        }
+        let flat = crate::util::sanitize_filename(trimmed);
+        let meaningful = flat.bytes().filter(|b| b.is_ascii_alphanumeric()).count();
+        if meaningful < 3 || flat.len() < 4 || !flat.starts_with('_') {
+            // Drive paths (`C__…`) are covered by the drive rule already;
+            // anything else that does not start like a flattened root is
+            // not one.
+            return;
+        }
+        if !self.flattened_roots.contains(&flat) {
+            self.flattened_roots.push(flat);
+        }
+    }
+
     /// [`Redactor::new`] with the path-resolution hook made explicit
     /// (tests count the filesystem calls a redaction pass makes).
     pub fn with_canonicalizer(case_dir: &Path, canonicalize: Canonicalize) -> Self {
@@ -120,11 +157,16 @@ impl Redactor {
         if given.has_root() && !case_roots.contains(&given) {
             case_roots.push(given);
         }
-        Self {
+        let mut redactor = Self {
             case_roots,
+            flattened_roots: Vec::new(),
             cache: RefCell::new(HashMap::new()),
             canonicalize,
+        };
+        for root in known_roots(case_dir, &redactor.case_roots) {
+            redactor.add_flattened_root(&root);
         }
+        redactor
     }
 
     /// [`redact_json_text`] with this pass's roots and cache.
@@ -246,7 +288,7 @@ impl Redactor {
         let mut copied = 0usize;
         let mut i = 0usize;
         while i < bytes.len() {
-            let Some(kind) = path_start(text, i) else {
+            let Some(kind) = path_start(text, i, &self.flattened_roots) else {
                 i += 1;
                 continue;
             };
@@ -341,7 +383,7 @@ impl Redactor {
                         // D5: an artifact named after a flattened source
                         // path (`C__Users_kim_…_proxy_….mp4`) keeps its
                         // directory but not the name.
-                        if is_sanitized_path_start(name.as_bytes()) {
+                        if is_sanitized_path_start(name.as_bytes(), &self.flattened_roots) {
                             rendered.push_str(&format!("<redacted:{}>", stable_token(&name)));
                         } else {
                             rendered.push_str(&name);
@@ -360,6 +402,47 @@ impl Redactor {
 /// report tables readable.
 fn stable_token(input: &str) -> String {
     crate::sha256::digest_bytes(input.as_bytes())[..16].to_string()
+}
+
+/// R5-P6: the host-name token a redacted report or custody statement shows
+/// (`<redacted-host:HASH>`, HASH = first 16 hex of the SHA-256 of the
+/// name) — the same token for the same host everywhere.
+pub fn host_token(host: &str) -> String {
+    format!(
+        "<redacted-host:{}>",
+        &crate::sha256::digest_bytes(host.as_bytes())[..16]
+    )
+}
+
+/// R5-P6: every root a flattened path in this case may start with — the
+/// case directory, registered evidence sources, the source folders scans
+/// recorded, and the examiner's home directory. Best effort: an unreadable
+/// source contributes nothing (the drive-letter rule still applies).
+fn known_roots(case_dir: &Path, case_roots: &[PathBuf]) -> Vec<String> {
+    let mut roots: Vec<String> = case_roots
+        .iter()
+        .map(|root| root.to_string_lossy().to_string())
+        .collect();
+    roots.extend(crate::case_db::evidence_source_paths(case_dir).unwrap_or_default());
+    if let Ok(text) = std::fs::read_to_string(case_dir.join("evidence/logs/scan-log.jsonl")) {
+        for line in text.lines() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(source) = value.get("source_path").and_then(|v| v.as_str())
+            {
+                roots.push(source.to_string());
+            }
+        }
+    }
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(var)
+            && !home.trim().is_empty()
+        {
+            roots.push(home);
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 #[derive(Clone, Copy)]
@@ -389,26 +472,27 @@ fn after_escape(bytes: &[u8], i: usize) -> bool {
         && (i < 3 || bytes[i - 3] != b'\\')
 }
 
-/// D7: punctuation that may glue a path to the preceding text
-/// (`원본경로:/home/…`, `**/home/…`, `#/mnt/…`).
-fn is_glue_punctuation(prev: Option<u8>) -> bool {
-    prev.is_some_and(|b| b":*!#".contains(&b))
+/// D7/R5-P6: punctuation that may glue a path to the preceding text —
+/// a colon (`원본경로:/home/…`) or Markdown bold (`**/home/…`). Nothing
+/// else: `#/route` (a URL fragment), `x*/2` (arithmetic) and `!/…` are not
+/// paths.
+fn is_glue_punctuation(bytes: &[u8], i: usize) -> bool {
+    match i.checked_sub(1).map(|p| bytes[p]) {
+        Some(b':') => true,
+        Some(b'*') => i >= 2 && bytes[i - 2] == b'*',
+        _ => false,
+    }
 }
 
 /// URL schemes whose whole URL is redacted (D7: `smb://`, `nfs://`, …).
 const NETWORK_URL_SCHEMES: &[&[u8]] = &[b"smb://", b"nfs://", b"afp://", b"cifs://"];
 
-/// Root directory names a `sanitize_filename`-flattened POSIX path starts
-/// with (`/home/kim` → `_home_kim`).
-const SANITIZED_POSIX_ROOTS: &[&[u8]] = &[
-    b"home", b"Users", b"Volumes", b"mnt", b"media", b"private", b"var", b"tmp", b"root", b"srv",
-    b"opt", b"data", b"run", b"net",
-];
-
-/// D5: a `sanitize_filename`-flattened absolute path starting at `rest`:
-/// `C__…` (drive), `__host_share_…` (UNC, three or more parts) or
-/// `_home_…`-style POSIX roots.
-fn is_sanitized_path_start(rest: &[u8]) -> bool {
+/// D5/R5-P6: a `sanitize_filename`-flattened absolute path starting at
+/// `rest`: `C__…` (a drive letter + `__`), or a word that begins with the
+/// flattened form of a known root (`_home_kim…` when `/home/kim` is the
+/// examiner's home or a source root, `__nas01_share…` for a registered UNC
+/// source). An ordinary identifier (`_run_id`, `__init__`) is not one.
+fn is_sanitized_path_start(rest: &[u8], roots: &[String]) -> bool {
     let word_len = rest
         .iter()
         .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
@@ -422,22 +506,12 @@ fn is_sanitized_path_start(rest: &[u8]) -> bool {
     {
         return true;
     }
-    if word.len() >= 3 && word[0] == b'_' && word[1] == b'_' && word[2].is_ascii_alphanumeric() {
-        let parts = word[2..]
-            .split(|&b| b == b'_')
-            .filter(|part| !part.is_empty())
-            .count();
-        return parts >= 3;
-    }
-    if word.first() == Some(&b'_') {
-        return SANITIZED_POSIX_ROOTS.iter().any(|root| {
-            word.len() > root.len() + 2
-                && word[1..].starts_with(root)
-                && word[1 + root.len()] == b'_'
-                && word[2 + root.len()].is_ascii_alphanumeric()
-        });
-    }
-    false
+    roots.iter().any(|root| {
+        let root = root.as_bytes();
+        word.len() >= root.len()
+            && word[..root.len()].eq_ignore_ascii_case(root)
+            && word.get(root.len()).is_none_or(|&b| b == b'_' || b == b'-')
+    })
 }
 
 /// End of a flattened path: the rest of the file-name word (a directory
@@ -455,7 +529,7 @@ fn is_terminator(b: u8) -> bool {
     b.is_ascii_whitespace() || b"\"'`<>|*?".contains(&b) || b < 0x20
 }
 
-fn path_start(text: &str, i: usize) -> Option<StartKind> {
+fn path_start(text: &str, i: usize, roots: &[String]) -> Option<StartKind> {
     let bytes = text.as_bytes();
     let prev = i.checked_sub(1).map(|p| bytes[p]);
     // A non-ASCII predecessor (Korean prose glued to a drive path) still
@@ -467,12 +541,12 @@ fn path_start(text: &str, i: usize) -> Option<StartKind> {
     let rest = &bytes[i..];
     if rest.len() >= 6
         && rest[..5].eq_ignore_ascii_case(b"file:")
-        && (loose_boundary || is_glue_punctuation(prev))
+        && (loose_boundary || is_glue_punctuation(bytes, i))
         && !is_terminator(rest[5])
     {
         return Some(StartKind::Url);
     }
-    if (loose_boundary || is_glue_punctuation(prev))
+    if (loose_boundary || is_glue_punctuation(bytes, i))
         && NETWORK_URL_SCHEMES.iter().any(|scheme| {
             rest.len() > scheme.len()
                 && rest[..scheme.len()].eq_ignore_ascii_case(scheme)
@@ -483,7 +557,7 @@ fn path_start(text: &str, i: usize) -> Option<StartKind> {
     }
     if rest.starts_with(b"\\\\")
         && prev != Some(b'\\')
-        && (loose_boundary || is_glue_punctuation(prev))
+        && (loose_boundary || is_glue_punctuation(bytes, i))
         && rest
             .get(2)
             .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'?' || b == b'.' || b >= 0x80)
@@ -503,7 +577,7 @@ fn path_start(text: &str, i: usize) -> Option<StartKind> {
     // D7: `//host/share/…` (a UNC path written with forward slashes). Not
     // after `:` — that is a URL (`https://…`).
     if rest.starts_with(b"//")
-        && (loose_boundary || matches!(prev, Some(b'*' | b'!' | b'#')))
+        && (loose_boundary || (is_glue_punctuation(bytes, i) && prev != Some(b':')))
         && rest.get(2).is_some_and(|&b| b.is_ascii_alphanumeric())
         && {
             let end = token_end(bytes, i, false);
@@ -518,7 +592,7 @@ fn path_start(text: &str, i: usize) -> Option<StartKind> {
             b != b'/' && (b.is_ascii_alphanumeric() || b"_.~-$".contains(&b) || b >= 0x80)
         })
     {
-        let strict = is_word_boundary(prev) || escaped || is_glue_punctuation(prev);
+        let strict = is_word_boundary(prev) || escaped || is_glue_punctuation(bytes, i);
         // After non-ASCII prose (`경로/home/kim`) a slash alone is too
         // common (`판독/검증`): require at least two path components.
         let after_prose = prev.is_some_and(|b| b >= 0x80) && {
@@ -532,9 +606,19 @@ fn path_start(text: &str, i: usize) -> Option<StartKind> {
     // D5: sanitize_filename-flattened paths, usually a file-name component
     // right after a directory separator.
     if (is_word_boundary(prev) || escaped || matches!(prev, Some(b'/' | b'\\')))
-        && is_sanitized_path_start(rest)
+        && is_sanitized_path_start(rest, roots)
     {
         return Some(StartKind::SanitizedPath);
+    }
+    // R5-P6: a home-relative path (`~/Videos/kim.mp4`, `~\Videos\…`)
+    // names the examiner's home as surely as an absolute one.
+    if rest.len() >= 3
+        && rest[0] == b'~'
+        && (rest[1] == b'/' || rest[1] == b'\\')
+        && !is_terminator(rest[2])
+        && (loose_boundary || is_glue_punctuation(bytes, i))
+    {
+        return Some(StartKind::Path);
     }
     None
 }
@@ -623,7 +707,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn looks_like_absolute_path(text: &str) -> bool {
-        path_start(text, 0).is_some()
+        path_start(text, 0, &[]).is_some()
     }
 
     fn temp_case(name: &str) -> PathBuf {
@@ -725,6 +809,9 @@ mod tests {
     #[test]
     fn sanitized_path_file_names_are_redacted() {
         let case_dir = temp_case("d5");
+        // R5-P6: POSIX/UNC flattened names are recognised by known roots.
+        let redactor =
+            Redactor::with_known_roots(&case_dir, &["/home/kim", "/Users/kim/", r"\\nas01\share"]);
         for name in [
             "C__Users_kim_Videos_a_mp4_proxy_1700000000.mp4",
             "D__Evidence_kim_cam1_avi_clip_17.mp4",
@@ -732,7 +819,7 @@ mod tests {
             "_Users_kim_Movies_a_mp4_thumb_3.jpg",
             "__nas01_share_kim_a_mp4_proxy_2.mp4",
         ] {
-            let out = redact_text(&format!("built {name}."), &case_dir);
+            let out = redactor.text(&format!("built {name}."));
             assert!(!out.contains("kim"), "{name} -> {out}");
             assert!(
                 out.starts_with("built <redacted:") && out.ends_with(">."),
@@ -756,6 +843,60 @@ mod tests {
         ] {
             assert_eq!(redact_text(kept, &case_dir), kept);
         }
+        let _ = fs::remove_dir_all(case_dir);
+    }
+
+    /// R5-P6: flattened names are matched against the case's KNOWN roots
+    /// (a registered evidence source here), not a fixed list of directory
+    /// names; `~/` paths and the report host are redacted; URL fragments,
+    /// arithmetic and identifiers are not paths.
+    #[test]
+    fn known_roots_tilde_paths_and_narrow_glue() {
+        let case_dir = temp_case("r5-p6");
+        crate::case_db::register_evidence_source(
+            &case_dir,
+            &crate::case_db::EvidenceSourceInput {
+                kind: "sd".into(),
+                path: PathBuf::from("/evidence/kim-sd"),
+                source_id: Some("SD1".into()),
+                write_protect: None,
+                acquisition_tool: None,
+                evidence_hash: None,
+                notes: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        let redactor = Redactor::new(&case_dir);
+        // A flattened path under a registered source whose top directory
+        // was not on the old fixed list (`/evidence` was not; mounts like
+        // it were missed).
+        let out = redactor.text("built _evidence_kim-sd_cam1_mp4_proxy_1.mp4.");
+        assert!(!out.contains("kim"), "{out}");
+        for input in ["see ~/Videos/kim/a.mp4 now", r"경로:~\Videos\kim\a.mp4"] {
+            let out = redactor.text(input);
+            assert!(!out.contains("kim"), "{input} -> {out}");
+            assert!(out.contains("<redacted:"), "{input} -> {out}");
+        }
+        for kept in [
+            "index.html#/records/vid_1",
+            "x*/2",
+            "a*/b/c",
+            "_run_id",
+            "_tmp_value",
+            "__init__",
+            "#!/route/x",
+            "ratio 1*/2",
+        ] {
+            assert_eq!(redactor.text(kept), kept, "{kept}");
+        }
+        assert_eq!(
+            super::host_token("SECRET-LAPTOP"),
+            format!(
+                "<redacted-host:{}>",
+                &crate::sha256::digest_bytes(b"SECRET-LAPTOP")[..16]
+            )
+        );
         let _ = fs::remove_dir_all(case_dir);
     }
 

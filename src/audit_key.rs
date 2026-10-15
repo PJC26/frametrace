@@ -84,7 +84,90 @@ pub fn verification_keys() -> Result<Vec<AuditKey>, String> {
             keys.push(key);
         }
     }
-    Ok(keys)
+    Ok(normalize_retired_aliases(&keys))
+}
+
+/// R5-P8: a fingerprint of the verification key set — changes whenever a
+/// key is added, removed, renamed or retired — for caches whose content
+/// depends on which entries verify (the sound-level map). It is a SHA-256
+/// over each key's id, retirement and the SHA-256 of its material, so no
+/// key material is exposed. A key-source error yields a distinct value
+/// (the error text), never the fingerprint of an empty set.
+pub fn verification_fingerprint() -> String {
+    match verification_keys() {
+        Ok(keys) => key_set_fingerprint(&keys),
+        Err(err) => format!("error:{err}"),
+    }
+}
+
+/// Pure core of [`verification_fingerprint`]: order-independent.
+pub fn key_set_fingerprint(keys: &[AuditKey]) -> String {
+    let mut parts: Vec<String> = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "{}\u{1}{:?}\u{1}{}",
+                key.id,
+                key.retired_unix,
+                crate::sha256::digest_bytes(&key.bytes)
+            )
+        })
+        .collect();
+    parts.sort();
+    crate::sha256::digest_bytes(parts.join("\u{2}").as_bytes())
+}
+
+/// R5-P7: the same key material supplied by more than one source (a
+/// `--key-source` override, the key file, the env var) is ONE key. When the
+/// keyring retired that material, every alias carries the keyring's id and
+/// retirement — otherwise a retired secret handed in again through
+/// `--key-source` (stamped `default`, not retired) would out-rank the
+/// keyring's retirement record. Order is kept; duplicates collapse.
+pub fn normalize_retired_aliases(keys: &[AuditKey]) -> Vec<AuditKey> {
+    let mut out: Vec<AuditKey> = Vec::with_capacity(keys.len());
+    for key in keys {
+        // The earliest retirement recorded for this material wins.
+        let retired = keys
+            .iter()
+            .filter(|other| other.bytes == key.bytes && other.retired_unix.is_some())
+            .min_by_key(|other| other.retired_unix);
+        let normalized = match retired {
+            Some(retired) => AuditKey {
+                id: retired.id.clone(),
+                bytes: key.bytes.clone(),
+                retired_unix: retired.retired_unix,
+            },
+            None => key.clone(),
+        };
+        if !out
+            .iter()
+            .any(|known| known.id == normalized.id && known.bytes == normalized.bytes)
+        {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+/// R5-P7: refuses an append key that the keyring has retired. Entries it
+/// signed would only fail verification later (or read as forged), so the
+/// mistake is reported now instead.
+fn refuse_retired_append_key(key: AuditKey) -> Result<AuditKey, String> {
+    refuse_retired_key(key, &keyring_keys()?)
+}
+
+/// Pure core of [`refuse_retired_append_key`] against a loaded keyring.
+fn refuse_retired_key(key: AuditKey, keyring: &[AuditKey]) -> Result<AuditKey, String> {
+    let retired = keyring
+        .iter()
+        .find(|known| known.bytes == key.bytes && known.retired_unix.is_some());
+    match retired {
+        Some(retired) => Err(format!(
+            "the configured audit key is the keyring's retired key \"{}\" — it may no longer sign audit entries; use the keyring's active key (or rotate again)",
+            retired.id
+        )),
+        None => Ok(key),
+    }
 }
 
 /// Resolves the configured append key, if any. Absent sources are not an
@@ -93,7 +176,7 @@ pub fn verification_keys() -> Result<Vec<AuditKey>, String> {
 /// degrades an intended-keyed log to unkeyed.
 pub fn configured() -> Result<Option<AuditKey>, String> {
     if let Some(key) = SOURCE_OVERRIDE.get() {
-        return Ok(Some(key.clone()));
+        return refuse_retired_append_key(key.clone()).map(Some);
     }
     if let Some(key) = keyring_active()? {
         return Ok(Some(key));
@@ -760,17 +843,33 @@ mod tests {
                 .contains("\"retired\"")
         );
 
-        // A forger holding the old key appends an entry dated after the
-        // rotation: refused under the keyring's key set.
+        // A forger holding the old key appends an entry (dated before the
+        // rotation, R5-P7: times are not trusted): nothing newer follows it,
+        // so it is never authenticated as keyed under the keyring's key set.
         let log = dir.join("audit.jsonl");
         crate::audit::append_chained_jsonl_keyed(
             &log,
-            &format!(r#"{{"kind":"forged","created_unix":{}}}"#, at + 3600),
+            &format!(r#"{{"kind":"forged","created_unix":{}}}"#, at - 3600),
             Some(&old),
         )
         .unwrap();
-        let err = crate::audit::verify_chained_jsonl_keyed(&log, &keyring.keys).unwrap_err();
-        assert!(err.contains("retired"), "{err}");
+        let verification = crate::audit::verify_chained_jsonl_keyed(&log, &keyring.keys).unwrap();
+        assert_eq!(
+            verification.integrity,
+            crate::audit::AuditIntegrity::StructuralOnly
+        );
+        assert!(
+            verification.warnings.iter().any(|w| w.contains("retired")),
+            "{:?}",
+            verification.warnings
+        );
+        // R5-P7: the retired secret handed in again (a `--key-source`
+        // override) may not sign new entries; the active key may.
+        let err = super::refuse_retired_key(old.clone(), &keyring.keys).unwrap_err();
+        assert!(err.contains("2026-Q1") && err.contains("retired"), "{err}");
+        let again = AuditKey::new("default", &[0x44; 32]);
+        assert!(super::refuse_retired_key(again, &keyring.keys).is_err());
+        assert!(super::refuse_retired_key(active.clone(), &keyring.keys).is_ok());
 
         // Pre-D15 keyring: non-active keys are retired at an unknown time.
         let legacy = dir.join("legacy-keys.json");

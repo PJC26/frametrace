@@ -17,7 +17,7 @@
 use crate::audit;
 use crate::rectime::{self, NaiveRecTime};
 use crate::tool_policy::{command_version, resolve_tool_binary};
-use crate::util::{canonicalize_display, now_unix};
+use crate::util::now_unix;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -1052,11 +1052,11 @@ pub fn plan_with_tools(
             inputs.push(not_indexed("다시 스캔할 때 원본이 사라진 영상입니다"));
             continue;
         }
-        let raw_path = row
-            .get("source_path")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let source_path = match canonicalize_display(Path::new(raw_path)) {
+        // R5-P3: the lossless path (`source_path_raw_hex` first), so a
+        // non-Unicode name resolves to its own file, not to the lossy
+        // display spelling.
+        let raw_path = crate::model::record_os_path(row).unwrap_or_default();
+        let source_path = match crate::model::canonicalize_lossless(&raw_path) {
             Ok(path) if path.is_file() => path,
             _ => {
                 inputs.push(not_indexed("원본 파일을 찾을 수 없습니다"));
@@ -3361,6 +3361,62 @@ mod tests {
         };
         let plan = plan_of(vec![a, c]);
         assert!(codes(&plan.blocking).contains(&"unknown-duration"));
+    }
+
+    /// R5-P3: the plan finds an indexed file through its lossless path
+    /// (`source_path_raw_hex`); a non-Unicode name is then refused for the
+    /// concat list with its own code, not reported as a missing file.
+    #[test]
+    fn plan_resolves_indexed_files_through_the_lossless_path() {
+        let case = std::env::temp_dir().join(format!("ft-join-p3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case);
+        std::fs::create_dir_all(case.join("db")).unwrap();
+        let odd = case.join(crate::model::test_non_unicode_name("20260910_120000_F"));
+        if std::fs::write(&odd, b"x").is_err() {
+            eprintln!("skipped: this filesystem refuses non-Unicode names");
+            let _ = std::fs::remove_dir_all(&case);
+            return;
+        }
+        let plain = case.join("20260910_120100_F.mp4");
+        std::fs::write(&plain, b"y").unwrap();
+        let rows = [
+            serde_json::json!({
+                "id": "vid_000001", "relative_path": "a.mp4",
+                "source_path": odd.to_string_lossy(),
+                "source_path_raw_hex": crate::model::path_raw_hex(&odd).unwrap(),
+            }),
+            serde_json::json!({
+                "id": "vid_000002", "relative_path": "20260910_120100_F.mp4",
+                "source_path": plain.to_string_lossy(),
+            }),
+        ];
+        let text: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        std::fs::write(case.join("db/videos.jsonl"), text).unwrap();
+        let tools = Tools {
+            ffmpeg: "no-such-ffmpeg".into(),
+            ffprobe: "no-such-ffprobe".into(),
+        };
+        let plan = plan_with_tools(
+            &case,
+            &["vid_000001".to_string(), "vid_000002".to_string()],
+            1.0,
+            &tools,
+        )
+        .unwrap();
+        assert!(
+            plan.blocking
+                .iter()
+                .all(|issue| issue.code != "not-indexed"),
+            "{:?}",
+            plan.blocking
+        );
+        let utf8 = plan
+            .blocking
+            .iter()
+            .find(|issue| issue.code == "path-not-utf8")
+            .expect("non-Unicode name is found, then refused for the concat list");
+        assert_eq!(utf8.ids, vec!["vid_000001"]);
+        let _ = std::fs::remove_dir_all(&case);
     }
 
     #[test]

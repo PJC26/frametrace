@@ -24,6 +24,28 @@ use crate::util::now_unix;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::Path;
 
+/// R5-P6: every registered evidence source path (`evidence_sources.path`),
+/// for path redaction's list of known roots. `Ok(empty)` without a db or
+/// table; an unreadable db is an error.
+pub fn evidence_source_paths(case_dir: &Path) -> Result<Vec<String>, String> {
+    let path = case_db_path(case_dir);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let conn = open_readonly_case_db(&path)?;
+    if !table_exists(&conn, "evidence_sources")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT path FROM evidence_sources ORDER BY path")
+        .map_err(|err| format!("failed to prepare evidence source query: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| format!("failed to query evidence sources: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read evidence sources: {err}"))
+}
+
 /// Where a recorded evidence hash came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashOrigin {

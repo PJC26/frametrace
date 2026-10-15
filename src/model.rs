@@ -316,6 +316,84 @@ pub fn path_from_raw_hex(raw: &str) -> Option<PathBuf> {
     }
 }
 
+/// R5-P3: the exact OS path of an indexed record (a `db/videos.jsonl` /
+/// `video_index.json` row): `source_path_raw_hex` first (the lossless
+/// form of a non-Unicode name), then the display `source_path`. Every
+/// consumer that opens, hashes, probes or identifies a record's file goes
+/// through this, so a non-Unicode name never resolves to the U+FFFD
+/// display spelling (which names no file, or another one). `None` without
+/// a usable path.
+pub fn record_os_path(record: &serde_json::Value) -> Option<PathBuf> {
+    record_os_path_from(
+        record
+            .get("source_path")
+            .and_then(serde_json::Value::as_str),
+        record
+            .get("source_path_raw_hex")
+            .and_then(serde_json::Value::as_str),
+    )
+}
+
+/// [`record_os_path`] over already-extracted fields.
+pub fn record_os_path_from(display: Option<&str>, raw_hex: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = raw_hex.and_then(path_from_raw_hex) {
+        return Some(path);
+    }
+    display.filter(|text| !text.is_empty()).map(PathBuf::from)
+}
+
+/// R5-P3: `util::canonicalize_display` without the lossy step — the
+/// Windows verbatim prefix (`\\?\`, `\\?\UNC\`) is removed on the UTF-16
+/// units, so a non-Unicode name survives canonicalization byte for byte.
+pub fn canonicalize_lossless(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    if canonical.to_str().is_some() {
+        return Ok(crate::util::strip_windows_extended_prefix(&canonical));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let units: Vec<u16> = canonical.as_os_str().encode_wide().collect();
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        let unc = wide(r"\\?\UNC\");
+        let verbatim = wide(r"\\?\");
+        let stripped: Vec<u16> = if units.starts_with(&unc) {
+            wide(r"\\")
+                .into_iter()
+                .chain(units[unc.len()..].iter().copied())
+                .collect()
+        } else if units.starts_with(&verbatim) {
+            units[verbatim.len()..].to_vec()
+        } else {
+            units
+        };
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(&stripped)))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(canonical)
+    }
+}
+
+/// R5-P3: lossless identity key of an indexed record's file — the display
+/// path, plus (after a NUL no real path contains) the raw encoding when the
+/// record carries one. Two distinct non-Unicode names that share one lossy
+/// display spelling get different keys; a UTF-8 path keeps its display key.
+pub fn record_path_key(record: &serde_json::Value) -> String {
+    let display = record
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match record
+        .get("source_path_raw_hex")
+        .and_then(serde_json::Value::as_str)
+        .filter(|raw| !raw.is_empty())
+    {
+        Some(raw) => format!("{display}\0{raw}"),
+        None => display.to_string(),
+    }
+}
+
 impl VideoRecord {
     pub fn to_json(&self) -> String {
         let source_path = self.source_path.to_string_lossy();
@@ -587,6 +665,29 @@ mod probe_summary_flat {
     }
 }
 
+/// A file name that is not valid Unicode on this platform (unix: a raw
+/// `0xff` byte; Windows: an unpaired surrogate), for R5-P3 tests. Some
+/// filesystems (APFS) refuse such names — tests creating the file skip
+/// when the create fails.
+#[cfg(test)]
+pub(crate) fn test_non_unicode_name(stem: &str) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = stem.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xff, b'.', b'm', b'p', b'4']);
+        std::ffi::OsString::from_vec(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut units: Vec<u16> = stem.encode_utf16().collect();
+        units.push(0xD800);
+        units.extend(".mp4".encode_utf16());
+        std::ffi::OsString::from_wide(&units)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProbeSummary, SourceProfile, VideoRecord};
@@ -682,5 +783,30 @@ mod tests {
         assert_eq!(parsed.source_path, record.source_path);
         assert_eq!(parsed.relative_path, record.relative_path);
         assert_eq!(parsed.probe.width, Some(1920));
+    }
+
+    /// R5-P3: the raw form wins over the lossy display path, and the
+    /// identity key separates two non-Unicode names with one display form.
+    #[test]
+    fn record_os_path_prefers_the_lossless_raw_form() {
+        let name = super::test_non_unicode_name("clip");
+        let path = std::env::temp_dir().join(&name);
+        let raw = super::path_raw_hex(&path).expect("non-unicode path has a raw form");
+        let display = path.to_string_lossy().to_string();
+        let row = serde_json::json!({"source_path": display, "source_path_raw_hex": raw});
+        assert_eq!(super::record_os_path(&row), Some(path.clone()));
+        assert_ne!(super::record_os_path(&row), Some(PathBuf::from(&display)));
+        let plain = serde_json::json!({"source_path": "/e/a.mp4"});
+        assert_eq!(
+            super::record_os_path(&plain),
+            Some(PathBuf::from("/e/a.mp4"))
+        );
+        assert_eq!(super::record_path_key(&plain), "/e/a.mp4");
+        let other =
+            super::path_raw_hex(&std::env::temp_dir().join(super::test_non_unicode_name("clip2")))
+                .unwrap();
+        let twin = serde_json::json!({"source_path": display, "source_path_raw_hex": other});
+        assert_ne!(super::record_path_key(&row), super::record_path_key(&twin));
+        assert_eq!(super::record_os_path(&serde_json::json!({})), None);
     }
 }
