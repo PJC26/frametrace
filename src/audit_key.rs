@@ -72,6 +72,10 @@ impl AuditKey {
 /// single-key file, env var, and any `--key-source` override — deduplicated
 /// on (id, material).
 pub fn verification_keys() -> Result<Vec<AuditKey>, String> {
+    #[cfg(test)]
+    if let Some(keys) = TEST_KEYS.with(|keys| keys.borrow().clone()) {
+        return Ok(normalize_retired_aliases(&keys));
+    }
     let mut keys: Vec<AuditKey> = SOURCE_OVERRIDE.get().cloned().into_iter().collect();
     let extras = keyring_keys()?
         .into_iter()
@@ -175,6 +179,10 @@ fn refuse_retired_key(key: AuditKey, keyring: &[AuditKey]) -> Result<AuditKey, S
 /// material, wrong length) is, so a misconfigured key never silently
 /// degrades an intended-keyed log to unkeyed.
 pub fn configured() -> Result<Option<AuditKey>, String> {
+    #[cfg(test)]
+    if let Some(keys) = TEST_KEYS.with(|keys| keys.borrow().clone()) {
+        return Ok(keys.into_iter().find(|key| key.retired_unix.is_none()));
+    }
     if let Some(key) = SOURCE_OVERRIDE.get() {
         return refuse_retired_append_key(key.clone()).map(Some);
     }
@@ -185,6 +193,31 @@ pub fn configured() -> Result<Option<AuditKey>, String> {
         return Ok(Some(key));
     }
     from_env()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the key set this thread's `verification_keys()` /
+    /// `configured()` return instead of the ambient sources, so consumer
+    /// tests can run "this PC holds keys" without touching the real config
+    /// or process environment ([`with_test_keys`]).
+    static TEST_KEYS: std::cell::RefCell<Option<Vec<AuditKey>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: runs `f` with `keys` as this thread's audit key set (the
+/// first non-retired key appends). An empty slice = "no keys on this PC".
+#[cfg(test)]
+pub(crate) fn with_test_keys<R>(keys: &[AuditKey], f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Vec<AuditKey>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TEST_KEYS.with(|keys| *keys.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(TEST_KEYS.with(|current| current.replace(Some(keys.to_vec()))));
+    f()
 }
 
 /// Process-wide `--key-source` override. The CLI installs it once before

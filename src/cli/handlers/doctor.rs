@@ -52,23 +52,31 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
         let mut not_verified = Vec::new();
         for log in &logs {
             match audit::verify_chained_jsonl(log) {
-                // R7-I3: a possible tail rewrite is never "verified".
-                Ok(result) if result.rewrite_not_excluded.is_some() => {
-                    println!(
-                        "audit NOT VERIFIED: {} (entries: {}): {}",
-                        log.display(),
-                        result.entries,
-                        result.rewrite_not_excluded.as_deref().unwrap_or_default()
-                    );
-                    not_verified.push(log.display().to_string());
-                }
                 Ok(result) => {
-                    println!(
-                        "audit verified: {} (entries: {}, integrity: {})",
-                        log.display(),
-                        result.entries,
-                        result.integrity.label()
-                    );
+                    // R8 P0/P2: with audit keys on this PC, a lane holding
+                    // any line not authenticated here is NOT VERIFIED.
+                    let trust = result.lane_trust();
+                    if trust.passes() {
+                        println!(
+                            "audit verified: {} (entries: {}, integrity: {}){}",
+                            log.display(),
+                            result.entries,
+                            trust.label(),
+                            if trust.reason().is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {}", trust.reason())
+                            }
+                        );
+                    } else {
+                        println!(
+                            "audit NOT VERIFIED: {} (entries: {}): {}",
+                            log.display(),
+                            result.entries,
+                            trust.reason()
+                        );
+                        not_verified.push(log.display().to_string());
+                    }
                 }
                 Err(err) => {
                     println!("audit FAILED: {}: {err}", log.display());
@@ -84,28 +92,33 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
         }
         if !not_verified.is_empty() {
             return Err(format!(
-                "{} audit log(s) could not be verified (NOT VERIFIED — not a tampering verdict, but a re-write cannot be ruled out)",
+                "{} audit log(s) could not be verified on this PC (NOT VERIFIED — lines this PC cannot authenticate; not a tampering verdict — check lines signed under another PC's key on the PC holding that key)",
                 not_verified.len()
             ));
         }
         return Ok(());
     }
     let result = audit::verify_chained_jsonl(log_path)?;
-    if let Some(reason) = &result.rewrite_not_excluded {
+    let trust = result.lane_trust();
+    if !trust.passes() {
         println!("audit NOT VERIFIED: {}", log_path.display());
         println!("entries: {}", result.entries);
         for warning in &result.warnings {
             println!("warning: {warning}");
         }
         return Err(format!(
-            "audit log {} could not be verified: {reason}",
-            log_path.display()
+            "audit log {} could not be verified on this PC: {}",
+            log_path.display(),
+            trust.reason()
         ));
     }
     println!("audit verified: {}", log_path.display());
     println!("entries: {}", result.entries);
     println!("last entry sha256: {}", result.last_entry_sha256);
-    println!("integrity: {}", result.integrity.label());
+    println!("integrity: {}", trust.label());
+    if !trust.reason().is_empty() {
+        println!("trust: {}", trust.reason());
+    }
     if result.keyed_entries > 0 {
         println!(
             "keyed entries: {} ({} unauthenticated)",
@@ -141,7 +154,9 @@ pub fn rotate_audit_key(key_id: Option<&str>, marker_logs: &[PathBuf]) -> Result
             targets.push(log.clone());
         }
     }
-    targets.dedup();
+    let targets = dedup_lanes(targets);
+    // R8-I8: which lanes hold entries but no keyed entry (before rotating).
+    let keyless: Vec<bool> = targets.iter().map(|lane| lane_is_keyless(lane)).collect();
     let rotation = crate::audit_key::rotate(key_id)?;
     println!("audit key rotated");
     println!("new key id: {}", rotation.new_key.id);
@@ -152,22 +167,106 @@ pub fn rotate_audit_key(key_id: Option<&str>, marker_logs: &[PathBuf]) -> Result
         None => println!("no previous key configured — audit keying enabled"),
     }
     println!("keyring: {}", rotation.keyring_path.display());
+    // R8-I8: without a case folder, no case gets a marker — every entry the
+    // retired key signed then reads "retired key, not proven" (and, from
+    // now on, every unauthenticated line of every case is not trusted on
+    // this PC).
+    if !marker_logs.iter().any(|log| log.is_dir()) {
+        eprintln!(
+            "warning: no case folder was given with --log — no case's lanes got the rotation marker. Entries signed by the retired key are authenticated only when a newer key's entry follows them, so existing sign-offs and measurements now read \"cannot be verified\" (re-finalize / re-measure them); when rotating, pass every case folder you keep working on: rotate-audit-key --log <case folder> (경고: --log <케이스 폴더> 없이 회전함 — 케이스 레인에 회전 표식이 없습니다)"
+        );
+    }
     for note in &skipped {
         println!("marker skipped: {note}");
     }
-    for log in &targets {
-        let marker = format!(
-            "{{\"kind\":\"audit-key-rotate\",\"from\":{},\"to\":{}}}",
-            audit::optional_string(rotation.previous_id.as_deref()),
-            audit::optional_string(Some(&rotation.new_key.id)),
-        );
-        // The marker is signed under the NEW key explicitly (the design's
-        // rotation rule), even if a --key-source override still names the
-        // old key for this process.
-        audit::append_chained_jsonl_keyed(log, &marker, Some(&rotation.new_key))?;
-        println!("marker appended: {}", log.display());
+    let failed = append_rotation_markers(
+        &targets,
+        &keyless,
+        rotation.previous_id.as_deref(),
+        &rotation.new_key,
+    );
+    if !failed.is_empty() {
+        return Err(format!(
+            "the audit key WAS rotated (new key id {}), but the rotation marker could not be appended to {} lane(s): {} — their retired-key entries stay unproven until a newer key's entry follows them",
+            rotation.new_key.id,
+            failed.len(),
+            failed.join("; ")
+        ));
     }
     Ok(())
+}
+
+/// Appends the rotation marker to every target (signed under the NEW key
+/// explicitly — the design's rotation rule — even if a --key-source
+/// override still names the old key for this process). Returns the
+/// failures.
+///
+/// R8-I10: one lane failing does not stop the others (the keyring is
+/// already rotated); every failure is reported.
+///
+/// R8-I8: a lane that held entries but no keyed entry (`keyless`), on a PC
+/// that had no key before this rotation (`previous_id` none), gets a
+/// key-INTRODUCTION marker instead: its earlier entries were written
+/// before keying (self-consistency only, never authenticated) — the case
+/// is not flipped to "every earlier line unauthenticated". A PC that
+/// already held a key never introduces keying (a lane stripped of its
+/// HMACs stays NOT VERIFIED there).
+fn append_rotation_markers(
+    targets: &[PathBuf],
+    keyless: &[bool],
+    previous_id: Option<&str>,
+    new_key: &crate::audit_key::AuditKey,
+) -> Vec<String> {
+    let mut failed: Vec<String> = Vec::new();
+    for (log, keyless) in targets.iter().zip(keyless) {
+        let marker = if *keyless && previous_id.is_none() {
+            format!(
+                "{{\"kind\":\"{}\",\"to\":{},\"note\":\"entries before this marker were written before audit keying was introduced for this lane on this PC: self-consistency only, not authenticated\"}}",
+                audit::KEY_INTRODUCED_KIND,
+                audit::optional_string(Some(&new_key.id)),
+            )
+        } else {
+            format!(
+                "{{\"kind\":\"audit-key-rotate\",\"from\":{},\"to\":{}}}",
+                audit::optional_string(previous_id),
+                audit::optional_string(Some(&new_key.id)),
+            )
+        };
+        match audit::append_chained_jsonl_keyed(log, &marker, Some(new_key)) {
+            Ok(()) => println!("marker appended: {}", log.display()),
+            Err(err) => {
+                println!("marker FAILED: {}: {err}", log.display());
+                failed.push(format!("{}: {err}", log.display()));
+            }
+        }
+    }
+    failed
+}
+
+/// R8-I10: the marker targets without duplicates — the same lane named
+/// twice (a case folder and one of its lanes, `case` and `case/`, another
+/// spelling of the path) gets ONE marker. Order is kept.
+fn dedup_lanes(targets: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    targets
+        .into_iter()
+        .filter(|lane| {
+            let key = match (lane.parent().map(fs::canonicalize), lane.file_name()) {
+                (Some(Ok(parent)), Some(name)) => parent.join(name),
+                _ => lane.clone(),
+            };
+            seen.insert(key)
+        })
+        .collect()
+}
+
+/// R8-I8: the lane holds entries and none of them carries an HMAC.
+fn lane_is_keyless(lane: &Path) -> bool {
+    audit::read_log_locked(lane)
+        .ok()
+        .flatten()
+        .and_then(|text| audit::verify_chained_jsonl_text(&text, "lane", &[]).ok())
+        .is_some_and(|result| result.entries > 0 && result.keyed_entries == 0)
 }
 
 /// R7-I6: the lanes of the case at `case_dir` that get a rotation marker:
@@ -398,11 +497,14 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
     match crate::audit_key::configured() {
         Ok(Some(key)) => checks.push(DoctorCheck::ok(
             "audit keyring",
-            format!("활성 키 '{}' — HMAC 서명 감사 사용", key.id),
+            format!(
+                "활성 키 '{}' — HMAC 서명 감사 사용 · 이 PC에서 인증되지 않은 감사 항목은 신뢰하지 않음",
+                key.id
+            ),
         )),
         Ok(None) => checks.push(DoctorCheck::warn(
             "audit keyring",
-            "키 없음 — 감사 로그가 구조 검증 전용으로 동작".into(),
+            "키 없음 — 감사 로그는 구조만 확인, 모든 확인 결과는 자기 일관성만(인증 아님)".into(),
         )),
         Err(err) => checks.push(DoctorCheck::fail(
             "audit keyring",
@@ -465,17 +567,26 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
                 );
                 match audit::verify_chained_jsonl(&path) {
                     Ok(result) => {
+                        // R8-I10: the label is the lane's trust under this
+                        // PC's policy (R7 printed `integrity-structural-only`
+                        // for a NOT VERIFIED lane).
+                        let trust = result.lane_trust();
                         let detail = format!(
-                            "{}건 · {}{}",
+                            "{}건 · {}{}{}",
                             result.entries,
-                            result.integrity.label(),
+                            trust.label(),
+                            if trust.reason().is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {}", trust.reason())
+                            },
                             if result.warnings.is_empty() {
                                 String::new()
                             } else {
                                 format!(" · {}", result.warnings.join("; "))
                             }
                         );
-                        checks.push(if result.integrity == crate::audit::AuditIntegrity::Keyed {
+                        checks.push(if trust == audit::LaneTrust::Authenticated {
                             DoctorCheck::ok(&name, detail)
                         } else {
                             DoctorCheck::warn(&name, detail)
@@ -572,6 +683,113 @@ mod tests {
         let after = audit::verify_chained_jsonl_keyed(&signoff, &keys).unwrap();
         assert_eq!(after.entry_auth[0], audit::EntryAuth::Authenticated);
         assert_eq!(fs::read(&damaged).unwrap(), damaged_before);
+        let _ = fs::remove_dir_all(&case);
+    }
+
+    fn r8_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ft-r8-doctor-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("evidence/logs")).unwrap();
+        dir
+    }
+
+    /// R8 P0/P2 for `verify-audit`: a lane stripped of its HMACs was
+    /// "audit verified" (exit 0) on a PC holding the key in R7; now it is
+    /// NOT VERIFIED (non-zero). A lane continued on another PC names that
+    /// PC's key and is not "FAILED". Without keys: verified, with the
+    /// self-consistency caveat.
+    #[test]
+    fn r8_verify_audit_trust_comes_from_keys_held() {
+        let case = r8_dir("verify");
+        let lane = case.join("evidence/logs/scan-log.jsonl");
+        audit::append_chained_jsonl_keyed(&lane, r#"{"n":1}"#, None).unwrap();
+        let mine = AuditKey::new("pc-a", &[0xf1; 32]);
+        let other = AuditKey::new("pc-b", &[0xf2; 32]);
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let err = super::verify_audit(&lane).unwrap_err();
+            assert!(err.contains("could not be verified on this PC"), "{err}");
+            assert!(super::verify_audit(&case).is_err());
+        });
+        crate::audit_key::with_test_keys(&[], || {
+            assert!(super::verify_audit(&lane).is_ok());
+            assert!(super::verify_audit(&case).is_ok());
+        });
+        let multi = case.join("evidence/logs/anomaly-log.jsonl");
+        audit::append_chained_jsonl_keyed(&multi, r#"{"n":1}"#, Some(&mine)).unwrap();
+        audit::append_chained_jsonl_keyed(&multi, r#"{"n":2}"#, Some(&other)).unwrap();
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let err = super::verify_audit(&multi).unwrap_err();
+            assert!(err.contains("\"pc-b\" 보유 PC에서 확인"), "{err}");
+            assert!(!err.contains("failed verification"), "{err}");
+        });
+        let _ = fs::remove_dir_all(&case);
+    }
+
+    /// R8-I10: the same lane named twice (a case folder and one of its
+    /// lanes, another spelling of the path) gets ONE marker, and one lane
+    /// failing does not stop the others — every failure is reported.
+    #[test]
+    fn r8_i10_rotation_markers_dedup_and_survive_a_failing_lane() {
+        let case = r8_dir("rotate");
+        let lane = case.join("evidence/logs/scan-log.jsonl");
+        audit::append_chained_jsonl_keyed(&lane, r#"{"n":1}"#, None).unwrap();
+        let twin = case.join("evidence/./logs/scan-log.jsonl");
+        let targets = super::dedup_lanes(vec![lane.clone(), twin, lane.clone()]);
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        // A lane whose parent is a FILE cannot be appended to.
+        let blocker = case.join("blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let bad = blocker.join("x.jsonl");
+        let new = AuditKey::new("new", &[0xf3; 32]);
+        let failed = super::append_rotation_markers(
+            &[bad.clone(), lane.clone()],
+            &[false, false],
+            Some("old"),
+            &new,
+        );
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("x.jsonl"), "{failed:?}");
+        let text = fs::read_to_string(&lane).unwrap();
+        assert!(text.contains("audit-key-rotate"), "{text}");
+        let _ = fs::remove_dir_all(&case);
+    }
+
+    /// R8-I8: enabling keying (no previous key) on a lane that held only
+    /// unkeyed entries stamps a key-INTRODUCTION marker, so the earlier
+    /// entries read self-consistency only instead of "not authenticated";
+    /// a PC that already held a key stamps the ordinary rotation marker
+    /// (a stripped lane is never "introduced" there).
+    #[test]
+    fn r8_i8_first_keying_introduces_instead_of_flipping_the_lane() {
+        let case = r8_dir("introduce");
+        let first = case.join("evidence/logs/scan-log.jsonl");
+        let second = case.join("evidence/logs/anomaly-log.jsonl");
+        for lane in [&first, &second] {
+            audit::append_chained_jsonl_keyed(lane, r#"{"n":1}"#, None).unwrap();
+        }
+        assert!(super::lane_is_keyless(&first));
+        let new = AuditKey::new("new", &[0xf4; 32]);
+        assert!(
+            super::append_rotation_markers(std::slice::from_ref(&first), &[true], None, &new)
+                .is_empty()
+        );
+        assert!(
+            super::append_rotation_markers(
+                std::slice::from_ref(&second),
+                &[true],
+                Some("old"),
+                &new
+            )
+            .is_empty()
+        );
+        let keys = std::slice::from_ref(&new);
+        let introduced = audit::verify_chained_jsonl_keyed(&first, keys).unwrap();
+        assert_eq!(introduced.pre_key_entries, 1);
+        assert!(introduced.lane_trust().passes());
+        assert!(!super::lane_is_keyless(&first));
+        let rotated = audit::verify_chained_jsonl_keyed(&second, keys).unwrap();
+        assert_eq!(rotated.pre_key_entries, 0);
+        assert!(!rotated.lane_trust().passes());
         let _ = fs::remove_dir_all(&case);
     }
 }

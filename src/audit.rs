@@ -53,7 +53,300 @@ pub struct AuditChainVerification {
     /// structurally, but the lane must never read PASS — it is NOT
     /// VERIFIED, with this reason.
     pub rewrite_not_excluded: Option<String>,
+    /// R8 P0/P1: whether this verification ran on a PC holding audit keys
+    /// ([`trust_policy`] of the key set it was given). Every trust decision
+    /// over this lane goes through [`AuditChainVerification::line_trust`] /
+    /// [`AuditChainVerification::lane_trust`], which read THIS — never a
+    /// signal inside the case files (lane presence, HMAC fields), which an
+    /// attacker can delete or strip.
+    pub requirement: AuthRequirement,
+    /// R8 P2: the `entry_hmac_key_id` each entry carries (`None` = no
+    /// HMAC), in line order like `entry_auth` — so "not authenticable here"
+    /// can name the key to check it with.
+    pub entry_key_ids: Vec<Option<String>>,
+    /// R8-I8: entries before this lane's authenticated key-introduction
+    /// marker (`{"kind":"audit-key-introduced"}`, signed by a key this PC
+    /// holds, the lane's FIRST keyed entry): written before audit keying
+    /// was introduced for the lane. The marker's HMAC covers the chain hash
+    /// of everything before it, so this prefix cannot be extended later —
+    /// but it was never authenticated, so it is self-consistency only.
+    pub pre_key_entries: usize,
 }
+
+/// R8 §0 — THE governing rule (docs/audit-hmac-design.md "Trust policy"):
+/// whether authentication is required is decided by whether THIS PC holds
+/// audit keys. Never by anything inside the case files — a lane's
+/// presence, `entry_hmac_*` fields, a "keyed case" — because an attacker
+/// can delete or strip those to switch the requirement off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRequirement {
+    /// P0: this PC holds audit keys. Nothing that is not authenticated HERE
+    /// is ever shown as trusted / current / measured / reusable.
+    Required,
+    /// P1: no audit key on this PC. Everything is self-consistency only and
+    /// every trust display says so ("자기 일관성만 확인(인증 아님)").
+    SelfConsistentOnly,
+}
+
+impl AuthRequirement {
+    pub fn keys_held(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
+/// R8 P0/P1: the trust policy for a verification key set.
+pub fn trust_policy(keys: &[AuditKey]) -> AuthRequirement {
+    if keys.is_empty() {
+        AuthRequirement::SelfConsistentOnly
+    } else {
+        AuthRequirement::Required
+    }
+}
+
+/// R8 P0/P1: this PC's trust policy and verification key set. A key source
+/// that is present but unusable is an error — callers fail closed (it is
+/// never read as "no keys", which would relax P0 to P1).
+pub fn trust_policy_here() -> Result<(AuthRequirement, Vec<AuditKey>), String> {
+    let keys = crate::audit_key::verification_keys()?;
+    Ok((trust_policy(&keys), keys))
+}
+
+/// P1 wording: what a match proves on a PC without audit keys.
+pub const SELF_CONSISTENT_NOTE: &str = "자기 일관성만 확인(인증 아님)";
+
+/// R8: what one audit entry may be relied on for, under this PC's policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineTrust {
+    /// HMAC verified here under a key this PC holds (P0 satisfied).
+    Authenticated,
+    /// P1: no audit key on this PC — self-consistency only. `key_id` names
+    /// the key the entry is HMAC-signed under, when it is.
+    SelfConsistentOnly { key_id: Option<String> },
+    /// R8-I8: written before the lane's authenticated key-introduction
+    /// marker — self-consistency only, never "authenticated".
+    PreKey,
+    /// P2: signed under a key this PC does not hold — not authenticable
+    /// here; check it on the PC holding `key_id`. Never a FAIL.
+    OtherPc { key_id: String },
+    /// P0: keys are held here and the entry is not authenticated (no HMAC —
+    /// possibly stripped — or signed only by a retired key nothing later
+    /// proves).
+    NotAuthenticated { retired_unproven: bool },
+}
+
+impl LineTrust {
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self, Self::Authenticated)
+    }
+
+    /// May the entry be shown at all as a (caveated) result? True for
+    /// authenticated and self-consistent-only entries; false for entries P0
+    /// refuses (other PC, not authenticated).
+    pub fn is_usable(&self) -> bool {
+        matches!(
+            self,
+            Self::Authenticated | Self::SelfConsistentOnly { .. } | Self::PreKey
+        )
+    }
+
+    /// One Korean sentence: why the entry is or is not relied on here.
+    pub fn note(&self) -> String {
+        match self {
+            Self::Authenticated => "이 PC의 감사 키로 인증됨".to_string(),
+            Self::SelfConsistentOnly { key_id: Some(id) } => format!(
+                "{SELF_CONSISTENT_NOTE} — 이 PC에 감사 키가 없어 HMAC을 확인하지 않음 (키 \"{id}\" 보유 PC에서 확인)"
+            ),
+            Self::SelfConsistentOnly { key_id: None } => {
+                format!("{SELF_CONSISTENT_NOTE} — 감사 키 HMAC이 없는 항목")
+            }
+            Self::PreKey => format!(
+                "{SELF_CONSISTENT_NOTE} — 감사 키 도입 이전에 기록된 항목 (키 도입 표식이 그 앞부분을 고정)"
+            ),
+            Self::OtherPc { key_id } => format!(
+                "이 PC에서 인증 불가 — 키 \"{key_id}\" 보유 PC에서 확인 (다른 PC의 키로 서명됨, 변조 판정 아님)"
+            ),
+            Self::NotAuthenticated {
+                retired_unproven: true,
+            } => "이 PC에서 인증되지 않음 — 은퇴한 감사 키로만 서명되었고 그 뒤에 현재 키 항목이 없음"
+                .to_string(),
+            Self::NotAuthenticated {
+                retired_unproven: false,
+            } => "이 PC에서 인증되지 않음 — 감사 키가 있는 PC에서 HMAC 없는 항목은 믿지 않음 (HMAC이 제거됐거나 키 없이 추가된 항목일 수 있음)"
+                .to_string(),
+        }
+    }
+}
+
+/// R8: what a whole lane may be relied on for, under this PC's policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneTrust {
+    /// P0 satisfied: keys held, every entry authenticated here.
+    Authenticated,
+    /// P1 (no keys here), or keys held with every entry authenticated
+    /// except the R8-I8 pre-key prefix: structure verified, self-consistency
+    /// only (the text says what).
+    SelfConsistentOnly(String),
+    /// P0/P2: keys held and at least one entry is not authenticated here.
+    /// NOT VERIFIED — never PASS, and never FAIL (a FAIL needs a key this
+    /// PC holds to refute an entry, which is a verification error).
+    NotVerified {
+        reason: String,
+        /// P2: the keys the unauthenticable entries name — "check on the
+        /// PC holding key <id>".
+        other_pc_key_ids: Vec<String>,
+    },
+}
+
+impl LaneTrust {
+    /// The report's chain status word.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Authenticated => "keyed",
+            Self::SelfConsistentOnly(_) => "structural",
+            Self::NotVerified { .. } => "not-verified",
+        }
+    }
+
+    /// The stable label `verify-audit`, doctor, custody and the server print.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Authenticated => AuditIntegrity::Keyed.label(),
+            Self::SelfConsistentOnly(_) => AuditIntegrity::StructuralOnly.label(),
+            Self::NotVerified { .. } => "integrity-not-verified",
+        }
+    }
+
+    /// A lane check may PASS (possibly with the self-consistency caveat).
+    pub fn passes(&self) -> bool {
+        !matches!(self, Self::NotVerified { .. })
+    }
+
+    /// The caveat / reason text (empty when authenticated).
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Authenticated => "",
+            Self::SelfConsistentOnly(text) => text,
+            Self::NotVerified { reason, .. } => reason,
+        }
+    }
+}
+
+impl AuditChainVerification {
+    /// R8: the trust of audit line `index + 1` under this PC's policy.
+    pub fn line_trust(&self, index: usize) -> LineTrust {
+        let key_id = self.entry_key_ids.get(index).cloned().flatten();
+        if self.requirement == AuthRequirement::SelfConsistentOnly {
+            return LineTrust::SelfConsistentOnly { key_id };
+        }
+        match self.entry_auth.get(index) {
+            Some(EntryAuth::Authenticated) => LineTrust::Authenticated,
+            Some(EntryAuth::UnknownKey) => LineTrust::OtherPc {
+                key_id: key_id.unwrap_or_default(),
+            },
+            Some(EntryAuth::RetiredUnproven) => LineTrust::NotAuthenticated {
+                retired_unproven: true,
+            },
+            Some(EntryAuth::Unkeyed) if index < self.pre_key_entries => LineTrust::PreKey,
+            Some(EntryAuth::Unkeyed | EntryAuth::NoKey) | None => LineTrust::NotAuthenticated {
+                retired_unproven: false,
+            },
+        }
+    }
+
+    /// R8: the trust of the whole lane under this PC's policy — the one
+    /// mapping every lane consumer (verify-audit, verify-package, the
+    /// report's chain table, custody, doctor, the workstation audit API)
+    /// uses.
+    pub fn lane_trust(&self) -> LaneTrust {
+        let mut other_pc: std::collections::BTreeMap<String, usize> = Default::default();
+        let (mut unkeyed, mut retired, mut pre_key, mut authenticated) = (0, 0, 0, 0);
+        let mut signed_ids: std::collections::BTreeSet<String> = Default::default();
+        for index in 0..self.entries {
+            match self.line_trust(index) {
+                LineTrust::Authenticated => authenticated += 1,
+                LineTrust::SelfConsistentOnly { key_id } => signed_ids.extend(key_id),
+                LineTrust::PreKey => pre_key += 1,
+                LineTrust::OtherPc { key_id } => *other_pc.entry(key_id).or_default() += 1,
+                LineTrust::NotAuthenticated {
+                    retired_unproven: true,
+                } => retired += 1,
+                LineTrust::NotAuthenticated {
+                    retired_unproven: false,
+                } => unkeyed += 1,
+            }
+        }
+        let quoted = |ids: Vec<&String>| {
+            ids.iter()
+                .map(|id| format!("\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if self.requirement == AuthRequirement::SelfConsistentOnly {
+            let mut text = format!(
+                "{SELF_CONSISTENT_NOTE}: 이 PC에 감사 키가 없어 HMAC을 확인하지 않았습니다 — 구조(해시 체인)만 확인되어, 케이스 폴더를 가진 누구나 레인 전체를 다시 계산할 수 있습니다"
+            );
+            if !signed_ids.is_empty() {
+                text.push_str(&format!(
+                    " (HMAC 항목은 키 {} 보유 PC에서 확인)",
+                    quoted(signed_ids.iter().collect())
+                ));
+            }
+            return LaneTrust::SelfConsistentOnly(text);
+        }
+        if self.entries == 0 {
+            return LaneTrust::SelfConsistentOnly("항목 없음 — 인증할 항목이 없습니다".to_string());
+        }
+        let other_total: usize = other_pc.values().sum();
+        let not_here = unkeyed + retired + other_total;
+        if not_here == 0 && self.rewrite_not_excluded.is_none() {
+            if pre_key == 0 && authenticated == self.entries {
+                return LaneTrust::Authenticated;
+            }
+            return LaneTrust::SelfConsistentOnly(format!(
+                "감사 키 도입 이전 항목 {pre_key}개는 {SELF_CONSISTENT_NOTE} — 그 뒤 {authenticated}개는 이 PC의 감사 키로 인증됨 ({}번째 줄의 키 도입 표식이 앞부분을 고정)",
+                pre_key + 1
+            ));
+        }
+        let mut parts = vec![format!(
+            "이 PC에서 인증되지 않은 줄 {not_here}개 (전체 {}개 중) — NOT VERIFIED: 이 PC에 감사 키가 있으면 인증되지 않은 줄은 신뢰하지 않습니다",
+            self.entries
+        )];
+        if unkeyed > 0 {
+            parts.push(format!(
+                "HMAC 없는 줄 {unkeyed}개 (HMAC이 제거됐거나 키 없이 추가됐을 수 있음)"
+            ));
+        }
+        if retired > 0 {
+            parts.push(format!(
+                "은퇴한 키로만 서명되고 이후 현재 키 항목이 없는 줄 {retired}개"
+            ));
+        }
+        if other_total > 0 {
+            parts.push(format!(
+                "다른 PC 키로 서명된 줄 {other_total}개 — 이 PC에서 인증 불가, 키 {} 보유 PC에서 확인 (변조 판정 아님)",
+                quoted(other_pc.keys().collect())
+            ));
+        }
+        if pre_key > 0 {
+            parts.push(format!(
+                "감사 키 도입 이전 항목 {pre_key}개는 {SELF_CONSISTENT_NOTE}"
+            ));
+        }
+        if let Some(reason) = &self.rewrite_not_excluded {
+            parts.push(reason.clone());
+        }
+        LaneTrust::NotVerified {
+            reason: parts.join("; "),
+            other_pc_key_ids: other_pc.into_keys().collect(),
+        }
+    }
+}
+
+/// R8-I8: the `kind` of the marker `rotate-audit-key --log <case>` signs
+/// into a lane that holds entries but no keyed entry yet (instead of the
+/// rotation marker): the entries before it were written before audit
+/// keying was introduced for the lane.
+pub const KEY_INTRODUCED_KIND: &str = "audit-key-introduced";
 
 /// R6-I2/I3/I4: the keyed-layer result of one chained entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,32 +884,14 @@ pub fn verify_chained_jsonl_text(
     // line after it (line, key id) — a possible tail rewrite.
     let mut first_authenticated: Option<usize> = None;
     let mut unknown_after_authenticated: Vec<(usize, String)> = Vec::new();
-    // R7-I4: the legacy shared id `"default"` names no particular key (every
-    // PC defaulted to it). It is bound to a key only when one of THIS log's
-    // "default" entries verifies under a key this PC holds; then a
-    // "default" entry no key verifies is a forgery, otherwise it is an
-    // entry from another PC's "default" key (not verifiable here).
-    let legacy_default_bound = !keys.is_empty()
-        && text.contains("\"entry_hmac_key_id\":\"default\"")
-        && lines.iter().any(|line| {
-            extract_json_string(line, "entry_hmac_key_id").as_deref()
-                == Some(crate::audit_key::LEGACY_DEFAULT_KEY_ID)
-                && match (
-                    extract_json_string(line, "entry_hmac_sha256"),
-                    entry_without_recorded_hash(line),
-                ) {
-                    (Some(recorded), Some(signed)) => {
-                        let tag = decode_hex_tag(&recorded).unwrap_or([0xff; 32]);
-                        keys.iter().any(|key| {
-                            crate::hmac::tags_equal(
-                                &crate::hmac::hmac_sha256(&key.bytes, signed.as_bytes()),
-                                &tag,
-                            )
-                        })
-                    }
-                    _ => false,
-                }
-        });
+    // R8 P2: the key id each entry names, for "check on the PC holding it".
+    let mut entry_key_ids: Vec<Option<String>> = Vec::with_capacity(lines.len());
+    // R7-I4 / R8-I7: the legacy shared id `"default"` names no particular
+    // key (every PC defaulted to it). A "default" entry a key held here
+    // verifies is authenticated; one no held key verifies is ANOTHER PC's
+    // "default" key (not authenticable here) — never a FAIL, even when other
+    // "default" entries of the same log verify here (a log continued on two
+    // PCs that both used the shared default id holds both).
 
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
@@ -720,9 +995,10 @@ pub fn verify_chained_jsonl_text(
                             )
                         })
                         .collect();
-                    let held_here = keys.iter().any(answers)
-                        || (key_id == crate::audit_key::LEGACY_DEFAULT_KEY_ID
-                            && legacy_default_bound);
+                    // R8 P2: only a key this PC holds AND that the entry
+                    // names can refute it (FAIL); `key_answers_to` never
+                    // binds the legacy "default" id to a key.
+                    let held_here = keys.iter().any(answers);
                     if matching.is_empty() && !held_here {
                         // R6-I4: signed under a key this PC does not hold
                         // (another workstation's key, a key removed from
@@ -814,10 +1090,42 @@ pub fn verify_chained_jsonl_text(
             }
         }
 
+        entry_key_ids.push(
+            (entry_auth.last() != Some(&EntryAuth::Unkeyed))
+                .then(|| extract_json_string(line, "entry_hmac_key_id"))
+                .flatten(),
+        );
         previous_entry_sha256 = sha256::digest_bytes(line.as_bytes());
         last_entry_sha256 = recorded_entry_hash(line).unwrap_or_else(|| last_entry_sha256.clone());
         entries += 1;
     }
+    // R8-I8: the lane's first keyed entry is an authenticated
+    // key-introduction marker → the unkeyed entries before it predate
+    // keying (self-consistency only, see `pre_key_entries`). Evaluated
+    // after the retired-key fix-up below has run (see its call site).
+    let pre_key_of = |entry_auth: &[EntryAuth]| match entry_auth
+        .iter()
+        .position(|auth| *auth != EntryAuth::Unkeyed)
+    {
+        Some(first)
+            if first > 0
+                && !keys.is_empty()
+                && entry_auth[first] == EntryAuth::Authenticated
+                && serde_json::from_str::<serde_json::Value>(lines[first])
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some(KEY_INTRODUCED_KIND) =>
+        {
+            first
+        }
+        _ => 0,
+    };
 
     // Log-level mark per the design's verification matrix.
     let mut warnings = Vec::new();
@@ -837,7 +1145,7 @@ pub fn verify_chained_jsonl_text(
     // same rewriter.
     let rewrite_not_excluded = unknown_after_authenticated.first().map(|(line, key_id)| {
         format!(
-            "이 PC에 없는 키 — 재작성 배제 불가: audit line {line} (and {} more) is signed under key id \"{key_id}\" that this PC does not hold, after audit line {} that this PC authenticated — the log's tail may have been re-written under an invented key id; NOT VERIFIED (check it on the PC that holds that key)",
+            "이 PC에 없는 키 — 재작성 배제 불가 (이 PC에서 인증 불가 — 키 \"{key_id}\" 보유 PC에서 확인): audit line {line} (and {} more) is signed under key id \"{key_id}\" that this PC does not hold, after audit line {} that this PC authenticated — another PC may have continued the log, or the tail was re-written under an invented key id; NOT VERIFIED here (check it on the PC that holds that key)",
             unknown_after_authenticated.len() - 1,
             first_authenticated.unwrap_or(0)
         )
@@ -905,6 +1213,7 @@ pub fn verify_chained_jsonl_text(
         integrity = AuditIntegrity::Keyed;
     }
 
+    let pre_key_entries = pre_key_of(&entry_auth);
     Ok(AuditChainVerification {
         entries,
         last_entry_sha256,
@@ -914,6 +1223,9 @@ pub fn verify_chained_jsonl_text(
         warnings,
         entry_auth,
         rewrite_not_excluded,
+        requirement: trust_policy(keys),
+        entry_key_ids,
+        pre_key_entries,
     })
 }
 
@@ -2006,14 +2318,32 @@ mod tests {
         append_chained_jsonl_keyed(&own, r#"{"kind":"two"}"#, Some(&mine_old)).unwrap();
         let verification = verify_chained_jsonl_keyed(&own, std::slice::from_ref(&mine)).unwrap();
         assert_eq!(verification.integrity, AuditIntegrity::Keyed);
-        // ...and a forged "default" line in it is still a FAIL.
+        // R8-I7: a "default" line in it that no held key verifies is
+        // ANOTHER PC's legacy "default" key (a log two PCs continued) — not
+        // authenticable here, never a FAIL; the lane is NOT VERIFIED (P0)
+        // and names the key to check it with (P2).
         let text = read_to_string(&own).unwrap();
         let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
         let start = lines[1].find("\"entry_hmac_sha256\":\"").unwrap() + 21;
         lines[1].replace_range(start..start + 64, &"0".repeat(64));
         let forged = format!("{}\n", lines.join("\n"));
-        let err = verify_chained_jsonl_text(&forged, "t", std::slice::from_ref(&mine)).unwrap_err();
-        assert!(err.contains("HMAC verification failed"), "{err}");
+        let mixed = verify_chained_jsonl_text(&forged, "t", std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(
+            mixed.entry_auth,
+            [EntryAuth::Authenticated, EntryAuth::UnknownKey]
+        );
+        assert_eq!(
+            mixed.line_trust(1),
+            super::LineTrust::OtherPc {
+                key_id: "default".to_string()
+            }
+        );
+        let trust = mixed.lane_trust();
+        assert!(!trust.passes(), "{trust:?}");
+        assert!(
+            trust.reason().contains("\"default\" 보유 PC에서 확인"),
+            "{trust:?}"
+        );
         // A fingerprint id names exactly that material.
         let fp = dir.join("fp.jsonl");
         append_chained_jsonl_keyed(
@@ -2082,6 +2412,156 @@ mod tests {
         let edited = good.replacen("\"n\":1", "\"n\":9", 1);
         let first_len = good.find('\n').unwrap() + 1;
         assert_eq!(super::verified_prefix(&edited, &[]), (1, first_len));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn r8_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ft-audit-r8-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// R8 P0/P1: whether a lane must be authenticated comes from THIS PC
+    /// holding keys. A keyed lane re-chained with every HMAC stripped is a
+    /// valid chain — R7 graded it "structural" (a PASS) on a PC holding the
+    /// key; now it is NOT VERIFIED there, and only self-consistency on a PC
+    /// without keys.
+    #[test]
+    fn r8_stripped_lane_is_never_trusted_where_keys_are_held() {
+        use super::{AuthRequirement, LaneTrust, LineTrust};
+        let dir = r8_dir("strip");
+        let mine = test_key("mine", 0x71);
+        let genuine = dir.join("genuine.jsonl");
+        let stripped = dir.join("stripped.jsonl");
+        for body in [r#"{"kind":"one"}"#, r#"{"kind":"two"}"#] {
+            append_chained_jsonl_keyed(&genuine, body, Some(&mine)).unwrap();
+            append_chained_jsonl_keyed(&stripped, body, None).unwrap();
+        }
+        let keys = std::slice::from_ref(&mine);
+        let ok = verify_chained_jsonl_keyed(&genuine, keys).unwrap();
+        assert_eq!(ok.lane_trust(), LaneTrust::Authenticated);
+        let v = verify_chained_jsonl_keyed(&stripped, keys).unwrap();
+        assert_eq!(v.requirement, AuthRequirement::Required);
+        assert_eq!(
+            v.line_trust(0),
+            LineTrust::NotAuthenticated {
+                retired_unproven: false
+            }
+        );
+        let trust = v.lane_trust();
+        assert!(!trust.passes(), "{trust:?}");
+        assert_eq!(trust.status(), "not-verified");
+        assert!(trust.reason().contains("HMAC 없는 줄 2개"), "{trust:?}");
+        // P1: on a PC without keys the same lane is self-consistency only.
+        let keyless = verify_chained_jsonl_keyed(&stripped, &[]).unwrap();
+        assert_eq!(keyless.requirement, AuthRequirement::SelfConsistentOnly);
+        let trust = keyless.lane_trust();
+        assert!(trust.passes());
+        assert!(trust.reason().contains("자기 일관성만 확인(인증 아님)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R8 P2: a lane continued on another PC (its own key) is NOT VERIFIED
+    /// on each PC — never a FAIL — and names the key to check the other
+    /// lines with, on both PCs.
+    #[test]
+    fn r8_multi_pc_lane_is_not_authenticable_here_never_failed() {
+        use super::LineTrust;
+        let dir = r8_dir("multi");
+        let a = test_key(&crate::audit_key::fingerprint_id(&[0x73; 32]), 0x73);
+        let b = test_key(&crate::audit_key::fingerprint_id(&[0x74; 32]), 0x74);
+        let lane = dir.join("lane.jsonl");
+        append_chained_jsonl_keyed(&lane, r#"{"kind":"a"}"#, Some(&a)).unwrap();
+        append_chained_jsonl_keyed(&lane, r#"{"kind":"b"}"#, Some(&b)).unwrap();
+        for (here, other, other_line) in [(&a, &b, 1usize), (&b, &a, 0usize)] {
+            let v = verify_chained_jsonl_keyed(&lane, std::slice::from_ref(here)).unwrap();
+            assert_eq!(
+                v.line_trust(other_line),
+                LineTrust::OtherPc {
+                    key_id: other.id.clone()
+                }
+            );
+            let trust = v.lane_trust();
+            assert!(!trust.passes(), "{trust:?}");
+            assert!(
+                trust
+                    .reason()
+                    .contains(&format!("\"{}\" 보유 PC에서 확인", other.id)),
+                "{trust:?}"
+            );
+            match trust {
+                super::LaneTrust::NotVerified {
+                    other_pc_key_ids, ..
+                } => assert_eq!(other_pc_key_ids, std::slice::from_ref(&other.id)),
+                other => panic!("{other:?}"),
+            }
+        }
+        // A PC holding both keys authenticates the whole lane.
+        let both = verify_chained_jsonl_keyed(&lane, &[a, b]).unwrap();
+        assert_eq!(both.lane_trust(), super::LaneTrust::Authenticated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// R8-I8: entries before a lane's authenticated key-introduction marker
+    /// (its first keyed entry) are self-consistency only — not "forged" —
+    /// and that prefix cannot be manufactured: a marker this PC did not
+    /// sign, a rotation marker, or an earlier keyed entry introduces
+    /// nothing, and a line slipped in before the marker breaks the chain.
+    #[test]
+    fn r8_i8_key_introduction_marker_bounds_the_pre_key_prefix() {
+        use super::{LaneTrust, LineTrust};
+        let dir = r8_dir("prekey");
+        let mine = test_key("mine", 0x75);
+        let other = test_key("other-pc", 0x76);
+        let introduced = format!(r#"{{"kind":"{}","to":"mine"}}"#, super::KEY_INTRODUCED_KIND);
+        let lane = dir.join("lane.jsonl");
+        append_chained_jsonl_keyed(&lane, r#"{"kind":"old1"}"#, None).unwrap();
+        append_chained_jsonl_keyed(&lane, r#"{"kind":"old2"}"#, None).unwrap();
+        append_chained_jsonl_keyed(&lane, &introduced, Some(&mine)).unwrap();
+        append_chained_jsonl_keyed(&lane, r#"{"kind":"new"}"#, Some(&mine)).unwrap();
+        let v = verify_chained_jsonl_keyed(&lane, std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(v.pre_key_entries, 2);
+        assert_eq!(v.line_trust(0), LineTrust::PreKey);
+        assert_eq!(v.line_trust(3), LineTrust::Authenticated);
+        let trust = v.lane_trust();
+        assert!(
+            matches!(&trust, LaneTrust::SelfConsistentOnly(why) if why.contains("도입 이전 항목 2개")),
+            "{trust:?}"
+        );
+        // Another PC (not holding `mine`): no pre-key prefix there.
+        let there = verify_chained_jsonl_keyed(&lane, std::slice::from_ref(&other)).unwrap();
+        assert_eq!(there.pre_key_entries, 0);
+        assert!(!there.lane_trust().passes());
+        // A line inserted before the marker breaks the chain.
+        let text = read_to_string(&lane).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        let first = lines[0].to_string();
+        lines.insert(1, &first);
+        let spliced = format!("{}\n", lines.join("\n"));
+        assert!(
+            super::verify_chained_jsonl_text(&spliced, "t", std::slice::from_ref(&mine)).is_err()
+        );
+        // A rotation marker (not an introduction) introduces nothing.
+        let rotated = dir.join("rotated.jsonl");
+        append_chained_jsonl_keyed(&rotated, r#"{"kind":"old"}"#, None).unwrap();
+        append_chained_jsonl_keyed(
+            &rotated,
+            r#"{"kind":"audit-key-rotate","from":null,"to":"mine"}"#,
+            Some(&mine),
+        )
+        .unwrap();
+        let v = verify_chained_jsonl_keyed(&rotated, std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(v.pre_key_entries, 0);
+        assert!(!v.lane_trust().passes());
+        // Nor does an introduction that is not the first keyed entry.
+        let late = dir.join("late.jsonl");
+        append_chained_jsonl_keyed(&late, r#"{"kind":"k"}"#, Some(&mine)).unwrap();
+        append_chained_jsonl_keyed(&late, r#"{"kind":"stripped"}"#, None).unwrap();
+        append_chained_jsonl_keyed(&late, &introduced, Some(&mine)).unwrap();
+        let v = verify_chained_jsonl_keyed(&late, std::slice::from_ref(&mine)).unwrap();
+        assert_eq!(v.pre_key_entries, 0);
+        assert!(!v.lane_trust().passes());
         let _ = fs::remove_dir_all(&dir);
     }
 }
