@@ -242,14 +242,19 @@ FTViewer._attach({
   // R5 U15: read-only with NOTHING held here (no draft, no edit) has nothing
   // to lose: true (the host warns, it does not ask to confirm a close).
   // R5 U6: a "busy, retry" reply (R4 B4) is waited out — retry_after_ms,
-  // up to SAVE_BUSY_RETRIES replies and SAVE_BUSY_WAIT_MS in all — instead of
-  // answering false at once.
-  async save() {
+  // up to SAVE_BUSY_RETRIES replies — instead of answering false at once.
+  // R6 U5: how long is the CALLER's choice: save({ timeoutMs }) (or
+  // save(ms)), default SAVE_CALLER_WAIT_MS (5 s), never more than
+  // SAVE_BUSY_WAIT_MS — one caller's patience no longer holds every other
+  // save() for 20 s. The indicator shows the retry count meanwhile.
+  async save(opts) {
     if (!viewerIsServed) return false;
     if (annotationsReadOnly) return !Object.keys(state.drafts).length && !state.dirtyIds.size && !conflictIds.size;
     const idle = () => localReviewIdle();
     let busyWaits = 0;
-    const busyDeadline = Date.now() + SAVE_BUSY_WAIT_MS;
+    const asked = Number(typeof opts === "number" ? opts : opts && opts.timeoutMs);
+    const budget = Math.min(SAVE_BUSY_WAIT_MS, Number.isFinite(asked) && asked >= 0 ? asked : SAVE_CALLER_WAIT_MS);
+    const busyDeadline = Date.now() + budget;
     for (let attempt = 0; attempt < 4; attempt++) {
       await whenSaveSettled();
       await whenConflictsChecked();
@@ -314,7 +319,8 @@ FTViewer._attach({
     if (!touched.length) return 0;
     // Other records' state (an unrelated open conflict) does not decide it:
     // only whether THESE records left the drafts without a conflict.
-    await FTViewer.save();
+    // This caller waits for its own answer: the longest busy budget.
+    await FTViewer.save({ timeoutMs: SAVE_BUSY_WAIT_MS });
     const conflicted = touched.filter(id => conflictIds.has(id)).length;
     if (conflicted) throw new Error(tf("attr.conflict", { n: conflicted }));
     const unsaved = touched.filter(id => state.dirtyIds.has(id) || state.drafts[id]).length;
@@ -322,6 +328,7 @@ FTViewer._attach({
     return touched.length;
   },
   liveState: () => liveStateDetail(),
+  closeWarning: () => t("close.readonlyWarn"),
   debugStats: () => ({ filterComputes: filterComputeCount, activeId: state.activeId }),
   popout: () => openPlayerWindow(),
   toast: (message, kind) => (kind === "error" ? toastError(message) : toast(message)),

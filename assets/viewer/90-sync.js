@@ -315,6 +315,7 @@ var saveFailures = 0;
 var saveBusyRetries = 0;          // consecutive "busy, retry" replies (R4 B4)
 const SAVE_BUSY_RETRIES = 10;
 const SAVE_BUSY_WAIT_MS = 20000;  // FTViewer.save(): longest total wait for "busy, retry" (R5 U6)
+const SAVE_CALLER_WAIT_MS = 5000; // FTViewer.save() default busy budget per caller (R6 U5)
 var lastReportError = "";         // R4 B7 notice shown once per text
 var saveError = "";
 var saveAuthExpired = false; // the last attempt was refused with 401 (U8)
@@ -417,8 +418,9 @@ function renderSaveState() {
   } else if (unsaved) {
     kind = "pending";
     cls = "candidate";
-    label = tf("save.pending", { n });
-    title = conflictIds.size && !state.dirtyIds.size
+    label = saveBusyRetries > 0 ? tf("save.busyRetry", { n: saveBusyRetries, max: SAVE_BUSY_RETRIES }) : tf("save.pending", { n });
+    title = saveBusyRetries > 0 ? tf("save.title.busy", { n: saveBusyRetries, max: SAVE_BUSY_RETRIES })
+      : conflictIds.size && !state.dirtyIds.size
       ? tf("save.title.conflict", { n: conflictIds.size })
       : tf("save.title.pending", { n });
     if (conflictIds.size && state.dirtyIds.size) title += " " + tf("save.title.conflict", { n: conflictIds.size });
@@ -438,6 +440,7 @@ function renderSaveState() {
     // R5 U4: the queued values could not (all) be read — say so.
     if (queueValuesState === "unreadable") title += " " + t("save.title.queueUnreadable");
     else if (queueValuesState === "truncated") title += " " + t("save.title.queueTruncated");
+    if (queueUnreadableFiles) title += " " + tf("save.title.queueUnreadableFiles", { n: queueUnreadableFiles });
   } else if (conflictChecks > 0) {
     // "saved" is never claimed before the server's conflict journal was
     // read (a queued save may have met a newer revision at drain time).
@@ -457,6 +460,10 @@ function renderSaveState() {
   saveStateEl.dataset.state = kind;
   if (queueValuesState && queuedOnServer > 0) saveStateEl.dataset.queueValues = queueValuesState;
   else delete saveStateEl.dataset.queueValues;
+  if (queueUnreadableFiles && queuedOnServer > 0) saveStateEl.dataset.queueUnreadable = String(queueUnreadableFiles);
+  else delete saveStateEl.dataset.queueUnreadable;
+  if (kind === "pending" && saveBusyRetries > 0) saveStateEl.dataset.busyRetry = String(saveBusyRetries);
+  else delete saveStateEl.dataset.busyRetry;
   saveStateEl.innerHTML = `${ftIcon(kind === "failed" || kind === "readonly" || kind === "unknown" ? "warning" : kind === "saved" ? "check" : kind === "saving" ? "spinner" : "save")}<span class="save-label"></span>`;
   saveStateEl.lastElementChild.textContent = label;
   saveStateEl.title = title;
@@ -838,8 +845,15 @@ async function fetchJsonOrNull(url) {
 // (`next_offset`, or `total`/`count`). The returned array carries
 // `truncated: true` when the server said so (`truncated`), when fewer
 // entries came back than its count, or when the page cap was hit.
+// R6 U1 (S2): the cursor is opaque — "<file seq>:<index>" (a string, so a
+// file holding more ids than one page is continued INSIDE that file), or
+// a plain number from an older server; it goes back verbatim (URL-encoded).
+// R6 U2: `unreadable` (queue files the server could not read or parse:
+// [{file, error}]) is collected over every page (once per file name) and
+// carried as `all.unreadable` — never dropped.
 async function readPagedList(get, path, pick) {
   const all = [];
+  const unreadable = new Map();
   let offset = 0;
   let after = null;
   let total = NaN;
@@ -855,12 +869,20 @@ async function readPagedList(get, path, pick) {
     }
     all.push(...items);
     if (data.truncated === true) truncated = true;
+    if (Array.isArray(data.unreadable)) {
+      for (const u of data.unreadable) {
+        const name = u && typeof u === "object" ? String(u.file || "") : String(u || "");
+        if (!unreadable.has(name)) unreadable.set(name, u);
+      }
+    } else if (Number(data.unreadable) > 0 && !unreadable.size) {
+      for (let i = 0; i < Number(data.unreadable); i++) unreadable.set("#" + i, { file: "", error: "" });
+    }
     const count = Number(data.total ?? data.count);
     if (Number.isFinite(count)) total = count;
     if (Object.prototype.hasOwnProperty.call(data, "next_after")) {
       const next = data.next_after;
-      if (next == null || String(next) === String(after)) { finished = true; break; }
-      after = next;
+      if (next == null || next === "" || String(next) === String(after)) { finished = true; break; }
+      after = String(next);
       continue;
     }
     // R4 B3/B6 as implemented: `next_offset` (null on the last page).
@@ -876,11 +898,15 @@ async function readPagedList(get, path, pick) {
   }
   if (!finished || (Number.isFinite(total) && all.length < total)) truncated = true;
   if (truncated) all.truncated = true;
+  if (unreadable.size) all.unreadable = [...unreadable.values()];
   return all;
 }
 async function loadServerConflicts(st, get = fetchJsonOrNull) {
   const mc = st && st.mark_conflicts;
-  if (!mc || !(Number(mc.count) > 0)) return 0;
+  if (!mc || !(Number(mc.count) > 0)) {
+    if (conflictsTruncated) noteConflictsTruncated(null); // none left on the server
+    return 0;
+  }
   const conflicts = await readPagedList(get, "/api/mark-conflicts", data => (Array.isArray(data.conflicts) ? data.conflicts : null));
   if (ftSignal.aborted) return 0;
   if (!conflicts) {
@@ -897,6 +923,9 @@ async function loadServerConflicts(st, get = fetchJsonOrNull) {
     }
     return loadQueueConflicts(ids, get);
   }
+  // R6 U10: a list the server cut short (or that ended below its count)
+  // is said so — the conflicts not listed are real and stay on the server.
+  noteConflictsTruncated(conflicts.truncated ? { listed: conflicts.length, total: Math.max(conflicts.length, Number(mc.count) || 0) } : null);
   const list = [];
   for (const c of conflicts) {
     if (!c || typeof c.id !== "string") continue;
@@ -919,6 +948,44 @@ async function conflictRouteMissing() {
     try { data = await res.json(); } catch (e) { return true; }
     return !data || typeof data !== "object" || !Array.isArray(data.conflicts);
   } catch (e) { return false; }
+}
+// R6 U10: { listed, total } while the last conflict list read was partial.
+var conflictsTruncated = null;
+function noteConflictsTruncated(info) {
+  conflictsTruncated = info && info.total > 0 ? info : null;
+  const text = conflictsTruncated ? tf("conflict.truncated", { m: conflictsTruncated.listed, n: conflictsTruncated.total }) : "";
+  const bar = statusNotice("conflictsTruncatedNotice", text);
+  if (bar) { bar.dataset.listed = String(conflictsTruncated.listed); bar.dataset.total = String(conflictsTruncated.total); }
+}
+// R6 U2: queue files the server could not read (GET /api/marks-pending
+// `unreadable`): their values cannot be shown — a visible notice, never a
+// silent gap (the save indicator's title says it too).
+var queueUnreadableFiles = 0;
+function noteQueueUnreadable(n) {
+  queueUnreadableFiles = Number(n) > 0 ? Number(n) : 0;
+  const bar = statusNotice("queueUnreadableNotice", queueUnreadableFiles ? tf("queue.unreadableFiles", { n: queueUnreadableFiles }) : "");
+  if (bar) bar.dataset.files = String(queueUnreadableFiles);
+}
+// One role=status line in the notices row (no button: it clears itself
+// once the condition is gone). Empty text removes it.
+function statusNotice(id, text) {
+  const old = document.getElementById(id);
+  if (!text) {
+    if (old) old.remove();
+    return null;
+  }
+  const bar = old || document.createElement("div");
+  if (!old) {
+    bar.id = id;
+    bar.className = "ft-banner";
+    bar.setAttribute("role", "status");
+    const msg = document.createElement("span");
+    msg.className = "ft-banner-msg";
+    bar.appendChild(msg);
+    noticesHost().appendChild(bar);
+  }
+  if (bar.firstChild.textContent !== text) bar.firstChild.textContent = text;
+  return bar;
 }
 var conflictsUnlistedShown = false;
 function noteConflictsUnlisted(n) {
@@ -1055,6 +1122,7 @@ async function loadServerQueue(st, get = fetchJsonOrNull) {
   // missing or failed ("unreadable"), or the list came back short
   // ("truncated"). The indicator's title names it; never a silent gap.
   queueValuesState = !items ? "unreadable" : items.truncated ? "truncated" : "";
+  noteQueueUnreadable(items && items.unreadable ? items.unreadable.length : 0);
   let shown = 0;
   if (items) {
     const serverById = serverAnnotationMap(DATA.annotations || {});
@@ -1431,8 +1499,9 @@ async function syncMarksNow() {
     for (const group of splitUnsafeBase(payload)) {
       if (group.unsafe) {
         // R5 U1: base -1 drafts in a body of their own, never downgraded.
+        // R6 U9: its failure stays its own — the ordinary edits are still
+        // sent (independently); the unsafe ids stay dirty and are retried.
         result = mergeSaveResult(result, await sendUnsafeGroup(group.body));
-        if (!result.ok) break;
         continue;
       }
       for (const part of splitByExaminer(group.body)) {
@@ -1442,7 +1511,6 @@ async function syncMarksNow() {
         if (r.legacy) saveLegacyProtocol = true;
         if (!r.ok) break;
       }
-      if (result && !result.ok) break;
     }
   } catch (error) {
     result = { ok: false, offline: true, error: t("save.offlineErr"), applied: {}, conflicts: [], queuedIds: [] };
@@ -1477,6 +1545,8 @@ async function syncMarksNow() {
     saveBusyRetries = 0;
     pendingReviewSync = state.dirtyIds.size > 0;
     if (pendingReviewSync) scheduleAutosave(AUTOSAVE_DEBOUNCE_MS);
+    // R6 U10: the listed conflicts are all decided — read the rest.
+    if (conflictsTruncated && !conflictIds.size && typeof checkServerConflicts === "function") checkServerConflicts();
     // R4 B7: saved, but the case report was not refreshed — say so once per text.
     if (result.reportError && result.reportError !== lastReportError) {
       lastReportError = result.reportError;

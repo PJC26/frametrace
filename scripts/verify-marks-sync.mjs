@@ -31,6 +31,11 @@
 //  ⑥ 30 000-record bulk "판독완료" with storage pre-filled to the quota →
 //    ceil(n/2000) POSTs, no 413, saved, exactly ONE storage-quota toast
 //  ⑦ a legacy patch-v1 body sent with fetch still lands (200 + applied)
+//  ⑯ R6 U1/U2 (S2): GET /api/marks-pending of the real server, read by the
+//    viewer's own readPagedList: one queue file of 800 ids is read in full
+//    across the page boundary (string cursor "<seq>:<idx>"), an unreadable
+//    queue file is reported. A server before S2 (numeric cursor) must at
+//    least flag the short read as truncated — reported as AWAITS track S.
 //  ⑮ R4 A1/A2: an older browser range (retired RANGES_KEY) vs a range another
 //    window stored → an ordinary conflict; i/o, a tag and a cleared mark
 //    meanwhile send nothing and never read "saved"; the server keeps its
@@ -38,7 +43,8 @@
 //
 // --pre-v10: skip the checks that need the §10.1/§10.2 server rules
 // (reported as SKIP), for a workstation built before them.
-import { mkdtempSync, rmSync, openSync, writeSync, closeSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, openSync, writeSync, closeSync, mkdirSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { randomFillSync } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -639,6 +645,43 @@ try {
   const legacyRes = await srv.postJson('/api/import-marks', { marks_json: JSON.stringify(legacy) });
   const legacyRow = await serverRow(vid1);
   check('⑦ legacy patch-v1 body: 200, applied map, value stored', legacyRes.ok === true && legacyRes.applied && typeof legacyRes.applied[vid1] === 'number' && legacyRow.row?.status === 'important' && legacyRow.row?.note === 'legacy note' && legacyRow.tags.includes('레거시'), JSON.stringify(legacyRes).slice(0, 200));
+
+  // ⑯ R6 U1/U2 ↔ S2: the real marks-pending route, read the viewer's way.
+  {
+    const qdir = join(caseDir, 'marks-pending');
+    const preexisting = existsSync(qdir);
+    mkdirSync(qdir, { recursive: true });
+    const seqName = (n) => `${String(n).padStart(32, '0')}.json`;
+    const big = join(qdir, seqName(900000001));
+    const bad = join(qdir, seqName(900000002));
+    const ids = Array.from({ length: 800 }, (_, i) => `vid_qpage_${String(i).padStart(4, '0')}`);
+    writeFileSync(big, JSON.stringify({ schema_version: 2, protocol: 'patch-v2', case_id: caseId, examiner: 'q', client_id: 'w-queue-test', exported_unix: 1,
+      base_revisions: Object.fromEntries(ids.map((id) => [id, 0])), marks: ids.map((id) => ({ id, status: 'reviewed', marked_unix: 1, note: '', examiner: 'q', tags: [], range: { in: null, out: null } })), tags: [], deleted_ids: [] }));
+    writeFileSync(bad, '{"schema_version":2,"marks":[{"id":"vid_qbroken"'); // cut short: unreadable
+    try {
+      const fnSrc = viewerBundleJs(root).match(/^async function readPagedList\([^]*?^}/m)[0];
+      const queries = [];
+      const ctx = { get: async (path) => { queries.push(path); return srv.getJson(path); } };
+      const list = await runInNewContext(fnSrc + '\nvar CONFLICT_PAGE = 500, CONFLICT_PAGES_MAX = 2000;\nreadPagedList(get, "/api/marks-pending", (d) => Array.isArray(d.entries) ? d.entries : null);', ctx);
+      const got = new Set((list || []).map((e) => e && e.id).filter((id) => id && id.startsWith('vid_qpage_')));
+      const unread = (list && list.unreadable) || [];
+      const page1 = await srv.getJson('/api/marks-pending?offset=0&limit=500');
+      const stringCursor = typeof page1.next_after === 'string';
+      check('⑯ U2: the cut-short queue file is reported unreadable (carried by the viewer\'s reader)', unread.some((u) => String(u.file || '').endsWith(seqName(900000002))), JSON.stringify(unread).slice(0, 200));
+      if (stringCursor) {
+        check('⑯ U1 (S2): 800 ids of ONE queue file read in full across the page boundary (string cursor)', got.size === 800 && !list.truncated && queries.length >= 2, `${got.size} ids, queries ${JSON.stringify(queries)}`);
+      } else {
+        // Before track S2: the numeric cursor skips the rest of that file — the
+        // viewer must not pass the short read off as the whole queue.
+        check('⑯ U1 (pre-S2 server): the short read is flagged truncated, never silent', got.size === 800 || list.truncated === true, `${got.size} ids, truncated=${list && list.truncated}`);
+        console.log(`AWAITS track S2  ⑯ full 800-id read needs the string cursor (server answered next_after=${JSON.stringify(page1.next_after)}; read ${got.size}/800)`);
+      }
+    } finally {
+      rmSync(big, { force: true });
+      rmSync(bad, { force: true });
+      if (!preexisting) rmSync(qdir, { recursive: true, force: true });
+    }
+  }
 } catch (err) {
   check('harness ran to the end', false, err && err.stack || String(err));
   console.log('--- server log (tail) ---\n' + srv.log().split('\n').slice(-25).join('\n'));

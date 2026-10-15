@@ -589,7 +589,12 @@ function renderTrack(steps, names, progress, warnings) {
     const cls = s === "done" || partial ? "done" : s === "running" ? "running" : s === "failed" ? "failed" : "";
     let extra = "";
     const ws = (warnings || []).filter(w => w && w.step === i && w.message);
-    if (s === "running" && progress && progress.total > 0) {
+    if (s === "running" && progress && progress.job_type === "raw-rehash") {
+      // R6 (S4): raw re-verification — bytes, not files.
+      const total = Number(progress.total) || 0;
+      const pct = total > 0 ? Math.min(100, Math.floor((Number(progress.done) || 0) * 100 / total)) : 0;
+      extra = `<span class="h-prog"><span class="h-bar${total > 0 ? "" : " indet"}" role="progressbar" aria-valuemin="0" aria-valuemax="100"${total > 0 ? ` aria-valuenow="${pct}"` : ""} aria-label="원본 재검증 진행률"><i${total > 0 ? ` style="width:${pct}%"` : ""}></i></span><span class="h-ptext mono num">${esc(rawRehashText(progress))}</span></span>`;
+    } else if (s === "running" && progress && progress.total > 0) {
       const pct = Math.min(100, Math.round(progress.done * 100 / progress.total));
       const eta = progress.eta_secs > 0 ? ` · 남은 시간 ${fmtEta(progress.eta_secs)}` : ` · 계산 중`;
       extra = `<span class="h-prog"><span class="h-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-label="${esc(name)} 진행률"><i style="width:${pct}%"></i></span><span class="h-ptext mono num">${progress.done.toLocaleString()}/${progress.total.toLocaleString()} (${pct}%)${eta}</span></span>`;

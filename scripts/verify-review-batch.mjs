@@ -253,6 +253,7 @@ async function unitTests() {
   Object.assign(state, { marks: {}, selectedIds: new Set(), pageSize: 100, currentPage: 1, groupBy: 'none', collapsedGroups: new Set() });
   // Exercises the paged renderer; the virtual grid has its own Playwright check.
   const grid = { state, records, recordById: new Map(records.map(r => [r.id, r])), els, t: x => x, tf, escapeHtml: x => x, groupKeyFor: () => 'group', renderCard: r => `<card>${r.id}</card>`, groupHeaderHtml: key => `<hdr>${key}</hdr>`, announceResultCount: () => {}, virtualGridEnabled: () => false, document: { body: { classList: { toggle: () => {} } } } };
+  runInNewContext(fn('indexInList'), grid); // R6 U8: renderGrid looks the active id up by its index map
   const selectedSource = source.match(/^function selectedRecord\(\).*$/m)[0];
   assert.equal(runInNewContext(selectedSource + '\nselectedRecord();', grid), records[0]);
   runInNewContext(fn('renderGrid') + '\nrenderGrid([]);', grid);
@@ -743,6 +744,100 @@ async function unitTests() {
   console.log('PASS VM unplayable gate, proxy preference, file:// fallback');
 
   await r5TrackU({ fn, source, grid, state, runInNewContext, assert, appSrc: exScript, ex, store, RK: 'ft.viewer.test.ranges', P: 'ft.draft.test.', hydrateSrc, touch });
+  await r6TrackU({ fn, source, runInNewContext, assert, ex });
+}
+
+// ---- R6 track U (docs/PLAN_R6_2026-10-15.md) ------------------------------
+async function r6TrackU({ fn, source, runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  // U1 (S2): the "<seq>:<idx>" string cursor is followed verbatim (URL-
+  // encoded) across a page boundary inside ONE file (800 ids); U2: the
+  // server's `unreadable` files are collected over the pages (once each).
+  const seen = [];
+  const items = Array.from({ length: 800 }, (_, i) => ({ id: 'q' + i, seq: 4, cursor: '4:' + i }));
+  const pg = { get: async (url) => {
+    const q = new URL(url, 'http://x').searchParams;
+    seen.push(q.has('after') ? 'a' + q.get('after') : 'o' + q.get('offset'));
+    const start = q.has('after') ? items.findIndex((e) => e.cursor === q.get('after')) + 1 : 0;
+    const page = items.slice(start, start + 500);
+    const more = start + page.length < items.length;
+    return { ok: true, count: 800, next_after: more ? page.at(-1).cursor : null, entries: page, unreadable: [{ file: '0005.json', error: 'EOF' }, { file: '0006.json', error: 'utf-8' }] };
+  } };
+  const got = await runInNewContext(fn('readPagedList') + '\nCONFLICT_PAGE=500;CONFLICT_PAGES_MAX=2000;\nreadPagedList(get, "/api/marks-pending", d => d.entries);', pg);
+  assert.ok(got.length === 800 && new Set(got.map((e) => e.id)).size === 800 && !got.truncated && JSON.stringify(seen) === '["o0","a4:499"]', 'U1: 800 ids of one file across the page boundary by string cursor: ' + JSON.stringify(seen));
+  assert.ok(Array.isArray(got.unreadable) && got.unreadable.length === 2, 'U2: unreadable queue files carried (once per file over 2 pages): ' + JSON.stringify(got.unreadable));
+  assert.ok(/noteQueueUnreadable\(items && items\.unreadable \? items\.unreadable\.length : 0\)/.test(source), 'U2: the queue load shows the unreadable files');
+  console.log('PASS VM R6 U1/U2 string cursor across a file boundary, unreadable queue files kept');
+
+  // U3: [원본 다시 가져오기] only while the server names a waiting raw
+  // (hRawReimport); a re-render keeps its in-progress state; a busy
+  // pipeline keeps it disabled (and the handler refuses).
+  const html = (expr) => runInNewContext(expr, ex);
+  runInNewContext('hRawReimport = null; hStatusBusy = false; reimportRawBusy = false;', ex);
+  assert.ok(!/data-reimport-raw/.test(html('errorHtml("raw 불일치 — 재임포트 필요: case/raw/evidence.raw")')), 'U3: an error text alone (no raw_reimport from the server) shows no reimport button');
+  runInNewContext('hRawReimport = { raw_path: "C:/case/raw/e.raw", reason: "marker mismatch", endpoint: "/api/reimport-raw" };', ex);
+  const shown = html('errorHtml("raw 불일치 — 재임포트 필요")');
+  assert.ok(/<button type="button" data-reimport-raw>원본 다시 가져오기<\/button>/.test(shown), 'U3: shown, enabled, while the server waits for the decision: ' + shown);
+  runInNewContext('reimportRawBusy = true;', ex);
+  assert.ok(/data-reimport-raw disabled aria-busy="true">다시 가져오는 중…/.test(html('errorHtml("raw 불일치")')), 'U3: a re-render while the request runs keeps "다시 가져오는 중…" (disabled, aria-busy)');
+  runInNewContext('reimportRawBusy = false; hStatusBusy = true;', ex);
+  assert.ok(/data-reimport-raw disabled title="작업이 진행 중/.test(html('errorHtml("raw 불일치")')), 'U3: disabled while a job is busy');
+  ex.__calls = [];
+  runInNewContext('askDialog = async () => true; jpost = async (u, b) => { __calls.push([u, b]); return { ok: true }; }; poll = () => {};', ex);
+  await runInNewContext('hReimportRaw(null)', ex);
+  assert.equal(ex.__calls.length, 0, 'U3: the handler refuses while busy');
+  runInNewContext('hStatusBusy = false; hRawReimport = null;', ex);
+  await runInNewContext('hReimportRaw(null)', ex);
+  assert.equal(ex.__calls.length, 0, 'U3: the handler refuses without a waiting raw');
+  console.log('PASS VM R6 U3 reimport button: only with raw_reimport, state kept across re-renders, disabled while busy');
+
+  // U4 (S ↔ U): the shell's close flush prefers hBeforeClose() — it must
+  // answer inside the shell's 5 s wait: default 4 s, the viewer's busy
+  // budget passed down (FTViewer.save({timeoutMs})), the read-only warning
+  // shown here too.
+  const asked = [];
+  const api = { save: async (opts) => { asked.push(opts); return true; }, summary: () => ({ pending: 0 }), saveState: () => 'readonly' };
+  ex.__api = api;
+  ex.__toasts = [];
+  runInNewContext('hViewerApi = () => __api; FTStore.state.viewer.mounted = true; toast = (m, k) => { __toasts.push([m, k]); };', ex);
+  const r4 = await runInNewContext('hBeforeClose()', ex);
+  assert.ok(asked.length === 1 && asked[0] && asked[0].timeoutMs > 0 && asked[0].timeoutMs < 4500, 'U4: hBeforeClose passes a busy budget below the shell\'s 5 s wait to FTViewer.save: ' + JSON.stringify(asked));
+  assert.ok(r4.ok === true && r4.pending === 0 && /판독 기록을 읽지 못한/.test(r4.warning) && ex.__toasts.some(([m, k]) => /판독 기록을 읽지 못한/.test(m) && k === 'warn'), 'U4: read-only close → ok + warning, and the warning is shown: ' + JSON.stringify([r4, ex.__toasts]));
+  runInNewContext('FTStore.state.viewer.mounted = false;', ex);
+  // Standalone pages answer too (00-host.js): same shape, prefers the viewer's own hook.
+  assert.ok(/window\.hBeforeClose = async \(timeoutMs = 4000\)/.test(source) && /!document\.documentElement\.hasAttribute\("data-ft-host"\)/.test(source), 'U4: a standalone viewer page defines window.hBeforeClose (not on the shell page)');
+  console.log('PASS VM R6 U4 hBeforeClose: prompt (4 s, budget passed down), read-only warning returned and shown');
+
+  // U5: FTViewer.save(opts) — the caller's busy budget (default 5 s), not a fixed 20 s for every caller.
+  const saveFn = source.match(/^ {2}async save\(opts\) \{[^]*?^ {2}\},/m)?.[0] || '';
+  assert.ok(/SAVE_CALLER_WAIT_MS/.test(saveFn) && /Math\.min\(SAVE_BUSY_WAIT_MS/.test(saveFn) && /const SAVE_CALLER_WAIT_MS = 5000;/.test(source), 'U5: save(opts) takes the caller\'s budget (default 5 s, capped at 20 s)');
+  assert.ok(/async save\(opts\) \{ return impl \? impl\.save\(opts\) : true; \}/.test(source), 'U5: FTViewer.save passes the options through');
+  console.log('PASS VM R6 U5 per-caller save budget');
+
+  // U9: the base -1 group's failure no longer stops the loop before the ordinary group.
+  const syncFn = fn('syncMarksNow') || '';
+  const unsafeBlock = syncFn.match(/if \(group\.unsafe\) \{[^]*?continue;\s*\}/)?.[0] || '';
+  assert.ok(unsafeBlock && !/break/.test(unsafeBlock) && !/if \(result && !result\.ok\) break;/.test(syncFn), 'U9: the unsafe body is sent independently of the ordinary edits');
+  console.log('PASS VM R6 U9 unsafe group sent independently');
+
+  // U11: the harness job's limit has a measured basis.
+  const yml = readFileSync(new URL('../.github/workflows/harnesses.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const minutes = Number((yml.match(/^    timeout-minutes: (\d+)$/m) || [])[1]);
+  assert.ok(minutes === 60, 'U11: harnesses job timeout-minutes 60, got ' + minutes);
+  assert.ok(/Measured/.test(yml) && /verify-virtual-grid/.test(yml) && /total/i.test(yml), 'U11: the measured harness durations are recorded next to the limit');
+  const sh = readFileSync(new URL('./ci-harnesses.sh', import.meta.url), 'utf8');
+  assert.ok(/durations/.test(sh), 'U11: ci-harnesses.sh prints the per-harness durations summary');
+  console.log('PASS R6 U11 harness CI limit 60 min with measured durations');
+
+  // S4 ↔ U: progress job_type "raw-rehash" (bytes) reads as raw re-verification.
+  const rh = { job_type: 'raw-rehash', done: 3 * 1024 ** 3, total: 12 * 1024 ** 3, elapsed_secs: 0, eta_secs: 0 };
+  ex.__rh = rh;
+  const rhText = runInNewContext('rawRehashText(__rh)', ex);
+  assert.ok(/^원본 재검증 3(\.0)? GB \/ 12(\.0)? GB \(25%\)$/.test(rhText), 'S4: raw-rehash progress text: ' + rhText);
+  ex.renderTrack(['done', 'running', 'pending', 'pending', 'pending'], null, rh, []);
+  const trk = ex.document.getElementById('track').innerHTML;
+  assert.ok(/원본 재검증/.test(trk) && /aria-valuenow="25"/.test(trk) && !/raw-rehash/.test(trk), 'S4: the running step shows the re-verification bar, not the raw job_type: ' + trk.slice(0, 300));
+  console.log('PASS VM R6 S4 raw-rehash progress shown as 원본 재검증');
 }
 
 // ---- R5 track U (docs/PLAN_R5_2026-10-14.md) ------------------------------
@@ -872,6 +967,8 @@ async function r5TrackU({ fn, source, grid, state, runInNewContext, assert, appS
   console.log('PASS VM R5 U15 read-only close without edits: no confirmation');
 
   // S6 ↔ U: a raw-mismatch error carries the [원본 다시 가져오기] action.
+  // (R6 U3: the button needs the server's raw_reimport — set here.)
+  runInNewContext('hRawReimport = { raw_path: "C:/case/raw/e.raw", reason: "marker mismatch", endpoint: "/api/reimport-raw" };', ex);
   const eh = runInNewContext('errorHtml("raw 불일치 — 재임포트 필요: case/raw/evidence.raw")', ex);
   assert.ok(/data-reimport-raw/.test(eh) && !/data-reimport-raw/.test(runInNewContext('errorHtml("ffmpeg not found")', ex)), 'S6: the reimport button only on a raw mismatch');
   // The button deletes the kept raw: it asks first, and sends the raw_path the

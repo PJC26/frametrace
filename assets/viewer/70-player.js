@@ -149,11 +149,17 @@ const viewerBridge = {
   },
   // markActive applies the mark and advances — the popup treats the
   // returned descriptor as the next clip to play.
+  // R6 U6: an edit the main viewer refused (read-only: the review records
+  // could not be read; nothing to undo) comes back as `refused` (the
+  // reason) on the descriptor, so the pop-out never claims "실행 취소됨"
+  // or a mark that did not happen.
   mark(status) {
+    if (refuseLockedEdit()) return bridgeRefused("locked");
     markActive(status);
     return playerDescriptor();
   },
   toggleTag(tag) {
+    if (refuseLockedEdit()) return bridgeRefused("locked");
     const id = state.activeId;
     if (id) {
       journaled(tf("journal.tag", { tag }), [id], () => toggleTag(id, tag));
@@ -163,25 +169,38 @@ const viewerBridge = {
   },
   // Ctrl+Z / Ctrl+Y in the popup share the main viewer's journal.
   undo() {
-    undoJournal();
-    return playerDescriptor();
+    return undoJournal() ? playerDescriptor() : bridgeRefused(annotationsLocked() ? "locked" : "undo");
   },
   redo() {
-    redoJournal();
-    return playerDescriptor();
+    return redoJournal() ? playerDescriptor() : bridgeRefused(annotationsLocked() ? "locked" : "redo");
   },
+  // R6 U7: the pop-out asks first whether this window still answers.
+  ping: () => ({ alive: true }),
   // R5 U8: the pop-out's frame capture goes through the viewer's common
   // POST door (viewerPost) like every other request: a 401 reads as the
   // authorization refusal (and reaches the host banner), not "offline".
   // Resolves { ok, path?, error?, auth? } — never rejects.
-  async capture(arg) {
-    try {
-      const body = arg && typeof arg === "object" ? { id: String(arg.id || "unknown"), image: String(arg.image || ""), time: String(arg.time || "") } : {};
-      const data = await viewerPost("/api/capture-frame", body);
-      return data && typeof data === "object" ? data : { ok: false, error: "?" };
-    } catch (err) {
-      return err && err.ftAuth ? { ok: false, auth: true, error: err.message } : { ok: false, offline: true, error: t("player.capOffline") };
+  // R6 U7: `arg.rid` (the pop-out's request id) makes a resend of the same
+  // capture (its reply was late) answer the first request's outcome —
+  // one frame, one file. Kept per window, so it outlives a remount.
+  capture(arg) {
+    const rid = arg && typeof arg === "object" && typeof arg.rid === "string" ? arg.rid.slice(0, 80) : "";
+    const seen = window.__ftCaptureRids || (window.__ftCaptureRids = new Map());
+    if (rid && seen.has(rid)) return seen.get(rid);
+    const run = (async () => {
+      try {
+        const body = arg && typeof arg === "object" ? { id: String(arg.id || "unknown"), image: String(arg.image || ""), time: String(arg.time || "") } : {};
+        const data = await viewerPost("/api/capture-frame", body);
+        return data && typeof data === "object" ? data : { ok: false, error: "?" };
+      } catch (err) {
+        return err && err.ftAuth ? { ok: false, auth: true, error: err.message } : { ok: false, offline: true, error: t("player.capOffline") };
+      }
+    })();
+    if (rid) {
+      seen.set(rid, run);
+      while (seen.size > 32) seen.delete(seen.keys().next().value);
     }
+    return run;
   },
   // Filtered list for the popup's quick-jump sidebar — mirrors the main
   // grid order so popup position always matches what the examiner sees.
@@ -196,6 +215,12 @@ const viewerBridge = {
     }));
   },
 };
+// The descriptor of the active record plus why the bridge did nothing.
+function bridgeRefused(why) {
+  const d = playerDescriptor();
+  const reason = why === "locked" ? t("player.refusedReadonly") : why === "undo" ? t("toast.nothingUndo") : why === "redo" ? t("toast.nothingRedo") : String(why || "");
+  return d ? { ...d, refused: reason } : { refused: reason, none: true };
+}
 window.__ftBridge = viewerBridge;
 
 // BroadcastChannel mirror of __ftBridge: a popup bound to this case keeps
@@ -220,6 +245,7 @@ if (playerChannel) {
     else if (m.type === "list") reply(viewerBridge.list());
     else if (m.type === "undo") reply(viewerBridge.undo());
     else if (m.type === "redo") reply(viewerBridge.redo());
+    else if (m.type === "ping") reply(viewerBridge.ping());
     else if (m.type === "capture") viewerBridge.capture(m.arg).then(reply);
   }, { signal: ftSignal });
   // One channel per mount: closing it on destroy() means a stale mount can
@@ -346,9 +372,10 @@ var on=listEl.querySelector(".li.on");if(on)on.scrollIntoView({block:"nearest"})
 listEl.addEventListener("click",function(e){var it=e.target.closest(".li");if(!it)return;call("focus",it.dataset.id,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});
 listEl.addEventListener("keydown",function(e){if((e.key!=="Enter"&&e.key!==" ")||e.isComposing||e.keyCode===229)return;var it=e.target.closest(".li");if(!it)return;e.preventDefault();call("focus",it.dataset.id,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});
 function nav(step,autoplay){call("navigate",step,function(r){if(!r){dead();return;}applyDesc(r.descriptor,autoplay);if(!r.moved)note(step>0?${jsLit(t("player.last"))}:${jsLit(t("player.first"))});else note("");});}
-function doMark(m){if(!cur)return;call("focus",cur.id,function(f){if(f===undefined){dead();return;}call("mark",m||null,function(d){if(d===undefined){dead();return;}applyDesc(d,true);});});}
-function doHist(op){call(op,null,function(d){if(d===undefined){dead();return;}applyDesc(d,false);note(op==="undo"?${jsLit(t("player.undone"))}:${jsLit(t("player.redone"))});});}
-function doTag(t){if(!cur)return;call("focus",cur.id,function(f){if(f===undefined){dead();return;}call("toggleTag",t,function(d){if(d===undefined){dead();return;}applyDesc(d,false);});});}
+function refused(d){if(!d||!d.refused)return false;if(!d.none)applyDesc(d,false);note(d.refused);return true;}
+function doMark(m){if(!cur)return;call("focus",cur.id,function(f){if(f===undefined){dead();return;}call("mark",m||null,function(d){if(d===undefined){dead();return;}if(refused(d))return;applyDesc(d,true);});});}
+function doHist(op){call(op,null,function(d){if(d===undefined){dead();return;}if(refused(d))return;applyDesc(d,false);note(op==="undo"?${jsLit(t("player.undone"))}:${jsLit(t("player.redone"))});});}
+function doTag(t){if(!cur)return;call("focus",cur.id,function(f){if(f===undefined){dead();return;}call("toggleTag",t,function(d){if(d===undefined){dead();return;}if(refused(d))return;applyDesc(d,false);});});}
 function skip(d){v.currentTime=Math.max(0,Math.min(v.duration||1e9,v.currentTime+d));}
 function stepRate(d){var i=RATES.indexOf(Number(rate.value));var n=RATES[Math.max(0,Math.min(RATES.length-1,(i<0?3:i)+d))];rate.value=String(n);v.playbackRate=n;}
 document.getElementById("b10").onclick=function(){skip(-10)};
@@ -366,13 +393,22 @@ if(!v.videoWidth){note(${jsLit(t("player.noVideo"))});return;}
 var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
 c.getContext("2d").drawImage(v,0,0);
 var du=c.toDataURL("image/jpeg",0.92);
-var arg={id:cur?cur.id:"unknown",image:du.slice(du.indexOf(",")+1),time:v.currentTime.toFixed(2)};
-function shown(d){note(d.ok?${jsLit(t("player.savedPfx"))}+" "+d.path:d.auth?String(d.error||${jsLit(t("net.authRefused"))}):${jsLit(t("player.capFailPfx"))}+" "+(d.error||""));}
-call("capture",arg,function(d){
-if(d){shown(d);return;}
-fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify(arg)}).then(function(r){if(r.status===401)return{ok:false,auth:true,error:${jsLit(t("net.authRefused"))}};return r.json().catch(function(){return{ok:false,error:"HTTP "+r.status};});}).then(shown).catch(function(){note(${jsLit(t("player.capOffline"))})});
-},30000);
+var arg={id:cur?cur.id:"unknown",image:du.slice(du.indexOf(",")+1),time:v.currentTime.toFixed(2),rid:TOKEN+"-"+Date.now().toString(36)+"-"+(++capN)};
+capture(arg);
 };
+// R6 U7: the capture goes through the main viewer when it still answers
+// (a short ping first); only a viewer that is gone means the direct POST —
+// at once, not after a 30 s wait. A capture reply that is late is asked
+// for again with the SAME request id (the viewer answers the first
+// request's outcome: one frame, one file); if the viewer died meanwhile
+// the frame may or may not be saved — said so, never posted a second time.
+var capN=0,CAP_MS=30000,PING_MS=1500;
+function shown(d){note(d.ok?${jsLit(t("player.savedPfx"))}+" "+d.path:d.auth?String(d.error||${jsLit(t("net.authRefused"))}):${jsLit(t("player.capFailPfx"))}+" "+(d.error||""));}
+function alive(cb){call("ping",null,function(d){cb(!!(d&&d.alive));},PING_MS);}
+function capDirect(arg){var body={id:arg.id,image:arg.image,time:arg.time};
+fetch("/api/capture-frame",{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify(body)}).then(function(r){if(r.status===401)return{ok:false,auth:true,error:${jsLit(t("net.authRefused"))}};return r.json().catch(function(){return{ok:false,error:"HTTP "+r.status};});}).then(shown).catch(function(){note(${jsLit(t("player.capOffline"))})});}
+function capVia(arg,tries){call("capture",arg,function(d){if(d){shown(d);return;}alive(function(ok){if(ok&&tries<4)capVia(arg,tries+1);else note(${jsLit(t("player.capUnsure"))});});},CAP_MS);}
+function capture(arg){alive(function(ok){if(ok)capVia(arg,0);else capDirect(arg);});}
 v.addEventListener("ended",function(){nav(1,true);});
 var NAV={ArrowUp:1,ArrowDown:1,ArrowLeft:1,ArrowRight:1,Home:1,End:1,PageUp:1,PageDown:1," ":1,Enter:1,Tab:1};
 var NLS=new RegExp(${jsLit(NON_LATIN_SCRIPT_RE.source)},"u");

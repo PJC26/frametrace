@@ -504,20 +504,23 @@ try {
         //     address bar like ?token= — the shell and the served viewer.
         // R5 U14: the old check waited for "no launch" and then asserted "no
         // launch" (always true) while the 303 silently dropped every other
-        // query parameter. Contract (S ↔ U): the 303 removes ONLY launch.
-        // Asked with this browser's cookies (page.request), not followed.
-        const redirect = await page.request.get(`${base}/?launch=a4test&keep=1`, { maxRedirects: 0 }).catch(() => null);
-        const location303 = redirect ? redirect.headers()['location'] || '' : '';
-        const serverKeeps = !!redirect && redirect.status() === 303 && /[?&]keep=1(&|$)/.test(location303) && !/launch/.test(location303);
+        // query parameter. R6 S3 contract (S ↔ U): a launch answers 200
+        // text/html — a same-origin step page that sets the cookie and goes
+        // on with location.replace(target + location.hash) (a 303 lost the
+        // SameSite=Strict cookie on Linux/macOS); NO 303 / Location. The
+        // target drops ONLY launch. Asked with this browser's cookies
+        // (page.request), not followed; then opened for real.
+        const step = await page.request.get(`${base}/?launch=a4test&keep=1`, { maxRedirects: 0 }).catch(() => null);
+        const stepBody = step ? await step.text().catch(() => '') : '';
+        const stepInfo = step ? { status: step.status(), type: step.headers()['content-type'] || '', location: step.headers()['location'] || null } : { status: 0 };
+        check('B2/S3: launch answers 200 text/html, a same-origin step page (location.replace(target + location.hash)), no 303 / Location',
+          stepInfo.status === 200 && /text\/html/.test(stepInfo.type) && !stepInfo.location && /location\.replace\([^)]*\+ location\.hash\)/.test(stepBody), JSON.stringify(stepInfo));
+        check('B2/U14: the step page\'s target keeps the other query (?keep=1) and drops only launch',
+          /location\.replace\([^)]*keep=1/.test(stepBody) && !/location\.replace\([^)]*launch/.test(stepBody), (stepBody.match(/location\.replace\([^)]*\)/) || [''])[0]);
         await page.goto(`${base}/?launch=a4test&keep=1#frag`);
-        await until(() => page.evaluate(() => !location.search.includes('launch')), 10000);
+        await until(() => page.evaluate(() => !location.search.includes('launch') && !!document.getElementById('main')), 15000);
         const shellUrl = await page.evaluate(() => ({ search: location.search, hash: location.hash }));
-        if (serverKeeps) {
-          check('B2/U14: launch 303 keeps the other query (?keep=1) and the hash, drops only launch', shellUrl.search === '?keep=1' && shellUrl.hash === '#frag', JSON.stringify({ shellUrl, location303 }));
-        } else {
-          check('B2: no ?launch= left in the shell address bar (hash kept)', !/launch/.test(shellUrl.search) && shellUrl.hash === '#frag', JSON.stringify(shellUrl));
-          skip('B2/U14: launch 303 keeps the other query', `awaits track S — this server answers ${redirect ? redirect.status() : 'no response'} → ${JSON.stringify(location303)}`);
-        }
+        check('B2/U14: after the step page the shell has ?keep=1 and the hash, no ?launch=', shellUrl.search === '?keep=1' && shellUrl.hash === '#frag', JSON.stringify(shellUrl));
         await page.goto(`${base}/viewer/?token=${token}&launch=a4test&keep=2`);
         await until(() => page.evaluate(() => !/launch|token/.test(location.search)), 15000);
         const viewerUrl = await page.evaluate(() => location.search);

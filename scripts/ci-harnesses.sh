@@ -43,7 +43,11 @@ harnesses=(
   "check-rectime-fixture"
 )
 
+all_start=$(date +%s)
 failed=()
+# R6 U11: per-harness durations, printed at the end (the CI time limit in
+# .github/workflows/harnesses.yml is set from these measurements).
+durations=()
 for entry in "${harnesses[@]}"; do
   # shellcheck disable=SC2086
   set -- $entry
@@ -57,9 +61,15 @@ for entry in "${harnesses[@]}"; do
     failed+=("$name")
   fi
   echo "::endgroup::"
-  echo "[$status] $name ($(( $(date +%s) - start ))s)"
+  took=$(( $(date +%s) - start ))
+  echo "[$status] $name (${took}s)"
+  durations+=("$(printf '%5d s  %s %s' "$took" "$entry" "$status")")
 done
 
+echo
+echo "durations (slowest first):"
+printf '%s\n' "${durations[@]}" | sort -rn
+echo "total: $(( $(date +%s) - all_start )) s"
 echo
 if [ "${#failed[@]}" -gt 0 ]; then
   echo "FAILED harnesses: ${failed[*]}"

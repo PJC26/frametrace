@@ -181,7 +181,8 @@ const FTViewer = (() => {
     focus() { return impl ? impl.focus() : false; },
     summary() { return impl ? impl.summary() : null; },
     saveState() { return impl ? impl.saveState() : null; },
-    async save() { return impl ? impl.save() : true; },
+    /** R6 U5: save({ timeoutMs }) — the caller's cap on "busy, retry" waits (default 5 s). */
+    async save(opts) { return impl ? impl.save(opts) : true; },
     /** Internal (22-viewer-host.js unmount): resolves true once no marks
      *  save request is in flight, false after `timeoutMs` (default 15 s). */
     _whenSaveSettled(timeoutMs = 15000) {
@@ -231,6 +232,8 @@ const FTViewer = (() => {
     get _root() { return root; },
     get _apiBase() { return apiBase; },
     _attach(methods) { impl = methods; },
+    // R6 U4: the read-only close warning, in the viewer's language.
+    _closeWarning() { return impl && impl.closeWarning ? impl.closeWarning() : "The review records could not be read — this window holds no unsaved edits."; },
     _emit: emit,
     _applyTheme: applyTheme,
     _listens(event) { return (counts.get(event) || 0) > 0; },
@@ -253,3 +256,33 @@ const FTViewer = (() => {
   return api;
 })();
 window.FTViewer = FTViewer;
+// R6 U4 (S ↔ U contract): the desktop shell's close flush (src/shell.rs
+// FLUSH_SCRIPT) prefers window.hBeforeClose() over FTViewer.save(). The
+// workstation shell page has its own (assets/app/95-quit.js); a standalone
+// viewer page (/viewer/, /review/*.html) gets this one — the same answer
+// { ok, pending, state, message, warning }, within `timeoutMs` (4 s: under
+// the shell's 5 s wait). Read-only with nothing held here closes without a
+// confirmation; `warning` says the records were unreadable (also toasted).
+if (!document.documentElement.hasAttribute("data-ft-host") && typeof window.hBeforeClose !== "function") {
+  window.hBeforeClose = async (timeoutMs = 4000) => {
+    const ms = Math.max(0, Number(timeoutMs) || 0);
+    let saved = false;
+    let timedOut = false;
+    let timer = 0;
+    try {
+      saved = await Promise.race([
+        Promise.resolve(FTViewer.save({ timeoutMs: Math.max(0, ms - 250) })).then(v => v === true),
+        new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, ms); }),
+      ]);
+    } catch (e) { saved = false; }
+    clearTimeout(timer);
+    let pending = 0;
+    let state = null;
+    try { pending = Number((FTViewer.summary() || {}).pending) || 0; state = FTViewer.saveState(); } catch (e) { pending = 0; }
+    const ok = saved && (state !== "readonly" || pending === 0);
+    const warning = ok && state === "readonly" ? FTViewer._closeWarning() : "";
+    if (warning) FTViewer.toast(warning, "error");
+    const message = ok ? "" : (pending > 0 ? "unsaved " + pending : "not confirmed: " + String(state || "?")) + (timedOut ? " (timeout)" : "");
+    return { ok, pending, state, message, warning };
+  };
+}

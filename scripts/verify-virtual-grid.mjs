@@ -150,6 +150,68 @@ try {
   });
   check('U17: card click median < 200 ms on 50k records', lat.click < 200, JSON.stringify(lat));
   check('U17: mark (key 1) median < 200 ms on 50k records', lat.mark < 200, JSON.stringify(lat));
+  // R6 U8: a time budget passes on a fast machine even with O(n) work per
+  // click, so the interactions are COUNTED as well: every whole-list pass
+  // through an Array method (some/find/findIndex/filter/reduce/forEach/map/
+  // slice/indexOf/includes/every/sort/…) over an array of ≥ 10 000 entries
+  // is a list scan. A click and a mark must cause none (the memoised list,
+  // the id → index map, the sparse mark map), never re-run the filter, and
+  // must actually DO what they are for: the clicked card is the active one,
+  // the marked record carries its mark chip.
+  const counted = await page.evaluate(async () => {
+    const frame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+    const BIG = 10_000;
+    const names = ['some', 'find', 'findIndex', 'findLast', 'findLastIndex', 'filter', 'reduce', 'reduceRight', 'forEach', 'map', 'flatMap', 'slice', 'indexOf', 'lastIndexOf', 'includes', 'every', 'sort', 'concat', 'join'];
+    const orig = {};
+    const scans = { n: 0, where: {} };
+    for (const name of names) {
+      orig[name] = Array.prototype[name];
+      Array.prototype[name] = function (...args) {
+        if (this && this.length >= BIG && scans.on) {
+          scans.n += 1;
+          const at = (new Error().stack || '').split('\n')[2] || '?';
+          const key = name + ' @ ' + at.trim().replace(/\(?https?:\/\/[^)]*\/:?/, '').slice(0, 80);
+          scans.where[key] = (scans.where[key] || 0) + 1;
+        }
+        return orig[name].apply(this, args);
+      };
+    }
+    const out = { click: 0, mark: 0, clickWhere: {}, markWhere: {}, clickMiss: [], markMiss: [], filter: { click: 0, mark: 0 } };
+    try {
+      for (let i = 0; i < 12; i++) {
+        const cards = [...document.querySelectorAll('#recordGrid .card')];
+        const card = cards[(i * 5 + 2) % cards.length];
+        const id = card.dataset.id;
+        let f0 = FTViewer._debugStats().filterComputes;
+        scans.n = 0; scans.where = {}; scans.on = true;
+        card.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        await frame();
+        scans.on = false;
+        out.click += scans.n; Object.assign(out.clickWhere, scans.where);
+        out.filter.click += FTViewer._debugStats().filterComputes - f0;
+        if (FTViewer._debugStats().activeId !== id || document.querySelector('#recordGrid .card.active')?.dataset.id !== id) out.clickMiss.push(id);
+        document.activeElement?.blur();
+        f0 = FTViewer._debugStats().filterComputes;
+        const marked0 = FTViewer.summary().marked;
+        scans.n = 0; scans.where = {}; scans.on = true;
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: '2', bubbles: true }));
+        await frame();
+        scans.on = false;
+        out.mark += scans.n; Object.assign(out.markWhere, scans.where);
+        out.filter.mark += FTViewer._debugStats().filterComputes - f0;
+        // Key 2 = 중요 (important): the chip of THAT status, whatever the card held before.
+        const chip = document.querySelector(`#recordGrid .card[data-id="${CSS.escape(id)}"] .mark-chip.important`);
+        if (!chip || FTViewer.summary().marked < marked0) out.markMiss.push(id);
+      }
+    } finally {
+      for (const name of names) Array.prototype[name] = orig[name];
+    }
+    return out;
+  });
+  check('U8: a card click is applied (that card is the active one, 12/12)', counted.clickMiss.length === 0, JSON.stringify(counted.clickMiss));
+  check('U8: a mark is applied (the marked card shows its mark chip, 12/12)', counted.markMiss.length === 0, JSON.stringify(counted.markMiss));
+  check('U8: 12 clicks on 50k records: 0 whole-list scans, 0 filter runs', counted.click === 0 && counted.filter.click === 0, JSON.stringify({ scans: counted.click, filter: counted.filter.click, where: counted.clickWhere }));
+  check('U8: 12 marks on 50k records: 0 whole-list scans, 0 filter runs', counted.mark === 0 && counted.filter.mark === 0, JSON.stringify({ scans: counted.mark, filter: counted.filter.mark, where: counted.markWhere }));
   // Grouping: headers render, collapse works, DOM bounded.
   await setGroup(page, 'prefix');
   await page.waitForTimeout(300);

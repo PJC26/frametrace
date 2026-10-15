@@ -497,7 +497,12 @@ function markActive(status) {
     touchAnnotation(id);
   }, tf("toast.markApplied", { n: 1, status: label }));
   const after = filteredRecords();
-  const next = before.slice(index + 1).find(record => after.some(item => item.id === record.id));
+  // R6 U8: the next record of the old list that the new one still holds —
+  // by index map (the same memoised list in the common case: the very next).
+  let next = null;
+  for (let i = index + 1; i < before.length; i++) {
+    if (indexInList(after, before[i].id) >= 0) { next = before[i]; break; }
+  }
   state.activeId = next?.id || after[Math.min(index, after.length - 1)]?.id || null;
   state.currentPage = Math.max(1, Math.floor(indexInList(after, state.activeId) / state.pageSize) + 1);
   render();
@@ -565,7 +570,10 @@ function updateReviewMeta() {
   // on every j/k or click (an O(n) pass over 50k records per render).
   const gen = typeof annotationGen === "number" ? annotationGen : NaN;
   if (!(reviewedCount && reviewedCount.gen === gen && reviewedCount.total === total)) {
-    reviewedCount = { gen, total, n: records.reduce((n, record) => n + (isReviewed(record) ? 1 : 0), 0) };
+    // Marks are sparse: walk the mark map, not every record (R6 U8).
+    let n = 0;
+    for (const id of Object.keys(state.marks)) if (state.marks[id] && recordById.has(id)) n += 1;
+    reviewedCount = { gen, total, n };
   }
   const reviewed = reviewedCount.n;
   reviewMeta.progressText.textContent = tf("progress.label", { n: reviewed, m: total });
