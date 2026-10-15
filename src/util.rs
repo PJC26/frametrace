@@ -650,12 +650,45 @@ pub fn canonicalize_display(path: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn strip_windows_extended_prefix(path: &Path) -> PathBuf {
-    let text = path.as_os_str().to_string_lossy();
+    let Some(text) = path.to_str() else {
+        // R5 (P3): a name that is not valid Unicode is handled on its OS
+        // units — `to_string_lossy` used to replace them with U+FFFD and
+        // so name another (usually nonexistent) file.
+        return strip_extended_prefix_lossless(path);
+    };
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
     } else if let Some(rest) = text.strip_prefix(r"\\?\") {
         PathBuf::from(rest.to_string())
     } else {
+        path.to_path_buf()
+    }
+}
+
+/// [`strip_windows_extended_prefix`] on the UTF-16 units (Windows); other
+/// platforms have no verbatim prefix, so the path is returned unchanged.
+fn strip_extended_prefix_lossless(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        let unc = wide(r"\\?\UNC\");
+        let verbatim = wide(r"\\?\");
+        let stripped: Vec<u16> = if units.starts_with(&unc) {
+            wide(r"\\")
+                .into_iter()
+                .chain(units[unc.len()..].iter().copied())
+                .collect()
+        } else if units.starts_with(&verbatim) {
+            units[verbatim.len()..].to_vec()
+        } else {
+            return path.to_path_buf();
+        };
+        PathBuf::from(std::ffi::OsString::from_wide(&stripped))
+    }
+    #[cfg(not(windows))]
+    {
         path.to_path_buf()
     }
 }
@@ -1253,6 +1286,39 @@ mod tests {
         csv_safe_cell, run_with_timeout, sanitize_filename, unique_dir, unique_path,
         write_text_atomic,
     };
+
+    /// R5 (P3): a non-Unicode name keeps its exact UTF-16 units when the
+    /// verbatim prefix is removed (before: `to_string_lossy` turned the
+    /// lone surrogate into U+FFFD — another file name).
+    #[cfg(windows)]
+    #[test]
+    fn extended_prefix_strip_is_lossless_for_non_unicode_names() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        let mut name = wide(r"\\?\C:\cases\clip");
+        name.push(0xD800); // lone surrogate: not valid Unicode
+        name.extend(wide(".mp4"));
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&name));
+        let stripped = super::strip_windows_extended_prefix(&path);
+        let mut expected = wide(r"C:\cases\clip");
+        expected.push(0xD800);
+        expected.extend(wide(".mp4"));
+        assert_eq!(
+            stripped.as_os_str().encode_wide().collect::<Vec<u16>>(),
+            expected
+        );
+        let mut unc = wide(r"\\?\UNC\srv\share\x");
+        unc.push(0xDC00);
+        let stripped = super::strip_windows_extended_prefix(&std::path::PathBuf::from(
+            std::ffi::OsString::from_wide(&unc),
+        ));
+        let mut expected = wide(r"\\srv\share\x");
+        expected.push(0xDC00);
+        assert_eq!(
+            stripped.as_os_str().encode_wide().collect::<Vec<u16>>(),
+            expected
+        );
+    }
 
     #[test]
     fn sanitize_filename_blocks_hostile_names() {

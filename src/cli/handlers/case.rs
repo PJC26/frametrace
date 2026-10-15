@@ -2402,7 +2402,7 @@ mod report_output_tests {
         assert!(
             details
                 .iter()
-                .any(|d| d.contains("sign-off v4: marks, evidence")),
+                .any(|d| d.contains("sign-off v4: marks, the case records' target hashes")),
             "{details:?}"
         );
         assert!(

@@ -151,7 +151,7 @@ pub(crate) fn cached_fts_search(
 /// audio lane, the index generation and `db/videos.jsonl` are unchanged.
 struct AudioLevelsCacheEntry {
     case_dir: PathBuf,
-    key: (FileStamp, u64, FileStamp),
+    key: (String, u64, FileStamp),
     json: Arc<String>,
 }
 
@@ -176,8 +176,11 @@ pub(crate) fn cached_audio_levels_json(
     state: &SharedState,
     case_dir: &Path,
 ) -> Result<Arc<String>, String> {
+    // R5 (P8): every sound lane (a damaged lane continues in a new file)
+    // and the keyring fingerprint are part of the key, so a new lane or a
+    // key change refreshes the map.
     let key = (
-        file_stamp(&case_dir.join(crate::audio_level::LOG_REL)),
+        crate::audio_level::levels_cache_key(case_dir),
         index_generation(state, case_dir),
         file_stamp(&case_dir.join("db/videos.jsonl")),
     );

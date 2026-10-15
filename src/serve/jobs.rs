@@ -2094,7 +2094,15 @@ fn resolve_queue_conflicts(
         .iter()
         .filter(|(id, _)| {
             open.iter().any(|entry| {
-                &entry.id == id && bases.get(id).copied().unwrap_or(0) >= entry.server_revision
+                // R5 (base −1 contract): an "unsafe base" save (a draft
+                // edited while the viewer was read-only) never decides a
+                // conflict — it only lands when identical to the server
+                // value, so it says nothing about which side the examiner
+                // chose. (`u64::MAX >= revision` would otherwise resolve.)
+                let base = bases.get(id).copied().unwrap_or(0);
+                &entry.id == id
+                    && base != crate::case_db::UNSAFE_BASE_REVISION
+                    && base >= entry.server_revision
             })
         })
         .map(|(id, revision)| {

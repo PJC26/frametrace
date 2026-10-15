@@ -1516,7 +1516,7 @@ fn verify_package_db_and_signoff(
             CheckStatus::Pass,
             signoff_rel,
             format!(
-                "sign-off v4: marks, evidence SHA-256 bindings and audit-lane anchors match the package (examiner recorded as typed: {examiner}; not an authenticated identity)"
+                "sign-off v4: marks, the case records' target hashes and audit-lane anchors match the package, and the sign-off audit lane records this sign-off (examiner recorded as typed: {examiner}; not an authenticated identity)"
             ),
         ),
         crate::report::SignoffCurrency::Changed if v4 => {
@@ -1538,6 +1538,14 @@ fn verify_package_db_and_signoff(
                 "content_sha256 does not match the review marks / tags in the packaged db/case.db (now {}): the sign-off does not cover this package's marks",
                 digests.content
             ),
+        ),
+        // R5-P1: a v4 record that the sign-off audit lane does not
+        // confirm is "cannot be verified", not "predates content binding"
+        // (the reason itself is listed under not_verified below).
+        crate::report::SignoffCurrency::Unbound if v4 => out.push(
+            CheckStatus::NotVerified,
+            signoff_rel,
+            "sign-off v4 is not confirmed by the sign-off audit lane (evidence/logs/signoff-log.jsonl) — the sign-off cannot be verified",
         ),
         crate::report::SignoffCurrency::LegacyBinding => out.push(
             CheckStatus::NotVerified,
@@ -1590,17 +1598,20 @@ fn verify_package_db_and_signoff(
             "no packaged report to compare with the sign-off",
         ),
     }
-    // D13: whether the record is in the packaged sign-off audit lane.
-    let (recorded, note) = crate::report::signoff_audit_status(package_dir, &text);
-    out.push(
-        if recorded {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::NotVerified
-        },
-        crate::report::SIGNOFF_LOG_REL_PATH,
-        note,
+    // D13 / R5-P1: whether the packaged sign-off audit lane records this
+    // very record. A lane that contradicts it (broken chain, only other
+    // sign-offs, another content digest) is a FAIL, not "not verified".
+    let record = crate::report::signoff_audit_record(
+        package_dir,
+        &text,
+        listed.contains_key(crate::report::SIGNOFF_LOG_REL_PATH),
     );
+    let status = match &record {
+        crate::report::SignoffAuditRecord::Verified { .. } => CheckStatus::Pass,
+        crate::report::SignoffAuditRecord::NotVerifiable(_) => CheckStatus::NotVerified,
+        crate::report::SignoffAuditRecord::Contradicted(_) => CheckStatus::Fail,
+    };
+    out.push(status, crate::report::SIGNOFF_LOG_REL_PATH, record.note());
 }
 
 fn copy_optional_package_file(
