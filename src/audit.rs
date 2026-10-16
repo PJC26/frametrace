@@ -530,7 +530,7 @@ impl LaneRow {
     pub fn note(&self) -> String {
         if let Some(index) = self.lane_broken_at {
             return format!(
-                "{LANE_BROKEN_NOTE} — 이 레인의 감사 체인이 {}번째 줄에서 깨져, 그 앞 항목도 현재값·확인됨으로 쓰지 않음 (기록의 최신 상태를 알 수 없음)",
+                "{LANE_BROKEN_NOTE} — 이 레인의 감사 체인이 {}번째 줄에서 깨져, 그 앞 항목도 현재값·확인됨으로 쓰지 않음 (기록의 최신 상태를 알 수 없음). {REPAIR_LANE_HINT}",
                 index + 1
             );
         }
@@ -691,6 +691,9 @@ pub struct LaneRows {
     /// The verification of the verifying prefix (all of it when
     /// `failure` is `None`).
     pub verification: Option<AuditChainVerification>,
+    /// R12-I3: repairs recorded in the lane — USABLE [`LANE_REPAIR_EVENT`]
+    /// markers ([`repair_lane`]); the lane is shown "수리됨".
+    pub repairs: Vec<LaneRepair>,
 }
 
 impl LaneRows {
@@ -710,6 +713,7 @@ impl LaneRows {
             key_error,
             unbound_authenticated: 0,
             verification: None,
+            repairs: Vec::new(),
         }
     }
 
@@ -764,7 +768,7 @@ impl LaneRows {
     pub fn detail(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(failure) = &self.failure {
-            parts.push(format!("체인 검증 실패: {failure}"));
+            parts.push(format!("체인 검증 실패: {failure} — {REPAIR_LANE_HINT}"));
         }
         if !self.lane.reason().is_empty() && self.failure.is_none() {
             parts.push(self.lane.reason().to_string());
@@ -785,6 +789,9 @@ impl LaneRows {
                 "그중 {superseded}개는 {SUPERSEDED_NOTE} — 같은 기록의 최신 항목이 인증되지 않아 이전 인증 항목으로 되돌리지 않음"
             ));
         }
+        for repair in &self.repairs {
+            parts.push(repair.describe());
+        }
         if self.unbound_authenticated > 0 {
             parts.push(format!(
                 "레인·케이스 결합이 없는 이전 형식의 인증 항목 {}개 (다른 레인·케이스에서 옮겨 왔는지 확인 불가 — 레거시)",
@@ -797,15 +804,30 @@ impl LaneRows {
         parts.join("; ")
     }
 
-    /// The report / API chain object: `{"path", "status", "entries",
-    /// "unauthenticated", "detail"}`.
+    /// R12-I3: the chain object's status word — [`Self::status`], except
+    /// `repaired` for a lane holding a usable `lane-repair` marker whose
+    /// chain otherwise passes (`keyed` / `structural`, kept in
+    /// `base_status`). A worse state (`failed`, `not-verified`) wins and
+    /// `repaired: true` is still set.
+    pub fn chain_status(&self) -> &'static str {
+        match self.status() {
+            "keyed" | "structural" if !self.repairs.is_empty() => "repaired",
+            status => status,
+        }
+    }
+
+    /// The report / API chain object: `{"path", "status", "base_status",
+    /// "entries", "unauthenticated", "detail", "repaired", "repairs"}`.
     pub fn chain_json(&self, rel: &str) -> serde_json::Value {
         serde_json::json!({
             "path": rel,
-            "status": self.status(),
+            "status": self.chain_status(),
+            "base_status": self.status(),
             "entries": self.rows.len(),
             "unauthenticated": self.unusable().count(),
             "detail": self.detail(),
+            "repaired": !self.repairs.is_empty(),
+            "repairs": self.repairs.iter().map(LaneRepair::to_json).collect::<Vec<_>>(),
         })
     }
 }
@@ -1004,6 +1026,11 @@ fn read_lane_rows_inner(
     if let Some(binding) = binding {
         apply_recency(&binding.rel, &mut rows);
     }
+    let repairs = rows
+        .iter()
+        .filter(|row| row.usable() && is_lane_repair_marker(&row.value))
+        .map(LaneRepair::from_row)
+        .collect();
     let lane = if let Some(err) = &key_error {
         LaneTrust::NotVerified {
             reason: err.clone(),
@@ -1025,6 +1052,7 @@ fn read_lane_rows_inner(
         key_error,
         unbound_authenticated: outcome.unbound.len(),
         verification: Some(verification),
+        repairs,
     })
 }
 
@@ -1466,7 +1494,7 @@ fn last_committed_line(file: &mut File) -> Result<Option<Vec<u8>>, String> {
         .map_err(|err| err.to_string())?;
     if last[0] != b'\n' {
         return Err(
-            "audit log ends with an incomplete line (likely a torn write); run verify-audit and repair the log before appending"
+            "audit log ends with an incomplete line (likely a torn write); repair it with `frametrace repair-lane <log>` (cuts back to the verifying prefix, keeps the cut bytes beside the lane, records a lane-repair marker) before appending — do not edit it by hand"
                 .to_string(),
         );
     }
@@ -1547,7 +1575,11 @@ fn append_chained_locked(
         )
     };
     // Append mode always writes at the end; one write_all + fsync keeps the
-    // window for a torn write down to the final line only.
+    // window for a torn write down to the final line only. (R12-I3: a
+    // read/write handle — `repair_lane` — is positioned at the end too.)
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::End(0))
+        .map_err(|err| format!("failed to seek to the end of the audit log: {err}"))?;
     file.write_all(line.as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|err| format!("failed to append chained audit log entry: {err}"))
@@ -1567,6 +1599,325 @@ pub fn chain_head(path: &Path) -> Result<Option<String>, String> {
         .rev()
         .find(|line| !line.trim().is_empty())
         .map(|line| sha256::digest_bytes(line.as_bytes())))
+}
+
+/// R12-I3: the `event` of the marker [`repair_lane`] appends to a lane it
+/// cut back to its verifying prefix.
+pub const LANE_REPAIR_EVENT: &str = "lane-repair";
+
+/// R12-I3: the display word for a lane holding a [`LANE_REPAIR_EVENT`]
+/// marker this PC may rely on.
+pub const LANE_REPAIRED_NOTE: &str = "수리됨";
+
+/// R12-I3: the one command a damaged lane is repaired with (every
+/// "repair the lane" message names it).
+pub const REPAIR_LANE_HINT: &str = "frametrace repair-lane <레인 파일>로 수리하십시오(검증되는 앞부분까지 자르고, 잘린 바이트는 레인 옆 .removed 파일로 보관, lane-repair 표식에 그 SHA-256 기록) — 손으로 고치지 마십시오";
+
+/// R12-I3: whether `value` is a [`LANE_REPAIR_EVENT`] marker.
+pub fn is_lane_repair_marker(value: &serde_json::Value) -> bool {
+    value.get("event").and_then(serde_json::Value::as_str) == Some(LANE_REPAIR_EVENT)
+}
+
+/// R12-I3: one repair recorded in a lane (a USABLE [`LANE_REPAIR_EVENT`]
+/// marker — an unusable one is just an unauthenticated line).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneRepair {
+    /// Lane index of the marker.
+    pub index: usize,
+    pub logged_unix: u64,
+    /// Entries kept (the verifying prefix the marker follows).
+    pub kept_entries: usize,
+    pub removed_lines: usize,
+    pub removed_bytes: u64,
+    /// SHA-256 of the bytes cut off.
+    pub removed_sha256: String,
+    /// File name (beside the lane) the cut bytes were saved as.
+    pub removed_saved_as: Option<String>,
+}
+
+impl LaneRepair {
+    fn from_row(row: &LaneRow) -> Self {
+        let value = &row.value;
+        let num = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Self {
+            index: row.index,
+            logged_unix: num("logged_unix").unwrap_or(0),
+            kept_entries: num("kept_entries").unwrap_or(0) as usize,
+            removed_lines: num("removed_lines").unwrap_or(0) as usize,
+            removed_bytes: num("removed_bytes").unwrap_or(0),
+            removed_sha256: text("removed_sha256").unwrap_or_default(),
+            removed_saved_as: text("removed_saved_as"),
+        }
+    }
+
+    /// One Korean sentence for details and CLI output.
+    pub fn describe(&self) -> String {
+        format!(
+            "{LANE_REPAIRED_NOTE} — {}번째 줄 뒤를 잘라 냄 (잘린 줄 {}개 · {}바이트 · sha256 {}{}); 잘린 부분에 있던 기록은 이 레인에서 읽지 않음",
+            self.kept_entries,
+            self.removed_lines,
+            self.removed_bytes,
+            self.removed_sha256,
+            self.removed_saved_as
+                .as_deref()
+                .map(|name| format!(" · 보관 파일 {name}"))
+                .unwrap_or_default()
+        )
+    }
+
+    /// The report / API object ([`LaneRows::chain_json`] `repairs`).
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "line": self.index + 1,
+            "logged_unix": self.logged_unix,
+            "kept_entries": self.kept_entries,
+            "removed_lines": self.removed_lines,
+            "removed_bytes": self.removed_bytes,
+            "removed_sha256": self.removed_sha256,
+            "removed_saved_as": self.removed_saved_as,
+        })
+    }
+}
+
+/// R12-I3: what [`repair_lane`] did (or, with `dry_run`, would do).
+#[derive(Debug, Clone)]
+pub struct LaneRepairOutcome {
+    /// `false`: the lane verifies — nothing to repair, nothing written.
+    pub needed: bool,
+    /// Why the lane did not verify.
+    pub failure: Option<String>,
+    pub kept_entries: usize,
+    pub kept_bytes: u64,
+    pub removed_lines: usize,
+    pub removed_bytes: u64,
+    pub removed_sha256: String,
+    /// Where the cut bytes were saved (`None` for a dry run).
+    pub removed_saved_to: Option<PathBuf>,
+    /// The marker was HMAC-signed with this PC's configured key.
+    pub keyed: bool,
+}
+
+/// R12-I3: repairs a lane whose chain does not verify (a torn final line
+/// made the WHOLE lane unusable, R11-I4) by cutting it back to the prefix
+/// the lane reader accepts, and records that it did so:
+///
+/// 1. the cut bytes are saved beside the lane as
+///    `<lane>.repair-<unix>.removed` (fsync'd, never overwritten) — nothing
+///    the lane held is lost;
+/// 2. the lane is truncated to its verifying prefix under the lane's
+///    exclusive lock (refused when the file changed since it was read);
+/// 3. a [`LANE_REPAIR_EVENT`] marker is appended under the same lock
+///    (keyed with this PC's configured key) naming the kept entries, the
+///    cut bytes' count and SHA-256, the saved file, and the lane's SHA-256
+///    before the repair.
+///
+/// The lane is then shown as "수리됨" ([`LaneRows::repairs`]). Refused: a
+/// lane whose location cannot be confirmed (link / junction), an
+/// unreadable key configuration (the prefix cannot be judged), and a
+/// sound-measurement lane another lane already continues (its continuation
+/// marker checks it by hash — [`crate::audio_level::DO_NOT_REPAIR_LANE`]).
+pub fn repair_lane(path: &Path, dry_run: bool) -> Result<LaneRepairOutcome, String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("레인 파일을 열 수 없습니다 {}: {err}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "{}: 일반 파일이 아닙니다(링크·폴더) — 수리하지 않음",
+            path.display()
+        ));
+    }
+    let location = lane_location(path);
+    if let Some(why) = &location.unverified {
+        return Err(format!(
+            "{}: 레인 위치를 확인할 수 없어 수리하지 않음: {why}",
+            path.display()
+        ));
+    }
+    if let Some(binding) = &location.binding
+        && let Some(number) = audio_level_lane_number(&binding.rel)
+    {
+        let next = path.with_file_name(format!("audio-level-log.{}.jsonl", number + 1));
+        if next.exists() {
+            return Err(format!(
+                "{}: 이 측정 레인은 이미 다음 레인({})으로 이어졌습니다 — 수리하지 않음. {}",
+                path.display(),
+                next.display(),
+                crate::audio_level::DO_NOT_REPAIR_LANE
+            ));
+        }
+    }
+    let text = read_log_locked(path)?
+        .ok_or_else(|| format!("레인 파일이 없습니다: {}", path.display()))?;
+    let rows = read_lane_rows(path)?;
+    if let Some(err) = &rows.key_error {
+        return Err(format!(
+            "감사 키 설정을 읽지 못해 검증되는 앞부분을 판단할 수 없습니다 — 수리하지 않음: {err}"
+        ));
+    }
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    let joined: Vec<&str> = rows.rows.iter().map(|row| row.raw.as_str()).collect();
+    if (text.is_empty() && !rows.rows.is_empty()) || (!text.is_empty() && joined.join("\n") != body)
+    {
+        return Err(format!(
+            "{}: 읽는 동안 레인이 바뀌었습니다 — 다시 실행하십시오",
+            path.display()
+        ));
+    }
+    let Some(failure) = rows.failure.clone() else {
+        return Ok(LaneRepairOutcome {
+            needed: false,
+            failure: None,
+            kept_entries: rows.rows.len(),
+            kept_bytes: text.len() as u64,
+            removed_lines: 0,
+            removed_bytes: 0,
+            removed_sha256: String::new(),
+            removed_saved_to: None,
+            keyed: false,
+        });
+    };
+    let cut = rows
+        .rows
+        .iter()
+        .position(|row| matches!(row.trust, LineTrust::ChainBroken))
+        .unwrap_or(rows.rows.len());
+    let kept_len = rows.rows[..cut]
+        .iter()
+        .map(|row| row.raw.len() + 1)
+        .sum::<usize>();
+    if kept_len >= text.len() {
+        return Err(format!(
+            "{}: 검증되는 앞부분이 레인 전체입니다 — 잘라 낼 꼬리가 없어 수리할 수 없음 ({failure})",
+            path.display()
+        ));
+    }
+    let removed = &text.as_bytes()[kept_len..];
+    let removed_sha256 = sha256::digest_bytes(removed);
+    let mut outcome = LaneRepairOutcome {
+        needed: true,
+        failure: Some(failure.clone()),
+        kept_entries: cut,
+        kept_bytes: kept_len as u64,
+        removed_lines: rows.rows.len() - cut,
+        removed_bytes: removed.len() as u64,
+        removed_sha256: removed_sha256.clone(),
+        removed_saved_to: None,
+        keyed: false,
+    };
+    if dry_run {
+        return Ok(outcome);
+    }
+    let key = crate::audit_key::configured()?;
+    let now = crate::util::now_unix()?;
+    // 1. Keep the cut bytes (never overwrite an earlier repair's file).
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "lane.jsonl".to_string());
+    let mut saved = None;
+    for attempt in 0..100u32 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let candidate = path.with_file_name(format!("{file_name}.repair-{now}{suffix}.removed"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(removed)
+                    .and_then(|_| file.sync_all())
+                    .map_err(|err| {
+                        format!(
+                            "잘린 바이트를 보관하지 못했습니다 {}: {err}",
+                            candidate.display()
+                        )
+                    })?;
+                saved = Some(candidate);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "잘린 바이트 보관 파일을 만들지 못했습니다 {}: {err} — 레인은 바꾸지 않음",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    let saved =
+        saved.ok_or_else(|| "잘린 바이트 보관 파일 이름을 정하지 못했습니다".to_string())?;
+    crate::util::sync_parent_directory(&saved);
+    let saved_name = saved
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // 2./3. Truncate and append the marker under one exclusive lock.
+    let marker = serde_json::json!({
+        "schema_version": 1,
+        "event": LANE_REPAIR_EVENT,
+        "logged_unix": now,
+        "kept_entries": cut,
+        "kept_bytes": kept_len,
+        "kept_sha256": sha256::digest_bytes(&text.as_bytes()[..kept_len]),
+        "removed_lines": outcome.removed_lines,
+        "removed_bytes": removed.len(),
+        "removed_sha256": removed_sha256,
+        "removed_saved_as": saved_name,
+        "lane_sha256_before": sha256::digest_bytes(text.as_bytes()),
+        "failure": failure,
+        "note": "the lane did not verify as a chain; it was cut back to its verifying prefix by `frametrace repair-lane` — the cut bytes are kept in the file named in removed_saved_as (their SHA-256 is removed_sha256); records that only the cut part held are not read from this lane",
+    })
+    .to_string();
+    let marker = match &key {
+        Some(_) => bind_body(path, &marker)?,
+        None => marker,
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| format!("레인을 쓰기로 열지 못했습니다 {}: {err}", path.display()))?;
+    file.lock_exclusive().map_err(|err| {
+        format!(
+            "레인을 잠그지 못했습니다 {} (다른 작업이 쓰는 중일 수 있음): {err}",
+            path.display()
+        )
+    })?;
+    let result = (|| -> Result<(), String> {
+        let mut now_text = Vec::new();
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_end(&mut now_text))
+            .map_err(|err| format!("레인을 다시 읽지 못했습니다: {err}"))?;
+        if now_text != text.as_bytes() {
+            return Err(format!(
+                "{}: 읽은 뒤 레인이 바뀌었습니다 — 수리하지 않음 (보관 파일 {} 은 남김), 다시 실행하십시오",
+                path.display(),
+                saved.display()
+            ));
+        }
+        file.set_len(kept_len as u64)
+            .and_then(|_| file.sync_all())
+            .map_err(|err| format!("레인을 자르지 못했습니다: {err}"))?;
+        file.seek(SeekFrom::End(0))
+            .map_err(|err| format!("레인 끝으로 이동하지 못했습니다: {err}"))?;
+        append_chained_locked(&mut file, &marker, key.as_ref())
+            .map_err(|err| format!("수리 표식을 쓰지 못했습니다 (레인은 이미 잘림): {err}"))
+    })();
+    let _ = file.unlock();
+    result?;
+    outcome.removed_saved_to = Some(saved);
+    outcome.keyed = key.is_some();
+    Ok(outcome)
 }
 
 /// D16: every hash-chained audit lane FrameTrace writes, relative to a case
@@ -2194,7 +2545,7 @@ pub fn verify_chained_jsonl_text(
             Err(error) => {
                 if line_number == lines.len() && !complete_tail {
                     return Err(format!(
-                        "audit log {source_name} ends with an incomplete final entry (torn write): {error}; remove or repair the last line, then re-run verify"
+                        "audit log {source_name} ends with an incomplete final entry (torn write): {error}; repair it with `frametrace repair-lane <log>` (cuts back to the verifying prefix, keeps the cut bytes beside the lane, records a lane-repair marker), then re-run verify — do not edit it by hand"
                     ));
                 }
                 return Err(error);
@@ -3748,3 +4099,7 @@ mod tests_r10;
 #[cfg(test)]
 #[path = "tests_audit_r11.rs"]
 mod tests_r11;
+
+#[cfg(test)]
+#[path = "tests_audit_r12.rs"]
+mod tests_r12;

@@ -53,6 +53,7 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
                                 format!(" — {}", trust.reason())
                             }
                         );
+                        print_lane_repairs(log);
                     } else {
                         println!(
                             "audit NOT VERIFIED: {} (entries: {}): {}",
@@ -71,6 +72,7 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
                 }
                 Err(err) => {
                     println!("audit FAILED: {}: {err}", log.display());
+                    println!("hint: {}", audit::REPAIR_LANE_HINT);
                     failures.push(log.display().to_string());
                 }
             }
@@ -96,8 +98,10 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
                 "audit log {} could not be verified on this PC: {err}",
                 log_path.display()
             )
-        } else {
+        } else if err.contains("repair-lane") {
             err
+        } else {
+            format!("{err} — {}", audit::REPAIR_LANE_HINT)
         }
     })?;
     let trust = result.lane_trust();
@@ -128,6 +132,70 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
     }
     for warning in &result.warnings {
         println!("warning: {warning}");
+    }
+    print_lane_repairs(log_path);
+    Ok(())
+}
+
+/// R12-I3: prints the "수리됨" line of every repair recorded in the lane
+/// (`verify-audit` output).
+fn print_lane_repairs(log: &Path) {
+    if let Ok(rows) = audit::read_lane_rows(log) {
+        for repair in &rows.repairs {
+            println!("repaired: {} — {}", log.display(), repair.describe());
+        }
+    }
+}
+
+/// `repair-lane` (R12-I3): [`audit::repair_lane`] with a report of what
+/// was cut and where it was kept.
+pub fn repair_lane(log_path: &Path, dry_run: bool) -> Result<(), String> {
+    let outcome = audit::repair_lane(log_path, dry_run)?;
+    if !outcome.needed {
+        println!(
+            "lane verifies — nothing to repair: {} (entries: {})",
+            log_path.display(),
+            outcome.kept_entries
+        );
+        return Ok(());
+    }
+    println!(
+        "{}: {}",
+        if dry_run {
+            "would repair (dry run, nothing changed)"
+        } else {
+            "lane repaired (수리됨)"
+        },
+        log_path.display()
+    );
+    println!(
+        "kept: {} entr{} ({} bytes)",
+        outcome.kept_entries,
+        if outcome.kept_entries == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        outcome.kept_bytes
+    );
+    println!(
+        "cut: {} line(s), {} bytes, sha256 {}",
+        outcome.removed_lines, outcome.removed_bytes, outcome.removed_sha256
+    );
+    if let Some(failure) = &outcome.failure {
+        println!("reason: {failure}");
+    }
+    if let Some(saved) = &outcome.removed_saved_to {
+        println!("cut bytes kept in: {}", saved.display());
+        println!(
+            "marker: {} appended ({})",
+            audit::LANE_REPAIR_EVENT,
+            if outcome.keyed {
+                "HMAC-signed with this PC's audit key"
+            } else {
+                "unkeyed — no audit key configured"
+            }
+        );
     }
     Ok(())
 }

@@ -3198,13 +3198,16 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
         .logs
         .push("원본 재검증: 색인된 모든 원본을 다시 해시하는 중…".into());
     let case_text = case_dir.to_string_lossy().to_string();
-    if let Err(err) = run_step(
+    // R12-I4: the run id the child wrote — the reported result must be
+    // THIS run, never an older one the log happens to end on.
+    let just_run = match run_step(
         exe,
         &["qa".into(), "anomalies".into(), case_text.clone()],
         state,
     ) {
-        return api_err(&err);
-    }
+        Ok(output) => crate::anomaly::printed_hash_verify_run_id(&output),
+        Err(err) => return api_err(&err),
+    };
     // Best effort: the custody statement is regenerated at package time too.
     // A cancel is not "best effort": the user stopped the run, so it is
     // reported as cancelled, never as a completed verification.
@@ -3223,7 +3226,28 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
         warn_step(state, 4, format!("보관 이력서 갱신 건너뜀: {err}"));
     }
     match crate::anomaly::latest_hash_verify_summary(&case_dir) {
-        Some(summary) => {
+        Some(mut summary) => {
+            // R12-I4: the result is not the run just made (the child did
+            // not say which run it wrote, or the log's result is another
+            // run): no current result — never an older run's counts.
+            if summary.is_result && (just_run.is_none() || summary.run_id != just_run) {
+                let reason = match &just_run {
+                    None => {
+                        "방금 실행한 재검증이 실행 id를 알리지 않아 결과를 이 실행과 대조할 수 없음"
+                            .to_string()
+                    }
+                    Some(id) => format!(
+                        "방금 실행한 재검증({id})이 아닌 실행({})이 현재 결과로 읽힘 — 이 실행의 결과를 확인할 수 없음",
+                        summary.run_id.as_deref().unwrap_or("?")
+                    ),
+                };
+                summary = crate::anomaly::HashVerifySummary {
+                    unauthenticated: summary.unauthenticated,
+                    not_verified_reason: Some(reason),
+                    lane_status: summary.lane_status,
+                    ..Default::default()
+                };
+            }
             // R11 P9/I2: a summary that is not verified (rows this PC
             // cannot authenticate, a withheld result) is said so in the
             // log and the response — never "모두 일치".
@@ -3246,6 +3270,7 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
                 "ok": true,
                 "run_unix": summary.run_unix,
                 "run_id": summary.run_id,
+                "expected_run_id": just_run,
                 "matched": summary.matched,
                 "mismatched": summary.mismatched,
                 "not_comparable": summary.not_comparable,
@@ -3669,3 +3694,7 @@ pub(crate) fn case_job_json(job: &CaseJob) -> serde_json::Value {
         "error": job.error,
     })
 }
+
+#[cfg(test)]
+#[path = "tests_r12_verify_sources.rs"]
+mod tests_r12_verify_sources;
