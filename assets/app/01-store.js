@@ -13,7 +13,7 @@
 const H_REVIEW_PHASES = ["review-partial", "review-ready", "done", "finalized"];
 const FTStore = (() => {
   const state = {
-    project: { caseDir: "", name: "", packageDir: "", restored: false, sourcePath: "" },
+    project: { caseDir: "", name: "", packageDir: "", packageIncomplete: false, restored: false, sourcePath: "" },
     phase: "empty",
     jobs: {
       pipeline: { steps: [], stepNames: [], current: "", progress: null, enrichment: null, warnings: [], logs: [], busy: false, error: "" },

@@ -17,7 +17,7 @@
 const FIN = {
   built: false, open: false, loading: false, busy: false, gen: 0,
   checks: [], caseId: null, status: null, env: null,
-  result: null, verify: null, audit: null, examinerTouched: false,
+  result: null, incomplete: null, verify: null, audit: null, examinerTouched: false,
   bound: false, timer: 0, caseDir: null, sig: "", attributing: false,
 };
 const FIN_LEVEL = { block: { icon: "i-x", word: "차단" }, warn: { icon: "i-warning", word: "주의" }, info: { icon: "i-info", word: "정보" }, ok: { icon: "i-check", word: "완료" } };
@@ -145,6 +145,19 @@ function pkgExplorerLink(dir) {
   return `<button type="button" class="quiet" data-pkgdir="${esc(dir)}">탐색기에서 폴더 열기</button>`;
 }
 
+// R10 U4 (track S2): a finalize answer whose package was published but not
+// finalized -> { package_dir } ("" when only the server's words say so),
+// else null. Fields a server may send are preferred over its error text.
+function finIncompleteOf(res) {
+  if (!res || typeof res !== "object") return null;
+  for (const k of ["incomplete_package_dir", "package_dir"]) {
+    const v = typeof res[k] === "string" ? res[k] : "";
+    if (v && (k === "incomplete_package_dir" || packageIncomplete(v, res.finalize_incomplete))) return { package_dir: v };
+  }
+  if (res.finalize_incomplete === true) return { package_dir: "" };
+  if (!res.ok && /최종화 미완료|_INCOMPLETE\b/i.test(String(res.error || ""))) return { package_dir: "" };
+  return null;
+}
 // Pure: what the verdict line, the button state and its tooltip say.
 function finSummarize(rows, { loading = false, name = "" } = {}) {
   const blocks = rows.filter(r => r.level === "block");
@@ -274,6 +287,10 @@ async function finAttribute() {
 // ("warn"), never green; a failed chain is "bad".
 //   -> { level: "ok"|"warn"|"bad", text, title }
 function auditVerdict(res) {
+  // R10 U2: an unreadable key configuration comes first, in its own words —
+  // nothing could be authenticated, which is not a tampering verdict (P8).
+  const keyErr = auditKeyConfigError(res);
+  if (keyErr) return { level: "warn", text: "감사 키 설정을 읽지 못함 — 인증 불가(변조 판정 아님)", title: keyErr };
   if (!res || !res.ok) return { level: "bad", text: "감사 로그 검증 실패", title: (res && (res.error || "")) || "" };
   const logs = Array.isArray(res.logs) ? res.logs : [];
   const count = `(${res.verified}개 로그, ${res.entries}항목)`;
@@ -292,6 +309,18 @@ function auditVerdict(res) {
   }
   if (res.integrity === "integrity-structural-only") return { level: "warn", text: `감사 로그 자기 일관성만 확인(인증 아님) ${count}`, title };
   return { level: "warn", text: `감사 로그 상태 확인 불가${where} ${count}`, title: title || String(res.integrity || "") };
+}
+// R10 U2: the tooltip of a key-configuration failure ("" when none):
+// `key_config_error: true` on a lane (or on the answer), with the server's
+// reason (`trust`, else `error`).
+function auditKeyConfigError(res) {
+  if (!res || typeof res !== "object") return "";
+  const logs = Array.isArray(res.logs) ? res.logs : [];
+  const bad = logs.filter(l => l && l.key_config_error === true);
+  if (!bad.length && res.key_config_error !== true) return "";
+  const lines = bad.map(l => `${l.name || l.path || "-"}: ${l.trust || "키 설정을 읽지 못함"}`);
+  if (!lines.length) lines.push(String(res.trust || res.error || "키 설정을 읽지 못함"));
+  return lines.join("\n");
 }
 // R9 U4: per not-verified lane, how many lines are simply not authenticated
 // here (no HMAC / retired key only) and how many carry another PC's key.
@@ -433,11 +462,18 @@ function finResultHtml() {
   const r = FIN.result;
   const st = FIN.status;
   const pkgDir = (r && r.package_dir) || (st && ["done", "finalized"].includes(st.phase) && st.package_dir) || "";
-  if (!r && !pkgDir) return "";
+  // R10 U4: the last finalize published a package but did not complete
+  // (its own row unless it is the package listed below).
+  const pkgInc = !!pkgDir && packageIncomplete(pkgDir, r && r.finalize_incomplete);
+  const inc = FIN.incomplete;
+  const incRow = inc && !(pkgInc && (!inc.package_dir || inc.package_dir === pkgDir)) ? `<li class="h-fin-incomplete-row"><span class="h-fin-incomplete">${esc(H_PKG_INCOMPLETE)}</span>` +
+    (inc.package_dir ? ` <code class="mono">${esc(inc.package_dir)}</code> ${pkgExplorerLink(inc.package_dir)}` : "") +
+    ` <span class="muted">최종 결과로 쓰지 마십시오</span></li>` : "";
+  if (!r && !pkgDir) return incRow ? `<h3 class="h-fin-h">결과</h3><ul class="h-fin-links">${incRow}</ul>` : "";
   const pkgUrl = r && r.package_url ? `<a href="/case/${esc(r.package_url)}" target="_blank" rel="noopener">패키지 폴더 보기${finIcon("i-external")}</a>` : "";
-  return `<h3 class="h-fin-h">결과</h3><ul class="h-fin-links">` +
+  return `<h3 class="h-fin-h">결과</h3><ul class="h-fin-links">` + incRow +
     `<li><a href="/case/reports/case-report.html" target="_blank" rel="noopener"><b>보고서 열기</b>${finIcon("i-external")}</a> <span class="muted">새 탭에서 열립니다</span></li>` +
-    (pkgDir ? `<li><span class="muted">패키지</span> <code class="mono">${esc(pkgDir)}</code> ${pkgUrl} ${pkgExplorerLink(pkgDir)}</li>` : "") +
+    (pkgDir ? `<li><span class="muted">패키지</span>${pkgInc ? ` <span class="h-fin-incomplete">${esc(H_PKG_INCOMPLETE)}</span>` : ""} <code class="mono">${esc(pkgDir)}</code> ${pkgUrl} ${pkgExplorerLink(pkgDir)}${pkgInc ? ` <span class="muted">최종 결과로 쓰지 마십시오</span>` : ""}</li>` : "") +
     (r && r.manifest_sha256 ? `<li><span class="muted">manifest.sha256의 SHA-256</span> <code class="mono num">${esc(r.manifest_sha256)}</code></li>` : "") +
     (r ? `<li><span class="muted">검토자(입력값 기록)</span> ${esc(r.examiner || "-")}</li>` : "") + `</ul>`;
 }
@@ -540,7 +576,7 @@ function finPaint() {
   const cls = "h-fin-verdict " + (done ? "done" : sum.state);
   if (verdict.className !== cls) verdict.className = cls;
   finSetHtml(verdict, finIcon(sum.state === "blocked" ? "i-warning" : sum.state === "loading" ? "i-spinner" : "i-check") +
-    `<span>${esc(done ? "보고서·패키지를 만들었습니다" : sum.text)}</span>`);
+    `<span>${esc(done ? (FIN.incomplete ? `보고서·패키지를 만들었지만 ${H_PKG_INCOMPLETE}` : "보고서·패키지를 만들었습니다") : sum.text)}</span>`);
   const list = finEl("finalChecklist");
   const hadFocus = typeof list.contains === "function" && list.contains(document.activeElement) && document.activeElement && document.activeElement.id;
   if (finSetHtml(list, rows.map(finRowHtml).join("")) && hadFocus) {
@@ -634,6 +670,7 @@ function finClose() {
 }
 // A different case was opened: nothing about the old one may stay visible.
 function finResetSheet() {
+  FIN.incomplete = null;
   FIN.result = null; FIN.verify = null; FIN.audit = null; FIN.checks = []; FIN.status = null;
   FIN.caseId = null; FIN.examinerTouched = false; FIN.gen++;
   if (FIN.built) { finEl("finalExaminer").value = ""; finHint(""); finEl("advOut").hidden = true; finEl("advOut").textContent = ""; finEl("advLink").innerHTML = ""; finPaint(); }
@@ -698,11 +735,13 @@ async function finFinalize() {
   let res;
   try { res = await jpost("/api/finalize", { examiner: name }); }
   finally { finSetFinalizing(false); }
+  FIN.incomplete = finIncompleteOf(res);
   if (!res.ok) { finHint("실패: " + (res.error || "알 수 없는 오류")); finPaint(); return; }
-  FIN.result = { examiner: res.examiner || name, manifest_sha256: res.manifest_sha256 || "", package_dir: res.package_dir || "", package_url: res.package_url || "" };
+  FIN.result = { examiner: res.examiner || name, manifest_sha256: res.manifest_sha256 || "", package_dir: res.package_dir || "", package_url: res.package_url || "", finalize_incomplete: res.finalize_incomplete === true };
   finHint("");
   finPaint();
-  toast("보고서·패키지를 만들었습니다", "ok");
+  if (FIN.incomplete) toast(`보고서·패키지를 만들었지만 ${H_PKG_INCOMPLETE} — 최종 결과로 쓰지 마십시오`, "warn");
+  else toast("보고서·패키지를 만들었습니다", "ok");
 }
 async function finVerifySources() {
   const btn = finEl("btnVerifySources");

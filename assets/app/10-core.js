@@ -6,6 +6,17 @@ const $ = id => document.getElementById(id);
 // Escapes for both text and quoted attribute contexts (", ' included).
 const esc = v => String(v ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
 
+// R10 U4 (track S2): a package whose finalize did not complete is renamed
+// "<name>_INCOMPLETE" (marker "<package>.finalize-incomplete.txt" beside it)
+// — shown as "최종화 미완료" wherever a package or the finalized state is.
+// `flag`: an explicit server field, when one is sent (absent is fine).
+const H_PKG_INCOMPLETE = "최종화 미완료";
+function packageIncomplete(dir, flag) {
+  if (flag === true) return true;
+  const base = String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+  return /_INCOMPLETE$/i.test(base) || /\.finalize-incomplete\.txt$/i.test(base);
+}
+
 // A6: an Enter that only commits an IME composition (Korean input) is
 // not a command — every Enter handler of the shell checks this first.
 const hImeComposing = e => !!e && (e.isComposing === true || e.keyCode === 229);

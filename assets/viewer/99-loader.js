@@ -231,6 +231,9 @@ async function loadAllRecordPages(first, ui, live) {
   }
 }
 
+// R10 U5: the data objects built from this server's API (10-boot
+// trustFromBundle) — a bundle cannot claim it by a field of its own.
+const LIVE_TRUST_DATA = new WeakSet();
 async function loadViewerDataFromApi(first, ui) {
   const live = !!(first && first.live);
   const paged = await loadAllRecordPages(first, ui, live);
@@ -270,7 +273,12 @@ async function loadViewerDataFromApi(first, ui) {
     // A failed read of the measurement log (records-meta reports it beside
     // an empty map): kept so the viewer never shows it as "not measured".
     audioLevelsError: meta.audioLevelsError || null,
+    // R10 U3: per-lane chain state ({carveLog|…: {status, entries,
+    // unauthenticated, detail}}); absent from older servers and bundles.
+    logChains: meta.logChains && typeof meta.logChains === "object" ? meta.logChains : null,
   };
+  // R10 U5: trust codes computed by this server just now (not a bundle's).
+  LIVE_TRUST_DATA.add(data);
   if (live) {
     // The index is still growing/enriching: whatever arrived is the
     // current snapshot, not a truncation. The chip tells the examiner.

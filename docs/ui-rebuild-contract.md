@@ -799,3 +799,25 @@ const FTStore = {
 - `FTViewer.channels.player(key)`는 키가 없으면 `caseStorageKey(null, "")`(이 페이지 주소의 해시) — `"case"` 없음.
 - 하네스에서 실제 저장을 기다리는 `FTViewer.save`는 `{ patient: true }`. 4 s 무예산 경로를 시험하는 곳만 `FTViewer.save(/* no-budget: … */)`로 표시(verify-review-batch --unit "R9 U9"가 scripts/*.mjs 검사).
 - 충돌 배너는 알림 행의 **마지막** 배너(다른 알림은 `noticeAppend`로 그 앞), 목록 토글은 배너의 마지막 버튼 — Tab 순서가 토글 → 목록 첫 버튼, Shift+Tab은 토글로. verify-layout "R9 U10".
+
+## 17. R10 트랙 U 추가 계약 (2026-10-15, docs/PLAN_R10_2026-10-15.md)
+
+### 17.1 최신성 규칙 P7 (U1)
+- 같은 키(카빙 id, 복구 inode, 조인 출력 경로, 검증 대상 경로)의 현재 항목 = **마지막 줄**. 마지막 줄이 쓸 수 없는 줄(`unauth`·`pc:`)이면 그 앞의 인증 줄로 되돌아가지 않는다(R9 §16.1의 "마지막 쓸 수 있는 줄"을 대신함). 30-records `logSlots`(`last`) · `currentLogEntries` · `splitValidationSlots`.
+- 앞에 쓸 수 있는 줄이 있었으면 그 항목은 복사본에 열거 안 되는 `ftNewerUnauth` 표시(내보내기에 안 나감). 기록은 `statusNewer: true` — 상태는 `unauthenticated`/`auth-other-pc` 그대로, 배지 툴팁 맨 앞과 상세 로그 목록에 "더 최근 인증 안 된 항목 있음"(i18n `status.tip.newer`, 행 `.status-newer`). 검증 값(SHA-256·길이·코덱)도 그 경로의 쓸 수 있는 최신 검증이 아니면 쓰지 않는다.
+
+### 17.2 key_config_error (U2)
+- `auditVerdict`(41-finalize): `logs[].key_config_error === true`(또는 응답 자체)면 다른 모든 상태보다 먼저 "감사 키 설정을 읽지 못함 — 인증 불가(변조 판정 아님)", 호박색(`warn`, P8 — 실패 아님), 툴팁은 레인별 서버 사유(`auditKeyConfigError`).
+
+### 17.3 trust_note · logChains (U3)
+- 쓸 수 없는 항목의 `trust_note`: 상태 배지 툴팁(`statusNote`)·상세 목록 신뢰 배지 툴팁·항목 아래 `.trust-note` 줄(30-records `logTrustNote`, 40-grid `logTrustNoteHtml`).
+- `/api/records-meta` `logChains`는 로더가 그대로 넘기고(`data.logChains`), 상세 로그 목록(`#validationList`) 머리에 그 기록의 레인(검증 + 카빙/복구/조인 + 이상 있으면 이상 탐지)마다 문제가 있을 때만 한 줄 `.log-chain[data-lane]`: "검증 로그 체인 검증 실패 / 자기 일관성만(인증 아님) / 인증 안 된 줄 N개 / 인증 불가(변조 판정 아님) / 읽지 못함", 툴팁 = 서버 `detail`. `absent`·인증 줄만 있는 `keyed`는 표시 없음, 모르는 상태는 "인증 불가". `logChains` 없음(구 서버·번들) = 표시 없음.
+
+### 17.4 최종화 미완료 패키지 (U4, 트랙 S2)
+- `packageIncomplete(dir, flag)`(10-core): 폴더 이름이 `…_INCOMPLETE`(또는 `*.finalize-incomplete.txt`)이거나 서버가 명시 필드(`package_incomplete`·`finalize_incomplete`)를 보내면 참. 표시는 "최종화 미완료"(`H_PKG_INCOMPLETE`).
+- 상태: `done`/`finalized` + 미완료 패키지 → 상점 phase `done`(결과물 생성됨 아님), `project.packageIncomplete`; 프로젝트 전환 팝업 배지 `warn` "최종화 미완료"; 최근 케이스 `phase_hint: "finalize-incomplete"` 또는 `finalized` + 미완료 `package_dir` → "최종화 미완료".
+- 결과물 시트: `finIncompleteOf(res)` — `incomplete_package_dir`/미완료 `package_dir`/`finalize_incomplete`/실패 문구의 "최종화 미완료" → 결과 목록 첫 줄 `.h-fin-incomplete` "최종화 미완료"(+경로가 필드로 오면 경로·탐색기) "최종 결과로 쓰지 마십시오", 판정 줄 "보고서·패키지를 만들었지만 최종화 미완료". 오류 문구에서 경로를 잘라내지 않는다(공백 있는 경로). 완전한 패키지로 다시 최종화하면 사라진다. 필드가 없어도 동작.
+
+### 17.5 번들의 신뢰 문구 (U5)
+- 신뢰 코드가 이 서버 API에서 온 데이터(99-loader `LIVE_TRUST_DATA` WeakSet — 번들 필드로는 주장 못 함)가 아니면 `trustFromBundle`(10-boot). 그때 "이 PC"가 들어간 신뢰 문구는 `<key>@bundle` 쌍둥이("생성 PC 기준 …": `trust.otherPc`, `status.otherPc`, `status.tip.unauth`, `trust.sc`, `audio.selfConsistent`; 20-i18n `trustI18nKey`), 서버 사유(`trust_note`, `logChains[].detail`)의 "이 PC"는 "생성 PC"로.
+- 하네스: verify-review-batch --unit "R10 U1–U5", verify-audio-facet(`/trust` 번들 페이지 = 생성 PC 문구·P7·trust_note·logChains, `/live/` API 페이지 = 이 PC 문구·logChains 전달), verify-finalize-sheet 1(U2)·4c(U4, 두 테마 AA).

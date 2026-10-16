@@ -11,8 +11,10 @@ function hProjectPopRender() {
   const s = FTStore.state;
   const cur = $("hProjectCur");
   if (cur) {
-    const label = H_PHASE_LABEL[s.phase] || "";
-    const cls = s.phase === "finalized" ? " ok" : s.phase === "review-partial" ? " warn" : "";
+    // R10 U4: the open project's last package did not finish finalizing.
+    const incomplete = !!s.project.packageIncomplete;
+    const label = incomplete ? H_PKG_INCOMPLETE : H_PHASE_LABEL[s.phase] || "";
+    const cls = incomplete ? " warn" : s.phase === "finalized" ? " ok" : s.phase === "review-partial" ? " warn" : "";
     cur.innerHTML = s.project.caseDir
       ? `<b title="${esc(s.project.caseDir)}">${esc(s.project.name || s.project.caseDir)}</b>` +
         `<span class="mono">${esc(s.project.caseDir)}</span>` +

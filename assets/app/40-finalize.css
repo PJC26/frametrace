@@ -41,6 +41,8 @@
 .h-fin-links li { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); align-items: center; overflow-wrap: anywhere; }
 .h-fin-links a { color: var(--accent-ink); text-underline-offset: 2px; }
 .h-fin-links code { font-family: var(--font-mono); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+/* R10 U4: a package whose finalize did not complete. */
+.h-fin-incomplete { display: inline-flex; align-items: center; min-height: 20px; padding: 0 var(--sp-2); border-radius: var(--radius); background: var(--warn-bg); color: var(--warn-fg); font-size: var(--fs-xs); font-weight: 600; }
 
 .h-fin-adv { border: 1px solid var(--border); border-radius: var(--radius); }
 .h-fin-adv > summary { cursor: pointer; padding: var(--sp-2) var(--sp-3); min-height: 28px; box-sizing: border-box; display: flex; align-items: center; font-weight: 600; }
