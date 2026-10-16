@@ -1432,8 +1432,21 @@ pub fn verify_package_with(package_dir: &Path, strict: bool) -> Result<i32, Stri
 }
 
 /// R11-S8: the exit code of a verification without a FAIL.
+///
+/// R12-S8: `--strict` also exits 3 when the SIGN-OFF is NOT VERIFIED —
+/// the sign-off record (`review/signoff.json`: none in the package, or one
+/// the package cannot check) or its audit-lane entry (`signoff-log`, e.g.
+/// keyed on another PC or recorded by an older build). R11 exited 0 for
+/// those: a script using `--strict` as "final and signed" accepted a
+/// package whose sign-off nothing confirmed. Other NOT VERIFIED lines
+/// (what no package alone can prove) do not change the code.
 pub fn verify_package_exit_code(result: &package::PackageVerification, strict: bool) -> i32 {
-    if strict && result.passed() && result.finalize_incomplete {
+    let signoff_not_verified = result.checks.iter().any(|check| {
+        check.status == package::CheckStatus::NotVerified
+            && (check.subject == crate::report::SIGNOFF_REL_PATH
+                || check.subject == crate::report::SIGNOFF_LOG_REL_PATH)
+    });
+    if strict && result.passed() && (result.finalize_incomplete || signoff_not_verified) {
         VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE
     } else {
         0
@@ -2751,6 +2764,44 @@ mod report_output_tests {
         // A FAIL stays a failure, strict or not.
         fs::write(incomplete.join("README.txt"), "changed").unwrap();
         assert!(super::verify_package_with(&incomplete, true).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R12-S8: `--strict` exits 3 when the sign-off is NOT VERIFIED — here
+    /// a package with no sign-off record and one whose sign-off-lane entry
+    /// is gone from the package. R11 exited 0 for both (only an incomplete
+    /// finalize was 3). Without `--strict` both stay 0.
+    #[test]
+    fn r12_s8_strict_verify_package_exits_3_for_an_unverified_signoff() {
+        let (root, case_dir, _id) = signed_case("r12-s8");
+        // Signed and complete: 0 either way.
+        let signed = root.join("package_signed");
+        super::package_case(
+            &case_dir,
+            super::PackageOptions {
+                output_dir: Some(signed.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(super::verify_package_with(&signed, true), Ok(0));
+        // No sign-off record at all.
+        fs::remove_file(case_dir.join(crate::report::SIGNOFF_REL_PATH)).unwrap();
+        make_report(&case_dir, false, false, None).unwrap();
+        let unsigned = root.join("package_unsigned");
+        super::package_case(
+            &case_dir,
+            super::PackageOptions {
+                output_dir: Some(unsigned.clone()),
+            },
+        )
+        .unwrap();
+        let checked = crate::package::verify_package(&unsigned).unwrap();
+        assert!(checked.passed(), "{:?}", checked.checks);
+        assert_eq!(super::verify_package_with(&unsigned, false), Ok(0));
+        assert_eq!(
+            super::verify_package_with(&unsigned, true),
+            Ok(super::VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE)
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -1818,6 +1818,44 @@ pub fn record_signoff_abandoned(
     .map_err(|err| format!("완료되지 않은 최종화를 감사 체인에 기록하지 못했습니다: {err}"))
 }
 
+/// R12-S2/S6: where the sign-off record `signoff_text` stands in the
+/// sign-off lane under `case_dir`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SignoffLaneState {
+    /// The lane holds a `signoff` entry naming this record (any trust).
+    pub recorded: bool,
+    /// A trusted [`SIGNOFF_ABANDONED_EVENT`] entry names this record.
+    pub abandoned: bool,
+}
+
+/// R12-S2/S6: [`SignoffLaneState`] of `signoff_text` with this PC's
+/// verification keys. A finalize journal's recovery uses it to abandon a
+/// recorded sign-off once (never twice), and a finalize to tell whether
+/// the "previous" sign-off it would restore was itself abandoned.
+pub fn signoff_lane_state(
+    case_dir: &std::path::Path,
+    signoff_text: &str,
+) -> Result<SignoffLaneState, String> {
+    let keys = crate::audit_key::verification_keys()?;
+    let lane = crate::audit::read_lane_rows_with_keys(&case_dir.join(SIGNOFF_LOG_REL_PATH), &keys)?;
+    if !lane.present {
+        return Ok(SignoffLaneState::default());
+    }
+    let sha = crate::sha256::digest_bytes(signoff_text.as_bytes());
+    let recorded = lane.rows.iter().any(|row| {
+        row.value.get("event").and_then(|v| v.as_str()) == Some("signoff")
+            && row
+                .value
+                .get("signoff_record_sha256")
+                .and_then(|v| v.as_str())
+                == Some(sha.as_str())
+    });
+    Ok(SignoffLaneState {
+        recorded,
+        abandoned: abandoned_signoff_records(&lane.rows).contains(&sha),
+    })
+}
+
 /// R8-I9: the record SHA-256s trusted `signoff-abandoned` entries name.
 /// P0: with audit keys on this PC only an AUTHENTICATED entry counts (an
 /// unauthenticated one would let anyone hide a newer sign-off); without

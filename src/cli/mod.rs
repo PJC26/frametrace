@@ -177,7 +177,8 @@ pub enum Commands {
     VerifyPackage {
         package_dir: PathBuf,
         /// Exit with code 3 (not 0) when every file checks out but the
-        /// package is from a finalize that did not complete
+        /// package is from a finalize that did not complete, or its
+        /// sign-off (record or audit-lane entry) is NOT VERIFIED
         #[arg(long)]
         strict: bool,
     },

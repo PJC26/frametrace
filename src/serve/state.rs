@@ -212,6 +212,11 @@ pub(crate) struct JobState {
     /// so /api/status shows it after the finalize response is gone;
     /// cleared by a finalize that completes.
     pub(crate) finalize_incomplete: Option<String>,
+    /// R12-S2: what recovering an interrupted finalize's journal
+    /// (`review/finalize.inprogress.json`) did or could not do, at server
+    /// start, open-case or the next finalize — `None` when nothing was
+    /// recovered. Cleared by a finalize that completes or another case.
+    pub(crate) finalize_recovered: Option<String>,
 }
 
 /// R5-S6: the pending "raw 불일치 — 재임포트 필요" decision.
@@ -378,6 +383,7 @@ impl JobState {
             raw_reimport: None,
             report_stale: false,
             finalize_incomplete: None,
+            finalize_recovered: None,
         }
     }
 }

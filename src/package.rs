@@ -262,7 +262,10 @@ fn reserve_package_dirs_with(
         } else {
             parent.join(format!("{name}_{attempt:03}"))
         };
-        if candidate.exists() {
+        // R12-S5: a name an unfinished finalize's marker still names (a
+        // kept work folder meant to get it) is not reused — the marker
+        // would make the new package read as incomplete.
+        if candidate.exists() || finalize_incomplete_marker(&candidate).exists() {
             continue;
         }
         let work = crate::join::pid_part_path(&candidate, pid);
@@ -1306,22 +1309,41 @@ pub fn finalize_incomplete_marker(package_dir: &Path) -> PathBuf {
 }
 
 /// R11-S2: what a folder copy appends to a name — Windows Explorer's
-/// ` - 복사본` / ` - Copy` (any case) and ` (n)`, as often as copies of
+/// ` - 복사본` / ` - Copy` (any case; R12-S10: the other [`COPY_TAILS`]
+/// too) and ` (n)`, as often as copies of
 /// copies add them — with the trailing dots and spaces Windows drops from
 /// a name. Returns the name without them.
 pub fn strip_copy_tails(name: &str) -> &str {
     let mut rest = name;
     loop {
         let trimmed = rest.trim_end_matches([' ', '.']);
-        let next = strip_numbered_tail(trimmed)
-            .or_else(|| strip_suffix_ignore_ascii_case(trimmed, " - 복사본"))
-            .or_else(|| strip_suffix_ignore_ascii_case(trimmed, " - copy"));
+        let next = strip_numbered_tail(trimmed).or_else(|| {
+            COPY_TAILS
+                .iter()
+                .find_map(|tail| strip_suffix_ignore_ascii_case(trimmed, tail))
+        });
         match next {
             Some(shorter) => rest = shorter,
             None => return trimmed,
         }
     }
 }
+
+/// R11-S2 / R12-S10: the copy tails Windows Explorer appends in the
+/// display languages an examiner's PC is likely to use — Korean, English,
+/// German, Japanese, Chinese (Simplified), French — matched ASCII
+/// case-insensitively. Other locales' tails (and copies made by other
+/// tools) are NOT recognized: the marker beside the original then only
+/// helps for a copy made next to it, and a copied folder keeps the
+/// `_INCOMPLETE` in its own name only when the tail comes after it.
+const COPY_TAILS: &[&str] = &[
+    " - 복사본",
+    " - copy",
+    " - kopie",
+    " - コピー",
+    " - 副本",
+    " - copie",
+];
 
 /// ` (n)` at the end of `name` (n = one or more ASCII digits).
 fn strip_numbered_tail(name: &str) -> Option<&str> {
@@ -3612,6 +3634,32 @@ mod tests {
         assert_eq!(super::strip_copy_tails("a - 복사본 (2). "), "a");
         assert_eq!(super::strip_copy_tails("a (b)"), "a (b)");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// R12-S10: Explorer's copy tails of German, Japanese, Chinese and
+    /// French Windows (R11 knew Korean and English only), alone, repeated
+    /// and mixed with ` (n)`; near misses stay plain.
+    #[test]
+    fn r12_s10_other_locale_copy_tails_are_stripped() {
+        for copy in [
+            "package_7_INCOMPLETE - Kopie",
+            "package_7_INCOMPLETE - kopie (2)",
+            "package_7_INCOMPLETE - コピー",
+            "package_7_INCOMPLETE - 副本",
+            "package_7_INCOMPLETE - Copie",
+            "package_7_INCOMPLETE_2 - Copie (3) - コピー - 副本",
+        ] {
+            assert!(super::is_incomplete_package_name(copy), "{copy}");
+        }
+        assert_eq!(super::strip_copy_tails("a - コピー (2)"), "a");
+        assert_eq!(super::strip_copy_tails("a - 副本 - Kopie"), "a");
+        for plain in [
+            "package_9 - Kopie",
+            "package_9_INCOMPLETE-Kopie",
+            "package_9_INCOMPLETE - Kopien",
+        ] {
+            assert!(!super::is_incomplete_package_name(plain), "{plain}");
+        }
     }
 
     /// R11-S7: a rename whose source is gone fails at once (R10 retried
