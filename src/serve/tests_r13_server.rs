@@ -280,8 +280,18 @@ fn r13_s2_only_the_reserved_package_is_marked() {
         .unwrap()
         .unwrap();
     assert_eq!(kept.state, super::finalize_journal::STATE_RECOVERED);
-    // The examiner packages by hand (plain package-case), then restarts.
-    run_cli(&bin, &["package-case", case.to_str().unwrap()]);
+    // The examiner packages by hand, then restarts. A fixed name keeps
+    // a fast runner from reusing the reserved `package_<unix>` name in
+    // the same second.
+    run_cli(
+        &bin,
+        &[
+            "package-case",
+            case.to_str().unwrap(),
+            "--package-name",
+            "package_by_hand",
+        ],
+    );
     let before = package_entries(&case);
     super::finalize_journal::recover_bound_case(&bound_state(&case));
     assert_eq!(package_entries(&case), before, "a later package was marked");
