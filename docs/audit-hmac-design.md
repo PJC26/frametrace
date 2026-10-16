@@ -289,8 +289,69 @@ older run). R11:
     R10 used the verified prefix, so editing a record's newest entry rolled
     it back to the previous value (P7 defeated). A sign-off anchored before
     the break is `AnchorStatus::NotAuthenticated` (R10: Intact). A torn
-    final line counts as a break too — repair it to use the lane again
-    (fail closed; R10 kept the prefix).
+    final line counts as a break too — repair it with `frametrace
+    repair-lane` (R12-I3, below) to use the lane again (fail closed; R10
+    kept the prefix).
+  - **Correction (R12):** R11's rule for `hash-verify.jsonl` attributed an
+    unusable line to a run by that line's own `run_id` and skipped it when
+    its `event` was not a re-hash event. Both are attacker-controlled on an
+    unsigned line, so replacing the newest run's completion marker (the
+    last line — the chain stays intact when `entry_sha256` is recomputed)
+    with an unsigned line claiming `event:"x-note"` or an OLDER run's id
+    brought the older all-match run back as the result (`is_result:true`,
+    `unauthenticated:0`). The R11 claim "a newer run holding an unusable
+    entry withholds the result" was only true for unusable lines that
+    told the truth about themselves. Superseded by P12.
+
+### Position, not content (R12)
+
+- **P12 — an unusable line's content is never used for a decision; only
+  its position.** `anomaly::runs_from_lane` groups USABLE entries only;
+  the result candidate is the run whose usable completion marker sits
+  LAST in the lane, and **any** unusable line after that marker (whatever
+  its `event`, `run_id`, or whether it parses) withholds the result
+  (`is_result:false`) and is counted in `unauthenticated`. With no usable
+  completed run, any unusable line withholds. Unusable lines from the
+  candidate run's first entry on make it not `verified`. Unusable lines
+  BEFORE the candidate run (an older run under another PC's key) do not
+  affect it. Remaining content use of unusable lines: P7 `recency_keys`
+  still reads them, but only to make OLDER usable entries unusable — it
+  can only withhold, never restore.
+- **I3 — `frametrace repair-lane <lane> [--dry-run]`.** A lane whose chain
+  does not verify is cut back to the prefix the lane reader accepts (the
+  first `ChainBroken` row), under the lane's exclusive lock and only if
+  the file is byte-identical to what was analysed. The cut bytes are
+  saved beside the lane as `<lane>.repair-<unix>.removed` (create-new,
+  fsync'd; not a `.jsonl`, so never read as a lane), then a
+  `lane-repair` marker is appended (HMAC-signed when this PC has a key)
+  with `kept_entries`, `kept_bytes`, `kept_sha256`, `removed_lines`,
+  `removed_bytes`, `removed_sha256`, `removed_saved_as`,
+  `lane_sha256_before`, `failure`. A usable marker makes the lane
+  "수리됨" (`LaneRows::repairs`, `chain_json` `repaired`/`repairs`,
+  `detail`, `verify-audit` "repaired:" lines). Repair is no more than a
+  tail deletion an attacker could do by hand (I9) — except that it is
+  disclosed; consumers that rely on "the newest run" treat a usable
+  `lane-repair` marker after the result run's marker like an unusable
+  line (the re-hash result is withheld until a new run). Refused: a lane
+  on a link / junction, an unreadable key configuration, and a sound
+  lane that a continuation lane already follows (its continuation marker
+  checks it by hash — `audio_level::DO_NOT_REPAIR_LANE`). Every
+  "repair the lane" message names the command
+  (`audit::REPAIR_LANE_HINT`).
+- **I4.** `qa anomalies` prints `hash-verify-run-id: <id>` (first line,
+  before any finding text); `/api/verify-sources` compares it with the
+  result run's id — a different id, or none, is `is_result:false`.
+- **I5.** `--key-source env:VAR` / `FRAMETRACE_KEY_SOURCE=env:VAR` naming a
+  system variable (`audit_key::SYSTEM_ENV_VARS`: `PATH`, `SystemRoot`,
+  `TEMP`, `APPDATA`, `HOME`, …, plus `LC_*` / `XDG_*`; ASCII case ignored)
+  is refused and never adopted — R11's adoption removed it from the
+  environment of every tool a step ran.
+- **I2.** The timeline emits a `db/carve_results.json` snapshot artifact as
+  `carved-candidate` only when a usable carve-lane entry names the same
+  `(id, output_path)` (it is then the lane's event); otherwise
+  `carved-candidate-unaudited`. A carve lane whose chain does not verify
+  makes the snapshot unused.
+- Tail deletion remains detectable only through the sign-off anchors (I9).
 - **P10 — a secret leaves the environment as soon as it is read.**
   `audit_key::adopt_key_env` also adopts the variable an `env:VAR` key
   source names — from the process's `--key-source` argument (either

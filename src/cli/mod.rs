@@ -350,6 +350,17 @@ pub enum Commands {
     },
     /// Verify a chained JSONL audit log and report tamper status
     VerifyAudit { log_path: PathBuf },
+    /// Repair an audit lane whose chain does not verify (e.g. a torn final
+    /// line): cut it back to its verifying prefix, keep the cut bytes
+    /// beside the lane (`<lane>.repair-<unix>.removed`), and append a
+    /// `lane-repair` marker recording their SHA-256. The lane then shows as
+    /// 수리됨 (repaired)
+    RepairLane {
+        log_path: PathBuf,
+        /// Only report what would be cut; change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Rotate the audit-chain HMAC key: generate a new key, register it as
     /// the keyring's active key, and retire the previous key so older keyed
     /// entries stay verifiable
@@ -945,6 +956,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             validate_artifact(&case_dir, &selector, options)
         }
         Commands::VerifyAudit { log_path } => verify_audit(&log_path),
+        Commands::RepairLane { log_path, dry_run } => repair_lane(&log_path, dry_run),
         Commands::RotateAuditKey { key_id, log, init } => {
             rotate_audit_key(key_id.as_deref(), &log, init)
         }
@@ -1099,6 +1111,10 @@ fn run_qa(command: QaCommands) -> Result<(), String> {
         }
         QaCommands::Anomalies { case_dir } => {
             let result = crate::anomaly::scan_case(&case_dir, true)?;
+            // R12-I4: first line, before any finding text.
+            if let Some(run_id) = &result.hash_verify_run_id {
+                println!("{}{run_id}", crate::anomaly::HASH_VERIFY_RUN_ID_PREFIX);
+            }
             println!(
                 "anomaly scan complete: {} candidate finding(s)",
                 result.findings.len()

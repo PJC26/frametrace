@@ -1134,7 +1134,7 @@ pub fn verified_active_lane(case_dir: &Path) -> Result<Option<String>, String> {
 }
 
 /// R7-I10: the warning every damaged-lane message carries.
-pub const DO_NOT_REPAIR_LANE: &str = "손상된 측정 레인을 직접 고치지 마십시오 — 이어진 레인의 연속 표식은 손상 당시 해시로 연결을 확인합니다(끝부분을 검증되는 구간까지 잘라 낸 수리만 '수리 전 검증 구간' 해시로 인정됨)";
+pub const DO_NOT_REPAIR_LANE: &str = "손상된 측정 레인을 직접 고치지 마십시오 — 이미 다음 레인으로 이어진 레인은 수리하지 않습니다(측정은 다음 레인에서 계속되고, 연속 표식이 손상 당시 해시로 연결을 확인 — 검증되는 구간까지 잘라 낸 상태만 '수리 전 검증 구간' 해시로 인정됨). 아직 이어지지 않은 레인만 frametrace repair-lane <레인 파일>로 수리합니다(잘린 바이트 보관 + lane-repair 표식)";
 
 /// Why `text` (continuation lane number `number`) is not a proven
 /// continuation of `previous`, or `Ok` when it is (see [`lane_statuses`]).

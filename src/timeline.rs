@@ -26,6 +26,14 @@ pub const UNAUTHENTICATED_KIND: &str = "audit-entry-unauthenticated";
 /// is [`UNAUTHENTICATED_KIND`]). R9 emitted these as `audit-event`.
 pub const UNCHAINED_KIND: &str = "unchained-log-entry";
 
+/// R12-I2: the kind of a carve event taken only from
+/// `db/carve_results.json` (outside the audit chain) — no usable
+/// `carve-file` entry of the carve lane names the same `(id,
+/// output_path)`. R11 emitted it as `carved-candidate`, so a carve entry
+/// the lane could not authenticate came back through the snapshot as a
+/// plain candidate.
+pub const CARVED_UNAUDITED_KIND: &str = "carved-candidate-unaudited";
+
 /// R10-I2: why a non-lane log entry is not authenticated where keys are
 /// held.
 const UNCHAINED_NOTE: &str =
@@ -263,17 +271,20 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
         .map_err(|err| format!("failed to read carve log {}: {err}", log_path.display()))?;
     let mut skipped = 0usize;
     let mut seen = std::collections::HashSet::new();
+    // R12-I2: `snapshot` = the artifact comes from db/carve_results.json.
     let mut emit = |artifact: &serde_json::Value,
                     ts: Option<u64>,
                     unauthenticated: Option<String>,
+                    snapshot: bool,
                     skipped: &mut usize| {
         let (id, output_path) = key_of(artifact);
         if output_path.is_empty() {
             *skipped += 1;
             return;
         }
-        // An unauthenticated entry never claims the artifact's slot (the
-        // snapshot or a usable entry still shows it as a candidate).
+        // An unauthenticated entry never claims the artifact's slot. R12-I2:
+        // a snapshot artifact a usable entry already showed is not repeated;
+        // any other is shown as unaudited, never as a carved candidate.
         if unauthenticated.is_none() && !seen.insert((id.clone(), output_path.clone())) {
             return; // the same artifact logged again by a resumed run
         }
@@ -289,6 +300,15 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             .unwrap_or_else(|| "unknown".to_string());
         let detail = format!("carved candidate {id} from {source} at offset {offset}");
         events.push(match unauthenticated {
+            None if snapshot => TimelineEvent {
+                ts_unix,
+                source: "carve",
+                kind: CARVED_UNAUDITED_KIND,
+                path: output_path,
+                detail: format!(
+                    "NOT AUDITED (감사 안 됨: db/carve_results.json에만 있고 카빙 감사 레인에 이 PC에서 쓸 수 있는 항목이 없음) — {detail}"
+                ),
+            },
             None => TimelineEvent {
                 ts_unix,
                 source: "carve",
@@ -316,14 +336,20 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             .and_then(serde_json::Value::as_u64)
             .or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(value))));
         let unauthenticated = (!row.usable()).then(|| row.note());
-        emit(value, ts, unauthenticated, &mut skipped);
+        emit(value, ts, unauthenticated, false, &mut skipped);
     }
-    for artifact in &snapshot_artifacts {
-        let ts = artifact
-            .get("carved_unix")
-            .and_then(serde_json::Value::as_u64)
-            .or(snapshot_unix);
-        emit(artifact, ts, None, &mut skipped);
+    // R12-I2: a lane whose chain does not verify vouches for nothing — the
+    // snapshot (outside the chain) is not used at all then.
+    if lane.failure.is_none() {
+        for artifact in &snapshot_artifacts {
+            let ts = artifact
+                .get("carved_unix")
+                .and_then(serde_json::Value::as_u64)
+                .or(snapshot_unix);
+            emit(artifact, ts, None, true, &mut skipped);
+        }
+    } else if !snapshot_artifacts.is_empty() {
+        skipped += snapshot_artifacts.len();
     }
     Ok(skipped)
 }
@@ -785,7 +811,9 @@ mod tests {
             .map(|event| event["kind"].as_str().unwrap())
             .collect();
         assert_eq!(kinds[0], "file-modified");
-        assert_eq!(kinds[2], "carved-candidate");
+        // R12-I2: a snapshot-only artifact (no carve lane entry) is
+        // unaudited, never a plain carved candidate.
+        assert_eq!(kinds[2], CARVED_UNAUDITED_KIND);
         assert_eq!(kinds[3], "media-creation-time");
 
         // The run is audit-logged and the chain verifies.

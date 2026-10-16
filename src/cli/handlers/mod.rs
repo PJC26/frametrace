@@ -272,8 +272,8 @@ pub(crate) use case::{
     review_marks_json_from_rows, scan_folder, signoff_content_json_from, verify_package_with,
 };
 pub(crate) use doctor::{
-    BenchmarkOptions, benchmark_db, deepfake_scan, deepfake_screen, doctor, rotate_audit_key,
-    verify_audit,
+    BenchmarkOptions, benchmark_db, deepfake_scan, deepfake_screen, doctor, repair_lane,
+    rotate_audit_key, verify_audit,
 };
 pub(crate) use forensic::{
     carve_file, import_e01, inspect_e01, inspect_image, recover_batch, recover_inode,

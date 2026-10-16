@@ -250,6 +250,11 @@ fn resolve_key_source(spec: &str) -> Result<AuditKey, String> {
     match spec.split_once(':') {
         Some(("env", var)) if !var.trim().is_empty() => {
             let var = var.trim();
+            if is_system_env_var(var) {
+                return Err(format!(
+                    "--key-source env:{var}: {var} is a system environment variable, not a key secret — refused (adopting it would remove it from this process and every tool it runs); put the key in its own variable, e.g. env:FRAMETRACE_AUDIT_KEY_SECRET"
+                ));
+            }
             key_from_env(var)?.ok_or_else(|| format!("--key-source env:{var}: {var} is not set"))
         }
         Some(("file", path)) if !path.trim().is_empty() => {
@@ -368,6 +373,80 @@ struct AdoptedKeyEnv {
 
 static ADOPTED_KEY_ENV: OnceLock<AdoptedKeyEnv> = OnceLock::new();
 
+/// R12-I5: environment variables the system, shells and tools rely on —
+/// never key material. `--key-source env:VAR` / `FRAMETRACE_KEY_SOURCE=
+/// env:VAR` naming one is refused ([`resolve_key_source`]) and never
+/// adopted ([`key_source_env_vars`]): R11's adoption REMOVED the named
+/// variable from the process environment, so `env:PATH` stripped `PATH`
+/// from every tool a step ran. Compared ignoring ASCII case (Windows
+/// variable names are case-insensitive).
+pub const SYSTEM_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "HOME",
+    "USERNAME",
+    "USERDOMAIN",
+    "USERDOMAIN_ROAMINGPROFILE",
+    "LOGONSERVER",
+    "COMPUTERNAME",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "NUMBER_OF_PROCESSORS",
+    "PSMODULEPATH",
+    "DRIVERDATA",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PWD",
+    "OLDPWD",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "TZ",
+    "DISPLAY",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "FRAMETRACE_KEY_SOURCE",
+    "FRAMETRACE_AUDIT_KEY_ID",
+];
+
+/// R12-I5: whether `name` is a system variable ([`SYSTEM_ENV_VARS`], or an
+/// `LC_*` / `XDG_*` locale / base-directory variable).
+pub fn is_system_env_var(name: &str) -> bool {
+    let upper = name.trim().to_ascii_uppercase();
+    SYSTEM_ENV_VARS.iter().any(|known| *known == upper)
+        || upper.starts_with("LC_")
+        || upper.starts_with("XDG_")
+}
+
 /// R11-I3 (P10): the environment variables a key-source spec reads key
 /// MATERIAL from — `VAR` of every `env:VAR` spec this process will
 /// install: the `--key-source` global flag in `args` (`--key-source SPEC`
@@ -398,6 +477,9 @@ pub fn key_source_env_vars(
     for spec in specs {
         if let Some(("env", var)) = spec.trim().split_once(':')
             && !var.trim().is_empty()
+            // R12-I5: a system variable is refused at install, never
+            // adopted (removed from the environment) first.
+            && !is_system_env_var(var)
             && !vars.iter().any(|known| known == var.trim())
         {
             vars.push(var.trim().to_string());

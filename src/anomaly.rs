@@ -73,6 +73,27 @@ pub struct AnomalyScanResult {
     /// otherwise), so finalize's sign-off check reuses them instead of
     /// reading every original twice.
     pub checks: Vec<HashCheck>,
+    /// R12-I4: the run id this `--rehash` scan wrote to `hash-verify.jsonl`
+    /// (`None` without `--rehash`). `qa anomalies` prints it as
+    /// [`HASH_VERIFY_RUN_ID_PREFIX`] so the workstation can check that the
+    /// result it reports IS this run.
+    pub hash_verify_run_id: Option<String>,
+}
+
+/// R12-I4: the stdout line prefix `qa anomalies` prints the run id with
+/// (printed first, before any finding text).
+pub const HASH_VERIFY_RUN_ID_PREFIX: &str = "hash-verify-run-id: ";
+
+/// R12-I4: the run id from `qa anomalies` output — the FIRST line starting
+/// with [`HASH_VERIFY_RUN_ID_PREFIX`] (printed before any finding text, so
+/// a finding detail cannot forge it).
+pub fn printed_hash_verify_run_id(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim_end()
+            .strip_prefix(HASH_VERIFY_RUN_ID_PREFIX)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    })
 }
 
 /// Index lines and records an anomaly scan did not examine (E8): lines
@@ -150,9 +171,11 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     findings.extend(dav_frame_gap_findings(case_dir, &rows));
 
     let scanned_unix = now_unix()?;
-    if rehash {
-        write_hash_verify_log(case_dir, scanned_unix, &checks)?;
-    }
+    let hash_verify_run_id = if rehash {
+        Some(write_hash_verify_log(case_dir, scanned_unix, &checks)?)
+    } else {
+        None
+    };
     let log_path = case_dir.join("evidence/logs/anomaly-log.jsonl");
     for finding in &findings {
         let line = format!(
@@ -226,6 +249,7 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         coverage,
         index: index_coverage,
         checks,
+        hash_verify_run_id,
     })
 }
 
@@ -323,14 +347,18 @@ pub struct HashVerifyRun {
     pub entries: Vec<serde_json::Value>,
     /// True when the run's `hash-verify-run` completion marker is present.
     pub completed: bool,
-    /// R9 P3: entries of this run (records or its completion marker) that
-    /// may not feed a result here — not authenticated on a PC holding
-    /// audit keys, another PC's, or past a chain break. They are left out
-    /// of `entries` / `completed` and only counted.
+    /// R9 P3 / R12 P12: unusable lines positioned inside this run's span
+    /// (its first usable entry through its completion marker, or the end
+    /// of the lane) — counted by POSITION, never by what they claim
+    /// (`event`, `run_id`); never part of `entries` / `completed`.
     pub unauthenticated: usize,
     /// R11 I1: the `records` count the (usable) completion marker states —
     /// `None` without a marker, or for a marker written before the field.
     pub marker_records: Option<usize>,
+    /// R12 P12: lane index of the run's first usable entry.
+    pub first_index: usize,
+    /// R12 P12: lane index of the run's usable completion marker.
+    pub marker_index: Option<usize>,
 }
 
 /// Every run in `hash-verify.jsonl`, in first-appearance order. Entries are
@@ -342,9 +370,15 @@ pub fn hash_verify_runs(case_dir: &Path) -> Result<Vec<HashVerifyRun>, String> {
     Ok(hash_verify_assessment(case_dir)?.runs)
 }
 
+/// R12 P12: groups the USABLE `hash-verify` / `hash-verify-run` entries by
+/// run id. The content of an unusable line (its `event`, `run_id`, whether
+/// it even parses) is never read here — R11 read it, so an unsigned tail
+/// line claiming another event ("x-note") or an older run's id was not
+/// counted against the newer run and the older all-match run stood as the
+/// result. Unusable lines are judged by POSITION only ([`assess_runs`]).
 fn runs_from_lane(lane: &audit::LaneRows) -> Vec<HashVerifyRun> {
     let mut runs: Vec<HashVerifyRun> = Vec::new();
-    for row in &lane.rows {
+    for row in lane.usable() {
         let value = &row.value;
         let event = value.get("event").and_then(|e| e.as_str());
         if !matches!(event, Some("hash-verify" | "hash-verify-run")) {
@@ -366,14 +400,15 @@ fn runs_from_lane(lane: &audit::LaneRows) -> Vec<HashVerifyRun> {
                     completed: false,
                     unauthenticated: 0,
                     marker_records: None,
+                    first_index: row.index,
+                    marker_index: None,
                 });
                 runs.len() - 1
             }
         };
-        if !row.usable() {
-            runs[index].unauthenticated += 1;
-        } else if event == Some("hash-verify-run") {
+        if event == Some("hash-verify-run") {
             runs[index].completed = true;
+            runs[index].marker_index = Some(row.index);
             runs[index].marker_records = value
                 .get("records")
                 .and_then(|v| v.as_u64())
@@ -381,6 +416,15 @@ fn runs_from_lane(lane: &audit::LaneRows) -> Vec<HashVerifyRun> {
         } else {
             runs[index].entries.push(row.value_with_trust());
         }
+    }
+    // P12: a run's unusable count is the unusable lines positioned inside
+    // its span (first usable entry .. its marker, or the end of the lane).
+    let unusable: Vec<usize> = lane.unusable().map(|row| row.index).collect();
+    for run in &mut runs {
+        run.unauthenticated = unusable
+            .iter()
+            .filter(|at| **at >= run.first_index && run.marker_index.is_none_or(|m| **at <= m))
+            .count();
     }
     runs
 }
@@ -473,29 +517,61 @@ pub fn hash_verify_assessment(case_dir: &Path) -> Result<HashVerifyAssessment, S
 }
 
 fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAssessment {
-    let latest = runs.iter().rposition(|run| run.completed);
-    let newest_unusable = runs.iter().rposition(|run| run.unauthenticated > 0);
+    // R12 P12: the candidate is the run whose usable completion marker sits
+    // LAST in the lane; every decision about unusable lines is by position
+    // (R11 compared run indices derived from an unusable line's `run_id`).
+    let latest = runs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, run)| run.marker_index.map(|at| (at, index)))
+        .max()
+        .map(|(_, index)| index);
+    let marker_at = latest.and_then(|index| runs[index].marker_index);
+    let after_marker = |at: usize| marker_at.is_none_or(|m| at > m);
+    let unusable_after = lane
+        .unusable()
+        .filter(|row| after_marker(row.index))
+        .count();
+    // R12 I3: a `lane-repair` marker after the result run's marker — the
+    // repair cut a tail that may have held a newer run.
+    let repaired_after = lane
+        .usable()
+        .any(|row| after_marker(row.index) && audit::is_lane_repair_marker(&row.value));
     let mut withheld = None;
     if let Some(failure) = &lane.failure {
         withheld = Some(format!(
             "재검증 기록의 감사 체인 검증 실패 — 어떤 실행도 현재 결과로 쓰지 않음: {failure}"
         ));
-    } else if let Some(unusable) = newest_unusable
-        && latest.is_none_or(|latest| unusable > latest)
-    {
-        let run = &runs[unusable];
-        withheld = Some(format!(
-            "더 새 재검증 실행({})의 항목 {}개를 이 PC에서 인증할 수 없음 (완료 표식일 수 있음) — 그 실행의 결과를 알 수 없어 이전 완료 실행을 현재 결과로 쓰지 않음",
-            run.run_id, run.unauthenticated
-        ));
+    } else if unusable_after > 0 {
+        withheld = Some(match latest {
+            Some(index) => format!(
+                "마지막 완료 실행({})의 완료 표식 뒤에 이 PC에서 쓸 수 없는 줄 {unusable_after}개 — 그 줄의 내용(이벤트·실행 id)은 믿을 수 없고 더 새 실행의 결과일 수 있어, 이 실행을 현재 결과로 쓰지 않음",
+                runs[index].run_id
+            ),
+            None => format!(
+                "이 PC에서 쓸 수 있는 완료 실행이 없고 쓸 수 없는 줄 {unusable_after}개가 있음 — 그 줄의 내용은 믿을 수 없어 결과를 알 수 없음"
+            ),
+        });
+    } else if repaired_after {
+        withheld = Some(
+            "마지막 완료 실행 뒤에 레인 수리(lane-repair) 표식이 있음 — 수리로 잘린 꼬리에 더 새 실행이 있었을 수 있어 이 실행을 현재 결과로 쓰지 않음 (원본 재검증을 다시 실행하십시오)"
+                .to_string(),
+        );
     }
     let result = if withheld.is_some() { None } else { latest };
-    let unauthenticated = runs[result.unwrap_or(0)..]
-        .iter()
-        .map(|run| run.unauthenticated)
-        .sum();
-    let interrupted = (result.map_or(0, |index| index + 1)..runs.len())
-        .filter(|index| !runs[*index].completed && runs[*index].unauthenticated == 0)
+    // Unusable lines from the candidate run's first entry on (every one
+    // when there is no candidate), by position.
+    let start = latest.map_or(0, |index| runs[index].first_index);
+    let unauthenticated = lane.unusable().filter(|row| row.index >= start).count();
+    // Runs that never completed: after the result's marker, or every one
+    // when there is no result. Disclosed, never the result.
+    let interrupted = (0..runs.len())
+        .filter(|index| {
+            let run = &runs[*index];
+            !run.completed
+                && run.unauthenticated == 0
+                && (result.is_none() || marker_at.is_some_and(|m| run.first_index > m))
+        })
         .collect();
     let mut not_verified = Vec::new();
     match result {
@@ -554,7 +630,7 @@ fn write_hash_verify_log(
     case_dir: &Path,
     run_unix: u64,
     checks: &[HashCheck],
-) -> Result<(), String> {
+) -> Result<String, String> {
     let log_path = case_dir.join(HASH_VERIFY_REL_PATH);
     let opt = |value: &Option<String>| match value {
         Some(text) => format!("\"{}\"", json_escape(text)),
@@ -579,7 +655,8 @@ fn write_hash_verify_log(
         "{{\"schema_version\":1,\"event\":\"hash-verify-run\",\"run_unix\":{run_unix},\"run_id\":\"{run_id}\",\"records\":{}}}",
         checks.len()
     );
-    audit::append_chained_jsonl(&log_path, &summary)
+    audit::append_chained_jsonl(&log_path, &summary)?;
+    Ok(run_id)
 }
 
 fn hash_revalidation_findings(
