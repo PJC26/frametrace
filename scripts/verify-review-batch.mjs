@@ -765,12 +765,12 @@ async function r13TrackU({ fn, runInNewContext, assert, ex }) {
   const unp = js({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired') });
   assert.ok(/data-journal="unpaired"/.test(unp) && /이전 최종화 기록 짝 없음 — 확인 필요/.test(unp) && /<small class="h-fin-detail[^"]*">아무것도 바뀌지 않았습니다<\/small>/.test(unp), 'R13 U1 unpaired: ' + unp);
   const oh = js({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: 'PC-LAB2' }) });
-  assert.ok(/data-journal="otherhost"/.test(oh) && /다른 PC의 최종화 — 차단 중/.test(oh) && />PC-LAB2<\/small>/.test(oh) && /title="호스트 PC-LAB2/.test(oh), 'R13 U1 other-host (host shown): ' + oh);
+  assert.ok(/data-journal="otherhost"/.test(oh) && /다른 PC의 최종화 — 차단 중/.test(oh) && />PC PC-LAB2<\/small>/.test(oh) && /title="호스트 PC-LAB2/.test(oh), 'R13 U1 other-host (host shown): ' + oh);
   const recv = js({ ok: true, phase: 'review-ready', busy: true, finalize_journal: jn('recovering') });
   assert.ok(/data-journal="recovering"/.test(recv) && /class="h-fin-info">이전 최종화 복구 중</.test(recv) && !/확인 필요/.test(recv), 'R13 U1 recovering is info: ' + recv);
   // The checklist blocks while recovering / another PC's finalize is open.
   const src = readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8');
-  assert.ok(/journal\.kind === "recovering"\) add\("block", "이전 최종화 복구 중"/.test(src) && /journal\.kind === "otherhost"\)[^]{0,200}add\("block", "다른 PC의 최종화 — 차단 중"/.test(src), 'R13 U1: checklist block rows');
+  assert.ok(/journal\.kind === "recovering" && finJournalBlocks\(journal\)\) add\("block", "이전 최종화 복구 중"/.test(src) && /finJournalBlocks\(journal\)\) \{[^]{0,600}add\("block", "최종화 차단: " \+ \(FIN_JOURNAL_HEAD/.test(src), 'R13 U1: checklist block rows');
   const css = readFileSync(new URL('../assets/app/40-finalize.css', import.meta.url), 'utf8');
   assert.ok(/\.h-fin-info \{[^}]*var\(--info-bg\)[^}]*var\(--info-fg\)/.test(css), 'R13 U1: .h-fin-info uses the info tokens');
   console.log('PASS VM R13 U1 journal unpaired / other-host (host) / recovering (info) + checklist blocks');
@@ -781,8 +781,26 @@ async function r13TrackU({ fn, runInNewContext, assert, ex }) {
   const own = js({ ok: true, phase: 'review-ready', finalize_journal: jn('unreadable', { error: 'x', dismiss_command: 'frametrace finalize-journal --dismiss D:/c' }) });
   assert.ok(/<code class="mono">frametrace finalize-journal --dismiss D:\/c<\/code>/.test(own), 'R13 U3: the server\'s own command wins: ' + own);
   assert.ok(!/finalize-journal --dismiss/.test(js({ ok: true, phase: 'review-ready', finalize_journal: jn('interrupted') })), 'R13 U3: only the unreadable row');
-  runInNewContext('FIN.status = null;', ex);
   console.log('PASS VM R13 U3 unreadable journal row names finalize-journal --dismiss');
+
+  // R13 follow-up (track S c76a4df): completed / in-progress, reason,
+  // blocks_finalize, blocked_until_unix, dismiss_command on unpaired.
+  const cmdS = 'frametrace finalize-journal "C:/cases/c1" --dismiss';
+  const done = js({ ok: true, phase: 'review-ready', finalize_recovered: false, finalize_journal: jn('completed', { blocks_finalize: false, dismiss_command: cmdS }) });
+  assert.ok(/data-journal="completed"/.test(done) && /class="h-fin-info">이전 최종화 완료 — 기록만 남음</.test(done) && !/확인 필요|치우기/.test(done), 'R13 S completed → info, no command: ' + done);
+  const unpR = js({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired', { reason: '서명 레인에 이 최종화의 시작 기록이 없음(R12 저널)', blocks_finalize: true, dismiss_command: cmdS }) });
+  assert.ok(/<small class="h-fin-detail muted">서명 레인에 이 최종화의 시작 기록이 없음\(R12 저널\)<\/small>/.test(unpR) && unpR.includes('<code class="mono">frametrace finalize-journal &quot;C:/cases/c1&quot; --dismiss</code>') && !/아무것도 바뀌지 않았습니다/.test(unpR), 'R13 S unpaired: reason in the body + dismiss_command: ' + unpR);
+  const live = js({ ok: true, phase: 'review-ready', finalize_journal: jn('in-progress', { reason: '다른 FrameTrace 프로세스(pid 4120)가 최종화 중', blocks_finalize: true, dismiss_command: cmdS }) });
+  assert.ok(/data-journal="inprogress"/.test(live) && /pid 4120/.test(live) && !/치우기/.test(live), 'R13 S in-progress reason: ' + live);
+  const until = 1760086400;
+  const ohU = js({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: '0a1b2c3d4e5f', host_id: '0a1b2c3d4e5f'.padEnd(32, '0'), this_host: false, blocks_finalize: true, blocked_until_unix: until, dismiss_command: cmdS }) });
+  const untilText = runInNewContext(`new Date(${until} * 1000).toLocaleString()`, ex);
+  assert.ok(ohU.includes(`>PC 0a1b2c3d4e5f · ${untilText}까지 차단</small>`), 'R13 S other-host blocked until: ' + ohU);
+  const blocks = (k, extra) => runInNewContext(`finJournalBlocks(finJournalState(s))`, Object.assign(ex, { s: { ok: true, finalize_journal: jn(k, extra) } }));
+  assert.deepEqual([blocks('other-host', { blocks_finalize: false }), blocks('interrupted', { blocks_finalize: true }), blocks('completed', { blocks_finalize: false }), blocks('unpaired', { blocks_finalize: true }), blocks('other-host'), blocks('interrupted')],
+    [false, true, false, true, true, false], 'R13 S: blocks_finalize decides (fallback: recovering / other-host only)');
+  runInNewContext('FIN.status = null;', ex);
+  console.log('PASS VM R13 S journal completed (info) / in-progress, reason in the body, blocks_finalize, blocked_until, dismiss_command');
 
   // U2 (track I1, P16): newer usable run without a marker — mismatches shown.
   const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
@@ -967,7 +985,8 @@ async function r12TrackU({ fn, runInNewContext, assert, ex }) {
   const unr = js({ ok: true, phase: 'review-ready', finalize_journal: { path: 'review/finalize.inprogress.json', state: 'unreadable', examiner: null, started_unix: null, signoff_sha256: null, error: 'JSON 파싱 실패: line 1' } });
   assert.ok(/data-journal="unreadable"/.test(unr) && /이전 최종화 기록을 읽지 못함 — 확인 필요/.test(unr) && /<small class="h-fin-detail[^"]*">JSON 파싱 실패: line 1<\/small>/.test(unr), 'R12 S2 unreadable journal: ' + unr);
   const inprog = js({ ok: true, phase: 'review-ready', finalize_journal: { path: 'p', state: 'in-progress', examiner: 'Kim', started_unix: 1760000000, signoff_sha256: 'ff', error: null } });
-  assert.ok(/data-journal="check"/.test(inprog) && /title="검토자 Kim/.test(inprog), 'R12 S2 in-progress (another process) → 확인 필요: ' + inprog);
+  // R13 (track S c76a4df): in-progress = another live FrameTrace process on this PC.
+  assert.ok(/data-journal="inprogress"/.test(inprog) && /다른 FrameTrace에서 최종화 중/.test(inprog) && /title="검토자 Kim/.test(inprog), 'R12/R13 S in-progress (another process): ' + inprog);
   const recDetail = '이전 최종화(2026-10-16 10:00)를 되돌렸습니다: 이전 서명 복원, 보고서 재생성 — 확인 필요: reports/package_003_INCOMPLETE';
   const recd = js({ ok: true, phase: 'review-ready', finalize_journal: null, finalize_recovered: true, finalize_recovered_detail: recDetail });
   const recBody = /<small class="h-fin-detail[^"]*">([^<]*)<\/small>/.exec(recd);

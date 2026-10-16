@@ -513,6 +513,28 @@ await check('4g R13 U1–U3: 짝 없음 / 다른 PC 차단 / 복구 중; --dismi
   await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'unpaired', null, { timeout: 5000 });
   j = await journalRow();
   assert.ok(/이전 최종화 기록 짝 없음 — 확인 필요/.test(j.text) && /아무것도 바뀌지 않았습니다/.test(j.text) && j.inside, 'unpaired row: ' + JSON.stringify(j));
+  // Track S (c76a4df): blocks_finalize decides the block row, not the state.
+  const blockRows = async () => (await rows(page)).filter((r) => r.level === 'block' && /최종화 차단: |이전 최종화 복구 중/.test(r.text));
+  S.status = Object.assign({}, before, base, { finalize_journal: jn('completed', { blocks_finalize: false, dismiss_command: 'frametrace finalize-journal "C:/cases/c1" --dismiss' }) });
+  await page.click('#btnFinalRecheck');
+  await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'completed', null, { timeout: 5000 });
+  j = await journalRow();
+  assert.ok(/이전 최종화 완료 — 기록만 남음/.test(j.text) && j.label === 'h-fin-info' && !(await blockRows()).length && !(await btnState(page)).disabled, 'completed = info, no block: ' + JSON.stringify(j));
+  for (const th of ['light', 'dark']) {
+    await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
+    const lab = (await contrastReport(page)).find((e) => e.cls === 'h-fin-info');
+    assert.ok(lab && ratio(lab.fg, lab.bg) >= 4.5, `${th}: 기록만 남음 label contrast`);
+  }
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+  S.status = Object.assign({}, before, base, { finalize_journal: jn('other-host', { host: '0a1b2c3d4e5f', blocks_finalize: false, blocked_until_unix: 1760086400 }) });
+  await page.click('#btnFinalRecheck');
+  await page.waitForFunction(() => /0a1b2c3d4e5f/.test(document.querySelector('#finalLinks .h-fin-journal-row')?.textContent || ''), null, { timeout: 5000 });
+  assert.ok(!(await blockRows()).length && /까지 차단/.test((await journalRow()).text), 'other-host past its block: no block row');
+  S.status = Object.assign({}, before, base, { finalize_journal: jn('interrupted', { blocks_finalize: true, reason: null }) });
+  await page.click('#btnFinalRecheck');
+  await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'check', null, { timeout: 5000 });
+  const ib = await blockRows();
+  assert.ok(ib.length === 1 && /최종화 차단: 이전 최종화 중단됨/.test(ib[0].text) && (await btnState(page)).disabled, 'interrupted + blocks_finalize → block: ' + JSON.stringify(ib));
   // unreadable: the dismiss command, inside the sheet, AA in both themes.
   S.status = Object.assign({}, before, base, { case_dir: 'C:/cases/c1', finalize_journal: jn('unreadable', { error: 'JSON 파싱 실패: line 1' }) });
   await page.click('#btnFinalRecheck');

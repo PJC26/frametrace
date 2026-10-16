@@ -424,7 +424,7 @@ async function gatherFinalizeChecks() {
   // PC's unfinished finalize blocks this one (never recovered from here).
   const journal = finJournalState(st);
   if (!st) add("block", "서버 상태를 확인할 수 없습니다", "연결이 복구된 뒤 '다시 확인'을 누르십시오.");
-  else if (journal && journal.kind === "recovering") add("block", "이전 최종화 복구 중", "끝나면 '다시 확인'을 누르십시오.");
+  else if (journal && journal.kind === "recovering" && finJournalBlocks(journal)) add("block", "이전 최종화 복구 중", "끝나면 '다시 확인'을 누르십시오.");
   else if (phase === "review-partial") {
     const e = st.enrichment;
     add("block", "분석 보강 중 — 해시·검증이 끝나야 보고서를 낼 수 있습니다",
@@ -433,9 +433,13 @@ async function gatherFinalizeChecks() {
   } else if (phase === "running") add("block", "분석이 진행 중입니다", "끝난 뒤 '다시 확인'을 누르십시오.");
   else if (st.busy) add("block", "다른 작업이 진행 중입니다", `현재 단계: ${phase || "-"} — 끝난 뒤 다시 확인하십시오.`);
   else if (!["review-ready", "done", "finalized"].includes(phase)) add("block", "완료된 분석 결과가 없습니다", "먼저 분석을 끝내십시오.");
-  if (journal && journal.kind === "otherhost") {
-    const host = journal.journal && journal.journal.host ? String(journal.journal.host) : "";
-    add("block", "다른 PC의 최종화 — 차단 중", (host ? host + "에서" : "그 PC에서") + " 끝난 뒤 다시 확인하십시오.");
+  // R13 (track S c76a4df): `blocks_finalize` decides, not the state.
+  if (journal && journal.kind !== "recovering" && finJournalBlocks(journal)) {
+    const jj = journal.journal || {};
+    const sub = journal.kind === "otherhost" ? [finJournalOtherHost(jj), "그 PC에서 끝난 뒤 다시 확인하십시오."].filter(Boolean).join(" — ")
+      : journal.kind === "unreadable" || journal.kind === "unpaired" ? "치우기: " + finJournalDismissCmd(st)
+      : journal.detail ? finShortDetail(journal.detail) : "결과 아래 안내를 확인하십시오.";
+    add("block", "최종화 차단: " + (FIN_JOURNAL_HEAD[journal.kind] || FIN_JOURNAL_HEAD.check), sub);
   }
   let meta = null;
   try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
@@ -559,16 +563,26 @@ function finJournalState(st) {
   const j = st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : null;
   const jState = j && j.state != null ? String(j.state) : "";
   const detail = st.finalize_recovered_detail == null ? "" : String(st.finalize_recovered_detail);
+  // R13 (track S c76a4df): `reason` says why (unpaired; the live process of
+  // in-progress) — the row body.
+  const reason = j && j.reason != null ? String(j.reason).trim() : "";
   if (j && jState === "unreadable") return { kind: "unreadable", journal: j, detail: j.error == null ? "" : String(j.error) };
   // R13 U1 (track S, P15/P17): no matching lane record — nothing was changed;
   // another PC's finalize — blocked, never recovered here; startup recovery
-  // running in the background (busy).
-  if (j && jState === "unpaired") return { kind: "unpaired", journal: j, detail };
-  if (j && jState === "other-host") return { kind: "otherhost", journal: j, detail };
-  if (j && jState === "recovering") return { kind: "recovering", journal: j, detail };
-  if (j && jState !== "recovered") return { kind: "check", journal: j, detail };
+  // running in the background (busy); the lane says the finalize completed
+  // or was resolved — only the journal is left (cleared on the next open).
+  const kind = { "unpaired": "unpaired", "other-host": "otherhost", "recovering": "recovering", "completed": "completed", "in-progress": "inprogress" }[jState];
+  if (j && kind) return { kind, journal: j, detail: reason || detail };
+  if (j && jState !== "recovered") return { kind: "check", journal: j, detail: reason || detail };
   if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j, detail };
   return null;
+}
+// Does the journal block the next finalize? The server's `blocks_finalize`
+// when it sends one; else (older server) recovering / other-host only.
+function finJournalBlocks(s) {
+  if (!s || !s.journal) return false;
+  if (typeof s.journal.blocks_finalize === "boolean") return s.journal.blocks_finalize;
+  return s.kind === "recovering" || s.kind === "otherhost";
 }
 // The body shows what is left first: from "확인 필요:" on when the detail has it.
 function finJournalBody(detail) {
@@ -581,16 +595,24 @@ const FIN_JOURNAL_HEAD = {
   unpaired: "이전 최종화 기록 짝 없음 — 확인 필요",
   otherhost: "다른 PC의 최종화 — 차단 중",
   recovering: "이전 최종화 복구 중",
+  completed: "이전 최종화 완료 — 기록만 남음",
+  inprogress: "다른 FrameTrace에서 최종화 중",
   check: "이전 최종화 중단됨 — 확인 필요",
   recovered: "이전 최종화 중단됨 — 복구됨",
 };
-// R13 U3: the command that sets an unreadable journal aside (the server's own
-// when it sends one).
+const FIN_JOURNAL_INFO = new Set(["recovering", "completed"]);
+// R13 U3: the command that sets an unreadable / unpaired journal aside (the
+// server's own — track S always sends it).
 function finJournalDismissCmd(st) {
   const j = st && st.finalize_journal;
   if (j && typeof j.dismiss_command === "string" && j.dismiss_command.trim()) return j.dismiss_command.trim();
   const dir = st && typeof st.case_dir === "string" ? st.case_dir : "";
   return "frametrace finalize-journal --dismiss" + (dir ? ` "${dir}"` : "");
+}
+// other-host: "PC <host> · <time>까지 차단".
+function finJournalOtherHost(j) {
+  const until = Number(j && j.blocked_until_unix);
+  return [j && j.host ? "PC " + String(j.host) : "", until > 0 ? new Date(until * 1000).toLocaleString() + "까지 차단" : ""].filter(Boolean).join(" · ");
 }
 function finJournalRow(st) {
   const s = finJournalState(st);
@@ -600,20 +622,24 @@ function finJournalRow(st) {
   if (j.host) tip.push("호스트 " + String(j.host));
   if (j.examiner) tip.push("검토자 " + String(j.examiner));
   if (j.signoff_sha256) tip.push("검토자 기록 SHA-256 " + String(j.signoff_sha256));
+  if (j.package_name) tip.push("패키지 " + String(j.package_name));
+  if (j.finalize_id) tip.push("최종화 id " + String(j.finalize_id));
   const started = Number(j.started_unix);
   if (started > 0) tip.push("시작 " + new Date(started * 1000).toLocaleString());
   if (j.state != null && String(j.state)) tip.push("상태 " + String(j.state));
   if (j.path) tip.push(String(j.path));
   if (s.detail) tip.push(s.detail);
   const head = FIN_JOURNAL_HEAD[s.kind] || FIN_JOURNAL_HEAD.recovered;
-  let body = s.detail ? finJournalBody(s.detail) : "";
-  if (!body && s.kind === "unpaired") body = "아무것도 바뀌지 않았습니다";
-  if (!body && s.kind === "otherhost" && j.host) body = String(j.host);
-  // R13 U3 (track S6): an unreadable journal is set aside with the CLI.
-  const cmd = s.kind === "unreadable" ? finJournalDismissCmd(st) : "";
+  const lines = [];
+  if (s.kind === "otherhost") { const o = finJournalOtherHost(j); if (o) lines.push(o); }
+  if (s.detail) lines.push(finJournalBody(s.detail));
+  else if (s.kind === "unpaired") lines.push("아무것도 바뀌지 않았습니다");
+  // R13 U3 (track S6): an unreadable or unpaired journal (R12 journals read
+  // unpaired) is set aside with the CLI.
+  const cmd = s.kind === "unreadable" || s.kind === "unpaired" ? finJournalDismissCmd(st) : "";
   return `<li class="h-fin-journal-row" data-journal="${s.kind}"${tip.length ? ` title="${esc(tip.join("\n"))}"` : ""}>` +
-    `<span class="${s.kind === "recovering" ? "h-fin-info" : "h-fin-incomplete"}">${esc(head)}</span>` +
-    (body ? `<small class="h-fin-detail muted">${esc(body)}</small>` : "") +
+    `<span class="${FIN_JOURNAL_INFO.has(s.kind) ? "h-fin-info" : "h-fin-incomplete"}">${esc(head)}</span>` +
+    lines.map(b => `<small class="h-fin-detail muted">${esc(b)}</small>`).join("") +
     (cmd ? `<small class="h-fin-detail h-fin-cmd">치우기: <code class="mono">${esc(cmd)}</code></small>` : "") + `</li>`;
 }
 function finResultHtml() {
