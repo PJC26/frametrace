@@ -165,6 +165,13 @@ function pkgExplorerLink(dir) {
 // else null. Fields a server may send are preferred over its error text.
 function finIncompleteOf(res) {
   if (!res || typeof res !== "object") return null;
+  // R11 (track S 2a51c94): the server's own verdict when it sends one — a
+  // failed promotion creates no package, so there is no path to name.
+  if (typeof res.finalize_incomplete === "boolean") {
+    if (!res.finalize_incomplete) return null;
+    const dir = typeof res.incomplete_package_dir === "string" ? res.incomplete_package_dir : typeof res.package_dir === "string" ? res.package_dir : "";
+    return { package_dir: dir };
+  }
   for (const k of ["incomplete_package_dir", "package_dir"]) {
     const v = typeof res[k] === "string" ? res[k] : "";
     if (v && (k === "incomplete_package_dir" || packageIncomplete(v, res.finalize_incomplete))) return { package_dir: v };
@@ -480,13 +487,19 @@ function finResultHtml() {
   // R10 U4: the last finalize published a package but did not complete
   // (its own row unless it is the package listed below).
   // R11 U4 (S6): the status flag speaks for the status package_dir only.
-  const pkgInc = !!pkgDir && packageIncomplete(pkgDir, (r && r.package_dir) ? r.finalize_incomplete : !!st && st.package_incomplete === true);
-  const inc = FIN.incomplete;
+  const pkgInc = !!pkgDir && packageIncomplete(pkgDir, (r && r.package_dir) ? r.finalize_incomplete : st ? st.package_incomplete : undefined);
+  // R11 (track S 2a51c94): after a reload /api/status says what the last
+  // finalize left (`finalize_incomplete` + detail, `report_stale`; memory
+  // only) — used when this sheet has no answer of its own.
+  const own = !!(FIN.incomplete || FIN.reportStale || r);
+  const inc = FIN.incomplete || (!own && st && st.finalize_incomplete === true
+    ? { package_dir: "", detail: st.finalize_incomplete_detail == null ? "" : String(st.finalize_incomplete_detail) } : null);
+  const stale = FIN.reportStale || (!own && st && st.report_stale === true ? { error: "" } : null);
   // R11 U4 (track S5): the report could not be re-rendered after a failed
   // step — reports/case-report.html is not current.
-  const staleRow = FIN.reportStale ? `<li class="h-fin-stale-row"><span class="h-fin-incomplete">보고서 최신 아님</span>` +
-    ` <span class="muted"${FIN.reportStale.error ? ` title="${esc(FIN.reportStale.error)}"` : ""}>다시 최종화하십시오</span></li>` : "";
-  const incRow = staleRow + (inc && !(pkgInc && (!inc.package_dir || inc.package_dir === pkgDir)) ? `<li class="h-fin-incomplete-row"><span class="h-fin-incomplete">${esc(H_PKG_INCOMPLETE)}</span>` +
+  const staleRow = stale ? `<li class="h-fin-stale-row"><span class="h-fin-incomplete">보고서 최신 아님</span>` +
+    ` <span class="muted"${stale.error ? ` title="${esc(stale.error)}"` : ""}>다시 최종화하십시오</span></li>` : "";
+  const incRow = staleRow + (inc && !(pkgInc && (!inc.package_dir || inc.package_dir === pkgDir)) ? `<li class="h-fin-incomplete-row"${inc.detail ? ` title="${esc(inc.detail)}"` : ""}><span class="h-fin-incomplete">${esc(H_PKG_INCOMPLETE)}</span>` +
     (inc.package_dir ? ` <code class="mono">${esc(inc.package_dir)}</code> ${pkgExplorerLink(inc.package_dir)}` : "") +
     ` <span class="muted">최종 결과로 쓰지 마십시오</span></li>` : "");
   if (!r && !pkgDir) return incRow ? `<h3 class="h-fin-h">결과</h3><ul class="h-fin-links">${incRow}</ul>` : "";
@@ -758,7 +771,7 @@ async function finFinalize() {
   FIN.incomplete = finIncompleteOf(res);
   FIN.reportStale = res && res.report_stale === true ? { error: String(res.error || "") } : null;
   if (!res.ok) { finHint("실패: " + (res.error || "알 수 없는 오류")); finPaint(); return; }
-  FIN.result = { examiner: res.examiner || name, manifest_sha256: res.manifest_sha256 || "", package_dir: res.package_dir || "", package_url: res.package_url || "", finalize_incomplete: res.finalize_incomplete === true };
+  FIN.result = { examiner: res.examiner || name, manifest_sha256: res.manifest_sha256 || "", package_dir: res.package_dir || "", package_url: res.package_url || "", finalize_incomplete: typeof res.finalize_incomplete === "boolean" ? res.finalize_incomplete : undefined };
   finHint("");
   finPaint();
   if (FIN.incomplete) toast(`보고서·패키지를 만들었지만 ${H_PKG_INCOMPLETE} — 최종 결과로 쓰지 마십시오`, "warn");

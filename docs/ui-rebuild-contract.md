@@ -831,13 +831,14 @@ const FTStore = {
 - 쓸 수 있는 항목도 `trust_note`가 있으면(레거시 `auth` + "레인·케이스 결합 없음(레거시) …") 툴팁에만 보인다: `logTrustNote(item, true)`, 기록 상태 `statusNote`(배지 툴팁 `상태\nnote`), 상세 목록 `.trust-info`(`info` 아이콘, title·aria-label = note). 항목 아래 `.trust-note` 줄은 여전히 쓸 수 없는 항목만.
 
 ### 18.3 `_INCOMPLETE` 판정 (U3, P11)
-- `packageIncomplete`(10-core): 경로 끝 `/[\\/. ]+$/`를 떼고 폴더 이름이 `/_INCOMPLETE(_\d+)?( - 복사본| \(\d+\))?$/i`(`H_PKG_INCOMPLETE_RE`)이거나 `*.finalize-incomplete.txt`.
+- `packageIncomplete(dir, flag)`(10-core): 서버가 boolean `flag`를 보내면 그것이 판정. 없으면 `packageIncompleteName` — 서버 규칙(트랙 S 2a51c94)과 같게 폴더 이름 끝의 점·공백, ` - 복사본`, ` - Copy`(대소문자 무관), ` (n)`을 되풀이해 떼고 `/_INCOMPLETE(_\d+)?$/i`(`H_PKG_INCOMPLETE_RE`), 또는 `*.finalize-incomplete.txt`.
 - `/api/recent-cases`는 패키지 힌트를 보내지 않는다(recent.rs `phase_hint`만) → 55-home `recentState`의 `finalize-incomplete`·`package_dir` 분기 제거. 연 케이스는 `/api/status`로 "최종화 미완료".
 
 ### 18.4 미인증 재검증 줄 · report_stale · package_incomplete (U4, 트랙 I2/S5/S6)
 - `/api/verify-sources`(트랙 I dfa2f8a: `run_id`, `unauthenticated`, `verified`, `is_result`, `not_verified_reason`, `lane_status`): `verifySourcesVerdict`(41-finalize, legacy 70-finalize 동일) — 불일치 `err`가 먼저; `is_result: false` → `warn` "원본 재검증: 현재 결과 없음(결과 아님)"(+ 사유), 점검 목록 "현재 결과 없음"; `verified: false` 또는 `unauthenticated` > 0 → `warn` "확인 불가"(+ 사유·인증 안 된 줄 수). 초록 "모두 일치"는 `verified && is_result && mismatched == 0 && not_comparable == 0 && matched > 0`일 때만. 필드 없음(구 서버) = 수치만, 이전과 같음.
 - 최종화 응답 `report_stale: true`: 결과 목록 첫 줄 `.h-fin-stale-row` "보고서 최신 아님 · 다시 최종화하십시오"(title = 서버 `error`); 성공 응답이면 판정 줄 "보고서·패키지를 만들었지만 보고서 최신 아님"·`warn` 토스트. 다른 케이스를 열면 지워진다.
-- `/api/status` `package_incomplete: true`는 폴더 이름과 상관없이(이름 변경 실패, `package_dir` 없음) 미완료(40-status `stPackageIncomplete`): 상점 phase `done`, `project.packageIncomplete`, 결과물 시트 패키지 줄(상태의 `package_dir`일 때만).
+- `/api/status` `package_incomplete`(boolean)는 `package_dir` 폴더에 대한 서버 판정 — 이름보다 우선, 없으면 이름(40-status `stPackageIncomplete`): 상점 phase `done`, `project.packageIncomplete`, 결과물 시트 패키지 줄(상태의 `package_dir`일 때만). 이전 버전이 남긴 폴더(`incomplete_packages`)용.
+- 트랙 S(2a51c94) 최종화: 실패 응답은 `error`·`report_stale`·`finalize_incomplete`(boolean, 승격 실패는 패키지를 만들지 않으므로 경로 없음 — `incomplete_package_dir`/`url` 없음), 성공 응답도 `report_stale: false`. `finIncompleteOf`는 boolean `finalize_incomplete`가 있으면 그것만 믿는다(오류 문구 추측 안 함). `/api/status`의 `finalize_incomplete`·`finalize_incomplete_detail`·`report_stale`(메모리, 성공·케이스 전환 시 지워짐)은 시트에 이번 응답이 없을 때(새로 고침 뒤) "최종화 미완료"(title = detail)·"보고서 최신 아님" 줄로 보인다. 실패 시 `package_dir`은 그대로이므로 "결과물 생성됨"은 `phase`(`done`/`finalized`)로만. verify-finalize-sheet 4e.
 
 ### 18.5 카빙 페이지 지표 (U5, 트랙 I5)
 - 카빙 페이지(`review/carve-report.html`)는 src/html_report.rs(트랙 I). verify-jobs-e2e 3b: 실제 카빙 뒤 `db/carve_results.json`을 위조(원본 크기·경고·스캔 완료)하고 `make-review`를 다시 돌려, 지표가 "감사 안 됨"(초록 `ok` 없음)이거나 위조 값이 아닌지 본다. I5(dfa2f8a: 네 지표 뒤 `<span class="unaudited">· 감사 안 됨</span>`) 없는 바이너리에서는 `PEND`, `FRAMETRACE_R11_STRICT=1`이면 실패.

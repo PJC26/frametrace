@@ -821,6 +821,27 @@ async function r11TrackU({ fn, runInNewContext, assert, ex }) {
     packageIncomplete('/c/reports/package_001_INCOMPLETE_x'),
   ]`, ex);
   assert.deepEqual(plain(pi), [true, true, true, true, true, false, false, false], 'R11 U3 packageIncomplete: ' + JSON.stringify(pi));
+  // Track S (2a51c94) name rule: " - Copy" (any case), several tails, a dot
+  // after a tail; and the server's boolean verdict wins over the name.
+  const pi2 = runInNewContext(`[
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE - Copy'),
+    packageIncomplete('C:/c/reports/package_001_incomplete - COPY (2)'),
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE_3 - 복사본 - 복사본 (4).'),
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE (2) - Copy. '),
+    packageIncomplete('C:/c/reports/package_001 - Copy'),
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE', false),
+    packageIncomplete('C:/c/reports/package_001', true),
+  ]`, ex);
+  assert.deepEqual(plain(pi2), [true, true, true, true, false, false, true], 'R11 U3 (S rule) packageIncomplete: ' + JSON.stringify(pi2));
+  assert.equal(runInNewContext(`stPackageIncomplete({ package_dir: '/c/reports/p_INCOMPLETE', package_incomplete: false })`, ex), false, 'R11 U3: the status verdict wins over the name');
+  assert.equal(runInNewContext(`stPackageIncomplete({ package_dir: '/c/reports/p_INCOMPLETE - Copy' })`, ex), true, 'R11 U3: older server → the name');
+  // Track S finalize answers: finalize_incomplete is the verdict, no package path.
+  const fi = runInNewContext(`[
+    finIncompleteOf({ ok: false, error: 'x 최종화 미완료', finalize_incomplete: false, report_stale: false }),
+    finIncompleteOf({ ok: false, error: 'x', finalize_incomplete: true, report_stale: true }),
+    finIncompleteOf({ ok: true, package_dir: 'C:/c/reports/package_001_INCOMPLETE', finalize_incomplete: false, report_stale: false }),
+  ]`, ex);
+  assert.deepEqual(plain(fi), [null, { package_dir: '' }, null], 'R11 (S) finIncompleteOf prefers finalize_incomplete: ' + JSON.stringify(fi));
   const home = readFileSync(new URL('../assets/app/55-home.js', import.meta.url), 'utf8');
   assert.ok(!/case "finalize-incomplete"|it\.finalize_incomplete|it\.package_dir/.test(home), 'R11 U3: no dead recent-cases package branch (recent.rs sends no hint)');
   assert.equal(runInNewContext(`recentState({ phase_hint: 'finalized' }, null).state`, ex), '결과물 생성됨');

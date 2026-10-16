@@ -426,10 +426,13 @@ function shellOnStatus(st) {
 // Server phase -> store phase (contract §4). "idle" (no job, no case) is
 // "empty"; "finalizing" is the review phase with busy set; a sealed case
 // (done + package) is "finalized".
-// R11 U4 (track S6): `package_incomplete: true` counts even when the
-// folder could not be renamed (or no package_dir is named at all).
+// R11 U4 (track S6): the server's `package_incomplete` is its verdict on
+// `package_dir` (true counts even without a renamed folder); absent (older
+// server) = the folder name.
 function stPackageIncomplete(st) {
-  return !!st && (st.package_incomplete === true || (!!st.package_dir && packageIncomplete(st.package_dir)));
+  if (!st) return false;
+  if (typeof st.package_incomplete === "boolean") return st.package_incomplete;
+  return !!st.package_dir && packageIncompleteName(st.package_dir);
 }
 function storePhase(st) {
   if (!st || !st.has_job) return "empty";

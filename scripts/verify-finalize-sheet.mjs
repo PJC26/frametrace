@@ -375,6 +375,32 @@ await check('4d R11 U4: report_stale → 보고서 최신 아님; unauthenticate
   await page.context().close();
 });
 
+// Track S (2a51c94): after a reload, /api/status carries what the last
+// finalize left (memory only) — the sheet shows it without an answer of its
+// own; a failure answer's finalize_incomplete:false is believed over its words.
+await check('4e R11 (S): status finalize_incomplete / report_stale after a reload; the answer\'s verdict wins', async () => {
+  const page = await newPage(browser);
+  const before = S.status;
+  S.status = Object.assign({}, before, { phase: 'review-ready', busy: false, pending_marks: 0, finalize_incomplete: true, finalize_incomplete_detail: '검토자 기록 확정 실패: busy', report_stale: true });
+  await openSheet(page);
+  await page.waitForFunction(() => /최종화 미완료/.test(document.getElementById('finalLinks').textContent), null, { timeout: 5000 })
+    .catch(async (e) => { throw new Error(e.message + ' ' + await page.evaluate(() => JSON.stringify({ st: FIN.status, html: document.getElementById('finalLinks').innerHTML }))); });
+  const rows = await page.evaluate(() => ({
+    inc: document.querySelector('#finalLinks .h-fin-incomplete-row')?.getAttribute('title') || '',
+    stale: !!document.querySelector('#finalLinks .h-fin-stale-row'),
+  }));
+  assert.ok(rows.inc === '검토자 기록 확정 실패: busy' && rows.stale, 'status rows: ' + JSON.stringify(rows));
+  S.status = Object.assign({}, before, { phase: 'review-ready', busy: false, pending_marks: 0, finalize_incomplete: false, report_stale: false });
+  await page.fill('#finalExaminer', 'Hong');
+  S.finalize = { ok: false, error: '패키징 실패 — (이전 실행의 _INCOMPLETE 폴더 언급) 최종화 미완료 아님', finalize_incomplete: false, report_stale: false };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /실패/.test(document.getElementById('finalHint').textContent));
+  const links = await page.textContent('#finalLinks');
+  assert.ok(!/최종화 미완료/.test(links) && !/보고서 최신 아님/.test(links), 'server verdict false: ' + links);
+  assert.deepEqual(page.__errors, []);
+  await page.context().close();
+});
+
 await check('4b a stale "ready" never seals: fresh block at click time -> no POST', async () => {
   const page = await newPage(browser);
   await openSheet(page);

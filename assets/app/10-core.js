@@ -10,15 +10,22 @@ const esc = v => String(v ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").
 // "<name>_INCOMPLETE" (marker "<package>.finalize-incomplete.txt" beside it)
 // — shown as "최종화 미완료" wherever a package or the finalized state is.
 // `flag`: an explicit server field, when one is sent (absent is fine).
-// R11 U3 (P11): a second incomplete package ("_INCOMPLETE_2") and an
-// Explorer copy (" - 복사본", " (2)") count too; trailing dots / spaces
-// (dropped by Windows) are ignored.
+// R11 U3 (P11, the server's rule in track S 2a51c94): strip trailing dots /
+// spaces and copy tails (" - 복사본", " - Copy", " (2)") repeatedly, then
+// "_INCOMPLETE" or "_INCOMPLETE_<n>" (any case). A boolean `flag` from the
+// server is its verdict and wins over the name.
 const H_PKG_INCOMPLETE = "최종화 미완료";
-const H_PKG_INCOMPLETE_RE = /_INCOMPLETE(_\d+)?( - 복사본| \(\d+\))?$/i;
+const H_PKG_INCOMPLETE_RE = /_INCOMPLETE(_\d+)?$/i;
+const H_PKG_COPY_TAIL_RE = /(?:[. ]+| - 복사본| - copy| \(\d+\))$/i;
+function packageIncompleteName(dir) {
+  let base = String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+  if (/\.finalize-incomplete\.txt$/i.test(base)) return true;
+  for (let i = 0; i < 64 && H_PKG_COPY_TAIL_RE.test(base); i++) base = base.replace(H_PKG_COPY_TAIL_RE, "");
+  return H_PKG_INCOMPLETE_RE.test(base);
+}
 function packageIncomplete(dir, flag) {
-  if (flag === true) return true;
-  const base = String(dir || "").replace(/[\\/. ]+$/, "").split(/[\\/]/).pop() || "";
-  return H_PKG_INCOMPLETE_RE.test(base) || /\.finalize-incomplete\.txt$/i.test(base);
+  if (typeof flag === "boolean") return flag;
+  return packageIncompleteName(dir);
 }
 
 // A6: an Enter that only commits an IME composition (Korean input) is
