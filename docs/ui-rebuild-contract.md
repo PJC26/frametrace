@@ -871,3 +871,23 @@ const FTStore = {
 - 타임라인 패널(90-sync `timelineKindHtml`): kind `carved-candidate-unaudited`(db/carve_results.json에만 있는 카빙 결과)는 kind 단어 대신 `badge warn tl-unaudited` "후보(감사 안 됨)"(`timeline.kind.carvedUnaudited`, title `timeline.tip.carvedUnaudited`). 다른 kind는 기록된 그대로.
 - `/api/verify-sources` `expected_run_id`(이번 요청이 시작한 실행): `is_result: false`면 `verifySourcesVerdict(res).tip` = "이번 실행 <expected_run_id> · 결과 실행 <run_id|없음>" — 앱 셸 점검 목록 줄의 title, legacy `#finalHint` title.
 - 하네스: verify-review-batch --unit "R12 U1–U4", "R12 I2/I3/I4", "R12 S", verify-finalize-sheet 4f(U1–U3·I4·S 차단·미완료 폴더들, 두 테마 AA).
+
+## 20. R13 트랙 U 추가 계약 (2026-10-16, docs/PLAN_R13_2026-10-16.md)
+
+### 20.1 저널 상태 재설계 (U1, 트랙 S P15/P17)
+- `/api/status` `finalize_journal.state` 추가값(41-finalize `finJournalState`, 머리말 `FIN_JOURNAL_HEAD`):
+  - `"unpaired"`(서명 레인에 짝 맞는 begin 항목 없음 — 아무것도 바꾸지 않음) → `[data-journal="unpaired"]` "이전 최종화 기록 짝 없음 — 확인 필요", detail 없으면 본문 "아무것도 바뀌지 않았습니다". 점검 목록은 막지 않음(서버가 막으면 "최종화 차단:" 경고 — §19.3).
+  - `"other-host"`(다른 PC의 작업, `host` 필드) → `[data-journal="otherhost"]` "다른 PC의 최종화 — 차단 중", 본문 = `host`(detail 없을 때), title에 "호스트 …". 점검 목록 `block` "다른 PC의 최종화 — 차단 중"(sub "<host>에서 끝난 뒤 다시 확인하십시오.") → 최종화 버튼 비활성.
+  - `"recovering"`(시작 시 백그라운드 복구, busy) → `[data-journal="recovering"]` "이전 최종화 복구 중", 라벨은 경고가 아닌 `.h-fin-info`(`--info-bg`/`--info-fg`, 두 테마 AA). 점검 목록 첫 `block` "이전 최종화 복구 중"("다른 작업이 진행 중" 대신).
+  - 그 밖의 recovered 아닌 값은 §19.3대로 "확인 필요".
+
+### 20.2 더 새 미완료 실행의 불일치 (U2, 트랙 I1 P16)
+- `/api/verify-sources` `withheld_reason: string|null`, `newer_mismatched: number`(`verifySourcesVerdict`, 41-finalize·legacy 70-finalize 같음): `mismatched` > 0(`err`)이 먼저, 그다음 `newer_mismatched` > 0이면 `is_result`와 무관하게 `err`, `kind: "newermismatch"`, 토스트 "원본 재검증: 표식 없는 더 새 실행 있음 — 불일치 N건", 점검 목록 줄 `label` "원본 재검증: 현재 결과 없음 — 불일치 N건"(sub에 "표식 없는 더 새 실행 있음 — 불일치 N건"). 숨기지 않는다. `is_result: false`의 사유는 `withheld_reason` · `not_verified_reason`(다를 때) 순서.
+- 보관 이력서 요약(src/custody.rs)은 트랙 I 소유 — 뷰어는 "보관 이력서 5절"로 안내만.
+
+### 20.3 읽을 수 없는 저널 치우기 (U3, 트랙 S6)
+- `state: "unreadable"` 줄에 `<small class="h-fin-detail h-fin-cmd">치우기: <code>…</code></small>`: 서버가 `finalize_journal.dismiss_command`(문자열)를 보내면 그것, 없으면 `frametrace finalize-journal --dismiss "<status.case_dir>"`(`finJournalDismissCmd`). 다른 상태엔 없음.
+
+### 20.4 보관본 상태 (U4, 트랙 I5)
+- `logChains[lane].removed_archive`(수리된 레인; 없으면 `repairs[].removed_archive` 중 가장 나쁜 것: differs > 알 수 없는 값 > missing > match) → 30-records `logChainArchiveText`: "보관본 일치"/"보관본 없음"/"보관본 다름"/"보관본 확인 안 됨"(i18n `chain.archive.*`, ko·en). "수리됨(…)" 바로 뒤, 더 나쁜 상태면 "… · 수리됨 · 보관본 …". 필드 없음(구 서버) = 덧붙이지 않음.
+- 하네스: verify-review-batch --unit "R13 U1–U4", verify-finalize-sheet 4g(U1–U3, 두 테마 AA, 시트 안에 보임).

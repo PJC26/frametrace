@@ -53,5 +53,9 @@
 .h-fin-adv-body input[type="text"] { width: 100%; box-sizing: border-box; }
 .h-fin-out { margin: 0; padding: var(--sp-2); background: var(--surface-2); border-radius: var(--radius); font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow: auto; }
 .h-fin-adv-body a { color: var(--accent-ink); }
+/* R13 U1: startup recovery in progress — information, not a fault. */
+.h-fin-info { display: inline-flex; align-items: center; min-height: 20px; padding: 0 var(--sp-2); border-radius: var(--radius); background: var(--info-bg); color: var(--info-fg); font-size: var(--fs-xs); font-weight: 600; }
+/* R13 U3: the CLI command that sets an unreadable journal aside. */
+.h-fin-cmd code { user-select: all; }
 /* R12 U2: the server's short detail under a 최종화 미완료 row. */
 .h-fin-detail { flex-basis: 100%; font-size: var(--fs-xs); overflow-wrap: anywhere; }

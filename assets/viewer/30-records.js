@@ -542,18 +542,38 @@ function logChainSummary(chain) {
   // R12 U4 (track I3): `repair-lane` cut a torn tail off — say so (detail =
   // what was cut, the tooltip) with the chain's own state (`base_status`,
   // keyed = nothing more), plus any lines still not authenticated.
+  // R13 U4 (track I5): the cut bytes' archive (`.removed`) checked by
+  // verify-audit — 일치 / 없음 / 다름, next to the repair.
+  const arc = logChainArchiveText(chain);
   if (st === "repaired") {
     const base = String(chain.base_status || "");
     const baseText = base === "structural" ? t("chain.structural") : base && base !== "keyed" && base !== "repaired" ? logChainSummary({ status: base }) : "";
-    return [t("chain.repaired"), baseText, n ? tf("chain.unauthN", { n }) : ""].filter(Boolean).join(" · ");
+    return [t("chain.repaired"), arc, baseText, n ? tf("chain.unauthN", { n }) : ""].filter(Boolean).join(" · ");
   }
   // A worse state wins over the repair, which is still mentioned.
-  const fix = chain.repaired === true ? " · " + t("chain.repairedShort") : "";
+  const fix = chain.repaired === true ? " · " + t("chain.repairedShort") + (arc ? " · " + arc : "") : "";
   if (st === "failed") return t("chain.failed") + fix;
   if (st === "unreadable") return t("chain.unreadable") + fix;
   if (st === "structural") return t("chain.structural") + fix;
   if (n) return tf("chain.unauthN", { n }) + fix;
   return t("chain.notVerified") + fix;
+}
+// `removed_archive` on the chain (or, failing that, the worst one among its
+// `repairs[]`): "match" | "missing" | "differs"; another value reads 확인 안 됨.
+function logChainArchiveText(chain) {
+  let v = chain && chain.removed_archive != null ? String(chain.removed_archive) : "";
+  if (!v && chain && Array.isArray(chain.repairs)) {
+    const rank = (x) => ({ differs: 4, missing: 2, match: 1 })[x] || (x ? 3 : 0);
+    for (const r of chain.repairs) {
+      const x = r && r.removed_archive != null ? String(r.removed_archive) : "";
+      if (rank(x) > rank(v)) v = x;
+    }
+  }
+  if (!v) return "";
+  if (v === "match") return t("chain.archive.match");
+  if (v === "missing") return t("chain.archive.missing");
+  if (v === "differs") return t("chain.archive.differs");
+  return t("chain.archive.unknown");
 }
 // The lanes a record's log entries come from (head of its log list).
 function logChainLanesOf(record) {

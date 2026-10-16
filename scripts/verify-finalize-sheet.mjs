@@ -468,6 +468,82 @@ await check('4f R12 U1–U3: structural verify-sources is info; detail in the ro
   await page.context().close();
 });
 
+// R13 track U: U1 journal unpaired / other-host / recovering (track S P15/P17),
+// U3 the dismiss command on an unreadable journal, U2 a newer run's
+// mismatches (track I P16) on the checklist.
+await check('4g R13 U1–U3: 짝 없음 / 다른 PC 차단 / 복구 중; --dismiss command; newer run mismatches shown', async () => {
+  const page = await newPage(browser);
+  await page.evaluate(() => savePrefs({ examinerName: 'Hong' }));
+  const before = S.status;
+  const savedVs = S.verifySources;
+  const jn = (state, extra) => Object.assign({ path: 'review/finalize.inprogress.json', state, examiner: 'Hong', signoff_sha256: 'c0ffee', started_unix: 1760000000, error: null }, extra || {});
+  const base = { phase: 'review-ready', busy: false, pending_marks: 0, finalize_recovered: false };
+  const journalRow = () => page.evaluate(() => {
+    const j = document.querySelector('#finalLinks .h-fin-journal-row');
+    const sheet = document.querySelector('#finalLinks').getBoundingClientRect();
+    const out = j ? [...j.querySelectorAll('span, small, code')].every((e) => { const b = e.getBoundingClientRect(); return b.width > 0 && b.right <= sheet.right + 1; }) : false;
+    return j ? { kind: j.dataset.journal, text: j.textContent, inside: out, label: j.querySelector('span')?.className || '' } : null;
+  });
+  // other-host: a block row, the button is disabled, the host is named.
+  S.status = Object.assign({}, before, base, { finalize_journal: jn('other-host', { host: 'PC-LAB2' }) });
+  await openSheet(page);
+  await page.waitForFunction(() => !!document.querySelector('#finalLinks .h-fin-journal-row'), null, { timeout: 5000 });
+  let j = await journalRow();
+  assert.ok(j && j.kind === 'otherhost' && /다른 PC의 최종화 — 차단 중/.test(j.text) && /PC-LAB2/.test(j.text) && j.inside, 'other-host row: ' + JSON.stringify(j));
+  let rs = await rows(page);
+  assert.ok(rs.some((r) => r.level === 'block' && /다른 PC의 최종화 — 차단 중/.test(r.text) && /PC-LAB2/.test(r.text)), 'other-host block row: ' + JSON.stringify(rs));
+  assert.equal((await btnState(page)).disabled, true, 'other-host disables 최종화');
+  // recovering: info label, block row (not "다른 작업이 진행 중").
+  S.status = Object.assign({}, before, base, { busy: true, finalize_journal: jn('recovering') });
+  await page.click('#btnFinalRecheck');
+  await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'recovering', null, { timeout: 5000 });
+  j = await journalRow();
+  assert.ok(/이전 최종화 복구 중/.test(j.text) && j.label === 'h-fin-info' && !/확인 필요/.test(j.text), 'recovering row: ' + JSON.stringify(j));
+  rs = await rows(page);
+  assert.ok(rs[0].level === 'block' && /이전 최종화 복구 중/.test(rs[0].text) && !rs.some((r) => /다른 작업이 진행 중/.test(r.text)), 'recovering block row: ' + JSON.stringify(rs));
+  for (const th of ['light', 'dark']) {
+    await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
+    const lab = (await contrastReport(page)).find((e) => e.cls === 'h-fin-info');
+    assert.ok(lab && ratio(lab.fg, lab.bg) >= 4.5, `${th}: 복구 중 label contrast ${lab && ratio(lab.fg, lab.bg).toFixed(2)}`);
+  }
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+  // unpaired: 확인 필요, nothing changed; does not block on its own.
+  S.status = Object.assign({}, before, base, { finalize_journal: jn('unpaired') });
+  await page.click('#btnFinalRecheck');
+  await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'unpaired', null, { timeout: 5000 });
+  j = await journalRow();
+  assert.ok(/이전 최종화 기록 짝 없음 — 확인 필요/.test(j.text) && /아무것도 바뀌지 않았습니다/.test(j.text) && j.inside, 'unpaired row: ' + JSON.stringify(j));
+  // unreadable: the dismiss command, inside the sheet, AA in both themes.
+  S.status = Object.assign({}, before, base, { case_dir: 'C:/cases/c1', finalize_journal: jn('unreadable', { error: 'JSON 파싱 실패: line 1' }) });
+  await page.click('#btnFinalRecheck');
+  await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'unreadable', null, { timeout: 5000 });
+  j = await journalRow();
+  const cmd = await page.textContent('#finalLinks .h-fin-journal-row .h-fin-cmd code');
+  assert.ok(cmd === 'frametrace finalize-journal --dismiss "C:/cases/c1"' && j.inside, 'dismiss command: ' + cmd + ' ' + JSON.stringify(j));
+  for (const th of ['light', 'dark']) {
+    await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
+    const cmdEls = (await contrastReport(page)).filter((x) => /h-fin-cmd|mono/.test(x.cls) && /finalize-journal|치우기/.test(x.text));
+    assert.ok(cmdEls.length >= 2, `${th}: command text measured (${cmdEls.length})`);
+    for (const e of cmdEls) {
+      assert.ok(ratio(e.fg, e.bg) >= 4.5, `${th}: ${e.cls} contrast ${ratio(e.fg, e.bg).toFixed(2)}`);
+    }
+  }
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+  // U2: a newer usable run without a marker — its mismatches on the checklist.
+  S.status = Object.assign({}, before, base, { finalize_journal: null });
+  S.verifySources = { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: 'r1', withheld_reason: '표식 없는 더 새 실행 있음', newer_mismatched: 2, lane_status: 'keyed' };
+  await page.click('#finalAdvanced > summary');
+  await page.click('#btnVerifySources');
+  await page.waitForFunction(() => /원본 재검증: 현재 결과 없음 — 불일치 2건/.test(document.getElementById('finalChecklist').textContent), null, { timeout: 5000 })
+    .catch(async (e) => { throw new Error(e.message + ' ' + await page.textContent('#finalChecklist')); });
+  const vs = (await rows(page)).find((r) => /원본 재검증/.test(r.text));
+  assert.ok(vs && vs.level === 'warn' && /표식 없는 더 새 실행 있음 — 불일치 2건/.test(vs.text) && !/모두 일치/.test(vs.text), 'U2 row: ' + JSON.stringify(vs));
+  S.verifySources = savedVs;
+  S.status = before;
+  assert.deepEqual(page.__errors, []);
+  await page.context().close();
+});
+
 await check('4b a stale "ready" never seals: fresh block at click time -> no POST', async () => {
   const page = await newPage(browser);
   await openSheet(page);

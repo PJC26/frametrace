@@ -236,9 +236,20 @@ function verifySourcesVerdict(res) {
     return { level: "err", toast: `원본 재검증: 불일치 ${mismatched}건`,
       hint: `원본 재검증 완료 — ${counts} (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)` };
   }
+  // R13 U2 (track I1, P16): a newer usable run without a completion marker
+  // withholds the result — its mismatches are shown, never hidden.
+  const newerMis = Number(res.newer_mismatched) > 0 ? Number(res.newer_mismatched) : 0;
+  const withheld = res.withheld_reason == null ? "" : String(res.withheld_reason).trim();
+  const why = [withheld, reason && reason !== withheld ? reason : ""].filter(Boolean).join(" · ");
+  if (newerMis > 0) {
+    return { level: "err", kind: "newermismatch", label: `원본 재검증: 현재 결과 없음 — 불일치 ${newerMis}건`,
+      toast: `원본 재검증: 표식 없는 더 새 실행 있음 — 불일치 ${newerMis}건`,
+      hint: `원본 재검증: 현재 결과 없음 — 표식 없는 더 새 실행 있음 — 불일치 ${newerMis}건` + (why ? ` (${why})` : "") + " — 보관 이력서 5절에서 확인하십시오.",
+      tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+  }
   if (res.is_result === false) {
     return { level: "warn", toast: "원본 재검증: 현재 결과 없음(결과 아님)",
-      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (reason ? ` — ${reason}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조).",
+      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (why ? ` — ${why}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조).",
       // R12 (track I4): the run this request started vs the lane's result run.
       tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
   }

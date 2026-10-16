@@ -752,6 +752,65 @@ async function unitTests() {
   await r10TrackU({ fn, source, runInNewContext, assert, ex });
   await r11TrackU({ fn, runInNewContext, assert, ex });
   await r12TrackU({ fn, runInNewContext, assert, ex });
+  await r13TrackU({ fn, runInNewContext, assert, ex });
+}
+
+// ---- R13 track U (docs/PLAN_R13_2026-10-16.md) -----------------------------
+async function r13TrackU({ fn, runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
+  const jn = (state, extra) => Object.assign({ path: 'review/finalize.inprogress.json', state, examiner: 'Hong', started_unix: 1760000000, signoff_sha256: 'ab12', error: null }, extra || {});
+  // U1 (track S, P15/P17): unpaired / other-host / recovering.
+  const unp = js({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired') });
+  assert.ok(/data-journal="unpaired"/.test(unp) && /이전 최종화 기록 짝 없음 — 확인 필요/.test(unp) && /<small class="h-fin-detail[^"]*">아무것도 바뀌지 않았습니다<\/small>/.test(unp), 'R13 U1 unpaired: ' + unp);
+  const oh = js({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: 'PC-LAB2' }) });
+  assert.ok(/data-journal="otherhost"/.test(oh) && /다른 PC의 최종화 — 차단 중/.test(oh) && />PC-LAB2<\/small>/.test(oh) && /title="호스트 PC-LAB2/.test(oh), 'R13 U1 other-host (host shown): ' + oh);
+  const recv = js({ ok: true, phase: 'review-ready', busy: true, finalize_journal: jn('recovering') });
+  assert.ok(/data-journal="recovering"/.test(recv) && /class="h-fin-info">이전 최종화 복구 중</.test(recv) && !/확인 필요/.test(recv), 'R13 U1 recovering is info: ' + recv);
+  // The checklist blocks while recovering / another PC's finalize is open.
+  const src = readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8');
+  assert.ok(/journal\.kind === "recovering"\) add\("block", "이전 최종화 복구 중"/.test(src) && /journal\.kind === "otherhost"\)[^]{0,200}add\("block", "다른 PC의 최종화 — 차단 중"/.test(src), 'R13 U1: checklist block rows');
+  const css = readFileSync(new URL('../assets/app/40-finalize.css', import.meta.url), 'utf8');
+  assert.ok(/\.h-fin-info \{[^}]*var\(--info-bg\)[^}]*var\(--info-fg\)/.test(css), 'R13 U1: .h-fin-info uses the info tokens');
+  console.log('PASS VM R13 U1 journal unpaired / other-host (host) / recovering (info) + checklist blocks');
+
+  // U3 (track S6): unreadable row shows the dismiss command.
+  const unr = js({ ok: true, phase: 'review-ready', case_dir: 'C:/cases/c1', finalize_journal: jn('unreadable', { error: 'JSON 파싱 실패' }) });
+  assert.ok(/data-journal="unreadable"/.test(unr) && /치우기: <code class="mono">frametrace finalize-journal --dismiss &quot;C:\/cases\/c1&quot;<\/code>/.test(unr), 'R13 U3 dismiss command: ' + unr);
+  const own = js({ ok: true, phase: 'review-ready', finalize_journal: jn('unreadable', { error: 'x', dismiss_command: 'frametrace finalize-journal --dismiss D:/c' }) });
+  assert.ok(/<code class="mono">frametrace finalize-journal --dismiss D:\/c<\/code>/.test(own), 'R13 U3: the server\'s own command wins: ' + own);
+  assert.ok(!/finalize-journal --dismiss/.test(js({ ok: true, phase: 'review-ready', finalize_journal: jn('interrupted') })), 'R13 U3: only the unreadable row');
+  runInNewContext('FIN.status = null;', ex);
+  console.log('PASS VM R13 U3 unreadable journal row names finalize-journal --dismiss');
+
+  // U2 (track I1, P16): newer usable run without a marker — mismatches shown.
+  const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  const legacyVm = {};
+  runInNewContext(legacySrc.match(/^function verifySourcesVerdict\([^]*?^}/m)[0], legacyVm);
+  const nm = `verifySourcesVerdict({ ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: 'r1', withheld_reason: '표식 없는 더 새 실행 있음', newer_mismatched: 2, lane_status: 'keyed' })`;
+  for (const [i, r] of [runInNewContext(nm, ex), runInNewContext(nm, legacyVm)].entries()) {
+    assert.ok(r.level === 'err' && /불일치 2건/.test(r.toast) && /표식 없는 더 새 실행 있음 — 불일치 2건/.test(r.hint) && /현재 결과 없음 — 불일치 2건/.test(r.label), `R13 U2 newer_mismatched shown (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
+  }
+  const wr = runInNewContext(`verifySourcesVerdict({ matched: 0, mismatched: 0, not_comparable: 0, is_result: false, withheld_reason: '표식 없는 더 새 실행 있음', newer_mismatched: 0, not_verified_reason: null })`, ex);
+  assert.ok(wr.level === 'warn' && /현재 결과 없음\(결과 아님\) — 표식 없는 더 새 실행 있음/.test(wr.hint), 'R13 U2 withheld_reason in the hint: ' + JSON.stringify(wr));
+  assert.ok(/label: verdict\.label/.test(src) && /FIN\.verify\.label \?/.test(src), 'R13 U2: the checklist uses the verdict label');
+  console.log('PASS VM R13 U2 withheld_reason / newer_mismatched (shell + legacy): mismatches never hidden');
+
+  // U4 (track I5): removed_archive on repaired lanes.
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  for (const k of ['match', 'missing', 'differs', 'unknown']) assert.equal((i18n.match(new RegExp(`"chain\\.archive\\.${k}": `, 'g')) || []).length, 2, `R13 U4: chain.archive.${k} in ko + en`);
+  const L = { 'chain.failed': '체인 검증 실패', 'chain.structural': '자기 일관성만(인증 아님)', 'chain.notVerified': '인증 불가(변조 판정 아님)', 'chain.repaired': '수리됨(손상된 끝부분 잘라냄)', 'chain.repairedShort': '수리됨',
+    'chain.archive.match': '보관본 일치', 'chain.archive.missing': '보관본 없음', 'chain.archive.differs': '보관본 다름', 'chain.archive.unknown': '보관본 확인 안 됨' };
+  const tctx = { t: (k) => L[k] || k, tf: (k, s) => (k === 'chain.unauthN' ? `인증 안 된 줄 ${s.n}개` : k) };
+  runInNewContext(['logChainArchiveText', 'logChainSummary'].map((n) => fn(n)).join('\n'), tctx);
+  const sum = (c) => runInNewContext(`logChainSummary(${JSON.stringify(c)})`, tctx);
+  assert.equal(sum({ status: 'repaired', base_status: 'keyed', repaired: true, removed_archive: 'match' }), '수리됨(손상된 끝부분 잘라냄) · 보관본 일치', 'R13 U4 match');
+  assert.equal(sum({ status: 'repaired', base_status: 'structural', repaired: true, removed_archive: 'missing' }), '수리됨(손상된 끝부분 잘라냄) · 보관본 없음 · 자기 일관성만(인증 아님)', 'R13 U4 missing');
+  assert.equal(sum({ status: 'failed', repaired: true, removed_archive: 'differs' }), '체인 검증 실패 · 수리됨 · 보관본 다름', 'R13 U4 differs on a worse state');
+  assert.equal(sum({ status: 'repaired', repaired: true, repairs: [{ removed_archive: 'match' }, { removed_archive: 'differs' }] }), '수리됨(손상된 끝부분 잘라냄) · 보관본 다름', 'R13 U4 worst of repairs[]');
+  assert.equal(sum({ status: 'repaired', repaired: true }), '수리됨(손상된 끝부분 잘라냄)', 'R13 U4 absent (older server) → nothing added');
+  assert.equal(sum({ status: 'repaired', repaired: true, removed_archive: 'weird' }), '수리됨(손상된 끝부분 잘라냄) · 보관본 확인 안 됨', 'R13 U4 unknown value');
+  console.log('PASS VM R13 U4 logChains removed_archive → 보관본 일치/없음/다름');
 }
 
 // ---- R12 track U (docs/PLAN_R12_2026-10-16.md) -----------------------------
@@ -806,7 +865,7 @@ async function r12TrackU({ fn, runInNewContext, assert, ex }) {
     tf: (k, s) => (k === 'chain.unauthN' ? `인증 안 된 줄 ${s.n}개` : k),
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
   };
-  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logChainSummary', 'logChainItems'].map((n) => fn(n)).join('\n'), tctx);
+  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logChainArchiveText', 'logChainSummary', 'logChainItems'].map((n) => fn(n)).join('\n'), tctx);
   assert.equal(runInNewContext('logChainSummary({ status: "repaired", entries: 5, detail: "x" })', tctx), '수리됨(손상된 끝부분 잘라냄)', 'R12 U4: repaired is not "인증 불가"');
   assert.equal(runInNewContext('logChainSummary({ status: "repaired", unauthenticated: 2 })', tctx), '수리됨(손상된 끝부분 잘라냄) · 인증 안 된 줄 2개', 'R12 U4: repaired + unauthenticated lines');
   const rows = plain(runInNewContext('logChainItems({ validationLog: { status: "repaired", detail: "잘라낸 37바이트 SHA-256 9f…" } }, ["validationLog"])', tctx));
@@ -1005,7 +1064,7 @@ async function r10TrackU({ fn, source, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainArchiveText', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R10 U1/U3: ${n} exists (30-records.js)`);
