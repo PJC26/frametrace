@@ -856,8 +856,18 @@ const FTStore = {
 - `/api/status`의 "최종화 미완료" 줄(`.h-fin-incomplete-row`)은 detail을 툴팁뿐 아니라 줄 본문 `<small class="h-fin-detail">`에 짧게(공백 정리, 90자 넘으면 `…`; 41-finalize `finShortDetail`) 보인다. 전체 문구는 title.
 
 ### 19.3 최종화 저널 (U3, 트랙 S2 P13)
-- `/api/status` `finalize_journal`(`{signoff_sha256, started_unix, state}`)이 객체이고 `state !== "recovered"` → 결과 목록 첫 줄 `.h-fin-journal-row[data-journal="check"]` "이전 최종화 중단됨 — 확인 필요" + "다시 최종화하십시오". `finalize_recovered === true`(또는 `state === "recovered"`) → `[data-journal="recovered"]` "이전 최종화 중단됨 — 복구됨". title = 검토자 기록 SHA-256 · 시작 시각 · 상태. 필드 없음(구 서버) = 줄 없음. 41-finalize `finJournalState`/`finJournalRow`. (트랙 S가 다른 `state` 값·의미를 쓰면 이 규칙을 맞춘다.)
+- `/api/status` `finalize_journal`(트랙 S 608884d): 이 PC의 최종화가 도는 동안 `null`, 그 밖에는 `{path, state, examiner, started_unix, signoff_sha256, error}`. 결과 목록 첫 줄 `.h-fin-journal-row`(41-finalize `finJournalState`/`finJournalRow`):
+  - `state: "unreadable"`(다음 최종화를 막음) → `[data-journal="unreadable"]` "이전 최종화 기록을 읽지 못함 — 확인 필요", 본문 = `error`(짧게).
+  - `"interrupted"`·`"in-progress"`(다른 프로세스가 쓰는 중이거나 아직 복구 안 됨) → `[data-journal="check"]` "이전 최종화 중단됨 — 확인 필요".
+  - `"recovered"`, 또는 저널 없이 `finalize_recovered === true` → `[data-journal="recovered"]` "이전 최종화 중단됨 — 복구됨".
+  - `finalize_recovered_detail`이 있으면 줄 본문 `.h-fin-detail`에 짧게(U2와 같음). "확인 필요:"가 들어 있으면 그 부분부터 보인다. title = 검토자 · SHA-256 · 시작 · 상태 · 경로 · 전체 detail. 필드 없음(구 서버) = 줄 없음. 복구가 세운 `report_stale`은 §18.4의 "보고서 최신 아님" 줄.
+- `POST /api/finalize` 실패의 `incomplete_package_dirs: string[]`(이번 최종화가 게시·보관해 `…_INCOMPLETE`/옆 표식이 된 패키지): `finIncompleteOf` → `{package_dir: 첫째, dirs}`, "최종화 미완료" 줄에 폴더마다 경로·탐색기 버튼. 오류가 "최종화 차단:"으로 시작하면(아무것도 바꾸기 전 거부) 실패가 아니라 경고: 힌트에 문구 그대로("실패:" 없음) + `warn` 토스트(`finBlockedError`; legacy 70-finalize 같음).
 
 ### 19.4 수리된 레인 (U4, 트랙 I3)
 - `logChains[lane].status === "repaired"`(`repair-lane`으로 찢긴 끝부분을 잘라냄) → `.log-chain` 줄 "수리됨(손상된 끝부분 잘라냄)"(i18n `chain.repaired`), 인증 안 된 줄이 있으면 " · 인증 안 된 줄 N개". title = 서버 `detail`. (이전에는 모르는 상태라 "인증 불가".)
-- 하네스: verify-review-batch --unit "R12 U1–U4", verify-finalize-sheet 4f(U1–U3, 두 테마 AA).
+- 트랙 I(cc4688c) 체인 객체의 `base_status`(수리를 빼고 본 상태)·`repaired: bool`·`repairs[]`: `repaired`면 기반 상태 문구를 덧붙인다(`structural` → "수리됨(…) · 자기 일관성만(인증 아님)", `keyed` → 수리됨만). 더 나쁜 상태(`failed`·`not-verified`·`unreadable`·인증 안 된 줄)가 이기고 `repaired: true`면 그 문구 뒤에 " · 수리됨"(i18n `chain.repairedShort`).
+
+### 19.5 감사 안 된 카빙 후보 · 실행 id (트랙 I2/I4)
+- 타임라인 패널(90-sync `timelineKindHtml`): kind `carved-candidate-unaudited`(db/carve_results.json에만 있는 카빙 결과)는 kind 단어 대신 `badge warn tl-unaudited` "후보(감사 안 됨)"(`timeline.kind.carvedUnaudited`, title `timeline.tip.carvedUnaudited`). 다른 kind는 기록된 그대로.
+- `/api/verify-sources` `expected_run_id`(이번 요청이 시작한 실행): `is_result: false`면 `verifySourcesVerdict(res).tip` = "이번 실행 <expected_run_id> · 결과 실행 <run_id|없음>" — 앱 셸 점검 목록 줄의 title, legacy `#finalHint` title.
+- 하네스: verify-review-batch --unit "R12 U1–U4", "R12 I2/I3/I4", "R12 S", verify-finalize-sheet 4f(U1–U3·I4·S 차단·미완료 폴더들, 두 테마 AA).

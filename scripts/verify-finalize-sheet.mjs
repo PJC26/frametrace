@@ -409,7 +409,7 @@ await check('4f R12 U1–U3: structural verify-sources is info; detail in the ro
   const savedVs = S.verifySources;
   const detail = '검토자 기록 확정 실패: review/signoff.json 사용 중 — 최종화는 끝나지 않았고 패키지는 만들지 않았습니다. 이전 서명을 복원하지 못했습니다';
   S.status = Object.assign({}, before, { phase: 'review-ready', busy: false, pending_marks: 0, finalize_incomplete: true, finalize_incomplete_detail: detail,
-    finalize_recovered: false, finalize_journal: { signoff_sha256: 'c0ffee', started_unix: 1760000000, state: 'promoted' } });
+    finalize_recovered: false, finalize_journal: { path: 'review/finalize.inprogress.json', state: 'interrupted', examiner: 'Hong', signoff_sha256: 'c0ffee', started_unix: 1760000000, error: null } });
   await openSheet(page);
   await page.waitForFunction(() => !!document.querySelector('#finalLinks .h-fin-journal-row'), null, { timeout: 5000 })
     .catch(async (e) => { throw new Error(e.message + ' ' + await page.evaluate(() => document.getElementById('finalLinks').innerHTML)); });
@@ -440,7 +440,29 @@ await check('4f R12 U1–U3: structural verify-sources is info; detail in the ro
   const row = await page.evaluate(() => [...document.querySelectorAll('#finalChecklist .h-check')].find((li) => /원본 재검증/.test(li.textContent))?.dataset.level);
   assert.equal(row, 'info', 'U1: structural is info');
   assert.ok(!/모두 일치/.test(await page.textContent('#finalChecklist')), 'U1: never 모두 일치');
+  // Track I4: is_result:false names the run this request started (tooltip).
+  S.verifySources = { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: null, expected_run_id: '200-bbbb', not_verified_reason: '이번 실행이 결과 실행이 아님', lane_status: 'keyed' };
+  await page.click('#btnVerifySources');
+  await page.waitForFunction(() => /원본 재검증: 현재 결과 없음/.test(document.getElementById('finalChecklist').textContent));
+  const tip = await page.evaluate(() => [...document.querySelectorAll('#finalChecklist .h-check')].find((li) => /원본 재검증/.test(li.textContent))?.getAttribute('title') || '');
+  assert.ok(/200-bbbb/.test(tip), 'I4 expected_run_id tooltip: ' + tip);
   S.verifySources = savedVs;
+  // Track S: a blocked finalize is a warning toast; a failure lists every
+  // incomplete package it left.
+  S.status = Object.assign({}, before, { phase: 'review-ready', busy: false, pending_marks: 0 });
+  await page.click('#finalAdvanced > summary');
+  await page.fill('#finalExaminer', 'Hong');
+  S.finalize = { ok: false, error: '최종화 차단: 저장 충돌 2건을 먼저 해결하십시오', report_stale: false, finalize_incomplete: false, incomplete_package_dirs: [] };
+  // This fixture has no toast box: record what toast() is asked to show.
+  await page.evaluate(() => { const real = window.toast; window.__toasts = []; window.toast = (m, k) => { window.__toasts.push(k + '|' + m); return real(m, k); }; });
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /최종화 차단/.test(document.getElementById('finalHint').textContent));
+  const blocked = await page.evaluate(() => ({ hint: document.getElementById('finalHint').textContent, toasts: window.__toasts }));
+  assert.ok(!/^실패/.test(blocked.hint) && blocked.toasts.some((t) => /\bwarn\b/.test(t) && /최종화 차단/.test(t)), 'blocked finalize = warning: ' + JSON.stringify(blocked));
+  S.finalize = { ok: false, error: '패키징 실패', report_stale: false, finalize_incomplete: true, incomplete_package_dirs: ['C:/c/reports/package_004_INCOMPLETE', 'C:/c/reports/package_005_INCOMPLETE'] };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /package_005_INCOMPLETE/.test(document.getElementById('finalLinks').textContent));
+  assert.equal(await page.evaluate(() => document.querySelectorAll('#finalLinks .h-fin-incomplete-row [data-pkgdir]').length), 2, 'both incomplete packages listed');
   S.status = before;
   assert.deepEqual(page.__errors, []);
   await page.context().close();

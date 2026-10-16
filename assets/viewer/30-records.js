@@ -539,14 +539,21 @@ function logChainSummary(chain) {
   const st = String(chain.status || "");
   const n = Number(chain.unauthenticated) > 0 ? Number(chain.unauthenticated) : 0;
   if (st === "absent" || (st === "keyed" && !n)) return "";
-  if (st === "failed") return t("chain.failed");
-  if (st === "unreadable") return t("chain.unreadable");
-  if (st === "structural") return t("chain.structural");
   // R12 U4 (track I3): `repair-lane` cut a torn tail off — say so (detail =
-  // what was cut, the tooltip), plus any lines still not authenticated.
-  if (st === "repaired") return t("chain.repaired") + (n ? " · " + tf("chain.unauthN", { n }) : "");
-  if (n) return tf("chain.unauthN", { n });
-  return t("chain.notVerified");
+  // what was cut, the tooltip) with the chain's own state (`base_status`,
+  // keyed = nothing more), plus any lines still not authenticated.
+  if (st === "repaired") {
+    const base = String(chain.base_status || "");
+    const baseText = base === "structural" ? t("chain.structural") : base && base !== "keyed" && base !== "repaired" ? logChainSummary({ status: base }) : "";
+    return [t("chain.repaired"), baseText, n ? tf("chain.unauthN", { n }) : ""].filter(Boolean).join(" · ");
+  }
+  // A worse state wins over the repair, which is still mentioned.
+  const fix = chain.repaired === true ? " · " + t("chain.repairedShort") : "";
+  if (st === "failed") return t("chain.failed") + fix;
+  if (st === "unreadable") return t("chain.unreadable") + fix;
+  if (st === "structural") return t("chain.structural") + fix;
+  if (n) return tf("chain.unauthN", { n }) + fix;
+  return t("chain.notVerified") + fix;
 }
 // The lanes a record's log entries come from (head of its log list).
 function logChainLanesOf(record) {

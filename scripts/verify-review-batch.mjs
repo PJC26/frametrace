@@ -790,8 +790,8 @@ async function r12TrackU({ fn, runInNewContext, assert, ex }) {
 
   // U3 (track S2): finalize_journal / finalize_recovered; absent = nothing.
   const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
-  const chk = js({ ok: true, phase: 'review-ready', finalize_journal: { signoff_sha256: 'ab12', started_unix: 1760000000, state: 'promoted' }, finalize_recovered: false });
-  assert.ok(/data-journal="check"/.test(chk) && /이전 최종화 중단됨 — 확인 필요/.test(chk) && /title="[^"]*ab12[^"]*상태 promoted"/.test(chk), 'R12 U3 journal on disk → 확인 필요: ' + chk);
+  const chk = js({ ok: true, phase: 'review-ready', finalize_journal: { path: 'review/finalize.inprogress.json', state: 'interrupted', examiner: 'Hong', signoff_sha256: 'ab12', started_unix: 1760000000, error: null }, finalize_recovered: false });
+  assert.ok(/data-journal="check"/.test(chk) && /이전 최종화 중단됨 — 확인 필요/.test(chk) && /title="[^"]*ab12[^"]*상태 interrupted/.test(chk), 'R12 U3 journal on disk → 확인 필요: ' + chk);
   const rec = js({ ok: true, phase: 'done', finalize_recovered: true, finalize_journal: null });
   assert.ok(/data-journal="recovered"/.test(rec) && /이전 최종화 중단됨 — 복구됨/.test(rec) && !/확인 필요/.test(rec), 'R12 U3 recovered: ' + rec);
   assert.ok(!/h-fin-journal-row/.test(js({ ok: true, phase: 'review-ready' })) && !/h-fin-journal-row/.test(js({ ok: true, phase: 'review-ready', finalize_recovered: false, finalize_journal: null })), 'R12 U3: absent fields (older server) → no row');
@@ -812,6 +812,61 @@ async function r12TrackU({ fn, runInNewContext, assert, ex }) {
   const rows = plain(runInNewContext('logChainItems({ validationLog: { status: "repaired", detail: "잘라낸 37바이트 SHA-256 9f…" } }, ["validationLog"])', tctx));
   assert.ok(rows.length === 1 && /검증 로그<\/strong> 수리됨/.test(rows[0]) && /title="잘라낸 37바이트 SHA-256 9f…"/.test(rows[0]), 'R12 U4 row: ' + JSON.stringify(rows));
   console.log('PASS VM R12 U4 logChains "repaired" → 수리됨 (detail tooltip)');
+
+  // R12 follow-up (track I cc4688c): base_status / repaired on logChains.
+  tctx.t = ((prev) => (k) => (k === 'chain.repairedShort' ? '수리됨' : prev(k)))(tctx.t);
+  assert.equal((i18n.match(/"chain\.repairedShort": /g) || []).length, 2, 'R12 I3: chain.repairedShort in ko + en');
+  assert.equal(runInNewContext('logChainSummary({ status: "repaired", base_status: "structural", repaired: true })', tctx), '수리됨(손상된 끝부분 잘라냄) · 자기 일관성만(인증 아님)', 'R12 I3: repaired shows its base status');
+  assert.equal(runInNewContext('logChainSummary({ status: "repaired", base_status: "keyed", repaired: true })', tctx), '수리됨(손상된 끝부분 잘라냄)', 'R12 I3: repaired keyed = repair only');
+  assert.equal(runInNewContext('logChainSummary({ status: "failed", base_status: "failed", repaired: true })', tctx), '체인 검증 실패 · 수리됨', 'R12 I3: a worse state wins, repair appended');
+  assert.equal(runInNewContext('logChainSummary({ status: "not-verified", unauthenticated: 2, repaired: true })', tctx), '인증 안 된 줄 2개 · 수리됨', 'R12 I3: unauth lines + repair');
+  assert.equal(runInNewContext('logChainSummary({ status: "failed", repaired: false })', tctx), '체인 검증 실패', 'R12 I3: no repair, no suffix');
+  console.log('PASS VM R12 I3 logChains base_status shown with 수리됨; a worse state gets "· 수리됨"');
+
+  // R12 follow-up (track I2): timeline kind carved-candidate-unaudited.
+  const tl = { t: (k) => ({ 'timeline.kind.carvedUnaudited': '후보(감사 안 됨)', 'timeline.tip.carvedUnaudited': 'db/carve_results.json에만' })[k] || k, escapeHtml: tctx.escapeHtml };
+  const tlFn = fn('timelineKindHtml');
+  assert.ok(tlFn, 'R12 I2: timelineKindHtml exists (90-sync.js)');
+  runInNewContext(tlFn, tl);
+  const un = runInNewContext('timelineKindHtml("carved-candidate-unaudited")', tl);
+  assert.ok(/class="badge warn tl-unaudited"/.test(un) && />후보\(감사 안 됨\)</.test(un) && !/>carved-candidate/.test(un), 'R12 I2 unaudited badge: ' + un);
+  assert.equal(runInNewContext('timelineKindHtml("carved-candidate")', tl), 'carved-candidate', 'R12 I2: plain candidate unchanged');
+  const sync = readFileSync(new URL('../assets/viewer/90-sync.js', import.meta.url), 'utf8');
+  assert.ok(/\$\{timelineKindHtml\(ev\.kind\)\}/.test(sync), 'R12 I2: the timeline panel uses timelineKindHtml');
+  for (const k of ['timeline.kind.carvedUnaudited', 'timeline.tip.carvedUnaudited']) assert.equal((i18n.match(new RegExp(`"${k.replace(/\./g, '\\.')}": `, 'g')) || []).length, 2, `R12 I2: ${k} in ko + en`);
+  console.log('PASS VM R12 I2 timeline carved-candidate-unaudited → "후보(감사 안 됨)" warn badge');
+
+  // R12 follow-up (track I4): expected_run_id in the tooltip when is_result:false.
+  const nr = `verifySourcesVerdict({ ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: null, expected_run_id: '200-bbbb', not_verified_reason: '이번 실행이 결과 실행이 아님', lane_status: 'keyed' })`;
+  for (const [i, r] of [runInNewContext(nr, ex), runInNewContext(nr, legacyVm)].entries()) {
+    assert.ok(r.kind === 'noresult' || /현재 결과 없음/.test(r.toast), `R12 I4 (${i ? 'legacy' : 'shell'}) no result`);
+    assert.ok(/200-bbbb/.test(r.tip || '') && /결과 실행 없음/.test(r.tip || ''), `R12 I4 expected_run_id in the tip (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
+  }
+  assert.ok(!runInNewContext(`verifySourcesVerdict({ matched: 0, mismatched: 0, not_comparable: 0, is_result: false }).tip`, ex), 'R12 I4: no expected_run_id → no tip');
+  assert.ok(/title="\$\{esc\(c\.tip\)\}"/.test(readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8')) && /\$\("finalHint"\)\.title = verdict\.tip/.test(legacySrc), 'R12 I4: both shells put the tip on screen');
+  console.log('PASS VM R12 I4 expected_run_id shown in the tooltip when is_result:false');
+
+  // R12 follow-up (track S 608884d): journal states, recovered detail,
+  // incomplete_package_dirs, "최종화 차단:".
+  const unr = js({ ok: true, phase: 'review-ready', finalize_journal: { path: 'review/finalize.inprogress.json', state: 'unreadable', examiner: null, started_unix: null, signoff_sha256: null, error: 'JSON 파싱 실패: line 1' } });
+  assert.ok(/data-journal="unreadable"/.test(unr) && /이전 최종화 기록을 읽지 못함 — 확인 필요/.test(unr) && /<small class="h-fin-detail[^"]*">JSON 파싱 실패: line 1<\/small>/.test(unr), 'R12 S2 unreadable journal: ' + unr);
+  const inprog = js({ ok: true, phase: 'review-ready', finalize_journal: { path: 'p', state: 'in-progress', examiner: 'Kim', started_unix: 1760000000, signoff_sha256: 'ff', error: null } });
+  assert.ok(/data-journal="check"/.test(inprog) && /title="검토자 Kim/.test(inprog), 'R12 S2 in-progress (another process) → 확인 필요: ' + inprog);
+  const recDetail = '이전 최종화(2026-10-16 10:00)를 되돌렸습니다: 이전 서명 복원, 보고서 재생성 — 확인 필요: reports/package_003_INCOMPLETE';
+  const recd = js({ ok: true, phase: 'review-ready', finalize_journal: null, finalize_recovered: true, finalize_recovered_detail: recDetail });
+  const recBody = /<small class="h-fin-detail[^"]*">([^<]*)<\/small>/.exec(recd);
+  assert.ok(/data-journal="recovered"/.test(recd) && recBody && /^확인 필요: reports\/package_003_INCOMPLETE/.test(recBody[1]) && recd.includes('package_003_INCOMPLETE') && /title="[^"]*되돌렸습니다/.test(recd), 'R12 S2 recovered detail in the body (확인 필요 part first): ' + recd);
+  const recOk = js({ ok: true, phase: 'review-ready', finalize_recovered: true, finalize_recovered_detail: '이전 서명 복원' });
+  assert.ok(/<small class="h-fin-detail[^"]*">이전 서명 복원<\/small>/.test(recOk), 'R12 S2 recovered detail without 확인 필요: ' + recOk);
+  assert.equal(runInNewContext(`FIN.status = { ok: true, phase: 'review-ready', finalize_journal: null }; finJournalRow(FIN.status)`, ex), '', 'R12 S2: null journal (own finalize running) → no row');
+  const dirsRes = { ok: false, error: '패키징 실패', report_stale: false, finalize_incomplete: false, incomplete_package_dirs: ['C:/c/reports/package_004_INCOMPLETE', 'C:/c/reports/package 005'] };
+  const fid = plain(runInNewContext('finIncompleteOf(r)', Object.assign(ex, { r: dirsRes })));
+  assert.deepEqual(fid, { package_dir: 'C:/c/reports/package_004_INCOMPLETE', dirs: dirsRes.incomplete_package_dirs }, 'R12 S1 incomplete_package_dirs: ' + JSON.stringify(fid));
+  const dirsHtml = runInNewContext(`FIN.status = { ok: true, phase: 'review-ready' }; FIN.result = null; FIN.reportStale = null; FIN.incomplete = finIncompleteOf(r); const h = finResultHtml(); FIN.incomplete = null; FIN.status = null; h`, ex);
+  assert.ok(dirsHtml.includes('<code class="mono">C:/c/reports/package_004_INCOMPLETE</code>') && dirsHtml.includes('<code class="mono">C:/c/reports/package 005</code>') && (dirsHtml.match(/data-pkgdir=/g) || []).length === 2, 'R12 S1 every dir listed: ' + dirsHtml);
+  assert.equal(runInNewContext(`[finBlockedError('최종화 차단: 저장 충돌 2건을 먼저 해결하십시오'), finBlockedError('패키징 실패: 최종화 차단: x'), finBlockedError('')].join()`, ex), 'true,false,false', 'R12 S: 최종화 차단 = blocked');
+  assert.ok(/최종화 차단:/.test(legacySrc) && /toast\(err, "warn"\)/.test(legacySrc), 'R12 S: the legacy shell shows a blocked finalize as a warning');
+  console.log('PASS VM R12 S journal unreadable/interrupted/recovered detail, incomplete_package_dirs, 최종화 차단 = warning');
 }
 
 // ---- R11 track U (docs/PLAN_R11_2026-10-16.md) -----------------------------

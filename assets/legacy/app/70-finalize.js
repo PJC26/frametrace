@@ -193,7 +193,13 @@ $("btnFinalize").addEventListener("click", async () => {
   $("finalHint").textContent = "보고서 생성 중… (원본 해시 재계산 포함 — 소스 크기에 따라 오래 걸릴 수 있습니다)";
   try {
     const res = await jpost("/api/finalize", { examiner: finalizeExaminer });
-    if (!res.ok) { $("finalHint").textContent = "실패: " + (res.error || "알 수 없는 오류"); return; }
+    if (!res.ok) {
+      // R12 (track S): "최종화 차단: …" is a refusal (warning), not a failure.
+      const err = String(res.error || "알 수 없는 오류");
+      if (/^\s*최종화 차단:/.test(err)) { $("finalHint").textContent = err; toast(err, "warn"); }
+      else $("finalHint").textContent = "실패: " + err;
+      return;
+    }
     $("finalHint").textContent = "보고서·패키지 생성 완료. 검토자(입력값 기록): " + (res.examiner || "-") +
       (res.manifest_sha256 ? " · manifest.sha256의 SHA-256: " + res.manifest_sha256 : "");
     $("finalLinks").innerHTML =
@@ -232,7 +238,9 @@ function verifySourcesVerdict(res) {
   }
   if (res.is_result === false) {
     return { level: "warn", toast: "원본 재검증: 현재 결과 없음(결과 아님)",
-      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (reason ? ` — ${reason}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조)." };
+      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (reason ? ` — ${reason}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조).",
+      // R12 (track I4): the run this request started vs the lane's result run.
+      tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
   }
   if (res.verified === false || unauth > 0) {
     return { level: "warn", toast: "원본 재검증: 확인 불가" + (unauth ? ` — 인증 안 된 줄 ${unauth}개` : ""),
@@ -262,11 +270,13 @@ $("btnVerifySources").addEventListener("click", async () => {
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   $("finalHint").textContent = "원본 재검증 중… (색인된 모든 원본을 다시 해시합니다 — 소스 크기에 따라 오래 걸릴 수 있습니다)";
+  $("finalHint").title = "";
   try {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { $("finalHint").textContent = "원본 재검증 실패: " + (res.error || "알 수 없는 오류"); return; }
     const verdict = verifySourcesVerdict(res);
     $("finalHint").textContent = verdict.hint;
+    $("finalHint").title = verdict.tip || "";
     toast(verdict.toast, verdict.level);
   } catch (err) {
     $("finalHint").textContent = "원본 재검증 실패: " + (err.message || err);

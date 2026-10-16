@@ -135,7 +135,9 @@ function verifySourcesVerdict(res) {
   }
   if (res.is_result === false) {
     return { level: "warn", kind: "noresult", toast: "원본 재검증: 현재 결과 없음(결과 아님)",
-      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (reason ? ` — ${reason}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조)." };
+      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (reason ? ` — ${reason}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조).",
+      // R12 (track I4): the run this request started vs the lane's result run.
+      tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
   }
   if (res.verified === false || unauth > 0) {
     return { level: "warn", kind: "unverified", toast: "원본 재검증: 확인 불가" + (unauth ? ` — 인증 안 된 줄 ${unauth}개` : ""),
@@ -173,6 +175,10 @@ function finIncompleteOf(res) {
   if (!res || typeof res !== "object") return null;
   // R11 (track S 2a51c94): the server's own verdict when it sends one — a
   // failed promotion creates no package, so there is no path to name.
+  // R12 (track S1 608884d): packages this finalize published or kept, now
+  // `…_INCOMPLETE` or marked beside — each one listed.
+  const dirs = Array.isArray(res.incomplete_package_dirs) ? res.incomplete_package_dirs.filter(d => typeof d === "string" && d) : [];
+  if (dirs.length) return { package_dir: dirs[0], dirs };
   if (typeof res.finalize_incomplete === "boolean") {
     if (!res.finalize_incomplete) return null;
     const dir = typeof res.incomplete_package_dir === "string" ? res.incomplete_package_dir : typeof res.package_dir === "string" ? res.package_dir : "";
@@ -383,7 +389,7 @@ async function finRunAudit() {
 
 async function gatherFinalizeChecks() {
   const checks = [];
-  const add = (level, text, sub) => checks.push({ level, text, sub: sub || "" });
+  const add = (level, text, sub, tip) => checks.push({ level, text, sub: sub || "", tip: tip || "" });
   let st = null;
   try { st = await jget("/api/status"); } catch (e) { st = null; }
   const phase = st ? String(st.phase || "") : "";
@@ -448,7 +454,7 @@ async function gatherFinalizeChecks() {
     const lv = FIN.verify.level;
     // R12 U1: lane_status "structural" → info "자기 일관성만 — 인증 아님".
     if (FIN.verify.kind === "structural") add("info", "원본 재검증: 자기 일관성만 — 인증 아님", FIN.verify.hint);
-    else add(lv === "ok" ? "ok" : "warn", lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.kind === "noresult" ? "원본 재검증: 현재 결과 없음" : FIN.verify.kind === "unverified" ? "원본 재검증: 확인 불가" : "원본 재검증: 일부만 확인됨", FIN.verify.hint);
+    else add(lv === "ok" ? "ok" : "warn", lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.kind === "noresult" ? "원본 재검증: 현재 결과 없음" : FIN.verify.kind === "unverified" ? "원본 재검증: 확인 불가" : "원본 재검증: 일부만 확인됨", FIN.verify.hint, FIN.verify.tip);
   } else {
     add("info", "원본 재검증: 아직 실행하지 않음", "패키징할 때 원본 SHA-256을 다시 계산해 일치/불일치를 그대로 기록합니다. 지금 확인하려면 고급 ▸ 원본 재검증.");
   }
@@ -470,7 +476,7 @@ function finRowHtml(c) {
   const fix = c.attribute
     ? `<button type="button" id="btnFinalAttribute"${FIN.attributing ? ' disabled aria-busy="true"' : ""}>현재 이름으로 귀속</button>`
     : "";
-  return `<li class="h-check h-check-${esc(c.level)}" data-level="${esc(c.level)}">${finIcon(lv.icon)}` +
+  return `<li class="h-check h-check-${esc(c.level)}" data-level="${esc(c.level)}"${c.tip ? ` title="${esc(c.tip)}"` : ""}>${finIcon(lv.icon)}` +
     `<span class="h-check-text"><span class="sr-only">${lv.word}: </span>${esc(c.text)}` +
     (c.sub ? `<small>${esc(c.sub)}</small>` : "") + fix + `</span></li>`;
 }
@@ -488,36 +494,55 @@ function finSetHtml(el, html) {
   el.innerHTML = html;
   return true;
 }
+// R12 (track S): a finalize the server refused before starting.
+function finBlockedError(err) { return /^\s*최종화 차단:/.test(String(err || "")); }
 // R12 U2: a server detail line, cut short for the row.
 function finShortDetail(text, max) {
   const lim = max || 90;
   const t = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
   return t.length > lim ? t.slice(0, lim - 1).trimEnd() + "…" : t;
 }
-// R12 U3 (track S2, P13): /api/status says an earlier finalize was cut off —
-// `finalize_journal` (still on disk → 확인 필요) or `finalize_recovered`
-// (the server undid it → 복구됨). Absent fields (older server) = no row.
+// R12 U3 (track S2, P13 — 608884d): /api/status `finalize_journal` is null
+// while this workstation's own finalize runs, else {path, state, examiner,
+// started_unix, signoff_sha256, error}; state "recovered" → 복구됨,
+// "interrupted" / "in-progress" → 확인 필요, "unreadable" (reason in `error`;
+// blocks the next finalize) → 기록을 읽지 못함. `finalize_recovered` +
+// `finalize_recovered_detail` (what the recovery did; "확인 필요: …" when
+// something is left) without a journal → 복구됨. Absent fields = no row.
 function finJournalState(st) {
   if (!st || typeof st !== "object") return null;
   const j = st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : null;
   const jState = j && j.state != null ? String(j.state) : "";
-  if (j && jState !== "recovered") return { kind: "check", journal: j };
-  if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j };
+  const detail = st.finalize_recovered_detail == null ? "" : String(st.finalize_recovered_detail);
+  if (j && jState === "unreadable") return { kind: "unreadable", journal: j, detail: j.error == null ? "" : String(j.error) };
+  if (j && jState !== "recovered") return { kind: "check", journal: j, detail };
+  if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j, detail };
   return null;
+}
+// The body shows what is left first: from "확인 필요:" on when the detail has it.
+function finJournalBody(detail) {
+  const d = String(detail || "");
+  const at = d.indexOf("확인 필요:");
+  return finShortDetail(at > 0 ? d.slice(at) : d);
 }
 function finJournalRow(st) {
   const s = finJournalState(st);
   if (!s) return "";
   const j = s.journal || {};
   const tip = [];
+  if (j.examiner) tip.push("검토자 " + String(j.examiner));
   if (j.signoff_sha256) tip.push("검토자 기록 SHA-256 " + String(j.signoff_sha256));
   const started = Number(j.started_unix);
   if (started > 0) tip.push("시작 " + new Date(started * 1000).toLocaleString());
   if (j.state != null && String(j.state)) tip.push("상태 " + String(j.state));
-  const word = s.kind === "check" ? "확인 필요" : "복구됨";
-  return `<li class="h-fin-journal-row" data-journal="${s.kind}"${tip.length ? ` title="${esc(tip.join(" · "))}"` : ""}>` +
-    `<span class="h-fin-incomplete">이전 최종화 중단됨 — ${word}</span>` +
-    (s.kind === "check" ? ` <span class="muted">다시 최종화하십시오</span>` : "") + `</li>`;
+  if (j.path) tip.push(String(j.path));
+  if (s.detail) tip.push(s.detail);
+  const head = s.kind === "unreadable" ? "이전 최종화 기록을 읽지 못함 — 확인 필요"
+    : s.kind === "check" ? "이전 최종화 중단됨 — 확인 필요" : "이전 최종화 중단됨 — 복구됨";
+  const body = s.detail ? finJournalBody(s.detail) : "";
+  return `<li class="h-fin-journal-row" data-journal="${s.kind}"${tip.length ? ` title="${esc(tip.join("\n"))}"` : ""}>` +
+    `<span class="h-fin-incomplete">${esc(head)}</span>` +
+    (body ? `<small class="h-fin-detail muted">${esc(body)}</small>` : "") + `</li>`;
 }
 function finResultHtml() {
   const r = FIN.result;
@@ -542,7 +567,8 @@ function finResultHtml() {
   // the full text stays in the tooltip.
   const incDetail = inc && inc.detail ? finShortDetail(inc.detail) : "";
   const incRow = finJournalRow(st) + staleRow + (inc && !(pkgInc && (!inc.package_dir || inc.package_dir === pkgDir)) ? `<li class="h-fin-incomplete-row"${inc.detail ? ` title="${esc(inc.detail)}"` : ""}><span class="h-fin-incomplete">${esc(H_PKG_INCOMPLETE)}</span>` +
-    (inc.package_dir ? ` <code class="mono">${esc(inc.package_dir)}</code> ${pkgExplorerLink(inc.package_dir)}` : "") +
+    (inc.dirs && inc.dirs.length ? inc.dirs.map(d => ` <code class="mono">${esc(d)}</code> ${pkgExplorerLink(d)}`).join("")
+      : inc.package_dir ? ` <code class="mono">${esc(inc.package_dir)}</code> ${pkgExplorerLink(inc.package_dir)}` : "") +
     ` <span class="muted">최종 결과로 쓰지 마십시오</span>` +
     (incDetail ? `<small class="h-fin-detail muted">${esc(incDetail)}</small>` : "") + `</li>` : "");
   if (!r && !pkgDir) return incRow ? `<h3 class="h-fin-h">결과</h3><ul class="h-fin-links">${incRow}</ul>` : "";
@@ -813,7 +839,14 @@ async function finFinalize() {
   finally { finSetFinalizing(false); }
   FIN.incomplete = finIncompleteOf(res);
   FIN.reportStale = res && res.report_stale === true ? { error: String(res.error || "") } : null;
-  if (!res.ok) { finHint("실패: " + (res.error || "알 수 없는 오류")); finPaint(); return; }
+  if (!res.ok) {
+    // R12 (track S): "최종화 차단: …" = refused before anything changed —
+    // a warning to resolve, not a failure.
+    const err = String(res.error || "알 수 없는 오류");
+    if (finBlockedError(err)) { finHint(err); toast(err, "warn"); }
+    else finHint("실패: " + err);
+    finPaint(); return;
+  }
   FIN.result = { examiner: res.examiner || name, manifest_sha256: res.manifest_sha256 || "", package_dir: res.package_dir || "", package_url: res.package_url || "", finalize_incomplete: typeof res.finalize_incomplete === "boolean" ? res.finalize_incomplete : undefined };
   finHint("");
   finPaint();
@@ -830,7 +863,7 @@ async function finVerifySources() {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { finHint("원본 재검증 실패: " + (res.error || "알 수 없는 오류")); return; }
     const verdict = verifySourcesVerdict(res);
-    FIN.verify = { level: verdict.level, hint: verdict.hint, kind: verdict.kind || "" };
+    FIN.verify = { level: verdict.level, hint: verdict.hint, kind: verdict.kind || "", tip: verdict.tip || "" };
     finHint("");
     toast(verdict.toast, verdict.level);
     finRefresh();

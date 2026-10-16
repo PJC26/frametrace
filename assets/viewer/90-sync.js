@@ -2145,6 +2145,16 @@ document.getElementById("btnTranscodeQueue").addEventListener("click", async (ev
   }, { start: "toast.queueRunning", fail: () => t("toast.queueOffline") });
 });
 
+// R12 (track I2): a carve event taken only from db/carve_results.json
+// (`carved-candidate-unaudited`) is not a candidate — warn badge
+// "후보(감사 안 됨)", never the plain kind word. Other kinds as recorded.
+function timelineKindHtml(kind) {
+  const k = String(kind || "");
+  if (k === "carved-candidate-unaudited") {
+    return `<span class="badge warn tl-unaudited" data-kind="${escapeHtml(k)}" title="${escapeHtml(t("timeline.tip.carvedUnaudited"))}">${escapeHtml(t("timeline.kind.carvedUnaudited"))}</span>`;
+  }
+  return escapeHtml(k);
+}
 // --- 케이스 타임라인 패널: db/timeline.jsonl을 읽어 시간순 이벤트를 표시 ---
 async function loadTimeline(regenerate) {
   const list = document.getElementById("timelineList");
@@ -2177,7 +2187,7 @@ async function loadTimeline(regenerate) {
       return `<div class="timeline-row" data-id="${escapeHtml(recId || "")}">
         <span class="ts">${escapeHtml(isoTime(ev.ts_unix))}</span>
         <span class="src">${escapeHtml(ev.source || "")}</span>
-        <span class="desc" title="${escapeHtml(ev.path || "")} ${escapeHtml(ev.detail || "")}">${escapeHtml(ev.kind || "")} — ${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
+        <span class="desc" title="${escapeHtml(ev.path || "")} ${escapeHtml(ev.detail || "")}">${timelineKindHtml(ev.kind)} — ${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
       </div>`;
     }).join("") + (events.length > cap ? `<div class="timeline-row"><span class="desc muted">${tf("timeline.ellipsis", { n: events.length - cap })}</span></div>` : "");
     list.querySelectorAll(".timeline-row[data-id]").forEach(row => {
