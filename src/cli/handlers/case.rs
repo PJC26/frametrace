@@ -1410,12 +1410,40 @@ pub fn package_case_with_pending(
     Ok(())
 }
 
-/// `verify-package`: checks a package directory written by package-case
-/// and prints every check with its status — PASS, FAIL (naming the file)
-/// or NOT VERIFIED (what the package alone cannot prove). Exits non-zero
-/// when any check fails.
-pub fn verify_package(package_dir: &Path) -> Result<(), String> {
+/// R11-S8: the exit code `verify-package --strict` uses for a package
+/// whose files all check out but whose finalize did not complete
+/// (`_INCOMPLETE` name or marker beside it). Without `--strict` such a
+/// package exits 0 (P8: NOT VERIFIED is not FAIL); a FAIL is exit 1 either
+/// way.
+pub const VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE: i32 = 3;
+
+/// `verify-package [--strict]`: checks a package directory written by
+/// package-case and prints every check with its status — PASS, FAIL
+/// (naming the file) or NOT VERIFIED (what the package alone cannot
+/// prove). A failed check is the `Err` (exit 1). Returns the process exit
+/// code otherwise — 0, or
+/// [`VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE`] for an incomplete finalize when
+/// `strict` (a failed check is still the `Err`, exit 1).
+pub fn verify_package_with(package_dir: &Path, strict: bool) -> Result<i32, String> {
     let result = verify_package_extended(package_dir)?;
+    let code = verify_package_exit_code(&result, strict);
+    print_package_verification(package_dir, &result)?;
+    Ok(code)
+}
+
+/// R11-S8: the exit code of a verification without a FAIL.
+pub fn verify_package_exit_code(result: &package::PackageVerification, strict: bool) -> i32 {
+    if strict && result.passed() && result.finalize_incomplete {
+        VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE
+    } else {
+        0
+    }
+}
+
+fn print_package_verification(
+    package_dir: &Path,
+    result: &package::PackageVerification,
+) -> Result<(), String> {
     println!("package: {}", package_dir.display());
     if let Some(hash) = &result.manifest_sha256 {
         println!("manifest.sha256 SHA-256: {hash}");
@@ -2688,5 +2716,41 @@ mod report_output_tests {
             "{keyless}"
         );
         fs::remove_dir_all(&case).unwrap();
+    }
+
+    /// R11-S8: `verify-package --strict` exits 3 for a package whose files
+    /// check out but whose finalize did not complete (R10 exited 0 — a
+    /// script checking only the exit code took it as final). Without
+    /// `--strict` it stays 0 (NOT VERIFIED is not FAIL); a complete
+    /// package is 0 either way and a FAIL is still the error (exit 1).
+    #[test]
+    fn r11_s8_strict_verify_package_exits_3_for_an_incomplete_finalize() {
+        let (root, case_dir, _id) = signed_case("r11-s8");
+        let package = root.join("package_1");
+        super::package_case(
+            &case_dir,
+            super::PackageOptions {
+                output_dir: Some(package.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(super::verify_package_with(&package, true), Ok(0));
+        let incomplete = root.join("package_1_INCOMPLETE");
+        fs::rename(&package, &incomplete).unwrap();
+        assert_eq!(super::verify_package_with(&incomplete, false), Ok(0));
+        assert_eq!(
+            super::verify_package_with(&incomplete, true),
+            Ok(super::VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE)
+        );
+        assert_eq!(super::VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE, 3);
+        // `.` inside the folder (R11-S2) is the same package.
+        assert_eq!(
+            super::verify_package_with(&incomplete.join("."), true),
+            Ok(3)
+        );
+        // A FAIL stays a failure, strict or not.
+        fs::write(incomplete.join("README.txt"), "changed").unwrap();
+        assert!(super::verify_package_with(&incomplete, true).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }

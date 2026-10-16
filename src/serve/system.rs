@@ -554,6 +554,14 @@ fn status_snapshot(guard: &JobState) -> serde_json::Value {
         "case_dir": opt(&guard.case_dir),
         "package_dir": opt(&guard.package_dir),
         "error": guard.error,
+        // R11-S5: the case report could not be re-rendered after a failed
+        // finalize (it still names that finalize's unfinished sign-off).
+        "report_stale": guard.report_stale,
+        // R11-S6: the last failed finalize left something that must not
+        // be read as final (sign-off not restored, report stale, abandon
+        // record missing); `finalize_incomplete_detail` says what.
+        "finalize_incomplete": guard.finalize_incomplete.is_some(),
+        "finalize_incomplete_detail": guard.finalize_incomplete,
         // UX-06: which kind of job holds `busy` (null when idle), and the
         // current/last background case job with its stage and outcome.
         "job_kind": status_job_kind(guard),
@@ -839,6 +847,9 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
         // Finished clip jobs belong to the previous binding.
         guard.clip_jobs.clear();
+        // R11-S5/S6: so did the last finalize's leftovers.
+        guard.report_stale = false;
+        guard.finalize_incomplete = None;
     }
     guard.case_dir = Some(case_dir.clone());
     // Reopening the same case must keep extra media roots the earlier

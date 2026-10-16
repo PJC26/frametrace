@@ -707,9 +707,46 @@ pub fn parse_framehash(text: &str) -> Option<Vec<u64>> {
     parse_framehash_lines(text).map(|lines| lines.iter().map(|line| line.hash).collect())
 }
 
-/// R10-S8: per packet (file order) its `(dts, pts)` in the stream's own
-/// time base, as ffprobe lists them.
-pub type PacketStamp = (Option<i64>, Option<i64>);
+/// R10-S8: per packet (file order) its timestamps in the stream's own
+/// time base, as ffprobe lists them (`None` = `N/A`).
+///
+/// R11-S1: a struct with named fields, read from ffprobe's `key=value`
+/// output. R10 kept an unnamed `(dts, pts)` pair parsed by position, but
+/// ffprobe prints `pts` before `dts` whatever order `-show_entries` names
+/// them in: with B-frames (pts ≠ dts) every packet then "differed from
+/// ffmpeg's timestamps" and every such source was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PacketStamp {
+    pub pts: Option<i64>,
+    pub dts: Option<i64>,
+}
+
+/// R11-S1: which timestamp identifies a packet in
+/// [`align_normalized_hashes`]: the presentation time (unique per
+/// packet, and what Matroska always stores — it reports no dts for the
+/// first packets of a B-frame stream, where ffmpeg's framehash computes
+/// one), or the decode time for a stream with no pts at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampKey {
+    Pts,
+    Dts,
+}
+
+impl StampKey {
+    fn of_stamp(self, stamp: &PacketStamp) -> Option<i64> {
+        match self {
+            StampKey::Pts => stamp.pts,
+            StampKey::Dts => stamp.dts,
+        }
+    }
+
+    fn of_line(self, line: &FrameHashLine) -> Option<i64> {
+        match self {
+            StampKey::Pts => line.pts,
+            StampKey::Dts => line.dts,
+        }
+    }
+}
 
 /// R10-S8: one hash per listed packet when the normalizing filter dropped
 /// some packets (`normalized` is shorter than `stamps`).
@@ -725,6 +762,10 @@ pub type PacketStamp = (Option<i64>, Option<i64>);
 /// bytes for it. Anything else — a timestamp that is missing, repeated or
 /// not found, a dropped packet that had picture data — is an error (the
 /// check cannot run; the join is refused, never passed unverified).
+///
+/// R11-S1: packets are identified by pts alone (by dts only when the
+/// stream lists no pts at all); a dts ffprobe lists must still equal
+/// ffmpeg's, one it reports as `N/A` is not compared.
 pub fn align_normalized_hashes(
     stamps: &[PacketStamp],
     normalized: &[FrameHashLine],
@@ -738,35 +779,57 @@ pub fn align_normalized_hashes(
             stamps.len()
         ));
     }
+    let key = if stamps.iter().all(|s| s.pts.is_some()) {
+        StampKey::Pts
+    } else if stamps.iter().all(|s| s.pts.is_none() && s.dts.is_some()) {
+        StampKey::Dts
+    } else {
+        let index = stamps
+            .iter()
+            .position(|s| s.pts.is_none())
+            .unwrap_or_default();
+        return Err(format!(
+            "packet {} has no presentation timestamp",
+            index + 1
+        ));
+    };
     let mut seen = std::collections::HashSet::new();
     for (index, (stamp, line)) in stamps.iter().zip(framed).enumerate() {
-        if *stamp == (None, None) {
+        let Some(value) = key.of_stamp(stamp) else {
             return Err(format!("packet {} has no timestamp", index + 1));
-        }
-        if !seen.insert(*stamp) {
+        };
+        if !seen.insert(value) {
             return Err(format!("packet {} repeats a timestamp", index + 1));
         }
-        if (line.dts, line.pts) != *stamp {
+        let differs = line.pts != stamp.pts && (key == StampKey::Pts || stamp.pts.is_some())
+            || stamp.dts.is_some() && line.dts != stamp.dts;
+        if differs {
             return Err(format!(
-                "packet {}: ffmpeg's timestamps {:?} differ from ffprobe's {stamp:?}",
+                "packet {}: ffmpeg's timestamps (pts {:?}, dts {:?}) differ from ffprobe's (pts {:?}, dts {:?})",
                 index + 1,
-                (line.dts, line.pts)
+                line.pts,
+                line.dts,
+                stamp.pts,
+                stamp.dts
             ));
         }
     }
-    let ps_only: std::collections::HashMap<PacketStamp, u64> = ps_only
+    let ps_only: std::collections::HashMap<i64, u64> = ps_only
         .iter()
-        .map(|line| ((line.dts, line.pts), line.hash))
+        .filter_map(|line| Some((key.of_line(line)?, line.hash)))
         .collect();
     let mut out = Vec::with_capacity(stamps.len());
     let mut next = normalized.iter().peekable();
     for (index, (stamp, line)) in stamps.iter().zip(framed).enumerate() {
+        let value = key.of_stamp(stamp);
         match next.peek() {
-            Some(kept) if (kept.dts, kept.pts) == *stamp => {
+            Some(kept) if key.of_line(kept) == value => {
                 out.push(kept.hash);
                 next.next();
             }
-            _ if ps_only.get(stamp) == Some(&line.hash) => out.push(EMPTY_PAYLOAD_HASH),
+            _ if value.and_then(|v| ps_only.get(&v)) == Some(&line.hash) => {
+                out.push(EMPTY_PAYLOAD_HASH)
+            }
             _ => {
                 return Err(format!(
                     "packet {} was dropped by the normalizing filter but is not parameter sets only",
@@ -807,19 +870,18 @@ fn framehash_lines(
     })
 }
 
-/// R10-S8: the first video stream's packet timestamps (`dts, pts`) in its
-/// own time base.
-fn packet_stamps(
+/// R10-S8: the first video stream's packet timestamps in its own time
+/// base. R11-S1: printed as `key=value` (`csv=p=0:nk=0`) and parsed by
+/// name — ffprobe's field order is its own, not the `-show_entries`
+/// order.
+pub fn packet_stamps(
     ffprobe: &str,
     path: &Path,
     timeout_secs: Option<u64>,
 ) -> Result<Vec<PacketStamp>, String> {
     let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
     let mut command = Command::new(&binary);
-    command
-        .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "packet=dts,pts", "-of", "csv=p=0"])
-        .arg(path);
+    command.args(packet_stamp_args()).arg(path);
     let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
     if !output.status.success() {
         return Err(format!(
@@ -828,19 +890,59 @@ fn packet_stamps(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(parse_packet_stamps(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    parse_packet_stamps(&String::from_utf8_lossy(&output.stdout)).map_err(|why| {
+        format!(
+            "ffprobe packet timestamps of {} are unreadable: {why}",
+            path.display()
+        )
+    })
 }
 
-/// R10-S8: `dts,pts[,…]` per line (`N/A` = none).
-pub fn parse_packet_stamps(text: &str) -> Vec<PacketStamp> {
+/// R11-S1: the ffprobe arguments (before the path) of [`packet_stamps`].
+pub fn packet_stamp_args() -> [&'static str; 8] {
+    [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "packet=pts,dts",
+        "-of",
+        "csv=p=0:nk=0",
+    ]
+}
+
+/// R11-S1: `pts=…,dts=…` per line, in any order (`N/A` = none). A line
+/// without both keys, or with a value that is neither a number nor
+/// `N/A`, is an error — never read by position.
+pub fn parse_packet_stamps(text: &str) -> Result<Vec<PacketStamp>, String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| {
-            let mut fields = line.split(',').map(|f| f.trim().parse::<i64>().ok());
-            (fields.next().flatten(), fields.next().flatten())
+        .enumerate()
+        .map(|(index, line)| {
+            let mut pts = None;
+            let mut dts = None;
+            for field in line.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+                let (key, value) = field
+                    .split_once('=')
+                    .ok_or_else(|| format!("line {}: {field:?} has no key", index + 1))?;
+                let value = match value.trim() {
+                    "N/A" => None,
+                    number => Some(number.parse::<i64>().map_err(|_| {
+                        format!("line {}: {key}={number:?} is not a timestamp", index + 1)
+                    })?),
+                };
+                match key.trim() {
+                    "pts" => pts = Some(value),
+                    "dts" => dts = Some(value),
+                    _ => {}
+                }
+            }
+            match (pts, dts) {
+                (Some(pts), Some(dts)) => Ok(PacketStamp { pts, dts }),
+                _ => Err(format!("line {}: {line:?} lacks pts or dts", index + 1)),
+            }
         })
         .collect()
 }
@@ -5417,14 +5519,28 @@ mod tests {
         assert_eq!(lines[0].dts, Some(-1024));
         assert_eq!(lines[1].dts, None);
         assert_eq!(lines[1].pts, Some(0));
+        let stamp = |pts, dts| PacketStamp { pts, dts };
+        // R11-S1: by key name, in ffprobe's own order (pts first), with
+        // Matroska's `N/A` dts and MPEG-TS's trailing comma.
         assert_eq!(
-            parse_packet_stamps("0,0\nN/A,100\n126000,126000,\n"),
+            parse_packet_stamps("pts=0,dts=-1024\npts=100,dts=N/A\npts=144000,dts=126000,\n")
+                .unwrap(),
             vec![
-                (Some(0), Some(0)),
-                (None, Some(100)),
-                (Some(126000), Some(126000))
+                stamp(Some(0), Some(-1024)),
+                stamp(Some(100), None),
+                stamp(Some(144000), Some(126000))
             ]
         );
+        assert_eq!(
+            parse_packet_stamps("dts=-1024,pts=0\n").unwrap(),
+            vec![stamp(Some(0), Some(-1024))]
+        );
+        // Never by position: a keyless line, a missing key or a value
+        // that is no timestamp is an error.
+        assert!(parse_packet_stamps("0,-1024\n").is_err());
+        assert!(parse_packet_stamps("pts=0\n").is_err());
+        assert!(parse_packet_stamps("pts=0,dts=x\n").is_err());
+        assert!(packet_stamp_args().contains(&"csv=p=0:nk=0"));
         // SHA-256 of the empty string.
         let empty: [u8; 32] = {
             use sha2::Digest;
@@ -5446,7 +5562,12 @@ mod tests {
             pts: Some(ts),
             hash,
         };
-        let stamps: Vec<PacketStamp> = (0..4).map(|t| (Some(t * 10), Some(t * 10))).collect();
+        let stamps: Vec<PacketStamp> = (0..4)
+            .map(|t| PacketStamp {
+                pts: Some(t * 10),
+                dts: Some(t * 10),
+            })
+            .collect();
         // Packet 2 (ts 10) carried only SPS/PPS: dropped by the filter;
         // the unfiltered and the parameter-sets-only passes agree on it.
         let normalized = [line(0, 100), line(20, 120), line(30, 130)];
@@ -5471,14 +5592,82 @@ mod tests {
         assert!(align_normalized_hashes(&stamps, &normalized, &shifted, &ps_only).is_err());
         // Missing or repeated timestamps cannot be aligned: refused.
         let mut none = stamps.clone();
-        none[1] = (None, None);
+        none[1] = PacketStamp::default();
         assert!(align_normalized_hashes(&none, &normalized, &framed, &ps_only).is_err());
+        // A pts missing on one packet only: refused (no mixed keys).
+        let mut no_pts = stamps.clone();
+        no_pts[1].pts = None;
+        assert!(align_normalized_hashes(&no_pts, &normalized, &framed, &ps_only).is_err());
         let mut repeated = stamps.clone();
         repeated[2] = repeated[1];
         assert!(align_normalized_hashes(&repeated, &normalized, &framed, &ps_only).is_err());
         // A normalized line ffprobe does not list: refused.
         let extra = [line(0, 100), line(20, 120), line(30, 130), line(40, 140)];
         assert!(align_normalized_hashes(&stamps, &extra, &framed, &ps_only).is_err());
+    }
+
+    /// R11-S1: B-frames — decode order is not presentation order and pts
+    /// ≠ dts. Packets are matched by pts; Matroska's `N/A` dts (ffmpeg's
+    /// framehash computes one) is not compared, a listed dts is.
+    #[test]
+    fn bframe_packets_are_aligned_by_presentation_time() {
+        // Decode order I P B B (pts 0 30 10 20, dts -20 -10 0 10), then
+        // a parameter-set-only packet (pts = dts = 40).
+        let ts = [(0, -20), (30, -10), (10, 0), (20, 10), (40, 40)];
+        let line = |(pts, dts): (i64, i64), hash: u64| FrameHashLine {
+            pts: Some(pts),
+            dts: Some(dts),
+            hash,
+        };
+        let framed: Vec<FrameHashLine> = ts.iter().map(|t| line(*t, 900 + t.0 as u64)).collect();
+        let normalized: Vec<FrameHashLine> =
+            ts[..4].iter().map(|t| line(*t, 100 + t.0 as u64)).collect();
+        let ps_only = [line(ts[0], 1), line(ts[4], 940)];
+        let want = vec![100, 130, 110, 120, EMPTY_PAYLOAD_HASH];
+        let listed: Vec<PacketStamp> = ts
+            .iter()
+            .map(|(pts, dts)| PacketStamp {
+                pts: Some(*pts),
+                dts: Some(*dts),
+            })
+            .collect();
+        assert_eq!(
+            align_normalized_hashes(&listed, &normalized, &framed, &ps_only).unwrap(),
+            want
+        );
+        // Matroska: ffprobe has no dts for the first two packets.
+        let mut mkv = listed.clone();
+        mkv[0].dts = None;
+        mkv[1].dts = None;
+        assert_eq!(
+            align_normalized_hashes(&mkv, &normalized, &framed, &ps_only).unwrap(),
+            want
+        );
+        // R10's misreading — the pair swapped — never aligns.
+        let swapped: Vec<PacketStamp> = listed
+            .iter()
+            .map(|s| PacketStamp {
+                pts: s.dts,
+                dts: s.pts,
+            })
+            .collect();
+        assert!(align_normalized_hashes(&swapped, &normalized, &framed, &ps_only).is_err());
+        // A listed dts that differs from ffmpeg's: refused.
+        let mut off = listed.clone();
+        off[2].dts = Some(1);
+        assert!(align_normalized_hashes(&off, &normalized, &framed, &ps_only).is_err());
+        // A stream with no pts at all is matched by dts.
+        let dts_only: Vec<PacketStamp> = listed
+            .iter()
+            .map(|s| PacketStamp {
+                pts: None,
+                dts: s.dts,
+            })
+            .collect();
+        assert_eq!(
+            align_normalized_hashes(&dts_only, &normalized, &framed, &ps_only).unwrap(),
+            want
+        );
     }
 
     /// R7-S3: the segment check lists packets without payload hashes and

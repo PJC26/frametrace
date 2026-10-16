@@ -2275,14 +2275,42 @@ pub(crate) fn incomplete_package_dirs(case_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = case_dir.join("reports").read_dir() else {
         return Vec::new();
     };
+    // R11-S4: the entry's own type (no link followed — R10 called
+    // `is_dir()` on every `package_*` entry at each /api/status poll, so a
+    // junction or symlink to a slow or offline share was traversed every
+    // poll); links and other reparse points are skipped.
     let mut found: Vec<PathBuf> = entries
         .flatten()
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("package_"))
+        .filter(is_plain_dir_entry)
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && crate::package::finalize_incomplete_reason(path).is_some())
+        .filter(|path| crate::package::finalize_incomplete_reason(path).is_some())
         .collect();
     found.sort();
     found
+}
+
+/// R11-S4: a directory entry that is a real directory — not a symlink, a
+/// junction or any other reparse point — judged from the entry itself
+/// (`DirEntry::file_type` / its metadata do not follow links).
+pub(crate) fn is_plain_dir_entry(entry: &std::fs::DirEntry) -> bool {
+    let Ok(file_type) = entry.file_type() else {
+        return false;
+    };
+    if !file_type.is_dir() || file_type.is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        match entry.metadata() {
+            Ok(meta) => meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 /// R10-S3: the package a `package-case` step published, from its own

@@ -300,53 +300,89 @@ fn logged_calls(log: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Makes promoting the sign-off fail for good: `review/signoff.json` is a
-/// non-empty folder. The rename budget is shortened to the bare backoff
-/// on this thread (finalize runs on it).
-fn block_promotion(case: &Path) -> PathBuf {
-    let blocker = case.join(crate::report::SIGNOFF_REL_PATH);
-    std::fs::create_dir_all(&blocker).unwrap();
-    std::fs::write(blocker.join("keep"), b"x").unwrap();
+/// Makes promoting the sign-off fail for good (as a handle that is never
+/// released would): every promotion rename fails, and the rename budget
+/// is shortened to the bare backoff on this thread (finalize runs on it).
+fn block_promotion() {
+    super::jobs::FAIL_SIGNOFF_PROMOTIONS.with(|left| left.set(usize::MAX));
     crate::package::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
-    blocker
 }
 
-fn unblock_promotion(blocker: &Path) {
+fn unblock_promotion() {
+    super::jobs::FAIL_SIGNOFF_PROMOTIONS.with(|left| left.set(0));
     crate::package::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(None));
-    std::fs::remove_dir_all(blocker).unwrap();
 }
 
-/// R9-S4: package-case published its package, then promoting the sign-off
-/// failed. R8 answered only "검토자 기록 확정 실패" while a complete-looking
-/// package sat in reports/. The error now names the package and says the
-/// finalize is incomplete, and a marker beside the package says so too
-/// (outside it: verify-package must still see exactly its files).
-/// R10-S2/S3: the package is the one package-case named and is renamed
-/// `…_INCOMPLETE` (the marker sits beside the renamed folder).
+/// `package_*` entries of the case's reports folder.
+fn package_entries(case: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(case.join("reports"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with("package_"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// R11-S3 (replaces R9-S4 / R10-S2): the sign-off is promoted BEFORE
+/// package-case runs. R10 packaged first: a promotion that then failed
+/// left a complete-looking package (renamed `…_INCOMPLETE`) whose
+/// sign-off was never promoted. Now a failed promotion publishes nothing
+/// — package-case is never run — the attempt is abandoned in the audit
+/// chain, the pending record is removed and the report is re-rendered
+/// without it.
 #[test]
-fn r9_s4_published_package_with_failed_promotion_is_named_incomplete() {
-    let Some((root, case)) = finalize_case("s4") else {
+fn r11_s3_failed_promotion_publishes_no_package() {
+    let Some((root, case)) = finalize_case("r11-s3-promote") else {
         return;
     };
-    let fake = packaging_fake(&root, &root.join("calls.log"), "package_1", None);
-    let blocker = block_promotion(&case);
+    let log = root.join("calls.log");
+    let fake = packaging_fake(&root, &log, "package_1", None);
+    block_promotion();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     state_lock(&state).case_dir = Some(case.clone());
-    let error = finalize_error(&finalize_with_exe(&fake, &case, "홍길동", &state));
-    unblock_promotion(&blocker);
-    let package = case.join("reports").join("package_1_INCOMPLETE");
-    assert!(package.is_dir(), "the published package, renamed");
+    let response = finalize_with_exe(&fake, &case, "홍길동", &state);
+    unblock_promotion();
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], false, "{response}");
+    let error = value["error"].as_str().unwrap();
     assert!(error.contains("검토자 기록 확정 실패"), "{error}");
-    assert!(error.contains("최종화 미완료"), "{error}");
+    assert!(error.contains("패키지는 만들지 않았습니다"), "{error}");
+    assert_eq!(package_entries(&case), Vec::<String>::new(), "no package");
+    let calls = logged_calls(&log);
     assert!(
-        error.contains(&package.display().to_string()),
-        "the published package is not named: {error}"
+        !calls.iter().any(|call| call.starts_with("package-case")),
+        "package-case ran: {calls:?}"
     );
-    let marker = super::jobs::finalize_incomplete_marker(&package);
-    assert_eq!(marker.parent(), package.parent(), "beside, not inside");
-    let text = std::fs::read_to_string(&marker).expect("incomplete marker");
-    assert!(text.contains("최종화 미완료"), "{text}");
+    let last = calls.last().expect("calls logged");
+    assert!(
+        last.starts_with("make-report") && !last.contains("--signoff"),
+        "the report was not re-rendered: {calls:?}"
+    );
     assert!(!case.join(SIGNOFF_PENDING_REL_PATH).exists());
+    assert!(!case.join(crate::report::SIGNOFF_REL_PATH).exists());
+    let lane = std::fs::read_to_string(case.join("evidence/logs/signoff-log.jsonl")).unwrap();
+    assert!(
+        lane.contains(crate::report::SIGNOFF_ABANDONED_EVENT),
+        "{lane}"
+    );
+    // Nothing irregular was left: the status says so.
+    assert_eq!(value["finalize_incomplete"], false, "{response}");
+    let status: serde_json::Value = serde_json::from_str(&api_status(&state)).unwrap();
+    assert_eq!(status["package_incomplete"], false, "{status}");
+    assert_eq!(status["incomplete_packages"], serde_json::json!([]));
+    assert_eq!(status["finalize_incomplete"], false, "{status}");
+    assert_eq!(status["report_stale"], false, "{status}");
+    // The next finalize completes with its own package.
+    let response = finalize_with_exe(&fake, &case, "홍길동", &state);
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], true, "{response}");
+    assert_eq!(value["package_url"].as_str(), Some("reports/package_1"));
+    assert!(case.join(crate::report::SIGNOFF_REL_PATH).is_file());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -444,117 +480,20 @@ fn r10_s1_promotion_waits_out_a_real_sharing_violation() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// R10-S1/S2: a finalize that published its package and then could not
-/// promote the sign-off.
-/// - S2: R9 only wrote a marker BESIDE the package, which nothing read
-///   and which a copy of the folder alone lost. The folder is renamed
-///   `…_INCOMPLETE` now: verify-package says NOT VERIFIED (finalize
-///   incomplete), the finalize result and /api/status name it, and it is
-///   never "the" package. A later successful finalize names it again
-///   (never deletes it).
-/// - S1: the case report rendered with the abandoned sign-off is
-///   rendered again (R9 re-rendered only after a failed report/package).
+/// R10-S3: the package reported on success is the one the package-case
+/// step named on its `output:` line — here a NEWER folder the step did
+/// not publish sits beside it. (R10's failure half — which folder to mark
+/// `…_INCOMPLETE` — is gone with R11-S3: a failed finalize publishes no
+/// package.)
 #[test]
-fn r10_s2_incomplete_finalize_renames_and_reports_the_package() {
-    let Some((root, case)) = finalize_case("r10-s2") else {
-        return;
-    };
-    let log = root.join("calls.log");
-    let fake = packaging_fake(&root, &log, "package_1", None);
-    let blocker = block_promotion(&case);
-    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
-    state_lock(&state).case_dir = Some(case.clone());
-    let response = finalize_with_exe(&fake, &case, "홍길동", &state);
-    unblock_promotion(&blocker);
-    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(value["ok"], false, "{response}");
-    let renamed = case.join("reports").join("package_1_INCOMPLETE");
-    assert_eq!(value["finalize_incomplete"], true, "{response}");
-    assert_eq!(
-        value["incomplete_package_dir"].as_str(),
-        Some(renamed.to_string_lossy().as_ref()),
-        "{response}"
-    );
-    assert_eq!(
-        value["incomplete_package_url"].as_str(),
-        Some("reports/package_1_INCOMPLETE")
-    );
-    assert!(renamed.is_dir());
-    assert!(!case.join("reports").join("package_1").exists());
-    assert!(crate::package::finalize_incomplete_marker(&renamed).is_file());
-    // verify-package: NOT VERIFIED "finalize", whatever else it finds.
-    let checked = crate::package::verify_package(&renamed).unwrap();
-    assert!(checked.finalize_incomplete);
-    assert!(checked.checks.iter().any(|check| {
-        check.subject == crate::package::FINALIZE_CHECK_SUBJECT
-            && check.status == crate::package::CheckStatus::NotVerified
-            && check.detail.contains("FINALIZE INCOMPLETE")
-    }));
-    assert_eq!(newest_package_dir(&case), None, "never the package");
-    let status: serde_json::Value = serde_json::from_str(&api_status(&state)).unwrap();
-    assert_eq!(
-        status["incomplete_packages"][0].as_str(),
-        Some(renamed.to_string_lossy().as_ref()),
-        "{status}"
-    );
-    assert_eq!(status["package_incomplete"], true, "{status}");
-    assert_eq!(
-        status["package_dir"].as_str(),
-        Some(renamed.to_string_lossy().as_ref())
-    );
-    // S1: the report was rendered again after the failed promotion,
-    // without the abandoned sign-off.
-    let calls = logged_calls(&log);
-    let last = calls.last().expect("calls logged");
-    assert!(
-        last.starts_with("make-report") && !last.contains("--signoff"),
-        "the report was not re-rendered: {calls:?}"
-    );
-    // A later finalize that completes: its own package, and the earlier
-    // incomplete one named (kept).
-    let fake = packaging_fake(&root, &log, "package_2", None);
-    let response = finalize_with_exe(&fake, &case, "홍길동", &state);
-    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(value["ok"], true, "{response}");
-    let second = case.join("reports").join("package_2");
-    assert_eq!(
-        value["package_dir"].as_str(),
-        Some(second.to_string_lossy().as_ref())
-    );
-    assert_eq!(
-        value["incomplete_packages"][0].as_str(),
-        Some(renamed.to_string_lossy().as_ref()),
-        "{response}"
-    );
-    assert!(renamed.is_dir(), "never deleted");
-    let logs = state_lock(&state).logs.join("\n");
-    assert!(logs.contains("미완료 패키지 1개"), "{logs}");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// R10-S3: the package to mark (and to report on success) is the one the
-/// package-case step named on its `output:` line. R9 took the folder
-/// with the newest modification time — here a NEWER folder the step did
-/// not publish — so the decoy was marked and the real package passed as
-/// final.
-#[test]
-fn r10_s3_the_marked_package_is_the_one_package_case_named() {
+fn r10_s3_the_reported_package_is_the_one_package_case_named() {
     let Some((root, case)) = finalize_case("r10-s3") else {
         return;
     };
     let log = root.join("calls.log");
-    let fake = packaging_fake(&root, &log, "package_1", Some("package_9"));
-    let blocker = block_promotion(&case);
+    let reports = case.join("reports");
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     state_lock(&state).case_dir = Some(case.clone());
-    let error = finalize_error(&finalize_with_exe(&fake, &case, "홍길동", &state));
-    unblock_promotion(&blocker);
-    let reports = case.join("reports");
-    assert!(reports.join("package_1_INCOMPLETE").is_dir(), "{error}");
-    assert!(reports.join("package_9").is_dir(), "the decoy is untouched");
-    assert!(!crate::package::finalize_incomplete_marker(&reports.join("package_9")).exists());
-    assert!(error.contains("package_1_INCOMPLETE"), "{error}");
-    // Success: the reported package is the named one, not the newest.
     let fake = packaging_fake(&root, &log, "package_3", Some("package_8"));
     let response = finalize_with_exe(&fake, &case, "홍길동", &state);
     let value: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -565,6 +504,232 @@ fn r10_s3_the_marked_package_is_the_one_package_case_named() {
         Some(reports.join("package_3").as_path())
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// A fake CLI that runs the REAL `bin` for every command except
+/// package-case, which fails ("package disk full") after running
+/// `package_cmd` / `package_sh`; with `fail_plain_report`, a make-report
+/// WITHOUT `--signoff` (the re-render after a failed finalize) fails too.
+fn delegating_fake(
+    root: &Path,
+    bin: &Path,
+    package_sh: &str,
+    package_cmd: &str,
+    fail_plain_report: bool,
+) -> PathBuf {
+    let sh_report = if fail_plain_report {
+        "if [ \"$1\" = make-report ]; then case \" $* \" in *\" --signoff \"*) ;; *) echo 'render failed' >&2; exit 1;; esac; fi\n"
+    } else {
+        ""
+    };
+    let cmd_report = if fail_plain_report {
+        "if \"%1\"==\"make-report\" (\necho %* | findstr /C:\"--signoff\" >nul || (echo render failed 1>&2 & exit /b 1)\n)\n"
+    } else {
+        ""
+    };
+    write_fake(
+        root,
+        &format!(
+            "case \"$1\" in package-case) {package_sh} echo 'package disk full' >&2; exit 1;; esac\n{sh_report}exec \"{}\" \"$@\"",
+            bin.display()
+        ),
+        &format!(
+            "if \"%1\"==\"package-case\" (\n{package_cmd}\necho package disk full 1>&2\nexit /b 1\n)\n{cmd_report}\"{}\" %*\nexit /b %errorlevel%",
+            bin.display()
+        ),
+    )
+}
+
+/// R11-S3 (real CLI): a completed finalize packages the PROMOTED sign-off
+/// (`signoff_source` `review/signoff.json`; R10 packaged the pending
+/// record and promoted it afterwards). A later finalize whose package
+/// fails AFTER its sign-off was promoted takes it back: the previous
+/// record is restored byte for byte, the attempt is abandoned in the
+/// chain, the report is rendered again from the restored record and no
+/// package is added.
+#[test]
+fn r11_s3_failed_package_takes_the_promoted_signoff_back() {
+    let Some((root, case)) = finalize_case("r11-s3-restore") else {
+        return;
+    };
+    let bin = cli_bin().unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case.clone());
+    let response = finalize_with_exe(&bin, &case, "홍길동", &state);
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], true, "{response}");
+    let first = PathBuf::from(value["package_dir"].as_str().unwrap());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(first.join("package-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["signoff_source"].as_str(),
+        Some(crate::report::SIGNOFF_REL_PATH),
+        "the promoted record is packaged: {manifest:#}"
+    );
+    let checked = crate::package::verify_package(&first).unwrap();
+    assert!(checked.passed(), "{:?}", checked.checks);
+    let signoff_path = case.join(crate::report::SIGNOFF_REL_PATH);
+    let signed = std::fs::read(&signoff_path).unwrap();
+    let before = package_entries(&case);
+    // A second finalize (another examiner) whose package-case fails.
+    let fake = delegating_fake(&root, &bin, "", "", false);
+    let response = finalize_with_exe(&fake, &case, "김철수", &state);
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], false, "{response}");
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("package disk full"),
+        "{response}"
+    );
+    assert_eq!(
+        std::fs::read(&signoff_path).unwrap(),
+        signed,
+        "the previous sign-off is restored byte for byte"
+    );
+    assert!(!case.join(SIGNOFF_PENDING_REL_PATH).exists());
+    assert_eq!(package_entries(&case), before, "no package added");
+    let lane = std::fs::read_to_string(case.join("evidence/logs/signoff-log.jsonl")).unwrap();
+    assert!(
+        lane.contains(crate::report::SIGNOFF_ABANDONED_EVENT),
+        "{lane}"
+    );
+    let report = std::fs::read_to_string(case.join("reports/case-report.html")).unwrap();
+    assert_eq!(
+        crate::report::report_signoff_sha256(&report),
+        Some(crate::sha256::digest_bytes(&signed).as_str()),
+        "the report is rendered from the restored record"
+    );
+    assert!(
+        !report.contains("김철수"),
+        "the abandoned examiner is named"
+    );
+    assert_eq!(value["report_stale"], false, "{response}");
+    assert_eq!(value["finalize_incomplete"], false, "{response}");
+    // The first package still verifies.
+    assert!(crate::package::verify_package(&first).unwrap().passed());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// R11-S5/S6 (real CLI): the package fails and the report cannot be
+/// rendered again. R10 only logged a warning: the error did not say that
+/// reports/case-report.html still names the abandoned sign-off. Now the
+/// error says so, `report_stale` and `finalize_incomplete` are set in the
+/// response and in /api/status (until a finalize completes).
+#[test]
+fn r11_s5_failed_rerender_is_in_the_error_and_the_status() {
+    let Some((root, case)) = finalize_case("r11-s5") else {
+        return;
+    };
+    let bin = cli_bin().unwrap();
+    let fake = delegating_fake(&root, &bin, "", "", true);
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case.clone());
+    let response = finalize_with_exe(&fake, &case, "홍길동", &state);
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], false, "{response}");
+    let error = value["error"].as_str().unwrap();
+    assert!(error.contains("package disk full"), "{error}");
+    assert!(error.contains("보고서를 다시 만들지 못했습니다"), "{error}");
+    assert!(error.contains("render failed"), "{error}");
+    assert_eq!(value["report_stale"], true, "{response}");
+    assert_eq!(value["finalize_incomplete"], true, "{response}");
+    let status: serde_json::Value = serde_json::from_str(&api_status(&state)).unwrap();
+    assert_eq!(status["report_stale"], true, "{status}");
+    assert_eq!(status["finalize_incomplete"], true, "{status}");
+    assert!(
+        status["finalize_incomplete_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("case-report.html")),
+        "{status}"
+    );
+    // A completed finalize clears both.
+    let response = finalize_with_exe(&bin, &case, "홍길동", &state);
+    assert!(response.contains("\"ok\":true"), "{response}");
+    let status: serde_json::Value = serde_json::from_str(&api_status(&state)).unwrap();
+    assert_eq!(status["report_stale"], false, "{status}");
+    assert_eq!(status["finalize_incomplete"], false, "{status}");
+    assert_eq!(
+        status["finalize_incomplete_detail"],
+        serde_json::Value::Null
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// R11-S6 (real CLI): the promoted sign-off cannot be taken back (here
+/// package-case replaced it by a folder before failing). The leftover is
+/// named in the error and kept as `finalize_incomplete` in the status.
+#[test]
+fn r11_s6_unrestorable_signoff_is_kept_in_the_status() {
+    let Some((root, case)) = finalize_case("r11-s6") else {
+        return;
+    };
+    let bin = cli_bin().unwrap();
+    let fake = delegating_fake(
+        &root,
+        &bin,
+        "rm -f \"$2/review/signoff.json\"; mkdir -p \"$2/review/signoff.json/keep\";",
+        "del /q \"%~2\\review\\signoff.json\"\nmkdir \"%~2\\review\\signoff.json\\keep\"",
+        false,
+    );
+    crate::package::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case.clone());
+    let response = finalize_with_exe(&fake, &case, "홍길동", &state);
+    crate::package::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(None));
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], false, "{response}");
+    let error = value["error"].as_str().unwrap();
+    assert!(error.contains("되돌리지 못함"), "{error}");
+    assert_eq!(value["finalize_incomplete"], true, "{response}");
+    let status: serde_json::Value = serde_json::from_str(&api_status(&state)).unwrap();
+    assert_eq!(status["finalize_incomplete"], true, "{status}");
+    assert!(
+        status["finalize_incomplete_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("signoff.json")),
+        "{status}"
+    );
+    assert_eq!(package_entries(&case), Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// R11-S4: `/api/status` lists incomplete packages from each entry's own
+/// type. R10 called `is_dir()` — following links — on every `package_*`
+/// entry at every poll, so a link to a slow share was traversed each
+/// time, and a link named `…_INCOMPLETE` was listed as a package.
+#[test]
+fn r11_s4_incomplete_package_listing_skips_links() {
+    let case = temp_case("r11-s4");
+    let reports = case.join("reports");
+    std::fs::create_dir_all(reports.join("package_1_INCOMPLETE")).unwrap();
+    let target = case.join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    let link = reports.join("package_2_INCOMPLETE");
+    #[cfg(windows)]
+    let linked = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .is_ok_and(|out| out.status.success());
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&target, &link).is_ok();
+    assert!(linked && link.is_dir(), "link fixture");
+    let listed = super::media::incomplete_package_dirs(&case);
+    assert_eq!(
+        listed,
+        vec![reports.join("package_1_INCOMPLETE")],
+        "{listed:?}"
+    );
+    #[cfg(windows)]
+    let _ = std::fs::remove_dir(&link);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(case);
 }
 
 /// R10-S6: without the CLI binary the finalize tests skip with a message

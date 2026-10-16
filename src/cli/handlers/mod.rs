@@ -269,7 +269,7 @@ pub(crate) use case::signoff_content_json;
 pub(crate) use case::{
     InitCaseOptions, PackageOptions, RegisterSourceOptions, init_case, inspect, make_custody,
     make_report, make_review, package_case_with_pending, register_source,
-    review_marks_json_from_rows, scan_folder, signoff_content_json_from, verify_package,
+    review_marks_json_from_rows, scan_folder, signoff_content_json_from, verify_package_with,
 };
 pub(crate) use doctor::{
     BenchmarkOptions, benchmark_db, deepfake_scan, deepfake_screen, doctor, rotate_audit_key,

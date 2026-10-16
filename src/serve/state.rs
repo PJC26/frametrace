@@ -201,6 +201,17 @@ pub(crate) struct JobState {
     /// not be confirmed as this E01's complete import. Nothing was deleted;
     /// `/api/reimport-raw` discards it and re-runs the same analysis.
     pub(crate) raw_reimport: Option<RawReimport>,
+    /// R11-S5: `reports/case-report.html` is known to be out of date — a
+    /// failed finalize could not re-render it after taking its sign-off
+    /// back, so the report on disk still names that unfinished sign-off.
+    /// Cleared when a make-report the workstation runs succeeds.
+    pub(crate) report_stale: bool,
+    /// R11-S6: what the last failed finalize left that must not be read
+    /// as final (sign-off not restored, report not re-rendered, abandon
+    /// record not written) — `None` when it left nothing. Kept in memory
+    /// so /api/status shows it after the finalize response is gone;
+    /// cleared by a finalize that completes.
+    pub(crate) finalize_incomplete: Option<String>,
 }
 
 /// R5-S6: the pending "raw 불일치 — 재임포트 필요" decision.
@@ -365,6 +376,8 @@ impl JobState {
             launch_codes: Vec::new(),
             conn_limits: Arc::new(super::http::ConnLimits::default()),
             raw_reimport: None,
+            report_stale: false,
+            finalize_incomplete: None,
         }
     }
 }
