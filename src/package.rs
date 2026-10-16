@@ -3519,6 +3519,7 @@ mod tests {
         ));
         fs::rename(&result.output_dir, &incomplete).unwrap();
         let reason = |path: &std::path::Path| super::finalize_incomplete_reason(path);
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut spellings = vec![
             incomplete.join("."),
             incomplete.join("review").join(".."),
