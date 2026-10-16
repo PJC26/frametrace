@@ -2064,12 +2064,14 @@ pub fn finalize_lane_pairing(case_dir: &std::path::Path, finalize_id: &str) -> F
                 ));
             }
         };
+    // R14 (P19): an entry before a chain break is not usable either.
     let trusted = |row: &crate::audit::LaneRow| {
-        matches!(
-            row.trust,
-            crate::audit::LineTrust::Authenticated
-                | crate::audit::LineTrust::SelfConsistentOnly { .. }
-        )
+        row.lane_broken_at.is_none()
+            && matches!(
+                row.trust,
+                crate::audit::LineTrust::Authenticated
+                    | crate::audit::LineTrust::SelfConsistentOnly { .. }
+            )
     };
     let event = |row: &crate::audit::LaneRow| {
         row.value
@@ -2110,14 +2112,32 @@ pub fn finalize_lane_pairing(case_dir: &std::path::Path, finalize_id: &str) -> F
         .iter()
         .rev()
         .filter(|row| trusted(row) && event(row) == FINALIZE_BEGIN_EVENT)
-        .find_map(|row| FinalizeBegin::from_value(&row.value));
+        .find_map(|row| FinalizeBegin::from_value(&row.value).map(|begin| (row.index, begin)));
     let named = |only_trusted: bool| {
         lane.rows.iter().any(|row| {
             event(row) == FINALIZE_BEGIN_EVENT && names_it(row) && (!only_trusted || trusted(row))
         })
     };
     match latest_begin {
-        Some(begin) if begin.finalize_id == finalize_id => FinalizeLanePairing::Open(begin),
+        // R14 (P19): what follows the begin entry must be known — an entry
+        // this PC cannot vouch for (stripped HMAC, another key, a torn or
+        // edited line) may be the cut-off complete / resolved entry, and
+        // so may whatever a lane-repair removed after it.
+        Some((index, begin)) if begin.finalize_id == finalize_id => {
+            if lane.repaired_after(index) {
+                FinalizeLanePairing::Unpaired(
+                    "서명 감사 레인이 이 최종화의 시작 기록 뒤에서 수리되어(lane-repair) 완료 여부를 알 수 없습니다"
+                        .to_string(),
+                )
+            } else if lane.rows[index + 1..].iter().any(|row| !trusted(row)) {
+                FinalizeLanePairing::Unpaired(
+                    "서명 감사 레인의 이 최종화 시작 기록 뒤에 이 PC에서 확인할 수 없는 항목이 있어 완료 여부를 알 수 없습니다"
+                        .to_string(),
+                )
+            } else {
+                FinalizeLanePairing::Open(begin)
+            }
+        }
         Some(_) if named(true) => FinalizeLanePairing::Unpaired(
             "이 최종화의 시작 기록 뒤에 다른 최종화가 시작되었습니다 (가장 최근 최종화가 아님)"
                 .to_string(),
@@ -2133,6 +2153,37 @@ pub fn finalize_lane_pairing(case_dir: &std::path::Path, finalize_id: &str) -> F
             "서명 감사 레인(signoff-log)에 이 최종화의 시작 기록이 없습니다".to_string(),
         ),
     }
+}
+
+/// R14-S8: the lane holds a begin entry (ANY trust — another PC's keyed
+/// entries do not authenticate here) of `finalize_id` naming
+/// `package_name`, and no complete / resolved entry (any trust) of it.
+/// Only for marking another PC's unfinished package beside it.
+pub fn finalize_lane_mentions(
+    case_dir: &std::path::Path,
+    finalize_id: &str,
+    package_name: &str,
+) -> bool {
+    // Every row counts whatever its trust (an empty key set: no key work).
+    let Ok(lane) =
+        crate::audit::read_lane_rows_with_keys(&case_dir.join(SIGNOFF_LOG_REL_PATH), &[])
+    else {
+        return false;
+    };
+    let mut begun = false;
+    for value in lane.rows.iter().map(|row| &row.value) {
+        if value.get("finalize_id").and_then(|v| v.as_str()) != Some(finalize_id) {
+            continue;
+        }
+        match value.get("event").and_then(|v| v.as_str()) {
+            Some(FINALIZE_BEGIN_EVENT) => {
+                begun |= value.get("package_name").and_then(|v| v.as_str()) == Some(package_name);
+            }
+            Some(FINALIZE_COMPLETE_EVENT) | Some(FINALIZE_RESOLVED_EVENT) => return false,
+            _ => {}
+        }
+    }
+    begun
 }
 
 /// R12-S2/S6: where the sign-off record `signoff_text` stands in the

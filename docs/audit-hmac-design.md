@@ -889,6 +889,57 @@ self-consistency only, so someone who can write the case folder can also
 append a chained `finalize-begin` — the same limit as every other keyless
 record (and `--strict` exits 3 for such a sign-off, R13-S12).
 
+#### R14 (P18/P19): the lane's tail is not proof of an interruption
+
+A chained lane's END can be cut (I9): deleting the last line of a good
+finalize (`finalize-complete`) and rebuilding the journal from the plaintext
+`finalize-begin` made the begin entry "the latest one without a complete
+entry", and R13 abandoned the good keyed sign-off, restored the older bytes
+and renamed its package (two R13 reviewers reproduced it with the real CLI).
+So the lane alone never starts a recovery any more:
+
+- **P18 — host-local open-finalize record.** Before its begin entry a
+  finalize writes `<local state dir>/finalize-open/<finalize_id>.json`
+  (Windows `%LOCALAPPDATA%\frametrace\finalize-open\`, falling back to
+  `%APPDATA%\frametrace\`; elsewhere `$XDG_CONFIG_HOME/frametrace/` or
+  `~/.config/frametrace/`) with the finalize id, the canonical case path,
+  the sign-off / previous sign-off SHA-256, the reserved package name, the
+  host id and `state` (`open`, or `completed-unrecorded` when the complete
+  entry could not be appended). It is removed once the lane records the
+  finalize complete or resolved. A recovery (abandon, restore, mark) runs
+  only when this record, the lane's begin entry and the journal agree on
+  every field; otherwise the journal is `unpaired` with `unpaired_code:
+  "no-local-record"` ("로컬 기록 없음") / `local-mismatch` /
+  `local-unreadable` and nothing changes. The record lives outside the
+  case folder, so a copy or share of the case never carries it, and
+  writing it needs the examiner's own profile (examiner-level access is
+  out of scope, as for the key file). Records older than 30 days that
+  stand for nothing left to recover are swept at server start.
+- **P19 — external evidence first.** When `review/signoff.json` is the
+  begin entry's sign-off and the reserved package is published with a
+  complete `manifest.sha256` (newline-terminated, every listed file present,
+  `review/signoff.json` listed with that SHA-256 and the packaged copy
+  hashing to it), the finalize FINISHED: only the missing
+  `finalize-complete` entry is appended — nothing is rolled back. A begin
+  entry followed by any entry this PC cannot vouch for (stripped HMAC,
+  another key, a broken chain — the cut entries may have closed it) or by a
+  usable `lane-repair` is `unpaired`.
+- **Host id (R14-S7).** `util::host_id` uses the Windows `MachineGuid` and
+  the physical DNS host name from `GetComputerNameExW` (R13 read the
+  `COMPUTERNAME` variable, which a parent process sets). When the
+  MachineGuid cannot be read the id is `unknown` and the PC recovers
+  nothing. Limits: a cloned VM / disk image shares the MachineGuid (and,
+  unless renamed, the host name) with its source; Linux without
+  `/etc/machine-id` and macOS use the host name alone. The P18 record is
+  what really ties a recovery to the PC that ran the finalize.
+- **Writer liveness (R14-S3).** A journal's writer counts as running only
+  on a positive match: known start time within 2 s of the recorded one, and
+  a FrameTrace executable (`frametrace…`) of the recorded name. A platform
+  that cannot read process start times never sees a live writer (the
+  exclusive journal creation, R14-S4, and the busy lease keep finalizes
+  apart). `frametrace finalize-journal <case> --dismiss --force` moves a
+  journal whose writer seems to run.
+
 ## Retired keys
 
 Each key the keyring retires gets a retirement time (`retired` map in

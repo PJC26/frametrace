@@ -50,6 +50,8 @@ mod tests_r12_server;
 #[cfg(test)]
 mod tests_r13_server;
 #[cfg(test)]
+mod tests_r14_server;
+#[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
 mod tests_r4_jobs;
@@ -385,8 +387,12 @@ pub(crate) fn kill_all_tracked() {
 
 /// R13-S6: `frametrace finalize-journal <case> [--dismiss]` (the CLI's
 /// view of a case's finalize journal; `--dismiss` moves it aside).
-pub fn finalize_journal_command(case_dir: &Path, dismiss: bool) -> Result<String, String> {
-    finalize_journal::cli_command(case_dir, dismiss)
+pub fn finalize_journal_command(
+    case_dir: &Path,
+    dismiss: bool,
+    force: bool,
+) -> Result<String, String> {
+    finalize_journal::cli_command(case_dir, dismiss, force)
 }
 
 /// C4: stamps every selection export this process is still writing as

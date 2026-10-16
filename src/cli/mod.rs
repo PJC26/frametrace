@@ -183,11 +183,16 @@ pub enum Commands {
     FinalizeJournal {
         case_dir: PathBuf,
         /// Move the journal to review/finalize.dismissed-<unix>.json and
-        /// record that in the sign-off lane. Nothing else is changed: check
-        /// review/signoff.json and the reports folder yourself, then
-        /// finalize again
+        /// record that in the sign-off lane. An interrupted finalize this PC
+        /// can clean up is cleaned up first (as opening the case would);
+        /// otherwise nothing is changed: check review/signoff.json and the
+        /// reports folder yourself, then finalize again
         #[arg(long)]
         dismiss: bool,
+        /// With --dismiss: also move a journal whose writer process still
+        /// seems to run, or one whose cleanup left something to check
+        #[arg(long, requires = "dismiss")]
+        force: bool,
     },
     /// Verify a package written by package-case: manifest.sha256 entries vs
     /// files, package-manifest.json, audit chains, database snapshot and
@@ -801,8 +806,12 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             let options = PackageOptions { output_dir: output };
             package_case_with_pending(&case_dir, options, allow_pending, package_name.as_deref())
         }
-        Commands::FinalizeJournal { case_dir, dismiss } => {
-            let text = crate::serve::finalize_journal_command(&case_dir, dismiss)?;
+        Commands::FinalizeJournal {
+            case_dir,
+            dismiss,
+            force,
+        } => {
+            let text = crate::serve::finalize_journal_command(&case_dir, dismiss, force)?;
             print!("{text}");
             Ok(())
         }

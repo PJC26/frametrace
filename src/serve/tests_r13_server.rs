@@ -268,6 +268,9 @@ fn r13_s2_only_the_reserved_package_is_marked() {
     let journal = interrupted_finalize(&bin, &case, super::jobs::FinalizeStop::Package);
     let reserved = case.join("reports").join(&journal.package_name);
     assert!(reserved.join("manifest.sha256").is_file(), "published");
+    // R14 (P19): an incomplete package (a listed file missing), so the
+    // finalize did not finish and the recovery marks it.
+    std::fs::remove_file(reserved.join("README.txt")).unwrap();
     super::finalize_journal::recover_bound_case(&bound_state(&case));
     assert!(!reserved.exists(), "the reserved package was renamed");
     assert!(
@@ -349,13 +352,13 @@ fn r13_s3_completed_finalize_only_loses_its_journal() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// R13-S4: the writer check needs a positive match. a4fb793 took any live
-/// pid (or one it could not inspect) as the writer, so such a journal
-/// blocked the case for good.
+/// R13-S4 (R14-S3 semantics): the writer check needs a positive match.
+/// a4fb793 took any live pid (or one it could not inspect) as the writer,
+/// so such a journal blocked the case for good; R13 still took an unknown
+/// start time as alive for 24 h (see `r14_s3_*`).
 #[test]
 fn r13_s4_writer_check_needs_start_time_and_image() {
     use crate::util::{ProcessProbe, WriterIdentity, writer_still_running};
-    let day = Duration::from_secs(24 * 3600);
     let started = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
     let writer = WriterIdentity {
         pid: 4242,
@@ -365,63 +368,58 @@ fn r13_s4_writer_check_needs_start_time_and_image() {
     let running = ProcessProbe::Running {
         started: Some(started),
     };
-    let fresh = Duration::from_secs(5);
     assert!(writer_still_running(
         &writer,
         running,
-        Some("FrameTrace-App.exe"),
-        fresh,
-        day
+        Some("FrameTrace-App.exe")
     ));
     // Same pid, another program, or started later: a reused pid.
-    assert!(!writer_still_running(
-        &writer,
-        running,
-        Some("notepad.exe"),
-        fresh,
-        day
-    ));
+    assert!(!writer_still_running(&writer, running, Some("notepad.exe")));
     let later = ProcessProbe::Running {
         started: Some(started + Duration::from_secs(60)),
     };
-    assert!(!writer_still_running(&writer, later, None, fresh, day));
+    assert!(!writer_still_running(
+        &writer,
+        later,
+        Some("frametrace-app.exe")
+    ));
     assert!(!writer_still_running(
         &writer,
         ProcessProbe::Gone,
-        None,
-        fresh,
-        day
+        Some("frametrace-app.exe")
     ));
-    // pid 0 is never a writer; "can't tell" counts only while young.
+    // pid 0 is never a writer; neither is an unknown start time.
     let unknown = ProcessProbe::Running { started: None };
     let zero = WriterIdentity {
         pid: 0,
         ..writer.clone()
     };
-    assert!(!writer_still_running(&zero, unknown, None, fresh, day));
+    assert!(!writer_still_running(
+        &zero,
+        running,
+        Some("frametrace-app.exe")
+    ));
     let no_start = WriterIdentity {
         started_ms: None,
         ..writer.clone()
     };
-    assert!(writer_still_running(&no_start, unknown, None, fresh, day));
     assert!(!writer_still_running(
         &no_start,
+        running,
+        Some("frametrace-app.exe")
+    ));
+    assert!(!writer_still_running(
+        &writer,
         unknown,
-        None,
-        day * 2,
-        day
+        Some("frametrace-app.exe")
     ));
     // This process, as recorded, is its own writer.
     let me = crate::util::current_writer();
     let probe = crate::util::probe_process(me.pid);
     let image = crate::util::process_image_name(me.pid);
-    assert!(writer_still_running(
-        &me,
-        probe,
-        image.as_deref(),
-        fresh,
-        day
-    ));
+    if cfg!(any(windows, target_os = "linux")) {
+        assert!(writer_still_running(&me, probe, image.as_deref()));
+    }
 }
 
 /// R13-S5 (P17, real CLI): a journal another PC wrote is never recovered
