@@ -541,7 +541,7 @@ await check('4g R13 U1–U3: 짝 없음 / 다른 PC 차단 / 복구 중; --dismi
   await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'unreadable', null, { timeout: 5000 });
   j = await journalRow();
   const cmd = await page.textContent('#finalLinks .h-fin-journal-row .h-fin-cmd code');
-  assert.ok(cmd === 'frametrace finalize-journal --dismiss "C:/cases/c1"' && j.inside, 'dismiss command: ' + cmd + ' ' + JSON.stringify(j));
+  assert.ok(cmd === "frametrace finalize-journal 'C:/cases/c1' --dismiss" && j.inside, 'dismiss command: ' + cmd + ' ' + JSON.stringify(j));
   for (const th of ['light', 'dark']) {
     await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
     const cmdEls = (await contrastReport(page)).filter((x) => /h-fin-cmd|mono/.test(x.cls) && /finalize-journal|치우기/.test(x.text));

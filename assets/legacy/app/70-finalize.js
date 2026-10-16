@@ -66,6 +66,7 @@ const FIN_JOURNAL_HEAD = {
   closedrefused: "이전 최종화 거부됨 — 기록만 남음",
   closedsuperseded: "이전 최종화 대체됨 — 기록만 남음",
   unrecorded: "이전 최종화 완료 — 완료 기록만 빠짐",
+  unrecordedblocked: "이전 최종화 완료 — 완료 기록 못 씀",
   closed: "이전 최종화 끝남 — 확인 필요",
   inprogress: "다른 FrameTrace에서 최종화 중",
   check: "이전 최종화 중단됨 — 확인 필요",
@@ -112,6 +113,8 @@ function finJournalState(st) {
     const o = j.outcome == null ? "completed" : String(j.outcome);
     kind = { completed: "completed", recovered: "closedrecovered", failed: "closedfailed", dismissed: "closeddismissed", refused: "closedrefused", superseded: "closedsuperseded" }[o] || "closed";
   }
+  // R15 U4 (track S6): the complete record could not be written again — it blocks.
+  if (kind === "unrecorded" && j.blocks_finalize === true) kind = "unrecordedblocked";
   if (j && kind) return { kind, journal: j, detail: reason || detail, code: kind === "unpaired" ? finJournalUnpairedCode(j, reason) : "" };
   if (j && jState !== "recovered") return { kind: "check", journal: j, detail: reason || detail };
   if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j, detail };
@@ -130,7 +133,12 @@ function finJournalDismissCmd(st) {
   const j = st && st.finalize_journal;
   if (j && typeof j.dismiss_command === "string" && j.dismiss_command.trim()) return j.dismiss_command.trim();
   const dir = st && typeof st.case_dir === "string" ? st.case_dir : "";
-  return "frametrace finalize-journal --dismiss" + (dir ? ` "${dir}"` : "");
+  return dir ? `frametrace finalize-journal ${finJournalDismissQuote(dir)} --dismiss` : "frametrace finalize-journal --dismiss";
+}
+// R15 U3: single quotes like the server's form (assets/app/41-finalize.js).
+function finJournalDismissQuote(dir) {
+  const d = String(dir);
+  return "'" + (/^[A-Za-z]:|\\/.test(d) ? d.replace(/'/g, "''") : d.replace(/'/g, "'\\''")) + "'";
 }
 function finShortDetail(text, max) {
   const lim = max || 90;
@@ -384,15 +392,30 @@ function verifySourcesVerdict(res) {
         tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
     }
     // R14 (track I3): the lane is shorter than its anchored head.
-    if (parts.some(x => x.includes("꼬리 잘림")) || head === "truncated" || head === "rewritten") {
+    // R15 U4 (track I5): a head this PC cannot use may be another PC's —
+    // warn, never err (a cut tail named on its own stays err).
+    const OTHER_HEAD = "다른 PC 머리일 수 있음";
+    const otherHead = parts.some(x => x.includes(OTHER_HEAD));
+    if (parts.some(x => x.includes("꼬리 잘림") && !x.includes(OTHER_HEAD)) || head === "truncated" || (head === "rewritten" && !otherHead)) {
       return { level: "err", kind: "truncated", label: "원본 재검증: 기록 꼬리 잘림 — 현재 결과 없음", toast: "원본 재검증: 기록 꼬리 잘림",
         hint: `원본 재검증: 기록 꼬리 잘림 — ${why} (보관 이력서 5절 참조).`,
         tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
     }
     // R14 (track I3): the re-verification head could not be checked — no result (warn).
+    if (otherHead) {
+      const label = `원본 재검증: ${OTHER_HEAD} — 현재 결과 없음`;
+      return { level: "warn", kind: "headotherpc", label, toast: label, hint: label + (why ? ` — ${why}` : "") + " (보관 이력서 5절 참조).",
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
     if (head === "unknown" || parts.some(x => x.includes("머리 확인 불가"))) {
       return { level: "warn", kind: "headunknown", label: "원본 재검증: 머리 확인 불가 — 현재 결과 없음", toast: "원본 재검증: 머리 확인 불가 — 현재 결과 없음",
         hint: "원본 재검증: 머리 확인 불가 — 현재 결과 없음" + (why ? ` — ${why}` : "") + " (보관 이력서 5절 참조).",
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
+    // R15 U4 (track I4): a run time ahead of this PC's clock — never green.
+    if (parts.some(x => x.includes("시계 이상"))) {
+      const label = "원본 재검증: 시계 이상 — " + (res.is_result === false ? "현재 결과 없음" : "확인 필요");
+      return { level: "warn", kind: "clock", label, toast: label, hint: `${label} — ${why} (보관 이력서 5절 참조).`,
         tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
     }
     if (res.is_result === false) {

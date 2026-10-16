@@ -938,3 +938,22 @@ const FTStore = {
 - `local_record`(true/false) → title "이 PC의 로컬 기록 있음/없음"; `unpaired_code` → title "짝 없음 코드 <code>".
 - 치우기 명령(`finJournalDismissLines`, unreadable·unpaired·other-host만): `dismiss_command`(PowerShell, 작은따옴표)와 `dismiss_command_cmd`(cmd.exe)가 둘 다 있으면 두 줄 "치우기(PowerShell): …" / "치우기(명령 프롬프트): …", 하나면 "치우기: …", 둘 다 null이면 unreadable·unpaired만 내장 형식(§20.3). 점검 목록 sub는 같은 줄들을 " · "로. legacy 같음.
 - 하네스: verify-review-batch --unit "R14 track S follow-up"(이전 커밋 자산에서 실패 확인).
+
+## 22. R15 트랙 U 추가 계약 (2026-10-16, docs/PLAN_R15_2026-10-16.md)
+
+### 22.1 수리 뒤 다시 확인은 같은 바이트의 확인 상태만 (U1)
+- §21.4를 좁힌다. 수리 앞 own 항목(카빙·복구·이어붙임)은 그 파일의 사용 가능 최신 검증이 수리 뒤이고 **`validation_status`가 `ffprobe-confirmed`/`ffprobe-video-stream-confirmed`이며 `target_sha256`이 own의 SHA-256**(이어붙임 `output_sha256`, 카빙·복구 `sha256`; 대소문자 무시, 둘 다 있어야 함)일 때만 다시 확인된다 — 카빙·복구는 검증 상태, 이어붙임은 "derived".
+- 수리 뒤 검증이 확인 상태가 아니면(`validation-failed`, `candidate-unvalidated` 등) 그 검증 상태를 그대로 보인다(이어붙임도 "derived"로 떨어지지 않음). 확인 상태지만 SHA가 다르거나 없으면, 또는 own SHA를 모르면 "최신 여부 알 수 없음" 그대로.
+
+### 22.2 위치가 시각보다 먼저 (U2)
+- `logSlots`는 사용 가능 항목마다 (레인 배열, 1부터 줄 번호)를 옆에(`logPosOf`, WeakMap — 객체에 쓰지 않음) 두고, 수리 앞 항목 사본에 비열거 `ftRepairedLine`(마지막 수리 줄)을 단다.
+- "수리 뒤" 판정: 검증과 수리가 **같은 레인**이면 줄 번호(`줄 > 수리 줄`)만 본다(시각 무시). 다른 레인(보통: own은 carve/filesystem/join 레인, 검증은 validation 레인)은 공통 위치가 없어 §21.4의 시각 비교(`validated_unix` > 수리 시각, 같은 초 아님)가 남는다.
+
+### 22.3 내장 치우기 명령은 작은따옴표 (U3)
+- 서버 명령이 둘 다 null일 때의 내장 형식(두 셸 `finJournalDismissCmd`): `frametrace finalize-journal '<case_dir>' --dismiss` — Windows 경로(드라이브 문자 또는 `\`)는 `'`→`''`(PowerShell), 그 밖은 `'\''`(POSIX). case_dir 없으면 `frametrace finalize-journal --dismiss`. (§20.3·§21.1의 큰따옴표 형식을 대신한다.)
+
+### 22.4 문구 (U4, 트랙 S6·I4·I5)
+- `state: "completed-unrecorded"` + `blocks_finalize: true` → `[data-journal="unrecordedblocked"]` "이전 최종화 완료 — 완료 기록 못 씀"(경고 `.h-fin-incomplete`, 본문 = `reason`), 점검 목록 `block` "최종화 차단: 이전 최종화 완료 — 완료 기록 못 씀"(legacy 같음). `blocks_finalize`가 없거나 false면 §21.7 그대로(info).
+- `/api/verify-sources` 사유(`withheld_reason`/`not_verified_reason`, 포함 검사)에 **"다른 PC 머리일 수 있음"** → `warn`, `kind: "headotherpc"`, 라벨·토스트 "원본 재검증: 다른 PC 머리일 수 있음 — 현재 결과 없음", hint에 사유 — `head_status`가 unknown·rewritten·not-authenticated여도 err 아님. 그 문구가 없는 사유 조각에 "꼬리 잘림"이 있거나 `head_status: "truncated"`면 §21.3 err 그대로.
+- 사유에 **"시계 이상"** → `warn`, `kind: "clock"`, 라벨 "원본 재검증: 시계 이상 — 확인 필요"(`is_result: false`면 "— 현재 결과 없음"), hint에 사유. 초록·자기 일관성(info)보다 먼저. 순서: 불일치 > 더 새 실행 불일치 > 꼬리 잘림 > 다른 PC 머리 > 머리 확인 불가 > 시계 이상 > 현재 결과 없음.
+- 하네스: verify-review-batch --unit "R15 U1"–"R15 U4"(7c3955e 자산에서 각각 실패 확인).

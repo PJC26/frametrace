@@ -458,6 +458,14 @@ function logRepairs(chain, source) {
   });
   return out;
 }
+// R15 U2: a usable entry's lane (the whole lane array) and 1-based line,
+// kept beside it (never on the object — exports never see it).
+function logPosOf(item, pos) {
+  const map = logPosOf.map || (logPosOf.map = new WeakMap());
+  if (!item || typeof item !== "object") return null;
+  if (pos) { map.set(item, pos); return pos; }
+  return map.get(item) || null;
+}
 function logSlots(list, keyOf, chain, source) {
   const slots = new Map();
   const all = Array.isArray(source) ? source : Array.isArray(list) ? list : [];
@@ -466,8 +474,12 @@ function logSlots(list, keyOf, chain, source) {
   // The newest repair's time (R14 U4: a validation logged after it
   // re-verifies an entry written before it); 0 = unknown.
   const lastRepairUnix = Math.max(0, ...repairs.filter(r => r.line === lastRepair).map(r => r.unix));
-  const lineOf = lastRepair ? new Map(all.map((item, i) => [item, i + 1])) : null;
-  for (const item of Array.isArray(list) ? list : []) {
+  // R15 U2: every usable entry's line in the whole lane (logPosOf).
+  const items = Array.isArray(list) ? list : [];
+  const lineOf = items === all ? null : new Map(all.map((item, i) => [item, i + 1]));
+  let idx = 0;
+  for (const item of items) {
+    idx += 1;
     if (!item || typeof item !== "object") continue;
     const key = keyOf(item);
     if (!key) continue;
@@ -475,12 +487,14 @@ function logSlots(list, keyOf, chain, source) {
     if (!slot) { slot = { usable: null, untrusted: null, last: null, superseded: false }; slots.set(key, slot); }
     if (logTrustUsable(logTrustOf(item))) {
       let entry = item;
-      const line = lineOf ? lineOf.get(item) : 0;
+      const line = lineOf ? lineOf.get(item) || 0 : idx;
       if (lastRepair && !(line > lastRepair)) {
         entry = Object.assign({}, item);
         Object.defineProperty(entry, "ftRepairedAfter", { value: true, enumerable: false });
         Object.defineProperty(entry, "ftRepairedUnix", { value: lastRepairUnix, enumerable: false });
+        Object.defineProperty(entry, "ftRepairedLine", { value: lastRepair, enumerable: false });
       }
+      if (line > 0) logPosOf(entry, { lane: all, line });
       slot.usable = entry;
       slot.last = entry;
       continue;
@@ -532,9 +546,30 @@ function recordStatusOf(own, valid, unvalid, fallback, recheck) {
   // R14 U4: an own entry before its lane's last repair is confirmed again
   // by a usable latest validation of its file logged after that repair
   // (`recheck`: the validation of a record that otherwise shows none).
-  const again = v => !!v && !v.ftRepairedAfter && logTrustUsable(logTrustOf(v)) &&
-    Number(own.ftRepairedUnix) > 0 && Number(v.validated_unix) > Number(own.ftRepairedUnix);
-  const reverified = !!own && !!own.ftRepairedAfter && logTrustUsable(ownTrust) && again(valid || recheck);
+  // R15 U1: only a confirmed state of the same bytes (`target_sha256` ===
+  // the join's `output_sha256` / the carve's or recovery's `sha256`) confirms
+  // again; another validation after the repair shows its own status.
+  // R15 U2: in the repaired lane itself the line decides (a clock may be
+  // off); across lanes there is no common line — the time, strictly after.
+  const after = v => {
+    if (!v || v.ftRepairedAfter || !logTrustUsable(logTrustOf(v))) return false;
+    const vp = logPosOf(v), op = logPosOf(own);
+    if (vp && op && vp.lane === op.lane && Number(own.ftRepairedLine) > 0) return vp.line > Number(own.ftRepairedLine);
+    return Number(own.ftRepairedUnix) > 0 && Number(v.validated_unix) > Number(own.ftRepairedUnix);
+  };
+  const sameBytes = v => {
+    const mine = String(own.output_sha256 || own.sha256 || "").trim().toLowerCase();
+    return !!mine && String(v.target_sha256 || "").trim().toLowerCase() === mine;
+  };
+  const confirmedState = s => s === "ffprobe-confirmed" || s === "ffprobe-video-stream-confirmed";
+  const recent = !!own && !!own.ftRepairedAfter && logTrustUsable(ownTrust) && after(valid || recheck) ? (valid || recheck) : null;
+  const reverified = !!recent && confirmedState(recent.validation_status) && sameBytes(recent);
+  if (recent && !reverified && recent.validation_status && !confirmedState(recent.validation_status)) {
+    const note = [...new Set([own, recent].map(i => logTrustNote(i, true)).filter(Boolean))].join("\n");
+    const out = { status: String(recent.validation_status), trust: logTrustOf(recent) || ownTrust };
+    if (note) out.note = note;
+    return out;
+  }
   const untrusted = (item, trust) => {
     // R13: usable, but a lane repair follows it — the latest is unknown.
     if (item.ftRepairedAfter && logTrustUsable(trust)) return { status: "unknown-after-repair", trust, repairedAfter: true };
