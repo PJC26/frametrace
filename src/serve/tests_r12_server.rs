@@ -454,6 +454,12 @@ fn r12_s2_crash_after_publish_is_recovered_on_open_case() {
     assert_eq!(published.len(), 1, "{after:?}");
     let published = case.join("reports").join(published[0]);
     assert!(crate::package::verify_package(&published).unwrap().passed());
+    // R14 (P19): a published package that carries the promoted sign-off
+    // with a complete manifest is a FINISHED finalize (see
+    // `r14_p19_crash_after_publish_is_a_finished_finalize`); this test
+    // keeps the interrupted path with a package whose manifest names a
+    // file that is missing (the publish did not finish).
+    std::fs::remove_file(published.join("README.txt")).unwrap();
     // Another server state opens the case.
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     let request = Request {

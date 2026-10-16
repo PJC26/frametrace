@@ -629,14 +629,18 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// R13-S9: renames `from` over `to` so the new name survives a power loss.
-/// Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`
-/// — the call returns only once the rename is flushed to disk (R12 used
-/// `fs::rename`, which is not write-through, and its directory "sync" was a
-/// no-op there); when that call fails (e.g. a target another program holds
-/// open with delete sharing, which `fs::rename`'s POSIX-semantics rename
-/// can replace) `fs::rename` is tried and the directory flushed. Elsewhere:
-/// `rename(2)` and an fsync of the parent directory.
+/// R13-S9 / R14-S6: renames `from` over `to` and then flushes the parent
+/// directory, so the new name survives a power loss. Windows:
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
+/// `MOVEFILE_WRITE_THROUGH` only promises anything for a move that copies
+/// across volumes (the call then returns once the copy is on disk); a
+/// same-volume rename is a metadata change it does NOT flush (R13 claimed
+/// it did) — so the directory is flushed after a successful call too
+/// ([`sync_parent_directory`]). When that call fails (e.g. a target another
+/// program holds open with delete sharing, which `fs::rename`'s
+/// POSIX-semantics rename can replace) `fs::rename` is tried. Elsewhere:
+/// `rename(2)` and an fsync of the parent directory. The directory flush is
+/// best-effort on every platform (see [`sync_parent_directory`]).
 pub fn rename_durable(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -655,6 +659,7 @@ pub fn rename_durable(from: &Path, to: &Path) -> io::Result<()> {
             )
         };
         if moved.is_ok() {
+            sync_parent_directory(to);
             return Ok(());
         }
     }
@@ -682,8 +687,9 @@ pub fn remove_file_durable(path: &Path) -> io::Result<()> {
 /// opened with write access and backup semantics (the only way to get a
 /// directory handle) and `FlushFileBuffers` flushes its metadata. Failures
 /// are ignored (a file system that cannot flush a directory, no write
-/// access): callers that need the guarantee use [`rename_durable`], which is
-/// write-through on Windows by itself.
+/// access) — a same-volume rename or removal is then only as durable as
+/// the file system's own metadata journaling makes it (NTFS: the change is
+/// journaled and lazily flushed; there is no stronger Win32 guarantee).
 pub fn sync_parent_directory(path: &Path) {
     let Some(parent) = path.parent() else {
         return;
@@ -1821,13 +1827,27 @@ pub fn writer_may_be_alive(probe: ProcessProbe, born: Option<SystemTime>) -> boo
 /// is never written to this PC's configuration, so two PCs sharing a case
 /// folder over the network tell their journals apart. Computed once per
 /// process.
+///
+/// R14-S7: on Windows, where every installation has a `MachineGuid`, an
+/// unreadable one makes the id [`HOST_ID_UNKNOWN`] — such a PC never
+/// recovers a finalize journal (it cannot tell its own from another
+/// PC's). Linux without `/etc/machine-id` (minimal containers) and macOS
+/// (no machine id read here) fall back to the host name alone. Limits
+/// (docs/audit-hmac-design.md): a cloned VM / disk image keeps the
+/// MachineGuid and, if not renamed, the host name, so two clones share an
+/// id. The host-local open-finalize record (R14 P18) is what a recovery
+/// really relies on.
 pub fn host_id() -> String {
     static HOST_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HOST_ID
         .get_or_init(|| {
+            let machine = machine_id();
+            if machine.is_none() && cfg!(windows) {
+                return HOST_ID_UNKNOWN.to_string();
+            }
             let material = format!(
                 "frametrace-host-v1\0{}\0{}",
-                machine_id().unwrap_or_default(),
+                machine.unwrap_or_default(),
                 host_name().unwrap_or_default().to_lowercase()
             );
             crate::sha256::digest_bytes(material.as_bytes())[..32].to_string()
@@ -1835,13 +1855,33 @@ pub fn host_id() -> String {
         .clone()
 }
 
-/// The host name (Windows `COMPUTERNAME`, else `gethostname`).
+/// R14-S7: [`host_id`] of a PC whose machine id could not be read.
+pub const HOST_ID_UNKNOWN: &str = "unknown";
+
+/// The host name (Windows `GetComputerNameExW` physical DNS host name —
+/// R14-S7: R13 read the `COMPUTERNAME` environment variable, which any
+/// parent process can set; else `gethostname`).
 pub fn host_name() -> Option<String> {
     #[cfg(windows)]
     {
-        std::env::var("COMPUTERNAME")
-            .ok()
-            .filter(|name| !name.trim().is_empty())
+        use windows::Win32::System::SystemInformation::{
+            ComputerNamePhysicalDnsHostname, GetComputerNameExW,
+        };
+        let mut buffer = vec![0u16; 512];
+        let mut size = buffer.len() as u32;
+        // SAFETY: the buffer holds `size` wide chars; the API writes at
+        // most that many and sets `size` to the length written.
+        let read = unsafe {
+            GetComputerNameExW(
+                ComputerNamePhysicalDnsHostname,
+                Some(windows::core::PWSTR(buffer.as_mut_ptr())),
+                &mut size,
+            )
+        };
+        read.ok()?;
+        let len = (size as usize).min(buffer.len());
+        let name = String::from_utf16_lossy(&buffer[..len]).trim().to_string();
+        (!name.is_empty()).then_some(name)
     }
     #[cfg(unix)]
     {
@@ -1984,46 +2024,58 @@ pub fn current_writer() -> WriterIdentity {
     }
 }
 
-/// R13-S4 (pure): is the process `probe` describes (executable `image`
-/// now) still the writer `writer`? When the writer's start time was
-/// recorded only a POSITIVE match counts: the live process must have
-/// started within the clock slack of it, and its executable name — when
-/// both are known — must be the writer's. R12 judged by the pid alone
-/// ("can't tell" = alive), so a journal naming pid 0, or a pid another
-/// program now holds, blocked the case for good. Without a recorded start
-/// time (a platform that cannot read it) a live pid counts as the writer
-/// only while the journal is younger than `max_age_unknown`.
+/// R13-S4 / R14-S3 (pure): is the process `probe` describes (executable
+/// `image` now) still the writer `writer`? Only a POSITIVE match counts:
+/// the writer's start time was recorded AND the live process's start time
+/// is known and within the clock slack of it, AND its executable name is
+/// known, is a FrameTrace executable (`frametrace…`) and — when recorded —
+/// the writer's. R12 judged by the pid alone ("can't tell" = alive); R13
+/// still took an unknown start time as alive for 24 h, so a planted
+/// journal naming `pid: 4` (System, whose start time a user process cannot
+/// read) and a future `started_unix` blocked the case for a day and
+/// refused `--dismiss`. A platform that cannot read process start times
+/// (macOS here) therefore never sees a live writer — the busy lease and
+/// the exclusive journal creation (R14-S4) are what keep two finalizes of
+/// one case apart.
 pub fn writer_still_running(
     writer: &WriterIdentity,
     probe: ProcessProbe,
     image: Option<&str>,
-    age: Duration,
-    max_age_unknown: Duration,
 ) -> bool {
     if writer.pid == 0 {
         return false;
     }
-    if let (Some(recorded), Some(now)) = (writer.image.as_deref(), image)
+    let Some(now) = image else {
+        return false;
+    };
+    if !is_frametrace_image(now) {
+        return false;
+    }
+    if let Some(recorded) = writer.image.as_deref()
         && !recorded.eq_ignore_ascii_case(now)
     {
         return false;
     }
-    match probe {
-        ProcessProbe::Gone => false,
+    let (
         ProcessProbe::Running {
             started: Some(started),
-        } => match writer.started_ms {
-            Some(recorded) => {
-                let started_ms = started
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                started_ms.abs_diff(recorded) <= START_TIME_SLACK.as_millis() as u64
-            }
-            None => age < max_age_unknown,
         },
-        ProcessProbe::Running { started: None } | ProcessProbe::Unknown => age < max_age_unknown,
-    }
+        Some(recorded),
+    ) = (probe, writer.started_ms)
+    else {
+        return false;
+    };
+    let started_ms = started
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    started_ms.abs_diff(recorded) <= START_TIME_SLACK.as_millis() as u64
+}
+
+/// R14-S3: whether an executable file name is one of FrameTrace's
+/// (`frametrace.exe`, `frametrace-app.exe`, `frametrace` …).
+pub fn is_frametrace_image(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("frametrace")
 }
 
 /// Standard (padded) base64 of `bytes` (CSP hash sources).

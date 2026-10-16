@@ -2914,13 +2914,26 @@ pub(crate) fn finalize_with_exe(
             ));
         }
         // R13-S5: another PC's journal older than 24 h is moved aside
-        // (never recovered here, never deleted).
+        // (never recovered here, never deleted). R14-S8: the package that
+        // finalize reserved is marked beside it (never renamed).
         if set_aside {
+            let marked = match super::finalize_journal::read_journal(case_dir) {
+                Ok(Some(journal)) => {
+                    super::finalize_journal::mark_other_host_package(case_dir, &journal)
+                }
+                _ => None,
+            };
             match super::finalize_journal::set_aside(case_dir, "other-host") {
-                Ok(path) => state_lock(state).logs.push(format!(
-                    "다른 PC의 오래된 최종화 저널을 {}(으)로 옮겼습니다 (복구하지 않음).",
-                    path.display()
-                )),
+                Ok(path) => {
+                    let mut guard = state_lock(state);
+                    guard.logs.push(format!(
+                        "다른 PC의 오래된 최종화 저널을 {}(으)로 옮겼습니다 (복구하지 않음).",
+                        path.display()
+                    ));
+                    if let Some(note) = marked {
+                        guard.logs.push(format!("경고: {note}"));
+                    }
+                }
                 Err(err) => {
                     return api_err(&format!(
                         "최종화 차단: 다른 PC의 최종화 저널을 옮기지 못했습니다 — {err}"
@@ -2930,20 +2943,33 @@ pub(crate) fn finalize_with_exe(
         }
         // A journal of this PC kept only for its stale report: this
         // finalize re-renders the report, so its begin entry is closed.
-        if let Some(super::finalize_journal::Assessment::Open(journal, _)) =
-            super::finalize_journal::assess(case_dir)
-        {
-            if let Err(err) = crate::report::record_finalize_resolved(
-                case_dir,
-                &journal.finalize_id,
-                Some(&journal.signoff_sha256),
-                "superseded",
-            ) {
-                state_lock(state).logs.push(format!("경고: {err}"));
+        match super::finalize_journal::assess(case_dir) {
+            None => {}
+            Some(super::finalize_journal::Assessment::Open(journal, _)) => {
+                if let Err(err) = crate::report::record_finalize_resolved(
+                    case_dir,
+                    &journal.finalize_id,
+                    Some(&journal.signoff_sha256),
+                    "superseded",
+                ) {
+                    state_lock(state).logs.push(format!("경고: {err}"));
+                } else {
+                    let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
+                }
+                if let Err(err) =
+                    super::finalize_journal::remove_journal(case_dir, &journal.finalize_id)
+                {
+                    return api_err(&format!(
+                        "최종화 차단: 이전 최종화 저널을 지우지 못했습니다 — {err}"
+                    ));
+                }
             }
-            if let Err(err) = super::finalize_journal::remove_journal(case_dir) {
+            // R14: anything else still there (a finished finalize whose
+            // complete entry could not be written, a journal whose removal
+            // failed) would make this finalize's exclusive journal fail.
+            Some(_) => {
                 return api_err(&format!(
-                    "최종화 차단: 이전 최종화 저널을 지우지 못했습니다 — {err}"
+                    "최종화 차단: 이전 최종화 저널이 남아 있습니다 — {detail}"
                 ));
             }
         }
@@ -3053,29 +3079,53 @@ pub(crate) fn finalize_with_exe(
             ),
         )
     };
-    // R13-S11: the previous record's bytes beside the journal (fsync'd).
-    if let Err(err) = super::finalize_journal::write_previous_signoff(case_dir, previous.as_deref())
+    // R14 (P18): this PC's local open-finalize record first — outside the
+    // case folder, so a copy or share of the case never carries it; a
+    // recovery acts only where it agrees with the journal and the lane.
+    if let Err(err) = journal
+        .local_record(case_dir, super::finalize_journal::LOCAL_OPEN)
+        .write()
     {
         return refuse_unjournaled(err, state);
     }
-    // R13 (P15): the keyed begin entry first — a journal is acted on only
-    // when it pairs with it — then (R12-S2, P13) the journal, both before
-    // the sign-off is chained, rendered or promoted, so an interruption
+    // Undoes what was written so far when a later preparation step fails
+    // (nothing of the sign-off has been chained, rendered or promoted).
+    let unwind = |journal_created: bool| {
+        if journal_created {
+            let _ = super::finalize_journal::remove_journal(case_dir, &journal.finalize_id);
+        }
+        let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
+    };
+    // R13 (P15): the keyed begin entry — a journal is acted on only when
+    // it pairs with it — then (R12-S2, P13) the journal, both before the
+    // sign-off is chained, rendered or promoted, so an interruption
     // anywhere after this point is found and cleaned up on the next start
     // / open-case.
     if let Err(err) = crate::report::record_finalize_begin(case_dir, &journal.begin_entry()) {
-        let _ = super::finalize_journal::write_previous_signoff(case_dir, None);
+        unwind(false);
         return refuse_unjournaled(err, state);
     }
-    if let Err(err) = journal.write(case_dir) {
-        let _ = super::finalize_journal::write_previous_signoff(case_dir, None);
+    let refuse_begun = |err: String, journal_created: bool, state: &SharedState| {
         let _ = crate::report::record_finalize_resolved(
             case_dir,
             &journal.finalize_id,
             Some(&journal.signoff_sha256),
             "refused",
         );
-        return refuse_unjournaled(err, state);
+        unwind(journal_created);
+        refuse_unjournaled(err, state)
+    };
+    // R14-S4: created exclusively — another finalize's journal (another
+    // PC on a shared case) is never overwritten.
+    if let Err(err) = journal.create_exclusive(case_dir) {
+        return refuse_begun(err, false, state);
+    }
+    // R13-S11: the previous record's bytes beside the journal (fsync'd) —
+    // R14-S4: only once the journal is this finalize's, so a concurrent
+    // finalize's copy is never overwritten.
+    if let Err(err) = super::finalize_journal::write_previous_signoff(case_dir, previous.as_deref())
+    {
+        return refuse_begun(err, true, state);
     }
     // R4-B18 / D13: the sign-off is chained into the audit trail right
     // after it is written and BEFORE make-report and package-case, so the
@@ -3092,7 +3142,7 @@ pub(crate) fn finalize_with_exe(
             Some(&journal.signoff_sha256),
             "refused",
         );
-        let _ = super::finalize_journal::remove_journal(case_dir);
+        unwind(true);
         return finalize_refused(
             state,
             format!("검토자 기록을 감사 로그에 남기지 못했습니다: {err}"),
@@ -3266,15 +3316,19 @@ pub(crate) fn finalize_with_exe(
             )
         } else {
             // R13 (P15): cleaned up — the begin entry is closed first.
-            if let Err(err) = crate::report::record_finalize_resolved(
+            // R14 (P18): the local record goes once the lane says so.
+            match crate::report::record_finalize_resolved(
                 case_dir,
                 &journal.finalize_id,
                 Some(&journal.signoff_sha256),
                 "failed",
             ) {
-                state_lock(state).logs.push(format!("경고: {err}"));
+                Ok(()) => {
+                    let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
+                }
+                Err(err) => state_lock(state).logs.push(format!("경고: {err}")),
             }
-            super::finalize_journal::remove_journal(case_dir)
+            super::finalize_journal::remove_journal(case_dir, &journal.finalize_id)
         };
         if let Err(err) = journal_result {
             state_lock(state).logs.push(format!(
@@ -3293,24 +3347,60 @@ pub(crate) fn finalize_with_exe(
             // journal goes, so a journal whose removal fails is only
             // deleted by the next recovery (R12 then treated the completed
             // finalize as interrupted and marked its package incomplete).
-            let complete_error = crate::report::record_finalize_complete(
-                case_dir,
-                &journal.finalize_id,
-                &journal.signoff_sha256,
-                &journal.package_name,
-                manifest_sha256.as_deref(),
-            )
-            .err();
-            // R12-S2: the finalize completed — its journal goes.
-            let journal_left = super::finalize_journal::remove_journal(case_dir)
+            #[cfg(test)]
+            let injected = FAIL_FINALIZE_COMPLETE.with(|cell| cell.get());
+            #[cfg(not(test))]
+            let injected = false;
+            let complete_error = if injected {
+                Some("test: injected finalize-complete failure".to_string())
+            } else {
+                crate::report::record_finalize_complete(
+                    case_dir,
+                    &journal.finalize_id,
+                    &journal.signoff_sha256,
+                    &journal.package_name,
+                    manifest_sha256.as_deref(),
+                )
                 .err()
-                .map(|err| match &complete_error {
-                    Some(lane) => format!("{err}; {lane}"),
-                    None => err,
-                });
+            };
+            // R12-S2: the finalize completed — its journal goes, and (R14
+            // P18) its local record. R14-S2: when the lane did not take the
+            // complete entry both are kept as `completed-unrecorded` (R13
+            // removed the journal anyway, leaving the begin entry open for
+            // good) and the next recovery writes the entry.
+            let journal_left = match &complete_error {
+                None => {
+                    let left =
+                        super::finalize_journal::remove_journal(case_dir, &journal.finalize_id)
+                            .err();
+                    if let Err(err) =
+                        super::finalize_journal::remove_local_record(&journal.finalize_id)
+                    {
+                        state_lock(state).logs.push(format!(
+                            "경고: 최종화는 끝났지만 이 PC의 열린 최종화 로컬 기록을 지우지 못했습니다 ({err}) — 서버를 다시 시작하면 30일 뒤 정리됩니다."
+                        ));
+                    }
+                    left
+                }
+                Some(lane) => {
+                    let _ = journal
+                        .local_record(
+                            case_dir,
+                            super::finalize_journal::STATE_COMPLETED_UNRECORDED,
+                        )
+                        .write();
+                    journal
+                        .rewrite_as(
+                            super::finalize_journal::STATE_COMPLETED_UNRECORDED,
+                            case_dir,
+                        )
+                        .err()
+                        .map(|err| format!("{err}; {lane}"))
+                }
+            };
             if let Some(err) = &complete_error {
                 state_lock(state).logs.push(format!(
-                    "경고: 최종화는 끝났지만 그 완료를 서명 감사 레인에 남기지 못했습니다 ({err})."
+                    "경고: 최종화는 끝났지만 그 완료를 서명 감사 레인에 남기지 못했습니다 ({err}) — 최종화 저널을 'completed-unrecorded'로 남겼고, 다음에 케이스를 열 때 완료 기록을 다시 남깁니다."
                 ));
             }
             Some((manifest_sha256, leftovers, journal_left))
@@ -3444,6 +3534,9 @@ thread_local! {
     /// on this thread (fake CLIs publish a fixed `package_1`).
     pub(crate) static PACKAGE_BASE_FOR_TEST: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
+    /// R14-S2 test hook: the `finalize-complete` lane append fails.
+    pub(crate) static FAIL_FINALIZE_COMPLETE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// R12-S1 (P14): package-case for a finalize. A cancel (`/api/cancel`, the
