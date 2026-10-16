@@ -265,7 +265,7 @@ try {
       check('R11 U5: make-review re-renders the carve page', mr.status === 0, (mr.stderr || '').slice(-400));
       const cp = await browser.newPage();
       await cp.goto(pathToFileURL(pagePath).href);
-      const m = await cp.evaluate(() => [...document.querySelectorAll('#metrics .metric')].map((el) => ({ text: el.textContent, cls: el.className })));
+      const m = await cp.evaluate(() => [...document.querySelectorAll('#metrics .metric')].map((el) => ({ text: el.textContent, cls: el.className, marked: !!el.querySelector('.unaudited') })));
       await cp.close();
       const all = m.map((x) => x.text).join(' | ');
       const unaudited = /감사 안 됨/.test(all);
@@ -273,7 +273,9 @@ try {
       // The page's fmtSize renders the forged 7777777777777 B as "7777.78 GB".
       const forgedShown = /7777\.78\s*GB/.test(sizeText);
       const okColour = m.some((x) => /\bok\b/.test(x.cls));
-      const verdict = unaudited ? !okColour : !forgedShown;
+      // dfa2f8a: the four db/carve_results.json metrics each carry <span class="unaudited">· 감사 안 됨</span>.
+      const fromResults = m.filter((x) => /스캔 완료|상한 도달|원본 크기|경고/.test(x.text));
+      const verdict = unaudited ? !okColour && fromResults.length === 4 && fromResults.every((x) => x.marked) : !forgedShown;
       if (!verdict && !unaudited && !process.env.FRAMETRACE_R11_STRICT) {
         console.log(`PEND  R11 U5: carve page still reads db/carve_results.json (track I5 not in this binary) — ${all}`);
       } else {

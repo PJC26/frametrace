@@ -363,7 +363,12 @@ await check('4d R11 U4: report_stale → 보고서 최신 아님; unauthenticate
   S.verifySources = { ok: true, matched: 3, mismatched: 0, not_comparable: 0, unauthenticated: 1 };
   await page.click('#finalAdvanced > summary');
   await page.click('#btnVerifySources');
-  await page.waitForFunction(() => /원본 재검증: 인증 안 된 줄 있음/.test(document.getElementById('finalChecklist').textContent));
+  await page.waitForFunction(() => /원본 재검증: 확인 불가/.test(document.getElementById('finalChecklist').textContent));
+  assert.ok(!/원본 재검증: 모두 일치/.test(await page.textContent('#finalChecklist')));
+  // Track I verdict: no current result (completion marker not authenticated).
+  S.verifySources = { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 1, verified: false, is_result: false, not_verified_reason: '완료 표식 인증 안 됨', run_id: null, lane_status: 'not-verified' };
+  await page.click('#btnVerifySources');
+  await page.waitForFunction(() => /원본 재검증: 현재 결과 없음/.test(document.getElementById('finalChecklist').textContent));
   assert.ok(!/원본 재검증: 모두 일치/.test(await page.textContent('#finalChecklist')));
   S.verifySources = saved;
   assert.deepEqual(page.__errors, []);

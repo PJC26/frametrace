@@ -835,12 +835,12 @@ const FTStore = {
 - `/api/recent-cases`는 패키지 힌트를 보내지 않는다(recent.rs `phase_hint`만) → 55-home `recentState`의 `finalize-incomplete`·`package_dir` 분기 제거. 연 케이스는 `/api/status`로 "최종화 미완료".
 
 ### 18.4 미인증 재검증 줄 · report_stale · package_incomplete (U4, 트랙 I2/S5/S6)
-- `/api/verify-sources` `unauthenticated`(> 0): `verifySourcesVerdict`(41-finalize, legacy 70-finalize 동일)는 불일치(`err`) 다음으로 `warn` "원본 재검증: 인증 안 된 줄 N개 — 결과 확인 불가", 점검 목록 "원본 재검증: 인증 안 된 줄 있음" — "모두 일치"가 되지 않는다. 필드 없음 = 이전과 같음.
+- `/api/verify-sources`(트랙 I dfa2f8a: `run_id`, `unauthenticated`, `verified`, `is_result`, `not_verified_reason`, `lane_status`): `verifySourcesVerdict`(41-finalize, legacy 70-finalize 동일) — 불일치 `err`가 먼저; `is_result: false` → `warn` "원본 재검증: 현재 결과 없음(결과 아님)"(+ 사유), 점검 목록 "현재 결과 없음"; `verified: false` 또는 `unauthenticated` > 0 → `warn` "확인 불가"(+ 사유·인증 안 된 줄 수). 초록 "모두 일치"는 `verified && is_result && mismatched == 0 && not_comparable == 0 && matched > 0`일 때만. 필드 없음(구 서버) = 수치만, 이전과 같음.
 - 최종화 응답 `report_stale: true`: 결과 목록 첫 줄 `.h-fin-stale-row` "보고서 최신 아님 · 다시 최종화하십시오"(title = 서버 `error`); 성공 응답이면 판정 줄 "보고서·패키지를 만들었지만 보고서 최신 아님"·`warn` 토스트. 다른 케이스를 열면 지워진다.
 - `/api/status` `package_incomplete: true`는 폴더 이름과 상관없이(이름 변경 실패, `package_dir` 없음) 미완료(40-status `stPackageIncomplete`): 상점 phase `done`, `project.packageIncomplete`, 결과물 시트 패키지 줄(상태의 `package_dir`일 때만).
 
 ### 18.5 카빙 페이지 지표 (U5, 트랙 I5)
-- 카빙 페이지(`review/carve-report.html`)는 src/html_report.rs(트랙 I). verify-jobs-e2e 3b: 실제 카빙 뒤 `db/carve_results.json`을 위조(원본 크기·경고·스캔 완료)하고 `make-review`를 다시 돌려, 지표가 "감사 안 됨"(초록 `ok` 없음)이거나 위조 값이 아닌지 본다. I5 없는 바이너리에서는 `PEND`(실패 아님), `FRAMETRACE_R11_STRICT=1`이면 실패.
+- 카빙 페이지(`review/carve-report.html`)는 src/html_report.rs(트랙 I). verify-jobs-e2e 3b: 실제 카빙 뒤 `db/carve_results.json`을 위조(원본 크기·경고·스캔 완료)하고 `make-review`를 다시 돌려, 지표가 "감사 안 됨"(초록 `ok` 없음)이거나 위조 값이 아닌지 본다. I5(dfa2f8a: 네 지표 뒤 `<span class="unaudited">· 감사 안 됨</span>`) 없는 바이너리에서는 `PEND`, `FRAMETRACE_R11_STRICT=1`이면 실패.
 
 ### 18.6 그리드 재구성과 포커스 (PR #4 Windows CI)
 - 그리드 재구성(`render()`·그룹 접기 → 40-grid `renderGridKeepFocus`)은 카드 노드를 바꾼다: 재구성 전에 포커스가 카드·그룹 머리·그리드에 있었고 뒤에 `<body>`로 떨어졌으면 같은 카드(없으면 그리드)로 되돌린다(`preventScroll`). 자동 저장 재시도·크기 변경 재렌더가 아무 때나 와도 키보드 포커스를 잃지 않는다. verify-viewer-dialogs "R11: a grid rebuild keeps keyboard focus".

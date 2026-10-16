@@ -827,8 +827,29 @@ async function r11TrackU({ fn, runInNewContext, assert, ex }) {
   console.log('PASS VM R11 U3 _INCOMPLETE_n / copy tails read 최종화 미완료; dead home branch removed');
 
   // U4: hash-verify `unauthenticated` (I2) never "모두 일치"; S6 status flag.
+  // The legacy shell's verdict, evaluated on its own.
+  const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  const legacyFn = legacySrc.match(/^function verifySourcesVerdict\([^]*?^}/m)?.[0];
+  assert.ok(legacyFn, 'R11 U4: legacy verifySourcesVerdict exists');
+  const legacyVm = {};
+  runInNewContext(legacyFn, legacyVm);
   const v = runInNewContext(`verifySourcesVerdict({ matched: 3, mismatched: 0, not_comparable: 0, unauthenticated: 2 })`, ex);
   assert.ok(v.level === 'warn' && !/모두 일치/.test(v.toast + v.hint.replace(/"모두 일치"로 쓸 수 없습니다/, '')) && /인증 안 된 줄 2개/.test(v.toast) && /인증 안 됨 2/.test(v.hint), 'R11 U4: ' + JSON.stringify(v));
+  // Track I (dfa2f8a) verdict fields: verified / is_result / not_verified_reason.
+  const both = (expr) => [runInNewContext(expr, ex), runInNewContext(expr, legacyVm)];
+  for (const [i, r] of both(`verifySourcesVerdict({ matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 1, verified: false, is_result: false, not_verified_reason: '완료 표식 인증 안 됨', run_id: null, lane_status: 'not-verified' })`).entries()) {
+    assert.ok(r.level === 'warn' && /현재 결과 없음\(결과 아님\)/.test(r.toast) && /완료 표식 인증 안 됨/.test(r.hint) && !/모두 일치/.test(r.toast), `R11 U4 is_result:false (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
+  }
+  for (const [i, r] of both(`verifySourcesVerdict({ matched: 4, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: true, not_verified_reason: '레인 체인 파손', run_id: 'r1', lane_status: 'failed' })`).entries()) {
+    assert.ok(r.level === 'warn' && /확인 불가/.test(r.toast) && /레인 체인 파손/.test(r.hint) && !/모두 일치/.test(r.toast), `R11 U4 verified:false (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
+  }
+  for (const [i, r] of both(`verifySourcesVerdict({ matched: 4, mismatched: 1, not_comparable: 0, verified: false, is_result: true })`).entries()) {
+    assert.equal(r.level, 'err', `R11 U4: a mismatch still ranks first (${i ? 'legacy' : 'shell'})`);
+  }
+  for (const [i, r] of both(`verifySourcesVerdict({ matched: 4, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: true, is_result: true, run_id: 'r2', lane_status: 'keyed' })`).entries()) {
+    assert.ok(r.level === 'ok' && /모두 일치/.test(r.toast), `R11 U4: verified current result → 모두 일치 (${i ? 'legacy' : 'shell'})`);
+  }
+  assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 0, mismatched: 0, not_comparable: 0, verified: true, is_result: true }).level`, ex), 'warn', 'R11 U4: nothing compared is never green');
   assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 3, mismatched: 1, not_comparable: 0, unauthenticated: 2 }).level`, ex), 'err', 'R11 U4: a mismatch still outranks');
   assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 3, mismatched: 0, not_comparable: 0 }).level`, ex), 'ok', 'R11 U4: absent field (older server) unchanged');
   assert.equal(runInNewContext(`storePhase({ has_job: true, phase: 'done', package_dir: '/c/reports/package_002', package_incomplete: true })`, ex), 'done', 'R11 U4 (S6): flag without a renamed folder → not finalized');

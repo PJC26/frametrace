@@ -117,21 +117,29 @@ function unsavedMarksChecks({ pendingMarks, saveState, drafts, markConflicts = 0
 // SHOULD-FIX 4: "all match" only when something was actually compared and
 // nothing was left uncompared — 0 matched / N not comparable is a warning,
 // never a green pass.
-// R11 U4 (track I2, P9): `unauthenticated` = lines of the run this PC could
-// not authenticate — then never "모두 일치" (absent on older servers).
+// R11 U4 (track I2, P9): the run's own verdict — `is_result: false` = no
+// current result (counts are 0), `verified: false` = 확인 불가 (reason in
+// `not_verified_reason`, `unauthenticated` lines). Green only when
+// verified && is_result && nothing mismatched / uncompared && matched > 0.
+// Fields absent (older server) = the counts alone, as before.
 function verifySourcesVerdict(res) {
   const matched = Number(res.matched) || 0;
   const mismatched = Number(res.mismatched) || 0;
   const notComparable = Number(res.not_comparable) || 0;
   const unauth = Number(res.unauthenticated) > 0 ? Number(res.unauthenticated) : 0;
+  const reason = res.not_verified_reason == null ? "" : String(res.not_verified_reason).trim();
   const counts = `일치 ${matched} · 불일치 ${mismatched} · 비교 불가 ${notComparable}` + (unauth ? ` · 인증 안 됨 ${unauth}` : "");
   if (mismatched > 0) {
     return { level: "err", toast: `원본 재검증: 불일치 ${mismatched}건`,
       hint: `원본 재검증 완료 — ${counts} (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)` };
   }
-  if (unauth > 0) {
-    return { level: "warn", unauth, toast: `원본 재검증: 인증 안 된 줄 ${unauth}개 — 결과 확인 불가`,
-      hint: `원본 재검증 완료 — ${counts}. 인증 안 된 줄이 있어 "모두 일치"로 쓸 수 없습니다 (보관 이력서 5절 참조).` };
+  if (res.is_result === false) {
+    return { level: "warn", kind: "noresult", toast: "원본 재검증: 현재 결과 없음(결과 아님)",
+      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (reason ? ` — ${reason}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조)." };
+  }
+  if (res.verified === false || unauth > 0) {
+    return { level: "warn", kind: "unverified", toast: "원본 재검증: 확인 불가" + (unauth ? ` — 인증 안 된 줄 ${unauth}개` : ""),
+      hint: `원본 재검증: 확인 불가 — ${counts}` + (reason ? `. ${reason}` : "") + ` — "모두 일치"로 쓸 수 없습니다 (보관 이력서 5절 참조).` };
   }
   if (matched === 0) {
     return { level: "warn", toast: "원본 재검증: 비교된 파일 없음 — 재검증되지 않았습니다",
@@ -425,7 +433,7 @@ async function gatherFinalizeChecks() {
   // Source re-verification: only what actually ran is claimed.
   if (FIN.verify) {
     const lv = FIN.verify.level;
-    add(lv === "ok" ? "ok" : "warn", lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.unauth ? "원본 재검증: 인증 안 된 줄 있음" : "원본 재검증: 일부만 확인됨", FIN.verify.hint);
+    add(lv === "ok" ? "ok" : "warn", lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.kind === "noresult" ? "원본 재검증: 현재 결과 없음" : FIN.verify.kind === "unverified" ? "원본 재검증: 확인 불가" : "원본 재검증: 일부만 확인됨", FIN.verify.hint);
   } else {
     add("info", "원본 재검증: 아직 실행하지 않음", "패키징할 때 원본 SHA-256을 다시 계산해 일치/불일치를 그대로 기록합니다. 지금 확인하려면 고급 ▸ 원본 재검증.");
   }
@@ -766,7 +774,7 @@ async function finVerifySources() {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { finHint("원본 재검증 실패: " + (res.error || "알 수 없는 오류")); return; }
     const verdict = verifySourcesVerdict(res);
-    FIN.verify = { level: verdict.level, hint: verdict.hint, unauth: verdict.unauth || 0 };
+    FIN.verify = { level: verdict.level, hint: verdict.hint, kind: verdict.kind || "" };
     finHint("");
     toast(verdict.toast, verdict.level);
     finRefresh();

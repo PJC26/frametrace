@@ -221,16 +221,22 @@ function verifySourcesVerdict(res) {
   const matched = Number(res.matched) || 0;
   const mismatched = Number(res.mismatched) || 0;
   const notComparable = Number(res.not_comparable) || 0;
-  // R11 U4 (track I2): unauthenticated lines → never "모두 일치".
+  // R11 U4 (track I2): is_result / verified / unauthenticated → never "모두 일치"
+  // (same rule as assets/app/41-finalize.js; absent fields = counts only).
   const unauth = Number(res.unauthenticated) > 0 ? Number(res.unauthenticated) : 0;
+  const reason = res.not_verified_reason == null ? "" : String(res.not_verified_reason).trim();
   const counts = `일치 ${matched} · 불일치 ${mismatched} · 비교 불가 ${notComparable}` + (unauth ? ` · 인증 안 됨 ${unauth}` : "");
   if (mismatched > 0) {
     return { level: "err", toast: `원본 재검증: 불일치 ${mismatched}건`,
       hint: `원본 재검증 완료 — ${counts} (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)` };
   }
-  if (unauth > 0) {
-    return { level: "warn", toast: `원본 재검증: 인증 안 된 줄 ${unauth}개 — 결과 확인 불가`,
-      hint: `원본 재검증 완료 — ${counts}. 인증 안 된 줄이 있어 "모두 일치"로 쓸 수 없습니다 (보관 이력서 5절 참조).` };
+  if (res.is_result === false) {
+    return { level: "warn", toast: "원본 재검증: 현재 결과 없음(결과 아님)",
+      hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (reason ? ` — ${reason}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조)." };
+  }
+  if (res.verified === false || unauth > 0) {
+    return { level: "warn", toast: "원본 재검증: 확인 불가" + (unauth ? ` — 인증 안 된 줄 ${unauth}개` : ""),
+      hint: `원본 재검증: 확인 불가 — ${counts}` + (reason ? `. ${reason}` : "") + ` — "모두 일치"로 쓸 수 없습니다 (보관 이력서 5절 참조).` };
   }
   if (matched === 0) {
     return { level: "warn", toast: "원본 재검증: 비교된 파일 없음 — 재검증되지 않았습니다",
