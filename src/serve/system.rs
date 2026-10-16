@@ -506,6 +506,13 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         .as_str()
         .is_some_and(|dir| crate::package::finalize_incomplete_reason(Path::new(dir)).is_some());
     body["package_incomplete"] = package_incomplete.into();
+    // R12-S2: a finalize journal on disk (an interrupted finalize not yet
+    // fully recovered, or — `active` — the finalize running now).
+    let active = body["phase"].as_str() == Some("finalizing");
+    body["finalize_journal"] = case_dir
+        .as_deref()
+        .map(|dir| super::finalize_journal::status_value(dir, active))
+        .unwrap_or(serde_json::Value::Null);
     body.to_string()
 }
 
@@ -562,6 +569,11 @@ fn status_snapshot(guard: &JobState) -> serde_json::Value {
         // record missing); `finalize_incomplete_detail` says what.
         "finalize_incomplete": guard.finalize_incomplete.is_some(),
         "finalize_incomplete_detail": guard.finalize_incomplete,
+        // R12-S2: an interrupted finalize (journal found at server start,
+        // open-case or the next finalize) was recovered; the detail says
+        // what was done and what still needs a look ("확인 필요").
+        "finalize_recovered": guard.finalize_recovered.is_some(),
+        "finalize_recovered_detail": guard.finalize_recovered,
         // UX-06: which kind of job holds `busy` (null when idle), and the
         // current/last background case job with its stage and outcome.
         "job_kind": status_job_kind(guard),
@@ -833,6 +845,18 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     // script — say so instead of leaving a blank dashboard unexplained.
     let unverified_pages = has_review
         && !crate::util::generated_pages::page_is_trusted(&case_dir, "review/index.html");
+    // R12-S2 (P13): an interrupted finalize of this case is cleaned up
+    // before the case is bound — holding `busy` (so no finalize of this
+    // workstation is running) and outside the state lock.
+    let recovery = if super::finalize_journal::journal_path(&case_dir).exists() {
+        let _busy = match try_acquire_busy(state) {
+            Ok(guard) => guard,
+            Err(err) => return api_err(&err),
+        };
+        super::finalize_journal::recover(&case_dir, state)
+    } else {
+        None
+    };
     let mut guard = state_lock(state);
     if guard.busy {
         return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
@@ -850,6 +874,13 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
         // R11-S5/S6: so did the last finalize's leftovers.
         guard.report_stale = false;
         guard.finalize_incomplete = None;
+        guard.finalize_recovered = None;
+    }
+    if let Some(recovery) = recovery {
+        if recovery.report_stale {
+            guard.report_stale = true;
+        }
+        guard.finalize_recovered = Some(recovery.detail);
     }
     guard.case_dir = Some(case_dir.clone());
     // Reopening the same case must keep extra media roots the earlier

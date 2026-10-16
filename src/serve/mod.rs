@@ -18,6 +18,7 @@ pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod discovery;
+mod finalize_journal;
 mod http;
 mod jobs;
 mod media;
@@ -44,6 +45,8 @@ mod tests_marks_live;
 mod tests_phase3;
 #[cfg(test)]
 mod tests_post_review;
+#[cfg(test)]
+mod tests_r12_server;
 #[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
@@ -324,6 +327,11 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
             listener
         }
     };
+    // R12-S2 (P13): a finalize the last run left unfinished (crash, kill,
+    // power loss) is cleaned up before serving — this process owns the
+    // workstation now (the audit key is installed), no job runs yet, and
+    // the disk work happens outside the state lock.
+    finalize_journal::recover_bound_case(&state);
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
     // In-process publish first: the shell must never depend on the file.
     publish_local_server(port, token.as_deref());

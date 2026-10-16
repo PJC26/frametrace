@@ -2297,20 +2297,13 @@ pub(crate) fn is_plain_dir_entry(entry: &std::fs::DirEntry) -> bool {
     let Ok(file_type) = entry.file_type() else {
         return false;
     };
-    if !file_type.is_dir() || file_type.is_symlink() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        match entry.metadata() {
-            Ok(meta) => meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(windows))]
-    true
+    // R12-S9: `is_symlink()` alone. On Windows it is true for the
+    // name-surrogate reparse points — symbolic links AND junctions (mount
+    // points) — and false for the others, such as OneDrive / cloud-files
+    // placeholders. R11 also excluded every FILE_ATTRIBUTE_REPARSE_POINT
+    // entry, which dropped real package folders in a OneDrive-synced case
+    // from the listing.
+    file_type.is_dir() && !file_type.is_symlink()
 }
 
 /// R10-S3: the package a `package-case` step published, from its own
