@@ -622,15 +622,39 @@ pub fn normalizing_bsf(codec: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// R10-S8: [`normalizing_bsf`] in its two parts — the Annex B filter and
+/// the NAL unit types it removes — for the parameter-set-only proof of
+/// [`align_normalized_hashes`].
+pub fn normalizing_parts(codec: Option<&str>) -> Option<(&'static str, &'static str)> {
+    match codec {
+        Some("h264") => Some(("h264_mp4toannexb", "7|8|9")),
+        Some("hevc") => Some(("hevc_mp4toannexb", "32|33|34|35")),
+        _ => None,
+    }
+}
+
+/// R10-S8: the hash a packet whose payload normalization removed entirely
+/// (only parameter sets / access unit delimiters) stands for: the first
+/// 64 bits of the SHA-256 of the empty payload.
+pub const EMPTY_PAYLOAD_HASH: u64 = 0xe3b0_c442_98fc_1c14;
+
 /// R9-S2: the ffmpeg arguments that print one SHA-256 per video packet of
 /// `path` (stream copy through [`normalizing_bsf`], `framehash` muxer).
+///
+/// R10-S8: `-copyinkf` — stream copy otherwise drops every packet before
+/// the first key frame, so a clip that starts on a non-key frame (cut
+/// mid-GOP: CCTV exports, a byte-cut MPEG-TS) printed fewer hashes than
+/// ffprobe lists packets and every join of it was refused as "cannot
+/// verify". `-copyts` keeps the demuxer's timestamps (in the stream's own
+/// time base, as ffprobe lists them), so a packet the filter drops can be
+/// located ([`align_normalized_hashes`]).
 pub fn normalized_hash_args(path: &Path, bsf: Option<&str>) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = ["-v", "error", "-nostdin", "-i"]
+    let mut args: Vec<std::ffi::OsString> = ["-v", "error", "-nostdin", "-copyts", "-i"]
         .iter()
         .map(Into::into)
         .collect();
     args.push(path.as_os_str().to_os_string());
-    for arg in ["-map", "0:v:0", "-c", "copy"] {
+    for arg in ["-map", "0:v:0", "-c", "copy", "-copyinkf"] {
         args.push(arg.into());
     }
     if let Some(bsf) = bsf {
@@ -643,16 +667,180 @@ pub fn normalized_hash_args(path: &Path, bsf: Option<&str>) -> Vec<std::ffi::OsS
     args
 }
 
-/// R9-S2: the first 64 bits of each packet hash of `framehash` output
-/// (`stream, dts, pts, duration, size, hash[, side data…]` per line;
-/// `#` lines are headers). `None` when a line has no readable hash.
-pub fn parse_framehash(text: &str) -> Option<Vec<u64>> {
+/// R10-S8: one `framehash` line — `stream, dts, pts, duration, size,
+/// hash[, side data…]` — with the timestamps (`None` for ffmpeg's
+/// no-timestamp value) and the first 64 bits of the hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHashLine {
+    pub dts: Option<i64>,
+    pub pts: Option<i64>,
+    pub hash: u64,
+}
+
+/// R10-S8: every packet line of `framehash` output (`#` lines are
+/// headers). `None` when a line has no readable timestamps or hash.
+pub fn parse_framehash_lines(text: &str) -> Option<Vec<FrameHashLine>> {
+    let stamp = |field: &str| -> Option<Option<i64>> {
+        let value: i64 = field.trim().parse().ok()?;
+        Some((value != i64::MIN).then_some(value))
+    };
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| {
-            let hash = line.split(',').nth(5)?.trim();
-            hash.get(..16).and_then(|h| u64::from_str_radix(h, 16).ok())
+            let fields: Vec<&str> = line.split(',').collect();
+            let hash = fields.get(5)?.trim();
+            Some(FrameHashLine {
+                dts: stamp(fields.get(1)?)?,
+                pts: stamp(fields.get(2)?)?,
+                hash: hash
+                    .get(..16)
+                    .and_then(|h| u64::from_str_radix(h, 16).ok())?,
+            })
+        })
+        .collect()
+}
+
+/// R9-S2: the first 64 bits of each packet hash of `framehash` output.
+/// `None` when a line has no readable hash.
+pub fn parse_framehash(text: &str) -> Option<Vec<u64>> {
+    parse_framehash_lines(text).map(|lines| lines.iter().map(|line| line.hash).collect())
+}
+
+/// R10-S8: per packet (file order) its `(dts, pts)` in the stream's own
+/// time base, as ffprobe lists them.
+pub type PacketStamp = (Option<i64>, Option<i64>);
+
+/// R10-S8: one hash per listed packet when the normalizing filter dropped
+/// some packets (`normalized` is shorter than `stamps`).
+///
+/// `filter_units` drops a packet when nothing is left of it — it carried
+/// only parameter sets / access unit delimiters (some DVRs write SPS/PPS
+/// as packets of their own). R9 refused every such file ("hashed N
+/// packets but ffprobe lists M"). A dropped packet is taken as
+/// [`EMPTY_PAYLOAD_HASH`] only when that is PROVEN: `framed` (the same
+/// packets through the Annex B filter and a no-op unit filter, so
+/// serialized the same way) lists every packet with these timestamps, and
+/// `ps_only` (only the removed unit types kept) carries exactly the same
+/// bytes for it. Anything else — a timestamp that is missing, repeated or
+/// not found, a dropped packet that had picture data — is an error (the
+/// check cannot run; the join is refused, never passed unverified).
+pub fn align_normalized_hashes(
+    stamps: &[PacketStamp],
+    normalized: &[FrameHashLine],
+    framed: &[FrameHashLine],
+    ps_only: &[FrameHashLine],
+) -> Result<Vec<u64>, String> {
+    if framed.len() != stamps.len() {
+        return Err(format!(
+            "the unfiltered pass hashed {} packets but ffprobe lists {}",
+            framed.len(),
+            stamps.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (index, (stamp, line)) in stamps.iter().zip(framed).enumerate() {
+        if *stamp == (None, None) {
+            return Err(format!("packet {} has no timestamp", index + 1));
+        }
+        if !seen.insert(*stamp) {
+            return Err(format!("packet {} repeats a timestamp", index + 1));
+        }
+        if (line.dts, line.pts) != *stamp {
+            return Err(format!(
+                "packet {}: ffmpeg's timestamps {:?} differ from ffprobe's {stamp:?}",
+                index + 1,
+                (line.dts, line.pts)
+            ));
+        }
+    }
+    let ps_only: std::collections::HashMap<PacketStamp, u64> = ps_only
+        .iter()
+        .map(|line| ((line.dts, line.pts), line.hash))
+        .collect();
+    let mut out = Vec::with_capacity(stamps.len());
+    let mut next = normalized.iter().peekable();
+    for (index, (stamp, line)) in stamps.iter().zip(framed).enumerate() {
+        match next.peek() {
+            Some(kept) if (kept.dts, kept.pts) == *stamp => {
+                out.push(kept.hash);
+                next.next();
+            }
+            _ if ps_only.get(stamp) == Some(&line.hash) => out.push(EMPTY_PAYLOAD_HASH),
+            _ => {
+                return Err(format!(
+                    "packet {} was dropped by the normalizing filter but is not parameter sets only",
+                    index + 1
+                ));
+            }
+        }
+    }
+    if next.next().is_some() {
+        return Err("the normalizing filter printed a packet ffprobe does not list".to_string());
+    }
+    Ok(out)
+}
+
+/// One `framehash` pass of `path` through `bsf`.
+fn framehash_lines(
+    ffmpeg: &str,
+    path: &Path,
+    bsf: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> Result<Vec<FrameHashLine>, String> {
+    let binary = resolve_tool_binary(ffmpeg, &["ffmpeg"])?;
+    let mut command = Command::new(&binary);
+    command.args(normalized_hash_args(path, bsf));
+    let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg packet hashing failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_framehash_lines(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        format!(
+            "ffmpeg packet hashing of {} printed an unreadable line",
+            path.display()
+        )
+    })
+}
+
+/// R10-S8: the first video stream's packet timestamps (`dts, pts`) in its
+/// own time base.
+fn packet_stamps(
+    ffprobe: &str,
+    path: &Path,
+    timeout_secs: Option<u64>,
+) -> Result<Vec<PacketStamp>, String> {
+    let binary = resolve_tool_binary(ffprobe, &["ffprobe"])?;
+    let mut command = Command::new(&binary);
+    command
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "packet=dts,pts", "-of", "csv=p=0"])
+        .arg(path);
+    let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe packet timestamps failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(parse_packet_stamps(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// R10-S8: `dts,pts[,…]` per line (`N/A` = none).
+pub fn parse_packet_stamps(text: &str) -> Vec<PacketStamp> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split(',').map(|f| f.trim().parse::<i64>().ok());
+            (fields.next().flatten(), fields.next().flatten())
         })
         .collect()
 }
@@ -667,6 +855,10 @@ pub fn parse_framehash(text: &str) -> Option<Vec<u64>> {
 /// compared raw (a mix of rewritten IDR frames and untouched frames was
 /// refused). Normalized, the same picture data compares equal whatever
 /// the muxer did, and every position is compared exactly.
+///
+/// R10-S8: leading non-key packets are hashed too (`-copyinkf`), and a
+/// packet the filter empties (parameter sets only) is accounted for by
+/// [`align_normalized_hashes`] instead of failing the count.
 pub fn normalized_video_packets(
     ffprobe: &str,
     ffmpeg: &str,
@@ -675,34 +867,47 @@ pub fn normalized_video_packets(
 ) -> Result<Vec<VideoPacket>, String> {
     let mut packets = video_packets(ffprobe, path, timeout_secs, false)?;
     let codec = video_codec_name(ffprobe, path, timeout_secs)?;
-    let binary = resolve_tool_binary(ffmpeg, &["ffmpeg"])?;
-    let mut command = Command::new(&binary);
-    command.args(normalized_hash_args(
+    let lines = framehash_lines(
+        ffmpeg,
         path,
         normalizing_bsf(codec.as_deref()),
-    ));
-    let output = crate::util::run_with_timeout(&mut command, timeout_secs)?;
-    if !output.status.success() {
-        return Err(format!(
-            "ffmpeg packet hashing failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let hashes = parse_framehash(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        timeout_secs,
+    )?;
+    let mismatch = |why: String| {
         format!(
-            "ffmpeg packet hashing of {} printed an unreadable line",
-            path.display()
-        )
-    })?;
-    if hashes.len() != packets.len() {
-        return Err(format!(
-            "ffmpeg hashed {} video packets of {} but ffprobe lists {}",
-            hashes.len(),
+            "ffmpeg hashed {} video packets of {} but ffprobe lists {}{why}",
+            lines.len(),
             path.display(),
             packets.len()
-        ));
-    }
+        )
+    };
+    let hashes: Vec<u64> = match normalizing_parts(codec.as_deref()) {
+        _ if lines.len() == packets.len() => lines.iter().map(|line| line.hash).collect(),
+        Some((annexb, types)) if lines.len() < packets.len() => {
+            let stamps = packet_stamps(ffprobe, path, timeout_secs)?;
+            if stamps.len() != packets.len() {
+                return Err(mismatch(format!(
+                    " (and {} in its timestamp listing)",
+                    stamps.len()
+                )));
+            }
+            let framed = framehash_lines(
+                ffmpeg,
+                path,
+                Some(&format!("{annexb},filter_units=remove_types=0")),
+                timeout_secs,
+            )?;
+            let ps_only = framehash_lines(
+                ffmpeg,
+                path,
+                Some(&format!("{annexb},filter_units=pass_types={types}")),
+                timeout_secs,
+            )?;
+            align_normalized_hashes(&stamps, &lines, &framed, &ps_only)
+                .map_err(|why| mismatch(format!(" ({why})")))?
+        }
+        _ => return Err(mismatch(String::new())),
+    };
     for (packet, hash) in packets.iter_mut().zip(hashes) {
         packet.hash = Some(hash);
     }
@@ -2609,6 +2814,11 @@ pub fn ffmpeg_argv(tag: &str, container: Container) -> Vec<String> {
         "0:a?",
         "-c",
         "copy",
+        // R10-S8: stream copy drops every packet before the first key
+        // frame unless told otherwise, so a first source that starts on a
+        // non-key frame (cut mid-GOP) lost those frames and the segment
+        // check refused the join on the packet count.
+        "-copyinkf",
         "-avoid_negative_ts",
         "make_zero",
     ] {
@@ -4297,6 +4507,8 @@ mod tests {
             assert!(args.contains(&".join-job-7_x.ffconcat".to_string()));
             assert_eq!(args.last().unwrap(), ".join-job-7_x.part");
             assert!(args.windows(2).any(|w| w == ["-c", "copy"]));
+            // R10-S8: leading non-key frames are kept.
+            assert!(args.contains(&"-copyinkf".to_string()), "{args:?}");
             assert_eq!(
                 args.contains(&"+faststart".to_string()),
                 container == Container::Mp4
@@ -5187,6 +5399,86 @@ mod tests {
             Some(vec![0xdb74c93919c9d461, 0x0123456789abcdef])
         );
         assert_eq!(parse_framehash("0, 0, 0, 1, 2\n"), None);
+        // R10-S8: leading non-key packets are hashed, timestamps kept.
+        assert!(args.contains(&"-copyinkf".to_string()), "{args:?}");
+        assert!(args.contains(&"-copyts".to_string()), "{args:?}");
+        for codec in ["h264", "hevc"] {
+            let (annexb, types) = normalizing_parts(Some(codec)).unwrap();
+            assert_eq!(
+                normalizing_bsf(Some(codec)).unwrap(),
+                format!("{annexb},filter_units=remove_types={types}")
+            );
+        }
+        assert_eq!(normalizing_parts(Some("mjpeg")), None);
+        let lines = parse_framehash_lines(
+            "0, -1024, -1024, 1024, 260, 7cf784de4454d50c26d1\n0, -9223372036854775808, 0, 1, 2, 0123456789abcdef\n",
+        )
+        .unwrap();
+        assert_eq!(lines[0].dts, Some(-1024));
+        assert_eq!(lines[1].dts, None);
+        assert_eq!(lines[1].pts, Some(0));
+        assert_eq!(
+            parse_packet_stamps("0,0\nN/A,100\n126000,126000,\n"),
+            vec![
+                (Some(0), Some(0)),
+                (None, Some(100)),
+                (Some(126000), Some(126000))
+            ]
+        );
+        // SHA-256 of the empty string.
+        let empty: [u8; 32] = {
+            use sha2::Digest;
+            sha2::Sha256::digest(b"").into()
+        };
+        assert_eq!(
+            EMPTY_PAYLOAD_HASH,
+            u64::from_be_bytes(empty[..8].try_into().unwrap())
+        );
+    }
+
+    /// R10-S8: a packet the normalizing filter dropped is accounted for
+    /// only when it is proven to be parameter sets only; R9 refused every
+    /// file with such a packet on the count.
+    #[test]
+    fn dropped_parameter_set_packets_are_proven_before_they_count_as_empty() {
+        let line = |ts: i64, hash: u64| FrameHashLine {
+            dts: Some(ts),
+            pts: Some(ts),
+            hash,
+        };
+        let stamps: Vec<PacketStamp> = (0..4).map(|t| (Some(t * 10), Some(t * 10))).collect();
+        // Packet 2 (ts 10) carried only SPS/PPS: dropped by the filter;
+        // the unfiltered and the parameter-sets-only passes agree on it.
+        let normalized = [line(0, 100), line(20, 120), line(30, 130)];
+        let framed = [line(0, 900), line(10, 777), line(20, 920), line(30, 930)];
+        let ps_only = [line(0, 555), line(10, 777)];
+        assert_eq!(
+            align_normalized_hashes(&stamps, &normalized, &framed, &ps_only).unwrap(),
+            vec![100, EMPTY_PAYLOAD_HASH, 120, 130]
+        );
+        // The dropped packet had picture data too (its parameter sets
+        // alone are not the whole packet): refused.
+        let partial = [line(0, 555), line(10, 778)];
+        let err = align_normalized_hashes(&stamps, &normalized, &framed, &partial).unwrap_err();
+        assert!(err.contains("not parameter sets only"), "{err}");
+        // A dropped packet with no parameter sets at all: refused.
+        assert!(align_normalized_hashes(&stamps, &normalized, &framed, &[]).is_err());
+        // The unfiltered pass lost a packet, or its timestamps differ
+        // from ffprobe's (another time base): refused.
+        assert!(align_normalized_hashes(&stamps, &normalized, &framed[..3], &ps_only).is_err());
+        let mut shifted = framed;
+        shifted[3].dts = Some(31);
+        assert!(align_normalized_hashes(&stamps, &normalized, &shifted, &ps_only).is_err());
+        // Missing or repeated timestamps cannot be aligned: refused.
+        let mut none = stamps.clone();
+        none[1] = (None, None);
+        assert!(align_normalized_hashes(&none, &normalized, &framed, &ps_only).is_err());
+        let mut repeated = stamps.clone();
+        repeated[2] = repeated[1];
+        assert!(align_normalized_hashes(&repeated, &normalized, &framed, &ps_only).is_err());
+        // A normalized line ffprobe does not list: refused.
+        let extra = [line(0, 100), line(20, 120), line(30, 130), line(40, 140)];
+        assert!(align_normalized_hashes(&stamps, &extra, &framed, &ps_only).is_err());
     }
 
     /// R7-S3: the segment check lists packets without payload hashes and

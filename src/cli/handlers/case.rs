@@ -1432,7 +1432,15 @@ pub fn verify_package(package_dir: &Path) -> Result<(), String> {
         .failures()
         .map(|check| check.subject.as_str())
         .collect();
-    if failures.is_empty() {
+    if failures.is_empty() && result.finalize_incomplete {
+        // R10-S2: the files may all check out, but this is not a final
+        // result — never the plain "package verified" line.
+        println!(
+            "package files match manifest.sha256 ({} file(s)), but FINALIZE INCOMPLETE: this package is NOT a final result (see the [NOT VERIFIED] finalize line)",
+            result.files_verified
+        );
+        Ok(())
+    } else if failures.is_empty() {
         println!(
             "package verified: {} file(s) match manifest.sha256 (see NOT VERIFIED lines for what this does not establish)",
             result.files_verified

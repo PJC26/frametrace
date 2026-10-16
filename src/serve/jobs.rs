@@ -2720,12 +2720,114 @@ fn abandon_failure_note(err: &str) -> String {
 /// promote its sign-off (outside the package, so verify-package still
 /// sees exactly the files it lists - R6-S5).
 pub(crate) fn finalize_incomplete_marker(package_dir: &Path) -> PathBuf {
-    let mut name = package_dir
+    crate::package::finalize_incomplete_marker(package_dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// R10-S1 test hook: how many sign-off promotion renames fail (as an
+    /// antivirus / indexer handle would) before one is attempted for real.
+    pub(crate) static FAIL_SIGNOFF_PROMOTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// R10-S1: promotes the pending sign-off to `review/signoff.json`,
+/// retried for the rename budget (`package::rename_with_retry`). R9 tried
+/// once: a handle an antivirus or indexer held on the fresh file for a
+/// moment left a published package without a promoted sign-off.
+fn promote_signoff(pending: &Path, target: &Path) -> std::io::Result<()> {
+    crate::package::rename_with_retry(pending, target, &|from, to| {
+        #[cfg(test)]
+        if FAIL_SIGNOFF_PROMOTIONS.with(|left| {
+            let n = left.get();
+            left.set(n.saturating_sub(1));
+            n > 0
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected: file in use",
+            ));
+        }
+        std::fs::rename(from, to)
+    })
+}
+
+/// R10-S2: renames a published package whose finalize did not complete to
+/// `<name>_INCOMPLETE` (`_INCOMPLETE_2`, … when taken), so the state
+/// travels with the folder (R9's marker beside it is lost when only the
+/// folder is copied). Returns the new path.
+fn rename_incomplete_package(package_dir: &Path) -> std::io::Result<PathBuf> {
+    let name = package_dir
         .file_name()
-        .map(|n| n.to_os_string())
+        .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    name.push(".finalize-incomplete.txt");
-    package_dir.with_file_name(name)
+    let mut last = None;
+    for n in 1..100u32 {
+        let suffix = if n == 1 {
+            crate::package::INCOMPLETE_PACKAGE_SUFFIX.to_string()
+        } else {
+            format!("{}_{n}", crate::package::INCOMPLETE_PACKAGE_SUFFIX)
+        };
+        let target = package_dir.with_file_name(format!("{name}{suffix}"));
+        if std::fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
+        match crate::package::rename_with_retry(package_dir, &target, &|from, to| {
+            std::fs::rename(from, to)
+        }) {
+            Ok(()) => return Ok(target),
+            Err(err) => last = Some(err),
+        }
+        break;
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free _INCOMPLETE name")))
+}
+
+/// R10-S2/S3: a finalize published `published` (from package-case's own
+/// `output:` line) and then could not promote the sign-off (`err`). The
+/// package is renamed `…_INCOMPLETE` and marked beside; returns the
+/// examiner-facing error and where the package now is.
+fn mark_package_incomplete(published: Option<&Path>, err: &str) -> (String, Option<PathBuf>) {
+    let Some(dir) = published else {
+        return (
+            format!(
+                "검토자 기록 확정 실패: {err} — 최종화는 끝나지 않았습니다(최종화 미완료). 이번에 만든 패키지 위치를 package-case 출력에서 확인하지 못해 미완료 표시를 하지 못했습니다 — reports 폴더의 패키지를 최종 결과로 쓰지 말고 최종화를 다시 실행하십시오."
+            ),
+            None,
+        );
+    };
+    let (now, renamed) = match rename_incomplete_package(dir) {
+        Ok(renamed) => (
+            renamed.clone(),
+            format!(
+                "패키지 폴더 이름을 {}(으)로 바꿔 미완료로 표시했습니다. ",
+                renamed.display()
+            ),
+        ),
+        Err(rename_err) => (
+            dir.to_path_buf(),
+            format!("패키지 폴더 이름을 미완료로 바꾸지 못했습니다 ({rename_err}). "),
+        ),
+    };
+    let marker = finalize_incomplete_marker(&now);
+    let marked = std::fs::write(
+        &marker,
+        format!(
+            "FrameTrace: 최종화 미완료 — 이 패키지({})는 만들어졌지만 검토자 기록을 확정하지 못해 최종화가 끝나지 않았습니다 ({err}). 이 패키지를 최종 결과로 쓰지 말고 최종화를 다시 실행하십시오.\nFinalize incomplete: this package was written but the sign-off could not be promoted; do not use it as the final result, finalize again.\n",
+            now.display()
+        ),
+    );
+    let marked = match marked {
+        Ok(()) => format!("패키지 옆에 표식 {}을(를) 남겼습니다. ", marker.display()),
+        Err(_) => "표식 파일은 남기지 못했습니다. ".to_string(),
+    };
+    (
+        format!(
+            "검토자 기록 확정 실패: {err} — 패키지는 이미 {}에 만들어졌지만 최종화는 끝나지 않았습니다(최종화 미완료). {renamed}{marked}이 패키지를 최종 결과로 쓰지 말고, 원인(파일을 잡고 있는 프로그램 등)을 해결한 뒤 최종화를 다시 실행하십시오.",
+            now.display()
+        ),
+        Some(now),
+    )
 }
 
 /// R4-B18 call site for track D's `record_signoff_audit(case_dir,
@@ -2908,43 +3010,41 @@ pub(crate) fn finalize_with_exe(
     };
     // R9-S5: why the abandon record could not be written, if it failed.
     let mut abandon_note: Option<String> = None;
+    // R10-S3: the package this finalize's package-case published, from
+    // its own `output:` line (R9 marked the folder with the newest mtime).
+    let published = packaging
+        .as_ref()
+        .ok()
+        .and_then(|out| super::media::published_package_dir(case_dir, out));
+    // R10-S2: where the package of an incomplete finalize now is.
+    let mut incomplete_package: Option<PathBuf> = None;
     let promoted = match (&report, &packaging) {
-        (Ok(_), Ok(_)) => std::fs::rename(
+        (Ok(_), Ok(_)) => match promote_signoff(
             &pending_signoff,
-            case_dir.join(crate::report::SIGNOFF_REL_PATH),
-        )
-        .map_err(|err| {
-            // R9-S4: the package is already published at this point; R8
-            // reported only "검토자 기록 확정 실패" while a complete-looking
-            // package (carrying this sign-off) sat in reports/.
-            let package = super::media::newest_package_dir(case_dir);
-            let marked = package.as_deref().and_then(|dir| {
-                let marker = finalize_incomplete_marker(dir);
-                std::fs::write(
-                    &marker,
-                    format!(
-                        "FrameTrace: 최종화 미완료 — 이 패키지({})는 만들어졌지만 검토자 기록을 확정하지 못해 최종화가 끝나지 않았습니다 ({err}). 이 패키지를 최종 결과로 쓰지 말고 최종화를 다시 실행하십시오.\nFinalize incomplete: this package was written but the sign-off could not be promoted; do not use it as the final result, finalize again.\n",
-                        dir.display()
-                    ),
-                )
-                .ok()
-                .map(|()| marker)
-            });
-            match package {
-                Some(dir) => format!(
-                    "검토자 기록 확정 실패: {err} — 패키지는 이미 {}에 만들어졌지만 최종화는 끝나지 않았습니다(최종화 미완료). {}이 패키지를 최종 결과로 쓰지 말고, 원인(파일을 잡고 있는 프로그램 등)을 해결한 뒤 최종화를 다시 실행하십시오.",
-                    dir.display(),
-                    marked
-                        .map(|marker| format!("패키지 옆에 표식 {}을(를) 남겼습니다. ", marker.display()))
-                        .unwrap_or_else(|| "표식 파일도 남기지 못했습니다. ".to_string())
-                ),
-                None => format!("검토자 기록 확정 실패: {err} — 최종화는 끝나지 않았습니다."),
+            &case_dir.join(crate::report::SIGNOFF_REL_PATH),
+        ) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // R9-S4: the package is already published at this point.
+                // R10-S2: it is renamed `…_INCOMPLETE` (and marked beside).
+                let (message, now) =
+                    mark_package_incomplete(published.as_deref(), &err.to_string());
+                incomplete_package = now;
+                abandon_note = abandon_signoff(case_dir, &signoff.text, &message, state);
+                let _ = std::fs::remove_file(&pending_signoff);
+                // R10-S1: reports/case-report.html was rendered with the
+                // sign-off that is now abandoned; re-render it from the
+                // promoted state (best effort), as for a failed package.
+                if let Err(rerender) =
+                    run_step(exe, &["make-report".into(), case_text.clone()], state)
+                {
+                    state_lock(state).logs.push(format!(
+                        "경고: 보고서를 다시 만들지 못했습니다 — reports/case-report.html에 확정되지 않은 검토자 기록이 남아 있을 수 있습니다: {rerender}"
+                    ));
+                }
+                Err(message)
             }
-        })
-        .inspect_err(|err| {
-            abandon_note = abandon_signoff(case_dir, &signoff.text, err, state);
-            let _ = std::fs::remove_file(&pending_signoff);
-        }),
+        },
         _ => {
             // R8-I9: the sign-off entry is already in the chain; mark it
             // abandoned so it never reads as the case's latest sign-off.
@@ -2969,10 +3069,21 @@ pub(crate) fn finalize_with_exe(
         (Ok(out), Ok(())) => Ok(out),
         (Ok(_), Err(err)) | (Err(err), _) => Err(err),
     };
-    let mut guard = state_lock(state);
-    match (report, packaging) {
+    // Every disk read happens before the state lock is taken.
+    let finished = match (&report, &packaging) {
         (Ok(_), Ok(_)) => {
-            let package_dir = newest_package_dir(case_dir);
+            let manifest_sha256 = published.as_deref().and_then(package_manifest_sha256);
+            // R10-S2: packages earlier finalizes left incomplete are named
+            // (never deleted: the examiner decides what to keep).
+            let leftovers = super::media::incomplete_package_dirs(case_dir);
+            Some((manifest_sha256, leftovers))
+        }
+        _ => None,
+    };
+    let mut guard = state_lock(state);
+    match (report, packaging, finished) {
+        (Ok(_), Ok(_), Some((manifest_sha256, leftovers))) => {
+            let package_dir = published;
             let package_url = package_dir
                 .as_ref()
                 .and_then(|path| path.strip_prefix(case_dir).ok())
@@ -2981,7 +3092,11 @@ pub(crate) fn finalize_with_exe(
             guard.phase = "done";
             guard.byte_progress = None;
             guard.package_dir = package_dir.clone();
-            let manifest_sha256 = package_dir.as_deref().and_then(package_manifest_sha256);
+            if package_dir.is_none() {
+                guard.logs.push(
+                    "경고: package-case 출력에서 패키지 위치(output: 줄)를 찾지 못했습니다 — reports 폴더에서 이번 패키지를 직접 확인하십시오.".to_string(),
+                );
+            }
             guard.logs.push(format!(
                 "보고서·패키지 생성 완료. 검토자(입력값 기록): {examiner}{}",
                 manifest_sha256
@@ -2989,25 +3104,54 @@ pub(crate) fn finalize_with_exe(
                     .map(|hash| format!(" · manifest.sha256 SHA-256 {hash}"))
                     .unwrap_or_default()
             ));
-            format!(
-                "{{\"ok\":true,\"package_url\":{},\"package_dir\":{},\"examiner\":{},\"manifest_sha256\":{}}}",
-                json_string(&package_url),
-                opt_path(&package_dir),
-                json_string(examiner),
-                manifest_sha256
-                    .as_deref()
-                    .map(json_string)
-                    .unwrap_or_else(|| "null".to_string())
-            )
+            if !leftovers.is_empty() {
+                guard.logs.push(format!(
+                    "참고: 이전 최종화가 끝나지 않아 남은 미완료 패키지 {}개가 reports 폴더에 있습니다 (자동으로 지우지 않음 — 최종 결과로 쓰지 마십시오): {}",
+                    leftovers.len(),
+                    leftovers
+                        .iter()
+                        .map(|dir| dir.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            serde_json::json!({
+                "ok": true,
+                "package_url": package_url,
+                "package_dir": package_dir.as_ref().map(|dir| dir.to_string_lossy().to_string()),
+                "examiner": examiner,
+                "manifest_sha256": manifest_sha256,
+                "incomplete_packages": leftovers
+                    .iter()
+                    .map(|dir| dir.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+            })
+            .to_string()
         }
-        (report, packaging) => {
+        (report, packaging, _) => {
             let mut error = report.err().or_else(|| packaging.err()).unwrap_or_default();
             if let Some(note) = abandon_note {
                 error = format!("{error} {note}");
             }
             guard.phase = "review-ready";
             guard.error = Some(error.clone());
-            serde_json::json!({"ok": false, "error": error}).to_string()
+            let mut body = serde_json::json!({"ok": false, "error": error});
+            if let Some(dir) = incomplete_package {
+                // R10-S2: /api/status `package_dir` names it too (with
+                // `package_incomplete: true`), so the viewer can show
+                // "최종화 미완료" after a reload.
+                guard.package_dir = Some(dir.clone());
+                // R10-S2: the published package of this incomplete
+                // finalize, for the finalize sheet (track U).
+                body["finalize_incomplete"] = true.into();
+                body["incomplete_package_dir"] = dir.to_string_lossy().to_string().into();
+                body["incomplete_package_url"] = dir
+                    .strip_prefix(case_dir)
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default()
+                    .into();
+            }
+            body.to_string()
         }
     }
 }
