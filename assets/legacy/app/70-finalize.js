@@ -247,6 +247,12 @@ function verifySourcesVerdict(res) {
     return { level: "warn", toast: `원본 재검증: 일치 ${matched}건, 비교 불가 ${notComparable}건`,
       hint: `원본 재검증 완료 — ${counts}. 비교 불가 ${notComparable}건은 재검증되지 않았습니다 (접근 불가·읽기 실패·기록된 해시 없음 — 보관 이력서 5절 참조).` };
   }
+  // R12 U1: no audit key on this PC — the lane is self-consistent only, so
+  // the match is not authenticated: info, never green.
+  if (res.lane_status === "structural") {
+    return { level: "info", kind: "structural", toast: `원본 재검증: ${matched}건 일치 (자기 일관성만 — 인증 아님)`,
+      hint: `원본 재검증 완료 — ${counts}. 자기 일관성만 — 인증 아님 (이 PC에 감사 키 없음).` };
+  }
   return { level: "ok", toast: `원본 재검증: ${matched}건 모두 일치`, hint: `원본 재검증 완료 — ${counts}` };
 }
 

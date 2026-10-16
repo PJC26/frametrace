@@ -542,6 +542,9 @@ function logChainSummary(chain) {
   if (st === "failed") return t("chain.failed");
   if (st === "unreadable") return t("chain.unreadable");
   if (st === "structural") return t("chain.structural");
+  // R12 U4 (track I3): `repair-lane` cut a torn tail off — say so (detail =
+  // what was cut, the tooltip), plus any lines still not authenticated.
+  if (st === "repaired") return t("chain.repaired") + (n ? " · " + tf("chain.unauthN", { n }) : "");
   if (n) return tf("chain.unauthN", { n });
   return t("chain.notVerified");
 }

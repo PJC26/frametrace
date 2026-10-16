@@ -401,6 +401,51 @@ await check('4e R11 (S): status finalize_incomplete / report_stale after a reloa
   await page.context().close();
 });
 
+// R12 track U: U1 lane_status "structural" → info, never 모두 일치; U2 the
+// status detail shows in the row; U3 finalize journal (track S2) rows.
+await check('4f R12 U1–U3: structural verify-sources is info; detail in the row; 이전 최종화 중단됨', async () => {
+  const page = await newPage(browser);
+  const before = S.status;
+  const savedVs = S.verifySources;
+  const detail = '검토자 기록 확정 실패: review/signoff.json 사용 중 — 최종화는 끝나지 않았고 패키지는 만들지 않았습니다. 이전 서명을 복원하지 못했습니다';
+  S.status = Object.assign({}, before, { phase: 'review-ready', busy: false, pending_marks: 0, finalize_incomplete: true, finalize_incomplete_detail: detail,
+    finalize_recovered: false, finalize_journal: { signoff_sha256: 'c0ffee', started_unix: 1760000000, state: 'promoted' } });
+  await openSheet(page);
+  await page.waitForFunction(() => !!document.querySelector('#finalLinks .h-fin-journal-row'), null, { timeout: 5000 })
+    .catch(async (e) => { throw new Error(e.message + ' ' + await page.evaluate(() => document.getElementById('finalLinks').innerHTML)); });
+  const r = await page.evaluate(() => {
+    const inc = document.querySelector('#finalLinks .h-fin-incomplete-row');
+    const d = inc && inc.querySelector('.h-fin-detail');
+    const j = document.querySelector('#finalLinks .h-fin-journal-row');
+    const box = d && d.getBoundingClientRect();
+    const sheet = document.querySelector('#finalLinks').getBoundingClientRect();
+    return { detail: d ? d.textContent : '', visible: !!(box && box.width > 0 && box.height > 0 && box.right <= sheet.right + 1),
+      journal: j ? j.textContent : '', kind: j ? j.dataset.journal : '', tip: j ? j.getAttribute('title') : '' };
+  });
+  assert.ok(/^검토자 기록 확정 실패/.test(r.detail) && r.visible, 'U2 detail in the row body: ' + JSON.stringify(r));
+  assert.ok(r.kind === 'check' && /이전 최종화 중단됨 — 확인 필요/.test(r.journal) && /c0ffee/.test(r.tip), 'U3 journal row: ' + JSON.stringify(r));
+  for (const th of ['light', 'dark']) {
+    await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
+    for (const e of (await contrastReport(page)).filter((x) => /h-fin-incomplete|h-fin-detail/.test(x.cls))) {
+      assert.ok(ratio(e.fg, e.bg) >= 4.5, `${th}: ${e.cls} contrast ${ratio(e.fg, e.bg).toFixed(2)}`);
+    }
+  }
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+  // U1: a match on a PC without an audit key.
+  S.verifySources = { ok: true, matched: 3, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: true, is_result: true, run_id: 'r1', not_verified_reason: null, lane_status: 'structural' };
+  await page.click('#finalAdvanced > summary');
+  await page.click('#btnVerifySources');
+  await page.waitForFunction(() => /원본 재검증: 자기 일관성만 — 인증 아님/.test(document.getElementById('finalChecklist').textContent), null, { timeout: 5000 })
+    .catch(async (e) => { throw new Error(e.message + ' ' + await page.textContent('#finalChecklist')); });
+  const row = await page.evaluate(() => [...document.querySelectorAll('#finalChecklist .h-check')].find((li) => /원본 재검증/.test(li.textContent))?.dataset.level);
+  assert.equal(row, 'info', 'U1: structural is info');
+  assert.ok(!/모두 일치/.test(await page.textContent('#finalChecklist')), 'U1: never 모두 일치');
+  S.verifySources = savedVs;
+  S.status = before;
+  assert.deepEqual(page.__errors, []);
+  await page.context().close();
+});
+
 await check('4b a stale "ready" never seals: fresh block at click time -> no POST', async () => {
   const page = await newPage(browser);
   await openSheet(page);

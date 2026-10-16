@@ -846,3 +846,18 @@ const FTStore = {
 ### 18.6 그리드 재구성과 포커스 (PR #4 Windows CI)
 - 그리드 재구성(`render()`·그룹 접기 → 40-grid `renderGridKeepFocus`)은 카드 노드를 바꾼다: 재구성 전에 포커스가 카드·그룹 머리·그리드에 있었고 뒤에 `<body>`로 떨어졌으면 같은 카드(없으면 그리드)로 되돌린다(`preventScroll`). 자동 저장 재시도·크기 변경 재렌더가 아무 때나 와도 키보드 포커스를 잃지 않는다. verify-viewer-dialogs "R11: a grid rebuild keeps keyboard focus".
 - 하네스: verify-review-batch --unit "R11 U1–U4", verify-finalize-sheet 4d(U4).
+
+## 19. R12 트랙 U 추가 계약 (2026-10-16, docs/PLAN_R12_2026-10-16.md)
+
+### 19.1 `lane_status: "structural"` (U1)
+- `/api/verify-sources`의 `lane_status === "structural"`(이 PC에 감사 키 없음)이면 `verifySourcesVerdict`(41-finalize, legacy 70-finalize 동일)는 초록이 아니라 `info`(`kind: "structural"`): 토스트 "원본 재검증: N건 일치 (자기 일관성만 — 인증 아님)", 점검 목록 "원본 재검증: 자기 일관성만 — 인증 아님"(`data-level="info"`). 불일치(`err`)·현재 결과 없음·확인 불가·비교 0건·비교 불가(`warn`)가 먼저. `keyed`이고 §18.4 조건을 만족할 때만 "모두 일치".
+
+### 19.2 `finalize_incomplete_detail` (U2)
+- `/api/status`의 "최종화 미완료" 줄(`.h-fin-incomplete-row`)은 detail을 툴팁뿐 아니라 줄 본문 `<small class="h-fin-detail">`에 짧게(공백 정리, 90자 넘으면 `…`; 41-finalize `finShortDetail`) 보인다. 전체 문구는 title.
+
+### 19.3 최종화 저널 (U3, 트랙 S2 P13)
+- `/api/status` `finalize_journal`(`{signoff_sha256, started_unix, state}`)이 객체이고 `state !== "recovered"` → 결과 목록 첫 줄 `.h-fin-journal-row[data-journal="check"]` "이전 최종화 중단됨 — 확인 필요" + "다시 최종화하십시오". `finalize_recovered === true`(또는 `state === "recovered"`) → `[data-journal="recovered"]` "이전 최종화 중단됨 — 복구됨". title = 검토자 기록 SHA-256 · 시작 시각 · 상태. 필드 없음(구 서버) = 줄 없음. 41-finalize `finJournalState`/`finJournalRow`. (트랙 S가 다른 `state` 값·의미를 쓰면 이 규칙을 맞춘다.)
+
+### 19.4 수리된 레인 (U4, 트랙 I3)
+- `logChains[lane].status === "repaired"`(`repair-lane`으로 찢긴 끝부분을 잘라냄) → `.log-chain` 줄 "수리됨(손상된 끝부분 잘라냄)"(i18n `chain.repaired`), 인증 안 된 줄이 있으면 " · 인증 안 된 줄 N개". title = 서버 `detail`. (이전에는 모르는 상태라 "인증 불가".)
+- 하네스: verify-review-batch --unit "R12 U1–U4", verify-finalize-sheet 4f(U1–U3, 두 테마 AA).

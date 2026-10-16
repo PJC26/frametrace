@@ -751,6 +751,67 @@ async function unitTests() {
   await r9TrackU({ fn, source, runInNewContext, assert, ex });
   await r10TrackU({ fn, source, runInNewContext, assert, ex });
   await r11TrackU({ fn, runInNewContext, assert, ex });
+  await r12TrackU({ fn, runInNewContext, assert, ex });
+}
+
+// ---- R12 track U (docs/PLAN_R12_2026-10-16.md) -----------------------------
+async function r12TrackU({ fn, runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  // U1: lane_status "structural" (no audit key) is never green, in both shells.
+  const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  const legacyFn = legacySrc.match(/^function verifySourcesVerdict\([^]*?^}/m)?.[0];
+  assert.ok(legacyFn, 'R12 U1: legacy verifySourcesVerdict exists');
+  const legacyVm = {};
+  runInNewContext(legacyFn, legacyVm);
+  const expr = `verifySourcesVerdict({ ok: true, matched: 4, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: true, is_result: true, run_id: 'r1', lane_status: 'structural' })`;
+  for (const [i, r] of [runInNewContext(expr, ex), runInNewContext(expr, legacyVm)].entries()) {
+    assert.ok(r.level === 'info' && /자기 일관성만 — 인증 아님/.test(r.toast) && /자기 일관성만 — 인증 아님/.test(r.hint) && !/모두 일치/.test(r.toast + r.hint),
+      `R12 U1 structural → info, never 모두 일치 (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
+  }
+  // A mismatch / an uncompared file still outranks the structural hint.
+  assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 4, mismatched: 1, not_comparable: 0, verified: true, is_result: true, lane_status: 'structural' }).level`, ex), 'err', 'R12 U1: mismatch first');
+  assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 4, mismatched: 0, not_comparable: 2, verified: true, is_result: true, lane_status: 'structural' }).level`, ex), 'warn', 'R12 U1: not comparable stays warn');
+  assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 4, mismatched: 0, not_comparable: 0, verified: true, is_result: true, lane_status: 'keyed' }).level`, ex), 'ok', 'R12 U1: keyed stays green');
+  console.log('PASS VM R12 U1 lane_status "structural" → info "자기 일관성만 — 인증 아님" (shell + legacy), never green');
+
+  // U2: finalize_incomplete_detail in the row body (shortened), tooltip = full.
+  const longDetail = '검토자 기록 확정 실패: review/signoff.json 사용 중 — 최종화는 끝나지 않았고 패키지는 만들지 않았습니다. 이전 서명을 복원하지 못했습니다: 액세스가 거부되었습니다 (os error 5) — 수동으로 확인하십시오';
+  const html = runInNewContext(`FIN.result = null; FIN.incomplete = null; FIN.reportStale = null;
+    FIN.status = { ok: true, phase: 'review-ready', finalize_incomplete: true, finalize_incomplete_detail: d };
+    finResultHtml()`, Object.assign(ex, { d: longDetail }));
+  const body = /<small class="h-fin-detail[^"]*">([^<]*)<\/small>/.exec(html);
+  assert.ok(body && /^검토자 기록 확정 실패/.test(body[1]) && body[1].length <= 90 && /…$/.test(body[1]), 'R12 U2: short detail in the row body: ' + html);
+  assert.ok(html.includes(`title="${longDetail}"`), 'R12 U2: full detail stays the tooltip');
+  const short = runInNewContext(`FIN.status = { ok: true, phase: 'review-ready', finalize_incomplete: true, finalize_incomplete_detail: '보고서 재생성 실패' }; finResultHtml()`, ex);
+  assert.ok(/<small class="h-fin-detail[^"]*">보고서 재생성 실패<\/small>/.test(short), 'R12 U2: a short detail is shown whole: ' + short);
+  assert.ok(!/h-fin-detail/.test(runInNewContext(`FIN.status = { ok: true, phase: 'review-ready', finalize_incomplete: true, finalize_incomplete_detail: null }; finResultHtml()`, ex)), 'R12 U2: no detail → no line');
+  console.log('PASS VM R12 U2 finalize_incomplete_detail shown (short) in the row body');
+
+  // U3 (track S2): finalize_journal / finalize_recovered; absent = nothing.
+  const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
+  const chk = js({ ok: true, phase: 'review-ready', finalize_journal: { signoff_sha256: 'ab12', started_unix: 1760000000, state: 'promoted' }, finalize_recovered: false });
+  assert.ok(/data-journal="check"/.test(chk) && /이전 최종화 중단됨 — 확인 필요/.test(chk) && /title="[^"]*ab12[^"]*상태 promoted"/.test(chk), 'R12 U3 journal on disk → 확인 필요: ' + chk);
+  const rec = js({ ok: true, phase: 'done', finalize_recovered: true, finalize_journal: null });
+  assert.ok(/data-journal="recovered"/.test(rec) && /이전 최종화 중단됨 — 복구됨/.test(rec) && !/확인 필요/.test(rec), 'R12 U3 recovered: ' + rec);
+  assert.ok(!/h-fin-journal-row/.test(js({ ok: true, phase: 'review-ready' })) && !/h-fin-journal-row/.test(js({ ok: true, phase: 'review-ready', finalize_recovered: false, finalize_journal: null })), 'R12 U3: absent fields (older server) → no row');
+  runInNewContext('FIN.status = null;', ex);
+  console.log('PASS VM R12 U3 finalize journal: 이전 최종화 중단됨 — 확인 필요 / 복구됨');
+
+  // U4 (track I3): logChains status "repaired" reads 수리됨, detail = tooltip.
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  assert.equal((i18n.match(/"chain\.repaired": /g) || []).length, 2, 'R12 U4: chain.repaired in ko + en');
+  const tctx = {
+    t: (k) => ({ 'chain.failed': '체인 검증 실패', 'chain.unreadable': '읽지 못함', 'chain.structural': '자기 일관성만(인증 아님)', 'chain.notVerified': '인증 불가(변조 판정 아님)', 'chain.repaired': '수리됨(손상된 끝부분 잘라냄)', 'chain.lane.validationLog': '검증 로그' })[k] || k,
+    tf: (k, s) => (k === 'chain.unauthN' ? `인증 안 된 줄 ${s.n}개` : k),
+    escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
+  };
+  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logChainSummary', 'logChainItems'].map((n) => fn(n)).join('\n'), tctx);
+  assert.equal(runInNewContext('logChainSummary({ status: "repaired", entries: 5, detail: "x" })', tctx), '수리됨(손상된 끝부분 잘라냄)', 'R12 U4: repaired is not "인증 불가"');
+  assert.equal(runInNewContext('logChainSummary({ status: "repaired", unauthenticated: 2 })', tctx), '수리됨(손상된 끝부분 잘라냄) · 인증 안 된 줄 2개', 'R12 U4: repaired + unauthenticated lines');
+  const rows = plain(runInNewContext('logChainItems({ validationLog: { status: "repaired", detail: "잘라낸 37바이트 SHA-256 9f…" } }, ["validationLog"])', tctx));
+  assert.ok(rows.length === 1 && /검증 로그<\/strong> 수리됨/.test(rows[0]) && /title="잘라낸 37바이트 SHA-256 9f…"/.test(rows[0]), 'R12 U4 row: ' + JSON.stringify(rows));
+  console.log('PASS VM R12 U4 logChains "repaired" → 수리됨 (detail tooltip)');
 }
 
 // ---- R11 track U (docs/PLAN_R11_2026-10-16.md) -----------------------------

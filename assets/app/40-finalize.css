@@ -53,3 +53,5 @@
 .h-fin-adv-body input[type="text"] { width: 100%; box-sizing: border-box; }
 .h-fin-out { margin: 0; padding: var(--sp-2); background: var(--surface-2); border-radius: var(--radius); font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow: auto; }
 .h-fin-adv-body a { color: var(--accent-ink); }
+/* R12 U2: the server's short detail under a 최종화 미완료 row. */
+.h-fin-detail { flex-basis: 100%; font-size: var(--fs-xs); overflow-wrap: anywhere; }
