@@ -1978,32 +1978,57 @@ fn verify_package_manifest_json(
     }
 }
 
-/// R14 I3 (track I): the packaged re-verification lane
-/// (`evidence/logs/hash-verify.jsonl`) against the newest usable
-/// `hash-verify-head` in the packaged sign-off lane. Nothing is said for a
-/// package without a sign-off lane or without any head (before R14).
+/// R14 I3 / R15 I7 (track I): each packaged result lane — the
+/// re-verification lane (`evidence/logs/hash-verify.jsonl`) and the
+/// anomaly lane (`evidence/logs/anomaly-log.jsonl`) — against the newest
+/// usable `hash-verify-head` in the PACKAGE's own sign-off lane, with the
+/// package's result run (its marker's `head_in`: its own head must be
+/// there — R14 checked with no result run, so a cut head of the result
+/// run was not seen). Nothing is said for a lane not in the package or
+/// when there is no head and nothing could hide one (`Absent`).
 fn verify_package_hash_verify_head(
     package_dir: &Path,
     listed: &std::collections::BTreeMap<String, String>,
     out: &mut PackageVerification,
 ) {
+    use crate::report::{HashVerifyHeadCheck, HeadLane};
     if !listed.contains_key(crate::report::SIGNOFF_LOG_REL_PATH) {
         return;
     }
-    let check = crate::report::hash_verify_head_check(package_dir, None, false);
-    let status = match &check {
-        crate::report::HashVerifyHeadCheck::Absent => return,
-        crate::report::HashVerifyHeadCheck::Intact { .. } => CheckStatus::Pass,
-        crate::report::HashVerifyHeadCheck::Truncated { .. }
-        | crate::report::HashVerifyHeadCheck::Rewritten { .. } => CheckStatus::Fail,
-        crate::report::HashVerifyHeadCheck::Unknown(_)
-        | crate::report::HashVerifyHeadCheck::NotAuthenticated(_) => CheckStatus::NotVerified,
-    };
-    out.push(
-        status,
-        crate::anomaly::HASH_VERIFY_REL_PATH,
-        format!("re-verification lane anchor: {}", check.describe()),
-    );
+    for lane in HeadLane::ALL {
+        if !listed.contains_key(lane.rel()) {
+            continue;
+        }
+        let check = match lane {
+            HeadLane::HashVerify => match crate::anomaly::hash_verify_assessment(package_dir) {
+                Ok(assessment) => assessment.head,
+                Err(err) => HashVerifyHeadCheck::Unknown {
+                    code: "unreadable",
+                    why: err,
+                },
+            },
+            HeadLane::Anomaly => crate::report::anomaly_head_check(package_dir),
+        };
+        let status = match &check {
+            HashVerifyHeadCheck::Absent => continue,
+            HashVerifyHeadCheck::Intact { .. } => CheckStatus::Pass,
+            HashVerifyHeadCheck::Truncated { .. } | HashVerifyHeadCheck::Rewritten { .. } => {
+                CheckStatus::Fail
+            }
+            HashVerifyHeadCheck::Unknown { .. } | HashVerifyHeadCheck::NotAuthenticated(_) => {
+                CheckStatus::NotVerified
+            }
+        };
+        let label = match lane {
+            HeadLane::HashVerify => "re-verification lane anchor",
+            HeadLane::Anomaly => "anomaly lane anchor",
+        };
+        out.push(
+            status,
+            lane.rel(),
+            format!("{label}: {}", check.describe_in(lane)),
+        );
+    }
 }
 
 fn verify_package_db_and_signoff(

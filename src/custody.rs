@@ -390,7 +390,7 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
             "<p class=\"banner bad\">Re-verification lane anchor: {}.</p>\n",
             esc(&head.describe())
         ),
-        crate::report::HashVerifyHeadCheck::Unknown(_)
+        crate::report::HashVerifyHeadCheck::Unknown { .. }
         | crate::report::HashVerifyHeadCheck::NotAuthenticated(_) => format!(
             "<p class=\"note warn\">Re-verification lane anchor: {}.</p>\n",
             esc(&head.describe())

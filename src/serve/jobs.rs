@@ -3787,6 +3787,8 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
                     not_verified_reason: Some(reason),
                     lane_status: summary.lane_status,
                     head_status: summary.head_status,
+                    head_reason: summary.head_reason,
+                    clock_note: summary.clock_note.clone(),
                     ..Default::default()
                 };
             }
@@ -3836,6 +3838,10 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
                 // R14 I3 (track U contract): the sign-off lane's
                 // `hash-verify-head` against the lane.
                 "head_status": summary.head_status,
+                // R15 I4/I5 (track U contract): why the head is unknown
+                // (`other-pc` = "다른 PC 머리일 수 있음"), and "시계 이상".
+                "head_reason": summary.head_reason,
+                "clock_note": summary.clock_note,
                 "log": crate::anomaly::HASH_VERIFY_REL_PATH,
                 "custody_url": "case/reports/custody-statement.html",
             })

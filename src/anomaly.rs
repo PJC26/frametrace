@@ -174,12 +174,19 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     findings.extend(dav_frame_gap_findings(case_dir, &rows));
 
     let scanned_unix = now_unix()?;
+    // D4 / R15 P22: one id per scan — the re-verification run id when it
+    // re-hashes, and the anomaly marker's `scan_id` — named by the head
+    // the scan writes LAST.
+    let mut nonce = [0u8; 2];
+    getrandom::fill(&mut nonce).map_err(|err| format!("failed to draw a run id: {err}"))?;
+    let scan_id = format!("{scanned_unix}-{:02x}{:02x}", nonce[0], nonce[1]);
     let hash_verify_run_id = if rehash {
-        Some(write_hash_verify_log(case_dir, scanned_unix, &checks)?)
+        write_hash_verify_log(case_dir, scanned_unix, &scan_id, &checks)?;
+        Some(scan_id.clone())
     } else {
         None
     };
-    let log_path = case_dir.join("evidence/logs/anomaly-log.jsonl");
+    let log_path = case_dir.join(crate::report::ANOMALY_LOG_REL_PATH);
     for finding in &findings {
         let line = format!(
             "{{\"schema_version\":1,\"event\":\"anomaly-scan\",\"scanned_unix\":{},\"label\":\"{}\",\"kind\":\"{}\",\"selector\":\"{}\",\"source_path\":\"{}\",\"detail\":\"{}\"}}",
@@ -230,8 +237,11 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         ) + &mtime_note
     };
     let line = format!(
-        "{{\"schema_version\":1,\"event\":\"anomaly-scan-run\",\"scanned_unix\":{},\"hash_mode\":\"{}\",\"finding_count\":{},\"mtime_unavailable\":{},\"skipped_no_hash\":{},\"skipped_missing\":{},\"skipped_error\":{},\"index_unparseable_lines\":{},\"index_rows_without_id\":{},\"index_stale_rows\":{},\"coverage_limited\":{},\"detail\":\"{}\"}}",
+        "{{\"schema_version\":1,\"event\":\"anomaly-scan-run\",\"scanned_unix\":{},\"scan_id\":\"{}\",\"{}\":\"{}\",\"hash_mode\":\"{}\",\"finding_count\":{},\"mtime_unavailable\":{},\"skipped_no_hash\":{},\"skipped_missing\":{},\"skipped_error\":{},\"index_unparseable_lines\":{},\"index_rows_without_id\":{},\"index_stale_rows\":{},\"coverage_limited\":{},\"detail\":\"{}\"}}",
         scanned_unix,
+        json_escape(&scan_id),
+        crate::report::HASH_VERIFY_MARKER_HEAD_FIELD,
+        crate::report::SIGNOFF_LOG_REL_PATH,
         if rehash { "rehash" } else { "stored" },
         findings.len(),
         mtime_unavailable,
@@ -245,6 +255,15 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         json_escape(&detail),
     );
     audit::append_chained_jsonl(&log_path, &line)?;
+    // R15 P22: the head LAST — after both result lanes are complete — so
+    // it anchors the newest run of each (R14 wrote it before the anomaly
+    // rows and anchored the re-verification lane only).
+    crate::report::record_scan_head(
+        case_dir,
+        &scan_id,
+        hash_verify_run_id.as_deref(),
+        scanned_unix,
+    )?;
     Ok(AnomalyScanResult {
         findings,
         log_path,
@@ -282,13 +301,29 @@ impl ScanLock {
             .truncate(false)
             .open(&path)
             .map_err(|err| format!("failed to open scan lock {}: {err}", path.display()))?;
-        file.try_lock_exclusive().map_err(|err| {
-            format!(
-                "이 케이스에서 다른 이상 징후 검사·원본 재검증이 실행 중입니다 — 끝난 뒤 다시 실행하십시오 ({}: {err})",
-                path.display()
-            )
-        })?;
+        file.try_lock_exclusive()
+            .map_err(|err| scan_lock_error(&path, &err))?;
         Ok(Self { file })
+    }
+}
+
+/// R15 I6: only lock CONTENTION (`WouldBlock`, or the platform's
+/// contended-lock error fs2 reports — Windows `ERROR_LOCK_VIOLATION`) is
+/// "another scan is running"; any other failure is reported as itself.
+pub(crate) fn scan_lock_error(path: &Path, err: &std::io::Error) -> String {
+    let contended = err.kind() == std::io::ErrorKind::WouldBlock
+        || (err.raw_os_error().is_some()
+            && err.raw_os_error() == fs2::lock_contended_error().raw_os_error());
+    if contended {
+        format!(
+            "이 케이스에서 다른 이상 징후 검사·원본 재검증이 실행 중입니다 — 끝난 뒤 다시 실행하십시오 ({}: {err})",
+            path.display()
+        )
+    } else {
+        format!(
+            "이상 징후 검사 잠금을 걸지 못했습니다 {}: {err}",
+            path.display()
+        )
     }
 }
 
@@ -397,7 +432,27 @@ pub struct HashVerifySummary {
     /// `intact`, `truncated`, `rewritten`, `unknown`, `not-authenticated`
     /// (`""` only in a hand-built summary).
     pub head_status: &'static str,
+    /// R15 I5: [`crate::report::HashVerifyHeadCheck::reason_code`] when
+    /// `head_status` is `unknown` (`other-pc` = "다른 PC 머리일 수 있음").
+    pub head_reason: Option<&'static str>,
+    /// R15 I4: runs whose `run_unix` is more than
+    /// [`CLOCK_SKEW_MARGIN_SECS`] after this PC's clock now.
+    pub clock_anomaly_runs: usize,
+    /// R15 I4: the "시계 이상" sentence ([`CLOCK_ANOMALY_NOTE`] first),
+    /// `None` without such a run. Not a withholding reason by itself.
+    pub clock_note: Option<String>,
 }
+
+/// R15 I4: how far in this PC's future a run's `run_unix` may lie before
+/// it is shown as a clock anomaly.
+pub const CLOCK_SKEW_MARGIN_SECS: i64 = 600;
+
+/// R15 I4: the start of [`HashVerifySummary::clock_note`].
+pub const CLOCK_ANOMALY_NOTE: &str = "시계 이상";
+
+/// R15 I3: the reason when the result run's span overlaps another
+/// completed run's (two runs written into each other).
+pub const OVERLAPPING_RUNS_REASON: &str = "완료 실행 구간 겹침";
 
 /// R13 P16: one usable `mismatch` row of a run without a completion
 /// marker that withholds the result.
@@ -589,6 +644,9 @@ pub struct HashVerifyAssessment {
     pub lane: audit::LaneRows,
     /// R14 I3: the sign-off lane's `hash-verify-head` against this lane.
     pub head: crate::report::HashVerifyHeadCheck,
+    /// R15 I4: indices into `runs` stamped more than
+    /// [`CLOCK_SKEW_MARGIN_SECS`] in this PC's future.
+    pub clock_anomalies: Vec<usize>,
 }
 
 impl HashVerifyAssessment {
@@ -617,6 +675,24 @@ impl HashVerifyAssessment {
             .collect()
     }
 
+    /// R15 I4: the "시계 이상" sentence, `None` without such a run.
+    pub fn clock_note(&self) -> Option<String> {
+        if self.clock_anomalies.is_empty() {
+            return None;
+        }
+        let ids: Vec<&str> = self
+            .clock_anomalies
+            .iter()
+            .map(|index| self.runs[*index].run_id.as_str())
+            .collect();
+        Some(format!(
+            "{CLOCK_ANOMALY_NOTE}: 실행 시각이 이 PC의 현재 시각보다 {}초 넘게 뒤인 실행 {}개({}) — 그 실행을 기록한 PC의 시계가 틀렸을 수 있음 (실행 시각은 순서의 근거가 아님)",
+            CLOCK_SKEW_MARGIN_SECS,
+            ids.len(),
+            ids.join(", ")
+        ))
+    }
+
     /// The API summary; `None` when nothing usable was ever recorded and
     /// nothing is withheld.
     pub fn summary(&self) -> Option<HashVerifySummary> {
@@ -634,6 +710,9 @@ impl HashVerifyAssessment {
                     newer_mismatched: newer_mismatches.len(),
                     newer_mismatches,
                     head_status: self.head.status(),
+                    head_reason: self.head.reason_code(),
+                    clock_anomaly_runs: self.clock_anomalies.len(),
+                    clock_note: self.clock_note(),
                     ..Default::default()
                 }
             });
@@ -648,6 +727,9 @@ impl HashVerifyAssessment {
                 .then(|| self.not_verified.join("; ")),
             lane_status,
             head_status: self.head.status(),
+            head_reason: self.head.reason_code(),
+            clock_anomaly_runs: self.clock_anomalies.len(),
+            clock_note: self.clock_note(),
             ..Default::default()
         };
         for entry in &run.entries {
@@ -678,7 +760,8 @@ pub fn hash_verify_assessment(case_dir: &Path) -> Result<HashVerifyAssessment, S
             path.display()
         )
     })?;
-    Ok(assess_runs(runs_from_lane(&lane), lane, |result| {
+    let now = now_unix().ok().map(|now| now as i64);
+    Ok(assess_runs(runs_from_lane(&lane), lane, now, |result| {
         crate::report::hash_verify_head_check(
             case_dir,
             result.map(|run| run.run_id.as_str()),
@@ -690,6 +773,7 @@ pub fn hash_verify_assessment(case_dir: &Path) -> Result<HashVerifyAssessment, S
 fn assess_runs(
     runs: Vec<HashVerifyRun>,
     lane: audit::LaneRows,
+    now: Option<i64>,
     head_check: impl FnOnce(Option<&HashVerifyRun>) -> crate::report::HashVerifyHeadCheck,
 ) -> HashVerifyAssessment {
     // R12 P12: the candidate is the run whose usable completion marker sits
@@ -722,6 +806,10 @@ fn assess_runs(
     // sit before A's marker once B's own marker is deleted. An unfinished
     // run is also newer when its first row is after the result run's
     // first row, or its `run_unix` is greater.
+    // R15 I4: (c) `run_unix` greater — only for a run not wholly BEFORE
+    // the result run's first row: a crashed run stamped by a clock set in
+    // the future, positioned entirely before the result, withheld every
+    // later result forever (its stamp stayed "newer").
     let result_first = latest.map(|index| runs[index].first_index);
     let result_unix = latest.map(|index| runs[index].run_unix);
     let interrupted: Vec<usize> = (0..runs.len())
@@ -730,9 +818,36 @@ fn assess_runs(
             !run.completed
                 && (after_marker(run.last_index)
                     || result_first.is_some_and(|first| run.first_index > first)
-                    || result_unix.is_some_and(|unix| run.run_unix > unix))
+                    || (result_unix.is_some_and(|unix| run.run_unix > unix)
+                        && result_first.is_some_and(|first| run.last_index > first)))
         })
         .collect();
+    // R15 I3: two COMPLETED runs written into each other (a lane from
+    // before the scan lock, or a crash-resumed writer): which one is newer
+    // cannot be told from position — the result run's span (first row ..
+    // marker) overlapping another completed run's span withholds it.
+    let overlapping: Vec<usize> = match latest {
+        Some(result) => {
+            let (first, last) = (runs[result].first_index, runs[result].last_index);
+            (0..runs.len())
+                .filter(|index| {
+                    let run = &runs[*index];
+                    *index != result
+                        && run.completed
+                        && run.first_index <= last
+                        && run.last_index >= first
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    // R15 I4: runs stamped in this PC's future.
+    let clock_anomalies: Vec<usize> = match now {
+        Some(now) => (0..runs.len())
+            .filter(|index| runs[*index].run_unix > now.saturating_add(CLOCK_SKEW_MARGIN_SECS))
+            .collect(),
+        None => Vec::new(),
+    };
     // R14 I3: the newest `hash-verify-head` in the sign-off lane — a lane
     // shorter than it lost its tail (two deleted lines need no key).
     let head = head_check(latest.map(|index| &runs[index]));
@@ -783,9 +898,33 @@ fn assess_runs(
         });
     }
     if lane.failure.is_none()
+        && let Some(index) = latest
+        && !overlapping.is_empty()
+    {
+        let others: Vec<&str> = overlapping
+            .iter()
+            .map(|i| runs[*i].run_id.as_str())
+            .collect();
+        reasons.push(format!(
+            "{OVERLAPPING_RUNS_REASON} — 마지막 완료 실행({})의 구간(첫 항목~완료 표식)이 다른 완료 실행({})의 구간과 겹침: 두 실행이 섞여 기록돼 어느 쪽이 최신인지 위치로 알 수 없어 현재 결과로 쓰지 않음 (원본 재검증을 다시 실행하십시오)",
+            runs[index].run_id,
+            others.join(", ")
+        ));
+    }
+    if lane.failure.is_none()
         && let Some(reason) = head.withhold_reason()
     {
         reasons.push(reason);
+    }
+    // R15 I4: a withholding run stamped in the future says so.
+    if lane.failure.is_none()
+        && interrupted
+            .iter()
+            .any(|index| clock_anomalies.contains(index))
+    {
+        reasons.push(format!(
+            "{CLOCK_ANOMALY_NOTE}: 결과를 보류하는 완료 표식 없는 실행의 시각이 이 PC의 현재 시각보다 뒤임 — 실행 시각이 아니라 레인 위치로 판단함"
+        ));
     }
     let withheld = (!reasons.is_empty()).then(|| reasons.join("; "));
     let result = if withheld.is_some() { None } else { latest };
@@ -826,6 +965,7 @@ fn assess_runs(
         unauthenticated,
         lane,
         head,
+        clock_anomalies,
     }
 }
 
@@ -851,17 +991,16 @@ pub fn latest_hash_verify_summary(case_dir: &Path) -> Option<HashVerifySummary> 
 fn write_hash_verify_log(
     case_dir: &Path,
     run_unix: u64,
+    run_id: &str,
     checks: &[HashCheck],
-) -> Result<String, String> {
+) -> Result<(), String> {
     let log_path = case_dir.join(HASH_VERIFY_REL_PATH);
     let opt = |value: &Option<String>| match value {
         Some(text) => format!("\"{}\"", json_escape(text)),
         None => "null".to_string(),
     };
     // D4: every entry names its run, so readers group by run, not position.
-    let mut nonce = [0u8; 2];
-    getrandom::fill(&mut nonce).map_err(|err| format!("failed to draw a run id: {err}"))?;
-    let run_id = format!("{run_unix}-{:02x}{:02x}", nonce[0], nonce[1]);
+    let run_id = json_escape(run_id);
     for check in checks {
         let line = format!(
             "{{\"schema_version\":1,\"event\":\"hash-verify\",\"run_unix\":{run_unix},\"run_id\":\"{run_id}\",\"id\":\"{}\",\"source_path\":\"{}\",\"recorded_sha256\":{},\"observed_sha256\":{},\"status\":\"{}\"}}",
@@ -873,17 +1012,16 @@ fn write_hash_verify_log(
         );
         audit::append_chained_jsonl(&log_path, &line)?;
     }
-    // R14 I3: the marker names where this run anchors the lane, then the
-    // anchor itself (`hash-verify-head` in the sign-off lane).
+    // R14 I3: the marker names where this run anchors the lane; R15 P22:
+    // the anchor itself (`hash-verify-head` in the sign-off lane) is
+    // written by `scan_case` at the END of the scan.
     let summary = format!(
         "{{\"schema_version\":1,\"event\":\"hash-verify-run\",\"run_unix\":{run_unix},\"run_id\":\"{run_id}\",\"records\":{},\"{}\":\"{}\"}}",
         checks.len(),
         crate::report::HASH_VERIFY_MARKER_HEAD_FIELD,
         crate::report::SIGNOFF_LOG_REL_PATH,
     );
-    audit::append_chained_jsonl(&log_path, &summary)?;
-    crate::report::record_hash_verify_head(case_dir, &run_id, run_unix)?;
-    Ok(run_id)
+    audit::append_chained_jsonl(&log_path, &summary)
 }
 
 fn hash_revalidation_findings(

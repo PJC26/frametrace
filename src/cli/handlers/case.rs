@@ -1247,7 +1247,7 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
         // status and the cause-specific `detail` (chain break, key
         // configuration unreadable — not tampering —, unauthenticated
         // entries, legacy unbound entries) describe exactly those rows.
-        let entry = match crate::audit::read_lane_rows(&path) {
+        let mut entry = match crate::audit::read_lane_rows(&path) {
             Ok(lane) => lane.chain_json(rel),
             Err(err) => serde_json::json!({
                 "path": rel,
@@ -1255,6 +1255,12 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
                 "detail": format!("레인을 읽지 못함: {err}"),
             }),
         };
+        // R15 P22 / I2: the sign-off lane's head against the anomaly lane
+        // — the report's anomaly "현재 결과" is withheld when it is cut.
+        if *name == "anomaly" {
+            entry["head"] = crate::report::anomaly_head_check(case_dir)
+                .to_json_in(crate::report::HeadLane::Anomaly);
+        }
         map.insert((*name).to_string(), entry);
     }
     serde_json::Value::Object(map).to_string()

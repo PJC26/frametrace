@@ -45,7 +45,9 @@ pub struct TimelineEvent {
     pub source: &'static str,
     pub kind: &'static str,
     /// R14 I8: the event's time is not the audit lane's (a carve entry
-    /// without `carved_unix`, timed from `db/carve_results.json`) —
+    /// without `carved_unix`, timed from `db/carve_results.json`; R15 I8:
+    /// every index event — file mtime, stale mark, ffprobe creation_time —
+    /// read from `db/videos.jsonl`, which no audit chain covers) —
     /// `"time_unaudited": true` in the JSON (the viewer's badge).
     pub time_unaudited: bool,
     pub path: String,
@@ -177,7 +179,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             events.push(TimelineEvent {
                 ts_unix: mtime,
                 source: "index",
-                time_unaudited: false,
+                time_unaudited: true,
                 kind: "file-modified",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} filesystem mtime"),
@@ -192,7 +194,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             events.push(TimelineEvent {
                 ts_unix: stale_unix,
                 source: "index",
-                time_unaudited: false,
+                time_unaudited: true,
                 kind: "file-marked-stale",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} marked stale by rescan"),
@@ -216,7 +218,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 events.push(TimelineEvent {
                     ts_unix: ts,
                     source: "ffprobe",
-                    time_unaudited: false,
+                    time_unaudited: true,
                     kind: "media-creation-time",
                     path: source_path.clone(),
                     detail: format!(

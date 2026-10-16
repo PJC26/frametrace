@@ -111,9 +111,11 @@ fn r14_i1_interleaved_run_without_its_marker_withholds_the_result() {
         assert!(!html.contains(ALL_MATCH_OK), "green banner:\n{html}");
         assert!(html.contains("MISMATCH"), "{html}");
     });
-    // The same by `run_unix` alone: B's row positioned before A's first
-    // row but stamped later (a run clock is not proof, but a greater
-    // run_unix is never "older").
+    // The same by `run_unix` alone: B's first row positioned before A's
+    // first row but stamped later (a run clock is not proof, but a greater
+    // run_unix is never "older"). R15 I4: only while B is not WHOLLY
+    // before A's first row — B here spans it (`tests_r15` covers the
+    // wholly-before crash, which no longer withholds).
     let dir2 = r14_case("i1-unix", "C-i1u");
     let lane2 = dir2.join(crate::anomaly::HASH_VERIFY_REL_PATH);
     write_lane(
@@ -121,6 +123,7 @@ fn r14_i1_interleaved_run_without_its_marker_withholds_the_result() {
         &[
             hv(200, "200-bbbb", "vid_a", "mismatch"),
             hv(100, "100-aaaa", "vid_a", "match"),
+            hv(200, "200-bbbb", "vid_b", "mismatch"),
             hv_done(100, "100-aaaa", 1),
         ],
         &mine,

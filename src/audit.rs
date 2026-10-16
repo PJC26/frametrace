@@ -4313,3 +4313,7 @@ mod tests_r13;
 #[cfg(test)]
 #[path = "tests_audit_r14.rs"]
 mod tests_r14;
+
+#[cfg(test)]
+#[path = "tests_audit_r15.rs"]
+mod tests_r15;

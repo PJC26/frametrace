@@ -557,6 +557,96 @@ older run). R11:
   `db/carve_results.json` (its lane entry has no `carved_unix`); the
   detail text keeps `CARVE_TIME_UNAUDITED_NOTE`.
 
+### The head is the scan's last line and covers every result lane (R15)
+
+- **P22 — written last, both lanes.** R14 wrote the head from inside the
+  re-verification writer, BEFORE the anomaly rows, and anchored only
+  `hash-verify.jsonl`: cutting the newest anomaly run's tail (its rows and
+  marker, no key) left the anomaly lane `keyed` and the report showed the
+  previous run as "현재 결과" (reviewer PoC 5). Now `anomaly::scan_case`
+  draws ONE id per scan (`<scanned_unix>-<4 hex>`: the re-verification
+  `run_id` when it re-hashes, and the anomaly marker's new `scan_id`; the
+  marker also carries `"head_in":"evidence/logs/signoff-log.jsonl"`) and
+  calls `report::record_scan_head` as its LAST step — for every scan,
+  stored-hash scans included:
+
+  | `event` | fields |
+  |---|---|
+  | `hash-verify-head` (`schema_version: 2`) | `scan_id`, `run_id` (null without re-hash), `run_unix`, `lanes` = `{ "evidence/logs/hash-verify.jsonl": {entries, last_entry_sha256}, "evidence/logs/anomaly-log.jsonl": {…} }` (`entries: 0`, `last_entry_sha256: null` for an empty lane); plus the R14 top-level `lane`/`entries`/`last_entry_sha256` for the re-verification lane when it is not empty |
+
+  `report::lane_head_check(root, HeadLane, result_id, marker_wants_head)`
+  is the one reader (`hash_verify_head_check` and `anomaly_head_check`
+  wrap it; the anomaly result run is the lane's newest usable
+  `anomaly-scan-run` marker, its `scan_id`/`head_in` are the result id /
+  "wants head"). An R14 head (no `lanes`) anchors the re-verification lane
+  only — for the anomaly lane it is `absent`. The report's anomaly section
+  reads the check from `auditChains.anomaly.head` (`{status, reason_code,
+  withhold_reason, detail}`, filled by `make-report`'s
+  `report_audit_chains_json`) and withholds "현재 결과" on `truncated` /
+  `rewritten` / `unknown`.
+- **P22 — no usable head is not "absent" when something could hide one
+  (I1).** Reviewer PoC 1: pre-R14 run A (match, no `head_in`), R14 run B
+  (mismatch, head H_B); strip H_B's `entry_hmac_*` fields (it is the
+  sign-off lane's last line, so the chain still passes — or a keyed line
+  follows and the chain breaks there) and cut B's two rows from the
+  re-verification lane: no usable head was left, R14 said `absent` and A
+  was green. Now, with no usable head, a sign-off lane with a chain
+  failure (`chain-failed`), ANY line this PC cannot use (`unusable-line`,
+  or `other-pc`, below) or a `lane-repair` marker (`repaired`) is
+  `unknown` and withholds — the unusable line may be the stripped head,
+  and its content is never read (P12). `absent` remains only for a
+  sign-off lane that is missing or wholly usable with no head.
+  Consequence: a pre-R14 keyed case whose sign-off lane holds an
+  unusable line has no re-verification result until the next scan writes
+  a head (lines before a usable head do not matter).
+- **I5 — "다른 PC 머리일 수 있음".** When every such unusable sign-off line
+  (after the newest usable head, or anywhere with no usable head) is
+  signed under a key this PC does not hold (`LineTrust::OtherPc`, not
+  superseded, not in a broken lane), the reason is `other-pc`: it may be
+  that PC's newer head, not a stripped one — still no result here (a
+  newer head is exactly what such a line could be), check on the PC
+  holding the key or re-run the scan here. `HashVerifyHeadCheck::Unknown
+  { code, why }`; `reason_code()` = `other-pc` | `unusable-line` |
+  `chain-failed` | `repaired` | `malformed` | `own-head-missing` |
+  `unreadable`.
+- **I3 — overlapping completed runs.** Two COMPLETED runs written into
+  each other (A row, B row, B marker, A marker — a pre-lock lane): the
+  result run's span (first usable row … marker) overlapping another
+  completed run's span withholds the result
+  (`anomaly::OVERLAPPING_RUNS_REASON` "완료 실행 구간 겹침"). The report's
+  anomaly grouping cannot produce overlapping completed runs (a run is the
+  rows between two markers), so it has no such rule.
+- **I4 — clocks.** R14 rule (c) (an unfinished run with a greater
+  `run_unix` is newer) now applies only when the run is not WHOLLY before
+  the result run's first row: a crashed run stamped by a clock set in the
+  future, positioned entirely before the result, withheld every later
+  result forever. Runs stamped more than `CLOCK_SKEW_MARGIN_SECS` (600 s)
+  after this PC's clock are "시계 이상" (`HashVerifySummary.clock_note`,
+  `clock_anomaly_runs`; a withholding run with such a stamp adds a
+  "시계 이상" sentence to the reason). The report marks such an anomaly run
+  "(시계 이상: …)" against the viewer's clock and applies the same (c)
+  restriction.
+- **I6.** The scan lock reports "다른 … 실행 중" only for contention
+  (`WouldBlock` or fs2's `lock_contended_error`, Windows
+  `ERROR_LOCK_VIOLATION`); any other lock failure is "잠금을 걸지
+  못했습니다 …" with the real error.
+- **I7.** `verify-package` checks BOTH packaged result lanes against the
+  package's own sign-off lane with the package's result run
+  (`hash_verify_assessment(package)` / `anomaly_head_check(package)`): a
+  package whose result run's own head was cut is NOT VERIFIED
+  (`own-head-missing`) — R14 passed `(None, false)` and the older head
+  still matched. Subjects `evidence/logs/hash-verify.jsonl` and
+  `evidence/logs/anomaly-log.jsonl`, detail "… lane anchor: …".
+- **I8.** Index timeline events (file mtime, stale mark, ffprobe
+  `creation_time`, all from `db/videos.jsonl`, which no chain covers)
+  are `time_unaudited: true`.
+- **I9.** A source-scan test checks that every whole `"FRAMETRACE_…"`
+  string literal in `src/`, `tests/` is in `APP_ENV_VARS` or a short list
+  of key-material / key-source-test names.
+- **Limit (unchanged):** cutting the result lane's tail AND the sign-off
+  lane's last head still restores the previous run (its marker's
+  `head_in` names a head that is still there).
+
 **Implementation notes (what shipped):**
 
 - `src/hmac.rs` — HMAC-SHA-256 hand-assembled over the existing `sha2`

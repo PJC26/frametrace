@@ -656,6 +656,18 @@ const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(tru
 // unmarked run is also newer when its first entry is after the completed
 // run's first entry or its scanned_unix is greater.
 const anomalyRunFirst = run => Math.min(...run.entries.map(item => anomalyPosition.get(item) ?? Infinity), run.run ? (anomalyPosition.get(run.run) ?? Infinity) : Infinity);
+// R15 I4: the run's last lane position — a run stamped later but placed
+// wholly before the completed run's first entry is an older crash with a
+// clock set in the future, not a newer run.
+const anomalyRunLast = run => Math.max(...run.entries.map(item => anomalyPosition.get(item) ?? -Infinity), run.run ? (anomalyPosition.get(run.run) ?? -Infinity) : -Infinity);
+// R15 I4: "시계 이상" — a run stamped more than 600 s after this viewer's
+// clock.
+const anomalyClockAhead = run => Number.isFinite(run.ts) && run.ts > Date.now() / 1000 + 600;
+// R15 P22 / I2: the sign-off lane's hash-verify-head against the anomaly
+// lane (`auditChains.anomaly.head`): a cut tail, a rewritten lane or a
+// head that cannot be relied on withholds the current result.
+const anomalyHead = auditChains && auditChains.anomaly && typeof auditChains.anomaly.head === "object" ? auditChains.anomaly.head : null;
+const anomalyHeadReason = anomalyHead && typeof anomalyHead.withhold_reason === "string" ? anomalyHead.withhold_reason : "";
 const latestAnomalyRun = anomalyRuns[latestCompleted] || null;
 // R14 I4: no completed run at all in a lane written by a marker-writing
 // scanner (its entries carry schema_version — every scanner since run
@@ -666,13 +678,15 @@ const anomalyMarkedLane = anomalyLog.some(item => item?.schema_version !== undef
 const newerAnomalyRuns = latestAnomalyRun
   ? anomalyRuns.filter((run, index) => run.run === null && (index > latestCompleted
       || anomalyRunFirst(run) > anomalyRunFirst(latestAnomalyRun)
-      || (Number.isFinite(run.ts) && Number.isFinite(latestAnomalyRun.ts) && run.ts > latestAnomalyRun.ts)))
+      || (Number.isFinite(run.ts) && Number.isFinite(latestAnomalyRun.ts) && run.ts > latestAnomalyRun.ts
+        && anomalyRunLast(run) > anomalyRunFirst(latestAnomalyRun))))
   : anomalyMarkedLane ? anomalyRuns.slice() : [];
 const anomalyWithheldReasons = [
   anomalyUnusableAfter ? "가장 최근 완료 실행의 완료 표식 뒤에 이 PC에서 인증할 수 없는 항목이 있어(더 새 실행의 완료 표식일 수 있음) 그 결과를 알 수 없습니다 (아래 \"인증 안 된 감사 항목\" 참조)" : "",
   anomalyRepairedAfter ? "마지막 완료 실행 뒤에 레인 수리(lane-repair) 표식이 있어 — 잘린 꼬리에 더 새 실행이 있었을 수 있어 — 최신 실행을 알 수 없습니다 (이상 징후 검사를 다시 실행하십시오)" : "",
   newerAnomalyRuns.length && latestAnomalyRun ? `표식 없는 더 새 실행 있음 — 마지막 완료 실행 뒤에 있거나 그 뒤에 시작한 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회: 완료 표식이 지워졌거나 실행이 중단됐을 수 있습니다 (이상 징후 검사를 다시 실행하십시오)` : "",
   newerAnomalyRuns.length && !latestAnomalyRun ? `표식 없는 더 새 실행 있음 — 완료된 실행이 없고 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회만 있습니다: 완료 표식이 지워졌거나 실행이 중단됐을 수 있어 결과가 아닙니다 (이상 징후 검사를 다시 실행하십시오)` : "",
+  anomalyHeadReason,
 ].filter(Boolean);
 const currentAnomalyIndex = anomalyWithheldReasons.length ? -1 : latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
 const currentAnomalyRun = anomalyRuns[currentAnomalyIndex] || null;
@@ -701,7 +715,7 @@ const indexCoverageText = marker => {{
 }};
 const anomalyRunLine = run => {{
   const mode = run.run ? (run.run.hash_mode === "rehash" ? "해시 모드: 실시간 재해시" : "해시 모드: 색인에 저장된 해시") : "실행 기록 없음(완료 표시 없는 실행)";
-  return `실행 시각 ${{fmtUnix(run.ts)}} · ${{mode}} · 후보 ${{findingRows(run).length}}건${{run.run?.coverage_limited && run.run?.hash_mode === "rehash" && (run.run.skipped_no_hash || run.run.skipped_missing || run.run.skipped_error) ? " · 일부 파일 재해시 못 함" : ""}}${{indexCoverageText(run.run)}}`;
+  return `실행 시각 ${{fmtUnix(run.ts)}}${{anomalyClockAhead(run) ? " (시계 이상: 이 PC의 현재 시각보다 뒤)" : ""}} · ${{mode}} · 후보 ${{findingRows(run).length}}건${{run.run?.coverage_limited && run.run?.hash_mode === "rehash" && (run.run.skipped_no_hash || run.run.skipped_missing || run.run.skipped_error) ? " · 일부 파일 재해시 못 함" : ""}}${{indexCoverageText(run.run)}}`;
 }};
 const anomalyRows = currentAnomalyRun ? findingRows(currentAnomalyRun) : [];
 document.getElementById("anomaly-findings").innerHTML = currentAnomalyRun
@@ -2910,13 +2924,14 @@ pub(crate) fn audio_levels_object(json: &str) -> String {
     }
 }
 
-// R14 I3 (track I): the `hash-verify-head` writer/reader, apart from the
-// finalize pairing above.
+// R14 I3 / R15 P22 (track I): the `hash-verify-head` writer/reader, apart
+// from the finalize pairing above.
 #[path = "report_hash_verify_head.rs"]
 mod hash_verify_head;
 pub use hash_verify_head::{
-    HASH_VERIFY_HEAD_EVENT, HASH_VERIFY_HEAD_TRUNCATED, HASH_VERIFY_MARKER_HEAD_FIELD,
-    HashVerifyHeadCheck, hash_verify_head_check, record_hash_verify_head,
+    ANOMALY_LOG_REL_PATH, HASH_VERIFY_HEAD_EVENT, HASH_VERIFY_HEAD_TRUNCATED,
+    HASH_VERIFY_MARKER_HEAD_FIELD, HEAD_OTHER_PC_NOTE, HEAD_SCHEMA_VERSION, HashVerifyHeadCheck,
+    HeadLane, anomaly_head_check, hash_verify_head_check, lane_head_check, record_scan_head,
 };
 
 /// A JSON array literal; anything else (empty input, garbage) is `[]`.
