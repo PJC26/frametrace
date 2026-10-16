@@ -428,7 +428,13 @@ function logTrustPcKey(trust) {
 function untrustedStatusOf(trust) {
   return logTrustPcKey(trust) ? "auth-other-pc" : "unauthenticated";
 }
-// Per key: the latest usable entry, and the latest one that is not.
+// Per key: the latest usable entry, the latest one that is not, and the
+// latest of all (`last`).
+// R10 U1 (P7, recency): when the latest entry of a key is not usable and an
+// earlier one is, the key is NOT rolled back to that earlier line — the
+// unusable entry is current and carries the non-enumerable flag
+// `ftNewerUnauth` ("더 최근 인증 안 된 항목 있음"; a copy, so the log list
+// itself is untouched and exports never see the flag).
 function logSlots(list, keyOf) {
   const slots = new Map();
   for (const item of Array.isArray(list) ? list : []) {
@@ -436,38 +442,113 @@ function logSlots(list, keyOf) {
     const key = keyOf(item);
     if (!key) continue;
     let slot = slots.get(key);
-    if (!slot) { slot = { usable: null, untrusted: null }; slots.set(key, slot); }
-    if (logTrustUsable(logTrustOf(item))) slot.usable = item; else slot.untrusted = item;
+    if (!slot) { slot = { usable: null, untrusted: null, last: null }; slots.set(key, slot); }
+    if (logTrustUsable(logTrustOf(item))) {
+      slot.usable = item;
+      slot.last = item;
+      continue;
+    }
+    let entry = item;
+    if (slot.usable) {
+      entry = Object.assign({}, item);
+      Object.defineProperty(entry, "ftNewerUnauth", { value: true, enumerable: false });
+    }
+    slot.untrusted = entry;
+    slot.last = entry;
   }
   return slots;
 }
-// The current entry per key (first-seen key order): the latest usable one;
-// an entry this PC could not authenticate only when the key has no usable
-// entry at all (shown, with its own status — never as the result).
+// The current entry per key (first-seen key order): the latest one. R10 U1
+// (P7): an unusable latest entry is current even when an earlier one was
+// usable — the record is then not confirmed (its own status says so).
 function currentLogEntries(list, keyOf) {
-  return [...logSlots(list, keyOf).values()].map(slot => slot.usable || slot.untrusted);
+  return [...logSlots(list, keyOf).values()].map(slot => slot.last);
+}
+// The server's reason for an entry this PC could not use (`trust_note`),
+// "" otherwise. R10 U5: in a bundle the reason was written on the PC that
+// generated it — "이 PC" there is not the PC reading it now.
+function logTrustNote(item) {
+  if (!item || typeof item !== "object" || logTrustUsable(logTrustOf(item))) return "";
+  const note = item.trust_note == null ? "" : String(item.trust_note).trim();
+  return viewerTrustFromBundle() ? note.replace(/이 PC/g, "생성 PC").replace(/\bthis PC\b/gi, "the generating PC") : note;
 }
 // The status a record shows and the trust it rests on.
 //   own        the record's own log entry (carve / recovery / join; null
 //              for an indexed video)
-//   valid      the usable validation entry of its path (or null)
-//   unvalid    the latest validation entry this PC could not authenticate
+//   valid      the usable validation entry of its path (or null) — only
+//              when it is the path's latest validation (P7)
+//   unvalid    the path's latest validation when this PC could not
+//              authenticate it
 //   fallback   the status without any validation
+// -> { status, trust[, newer: true][, note] }  (`newer`: a newer entry this
+//    PC could not use superseded a usable one, R10 U1; `note`: that
+//    entry's trust_note, R10 U3)
 function recordStatusOf(own, valid, unvalid, fallback) {
   const ownTrust = own ? logTrustOf(own) : "";
-  if (own && !logTrustUsable(ownTrust)) return { status: untrustedStatusOf(ownTrust), trust: ownTrust };
+  const untrusted = (item, trust) => {
+    const out = { status: untrustedStatusOf(trust), trust };
+    if (item.ftNewerUnauth) out.newer = true;
+    const note = logTrustNote(item);
+    if (note) out.note = note;
+    return out;
+  };
+  if (own && !logTrustUsable(ownTrust)) return untrusted(own, ownTrust);
   if (valid && valid.validation_status) return { status: valid.validation_status, trust: logTrustOf(valid) || ownTrust };
-  if (unvalid) { const tr = logTrustOf(unvalid); return { status: untrustedStatusOf(tr), trust: tr }; }
+  if (unvalid) return untrusted(unvalid, logTrustOf(unvalid));
   return { status: fallback, trust: ownTrust };
 }
 // Tooltip of a record's status badge: the raw status plus what its trust means.
 function statusTitle(record) {
   const status = String(record && record.status || "");
   const trust = String(record && record.statusTrust || "");
-  if (status === "auth-other-pc") return tf("trust.otherPc", { key: logTrustPcKey(trust) || "?" });
-  if (status === "unauthenticated") return t("status.tip.unauth");
+  // R10 U3: the server's reason; R10 U1: a newer entry this PC could not
+  // use superseded a usable one.
+  const note = record && record.statusNote ? "\n" + record.statusNote : "";
+  const newer = !!(record && record.statusNewer);
+  const head = newer ? t("status.tip.newer") + " · " : "";
+  if (status === "auth-other-pc") return head + tf("trust.otherPc", { key: logTrustPcKey(trust) || "?" }) + note;
+  if (status === "unauthenticated") return head + t(newer ? "status.unauth" : "status.tip.unauth") + note;
   if (trust === "sc") return status + " · " + t("trust.sc");
   return status;
+}
+
+// R10 U3: what records-meta's `logChains[lane]` says when it is not plainly
+// fine: "" for an absent lane or a keyed one with every line authenticated;
+// otherwise a short state ("체인 검증 실패", "인증 안 된 줄 N개", …). An
+// unknown status reads "인증 불가" (fail closed, never a failure verdict).
+function logChainSummary(chain) {
+  if (!chain || typeof chain !== "object") return "";
+  const st = String(chain.status || "");
+  const n = Number(chain.unauthenticated) > 0 ? Number(chain.unauthenticated) : 0;
+  if (st === "absent" || (st === "keyed" && !n)) return "";
+  if (st === "failed") return t("chain.failed");
+  if (st === "unreadable") return t("chain.unreadable");
+  if (st === "structural") return t("chain.structural");
+  if (n) return tf("chain.unauthN", { n });
+  return t("chain.notVerified");
+}
+// The lanes a record's log entries come from (head of its log list).
+function logChainLanesOf(record) {
+  const lanes = ["validationLog"];
+  if (record && record.kind === "carved") lanes.push("carveLog");
+  if (record && record.kind === "filesystem") lanes.push("filesystemLog");
+  if (record && record.kind === "joined") lanes.push("joinLog");
+  if (record && Array.isArray(record.anomalies) && record.anomalies.length) lanes.push("anomalyLog");
+  return lanes;
+}
+// One warn row per lane whose chain is not plainly fine; the server's
+// `detail` is the tooltip. [] without logChains (older server, bundle).
+function logChainItems(chains, lanes) {
+  if (!chains || typeof chains !== "object") return [];
+  return lanes.map(lane => {
+    const chain = chains[lane];
+    const text = logChainSummary(chain);
+    if (!text) return "";
+    let detail = chain && chain.detail != null ? String(chain.detail) : "";
+    if (viewerTrustFromBundle()) detail = detail.replace(/이 PC/g, "생성 PC");
+    return `<div class="validation-item warn log-chain" data-lane="${escapeHtml(lane)}"${detail ? ` title="${escapeHtml(detail)}"` : ""}>` +
+      `<strong>${escapeHtml(t("chain.lane." + lane))}</strong> ${escapeHtml(text)}</div>`;
+  }).filter(Boolean);
 }
 
 function statusLabel(status) {
@@ -560,11 +641,23 @@ function videoFps(video) {
 }
 
 // R9 U1: a validation this PC could not authenticate never confirms a
-// record: `validationsByPath` holds the latest USABLE entry per path,
-// `untrustedValidationsByPath` the latest one that is not.
+// record: `validationsByPath` holds the usable entry per path,
+// `untrustedValidationsByPath` the one that is not.
 const validationSlots = logSlots(validationLog, item => normalizePath(item.target_path));
-const validationsByPath = new Map([...validationSlots].filter(([, s]) => s.usable).map(([k, s]) => [k, s.usable]));
-const untrustedValidationsByPath = new Map([...validationSlots].filter(([, s]) => s.untrusted).map(([k, s]) => [k, s.untrusted]));
+// R10 U1 (P7): only the path's LATEST validation counts — a usable one
+// confirms; an unusable one (even after a usable one) makes the record
+// unauthenticated. An older usable line is never rolled back to.
+function splitValidationSlots(slots) {
+  const usable = new Map(), untrusted = new Map();
+  for (const [k, s] of slots) {
+    if (s.last && s.last === s.usable) usable.set(k, s.usable);
+    else if (s.last) untrusted.set(k, s.last);
+  }
+  return { usable, untrusted };
+}
+const validationSplit = splitValidationSlots(validationSlots);
+const validationsByPath = validationSplit.usable;
+const untrustedValidationsByPath = validationSplit.untrusted;
 const recoveredFilesystemLog = currentLogEntries(
   filesystemLog.filter(item => item && item.event === "recover-inode" && item.output_path),
   item => `${item.partition_offset ?? 0}:${item.inode || normalizePath(item.output_path)}`);
@@ -578,7 +671,8 @@ const inspectionWarnings = filesystemLog
 // Lossless joins (artifacts/joined/join-log.jsonl, docs/PLAN_PHASE2_JOIN_AUDIO
 // §1.5/§1.8): one derived record per output file; a later entry for the same
 // output path supersedes an earlier one.
-// R9 U1: an unauthenticated later entry never replaces a usable one.
+// R10 U1 (P7): a later entry this PC could not use makes the record
+// unauthenticated ("더 최근 인증 안 된 항목 있음"), never the older usable one.
 const joinLog = currentLogEntries(Array.isArray(DATA.joinLog) ? DATA.joinLog : [], item => item.output_path ? normalizePath(item.output_path) : "");
 
 // Gaps/overlaps of a join (log entry, plan or manifest totals) are not
@@ -696,6 +790,8 @@ const records = [
       vendor: video.source_profile?.vendor || "-",
       status: st.status,
       statusTrust: st.trust,
+      statusNewer: !!st.newer,
+      statusNote: st.note || "",
       sha256: validation?.target_sha256 || video.sha256 || video.hash_status || "-",
       duration: validation?.duration_seconds ?? video.duration_seconds,
       codec: validation?.video_codec || video.video_codec || "-",
@@ -726,6 +822,8 @@ const records = [
       vendor: "Recovered candidate",
       status: st.status,
       statusTrust: st.trust,
+      statusNewer: !!st.newer,
+      statusNote: st.note || "",
       sha256: validation?.target_sha256 || item.sha256 || "-",
       duration: validation?.duration_seconds,
       // An extension is not a codec — falling back to it marks carved
@@ -788,6 +886,8 @@ const records = [
       vendor: "Filesystem recovery",
       status: st.status,
       statusTrust: st.trust,
+      statusNewer: !!st.newer,
+      statusNote: st.note || "",
       sha256: validation?.target_sha256 || item.sha256 || "-",
       duration: validation?.duration_seconds,
       codec: validation?.video_codec || "-",
@@ -825,6 +925,8 @@ const records = [
       vendor: t("joined.vendor"),
       status: st.status,
       statusTrust: st.trust,
+      statusNewer: !!st.newer,
+      statusNote: st.note || "",
       sha256: item.output_sha256 || "-",
       duration: Number.isFinite(item.duration_seconds) ? item.duration_seconds : null,
       codec: "-",

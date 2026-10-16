@@ -230,7 +230,7 @@ function renderDetails() {
   const related = validationLog.filter(item => normalizePath(item.target_path) === normalizePath(record.path) || item.selector === record.id);
   const anomalyRelated = (record.anomalies || []).map(item => `<div class="validation-item">
     <strong>${escapeHtml(item.kind || "anomaly")}</strong>${logTrustTagHtml(item)}
-    <div class="muted">${escapeHtml(item.detail || "")}</div>
+    <div class="muted">${escapeHtml(item.detail || "")}</div>${logTrustNoteHtml(item)}
     <code>candidate-finding</code>
   </div>`);
   const warningItems = (record.warnings || []).map(warning => `<div class="validation-item warn">
@@ -248,16 +248,22 @@ function renderDetails() {
     }).join("")}</ol>
     <div class="muted">${escapeHtml(record.note)}</div>
   </div>`] : [];
-  els.validationList.innerHTML = [
+  // R10 U1: the record rests on a newer entry this PC could not use.
+  const newerItems = record.statusNewer ? [`<div class="validation-item warn status-newer">
+    <strong>${escapeHtml(t("status.tip.newer"))}</strong>
+    ${record.statusNote ? `<div class="muted">${escapeHtml(record.statusNote)}</div>` : ""}
+  </div>`] : [];
+  // R10 U3: the lanes' chain state heads the list.
+  els.validationList.innerHTML = logChainItems(logChains, logChainLanesOf(record)).join("") + newerItems.join("") + ([
     ...joinItems,
     ...warningItems,
     ...related.map(item => `<div class="validation-item">
     <strong>${escapeHtml(item.validation_status || "-")}</strong>${logTrustTagHtml(item)}
-    <div class="muted">${escapeHtml(item.validation_note || item.ffprobe_error || "-")}</div>
+    <div class="muted">${escapeHtml(item.validation_note || item.ffprobe_error || "-")}</div>${logTrustNoteHtml(item)}
     <code>${escapeHtml(item.target_sha256 || "-")}</code>
   </div>`),
     ...anomalyRelated
-  ].join("") || `<div class="validation-item">${t("validation.none")}</div>`;
+  ].join("") || `<div class="validation-item">${t("validation.none")}</div>`);
 }
 
 // Facet counts come from facetCounts() (40-grid.js): each dimension is

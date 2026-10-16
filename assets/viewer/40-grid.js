@@ -887,7 +887,16 @@ function logTrustTagHtml(item) {
   if (trust === "sc") return ` <span class="badge candidate">${escapeHtml(t("trust.sc"))}</span>`;
   if (logTrustUsable(trust)) return "";
   const pc = logTrustPcKey(trust);
-  return ` <span class="badge candidate" title="${escapeHtml(pc ? tf("trust.otherPc", { key: pc }) : t("status.tip.unauth"))}">${ftIcon("lock")}${escapeHtml(pc ? t("status.otherPc") : t("trust.unauth"))}</span>`;
+  // R10 U3: the server's own reason (trust_note) in the tooltip.
+  const note = logTrustNote(item);
+  const tip = (pc ? tf("trust.otherPc", { key: pc }) : t("status.tip.unauth")) + (note ? "\n" + note : "");
+  return ` <span class="badge candidate" title="${escapeHtml(tip)}">${ftIcon("lock")}${escapeHtml(pc ? t("status.otherPc") : t("trust.unauth"))}</span>`;
+}
+// R10 U3: the trust_note of an entry this PC could not use, as a detail
+// line under it ("" otherwise).
+function logTrustNoteHtml(item) {
+  const note = logTrustNote(item);
+  return note ? `<div class="muted trust-note">${escapeHtml(note)}</div>` : "";
 }
 
 // Status is never colour alone: every status badge carries an icon + text.

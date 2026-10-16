@@ -430,6 +430,9 @@ function storePhase(st) {
   if (!st || !st.has_job) return "empty";
   const p = String(st.phase || "");
   if (p === "finalizing") return "review-ready";
+  // R10 U4: a package whose finalize did not complete is not "finalized".
+  const incomplete = !!st.package_dir && packageIncomplete(st.package_dir, st.package_incomplete);
+  if ((p === "done" || p === "finalized") && incomplete) return "done";
   if (p === "done" && st.package_dir) return "finalized";
   return ["running", "review-partial", "review-ready", "done", "finalized", "error"].includes(p) ? p : "empty";
 }
@@ -515,6 +518,7 @@ function applyStatus(st) {
         caseDir,
         name: caseBaseName(caseDir),
         packageDir: st.package_dir || "",
+        packageIncomplete: !!st.package_dir && packageIncomplete(st.package_dir, st.package_incomplete),
         restored: !!st.restored,
       }),
       jobs,

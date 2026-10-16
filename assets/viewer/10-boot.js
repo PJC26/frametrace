@@ -18,6 +18,11 @@ const ftHosted = !!opts.hosted;
 const DATA = opts.data && opts.data.manifest ? opts.data : await loadViewerData({ root: ftRoot, signal: ftSignal, url: opts.url || "" });
 // destroy() while the list was still loading: this mount is void.
 if (!opts.isCurrent()) return;
+// R10 U5: the trust codes of a bundle (data-bundle.js, an inline bundle)
+// were computed on the PC that generated it, not on this one — trust texts
+// then say "생성 PC 기준" instead of "이 PC" (20-i18n trustI18nKey). Only
+// data the loader fetched from this server's API is "live".
+const trustFromBundle = !(typeof LIVE_TRUST_DATA === "object" && LIVE_TRUST_DATA.has(DATA));
 // R7 (S ↔ U): make-review / records-meta embed `null` for a case.json or
 // evidence index that is not valid JSON (util::json_for_script). An empty
 // list would read as "no evidence": say the case files were not read
@@ -45,6 +50,9 @@ const carveLog = currentLogEntries(Array.isArray(DATA.carveLog) ? DATA.carveLog 
 const filesystemLog = Array.isArray(DATA.filesystemLog) ? DATA.filesystemLog : [];
 const validationLog = Array.isArray(DATA.validationLog) ? DATA.validationLog : [];
 const anomalyLog = Array.isArray(DATA.anomalyLog) ? DATA.anomalyLog : [];
+// R10 U3: records-meta's per-lane chain state (60-details logChainItems);
+// absent from older servers and bundles.
+const logChains = DATA.logChains && typeof DATA.logChains === "object" ? DATA.logChains : null;
 const anomalyFindings = anomalyLog.filter(item => item && item.kind && item.kind !== "none");
 const anomaliesBySelector = new Map();
 for (const item of anomalyFindings) {

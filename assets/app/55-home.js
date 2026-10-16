@@ -124,7 +124,10 @@ function recentState(it, st) {
       const what = pct !== null ? `분석 중단 ${pct}%` : done ? `분석 중단 (${done.toLocaleString()}건 처리)` : "분석 중단";
       return { state: what, action: it.source_path ? "resume" : "open", label: it.source_path ? "이어서" : "열기" };
     }
-    case "finalized": return { state: "결과물 생성됨" + counts, action: "open", label: "열기" };
+    // R10 U4: the case's last package did not finish finalizing (S2
+    // "<package>_INCOMPLETE"; fields a server may send — absent is fine).
+    case "finalize-incomplete": return { state: H_PKG_INCOMPLETE + counts, action: "open", label: "열기" };
+    case "finalized": return { state: (packageIncomplete(it.package_dir, it.finalize_incomplete) ? H_PKG_INCOMPLETE : "결과물 생성됨") + counts, action: "open", label: "열기" };
     case "review": return { state: (counts ? counts.slice(3) : "검토 가능"), action: "open", label: "열기" };
     case "partial": return { state: "색인 완료 · 보강 전" + counts, action: "open", label: "열기" };
     case "empty": return { state: "분석 결과 없음", action: "open", label: "열기" };

@@ -84,7 +84,7 @@ const TRUST = {
     vl('t_auth', 'ffprobe-video-stream-confirmed', 'auth'),
     vl('t_sc', 'ffprobe-video-stream-confirmed', 'sc'),
     vl('t_legacy', 'ffprobe-video-stream-confirmed'),
-    vl('t_unauth', 'ffprobe-video-stream-confirmed', 'unauth'),
+    { ...vl('t_unauth', 'ffprobe-video-stream-confirmed', 'unauth'), trust_note: '이 PC에서 인증되지 않음 — HMAC 없음' },
     vl('t_otherpc', 'ffprobe-video-stream-confirmed', 'pc:pc-b'),
     vl('t_newer', 'validation-failed', 'auth'),
     vl('t_newer', 'ffprobe-video-stream-confirmed', 'unauth'),
@@ -95,9 +95,29 @@ const TRUST = {
   ],
   joinLog: [{ ...DATA.joinLog[0], trust: 'unauth' }],
   audioLevels: { t_audiopc: { r: 'unverified', pc: 'pc-z' } },
+  // R10 U3: records-meta's per-lane chain state (a bundle may carry it too).
+  logChains: { validationLog: { path: 'evidence/logs/validation.jsonl', status: 'not-verified', entries: 7, unauthenticated: 3, detail: '이 PC에서 인증되지 않은 줄 3개 (전체 7개 중)' } },
 };
 const trustHtml = viewerPageHtml({ data: `window.__FRAMETRACE_DATA__ = ${JSON.stringify(TRUST)};`, js: viewerBundleJs(root), root });
-const server = createServer((req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(req.url.startsWith('/err') ? errHtml : req.url.startsWith('/trust') ? trustHtml : html); });
+// R10 U5: the same records served by an API (/live/api/records, /live/api/
+// records-meta) — trust codes computed by this server, so "이 PC" wording.
+const liveHtml = viewerPageHtml({ js: viewerBundleJs(root), root });
+const liveApi = (url) => {
+  const u = new URL(url, 'http://x');
+  if (u.pathname === '/api/records') return { ok: true, total: TRUST.scan.videos.length, videos: Number(u.searchParams.get('offset')) ? [] : TRUST.scan.videos };
+  if (u.pathname === '/api/records-meta') return { ok: true, ...TRUST, scan: { ...TRUST.scan, videos: undefined } };
+  return null;
+};
+const server = createServer((req, res) => {
+  if (req.url.startsWith('/api/')) {
+    const body = liveApi(req.url);
+    res.statusCode = body ? 200 : 404;
+    res.setHeader('Content-Type', 'application/json');
+    return res.end(JSON.stringify(body || { ok: false, error: 'not here' }));
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.end(req.url.startsWith('/err') ? errHtml : req.url.startsWith('/trust') ? trustHtml : req.url.startsWith('/live') ? liveHtml : html);
+});
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch();
@@ -366,26 +386,38 @@ try {
   check('R9 U1: sc validation → 검증됨, tooltip 자기 일관성만(인증 아님)', badges.t_sc?.text === '검증됨' && /자기 일관성만\(인증 아님\)/.test(badges.t_sc.title), JSON.stringify(badges.t_sc));
   check('R9 U1: legacy (no trust field) → as before, 검증됨, nothing called authenticated', badges.t_legacy?.text === '검증됨' && !/인증/.test(badges.t_legacy.title), JSON.stringify(badges.t_legacy));
   check('R9 U1: unauth validation → 인증 안 됨 (lock), never 검증됨', badges.t_unauth?.text === '인증 안 됨' && badges.t_unauth.icon === '#i-lock', JSON.stringify(badges.t_unauth));
-  check('R9 U1/U3: another PC\'s key → 이 PC에서 인증 불가, tooltip names the key (not a tampering verdict)', badges.t_otherpc?.text === '이 PC에서 인증 불가' && /변조 판정 아님/.test(badges.t_otherpc.title) && /키 pc-b 보유 PC에서 확인/.test(badges.t_otherpc.title), JSON.stringify(badges.t_otherpc));
-  check('R9 U1: a later unauthenticated line does not replace the authenticated result (검증 실패 stays)', badges.t_newer?.text === '검증 실패', JSON.stringify(badges.t_newer));
-  check('R9 U1: carve id — the authenticated entry is the record (not the later unauthenticated one)', badges.carve_t?.text === '미검증 후보' && await tpage.evaluate(() => ((t) => /carve_t\.mp4/.test(t) && !/forged/.test(t))(document.querySelector('.card[data-id="carve_t"]')?.title || '')), JSON.stringify(badges.carve_t));
+  // R10 U5: this page is a bundle — its trust codes were computed on the PC that generated it.
+  check('R9 U1/U3 + R10 U5: another PC\'s key → 생성 PC 기준 인증 불가 (bundle), tooltip names the key (not a tampering verdict)', badges.t_otherpc?.text === '생성 PC 기준 인증 불가' && /변조 판정 아님/.test(badges.t_otherpc.title) && /키 pc-b 보유 PC에서 확인/.test(badges.t_otherpc.title) && !/이 PC/.test(badges.t_otherpc.title), JSON.stringify(badges.t_otherpc));
+  // R10 U1 (P7): the newest entry decides — an older authenticated result is never rolled back to.
+  check('R10 U1: a later unauthenticated validation → 인증 안 됨, "더 최근 인증 안 된 항목 있음" (not the older 검증 실패)', badges.t_newer?.text === '인증 안 됨' && /^더 최근 인증 안 된 항목 있음/.test(badges.t_newer.title), JSON.stringify(badges.t_newer));
+  check('R10 U1: carve id — the newer unauthenticated entry makes the record 인증 안 됨 (never the older authenticated one as confirmed)', badges.carve_t?.text === '인증 안 됨' && /^더 최근 인증 안 된 항목 있음/.test(badges.carve_t.title), JSON.stringify(badges.carve_t));
+  check('R10 U3/U5: trust_note in the badge tooltip, "이 PC" → "생성 PC" in a bundle', /생성 PC에서 인증되지 않음 — HMAC 없음/.test(badges.t_unauth?.title || '') && !/이 PC/.test(badges.t_unauth?.title || ''), JSON.stringify(badges.t_unauth));
   check('R9 U1: an unauthenticated join line → 인증 안 됨, never 파생물', badges[jid]?.text === '인증 안 됨', JSON.stringify(badges[jid]));
   const metric = await tpage.evaluate(() => document.getElementById('metricVerified')?.textContent);
   check('R9 U1: 검증됨 counts auth + sc + legacy only (3), not unauth / other-PC lines', metric === '3', String(metric));
   await tpage.locator('.card[data-id="t_newer"]').click();
   const vitems = await tpage.evaluate(() => [...document.querySelectorAll('#validationList .validation-item')].map((i) => i.textContent.replace(/\s+/g, ' ').trim()));
   check('R9 U1: the detail list shows the unauthenticated line marked 인증 안 됨', vitems.some((t) => /ffprobe-video-stream-confirmed/.test(t) && /인증 안 됨/.test(t)) && vitems.some((t) => /validation-failed/.test(t) && !/인증 안 됨/.test(t)), JSON.stringify(vitems));
+  check('R10 U3: the log list starts with the lane state (logChains), then "더 최근 인증 안 된 항목 있음"', /^검증 로그 인증 안 된 줄 3개$/.test(vitems[0] || '') && /^더 최근 인증 안 된 항목 있음/.test(vitems[1] || ''), JSON.stringify(vitems.slice(0, 2)));
+  const chainTip = await tpage.evaluate(() => document.querySelector('#validationList .log-chain')?.getAttribute('title'));
+  check('R10 U3/U5: the lane state tooltip is the server detail ("생성 PC" in a bundle)', chainTip === '생성 PC에서 인증되지 않은 줄 3개 (전체 7개 중)', String(chainTip));
+  await tpage.locator('.card[data-id="t_unauth"]').click();
+  const unNote = await tpage.evaluate(() => document.querySelector('#validationList .trust-note')?.textContent);
+  check('R10 U3: the detail shows the trust_note under the entry', unNote === '생성 PC에서 인증되지 않음 — HMAC 없음', String(unNote));
+  await tpage.locator('.card[data-id="t_auth"]').click();
+  const authItems = await tpage.evaluate(() => [...document.querySelectorAll('#validationList .validation-item')].map((i) => i.className));
+  check('R10 U1: no "더 최근" row on a record whose newest entry is authenticated', !authItems.some((c) => /status-newer/.test(c)) && authItems.some((c) => /log-chain/.test(c)), JSON.stringify(authItems));
   const apc = await tpage.evaluate(() => {
     const f = document.querySelector('.card[data-id="t_audiopc"] .audio-flag');
     return f ? { href: f.querySelector('use')?.getAttribute('href'), label: f.getAttribute('aria-label') } : null;
   });
-  check('R9 U3: an unknown sound state signed by another PC\'s key says so on the card', !!apc && apc.href === '#i-lock' && /이 PC에서 인증 불가\(변조 판정 아님\)/.test(apc.label) && /키 pc-z 보유 PC에서 확인/.test(apc.label) && !/검증 실패/.test(apc.label), JSON.stringify(apc));
+  check('R9 U3 + R10 U5: an unknown sound state signed by another PC\'s key says so on the card (생성 PC 기준 in a bundle)', !!apc && apc.href === '#i-lock' && /생성 PC 기준 인증 불가\(변조 판정 아님\)/.test(apc.label) && /키 pc-z 보유 PC에서 확인/.test(apc.label) && !/검증 실패|이 PC/.test(apc.label), JSON.stringify(apc));
   await tpage.locator('.card[data-id="t_audiopc"]').click();
   const apcDetail = await tpage.evaluate(() => {
     const dt = [...document.querySelectorAll('#summaryList dt')].find((d) => d.textContent === '소리');
     return dt ? dt.nextElementSibling.textContent : null;
   });
-  check('R9 U3: the detail says 이 PC에서 인증 불가(변조 판정 아님) — 키 pc-z', /이 PC에서 인증 불가\(변조 판정 아님\) — 키 pc-z 보유 PC에서 확인/.test(apcDetail || ''), String(apcDetail));
+  check('R9 U3 + R10 U5: the detail says 생성 PC 기준 인증 불가(변조 판정 아님) — 키 pc-z', /생성 PC 기준 인증 불가\(변조 판정 아님\) — 키 pc-z 보유 PC에서 확인/.test(apcDetail || '') && !/이 PC/.test(apcDetail || ''), String(apcDetail));
   for (const id of ['t_sc', 't_unauth', 't_audiopc']) await tpage.locator(`.card[data-id="${id}"] input[data-check]`).check();
   const tdlWait = tpage.waitForEvent('download', { timeout: 15000 }).catch(() => null);
   await tpage.evaluate(() => document.getElementById('btnDownloadCsv').click());
@@ -403,6 +435,22 @@ try {
   await tpage.waitForSelector('.card');
   check('R9 U7: said once — not again after a reload', await tpage.evaluate(() => !document.getElementById('legacyCaseDraftsNotice')));
   await tpage.close();
+
+  // R10 U5: the same data from this server's API keeps "이 PC"; logChains travel through the loader.
+  const lpage = await ctx.newPage();
+  lpage.on('pageerror', (e) => errors.push('live page: ' + String(e)));
+  await lpage.goto(base + 'live/');
+  await lpage.waitForSelector('.card[data-id="t_otherpc"]');
+  const lb = await lpage.evaluate(() => {
+    const b = document.querySelector('.card[data-id="t_otherpc"] .badge-row .badge');
+    const u = document.querySelector('.card[data-id="t_unauth"] .badge-row .badge');
+    return { text: b?.textContent, title: b?.getAttribute('title'), unTitle: u?.getAttribute('title') };
+  });
+  check('R10 U5: API data says 이 PC에서 인증 불가 (not 생성 PC)', lb.text === '이 PC에서 인증 불가' && /^이 PC에서 인증 불가\(변조 판정 아님\) — 키 pc-b/.test(lb.title || '') && /이 PC에서 인증되지 않음 — HMAC 없음/.test(lb.unTitle || '') && !/생성 PC/.test((lb.title || '') + (lb.unTitle || '')), JSON.stringify(lb));
+  await lpage.locator('.card[data-id="t_newer"]').click();
+  const lchain = await lpage.evaluate(() => { const c = document.querySelector('#validationList .log-chain'); return c ? [c.textContent.replace(/\s+/g, ' ').trim(), c.getAttribute('title')] : null; });
+  check('R10 U3: records-meta logChains reach the viewer through the loader', !!lchain && lchain[0] === '검증 로그 인증 안 된 줄 3개' && lchain[1] === '이 PC에서 인증되지 않은 줄 3개 (전체 7개 중)', JSON.stringify(lchain));
+  await lpage.close();
 
   check('no page errors', !errors.length, errors.join(' | '));
 } finally {

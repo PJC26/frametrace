@@ -169,6 +169,10 @@ await check('1 pure rows: unsavedMarksChecks / verifySourcesVerdict / finSummari
       { name: 'b.jsonl', integrity: 'not-verified', entries: 4, trust: '…; 은퇴한 키로만 서명되고 이후 현재 키 항목이 없는 줄 2개', keys_held: true, other_pc_key_ids: [] }] }),
     auNumeric: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'not-verified', entries: 3, trust: '', unauthenticated_lines: 3, other_pc_lines: 0, keys_held: true, other_pc_key_ids: ['pc-c'] }] }),
     auRewrite: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'not-verified', entries: 3, trust: '다른 PC 키로 서명된 줄 1개', rewrite_not_excluded: 'rewrite not excluded', keys_held: true, other_pc_key_ids: ['pc-b'] }] }),
+    // R10 U2: an unreadable key configuration outranks every other state, in its own words.
+    auKeyCfg: auditVerdict({ ok: true, integrity: 'integrity-not-verified', verified: 2, entries: 6, logs: [
+      { name: 'a.jsonl', integrity: 'not-verified', entries: 3, unauthenticated_lines: 3, other_pc_lines: 0, trust: '' },
+      { name: 'b.jsonl', integrity: 'not-verified', entries: 3, key_config_error: true, trust: '키 설정을 읽지 못함: 폴더입니다' }] }),
     auUnknownState: auditVerdict({ ok: true, integrity: 'integrity-something-new', verified: 1, entries: 3, logs: [{ name: 'a.jsonl', integrity: 'x', entries: 3, other_pc_key_ids: ['pc-d'] }] }),
     // R9 U2: the read-only row names its cause.
     roCase: unsavedMarksChecks({ pendingMarks: 0, saveState: 'readonly', drafts: 0, lockCause: 'case' }).map((c) => c.text).join(' | '),
@@ -183,6 +187,7 @@ await check('1 pure rows: unsavedMarksChecks / verifySourcesVerdict / finSummari
   assert.ok(r.auMixed.level === 'warn' && /인증 안 된 줄 3개/.test(r.auMixed.text) && !/보유 PC/.test(r.auMixed.text), 'R9 U4 mixed: ' + JSON.stringify(r.auMixed));
   assert.ok(/인증 안 된 줄 3개/.test(r.auNumeric.text) && !/pc-c/.test(r.auNumeric.text), 'R9 U4 numeric fields: ' + JSON.stringify(r.auNumeric));
   assert.ok(!/보유 PC/.test(r.auRewrite.text) && !/인증 안 된 줄/.test(r.auRewrite.text) && /인증되지 않음/.test(r.auRewrite.text), 'R9 U4 another cause too: ' + JSON.stringify(r.auRewrite));
+  assert.ok(r.auKeyCfg.level === 'warn' && /^감사 키 설정을 읽지 못함 — 인증 불가\(변조 판정 아님\)$/.test(r.auKeyCfg.text) && /b\.jsonl: 키 설정을 읽지 못함: 폴더입니다/.test(r.auKeyCfg.title), 'R10 U2: ' + JSON.stringify(r.auKeyCfg));
   assert.ok(r.auUnknownState.level === 'warn' && /키 pc-d 보유 PC에서 확인/.test(r.auUnknownState.text), 'R9 U3 unknown state names the key too: ' + JSON.stringify(r.auUnknownState));
   assert.ok(/case\.json/.test(r.roCase) && !/판독 기록을 읽지 못했습니다/.test(r.roCase) && /판독 기록을 읽지 못했습니다/.test(r.roAnn), 'R9 U2 finalize read-only row by cause: ' + r.roCase + ' || ' + r.roAnn);
   assert.deepEqual(r.lockFromMeta, ['case', 'annotations', ''], 'R9 U2 lock cause: the viewer\'s first, else records-meta');
@@ -287,6 +292,38 @@ await check('4 finalize POSTs once with {examiner}; result links open in a new t
   // never claims source verification that did not run
   assert.ok(!/원본 재검증: 모두 일치/.test(await page.textContent('#finalChecklist')));
   assert.ok(await page.evaluate(() => JSON.parse(localStorage.getItem('ft.viewer.CASE-1.examiner')) === 'Hong'));
+  await page.context().close();
+});
+
+// R10 U4 (track S2): a package published by a finalize that did not complete
+// ("<package>_INCOMPLETE", marker beside it) reads 최종화 미완료.
+await check('4c R10 U4: a failed finalize that left a package says 최종화 미완료; an _INCOMPLETE package is marked', async () => {
+  const page = await newPage(browser);
+  await openSheet(page);
+  await page.fill('#finalExaminer', 'Hong');
+  S.finalize = { ok: false, error: '검토자 기록 확정 실패: busy — 패키지는 이미 C:\\c\\reports\\package_001_INCOMPLETE에 만들어졌지만 최종화는 끝나지 않았습니다(최종화 미완료).' };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /실패/.test(document.getElementById('finalHint').textContent));
+  const links = await page.textContent('#finalLinks');
+  assert.ok(/최종화 미완료/.test(links) && /최종 결과로 쓰지 마십시오/.test(links), 'incomplete row: ' + links);
+  // Explicit field + success answer with an _INCOMPLETE path (a server that names it).
+  S.finalize = { ok: true, examiner: 'Hong', manifest_sha256: 'b'.repeat(64), package_dir: 'C:/c/reports/package_002_INCOMPLETE', package_url: 'reports/package_002_INCOMPLETE/' };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /package_002_INCOMPLETE/.test(document.getElementById('finalLinks').textContent));
+  const r = await page.evaluate(() => ({ badge: document.querySelector('#finalLinks .h-fin-incomplete')?.textContent, verdict: document.getElementById('finalVerdict').textContent }));
+  assert.ok(r.badge === '최종화 미완료' && /최종화 미완료/.test(r.verdict) && !/만들었습니다$/.test(r.verdict.trim()), JSON.stringify(r));
+  for (const th of ['light', 'dark']) {
+    await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
+    const label = (await contrastReport(page)).find((e) => /h-fin-incomplete/.test(e.cls));
+    assert.ok(label && ratio(label.fg, label.bg) >= 4.5, `${th}: 최종화 미완료 label contrast ${label && ratio(label.fg, label.bg).toFixed(2)}`);
+  }
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+  // A complete package afterwards clears it.
+  S.finalize = { ok: true, examiner: 'Hong', manifest_sha256: 'c'.repeat(64), package_dir: 'C:/c/reports/package_003', package_url: 'reports/package_003/' };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /package_003/.test(document.getElementById('finalLinks').textContent));
+  assert.ok(!/최종화 미완료/.test(await page.textContent('#finalLinks')) && /보고서·패키지를 만들었습니다/.test(await page.textContent('#finalVerdict')));
+  assert.deepEqual(page.__errors, []);
   await page.context().close();
 });
 

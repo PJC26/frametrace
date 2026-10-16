@@ -581,6 +581,22 @@ const I18N = {
     "status.unauth": "인증 안 됨",
     "status.otherPc": "이 PC에서 인증 불가",
     "status.tip.unauth": "인증 안 됨 — 감사 로그의 이 줄은 이 PC의 키로 인증되지 않아 결과로 쓰지 않습니다",
+    "status.tip.newer": "더 최근 인증 안 된 항목 있음",
+    "trust.otherPc@bundle": "생성 PC 기준 인증 불가(변조 판정 아님) — 키 {key} 보유 PC에서 확인",
+    "status.otherPc@bundle": "생성 PC 기준 인증 불가",
+    "status.tip.unauth@bundle": "인증 안 됨 — 생성 PC 기준, 감사 로그의 이 줄은 인증되지 않아 결과로 쓰지 않습니다",
+    "trust.sc@bundle": "생성 PC 기준 자기 일관성만(인증 아님)",
+    "audio.selfConsistent@bundle": "생성 PC 기준 자기 일관성만(인증 아님)",
+    "chain.lane.validationLog": "검증 로그",
+    "chain.lane.carveLog": "카빙 로그",
+    "chain.lane.filesystemLog": "복구 로그",
+    "chain.lane.anomalyLog": "이상 탐지 로그",
+    "chain.lane.joinLog": "이어붙임 로그",
+    "chain.failed": "체인 검증 실패",
+    "chain.structural": "자기 일관성만(인증 아님)",
+    "chain.notVerified": "인증 불가(변조 판정 아님)",
+    "chain.unauthN": "인증 안 된 줄 {n}개",
+    "chain.unreadable": "읽지 못함",
     "audio.tip.trackOtherPc": "오디오 트랙 있음 · 소리 미확인",
     "audio.detail.trackOtherPc": "오디오 트랙 있음{codec} — 소리 미확인",
     "attr.stillSaving": "아직 저장 중입니다 — 끝나면 저장 상태가 저장됨으로 바뀝니다. 그 뒤 다시 누르십시오",
@@ -1243,6 +1259,22 @@ const I18N = {
     "status.unauth": "Not authenticated",
     "status.otherPc": "Not authenticable here",
     "status.tip.unauth": "Not authenticated — this audit-log line is not authenticated by this PC's key, so it is not used as a result",
+    "status.tip.newer": "A newer entry is not authenticated",
+    "trust.otherPc@bundle": "not authenticated on the generating PC (not a tampering verdict) — check on the PC holding key {key}",
+    "status.otherPc@bundle": "Not authenticable (generating PC)",
+    "status.tip.unauth@bundle": "Not authenticated — on the generating PC this audit-log line was not authenticated, so it is not used as a result",
+    "trust.sc@bundle": "self-consistency only on the generating PC (not authenticated)",
+    "audio.selfConsistent@bundle": "self-consistency only on the generating PC (not authenticated)",
+    "chain.lane.validationLog": "Validation log",
+    "chain.lane.carveLog": "Carve log",
+    "chain.lane.filesystemLog": "Recovery log",
+    "chain.lane.anomalyLog": "Anomaly log",
+    "chain.lane.joinLog": "Join log",
+    "chain.failed": "chain check failed",
+    "chain.structural": "self-consistency only (not authenticated)",
+    "chain.notVerified": "cannot be authenticated (not a tampering verdict)",
+    "chain.unauthN": "{n} lines not authenticated",
+    "chain.unreadable": "could not be read",
     "audio.tip.trackOtherPc": "Audio track present · sound unknown",
     "audio.detail.trackOtherPc": "Audio track present{codec} — sound unknown",
     "attr.stillSaving": "Still saving — the save state turns Saved when it finishes; press again then",
@@ -1325,7 +1357,19 @@ const I18N = {
   }
 };
 
+// R10 U5: is this mount showing a bundle's trust codes (computed on the PC
+// that generated it, 10-boot trustFromBundle)? false outside a mount.
+function viewerTrustFromBundle() {
+  try { return trustFromBundle === true; } catch { return false; }
+}
+// R10 U5: a trust text that says "이 PC" has a "<key>@bundle" twin
+// ("생성 PC 기준") used when the trust codes came from a bundle.
+function trustI18nKey(key) {
+  return viewerTrustFromBundle() && Object.prototype.hasOwnProperty.call(I18N.ko, key + "@bundle") ? key + "@bundle" : key;
+}
+
 function t(key) {
+  key = trustI18nKey(key);
   let locale = storageGet(LOCALE_KEY, "ko") || "ko";
   // `state` is a top-level const initialized after the record maps that
   // call t() run — touching it in its TDZ throws ReferenceError, so the
