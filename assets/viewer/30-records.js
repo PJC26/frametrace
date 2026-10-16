@@ -803,8 +803,13 @@ function audioInfoFor(record) {
   // R4 D1/D2: "unverified" (the measurement log failed its chain check) and
   // "replayed" (a checkpoint result recorded without re-measuring) are never
   // sound/silent — the track reads 미확인 with the reason.
-  if (hasTrack) return { state: "track", level: null, reason: ["error", "stale", "unverified", "replayed"].includes(r) ? r : audioLevelsError ? "unread" : "", trust: "", pcKey: r === "unverified" ? pcKey : "" };
-  if (r === "unverified" || r === "replayed") return { state: "unknown", level: null, reason: r, trust: "", pcKey: r === "unverified" ? pcKey : "" };
+  // R14 (track I5): the server's reason for an unverified / replayed state
+  // (e.g. AUDIO_REPAIRED_AFTER_NOTE "측정 레인이 이 측정 뒤에서 수리됨 …")
+  // when the entry carries one (`note`, else `error`) — tooltip / detail.
+  const why = level && typeof level === "object" && (r === "unverified" || r === "replayed")
+    ? String(level.note != null ? level.note : level.error != null ? level.error : "").trim() : "";
+  if (hasTrack) return { state: "track", level: null, reason: ["error", "stale", "unverified", "replayed"].includes(r) ? r : audioLevelsError ? "unread" : "", trust: "", pcKey: r === "unverified" ? pcKey : "", note: why };
+  if (r === "unverified" || r === "replayed") return { state: "unknown", level: null, reason: r, trust: "", pcKey: r === "unverified" ? pcKey : "", note: why };
   if (record.probeOk === true) return { state: "none", level: null, reason: "" };
   return { state: "unknown", level: null, reason: "" };
 }
@@ -832,7 +837,11 @@ function audioTrustNote(record) {
 }
 function audioTipFor(record) {
   const text = audioTipBase(record) || (record.audioPcKey ? t("audio.unknown") : "");
-  return text ? text + audioTrustNote(record) : text;
+  return text ? text + audioTrustNote(record) + audioReasonNote(record) : text;
+}
+// R14: the server's reason (tooltip: its own line; detail: " · ").
+function audioReasonNote(record, sep) {
+  return record && record.audioNote ? (sep || "\n") + record.audioNote : "";
 }
 function audioTipBase(record) {
   const level = record.audioLevel || {};
@@ -846,7 +855,7 @@ function audioTipBase(record) {
   }
 }
 function audioDetailFor(record) {
-  return audioDetailBase(record) + audioTrustNote(record);
+  return audioDetailBase(record) + audioTrustNote(record) + audioReasonNote(record, " · ");
 }
 function audioDetailBase(record) {
   const level = record.audioLevel || {};
@@ -1069,6 +1078,7 @@ records.forEach(record => {
   record.audioReason = audio.reason;
   record.audioTrust = audio.trust || "";
   record.audioPcKey = audio.pcKey || "";
+  record.audioNote = audio.note || "";
   record.audioFacet = audioFacetOf(audio.state);
   record.prefix = prefixFor(record);
   record.recType = recTypeFor(record);

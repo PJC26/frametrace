@@ -923,3 +923,18 @@ const FTStore = {
 ### 21.5 시각 감사 안 된 타임라인 항목 (U5, 트랙 I8)
 - 타임라인 항목 `time_unaudited: true` 또는 kind가 `…-time-unaudited`로 끝나면 kind 단어(접미 뺀 것) 뒤 `badge warn tl-time-unaudited` "시각 감사 안 됨"(`timeline.badge.timeUnaudited`, title `timeline.tip.timeUnaudited`, ko·en).
 - 하네스: verify-review-batch --unit "R14 U1"–"R14 U5"(40126c3 자산에서 각각 실패 확인).
+
+### 21.6 트랙 I(3e002d8) 후속
+- `/api/verify-sources` `head_status`(absent|intact|truncated|rewritten|unknown|not-authenticated): `verifySourcesVerdict`(두 셸)가 모든 판정의 tip에 " · 재검증 머리 <head_status>"를 덧붙인다(필드 없음 = 안 붙임; 앱 셸 점검 줄 title, legacy `#finalHint` title). `truncated`/`rewritten` 또는 사유 "꼬리 잘림" → §21.3 `err`(`kind: "truncated"`). `unknown` 또는 사유 "머리 확인 불가" → `warn`, `kind: "headunknown"`, 라벨·토스트 "원본 재검증: 머리 확인 불가 — 현재 결과 없음", hint에 사유. 순서: 불일치 > 더 새 실행 불일치 > 꼬리 잘림 > 머리 확인 불가 > 현재 결과 없음.
+- 타임라인: `time_unaudited`가 boolean이면 그것만으로 배지(§21.5의 kind 접미는 필드가 없을 때만).
+- 소리: `audioLevels[id]`가 `r: "unverified"`/`"replayed"`이고 `note`(없으면 `error`) 문자열이 있으면 `record.audioNote` → 그리드 소리 툴팁 다음 줄, 상세 " · <사유>". (서버의 압축 JSON `AudioLevelState::to_json`은 아직 이유를 보내지 않음 — 보내면 바로 표시.)
+- 뷰어는 이상 징후·재검증의 "현재 실행"을 스스로 판정하지 않는다: 이상 징후는 selector별 기록된 소견을 모두 나열(현재 결과라고 주장하지 않음), 재검증 판정은 서버 요약(`is_result`·`withheld_reason`·`newer_*`)만 따른다 — P20 구간 규칙은 서버 몫.
+- 하네스: verify-review-batch --unit "R14 track I follow-up"(5b77c07 자산에서 항목별 실패 확인).
+
+### 21.7 트랙 S(0608d98) 후속 — 저널 추가 필드
+- `state: "completed-unrecorded"` → `[data-journal="unrecorded"]` "이전 최종화 완료 — 완료 기록만 빠짐"(info `.h-fin-info`), 본문 = `reason`. 차단은 `blocks_finalize`(false). legacy는 info라 줄 없음.
+- `outcome` 추가값: `refused` → `closedrefused` "이전 최종화 거부됨 — 기록만 남음", `superseded` → `closedsuperseded` "이전 최종화 대체됨 — 기록만 남음"(둘 다 경고). 나머지는 §21.2.
+- `unpaired_code` → 머리말 "이전 최종화 짝 없음(<짧은 원인>) — 확인 필요": no-local-record "로컬 기록 없음" · local-mismatch "로컬 기록 불일치" · local-unreadable "로컬 기록 읽지 못함" · lane "서명 레인 확인 불가" · journal-mismatch "저널 불일치" · legacy-journal "이전 형식 기록" · host-unknown "이 PC 식별 불가"(`FIN_UNPAIRED_SHORT`). 코드 없고 사유에 "로컬 기록 없음"이면 no-local-record, 그 밖엔 "이전 최종화 기록 짝 없음 — 확인 필요".
+- `local_record`(true/false) → title "이 PC의 로컬 기록 있음/없음"; `unpaired_code` → title "짝 없음 코드 <code>".
+- 치우기 명령(`finJournalDismissLines`, unreadable·unpaired·other-host만): `dismiss_command`(PowerShell, 작은따옴표)와 `dismiss_command_cmd`(cmd.exe)가 둘 다 있으면 두 줄 "치우기(PowerShell): …" / "치우기(명령 프롬프트): …", 하나면 "치우기: …", 둘 다 null이면 unreadable·unpaired만 내장 형식(§20.3). 점검 목록 sub는 같은 줄들을 " · "로. legacy 같음.
+- 하네스: verify-review-batch --unit "R14 track S follow-up"(이전 커밋 자산에서 실패 확인).

@@ -764,14 +764,15 @@ async function r14TrackU({ fn, runInNewContext, assert, ex }) {
   const cmdS = 'frametrace finalize-journal "C:/cases/c1" --dismiss';
   const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
   const lfn = (name) => legacySrc.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
-  const lconst = (name) => legacySrc.match(new RegExp(`^(?:const|let) ${name} = (?:\\{[^]*?^\\};|.*$)`, 'm'))?.[0];
+  // A one-line declaration (ending in ";") first, else a multi-line object up to "};".
+  const lconst = (name) => legacySrc.match(new RegExp(`^(?:const|let) ${name} = .*;$`, 'm'))?.[0] || legacySrc.match(new RegExp(`^(?:const|let) ${name} = \\{[^]*?^\\};`, 'm'))?.[0];
 
   // U1: the legacy shell blocks on the journal like the app shell, with the
   // dismiss command. Its whole gatherFinalizeChecks runs against a stub server.
-  const lnames = ['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finShortDetail', 'finJournalChecks', 'verifyChecks', 'unsavedMarksChecks', 'readLs', 'viewerWindow', 'viewerSaveState', 'gatherFinalizeChecks'];
+  const lnames = ['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finShortDetail', 'finJournalChecks', 'verifyChecks', 'unsavedMarksChecks', 'readLs', 'viewerWindow', 'viewerSaveState', 'gatherFinalizeChecks'];
   // (Helpers are optional here so a shell without them fails on behaviour.)
   assert.ok(lfn('gatherFinalizeChecks'), 'R14 U1: legacy gatherFinalizeChecks exists');
-  const lparts = ['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'lastVerifyVerdict'].map(lconst).concat(lnames.map(lfn)).filter(Boolean);
+  const lparts = ['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT', 'lastVerifyVerdict'].map(lconst).concat(lnames.map(lfn)).filter(Boolean);
   const lvm = { reviewFrameLoaded: false, reviewFrame: null, localStorage: { getItem: () => null }, $: () => null, ST: null,
     jget: async (u) => (u === '/api/status' ? lvm.ST : { manifest: { case_id: 'c1' }, annotations: { marks: [] } }), console };
   runInNewContext(lparts.join('\n') + '\nthis.setVerdict = (v) => { lastVerifyVerdict = v; };', lvm);
@@ -877,6 +878,77 @@ async function r14TrackU({ fn, runInNewContext, assert, ex }) {
   const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
   for (const k of ['timeline.badge.timeUnaudited', 'timeline.tip.timeUnaudited']) assert.equal((i18n.match(new RegExp(`"${k.replace(/\./g, '\\.')}": `, 'g')) || []).length, 2, `R14 U5: ${k} in ko + en`);
   console.log('PASS VM R14 U5 timeline time_unaudited → "시각 감사 안 됨" badge');
+
+  // Track I (3e002d8) follow-up.
+  // (1) head_status: truncated / rewritten → err, unknown → warn, always in the tooltip.
+  const legacyVerdict = {};
+  runInNewContext(legacySrc.match(/^function verifySourcesVerdict\([^]*?^}/m)[0], legacyVerdict);
+  const base = { ok: true, matched: 3, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: true, is_result: true, run_id: '9-z', lane_status: 'keyed' };
+  for (const [i, vm] of [ex, legacyVerdict].entries()) {
+    const v = (o) => plain(runInNewContext('verifySourcesVerdict(o)', Object.assign(vm, { o: Object.assign({}, base, o) })));
+    const tag = i ? 'legacy' : 'shell';
+    const rw = v({ is_result: false, verified: false, head_status: 'rewritten', withheld_reason: null });
+    assert.ok(rw.level === 'err' && rw.kind === 'truncated' && /재검증 머리 rewritten/.test(rw.tip), `R14 I3 head rewritten → err + tooltip (${tag}): ` + JSON.stringify(rw));
+    const tc = v({ is_result: false, verified: false, head_status: 'truncated', withheld_reason: '꼬리 잘림 — 결과 없음: 앵커 4 · 레인 2' });
+    assert.ok(tc.level === 'err' && /앵커 4/.test(tc.hint) && /재검증 머리 truncated/.test(tc.tip), `R14 I3 head truncated (${tag}): ` + JSON.stringify(tc));
+    const un = v({ is_result: false, verified: false, head_status: 'unknown', withheld_reason: '재검증 머리 확인 불가 — 결과 없음: 머리 뒤 쓸 수 없는 줄' });
+    assert.ok(un.level === 'warn' && un.kind === 'headunknown' && /머리 확인 불가 — 현재 결과 없음/.test(un.label) && /머리 뒤 쓸 수 없는 줄/.test(un.hint) && /재검증 머리 unknown/.test(un.tip), `R14 I3 head unknown → warn (${tag}): ` + JSON.stringify(un));
+    const ok = v({ head_status: 'intact' });
+    assert.ok(ok.level === 'ok' && ok.tip === '재검증 머리 intact', `R14 I3 head intact in the tooltip (${tag}): ` + JSON.stringify(ok));
+    assert.ok(!('tip' in v({})) || !v({}).tip, `R14 I3: no head_status (older server) → no head tooltip (${tag})`);
+  }
+  // (2) the time_unaudited field decides (kind unchanged); the suffix only without it.
+  assert.equal(runInNewContext('timelineKindHtml("carved-candidate-time-unaudited", { time_unaudited: false })', tl), 'carved-candidate', 'R14 I8: time_unaudited:false → no badge');
+  assert.ok(/tl-time-unaudited/.test(runInNewContext('timelineKindHtml("carve-file", { time_unaudited: true })', tl)), 'R14 I8: time_unaudited:true → badge');
+  // (3) an unverified sound measurement shows the server's reason.
+  const NOTE = '측정 레인이 이 측정 뒤에서 수리됨(lane-repair) — 최신 여부 알 수 없음 (다시 측정하십시오)';
+  const au = { t: (k) => ({ 'audio.tip.trackUnverified': '오디오 트랙 있음 · 측정 기록 검증 실패 — 미확인', 'audio.detail.trackUnverified': '오디오 트랙 · 측정 기록 검증 실패{codec}', 'audio.unknown': '미확인' })[k] || k,
+    tf: (k, s) => (au.t(k)).replace('{codec}', (s && s.codec) || ''), audioLevelsError: '',
+    audioLevels: { a1: { r: 'unverified', note: NOTE, trust: 'unauth' }, a2: { r: 'unverified', error: 'chain: ' + NOTE, trust: 'unauth' }, a3: { r: 'unverified', trust: 'unauth' } } };
+  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', 'audioReasonNote', 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map((n) => fn(n) || '').join('\n') +
+    '\nthis.view = (id) => { const r = { id, audioCodec: "aac", probeOk: true }; const a = audioInfoFor(r); Object.assign(r, { audioState: a.state, audioLevel: a.level, audioReason: a.reason, audioTrust: a.trust || "", audioPcKey: a.pcKey || "", audioNote: a.note || "" }); return { tip: audioTipFor(r), detail: audioDetailFor(r) }; };', au);
+  const a1 = plain(runInNewContext('view("a1")', au));
+  assert.ok(a1.tip === '오디오 트랙 있음 · 측정 기록 검증 실패 — 미확인\n' + NOTE && a1.detail.endsWith(' · ' + NOTE), 'R14 I5 sound tooltip / detail carry the note: ' + JSON.stringify(a1));
+  assert.ok(plain(runInNewContext('view("a2")', au)).tip.includes(NOTE), 'R14 I5: `error` as the reason when there is no `note`');
+  assert.equal(plain(runInNewContext('view("a3")', au)).tip, '오디오 트랙 있음 · 측정 기록 검증 실패 — 미확인', 'R14 I5: no reason → tooltip unchanged');
+  const recAll = readFileSync(new URL('../assets/viewer/30-records.js', import.meta.url), 'utf8');
+  assert.ok(/record\.audioNote = audio\.note \|\| "";/.test(recAll), 'R14 I5: records carry audioNote');
+  console.log('PASS VM R14 track I follow-up: head_status (err / warn, tooltip), time_unaudited field decides, sound reason in the tooltip');
+
+  // Track S (0608d98) follow-up: completed-unrecorded, refused / superseded,
+  // unpaired_code, local_record, single-quoted dismiss_command + dismiss_command_cmd.
+  const psCmd = "frametrace finalize-journal 'C:\\cases\\c1' --dismiss";
+  const cmdCmd = 'frametrace finalize-journal "C:\\cases\\c1" --dismiss';
+  const ur = js({ ok: true, phase: 'review-ready', finalize_journal: jn('completed-unrecorded', { outcome: 'completed', blocks_finalize: false, local_record: true, reason: '로컬 기록이 완료를 확인 — 다음 열기 때 완료 기록', dismiss_command: null, dismiss_command_cmd: null }) });
+  assert.ok(/data-journal="unrecorded"/.test(ur) && /class="h-fin-info">이전 최종화 완료 — 완료 기록만 빠짐</.test(ur) && /로컬 기록이 완료를 확인/.test(ur) && /이 PC의 로컬 기록 있음/.test(ur) && !/치우기/.test(ur), 'R14 S completed-unrecorded → info + reason: ' + ur);
+  for (const [o, w] of [['refused', '거부됨'], ['superseded', '대체됨']]) {
+    const h = closed(o);
+    assert.ok(new RegExp(`class="h-fin-incomplete">이전 최종화 ${w} — 기록만 남음<`).test(h) && !/완료/.test(h), `R14 S outcome ${o} → warning "${w}": ` + h);
+  }
+  const shorts = { 'no-local-record': '로컬 기록 없음', 'local-mismatch': '로컬 기록 불일치', 'local-unreadable': '로컬 기록 읽지 못함', 'lane': '서명 레인 확인 불가', 'journal-mismatch': '저널 불일치', 'legacy-journal': '이전 형식 기록', 'host-unknown': '이 PC 식별 불가' };
+  for (const [i, vm] of [ex, lvm].entries()) {
+    for (const [code, w] of Object.entries(shorts)) {
+      const head = runInNewContext('finJournalHead(finJournalState(s))', Object.assign(vm, { s: { finalize_journal: jn('unpaired', { unpaired_code: code, reason: 'x' }) } }));
+      assert.equal(head, `이전 최종화 짝 없음(${w}) — 확인 필요`, `R14 S unpaired_code ${code} (${i ? 'legacy' : 'shell'})`);
+    }
+    assert.equal(runInNewContext('finJournalHead(finJournalState(s))', Object.assign(vm, { s: { finalize_journal: jn('unpaired', { reason: 'x' }) } })), '이전 최종화 기록 짝 없음 — 확인 필요', `R14 S: no code → plain head (${i ? 'legacy' : 'shell'})`);
+  }
+  const two = js({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired', { unpaired_code: 'host-unknown', reason: '이 PC의 호스트 ID를 알 수 없음', blocks_finalize: true, local_record: null, dismiss_command: psCmd, dismiss_command_cmd: cmdCmd }) });
+  assert.ok(two.includes(`치우기(PowerShell): <code class="mono">frametrace finalize-journal &#39;C:\\cases\\c1&#39; --dismiss</code>`) || two.includes(`치우기(PowerShell): <code class="mono">${psCmd.replace(/'/g, '&#39;')}</code>`), 'R14 S PowerShell line: ' + two);
+  assert.ok(two.includes(`치우기(명령 프롬프트): <code class="mono">${cmdCmd.replace(/"/g, '&quot;')}</code>`) && /이 PC 식별 불가/.test(two) && /짝 없음 코드 host-unknown/.test(two), 'R14 S cmd.exe line + host-unknown: ' + two);
+  const ohCmd = js({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: 'abc', blocks_finalize: true, dismiss_command: psCmd, dismiss_command_cmd: null }) });
+  assert.ok(/data-journal="otherhost"/.test(ohCmd) && /치우기: <code class="mono">frametrace finalize-journal/.test(ohCmd), 'R14 S other-host shows the server command: ' + ohCmd);
+  const nullCmd = js({ ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn('unpaired', { blocks_finalize: true, dismiss_command: null, dismiss_command_cmd: null }) });
+  assert.ok(/치우기: <code class="mono">frametrace finalize-journal --dismiss &quot;C:\/cases\/c9&quot;<\/code>/.test(nullCmd), 'R14 S: both null → the built-in fallback: ' + nullCmd);
+  assert.ok(!/치우기/.test(js({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: 'abc', blocks_finalize: true, dismiss_command: null }) })), 'R14 S: other-host without a server command → no fallback');
+  const lTwo = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired', { unpaired_code: 'local-mismatch', reason: 'r', blocks_finalize: true, dismiss_command: psCmd, dismiss_command_cmd: cmdCmd }) });
+  assert.ok(lTwo.some((c) => c.level === 'block' && /짝 없음\(로컬 기록 불일치\)/.test(c.text) && c.sub.includes('치우기(PowerShell): ' + psCmd) && c.sub.includes('치우기(명령 프롬프트): ' + cmdCmd)), 'R14 S legacy: both command lines: ' + JSON.stringify(lTwo));
+  const lUr = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('completed-unrecorded', { outcome: 'completed', blocks_finalize: false }) });
+  assert.ok(!lUr.some((c) => /최종화/.test(c.text)), 'R14 S legacy: completed-unrecorded is info (no row)');
+  const lRef = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('completed', { outcome: 'refused', blocks_finalize: false }) });
+  assert.ok(lRef.some((c) => c.level === 'warn' && c.text === '이전 최종화 거부됨 — 기록만 남음'), 'R14 S legacy refused → warn');
+  runInNewContext('FIN.status = null;', ex);
+  console.log('PASS VM R14 track S follow-up: completed-unrecorded (info), refused / superseded (warn), unpaired_code heads, local_record tooltip, PowerShell + cmd.exe dismiss lines (shell + legacy)');
 }
 
 // ---- R13 track U (docs/PLAN_R13_2026-10-16.md) -----------------------------
@@ -1645,7 +1717,7 @@ async function r8TrackU({ fn, source, runInNewContext, assert }) {
     t: (k) => i18nKo[k] || k,
     tf: (k, subs) => Object.entries(subs || {}).reduce((x, [n, v]) => x.split('{' + n + '}').join(String(v)), i18nKo[k] || k),
   };
-  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map(fn).join('\n') +
+  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', ...(fn('audioReasonNote') ? ['audioReasonNote'] : []), 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map(fn).join('\n') +
     '\nthis.view = (id) => { const r = { id, audioCodec: "aac", probeOk: true }; const a = audioInfoFor(r); Object.assign(r, { audioState: a.state, audioLevel: a.level, audioReason: a.reason, audioTrust: a.trust || "", audioPcKey: a.pcKey || "" }); return { state: a.state, tip: audioTipFor(r), detail: audioDetailFor(r) }; };', au);
   const v = (id) => runInNewContext(`view(${JSON.stringify(id)})`, au);
   const s1 = v('s1'), s2 = v('s2'), u1 = v('u1'), u2 = v('u2');

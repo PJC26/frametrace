@@ -2155,7 +2155,9 @@ function timelineKindHtml(kind, ev) {
   if (k === "carved-candidate-unaudited") {
     return `<span class="badge warn tl-unaudited" data-kind="${escapeHtml(k)}" title="${escapeHtml(t("timeline.tip.carvedUnaudited"))}">${escapeHtml(t("timeline.kind.carvedUnaudited"))}</span>`;
   }
-  const timeUnaudited = !!(ev && ev.time_unaudited === true) || /-time-unaudited$/.test(k);
+  // Track I (3e002d8): every event carries `time_unaudited: boolean` — the
+  // field decides; the kind suffix only when the field is absent.
+  const timeUnaudited = ev && typeof ev.time_unaudited === "boolean" ? ev.time_unaudited : /-time-unaudited$/.test(k);
   if (/-time-unaudited$/.test(k)) k = k.slice(0, -"-time-unaudited".length);
   return escapeHtml(k) + (timeUnaudited
     ? ` <span class="badge warn tl-time-unaudited" title="${escapeHtml(t("timeline.tip.timeUnaudited"))}">${escapeHtml(t("timeline.badge.timeUnaudited"))}</span>` : "");
