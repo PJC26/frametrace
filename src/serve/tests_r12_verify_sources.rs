@@ -111,3 +111,53 @@ fn r12_i4_printed_run_id_is_the_first_prefixed_line() {
     assert_eq!(id("anomaly scan complete\n"), None);
     assert_eq!(id("hash-verify-run-id: \n"), None);
 }
+
+/// R13 I1 (P16): the response names why there is no result and lists the
+/// newer unmarked run's mismatch rows (track U contract fields).
+#[test]
+fn r13_i1_verify_sources_surfaces_the_newer_unmarked_run() {
+    let root =
+        std::env::temp_dir().join(format!("ft-r13-i1-verify-sources-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let case = root.join("case");
+    std::fs::create_dir_all(case.join("evidence/logs")).unwrap();
+    std::fs::write(case.join("case.json"), "{\"case_id\":\"C-r13i1\"}").unwrap();
+    let key = AuditKey::new(&fingerprint_id(&[0xd5; 32]), &[0xd5; 32]);
+    hv_lane(&case, &key);
+    crate::audit::append_chained_jsonl_keyed(
+        &case.join(crate::anomaly::HASH_VERIFY_REL_PATH),
+        &serde_json::json!({"schema_version":1,"event":"hash-verify","run_unix":200,
+            "run_id":"200-bbbb","id":"vid_a","source_path":"/e/a.mp4",
+            "recorded_sha256":"a".repeat(64),"observed_sha256":"b".repeat(64),"status":"mismatch"})
+        .to_string(),
+        Some(&key),
+    )
+    .unwrap();
+    let state = {
+        let mut state = JobState::new();
+        state.case_dir = Some(case.clone());
+        state.phase = "review-ready";
+        Arc::new(Mutex::new(state))
+    };
+    let exe = fake_cli(&root, Some("100-aaaa"));
+    let response = with_test_keys(std::slice::from_ref(&key), || {
+        verify_sources_with_exe(&state, &exe)
+    });
+    let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["is_result"], false, "{body}");
+    assert_eq!(body["verified"], false, "{body}");
+    assert_eq!(body["matched"], 0, "{body}");
+    assert!(
+        body["withheld_reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with(crate::anomaly::NEWER_UNMARKED_RUN_REASON)),
+        "{body}"
+    );
+    assert_eq!(body["newer_runs"], 1, "{body}");
+    assert_eq!(body["newer_records"], 1, "{body}");
+    assert_eq!(body["newer_mismatched"], 1, "{body}");
+    assert_eq!(body["newer_mismatches"][0]["run_id"], "200-bbbb", "{body}");
+    assert_eq!(body["newer_mismatches"][0]["id"], "vid_a", "{body}");
+    let _ = std::fs::remove_dir_all(&root);
+}

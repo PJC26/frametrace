@@ -232,6 +232,11 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
 /// skipped (no timestamp), never stamped 0. Artifacts present only in the
 /// results snapshot (log missing) are still emitted. Returns how many
 /// artifacts were skipped.
+/// R13-I4: the `detail` note of a carve-lane event whose time is NOT the
+/// entry's own (an old entry without `carved_unix`, timed from
+/// `db/carve_results.json`, which no audit lane covers).
+pub const CARVE_TIME_UNAUDITED_NOTE: &str = "시각 감사 안 됨 (time not audited: 이 감사 항목에 carved_unix가 없어 db/carve_results.json의 시각을 씀 — 감사 레인 밖)";
+
 fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usize, String> {
     let path = case_dir.join("db/carve_results.json");
     let snapshot = match read_to_string(&path) {
@@ -272,8 +277,11 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
     let mut skipped = 0usize;
     let mut seen = std::collections::HashSet::new();
     // R12-I2: `snapshot` = the artifact comes from db/carve_results.json.
+    // R13-I4: `ts_unaudited` = the lane entry has no `carved_unix` and its
+    // time comes from the snapshot (outside the chain) — said in `detail`.
     let mut emit = |artifact: &serde_json::Value,
                     ts: Option<u64>,
+                    ts_unaudited: bool,
                     unauthenticated: Option<String>,
                     snapshot: bool,
                     skipped: &mut usize| {
@@ -298,7 +306,10 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             .and_then(serde_json::Value::as_u64)
             .map(|offset| offset.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        let detail = format!("carved candidate {id} from {source} at offset {offset}");
+        let mut detail = format!("carved candidate {id} from {source} at offset {offset}");
+        if ts_unaudited {
+            detail.push_str(&format!(" — {CARVE_TIME_UNAUDITED_NOTE}"));
+        }
         events.push(match unauthenticated {
             None if snapshot => TimelineEvent {
                 ts_unix,
@@ -331,12 +342,17 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
         if value.get("event").and_then(serde_json::Value::as_str) != Some("carve-file") {
             continue;
         }
-        let ts = value
-            .get("carved_unix")
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(value))));
+        let own = value.get("carved_unix").and_then(serde_json::Value::as_u64);
+        let ts = own.or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(value))));
         let unauthenticated = (!row.usable()).then(|| row.note());
-        emit(value, ts, unauthenticated, false, &mut skipped);
+        emit(
+            value,
+            ts,
+            own.is_none() && ts.is_some(),
+            unauthenticated,
+            false,
+            &mut skipped,
+        );
     }
     // R12-I2: a lane whose chain does not verify vouches for nothing — the
     // snapshot (outside the chain) is not used at all then.
@@ -346,7 +362,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 .get("carved_unix")
                 .and_then(serde_json::Value::as_u64)
                 .or(snapshot_unix);
-            emit(artifact, ts, None, true, &mut skipped);
+            emit(artifact, ts, false, None, true, &mut skipped);
         }
     } else if !snapshot_artifacts.is_empty() {
         skipped += snapshot_artifacts.len();

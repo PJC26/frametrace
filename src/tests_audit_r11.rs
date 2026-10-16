@@ -204,8 +204,8 @@ fn r11_i3_key_source_env_var_is_not_inherited_by_tools() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("FT_R11_KEYSRC", "22".repeat(32))
-        .env("FRAMETRACE_KEY_SOURCE", "env:FT_R11_KEYSRC")
+        .env("FT_R11_KEYSRC_KEY", "22".repeat(32))
+        .env("FRAMETRACE_KEY_SOURCE", "env:FT_R11_KEYSRC_KEY")
         .env("FT_R11_I3_HELPER", "1")
         .output()
         .unwrap();
@@ -217,7 +217,7 @@ fn r11_i3_key_source_env_var_is_not_inherited_by_tools() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("TOOL=[]") || stdout.contains("TOOL=[%FT_R11_KEYSRC%]"),
+        stdout.contains("TOOL=[]") || stdout.contains("TOOL=[%FT_R11_KEYSRC_KEY%]"),
         "a tool inherited the --key-source variable: {stdout}"
     );
     assert!(
@@ -237,7 +237,7 @@ fn r11_i3_helper() {
     // --test-threads=1); nothing else touches the environment.
     unsafe { crate::audit_key::adopt_key_env() };
     // The workstation installs its FRAMETRACE_KEY_SOURCE spec.
-    let installed = crate::audit_key::install_source_override("env:FT_R11_KEYSRC");
+    let installed = crate::audit_key::install_source_override("env:FT_R11_KEYSRC_KEY");
     println!(
         "INSTALLED={}",
         if installed.is_ok() { "ok" } else { "failed" }
@@ -249,13 +249,13 @@ fn r11_i3_helper() {
         #[cfg(windows)]
         let mut command = {
             let mut command = std::process::Command::new("cmd");
-            command.args(["/C", "echo [%FT_R11_KEYSRC%]"]);
+            command.args(["/C", "echo [%FT_R11_KEYSRC_KEY%]"]);
             command
         };
         #[cfg(unix)]
         let mut command = {
             let mut command = std::process::Command::new("sh");
-            command.args(["-c", "echo \"[$FT_R11_KEYSRC]\""]);
+            command.args(["-c", "echo \"[$FT_R11_KEYSRC_KEY]\""]);
             command
         };
         if forward {
@@ -280,16 +280,22 @@ fn r11_i3_key_source_env_vars_from_args_and_ambient() {
         list.iter().map(std::ffi::OsString::from).collect()
     };
     assert_eq!(
-        key_source_env_vars(args(&["--key-source", "env:A", "qa", "x"]), None),
-        ["A"]
+        key_source_env_vars(args(&["--key-source", "env:A_KEY", "qa", "x"]), None),
+        ["A_KEY"]
     );
     assert_eq!(
-        key_source_env_vars(args(&["qa", "--key-source=env:B"]), Some("env:C".into())),
-        ["B", "C"]
+        key_source_env_vars(
+            args(&["qa", "--key-source=env:B_KEY"]),
+            Some("env:C_KEY".into())
+        ),
+        ["B_KEY", "C_KEY"]
     );
     assert!(key_source_env_vars(args(&["--key-source", "file:/k"]), None).is_empty());
-    assert!(key_source_env_vars(args(&["--", "--key-source", "env:D"]), None).is_empty());
-    assert_eq!(key_source_env_vars(args(&[]), Some("env:E".into())), ["E"]);
+    assert!(key_source_env_vars(args(&["--", "--key-source", "env:D_KEY"]), None).is_empty());
+    assert_eq!(
+        key_source_env_vars(args(&[]), Some("env:E_KEY".into())),
+        ["E_KEY"]
+    );
 }
 
 /// I4 (P9): a chain break defeated P7 — editing the NEWEST entry of a

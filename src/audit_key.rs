@@ -250,9 +250,9 @@ fn resolve_key_source(spec: &str) -> Result<AuditKey, String> {
     match spec.split_once(':') {
         Some(("env", var)) if !var.trim().is_empty() => {
             let var = var.trim();
-            if is_system_env_var(var) {
+            if let Some(why) = key_source_var_refusal(var) {
                 return Err(format!(
-                    "--key-source env:{var}: {var} is a system environment variable, not a key secret — refused (adopting it would remove it from this process and every tool it runs); put the key in its own variable, e.g. env:FRAMETRACE_AUDIT_KEY_SECRET"
+                    "--key-source env:{var}: {why} — refused (adopting it would remove it from this process and every tool it runs); put the key in its own variable, e.g. env:FRAMETRACE_AUDIT_KEY_SECRET"
                 ));
             }
             key_from_env(var)?.ok_or_else(|| format!("--key-source env:{var}: {var} is not set"))
@@ -447,6 +447,46 @@ pub fn is_system_env_var(name: &str) -> bool {
         || upper.starts_with("XDG_")
 }
 
+/// R13-I3: why `name` may not be a `--key-source env:VAR` /
+/// `FRAMETRACE_KEY_SOURCE=env:VAR` variable (`None` = it may). R12's
+/// deny-list ([`SYSTEM_ENV_VARS`]) let `DYLD_INSERT_LIBRARIES` through
+/// (measured), so the rule is now an ALLOW-list: the name is ASCII
+/// letters, digits and `_`, and starts with `FRAMETRACE_` or ends with
+/// `_SECRET` / `_KEY` (ASCII case ignored). Refused even then: a
+/// `DYLD_*` / `LD_*` loader variable and any [`SYSTEM_ENV_VARS`] name
+/// (`FRAMETRACE_KEY_SOURCE`, `FRAMETRACE_AUDIT_KEY_ID`). A refused
+/// variable is never adopted (removed from the environment).
+pub fn key_source_var_refusal(name: &str) -> Option<String> {
+    let name = name.trim();
+    let upper = name.to_ascii_uppercase();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Some(format!(
+            "{name:?} is not a plain variable name (ASCII letters, digits, _)"
+        ));
+    }
+    if upper.starts_with("DYLD_") || upper.starts_with("LD_") {
+        return Some(format!(
+            "{name} is a dynamic-loader variable (DYLD_* / LD_*), not a key secret"
+        ));
+    }
+    if is_system_env_var(name) {
+        return Some(format!(
+            "{name} is a system environment variable, not a key secret"
+        ));
+    }
+    if !(upper.starts_with("FRAMETRACE_") || upper.ends_with("_SECRET") || upper.ends_with("_KEY"))
+    {
+        return Some(format!(
+            "{name} is not a key-secret variable name (it must start with FRAMETRACE_ or end with _SECRET or _KEY)"
+        ));
+    }
+    None
+}
+
 /// R11-I3 (P10): the environment variables a key-source spec reads key
 /// MATERIAL from — `VAR` of every `env:VAR` spec this process will
 /// install: the `--key-source` global flag in `args` (`--key-source SPEC`
@@ -477,9 +517,10 @@ pub fn key_source_env_vars(
     for spec in specs {
         if let Some(("env", var)) = spec.trim().split_once(':')
             && !var.trim().is_empty()
-            // R12-I5: a system variable is refused at install, never
-            // adopted (removed from the environment) first.
-            && !is_system_env_var(var)
+            // R12-I5 / R13-I3: a refused variable (not on the allow-list)
+            // is refused at install, never adopted (removed from the
+            // environment) first.
+            && key_source_var_refusal(var).is_none()
             && !vars.iter().any(|known| known == var.trim())
         {
             vars.push(var.trim().to_string());

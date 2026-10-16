@@ -292,8 +292,14 @@ const scan = scanInput || {{}};
 // counted, confirmed or derived from. (An entry without `trust` comes from
 // a caller that did not classify it and is shown as before.)
 const usableEntry = item => !item || typeof item !== "object" || item.trust === undefined || item.trust === "auth" || item.trust === "sc";
+// R13 I2: a usable `lane-repair` marker (frametrace repair-lane) is not a
+// record of the lane's own kind — the chain shows it as "수리됨". Every
+// "latest record" reader treats what sits BEFORE it as unknown (the cut
+// tail may have held a newer record).
+const isLaneRepair = item => !!item && typeof item === "object" && item.event === "lane-repair" && usableEntry(item);
 const unauthenticatedEntries = [];
 const usableLog = (name, rows) => (Array.isArray(rows) ? rows : []).filter(item => {{
+  if (isLaneRepair(item)) return false;
   if (usableEntry(item)) return true;
   unauthenticatedEntries.push({{ name, item }});
   return false;
@@ -303,14 +309,20 @@ const proxyLog = usableLog("proxy", {proxy_lines});
 const thumbnailLog = usableLog("thumbnail", {thumbnail_lines});
 const carveLog = usableLog("carve", {carve_lines});
 const filesystemLog = usableLog("filesystem", {filesystem_lines});
-const validationLog = usableLog("validation", {validation_lines});
+const validationAll = (rows => Array.isArray(rows) ? rows : [])({validation_lines});
+const validationLog = usableLog("validation", validationAll);
+// R13 I2: lane position of the last usable repair marker (-1: none).
+const validationRepairAt = validationAll.map(isLaneRepair).lastIndexOf(true);
+const validationPosition = new Map(validationAll.map((item, at) => [item, at]));
 const anomalyAll = (rows => Array.isArray(rows) ? rows : [])({anomaly_lines});
 const anomalyLog = usableLog("anomaly", anomalyAll);
 // R11-I2 (P9): an anomaly entry this PC cannot use AFTER the newest usable
 // run marker (e.g. the newest run's marker HMAC stripped) means the newest
 // run's outcome is unknown — no older run stands in as "current".
 const lastUsableAnomalyMarker = anomalyAll.map(item => item?.event === "anomaly-scan-run" && usableEntry(item)).lastIndexOf(true);
-const anomalyResultWithheld = anomalyAll.some((item, index) => index > lastUsableAnomalyMarker && !usableEntry(item));
+const anomalyUnusableAfter = anomalyAll.some((item, index) => index > lastUsableAnomalyMarker && !usableEntry(item));
+// R13 I2: a repair marker after it — the cut tail may have held a newer run.
+const anomalyRepairedAfter = anomalyAll.some((item, index) => index > lastUsableAnomalyMarker && isLaneRepair(item));
 const batchLog = usableLog("batch", {batch_lines});
 const joinLog = usableLog("join", {join_lines});
 const audioLevels = {audio_levels};
@@ -564,6 +576,11 @@ const supersededValidations = [];
   const keep = new Set([...latest.values()].map(entry => entry.order));
   validationLog.forEach((item, order) => (keep.has(order) ? currentValidations : supersededValidations).push(item));
 }}
+// R13 I2: a target's newest validation positioned BEFORE a lane-repair
+// marker is not known to be the latest (the repair cut a tail that may
+// have held a newer one) — shown as "알 수 없음", never as current.
+const unknownValidations = currentValidations.filter(item => (validationPosition.get(item) ?? -1) < validationRepairAt);
+currentValidations.splice(0, currentValidations.length, ...currentValidations.filter(item => !unknownValidations.includes(item)));
 const validationRow = (item, withTime) => `<tr>
       ${{withTime ? `<td>${{fmtUnix(item.validated_unix)}}</td>` : ""}}
       <td>${{escapeHtml(item.validation_status || "-")}}</td>
@@ -579,12 +596,18 @@ const validationHead = withTime => `<thead>
     <tr>${{withTime ? "<th>실행 시각</th>" : ""}}<th>상태</th><th>대상</th><th>포맷</th><th>코덱</th><th>길이</th><th>SHA-256</th><th>검증 메모</th><th>감사 체인</th></tr>
   </thead>`;
 document.getElementById("validations").textContent = currentValidations.length;
+const unknownValidationsHtml = unknownValidations.length ? `<div class="note"><strong>최신 여부 알 수 없음 ${{unknownValidations.length}}건</strong> — 검증 기록 레인이 이 검증들 뒤에서 수리됨(lane-repair): 잘린 꼬리에 같은 대상의 더 최근 검증이 있었을 수 있어 현재 결과로 보지 않습니다 (다시 검증하십시오).</div><table>
+  ${{validationHead(true)}}
+  <tbody>
+    ${{unknownValidations.map(item => validationRow(item, true)).join("")}}
+  </tbody>
+</table>` : "";
 document.getElementById("validation-results").innerHTML = currentValidations.length ? `<p class="muted">현재 결과: 대상별 가장 최근 검증 ${{currentValidations.length}}건${{supersededValidations.length ? ` (이전 검증 ${{supersededValidations.length}}건은 아래 이력에 접어 둠)` : ""}}</p><table>
   ${{validationHead(true)}}
   <tbody>
     ${{currentValidations.map(item => validationRow(item, true)).join("")}}
   </tbody>
-</table>` : emptyOr("validation", "<p>검증 기록이 없습니다.</p>");
+</table>${{unknownValidationsHtml}}` : unknownValidationsHtml || emptyOr("validation", "<p>검증 기록이 없습니다.</p>");
 document.getElementById("validation-history").innerHTML = supersededValidations.length ? `<details><summary>이전 검증 이력 ${{supersededValidations.length}}건 — 같은 대상의 더 최근 검증으로 대체됨 (현재 결과 아님)</summary><table>
   ${{validationHead(true)}}
   <tbody>
@@ -622,15 +645,18 @@ const anomalyRuns = [];
   flushUnmarked(pending);
 }}
 const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(true);
-const currentAnomalyIndex = anomalyResultWithheld ? -1 : latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
+// R13 P16: a newer run without its completion marker after the last
+// completed run — cut short, OR its marker was deleted (no key needed) —
+// WITHHOLDS the result (R8 showed the older run as "current" with a
+// notice); its findings are shown with the "no result" notice.
+const newerAnomalyRuns = latestCompleted >= 0 ? anomalyRuns.slice(latestCompleted + 1) : [];
+const anomalyWithheldReasons = [
+  anomalyUnusableAfter ? "가장 최근 완료 실행의 완료 표식 뒤에 이 PC에서 인증할 수 없는 항목이 있어(더 새 실행의 완료 표식일 수 있음) 그 결과를 알 수 없습니다 (아래 \"인증 안 된 감사 항목\" 참조)" : "",
+  anomalyRepairedAfter ? "마지막 완료 실행 뒤에 레인 수리(lane-repair) 표식이 있어 — 잘린 꼬리에 더 새 실행이 있었을 수 있어 — 최신 실행을 알 수 없습니다 (이상 징후 검사를 다시 실행하십시오)" : "",
+  newerAnomalyRuns.length ? `표식 없는 더 새 실행 있음 — 마지막 완료 실행 뒤에 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회: 완료 표식이 지워졌거나 실행이 중단됐을 수 있습니다 (이상 징후 검사를 다시 실행하십시오)` : "",
+].filter(Boolean);
+const currentAnomalyIndex = anomalyWithheldReasons.length ? -1 : latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
 const currentAnomalyRun = anomalyRuns[currentAnomalyIndex] || null;
-// R8: a newer run without its completion marker (cut short) exists, so the
-// "current" result is an OLDER completed run — say so instead of letting
-// the reader assume the latest scan is shown.
-const newestAnomalyRunInterrupted = latestCompleted >= 0 && latestCompleted < anomalyRuns.length - 1;
-const anomalyInterruptedNotice = newestAnomalyRunInterrupted
-  ? `<p class="muted"><strong>최근 실행이 중단되어 이전 완료 실행을 현재로 표시합니다</strong> — 중단된 실행(${{fmtUnix(anomalyRuns[anomalyRuns.length - 1].ts)}})의 부분 결과는 아래 이력에 있으며 현재 결과가 아닙니다.</p>`
-  : "";
 const findingRows = run => run.entries.filter(item => item.kind && item.kind !== "none");
 const anomalyTable = rows => `<table>
   <thead>
@@ -660,11 +686,11 @@ const anomalyRunLine = run => {{
 }};
 const anomalyRows = currentAnomalyRun ? findingRows(currentAnomalyRun) : [];
 document.getElementById("anomaly-findings").innerHTML = currentAnomalyRun
-  ? `${{anomalyInterruptedNotice}}<p class="muted">현재 결과 — ${{anomalyRunLine(currentAnomalyRun)}} · ${{escapeHtml(chainLabel("anomaly"))}}</p>${{anomalyRows.length ? anomalyTable(anomalyRows) : "<p>이 실행에서 이상 징후 후보가 없습니다.</p>"}}`
-  : anomalyResultWithheld
-    ? `<div class="note"><strong>현재 결과 없음(결과 아님)</strong> — 가장 최근 이상 징후 실행의 항목(완료 표식 포함 가능)을 이 PC에서 인증할 수 없어 그 결과를 알 수 없습니다. 이전 실행을 현재 결과로 보이지 않습니다 (아래 "인증 안 된 감사 항목" 참조).</div>`
+  ? `<p class="muted">현재 결과 — ${{anomalyRunLine(currentAnomalyRun)}} · ${{escapeHtml(chainLabel("anomaly"))}}</p>${{anomalyRows.length ? anomalyTable(anomalyRows) : "<p>이 실행에서 이상 징후 후보가 없습니다.</p>"}}`
+  : anomalyWithheldReasons.length
+    ? `<div class="note"><strong>현재 결과 없음(결과 아님)</strong> — ${{anomalyWithheldReasons.map(escapeHtml).join("; ")}}. 이전 실행을 현재 결과로 보이지 않습니다.</div>${{newerAnomalyRuns.map(run => `<p class="muted"><strong>표식 없는 더 새 실행 (결과 아님, 숨기지 않고 표시)</strong> — ${{anomalyRunLine(run)}}</p>${{findingRows(run).length ? anomalyTable(findingRows(run)) : "<p>후보 없음</p>"}}`).join("")}}`
     : emptyOr("anomaly", "<p>이상 징후 후보가 없습니다.</p>");
-const pastAnomalyRuns = anomalyRuns.filter((_, index) => index !== currentAnomalyIndex).reverse();
+const pastAnomalyRuns = anomalyRuns.filter((run, index) => index !== currentAnomalyIndex && !newerAnomalyRuns.includes(run)).reverse();
 document.getElementById("anomaly-history").innerHTML = pastAnomalyRuns.length ? `<details><summary>이전 실행 ${{pastAnomalyRuns.length}}회 — 현재 결과 아님</summary>${{pastAnomalyRuns.map(run => `<p class="muted">${{anomalyRunLine(run)}}</p>${{findingRows(run).length ? anomalyTable(findingRows(run)) : "<p>후보 없음</p>"}}`).join("")}}</details>` : "";
 
 document.getElementById("filesystem-recovery").innerHTML = filesystemLog.length ? `<table>
@@ -714,7 +740,12 @@ function validationForRow(row) {{
   const eligible = byExactPath.filter(item => /^[a-fA-F0-9]{{64}}$/.test(row.hash) &&
     typeof item.target_sha256 === "string" && item.target_sha256.toLowerCase() === row.hash.toLowerCase());
   if (eligible.length) {{
-    return eligible.sort((a, b) => (a.validated_unix ?? 0) - (b.validated_unix ?? 0)).at(-1);
+    const latest = eligible.sort((a, b) => (a.validated_unix ?? 0) - (b.validated_unix ?? 0)).at(-1);
+    // R13 I2: before a lane-repair marker the latest is unknown.
+    if ((validationPosition.get(latest) ?? -1) < validationRepairAt) {{
+      return {{validation_status: "validation-unknown-after-repair", validation_note: `최신 여부 알 수 없음 — 검증 기록 레인이 이 검증(${{latest.validation_status || "-"}}) 뒤에서 수리됨(lane-repair): 잘린 꼬리에 더 최근 검증이 있었을 수 있음`}};
+    }}
+    return latest;
   }}
   if (byExactPath.length) return {{validation_status: "validation-unbound", validation_note: "No validation is bound to the recorded evidence SHA-256; missing or different hashes cannot confirm these bytes."}};
   return null;
@@ -1716,6 +1747,14 @@ pub fn signoff_audit_record_with_keys(
             "더 최신 서명 존재 — 이 기록은 최신이 아님: 감사 체인(signoff-log)에 이 서명 뒤로 서명 {later_signoffs}건이 더 기록되어 있습니다 (이전 서명 기록으로 되돌려졌거나, 이후 최종화가 완료되지 않음 — 다시 최종화하십시오)"
         ));
     }
+    // R13 I2 (P16): a `lane-repair` marker after this record's entry — the
+    // repair cut a tail that may have held a newer sign-off or this
+    // record's abandonment: whether it is the latest is UNKNOWN.
+    if lane.repaired_after(index) {
+        return SignoffAuditRecord::NotVerifiable(format!(
+            "{SIGNOFF_REPAIRED_AFTER_NOTE} — 잘린 꼬리에 더 최신 서명이나 이 서명의 포기 기록이 있었을 수 있어 이 서명이 최신인지 알 수 없습니다 (다시 최종화하십시오)"
+        ));
+    }
     // R7-I7 / R8-I9: the record names how many entries the lane held when
     // it was signed; its own entry must be the FIRST sign-off entry at or
     // after that position. Other events appended in between (a rotation
@@ -1818,6 +1857,10 @@ pub fn record_signoff_abandoned(
     .map_err(|err| format!("완료되지 않은 최종화를 감사 체인에 기록하지 못했습니다: {err}"))
 }
 
+/// R13 I2: the sign-off lane was repaired after this record's entry.
+pub const SIGNOFF_REPAIRED_AFTER_NOTE: &str =
+    "서명 감사 레인(signoff-log)이 이 서명 항목 뒤에서 수리됨(lane-repair)";
+
 /// R12-S2/S6: where the sign-off record `signoff_text` stands in the
 /// sign-off lane under `case_dir`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1826,6 +1869,11 @@ pub struct SignoffLaneState {
     pub recorded: bool,
     /// A trusted [`SIGNOFF_ABANDONED_EVENT`] entry names this record.
     pub abandoned: bool,
+    /// R13 I2 (P16): a usable `lane-repair` marker follows this record's
+    /// last `signoff` entry ([`crate::audit::LaneRows::repaired_after`]):
+    /// the cut tail may have held its abandonment — `abandoned: false` is
+    /// then UNKNOWN, not "not abandoned" (check before acting on it).
+    pub repaired_after: bool,
 }
 
 /// R12-S2/S6: [`SignoffLaneState`] of `signoff_text` with this PC's
@@ -1842,7 +1890,7 @@ pub fn signoff_lane_state(
         return Ok(SignoffLaneState::default());
     }
     let sha = crate::sha256::digest_bytes(signoff_text.as_bytes());
-    let recorded = lane.rows.iter().any(|row| {
+    let entry_at = lane.rows.iter().rposition(|row| {
         row.value.get("event").and_then(|v| v.as_str()) == Some("signoff")
             && row
                 .value
@@ -1851,8 +1899,9 @@ pub fn signoff_lane_state(
                 == Some(sha.as_str())
     });
     Ok(SignoffLaneState {
-        recorded,
+        recorded: entry_at.is_some(),
         abandoned: abandoned_signoff_records(&lane.rows).contains(&sha),
+        repaired_after: entry_at.is_some_and(|at| lane.repaired_after(at)),
     })
 }
 
@@ -3345,13 +3394,20 @@ mod tests {
         .join("\n");
         let elements = rendered_elements(&[("anomaly", &anomaly)]);
         let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        // R13 P16: the newer unmarked run (its marker may have been
+        // deleted) withholds the result; its findings are shown with the
+        // notice, the older run is history only.
+        assert!(current.contains("현재 결과 없음(결과 아님)"), "{current}");
+        assert!(current.contains("표식 없는 더 새 실행 있음"), "{current}");
         assert!(
-            current.contains("최근 실행이 중단되어 이전 완료 실행을 현재로 표시"),
+            current.contains("vid_cut") && !current.contains("vid_done"),
             "{current}"
         );
+        assert!(!current.contains("현재 결과 —"), "{current}");
+        let history = elements["anomaly-history"]["innerHTML"].as_str().unwrap();
         assert!(
-            current.contains("vid_done") && !current.contains("vid_cut"),
-            "{current}"
+            history.contains("vid_done") && !history.contains("vid_cut"),
+            "{history}"
         );
         // A complete newest run carries no such notice.
         let complete = [
@@ -3361,7 +3417,109 @@ mod tests {
         .join("\n");
         let elements = rendered_elements(&[("anomaly", &complete)]);
         let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
-        assert!(!current.contains("최근 실행이 중단"), "{current}");
+        assert!(!current.contains("현재 결과 없음"), "{current}");
+        assert!(current.contains("현재 결과 —") && current.contains("vid_done"));
+    }
+
+    /// R13 I2: a usable `lane-repair` marker after the last completed
+    /// anomaly run / after a target's newest validation makes that value
+    /// UNKNOWN (the cut tail may have held a newer one); the marker itself
+    /// is never shown as a run or a validation row. Values recorded after
+    /// the marker are current again.
+    #[test]
+    fn r13_i2_repaired_lanes_make_the_latest_values_unknown() {
+        let repair = r#"{"event":"lane-repair","kept_entries":2,"removed_lines":1,"removed_bytes":10,"removed_sha256":"aa"}"#;
+        let anomaly = [
+            r#"{"event":"anomaly-scan","scanned_unix":100,"kind":"gap","selector":"vid_done","detail":"a"}"#,
+            r#"{"event":"anomaly-scan-run","scanned_unix":100,"hash_mode":"stored","finding_count":1}"#,
+            repair,
+        ]
+        .join("\n");
+        let validation = [
+            r#"{"selector":"vid_1","target_path":"/e/a.mp4","validated_unix":20,"validation_status":"ffprobe-video-stream-confirmed"}"#,
+            repair,
+            r#"{"selector":"vid_2","target_path":"/e/b.mp4","validated_unix":30,"validation_status":"validation-failed"}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &anomaly), ("validation", &validation)]);
+        let text = |id: &str| {
+            elements[id]["innerHTML"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let current = text("anomaly-findings");
+        assert!(current.contains("현재 결과 없음(결과 아님)"), "{current}");
+        assert!(current.contains("lane-repair"), "{current}");
+        assert!(!current.contains("현재 결과 —"), "{current}");
+        assert!(!text("anomaly-history").contains("lane-repair"));
+        let results = text("validation-results");
+        assert!(results.contains("최신 여부 알 수 없음 1건"), "{results}");
+        // vid_2 (after the marker) is current; vid_1 (before) is unknown.
+        let (known, unknown) = results.split_once("최신 여부 알 수 없음").unwrap();
+        assert!(
+            known.contains("/e/b.mp4") && !known.contains("/e/a.mp4"),
+            "{results}"
+        );
+        assert!(unknown.contains("/e/a.mp4"), "{results}");
+        assert_eq!(elements["validations"]["textContent"], 1);
+        // The marker is never a validation row ("-" target).
+        assert_eq!(
+            results.matches("</tr>").count() - results.matches("</thead>").count(),
+            2,
+            "two rows (one per target), no marker row: {results}"
+        );
+        // A completed run after the marker is current again.
+        let anomaly = format!(
+            "{anomaly}\n{}\n{}",
+            r#"{"event":"anomaly-scan","scanned_unix":300,"kind":"gap","selector":"vid_new","detail":"c"}"#,
+            r#"{"event":"anomaly-scan-run","scanned_unix":300,"hash_mode":"stored","finding_count":1}"#,
+        );
+        let elements = rendered_elements(&[("anomaly", &anomaly)]);
+        let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        assert!(
+            current.contains("현재 결과 —") && current.contains("vid_new"),
+            "{current}"
+        );
+    }
+
+    /// R13 I2: the sign-off lane repaired AFTER this record's entry — the
+    /// cut tail may have held a newer sign-off or this record's
+    /// abandonment: not verified (R12 verified it), and the lane state
+    /// says the abandonment is unknown.
+    #[test]
+    fn r13_i2_signoff_repaired_after_its_entry_is_not_the_latest() {
+        let mine = crate::audit_key::AuditKey::new("mine", &[0x93; 32]);
+        let keys = std::slice::from_ref(&mine);
+        let (root, digests) = signoff_tree("r13-i2");
+        let record = v4_record_for(&root, &digests, &["vid_000001"], 5);
+        record_with_key(&root, &record, Some(&mine));
+        assert!(matches!(
+            super::signoff_audit_record_with_keys(&root, &record, true, keys),
+            super::SignoffAuditRecord::Verified {
+                authenticated: true,
+                ..
+            }
+        ));
+        crate::audit::append_chained_jsonl_keyed(
+            &root.join(super::SIGNOFF_LOG_REL_PATH),
+            r#"{"event":"lane-repair","kept_entries":1,"removed_lines":1,"removed_bytes":10,"removed_sha256":"aa"}"#,
+            Some(&mine),
+        )
+        .unwrap();
+        let verdict = super::signoff_audit_record_with_keys(&root, &record, true, keys);
+        assert!(
+            matches!(&verdict, super::SignoffAuditRecord::NotVerifiable(why) if why.contains("lane-repair") && why.contains("최신인지 알 수 없습니다")),
+            "{verdict:?}"
+        );
+        let state = crate::audit_key::with_test_keys(keys, || {
+            super::signoff_lane_state(&root, &record).unwrap()
+        });
+        assert!(
+            state.recorded && !state.abandoned && state.repaired_after,
+            "{state:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// I5: a legacy log without run markers still separates runs by time.

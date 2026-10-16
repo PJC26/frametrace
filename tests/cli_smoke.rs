@@ -876,3 +876,49 @@ fn qa_reproducibility_compares_two_independent_scans() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// R13-I3: `--key-source env:VAR` takes only key-secret variable names
+/// (`FRAMETRACE_*`, `*_SECRET`, `*_KEY`); a loader variable
+/// (`DYLD_INSERT_LIBRARIES`, `LD_PRELOAD` — R12's deny-list let the first
+/// through) or any other name is refused before anything is read, with
+/// the real binary.
+#[test]
+fn r13_i3_key_source_env_takes_only_key_secret_names() {
+    let dir = unique_temp_dir("r13-i3-key-source");
+    fs::create_dir_all(dir.join("evidence/logs")).unwrap();
+    let case = dir.to_string_lossy().to_string();
+    let material = "33".repeat(32);
+    let run_with = |var: &str| {
+        Command::new(frametrace())
+            .args(["--key-source", &format!("env:{var}"), "verify-audit", &case])
+            .isolated()
+            .env(var, &material)
+            .output()
+            .expect("frametrace binary should run")
+    };
+    for (var, why) in [
+        ("DYLD_INSERT_LIBRARIES", "dynamic-loader"),
+        ("LD_PRELOAD", "dynamic-loader"),
+        ("LD_AUDIT_KEY", "dynamic-loader"),
+        ("PATH", "system environment variable"),
+        ("MY_TOKEN", "not a key-secret variable name"),
+    ] {
+        let output = run_with(var);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{var}: {stderr}");
+        assert!(
+            stderr.contains("refused") && stderr.contains(why),
+            "{var}: {stderr}"
+        );
+    }
+    for var in [
+        "FRAMETRACE_R13_TEST_MATERIAL",
+        "R13_AUDIT_KEY",
+        "R13_SECRET",
+    ] {
+        let output = run_with(var);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("refused"), "{var}: {stderr}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

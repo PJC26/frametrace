@@ -728,6 +728,25 @@ impl LaneRows {
         self.rows.iter().filter(|row| !row.usable())
     }
 
+    /// R13 I2 (P16): a usable [`LANE_REPAIR_EVENT`] marker sits AFTER lane
+    /// index `index`. The repair cut a tail that may have held newer
+    /// entries, so every "newest record" reader treats a value at or
+    /// before `index` as UNKNOWN (not the latest): the newest re-hash run,
+    /// the latest validation of a target, the current anomaly run, whether
+    /// a sign-off was abandoned or superseded.
+    pub fn repaired_after(&self, index: usize) -> bool {
+        self.repairs.iter().any(|repair| repair.index > index)
+    }
+
+    /// R13-I5: the worst [`RemovedArchive`] state among the repairs
+    /// (`None` without a repair).
+    pub fn removed_archive(&self) -> Option<RemovedArchive> {
+        self.repairs
+            .iter()
+            .map(|repair| repair.removed_archive)
+            .max()
+    }
+
     /// Parsed values of the usable entries, in lane order.
     pub fn usable_values(&self) -> Vec<serde_json::Value> {
         self.usable().map(|row| row.value.clone()).collect()
@@ -828,6 +847,9 @@ impl LaneRows {
             "detail": self.detail(),
             "repaired": !self.repairs.is_empty(),
             "repairs": self.repairs.iter().map(LaneRepair::to_json).collect::<Vec<_>>(),
+            // R13-I5: the worst `.removed` archive state of the repairs
+            // (`null` without a repair).
+            "removed_archive": self.removed_archive().map(RemovedArchive::as_str),
         })
     }
 }
@@ -1029,7 +1051,7 @@ fn read_lane_rows_inner(
     let repairs = rows
         .iter()
         .filter(|row| row.usable() && is_lane_repair_marker(&row.value))
-        .map(LaneRepair::from_row)
+        .map(|row| LaneRepair::from_row(row, path))
         .collect();
     let lane = if let Some(err) = &key_error {
         LaneTrust::NotVerified {
@@ -1633,10 +1655,83 @@ pub struct LaneRepair {
     pub removed_sha256: String,
     /// File name (beside the lane) the cut bytes were saved as.
     pub removed_saved_as: Option<String>,
+    /// R13-I5: the saved file checked against the marker
+    /// ([`RemovedArchive`]), when the lane was read.
+    pub removed_archive: RemovedArchive,
+}
+
+/// R13-I5: the `.removed` archive a [`LANE_REPAIR_EVENT`] marker names,
+/// checked against the marker's `removed_sha256` / `removed_bytes`.
+/// Ordered best to worst (`max` = the lane-level summary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RemovedArchive {
+    /// The file beside the lane has the recorded size and SHA-256.
+    Match,
+    /// No such file beside the lane (deleted, moved, or the marker names
+    /// no plain file name) — the cut bytes cannot be shown.
+    Missing,
+    /// A file is there but its bytes are not the cut bytes (or it is not
+    /// a regular file).
+    Differs,
+}
+
+impl RemovedArchive {
+    /// The API word: `match`, `missing`, `differs`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Missing => "missing",
+            Self::Differs => "differs",
+        }
+    }
+
+    /// Korean wording for details and `verify-audit`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Match => "보관 파일 일치(크기·sha256 같음)",
+            Self::Missing => "보관 파일 없음 — 잘린 바이트를 보일 수 없음",
+            Self::Differs => "보관 파일이 다름 — 기록된 크기·sha256과 다른 바이트(변경됨)",
+        }
+    }
+
+    /// Checks the archive `saved_as` names beside `lane` against
+    /// `bytes` / `sha256`. Only a plain file name in the lane's own folder
+    /// is looked at (never a path elsewhere, never a link).
+    fn check(lane: &Path, saved_as: Option<&str>, bytes: u64, sha256: &str) -> Self {
+        let Some(name) = saved_as.filter(|name| {
+            !name.is_empty() && *name != "." && *name != ".." && !name.contains(['/', '\\', ':'])
+        }) else {
+            return Self::Missing;
+        };
+        let path = lane.with_file_name(name);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self::Missing,
+            Err(_) => return Self::Differs,
+        };
+        if !meta.is_file() || meta.len() != bytes {
+            return Self::Differs;
+        }
+        match digest_file(&path) {
+            Ok(digest) if digest.eq_ignore_ascii_case(sha256) => Self::Match,
+            _ => Self::Differs,
+        }
+    }
 }
 
 impl LaneRepair {
-    fn from_row(row: &LaneRow) -> Self {
+    fn from_row(row: &LaneRow, lane: &Path) -> Self {
+        let mut repair = Self::from_value(row);
+        repair.removed_archive = RemovedArchive::check(
+            lane,
+            repair.removed_saved_as.as_deref(),
+            repair.removed_bytes,
+            &repair.removed_sha256,
+        );
+        repair
+    }
+
+    fn from_value(row: &LaneRow) -> Self {
         let value = &row.value;
         let num = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
         let text = |key: &str| {
@@ -1653,13 +1748,15 @@ impl LaneRepair {
             removed_bytes: num("removed_bytes").unwrap_or(0),
             removed_sha256: text("removed_sha256").unwrap_or_default(),
             removed_saved_as: text("removed_saved_as"),
+            // Checked by `from_row`; never assumed to match.
+            removed_archive: RemovedArchive::Missing,
         }
     }
 
     /// One Korean sentence for details and CLI output.
     pub fn describe(&self) -> String {
         format!(
-            "{LANE_REPAIRED_NOTE} — {}번째 줄 뒤를 잘라 냄 (잘린 줄 {}개 · {}바이트 · sha256 {}{}); 잘린 부분에 있던 기록은 이 레인에서 읽지 않음",
+            "{LANE_REPAIRED_NOTE} — {}번째 줄 뒤를 잘라 냄 (잘린 줄 {}개 · {}바이트 · sha256 {}{} · {}); 잘린 부분에 있던 기록은 이 레인에서 읽지 않음",
             self.kept_entries,
             self.removed_lines,
             self.removed_bytes,
@@ -1667,7 +1764,8 @@ impl LaneRepair {
             self.removed_saved_as
                 .as_deref()
                 .map(|name| format!(" · 보관 파일 {name}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            self.removed_archive.describe()
         )
     }
 
@@ -1681,6 +1779,7 @@ impl LaneRepair {
             "removed_bytes": self.removed_bytes,
             "removed_sha256": self.removed_sha256,
             "removed_saved_as": self.removed_saved_as,
+            "removed_archive": self.removed_archive.as_str(),
         })
     }
 }
@@ -4103,3 +4202,7 @@ mod tests_r11;
 #[cfg(test)]
 #[path = "tests_audit_r12.rs"]
 mod tests_r12;
+
+#[cfg(test)]
+#[path = "tests_audit_r13.rs"]
+mod tests_r13;

@@ -3486,6 +3486,7 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
                 };
                 summary = crate::anomaly::HashVerifySummary {
                     unauthenticated: summary.unauthenticated,
+                    withheld_reason: Some(reason.clone()),
                     not_verified_reason: Some(reason),
                     lane_status: summary.lane_status,
                     ..Default::default()
@@ -3521,6 +3522,18 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
                 "verified": summary.verified,
                 "is_result": summary.is_result,
                 "not_verified_reason": summary.not_verified_reason,
+                // R13 P16 (track U contract): why there is no current
+                // result, and the runs without a completion marker after
+                // the last completed run — their mismatches are shown.
+                "withheld_reason": summary.withheld_reason,
+                "newer_runs": summary.newer_runs,
+                "newer_records": summary.newer_records,
+                "newer_mismatched": summary.newer_mismatched,
+                "newer_mismatches": summary
+                    .newer_mismatches
+                    .iter()
+                    .map(crate::anomaly::NewerMismatch::to_json)
+                    .collect::<Vec<_>>(),
                 "lane_status": summary.lane_status,
                 "log": crate::anomaly::HASH_VERIFY_REL_PATH,
                 "custody_url": "case/reports/custody-statement.html",

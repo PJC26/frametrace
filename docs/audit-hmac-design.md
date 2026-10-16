@@ -314,7 +314,10 @@ older run). R11:
   completed run, any unusable line withholds. Unusable lines from the
   candidate run's first entry on make it not `verified`. Unusable lines
   BEFORE the candidate run (an older run under another PC's key) do not
-  affect it. Remaining content use of unusable lines: P7 `recency_keys`
+  withhold it (보류하지 않는다) — *corrected in R13 (I6): this said "do not
+  affect it", but they still appear in the lane's `unauthenticated` total
+  and `detail`; they only neither withhold the result nor count against
+  the candidate run.* Remaining content use of unusable lines: P7 `recency_keys`
   still reads them, but only to make OLDER usable entries unusable — it
   can only withhold, never restore.
 - **I3 — `frametrace repair-lane <lane> [--dry-run]`.** A lane whose chain
@@ -388,6 +391,73 @@ older run). R11:
   lane alone (package manifests and external timestamping are the
   controls). Deleting a row in the MIDDLE breaks the chain (I4: nothing
   from the lane is used).
+
+### Unmarked newer runs, repairs for every reader, allow-listed key variables (R13)
+
+- **P16 — a usable run without a completion marker after the result run
+  withholds the result too.** P12 withheld only for UNUSABLE lines after
+  the last usable completion marker. Deleting that marker itself (the
+  last line — no key, no forging; the shorter chain verifies) left the
+  newest run's usable records looking "interrupted", and R12 let the
+  previous run stand: R1 match + marker, R2 mismatch + marker, delete
+  R2's marker → `run_unix:100, mismatched:0, verified:true,
+  is_result:true` and the green "All … equal" custody banner, with R2's
+  authenticated MISMATCH row still in the lane (reviewer PoC). Now
+  `anomaly::assess_runs`: every run without a usable completion marker
+  whose last usable entry sits after the last usable marker (every such
+  run when none completed) is in `HashVerifyAssessment::interrupted` and
+  WITHHOLDS the result — reason prefix "표식 없는 더 새 실행 있음"
+  (`anomaly::NEWER_UNMARKED_RUN_REASON`). Its usable `mismatch` rows are
+  surfaced, never hidden: `HashVerifySummary.{newer_runs, newer_records,
+  newer_mismatched, newer_mismatches}` (and `/api/verify-sources`), the
+  custody statement lists them in a red table under the "No current
+  re-verification result" banner. An interrupted run positioned entirely
+  BEFORE the result's marker (an older crash) still does not withhold.
+  Withhold reasons now accumulate (unusable tail; lane-repair after the
+  result; unmarked newer run) in `withheld` / `withheld_reason`. The
+  case report's anomaly section applies the same rule: a newer run
+  without its `anomaly-scan-run` marker is no longer "최근 실행이 중단되어
+  이전 완료 실행을 현재로 표시" — there is no current result and that run's
+  findings are shown with the notice. A cut-short scan therefore also
+  reads "no current result" until the next completed run (the cost of not
+  being able to tell a deleted marker from a crash).
+- **I2 — "repaired after" for every newest-record reader.**
+  `audit::LaneRows::repaired_after(index)`: a usable `lane-repair` marker
+  sits after lane index `index`, so a value at or before it is UNKNOWN.
+  Applied to: the re-hash result (as R12), the sign-off verifier
+  (`signoff_audit_record_with_keys`: NOT VERIFIABLE
+  "…수리됨(lane-repair) … 이 서명이 최신인지 알 수 없습니다";
+  `SignoffLaneState.repaired_after` for the finalize recovery), the
+  report's validation section (a target's newest validation before the
+  marker → "최신 여부 알 수 없음", not counted as current; also the
+  evidence table's `validationForRow` → `validation-unknown-after-repair`)
+  and the report's current anomaly run. Usable `lane-repair` markers are
+  no longer shown as rows of the lane's own kind in the report
+  (`usableLog` drops them; the chain shows "수리됨").
+- **I3 — key-source variables are an allow-list.** R12's deny-list
+  (`SYSTEM_ENV_VARS`) let `DYLD_INSERT_LIBRARIES` through (measured).
+  `audit_key::key_source_var_refusal`: the name must be ASCII letters,
+  digits and `_`, start with `FRAMETRACE_` or end with `_SECRET` / `_KEY`
+  (ASCII case ignored), and is refused anyway when it starts with
+  `DYLD_` / `LD_` or is a `SYSTEM_ENV_VARS` name (`FRAMETRACE_KEY_SOURCE`,
+  `FRAMETRACE_AUDIT_KEY_ID`). A refused name is never adopted (removed
+  from the environment). CLI `--key-source env:X` exits 1 ("… — refused");
+  the workstation's `FRAMETRACE_KEY_SOURCE=env:X` fails to start.
+- **I4.** A carve-lane entry without `carved_unix` (old format) that the
+  timeline times from `db/carve_results.json` says so in its detail
+  ("시각 감사 안 됨 …", `timeline::CARVE_TIME_UNAUDITED_NOTE`); the
+  candidate itself is still the lane's.
+- **I5 — the `.removed` archive is checked.** Every lane read hashes the
+  archive a usable `lane-repair` marker names (a plain file name in the
+  lane's folder only; never a path elsewhere, never a link) against the
+  marker's `removed_bytes` / `removed_sha256`: `audit::RemovedArchive`
+  `match` / `missing` / `differs`. In `chain_json`:
+  `repairs[].removed_archive` and lane-level `removed_archive` (worst;
+  `null` without a repair); in `detail` and `verify-audit`
+  (`removed-archive: …` line, plus a `warning:` line when not `match`;
+  the exit code is still the chain's).
+- Tail deletion past the last sign-off remains undetectable from the lane
+  alone (I9); P16 only stops a deleted MARKER from promoting an older run.
 
 **Implementation notes (what shipped):**
 

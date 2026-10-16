@@ -318,18 +318,54 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
     // D4: runs are grouped by run id; only the newest COMPLETED run is the
     // result, and a newer run without its completion marker is disclosed
     // as interrupted instead of being mixed into (or shown as) the result.
-    let interrupted_html = assessment
-        .interrupted
-        .iter()
-        .map(|index| {
-            let run = &assessment.runs[*index];
+    // R13 P16: such a run WITHHOLDS the result (its marker may have been
+    // deleted — no key is needed for that), and its usable MISMATCH rows
+    // are listed here, never hidden.
+    let mut interrupted_html = assessment
+        .newer_runs()
+        .map(|run| {
+            let mismatched = run.mismatches().count();
             format!(
-                "<p class=\"note warn\">Interrupted run started {} ({} record(s) logged, no completion marker): not a result — its partial records are not shown as the latest re-verification.</p>\n",
+                "<p class=\"note {}\">Run {} started {} has no completion marker ({} record(s) logged{}; 표식 없는 더 새 실행): its marker may have been deleted or the run was cut short — it is not a result, and it means NO earlier run is the current result.</p>\n",
+                if mismatched > 0 { "bad" } else { "warn" },
+                esc(&run.run_id),
                 ts(run.run_unix),
-                run.entries.len()
+                run.entries.len(),
+                if mismatched > 0 {
+                    format!(", {mismatched} MISMATCH")
+                } else {
+                    String::new()
+                }
             )
         })
         .collect::<String>();
+    let newer_mismatches = assessment.newer_mismatches();
+    if !newer_mismatches.is_empty() {
+        let rows = newer_mismatches
+            .iter()
+            .map(|row| {
+                let dash = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .map(esc)
+                        .unwrap_or_else(|| "—".to_string())
+                };
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td class=path>{}</td><td class=hash>{}</td><td class=hash>{}</td><td class=bad>MISMATCH</td></tr>\n",
+                    esc(&row.run_id),
+                    esc(&row.id),
+                    esc(&row.source_path),
+                    dash(&row.recorded_sha256),
+                    dash(&row.observed_sha256),
+                )
+            })
+            .collect::<String>();
+        interrupted_html.push_str(&format!(
+            "<p class=\"banner bad\">{} MISMATCH row(s) recorded by a re-hash run without a completion marker — shown here because no completed run may stand in for it.</p>\n<table><tr><th>Run</th><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>\n",
+            newer_mismatches.len()
+        ));
+    }
     let unauthenticated = assessment.unauthenticated;
     let unauth_html = if unauthenticated > 0 {
         format!(
@@ -351,7 +387,7 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
         // is NOT the current result.
         let withheld_html = match &assessment.withheld {
             Some(reason) if lane.failure.is_none() => format!(
-                "<p class=\"banner warn\">No current re-verification result: the newest re-hash run recorded in hash-verify.jsonl cannot be authenticated on this PC, so its outcome is unknown — an earlier completed run is NOT presented as the latest result (결과 아님: {}).</p>\n",
+                "<p class=\"banner warn\">No current re-verification result: the newest re-hash run recorded in hash-verify.jsonl has no outcome this PC can rely on (an entry it cannot authenticate, a run without a completion marker, or a lane repair after the last completed run) — an earlier completed run is NOT presented as the latest result (결과 아님: {}).</p>\n",
                 esc(reason)
             ),
             _ => String::new(),
@@ -1200,36 +1236,48 @@ mod tests {
     }
 
     /// D4: an interrupted run's records are never mixed into the next
-    /// completed run, and a newer interrupted run is shown separately —
-    /// only the newest COMPLETED run is the result.
+    /// completed run — only the newest COMPLETED run is the result. R13
+    /// P16: an interrupted run AFTER it withholds the result (its marker
+    /// may have been deleted) and its mismatch rows are shown.
     #[test]
     fn hash_verify_groups_by_run_and_shows_interrupted_runs_separately() {
-        let dir = hash_verify_case(
-            "mixed",
-            &[
-                hv(100, Some("100-aaaa"), "vid_old", "match"),
-                hv_done(100, Some("100-aaaa")),
-                // Interrupted (no marker) — must not join run 300.
-                hv(200, Some("200-bbbb"), "vid_cut", "mismatch"),
-                hv(300, Some("300-cccc"), "vid_new", "match"),
-                hv_done(300, Some("300-cccc")),
-                // Newer interrupted run.
-                hv(400, Some("400-dddd"), "vid_late", "mismatch"),
-            ],
-        );
+        let lines = [
+            hv(100, Some("100-aaaa"), "vid_old", "match"),
+            hv_done(100, Some("100-aaaa")),
+            // Interrupted (no marker) — must not join run 300.
+            hv(200, Some("200-bbbb"), "vid_cut", "mismatch"),
+            hv(300, Some("300-cccc"), "vid_new", "match"),
+            hv_done(300, Some("300-cccc")),
+        ];
+        let dir = hash_verify_case("mixed", &lines);
         let (latest, entries) = crate::anomaly::latest_hash_verify_run(&dir).unwrap();
         assert_eq!(latest, 300);
         let ids: Vec<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["vid_new"], "only the completed run's own records");
         let html = render_hash_verify(&dir, None);
         assert!(html.contains("Latest completed live re-hash run"), "{html}");
-        assert!(html.contains("Interrupted run started"), "{html}");
         assert!(html.contains("vid_new"), "{html}");
+        assert!(!html.contains("vid_cut"), "{html}");
+        assert!(html.contains("banner ok"), "{html}");
+
+        // A newer run without a completion marker: no current result, and
+        // its mismatch is listed.
+        crate::audit::append_chained_jsonl_keyed(
+            &dir.join(crate::anomaly::HASH_VERIFY_REL_PATH),
+            &hv(400, Some("400-dddd"), "vid_late", "mismatch").to_string(),
+            None,
+        )
+        .unwrap();
+        assert!(crate::anomaly::latest_hash_verify_run(&dir).is_none());
+        let html = render_hash_verify(&dir, None);
+        assert!(html.contains("No current re-verification result"), "{html}");
+        assert!(html.contains("표식 없는 더 새 실행"), "{html}");
         assert!(
-            !html.contains("vid_cut") && !html.contains("vid_late"),
+            html.contains("vid_late") && html.contains("MISMATCH"),
             "{html}"
         );
-        assert!(html.contains("banner ok"), "{html}");
+        assert!(!html.contains("banner ok"), "{html}");
+        assert!(!html.contains("vid_cut"), "{html}");
 
         // Logs written before run ids existed group by run_unix the same way.
         let legacy = hash_verify_case(

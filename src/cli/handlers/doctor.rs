@@ -138,11 +138,31 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
 }
 
 /// R12-I3: prints the "수리됨" line of every repair recorded in the lane
-/// (`verify-audit` output).
+/// (`verify-audit` output). R13-I5: and the state of the `.removed`
+/// archive it names — hashed against the marker: `removed-archive:
+/// match|missing|differs` (a `missing` / `differs` archive is also a
+/// `warning:` line; it does not change the exit code — the lane's own
+/// chain decides that).
 fn print_lane_repairs(log: &Path) {
     if let Ok(rows) = audit::read_lane_rows(log) {
         for repair in &rows.repairs {
             println!("repaired: {} — {}", log.display(), repair.describe());
+            let archive = repair.removed_archive;
+            println!(
+                "removed-archive: {} {} — {}",
+                archive.as_str(),
+                repair.removed_saved_as.as_deref().unwrap_or("(이름 없음)"),
+                archive.describe()
+            );
+            if archive != audit::RemovedArchive::Match {
+                println!(
+                    "warning: 수리 보관 파일 {} {} — 레인 {}번째 줄의 lane-repair 표식(sha256 {})과 맞지 않음",
+                    repair.removed_saved_as.as_deref().unwrap_or("(이름 없음)"),
+                    archive.as_str(),
+                    repair.index + 1,
+                    repair.removed_sha256
+                );
+            }
         }
     }
 }

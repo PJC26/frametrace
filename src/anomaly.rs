@@ -334,7 +334,64 @@ pub struct HashVerifySummary {
     /// `structural` (self-consistency only), `not-verified`, `failed`,
     /// `absent`.
     pub lane_status: &'static str,
+    /// R13: why there is no current result (`is_result` false) — the
+    /// assessment's `withheld` (or the workstation's run-id check);
+    /// `None` when there is a result. Also part of `not_verified_reason`.
+    pub withheld_reason: Option<String>,
+    /// R13 P16: runs without a completion marker positioned after the
+    /// last completed run (every such run when none completed) — each one
+    /// withholds the result ([`NEWER_UNMARKED_RUN_REASON`]).
+    pub newer_runs: usize,
+    /// R13 P16: the usable per-record entries of those runs.
+    pub newer_records: usize,
+    /// R13 P16: how many of them are `mismatch` — shown, never hidden.
+    pub newer_mismatched: usize,
+    /// R13 P16: those mismatch rows.
+    pub newer_mismatches: Vec<NewerMismatch>,
 }
+
+/// R13 P16: one usable `mismatch` row of a run without a completion
+/// marker that withholds the result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewerMismatch {
+    pub run_id: String,
+    pub run_unix: i64,
+    pub id: String,
+    pub source_path: String,
+    pub recorded_sha256: Option<String>,
+    pub observed_sha256: Option<String>,
+}
+
+impl NewerMismatch {
+    fn from_entry(run: &HashVerifyRun, entry: &serde_json::Value) -> Self {
+        let text = |key: &str| entry.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        Self {
+            run_id: run.run_id.clone(),
+            run_unix: run.run_unix,
+            id: text("id").unwrap_or_default(),
+            source_path: text("source_path").unwrap_or_default(),
+            recorded_sha256: text("recorded_sha256"),
+            observed_sha256: text("observed_sha256"),
+        }
+    }
+
+    /// The `/api/verify-sources` `newer_mismatches[]` object.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": self.run_id,
+            "run_unix": self.run_unix,
+            "id": self.id,
+            "source_path": self.source_path,
+            "recorded_sha256": self.recorded_sha256,
+            "observed_sha256": self.observed_sha256,
+        })
+    }
+}
+
+/// R13 P16: the reason prefix when a run without a completion marker sits
+/// after the last completed run (its marker may have been deleted — no
+/// key is needed for that — or the run was cut short).
+pub const NEWER_UNMARKED_RUN_REASON: &str = "표식 없는 더 새 실행 있음";
 
 /// One run in `hash-verify.jsonl`, grouped by its run id (D4).
 #[derive(Debug, Clone, PartialEq)]
@@ -359,6 +416,18 @@ pub struct HashVerifyRun {
     pub first_index: usize,
     /// R12 P12: lane index of the run's usable completion marker.
     pub marker_index: Option<usize>,
+    /// R13 P16: lane index of the run's last usable entry (its marker
+    /// when completed).
+    pub last_index: usize,
+}
+
+impl HashVerifyRun {
+    /// R13 P16: the run's usable `mismatch` entries.
+    pub fn mismatches(&self) -> impl Iterator<Item = &serde_json::Value> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("mismatch"))
+    }
 }
 
 /// Every run in `hash-verify.jsonl`, in first-appearance order. Entries are
@@ -402,10 +471,12 @@ fn runs_from_lane(lane: &audit::LaneRows) -> Vec<HashVerifyRun> {
                     marker_records: None,
                     first_index: row.index,
                     marker_index: None,
+                    last_index: row.index,
                 });
                 runs.len() - 1
             }
         };
+        runs[index].last_index = row.index;
         if event == Some("hash-verify-run") {
             runs[index].completed = true;
             runs[index].marker_index = Some(row.index);
@@ -439,9 +510,12 @@ pub struct HashVerifyAssessment {
     /// Index into `runs` of the current result: the newest completed run,
     /// unless `withheld`.
     pub result: Option<usize>,
-    /// Newer runs after the result (or every run when there is none) that
-    /// never completed and hold only usable entries — cut short by a crash
-    /// or cancel, disclosed, never the result.
+    /// Runs that never completed (no usable completion marker) with a
+    /// usable entry positioned after the last usable completion marker (or
+    /// every such run when no run completed) — cut short by a crash or
+    /// cancel, OR their marker was deleted (no key is needed for that).
+    /// R13 P16: each one WITHHOLDS the result (an older completed run is
+    /// not the current result) and its usable mismatch rows are shown.
     pub interrupted: Vec<usize>,
     /// R11 I2: why there is no current result although runs exist — a run
     /// newer than every completed one holds an entry this PC cannot use
@@ -462,16 +536,45 @@ impl HashVerifyAssessment {
         self.result.map(|index| &self.runs[index])
     }
 
+    /// R13 P16: the runs without a completion marker that withhold the
+    /// result ([`Self::interrupted`]).
+    pub fn newer_runs(&self) -> impl Iterator<Item = &HashVerifyRun> {
+        self.interrupted.iter().map(|index| &self.runs[*index])
+    }
+
+    /// R13 P16: their usable per-record entries.
+    pub fn newer_records(&self) -> usize {
+        self.newer_runs().map(|run| run.entries.len()).sum()
+    }
+
+    /// R13 P16: their usable `mismatch` rows — shown, never hidden.
+    pub fn newer_mismatches(&self) -> Vec<NewerMismatch> {
+        self.newer_runs()
+            .flat_map(|run| {
+                run.mismatches()
+                    .map(move |entry| NewerMismatch::from_entry(run, entry))
+            })
+            .collect()
+    }
+
     /// The API summary; `None` when nothing usable was ever recorded and
     /// nothing is withheld.
     pub fn summary(&self) -> Option<HashVerifySummary> {
         let lane_status = self.lane.status();
         let Some(run) = self.result_run() else {
-            return self.withheld.as_ref().map(|reason| HashVerifySummary {
-                unauthenticated: self.unauthenticated,
-                not_verified_reason: Some(reason.clone()),
-                lane_status,
-                ..Default::default()
+            return self.withheld.as_ref().map(|reason| {
+                let newer_mismatches = self.newer_mismatches();
+                HashVerifySummary {
+                    unauthenticated: self.unauthenticated,
+                    not_verified_reason: Some(reason.clone()),
+                    withheld_reason: Some(reason.clone()),
+                    lane_status,
+                    newer_runs: self.interrupted.len(),
+                    newer_records: self.newer_records(),
+                    newer_mismatched: newer_mismatches.len(),
+                    newer_mismatches,
+                    ..Default::default()
+                }
             });
         };
         let mut summary = HashVerifySummary {
@@ -532,18 +635,35 @@ fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAss
         .unusable()
         .filter(|row| after_marker(row.index))
         .count();
-    // R12 I3: a `lane-repair` marker after the result run's marker — the
-    // repair cut a tail that may have held a newer run.
-    let repaired_after = lane
-        .usable()
-        .any(|row| after_marker(row.index) && audit::is_lane_repair_marker(&row.value));
-    let mut withheld = None;
+    // R12 I3 / R13 I2: a `lane-repair` marker after the result run's
+    // marker — the repair cut a tail that may have held a newer run.
+    let repaired_after = match marker_at {
+        Some(m) => lane.repaired_after(m),
+        None => !lane.repairs.is_empty(),
+    };
+    // R13 P16: runs that never completed with a usable entry after the
+    // last completed run's marker (every such run when none completed).
+    // Deleting the newest run's marker needs no key — the newer run then
+    // looks "interrupted"; R12 let the older run stand as the result.
+    let interrupted: Vec<usize> = (0..runs.len())
+        .filter(|index| {
+            let run = &runs[*index];
+            !run.completed && after_marker(run.last_index)
+        })
+        .collect();
+    let newer_records: usize = interrupted.iter().map(|i| runs[*i].entries.len()).sum();
+    let newer_mismatched: usize = interrupted
+        .iter()
+        .map(|i| runs[*i].mismatches().count())
+        .sum();
+    let mut reasons: Vec<String> = Vec::new();
     if let Some(failure) = &lane.failure {
-        withheld = Some(format!(
+        reasons.push(format!(
             "재검증 기록의 감사 체인 검증 실패 — 어떤 실행도 현재 결과로 쓰지 않음: {failure}"
         ));
-    } else if unusable_after > 0 {
-        withheld = Some(match latest {
+    }
+    if lane.failure.is_none() && unusable_after > 0 {
+        reasons.push(match latest {
             Some(index) => format!(
                 "마지막 완료 실행({})의 완료 표식 뒤에 이 PC에서 쓸 수 없는 줄 {unusable_after}개 — 그 줄의 내용(이벤트·실행 id)은 믿을 수 없고 더 새 실행의 결과일 수 있어, 이 실행을 현재 결과로 쓰지 않음",
                 runs[index].run_id
@@ -552,27 +672,37 @@ fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAss
                 "이 PC에서 쓸 수 있는 완료 실행이 없고 쓸 수 없는 줄 {unusable_after}개가 있음 — 그 줄의 내용은 믿을 수 없어 결과를 알 수 없음"
             ),
         });
-    } else if repaired_after {
-        withheld = Some(
+    }
+    if lane.failure.is_none() && repaired_after {
+        reasons.push(
             "마지막 완료 실행 뒤에 레인 수리(lane-repair) 표식이 있음 — 수리로 잘린 꼬리에 더 새 실행이 있었을 수 있어 이 실행을 현재 결과로 쓰지 않음 (원본 재검증을 다시 실행하십시오)"
                 .to_string(),
         );
     }
+    if lane.failure.is_none() && !interrupted.is_empty() {
+        let mismatch_note = if newer_mismatched > 0 {
+            format!(", 그중 불일치(MISMATCH) {newer_mismatched}개")
+        } else {
+            String::new()
+        };
+        reasons.push(match latest {
+            Some(index) => format!(
+                "{NEWER_UNMARKED_RUN_REASON} — 마지막 완료 실행({}) 뒤에 완료 표식 없는 실행 {}개(기록 {newer_records}개{mismatch_note}): 완료 표식이 지워졌거나 실행이 중단됐을 수 있어 이전 실행을 현재 결과로 쓰지 않음 (원본 재검증을 다시 실행하십시오)",
+                runs[index].run_id,
+                interrupted.len()
+            ),
+            None => format!(
+                "{NEWER_UNMARKED_RUN_REASON} — 완료된 실행이 없고 완료 표식 없는 실행 {}개(기록 {newer_records}개{mismatch_note})만 있음: 결과 아님 (원본 재검증을 다시 실행하십시오)",
+                interrupted.len()
+            ),
+        });
+    }
+    let withheld = (!reasons.is_empty()).then(|| reasons.join("; "));
     let result = if withheld.is_some() { None } else { latest };
     // Unusable lines from the candidate run's first entry on (every one
     // when there is no candidate), by position.
     let start = latest.map_or(0, |index| runs[index].first_index);
     let unauthenticated = lane.unusable().filter(|row| row.index >= start).count();
-    // Runs that never completed: after the result's marker, or every one
-    // when there is no result. Disclosed, never the result.
-    let interrupted = (0..runs.len())
-        .filter(|index| {
-            let run = &runs[*index];
-            !run.completed
-                && run.unauthenticated == 0
-                && (result.is_none() || marker_at.is_some_and(|m| run.first_index > m))
-        })
-        .collect();
     let mut not_verified = Vec::new();
     match result {
         None => not_verified.extend(withheld.clone()),
