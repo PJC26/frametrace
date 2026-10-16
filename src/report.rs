@@ -382,6 +382,7 @@ const chainLabel = name => {{
   switch (chain?.status) {{
     case "keyed": return "체인 검증: integrity-keyed (HMAC 키로 확인)";
     case "structural": return `체인 검증: 구조만 확인 — 자기 일관성만 확인(인증 아님)${{why}}`;
+    case "repaired": return `체인 검증: 수리됨 — frametrace repair-lane으로 검증되는 앞부분까지 잘라 냄 (${{chain.base_status === "keyed" ? "integrity-keyed" : "구조만 확인 — 자기 일관성만 확인(인증 아님)"}}; 잘린 부분의 기록은 읽지 않음)${{why}}`;
     case "failed": return `체인 검증 실패 — 이 로그를 그대로 믿으면 안 됨${{why}}`;
     case "not-verified": return `체인 확인 불가 (NOT VERIFIED)${{why}}`;
     case "absent": return "로그 없음";
@@ -947,6 +948,7 @@ const chainStatusText = chain => {{
   switch (chain?.status) {{
     case "keyed": return "integrity-keyed — 모든 항목이 설정된 키(HMAC)로 확인됨";
     case "structural": return "구조만 확인 (integrity-structural-only) — 자기 일관성만 확인(인증 아님): 항목 연결은 맞으나 감사 키로 인증되지 않아 로그 전체 재작성은 탐지 못함";
+    case "repaired": return `수리됨 (repair-lane) — 검증되는 앞부분까지 잘라 내고 lane-repair 표식으로 기록함; 남은 체인: ${{chain.base_status === "keyed" ? "integrity-keyed" : "구조만 확인(자기 일관성만, 인증 아님)"}}; 잘린 부분의 기록은 읽지 않음`;
     case "failed": return "검증 실패";
     case "not-verified": return "확인 불가 (NOT VERIFIED) — 이 PC에서 인증되지 않은 항목이 있음 (다른 PC 키면 그 키 보유 PC에서 확인, 상세 참조)";
     case "absent": return "로그 없음";

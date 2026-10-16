@@ -284,6 +284,10 @@ fn r12_i3_repair_lane_cuts_to_the_verified_prefix_and_records_it() {
         );
         let chain = rows.chain_json("artifacts/carved/carve-log.jsonl");
         assert_eq!(chain["repaired"], true, "{chain}");
+        // Track U contract: `logChains[*].status === "repaired"`.
+        assert_eq!(chain["status"], "repaired", "{chain}");
+        assert_eq!(chain["base_status"], "keyed", "{chain}");
+        assert_eq!(chain["unauthenticated"], 0, "{chain}");
         assert_eq!(
             chain["repairs"][0]["removed_sha256"],
             done.removed_sha256.as_str()

@@ -804,12 +804,25 @@ impl LaneRows {
         parts.join("; ")
     }
 
-    /// The report / API chain object: `{"path", "status", "entries",
-    /// "unauthenticated", "detail"}`.
+    /// R12-I3: the chain object's status word — [`Self::status`], except
+    /// `repaired` for a lane holding a usable `lane-repair` marker whose
+    /// chain otherwise passes (`keyed` / `structural`, kept in
+    /// `base_status`). A worse state (`failed`, `not-verified`) wins and
+    /// `repaired: true` is still set.
+    pub fn chain_status(&self) -> &'static str {
+        match self.status() {
+            "keyed" | "structural" if !self.repairs.is_empty() => "repaired",
+            status => status,
+        }
+    }
+
+    /// The report / API chain object: `{"path", "status", "base_status",
+    /// "entries", "unauthenticated", "detail", "repaired", "repairs"}`.
     pub fn chain_json(&self, rel: &str) -> serde_json::Value {
         serde_json::json!({
             "path": rel,
-            "status": self.status(),
+            "status": self.chain_status(),
+            "base_status": self.status(),
             "entries": self.rows.len(),
             "unauthenticated": self.unusable().count(),
             "detail": self.detail(),
