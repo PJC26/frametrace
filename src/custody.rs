@@ -948,6 +948,8 @@ mod tests {
                 entry_key_ids: vec![keyed.then(|| "k".to_string()); 2],
                 pre_key_entries: 0,
                 pre_key_other_pc: None,
+                rewrite_suspect_lines: Vec::new(),
+                location_unverified: None,
             }),
         }
     }

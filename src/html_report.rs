@@ -694,7 +694,7 @@ pub fn render_carve_report_html(
     <thead><tr>
       <th data-k="run_order">실행</th><th data-k="id">ID</th><th data-k="extension">확장자</th><th data-k="size_bytes">크기</th>
       <th data-k="offset">오프셋</th><th>라이브FS</th><th data-k="validation_status">검증 상태</th>
-      <th>SHA-256</th><th>비고</th><th></th>
+      <th data-k="trust_ok">신뢰</th><th>SHA-256</th><th>비고</th><th></th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -802,10 +802,16 @@ document.getElementById("sourceInfo").textContent =
   (R.source_path || "") + (R.carved_unix ? "  ·  " + fmtCarveTime(R.carved_unix) : "");
 const exts = [...new Set(ARTIFACTS.map(a => a.extension || "?"))].sort();
 const warnN = (R.warnings || []).length;
-const dupN = ARTIFACTS.filter(a => INDEXED_SHAS.has(a.sha256)).length;
-const newN = ARTIFACTS.length - dupN;
+// R10-I1: only entries usable here (trust_ok) are carve results; the rest
+// are listed with "인증 안 됨" in the 신뢰 column and never counted.
+const trusted = a => a.trust_ok !== false;
+const RESULT_ARTIFACTS = ARTIFACTS.filter(trusted);
+const unauthN = ARTIFACTS.length - RESULT_ARTIFACTS.length;
+const dupN = RESULT_ARTIFACTS.filter(a => INDEXED_SHAS.has(a.sha256)).length;
+const newN = RESULT_ARTIFACTS.length - dupN;
 document.getElementById("metrics").innerHTML = [
-  ["아티팩트", ARTIFACTS.length, ""],
+  ["아티팩트", RESULT_ARTIFACTS.length, ""],
+  ...(unauthN ? [["인증 안 됨(결과 아님)", unauthN, "fail"]] : []),
   ["라이브FS 미존재", newN, newN ? "warn" : ""],
   ["인덱스 동일", dupN, ""],
   ["스캔 완료", R.scan_complete ? "전체 완료" : "부분 스캔", R.scan_complete ? "ok" : "fail"],
@@ -868,8 +874,9 @@ function render() {{
   tbody.innerHTML = list.map(a => `<tr data-id="${{esc(a.id)}}">
     <td class="muted">${{esc(a.run_label || "-")}}</td><td>${{esc(a.id)}}</td><td>${{esc(a.extension || "-")}}</td><td>${{fmtSize(a.size_bytes)}}</td>
     <td title="${{a.offset}}">${{hex(a.offset)}}</td>
-    <td>${{INDEXED_SHAS.has(a.sha256) ? '<span class="badge">중복</span>' : '<span class="badge ok">신규</span>'}}</td>
-    <td><span class="badge ${{(a.validation_status||"").includes("failed") ? "failed" : (a.validation_status||"").includes("confirmed") ? "ok" : ""}}">${{esc(a.validation_status || "-")}}</span></td>
+    <td>${{!trusted(a) ? '<span class="badge">-</span>' : INDEXED_SHAS.has(a.sha256) ? '<span class="badge">중복</span>' : '<span class="badge ok">신규</span>'}}</td>
+    <td><span class="badge ${{!trusted(a) ? "" : (a.validation_status||"").includes("failed") ? "failed" : (a.validation_status||"").includes("confirmed") ? "ok" : ""}}">${{esc(a.validation_status || "-")}}</span></td>
+    <td>${{trusted(a) ? `<span class="badge ok" title="${{esc(a.trust_label)}}">${{esc(a.trust === "sc" ? "자기 일관성만" : "확인됨")}}</span>` : `<span class="badge failed" title="${{esc(a.trust_label)}}">인증 안 됨</span>`}}</td>
     <td class="muted">${{esc((a.sha256 || "").slice(0, 12))}}</td>
     <td class="muted" title="${{esc(a.validation_note)}}">${{esc((a.validation_note || "").slice(0, 60))}}</td>
     <td><a href="${{esc(downloadHref(a.output_path))}}">저장</a></td>
@@ -895,6 +902,7 @@ function showDetail(a) {{
     <div class="kv"><b>오프셋 / 크기</b>${{hex(a.offset)}} (${{a.offset}}) / ${{fmtSize(a.size_bytes)}}</div>
     <div class="kv"><b>SHA-256</b>${{esc(a.sha256)}}</div>
     <div class="kv"><b>검증 상태</b>${{esc(a.validation_status)}}</div>
+    <div class="kv"><b>신뢰</b>${{esc(a.trust_label)}}${{trusted(a) ? "" : " — 이 항목은 카빙 결과로 보지 마십시오"}}</div>
     <div class="kv"><b>검증 비고</b>${{esc(a.validation_note)}}</div>
     ${{proxy ? `<div class="kv"><b>프록시</b>${{esc(proxy)}}</div>` : ""}}
     ${{src
@@ -948,6 +956,9 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
                 last.insert((run_of(item), id.to_string()), i);
             }
         }
+        // R10 P7: the LAST entry per (run, id) decides — whatever its
+        // trust, so an unauthenticated newest entry is never rolled back
+        // to an older authenticated one (it is shown as "인증 안 됨").
         let keep: std::collections::HashSet<usize> = last.into_values().collect();
         let mut i = 0usize;
         items.retain(|item| {
@@ -955,6 +966,15 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
             i += 1;
             keep_it
         });
+        // R10-I1: every entry carries whether it may be shown as a result
+        // (`trust_ok`, from the reader's per-entry `trust`) and the
+        // "신뢰" column text; the page counts and lists results from
+        // `trust_ok` entries only.
+        for item in &mut items {
+            let (ok, label) = carve_entry_trust(item);
+            item["trust_ok"] = serde_json::Value::Bool(ok);
+            item["trust_label"] = serde_json::Value::String(label);
+        }
         // Run order: newest carved_unix first (then latest in the log);
         // the legacy group (no run id) last.
         let mut runs: Vec<(Option<String>, u64, usize)> = Vec::new();
@@ -1004,6 +1024,36 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
         item["output_path"] = serde_json::Value::String(crate::audit::path_string(&resolved));
     }
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// R10-I1: whether a carve-log entry (as `audit::LaneRows::
+/// jsonl_with_trust` hands it over, field `trust`) may be shown as a
+/// carve RESULT, and its "신뢰" text. `auth` / `sc` are results (`sc` says
+/// "자기 일관성만"); `unauth` and `pc:<id>` are listed as "인증 안 됨"
+/// (another PC's key named); an entry without `trust` comes from a caller
+/// that did not classify it and is shown as before.
+fn carve_entry_trust(item: &serde_json::Value) -> (bool, String) {
+    let note = item
+        .get("trust_note")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match item.get("trust").and_then(serde_json::Value::as_str) {
+        None | Some("auth") => (true, "확인됨".to_string()),
+        Some("sc") => (true, crate::audit::SELF_CONSISTENT_NOTE.to_string()),
+        Some(code) => {
+            let base = match code.strip_prefix("pc:") {
+                Some(key_id) => format!(
+                    "인증 안 됨 — 이 PC에서 인증 불가, 키 \"{key_id}\" 보유 PC에서 확인 (변조 판정 아님)"
+                ),
+                None => "인증 안 됨".to_string(),
+            };
+            if note.is_empty() || code.starts_with("pc:") {
+                (false, base)
+            } else {
+                (false, format!("{base} — {note}"))
+            }
+        }
+    }
 }
 
 fn jsonl_to_array(jsonl: &str) -> String {

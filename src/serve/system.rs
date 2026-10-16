@@ -1528,7 +1528,16 @@ mod tests_r8_audit_api {
             let body = parse(&multi);
             assert_eq!(body["ok"], true, "not failed: {body}");
             assert_eq!(body["integrity"], "integrity-not-verified", "{body}");
-            assert_eq!(body["logs"][0]["other_pc_key_ids"][0], "pc-b", "{body}");
+            // R10-I6: pc-b's line follows a line this PC authenticated —
+            // "재작성 배제 불가", counted as unauthenticated, not other-PC.
+            assert_eq!(body["logs"][0]["unauthenticated_lines"], 1, "{body}");
+            assert!(
+                body["logs"][0]["trust"]
+                    .as_str()
+                    .unwrap()
+                    .contains("재작성 배제 불가"),
+                "{body}"
+            );
         });
         crate::audit_key::with_test_keys(&[], || {
             let body = parse(&stripped);

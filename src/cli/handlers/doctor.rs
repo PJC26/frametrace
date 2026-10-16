@@ -141,7 +141,14 @@ pub fn verify_audit(log_path: &Path) -> Result<(), String> {
 /// sign-off lane above all: an entry signed by the now-retired key is only
 /// authenticated when a newer key's entry follows it, so without the marker
 /// every earlier sign-off would read "cannot be verified" after rotation.
-pub fn rotate_audit_key(key_id: Option<&str>, marker_logs: &[PathBuf]) -> Result<(), String> {
+///
+/// R10-I9: `init` allows creating a new keyring at a missing explicit
+/// `FRAMETRACE_AUDIT_KEYRING_FILE` path ([`crate::audit_key::rotate`]).
+pub fn rotate_audit_key(
+    key_id: Option<&str>,
+    marker_logs: &[PathBuf],
+    init: bool,
+) -> Result<(), String> {
     // Resolve the lanes BEFORE rotating, so a bad --log path fails without
     // changing the keyring.
     let mut targets: Vec<PathBuf> = Vec::new();
@@ -157,8 +164,23 @@ pub fn rotate_audit_key(key_id: Option<&str>, marker_logs: &[PathBuf]) -> Result
     }
     let targets = dedup_lanes(targets);
     // R8-I8: which lanes hold entries but no keyed entry (before rotating).
-    let keyless: Vec<bool> = targets.iter().map(|lane| lane_is_keyless(lane)).collect();
-    let rotation = crate::audit_key::rotate(key_id)?;
+    // R10-I9: decided per CASE, not per lane — a lane with no HMAC in a
+    // case where another lane holds HMAC entries was keyed and stripped
+    // (or continued without the key), never "written before keying".
+    let (keyless, refused) = introduction_candidates(&targets);
+    let rotation = crate::audit_key::rotate(key_id, init)?;
+    if rotation.previous_id.is_none() {
+        for (lane, _) in targets
+            .iter()
+            .zip(&refused)
+            .filter(|(_, refused)| **refused)
+        {
+            println!(
+                "key introduction refused: {} — another lane of this case holds HMAC entries, so this lane's unkeyed entries are not a pre-key prefix (it gets the rotation marker; its unkeyed entries stay NOT VERIFIED where keys are held) (키 도입 거부: 같은 케이스의 다른 레인에 HMAC 항목이 있음)",
+                lane.display()
+            );
+        }
+    }
     println!("audit key rotated");
     println!("new key id: {}", rotation.new_key.id);
     match &rotation.previous_id {
@@ -269,6 +291,45 @@ fn lane_is_keyless(lane: &Path) -> bool {
         .filter(|rows| rows.failure.is_none())
         .and_then(|rows| rows.verification)
         .is_some_and(|result| result.entries > 0 && result.keyed_entries == 0)
+}
+
+/// R8-I8 / R10-I9: per target, whether it may get a key-INTRODUCTION
+/// marker (holds entries, none keyed, and no other lane of its case holds
+/// HMAC entries), and whether it was refused only because of that case
+/// rule.
+fn introduction_candidates(targets: &[PathBuf]) -> (Vec<bool>, Vec<bool>) {
+    let mut keyless = Vec::with_capacity(targets.len());
+    let mut refused = Vec::with_capacity(targets.len());
+    for lane in targets {
+        let lane_keyless = lane_is_keyless(lane);
+        let case_keyed = lane_keyless && case_holds_keyed_lane(lane);
+        keyless.push(lane_keyless && !case_keyed);
+        refused.push(case_keyed);
+    }
+    (keyless, refused)
+}
+
+/// R10-I9: whether another chained lane of the case `lane` belongs to
+/// holds an HMAC-signed entry (structure only — no keys needed). A lane
+/// that is not under a case root counts as holding none.
+fn case_holds_keyed_lane(lane: &Path) -> bool {
+    let Some(binding) = audit::lane_binding_of(lane) else {
+        return false;
+    };
+    let me = audit::lane_rel_key(&binding.rel);
+    audit::case_lane_paths(&binding.root)
+        .iter()
+        .filter(|path| {
+            path.strip_prefix(&binding.root)
+                .map(|rel| audit::lane_rel_key(&rel.to_string_lossy()) != me)
+                .unwrap_or(true)
+        })
+        .any(|path| {
+            audit::read_lane_rows_with_keys(path, &[])
+                .ok()
+                .and_then(|rows| rows.verification)
+                .is_some_and(|verification| verification.keyed_entries > 0)
+        })
 }
 
 /// R7-I6: the lanes of the case at `case_dir` that get a rotation marker:
@@ -506,7 +567,15 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
         )),
         Ok(None) => checks.push(DoctorCheck::warn(
             "audit keyring",
-            "키 없음 — 감사 로그는 구조만 확인, 모든 확인 결과는 자기 일관성만(인증 아님)".into(),
+            match crate::audit_key::key_location_warning() {
+                // R10-I15: no config directory — default key locations
+                // were not even looked at.
+                Some(warning) => format!(
+                    "키 없음 — {warning} · 감사 로그는 구조만 확인, 모든 확인 결과는 자기 일관성만(인증 아님)"
+                ),
+                None => "키 없음 — 감사 로그는 구조만 확인, 모든 확인 결과는 자기 일관성만(인증 아님)"
+                    .into(),
+            },
         )),
         Err(err) => checks.push(DoctorCheck::fail(
             "audit keyring",
@@ -632,6 +701,35 @@ mod tests {
     use crate::audit;
     use crate::audit_key::AuditKey;
     use std::fs;
+
+    /// R10-I9: key introduction is decided per CASE — a lane without any
+    /// HMAC in a case where another lane holds HMAC entries was stripped
+    /// (or continued without the key), so it never gets the introduction
+    /// marker that would make its entries a "pre-key" prefix. R8/R9
+    /// decided per lane.
+    #[test]
+    fn r10_i9_key_introduction_refused_when_the_case_was_keyed() {
+        let case = std::env::temp_dir().join(format!("ft-r10-i9-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&case);
+        fs::create_dir_all(case.join("evidence/logs")).unwrap();
+        fs::write(case.join("case.json"), r#"{"case_id":"C-i9"}"#).unwrap();
+        let stripped = case.join("evidence/logs/scan-log.jsonl");
+        audit::append_chained_jsonl_keyed(&stripped, r#"{"n":1}"#, None).unwrap();
+        // Only unkeyed lanes: introduction allowed.
+        let (keyless, refused) = super::introduction_candidates(std::slice::from_ref(&stripped));
+        assert_eq!((keyless, refused), (vec![true], vec![false]));
+        // Another lane of the case carries an HMAC: refused.
+        let other = AuditKey::new("other", &[0x5a; 32]);
+        audit::append_chained_jsonl_keyed(
+            &case.join("evidence/logs/validation-log.jsonl"),
+            r#"{"n":1}"#,
+            Some(&other),
+        )
+        .unwrap();
+        let (keyless, refused) = super::introduction_candidates(std::slice::from_ref(&stripped));
+        assert_eq!((keyless, refused), (vec![false], vec![true]));
+        let _ = fs::remove_dir_all(&case);
+    }
 
     /// R7-I6: `rotate-audit-key --log <case dir>` stamps the rotation
     /// marker into every verifying chain lane of the case — the sign-off

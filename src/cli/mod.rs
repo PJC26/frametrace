@@ -357,6 +357,11 @@ pub enum Commands {
         /// (repeatable; the marker is keyed under the NEW key)
         #[arg(long)]
         log: Vec<PathBuf>,
+        /// Create a NEW keyring at the path FRAMETRACE_AUDIT_KEYRING_FILE
+        /// names when nothing is there yet (without it, a missing explicit
+        /// keyring is an error — the drive may just be disconnected)
+        #[arg(long)]
+        init: bool,
     },
     /// Batch-process a viewer selection file (export/proxy/thumbnail per item)
     ExportBatch {
@@ -912,7 +917,9 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             validate_artifact(&case_dir, &selector, options)
         }
         Commands::VerifyAudit { log_path } => verify_audit(&log_path),
-        Commands::RotateAuditKey { key_id, log } => rotate_audit_key(key_id.as_deref(), &log),
+        Commands::RotateAuditKey { key_id, log, init } => {
+            rotate_audit_key(key_id.as_deref(), &log, init)
+        }
         Commands::ExportBatch {
             case_dir,
             selection,

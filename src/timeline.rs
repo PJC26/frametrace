@@ -21,6 +21,16 @@ pub const LABEL: &str = "candidate-timeline";
 /// claims.
 pub const UNAUTHENTICATED_KIND: &str = "audit-entry-unauthenticated";
 
+/// R10-I2: the kind of an event from a `*.jsonl` that is NOT a chained
+/// lane, on a PC without audit keys (nothing vouches for it; with keys it
+/// is [`UNAUTHENTICATED_KIND`]). R9 emitted these as `audit-event`.
+pub const UNCHAINED_KIND: &str = "unchained-log-entry";
+
+/// R10-I2: why a non-lane log entry is not authenticated where keys are
+/// held.
+const UNCHAINED_NOTE: &str =
+    "체인 레인이 아닌 로그의 항목 — 해시 체인·HMAC이 없어 아무것도 이 항목을 보증하지 않음";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEvent {
     pub ts_unix: u64,
@@ -305,7 +315,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             .get("carved_unix")
             .and_then(serde_json::Value::as_u64)
             .or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(value))));
-        let unauthenticated = (!row.usable()).then(|| row.trust.note());
+        let unauthenticated = (!row.usable()).then(|| row.note());
         emit(value, ts, unauthenticated, &mut skipped);
     }
     for artifact in &snapshot_artifacts {
@@ -339,6 +349,12 @@ fn audit_log_events(
     files.sort(); // deterministic input order for the merge
     let output_canonical = output_path.canonicalize().ok();
     let mut skipped = 0usize;
+    // R10-I2: a `*.jsonl` that is not a chained lane has nothing that
+    // vouches for it — never an `audit-event`. Where this PC holds audit
+    // keys (or the key configuration cannot be read: fail closed) it is
+    // "not authenticated"; without keys it is an unchained log entry.
+    let keys_held = audit::trust_policy_here().map_or(true, |(policy, _)| policy.keys_held());
+    let mut seen_lanes = std::collections::BTreeSet::new();
     for file in files {
         if output_canonical
             .as_deref()
@@ -352,40 +368,49 @@ fn audit_log_events(
             .to_string_lossy()
             .to_string();
         // R9 P3: a known chained lane is read through the one lane reader
-        // (each entry with its trust); any other `*.jsonl` is plain data
-        // with nothing to authenticate.
-        let rows: Vec<(serde_json::Value, Option<String>)> =
-            if audit::is_known_chain_lane(&rel.replace('\\', "/")) {
-                let lane = audit::read_lane_rows(&file)
-                    .map_err(|err| format!("failed to read audit log {}: {err}", file.display()))?;
-                lane.rows
-                    .into_iter()
-                    .map(|row| {
-                        let note = (!row.usable()).then(|| row.trust.note());
-                        (row.value, note)
-                    })
-                    .collect()
-            } else {
-                let text = match read_to_string(&file) {
-                    Ok(text) => text,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(format!(
-                            "failed to read audit log {}: {err}",
-                            file.display()
-                        ));
-                    }
-                };
-                text.lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(|line| {
-                        (
-                            serde_json::from_str(line).unwrap_or(serde_json::Value::Null),
-                            None,
-                        )
-                    })
-                    .collect()
+        // (each entry with its trust). R10 P6: recognised under any
+        // spelling the file system treats as the lane (letter case on
+        // Windows / macOS) — and read once.
+        let lane_rel = audit::canonical_lane_rel(&rel);
+        if lane_rel
+            .as_ref()
+            .is_some_and(|rel| !seen_lanes.insert(rel.clone()))
+        {
+            continue;
+        }
+        let chained = lane_rel.is_some();
+        let rows: Vec<(serde_json::Value, Option<String>)> = if chained {
+            let lane = audit::read_lane_rows(&file)
+                .map_err(|err| format!("failed to read audit log {}: {err}", file.display()))?;
+            lane.rows
+                .into_iter()
+                .map(|row| {
+                    let note = (!row.usable()).then(|| row.note());
+                    (row.value, note)
+                })
+                .collect()
+        } else {
+            let text = match read_to_string(&file) {
+                Ok(text) => text,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(format!(
+                        "failed to read audit log {}: {err}",
+                        file.display()
+                    ));
+                }
             };
+            let note = keys_held.then(|| UNCHAINED_NOTE.to_string());
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    (
+                        serde_json::from_str(line).unwrap_or(serde_json::Value::Null),
+                        note.clone(),
+                    )
+                })
+                .collect()
+        };
         for (value, unauthenticated) in rows {
             let Some(object) = value.as_object() else {
                 skipped += 1;
@@ -419,12 +444,22 @@ fn audit_log_events(
             .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
             .map(str::to_string)
             .unwrap_or_else(|| rel.clone());
-            let detail = format!("audit event '{event}' recorded in {rel} ({ts_key})");
+            let detail = if chained {
+                format!("audit event '{event}' recorded in {rel} ({ts_key})")
+            } else {
+                format!(
+                    "unchained log entry '{event}' in {rel} ({ts_key}) — not an audit lane (체인 없는 로그)"
+                )
+            };
             events.push(match unauthenticated {
                 None => TimelineEvent {
                     ts_unix: ts,
                     source: "audit-log",
-                    kind: "audit-event",
+                    kind: if chained {
+                        "audit-event"
+                    } else {
+                        UNCHAINED_KIND
+                    },
                     path,
                     detail,
                 },

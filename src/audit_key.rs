@@ -80,6 +80,7 @@ fn verification_keys_raw() -> Result<Vec<AuditKey>, String> {
     if let Some(keys) = TEST_KEYS.with(|keys| keys.borrow().clone()) {
         return Ok(normalize_retired_aliases(&keys));
     }
+    warn_key_location_once();
     let mut keys: Vec<AuditKey> = SOURCE_OVERRIDE.get().cloned().into_iter().collect();
     let extras = keyring_keys()?
         .into_iter()
@@ -341,14 +342,75 @@ fn read_key_file(path: &Path) -> Result<AuditKey, String> {
 }
 
 fn from_env() -> Result<Option<AuditKey>, String> {
-    key_from_env("FRAMETRACE_AUDIT_KEY")
+    key_from_env(KEY_ENV)
+}
+
+/// R10-I14: the raw key material variable.
+const KEY_ENV: &str = "FRAMETRACE_AUDIT_KEY";
+
+/// R10-I14: the key variables read once at process start and REMOVED from
+/// the process environment ([`adopt_key_env`]) — the raw key and the paths
+/// of the key file / keyring. R9 left them in the environment, so every
+/// tool a step runs (ffmpeg, ffprobe, Sleuth Kit, python, …) inherited the
+/// raw key.
+const ADOPTED_KEY_VARS: &[&str] = &[KEY_ENV, KEY_FILE_ENV, KEYRING_ENV];
+
+/// R10-I14: what [`adopt_key_env`] took from the environment.
+static ADOPTED_KEY_ENV: OnceLock<BTreeMap<&'static str, std::ffi::OsString>> = OnceLock::new();
+
+/// R10-I14: keeps [`ADOPTED_KEY_VARS`] for this process and removes them
+/// from its environment, so no child inherits them. FrameTrace's own CLI
+/// step children get them back explicitly ([`forward_adopted_key_env`]).
+///
+/// # Safety
+/// Removes environment variables: call it at the start of `main`, before
+/// any other thread exists (right after `util::adopt_step_warning_token`).
+pub unsafe fn adopt_key_env() {
+    let mut adopted = BTreeMap::new();
+    for var in ADOPTED_KEY_VARS {
+        if let Some(value) = std::env::var_os(var) {
+            // SAFETY: forwarded to the caller (single-threaded start).
+            unsafe { std::env::remove_var(var) };
+            adopted.insert(*var, value);
+        }
+    }
+    let _ = ADOPTED_KEY_ENV.set(adopted);
+}
+
+/// R10-I14: sets the adopted key variables on a FrameTrace CLI step child
+/// (the workstation's own steps need the key; nothing else gets it). A
+/// no-op when nothing was adopted.
+pub fn forward_adopted_key_env(command: &mut std::process::Command) {
+    if let Some(adopted) = ADOPTED_KEY_ENV.get() {
+        for (var, value) in adopted {
+            command.env(var, value);
+        }
+    }
+}
+
+/// R10-I14: an audit key variable — the adopted value when the process
+/// adopted the key environment at start, the live environment otherwise
+/// (library callers, tests).
+fn key_env_var(var: &str) -> Result<String, std::env::VarError> {
+    if let Some(adopted) = ADOPTED_KEY_ENV.get()
+        && ADOPTED_KEY_VARS.contains(&var)
+    {
+        return match adopted.get(var) {
+            Some(value) => value
+                .clone()
+                .into_string()
+                .map_err(std::env::VarError::NotUnicode),
+            None => Err(std::env::VarError::NotPresent),
+        };
+    }
+    std::env::var(var)
 }
 
 /// Reads hex/base64 key material from an environment variable. Absent is
 /// `Ok(None)`; present-but-unusable (empty, non-unicode, malformed) is an
 /// error — a misconfigured source never silently degrades to unkeyed.
 fn key_from_env(var: &str) -> Result<Option<AuditKey>, String> {
-    match std::env::var(var) {
+    match key_env_var(var) {
         Ok(raw) if !raw.trim().is_empty() => {
             let bytes = parse_key_material(raw.trim()).map_err(|err| format!("{var}: {err}"))?;
             Ok(Some(AuditKey {
@@ -364,7 +426,7 @@ fn key_from_env(var: &str) -> Result<Option<AuditKey>, String> {
 }
 
 fn key_file_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("FRAMETRACE_AUDIT_KEY_FILE") {
+    if let Ok(path) = key_env_var(KEY_FILE_ENV) {
         let path = path.trim();
         if !path.is_empty() {
             return Some(PathBuf::from(path));
@@ -455,7 +517,7 @@ pub struct Rotation {
 }
 
 fn keyring_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("FRAMETRACE_AUDIT_KEYRING_FILE") {
+    if let Ok(path) = key_env_var(KEYRING_ENV) {
         let path = path.trim();
         if !path.is_empty() {
             return Some(PathBuf::from(path));
@@ -555,7 +617,7 @@ const KEYRING_ENV: &str = "FRAMETRACE_AUDIT_KEYRING_FILE";
 /// The variable when it is set (non-blank) — the path was configured
 /// explicitly, so its absence is an error, not "no key".
 fn explicit_var(var: &'static str) -> Option<&'static str> {
-    std::env::var(var)
+    key_env_var(var)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(|_| var)
@@ -579,9 +641,19 @@ pub(crate) fn probe_key_path(
         ))
     };
     match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && is_network_error(&err) => {
+            fail(format!("네트워크 위치에 연결할 수 없습니다: {err}"))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => match explicit_var {
             Some(var) => fail(format!("{var}로 지정된 경로에 파일이 없습니다")),
-            None => Ok(false),
+            // R10-I15: "nothing there" only when the location itself could
+            // be looked at — a broken junction / link above it, an
+            // unreachable network location or a missing volume is not
+            // "no key".
+            None => match unconfirmable_location(path) {
+                Some(why) => fail(why),
+                None => Ok(false),
+            },
         },
         Err(err) => fail(format!("확인할 수 없습니다: {err}")),
         Ok(meta) => {
@@ -604,14 +676,131 @@ pub(crate) fn probe_key_path(
     }
 }
 
+/// R10-I15 (verified on Windows 11, Rust 1.9x): `std` maps the Windows
+/// network errors `ERROR_BAD_NETPATH` (53, unreachable host) and
+/// `ERROR_BAD_NET_NAME` (67, missing share) to `ErrorKind::NotFound` — the
+/// same kind as a plain missing file — and a path under a junction whose
+/// target is gone fails with `ERROR_PATH_NOT_FOUND` (3), also `NotFound`.
+/// So `NotFound` alone cannot tell "no key here" from "the location is
+/// unreachable"; these raw codes can.
+fn is_network_error(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // BAD_NETPATH, NETWORK_BUSY, REM_NOT_LIST, UNEXP_NET_ERR,
+        // NETNAME_DELETED, BAD_NET_NAME, NO_NETWORK, NETWORK_UNREACHABLE,
+        // HOST_UNREACHABLE, NOT_CONNECTED.
+        matches!(
+            err.raw_os_error(),
+            Some(53 | 54 | 51 | 59 | 64 | 67 | 1222 | 1231 | 1232 | 2250)
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        // ESTALE / ENOTCONN / EHOSTDOWN / EHOSTUNREACH never map to
+        // `NotFound`; they already fail as "cannot check".
+        let _ = err;
+        false
+    }
+}
+
+/// R10-I15: why the (default) key location `path`, which does not exist,
+/// cannot be confirmed as "no key here": the nearest existing ancestor is a
+/// junction / symbolic link whose target is gone, an ancestor is on an
+/// unreachable network location, or the volume itself is missing. `None`
+/// when the nearest existing ancestor is an ordinary reachable folder.
+pub(crate) fn unconfirmable_location(path: &Path) -> Option<String> {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            return None;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink()
+                    && let Err(err) = std::fs::metadata(ancestor)
+                {
+                    return Some(format!(
+                        "상위 폴더 {}가 대상이 없는 재분석 지점(끊긴 정션·링크)입니다 — 키가 없는지 확인할 수 없습니다: {err}",
+                        ancestor.display()
+                    ));
+                }
+                return None;
+            }
+            Err(err) if is_network_error(&err) => {
+                return Some(format!(
+                    "상위 위치 {}(네트워크)에 연결할 수 없습니다 — 키가 없는지 확인할 수 없습니다: {err}",
+                    ancestor.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if ancestor.parent().is_none() {
+                    return Some(format!(
+                        "드라이브·볼륨 {}이(가) 없습니다 — 키가 없는지 확인할 수 없습니다",
+                        ancestor.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                return Some(format!(
+                    "상위 폴더 {}를 확인할 수 없습니다: {err}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// R10-I15: no config directory could be resolved (no `APPDATA` /
+/// `HOME`), so the default key and keyring locations were not looked at —
+/// "no key" there is not a finding. `None` when they were, or when an
+/// explicit path is configured for both.
+pub fn key_location_warning() -> Option<String> {
+    if config_dir().is_some() || (key_file_path().is_some() && keyring_path().is_some()) {
+        return None;
+    }
+    Some(format!(
+        "기본 감사 키 위치를 확인하지 못했습니다 — 설정 폴더(Windows %APPDATA%, Unix $HOME/$XDG_CONFIG_HOME)를 찾을 수 없어 기본 키 파일·키링을 찾아보지 않았습니다 ({KEY_FILE_ENV} / {KEYRING_ENV}로 경로를 지정하십시오)"
+    ))
+}
+
+/// R10-I15: [`key_location_warning`] printed once per process when keys
+/// are resolved without any config directory.
+fn warn_key_location_once() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if let Some(warning) = key_location_warning()
+        && WARNED.set(()).is_ok()
+    {
+        eprintln!("warning: {warning}");
+    }
+}
+
 /// Generates a new audit key, registers it as the keyring's active key, and
 /// retires the previously configured key — whichever source supplied it —
 /// into the keyring so its entries stay verifiable.
-pub fn rotate(requested_id: Option<&str>) -> Result<Rotation, String> {
+///
+/// R10-I9: a keyring path configured explicitly
+/// (`FRAMETRACE_AUDIT_KEYRING_FILE`) that does not exist is created only
+/// with `init` (`rotate-audit-key --init`). R9 created it silently — a
+/// keyring on a drive that was briefly unavailable then read as "no key
+/// before", so the rotation started a NEW keyring and stamped
+/// key-introduction markers that turned stripped lanes into a
+/// "pre-key" prefix.
+pub fn rotate(requested_id: Option<&str>, init: bool) -> Result<Rotation, String> {
     let path = keyring_path().ok_or_else(|| {
         "cannot rotate the audit key: no config directory resolved; set FRAMETRACE_AUDIT_KEYRING_FILE"
             .to_string()
     })?;
+    if explicit_var(KEYRING_ENV).is_some() && !init {
+        match std::fs::symlink_metadata(&path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "{KEY_CONFIG_UNREADABLE}: 감사 키링 {} — {KEYRING_ENV}로 지정된 경로에 키링이 없습니다. 드라이브가 잠시 연결되지 않은 것이라면 연결한 뒤 다시 실행하고, 이 경로에 새 키링을 만들려면 rotate-audit-key --init 으로 실행하십시오 (변조 판정 아님)",
+                    path.display()
+                ));
+            }
+            _ => {}
+        }
+    }
     rotate_at(&path, requested_id, configured_with(true)?)
 }
 

@@ -170,6 +170,92 @@ only (never authenticated) instead of "not authenticated". A PC that already
 held a key never introduces keying, so a lane stripped of its HMACs stays
 NOT VERIFIED there. Rotating without `--log <case>` prints a warning.
 
+### Lane identity, recency, location (R10)
+
+R9's one reader was kept, but consumers still (a) rendered rows and
+dropped their `trust` (the carve page), (b) disagreed on WHICH file is a
+lane under Windows path spellings, and (c) fell back to an older
+authenticated row when the newest one was not usable. R10:
+
+- **P6 — one lane identity.** A root-relative path is compared through
+  `audit::lane_rel_key` (`/` separators, no `./`, ASCII-lowercased on
+  Windows / macOS, whose file systems ignore case by default) and spelled
+  canonically by `canonical_lane_rel`. `collect_chain_lanes` looks every
+  `KNOWN_CHAIN_LANES` path up DIRECTLY under the root (R9 walked the tree
+  and compared names exactly, missing a lane reached under another letter
+  case or through a link the walk did not follow, while the consumers read
+  it through the constant path); `case_lane_paths`, the timeline and the
+  sound-lane listing use the same identity. `audit::lane_location` makes a
+  path lexically absolute (`std::path::absolute`, `.`/`..` removed; then
+  `canonicalize` as a fallback, e.g. 8.3 names) before finding its root and
+  canonical lane. A **reparse point** (junction or symbolic link — Rust
+  reports Windows junctions as `is_symlink()`, verified) on the lane path
+  below the case root makes the lane's location unconfirmable:
+  `AuditChainVerification::location_unverified`, every entry
+  `LineTrust::LocationUnverified` (`unauth`), lane NOT VERIFIED.
+- **P7 — recency.** `read_lane_rows` marks a usable entry as superseded
+  (`LaneRow::superseded_by`, no longer `usable()`, code `unauth`,
+  `trust_note` starting `더 최근 인증 안 된 항목 있음`,
+  `trust_superseded_by: <line>`) when a LATER entry about the same record
+  (`audit::recency_keys`: `id`, `record_id`, `selector`, `target_path`,
+  `output_path`, a recovered inode, the transcode-queue summary) is not
+  usable here. Stripping the HMAC of a record's newest entry therefore no
+  longer rolls the record back to its previous authenticated entry —
+  in sign-off target hashes / paths, validation target resolution, the
+  report, the viewer bundle, `/api/records-meta` and the timeline alike.
+  The sign-off lane (latest-sign-off rule) and the E01 lane (newest import
+  of any trust) keep their own rules; sound lanes have their own reader.
+  P1 (no keys here): nothing is unusable except past a chain break, so
+  nothing is superseded.
+- **P8 — location unknown ≠ tampering.** FAIL needs a key this PC holds to
+  refute an entry: an authenticated entry bound to ANOTHER lane / case is
+  still FAIL; a bound entry found where no known lane sits, or where the
+  root has no `case_id`, and a lane behind a reparse point, are NOT
+  VERIFIED (R9: FAIL for the first two).
+- **Anchors (I8).** `check_lane_anchor` reads through the lane reader: a
+  chain break at or before the anchored entry is "rewritten" (changed); an
+  entry up to the anchor that is not usable here (a stripped HMAC, another
+  PC's key, a key-configuration error, an unconfirmed location) is the new
+  `AnchorStatus::NotAuthenticated` — the sign-off is at most partially
+  verified. R9 compared only the recorded `entry_sha256` text, which
+  survives stripping the HMAC fields.
+- **I6.** An entry under a key this PC does not hold AFTER one this PC
+  authenticated is `LineTrust::RewriteNotExcluded` (`unauth`,
+  "재작성 배제 불가") — no longer the other-PC (`pc:`) wording.
+- **I9.** Key introduction is decided per CASE: a lane without any HMAC in
+  a case where another lane holds HMAC entries never gets the
+  introduction marker. A keyring path set explicitly
+  (`FRAMETRACE_AUDIT_KEYRING_FILE`) that does not exist is created only
+  with `rotate-audit-key --init` (a briefly disconnected drive no longer
+  reads as "no key before").
+- **I10.** The binding is added by the appender, decided from the body's
+  top-level JSON keys; a body that names `audit_lane` / `audit_case_id`
+  itself is refused.
+- **I11.** An authenticated entry without binding keeps `auth` with
+  `trust_note` "레인·케이스 결합 없음(레거시)".
+- **I12.** Only a usable sign-off-lane entry can contradict a record
+  (content mismatch); an unusable one counts as another sign-off entry
+  (NOT VERIFIED, "not the latest").
+- **I14.** `audit_key::adopt_key_env` (second statement of both `main`s,
+  right after the step token) keeps `FRAMETRACE_AUDIT_KEY`,
+  `FRAMETRACE_AUDIT_KEY_FILE` and `FRAMETRACE_AUDIT_KEYRING_FILE` and
+  removes them from the process environment, so ffmpeg / ffprobe / Sleuth
+  Kit / python children never inherit the raw key; the workstation hands
+  them back only to its own CLI step children
+  (`forward_adopted_key_env`).
+- **I15.** Verified on Windows 11: `std` reports an unreachable UNC host
+  (os error 53), a missing share (67) and a path under a junction whose
+  target is gone (3) all as `ErrorKind::NotFound`. A missing DEFAULT key
+  path is therefore "no key" only when its nearest existing ancestor is an
+  ordinary reachable folder; a dangling link / junction there, a network
+  error or a missing volume root is a P5 key-configuration error. With no
+  config directory at all, a warning says the default locations were not
+  looked at (stderr once, and in `doctor`).
+
+Remaining limits: P7 keys are field-name based (a new lane or record field
+needs its key added to `recency_keys`); case folding assumes the default
+case-insensitive volumes on Windows / macOS.
+
 **Implementation notes (what shipped):**
 
 - `src/hmac.rs` — HMAC-SHA-256 hand-assembled over the existing `sha2`

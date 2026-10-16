@@ -894,14 +894,22 @@ pub fn lane_rels(case_dir: &Path) -> Result<Vec<String>, String> {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let rel = format!("evidence/logs/{name}");
+        // R10 P6: the canonical lane spelling (a differently-cased name
+        // on Windows / macOS IS that lane); a link at a lane name is read
+        // too — the binding check reports it NOT VERIFIED.
+        let Some(rel) = audit::canonical_lane_rel(&format!("evidence/logs/{name}")) else {
+            continue;
+        };
         if let Some(number) = audit::audio_level_lane_number(&rel)
-            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file() || kind.is_symlink())
         {
             lanes.push((number, rel));
         }
     }
     lanes.sort();
+    lanes.dedup();
     Ok(lanes.into_iter().map(|(_, rel)| rel).collect())
 }
 
@@ -929,7 +937,7 @@ fn read_logged_results_with_keys(
     // lines written without one. This only ever adds a restriction (P1:
     // everything there is self-consistency only anyway).
     let keyed_case = is_keyed_case(&lanes);
-    let statuses = lane_statuses(&lanes, keys);
+    let statuses = lane_statuses(case_dir, &lanes, keys);
     let mut out: LoggedResults = BTreeMap::new();
     for ((rel, text), status) in lanes.iter().zip(&statuses) {
         let chain_error = status
@@ -978,7 +986,9 @@ fn read_logged_results_with_keys(
                     }
                 }
                 trust @ (audit::LineTrust::NotAuthenticated { .. }
-                | audit::LineTrust::ChainBroken) => LineFlag::unverified(format!(
+                | audit::LineTrust::ChainBroken
+                | audit::LineTrust::RewriteNotExcluded { .. }
+                | audit::LineTrust::LocationUnverified) => LineFlag::unverified(format!(
                     "{UNVERIFIED_ERROR}: {rel}: {}번째 줄은 측정값으로 쓰지 않습니다 — {}",
                     index + 1,
                     trust.note()
@@ -1059,13 +1069,26 @@ fn read_lanes(case_dir: &Path) -> Result<Vec<(String, String)>, String> {
 /// previous lane (P2). R7-I10: a previous lane REPAIRED by truncating it to
 /// its verifying prefix still matches, through the prefix hash the marker
 /// recorded (`previous_lane_verified_prefix_sha256`).
+///
+/// R10-I5: each lane also goes through the shared lane/case binding check
+/// (`audit::apply_lane_binding`, R9-I11) — R9 verified sound lanes from
+/// their text only, so an authenticated sound lane copied from another
+/// case or lane still measured here. An authenticated entry bound
+/// elsewhere makes the lane not verify (like a chain break: none of its
+/// lines is a measurement); a lane whose location cannot be confirmed (a
+/// junction / link on its path) has every line NOT VERIFIED.
 fn lane_statuses(
+    case_dir: &Path,
     lanes: &[(String, String)],
     keys: &[crate::audit_key::AuditKey],
 ) -> Vec<LaneStatus> {
     let mut statuses: Vec<LaneStatus> = Vec::with_capacity(lanes.len());
     for (index, (rel, text)) in lanes.iter().enumerate() {
-        let mut verification = audit::verify_chained_jsonl_text(text, rel, keys);
+        let mut verification =
+            audit::verify_chained_jsonl_text(text, rel, keys).and_then(|verification| {
+                audit::apply_lane_binding(&audit::join_rel(case_dir, rel), text, verification)
+                    .map_err(|err| format!("{rel}: {err}"))
+            });
         let number = audit::audio_level_lane_number(rel).unwrap_or(0);
         if number >= 1
             && let Ok(verified) = &verification
@@ -1103,7 +1126,7 @@ fn lane_statuses(
 pub fn verified_active_lane(case_dir: &Path) -> Result<Option<String>, String> {
     let lanes = read_lanes(case_dir)?;
     let keys = crate::audit_key::verification_keys()?;
-    let statuses = lane_statuses(&lanes, &keys);
+    let statuses = lane_statuses(case_dir, &lanes, &keys);
     Ok(statuses
         .last()
         .filter(|status| status.verification.is_ok())
@@ -1206,7 +1229,7 @@ pub fn active_lane_for_append(case_dir: &Path) -> Result<PathBuf, String> {
         return Ok(case_dir.join(LOG_REL));
     };
     let keys = crate::audit_key::verification_keys()?;
-    let statuses = lane_statuses(&lanes, &keys);
+    let statuses = lane_statuses(case_dir, &lanes, &keys);
     let Some(Err(reason)) = statuses.last().map(|status| status.verification.clone()) else {
         return Ok(case_dir.join(last));
     };

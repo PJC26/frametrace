@@ -37,14 +37,20 @@ fn r9_p3_rows_carry_their_trust() {
     append_chained_jsonl_keyed(&lane, r#"{"event":"validate","n":3}"#, Some(&other)).unwrap();
     let rows = read_lane_rows_with_keys(&lane, std::slice::from_ref(&mine)).unwrap();
     let codes: Vec<String> = rows.rows.iter().map(|row| row.trust.code()).collect();
+    // R10-I6: the other key's line follows a line this PC authenticated —
+    // "재작성 배제 불가" (`unauth`), not `pc:` (see r9_contract_… for `pc:`).
     assert_eq!(
         codes,
         vec![
             "auth".to_string(),
             "unauth".to_string(),
-            format!("pc:{}", other.id)
+            "unauth".to_string()
         ]
     );
+    assert!(matches!(
+        rows.rows[2].trust,
+        LineTrust::RewriteNotExcluded { .. }
+    ));
     assert_eq!(rows.usable().count(), 1);
     assert_eq!(rows.status(), "not-verified");
     let shown = rows.values_with_trust();
@@ -202,14 +208,16 @@ fn r9_i3_signoff_targets_and_hashes_come_from_usable_rows_only() {
     }
     crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
         let hashes = crate::report::evidence_hashes(&dir).unwrap();
-        assert_eq!(hashes.get("c1"), Some(&good));
+        // R10 P7: c1's NEWEST entry is not authenticated — c1 is not rolled
+        // back to its older authenticated hash either ("확인 불가").
+        assert_eq!(hashes.get("c1"), None);
         assert_eq!(
             hashes.get("c2"),
             None,
             "확인 불가 — never the unauthenticated hash"
         );
         let targets = crate::report::evidence_target_paths(&dir);
-        assert!(targets["c1"].ends_with("real.mp4"), "{targets:?}");
+        assert!(!targets.contains_key("c1"), "{targets:?}");
         assert!(!targets.contains_key("c2"));
     });
     // P1: without keys every entry is self-consistent; the last one wins.
@@ -499,15 +507,143 @@ fn lane_tokens() -> Vec<String> {
     tokens
 }
 
-/// Raw read primitives that would bypass `read_lane_rows`.
+/// Raw read primitives that would bypass `read_lane_rows`. R10-I13: plus
+/// `OpenOptions`, `read_to_end(` and splitting text into lines by hand.
 const RAW_READS: &[&str] = &[
     "read_to_string(",
     "fs::read(",
     "File::open(",
+    "OpenOptions",
+    "read_to_end(",
     "read_log_locked(",
     "BufReader::new(",
     "verify_chained_jsonl_text(",
+    "split('\\n')",
 ];
+
+/// R10-I13: the production part of a source file — everything except
+/// INLINE `#[cfg(test)] mod name { … }` blocks, found by tracking braces
+/// outside string / char literals and comments. R9 cut the file at the
+/// first `#[cfg(test)]\nmod `, so a `#[cfg(test)] mod tests;` DECLARATION
+/// near the top hid every function after it from the scan.
+pub(crate) fn production_source(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        if let Some(after_attr) = rest.strip_prefix("#[cfg(test)]") {
+            let trimmed = after_attr.trim_start();
+            let skip_ws = after_attr.len() - trimmed.len();
+            let item = trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| trimmed.strip_prefix("pub "))
+                .unwrap_or(trimmed);
+            if let Some(after_mod) = item.strip_prefix("mod ") {
+                let name_len = after_mod
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(after_mod.len());
+                let after_name = after_mod[name_len..].trim_start();
+                if after_name.starts_with('{') {
+                    // Skip to the matching closing brace.
+                    let start = i
+                        + "#[cfg(test)]".len()
+                        + skip_ws
+                        + (trimmed.len() - item.len())
+                        + "mod ".len()
+                        + name_len
+                        + (after_mod[name_len..].len() - after_name.len());
+                    i = matching_brace_end(text, start);
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Index just past the `}` matching the `{` at `open`, skipping string,
+/// raw string, char literals and comments.
+fn matching_brace_end(text: &str, open: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'r' if matches!(bytes.get(i + 1), Some(b'"' | b'#'))
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')) =>
+            {
+                let mut j = i + 1;
+                let mut hashes = 0usize;
+                while bytes.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    match text[j + 1..].find(&close) {
+                        Some(end) => i = j + 1 + end + close.len(),
+                        None => return bytes.len(),
+                    }
+                    continue;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'\'' => {
+                // A char literal ('x', '\n', '{'); a lifetime has no
+                // closing quote right after one character.
+                if bytes.get(i + 1) == Some(&b'\\') {
+                    if let Some(end) = text[i + 2..].find('\'') {
+                        i += 2 + end + 1;
+                        continue;
+                    }
+                } else if let Some(ch) = text[i + 1..].chars().next()
+                    && text[i + 1 + ch.len_utf8()..].starts_with('\'')
+                {
+                    i += 1 + ch.len_utf8() + 1;
+                    continue;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
 
 /// Splits production source into (fn name, body) chunks at every line that
 /// starts a function item.
@@ -617,8 +753,8 @@ fn r9_p3_every_lane_row_reader_goes_through_read_lane_rows() {
                 continue;
             }
             let text = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
-            let production = text.split("#[cfg(test)]\nmod ").next().unwrap_or("");
-            for (function, body) in functions(production) {
+            let production = production_source(&text);
+            for (function, body) in functions(&production) {
                 if function.is_empty() {
                     continue;
                 }

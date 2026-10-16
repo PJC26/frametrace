@@ -1143,6 +1143,9 @@ pub(crate) fn run_step_detailed(
     if let Some(tag) = key_tag {
         command.env(EXPECTED_AUDIT_KEY_ENV, tag);
     }
+    // R10-I14: the audit key variables this process adopted (removed from
+    // its environment at start) go to FrameTrace's own step child only.
+    crate::audit_key::forward_adopted_key_env(&mut command);
     // Spawned as a process tree (own group / Job object) so cancel reaches
     // the ffmpeg/ffprobe grandchildren, not just the direct child.
     let mut tracked = super::proc::spawn_tracked(&mut command)

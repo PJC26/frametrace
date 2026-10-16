@@ -778,8 +778,18 @@ fn rotate_audit_key_round_trips_through_verify() {
             .expect("frametrace binary should run")
     };
 
+    // R10-I9: a missing EXPLICIT keyring path is created only with --init.
+    let refused = framed(&["rotate-audit-key", "--key-id", "k0", "--log", path(&log)]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--init"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!keyring.exists() && !log.exists());
     assert_success(&framed(&[
         "rotate-audit-key",
+        "--init",
         "--key-id",
         "k1",
         "--log",

@@ -104,6 +104,9 @@ fn main() {
     // environment before any thread or tool exists (see `frametrace` main).
     // SAFETY: first statement of `main`; no other thread exists yet.
     unsafe { frametrace::util::adopt_step_warning_token() };
+    // R10-I14: the audit key variables too (see `frametrace` main).
+    // SAFETY: still single-threaded process start.
+    unsafe { frametrace::audit_key::adopt_key_env() };
     // C8: a step child of the workstation dies with it (unix watch pipe).
     frametrace::serve::watch_parent_from_env();
     // P7: no modal loader/critical-error dialogs for this process or the

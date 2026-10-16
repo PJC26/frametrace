@@ -1631,7 +1631,15 @@ pub fn signoff_audit_record_with_keys(
             continue;
         }
         let entry_record = value.get("signoff_record_sha256").and_then(|v| v.as_str());
-        let is_this = entry_record == Some(record.as_str());
+        // R10-I12 (P8): only an entry usable here can CONTRADICT the
+        // record (content mismatch = "changed"). An unusable entry naming
+        // this record with other content (e.g. an unkeyed line someone
+        // appended where keys are held) is not this record's entry — it
+        // counts as another sign-off entry ("not the latest": NOT
+        // VERIFIED), never as a refutation.
+        let entry_content = value.get("content_sha256").and_then(|v| v.as_str());
+        let is_this = entry_record == Some(record.as_str())
+            && (row.trust.is_usable() || entry_content == content.as_deref());
         if !is_this && entry_record.is_some_and(|sha| abandoned.contains(sha)) {
             abandoned_entries += 1;
             continue;
@@ -1641,7 +1649,6 @@ pub fn signoff_audit_record_with_keys(
             first_signoff_from_expected.get_or_insert(index);
         }
         if is_this {
-            let entry_content = value.get("content_sha256").and_then(|v| v.as_str());
             if entry_content != content.as_deref() {
                 return SignoffAuditRecord::Contradicted(format!(
                     "감사 체인의 이 서명 항목은 다른 결합 내용(content_sha256 {})을 기록합니다",
@@ -1761,6 +1768,12 @@ fn signoff_entry_not_authenticated(trust: &crate::audit::LineTrust) -> String {
         crate::audit::LineTrust::PreKey => format!(
             "이 서명의 감사 항목은 감사 키 도입 이전에 기록되어 {} — 이 PC에 감사 키가 있어 인증되지 않은 서명은 확인된 것으로 표시하지 않습니다. 다시 최종화하십시오",
             crate::audit::SELF_CONSISTENT_NOTE
+        ),
+        crate::audit::LineTrust::RewriteNotExcluded { .. }
+        | crate::audit::LineTrust::LocationUnverified
+        | crate::audit::LineTrust::ChainBroken => format!(
+            "이 서명의 감사 항목은 확인할 수 없습니다 — {} {REFINALIZE_WITH_KEY}",
+            trust.note()
         ),
         _ => format!(
             "감사 키가 설정되어 있으나 이 서명의 감사 항목에 HMAC 서명이 없습니다 — 키 없이 추가됐거나 HMAC이 제거된 항목일 수 있어 서명을 확인할 수 없습니다. {REFINALIZE_WITH_KEY}"
@@ -2258,6 +2271,11 @@ pub fn check_signoff_with(
             // R5-P5: unreadable (locked, I/O error) is not verified.
             crate::audit::AnchorStatus::Unreadable(err) => not_verified.push(format!(
                 "{rel}: 감사 레인을 읽지 못해 앵커 확인 불가 — {err}"
+            )),
+            // R10-I7/I8: the anchored entry is there, but the lane up to it
+            // is not usable here — not "changed", not current either.
+            crate::audit::AnchorStatus::NotAuthenticated(why) => not_verified.push(format!(
+                "{rel}: 앵커 지점까지 이 PC에서 인증되지 않은 항목이 있어 앵커 확인 불가 — {why}"
             )),
         }
     }
@@ -4423,10 +4441,21 @@ mod tests {
             });
             // The PC holding the key that signed it: Current.
             if let Some(key) = key {
+                // R10-I8: its sign-off entry is authenticated there; the
+                // fixture's other lanes were written WITHOUT a key, so their
+                // anchors are not authenticated on a PC holding keys —
+                // partially verified, never "changed".
                 crate::audit_key::with_test_keys(std::slice::from_ref(key), || {
                     let check = check_signoff(&root, &record, &digests, SignoffScope::Case);
-                    assert_eq!(check.currency, SignoffCurrency::Current, "{check:?}");
-                    assert!(check.authenticated);
+                    assert!(check.authenticated, "{check:?}");
+                    assert!(check.changes.is_empty(), "{check:?}");
+                    assert!(
+                        check
+                            .not_verified
+                            .iter()
+                            .all(|item| item.contains("앵커 확인 불가")),
+                        "{check:?}"
+                    );
                 });
             }
             let _ = std::fs::remove_dir_all(&root);
