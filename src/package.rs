@@ -3519,7 +3519,6 @@ mod tests {
         ));
         fs::rename(&result.output_dir, &incomplete).unwrap();
         let reason = |path: &std::path::Path| super::finalize_incomplete_reason(path);
-        #[cfg_attr(not(windows), allow(unused_mut))]
         // `<sub>/..` only opens the folder when `<sub>` exists (Unix resolves
         // `..` on disk), so pick a real subfolder of the package.
         let sub = fs::read_dir(&incomplete)
@@ -3528,6 +3527,7 @@ mod tests {
             .find(|e| e.path().is_dir())
             .map(|e| e.path().join(".."))
             .unwrap_or_else(|| incomplete.join("."));
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut spellings = vec![
             incomplete.join("."),
             sub,
