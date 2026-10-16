@@ -1520,6 +1520,13 @@ impl AudioLevelState {
             // R9 P3 (contract with track U): the same per-entry `trust`
             // code every other log entry carries.
             map.insert("trust".to_string(), json!(self.trust_code()));
+            // R14 (track U contract): why an `unverified` / `replayed`
+            // state is not a level — the viewer shows it as is.
+            if matches!(self.r, "unverified" | "replayed")
+                && let Some(why) = &self.error
+            {
+                map.insert("note".to_string(), json!(why));
+            }
         }
         value
     }
