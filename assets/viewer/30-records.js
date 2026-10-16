@@ -447,20 +447,25 @@ function logTrustSuperseded(item) {
 // and usable `event: "lane-repair"` entries of `source` (the whole lane as
 // sent, line = position + 1; defaults to `list` — pass it when `list` is a
 // filtered copy).
-function logRepairLines(chain, source) {
-  const lines = [];
+// R14 U4: each repair's line and time (`logged_unix`, 0 when unknown).
+function logRepairs(chain, source) {
+  const out = [];
   if (chain && typeof chain === "object" && Array.isArray(chain.repairs)) {
-    for (const r of chain.repairs) if (r && Number(r.line) > 0) lines.push(Number(r.line));
+    for (const r of chain.repairs) if (r && Number(r.line) > 0) out.push({ line: Number(r.line), unix: Number(r.logged_unix) > 0 ? Number(r.logged_unix) : 0 });
   }
   (Array.isArray(source) ? source : []).forEach((item, i) => {
-    if (item && typeof item === "object" && item.event === "lane-repair" && logTrustUsable(logTrustOf(item))) lines.push(i + 1);
+    if (item && typeof item === "object" && item.event === "lane-repair" && logTrustUsable(logTrustOf(item))) out.push({ line: i + 1, unix: Number(item.logged_unix) > 0 ? Number(item.logged_unix) : 0 });
   });
-  return lines;
+  return out;
 }
 function logSlots(list, keyOf, chain, source) {
   const slots = new Map();
   const all = Array.isArray(source) ? source : Array.isArray(list) ? list : [];
-  const lastRepair = Math.max(0, ...logRepairLines(chain, all));
+  const repairs = logRepairs(chain, all);
+  const lastRepair = Math.max(0, ...repairs.map(r => r.line));
+  // The newest repair's time (R14 U4: a validation logged after it
+  // re-verifies an entry written before it); 0 = unknown.
+  const lastRepairUnix = Math.max(0, ...repairs.filter(r => r.line === lastRepair).map(r => r.unix));
   const lineOf = lastRepair ? new Map(all.map((item, i) => [item, i + 1])) : null;
   for (const item of Array.isArray(list) ? list : []) {
     if (!item || typeof item !== "object") continue;
@@ -474,6 +479,7 @@ function logSlots(list, keyOf, chain, source) {
       if (lastRepair && !(line > lastRepair)) {
         entry = Object.assign({}, item);
         Object.defineProperty(entry, "ftRepairedAfter", { value: true, enumerable: false });
+        Object.defineProperty(entry, "ftRepairedUnix", { value: lastRepairUnix, enumerable: false });
       }
       slot.usable = entry;
       slot.last = entry;
@@ -521,8 +527,14 @@ function logTrustNote(item, any) {
 // -> { status, trust[, newer: true][, note] }  (`newer`: a newer entry this
 //    PC could not use superseded a usable one, R10 U1; `note`: that
 //    entry's trust_note, R10 U3)
-function recordStatusOf(own, valid, unvalid, fallback) {
+function recordStatusOf(own, valid, unvalid, fallback, recheck) {
   const ownTrust = own ? logTrustOf(own) : "";
+  // R14 U4: an own entry before its lane's last repair is confirmed again
+  // by a usable latest validation of its file logged after that repair
+  // (`recheck`: the validation of a record that otherwise shows none).
+  const again = v => !!v && !v.ftRepairedAfter && logTrustUsable(logTrustOf(v)) &&
+    Number(own.ftRepairedUnix) > 0 && Number(v.validated_unix) > Number(own.ftRepairedUnix);
+  const reverified = !!own && !!own.ftRepairedAfter && logTrustUsable(ownTrust) && again(valid || recheck);
   const untrusted = (item, trust) => {
     // R13: usable, but a lane repair follows it — the latest is unknown.
     if (item.ftRepairedAfter && logTrustUsable(trust)) return { status: "unknown-after-repair", trust, repairedAfter: true };
@@ -532,7 +544,7 @@ function recordStatusOf(own, valid, unvalid, fallback) {
     if (note) out.note = note;
     return out;
   };
-  if (own && (!logTrustUsable(ownTrust) || own.ftRepairedAfter)) return untrusted(own, ownTrust);
+  if (own && (!logTrustUsable(ownTrust) || (own.ftRepairedAfter && !reverified))) return untrusted(own, ownTrust);
   // R11 U2: a usable entry's note (legacy, unbound) stays in the tooltip.
   const usable = (out, ...items) => {
     const note = [...new Set(items.map(i => logTrustNote(i, true)).filter(Boolean))].join("\n");
@@ -993,7 +1005,7 @@ const records = [
     // record_id existed fall back to the output file name.
     const serverId = typeof item.record_id === "string" ? item.record_id.trim() : "";
     // R9 U1: "derived" only from a usable join-log line.
-    const st = recordStatusOf(item, null, null, "derived");
+    const st = recordStatusOf(item, null, null, "derived", validationsByPath.get(normalizePath(item.output_path)));
     return {
       id: serverId || `join:${name}`,
       kind: "joined",

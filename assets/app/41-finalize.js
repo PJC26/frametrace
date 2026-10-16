@@ -160,6 +160,13 @@ function verifySourcesVerdict(res) {
       items, more: Math.max(0, n - items.length),
       tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
   }
+  // R14 (track I3): the lane is shorter than its anchored head — a cut
+  // tail, never a plain "no result".
+  if (parts.some(x => x.includes("꼬리 잘림"))) {
+    return { level: "err", kind: "truncated", label: "원본 재검증: 기록 꼬리 잘림 — 현재 결과 없음", toast: "원본 재검증: 기록 꼬리 잘림",
+      hint: `원본 재검증: 기록 꼬리 잘림 — ${why} (보관 이력서 5절 참조).`,
+      tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+  }
   if (res.is_result === false) {
     return { level: "warn", kind: "noresult", toast: "원본 재검증: 현재 결과 없음(결과 아님)",
       hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (why ? ` — ${why}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조).",
@@ -439,7 +446,7 @@ async function gatherFinalizeChecks() {
     const sub = journal.kind === "otherhost" ? [finJournalOtherHost(jj), "그 PC에서 끝난 뒤 다시 확인하십시오."].filter(Boolean).join(" — ")
       : journal.kind === "unreadable" || journal.kind === "unpaired" ? "치우기: " + finJournalDismissCmd(st)
       : journal.detail ? finShortDetail(journal.detail) : "결과 아래 안내를 확인하십시오.";
-    add("block", "최종화 차단: " + (FIN_JOURNAL_HEAD[journal.kind] || FIN_JOURNAL_HEAD.check), sub);
+    add("block", "최종화 차단: " + finJournalHead(journal), sub);
   }
   let meta = null;
   try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
@@ -493,6 +500,8 @@ async function gatherFinalizeChecks() {
     const lv = FIN.verify.level;
     // R12 U1: lane_status "structural" → info "자기 일관성만 — 인증 아님".
     if (FIN.verify.kind === "structural") add("info", "원본 재검증: 자기 일관성만 — 인증 아님", FIN.verify.hint);
+    // R14 U3: a newer run's MISMATCH withholds the result — it blocks.
+    else if (FIN.verify.kind === "newermismatch") add("block", FIN.verify.label, FIN.verify.hint, FIN.verify.tip, { items: FIN.verify.items || [], more: FIN.verify.more || 0 });
     // R13 U2: the verdict's own label (newer run's mismatches) comes first.
     else add(lv === "ok" ? "ok" : "warn", FIN.verify.label ? FIN.verify.label : lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.kind === "noresult" ? "원본 재검증: 현재 결과 없음" : FIN.verify.kind === "unverified" ? "원본 재검증: 확인 불가" : "원본 재검증: 일부만 확인됨", FIN.verify.hint, FIN.verify.tip,
       { items: FIN.verify.items || [], more: FIN.verify.more || 0 });
@@ -571,8 +580,11 @@ function finJournalState(st) {
   // another PC's finalize — blocked, never recovered here; startup recovery
   // running in the background (busy); the lane says the finalize completed
   // or was resolved — only the journal is left (cleared on the next open).
-  const kind = { "unpaired": "unpaired", "other-host": "otherhost", "recovering": "recovering", "completed": "completed", "in-progress": "inprogress" }[jState];
-  if (j && kind) return { kind, journal: j, detail: reason || detail };
+  let kind = { "unpaired": "unpaired", "other-host": "otherhost", "recovering": "recovering", "completed": "completed", "in-progress": "inprogress" }[jState];
+  // R14 U2 (track S9): a closed journal says how it ended (`outcome`) —
+  // failed / dismissed are warnings, never "완료".
+  if (kind === "completed") kind = finJournalClosedKind(j.outcome);
+  if (j && kind) return { kind, journal: j, detail: reason || detail, noLocal: kind === "unpaired" && reason.includes("로컬 기록 없음") };
   if (j && jState !== "recovered") return { kind: "check", journal: j, detail: reason || detail };
   if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j, detail };
   return null;
@@ -596,11 +608,26 @@ const FIN_JOURNAL_HEAD = {
   otherhost: "다른 PC의 최종화 — 차단 중",
   recovering: "이전 최종화 복구 중",
   completed: "이전 최종화 완료 — 기록만 남음",
+  closedrecovered: "이전 최종화 복구됨 — 기록만 남음",
+  closedfailed: "이전 최종화 실패 — 기록만 남음",
+  closeddismissed: "이전 최종화 치워짐 — 기록만 남음",
+  closed: "이전 최종화 끝남 — 확인 필요",
   inprogress: "다른 FrameTrace에서 최종화 중",
   check: "이전 최종화 중단됨 — 확인 필요",
   recovered: "이전 최종화 중단됨 — 복구됨",
 };
-const FIN_JOURNAL_INFO = new Set(["recovering", "completed"]);
+const FIN_JOURNAL_INFO = new Set(["recovering", "completed", "closedrecovered"]);
+// R14 U2: `outcome` of a closed journal → row kind (absent = completed).
+function finJournalClosedKind(outcome) {
+  const o = outcome == null ? "completed" : String(outcome);
+  return { completed: "completed", recovered: "closedrecovered", failed: "closedfailed", dismissed: "closeddismissed" }[o] || "closed";
+}
+// The row / checklist head; P18: an unpaired journal without the local
+// open record says so.
+function finJournalHead(s) {
+  if (s && s.kind === "unpaired" && s.noLocal) return "이전 최종화 짝 없음(로컬 기록 없음) — 확인 필요";
+  return FIN_JOURNAL_HEAD[s && s.kind] || FIN_JOURNAL_HEAD.check;
+}
 // R13 U3: the command that sets an unreadable / unpaired journal aside (the
 // server's own — track S always sends it).
 function finJournalDismissCmd(st) {
@@ -629,7 +656,7 @@ function finJournalRow(st) {
   if (j.state != null && String(j.state)) tip.push("상태 " + String(j.state));
   if (j.path) tip.push(String(j.path));
   if (s.detail) tip.push(s.detail);
-  const head = FIN_JOURNAL_HEAD[s.kind] || FIN_JOURNAL_HEAD.recovered;
+  const head = s.kind === "unpaired" ? finJournalHead(s) : FIN_JOURNAL_HEAD[s.kind] || FIN_JOURNAL_HEAD.recovered;
   const lines = [];
   if (s.kind === "otherhost") { const o = finJournalOtherHost(j); if (o) lines.push(o); }
   if (s.detail) lines.push(finJournalBody(s.detail));

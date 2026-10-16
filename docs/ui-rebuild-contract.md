@@ -902,3 +902,24 @@ const FTStore = {
 - `finalize_recovered`는 실제로 정리했을 때만 true(서버) — 뷰어 규칙 그대로.
 - 하네스: verify-review-batch --unit "R13 S journal …", verify-finalize-sheet 4g(completed info AA·차단 없음, 차단 끝난 other-host 차단 없음, interrupted + blocks_finalize 차단).
 - 하네스: verify-review-batch --unit "R13 U1–U4", verify-finalize-sheet 4g(U1–U3, 두 테마 AA, 시트 안에 보임).
+
+## 21. R14 트랙 U 추가 계약 (2026-10-16, docs/PLAN_R14_2026-10-16.md)
+
+### 21.1 legacy 셸의 최종화 저널 (U1)
+- legacy 70-finalize `gatherFinalizeChecks`가 `/api/status.finalize_journal`을 앱 셸과 같은 규칙(`finJournalState`·`finJournalBlocks`·`finJournalHead`, 머리말 `FIN_JOURNAL_HEAD` 동일)으로 읽는다(`finJournalChecks`): 막으면 `block` "최종화 차단: <머리말>"(recovering은 "이전 최종화 복구 중" — 이때 "다른 작업이 진행 중"은 빠짐), sub = other-host "PC <host> · <시각>까지 차단" · 사유(짧게) · unreadable/unpaired는 "치우기: <dismiss_command 또는 `frametrace finalize-journal --dismiss "<case_dir>"`>". 막지 않고 정보(완료·복구됨·복구 중)가 아니면 `warn` 줄(같은 머리말). 결과 목록은 legacy에 없음.
+
+### 21.2 닫힌 저널의 `outcome` · 로컬 기록 없음 (U2, 트랙 S9/P18)
+- `state: "completed"` + `outcome`: `completed`(또는 없음) → `[data-journal="completed"]` "이전 최종화 완료 — 기록만 남음"(info) · `recovered` → `closedrecovered` "이전 최종화 복구됨 — 기록만 남음"(info) · `failed` → `closedfailed` "이전 최종화 실패 — 기록만 남음"(경고 `.h-fin-incomplete`) · `dismissed` → `closeddismissed` "이전 최종화 치워짐 — 기록만 남음"(경고) · 그 밖 → `closed` "이전 최종화 끝남 — 확인 필요"(경고). 실패·치움은 "완료"라 쓰지 않는다. 차단 여부는 여전히 `blocks_finalize`.
+- `state: "unpaired"`이고 `reason`에 "로컬 기록 없음"이 있으면 머리말 "이전 최종화 짝 없음(로컬 기록 없음) — 확인 필요"(결과 줄·점검 목록 둘 다). 본문 = `reason`, 치우기 명령 그대로.
+
+### 21.3 더 새 실행 불일치는 차단 · 꼬리 잘림 (U3, 트랙 I3)
+- `verifySourcesVerdict` `kind: "newermismatch"`(§20.2)는 점검 목록에서 `block`(라벨·sub·items 그대로) → 최종화 버튼 비활성. legacy는 이 페이지의 마지막 재검증 판정(`lastVerifyVerdict`, 케이스 바꾸면 비움)으로 같은 `block` 줄.
+- `withheld_reason`/`not_verified_reason`에 "꼬리 잘림"(레인이 앵커된 head보다 짧음) → `err`, `kind: "truncated"`, 토스트 "원본 재검증: 기록 꼬리 잘림", 라벨 "원본 재검증: 기록 꼬리 잘림 — 현재 결과 없음", hint에 사유. 더 새 실행 불일치가 있으면 그쪽이 먼저(사유는 hint에). 점검 목록은 `warn`.
+
+### 21.4 수리 뒤 다시 검증 (U4)
+- `logSlots`: 레인의 마지막 수리 줄보다 뒤에 있는 항목은 그대로 현재값(확인됨). 그 앞 항목은 §20.5대로 "최신 여부 알 수 없음"이고 마지막 수리 시각(`repairs[].logged_unix` 또는 표식 항목의 `logged_unix`)을 비열거 `ftRepairedUnix`로 갖는다.
+- `recordStatusOf(own, valid, unvalid, fallback, recheck)`: own이 수리 앞이어도 그 파일의 사용 가능 최신 검증(`valid`, 이어붙임은 `recheck` = 출력 경로의 검증)이 수리 뒤(`validated_unix` > 수리 시각, 같은 초는 아님)에 기록됐으면 다시 확인된 것 — 카빙·복구는 검증 상태, 이어붙임은 "derived". 수리 시각을 모르거나 검증이 수리 전·인증 안 됨이면 "최신 여부 알 수 없음" 그대로.
+
+### 21.5 시각 감사 안 된 타임라인 항목 (U5, 트랙 I8)
+- 타임라인 항목 `time_unaudited: true` 또는 kind가 `…-time-unaudited`로 끝나면 kind 단어(접미 뺀 것) 뒤 `badge warn tl-time-unaudited` "시각 감사 안 됨"(`timeline.badge.timeUnaudited`, title `timeline.tip.timeUnaudited`, ko·en).
+- 하네스: verify-review-batch --unit "R14 U1"–"R14 U5"(40126c3 자산에서 각각 실패 확인).

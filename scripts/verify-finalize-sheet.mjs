@@ -561,7 +561,9 @@ await check('4g R13 U1–U3: 짝 없음 / 다른 PC 차단 / 복구 중; --dismi
   await page.waitForFunction(() => /원본 재검증: 현재 결과 없음 — 불일치 2건/.test(document.getElementById('finalChecklist').textContent), null, { timeout: 5000 })
     .catch(async (e) => { throw new Error(e.message + ' ' + await page.textContent('#finalChecklist')); });
   const vs = (await rows(page)).find((r) => /원본 재검증/.test(r.text));
-  assert.ok(vs && vs.level === 'warn' && /표식 없는 더 새 실행 있음 — 불일치 2건/.test(vs.text) && !/모두 일치/.test(vs.text), 'U2 row: ' + JSON.stringify(vs));
+  // R14 U3: a newer run's mismatch blocks — the finalize button is disabled.
+  assert.ok(vs && vs.level === 'block' && /표식 없는 더 새 실행 있음 — 불일치 2건/.test(vs.text) && !/모두 일치/.test(vs.text), 'U2/R14 U3 row: ' + JSON.stringify(vs));
+  assert.ok(await page.evaluate(() => document.getElementById('btnFinalize').disabled), 'R14 U3: newer-run mismatch disables 보고서 생성·패키징');
   // Track I (32e88a2): each mismatch listed under the row — id + source path,
   // hashes in its tooltip, inside the sheet, AA in both themes.
   const items = await page.evaluate(() => {

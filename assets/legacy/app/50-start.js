@@ -98,6 +98,7 @@ $("btnStart").addEventListener("click", async () => {
 function resetCaseUi() {
   jobSeen = false; reviewReady = false; autoReviewed = false; autoProgress = false;
   auditVerified = false;
+  lastVerifyVerdict = null;
   $("s2").disabled = true; $("s3").disabled = true; $("s4").disabled = true;
   setStep(1, 0);
   $("btnFinalize").disabled = true;

@@ -753,6 +753,130 @@ async function unitTests() {
   await r11TrackU({ fn, runInNewContext, assert, ex });
   await r12TrackU({ fn, runInNewContext, assert, ex });
   await r13TrackU({ fn, runInNewContext, assert, ex });
+  await r14TrackU({ fn, runInNewContext, assert, ex });
+}
+
+// ---- R14 track U (docs/PLAN_R14_2026-10-16.md) -----------------------------
+async function r14TrackU({ fn, runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  const jn = (state, extra) => Object.assign({ path: 'review/finalize.inprogress.json', state, examiner: 'Hong', started_unix: 1760000000, signoff_sha256: 'ab12', error: null }, extra || {});
+  const cmdS = 'frametrace finalize-journal "C:/cases/c1" --dismiss';
+  const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  const lfn = (name) => legacySrc.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const lconst = (name) => legacySrc.match(new RegExp(`^(?:const|let) ${name} = (?:\\{[^]*?^\\};|.*$)`, 'm'))?.[0];
+
+  // U1: the legacy shell blocks on the journal like the app shell, with the
+  // dismiss command. Its whole gatherFinalizeChecks runs against a stub server.
+  const lnames = ['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finShortDetail', 'finJournalChecks', 'verifyChecks', 'unsavedMarksChecks', 'readLs', 'viewerWindow', 'viewerSaveState', 'gatherFinalizeChecks'];
+  // (Helpers are optional here so a shell without them fails on behaviour.)
+  assert.ok(lfn('gatherFinalizeChecks'), 'R14 U1: legacy gatherFinalizeChecks exists');
+  const lparts = ['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'lastVerifyVerdict'].map(lconst).concat(lnames.map(lfn)).filter(Boolean);
+  const lvm = { reviewFrameLoaded: false, reviewFrame: null, localStorage: { getItem: () => null }, $: () => null, ST: null,
+    jget: async (u) => (u === '/api/status' ? lvm.ST : { manifest: { case_id: 'c1' }, annotations: { marks: [] } }), console };
+  runInNewContext(lparts.join('\n') + '\nthis.setVerdict = (v) => { lastVerifyVerdict = v; };', lvm);
+  const lchecks = async (st) => { lvm.ST = st; return plain((await runInNewContext('gatherFinalizeChecks()', lvm)).checks); };
+  const lu = await lchecks({ ok: true, phase: 'review-ready', case_dir: 'C:/cases/c1', finalize_journal: jn('unpaired', { reason: '서명 레인에 짝 맞는 begin 없음', blocks_finalize: true, dismiss_command: cmdS }) });
+  const lb = lu.find((c) => c.level === 'block' && /^최종화 차단: /.test(c.text));
+  assert.ok(lb && /이전 최종화 기록 짝 없음 — 확인 필요/.test(lb.text) && lb.sub.includes('치우기: ' + cmdS) && /서명 레인에 짝 맞는 begin 없음/.test(lb.sub), 'R14 U1 legacy unpaired → block + dismiss: ' + JSON.stringify(lu));
+  const lr = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('unreadable', { error: 'JSON 파싱 실패', blocks_finalize: true }), case_dir: 'D:/c2' });
+  assert.ok(lr.some((c) => c.level === 'block' && /기록을 읽지 못함/.test(c.text) && c.sub.includes('치우기: frametrace finalize-journal --dismiss "D:/c2"')), 'R14 U1 legacy unreadable → fallback command: ' + JSON.stringify(lr));
+  const lrec = await lchecks({ ok: true, phase: 'review-ready', busy: true, finalize_journal: jn('recovering', { blocks_finalize: true }) });
+  assert.ok(lrec.some((c) => c.level === 'block' && c.text === '이전 최종화 복구 중') && !lrec.some((c) => /다른 작업이 진행 중/.test(c.text)), 'R14 U1 legacy recovering: ' + JSON.stringify(lrec));
+  const loh = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: '0a1b2c3d4e5f', blocks_finalize: true }) });
+  assert.ok(loh.some((c) => c.level === 'block' && /다른 PC의 최종화 — 차단 중/.test(c.text) && /PC 0a1b2c3d4e5f/.test(c.sub)), 'R14 U1 legacy other-host: ' + JSON.stringify(loh));
+  const ldone = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('completed', { blocks_finalize: false, dismiss_command: cmdS }) });
+  assert.ok(!ldone.some((c) => /최종화/.test(c.text)), 'R14 U1 legacy completed → no row: ' + JSON.stringify(ldone));
+  assert.ok(!(await lchecks({ ok: true, phase: 'review-ready' })).some((c) => /최종화/.test(c.text)), 'R14 U1 legacy: no journal → no row');
+  assert.ok(/journalRows\.forEach\(c => checks\.push\(c\)\)/.test(legacySrc) && /lastVerifyVerdict = null;/.test(readFileSync(new URL('../assets/legacy/app/50-start.js', import.meta.url), 'utf8')), 'R14 U1/U3: legacy wiring + reset on case switch');
+  console.log('PASS VM R14 U1 legacy shell: journal block rows + dismiss command (unpaired / unreadable / recovering / other-host)');
+
+  // U2 (track S9 outcome, P18 "로컬 기록 없음").
+  const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
+  const closed = (outcome) => js({ ok: true, phase: 'review-ready', finalize_journal: jn('completed', { outcome, blocks_finalize: false, dismiss_command: cmdS }) });
+  const cf = closed('failed');
+  assert.ok(/data-journal="closedfailed"/.test(cf) && /class="h-fin-incomplete">이전 최종화 실패 — 기록만 남음</.test(cf) && !/완료/.test(cf) && !/치우기/.test(cf), 'R14 U2 outcome failed → warning, not 완료: ' + cf);
+  const cd = closed('dismissed');
+  assert.ok(/data-journal="closeddismissed"/.test(cd) && /class="h-fin-incomplete">이전 최종화 치워짐 — 기록만 남음</.test(cd) && !/완료/.test(cd), 'R14 U2 outcome dismissed → warning: ' + cd);
+  assert.ok(/class="h-fin-info">이전 최종화 복구됨 — 기록만 남음</.test(closed('recovered')), 'R14 U2 outcome recovered → info');
+  assert.ok(/data-journal="completed"/.test(closed('completed')) && /이전 최종화 완료 — 기록만 남음/.test(closed(undefined)), 'R14 U2 outcome completed / absent → 완료');
+  assert.ok(/class="h-fin-incomplete">이전 최종화 끝남 — 확인 필요</.test(closed('weird')), 'R14 U2 unknown outcome → 확인 필요');
+  const nl = js({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired', { reason: '짝 없음(로컬 기록 없음) — 이 PC의 열린 최종화 기록이 없습니다', blocks_finalize: true, dismiss_command: cmdS }) });
+  assert.ok(/data-journal="unpaired"/.test(nl) && /이전 최종화 짝 없음\(로컬 기록 없음\) — 확인 필요/.test(nl) && /이 PC의 열린 최종화 기록이 없습니다/.test(nl) && /치우기:/.test(nl), 'R14 U2 unpaired 로컬 기록 없음: ' + nl);
+  for (const [i, vm] of [ex, lvm].entries()) {
+    const head = runInNewContext('finJournalHead(finJournalState(s))', Object.assign(vm, { s: { finalize_journal: jn('unpaired', { reason: '로컬 기록 없음' }) } }));
+    assert.equal(head, '이전 최종화 짝 없음(로컬 기록 없음) — 확인 필요', `R14 U2 checklist head (${i ? 'legacy' : 'shell'})`);
+    const st = runInNewContext('finJournalState(s).kind', Object.assign(vm, { s: { finalize_journal: jn('completed', { outcome: 'failed' }) } }));
+    assert.equal(st, 'closedfailed', `R14 U2 kind (${i ? 'legacy' : 'shell'})`);
+  }
+  const lfail = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('completed', { outcome: 'failed', blocks_finalize: false }) });
+  assert.ok(lfail.some((c) => c.level === 'warn' && c.text === '이전 최종화 실패 — 기록만 남음'), 'R14 U2 legacy failed outcome → warn row: ' + JSON.stringify(lfail));
+  runInNewContext('FIN.status = null;', ex);
+  console.log('PASS VM R14 U2 closed journal outcome (failed / dismissed warn, recovered / completed info) + 짝 없음(로컬 기록 없음)');
+
+  // U3: a newer run's MISMATCH is a block row (finalize disabled) in both shells.
+  const fr = { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: '100-aaaa',
+    withheld_reason: '표식 없는 더 새 실행 있음 (실행 1개 · 기록 1개 · 불일치 1건)', newer_runs: 1, newer_records: 1, newer_mismatched: 1,
+    newer_mismatches: [{ run_id: '300-c', run_unix: 1760000300, id: 'vid_000007', source_path: 'D:/src/a.mp4', recorded_sha256: 'aa', observed_sha256: 'bb' }], lane_status: 'keyed' };
+  runInNewContext(`jget = async (u) => (u === '/api/status' ? { ok: true, phase: 'review-ready', pending_marks: 0 } : { ok: true, manifest: { case_id: 'c1' }, annotations: { marks: [] } });
+    FIN.audit = { level: 'ok', text: '감사 로그 인증됨' };
+    { const v = verifySourcesVerdict(fr); FIN.verify = { level: v.level, hint: v.hint, kind: v.kind || '', tip: v.tip || '', label: v.label || '', items: v.items || [], more: v.more || 0 }; }`, Object.assign(ex, { fr }));
+  const sc = plain((await runInNewContext('gatherFinalizeChecks()', ex)).checks);
+  const sb = sc.find((c) => /현재 결과 없음 — 불일치 1건/.test(c.text));
+  assert.ok(sb && sb.level === 'block' && sb.items.length === 1, 'R14 U3 shell: newer-run mismatch → block row: ' + JSON.stringify(sc));
+  runInNewContext(`FIN.verify = { level: 'warn', hint: 'h', kind: 'noresult', tip: '', label: '', items: [], more: 0 };`, ex);
+  const sw = plain((await runInNewContext('gatherFinalizeChecks()', ex)).checks);
+  assert.ok(sw.some((c) => c.level === 'warn' && c.text === '원본 재검증: 현재 결과 없음'), 'R14 U3 shell: a plain withheld result stays warn');
+  lvm.fr = fr;
+  runInNewContext(legacySrc.match(/^function verifySourcesVerdict\([^]*?^}/m)[0] + '\nsetVerdict(verifySourcesVerdict(fr));', lvm);
+  const lm = await lchecks({ ok: true, phase: 'review-ready', pending_marks: 0 });
+  assert.ok(lm.some((c) => c.level === 'block' && /현재 결과 없음 — 불일치 1건/.test(c.text)), 'R14 U3 legacy: newer-run mismatch → block row: ' + JSON.stringify(lm));
+  // Track I3: a lane shorter than its anchored head ("꼬리 잘림") is an error.
+  const tr = `verifySourcesVerdict({ ok: true, matched: 3, mismatched: 0, not_comparable: 0, verified: false, is_result: false, run_id: '1-a', withheld_reason: '재검증 레인 꼬리 잘림 — 앵커 항목 수 9, 레인 7', lane_status: 'keyed' })`;
+  for (const [i, vm] of [ex, lvm].entries()) {
+    const r = plain(runInNewContext(tr, vm));
+    assert.ok(r.level === 'err' && r.kind === 'truncated' && /꼬리 잘림/.test(r.toast) && /앵커 항목 수 9/.test(r.hint) && /꼬리 잘림/.test(r.label), `R14 꼬리 잘림 → err (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
+  }
+  runInNewContext('FIN.verify = null; FIN.audit = null; FIN.status = null;', ex);
+  console.log('PASS VM R14 U3 newer-run MISMATCH → block row (shell + legacy); "꼬리 잘림" → err');
+
+  // U4: an own entry before its lane's repair is confirmed again by a usable
+  // validation logged after the repair; an entry after the repair is current.
+  const rctx = { t: (k) => k, tf: (k) => k, viewerTrustFromBundle: () => false, normalizePath: (p) => String(p) };
+  runInNewContext(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'untrustedStatusOf', 'logTrustSuperseded', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots'].map((n) => {
+    const f = fn(n); assert.ok(f, `R14 U4: ${n} exists`); return f; }).concat([fn('logRepairs') || fn('logRepairLines') || '']).join('\n'), rctx);
+  const carve = [{ id: 'c1', output_path: 'X', trust: 'auth' }, { id: 'c2', output_path: 'Y', trust: 'auth' }, { event: 'lane-repair', logged_unix: 2000, trust: 'auth' }, { id: 'c3', output_path: 'Z', trust: 'auth' }];
+  const vlog = (u) => [{ target_path: 'X', validation_status: 'ffprobe-confirmed', validated_unix: u, trust: 'auth' }];
+  const cst = (cl, chain, vl, id, recheck) => plain(runInNewContext(`(() => { const own = currentLogEntries(cl, (i) => i.id || '', chain).find((e) => e.id === id);
+    const sp = splitValidationSlots(logSlots(vl, (i) => i.target_path || '', null));
+    return recheck ? recordStatusOf(own, null, null, 'derived', sp.usable.get(own.output_path) || null)
+      : recordStatusOf(own, sp.usable.get(own.output_path) || null, sp.untrusted.get(own.output_path) || null, 'candidate-unvalidated'); })()`, Object.assign(rctx, { cl, chain, vl, id, recheck })));
+  assert.equal(cst(carve, null, vlog(2500), 'c1').status, 'ffprobe-confirmed', 'R14 U4: re-validated after the repair (marker time) → confirmed');
+  assert.equal(cst(carve.filter((x) => !x.event), { status: 'repaired', repairs: [{ line: 3, logged_unix: 2000 }] }, vlog(2500), 'c1').status, 'ffprobe-confirmed', 'R14 U4: repairs[].logged_unix');
+  assert.equal(cst(carve, null, vlog(1500), 'c1').status, 'unknown-after-repair', 'R14 U4: validated BEFORE the repair → still unknown');
+  assert.equal(cst(carve, null, vlog(2000), 'c1').status, 'unknown-after-repair', 'R14 U4: same second → still unknown (closed side)');
+  assert.equal(cst(carve.map((x) => (x.event ? { event: 'lane-repair', trust: 'auth' } : x)), null, vlog(2500), 'c1').status, 'unknown-after-repair', 'R14 U4: repair time unknown → still unknown');
+  assert.equal(cst(carve, null, [{ target_path: 'X', validation_status: 'ffprobe-confirmed', validated_unix: 2500, trust: 'unauth' }], 'c1').status, 'unknown-after-repair', 'R14 U4: an unusable validation never re-confirms');
+  assert.equal(cst(carve, null, [], 'c3').status, 'candidate-unvalidated', 'R14 U4: an own entry after the repair is current');
+  assert.equal(cst(carve, null, [], 'c2').status, 'unknown-after-repair', 'R14 U4: before the repair, no validation → unknown');
+  const join = [{ id: 'j1', output_path: 'X', trust: 'auth' }, { event: 'lane-repair', logged_unix: 2000, trust: 'auth' }];
+  assert.equal(cst(join, null, vlog(2500), 'j1', true).status, 'derived', 'R14 U4: a join re-validated after the repair → derived');
+  assert.equal(cst(join, null, vlog(1000), 'j1', true).status, 'unknown-after-repair', 'R14 U4: a join validated before the repair stays unknown');
+  const recSrc = readFileSync(new URL('../assets/viewer/30-records.js', import.meta.url), 'utf8');
+  assert.ok(/recordStatusOf\(item, null, null, "derived", validationsByPath\.get\(normalizePath\(item\.output_path\)\)\)/.test(recSrc), 'R14 U4: join records pass their validation');
+  console.log('PASS VM R14 U4 a record re-validated after its lane\'s repair is confirmed again; entries after the repair are current');
+
+  // U5 (track I8): time_unaudited → "시각 감사 안 됨" badge on the timeline.
+  const tl = { t: (k) => ({ 'timeline.badge.timeUnaudited': '시각 감사 안 됨', 'timeline.tip.timeUnaudited': '감사 기록에 없는 시각' })[k] || k, escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;') };
+  runInNewContext(fn('timelineKindHtml'), tl);
+  const b1 = runInNewContext('timelineKindHtml("carved-candidate", { time_unaudited: true })', tl);
+  assert.ok(/^carved-candidate <span class="badge warn tl-time-unaudited" title="감사 기록에 없는 시각">시각 감사 안 됨<\/span>$/.test(b1), 'R14 U5 time_unaudited badge: ' + b1);
+  const b2 = runInNewContext('timelineKindHtml("carved-candidate-time-unaudited", {})', tl);
+  assert.ok(/^carved-candidate <span class="badge warn tl-time-unaudited"/.test(b2), 'R14 U5 kind …-time-unaudited: ' + b2);
+  assert.equal(runInNewContext('timelineKindHtml("carved-candidate", { time_unaudited: false })', tl), 'carved-candidate', 'R14 U5: audited time → no badge');
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  for (const k of ['timeline.badge.timeUnaudited', 'timeline.tip.timeUnaudited']) assert.equal((i18n.match(new RegExp(`"${k.replace(/\./g, '\\.')}": `, 'g')) || []).length, 2, `R14 U5: ${k} in ko + en`);
+  console.log('PASS VM R14 U5 timeline time_unaudited → "시각 감사 안 됨" badge');
 }
 
 // ---- R13 track U (docs/PLAN_R13_2026-10-16.md) -----------------------------
@@ -770,7 +894,7 @@ async function r13TrackU({ fn, runInNewContext, assert, ex }) {
   assert.ok(/data-journal="recovering"/.test(recv) && /class="h-fin-info">이전 최종화 복구 중</.test(recv) && !/확인 필요/.test(recv), 'R13 U1 recovering is info: ' + recv);
   // The checklist blocks while recovering / another PC's finalize is open.
   const src = readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8');
-  assert.ok(/journal\.kind === "recovering" && finJournalBlocks\(journal\)\) add\("block", "이전 최종화 복구 중"/.test(src) && /finJournalBlocks\(journal\)\) \{[^]{0,600}add\("block", "최종화 차단: " \+ \(FIN_JOURNAL_HEAD/.test(src), 'R13 U1: checklist block rows');
+  assert.ok(/journal\.kind === "recovering" && finJournalBlocks\(journal\)\) add\("block", "이전 최종화 복구 중"/.test(src) && /finJournalBlocks\(journal\)\) \{[^]{0,600}add\("block", "최종화 차단: " \+ finJournalHead\(journal\)/.test(src), 'R13 U1: checklist block rows');
   const css = readFileSync(new URL('../assets/app/40-finalize.css', import.meta.url), 'utf8');
   assert.ok(/\.h-fin-info \{[^}]*var\(--info-bg\)[^}]*var\(--info-fg\)/.test(css), 'R13 U1: .h-fin-info uses the info tokens');
   console.log('PASS VM R13 U1 journal unpaired / other-host (host) / recovering (info) + checklist blocks');
@@ -856,7 +980,7 @@ async function r13TrackU({ fn, runInNewContext, assert, ex }) {
 
   // R13 follow-up (track I2): repaired-after in the viewer's latest-value logic.
   const rctx = { t: (k) => ({ 'status.repairedAfter': '최신 여부 알 수 없음', 'status.tip.repairedAfter': '최신 여부 알 수 없음 — 수리됨', 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가' })[k] || k, tf: (k) => k, viewerTrustFromBundle: () => false, normalizePath: (p) => String(p) };
-  runInNewContext(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'untrustedStatusOf', 'logTrustSuperseded', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusLabel'].map((n) => {
+  runInNewContext(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'untrustedStatusOf', 'logTrustSuperseded', 'logRepairs', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusLabel'].map((n) => {
     const f = fn(n); assert.ok(f, `R13 I2: ${n} exists`); return f; }).join('\n'), rctx);
   const vlog = [
     { target_path: 'A', validation_status: 'ffprobe-confirmed', trust: 'auth' },
@@ -966,7 +1090,7 @@ async function r12TrackU({ fn, runInNewContext, assert, ex }) {
   assert.ok(/class="badge warn tl-unaudited"/.test(un) && />후보\(감사 안 됨\)</.test(un) && !/>carved-candidate/.test(un), 'R12 I2 unaudited badge: ' + un);
   assert.equal(runInNewContext('timelineKindHtml("carved-candidate")', tl), 'carved-candidate', 'R12 I2: plain candidate unchanged');
   const sync = readFileSync(new URL('../assets/viewer/90-sync.js', import.meta.url), 'utf8');
-  assert.ok(/\$\{timelineKindHtml\(ev\.kind\)\}/.test(sync), 'R12 I2: the timeline panel uses timelineKindHtml');
+  assert.ok(/\$\{timelineKindHtml\(ev\.kind, ev\)\}/.test(sync), 'R12 I2: the timeline panel uses timelineKindHtml');
   for (const k of ['timeline.kind.carvedUnaudited', 'timeline.tip.carvedUnaudited']) assert.equal((i18n.match(new RegExp(`"${k.replace(/\./g, '\\.')}": `, 'g')) || []).length, 2, `R12 I2: ${k} in ko + en`);
   console.log('PASS VM R12 I2 timeline carved-candidate-unaudited → "후보(감사 안 됨)" warn badge');
 
@@ -1013,7 +1137,7 @@ async function r11TrackU({ fn, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'ftIcon', 'logTrustTagHtml'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'ftIcon', 'logTrustTagHtml'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R11 U1/U2: ${n} exists (viewer)`);
@@ -1140,7 +1264,7 @@ async function r10TrackU({ fn, source, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainArchiveText', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainArchiveText', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R10 U1/U3: ${n} exists (30-records.js)`);
@@ -1247,7 +1371,7 @@ async function r9TrackU({ fn, source, runInNewContext, assert, ex }) {
     t: (k) => ({ 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가', 'status.tip.unauth': '인증 안 됨 — …', 'trust.sc': '자기 일관성만(인증 아님)' })[k] || k,
     tf: (k, s) => (k === 'trust.otherPc' ? `이 PC에서 인증 불가(변조 판정 아님) — 키 ${s.key} 보유 PC에서 확인` : k),
   };
-  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
+  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
     const src = fn(n);
     assert.ok(src, `R9 U1: ${n} exists (30-records.js)`);
     return src;

@@ -2148,12 +2148,17 @@ document.getElementById("btnTranscodeQueue").addEventListener("click", async (ev
 // R12 (track I2): a carve event taken only from db/carve_results.json
 // (`carved-candidate-unaudited`) is not a candidate — warn badge
 // "후보(감사 안 됨)", never the plain kind word. Other kinds as recorded.
-function timelineKindHtml(kind) {
-  const k = String(kind || "");
+// R14 U5 (track I8): an event whose time was not audited (`time_unaudited:
+// true`, or the kind `…-time-unaudited`) gets a warn badge "시각 감사 안 됨".
+function timelineKindHtml(kind, ev) {
+  let k = String(kind || "");
   if (k === "carved-candidate-unaudited") {
     return `<span class="badge warn tl-unaudited" data-kind="${escapeHtml(k)}" title="${escapeHtml(t("timeline.tip.carvedUnaudited"))}">${escapeHtml(t("timeline.kind.carvedUnaudited"))}</span>`;
   }
-  return escapeHtml(k);
+  const timeUnaudited = !!(ev && ev.time_unaudited === true) || /-time-unaudited$/.test(k);
+  if (/-time-unaudited$/.test(k)) k = k.slice(0, -"-time-unaudited".length);
+  return escapeHtml(k) + (timeUnaudited
+    ? ` <span class="badge warn tl-time-unaudited" title="${escapeHtml(t("timeline.tip.timeUnaudited"))}">${escapeHtml(t("timeline.badge.timeUnaudited"))}</span>` : "");
 }
 // --- 케이스 타임라인 패널: db/timeline.jsonl을 읽어 시간순 이벤트를 표시 ---
 async function loadTimeline(regenerate) {
@@ -2187,7 +2192,7 @@ async function loadTimeline(regenerate) {
       return `<div class="timeline-row" data-id="${escapeHtml(recId || "")}">
         <span class="ts">${escapeHtml(isoTime(ev.ts_unix))}</span>
         <span class="src">${escapeHtml(ev.source || "")}</span>
-        <span class="desc" title="${escapeHtml(ev.path || "")} ${escapeHtml(ev.detail || "")}">${timelineKindHtml(ev.kind)} — ${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
+        <span class="desc" title="${escapeHtml(ev.path || "")} ${escapeHtml(ev.detail || "")}">${timelineKindHtml(ev.kind, ev)} — ${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
       </div>`;
     }).join("") + (events.length > cap ? `<div class="timeline-row"><span class="desc muted">${tf("timeline.ellipsis", { n: events.length - cap })}</span></div>` : "");
     list.querySelectorAll(".timeline-row[data-id]").forEach(row => {
