@@ -17,7 +17,7 @@
 const FIN = {
   built: false, open: false, loading: false, busy: false, gen: 0,
   checks: [], caseId: null, status: null, env: null,
-  result: null, incomplete: null, verify: null, audit: null, examinerTouched: false,
+  result: null, incomplete: null, reportStale: null, verify: null, audit: null, examinerTouched: false,
   bound: false, timer: 0, caseDir: null, sig: "", attributing: false,
 };
 const FIN_LEVEL = { block: { icon: "i-x", word: "차단" }, warn: { icon: "i-warning", word: "주의" }, info: { icon: "i-info", word: "정보" }, ok: { icon: "i-check", word: "완료" } };
@@ -117,14 +117,21 @@ function unsavedMarksChecks({ pendingMarks, saveState, drafts, markConflicts = 0
 // SHOULD-FIX 4: "all match" only when something was actually compared and
 // nothing was left uncompared — 0 matched / N not comparable is a warning,
 // never a green pass.
+// R11 U4 (track I2, P9): `unauthenticated` = lines of the run this PC could
+// not authenticate — then never "모두 일치" (absent on older servers).
 function verifySourcesVerdict(res) {
   const matched = Number(res.matched) || 0;
   const mismatched = Number(res.mismatched) || 0;
   const notComparable = Number(res.not_comparable) || 0;
-  const counts = `일치 ${matched} · 불일치 ${mismatched} · 비교 불가 ${notComparable}`;
+  const unauth = Number(res.unauthenticated) > 0 ? Number(res.unauthenticated) : 0;
+  const counts = `일치 ${matched} · 불일치 ${mismatched} · 비교 불가 ${notComparable}` + (unauth ? ` · 인증 안 됨 ${unauth}` : "");
   if (mismatched > 0) {
     return { level: "err", toast: `원본 재검증: 불일치 ${mismatched}건`,
       hint: `원본 재검증 완료 — ${counts} (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)` };
+  }
+  if (unauth > 0) {
+    return { level: "warn", unauth, toast: `원본 재검증: 인증 안 된 줄 ${unauth}개 — 결과 확인 불가`,
+      hint: `원본 재검증 완료 — ${counts}. 인증 안 된 줄이 있어 "모두 일치"로 쓸 수 없습니다 (보관 이력서 5절 참조).` };
   }
   if (matched === 0) {
     return { level: "warn", toast: "원본 재검증: 비교된 파일 없음 — 재검증되지 않았습니다",
@@ -418,7 +425,7 @@ async function gatherFinalizeChecks() {
   // Source re-verification: only what actually ran is claimed.
   if (FIN.verify) {
     const lv = FIN.verify.level;
-    add(lv === "ok" ? "ok" : "warn", lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : "원본 재검증: 일부만 확인됨", FIN.verify.hint);
+    add(lv === "ok" ? "ok" : "warn", lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.unauth ? "원본 재검증: 인증 안 된 줄 있음" : "원본 재검증: 일부만 확인됨", FIN.verify.hint);
   } else {
     add("info", "원본 재검증: 아직 실행하지 않음", "패키징할 때 원본 SHA-256을 다시 계산해 일치/불일치를 그대로 기록합니다. 지금 확인하려면 고급 ▸ 원본 재검증.");
   }
@@ -464,11 +471,16 @@ function finResultHtml() {
   const pkgDir = (r && r.package_dir) || (st && ["done", "finalized"].includes(st.phase) && st.package_dir) || "";
   // R10 U4: the last finalize published a package but did not complete
   // (its own row unless it is the package listed below).
-  const pkgInc = !!pkgDir && packageIncomplete(pkgDir, r && r.finalize_incomplete);
+  // R11 U4 (S6): the status flag speaks for the status package_dir only.
+  const pkgInc = !!pkgDir && packageIncomplete(pkgDir, (r && r.package_dir) ? r.finalize_incomplete : !!st && st.package_incomplete === true);
   const inc = FIN.incomplete;
-  const incRow = inc && !(pkgInc && (!inc.package_dir || inc.package_dir === pkgDir)) ? `<li class="h-fin-incomplete-row"><span class="h-fin-incomplete">${esc(H_PKG_INCOMPLETE)}</span>` +
+  // R11 U4 (track S5): the report could not be re-rendered after a failed
+  // step — reports/case-report.html is not current.
+  const staleRow = FIN.reportStale ? `<li class="h-fin-stale-row"><span class="h-fin-incomplete">보고서 최신 아님</span>` +
+    ` <span class="muted"${FIN.reportStale.error ? ` title="${esc(FIN.reportStale.error)}"` : ""}>다시 최종화하십시오</span></li>` : "";
+  const incRow = staleRow + (inc && !(pkgInc && (!inc.package_dir || inc.package_dir === pkgDir)) ? `<li class="h-fin-incomplete-row"><span class="h-fin-incomplete">${esc(H_PKG_INCOMPLETE)}</span>` +
     (inc.package_dir ? ` <code class="mono">${esc(inc.package_dir)}</code> ${pkgExplorerLink(inc.package_dir)}` : "") +
-    ` <span class="muted">최종 결과로 쓰지 마십시오</span></li>` : "";
+    ` <span class="muted">최종 결과로 쓰지 마십시오</span></li>` : "");
   if (!r && !pkgDir) return incRow ? `<h3 class="h-fin-h">결과</h3><ul class="h-fin-links">${incRow}</ul>` : "";
   const pkgUrl = r && r.package_url ? `<a href="/case/${esc(r.package_url)}" target="_blank" rel="noopener">패키지 폴더 보기${finIcon("i-external")}</a>` : "";
   return `<h3 class="h-fin-h">결과</h3><ul class="h-fin-links">` + incRow +
@@ -576,7 +588,7 @@ function finPaint() {
   const cls = "h-fin-verdict " + (done ? "done" : sum.state);
   if (verdict.className !== cls) verdict.className = cls;
   finSetHtml(verdict, finIcon(sum.state === "blocked" ? "i-warning" : sum.state === "loading" ? "i-spinner" : "i-check") +
-    `<span>${esc(done ? (FIN.incomplete ? `보고서·패키지를 만들었지만 ${H_PKG_INCOMPLETE}` : "보고서·패키지를 만들었습니다") : sum.text)}</span>`);
+    `<span>${esc(done ? (FIN.incomplete ? `보고서·패키지를 만들었지만 ${H_PKG_INCOMPLETE}` : FIN.reportStale ? "보고서·패키지를 만들었지만 보고서 최신 아님" : "보고서·패키지를 만들었습니다") : sum.text)}</span>`);
   const list = finEl("finalChecklist");
   const hadFocus = typeof list.contains === "function" && list.contains(document.activeElement) && document.activeElement && document.activeElement.id;
   if (finSetHtml(list, rows.map(finRowHtml).join("")) && hadFocus) {
@@ -670,7 +682,7 @@ function finClose() {
 }
 // A different case was opened: nothing about the old one may stay visible.
 function finResetSheet() {
-  FIN.incomplete = null;
+  FIN.incomplete = null; FIN.reportStale = null;
   FIN.result = null; FIN.verify = null; FIN.audit = null; FIN.checks = []; FIN.status = null;
   FIN.caseId = null; FIN.examinerTouched = false; FIN.gen++;
   if (FIN.built) { finEl("finalExaminer").value = ""; finHint(""); finEl("advOut").hidden = true; finEl("advOut").textContent = ""; finEl("advLink").innerHTML = ""; finPaint(); }
@@ -736,11 +748,13 @@ async function finFinalize() {
   try { res = await jpost("/api/finalize", { examiner: name }); }
   finally { finSetFinalizing(false); }
   FIN.incomplete = finIncompleteOf(res);
+  FIN.reportStale = res && res.report_stale === true ? { error: String(res.error || "") } : null;
   if (!res.ok) { finHint("실패: " + (res.error || "알 수 없는 오류")); finPaint(); return; }
   FIN.result = { examiner: res.examiner || name, manifest_sha256: res.manifest_sha256 || "", package_dir: res.package_dir || "", package_url: res.package_url || "", finalize_incomplete: res.finalize_incomplete === true };
   finHint("");
   finPaint();
   if (FIN.incomplete) toast(`보고서·패키지를 만들었지만 ${H_PKG_INCOMPLETE} — 최종 결과로 쓰지 마십시오`, "warn");
+  else if (FIN.reportStale) toast("보고서·패키지를 만들었지만 보고서 최신 아님 — 다시 최종화하십시오", "warn");
   else toast("보고서·패키지를 만들었습니다", "ok");
 }
 async function finVerifySources() {
@@ -752,7 +766,7 @@ async function finVerifySources() {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { finHint("원본 재검증 실패: " + (res.error || "알 수 없는 오류")); return; }
     const verdict = verifySourcesVerdict(res);
-    FIN.verify = { level: verdict.level, hint: verdict.hint };
+    FIN.verify = { level: verdict.level, hint: verdict.hint, unauth: verdict.unauth || 0 };
     finHint("");
     toast(verdict.toast, verdict.level);
     finRefresh();

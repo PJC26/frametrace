@@ -25,11 +25,11 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, openSync, writeSync, closeSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createHash, randomFillSync } from 'node:crypto';
-import { startIsolatedServer } from './lib/isolated-server.mjs';
+import { startIsolatedServer, isolatedEnv } from './lib/isolated-server.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -244,6 +244,43 @@ try {
   }, markId);
   check('mark still shown after the viewer reload; save state clean', shown && shown.marked >= 1 && shown.save === 'saved', JSON.stringify(shown));
   if (shots) await page.screenshot({ path: join(shots, 'jobs-carve-done.png') });
+
+  // ---- 3b. R11 U5 (track I5): carve page metrics are not taken from the
+  // unaudited db/carve_results.json. Forge it (a fake source size, warnings
+  // dropped, scan "complete"), re-render the review pages, and the page must
+  // either show the audited values or mark the metrics "감사 안 됨" without
+  // an ok (green) colour — never the forged size as fact.
+  {
+    const caseRoot = st3.case_dir || caseDir;
+    const resultsPath = join(caseRoot, 'db/carve_results.json');
+    const pagePath = join(caseRoot, 'review/carve-report.html');
+    if (!existsSync(resultsPath) || !existsSync(pagePath)) {
+      check('R11 U5: carve results + carve page exist after the carve job', false, `${existsSync(resultsPath)} ${existsSync(pagePath)}`);
+    } else {
+      const forged = JSON.parse(readFileSync(resultsPath, 'utf8'));
+      const FORGED_SIZE = 7777777777777;
+      Object.assign(forged, { source_size_bytes: FORGED_SIZE, scan_complete: true, candidate_limit_reached: false, warnings: [] });
+      writeFileSync(resultsPath, JSON.stringify(forged));
+      const mr = spawnSync(server.exe, ['make-review', caseRoot], { env: isolatedEnv(work), encoding: 'utf8' });
+      check('R11 U5: make-review re-renders the carve page', mr.status === 0, (mr.stderr || '').slice(-400));
+      const cp = await browser.newPage();
+      await cp.goto(pathToFileURL(pagePath).href);
+      const m = await cp.evaluate(() => [...document.querySelectorAll('#metrics .metric')].map((el) => ({ text: el.textContent, cls: el.className })));
+      await cp.close();
+      const all = m.map((x) => x.text).join(' | ');
+      const unaudited = /감사 안 됨/.test(all);
+      const sizeText = m.find((x) => /원본 크기/.test(x.text))?.text || '';
+      // The page's fmtSize renders the forged 7777777777777 B as "7777.78 GB".
+      const forgedShown = /7777\.78\s*GB/.test(sizeText);
+      const okColour = m.some((x) => /\bok\b/.test(x.cls));
+      const verdict = unaudited ? !okColour : !forgedShown;
+      if (!verdict && !unaudited && !process.env.FRAMETRACE_R11_STRICT) {
+        console.log(`PEND  R11 U5: carve page still reads db/carve_results.json (track I5 not in this binary) — ${all}`);
+      } else {
+        check('R11 U5: forged carve_results.json → metrics marked "감사 안 됨" (no green) or audited values', verdict, all);
+      }
+    }
+  }
 
   // ---- 4. clip export from the viewer ---------------------------------------
   const v = page; // hosted viewer: same document

@@ -750,6 +750,92 @@ async function unitTests() {
   await r8TrackU({ fn, source, runInNewContext, assert });
   await r9TrackU({ fn, source, runInNewContext, assert, ex });
   await r10TrackU({ fn, source, runInNewContext, assert, ex });
+  await r11TrackU({ fn, runInNewContext, assert, ex });
+}
+
+// ---- R11 track U (docs/PLAN_R11_2026-10-16.md) -----------------------------
+async function r11TrackU({ fn, runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  const tctx = {
+    t: (k) => ({ 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가', 'status.tip.unauth': '인증 안 됨 — …', 'status.tip.newer': '더 최근 인증 안 된 항목 있음', 'trust.sc': '자기 일관성만(인증 아님)', 'trust.unauth': '인증 안 됨' })[k] || k,
+    tf: (k, s) => (k === 'trust.otherPc' ? `이 PC에서 인증 불가(변조 판정 아님) — 키 ${s.key} 보유 PC에서 확인` : k),
+    escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
+    bundle: false,
+  };
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'ftIcon', 'logTrustTagHtml'];
+  runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
+    const src = fn(n);
+    assert.ok(src, `R11 U1/U2: ${n} exists (viewer)`);
+    return src;
+  }).join('\n'), tctx);
+  const run = (expr, vars) => runInNewContext(expr, Object.assign(tctx, vars || {}));
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+
+  // U1: what the server really sends under P7 — the OLDER entry already
+  // reads `unauth` with `trust_superseded_by` (1-based line of the newer one).
+  const SUP = '더 최근 인증 안 된 항목 있음 — 같은 기록(c1)의 더 새 항목(2번째 줄)이 이 PC에서 인증되지 않아 …';
+  const list = [
+    { id: 'c1', v: 1, trust: 'unauth', trust_note: SUP, trust_superseded_by: 2 },
+    { id: 'c1', v: 2, trust: 'unauth', trust_note: '이 PC에서 인증되지 않음 — HMAC 없음' },
+    { id: 'c2', v: 1, trust: 'unauth', trust_note: SUP, trust_superseded_by: 9 },
+    { id: 'c3', v: 1, trust: 'unauth', trust_note: 'HMAC 없음' },
+  ];
+  const cur = run('currentLogEntries(list, (i) => i.id)', { list });
+  assert.deepEqual(plain(cur.map((i) => `${i.id}${i.v}`)), ['c12', 'c21', 'c31'], 'R11 U1: latest per key');
+  assert.deepEqual(plain(cur.map((i) => !!i.ftNewerUnauth)), [true, true, false], 'R11 U1: trust_superseded_by sets "newer" (on the entry after it, and on a marked entry that is itself current); a plain unauth entry is not newer');
+  const st = run('recordStatusOf(cur[0], null, null, "candidate-unvalidated")', { cur });
+  assert.ok(st.status === 'unauthenticated' && st.newer === true && /HMAC 없음/.test(st.note), 'R11 U1: ' + JSON.stringify(st));
+  const vsplit = run('splitValidationSlots(logSlots(vl, (i) => i.target_path))', { vl: [
+    { target_path: '/p', validation_status: 'ffprobe-video-stream-confirmed', trust: 'unauth', trust_superseded_by: 2, trust_note: SUP },
+    { target_path: '/p', validation_status: 'validation-failed', trust: 'unauth' },
+  ] });
+  const vst = run('recordStatusOf(null, vsplit.usable.get("/p") || null, vsplit.untrusted.get("/p") || null, "ffprobe-confirmed")', { vsplit });
+  assert.ok(vst.status === 'unauthenticated' && vst.newer === true, 'R11 U1: validation superseded on the server → newer: ' + JSON.stringify(vst));
+  assert.ok(/^더 최근 인증 안 된 항목 있음 · 인증 안 됨/.test(run('statusTitle({ status: "unauthenticated", statusTrust: "unauth", statusNewer: true })')));
+  console.log('PASS VM R11 U1 trust_superseded_by → "더 최근 인증 안 된 항목 있음"');
+
+  // U2: a legacy authenticated entry (`auth` + "레거시" note) keeps its note in tooltips.
+  const LEG = '레인·케이스 결합 없음(레거시) — 이 PC의 감사 키로 인증됐으나 …';
+  assert.equal(run('logTrustNote({ trust: "auth", trust_note: "x" })'), '', 'R11 U2: no detail line (default) for a usable entry');
+  assert.equal(run('logTrustNote({ trust: "auth", trust_note: n }, true)', { n: LEG }), LEG, 'R11 U2: tooltip note of a usable entry');
+  const legOwn = run('recordStatusOf({ id: "c9", trust: "auth", trust_note: n }, { validation_status: "ffprobe-confirmed", trust: "auth", trust_note: n }, null, "candidate-unvalidated")', { n: LEG });
+  assert.ok(legOwn.status === 'ffprobe-confirmed' && /레거시/.test(legOwn.note || ''), 'R11 U2: record status keeps the legacy note: ' + JSON.stringify(legOwn));
+  const legFb = run('recordStatusOf({ id: "c9", trust: "auth", trust_note: n }, null, null, "candidate-unvalidated")', { n: LEG });
+  assert.ok(/레거시/.test(legFb.note || ''), 'R11 U2: fallback status keeps it too');
+  const legTip = run('statusTitle({ status: "ffprobe-confirmed", statusTrust: "auth", statusNote: n })', { n: LEG });
+  assert.ok(/^ffprobe-confirmed\n레인·케이스 결합 없음\(레거시\)/.test(legTip), 'R11 U2: badge tooltip: ' + legTip);
+  const tag = run('logTrustTagHtml({ trust: "auth", trust_note: n })', { n: LEG });
+  assert.ok(/title="레인·케이스 결합 없음\(레거시\)/.test(tag) && /i-info/.test(tag), 'R11 U2: detail list tooltip: ' + tag);
+  assert.equal(run('logTrustTagHtml({ trust: "auth" })'), '', 'R11 U2: a plain authenticated entry shows nothing');
+  console.log('PASS VM R11 U2 legacy note of a usable entry stays in tooltips');
+
+  // U3 (P11): _INCOMPLETE_n, copy tails, trailing dots/spaces; dead home branch gone.
+  const pi = runInNewContext(`[
+    packageIncomplete('C:\\\\c\\\\reports\\\\package_001_INCOMPLETE_2'),
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE - 복사본'),
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE (3)/'),
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE_2 (2)'),
+    packageIncomplete('C:/c/reports/package_001_INCOMPLETE. .'),
+    packageIncomplete('/c/reports/package_001_INCOMPLETEX'),
+    packageIncomplete('/c/reports/package_001 - 복사본'),
+    packageIncomplete('/c/reports/package_001_INCOMPLETE_x'),
+  ]`, ex);
+  assert.deepEqual(plain(pi), [true, true, true, true, true, false, false, false], 'R11 U3 packageIncomplete: ' + JSON.stringify(pi));
+  const home = readFileSync(new URL('../assets/app/55-home.js', import.meta.url), 'utf8');
+  assert.ok(!/case "finalize-incomplete"|it\.finalize_incomplete|it\.package_dir/.test(home), 'R11 U3: no dead recent-cases package branch (recent.rs sends no hint)');
+  assert.equal(runInNewContext(`recentState({ phase_hint: 'finalized' }, null).state`, ex), '결과물 생성됨');
+  console.log('PASS VM R11 U3 _INCOMPLETE_n / copy tails read 최종화 미완료; dead home branch removed');
+
+  // U4: hash-verify `unauthenticated` (I2) never "모두 일치"; S6 status flag.
+  const v = runInNewContext(`verifySourcesVerdict({ matched: 3, mismatched: 0, not_comparable: 0, unauthenticated: 2 })`, ex);
+  assert.ok(v.level === 'warn' && !/모두 일치/.test(v.toast + v.hint.replace(/"모두 일치"로 쓸 수 없습니다/, '')) && /인증 안 된 줄 2개/.test(v.toast) && /인증 안 됨 2/.test(v.hint), 'R11 U4: ' + JSON.stringify(v));
+  assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 3, mismatched: 1, not_comparable: 0, unauthenticated: 2 }).level`, ex), 'err', 'R11 U4: a mismatch still outranks');
+  assert.equal(runInNewContext(`verifySourcesVerdict({ matched: 3, mismatched: 0, not_comparable: 0 }).level`, ex), 'ok', 'R11 U4: absent field (older server) unchanged');
+  assert.equal(runInNewContext(`storePhase({ has_job: true, phase: 'done', package_dir: '/c/reports/package_002', package_incomplete: true })`, ex), 'done', 'R11 U4 (S6): flag without a renamed folder → not finalized');
+  assert.equal(runInNewContext(`typeof stPackageIncomplete === 'function' && stPackageIncomplete({ package_incomplete: true }) && !stPackageIncomplete({ package_dir: '/c/p_001' })`, ex), true, 'R11 U4 (S6): the status flag counts without a package_dir');
+  const legacyFin = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  assert.ok(/res\.unauthenticated/.test(legacyFin), 'R11 U4: the legacy shell reads unauthenticated too');
+  console.log('PASS VM R11 U4 unauthenticated hash-verify lines never "모두 일치"; package_incomplete flag honoured');
 }
 
 // ---- R10 track U (docs/PLAN_R10_2026-10-15.md) -----------------------------
@@ -761,7 +847,7 @@ async function r10TrackU({ fn, source, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R10 U1/U3: ${n} exists (30-records.js)`);
@@ -849,8 +935,7 @@ async function r10TrackU({ fn, source, runInNewContext, assert, ex }) {
   assert.deepEqual(plain(pi), [true, true, false, true, false], 'R10 U4 packageIncomplete');
   assert.equal(runInNewContext(`storePhase({ has_job: true, phase: 'done', package_dir: '/c/reports/package_002_INCOMPLETE' })`, ex), 'done', 'R10 U4: an incomplete package is not "finalized"');
   assert.equal(runInNewContext(`storePhase({ has_job: true, phase: 'done', package_dir: '/c/reports/package_002' })`, ex), 'finalized');
-  const rs = runInNewContext(`[recentState({ phase_hint: 'finalized', package_dir: '/c/reports/p_INCOMPLETE' }, null).state, recentState({ phase_hint: 'finalize-incomplete' }, null).state, recentState({ phase_hint: 'finalized' }, null).state]`, ex);
-  assert.deepEqual(plain(rs), ['최종화 미완료', '최종화 미완료', '결과물 생성됨'], 'R10 U4 recent cases: ' + JSON.stringify(rs));
+  // R11 U3: the recent-cases package branches were dead (no server hint) and are gone.
   const inc = runInNewContext(`[finIncompleteOf({ ok: false, error: '검토자 기록 확정 실패: x — 패키지는 이미 C:\\\\c\\\\reports\\\\package_001_INCOMPLETE에 만들어졌지만 최종화는 끝나지 않았습니다(최종화 미완료).' }), finIncompleteOf({ ok: false, error: 'x', incomplete_package_dir: 'D:/c/p_INCOMPLETE' }), finIncompleteOf({ ok: true, package_dir: '/c/p_001' }), finIncompleteOf({ ok: false, error: 'disk full' })]`, ex);
   assert.deepEqual(plain(inc), [{ package_dir: '' }, { package_dir: 'D:/c/p_INCOMPLETE' }, null, null], 'R10 U4 finalize answer: ' + JSON.stringify(inc));
   runInNewContext(`FTStore.set({ phase: 'done', project: Object.assign({}, FTStore.state.project, { caseDir: '/c/case', name: 'case', packageDir: '/c/reports/p_INCOMPLETE', packageIncomplete: true }) }); hProjectPopRender();`, ex);
@@ -869,7 +954,7 @@ async function r9TrackU({ fn, source, runInNewContext, assert, ex }) {
     t: (k) => ({ 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가', 'status.tip.unauth': '인증 안 됨 — …', 'trust.sc': '자기 일관성만(인증 아님)' })[k] || k,
     tf: (k, s) => (k === 'trust.otherPc' ? `이 PC에서 인증 불가(변조 판정 아님) — 키 ${s.key} 보유 PC에서 확인` : k),
   };
-  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
+  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
     const src = fn(n);
     assert.ok(src, `R9 U1: ${n} exists (30-records.js)`);
     return src;

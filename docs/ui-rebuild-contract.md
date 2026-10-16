@@ -815,9 +815,33 @@ const FTStore = {
 
 ### 17.4 최종화 미완료 패키지 (U4, 트랙 S2)
 - `packageIncomplete(dir, flag)`(10-core): 폴더 이름이 `…_INCOMPLETE`(또는 `*.finalize-incomplete.txt`)이거나 서버가 명시 필드(`package_incomplete`·`finalize_incomplete`)를 보내면 참. 표시는 "최종화 미완료"(`H_PKG_INCOMPLETE`).
-- 상태: `done`/`finalized` + 미완료 패키지 → 상점 phase `done`(결과물 생성됨 아님), `project.packageIncomplete`; 프로젝트 전환 팝업 배지 `warn` "최종화 미완료"; 최근 케이스 `phase_hint: "finalize-incomplete"` 또는 `finalized` + 미완료 `package_dir` → "최종화 미완료".
+- 상태: `done`/`finalized` + 미완료 패키지 → 상점 phase `done`(결과물 생성됨 아님), `project.packageIncomplete`; 프로젝트 전환 팝업 배지 `warn` "최종화 미완료". (R11 U3: 최근 케이스 분기는 서버 힌트가 없어 제거 — §18.3.)
 - 결과물 시트: `finIncompleteOf(res)` — `incomplete_package_dir`/미완료 `package_dir`/`finalize_incomplete`/실패 문구의 "최종화 미완료" → 결과 목록 첫 줄 `.h-fin-incomplete` "최종화 미완료"(+경로가 필드로 오면 경로·탐색기) "최종 결과로 쓰지 마십시오", 판정 줄 "보고서·패키지를 만들었지만 최종화 미완료". 오류 문구에서 경로를 잘라내지 않는다(공백 있는 경로). 완전한 패키지로 다시 최종화하면 사라진다. 필드가 없어도 동작.
 
 ### 17.5 번들의 신뢰 문구 (U5)
 - 신뢰 코드가 이 서버 API에서 온 데이터(99-loader `LIVE_TRUST_DATA` WeakSet — 번들 필드로는 주장 못 함)가 아니면 `trustFromBundle`(10-boot). 그때 "이 PC"가 들어간 신뢰 문구는 `<key>@bundle` 쌍둥이("생성 PC 기준 …": `trust.otherPc`, `status.otherPc`, `status.tip.unauth`, `trust.sc`, `audio.selfConsistent`; 20-i18n `trustI18nKey`), 서버 사유(`trust_note`, `logChains[].detail`)의 "이 PC"는 "생성 PC"로.
 - 하네스: verify-review-batch --unit "R10 U1–U5", verify-audio-facet(`/trust` 번들 페이지 = 생성 PC 문구·P7·trust_note·logChains, `/live/` API 페이지 = 이 PC 문구·logChains 전달), verify-finalize-sheet 1(U2)·4c(U4, 두 테마 AA).
+
+## 18. R11 트랙 U 추가 계약 (2026-10-16, docs/PLAN_R11_2026-10-16.md)
+
+### 18.1 서버의 P7 표시 `trust_superseded_by` (U1)
+- 서버는 더 새 쓸 수 없는 줄에 밀린 이전 줄을 `trust: "unauth"` + `trust_superseded_by`(더 새 줄의 1-기준 줄 번호) + `trust_note`("더 최근 인증 안 된 항목 있음 — …")로 보낸다. 30-records `logSlots`는 앞 줄이 쓸 수 있었을 때뿐 아니라 앞 줄(또는 그 항목 자신)에 `trust_superseded_by`가 있어도 현재 항목에 `ftNewerUnauth` → 기록 `statusNewer`("더 최근 인증 안 된 항목 있음", §17.1과 같은 표시). `logTrustSuperseded(item)`.
+
+### 18.2 쓸 수 있는 항목의 note (U2)
+- 쓸 수 있는 항목도 `trust_note`가 있으면(레거시 `auth` + "레인·케이스 결합 없음(레거시) …") 툴팁에만 보인다: `logTrustNote(item, true)`, 기록 상태 `statusNote`(배지 툴팁 `상태\nnote`), 상세 목록 `.trust-info`(`info` 아이콘, title·aria-label = note). 항목 아래 `.trust-note` 줄은 여전히 쓸 수 없는 항목만.
+
+### 18.3 `_INCOMPLETE` 판정 (U3, P11)
+- `packageIncomplete`(10-core): 경로 끝 `/[\\/. ]+$/`를 떼고 폴더 이름이 `/_INCOMPLETE(_\d+)?( - 복사본| \(\d+\))?$/i`(`H_PKG_INCOMPLETE_RE`)이거나 `*.finalize-incomplete.txt`.
+- `/api/recent-cases`는 패키지 힌트를 보내지 않는다(recent.rs `phase_hint`만) → 55-home `recentState`의 `finalize-incomplete`·`package_dir` 분기 제거. 연 케이스는 `/api/status`로 "최종화 미완료".
+
+### 18.4 미인증 재검증 줄 · report_stale · package_incomplete (U4, 트랙 I2/S5/S6)
+- `/api/verify-sources` `unauthenticated`(> 0): `verifySourcesVerdict`(41-finalize, legacy 70-finalize 동일)는 불일치(`err`) 다음으로 `warn` "원본 재검증: 인증 안 된 줄 N개 — 결과 확인 불가", 점검 목록 "원본 재검증: 인증 안 된 줄 있음" — "모두 일치"가 되지 않는다. 필드 없음 = 이전과 같음.
+- 최종화 응답 `report_stale: true`: 결과 목록 첫 줄 `.h-fin-stale-row` "보고서 최신 아님 · 다시 최종화하십시오"(title = 서버 `error`); 성공 응답이면 판정 줄 "보고서·패키지를 만들었지만 보고서 최신 아님"·`warn` 토스트. 다른 케이스를 열면 지워진다.
+- `/api/status` `package_incomplete: true`는 폴더 이름과 상관없이(이름 변경 실패, `package_dir` 없음) 미완료(40-status `stPackageIncomplete`): 상점 phase `done`, `project.packageIncomplete`, 결과물 시트 패키지 줄(상태의 `package_dir`일 때만).
+
+### 18.5 카빙 페이지 지표 (U5, 트랙 I5)
+- 카빙 페이지(`review/carve-report.html`)는 src/html_report.rs(트랙 I). verify-jobs-e2e 3b: 실제 카빙 뒤 `db/carve_results.json`을 위조(원본 크기·경고·스캔 완료)하고 `make-review`를 다시 돌려, 지표가 "감사 안 됨"(초록 `ok` 없음)이거나 위조 값이 아닌지 본다. I5 없는 바이너리에서는 `PEND`(실패 아님), `FRAMETRACE_R11_STRICT=1`이면 실패.
+
+### 18.6 그리드 재구성과 포커스 (PR #4 Windows CI)
+- 그리드 재구성(`render()`·그룹 접기 → 40-grid `renderGridKeepFocus`)은 카드 노드를 바꾼다: 재구성 전에 포커스가 카드·그룹 머리·그리드에 있었고 뒤에 `<body>`로 떨어졌으면 같은 카드(없으면 그리드)로 되돌린다(`preventScroll`). 자동 저장 재시도·크기 변경 재렌더가 아무 때나 와도 키보드 포커스를 잃지 않는다. verify-viewer-dialogs "R11: a grid rebuild keeps keyboard focus".
+- 하네스: verify-review-batch --unit "R11 U1–U4", verify-finalize-sheet 4d(U4).

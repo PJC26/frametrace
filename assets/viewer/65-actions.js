@@ -29,7 +29,7 @@ function setupGridDelegation() {
       const key = header.dataset.group;
       if (state.collapsedGroups.has(key)) state.collapsedGroups.delete(key);
       else state.collapsedGroups.add(key);
-      renderGrid(filteredRecords());
+      renderGridKeepFocus(filteredRecords());
       return;
     }
     if (event.target.closest("input[type='checkbox']")) return;
@@ -48,7 +48,7 @@ function setupGridDelegation() {
       const key = header.dataset.group;
       if (state.collapsedGroups.has(key)) state.collapsedGroups.delete(key);
       else state.collapsedGroups.add(key);
-      renderGrid(filteredRecords());
+      renderGridKeepFocus(filteredRecords());
       return;
     }
     const card = event.target.closest(".card");

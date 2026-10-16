@@ -426,12 +426,17 @@ function shellOnStatus(st) {
 // Server phase -> store phase (contract §4). "idle" (no job, no case) is
 // "empty"; "finalizing" is the review phase with busy set; a sealed case
 // (done + package) is "finalized".
+// R11 U4 (track S6): `package_incomplete: true` counts even when the
+// folder could not be renamed (or no package_dir is named at all).
+function stPackageIncomplete(st) {
+  return !!st && (st.package_incomplete === true || (!!st.package_dir && packageIncomplete(st.package_dir)));
+}
 function storePhase(st) {
   if (!st || !st.has_job) return "empty";
   const p = String(st.phase || "");
   if (p === "finalizing") return "review-ready";
   // R10 U4: a package whose finalize did not complete is not "finalized".
-  const incomplete = !!st.package_dir && packageIncomplete(st.package_dir, st.package_incomplete);
+  const incomplete = stPackageIncomplete(st);
   if ((p === "done" || p === "finalized") && incomplete) return "done";
   if (p === "done" && st.package_dir) return "finalized";
   return ["running", "review-partial", "review-ready", "done", "finalized", "error"].includes(p) ? p : "empty";
@@ -518,7 +523,7 @@ function applyStatus(st) {
         caseDir,
         name: caseBaseName(caseDir),
         packageDir: st.package_dir || "",
-        packageIncomplete: !!st.package_dir && packageIncomplete(st.package_dir, st.package_incomplete),
+        packageIncomplete: stPackageIncomplete(st),
         restored: !!st.restored,
       }),
       jobs,

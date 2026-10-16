@@ -761,6 +761,36 @@ function renderVirtualGrid(filtered) {
   if (activeChanged) gridEnsureActiveVisible();
 }
 
+// A grid rebuild replaces the card nodes: keyboard focus on a card, a
+// group header or the grid itself must not fall to <body> (an autosave
+// retry or a resize re-render lands at any time — PR #4 Windows CI).
+function gridFocusSnapshot() {
+  const el = document.activeElement;
+  if (!el || !els.recordGrid || !els.recordGrid.contains(el)) return null;
+  const card = el.closest(".card");
+  const header = card ? null : el.closest(".group-header");
+  return { id: card ? card.dataset.id : null, group: header ? header.dataset.group : null };
+}
+function gridFocusRestore(snap) {
+  if (!snap) return;
+  const now = document.activeElement;
+  if (now && now !== document.body && now.isConnected) return;
+  const grid = els.recordGrid;
+  let el = null;
+  if (snap.id != null) el = grid.querySelector(`.card[data-id="${CSS.escape(snap.id)}"]`);
+  else if (snap.group != null) el = grid.querySelector(`.group-header[data-group="${CSS.escape(snap.group)}"] .gh-cell`);
+  if (!el) {
+    el = grid;
+    if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+  }
+  try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+}
+function renderGridKeepFocus(filtered) {
+  const snap = gridFocusSnapshot();
+  renderGrid(filtered);
+  gridFocusRestore(snap);
+}
+
 function renderGrid(filtered) {
   // R6 U8: the id → index map, not a scan of the whole list per render.
   if (indexInList(filtered, state.activeId) < 0) {
@@ -884,7 +914,10 @@ const thumbDead = new Set();
 // nothing for authenticated / legacy entries.
 function logTrustTagHtml(item) {
   const trust = logTrustOf(item);
-  if (trust === "sc") return ` <span class="badge candidate">${escapeHtml(t("trust.sc"))}</span>`;
+  // R11 U2: a usable entry's own note (legacy: `auth` + "레거시") as a tooltip.
+  const own = logTrustUsable(trust) ? logTrustNote(item, true) : "";
+  if (trust === "sc") return ` <span class="badge candidate"${own ? ` title="${escapeHtml(own)}"` : ""}>${escapeHtml(t("trust.sc"))}</span>`;
+  if (own) return ` <span class="trust-info" role="img" title="${escapeHtml(own)}" aria-label="${escapeHtml(own)}">${ftIcon("info")}</span>`;
   if (logTrustUsable(trust)) return "";
   const pc = logTrustPcKey(trust);
   // R10 U3: the server's own reason (trust_note) in the tooltip.

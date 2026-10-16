@@ -305,8 +305,24 @@ try {
     }));
     check('Esc in a focused toast dismisses that toast and focuses the remaining one', !f7.texts.some((t) => t.includes('focus-older')) && f7.texts.some((t) => t.includes('focus-newer')) && f7.focusInToast.includes('focus-newer'), JSON.stringify(f7));
     await page.keyboard.press('Escape');
+    // PR #4 Windows CI ({"n":0,"onCard":false}): the toast was gone and focus
+    // had gone to the active card, but a grid rebuild that landed right after
+    // (this fixture's autosave retries / the theater-exit resize render)
+    // replaced the card node and focus fell to <body>. The viewer now keeps
+    // grid focus across rebuilds (40-grid renderGridKeepFocus); the check
+    // below forces such a rebuild deterministically instead of racing one.
     const f7b = await page.evaluate(() => ({ n: document.querySelectorAll('#toastHost .toast').length, onCard: !!document.activeElement?.closest('#recordGrid') }));
     check('Esc on the last focused toast returns focus to the grid', f7b.n === 0 && f7b.onCard, JSON.stringify(f7b));
+    const f7c = await page.evaluate(() => {
+      const card = document.querySelector('#recordGrid .card.active') || document.querySelector('#recordGrid .card');
+      card.focus();
+      const id = card.dataset.id;
+      const sel = document.getElementById('sortBy');
+      sel.dispatchEvent(new Event('change', { bubbles: true })); // render() → grid rebuilt
+      const el = document.activeElement;
+      return { id, rebuilt: !card.isConnected, focusedId: el?.closest?.('.card')?.dataset.id || el?.id || el?.tagName };
+    });
+    check('R11: a grid rebuild keeps keyboard focus on the same card (not <body>)', f7c.rebuilt && f7c.focusedId === f7c.id, JSON.stringify(f7c));
     await page.evaluate(() => window.__ftToastIsolationEnd && window.__ftToastIsolationEnd());
   }
   // --- A6: IME composition Enter is not a command -------------------------

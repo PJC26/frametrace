@@ -428,6 +428,11 @@ function logTrustPcKey(trust) {
 function untrustedStatusOf(trust) {
   return logTrustPcKey(trust) ? "auth-other-pc" : "unauthenticated";
 }
+// R11 U1: the server's P7 mark on an entry a newer unusable entry of the
+// same record supersedes (`trust_superseded_by`: that entry's line number).
+function logTrustSuperseded(item) {
+  return !!item && typeof item === "object" && Number(item.trust_superseded_by) > 0;
+}
 // Per key: the latest usable entry, the latest one that is not, and the
 // latest of all (`last`).
 // R10 U1 (P7, recency): when the latest entry of a key is not usable and an
@@ -442,17 +447,22 @@ function logSlots(list, keyOf) {
     const key = keyOf(item);
     if (!key) continue;
     let slot = slots.get(key);
-    if (!slot) { slot = { usable: null, untrusted: null, last: null }; slots.set(key, slot); }
+    if (!slot) { slot = { usable: null, untrusted: null, last: null, superseded: false }; slots.set(key, slot); }
     if (logTrustUsable(logTrustOf(item))) {
       slot.usable = item;
       slot.last = item;
       continue;
     }
     let entry = item;
-    if (slot.usable) {
+    // R11 U1: the server already marks an older entry a newer unusable one
+    // supersedes (`trust_superseded_by`, 1-based line of the newer entry;
+    // that older entry then reads `unauth`) — a later unusable entry after
+    // it, or the marked entry itself, is "더 최근 인증 안 된 항목 있음".
+    if (slot.usable || slot.superseded || logTrustSuperseded(item)) {
       entry = Object.assign({}, item);
       Object.defineProperty(entry, "ftNewerUnauth", { value: true, enumerable: false });
     }
+    if (logTrustSuperseded(item)) slot.superseded = true;
     slot.untrusted = entry;
     slot.last = entry;
   }
@@ -467,8 +477,10 @@ function currentLogEntries(list, keyOf) {
 // The server's reason for an entry this PC could not use (`trust_note`),
 // "" otherwise. R10 U5: in a bundle the reason was written on the PC that
 // generated it — "이 PC" there is not the PC reading it now.
-function logTrustNote(item) {
-  if (!item || typeof item !== "object" || logTrustUsable(logTrustOf(item))) return "";
+// R11 U2: `any` also returns the note of a usable entry (a legacy
+// authenticated entry: `auth` + "레거시" note) — tooltips only.
+function logTrustNote(item, any) {
+  if (!item || typeof item !== "object" || (!any && logTrustUsable(logTrustOf(item)))) return "";
   const note = item.trust_note == null ? "" : String(item.trust_note).trim();
   return viewerTrustFromBundle() ? note.replace(/이 PC/g, "생성 PC").replace(/\bthis PC\b/gi, "the generating PC") : note;
 }
@@ -493,9 +505,15 @@ function recordStatusOf(own, valid, unvalid, fallback) {
     return out;
   };
   if (own && !logTrustUsable(ownTrust)) return untrusted(own, ownTrust);
-  if (valid && valid.validation_status) return { status: valid.validation_status, trust: logTrustOf(valid) || ownTrust };
+  // R11 U2: a usable entry's note (legacy, unbound) stays in the tooltip.
+  const usable = (out, ...items) => {
+    const note = [...new Set(items.map(i => logTrustNote(i, true)).filter(Boolean))].join("\n");
+    if (note) out.note = note;
+    return out;
+  };
+  if (valid && valid.validation_status) return usable({ status: valid.validation_status, trust: logTrustOf(valid) || ownTrust }, own, valid);
   if (unvalid) return untrusted(unvalid, logTrustOf(unvalid));
-  return { status: fallback, trust: ownTrust };
+  return usable({ status: fallback, trust: ownTrust }, own);
 }
 // Tooltip of a record's status badge: the raw status plus what its trust means.
 function statusTitle(record) {
@@ -508,8 +526,8 @@ function statusTitle(record) {
   const head = newer ? t("status.tip.newer") + " · " : "";
   if (status === "auth-other-pc") return head + tf("trust.otherPc", { key: logTrustPcKey(trust) || "?" }) + note;
   if (status === "unauthenticated") return head + t(newer ? "status.unauth" : "status.tip.unauth") + note;
-  if (trust === "sc") return status + " · " + t("trust.sc");
-  return status;
+  if (trust === "sc") return status + " · " + t("trust.sc") + note;
+  return status + note;
 }
 
 // R10 U3: what records-meta's `logChains[lane]` says when it is not plainly

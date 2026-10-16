@@ -10,11 +10,15 @@ const esc = v => String(v ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").
 // "<name>_INCOMPLETE" (marker "<package>.finalize-incomplete.txt" beside it)
 // — shown as "최종화 미완료" wherever a package or the finalized state is.
 // `flag`: an explicit server field, when one is sent (absent is fine).
+// R11 U3 (P11): a second incomplete package ("_INCOMPLETE_2") and an
+// Explorer copy (" - 복사본", " (2)") count too; trailing dots / spaces
+// (dropped by Windows) are ignored.
 const H_PKG_INCOMPLETE = "최종화 미완료";
+const H_PKG_INCOMPLETE_RE = /_INCOMPLETE(_\d+)?( - 복사본| \(\d+\))?$/i;
 function packageIncomplete(dir, flag) {
   if (flag === true) return true;
-  const base = String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
-  return /_INCOMPLETE$/i.test(base) || /\.finalize-incomplete\.txt$/i.test(base);
+  const base = String(dir || "").replace(/[\\/. ]+$/, "").split(/[\\/]/).pop() || "";
+  return H_PKG_INCOMPLETE_RE.test(base) || /\.finalize-incomplete\.txt$/i.test(base);
 }
 
 // A6: an Enter that only commits an IME composition (Korean input) is

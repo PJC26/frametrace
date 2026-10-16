@@ -327,6 +327,49 @@ await check('4c R10 U4: a failed finalize that left a package says 최종화 미
   await page.context().close();
 });
 
+// R11 U4 (track S5): a finalize whose report re-render failed says the
+// report is not current; R11 U4 (I2): unauthenticated re-verify lines are
+// never "모두 일치".
+await check('4d R11 U4: report_stale → 보고서 최신 아님; unauthenticated verify-sources → not 모두 일치', async () => {
+  const page = await newPage(browser);
+  await openSheet(page);
+  await page.fill('#finalExaminer', 'Hong');
+  S.finalize = { ok: false, report_stale: true, error: '패키징 실패: disk full — 경고: 보고서를 다시 만들지 못했습니다 (reports/case-report.html이 최신이 아님)' };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /실패/.test(document.getElementById('finalHint').textContent));
+  const row = await page.evaluate(() => {
+    const li = document.querySelector('#finalLinks .h-fin-stale-row');
+    return li ? { text: li.textContent, title: li.querySelector('[title]')?.getAttribute('title') || '' } : null;
+  });
+  assert.ok(row && /보고서 최신 아님/.test(row.text) && /다시 최종화/.test(row.text) && /보고서를 다시 만들지 못했습니다/.test(row.title), 'stale row: ' + JSON.stringify(row));
+  for (const th of ['light', 'dark']) {
+    await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
+    const label = (await contrastReport(page)).find((e) => /h-fin-incomplete/.test(e.cls));
+    assert.ok(label && ratio(label.fg, label.bg) >= 4.5, `${th}: 보고서 최신 아님 label contrast ${label && ratio(label.fg, label.bg).toFixed(2)}`);
+  }
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+  // A success that still could not refresh the report.
+  S.finalize = { ok: true, report_stale: true, examiner: 'Hong', manifest_sha256: 'd'.repeat(64), package_dir: 'C:/c/reports/package_004', package_url: 'reports/package_004/' };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /package_004/.test(document.getElementById('finalLinks').textContent));
+  assert.match(await page.textContent('#finalVerdict'), /보고서 최신 아님/);
+  // A clean finalize clears it.
+  S.finalize = { ok: true, examiner: 'Hong', manifest_sha256: 'e'.repeat(64), package_dir: 'C:/c/reports/package_005', package_url: 'reports/package_005/' };
+  await page.click('#btnFinalize');
+  await page.waitForFunction(() => /package_005/.test(document.getElementById('finalLinks').textContent));
+  assert.ok(!/보고서 최신 아님/.test(await page.textContent('#finalLinks')) && /보고서·패키지를 만들었습니다/.test(await page.textContent('#finalVerdict')));
+  // verify-sources with unauthenticated lines (all compared files match).
+  const saved = S.verifySources;
+  S.verifySources = { ok: true, matched: 3, mismatched: 0, not_comparable: 0, unauthenticated: 1 };
+  await page.click('#finalAdvanced > summary');
+  await page.click('#btnVerifySources');
+  await page.waitForFunction(() => /원본 재검증: 인증 안 된 줄 있음/.test(document.getElementById('finalChecklist').textContent));
+  assert.ok(!/원본 재검증: 모두 일치/.test(await page.textContent('#finalChecklist')));
+  S.verifySources = saved;
+  assert.deepEqual(page.__errors, []);
+  await page.context().close();
+});
+
 await check('4b a stale "ready" never seals: fresh block at click time -> no POST', async () => {
   const page = await newPage(browser);
   await openSheet(page);

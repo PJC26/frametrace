@@ -589,7 +589,7 @@ function render() {
   const facets = facetCounts();
   renderHistogram(facets.dayCounts);
   renderTree(facets);
-  renderGrid(filtered);
+  renderGridKeepFocus(filtered);
   renderDetails();
   renderSaveState();
   syncSplitterAria();
