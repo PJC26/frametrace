@@ -217,6 +217,10 @@ pub(crate) struct JobState {
     /// start, open-case or the next finalize — `None` when nothing was
     /// recovered. Cleared by a finalize that completes or another case.
     pub(crate) finalize_recovered: Option<String>,
+    /// R13-S7: the case whose interrupted finalize the background start-up
+    /// recovery is cleaning up right now (it holds `busy`) — status
+    /// `finalize_journal.state: "recovering"`.
+    pub(crate) finalize_recovering: Option<PathBuf>,
 }
 
 /// R5-S6: the pending "raw 불일치 — 재임포트 필요" decision.
@@ -384,6 +388,7 @@ impl JobState {
             report_stale: false,
             finalize_incomplete: None,
             finalize_recovered: None,
+            finalize_recovering: None,
         }
     }
 }

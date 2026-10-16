@@ -756,6 +756,41 @@ A finalize that recorded its sign-off entry but then failed appends a
 keys are held) makes that sign-off entry display-only: it does not make the
 previous sign-off "not the latest", nor cap an older-schema record.
 
+### Finalize lifecycle entries (R13-S1, P15)
+
+R12's finalize journal (`review/finalize.inprogress.json`) was unkeyed: anyone
+able to write the case folder could plant one naming the CURRENT, completed
+sign-off and make the workstation itself append a keyed `signoff-abandoned`
+for it, write arbitrary bytes back as `review/signoff.json` and rename every
+package `_INCOMPLETE`. From R13 the sign-off lane carries three more keyed
+(HMAC when a key is configured) event kinds, and the journal is only a
+pointer to them:
+
+| `event` | written | fields |
+|---|---|---|
+| `finalize-begin` | before the journal and before the `signoff` entry | `finalize_id` (random 128-bit hex), `signoff_record_sha256` (pending record), `previous_signoff_sha256` (what `review/signoff.json` held, or null), `package_name` (the ONE `reports/` name `package-case --package-name` may publish), `host_id` (`util::host_id`), `pid`, `writer_started_ms`, `writer_image`, `started_unix` |
+| `finalize-complete` | after a finalize completed, before its journal is removed | `finalize_id`, `signoff_record_sha256`, `package_name`, `package_manifest_sha256` |
+| `finalize-resolved` | when an unfinished finalize was cleaned up | `finalize_id`, `signoff_record_sha256`, `outcome`: `failed` (its failure path left nothing), `recovered` (a recovery finished), `refused` (stopped before its sign-off was chained), `superseded` (a journal kept only for a stale report, replaced by the next finalize), `dismissed` (`frametrace finalize-journal <case> --dismiss`) |
+
+A recovery acts only when the journal's `finalize_id` names the lane's
+**latest trusted** `finalize-begin` (authenticated here; self-consistent only
+on a PC holding no audit key — P1) with no trusted `finalize-complete` /
+`finalize-resolved` for it, and the journal's SHAs, package name and host id
+equal the entry's. It then uses the entry's values: bytes are written back
+only when they hash to `previous_signoff_sha256`, only `package_name` (and a
+kept work folder reserved for it) is marked, only `signoff_record_sha256` is
+abandoned. A complete/resolved entry → the journal is only deleted. Anything
+else (`unpaired`: no entry, not the latest, not authenticated, lane broken,
+keys unreadable, R12-format journal) changes nothing. A journal whose
+`host_id` is another PC's is never recovered (P17). These events are not
+`signoff` entries: the sign-off position check, "not the latest" and the
+legacy-record cap ignore them, and the lane has no recency keys.
+
+**Keyless limit:** on a PC without an audit key every entry is
+self-consistency only, so someone who can write the case folder can also
+append a chained `finalize-begin` — the same limit as every other keyless
+record (and `--strict` exits 3 for such a sign-off, R13-S12).
+
 ## Retired keys
 
 Each key the keyring retires gets a retirement time (`retired` map in

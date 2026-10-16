@@ -97,6 +97,42 @@ fn package_redaction_mode(case_dir: &Path) -> Result<bool, String> {
 /// leaves a half-written `package_*` folder that looks like a deliverable
 /// — the server sweeps the `.part` directory of the killed step.
 pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<PackageResult, String> {
+    package_case_named(case_dir, output_dir, None)
+}
+
+/// R13-S2 (P15): whether `name` may be passed as `package-case
+/// --package-name` — `package_` followed by ASCII letters, digits, `_`
+/// or `-` (no separator, no `..`), not an `_INCOMPLETE` name.
+pub fn valid_reserved_package_name(name: &str) -> bool {
+    name.len() <= 96
+        && name.strip_prefix("package_").is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+        && !is_incomplete_package_name(name)
+}
+
+/// R13-S2 (P15): [`package_case`] that publishes under EXACTLY
+/// `reports/<package_name>` (a finalize recorded that name in its
+/// `finalize-begin` lane entry; a recovery marks only it). Fails when the
+/// name is taken — never falls back to another name.
+pub fn package_case_named(
+    case_dir: &Path,
+    output_dir: Option<&Path>,
+    package_name: Option<&str>,
+) -> Result<PackageResult, String> {
+    if let Some(name) = package_name {
+        if output_dir.is_some() {
+            return Err("--package-name and --output cannot be combined".to_string());
+        }
+        if !valid_reserved_package_name(name) {
+            return Err(format!(
+                "--package-name {name}: not a package folder name (package_<letters, digits, _ or ->)"
+            ));
+        }
+    }
     let created_unix = now_unix()?;
     let pid = std::process::id();
     let reports = case_dir.join("reports");
@@ -128,7 +164,14 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
             // — the server's kill sweep and the next run's stale sweep
             // remove both. Reserving first leaked an empty `package_<ts>`
             // when the process died before the work folder existed.
-            reserve_package_dirs(&reports.join(format!("package_{created_unix}")), pid)?
+            match package_name {
+                Some(name) => {
+                    reserve_package_dirs_with(&reports.join(name), pid, &reservation_rename, true)?
+                }
+                None => {
+                    reserve_package_dirs(&reports.join(format!("package_{created_unix}")), pid)?
+                }
+            }
         }
     };
     // The default name was reserved by creating it; an explicit output
@@ -240,7 +283,7 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
 /// folder for a candidate FIRST and the (empty) final-name reservation
 /// second. Returns `(final, work)`; both exist.
 fn reserve_package_dirs(base: &Path, pid: u32) -> Result<(PathBuf, PathBuf), String> {
-    reserve_package_dirs_with(base, pid, &reservation_rename)
+    reserve_package_dirs_with(base, pid, &reservation_rename, false)
 }
 
 /// [`reserve_package_dirs`] with the placing rename injected (tests).
@@ -248,6 +291,7 @@ fn reserve_package_dirs_with(
     base: &Path,
     pid: u32,
     rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    exact: bool,
 ) -> Result<(PathBuf, PathBuf), String> {
     let parent = base.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -256,7 +300,9 @@ fn reserve_package_dirs_with(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "package".to_string());
-    for attempt in 0..10_000u32 {
+    // R13-S2: an exact name (a finalize's reserved one) is tried alone.
+    let attempts = if exact { 1 } else { 10_000u32 };
+    for attempt in 0..attempts {
         let candidate = if attempt == 0 {
             base.to_path_buf()
         } else {
@@ -325,6 +371,12 @@ fn reserve_package_dirs_with(
                 ));
             }
         }
+    }
+    if exact {
+        return Err(format!(
+            "패키지 이름 {}이(가) 이미 있어 예약하지 못했습니다 (--package-name은 다른 이름으로 바꾸지 않음)",
+            base.display()
+        ));
     }
     Err(format!(
         "no free package folder name next to {}",
@@ -1282,6 +1334,10 @@ pub struct PackageVerification {
     /// complete ([`finalize_incomplete_reason`]); reported as a NOT
     /// VERIFIED check with subject [`FINALIZE_CHECK_SUBJECT`].
     pub finalize_incomplete: bool,
+    /// R13-S12: the packaged sign-off's audit-lane entry matched, but only
+    /// structurally — no HMAC was checked here (a keyless case, or a PC
+    /// without the key): the line passes, `--strict` exits 3.
+    pub signoff_unauthenticated: bool,
 }
 
 /// R10-S2: the `verify-package` check subject of the finalize state.
@@ -1320,7 +1376,7 @@ pub fn strip_copy_tails(name: &str) -> &str {
         let next = strip_numbered_tail(trimmed).or_else(|| {
             COPY_TAILS
                 .iter()
-                .find_map(|tail| strip_suffix_ignore_ascii_case(trimmed, tail))
+                .find_map(|tail| strip_suffix_ignore_case(trimmed, tail))
         });
         match next {
             Some(shorter) => rest = shorter,
@@ -1329,10 +1385,12 @@ pub fn strip_copy_tails(name: &str) -> &str {
     }
 }
 
-/// R11-S2 / R12-S10: the copy tails Windows Explorer appends in the
-/// display languages an examiner's PC is likely to use — Korean, English,
-/// German, Japanese, Chinese (Simplified), French — matched ASCII
-/// case-insensitively. Other locales' tails (and copies made by other
+/// R11-S2 / R12-S10 / R13-S13: the copy tails Windows Explorer appends in
+/// the display languages an examiner's PC is likely to use — Korean,
+/// English, German, Japanese, Chinese (Simplified and Traditional), French,
+/// Spanish/Italian, Portuguese, Russian — matched case-insensitively with
+/// Unicode lowercase (R12 compared ASCII case only, so ` - КОПИЯ` or
+/// ` - CÓPIA` was missed). Other locales' tails (and copies made by other
 /// tools) are NOT recognized: the marker beside the original then only
 /// helps for a copy made next to it, and a copied folder keeps the
 /// `_INCOMPLETE` in its own name only when the tail comes after it.
@@ -1342,7 +1400,11 @@ const COPY_TAILS: &[&str] = &[
     " - kopie",
     " - コピー",
     " - 副本",
+    " - 複製",
     " - copie",
+    " - copia",
+    " - cópia",
+    " - копия",
 ];
 
 /// ` (n)` at the end of `name` (n = one or more ASCII digits).
@@ -1353,10 +1415,18 @@ fn strip_numbered_tail(name: &str) -> Option<&str> {
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| &name[..open])
 }
 
-fn strip_suffix_ignore_ascii_case<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
-    let cut = name.len().checked_sub(suffix.len())?;
-    let tail = name.get(cut..)?;
-    tail.eq_ignore_ascii_case(suffix).then(|| &name[..cut])
+/// R13-S13: `name` without `suffix` (a lowercase tail), compared by
+/// Unicode lowercase character by character — the tail of `name` is the
+/// same number of characters as `suffix`, whatever its byte length.
+fn strip_suffix_ignore_case<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    let chars = suffix.chars().count();
+    let cut = name
+        .char_indices()
+        .rev()
+        .nth(chars.checked_sub(1)?)
+        .map(|(at, _)| at)?;
+    let tail = &name[cut..];
+    (tail.to_lowercase() == suffix.to_lowercase()).then(|| &name[..cut])
 }
 
 /// R10-S2: whether a folder NAME marks an incomplete finalize
@@ -2132,6 +2202,13 @@ fn verify_package_db_and_signoff(
         &text,
         listed.contains_key(crate::report::SIGNOFF_LOG_REL_PATH),
     );
+    if let crate::report::SignoffAuditRecord::Verified {
+        authenticated: false,
+        ..
+    } = &record
+    {
+        out.signoff_unauthenticated = true;
+    }
     let status = match &record {
         crate::report::SignoffAuditRecord::Verified { .. } => CheckStatus::Pass,
         crate::report::SignoffAuditRecord::NotVerifiable(_) => CheckStatus::NotVerified,
@@ -3440,8 +3517,9 @@ mod tests {
         let started = std::time::Instant::now();
         // R10-S4: the retry budget (12 s) shortened to the bare backoff.
         super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(Some(std::time::Duration::ZERO)));
-        let err = super::reserve_package_dirs_with(&reports.join("package_5"), 4242, &denied)
-            .expect_err("a persistent failure must fail the reservation");
+        let err =
+            super::reserve_package_dirs_with(&reports.join("package_5"), 4242, &denied, false)
+                .expect_err("a persistent failure must fail the reservation");
         super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(None));
         assert_eq!(calls.get(), 5, "one name, one backoff");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -3662,6 +3740,29 @@ mod tests {
         }
     }
 
+    /// R13-S13: more locales' tails, and non-ASCII case. a4fb793 kept
+    /// ` - 複製`, ` - copia`, ` - Cópia`, ` - копия` (unknown tails) and
+    /// compared ASCII case only (` - КОПИЯ`, ` - CÓPIA` missed).
+    #[test]
+    fn r13_s13_more_copy_tails_and_unicode_case() {
+        for copy in [
+            "package_7_INCOMPLETE - 複製",
+            "package_7_INCOMPLETE - Copia",
+            "package_7_INCOMPLETE - Cópia",
+            "package_7_INCOMPLETE - CÓPIA (2)",
+            "package_7_INCOMPLETE - копия",
+            "package_7_INCOMPLETE - КОПИЯ",
+            "package_7_INCOMPLETE - Копия - 복사본",
+        ] {
+            assert!(super::is_incomplete_package_name(copy), "{copy}");
+        }
+        assert_eq!(super::strip_copy_tails("가 - КОПИЯ"), "가");
+        assert_eq!(super::strip_copy_tails("ab"), "ab");
+        assert!(!super::is_incomplete_package_name(
+            "package_9_INCOMPLETE - копиям"
+        ));
+    }
+
     /// R11-S7: a rename whose source is gone fails at once (R10 retried
     /// NotFound for the whole 12 s budget), and a busy file reports each
     /// wait to the caller.
@@ -3729,9 +3830,13 @@ mod tests {
             }
             super::reservation_rename(from, to)
         };
-        let (reserved, work) =
-            super::reserve_package_dirs_with(&reports.join("package_7"), 4242, &busy_for_a_while)
-                .expect("a transient denial within the budget reserves the name");
+        let (reserved, work) = super::reserve_package_dirs_with(
+            &reports.join("package_7"),
+            4242,
+            &busy_for_a_while,
+            false,
+        )
+        .expect("a transient denial within the budget reserves the name");
         assert_eq!(reserved, reports.join("package_7"));
         assert!(reserved.is_dir() && work.is_dir());
         assert!(
@@ -3749,8 +3854,9 @@ mod tests {
                 "access denied",
             ))
         };
-        let err = super::reserve_package_dirs_with(&reports.join("package_9"), 4242, &denied)
-            .expect_err("persistent");
+        let err =
+            super::reserve_package_dirs_with(&reports.join("package_9"), 4242, &denied, false)
+                .expect_err("persistent");
         super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(None));
         let took = started.elapsed();
         assert!(took >= budget, "{took:?}");

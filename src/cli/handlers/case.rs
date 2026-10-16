@@ -1362,17 +1362,20 @@ fn read_scan_runs_json_checked(case_dir: &Path) -> Result<String, String> {
 /// [`package_case_with_pending`]).
 #[cfg(test)]
 pub fn package_case(case_dir: &Path, options: PackageOptions) -> Result<(), String> {
-    package_case_with_pending(case_dir, options, false)
+    package_case_with_pending(case_dir, options, false, None)
 }
 
 /// `package-case` (D9): refuses while marks are still queued or save
 /// conflicts are unresolved — the package would seal a review that is not
 /// the examiner's latest — unless `allow_pending` (`--allow-pending`) is
-/// given, in which case the state is printed as a warning.
+/// given, in which case the state is printed as a warning. R13-S2:
+/// `package_name` (`--package-name`) publishes under exactly that
+/// `reports/` name or fails.
 pub fn package_case_with_pending(
     case_dir: &Path,
     options: PackageOptions,
     allow_pending: bool,
+    package_name: Option<&str>,
 ) -> Result<(), String> {
     ensure_case(case_dir)?;
     let (queued, conflicts) = review_queue_state(case_dir);
@@ -1394,7 +1397,8 @@ pub fn package_case_with_pending(
     if let Err(err) = write_custody_statement(case_dir) {
         eprintln!("warning: custody statement not refreshed: {err}");
     }
-    let result = package::package_case(case_dir, options.output_dir.as_deref())?;
+    let result =
+        package::package_case_named(case_dir, options.output_dir.as_deref(), package_name)?;
     println!("case package written");
     println!("output: {}", result.output_dir.display());
     println!("files: {}", result.file_count);
@@ -1446,7 +1450,13 @@ pub fn verify_package_exit_code(result: &package::PackageVerification, strict: b
             && (check.subject == crate::report::SIGNOFF_REL_PATH
                 || check.subject == crate::report::SIGNOFF_LOG_REL_PATH)
     });
-    if strict && result.passed() && (result.finalize_incomplete || signoff_not_verified) {
+    // R13-S12: a sign-off whose lane entry matched only structurally (no
+    // HMAC checked: keyless, or no key on this PC) is not "final and
+    // signed" either — anyone with the case folder can recompute it.
+    if strict
+        && result.passed()
+        && (result.finalize_incomplete || signoff_not_verified || result.signoff_unauthenticated)
+    {
         VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE
     } else {
         0
@@ -2024,14 +2034,18 @@ mod report_output_tests {
         make_report(&case_dir, false, false, None).unwrap();
         let report = case_dir.join("reports/case-report.html");
         let before = fs::read(&report).unwrap();
-        let temp = case_dir.join(format!(
-            "reports/.case-report.html.tmp-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(temp.join("blocker")).unwrap();
-        assert!(make_report(&case_dir, false, false, None).is_err());
+        crate::util::FAIL_ATOMIC_WRITE.with(|fail| *fail.borrow_mut() = Some(report.clone()));
+        let failed = make_report(&case_dir, false, false, None);
+        crate::util::FAIL_ATOMIC_WRITE.with(|fail| *fail.borrow_mut() = None);
+        assert!(failed.is_err());
         assert_eq!(fs::read(&report).unwrap(), before);
-        fs::remove_dir_all(&temp).unwrap();
+        // No temp file is left behind.
+        let leftovers = fs::read_dir(case_dir.join("reports"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2747,7 +2761,14 @@ mod report_output_tests {
             },
         )
         .unwrap();
-        assert_eq!(super::verify_package_with(&package, true), Ok(0));
+        assert_eq!(super::verify_package_with(&package, false), Ok(0));
+        // R13-S12: keyless here — strict is 3 for the structural sign-off
+        // already; the incomplete finalize is what the rest checks.
+        assert!(
+            crate::package::verify_package(&package)
+                .unwrap()
+                .signoff_unauthenticated
+        );
         let incomplete = root.join("package_1_INCOMPLETE");
         fs::rename(&package, &incomplete).unwrap();
         assert_eq!(super::verify_package_with(&incomplete, false), Ok(0));
@@ -2774,7 +2795,8 @@ mod report_output_tests {
     #[test]
     fn r12_s8_strict_verify_package_exits_3_for_an_unverified_signoff() {
         let (root, case_dir, _id) = signed_case("r12-s8");
-        // Signed and complete: 0 either way.
+        // Signed and complete, keyless (structural sign-off): 0 without
+        // --strict; R13-S12: 3 with it (R12 exited 0).
         let signed = root.join("package_signed");
         super::package_case(
             &case_dir,
@@ -2783,7 +2805,11 @@ mod report_output_tests {
             },
         )
         .unwrap();
-        assert_eq!(super::verify_package_with(&signed, true), Ok(0));
+        assert_eq!(super::verify_package_with(&signed, false), Ok(0));
+        assert_eq!(
+            super::verify_package_with(&signed, true),
+            Ok(super::VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE)
+        );
         // No sign-off record at all.
         fs::remove_file(case_dir.join(crate::report::SIGNOFF_REL_PATH)).unwrap();
         make_report(&case_dir, false, false, None).unwrap();
@@ -2803,5 +2829,28 @@ mod report_output_tests {
             Ok(super::VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// R13-S12: `--strict` exits 3 when the sign-off lane entry matched
+    /// only structurally (`authenticated == false`); an authenticated
+    /// sign-off of a complete package is 0. a4fb793 exited 0 for both.
+    #[test]
+    fn r13_s12_strict_exits_3_for_a_structural_signoff() {
+        let pass = crate::package::PackageCheck {
+            status: crate::package::CheckStatus::Pass,
+            subject: crate::report::SIGNOFF_LOG_REL_PATH.to_string(),
+            detail: "matched".to_string(),
+        };
+        let mut result = crate::package::PackageVerification {
+            checks: vec![pass],
+            ..Default::default()
+        };
+        assert_eq!(super::verify_package_exit_code(&result, true), 0);
+        result.signoff_unauthenticated = true;
+        assert_eq!(super::verify_package_exit_code(&result, false), 0);
+        assert_eq!(
+            super::verify_package_exit_code(&result, true),
+            super::VERIFY_PACKAGE_INCOMPLETE_EXIT_CODE
+        );
     }
 }

@@ -86,6 +86,8 @@ fn fake_case(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 fn bound_state(case: &Path) -> SharedState {
+    // R13-S2: the fakes publish `package_1`, so the finalize reserves it.
+    super::jobs::PACKAGE_BASE_FOR_TEST.with(|cell| cell.set(Some("package_1")));
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     state_lock(&state).case_dir = Some(case.to_path_buf());
     state
@@ -165,6 +167,7 @@ fn finalize_cancelled_after_publish(
         let state = Arc::clone(state);
         let case = case.to_path_buf();
         thread::spawn(move || {
+            super::jobs::PACKAGE_BASE_FOR_TEST.with(|cell| cell.set(Some("package_1")));
             setup();
             let response = finalize_with_exe(&fake, &case, "홍길동", &state);
             super::jobs::CANCEL_IGNORES_PUBLISH.with(|hook| hook.set(false));
@@ -313,11 +316,11 @@ fn r12_s1_failure_after_publish_marks_the_package_incomplete() {
 /// name (publish rename failed) with the note "rename it yourself". A
 /// finalize failing that way marks it beside under both names, so the
 /// renamed folder still reads as incomplete, and rewrites the note.
-/// 632f557: renaming it to `package_5` gave a package that verified as final.
+/// 632f557: renaming it to its reserved name gave a package that verified as final.
 #[test]
 fn r12_s5_kept_work_folder_of_a_failed_finalize_is_marked() {
     let (root, case) = fake_case("s5-part");
-    let part = ".package_5.ft999.part";
+    let part = ".package_1.ft999.part";
     let keep = crate::join::PRESERVED_PART_SUFFIX;
     let fake = write_fake(
         &root,
@@ -341,7 +344,7 @@ fn r12_s5_kept_work_folder_of_a_failed_finalize_is_marked() {
         "still kept from sweeps"
     );
     // The examiner renames it as the old note said: still incomplete.
-    let renamed = reports.join("package_5");
+    let renamed = reports.join("package_1");
     std::fs::rename(&kept, &renamed).unwrap();
     assert!(crate::package::finalize_incomplete_reason(&renamed).is_some());
     let _ = std::fs::remove_dir_all(root);
@@ -659,22 +662,25 @@ fn r12_s2_restore_failure_is_retried_by_the_recovery() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// R12-S2/S3: the journal round-trips exactly, previous sign-off bytes
-/// included (any bytes), and a journal whose SHA does not match its
-/// record is refused (never recovered on a guess).
+/// R12-S2/S3 (R13 format): the journal round-trips exactly, and a journal
+/// that is not one (here: its SHA field is no SHA-256) is refused (never
+/// recovered on a guess). R13-S11: the previous bytes live beside it.
 #[test]
 fn r12_s2_journal_round_trips_and_refuses_a_mismatched_record() {
     let (root, case) = fake_case("s2-journal");
     let journal = super::finalize_journal::FinalizeJournal {
-        pid: 4242,
+        finalize_id: "00112233445566778899aabbccddeeff".into(),
+        host_id: crate::util::host_id(),
+        writer: crate::util::WriterIdentity {
+            pid: 4242,
+            started_ms: Some(1_700_000_000_123),
+            image: Some("frametrace-app.exe".into()),
+        },
         started_unix: 1_700_000_000,
         examiner: "홍길동".into(),
-        signoff_text: "{\"examiner\":\"홍길동\"}".into(),
-        previous_signoff: Some(vec![0, 159, 255, b'{', b'}']),
-        previous_abandoned: true,
-        reports_before: ["package_1".to_string(), "case-report.html".to_string()]
-            .into_iter()
-            .collect(),
+        signoff_sha256: crate::sha256::digest_bytes(b"{\"examiner\":\"x\"}"),
+        previous_signoff_sha256: Some(crate::sha256::digest_bytes(&[0, 159, 255])),
+        package_name: "package_1700000000".into(),
         state: super::finalize_journal::STATE_RECOVERED.to_string(),
     };
     journal.write(&case).unwrap();
@@ -684,7 +690,7 @@ fn r12_s2_journal_round_trips_and_refuses_a_mismatched_record() {
     );
     let path = super::finalize_journal::journal_path(&case);
     let text = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(&path, text.replace("홍길동\\\"}", "김철수\\\"}")).unwrap();
+    std::fs::write(&path, text.replace(&journal.signoff_sha256, "not-a-sha")).unwrap();
     assert!(super::finalize_journal::read_journal(&case).is_err());
     // An unreadable journal blocks the next finalize instead of being
     // overwritten.

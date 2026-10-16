@@ -170,6 +170,24 @@ pub enum Commands {
         /// printed as a warning (default: refuse)
         #[arg(long)]
         allow_pending: bool,
+        /// Publish under exactly reports/<NAME> (package_…); fail instead
+        /// of picking another name when it is taken. The workstation's
+        /// finalize passes the name it recorded in the sign-off lane.
+        #[arg(long, conflicts_with = "output")]
+        package_name: Option<String>,
+    },
+    /// Show the finalize journal of a case (review/finalize.inprogress.json:
+    /// an interrupted finalize, or one another PC is running) and what the
+    /// sign-off lane says about it; --dismiss moves it aside (never deletes)
+    /// so the next finalize is no longer blocked
+    FinalizeJournal {
+        case_dir: PathBuf,
+        /// Move the journal to review/finalize.dismissed-<unix>.json and
+        /// record that in the sign-off lane. Nothing else is changed: check
+        /// review/signoff.json and the reports folder yourself, then
+        /// finalize again
+        #[arg(long)]
+        dismiss: bool,
     },
     /// Verify a package written by package-case: manifest.sha256 entries vs
     /// files, package-manifest.json, audit chains, database snapshot and
@@ -178,7 +196,8 @@ pub enum Commands {
         package_dir: PathBuf,
         /// Exit with code 3 (not 0) when every file checks out but the
         /// package is from a finalize that did not complete, or its
-        /// sign-off (record or audit-lane entry) is NOT VERIFIED
+        /// sign-off (record or audit-lane entry) is NOT VERIFIED or matched
+        /// only structurally (no audit-key HMAC checked)
         #[arg(long)]
         strict: bool,
     },
@@ -777,9 +796,15 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             case_dir,
             output,
             allow_pending,
+            package_name,
         } => {
             let options = PackageOptions { output_dir: output };
-            package_case_with_pending(&case_dir, options, allow_pending)
+            package_case_with_pending(&case_dir, options, allow_pending, package_name.as_deref())
+        }
+        Commands::FinalizeJournal { case_dir, dismiss } => {
+            let text = crate::serve::finalize_journal_command(&case_dir, dismiss)?;
+            print!("{text}");
+            Ok(())
         }
         Commands::VerifyPackage {
             package_dir,

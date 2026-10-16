@@ -1812,8 +1812,10 @@ pub(crate) fn api_export_selected_with(
             json_string(&export_dir.to_string_lossy()),
         ),
     );
+    // R13-S14: the final manifests replace the in-progress ones
+    // atomically (R12 used a plain write — a crash left a torn file).
     let write = |name: &str, contents: String| -> Result<(), String> {
-        std::fs::write(export_dir.join(name), contents)
+        crate::util::write_text_atomic(&export_dir.join(name), &contents)
             .map_err(|err| format!("manifest write failed for {name}: {err}"))
     };
     let head = audit::chain_head(&audit_log)
@@ -2137,6 +2139,11 @@ pub(crate) fn begin_export_bundle(
 /// "중단됨" — an incomplete-note file and an `aborted` manifest-audit —
 /// so the folder can never be mistaken for a finished bundle. Returns how
 /// many were marked.
+/// R13-S14: the C4 and S14 tests both register an export and stamp EVERY
+/// registered one; run in parallel they stamped each other's folders.
+#[cfg(test)]
+pub(crate) static ABANDONED_EXPORTS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub(crate) fn mark_abandoned_exports() -> usize {
     let dirs = exports_in_progress().clone();

@@ -564,35 +564,126 @@ fn reserve_file(path: &Path) -> bool {
     }
 }
 
-/// Writes state files (case manifest, indexes) so a crash can never leave a
-/// truncated half-file: the payload lands in a sibling temp file first, is
-/// fsynced, and only then atomically renamed over the target.
-pub fn write_text_atomic(path: &Path, text: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+/// R13-S14: a per-process counter for [`write_text_atomic`] temp names.
+static ATOMIC_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// R13-S14: a temp name next to `path` that no other writer — another
+/// process, or another thread of this one — uses at the same time:
+/// `.<name>.tmp-<pid>-<seq>-<nanos>`. R12 used the pid alone, so two
+/// threads writing the same file (the C4/S14 abandoned-export tests, two
+/// marks saves) wrote into one temp file and one rename failed.
+pub fn unique_temp_sibling(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("state");
-    let temp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-    {
+    let seq = ATOMIC_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{seq}-{nanos:08x}",
+        std::process::id()
+    ))
+}
+
+/// Writes state files (case manifest, indexes) so a crash can never leave a
+/// truncated half-file: the payload lands in a sibling temp file first, is
+/// fsynced, and only then atomically renamed over the target
+/// ([`rename_durable`]: write-through on Windows, directory synced).
+pub fn write_text_atomic(path: &Path, text: &str) -> io::Result<()> {
+    write_bytes_atomic(path, text.as_bytes())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: [`write_bytes_atomic`] of exactly this path fails after
+    /// the temp file was written (R13-S14: the temp name is unique now, so
+    /// tests can no longer pre-create it as a blocker).
+    pub(crate) static FAIL_ATOMIC_WRITE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`write_text_atomic`] for any bytes.
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = unique_temp_sibling(path);
+    let written = (|| {
         let mut file = fs::File::create(&temp)?;
-        io::Write::write_all(&mut file, text.as_bytes())?;
+        io::Write::write_all(&mut file, bytes)?;
         io::Write::flush(&mut file)?;
         file.sync_all()?;
+        #[cfg(test)]
+        if FAIL_ATOMIC_WRITE.with(|fail| fail.borrow().as_deref() == Some(path)) {
+            return Err(io::Error::other("injected: atomic write failure"));
+        }
+        Ok(())
+    })();
+    if let Err(err) = written.and_then(|()| rename_durable(&temp, path)) {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
     }
-    fs::rename(&temp, path)?;
-    // The rename itself is only durable once the directory entry is synced;
-    // without this a power loss can roll back the "atomic" swap.
-    sync_parent_directory(path);
     Ok(())
 }
 
-/// Best-effort directory fsync so file creation/rename survive power loss.
-/// Not all platforms/filesystems support opening directories read-only for
-/// sync (Windows historically returns `ACCESS_DENIED`); failures are ignored
-/// because the crash-durability gain is incremental, not load-bearing.
+/// R13-S9: renames `from` over `to` so the new name survives a power loss.
+/// Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`
+/// — the call returns only once the rename is flushed to disk (R12 used
+/// `fs::rename`, which is not write-through, and its directory "sync" was a
+/// no-op there); when that call fails (e.g. a target another program holds
+/// open with delete sharing, which `fs::rename`'s POSIX-semantics rename
+/// can replace) `fs::rename` is tried and the directory flushed. Elsewhere:
+/// `rename(2)` and an fsync of the parent directory.
+pub fn rename_durable(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        use windows::core::HSTRING;
+        let source = HSTRING::from(from.as_os_str());
+        let target = HSTRING::from(to.as_os_str());
+        // SAFETY: two NUL-terminated wide strings that outlive the call.
+        let moved = unsafe {
+            MoveFileExW(
+                &source,
+                &target,
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved.is_ok() {
+            return Ok(());
+        }
+    }
+    fs::rename(from, to)?;
+    sync_parent_directory(to);
+    Ok(())
+}
+
+/// R13-S9: removes `path` and flushes its directory (a removal is durable
+/// only once the directory entry is on disk). NotFound is success.
+pub fn remove_file_durable(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_parent_directory(path);
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Best-effort directory flush so a file creation, rename or removal
+/// survives power loss. Unix: `fsync` of the parent directory. Windows
+/// (R13-S9 — R12 documented this but did nothing there): the parent is
+/// opened with write access and backup semantics (the only way to get a
+/// directory handle) and `FlushFileBuffers` flushes its metadata. Failures
+/// are ignored (a file system that cannot flush a directory, no write
+/// access): callers that need the guarantee use [`rename_durable`], which is
+/// write-through on Windows by itself.
 pub fn sync_parent_directory(path: &Path) {
     let Some(parent) = path.parent() else {
         return;
@@ -603,7 +694,32 @@ pub fn sync_parent_directory(path: &Path) {
             let _ = dir.sync_all();
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
+        };
+        use windows::core::HSTRING;
+        let dir = HSTRING::from(parent.as_os_str());
+        // SAFETY: a wide path that outlives the call; the handle is closed.
+        unsafe {
+            if let Ok(handle) = CreateFileW(
+                &dir,
+                GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            ) {
+                let _ = FlushFileBuffers(handle);
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = parent;
     }
@@ -1694,6 +1810,219 @@ pub fn writer_may_be_alive(probe: ProcessProbe, born: Option<SystemTime>) -> boo
         ProcessProbe::Running {
             started: Some(started),
         } => born.is_none_or(|born| started <= born + START_TIME_SLACK),
+    }
+}
+
+/// R13-S4/P17: this PC's identity for the finalize journal and its lane
+/// entries — `sha256("frametrace-host-v1" NUL machine-id NUL hostname)`,
+/// first 32 hex digits. The machine id is the Windows `MachineGuid`
+/// (`HKLM\SOFTWARE\Microsoft\Cryptography`), `/etc/machine-id` on Linux;
+/// macOS and others use the host name alone. It never names the user and
+/// is never written to this PC's configuration, so two PCs sharing a case
+/// folder over the network tell their journals apart. Computed once per
+/// process.
+pub fn host_id() -> String {
+    static HOST_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST_ID
+        .get_or_init(|| {
+            let material = format!(
+                "frametrace-host-v1\0{}\0{}",
+                machine_id().unwrap_or_default(),
+                host_name().unwrap_or_default().to_lowercase()
+            );
+            crate::sha256::digest_bytes(material.as_bytes())[..32].to_string()
+        })
+        .clone()
+}
+
+/// The host name (Windows `COMPUTERNAME`, else `gethostname`).
+pub fn host_name() -> Option<String> {
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+    }
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn gethostname(name: *mut u8, len: usize) -> i32;
+        }
+        let mut buffer = [0u8; 256];
+        // SAFETY: the buffer is writable for its whole length.
+        if unsafe { gethostname(buffer.as_mut_ptr(), buffer.len()) } != 0 {
+            return None;
+        }
+        let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+        let name = String::from_utf8_lossy(&buffer[..len]).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        None
+    }
+}
+
+fn machine_id() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+        use windows::core::{HSTRING, PCWSTR};
+        let subkey = HSTRING::from(r"SOFTWARE\Microsoft\Cryptography");
+        let value = HSTRING::from("MachineGuid");
+        let mut buffer = vec![0u16; 128];
+        let mut size: u32 = (buffer.len() * 2) as u32;
+        // SAFETY: a read into a buffer of `size` bytes; the registry API
+        // writes at most that many.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR::from_raw(subkey.as_ptr()),
+                PCWSTR::from_raw(value.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buffer.as_mut_ptr().cast()),
+                Some(&mut size),
+            )
+        };
+        if status.is_err() {
+            return None;
+        }
+        let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        let id = String::from_utf16_lossy(&buffer[..len]).trim().to_string();
+        (!id.is_empty()).then_some(id)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+            .iter()
+            .find_map(|path| fs::read_to_string(path).ok())
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// R13-S4: the executable file name of process `pid` (`frametrace-app.exe`,
+/// …) when the platform tells it (Windows, Linux), lowercased.
+pub fn process_image_name(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        };
+        // SAFETY: plain Win32 calls; the buffer holds `size` wide chars and
+        // the handle is closed below.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buffer = vec![0u16; 1024];
+            let mut size = buffer.len() as u32;
+            let read = QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut size,
+            );
+            let _ = CloseHandle(handle);
+            read.ok()?;
+            let full = String::from_utf16_lossy(&buffer[..size as usize]);
+            Path::new(&full)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_lowercase())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+            .map(|name| name.trim_end_matches(" (deleted)").to_string())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// R13-S4: who a journal writer is — pid, process start time (unix ms)
+/// and executable name — so a later reader can tell the writer from a
+/// process that merely reuses its pid.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WriterIdentity {
+    pub pid: u32,
+    pub started_ms: Option<u64>,
+    pub image: Option<String>,
+}
+
+/// R13-S4: [`WriterIdentity`] of this process.
+pub fn current_writer() -> WriterIdentity {
+    let pid = std::process::id();
+    let started_ms = match probe_process(pid) {
+        ProcessProbe::Running {
+            started: Some(started),
+        } => started
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as u64),
+        _ => None,
+    };
+    let image = process_image_name(pid).or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+    });
+    WriterIdentity {
+        pid,
+        started_ms,
+        image,
+    }
+}
+
+/// R13-S4 (pure): is the process `probe` describes (executable `image`
+/// now) still the writer `writer`? When the writer's start time was
+/// recorded only a POSITIVE match counts: the live process must have
+/// started within the clock slack of it, and its executable name — when
+/// both are known — must be the writer's. R12 judged by the pid alone
+/// ("can't tell" = alive), so a journal naming pid 0, or a pid another
+/// program now holds, blocked the case for good. Without a recorded start
+/// time (a platform that cannot read it) a live pid counts as the writer
+/// only while the journal is younger than `max_age_unknown`.
+pub fn writer_still_running(
+    writer: &WriterIdentity,
+    probe: ProcessProbe,
+    image: Option<&str>,
+    age: Duration,
+    max_age_unknown: Duration,
+) -> bool {
+    if writer.pid == 0 {
+        return false;
+    }
+    if let (Some(recorded), Some(now)) = (writer.image.as_deref(), image)
+        && !recorded.eq_ignore_ascii_case(now)
+    {
+        return false;
+    }
+    match probe {
+        ProcessProbe::Gone => false,
+        ProcessProbe::Running {
+            started: Some(started),
+        } => match writer.started_ms {
+            Some(recorded) => {
+                let started_ms = started
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                started_ms.abs_diff(recorded) <= START_TIME_SLACK.as_millis() as u64
+            }
+            None => age < max_age_unknown,
+        },
+        ProcessProbe::Running { started: None } | ProcessProbe::Unknown => age < max_age_unknown,
     }
 }
 

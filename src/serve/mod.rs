@@ -48,6 +48,8 @@ mod tests_post_review;
 #[cfg(test)]
 mod tests_r12_server;
 #[cfg(test)]
+mod tests_r13_server;
+#[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
 mod tests_r4_jobs;
@@ -327,11 +329,6 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
             listener
         }
     };
-    // R12-S2 (P13): a finalize the last run left unfinished (crash, kill,
-    // power loss) is cleaned up before serving — this process owns the
-    // workstation now (the audit key is installed), no job runs yet, and
-    // the disk work happens outside the state lock.
-    finalize_journal::recover_bound_case(&state);
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
     // In-process publish first: the shell must never depend on the file.
     publish_local_server(port, token.as_deref());
@@ -360,6 +357,12 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
     {
         eprintln!("frametrace: {err}");
     }
+    // R12-S2 (P13) / R13-S7 (P17): a finalize the last run left unfinished
+    // (crash, kill, power loss) is cleaned up in the background once the
+    // listener is bound and the URL handed out — holding `busy`, status
+    // "recovering" — so a file another program holds can no longer keep
+    // the app from starting. The audit key is installed by now.
+    let _recovery = finalize_journal::spawn_bound_case_recovery(&state);
     serve_on(listener, state);
     // Drop the instance file while it still names this process, so later
     // launches never send a token to whatever reuses the port.
@@ -378,6 +381,12 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
 #[cfg(target_os = "windows")]
 pub(crate) fn kill_all_tracked() {
     proc::kill_all_tracked();
+}
+
+/// R13-S6: `frametrace finalize-journal <case> [--dismiss]` (the CLI's
+/// view of a case's finalize journal; `--dismiss` moves it aside).
+pub fn finalize_journal_command(case_dir: &Path, dismiss: bool) -> Result<String, String> {
+    finalize_journal::cli_command(case_dir, dismiss)
 }
 
 /// C4: stamps every selection export this process is still writing as

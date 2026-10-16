@@ -816,11 +816,16 @@ fn r7_s5_reservation_cleanup_needs_the_owner_marker() {
 /// file on a forced exit) and is valid JSON.
 #[test]
 fn s14_abandoned_export_manifest_is_whole() {
+    // R13-S14: serialized with the C4 test; assertions are about this
+    // test's own folder only (another test's export may be registered).
+    let _serial = super::media::ABANDONED_EXPORTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let case = temp_case("s14-export");
     let export = case.join("exports/selection-1");
     std::fs::create_dir_all(&export).unwrap();
     let registration = super::media::begin_export_bundle(&export, 1, 3).unwrap();
-    assert_eq!(super::media::mark_abandoned_exports(), 1);
+    assert!(super::media::mark_abandoned_exports() >= 1);
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(export.join("manifest-audit.json")).unwrap())
             .unwrap();

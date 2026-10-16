@@ -1844,12 +1844,26 @@ pub fn record_signoff_abandoned(
     signoff_text: &str,
     reason: &str,
 ) -> Result<(), String> {
+    record_signoff_abandoned_sha(
+        case_dir,
+        &crate::sha256::digest_bytes(signoff_text.as_bytes()),
+        reason,
+    )
+}
+
+/// R13-S1: [`record_signoff_abandoned`] for a record known by its SHA-256
+/// (the finalize journal no longer carries the record text).
+pub fn record_signoff_abandoned_sha(
+    case_dir: &std::path::Path,
+    signoff_sha256: &str,
+    reason: &str,
+) -> Result<(), String> {
     crate::audit::append_chained_jsonl(
         &case_dir.join(SIGNOFF_LOG_REL_PATH),
         &serde_json::json!({
             "schema_version": 1,
             "event": SIGNOFF_ABANDONED_EVENT,
-            "signoff_record_sha256": crate::sha256::digest_bytes(signoff_text.as_bytes()),
+            "signoff_record_sha256": signoff_sha256,
             "reason": reason,
         })
         .to_string(),
@@ -1860,6 +1874,247 @@ pub fn record_signoff_abandoned(
 /// R13 I2: the sign-off lane was repaired after this record's entry.
 pub const SIGNOFF_REPAIRED_AFTER_NOTE: &str =
     "서명 감사 레인(signoff-log)이 이 서명 항목 뒤에서 수리됨(lane-repair)";
+
+/// R13-S1 (P15): the sign-off lane entry a finalize appends BEFORE its
+/// journal and its sign-off entry — what a later recovery may do for that
+/// finalize, keyed (HMAC) when an audit key is configured. The journal on
+/// disk is only a pointer to it: a recovery acts only on a journal that
+/// matches the lane's LATEST trusted begin entry with no
+/// [`FINALIZE_COMPLETE_EVENT`] / [`FINALIZE_RESOLVED_EVENT`] after it.
+pub const FINALIZE_BEGIN_EVENT: &str = "finalize-begin";
+/// R13-S3 (P15): appended once a finalize completed (package published,
+/// sign-off promoted) — before its journal is removed, so a journal whose
+/// removal failed is only deleted by the next recovery.
+pub const FINALIZE_COMPLETE_EVENT: &str = "finalize-complete";
+/// R13 (P15): appended when an unfinished finalize was cleaned up (its
+/// failure path or a recovery left nothing unresolved, or an examiner
+/// dismissed its journal) — the begin entry is closed.
+pub const FINALIZE_RESOLVED_EVENT: &str = "finalize-resolved";
+
+/// R13-S1/S2/S4 (P15/P17): the fields of a [`FINALIZE_BEGIN_EVENT`] entry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FinalizeBegin {
+    /// Random id naming this finalize in the journal and the lane.
+    pub finalize_id: String,
+    /// SHA-256 of the pending sign-off record bytes.
+    pub signoff_record_sha256: String,
+    /// SHA-256 of what `review/signoff.json` held before (`None`: nothing)
+    /// — a recovery writes back only bytes that hash to it.
+    pub previous_signoff_sha256: Option<String>,
+    /// The ONE `reports/` package name this finalize's package-case may
+    /// publish (`package-case --package-name`); a recovery marks only it.
+    pub package_name: String,
+    /// [`crate::util::host_id`] of the PC that ran it (P17).
+    pub host_id: String,
+    pub pid: u32,
+    /// The writer process's start time (unix ms) and executable name.
+    pub writer_started_ms: Option<u64>,
+    pub writer_image: Option<String>,
+    pub started_unix: u64,
+}
+
+impl FinalizeBegin {
+    fn body(&self) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "event": FINALIZE_BEGIN_EVENT,
+            "finalize_id": self.finalize_id,
+            "signoff_record_sha256": self.signoff_record_sha256,
+            "previous_signoff_sha256": self.previous_signoff_sha256,
+            "package_name": self.package_name,
+            "host_id": self.host_id,
+            "pid": self.pid,
+            "writer_started_ms": self.writer_started_ms,
+            "writer_image": self.writer_image,
+            "started_unix": self.started_unix,
+        })
+        .to_string()
+    }
+
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        Some(Self {
+            finalize_id: text("finalize_id")?,
+            signoff_record_sha256: text("signoff_record_sha256")?,
+            previous_signoff_sha256: text("previous_signoff_sha256"),
+            package_name: text("package_name")?,
+            host_id: text("host_id")?,
+            pid: value.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            writer_started_ms: value.get("writer_started_ms").and_then(|v| v.as_u64()),
+            writer_image: text("writer_image"),
+            started_unix: value
+                .get("started_unix")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        })
+    }
+}
+
+/// R13 (P15): appends `begin` to the sign-off lane. A failure refuses the
+/// finalize (nothing durable has happened yet).
+pub fn record_finalize_begin(
+    case_dir: &std::path::Path,
+    begin: &FinalizeBegin,
+) -> Result<(), String> {
+    crate::audit::append_chained_jsonl(&case_dir.join(SIGNOFF_LOG_REL_PATH), &begin.body())
+        .map_err(|err| format!("최종화 시작을 감사 체인에 기록하지 못했습니다: {err}"))
+}
+
+/// R13-S3 (P15): appends the [`FINALIZE_COMPLETE_EVENT`] of `finalize_id`.
+pub fn record_finalize_complete(
+    case_dir: &std::path::Path,
+    finalize_id: &str,
+    signoff_sha256: &str,
+    package_name: &str,
+    manifest_sha256: Option<&str>,
+) -> Result<(), String> {
+    crate::audit::append_chained_jsonl(
+        &case_dir.join(SIGNOFF_LOG_REL_PATH),
+        &serde_json::json!({
+            "schema_version": 1,
+            "event": FINALIZE_COMPLETE_EVENT,
+            "finalize_id": finalize_id,
+            "signoff_record_sha256": signoff_sha256,
+            "package_name": package_name,
+            "package_manifest_sha256": manifest_sha256,
+        })
+        .to_string(),
+    )
+    .map_err(|err| format!("최종화 완료를 감사 체인에 기록하지 못했습니다: {err}"))
+}
+
+/// R13 (P15): appends the [`FINALIZE_RESOLVED_EVENT`] of `finalize_id`
+/// (`outcome`: `failed`, `recovered`, `dismissed`, `refused`).
+pub fn record_finalize_resolved(
+    case_dir: &std::path::Path,
+    finalize_id: &str,
+    signoff_sha256: Option<&str>,
+    outcome: &str,
+) -> Result<(), String> {
+    crate::audit::append_chained_jsonl(
+        &case_dir.join(SIGNOFF_LOG_REL_PATH),
+        &serde_json::json!({
+            "schema_version": 1,
+            "event": FINALIZE_RESOLVED_EVENT,
+            "finalize_id": finalize_id,
+            "signoff_record_sha256": signoff_sha256,
+            "outcome": outcome,
+        })
+        .to_string(),
+    )
+    .map_err(|err| format!("최종화 정리를 감사 체인에 기록하지 못했습니다: {err}"))
+}
+
+/// R13 (P15): what the sign-off lane says about the finalize `finalize_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeLanePairing {
+    /// The lane's latest trusted begin entry is this finalize's and nothing
+    /// closes it: an interrupted finalize a recovery may clean up, with
+    /// exactly what that entry records.
+    Open(FinalizeBegin),
+    /// A trusted complete entry names it: the finalize completed.
+    Completed { manifest_sha256: Option<String> },
+    /// A trusted resolved entry names it: already cleaned up.
+    Resolved { outcome: String },
+    /// No trusted begin entry pairs with it (none, not the latest, not
+    /// authenticated where keys are held, the lane does not verify, keys
+    /// unreadable) — why. Nothing may be changed on its account.
+    Unpaired(String),
+}
+
+/// R13 (P15): [`FinalizeLanePairing`] of `finalize_id` under this PC's
+/// verification keys. Trusted = authenticated here, or self-consistent
+/// only on a PC that holds no audit key (P1 — anyone with the folder can
+/// write such entries there, as any other keyless record).
+pub fn finalize_lane_pairing(case_dir: &std::path::Path, finalize_id: &str) -> FinalizeLanePairing {
+    let keys = match crate::audit_key::verification_keys() {
+        Ok(keys) => keys,
+        Err(err) => return FinalizeLanePairing::Unpaired(err),
+    };
+    let lane =
+        match crate::audit::read_lane_rows_with_keys(&case_dir.join(SIGNOFF_LOG_REL_PATH), &keys) {
+            Ok(lane) if !lane.present => {
+                return FinalizeLanePairing::Unpaired(
+                    "서명 감사 레인(signoff-log)이 없습니다".to_string(),
+                );
+            }
+            Ok(lane) => lane,
+            Err(err) => {
+                return FinalizeLanePairing::Unpaired(format!(
+                    "서명 감사 레인을 읽지 못했습니다: {err}"
+                ));
+            }
+        };
+    let trusted = |row: &crate::audit::LaneRow| {
+        matches!(
+            row.trust,
+            crate::audit::LineTrust::Authenticated
+                | crate::audit::LineTrust::SelfConsistentOnly { .. }
+        )
+    };
+    let event = |row: &crate::audit::LaneRow| {
+        row.value
+            .get("event")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let names_it = |row: &crate::audit::LaneRow| {
+        row.value.get("finalize_id").and_then(|v| v.as_str()) == Some(finalize_id)
+    };
+    for row in lane.rows.iter().rev().filter(|row| trusted(row)) {
+        match event(row).as_str() {
+            FINALIZE_COMPLETE_EVENT if names_it(row) => {
+                return FinalizeLanePairing::Completed {
+                    manifest_sha256: row
+                        .value
+                        .get("package_manifest_sha256")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                };
+            }
+            FINALIZE_RESOLVED_EVENT if names_it(row) => {
+                return FinalizeLanePairing::Resolved {
+                    outcome: row
+                        .value
+                        .get("outcome")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+            }
+            _ => {}
+        }
+    }
+    let latest_begin = lane
+        .rows
+        .iter()
+        .rev()
+        .filter(|row| trusted(row) && event(row) == FINALIZE_BEGIN_EVENT)
+        .find_map(|row| FinalizeBegin::from_value(&row.value));
+    let named = |only_trusted: bool| {
+        lane.rows.iter().any(|row| {
+            event(row) == FINALIZE_BEGIN_EVENT && names_it(row) && (!only_trusted || trusted(row))
+        })
+    };
+    match latest_begin {
+        Some(begin) if begin.finalize_id == finalize_id => FinalizeLanePairing::Open(begin),
+        Some(_) if named(true) => FinalizeLanePairing::Unpaired(
+            "이 최종화의 시작 기록 뒤에 다른 최종화가 시작되었습니다 (가장 최근 최종화가 아님)"
+                .to_string(),
+        ),
+        _ if named(false) => FinalizeLanePairing::Unpaired(format!(
+            "서명 감사 레인의 시작 기록이 이 PC에서 인증되지 않습니다{}",
+            lane.failure
+                .as_deref()
+                .map(|err| format!(" (레인 검증 실패: {err})"))
+                .unwrap_or_default()
+        )),
+        _ => FinalizeLanePairing::Unpaired(
+            "서명 감사 레인(signoff-log)에 이 최종화의 시작 기록이 없습니다".to_string(),
+        ),
+    }
+}
 
 /// R12-S2/S6: where the sign-off record `signoff_text` stands in the
 /// sign-off lane under `case_dir`.
@@ -1884,12 +2139,23 @@ pub fn signoff_lane_state(
     case_dir: &std::path::Path,
     signoff_text: &str,
 ) -> Result<SignoffLaneState, String> {
+    signoff_lane_state_sha(
+        case_dir,
+        &crate::sha256::digest_bytes(signoff_text.as_bytes()),
+    )
+}
+
+/// R13-S1: [`signoff_lane_state`] for a record known by its SHA-256.
+pub fn signoff_lane_state_sha(
+    case_dir: &std::path::Path,
+    sha: &str,
+) -> Result<SignoffLaneState, String> {
     let keys = crate::audit_key::verification_keys()?;
     let lane = crate::audit::read_lane_rows_with_keys(&case_dir.join(SIGNOFF_LOG_REL_PATH), &keys)?;
     if !lane.present {
         return Ok(SignoffLaneState::default());
     }
-    let sha = crate::sha256::digest_bytes(signoff_text.as_bytes());
+    let sha = sha.to_string();
     let entry_at = lane.rows.iter().rposition(|row| {
         row.value.get("event").and_then(|v| v.as_str()) == Some("signoff")
             && row

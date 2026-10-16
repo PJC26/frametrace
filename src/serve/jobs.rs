@@ -2649,7 +2649,7 @@ pub(crate) fn import_marks_with_hooks(
         // R12-S2: a recovered journal kept only for the stale report goes
         // once the report is rendered again (never a live finalize's).
         if refreshed.is_ok() && state_lock(state).phase != "finalizing" {
-            super::finalize_journal::clear_if_resolved(&case_dir);
+            super::finalize_journal::clear_if_resolved(&case_dir, state);
         }
         let mut guard = state_lock(state);
         match refreshed {
@@ -2897,18 +2897,55 @@ pub(crate) fn finalize_with_exe(
     // journal is still on disk) is cleaned up first — the caller holds
     // `busy`, so it is not this workstation's live finalize.
     if super::finalize_journal::journal_path(case_dir).exists()
-        && let Some(recovery) = super::finalize_journal::recover(case_dir, state)
+        && let Some(recovery) =
+            super::finalize_journal::recover(case_dir, state, crate::package::rename_retry_budget())
     {
         let blocking = recovery.blocking;
+        let set_aside = recovery.set_aside;
         let detail = recovery.detail.clone();
         apply_recovery(state, recovery);
         // Only a stale report is left for this finalize to cure; anything
-        // else (a sign-off not taken back, no abandon record) would be
-        // overwritten by a new journal — refused.
+        // else (a sign-off not taken back, no abandon record, R13: an
+        // unpaired journal, another PC's recent one) would be overwritten
+        // by a new journal — refused.
         if blocking {
             return api_err(&format!(
                 "최종화 차단: 이전에 중단된 최종화를 정리하지 못했습니다 — {detail}"
             ));
+        }
+        // R13-S5: another PC's journal older than 24 h is moved aside
+        // (never recovered here, never deleted).
+        if set_aside {
+            match super::finalize_journal::set_aside(case_dir, "other-host") {
+                Ok(path) => state_lock(state).logs.push(format!(
+                    "다른 PC의 오래된 최종화 저널을 {}(으)로 옮겼습니다 (복구하지 않음).",
+                    path.display()
+                )),
+                Err(err) => {
+                    return api_err(&format!(
+                        "최종화 차단: 다른 PC의 최종화 저널을 옮기지 못했습니다 — {err}"
+                    ));
+                }
+            }
+        }
+        // A journal of this PC kept only for its stale report: this
+        // finalize re-renders the report, so its begin entry is closed.
+        if let Some(super::finalize_journal::Assessment::Open(journal, _)) =
+            super::finalize_journal::assess(case_dir)
+        {
+            if let Err(err) = crate::report::record_finalize_resolved(
+                case_dir,
+                &journal.finalize_id,
+                Some(&journal.signoff_sha256),
+                "superseded",
+            ) {
+                state_lock(state).logs.push(format!("경고: {err}"));
+            }
+            if let Err(err) = super::finalize_journal::remove_journal(case_dir) {
+                return api_err(&format!(
+                    "최종화 차단: 이전 최종화 저널을 지우지 못했습니다 — {err}"
+                ));
+            }
         }
     }
     // Never seal without the latest marks (SHOULD-FIX 5): marks queued on
@@ -2979,33 +3016,66 @@ pub(crate) fn finalize_with_exe(
     };
     // R12-S6: a "previous" record that was itself an abandoned finalize's
     // (its restore failed earlier) is never restored as if confirmed.
-    let previous_abandoned = previous
+    // R13 I2 (P16): one whose lane entry a lane-repair follows is
+    // "unknown" — never restored as current either (`previous_repaired`).
+    let previous_lane = previous
         .as_deref()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .is_some_and(|text| {
-            crate::report::signoff_lane_state(case_dir, text).is_ok_and(|lane| lane.abandoned)
-        });
-    // R12-S2 (P13): the journal is on disk before the sign-off is chained,
-    // rendered or promoted, so an interruption anywhere after this point
-    // is found and cleaned up on the next start / open-case.
+        .map(crate::sha256::digest_bytes)
+        .and_then(|sha| crate::report::signoff_lane_state_sha(case_dir, &sha).ok());
+    let previous_abandoned = previous_lane.is_some_and(|lane| lane.abandoned);
+    let previous_repaired = previous_lane.is_some_and(|lane| lane.repaired_after);
+    // R13-S1/S2 (P15): the ONE reports/ name this finalize's package-case
+    // may publish, recorded with the rest in the lane's begin entry.
+    let finalize_id = match new_finalize_id() {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = std::fs::remove_file(&pending_signoff);
+            return finalize_refused(state, err);
+        }
+    };
     let journal = super::finalize_journal::FinalizeJournal {
-        pid: std::process::id(),
+        finalize_id,
+        host_id: crate::util::host_id(),
+        writer: crate::util::current_writer(),
         started_unix: crate::util::now_unix().unwrap_or(0),
         examiner: examiner.to_string(),
-        signoff_text: signoff.text.clone(),
-        previous_signoff: previous,
-        previous_abandoned,
-        reports_before: super::finalize_journal::reports_entries(case_dir),
+        signoff_sha256: signoff.record_sha256(),
+        previous_signoff_sha256: previous.as_deref().map(crate::sha256::digest_bytes),
+        package_name: choose_package_name(case_dir),
         state: super::finalize_journal::STATE_IN_PROGRESS.to_string(),
     };
-    if let Err(err) = journal.write(case_dir) {
+    let refuse_unjournaled = |err: String, state: &SharedState| {
         let _ = std::fs::remove_file(&pending_signoff);
-        return finalize_refused(
+        finalize_refused(
             state,
             format!(
-                "최종화 차단: {err} — 중단되면 되돌릴 기록이 없어 최종화하지 않았습니다 (review 폴더를 쓸 수 있는지 확인하십시오)."
+                "최종화 차단: {err} — 중단되면 되돌릴 기록이 없어 최종화하지 않았습니다 (review 폴더와 감사 로그 폴더를 쓸 수 있는지 확인하십시오)."
             ),
+        )
+    };
+    // R13-S11: the previous record's bytes beside the journal (fsync'd).
+    if let Err(err) = super::finalize_journal::write_previous_signoff(case_dir, previous.as_deref())
+    {
+        return refuse_unjournaled(err, state);
+    }
+    // R13 (P15): the keyed begin entry first — a journal is acted on only
+    // when it pairs with it — then (R12-S2, P13) the journal, both before
+    // the sign-off is chained, rendered or promoted, so an interruption
+    // anywhere after this point is found and cleaned up on the next start
+    // / open-case.
+    if let Err(err) = crate::report::record_finalize_begin(case_dir, &journal.begin_entry()) {
+        let _ = super::finalize_journal::write_previous_signoff(case_dir, None);
+        return refuse_unjournaled(err, state);
+    }
+    if let Err(err) = journal.write(case_dir) {
+        let _ = super::finalize_journal::write_previous_signoff(case_dir, None);
+        let _ = crate::report::record_finalize_resolved(
+            case_dir,
+            &journal.finalize_id,
+            Some(&journal.signoff_sha256),
+            "refused",
         );
+        return refuse_unjournaled(err, state);
     }
     // R4-B18 / D13: the sign-off is chained into the audit trail right
     // after it is written and BEFORE make-report and package-case, so the
@@ -3016,6 +3086,12 @@ pub(crate) fn finalize_with_exe(
     // is never left promoted (abandoned in the chain, R8-I9).
     if let Err(err) = record_signoff_audit(case_dir, &signoff.text) {
         let _ = std::fs::remove_file(&pending_signoff);
+        let _ = crate::report::record_finalize_resolved(
+            case_dir,
+            &journal.finalize_id,
+            Some(&journal.signoff_sha256),
+            "refused",
+        );
         let _ = super::finalize_journal::remove_journal(case_dir);
         return finalize_refused(
             state,
@@ -3064,7 +3140,7 @@ pub(crate) fn finalize_with_exe(
         return "{\"ok\":false,\"error\":\"test: stopped after the promotion\"}".to_string();
     }
     let packaging = match &promotion {
-        Ok(()) => run_package_step(exe, case_dir, &case_text, &journal.reports_before, state),
+        Ok(()) => run_package_step(exe, case_dir, &case_text, &journal.package_name, state),
         Err(err) => Err(err.clone()),
     };
     #[cfg(test)]
@@ -3093,15 +3169,22 @@ pub(crate) fn finalize_with_exe(
         // (killed or failing after its publish rename) or kept under its
         // work-folder name is renamed `…_INCOMPLETE` / marked beside —
         // R11 left it plainly named, and it verified as a final package.
-        let (notes, dirs) = super::finalize_journal::mark_unfinished_packages(
+        // R13-S2: only this finalize's reserved name (and the folder its
+        // own `output:` line names). R13-S8: a folder that could not be
+        // marked (kept work folder included) keeps the journal, blocking.
+        let marked = super::finalize_journal::mark_unfinished_packages(
             case_dir,
-            &journal.reports_before,
+            &journal.package_name,
             reason,
             "finalize failed after package-case published it",
+            crate::package::rename_retry_budget(),
         );
-        leftover.extend(notes);
-        incomplete_dirs = dirs;
-        if !super::finalize_journal::published_since(case_dir, &journal.reports_before).is_empty() {
+        leftover.extend(marked.notes);
+        incomplete_dirs = marked.dirs;
+        if marked.failed
+            || super::finalize_journal::published_reserved(case_dir, &journal.package_name)
+                .is_some()
+        {
             unresolved = true;
             blocking_leftover = true;
         }
@@ -3118,11 +3201,21 @@ pub(crate) fn finalize_with_exe(
         // never cancellable; R12-S6: an abandoned previous record is not
         // restored; R12-S7: written back durably.
         if promoted {
+            if previous_repaired {
+                // R13 I2: kept for the examiner beside the kept journal.
+                unresolved = true;
+                blocking_leftover = true;
+                leftover.push(format!(
+                    "이전 검토자 기록은 서명 감사 레인이 그 항목 뒤에서 수리되어(lane-repair) 확정 여부를 알 수 없어 되돌리지 않았습니다 — 보관본 {}을 확인하십시오.",
+                    super::finalize_journal::PREVIOUS_SIGNOFF_REL_PATH
+                ));
+            }
             match super::finalize_journal::restore_previous(
                 &signoff_target,
-                journal.previous_signoff.as_deref(),
-                journal.previous_abandoned,
+                previous.as_deref().filter(|_| !previous_repaired),
+                previous_abandoned,
                 state,
+                crate::package::rename_retry_budget(),
             ) {
                 Ok(None) => {}
                 Ok(Some(note)) => leftover.push(note),
@@ -3162,16 +3255,25 @@ pub(crate) fn finalize_with_exe(
         // later recovery to redo.
         // Kept, its state says whether only the stale report is left.
         let journal_result = if unresolved {
-            let mut kept = journal.clone();
             let only_report = rerendered_stale == Some(true) && !blocking_leftover;
-            kept.state = if only_report {
-                super::finalize_journal::STATE_RECOVERED
-            } else {
-                super::finalize_journal::STATE_INTERRUPTED
-            }
-            .to_string();
-            kept.write(case_dir)
+            journal.rewrite_as(
+                if only_report {
+                    super::finalize_journal::STATE_RECOVERED
+                } else {
+                    super::finalize_journal::STATE_INTERRUPTED
+                },
+                case_dir,
+            )
         } else {
+            // R13 (P15): cleaned up — the begin entry is closed first.
+            if let Err(err) = crate::report::record_finalize_resolved(
+                case_dir,
+                &journal.finalize_id,
+                Some(&journal.signoff_sha256),
+                "failed",
+            ) {
+                state_lock(state).logs.push(format!("경고: {err}"));
+            }
             super::finalize_journal::remove_journal(case_dir)
         };
         if let Err(err) = journal_result {
@@ -3187,8 +3289,30 @@ pub(crate) fn finalize_with_exe(
             // R10-S2: packages earlier finalizes left incomplete are named
             // (never deleted: the examiner decides what to keep).
             let leftovers = super::media::incomplete_package_dirs(case_dir);
+            // R13-S3 (P15): the lane records the completion BEFORE the
+            // journal goes, so a journal whose removal fails is only
+            // deleted by the next recovery (R12 then treated the completed
+            // finalize as interrupted and marked its package incomplete).
+            let complete_error = crate::report::record_finalize_complete(
+                case_dir,
+                &journal.finalize_id,
+                &journal.signoff_sha256,
+                &journal.package_name,
+                manifest_sha256.as_deref(),
+            )
+            .err();
             // R12-S2: the finalize completed — its journal goes.
-            let journal_left = super::finalize_journal::remove_journal(case_dir).err();
+            let journal_left = super::finalize_journal::remove_journal(case_dir)
+                .err()
+                .map(|err| match &complete_error {
+                    Some(lane) => format!("{err}; {lane}"),
+                    None => err,
+                });
+            if let Some(err) = &complete_error {
+                state_lock(state).logs.push(format!(
+                    "경고: 최종화는 끝났지만 그 완료를 서명 감사 레인에 남기지 못했습니다 ({err})."
+                ));
+            }
             Some((manifest_sha256, leftovers, journal_left))
         }
         Err(_) => None,
@@ -3212,7 +3336,7 @@ pub(crate) fn finalize_with_exe(
             guard.finalize_recovered = None;
             if let Some(err) = journal_left {
                 guard.logs.push(format!(
-                    "경고: 최종화는 끝났지만 최종화 저널을 지우지 못했습니다 ({err}) — 다음에 이 케이스를 열면 이번 최종화가 중단된 것으로 처리되어 패키지에 미완료 표시가 붙습니다. 저널 파일을 직접 지우십시오."
+                    "경고: 최종화는 끝났지만 최종화 저널을 지우지 못했습니다 ({err}) — 서명 감사 레인에 완료가 기록되어 있으면 다음에 이 케이스를 열 때 저널만 지워집니다."
                 ));
             }
             if package_dir.is_none() {
@@ -3316,6 +3440,10 @@ thread_local! {
     /// the race the published check cannot close).
     pub(crate) static CANCEL_IGNORES_PUBLISH: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// R13 test hook: the base of the package name a finalize reserves
+    /// on this thread (fake CLIs publish a fixed `package_1`).
+    pub(crate) static PACKAGE_BASE_FOR_TEST: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// R12-S1 (P14): package-case for a finalize. A cancel (`/api/cancel`, the
@@ -3330,7 +3458,7 @@ fn run_package_step(
     exe: &Path,
     case_dir: &Path,
     case_text: &str,
-    before: &std::collections::BTreeSet<String>,
+    package_name: &str,
     state: &SharedState,
 ) -> Result<String, String> {
     let deferred = std::cell::Cell::new(false);
@@ -3342,8 +3470,8 @@ fn run_package_step(
         if CANCEL_IGNORES_PUBLISH.with(|hook| hook.get()) {
             return true;
         }
-        // Disk check outside the state lock.
-        if super::finalize_journal::published_since(case_dir, before).is_empty() {
+        // Disk check outside the state lock (R13-S2: its reserved name).
+        if super::finalize_journal::published_reserved(case_dir, package_name).is_none() {
             return true;
         }
         deferred.set(true);
@@ -3353,12 +3481,65 @@ fn run_package_step(
         );
         false
     };
-    let args = ["package-case".to_string(), case_text.to_string()];
+    let args = [
+        "package-case".to_string(),
+        case_text.to_string(),
+        "--package-name".to_string(),
+        package_name.to_string(),
+    ];
     let run = run_step_detailed_opts(exe, &args, &cancelled, true, state)?;
     if run.partial {
         report_process_warning(state, partial_step_warning(&args, &run.output));
     }
     Ok(run.output)
+}
+
+/// R13 (P15): a random id naming one finalize in its journal and lane
+/// entries.
+fn new_finalize_id() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| format!("최종화 ID를 만들지 못했습니다 (entropy: {err})"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// R13-S2 (P15): the `reports/` name this finalize's package-case is told
+/// to publish under — `package_<unix>` (`_001`, … when taken), free of a
+/// folder, of a finalize-incomplete marker naming it and of a kept work
+/// folder meant for it. package-case fails rather than pick another.
+fn choose_package_name(case_dir: &Path) -> String {
+    let reports = case_dir.join("reports");
+    let reserved: std::collections::BTreeSet<String> = std::fs::read_dir(&reports)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    crate::join::package_reservation_of(&entry.file_name().to_string_lossy())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    #[allow(unused_mut)]
+    let mut base = format!("package_{}", crate::util::now_unix().unwrap_or(0));
+    #[cfg(test)]
+    if let Some(fixed) = PACKAGE_BASE_FOR_TEST.with(|cell| cell.get()) {
+        base = fixed.to_string();
+    }
+    (0..10_000u32)
+        .map(|n| {
+            if n == 0 {
+                base.clone()
+            } else {
+                format!("{base}_{n:03}")
+            }
+        })
+        .find(|name| {
+            let candidate = reports.join(name);
+            std::fs::symlink_metadata(&candidate).is_err()
+                && !crate::package::finalize_incomplete_marker(&candidate).exists()
+                && !reserved.contains(name)
+        })
+        .unwrap_or(base)
 }
 
 /// R11-S3: what `target` holds now — kept (in the journal) so a finalize
@@ -3383,11 +3564,23 @@ fn read_previous_signoff(target: &Path) -> Result<Option<Vec<u8>>, String> {
 /// state (shown by /api/status until a finalize completes or another case
 /// is bound).
 pub(crate) fn apply_recovery(state: &SharedState, recovery: super::finalize_journal::Recovery) {
-    let mut guard = state_lock(state);
+    apply_recovery_locked(&mut state_lock(state), recovery);
+}
+
+/// [`apply_recovery`] inside a lock the caller holds. R13: only a recovery
+/// that cleaned something up is `finalize_recovered` ("복구됨"); a journal
+/// left alone (unpaired, another PC's, a live writer, unreadable) is shown
+/// by `finalize_journal` and the job log only.
+pub(crate) fn apply_recovery_locked(
+    guard: &mut JobState,
+    recovery: super::finalize_journal::Recovery,
+) {
     if recovery.report_stale {
         guard.report_stale = true;
     }
-    guard.finalize_recovered = Some(recovery.detail);
+    if recovery.recovered {
+        guard.finalize_recovered = Some(recovery.detail);
+    }
 }
 
 /// R11-S7: [`crate::package::retry_within`] for the rename budget with
@@ -3398,9 +3591,20 @@ pub(crate) fn retry_logged(
     what: &str,
     op: &mut dyn FnMut() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    retry_logged_within(state, what, crate::package::rename_retry_budget(), op)
+}
+
+/// [`retry_logged`] with an explicit budget (R13-S7: the start-up
+/// recovery's is shorter).
+pub(crate) fn retry_logged_within(
+    state: &SharedState,
+    what: &str,
+    budget: Duration,
+    op: &mut dyn FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut reported = 0u64;
     crate::package::retry_within_notify(
-        crate::package::rename_retry_budget(),
+        budget,
         op,
         &crate::package::is_final_rename_error,
         &mut |waited| {

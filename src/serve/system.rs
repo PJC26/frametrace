@@ -411,7 +411,15 @@ pub(crate) fn api_status(state: &SharedState) -> String {
     // runs AFTER the state lock is released. Holding the global lock across
     // those reads stalled every other endpoint for seconds while a carve
     // job was writing (measured: up to 4 s per /api/status poll).
-    let (mut body, case_dir, byte_progress, rehash_progress, enrichment_step, recent_clips) = {
+    let (
+        mut body,
+        case_dir,
+        byte_progress,
+        rehash_progress,
+        enrichment_step,
+        recent_clips,
+        recovering_case,
+    ) = {
         let guard = state_lock(state);
         (
             status_snapshot(&guard),
@@ -428,6 +436,7 @@ pub(crate) fn api_status(state: &SharedState) -> String {
                 .take(8)
                 .cloned()
                 .collect::<Vec<_>>(),
+            guard.finalize_recovering.clone(),
         )
     };
     // UX-09: clip exports and joins run beside `busy`; running + recent ones.
@@ -508,10 +517,14 @@ pub(crate) fn api_status(state: &SharedState) -> String {
     body["package_incomplete"] = package_incomplete.into();
     // R12-S2: a finalize journal on disk (an interrupted finalize not yet
     // fully recovered, or — `active` — the finalize running now).
+    // R13-S7: `recovering` while the background start-up recovery runs.
     let active = body["phase"].as_str() == Some("finalizing");
     body["finalize_journal"] = case_dir
         .as_deref()
-        .map(|dir| super::finalize_journal::status_value(dir, active))
+        .map(|dir| {
+            let recovering = recovering_case.as_deref() == Some(dir);
+            super::finalize_journal::status_value(dir, active, recovering)
+        })
         .unwrap_or(serde_json::Value::Null);
     body.to_string()
 }
@@ -845,28 +858,47 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     // script — say so instead of leaving a blank dashboard unexplained.
     let unverified_pages = has_review
         && !crate::util::generated_pages::page_is_trusted(&case_dir, "review/index.html");
+    // R13-S10: the refusals are checked BEFORE a recovery changes the
+    // case (R12 recovered first and then could refuse the open, so what
+    // the recovery did was only in the job log).
+    {
+        let guard = state_lock(state);
+        if guard.busy {
+            return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
+        }
+        if let Some(refusal) = side_work_refusal(&guard, "케이스를 여십시오") {
+            return api_err(&refusal);
+        }
+    }
     // R12-S2 (P13): an interrupted finalize of this case is cleaned up
     // before the case is bound — holding `busy` (so no finalize of this
-    // workstation is running) and outside the state lock.
+    // workstation is running) and outside the state lock. R13: only one
+    // its lane entry pairs with (see finalize_journal).
     let recovery = if super::finalize_journal::journal_path(&case_dir).exists() {
         let _busy = match try_acquire_busy(state) {
             Ok(guard) => guard,
             Err(err) => return api_err(&err),
         };
-        super::finalize_journal::recover(&case_dir, state)
+        super::finalize_journal::recover(&case_dir, state, crate::package::rename_retry_budget())
     } else {
         None
     };
     let mut guard = state_lock(state);
+    // R13-S10: a refusal that still comes now (a job or a clip export
+    // started meanwhile) carries what the recovery did.
+    let recovered_note = recovery
+        .as_ref()
+        .map(|recovery| format!(" (참고: {})", recovery.detail))
+        .unwrap_or_default();
     if guard.busy {
-        return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
+        return api_err(&format!("분석이 진행 중입니다.{recovered_note}"));
     }
     // Clip exports (and S1 write ops) write into the bound case and block
     // its finalize; a switch while one runs would leave the new case's
     // finalize refused for the old case's export (and the export landing
     // under a case no longer shown).
     if let Some(refusal) = side_work_refusal(&guard, "케이스를 여십시오") {
-        return api_err(&refusal);
+        return api_err(&format!("{refusal}{recovered_note}"));
     }
     if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
         // Finished clip jobs belong to the previous binding.
@@ -877,10 +909,7 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
         guard.finalize_recovered = None;
     }
     if let Some(recovery) = recovery {
-        if recovery.report_stale {
-            guard.report_stale = true;
-        }
-        guard.finalize_recovered = Some(recovery.detail);
+        super::jobs::apply_recovery_locked(&mut guard, recovery);
     }
     guard.case_dir = Some(case_dir.clone());
     // Reopening the same case must keep extra media roots the earlier

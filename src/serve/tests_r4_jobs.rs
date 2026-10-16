@@ -636,6 +636,10 @@ fn c4_export_bundle_reads_in_progress_until_finished() {
 /// is no longer registered and is never stamped.
 #[test]
 fn c4_abandoned_exports_are_marked_incomplete() {
+    // R13-S14: serialized with the S14 test (both stamp every export).
+    let _serial = super::media::ABANDONED_EXPORTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let case_dir = temp_case("c4-abandon");
     let dir = case_dir.join("exports/selection-1");
     std::fs::create_dir_all(&dir).unwrap();
