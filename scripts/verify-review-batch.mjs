@@ -755,6 +755,114 @@ async function unitTests() {
   await r13TrackU({ fn, runInNewContext, assert, ex });
   await r14TrackU({ fn, runInNewContext, assert, ex });
   await r15TrackU({ fn, runInNewContext, assert, ex });
+  await r15TrackIFollowUp({ fn, runInNewContext, assert, ex });
+  await r15TrackSFollowUp({ runInNewContext, assert, ex });
+}
+
+// ---- R15 track S (8b523ba) follow-up ---------------------------------------
+async function r15TrackSFollowUp({ runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  const lfn = (name) => legacySrc.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const lconst = (name) => legacySrc.match(new RegExp(`^(?:const|let) ${name} = .*;$`, 'm'))?.[0] || legacySrc.match(new RegExp(`^(?:const|let) ${name} = \\{[^]*?^\\};`, 'm'))?.[0];
+  const lvm = {};
+  runInNewContext(['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT'].map(lconst).concat(['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finJournalTipExtra', 'finShortDetail', 'finJournalChecks'].map(lfn)).filter(Boolean).join('\n'), lvm);
+  const jn = (state, extra) => Object.assign({ path: 'review/finalize.inprogress.json', state, examiner: 'Hong', started_unix: 1760000000, signoff_sha256: 'ab12', error: null }, extra || {});
+  const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
+  const lck = (st) => plain(runInNewContext('finJournalChecks(st)', Object.assign(lvm, { st })));
+  // dismiss_command present-but-null → no command; absent (older server) → the single-quoted form.
+  const nul = { ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn('unpaired', { unpaired_code: 'lane', reason: '서명 레인 확인 불가', blocks_finalize: true, dismiss_command: null, dismiss_command_cmd: null }) };
+  assert.ok(!/치우기/.test(js(nul)) && !lck(nul).some((c) => /치우기/.test(c.sub)), 'R15 S: dismiss_command null → no command (shell + legacy): ' + js(nul));
+  const abs = { ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn('unpaired', { blocks_finalize: true }) };
+  assert.ok(/치우기: <code class="mono">frametrace finalize-journal &#39;C:\/cases\/c9&#39; --dismiss<\/code>/.test(js(abs)) && lck(abs).some((c) => c.sub.includes("치우기: frametrace finalize-journal 'C:/cases/c9' --dismiss")), 'R15 S: field absent → built-in single-quoted command (shell + legacy)');
+  // in_progress_code other-account: blocks, no dismiss hint.
+  const oa = { ok: true, phase: 'review-ready', finalize_journal: jn('in-progress', { in_progress_code: 'other-account', blocks_finalize: true, blocked_until_unix: 1760086400, reason: '이 PC의 다른 계정 FrameTrace 프로세스(pid 812)일 수 있음', dismiss_command: null, dismiss_command_cmd: null }) };
+  const oh = js(oa);
+  assert.ok(/data-journal="otheraccount"/.test(oh) && /class="h-fin-incomplete">다른 계정의 최종화일 수 있음 — 차단 중</.test(oh) && /pid 812/.test(oh) && /까지 차단/.test(oh) && !/치우기/.test(oh) && /진행 중 코드 other-account/.test(oh), 'R15 S other-account row: ' + oh);
+  assert.equal(runInNewContext('finJournalHead(finJournalState(st))', Object.assign(ex, { st: oa })), '다른 계정의 최종화일 수 있음 — 차단 중', 'R15 S other-account checklist head (shell)');
+  const lo = lck(oa);
+  assert.ok(lo.length === 1 && lo[0].level === 'block' && lo[0].text === '최종화 차단: 다른 계정의 최종화일 수 있음 — 차단 중' && !/치우기/.test(lo[0].sub) && /까지 차단/.test(lo[0].sub), 'R15 S other-account legacy block row: ' + JSON.stringify(lo));
+  assert.ok(runInNewContext('finJournalBlocks(finJournalState(st))', Object.assign(ex, { st: { finalize_journal: jn('in-progress', { in_progress_code: 'other-account' }) } })), 'R15 S: other-account blocks even without blocks_finalize');
+  assert.ok(/data-journal="inprogress"/.test(js({ ok: true, phase: 'review-ready', finalize_journal: jn('in-progress', { in_progress_code: 'live-writer', blocks_finalize: true }) })), 'R15 S: live-writer stays in-progress');
+  // unpaired_code package-changed / local-state; local_record_state in the tooltip.
+  for (const [i, vm] of [ex, lvm].entries()) {
+    for (const [code, w] of [['package-changed', '패키지 변경됨'], ['local-state', '로컬 기록 상태 불일치']]) {
+      assert.equal(runInNewContext('finJournalHead(finJournalState(s))', Object.assign(vm, { s: { finalize_journal: jn('unpaired', { unpaired_code: code, reason: 'x' }) } })), `이전 최종화 짝 없음(${w}) — 확인 필요`, `R15 S unpaired_code ${code} (${i ? 'legacy' : 'shell'})`);
+    }
+  }
+  assert.ok(/로컬 기록 상태 packaged/.test(js({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired', { unpaired_code: 'package-changed', local_record: true, local_record_state: 'packaged', reason: 'r', blocks_finalize: true, dismiss_command: null }) })), 'R15 S: local_record_state in the tooltip');
+  runInNewContext('FIN.status = null;', ex);
+  console.log('PASS VM R15 track S follow-up: dismiss null → no command (absent → built-in), other-account blocks without a dismiss hint, package-changed / local-state heads, local_record_state tooltip (shell + legacy)');
+}
+
+// ---- R15 track I (db2bcb3) follow-up ---------------------------------------
+async function r15TrackIFollowUp({ fn, runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  const lfn = (name) => legacySrc.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const lvm = {};
+  runInNewContext([lfn('verifySourcesVerdict'), lfn('verifyChecks')].join('\n'), lvm);
+  const base = { ok: true, matched: 3, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: true, is_result: true, run_id: '9-z', lane_status: 'keyed', head_status: 'intact', head_reason: null, clock_note: null };
+  const NOTE = '시계 이상: 실행 시각이 이 PC의 현재 시각보다 600초 넘게 뒤인 실행 1개(9-z)';
+  for (const [i, vm] of [ex, lvm].entries()) {
+    const tag = i ? 'legacy' : 'shell';
+    const v = (o) => plain(runInNewContext('verifySourcesVerdict(o)', Object.assign(vm, { o: Object.assign({}, base, o) })));
+    // (1) head_reason: short wording in the tooltip; other-pc → the other-PC warning.
+    const words = { 'unusable-line': '쓸 수 없는 줄', 'chain-failed': '체인 실패', 'repaired': '레인 수리', 'malformed': '형식 오류', 'own-head-missing': '결과 실행 머리 없음', 'unreadable': '읽지 못함' };
+    for (const [code, w] of Object.entries(words)) {
+      const r = v({ is_result: false, verified: false, head_status: 'unknown', head_reason: code, withheld_reason: '재검증 머리 확인 불가 — 결과 없음: x' });
+      assert.ok(r.level === 'warn' && r.kind === 'headunknown' && r.tip.includes(`재검증 머리 unknown (${w})`), `R15 I head_reason ${code} → tooltip "${w}" (${tag}): ` + JSON.stringify(r));
+    }
+    const op = v({ is_result: false, verified: false, head_status: 'unknown', head_reason: 'other-pc', withheld_reason: '재검증 머리 확인 불가 — 결과 없음: 키 kid-2 줄 3개' });
+    assert.ok(op.level === 'warn' && op.kind === 'headotherpc' && op.tip.includes('재검증 머리 unknown (다른 PC 머리일 수 있음)'), `R15 I head_reason other-pc → other-PC warning (${tag}): ` + JSON.stringify(op));
+    // (2) clock_note: its own warning, the result stands (green stays green).
+    const ck = v({ clock_note: NOTE });
+    assert.ok(ck.level === 'ok' && ck.clock === NOTE, `R15 I clock_note does not withhold (${tag}): ` + JSON.stringify(ck));
+    assert.ok(!('clock' in v({})), `R15 I: no clock_note → no clock (${tag})`);
+    // (3) "완료 실행 구간 겹침" → warn.
+    const ov = v({ is_result: false, verified: false, withheld_reason: '완료 실행 구간 겹침 — 마지막 완료 실행(2-b)의 구간이 (1-a)와 겹침' });
+    assert.ok(ov.level === 'warn' && ov.kind === 'overlap' && ov.label === '원본 재검증: 완료 실행 겹침 — 현재 결과 없음' && /2-b/.test(ov.hint), `R15 I3 overlap → warn (${tag}): ` + JSON.stringify(ov));
+    // (4) no usable head + an unusable line: head unknown → warn.
+    const nu = v({ is_result: false, verified: false, head_status: 'unknown', head_reason: 'unusable-line', withheld_reason: '재검증 머리 확인 불가 — 결과 없음: 서명 레인에 쓸 수 없는 줄 1개' });
+    assert.equal(nu.level, 'warn', `R15 I1 unknown head → warn (${tag})`);
+  }
+  // clock rows: legacy checklist and the app shell's checklist.
+  const lrows = plain(runInNewContext('verifyChecks(verifySourcesVerdict(o))', Object.assign(lvm, { o: Object.assign({}, base, { clock_note: NOTE }) })));
+  assert.ok(lrows.length === 1 && lrows[0].level === 'warn' && lrows[0].text === '원본 재검증: 시계 이상' && lrows[0].sub === NOTE, 'R15 I legacy clock row: ' + JSON.stringify(lrows));
+  ex.fr15 = Object.assign({}, base, { clock_note: NOTE });
+  runInNewContext(`jget = async (u) => (u === '/api/status' ? { ok: true, phase: 'review-ready', pending_marks: 0 } : { ok: true, manifest: { case_id: 'c1' }, annotations: { marks: [] } });
+    FIN.audit = { level: 'ok', text: '감사 로그 인증됨' };
+    { const v = verifySourcesVerdict(fr15); FIN.verify = { level: v.level, hint: v.hint, kind: v.kind || '', tip: v.tip || '', label: v.label || '', items: v.items || [], more: v.more || 0, clock: v.clock || '' }; }`, ex);
+  const sc = plain((await runInNewContext('gatherFinalizeChecks()', ex)).checks);
+  assert.ok(sc.some((c) => c.level === 'ok' && /모두 일치/.test(c.text)) && sc.some((c) => c.level === 'warn' && c.text === '원본 재검증: 시계 이상' && c.tip === NOTE), 'R15 I shell: green row + separate clock warning: ' + JSON.stringify(sc));
+  const shellSrc = readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8');
+  assert.ok(/clock: verdict\.clock \|\| ""/.test(shellSrc), 'R15 I shell: the verify button keeps the clock note');
+  runInNewContext('FIN.verify = null; FIN.audit = null; FIN.status = null;', ex);
+  console.log('PASS VM R15 track I follow-up: head_reason wording (other-pc → warn), clock_note separate warn row, 완료 실행 겹침 → warn');
+
+  // (4) timeline: index / ffprobe events are all unaudited — one badge per
+  // run of same-source, same-kind rows, with the count.
+  const tl = { t: (k) => ({ 'timeline.badge.timeUnaudited': '시각 감사 안 됨', 'timeline.tip.timeUnaudited': '감사 기록에 없는 시각' })[k] || k,
+    tf: (k, s) => (({ 'timeline.badge.timeUnauditedN': '시각 감사 안 됨 ({n}건 연속)' })[k] || k).replace('{n}', s.n),
+    escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;') };
+  runInNewContext(['timelineKindHtml', 'timelineTimeUnaudited', 'timelineUnauditedGroups'].map((n) => fn(n) || '').join('\n'), tl);
+  const evs = [
+    { source: 'index', kind: 'file-modified', time_unaudited: true }, { source: 'index', kind: 'file-modified', time_unaudited: true }, { source: 'index', kind: 'file-modified', time_unaudited: true },
+    { source: 'ffprobe', kind: 'media-creation-time', time_unaudited: true },
+    { source: 'carve', kind: 'carved-candidate', time_unaudited: false },
+    { source: 'index', kind: 'file-modified', time_unaudited: true },
+  ];
+  const html = plain(runInNewContext('(() => { const g = timelineUnauditedGroups(evs); return evs.map((e, i) => timelineKindHtml(e.kind, e, g[i])); })()', Object.assign(tl, { evs })));
+  const badges = html.filter((h) => /tl-time-unaudited/.test(h));
+  assert.equal(badges.length, 3, 'R15 I8: one badge per run, not per row: ' + JSON.stringify(html));
+  assert.ok(/시각 감사 안 됨 \(3건 연속\)/.test(html[0]) && html[1] === 'file-modified' && html[2] === 'file-modified' && /">시각 감사 안 됨</.test(html[3]) && html[4] === 'carved-candidate' && /">시각 감사 안 됨</.test(html[5]), 'R15 I8 run heads: ' + JSON.stringify(html));
+  const sync = readFileSync(new URL('../assets/viewer/90-sync.js', import.meta.url), 'utf8');
+  assert.ok(/timelineKindHtml\(ev\.kind, ev, groups\[i\]\)/.test(sync) && /groups\[i\] === 0 \? "\\n" \+ t\("timeline\.tip\.timeUnaudited"\)/.test(sync), 'R15 I8: the panel groups the badges and keeps the tooltip on later rows');
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  assert.equal((i18n.match(/"timeline\.badge\.timeUnauditedN": /g) || []).length, 2, 'R15 I8: timeUnauditedN in ko + en');
+  console.log('PASS VM R15 I8 timeline: unaudited index rows get one badge per run (count), later rows keep the tooltip');
 }
 
 // ---- R15 track U (docs/PLAN_R15_2026-10-16.md) -----------------------------
@@ -835,10 +943,9 @@ async function r15TrackU({ fn, runInNewContext, assert, ex }) {
   for (const [i, vm] of [ex, legacyVerdict].entries()) {
     const tag = i ? 'legacy' : 'shell';
     const v = (o) => plain(runInNewContext('verifySourcesVerdict(o)', Object.assign(vm, { o: Object.assign({}, base, o) })));
-    const c1 = v({ not_verified_reason: '실행 시각이 이 PC 시각보다 앞섬 — 시계 이상' });
-    assert.ok(c1.level === 'warn' && c1.kind === 'clock' && c1.label === '원본 재검증: 시계 이상 — 확인 필요' && /시계 이상/.test(c1.hint), `R15 U4 "시계 이상" on a green result → warn (${tag}): ` + JSON.stringify(c1));
-    const c2 = v({ is_result: false, verified: false, withheld_reason: '완료 표식 없는 실행 1개 (시계 이상)' });
-    assert.ok(c2.level === 'warn' && c2.label === '원본 재검증: 시계 이상 — 현재 결과 없음', `R15 U4 "시계 이상" without a result (${tag}): ` + JSON.stringify(c2));
+    // (track I db2bcb3: "시계 이상" comes as `clock_note` — R15 I follow-up below.)
+    const c2 = v({ is_result: false, verified: false, withheld_reason: '표식 없는 더 새 실행 있음; 시계 이상: 결과를 보류하는 실행의 시각이 뒤임' });
+    assert.ok(c2.level === 'warn' && /시계 이상/.test(c2.hint), `R15 U4 "시계 이상" in a withheld reason stays in the hint (${tag}): ` + JSON.stringify(c2));
     for (const hs of ['unknown', 'rewritten', 'not-authenticated']) {
       const p = v({ is_result: false, verified: false, head_status: hs, withheld_reason: '재검증 머리 확인 불가 — 결과 없음: 다른 PC 머리일 수 있음 (키 k2)' });
       assert.ok(p.level === 'warn' && p.kind === 'headotherpc' && p.label === '원본 재검증: 다른 PC 머리일 수 있음 — 현재 결과 없음' && /키 k2/.test(p.hint), `R15 U4 "다른 PC 머리일 수 있음" (${hs}) → warn, never err (${tag}): ` + JSON.stringify(p));
@@ -962,7 +1069,7 @@ async function r14TrackU({ fn, runInNewContext, assert, ex }) {
 
   // U5 (track I8): time_unaudited → "시각 감사 안 됨" badge on the timeline.
   const tl = { t: (k) => ({ 'timeline.badge.timeUnaudited': '시각 감사 안 됨', 'timeline.tip.timeUnaudited': '감사 기록에 없는 시각' })[k] || k, escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;') };
-  runInNewContext(fn('timelineKindHtml'), tl);
+  runInNewContext(fn('timelineKindHtml') + '\n' + (fn('timelineTimeUnaudited') || ''), tl);
   const b1 = runInNewContext('timelineKindHtml("carved-candidate", { time_unaudited: true })', tl);
   assert.ok(/^carved-candidate <span class="badge warn tl-time-unaudited" title="감사 기록에 없는 시각">시각 감사 안 됨<\/span>$/.test(b1), 'R14 U5 time_unaudited badge: ' + b1);
   const b2 = runInNewContext('timelineKindHtml("carved-candidate-time-unaudited", {})', tl);
@@ -1031,8 +1138,8 @@ async function r14TrackU({ fn, runInNewContext, assert, ex }) {
   assert.ok(two.includes(`치우기(명령 프롬프트): <code class="mono">${cmdCmd.replace(/"/g, '&quot;')}</code>`) && /이 PC 식별 불가/.test(two) && /짝 없음 코드 host-unknown/.test(two), 'R14 S cmd.exe line + host-unknown: ' + two);
   const ohCmd = js({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: 'abc', blocks_finalize: true, dismiss_command: psCmd, dismiss_command_cmd: null }) });
   assert.ok(/data-journal="otherhost"/.test(ohCmd) && /치우기: <code class="mono">frametrace finalize-journal/.test(ohCmd), 'R14 S other-host shows the server command: ' + ohCmd);
-  const nullCmd = js({ ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn('unpaired', { blocks_finalize: true, dismiss_command: null, dismiss_command_cmd: null }) });
-  assert.ok(/치우기: <code class="mono">frametrace finalize-journal &#39;C:\/cases\/c9&#39; --dismiss<\/code>/.test(nullCmd), 'R14 S: both null → the built-in fallback: ' + nullCmd);
+  const nullCmd = js({ ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn('unpaired', { blocks_finalize: true }) });
+  assert.ok(/치우기: <code class="mono">frametrace finalize-journal &#39;C:\/cases\/c9&#39; --dismiss<\/code>/.test(nullCmd), 'R14 S (R15 S: fields absent, older server) → the built-in fallback: ' + nullCmd);
   assert.ok(!/치우기/.test(js({ ok: true, phase: 'review-ready', finalize_journal: jn('other-host', { host: 'abc', blocks_finalize: true, dismiss_command: null }) })), 'R14 S: other-host without a server command → no fallback');
   const lTwo = await lchecks({ ok: true, phase: 'review-ready', finalize_journal: jn('unpaired', { unpaired_code: 'local-mismatch', reason: 'r', blocks_finalize: true, dismiss_command: psCmd, dismiss_command_cmd: cmdCmd }) });
   assert.ok(lTwo.some((c) => c.level === 'block' && /짝 없음\(로컬 기록 불일치\)/.test(c.text) && c.sub.includes('치우기(PowerShell): ' + psCmd) && c.sub.includes('치우기(명령 프롬프트): ' + cmdCmd)), 'R14 S legacy: both command lines: ' + JSON.stringify(lTwo));
@@ -1059,7 +1166,7 @@ async function r13TrackU({ fn, runInNewContext, assert, ex }) {
   assert.ok(/data-journal="recovering"/.test(recv) && /class="h-fin-info">이전 최종화 복구 중</.test(recv) && !/확인 필요/.test(recv), 'R13 U1 recovering is info: ' + recv);
   // The checklist blocks while recovering / another PC's finalize is open.
   const src = readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8');
-  assert.ok(/journal\.kind === "recovering" && finJournalBlocks\(journal\)\) add\("block", "이전 최종화 복구 중"/.test(src) && /finJournalBlocks\(journal\)\) \{[^]{0,600}add\("block", "최종화 차단: " \+ finJournalHead\(journal\)/.test(src), 'R13 U1: checklist block rows');
+  assert.ok(/journal\.kind === "recovering" && finJournalBlocks\(journal\)\) add\("block", "이전 최종화 복구 중"/.test(src) && /finJournalBlocks\(journal\)\) \{[^]{0,900}add\("block", "최종화 차단: " \+ finJournalHead\(journal\)/.test(src), 'R13 U1: checklist block rows');
   const css = readFileSync(new URL('../assets/app/40-finalize.css', import.meta.url), 'utf8');
   assert.ok(/\.h-fin-info \{[^}]*var\(--info-bg\)[^}]*var\(--info-fg\)/.test(css), 'R13 U1: .h-fin-info uses the info tokens');
   console.log('PASS VM R13 U1 journal unpaired / other-host (host) / recovering (info) + checklist blocks');
@@ -1250,12 +1357,12 @@ async function r12TrackU({ fn, runInNewContext, assert, ex }) {
   const tl = { t: (k) => ({ 'timeline.kind.carvedUnaudited': '후보(감사 안 됨)', 'timeline.tip.carvedUnaudited': 'db/carve_results.json에만' })[k] || k, escapeHtml: tctx.escapeHtml };
   const tlFn = fn('timelineKindHtml');
   assert.ok(tlFn, 'R12 I2: timelineKindHtml exists (90-sync.js)');
-  runInNewContext(tlFn, tl);
+  runInNewContext(tlFn + '\n' + (fn('timelineTimeUnaudited') || ''), tl);
   const un = runInNewContext('timelineKindHtml("carved-candidate-unaudited")', tl);
   assert.ok(/class="badge warn tl-unaudited"/.test(un) && />후보\(감사 안 됨\)</.test(un) && !/>carved-candidate/.test(un), 'R12 I2 unaudited badge: ' + un);
   assert.equal(runInNewContext('timelineKindHtml("carved-candidate")', tl), 'carved-candidate', 'R12 I2: plain candidate unchanged');
   const sync = readFileSync(new URL('../assets/viewer/90-sync.js', import.meta.url), 'utf8');
-  assert.ok(/\$\{timelineKindHtml\(ev\.kind, ev\)\}/.test(sync), 'R12 I2: the timeline panel uses timelineKindHtml');
+  assert.ok(/\$\{timelineKindHtml\(ev\.kind, ev(, groups\[i\])?\)\}/.test(sync), 'R12 I2: the timeline panel uses timelineKindHtml');
   for (const k of ['timeline.kind.carvedUnaudited', 'timeline.tip.carvedUnaudited']) assert.equal((i18n.match(new RegExp(`"${k.replace(/\./g, '\\.')}": `, 'g')) || []).length, 2, `R12 I2: ${k} in ko + en`);
   console.log('PASS VM R12 I2 timeline carved-candidate-unaudited → "후보(감사 안 됨)" warn badge');
 

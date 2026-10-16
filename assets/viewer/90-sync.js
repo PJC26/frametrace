@@ -2150,17 +2150,40 @@ document.getElementById("btnTranscodeQueue").addEventListener("click", async (ev
 // "후보(감사 안 됨)", never the plain kind word. Other kinds as recorded.
 // R14 U5 (track I8): an event whose time was not audited (`time_unaudited:
 // true`, or the kind `…-time-unaudited`) gets a warn badge "시각 감사 안 됨".
-function timelineKindHtml(kind, ev) {
+// `group` (R15, track I8 — index / ffprobe events are all unaudited): the
+// badge on the first row of a run of such rows only — n > 1 says how many,
+// 0 = a later row of the run (no badge; the row tooltip says it).
+// Absent = one badge per row.
+function timelineKindHtml(kind, ev, group) {
   let k = String(kind || "");
   if (k === "carved-candidate-unaudited") {
     return `<span class="badge warn tl-unaudited" data-kind="${escapeHtml(k)}" title="${escapeHtml(t("timeline.tip.carvedUnaudited"))}">${escapeHtml(t("timeline.kind.carvedUnaudited"))}</span>`;
   }
-  // Track I (3e002d8): every event carries `time_unaudited: boolean` — the
-  // field decides; the kind suffix only when the field is absent.
-  const timeUnaudited = ev && typeof ev.time_unaudited === "boolean" ? ev.time_unaudited : /-time-unaudited$/.test(k);
+  const timeUnaudited = timelineTimeUnaudited(ev, k);
   if (/-time-unaudited$/.test(k)) k = k.slice(0, -"-time-unaudited".length);
-  return escapeHtml(k) + (timeUnaudited
-    ? ` <span class="badge warn tl-time-unaudited" title="${escapeHtml(t("timeline.tip.timeUnaudited"))}">${escapeHtml(t("timeline.badge.timeUnaudited"))}</span>` : "");
+  if (!timeUnaudited || group === 0) return escapeHtml(k);
+  const label = Number(group) > 1 ? tf("timeline.badge.timeUnauditedN", { n: Number(group) }) : t("timeline.badge.timeUnaudited");
+  return escapeHtml(k) + ` <span class="badge warn tl-time-unaudited" title="${escapeHtml(t("timeline.tip.timeUnaudited"))}">${escapeHtml(label)}</span>`;
+}
+// Track I (3e002d8): every event carries `time_unaudited: boolean` — the
+// field decides; the kind suffix only when the field is absent.
+function timelineTimeUnaudited(ev, kind) {
+  const k = String(kind == null ? (ev && ev.kind) || "" : kind);
+  return ev && typeof ev.time_unaudited === "boolean" ? ev.time_unaudited : /-time-unaudited$/.test(k);
+}
+// Per event: n (> 0) = first of n consecutive unaudited events of the same
+// source and kind, 0 = a later one of that run, undefined = audited.
+function timelineUnauditedGroups(events) {
+  const out = new Array(events.length);
+  const key = ev => String(ev && ev.source || "") + "\u0000" + String(ev && ev.kind || "").replace(/-time-unaudited$/, "");
+  let head = -1;
+  events.forEach((ev, i) => {
+    if (!timelineTimeUnaudited(ev)) { head = -1; return; }
+    if (head >= 0 && key(events[head]) === key(ev)) { out[i] = 0; out[head] += 1; return; }
+    head = i;
+    out[i] = 1;
+  });
+  return out;
 }
 // --- 케이스 타임라인 패널: db/timeline.jsonl을 읽어 시간순 이벤트를 표시 ---
 async function loadTimeline(regenerate) {
@@ -2189,12 +2212,15 @@ async function loadTimeline(regenerate) {
     const byPath = new Map(records.map(r => [r.path, r.id]));
     meta.textContent = tf("timeline.count", { n: events.length });
     const cap = 400;
-    list.innerHTML = events.slice(0, cap).map(ev => {
+    const shown = events.slice(0, cap);
+    const groups = timelineUnauditedGroups(shown);
+    list.innerHTML = shown.map((ev, i) => {
       const recId = byPath.get(ev.path);
+      const tip = `${ev.path || ""} ${ev.detail || ""}` + (groups[i] === 0 ? "\n" + t("timeline.tip.timeUnaudited") : "");
       return `<div class="timeline-row" data-id="${escapeHtml(recId || "")}">
         <span class="ts">${escapeHtml(isoTime(ev.ts_unix))}</span>
         <span class="src">${escapeHtml(ev.source || "")}</span>
-        <span class="desc" title="${escapeHtml(ev.path || "")} ${escapeHtml(ev.detail || "")}">${timelineKindHtml(ev.kind, ev)} — ${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
+        <span class="desc" title="${escapeHtml(tip)}">${timelineKindHtml(ev.kind, ev, groups[i])} —${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
       </div>`;
     }).join("") + (events.length > cap ? `<div class="timeline-row"><span class="desc muted">${tf("timeline.ellipsis", { n: events.length - cap })}</span></div>` : "");
     list.querySelectorAll(".timeline-row[data-id]").forEach(row => {

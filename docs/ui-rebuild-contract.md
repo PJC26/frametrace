@@ -957,3 +957,17 @@ const FTStore = {
 - `/api/verify-sources` 사유(`withheld_reason`/`not_verified_reason`, 포함 검사)에 **"다른 PC 머리일 수 있음"** → `warn`, `kind: "headotherpc"`, 라벨·토스트 "원본 재검증: 다른 PC 머리일 수 있음 — 현재 결과 없음", hint에 사유 — `head_status`가 unknown·rewritten·not-authenticated여도 err 아님. 그 문구가 없는 사유 조각에 "꼬리 잘림"이 있거나 `head_status: "truncated"`면 §21.3 err 그대로.
 - 사유에 **"시계 이상"** → `warn`, `kind: "clock"`, 라벨 "원본 재검증: 시계 이상 — 확인 필요"(`is_result: false`면 "— 현재 결과 없음"), hint에 사유. 초록·자기 일관성(info)보다 먼저. 순서: 불일치 > 더 새 실행 불일치 > 꼬리 잘림 > 다른 PC 머리 > 머리 확인 불가 > 시계 이상 > 현재 결과 없음.
 - 하네스: verify-review-batch --unit "R15 U1"–"R15 U4"(7c3955e 자산에서 각각 실패 확인).
+
+### 22.5 트랙 I(db2bcb3) 후속
+- `/api/verify-sources` `head_reason`(head_status unknown일 때): tip "재검증 머리 unknown (<짧은 말>)" — other-pc "다른 PC 머리일 수 있음" · unusable-line "쓸 수 없는 줄" · chain-failed "체인 실패" · repaired "레인 수리" · malformed "형식 오류" · own-head-missing "결과 실행 머리 없음" · unreadable "읽지 못함"(그 밖 코드는 그대로). `head_reason: "other-pc"`면 사유 문구가 없어도 §22.4 `headotherpc`(warn).
+- `clock_note`("시계 이상…")는 보류가 아니다: 판정(초록 포함)은 그대로, 판정에 `clock` = 문장. 앱 셸 점검 목록에 따로 `warn` "원본 재검증: 시계 이상"(sub = 짧게, title = 전체), legacy 점검 목록에 같은 `warn` 줄 + `#finalHint` 다음 줄. §22.4의 "사유에 시계 이상 → clock" 규칙은 없앤다(보류 사유 속 "시계 이상" 문장은 hint에만).
+- 사유에 "완료 실행 구간 겹침" → `warn`, `kind: "overlap"`, 라벨·토스트 "원본 재검증: 완료 실행 겹침 — 현재 결과 없음", hint에 사유. 순서: … > 머리 확인 불가 > 완료 실행 겹침 > 현재 결과 없음.
+- 타임라인 패널: `time_unaudited`인 연속 행(같은 source·같은 kind)은 첫 행에만 배지 — 2행 이상이면 "시각 감사 안 됨 (N건 연속)"(`timeline.badge.timeUnauditedN`, ko·en), 뒤 행은 배지 없이 행 title에 `timeline.tip.timeUnaudited`. `timelineKindHtml(kind, ev, group)`의 group 없으면 행마다 배지(이전 그대로).
+- 하네스: verify-review-batch --unit "R15 track I follow-up", "R15 I8"(972eb41 자산에서 실패 확인).
+
+### 22.6 트랙 S(8b523ba) 후속 — 저널 필드
+- 치우기 명령: `dismiss_command`가 **있고 null**이면 명령 없음(일부러 안내하지 않음 — other-account 등). 내장 작은따옴표 형식(§22.3)은 필드 자체가 **없을 때**(옛 서버)만. 점검 목록 sub는 명령이 없으면 사유(짧게). 두 셸 같음.
+- `state: "in-progress"` + `in_progress_code: "other-account"` → `[data-journal="otheraccount"]` "다른 계정의 최종화일 수 있음 — 차단 중"(경고), 본문 = `blocked_until_unix` "…까지 차단" · `reason`, 치우기 줄 없음. 점검 목록 `block` "최종화 차단: 다른 계정의 최종화일 수 있음 — 차단 중"(legacy 같음). `blocks_finalize`가 없어도 막음. `live-writer`(또는 코드 없음)는 §20 `inprogress` 그대로.
+- `unpaired_code` 추가: package-changed "패키지 변경됨" · local-state "로컬 기록 상태 불일치"(`FIN_UNPAIRED_SHORT`).
+- title에 `local_record_state` "로컬 기록 상태 <값>", `in_progress_code` "진행 중 코드 <값>".
+- 하네스: verify-review-batch --unit "R15 track S follow-up"(이전 커밋 자산에서 실패 확인).
