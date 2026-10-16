@@ -682,6 +682,7 @@ fn r12_s2_journal_round_trips_and_refuses_a_mismatched_record() {
             started_ms: Some(1_700_000_000_123),
             image: Some("frametrace-app.exe".into()),
         },
+        writer_image_sha256: None,
         started_unix: 1_700_000_000,
         examiner: "홍길동".into(),
         signoff_sha256: crate::sha256::digest_bytes(b"{\"examiner\":\"x\"}"),

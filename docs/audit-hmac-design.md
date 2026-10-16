@@ -1030,6 +1030,52 @@ So the lane alone never starts a recovery any more:
   apart). `frametrace finalize-journal <case> --dismiss --force` moves a
   journal whose writer seems to run.
 
+#### R15 (P21/P23): the local record is a state machine
+
+R14 removed the local record as the finalize's LAST step, with no retry. When
+that removal failed the record stayed `open`, and the R14-S1 attack worked
+again (R14 reviewer PoC A, reproduced): cut the lane's `finalize-complete`,
+rebuild the journal from the plaintext begin entry, put the older sign-off in
+`finalize.previous-signoff.bin` and delete one listed file of the good
+package (defeating P19) — recovery abandoned the good sign-off, restored the
+older bytes and renamed the package `_INCOMPLETE`. P19 itself trusted the
+case folder (PoC B: one forged manifest line plus a copy of the promoted
+sign-off made an interrupted finalize "finished").
+
+- **States.** `open` (before the begin entry) → `packaged` (right after
+  package-case succeeded, carrying `manifest_sha256`, the SHA-256 of the
+  reserved package's `manifest.sha256`) → `completed` (atomically rewritten
+  right after the `finalize-complete` entry, BEFORE the journal is removed) →
+  removed (retried within the rename budget). A failure path writes
+  `resolved` after its `finalize-resolved` entry; `completed-unrecorded`
+  (R14-S2) stays. A record left behind past `open` is safe.
+- **Only `open` is recovered.** `completed` / `completed-unrecorded` →
+  finished: only the missing complete entry is (re)written. `packaged` →
+  finished when the reserved package's manifest still hashes to the recorded
+  SHA-256, otherwise `unpaired` (`package-changed`) — never rolled back,
+  never recorded complete. `resolved` → closed (only the journal goes).
+  P19's case-folder evidence alone no longer makes anything "finished".
+- **Residual window.** A crash between the complete entry and the
+  `completed` rewrite leaves `packaged` (finished if the manifest is
+  intact); a crash between package-case's success and the `packaged` write
+  leaves `open` (rolled back, the safe side).
+- **Sweep (P23).** At server start an `open` record whose case lane holds a
+  trusted complete / resolved entry of it is closed at once; other `open`
+  records go after 30 days only when the case folder is reachable and holds
+  no journal of theirs. An unreachable case or an unparseable journal is
+  "unknown" — never swept (PoC C).
+- **Writer liveness (R15-S4/S10).** A live writer also needs its executable
+  in this executable's folder and hashing to the journal's
+  `writer_image_sha256` (PoC E: a renamed program counted). A live writer
+  without this PC's local record of that finalize is only a note. A writer
+  pid this account may not inspect whose Toolhelp / `/proc` name is a
+  FrameTrace one may be another account's finalize: blocked for 24 h from the
+  journal's start, no dismiss offered.
+- **Keyed children (R15-S5).** With the workstation's `key_source=file:` the
+  CLI steps get `--key-source` and key the entries they append after the
+  begin entry (`hash-verify-head`), so the pairing holds; an unkeyed line
+  planted after the begin entry still unpairs it.
+
 ## Retired keys
 
 Each key the keyring retires gets a retirement time (`retired` map in

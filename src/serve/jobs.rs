@@ -2946,22 +2946,35 @@ pub(crate) fn finalize_with_exe(
         match super::finalize_journal::assess(case_dir) {
             None => {}
             Some(super::finalize_journal::Assessment::Open(journal, _)) => {
-                if let Err(err) = crate::report::record_finalize_resolved(
+                // R15 (P21): `resolved` before the journal goes, then removed.
+                let resolved = match crate::report::record_finalize_resolved(
                     case_dir,
                     &journal.finalize_id,
                     Some(&journal.signoff_sha256),
                     "superseded",
                 ) {
-                    state_lock(state).logs.push(format!("경고: {err}"));
-                } else {
-                    let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
-                }
+                    Ok(()) => {
+                        let _ = journal.advance_local(
+                            case_dir,
+                            super::finalize_journal::LOCAL_RESOLVED,
+                            None,
+                        );
+                        true
+                    }
+                    Err(err) => {
+                        state_lock(state).logs.push(format!("경고: {err}"));
+                        false
+                    }
+                };
                 if let Err(err) =
                     super::finalize_journal::remove_journal(case_dir, &journal.finalize_id)
                 {
                     return api_err(&format!(
                         "최종화 차단: 이전 최종화 저널을 지우지 못했습니다 — {err}"
                     ));
+                }
+                if resolved {
+                    let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
                 }
             }
             // R14: anything else still there (a finished finalize whose
@@ -3063,6 +3076,7 @@ pub(crate) fn finalize_with_exe(
         finalize_id,
         host_id: crate::util::host_id(),
         writer: crate::util::current_writer(),
+        writer_image_sha256: super::finalize_journal::own_exe_sha256(),
         started_unix: crate::util::now_unix().unwrap_or(0),
         examiner: examiner.to_string(),
         signoff_sha256: signoff.record_sha256(),
@@ -3197,6 +3211,27 @@ pub(crate) fn finalize_with_exe(
     if STOP_FINALIZE_AT.with(|stop| stop.get()) == Some(FinalizeStop::Package) {
         return "{\"ok\":false,\"error\":\"test: stopped after package-case\"}".to_string();
     }
+    // R15 (P21): package-case succeeded — this PC's local record says so
+    // right away, with the SHA-256 of the manifest it left (the only proof
+    // a later recovery accepts that the finalize got past its package; the
+    // case folder's own contents can be forged). A record that cannot be
+    // advanced stays `open`: a crash before the complete entry then rolls
+    // the finalize back (safe side).
+    if packaging.is_ok() {
+        let manifest = super::finalize_journal::published_reserved(case_dir, &journal.package_name)
+            .and_then(|dir| super::finalize_journal::manifest_sha256_capped(&dir));
+        if let Err(err) =
+            journal.advance_local(case_dir, super::finalize_journal::LOCAL_PACKAGED, manifest)
+        {
+            state_lock(state).logs.push(format!(
+                "경고: 열린 최종화 로컬 기록을 갱신하지 못했습니다: {err}"
+            ));
+        }
+    }
+    #[cfg(test)]
+    if STOP_FINALIZE_AT.with(|stop| stop.get()) == Some(FinalizeStop::Packaged) {
+        return "{\"ok\":false,\"error\":\"test: stopped after the packaged record\"}".to_string();
+    }
     // R10-S3: the package this finalize's package-case published, from
     // its own `output:` line (R9 marked the folder with the newest mtime).
     let published = packaging
@@ -3228,6 +3263,7 @@ pub(crate) fn finalize_with_exe(
             reason,
             "finalize failed after package-case published it",
             crate::package::rename_retry_budget(),
+            None,
         );
         leftover.extend(marked.notes);
         incomplete_dirs = marked.dirs;
@@ -3316,19 +3352,32 @@ pub(crate) fn finalize_with_exe(
             )
         } else {
             // R13 (P15): cleaned up — the begin entry is closed first.
-            // R14 (P18): the local record goes once the lane says so.
-            match crate::report::record_finalize_resolved(
+            // R14 (P18): the local record goes once the lane says so;
+            // R15 (P21): rewritten `resolved` before the journal goes.
+            let resolved = match crate::report::record_finalize_resolved(
                 case_dir,
                 &journal.finalize_id,
                 Some(&journal.signoff_sha256),
                 "failed",
             ) {
                 Ok(()) => {
-                    let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
+                    let _ = journal.advance_local(
+                        case_dir,
+                        super::finalize_journal::LOCAL_RESOLVED,
+                        None,
+                    );
+                    true
                 }
-                Err(err) => state_lock(state).logs.push(format!("경고: {err}")),
+                Err(err) => {
+                    state_lock(state).logs.push(format!("경고: {err}"));
+                    false
+                }
+            };
+            let removed = super::finalize_journal::remove_journal(case_dir, &journal.finalize_id);
+            if removed.is_ok() && resolved {
+                let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
             }
-            super::finalize_journal::remove_journal(case_dir, &journal.finalize_id)
+            removed
         };
         if let Err(err) = journal_result {
             state_lock(state).logs.push(format!(
@@ -3370,25 +3419,39 @@ pub(crate) fn finalize_with_exe(
             // good) and the next recovery writes the entry.
             let journal_left = match &complete_error {
                 None => {
+                    // R15 (P21): `completed` (atomic rewrite) BEFORE the
+                    // journal goes — R14 left the record `open` when its
+                    // removal (the last step) failed, and a cut complete
+                    // entry plus a rebuilt journal then rolled the good
+                    // finalize back (R14 reviewer PoC A).
+                    if let Err(err) = journal.advance_local(
+                        case_dir,
+                        super::finalize_journal::LOCAL_COMPLETED,
+                        None,
+                    ) {
+                        state_lock(state).logs.push(format!(
+                            "경고: 열린 최종화 로컬 기록을 'completed'로 갱신하지 못했습니다: {err}"
+                        ));
+                    }
                     let left =
                         super::finalize_journal::remove_journal(case_dir, &journal.finalize_id)
                             .err();
-                    if let Err(err) =
-                        super::finalize_journal::remove_local_record(&journal.finalize_id)
+                    if left.is_none()
+                        && let Err(err) =
+                            super::finalize_journal::remove_local_record(&journal.finalize_id)
                     {
                         state_lock(state).logs.push(format!(
-                            "경고: 최종화는 끝났지만 이 PC의 열린 최종화 로컬 기록을 지우지 못했습니다 ({err}) — 서버를 다시 시작하면 30일 뒤 정리됩니다."
+                            "경고: 최종화는 끝났지만 이 PC의 최종화 로컬 기록을 지우지 못했습니다 ({err}) — 'completed'로 남아 있어 복구 대상이 아니며, 서버를 다시 시작하면 30일 뒤 정리됩니다."
                         ));
                     }
                     left
                 }
                 Some(lane) => {
-                    let _ = journal
-                        .local_record(
-                            case_dir,
-                            super::finalize_journal::STATE_COMPLETED_UNRECORDED,
-                        )
-                        .write();
+                    let _ = journal.advance_local(
+                        case_dir,
+                        super::finalize_journal::STATE_COMPLETED_UNRECORDED,
+                        None,
+                    );
                     journal
                         .rewrite_as(
                             super::finalize_journal::STATE_COMPLETED_UNRECORDED,
@@ -3516,6 +3579,8 @@ pub(crate) enum FinalizeStop {
     Chain,
     Promotion,
     Package,
+    /// R15: after the `packaged` local record was written.
+    Packaged,
 }
 
 #[cfg(test)]

@@ -1949,6 +1949,13 @@ fn machine_id() -> Option<String> {
 /// R13-S4: the executable file name of process `pid` (`frametrace-app.exe`,
 /// …) when the platform tells it (Windows, Linux), lowercased.
 pub fn process_image_name(pid: u32) -> Option<String> {
+    process_image_path(pid)
+        .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+}
+
+/// R15-S4: the full path of process `pid`'s executable when the platform
+/// tells it (Windows `QueryFullProcessImageNameW`, Linux `/proc/<pid>/exe`).
+pub fn process_image_path(pid: u32) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::CloseHandle;
@@ -1970,18 +1977,89 @@ pub fn process_image_name(pid: u32) -> Option<String> {
             );
             let _ = CloseHandle(handle);
             read.ok()?;
-            let full = String::from_utf16_lossy(&buffer[..size as usize]);
-            Path::new(&full)
-                .file_name()
-                .map(|name| name.to_string_lossy().to_lowercase())
+            Some(PathBuf::from(String::from_utf16_lossy(
+                &buffer[..size as usize],
+            )))
         }
     }
     #[cfg(target_os = "linux")]
     {
-        fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().to_lowercase()))
-            .map(|name| name.trim_end_matches(" (deleted)").to_string())
+        fs::read_link(format!("/proc/{pid}/exe")).ok().map(|exe| {
+            let text = exe.to_string_lossy();
+            PathBuf::from(text.trim_end_matches(" (deleted)"))
+        })
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// R15-S10: the executable file name (lowercased) of process `pid` when
+/// that process EXISTS but this process may not inspect it (another
+/// account's process: Windows `OpenProcess` → ERROR_ACCESS_DENIED, the
+/// name then read from a Toolhelp process snapshot; Linux `/proc/<pid>/exe`
+/// → EACCES, the name from `/proc/<pid>/stat`). `None` when the process is
+/// gone, inspectable, or its name unknown.
+pub fn inaccessible_process_name(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        if pid == 0 {
+            return None;
+        }
+        // SAFETY: plain Win32 calls; every handle is closed below and the
+        // entry's size is set before the first call.
+        unsafe {
+            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(handle) => {
+                    let _ = CloseHandle(handle);
+                    return None;
+                }
+                Err(err) if err.code().0 & 0xFFFF == ERROR_ACCESS_DENIED => {}
+                Err(_) => return None,
+            }
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut found = None;
+            let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+            while more {
+                if entry.th32ProcessID == pid {
+                    let len = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    found = Some(String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase());
+                    break;
+                }
+                more = Process32NextW(snapshot, &mut entry).is_ok();
+            }
+            let _ = CloseHandle(snapshot);
+            found
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match fs::read_link(format!("/proc/{pid}/exe")) {
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let start = stat.find('(')?;
+                let end = stat.rfind(')')?;
+                (start < end).then(|| stat[start + 1..end].to_lowercase())
+            }
+            _ => None,
+        }
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {

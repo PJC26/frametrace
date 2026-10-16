@@ -330,6 +330,7 @@ fn r13_s3_completed_finalize_only_loses_its_journal() {
         finalize_id: begin["finalize_id"].as_str().unwrap().into(),
         host_id: begin["host_id"].as_str().unwrap().into(),
         writer: crate::util::WriterIdentity::default(),
+        writer_image_sha256: None,
         started_unix: begin["started_unix"].as_u64().unwrap(),
         examiner: "홍길동".into(),
         signoff_sha256: begin["signoff_record_sha256"].as_str().unwrap().into(),
