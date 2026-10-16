@@ -342,26 +342,31 @@ fn place_reservation(staging: &Path, reserved: &Path) -> bool {
 /// R8-S6: renames the marked `staging` folder onto `reserved` with
 /// `rename`: [`Placement::Taken`] when the name exists
 /// ([`reservation_rename`] refuses an existing target), else retried with
-/// the R5-S12 backoff (a fresh folder briefly held by an antivirus scan)
-/// and [`Placement::Failed`] with the last error when it never succeeds.
+/// backoff (a fresh folder briefly held by an antivirus scan) and
+/// [`Placement::Failed`] with the last error when it never succeeds.
+///
+/// R10-S4: retried for [`rename_retry_budget`] in all (R9: five attempts,
+/// 1.85 s — shorter than a real-time antivirus scan of a fresh folder
+/// holds it, so a transient ACCESS_DENIED failed the whole package).
 fn place_reservation_with(
     staging: &Path,
     reserved: &Path,
     rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Placement {
-    let mut attempt = 0usize;
-    loop {
-        match rename(staging, reserved) {
-            Ok(()) => return Placement::Placed,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Placement::Taken;
-            }
-            Err(err) if attempt >= RENAME_BACKOFF_MS.len() => return Placement::Failed(err),
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(RENAME_BACKOFF_MS[attempt]));
-                attempt += 1;
-            }
-        }
+    let mut taken = false;
+    let result = retry_within(
+        rename_retry_budget(),
+        &mut || {
+            let result = rename(staging, reserved);
+            taken = matches!(&result, Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists);
+            result
+        },
+        &|err| err.kind() == std::io::ErrorKind::AlreadyExists,
+    );
+    match result {
+        Ok(()) => Placement::Placed,
+        Err(_) if taken => Placement::Taken,
+        Err(err) => Placement::Failed(err),
     }
 }
 
@@ -386,27 +391,71 @@ fn reservation_rename(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Delays between the R5-S12 rename attempts (5 attempts in all).
+/// Delays between the R5-S12 rename attempts; after the last one, every
+/// further attempt waits as long as the last (R10-S4).
 const RENAME_BACKOFF_MS: [u64; 4] = [100, 250, 500, 1000];
 
-/// R5-S12: `rename(from, to)` retried up to 5 times with backoff. The
-/// last error is returned when every attempt failed.
-fn rename_with_retry(
+/// R10-S4: how long a rename that keeps failing (an antivirus, indexer or
+/// sync client holding a fresh folder or file on Windows) is retried in
+/// all before the operation gives up.
+pub(crate) const RENAME_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: a shorter [`RENAME_RETRY_BUDGET`] on this thread.
+    pub(crate) static RENAME_BUDGET_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`RENAME_RETRY_BUDGET`] (tests may shorten it per thread).
+pub(crate) fn rename_retry_budget() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = RENAME_BUDGET_OVERRIDE.with(|cell| cell.get()) {
+        return budget;
+    }
+    RENAME_RETRY_BUDGET
+}
+
+/// R10-S4: runs `op` until it succeeds, fails with an error `final_err`
+/// accepts as final, or `budget` is spent — always at least five attempts
+/// (the R5-S12 backoff), then one per second while the budget lasts. The
+/// last error is returned.
+pub(crate) fn retry_within(
+    budget: std::time::Duration,
+    op: &mut dyn FnMut() -> std::io::Result<()>,
+    final_err: &dyn Fn(&std::io::Error) -> bool,
+) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
+    let mut attempt = 0usize;
+    loop {
+        let err = match op() {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        if final_err(&err) {
+            return Err(err);
+        }
+        let delay = std::time::Duration::from_millis(
+            RENAME_BACKOFF_MS[attempt.min(RENAME_BACKOFF_MS.len() - 1)],
+        );
+        if attempt >= RENAME_BACKOFF_MS.len() && started.elapsed() + delay > budget {
+            return Err(err);
+        }
+        std::thread::sleep(delay);
+        attempt += 1;
+    }
+}
+
+/// R5-S12: `rename(from, to)` retried with backoff; R10-S4: for
+/// [`rename_retry_budget`] in all (also used to promote a finalize's
+/// sign-off, R10-S1). The last error is returned when every attempt
+/// failed.
+pub(crate) fn rename_with_retry(
     from: &Path,
     to: &Path,
     rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let mut attempt = 0usize;
-    loop {
-        match rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(err) if attempt >= RENAME_BACKOFF_MS.len() => return Err(err),
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(RENAME_BACKOFF_MS[attempt]));
-                attempt += 1;
-            }
-        }
-    }
+    retry_within(rename_retry_budget(), &mut || rename(from, to), &|_| false)
 }
 
 #[cfg(test)]
@@ -1191,6 +1240,73 @@ pub struct PackageVerification {
     /// finalize; nothing inside the package can authenticate itself.
     pub manifest_sha256: Option<String>,
     pub files_verified: usize,
+    /// R10-S2: the package is marked as written by a finalize that did not
+    /// complete ([`finalize_incomplete_reason`]); reported as a NOT
+    /// VERIFIED check with subject [`FINALIZE_CHECK_SUBJECT`].
+    pub finalize_incomplete: bool,
+}
+
+/// R10-S2: the `verify-package` check subject of the finalize state.
+pub const FINALIZE_CHECK_SUBJECT: &str = "finalize";
+
+/// R10-S2: what a finalize appends to the name of a package folder it
+/// published but could not complete (the sign-off was not promoted).
+/// Matched case-insensitively; a second incomplete package of the same
+/// name gets `_INCOMPLETE_2`, `_INCOMPLETE_3`, ….
+pub const INCOMPLETE_PACKAGE_SUFFIX: &str = "_INCOMPLETE";
+
+/// R10-S2 (R9-S4): the marker file name suffix written BESIDE such a
+/// package (`<folder name>.finalize-incomplete.txt`; inside it would be
+/// an unlisted file and fail verify-package, R6-S5).
+pub const FINALIZE_INCOMPLETE_MARKER_SUFFIX: &str = ".finalize-incomplete.txt";
+
+/// R10-S2: the marker beside `package_dir`.
+pub fn finalize_incomplete_marker(package_dir: &Path) -> PathBuf {
+    let mut name = package_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(FINALIZE_INCOMPLETE_MARKER_SUFFIX);
+    package_dir.with_file_name(name)
+}
+
+/// R10-S2: whether a folder NAME marks an incomplete finalize
+/// (`…_INCOMPLETE` or `…_INCOMPLETE_<n>`, any case).
+pub fn is_incomplete_package_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    match upper.rfind(INCOMPLETE_PACKAGE_SUFFIX) {
+        Some(at) => {
+            let rest = &upper[at + INCOMPLETE_PACKAGE_SUFFIX.len()..];
+            rest.is_empty()
+                || rest
+                    .strip_prefix('_')
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        }
+        None => false,
+    }
+}
+
+/// R10-S2: why `package_dir` is from an incomplete finalize — its name
+/// ([`is_incomplete_package_name`], which survives copying the folder
+/// alone) or the marker beside it — or `None`.
+pub fn finalize_incomplete_reason(package_dir: &Path) -> Option<String> {
+    let name = package_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if is_incomplete_package_name(&name) {
+        return Some(format!("folder name ends with {INCOMPLETE_PACKAGE_SUFFIX}"));
+    }
+    let marker = finalize_incomplete_marker(package_dir);
+    fs::symlink_metadata(&marker).is_ok().then(|| {
+        format!(
+            "marker {} beside the folder",
+            marker
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        )
+    })
 }
 
 impl PackageVerification {
@@ -1262,6 +1378,18 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
         ));
     }
     let mut out = PackageVerification::default();
+    // R10-S2: a package whose finalize did not complete is not a final
+    // result, however well its files check out.
+    if let Some(why) = finalize_incomplete_reason(package_dir) {
+        out.finalize_incomplete = true;
+        out.push(
+            CheckStatus::NotVerified,
+            FINALIZE_CHECK_SUBJECT,
+            format!(
+                "FINALIZE INCOMPLETE ({why}): this package was written by a finalize that did not complete (the sign-off it carries was never confirmed), so it is NOT a final result — finalize the case again and use that package / 최종화 미완료 — 최종 결과로 쓰지 마십시오"
+            ),
+        );
+    }
     let manifest_path = package_dir.join("manifest.sha256");
     let manifest_text = match fs::read_to_string(&manifest_path) {
         Ok(text) => text,
@@ -2990,7 +3118,11 @@ mod tests {
         let result = package_case(&case_dir, None).expect("published after retries");
         assert!(result.output_dir.join("manifest.sha256").is_file());
         super::FAIL_PUBLISH_RENAMES.with(|left| left.set(99));
+        // R10-S4: retried for the whole budget; a short one here.
+        super::RENAME_BUDGET_OVERRIDE
+            .with(|cell| cell.set(Some(std::time::Duration::from_millis(500))));
         let err = package_case(&case_dir, None).unwrap_err();
+        super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(None));
         super::FAIL_PUBLISH_RENAMES.with(|left| left.set(0));
         assert!(err.contains("남겨 두었습니다"), "{err}");
         let kept: Vec<std::path::PathBuf> = fs::read_dir(case_dir.join("reports"))
@@ -3165,8 +3297,11 @@ mod tests {
             ))
         };
         let started = std::time::Instant::now();
+        // R10-S4: the retry budget (12 s) shortened to the bare backoff.
+        super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(Some(std::time::Duration::ZERO)));
         let err = super::reserve_package_dirs_with(&reports.join("package_5"), 4242, &denied)
             .expect_err("a persistent failure must fail the reservation");
+        super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(None));
         assert_eq!(calls.get(), 5, "one name, one backoff");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert!(
@@ -3181,6 +3316,110 @@ mod tests {
             super::reserve_package_dirs(&reports.join("package_5"), 4242).expect("reserve");
         assert_eq!(reserved, reports.join("package_5_001"));
         assert!(work.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R10-S2: R9 left the "finalize incomplete" marker beside the package
+    /// and nothing read it: verify-package passed the package as is. A
+    /// package renamed `…_INCOMPLETE` (or with the marker beside it) is
+    /// now reported NOT VERIFIED "finalize", while its files still check
+    /// out; the same package under a plain name is unaffected.
+    #[test]
+    fn r10_s2_verify_package_reports_an_incomplete_finalize() {
+        assert!(super::is_incomplete_package_name("package_1_INCOMPLETE"));
+        assert!(super::is_incomplete_package_name("package_1_incomplete_2"));
+        assert!(!super::is_incomplete_package_name("package_1"));
+        assert!(!super::is_incomplete_package_name("package_1_INCOMPLETE_x"));
+        assert!(!super::is_incomplete_package_name("package_INCOMPLETEness"));
+        let (root, case_dir) = minimal_packageable_case("r10-s2");
+        let result = package_case(&case_dir, None).expect("package");
+        let finalize = |checked: &super::PackageVerification| {
+            checked
+                .checks
+                .iter()
+                .filter(|c| c.subject == super::FINALIZE_CHECK_SUBJECT)
+                .map(|c| c.status)
+                .collect::<Vec<_>>()
+        };
+        let plain = super::verify_package(&result.output_dir).unwrap();
+        assert!(!plain.finalize_incomplete && finalize(&plain).is_empty());
+        // Marker beside (R9's only signal) is read now.
+        let marker = super::finalize_incomplete_marker(&result.output_dir);
+        fs::write(&marker, "x").unwrap();
+        let marked = super::verify_package(&result.output_dir).unwrap();
+        assert!(marked.finalize_incomplete);
+        assert_eq!(finalize(&marked), vec![super::CheckStatus::NotVerified]);
+        fs::remove_file(&marker).unwrap();
+        // Renamed: the state travels with the folder alone.
+        let renamed = result.output_dir.with_file_name(format!(
+            "{}_INCOMPLETE",
+            result.output_dir.file_name().unwrap().to_string_lossy()
+        ));
+        fs::rename(&result.output_dir, &renamed).unwrap();
+        let checked = super::verify_package(&renamed).unwrap();
+        assert!(checked.finalize_incomplete);
+        assert_eq!(finalize(&checked), vec![super::CheckStatus::NotVerified]);
+        assert!(
+            checked.passed(),
+            "its files still check out: {:?}",
+            checked.checks
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R10-S4: a reservation rename refused for longer than R9's five
+    /// attempts (1.85 s) — a real-time antivirus scan of the fresh staging
+    /// folder — failed the whole package. It is now retried for the
+    /// budget, and the first name is still the one reserved; a failure
+    /// that persists past the budget still fails, soon after it.
+    #[test]
+    fn r10_s4_transient_access_denied_longer_than_the_backoff_still_reserves() {
+        let root = std::env::temp_dir().join(format!("ft-r10-s4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let reports = root.join("reports");
+        fs::create_dir_all(&reports).unwrap();
+        let started = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0usize);
+        let busy_for_a_while = |from: &std::path::Path, to: &std::path::Path| {
+            calls.set(calls.get() + 1);
+            if started.elapsed() < std::time::Duration::from_millis(2600) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "access denied (scan in progress)",
+                ));
+            }
+            super::reservation_rename(from, to)
+        };
+        let (reserved, work) =
+            super::reserve_package_dirs_with(&reports.join("package_7"), 4242, &busy_for_a_while)
+                .expect("a transient denial within the budget reserves the name");
+        assert_eq!(reserved, reports.join("package_7"));
+        assert!(reserved.is_dir() && work.is_dir());
+        assert!(
+            calls.get() > 5,
+            "retried past the R9 backoff: {}",
+            calls.get()
+        );
+        // Persistent: gives up after the budget, not long after.
+        let budget = std::time::Duration::from_millis(1500);
+        super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(Some(budget)));
+        let started = std::time::Instant::now();
+        let denied = |_: &std::path::Path, _: &std::path::Path| -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "access denied",
+            ))
+        };
+        let err = super::reserve_package_dirs_with(&reports.join("package_9"), 4242, &denied)
+            .expect_err("persistent");
+        super::RENAME_BUDGET_OVERRIDE.with(|cell| cell.set(None));
+        let took = started.elapsed();
+        assert!(took >= budget, "{took:?}");
+        assert!(
+            took < budget + std::time::Duration::from_secs(3),
+            "{took:?}"
+        );
+        assert!(err.contains("access denied"), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 

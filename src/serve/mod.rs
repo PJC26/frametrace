@@ -80,11 +80,13 @@ pub(crate) use jobs::{
     api_recover_deleted, api_start, api_verify_sources, case_job_json, default_case_dir_checked,
     pending_marks_count, run_step, run_step_cancellable,
 };
+#[cfg(test)]
+pub(crate) use media::newest_package_dir;
 pub(crate) use media::{
     api_advanced, api_capture_frame, api_export_clip, api_export_clip_cancel,
     api_export_clip_status, api_export_selected, api_join, api_join_check, api_proxy,
-    api_telemetry, api_transcode_queue, cancel_all_clip_jobs, clip_job_json, newest_package_dir,
-    opt_path, running_clip_job_count,
+    api_telemetry, api_transcode_queue, cancel_all_clip_jobs, clip_job_json,
+    running_clip_job_count,
 };
 pub(crate) use recent::{api_recent_cases, api_recent_cases_forget, record_recent_case};
 pub(crate) use records::{

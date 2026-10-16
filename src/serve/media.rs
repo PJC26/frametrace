@@ -2240,19 +2240,23 @@ pub(crate) fn export_safe_name(name: &str) -> String {
     }
 }
 
-pub(crate) fn opt_path(value: &Option<PathBuf>) -> String {
-    match value {
-        Some(path) => json_string(&path.to_string_lossy()),
-        None => "null".to_string(),
-    }
-}
-
+/// The most recently modified finished package in `reports/`.
+///
+/// R10-S2: a package of an incomplete finalize
+/// (`crate::package::finalize_incomplete_reason` — renamed
+/// `…_INCOMPLETE` or marked beside) is never "the" package. R10-S3:
+/// finalize no longer guesses its package this way (it reads the step's
+/// `output:` line, [`published_package_dir`]); tests still use it.
+#[cfg(test)]
 pub(crate) fn newest_package_dir(case_dir: &Path) -> Option<PathBuf> {
     let entries = case_dir.join("reports").read_dir().ok()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
         if !name.to_string_lossy().starts_with("package_") || !entry.path().is_dir() {
+            continue;
+        }
+        if crate::package::finalize_incomplete_reason(&entry.path()).is_some() {
             continue;
         }
         if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified())
@@ -2262,6 +2266,43 @@ pub(crate) fn newest_package_dir(case_dir: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// R10-S2: every package folder in `reports/` that an incomplete finalize
+/// left (`crate::package::finalize_incomplete_reason`), sorted by path.
+/// Never deleted by FrameTrace — the examiner decides.
+pub(crate) fn incomplete_package_dirs(case_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = case_dir.join("reports").read_dir() else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("package_"))
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && crate::package::finalize_incomplete_reason(path).is_some())
+        .collect();
+    found.sort();
+    found
+}
+
+/// R10-S3: the package a `package-case` step published, from its own
+/// `output: <dir>` line — never guessed from folder times (another
+/// package-case, a copy or a restore can make a different folder the
+/// newest). Only a `reports/package_*` folder of this case that exists is
+/// accepted.
+pub(crate) fn published_package_dir(case_dir: &Path, step_output: &str) -> Option<PathBuf> {
+    let reports = case_dir.join("reports");
+    step_output
+        .lines()
+        .find_map(|line| line.strip_prefix("output: "))
+        .map(|text| PathBuf::from(text.trim_end()))
+        .filter(|path| {
+            path.parent() == Some(reports.as_path())
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("package_"))
+                && path.is_dir()
+        })
 }
 
 #[cfg(test)]

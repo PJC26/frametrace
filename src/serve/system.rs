@@ -490,6 +490,22 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         .as_deref()
         .map(super::jobs::pending_mark_conflicts)
         .unwrap_or_else(|| serde_json::json!({"count": 0, "ids": []}));
+    // R10-S2: package folders an incomplete finalize left in reports/
+    // (`…_INCOMPLETE` or marked beside) — "최종화 미완료", never final.
+    body["incomplete_packages"] = case_dir
+        .as_deref()
+        .map(super::media::incomplete_package_dirs)
+        .unwrap_or_default()
+        .iter()
+        .map(|dir| dir.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .into();
+    // R10-S2: whether `package_dir` is such a package (an incomplete
+    // finalize sets it to the renamed folder).
+    let package_incomplete = body["package_dir"]
+        .as_str()
+        .is_some_and(|dir| crate::package::finalize_incomplete_reason(Path::new(dir)).is_some());
+    body["package_incomplete"] = package_incomplete.into();
     body.to_string()
 }
 

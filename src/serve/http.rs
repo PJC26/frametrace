@@ -1450,7 +1450,12 @@ pub(crate) enum ServeVerdict {
 pub(crate) enum VerifiedBody {
     /// Read once into memory and served as read (small files).
     Memory(Vec<u8>),
-    /// Streamed from the verified handle and re-hashed on the way.
+    /// Streamed from the verified handle by [`stream_verified`]: each
+    /// [`VERIFY_CHUNK`] is re-read and compared with the hashing pass's
+    /// hash of that chunk BEFORE it is sent (R9-S1; no whole-file re-hash
+    /// at the end any more), the last chunk is held back until length,
+    /// end of file and identity still match, and the whole transfer has a
+    /// deadline (R10-S9).
     Stream(VerifiedStream),
     /// HEAD: no body.
     HeadOnly,
@@ -1887,6 +1892,26 @@ pub(crate) fn stream_verified(
             path.display()
         ))
     };
+    // R10-S9: the open handle pins the file (on Windows nothing can
+    // rename or replace it meanwhile — a regenerated review bundle, an
+    // `_INCOMPLETE` package rename). A client that keeps reading just
+    // enough to beat the 60 s per-write timeout held it for hours; the
+    // whole transfer now has a deadline from its size, and each write may
+    // block only until then.
+    let deadline = std::time::Instant::now() + stream_budget(verified.len);
+    let send = |stream: &mut TcpStream, bytes: &[u8]| -> Result<(), String> {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "{} was not taken by the client in time - transfer cut (slow or stalled client)",
+                path.display()
+            ));
+        }
+        let _ = stream.set_write_timeout(Some(left.min(STREAM_WRITE_STALL)));
+        stream
+            .write_all(bytes)
+            .map_err(|err| format!("file write failed: {err}"))
+    };
     let mut held: Vec<u8> = Vec::with_capacity(VERIFY_CHUNK);
     let mut chunk = vec![0u8; VERIFY_CHUNK];
     let mut read_total = 0u64;
@@ -1904,9 +1929,7 @@ pub(crate) fn stream_verified(
         }
         index += 1;
         if !held.is_empty() {
-            stream
-                .write_all(&held)
-                .map_err(|err| format!("file write failed: {err}"))?;
+            send(stream, &held)?;
         }
         held.clear();
         held.extend_from_slice(&chunk[..read]);
@@ -1927,12 +1950,38 @@ pub(crate) fn stream_verified(
     {
         return cut(stream, "length or identity");
     }
-    stream
-        .write_all(&held)
-        .map_err(|err| format!("file write failed: {err}"))?;
+    send(stream, &held)?;
     stream
         .flush()
         .map_err(|err| format!("file write failed: {err}"))
+}
+
+/// R10-S9: longest one write of a verified stream may block (a stalled
+/// client), within the transfer deadline.
+const STREAM_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// R10-S9: the slowest average rate a verified transfer may take before
+/// it is cut: 256 KiB/s (a loopback viewer reads tens of MB/s; a 512 MiB
+/// verified file then has about 35 minutes), plus [`STREAM_BASE_BUDGET`].
+const STREAM_MIN_RATE: u64 = 256 * 1024;
+
+/// R10-S9: the deadline every verified transfer gets regardless of size.
+const STREAM_BASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(test)]
+thread_local! {
+    /// R10-S9 test hook: a fixed transfer deadline on this thread.
+    pub(crate) static STREAM_BUDGET_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// R10-S9: how long a verified transfer of `len` bytes may take.
+fn stream_budget(len: u64) -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = STREAM_BUDGET_OVERRIDE.with(|cell| cell.get()) {
+        return budget;
+    }
+    STREAM_BASE_BUDGET + std::time::Duration::from_secs(len / STREAM_MIN_RATE)
 }
 
 /// R9-S1 test hook type (see [`STREAM_CHUNK_HOOK`]).

@@ -1175,3 +1175,260 @@ fn all_intra_edit_list_output_is_compared_frame_by_frame() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// [`concat_to`] with `-copyinkf`, as `join-video` runs it since R10-S8.
+fn concat_keep_leading(inputs: &[&Path], output: &Path, format: &str) {
+    let list = output.with_extension("ffconcat");
+    let mut text = String::from("ffconcat version 1.0\n");
+    for input in inputs {
+        text.push_str(&format!(
+            "file '{}'\n",
+            input.to_string_lossy().replace('\\', "/")
+        ));
+    }
+    std::fs::write(&list, text).unwrap();
+    let list_arg = list.to_str().unwrap().to_string();
+    let output_arg = output.to_str().unwrap().to_string();
+    ffmpeg_fixture(&[
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        &list_arg,
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        "-copyinkf",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-f",
+        format,
+        &output_arg,
+    ]);
+}
+
+/// A 10 fps long-GOP (key frame every 10) H.264 clip without B-frames.
+fn long_gop_clip(path: &Path, seconds: &str) {
+    ffmpeg_fixture(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x120:rate=10",
+        "-t",
+        seconds,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-g",
+        "10",
+        "-bf",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        path.to_str().unwrap(),
+    ]);
+}
+
+/// Stream copy of `input` from `start` seconds that keeps the non-key
+/// frames before the next key frame (`-copyinkf`): a clip that starts
+/// mid-GOP, as a CCTV export or a cut file does. `frames` limits the
+/// video frame count.
+fn cut_mid_gop(input: &Path, start: &str, frames: Option<&str>, output: &Path) {
+    let mut args = vec!["-i", input.to_str().unwrap(), "-ss", start];
+    if let Some(frames) = frames {
+        args.extend(["-frames:v", frames]);
+    }
+    args.extend(["-c", "copy", "-copyinkf", output.to_str().unwrap()]);
+    ffmpeg_fixture(&args);
+}
+
+/// R10-S8 (real ffmpeg, real `join-video`): a first source that starts on
+/// a non-key frame. Stream copy dropped every frame before its first key
+/// frame (no `-copyinkf`), so the output was short by those frames and
+/// the segment check refused a join that had lost material.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn join_video_keeps_a_non_keyframe_start_source() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_r10_s8_join");
+    let source = root.join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    let long = root.join("long.mp4");
+    long_gop_clip(&long, "3");
+    let first = source.join("20260910_120000_F.mp4");
+    cut_mid_gop(&long, "0.3", None, &first);
+    let flags = packet_fields(&first, "flags");
+    assert!(
+        flags.lines().next().is_some_and(|f| !f.contains('K')),
+        "fixture does not start on a non-key frame: {flags}"
+    );
+    assert!(!flags.contains('D'), "fixture has an edit list: {flags}");
+    let first_packets = flags.lines().count() as u64;
+    long_gop_clip(&source.join("20260910_120003_F.mp4"), "2");
+    let case = new_case(&root, &source, false);
+    let (_result, manifest) = join_all(&case, "r10-s8");
+    let check = &manifest["segment_check"];
+    assert_eq!(check["ok"], true, "{check:#}");
+    assert_eq!(
+        check["video_packets_observed"].as_u64(),
+        Some(first_packets + 20),
+        "{check:#}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// R10-S8 (real ffmpeg): a source that starts on a non-key frame AND has
+/// an edit list (its first packet is pre-roll). Its kept frames are
+/// compared by normalized payload hash, which R9 computed with stream
+/// copy WITHOUT `-copyinkf`: ffmpeg hashed fewer packets than ffprobe
+/// listed and the check could not run at all ("hashed N but lists M"),
+/// so every such join was refused. Now the correct output passes in MP4,
+/// Matroska and MPEG-TS and a one-frame shift (same count) is refused.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn non_keyframe_start_edit_list_output_is_compared_frame_by_frame() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_r10_s8");
+    let plain = root.join("plain.mp4");
+    long_gop_clip(&plain, "3");
+    // Frames 2..29 of `plain`: starts mid-GOP (key frame at frame 10).
+    let midgop = root.join("midgop.mp4");
+    cut_mid_gop(&plain, "0.2", None, &midgop);
+    let edited = root.join("edited.mp4");
+    ffmpeg_fixture(&[
+        "-i",
+        midgop.to_str().unwrap(),
+        "-c",
+        "copy",
+        "-copyinkf",
+        "-use_editlist",
+        "1",
+        edited.to_str().unwrap(),
+    ]);
+    patch_edit_list(&edited);
+    // The edit list drops frames 0-2 of `midgop` and flags frame 3 (a
+    // non-key frame) pre-roll: the source starts on a non-key frame.
+    let flags = packet_fields(&edited, "flags");
+    let first = flags.lines().next().unwrap_or_default();
+    assert!(
+        first.contains('D') && !first.contains('K'),
+        "fixture without non-key pre-roll: {flags}"
+    );
+    let kept = flags.lines().filter(|f| !f.contains('D')).count();
+    assert!(
+        flags
+            .lines()
+            .find(|f| !f.contains('D'))
+            .is_some_and(|f| !f.contains('K')),
+        "the first kept frame is a key frame: {flags}"
+    );
+    // What an ffmpeg that applies the edit list produces: the kept frames
+    // (frames 6.. of `plain`), and a one-frame shift of them (frames 5..,
+    // the last kept frame lost: same count).
+    let applied_part = root.join("applied.mp4");
+    cut_mid_gop(&plain, "0.6", Some(&kept.to_string()), &applied_part);
+    let shifted_part = root.join("shifted.mp4");
+    cut_mid_gop(&plain, "0.5", Some(&kept.to_string()), &shifted_part);
+    let sources = [edited.clone(), plain.clone()];
+    let offsets = [0.0, kept as f64 / 10.0];
+    let check = |output: &Path| {
+        frametrace::join::verify_segments_with(
+            &sources,
+            &offsets,
+            output,
+            &mut |path, hashes| {
+                if hashes {
+                    frametrace::join::normalized_video_packets("ffprobe", "ffmpeg", path, None)
+                } else {
+                    frametrace::join::video_packets("ffprobe", path, None, false)
+                }
+            },
+            &mut |path| frametrace::join::stream_packet_counts("ffprobe", path, None),
+        )
+        .expect("the check runs on a non-key-frame start")
+    };
+    for (format, ext) in [("mp4", "mp4"), ("matroska", "mkv"), ("mpegts", "ts")] {
+        let good = root.join(format!("out-good.{ext}"));
+        concat_keep_leading(&[&applied_part, &plain], &good, format);
+        let verdict = check(&good);
+        assert!(verdict.ok, "{format}: {:?}", verdict.problems);
+        assert_eq!(verdict.mode, "edit-list-applied", "{format}");
+        let bad = root.join(format!("out-shifted.{ext}"));
+        concat_keep_leading(&[&shifted_part, &plain], &bad, format);
+        let verdict = check(&bad);
+        assert!(!verdict.ok, "{format}: a one-frame shift passed");
+        assert!(
+            verdict.problems.iter().any(|p| p.contains("유지 프레임")),
+            "{format}: {:?}",
+            verdict.problems
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// R10-S8 (real ffmpeg): packets that carry ONLY parameter sets (SPS/PPS
+/// as packets of their own, as some DVRs write them). The normalizing
+/// filter removes their whole payload and drops them, so R9 hashed fewer
+/// packets than ffprobe listed and refused the file. They are now proven
+/// parameter-set-only and hashed as the empty payload; every other
+/// packet keeps the same normalized hash it has in the plain file.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn parameter_set_only_packets_are_accounted_for() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_r10_s8_ps");
+    let plain_mp4 = root.join("plain.mp4");
+    long_gop_clip(&plain_mp4, "3");
+    let plain = root.join("plain.mkv");
+    ffmpeg_fixture(&[
+        "-i",
+        plain_mp4.to_str().unwrap(),
+        "-c",
+        "copy",
+        plain.to_str().unwrap(),
+    ]);
+    // Packets of only SPS/PPS (one per key frame of `plain`) ...
+    let ps = root.join("ps.mkv");
+    ffmpeg_fixture(&[
+        "-i",
+        plain_mp4.to_str().unwrap(),
+        "-c",
+        "copy",
+        "-bsf:v",
+        "h264_mp4toannexb,filter_units=pass_types=7|8",
+        "-f",
+        "matroska",
+        ps.to_str().unwrap(),
+    ]);
+    // ... followed by the real stream, in one file.
+    let mixed = root.join("mixed.mkv");
+    concat_keep_leading(&[&ps, &plain], &mixed, "matroska");
+    let ps_count = packet_fields(&ps, "size").lines().count();
+    assert!(ps_count >= 2, "no parameter-set packets made");
+    let listed = packet_fields(&mixed, "size").lines().count();
+    assert_eq!(listed, ps_count + 30, "fixture packet count");
+    let mixed_packets =
+        frametrace::join::normalized_video_packets("ffprobe", "ffmpeg", &mixed, None)
+            .expect("parameter-set-only packets are accounted for");
+    let plain_packets =
+        frametrace::join::normalized_video_packets("ffprobe", "ffmpeg", &plain, None).unwrap();
+    assert_eq!(mixed_packets.len(), listed);
+    assert!(
+        mixed_packets[..ps_count]
+            .iter()
+            .all(|p| p.hash == Some(frametrace::join::EMPTY_PAYLOAD_HASH))
+    );
+    let rest: Vec<Option<u64>> = mixed_packets[ps_count..].iter().map(|p| p.hash).collect();
+    let expected: Vec<Option<u64>> = plain_packets.iter().map(|p| p.hash).collect();
+    assert_eq!(rest, expected, "picture packets hash as in the plain file");
+    let _ = std::fs::remove_dir_all(&root);
+}
