@@ -240,11 +240,27 @@ function verifySourcesVerdict(res) {
   // withholds the result — its mismatches are shown, never hidden.
   const newerMis = Number(res.newer_mismatched) > 0 ? Number(res.newer_mismatched) : 0;
   const withheld = res.withheld_reason == null ? "" : String(res.withheld_reason).trim();
-  const why = [withheld, reason && reason !== withheld ? reason : ""].filter(Boolean).join(" · ");
-  if (newerMis > 0) {
-    return { level: "err", kind: "newermismatch", label: `원본 재검증: 현재 결과 없음 — 불일치 ${newerMis}건`,
-      toast: `원본 재검증: 표식 없는 더 새 실행 있음 — 불일치 ${newerMis}건`,
-      hint: `원본 재검증: 현재 결과 없음 — 표식 없는 더 새 실행 있음 — 불일치 ${newerMis}건` + (why ? ` (${why})` : "") + " — 보관 이력서 5절에서 확인하십시오.",
+  // Several reasons may be joined with "; " (track I 32e88a2); the reason
+  // text repeats in not_verified_reason — each part once.
+  const parts = [];
+  for (const p of [withheld, reason].join("; ").split(/;\s*/)) {
+    const x = p.trim();
+    if (x && !parts.some(q => q.includes(x) || x.includes(q))) parts.push(x);
+  }
+  const why = parts.join(" · ");
+  const NEWER = "표식 없는 더 새 실행 있음";
+  const mis = Array.isArray(res.newer_mismatches) ? res.newer_mismatches.filter(m => m && typeof m === "object") : [];
+  if (newerMis > 0 || mis.length) {
+    const n = Math.max(newerMis, mis.length);
+    const other = parts.filter(x => !x.includes(NEWER)).join(" · ");
+    const runs = Number(res.newer_runs) > 1 ? ` · 실행 ${Number(res.newer_runs)}개` : "";
+    // Each mismatch: id + source path; hashes and run in its tooltip.
+    const items = mis.slice(0, 10).map(m => ({ id: String(m.id == null ? "" : m.id), path: String(m.source_path == null ? "" : m.source_path),
+      tip: [`기록 SHA-256 ${m.recorded_sha256 || "-"}`, `관측 SHA-256 ${m.observed_sha256 || "-"}`, `실행 ${m.run_id || "-"}` + (Number(m.run_unix) > 0 ? ` (${new Date(Number(m.run_unix) * 1000).toLocaleString()})` : "")].join("\n") }));
+    return { level: "err", kind: "newermismatch", label: `원본 재검증: 현재 결과 없음 — 불일치 ${n}건`,
+      toast: `원본 재검증: ${NEWER} — 불일치 ${n}건`,
+      hint: `${NEWER} — 불일치 ${n}건${runs}` + (other ? ` (${other})` : "") + " — 다시 실행하십시오 (보관 이력서 5절).",
+      items, more: Math.max(0, n - items.length),
       tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
   }
   if (res.is_result === false) {
@@ -286,8 +302,11 @@ $("btnVerifySources").addEventListener("click", async () => {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { $("finalHint").textContent = "원본 재검증 실패: " + (res.error || "알 수 없는 오류"); return; }
     const verdict = verifySourcesVerdict(res);
-    $("finalHint").textContent = verdict.hint;
-    $("finalHint").title = verdict.tip || "";
+    // R13 (track I1): a newer run's mismatches — id + source path listed,
+    // hashes in the tooltip.
+    const rows = Array.isArray(verdict.items) ? verdict.items : [];
+    $("finalHint").textContent = verdict.hint + rows.map(m => `\n· ${m.id || "-"} ${m.path}`).join("") + (verdict.more > 0 ? `\n· 외 ${verdict.more}건` : "");
+    $("finalHint").title = [verdict.tip || "", ...rows.map(m => `${m.id || "-"}: ${m.tip.replace(/\n/g, " · ")}`)].filter(Boolean).join("\n");
     toast(verdict.toast, verdict.level);
   } catch (err) {
     $("finalHint").textContent = "원본 재검증 실패: " + (err.message || err);

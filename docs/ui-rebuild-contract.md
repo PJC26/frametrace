@@ -890,4 +890,8 @@ const FTStore = {
 
 ### 20.4 보관본 상태 (U4, 트랙 I5)
 - `logChains[lane].removed_archive`(수리된 레인; 없으면 `repairs[].removed_archive` 중 가장 나쁜 것: differs > 알 수 없는 값 > missing > match) → 30-records `logChainArchiveText`: "보관본 일치"/"보관본 없음"/"보관본 다름"/"보관본 확인 안 됨"(i18n `chain.archive.*`, ko·en). "수리됨(…)" 바로 뒤, 더 나쁜 상태면 "… · 수리됨 · 보관본 …". 필드 없음(구 서버) = 덧붙이지 않음.
+### 20.5 트랙 I(32e88a2) 후속
+- `/api/verify-sources` `newer_runs`·`newer_records`·`newer_mismatches: [{run_id, run_unix, id, source_path, recorded_sha256, observed_sha256}]`: `newer_mismatched` 또는 목록이 있으면 위 `err` 판정에 `items`(최대 10개: id·source_path, title = 기록/관측 SHA-256·실행 id·시각)와 `more`(나머지 수). 앱 셸 점검 줄 아래 `<ul class="h-check-items">`(41-finalize `finCheckItemsHtml`, "외 N건 — 보관 이력서 5절"), legacy는 `#finalHint`에 줄마다(`white-space: pre-line`), 해시는 title. `withheld_reason`은 `; `로 여러 사유를 이을 수 있음 → 포함 검사, `not_verified_reason`과 겹치는 부분은 한 번만.
+- 수리 뒤 규칙(트랙 I2)을 뷰어 최신값에도: 30-records `logSlots(list, keyOf, chain, source)` — `chain.repairs[].line` 또는 `source`(전체 레인, 줄 = 위치 + 1)의 사용 가능 `event:"lane-repair"` 항목 중 마지막 줄이 키의 최신 사용 가능 항목 줄보다 뒤면 그 항목 복사본에 비열거 `ftRepairedAfter` → `recordStatusOf`가 `status: "unknown-after-repair"`(`repairedAfter: true`) "최신 여부 알 수 없음"(i18n `status.repairedAfter`, 툴팁 `status.tip.repairedAfter`), 확인됨·파생으로 쓰지 않음. 검증(validationLog)·카빙(carveLog, 10-boot)·복구(filesystemLog, 걸러낸 목록이라 전체 레인을 `source`로)·이어붙임(joinLog) 레인 모두 자기 `logChains[lane]`을 넘긴다. 줄 위치를 모르는 항목은 수리 뒤로 보지 않음(닫힌 쪽).
+- 하네스: verify-review-batch --unit "R13 I1", "R13 I2", verify-finalize-sheet 4g(불일치 행: 시트 안, 해시 title, 두 테마 AA).
 - 하네스: verify-review-batch --unit "R13 U1–U4", verify-finalize-sheet 4g(U1–U3, 두 테마 AA, 시트 안에 보임).

@@ -137,11 +137,27 @@ function verifySourcesVerdict(res) {
   // withholds the result — its mismatches are shown, never hidden.
   const newerMis = Number(res.newer_mismatched) > 0 ? Number(res.newer_mismatched) : 0;
   const withheld = res.withheld_reason == null ? "" : String(res.withheld_reason).trim();
-  const why = [withheld, reason && reason !== withheld ? reason : ""].filter(Boolean).join(" · ");
-  if (newerMis > 0) {
-    return { level: "err", kind: "newermismatch", label: `원본 재검증: 현재 결과 없음 — 불일치 ${newerMis}건`,
-      toast: `원본 재검증: 표식 없는 더 새 실행 있음 — 불일치 ${newerMis}건`,
-      hint: `원본 재검증: 현재 결과 없음 — 표식 없는 더 새 실행 있음 — 불일치 ${newerMis}건` + (why ? ` (${why})` : "") + " — 보관 이력서 5절에서 확인하십시오.",
+  // Several reasons may be joined with "; " (track I 32e88a2); the reason
+  // text repeats in not_verified_reason — each part once.
+  const parts = [];
+  for (const p of [withheld, reason].join("; ").split(/;\s*/)) {
+    const x = p.trim();
+    if (x && !parts.some(q => q.includes(x) || x.includes(q))) parts.push(x);
+  }
+  const why = parts.join(" · ");
+  const NEWER = "표식 없는 더 새 실행 있음";
+  const mis = Array.isArray(res.newer_mismatches) ? res.newer_mismatches.filter(m => m && typeof m === "object") : [];
+  if (newerMis > 0 || mis.length) {
+    const n = Math.max(newerMis, mis.length);
+    const other = parts.filter(x => !x.includes(NEWER)).join(" · ");
+    const runs = Number(res.newer_runs) > 1 ? ` · 실행 ${Number(res.newer_runs)}개` : "";
+    // Each mismatch: id + source path; hashes and run in its tooltip.
+    const items = mis.slice(0, 10).map(m => ({ id: String(m.id == null ? "" : m.id), path: String(m.source_path == null ? "" : m.source_path),
+      tip: [`기록 SHA-256 ${m.recorded_sha256 || "-"}`, `관측 SHA-256 ${m.observed_sha256 || "-"}`, `실행 ${m.run_id || "-"}` + (Number(m.run_unix) > 0 ? ` (${new Date(Number(m.run_unix) * 1000).toLocaleString()})` : "")].join("\n") }));
+    return { level: "err", kind: "newermismatch", label: `원본 재검증: 현재 결과 없음 — 불일치 ${n}건`,
+      toast: `원본 재검증: ${NEWER} — 불일치 ${n}건`,
+      hint: `${NEWER} — 불일치 ${n}건${runs}` + (other ? ` (${other})` : "") + " — 다시 실행하십시오 (보관 이력서 5절).",
+      items, more: Math.max(0, n - items.length),
       tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
   }
   if (res.is_result === false) {
@@ -400,7 +416,7 @@ async function finRunAudit() {
 
 async function gatherFinalizeChecks() {
   const checks = [];
-  const add = (level, text, sub, tip) => checks.push({ level, text, sub: sub || "", tip: tip || "" });
+  const add = (level, text, sub, tip, extra) => checks.push(Object.assign({ level, text, sub: sub || "", tip: tip || "" }, extra || {}));
   let st = null;
   try { st = await jget("/api/status"); } catch (e) { st = null; }
   const phase = st ? String(st.phase || "") : "";
@@ -474,7 +490,8 @@ async function gatherFinalizeChecks() {
     // R12 U1: lane_status "structural" → info "자기 일관성만 — 인증 아님".
     if (FIN.verify.kind === "structural") add("info", "원본 재검증: 자기 일관성만 — 인증 아님", FIN.verify.hint);
     // R13 U2: the verdict's own label (newer run's mismatches) comes first.
-    else add(lv === "ok" ? "ok" : "warn", FIN.verify.label ? FIN.verify.label : lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.kind === "noresult" ? "원본 재검증: 현재 결과 없음" : FIN.verify.kind === "unverified" ? "원본 재검증: 확인 불가" : "원본 재검증: 일부만 확인됨", FIN.verify.hint, FIN.verify.tip);
+    else add(lv === "ok" ? "ok" : "warn", FIN.verify.label ? FIN.verify.label : lv === "ok" ? "원본 재검증: 모두 일치" : lv === "err" ? "원본 재검증: 불일치 있음" : FIN.verify.kind === "noresult" ? "원본 재검증: 현재 결과 없음" : FIN.verify.kind === "unverified" ? "원본 재검증: 확인 불가" : "원본 재검증: 일부만 확인됨", FIN.verify.hint, FIN.verify.tip,
+      { items: FIN.verify.items || [], more: FIN.verify.more || 0 });
   } else {
     add("info", "원본 재검증: 아직 실행하지 않음", "패키징할 때 원본 SHA-256을 다시 계산해 일치/불일치를 그대로 기록합니다. 지금 확인하려면 고급 ▸ 원본 재검증.");
   }
@@ -498,7 +515,15 @@ function finRowHtml(c) {
     : "";
   return `<li class="h-check h-check-${esc(c.level)}" data-level="${esc(c.level)}"${c.tip ? ` title="${esc(c.tip)}"` : ""}>${finIcon(lv.icon)}` +
     `<span class="h-check-text"><span class="sr-only">${lv.word}: </span>${esc(c.text)}` +
-    (c.sub ? `<small>${esc(c.sub)}</small>` : "") + fix + `</span></li>`;
+    (c.sub ? `<small>${esc(c.sub)}</small>` : "") + finCheckItemsHtml(c) + fix + `</span></li>`;
+}
+// R13 (track I1): the rows behind a count (newer run's mismatches): id +
+// source path, the hashes in each row's tooltip.
+function finCheckItemsHtml(c) {
+  const items = Array.isArray(c.items) ? c.items : [];
+  if (!items.length) return "";
+  return `<ul class="h-check-items">` + items.map(m => `<li${m.tip ? ` title="${esc(m.tip)}"` : ""}><code class="mono">${esc(m.id || "-")}</code> <span>${esc(m.path)}</span></li>`).join("") +
+    (c.more > 0 ? `<li class="muted">외 ${Number(c.more)}건 — 보관 이력서 5절</li>` : "") + `</ul>`;
 }
 // Writes markup only when it changed: a background re-check that finds the
 // same result must not re-announce the verdict (role=status) or rebuild a
@@ -910,7 +935,8 @@ async function finVerifySources() {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { finHint("원본 재검증 실패: " + (res.error || "알 수 없는 오류")); return; }
     const verdict = verifySourcesVerdict(res);
-    FIN.verify = { level: verdict.level, hint: verdict.hint, kind: verdict.kind || "", tip: verdict.tip || "", label: verdict.label || "" };
+    FIN.verify = { level: verdict.level, hint: verdict.hint, kind: verdict.kind || "", tip: verdict.tip || "", label: verdict.label || "",
+      items: verdict.items || [], more: verdict.more || 0 };
     finHint("");
     toast(verdict.toast, verdict.level);
     finRefresh();

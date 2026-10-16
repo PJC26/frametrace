@@ -315,7 +315,7 @@ pre.log { background: var(--media-bg); color: var(--media-muted); border-radius:
 .minihead { font-size: var(--fs-xs); font-weight: 700; color: var(--muted); letter-spacing: .03em; text-transform: uppercase; margin: 0 0 6px; }
 #finalCard.on { display: flex; flex-direction: column; min-height: calc(100vh - var(--bar-h) - 80px); }
 #finalCard .viewcols { flex: 0 0 auto; }
-#finalHint { font-size: var(--fs-xs); margin: 8px 0 0; }
+#finalHint { font-size: var(--fs-xs); margin: 8px 0 0; white-space: pre-line; overflow-wrap: anywhere; }
 #reportWrap { flex: 1; min-height: 0; display: flex; flex-direction: column; margin-top: 12px; }
 #reportFrame { flex: 1; min-height: 300px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
 .stack { display: grid; gap: 6px; }

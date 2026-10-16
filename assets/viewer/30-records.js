@@ -440,8 +440,28 @@ function logTrustSuperseded(item) {
 // unusable entry is current and carries the non-enumerable flag
 // `ftNewerUnauth` ("더 최근 인증 안 된 항목 있음"; a copy, so the log list
 // itself is untouched and exports never see the flag).
-function logSlots(list, keyOf) {
+// R13 (track I2, P16): a usable `lane-repair` marker after a key's latest
+// entry — the repair cut a tail that may have held a newer entry — makes
+// that entry "최신 여부 알 수 없음" (a copy flagged `ftRepairedAfter`, never
+// confirmed). Markers: `chain.repairs[].line` (records-meta `logChains`)
+// and usable `event: "lane-repair"` entries of `source` (the whole lane as
+// sent, line = position + 1; defaults to `list` — pass it when `list` is a
+// filtered copy).
+function logRepairLines(chain, source) {
+  const lines = [];
+  if (chain && typeof chain === "object" && Array.isArray(chain.repairs)) {
+    for (const r of chain.repairs) if (r && Number(r.line) > 0) lines.push(Number(r.line));
+  }
+  (Array.isArray(source) ? source : []).forEach((item, i) => {
+    if (item && typeof item === "object" && item.event === "lane-repair" && logTrustUsable(logTrustOf(item))) lines.push(i + 1);
+  });
+  return lines;
+}
+function logSlots(list, keyOf, chain, source) {
   const slots = new Map();
+  const all = Array.isArray(source) ? source : Array.isArray(list) ? list : [];
+  const lastRepair = Math.max(0, ...logRepairLines(chain, all));
+  const lineOf = lastRepair ? new Map(all.map((item, i) => [item, i + 1])) : null;
   for (const item of Array.isArray(list) ? list : []) {
     if (!item || typeof item !== "object") continue;
     const key = keyOf(item);
@@ -449,8 +469,14 @@ function logSlots(list, keyOf) {
     let slot = slots.get(key);
     if (!slot) { slot = { usable: null, untrusted: null, last: null, superseded: false }; slots.set(key, slot); }
     if (logTrustUsable(logTrustOf(item))) {
-      slot.usable = item;
-      slot.last = item;
+      let entry = item;
+      const line = lineOf ? lineOf.get(item) : 0;
+      if (lastRepair && !(line > lastRepair)) {
+        entry = Object.assign({}, item);
+        Object.defineProperty(entry, "ftRepairedAfter", { value: true, enumerable: false });
+      }
+      slot.usable = entry;
+      slot.last = entry;
       continue;
     }
     let entry = item;
@@ -471,8 +497,8 @@ function logSlots(list, keyOf) {
 // The current entry per key (first-seen key order): the latest one. R10 U1
 // (P7): an unusable latest entry is current even when an earlier one was
 // usable — the record is then not confirmed (its own status says so).
-function currentLogEntries(list, keyOf) {
-  return [...logSlots(list, keyOf).values()].map(slot => slot.last);
+function currentLogEntries(list, keyOf, chain, source) {
+  return [...logSlots(list, keyOf, chain, source).values()].map(slot => slot.last);
 }
 // The server's reason for an entry this PC could not use (`trust_note`),
 // "" otherwise. R10 U5: in a bundle the reason was written on the PC that
@@ -498,13 +524,15 @@ function logTrustNote(item, any) {
 function recordStatusOf(own, valid, unvalid, fallback) {
   const ownTrust = own ? logTrustOf(own) : "";
   const untrusted = (item, trust) => {
+    // R13: usable, but a lane repair follows it — the latest is unknown.
+    if (item.ftRepairedAfter && logTrustUsable(trust)) return { status: "unknown-after-repair", trust, repairedAfter: true };
     const out = { status: untrustedStatusOf(trust), trust };
     if (item.ftNewerUnauth) out.newer = true;
     const note = logTrustNote(item);
     if (note) out.note = note;
     return out;
   };
-  if (own && !logTrustUsable(ownTrust)) return untrusted(own, ownTrust);
+  if (own && (!logTrustUsable(ownTrust) || own.ftRepairedAfter)) return untrusted(own, ownTrust);
   // R11 U2: a usable entry's note (legacy, unbound) stays in the tooltip.
   const usable = (out, ...items) => {
     const note = [...new Set(items.map(i => logTrustNote(i, true)).filter(Boolean))].join("\n");
@@ -526,6 +554,7 @@ function statusTitle(record) {
   const head = newer ? t("status.tip.newer") + " · " : "";
   if (status === "auth-other-pc") return head + tf("trust.otherPc", { key: logTrustPcKey(trust) || "?" }) + note;
   if (status === "unauthenticated") return head + t(newer ? "status.unauth" : "status.tip.unauth") + note;
+  if (status === "unknown-after-repair") return head + t("status.tip.repairedAfter") + note;
   if (trust === "sc") return status + " · " + t("trust.sc") + note;
   return status + note;
 }
@@ -602,6 +631,7 @@ function logChainItems(chains, lanes) {
 function statusLabel(status) {
   if (status === "unauthenticated") return t("status.unauth");
   if (status === "auth-other-pc") return t("status.otherPc");
+  if (status === "unknown-after-repair") return t("status.repairedAfter");
   if (status === "ffprobe-video-stream-confirmed") return t("status.verified");
   if (status === "ffprobe-confirmed") return t("status.confirmed");
   if (status === "validation-failed") return t("status.failed");
@@ -691,14 +721,14 @@ function videoFps(video) {
 // R9 U1: a validation this PC could not authenticate never confirms a
 // record: `validationsByPath` holds the usable entry per path,
 // `untrustedValidationsByPath` the one that is not.
-const validationSlots = logSlots(validationLog, item => normalizePath(item.target_path));
+const validationSlots = logSlots(validationLog, item => normalizePath(item.target_path), logChains && logChains.validationLog);
 // R10 U1 (P7): only the path's LATEST validation counts — a usable one
 // confirms; an unusable one (even after a usable one) makes the record
 // unauthenticated. An older usable line is never rolled back to.
 function splitValidationSlots(slots) {
   const usable = new Map(), untrusted = new Map();
   for (const [k, s] of slots) {
-    if (s.last && s.last === s.usable) usable.set(k, s.usable);
+    if (s.last && s.last === s.usable && !s.usable.ftRepairedAfter) usable.set(k, s.usable);
     else if (s.last) untrusted.set(k, s.last);
   }
   return { usable, untrusted };
@@ -708,7 +738,8 @@ const validationsByPath = validationSplit.usable;
 const untrustedValidationsByPath = validationSplit.untrusted;
 const recoveredFilesystemLog = currentLogEntries(
   filesystemLog.filter(item => item && item.event === "recover-inode" && item.output_path),
-  item => `${item.partition_offset ?? 0}:${item.inode || normalizePath(item.output_path)}`);
+  item => `${item.partition_offset ?? 0}:${item.inode || normalizePath(item.output_path)}`,
+  logChains && logChains.filesystemLog, filesystemLog);
 // Case-level warnings recorded on inspection events (e.g. a truncated
 // fls listing means the deleted-file list is incomplete) — the reviewer
 // must see them, not just the CLI.
@@ -721,7 +752,7 @@ const inspectionWarnings = filesystemLog
 // output path supersedes an earlier one.
 // R10 U1 (P7): a later entry this PC could not use makes the record
 // unauthenticated ("더 최근 인증 안 된 항목 있음"), never the older usable one.
-const joinLog = currentLogEntries(Array.isArray(DATA.joinLog) ? DATA.joinLog : [], item => item.output_path ? normalizePath(item.output_path) : "");
+const joinLog = currentLogEntries(Array.isArray(DATA.joinLog) ? DATA.joinLog : [], item => item.output_path ? normalizePath(item.output_path) : "", logChains && logChains.joinLog);
 
 // Gaps/overlaps of a join (log entry, plan or manifest totals) are not
 // determinable when it was ordered by file name only: the server counts

@@ -758,6 +758,7 @@ async function unitTests() {
 // ---- R13 track U (docs/PLAN_R13_2026-10-16.md) -----------------------------
 async function r13TrackU({ fn, runInNewContext, assert, ex }) {
   const { readFileSync } = await import('node:fs');
+  const plain = (v) => JSON.parse(JSON.stringify(v));
   const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
   const jn = (state, extra) => Object.assign({ path: 'review/finalize.inprogress.json', state, examiner: 'Hong', started_unix: 1760000000, signoff_sha256: 'ab12', error: null }, extra || {});
   // U1 (track S, P15/P17): unpaired / other-host / recovering.
@@ -811,6 +812,62 @@ async function r13TrackU({ fn, runInNewContext, assert, ex }) {
   assert.equal(sum({ status: 'repaired', repaired: true }), '수리됨(손상된 끝부분 잘라냄)', 'R13 U4 absent (older server) → nothing added');
   assert.equal(sum({ status: 'repaired', repaired: true, removed_archive: 'weird' }), '수리됨(손상된 끝부분 잘라냄) · 보관본 확인 안 됨', 'R13 U4 unknown value');
   console.log('PASS VM R13 U4 logChains removed_archive → 보관본 일치/없음/다름');
+
+  // R13 follow-up (track I 32e88a2): newer_mismatches listed under the row;
+  // withheld_reason may join several reasons with "; ".
+  const mm = [{ run_id: '300-cccc', run_unix: 1760000300, id: 'vid_000007', source_path: 'D:/src/a.mp4', recorded_sha256: 'aa11', observed_sha256: 'bb22' },
+    { run_id: '300-cccc', run_unix: 1760000300, id: 'vid_000009', source_path: 'D:/src/b.mp4', recorded_sha256: 'cc33', observed_sha256: 'dd44' }];
+  const fr = { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: '100-aaaa',
+    withheld_reason: '완료 표식 뒤 사용 불가 줄; 표식 없는 더 새 실행 있음 (실행 1개 · 기록 2개 · 불일치 2건)', not_verified_reason: '표식 없는 더 새 실행 있음 (실행 1개 · 기록 2개 · 불일치 2건)',
+    newer_runs: 1, newer_records: 2, newer_mismatched: 2, newer_mismatches: mm, lane_status: 'keyed' };
+  for (const [i, vm] of [ex, legacyVm].entries()) {
+    const r = plain(runInNewContext('verifySourcesVerdict(fr)', Object.assign(vm, { fr })));
+    assert.ok(r.level === 'err' && r.items.length === 2 && r.items[0].id === 'vid_000007' && r.items[0].path === 'D:/src/a.mp4' && /aa11/.test(r.items[0].tip) && /bb22/.test(r.items[0].tip) && /300-cccc/.test(r.items[0].tip) && r.more === 0,
+      `R13 I1 newer_mismatches items (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
+    assert.ok(/완료 표식 뒤 사용 불가 줄/.test(r.hint) && (r.hint.match(/표식 없는 더 새 실행 있음/g) || []).length === 1, `R13 I1 "; "-joined reasons, each once (${i ? 'legacy' : 'shell'}): ` + r.hint);
+  }
+  const rowHtml = runInNewContext(`finRowHtml({ level: 'warn', text: 'x', sub: 'y', tip: '', items: verifySourcesVerdict(fr).items, more: 3 })`, ex);
+  assert.ok(/<ul class="h-check-items"><li title="기록 SHA-256 aa11\n관측 SHA-256 bb22\n실행 300-cccc[^"]*"><code class="mono">vid_000007<\/code> <span>D:\/src\/a\.mp4<\/span><\/li>/.test(rowHtml) && /외 3건/.test(rowHtml), 'R13 I1 rows rendered under the count: ' + rowHtml);
+  const many = runInNewContext('verifySourcesVerdict(fm)', Object.assign(ex, { fm: Object.assign({}, fr, { newer_mismatched: 14, newer_mismatches: Array.from({ length: 14 }, (_, k) => Object.assign({}, mm[0], { id: 'v' + k })) }) }));
+  assert.ok(many.items.length === 10 && many.more === 4 && /불일치 14건/.test(many.label), 'R13 I1: 10 rows + 외 4건');
+  // withheld_reason with no newer run: the P16 sentence matched by contains.
+  const contains = runInNewContext(`verifySourcesVerdict({ matched: 0, mismatched: 0, not_comparable: 0, is_result: false, withheld_reason: 'lane-repair 표식; 표식 없는 더 새 실행 있음 (실행 1개 · 기록 1개 · 불일치 0건)', newer_mismatched: 0 })`, ex);
+  assert.ok(contains.level === 'warn' && /lane-repair 표식 · 표식 없는 더 새 실행 있음/.test(contains.hint), 'R13 I1 several reasons: ' + contains.hint);
+  assert.ok(/rows\.map\(m => `\\n· \$\{m\.id/.test(legacySrc) && /white-space: pre-line/.test(readFileSync(new URL('../assets/legacy/app/app.css', import.meta.url), 'utf8')), 'R13 I1: the legacy hint lists the rows on their own lines');
+  console.log('PASS VM R13 I1 newer_mismatches listed (id + path, hashes in tooltip) in both shells; "; "-joined reasons');
+
+  // R13 follow-up (track I2): repaired-after in the viewer's latest-value logic.
+  const rctx = { t: (k) => ({ 'status.repairedAfter': '최신 여부 알 수 없음', 'status.tip.repairedAfter': '최신 여부 알 수 없음 — 수리됨', 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가' })[k] || k, tf: (k) => k, viewerTrustFromBundle: () => false, normalizePath: (p) => String(p) };
+  runInNewContext(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'untrustedStatusOf', 'logTrustSuperseded', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusLabel'].map((n) => {
+    const f = fn(n); assert.ok(f, `R13 I2: ${n} exists`); return f; }).join('\n'), rctx);
+  const vlog = [
+    { target_path: 'A', validation_status: 'ffprobe-confirmed', trust: 'auth' },
+    { target_path: 'B', validation_status: 'ffprobe-confirmed', trust: 'auth' },
+    { event: 'lane-repair', kept_entries: 2, trust: 'auth' },
+    { target_path: 'B', validation_status: 'ffprobe-video-stream-confirmed', trust: 'auth' },
+  ];
+  const st = (list, chain, path) => plain(runInNewContext(`(() => { const sp = splitValidationSlots(logSlots(list, (i) => i.target_path || '', chain));
+    return recordStatusOf(null, sp.usable.get(path) || null, sp.untrusted.get(path) || null, 'candidate-unvalidated'); })()`, Object.assign(rctx, { list, chain, path })));
+  const a = st(vlog, { status: 'repaired', repairs: [{ line: 3 }] }, 'A');
+  assert.ok(a.status === 'unknown-after-repair' && a.repairedAfter === true, 'R13 I2: newest entry before the repair → 최신 여부 알 수 없음: ' + JSON.stringify(a));
+  assert.equal(runInNewContext('statusLabel("unknown-after-repair")', rctx), '최신 여부 알 수 없음', 'R13 I2 label');
+  assert.equal(st(vlog, { status: 'repaired', repairs: [{ line: 3 }] }, 'B').status, 'ffprobe-video-stream-confirmed', 'R13 I2: an entry after the repair stays current');
+  // From repairs[].line alone (no marker in the list), and from the marker alone.
+  const noMarker = vlog.filter((x) => x.event !== 'lane-repair');
+  assert.equal(st(noMarker, { status: 'repaired', repairs: [{ line: 2 }] }, 'A').status, 'unknown-after-repair', 'R13 I2: repairs[].line alone');
+  assert.equal(st(vlog, null, 'A').status, 'unknown-after-repair', 'R13 I2: the usable marker entry alone');
+  assert.equal(st(noMarker, null, 'A').status, 'ffprobe-confirmed', 'R13 I2: no repair → unchanged');
+  assert.equal(st([vlog[0], { event: 'lane-repair', trust: 'unauth' }], null, 'A').status, 'ffprobe-confirmed', 'R13 I2: an unusable marker is not a repair');
+  // Own entries (carve / join) and filtered lists use the whole lane's positions.
+  const ownSt = plain(runInNewContext(`(() => { const all = [{ event: 'recover-inode', output_path: 'X', trust: 'auth' }, { event: 'inspect' }, { event: 'lane-repair', trust: 'auth' }];
+    const cur = currentLogEntries(all.filter((i) => i.event === 'recover-inode'), (i) => i.output_path, null, all);
+    return recordStatusOf(cur[0], null, null, 'derived'); })()`, rctx));
+  assert.equal(ownSt.status, 'unknown-after-repair', 'R13 I2: a filtered list uses the source positions: ' + JSON.stringify(ownSt));
+  const recSrc = readFileSync(new URL('../assets/viewer/30-records.js', import.meta.url), 'utf8');
+  const bootSrc = readFileSync(new URL('../assets/viewer/10-boot.js', import.meta.url), 'utf8');
+  assert.ok(/logSlots\(validationLog, [^\n]*logChains && logChains\.validationLog\)/.test(recSrc) && /logChains && logChains\.filesystemLog, filesystemLog\)/.test(recSrc) && /logChains && logChains\.joinLog\)/.test(recSrc) && /DATA\.logChains\.carveLog/.test(bootSrc), 'R13 I2: every lane passes its chain');
+  for (const k of ['status.repairedAfter', 'status.tip.repairedAfter']) assert.equal((i18n.match(new RegExp(`"${k.replace(/\./g, '\\.')}": `, 'g')) || []).length, 2, `R13 I2: ${k} in ko + en`);
+  console.log('PASS VM R13 I2 a lane-repair after a record\'s newest entry → 최신 여부 알 수 없음 (validation / own / filtered lanes)');
 }
 
 // ---- R12 track U (docs/PLAN_R12_2026-10-16.md) -----------------------------
@@ -902,7 +959,7 @@ async function r12TrackU({ fn, runInNewContext, assert, ex }) {
     assert.ok(/200-bbbb/.test(r.tip || '') && /결과 실행 없음/.test(r.tip || ''), `R12 I4 expected_run_id in the tip (${i ? 'legacy' : 'shell'}): ` + JSON.stringify(r));
   }
   assert.ok(!runInNewContext(`verifySourcesVerdict({ matched: 0, mismatched: 0, not_comparable: 0, is_result: false }).tip`, ex), 'R12 I4: no expected_run_id → no tip');
-  assert.ok(/title="\$\{esc\(c\.tip\)\}"/.test(readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8')) && /\$\("finalHint"\)\.title = verdict\.tip/.test(legacySrc), 'R12 I4: both shells put the tip on screen');
+  assert.ok(/title="\$\{esc\(c\.tip\)\}"/.test(readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8')) && /\$\("finalHint"\)\.title = \[?verdict\.tip/.test(legacySrc), 'R12 I4: both shells put the tip on screen');
   console.log('PASS VM R12 I4 expected_run_id shown in the tooltip when is_result:false');
 
   // R12 follow-up (track S 608884d): journal states, recovered detail,
@@ -937,7 +994,7 @@ async function r11TrackU({ fn, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'ftIcon', 'logTrustTagHtml'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'ftIcon', 'logTrustTagHtml'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R11 U1/U2: ${n} exists (viewer)`);
@@ -1064,7 +1121,7 @@ async function r10TrackU({ fn, source, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainArchiveText', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainArchiveText', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R10 U1/U3: ${n} exists (30-records.js)`);
@@ -1171,7 +1228,7 @@ async function r9TrackU({ fn, source, runInNewContext, assert, ex }) {
     t: (k) => ({ 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가', 'status.tip.unauth': '인증 안 됨 — …', 'trust.sc': '자기 일관성만(인증 아님)' })[k] || k,
     tf: (k, s) => (k === 'trust.otherPc' ? `이 PC에서 인증 불가(변조 판정 아님) — 키 ${s.key} 보유 PC에서 확인` : k),
   };
-  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
+  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairLines', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
     const src = fn(n);
     assert.ok(src, `R9 U1: ${n} exists (30-records.js)`);
     return src;

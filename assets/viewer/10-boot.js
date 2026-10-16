@@ -46,7 +46,8 @@ const scan = DATA.scan && typeof DATA.scan === "object" ? DATA.scan : {};
 // artifacts that ever landed in the log. R9 U1: an authenticated (or
 // legacy / self-consistent) entry is the current one; a later entry this
 // PC could not authenticate never replaces it (30-records currentLogEntries).
-const carveLog = currentLogEntries(Array.isArray(DATA.carveLog) ? DATA.carveLog : [], item => item.id ? String(item.id) : "");
+const carveLog = currentLogEntries(Array.isArray(DATA.carveLog) ? DATA.carveLog : [], item => item.id ? String(item.id) : "",
+  DATA.logChains && typeof DATA.logChains === "object" ? DATA.logChains.carveLog : null);
 const filesystemLog = Array.isArray(DATA.filesystemLog) ? DATA.filesystemLog : [];
 const validationLog = Array.isArray(DATA.validationLog) ? DATA.validationLog : [];
 const anomalyLog = Array.isArray(DATA.anomalyLog) ? DATA.anomalyLog : [];

@@ -531,13 +531,37 @@ await check('4g R13 U1–U3: 짝 없음 / 다른 PC 차단 / 복구 중; --dismi
   await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
   // U2: a newer usable run without a marker — its mismatches on the checklist.
   S.status = Object.assign({}, before, base, { finalize_journal: null });
-  S.verifySources = { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: 'r1', withheld_reason: '표식 없는 더 새 실행 있음', newer_mismatched: 2, lane_status: 'keyed' };
+  S.verifySources = { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: 'r1', withheld_reason: '완료 표식 뒤 사용 불가 줄; 표식 없는 더 새 실행 있음 (실행 1개 · 기록 2개 · 불일치 2건)', newer_runs: 1, newer_records: 2, newer_mismatched: 2, lane_status: 'keyed',
+    newer_mismatches: [{ run_id: '300-cccc', run_unix: 1760000300, id: 'vid_000007', source_path: 'D:/증거/원본/a_very_long_folder_name_for_wrapping/clip_0007.mp4', recorded_sha256: 'a'.repeat(64), observed_sha256: 'b'.repeat(64) },
+      { run_id: '300-cccc', run_unix: 1760000300, id: 'vid_000009', source_path: 'D:/src/b.mp4', recorded_sha256: 'c'.repeat(64), observed_sha256: 'd'.repeat(64) }] };
   await page.click('#finalAdvanced > summary');
   await page.click('#btnVerifySources');
   await page.waitForFunction(() => /원본 재검증: 현재 결과 없음 — 불일치 2건/.test(document.getElementById('finalChecklist').textContent), null, { timeout: 5000 })
     .catch(async (e) => { throw new Error(e.message + ' ' + await page.textContent('#finalChecklist')); });
   const vs = (await rows(page)).find((r) => /원본 재검증/.test(r.text));
   assert.ok(vs && vs.level === 'warn' && /표식 없는 더 새 실행 있음 — 불일치 2건/.test(vs.text) && !/모두 일치/.test(vs.text), 'U2 row: ' + JSON.stringify(vs));
+  // Track I (32e88a2): each mismatch listed under the row — id + source path,
+  // hashes in its tooltip, inside the sheet, AA in both themes.
+  const items = await page.evaluate(() => {
+    const sheet = document.querySelector('#finalChecklist').getBoundingClientRect();
+    return [...document.querySelectorAll('#finalChecklist .h-check-items li')].map((li) => {
+      const b = li.getBoundingClientRect();
+      return { text: li.textContent, tip: li.getAttribute('title') || '', inside: b.width > 0 && b.right <= sheet.right + 1 };
+    });
+  });
+  assert.ok(items.length === 2 && /vid_000007/.test(items[0].text) && /clip_0007\.mp4/.test(items[0].text) && items[0].tip.includes('a'.repeat(64)) && items[0].tip.includes('b'.repeat(64)) && items.every((i) => i.inside), 'newer_mismatches rows: ' + JSON.stringify(items));
+  for (const th of ['light', 'dark']) {
+    await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, th);
+    const els = await page.evaluate(() => [...document.querySelectorAll('#finalChecklist .h-check-items li, #finalChecklist .h-check-items li *')].map((el) => {
+      const parse = (s) => s.match(/rgba?\(([^)]+)\)/)[1].split(',').map(Number);
+      let bg = [255, 255, 255];
+      for (let e = el; e; e = e.parentElement) { const c = parse(getComputedStyle(e).backgroundColor); if (c.length < 4 || c[3] > 0.5) { bg = c.slice(0, 3); break; } }
+      return { fg: parse(getComputedStyle(el).color).slice(0, 3), bg };
+    }));
+    assert.ok(els.length >= 4, 'measured rows');
+    for (const e of els) assert.ok(ratio(e.fg, e.bg) >= 4.5, `${th}: mismatch row contrast ${ratio(e.fg, e.bg).toFixed(2)}`);
+  }
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
   S.verifySources = savedVs;
   S.status = before;
   assert.deepEqual(page.__errors, []);
