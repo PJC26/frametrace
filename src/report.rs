@@ -316,6 +316,8 @@ const validationRepairAt = validationAll.map(isLaneRepair).lastIndexOf(true);
 const validationPosition = new Map(validationAll.map((item, at) => [item, at]));
 const anomalyAll = (rows => Array.isArray(rows) ? rows : [])({anomaly_lines});
 const anomalyLog = usableLog("anomaly", anomalyAll);
+// R14 P20: lane position of every entry — runs are judged by span.
+const anomalyPosition = new Map(anomalyAll.map((item, at) => [item, at]));
 // R11-I2 (P9): an anomaly entry this PC cannot use AFTER the newest usable
 // run marker (e.g. the newest run's marker HMAC stripped) means the newest
 // run's outcome is unknown — no older run stands in as "current".
@@ -649,11 +651,28 @@ const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(tru
 // completed run — cut short, OR its marker was deleted (no key needed) —
 // WITHHOLDS the result (R8 showed the older run as "current" with a
 // notice); its findings are shown with the "no result" notice.
-const newerAnomalyRuns = latestCompleted >= 0 ? anomalyRuns.slice(latestCompleted + 1) : [];
+// R14 P20: by SPAN, not position — `flushUnmarked` puts an interleaved
+// unmarked run BEFORE the completed run whose marker ended it, so an
+// unmarked run is also newer when its first entry is after the completed
+// run's first entry or its scanned_unix is greater.
+const anomalyRunFirst = run => Math.min(...run.entries.map(item => anomalyPosition.get(item) ?? Infinity), run.run ? (anomalyPosition.get(run.run) ?? Infinity) : Infinity);
+const latestAnomalyRun = anomalyRuns[latestCompleted] || null;
+// R14 I4: no completed run at all in a lane written by a marker-writing
+// scanner (its entries carry schema_version — every scanner since run
+// markers exist): every marker may have been deleted, so the last unmarked
+// run is not "current" either. Legacy logs without markers keep grouping
+// by time.
+const anomalyMarkedLane = anomalyLog.some(item => item?.schema_version !== undefined);
+const newerAnomalyRuns = latestAnomalyRun
+  ? anomalyRuns.filter((run, index) => run.run === null && (index > latestCompleted
+      || anomalyRunFirst(run) > anomalyRunFirst(latestAnomalyRun)
+      || (Number.isFinite(run.ts) && Number.isFinite(latestAnomalyRun.ts) && run.ts > latestAnomalyRun.ts)))
+  : anomalyMarkedLane ? anomalyRuns.slice() : [];
 const anomalyWithheldReasons = [
   anomalyUnusableAfter ? "가장 최근 완료 실행의 완료 표식 뒤에 이 PC에서 인증할 수 없는 항목이 있어(더 새 실행의 완료 표식일 수 있음) 그 결과를 알 수 없습니다 (아래 \"인증 안 된 감사 항목\" 참조)" : "",
   anomalyRepairedAfter ? "마지막 완료 실행 뒤에 레인 수리(lane-repair) 표식이 있어 — 잘린 꼬리에 더 새 실행이 있었을 수 있어 — 최신 실행을 알 수 없습니다 (이상 징후 검사를 다시 실행하십시오)" : "",
-  newerAnomalyRuns.length ? `표식 없는 더 새 실행 있음 — 마지막 완료 실행 뒤에 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회: 완료 표식이 지워졌거나 실행이 중단됐을 수 있습니다 (이상 징후 검사를 다시 실행하십시오)` : "",
+  newerAnomalyRuns.length && latestAnomalyRun ? `표식 없는 더 새 실행 있음 — 마지막 완료 실행 뒤에 있거나 그 뒤에 시작한 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회: 완료 표식이 지워졌거나 실행이 중단됐을 수 있습니다 (이상 징후 검사를 다시 실행하십시오)` : "",
+  newerAnomalyRuns.length && !latestAnomalyRun ? `표식 없는 더 새 실행 있음 — 완료된 실행이 없고 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회만 있습니다: 완료 표식이 지워졌거나 실행이 중단됐을 수 있어 결과가 아닙니다 (이상 징후 검사를 다시 실행하십시오)` : "",
 ].filter(Boolean);
 const currentAnomalyIndex = anomalyWithheldReasons.length ? -1 : latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
 const currentAnomalyRun = anomalyRuns[currentAnomalyIndex] || null;
@@ -2839,6 +2858,15 @@ pub(crate) fn audio_levels_object(json: &str) -> String {
         _ => "{}".to_string(),
     }
 }
+
+// R14 I3 (track I): the `hash-verify-head` writer/reader, apart from the
+// finalize pairing above.
+#[path = "report_hash_verify_head.rs"]
+mod hash_verify_head;
+pub use hash_verify_head::{
+    HASH_VERIFY_HEAD_EVENT, HASH_VERIFY_HEAD_TRUNCATED, HASH_VERIFY_MARKER_HEAD_FIELD,
+    HashVerifyHeadCheck, hash_verify_head_check, record_hash_verify_head,
+};
 
 /// A JSON array literal; anything else (empty input, garbage) is `[]`.
 fn json_array_or_empty(json: &str) -> String {
@@ -5077,5 +5105,65 @@ mod tests {
             }
         ));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R14 I2 (Medium, the R13 reviewer's PoC): two anomaly runs
+    /// interleaved — A's finding, B's finding, A's marker, B's marker —
+    /// and B's marker deleted (the last line; no key). `flushUnmarked`
+    /// pushed B BEFORE A, so B was not "newer" and A stood as the current
+    /// result with B's finding in the history. P20: an unmarked run whose
+    /// first row is after the result run's first row, or whose
+    /// `scanned_unix` is greater, is newer.
+    #[test]
+    fn r14_i2_interleaved_anomaly_run_without_its_marker_withholds() {
+        let anomaly = [
+            r#"{"schema_version":1,"event":"anomaly-scan","scanned_unix":100,"kind":"gap","selector":"vid_a","detail":"a"}"#,
+            r#"{"schema_version":1,"event":"anomaly-scan","scanned_unix":200,"kind":"gap","selector":"vid_b","detail":"b"}"#,
+            r#"{"schema_version":1,"event":"anomaly-scan-run","scanned_unix":100,"hash_mode":"stored","finding_count":1}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &anomaly)]);
+        let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        assert!(current.contains("현재 결과 없음(결과 아님)"), "{current}");
+        assert!(current.contains("표식 없는 더 새 실행 있음"), "{current}");
+        assert!(current.contains("vid_b"), "{current}");
+        assert!(!current.contains("현재 결과 —"), "{current}");
+        // An older crash (first entry and scan time before the completed
+        // run) still does not withhold.
+        let anomaly = [
+            r#"{"schema_version":1,"event":"anomaly-scan","scanned_unix":50,"kind":"gap","selector":"vid_old","detail":"o"}"#,
+            r#"{"schema_version":1,"event":"anomaly-scan","scanned_unix":100,"kind":"gap","selector":"vid_a","detail":"a"}"#,
+            r#"{"schema_version":1,"event":"anomaly-scan-run","scanned_unix":100,"hash_mode":"stored","finding_count":1}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &anomaly)]);
+        let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        assert!(
+            current.contains("현재 결과 —") && current.contains("vid_a"),
+            "{current}"
+        );
+    }
+
+    /// R14 I4: a lane written by a marker-writing scanner (entries carry
+    /// `schema_version`) with NO completed run — every marker may have been
+    /// deleted — has no current result; R13 showed the last unmarked run as
+    /// "현재 결과". A legacy log without markers or schema still groups by
+    /// time (`legacy_anomaly_log_without_run_markers_groups_by_scan_time`).
+    #[test]
+    fn r14_i4_marked_lane_without_a_completed_run_is_no_result() {
+        let anomaly = [
+            r#"{"schema_version":1,"event":"anomaly-scan","scanned_unix":100,"kind":"gap","selector":"vid_a","detail":"a"}"#,
+            r#"{"schema_version":1,"event":"anomaly-scan","scanned_unix":300,"kind":"gap","selector":"vid_b","detail":"b"}"#,
+        ]
+        .join("\n");
+        let elements = rendered_elements(&[("anomaly", &anomaly)]);
+        let current = elements["anomaly-findings"]["innerHTML"].as_str().unwrap();
+        assert!(current.contains("현재 결과 없음(결과 아님)"), "{current}");
+        assert!(current.contains("완료된 실행이 없고"), "{current}");
+        assert!(
+            current.contains("vid_a") && current.contains("vid_b"),
+            "{current}"
+        );
+        assert!(!current.contains("현재 결과 —"), "{current}");
     }
 }

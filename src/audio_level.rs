@@ -995,8 +995,11 @@ fn read_logged_results_with_keys(
                 )),
             }
         };
+        // R14 I5: P7 across lanes only from a lane that verifies (a proven
+        // continuation); within a lane always (see the line parser).
+        let proven = status.verification.is_ok();
         for (selector, entry) in parse_logged_results_lines(text, &line_flag) {
-            insert_logged_result(&mut out, selector, entry);
+            insert_logged_result(&mut out, selector, entry, proven);
         }
     }
     Ok((out, statuses))
@@ -1369,6 +1372,19 @@ pub const UNVERIFIED_ERROR: &str =
 /// `replayed_unverified` (D2).
 fn parse_logged_results_lines(text: &str, line_flag: &dyn Fn(usize) -> LineFlag) -> LoggedResults {
     let mut out = BTreeMap::new();
+    // R14 I5: the last usable `lane-repair` marker of this lane — a
+    // measurement before it is not known to be the newest of its record
+    // (the cut tail may have held a newer one).
+    let repaired_at = text
+        .lines()
+        .enumerate()
+        .filter(|(index, line)| {
+            serde_json::from_str::<Value>(line)
+                .is_ok_and(|entry| audit::is_lane_repair_marker(&entry))
+                && line_flag(*index).unverified.is_none()
+        })
+        .map(|(index, _)| index)
+        .last();
     for (index, line) in text.lines().enumerate() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -1400,17 +1416,30 @@ fn parse_logged_results_lines(text: &str, line_flag: &dyn Fn(usize) -> LineFlag)
             if let Some(mut result) = FileResult::from_json(item) {
                 result.replayed_unverified = replayed;
                 let flag = line_flag(index);
-                result.chain_unverified = flag.unverified;
+                result.chain_unverified = flag.unverified.or_else(|| {
+                    repaired_at
+                        .filter(|at| *at > index)
+                        .map(|at| format!("{UNVERIFIED_ERROR}: {AUDIO_REPAIRED_AFTER_NOTE} ({}번째 줄 뒤 {}번째 줄)", index + 1, at + 1))
+                });
                 result.self_consistent_only = flag.self_consistent_only;
                 result.other_pc_key = flag.other_pc_key;
                 let at = result.measured_unix.unwrap_or(measured);
                 let selector = result.selector.clone();
-                insert_logged_result(&mut out, selector, (result, at, method.clone(), threshold));
+                insert_logged_result(
+                    &mut out,
+                    selector,
+                    (result, at, method.clone(), threshold),
+                    true,
+                );
             }
         }
     }
     out
 }
+
+/// R14 I5: a measurement positioned before a usable `lane-repair` marker
+/// of its lane.
+pub const AUDIO_REPAIRED_AFTER_NOTE: &str = "측정 레인이 이 측정 뒤에서 수리됨(lane-repair) — 잘린 꼬리에 같은 기록의 더 새 측정이 있었을 수 있어 최신 여부 알 수 없음 (다시 측정하십시오)";
 
 /// Later results win — except that (R6-I3) a result that is not verified
 /// never replaces a verified one: a planted lane or an unkeyed line can
@@ -1419,6 +1448,7 @@ fn insert_logged_result(
     out: &mut LoggedResults,
     selector: String,
     entry: (FileResult, u64, String, f64),
+    supersedes: bool,
 ) {
     // R8-I8: and a self-consistent-only result (pre-key / no keys) never
     // replaces one authenticated here.
@@ -1427,9 +1457,18 @@ fn insert_logged_result(
         (None, true) => 1,
         (None, false) => 2,
     };
-    let keeps_existing = out
-        .get(&selector)
-        .is_some_and(|(existing, ..)| rank(existing) > rank(&entry.0));
+    // R14 I5 (P7): when `supersedes` (the newer result comes from the same
+    // lane, or from a proven continuation lane), a NEWER result that is not
+    // usable here (stripped HMAC, another PC's line, a line written without
+    // a key in a keyed case) replaces the older usable one — the record is
+    // then "unverified", never rolled back to the older measurement. A lane
+    // that is not a proven continuation (planted next to an intact one)
+    // still never replaces a verified measurement. Among usable results an
+    // authenticated one is not replaced by a self-consistent-only one.
+    let keeps_existing = !(supersedes && entry.0.chain_unverified.is_some())
+        && out
+            .get(&selector)
+            .is_some_and(|(existing, ..)| rank(existing) > rank(&entry.0));
     if !keeps_existing {
         out.insert(selector, entry);
     }
@@ -2535,8 +2574,9 @@ mod tests {
     }
 
     /// R6-I3: in a case measured under an audit key, a measurement line
-    /// written without one is not used as a level (and cannot replace the
-    /// keyed measurement of the same record).
+    /// written without one is not used as a level. R14 I5 (P7): nor does
+    /// the older keyed measurement of the same record come back as the
+    /// current value — the record reads "unverified".
     #[test]
     fn unkeyed_lines_in_a_keyed_case_are_not_levels() {
         let r1 = row("vid_1");
@@ -2555,8 +2595,13 @@ mod tests {
         )
         .unwrap();
         let logged = latest_logged_results(&dir).unwrap();
-        assert!(logged["vid_1"].0.chain_unverified.is_none(), "{logged:?}");
-        assert_eq!(audio_levels_for_case(&dir).unwrap()["vid_1"].r, "sound");
+        // R14 I5 (P7): the unkeyed newer line is no level, and the keyed
+        // older one is not the current value either — unverified.
+        assert!(logged["vid_1"].0.chain_unverified.is_some(), "{logged:?}");
+        assert_eq!(
+            audio_levels_for_case(&dir).unwrap()["vid_1"].r,
+            "unverified"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2706,8 +2751,11 @@ mod tests {
         .unwrap();
         let (logged, statuses) = read_logged_results_with_keys(&dir, keys).unwrap();
         let (result, at, ..) = &logged["vid_1"];
-        assert_eq!(*at, 7, "the authenticated measurement stays: {logged:?}");
-        assert!(result.chain_unverified.is_none(), "{logged:?}");
+        // R14 I5 (P7): the newer line is not a level — and the record is
+        // not rolled back to the older measurement either (stripping a
+        // newer line's HMAC must not bring the older one back): unverified.
+        assert_eq!(*at, 9, "{logged:?}");
+        assert!(result.chain_unverified.is_some(), "{logged:?}");
         // The lane itself is NOT VERIFIED (R7-I3), never "keyed"/"structural".
         assert!(
             statuses[0]
@@ -2976,6 +3024,36 @@ mod tests {
         let (logged, _) = read_logged_results_with_keys(&dir, keys).unwrap();
         assert_eq!(logged["vid_2"].1, 9);
         assert!(!logged["vid_2"].0.self_consistent_only);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R14 I5: a measurement positioned before a usable `lane-repair`
+    /// marker of its lane is not known to be the newest of its record
+    /// (the cut tail may have held a newer one) — unverified; a
+    /// measurement after the marker is a level again.
+    #[test]
+    fn r14_i5_measurement_before_a_lane_repair_is_unknown() {
+        let r1 = row("vid_1");
+        let dir = audio_case(
+            "r14-i5",
+            &[
+                log_entry_json(7, "ffmpeg x", &[result_for(&r1, Verdict::Sound, -12.0)]),
+                json!({"event": "lane-repair", "kept_entries": 1, "removed_lines": 1,
+                    "removed_bytes": 10, "removed_sha256": "aa"}),
+            ],
+        );
+        let (logged, _) = read_logged_results_with_keys(&dir, &[]).unwrap();
+        let reason = logged["vid_1"].0.chain_unverified.as_deref().unwrap_or("");
+        assert!(reason.contains(AUDIO_REPAIRED_AFTER_NOTE), "{logged:?}");
+        audit::append_chained_jsonl_keyed(
+            &dir.join(LOG_REL),
+            &log_entry_json(9, "ffmpeg x", &[result_for(&r1, Verdict::Silent, -91.0)]).to_string(),
+            None,
+        )
+        .unwrap();
+        let (logged, _) = read_logged_results_with_keys(&dir, &[]).unwrap();
+        assert!(logged["vid_1"].0.chain_unverified.is_none(), "{logged:?}");
+        assert_eq!(logged["vid_1"].1, 9);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

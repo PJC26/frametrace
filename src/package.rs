@@ -1792,6 +1792,10 @@ pub fn verify_package(package_dir: &Path) -> Result<PackageVerification, String>
         }
     }
 
+    // 3b. R14 I3: the re-verification lane against the `hash-verify-head`
+    // its runs recorded in the sign-off lane (a cut tail → FAIL).
+    verify_package_hash_verify_head(package_dir, &listed, &mut out);
+
     // 4 + 5. Database snapshot and sign-off.
     verify_package_db_and_signoff(package_dir, &listed, &mut out);
 
@@ -1972,6 +1976,34 @@ fn verify_package_manifest_json(
             "file list, digests and sizes agree with manifest.sha256 (the JSON itself is not covered by manifest.sha256)",
         );
     }
+}
+
+/// R14 I3 (track I): the packaged re-verification lane
+/// (`evidence/logs/hash-verify.jsonl`) against the newest usable
+/// `hash-verify-head` in the packaged sign-off lane. Nothing is said for a
+/// package without a sign-off lane or without any head (before R14).
+fn verify_package_hash_verify_head(
+    package_dir: &Path,
+    listed: &std::collections::BTreeMap<String, String>,
+    out: &mut PackageVerification,
+) {
+    if !listed.contains_key(crate::report::SIGNOFF_LOG_REL_PATH) {
+        return;
+    }
+    let check = crate::report::hash_verify_head_check(package_dir, None, false);
+    let status = match &check {
+        crate::report::HashVerifyHeadCheck::Absent => return,
+        crate::report::HashVerifyHeadCheck::Intact { .. } => CheckStatus::Pass,
+        crate::report::HashVerifyHeadCheck::Truncated { .. }
+        | crate::report::HashVerifyHeadCheck::Rewritten { .. } => CheckStatus::Fail,
+        crate::report::HashVerifyHeadCheck::Unknown(_)
+        | crate::report::HashVerifyHeadCheck::NotAuthenticated(_) => CheckStatus::NotVerified,
+    };
+    out.push(
+        status,
+        crate::anomaly::HASH_VERIFY_REL_PATH,
+        format!("re-verification lane anchor: {}", check.describe()),
+    );
 }
 
 fn verify_package_db_and_signoff(

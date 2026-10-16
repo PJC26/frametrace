@@ -1712,11 +1712,114 @@ impl RemovedArchive {
         if !meta.is_file() || meta.len() != bytes {
             return Self::Differs;
         }
-        match digest_file(&path) {
+        // R14 I7: hash through ONE handle opened without following a link
+        // (Windows: the reparse point itself; Unix: the same inode as the
+        // `lstat` above), so a link swapped in between the checks is never
+        // hashed; and remember the verdict per (path, size, mtime, sha256)
+        // so a repaired lane is not re-hashed on every read.
+        let Ok(file) = open_no_follow(&path) else {
+            return Self::Differs;
+        };
+        let Ok(handle_meta) = file.metadata() else {
+            return Self::Differs;
+        };
+        if !same_plain_file(&meta, &handle_meta) || handle_meta.len() != bytes {
+            return Self::Differs;
+        }
+        let key = (
+            path.clone(),
+            bytes,
+            modified_nanos(&handle_meta),
+            sha256.to_ascii_lowercase(),
+        );
+        if let Some(cached) = removed_archive_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).copied())
+        {
+            return cached;
+        }
+        let verdict = match sha256::digest_reader(BufReader::new(file)) {
             Ok(digest) if digest.eq_ignore_ascii_case(sha256) => Self::Match,
             _ => Self::Differs,
+        };
+        // Only a cache key with a known mtime at least 2 s in the past is
+        // remembered ("racy" timestamps: a rewrite within the filesystem's
+        // timestamp granularity would keep the same mtime). A file whose
+        // mtime cannot be read is always hashed again.
+        let settled = handle_meta
+            .modified()
+            .ok()
+            .and_then(|at| std::time::SystemTime::now().duration_since(at).ok())
+            .is_some_and(|age| age >= std::time::Duration::from_secs(2));
+        if key.2.is_some()
+            && settled
+            && let Ok(mut cache) = removed_archive_cache().lock()
+        {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(key, verdict);
         }
+        verdict
     }
+}
+
+/// R14 I7 test hook: whether a verdict for the archive at `path` is cached.
+#[cfg(test)]
+pub(crate) fn removed_archive_cached(path: &Path) -> Option<RemovedArchive> {
+    let cache = removed_archive_cache().lock().ok()?;
+    cache
+        .iter()
+        .find(|(key, _)| key.0 == path)
+        .map(|(_, verdict)| *verdict)
+}
+
+/// R14 I7: (archive path, size, mtime ns, recorded sha256) → verdict.
+type RemovedArchiveKey = (PathBuf, u64, Option<u128>, String);
+
+fn removed_archive_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<RemovedArchiveKey, RemovedArchive>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<RemovedArchiveKey, RemovedArchive>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// R14 I7: opens `path` for reading without following a final link
+/// (Windows `FILE_FLAG_OPEN_REPARSE_POINT`: a symlink / junction is
+/// opened as itself and then fails [`same_plain_file`]).
+#[cfg(windows)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// R14 I7: Unix — a plain open; [`same_plain_file`] then requires the
+/// handle's inode to be the one `lstat` saw (a link swapped in between is
+/// another inode).
+#[cfg(not(windows))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+/// R14 I7: the opened handle is a regular file, not a reparse point, and
+/// (Unix) the same inode as the `lstat` of the path.
+#[cfg(windows)]
+fn same_plain_file(_lstat: &std::fs::Metadata, handle: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    handle.is_file() && handle.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(not(windows))]
+fn same_plain_file(lstat: &std::fs::Metadata, handle: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    handle.is_file() && handle.dev() == lstat.dev() && handle.ino() == lstat.ino()
 }
 
 impl LaneRepair {
@@ -4206,3 +4309,7 @@ mod tests_r12;
 #[cfg(test)]
 #[path = "tests_audit_r13.rs"]
 mod tests_r13;
+
+#[cfg(test)]
+#[path = "tests_audit_r14.rs"]
+mod tests_r14;

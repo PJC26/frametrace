@@ -199,11 +199,18 @@ pub fn run_queue(
 /// Latest queue summary for status display.
 /// R9 P3: the newest entry usable here (read through
 /// `audit::read_lane_rows`), with its `trust` code.
+///
+/// R14 I5: the NEWEST line of the lane, whatever it is — an unusable line
+/// after the last usable summary may itself be a newer summary (P12: its
+/// content is never read), and a summary before a `lane-repair` marker is
+/// not known to be the latest. Either way: `None` (no summary claimed).
 pub fn latest_summary(case_dir: &Path) -> Option<serde_json::Value> {
     let lane = crate::audit::read_lane_rows(&case_dir.join(QUEUE_LOG)).ok()?;
-    lane.usable()
-        .next_back()
-        .map(crate::audit::LaneRow::value_with_trust)
+    let row = lane.rows.last()?;
+    if !row.usable() || lane.repaired_after(row.index) {
+        return None;
+    }
+    Some(row.value_with_trust())
         .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("transcode-queue"))
 }
 

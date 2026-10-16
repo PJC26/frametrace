@@ -381,6 +381,26 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
     } else {
         String::new()
     };
+    // R14 I3: the sign-off lane's `hash-verify-head` against this lane —
+    // a tail cut (even two lines, no key) is said here, never hidden.
+    let head = &assessment.head;
+    let head_html = match head {
+        crate::report::HashVerifyHeadCheck::Truncated { .. }
+        | crate::report::HashVerifyHeadCheck::Rewritten { .. } => format!(
+            "<p class=\"banner bad\">Re-verification lane anchor: {}.</p>\n",
+            esc(&head.describe())
+        ),
+        crate::report::HashVerifyHeadCheck::Unknown(_)
+        | crate::report::HashVerifyHeadCheck::NotAuthenticated(_) => format!(
+            "<p class=\"note warn\">Re-verification lane anchor: {}.</p>\n",
+            esc(&head.describe())
+        ),
+        crate::report::HashVerifyHeadCheck::Intact { .. }
+        | crate::report::HashVerifyHeadCheck::Absent => format!(
+            "<p class=note>Re-verification lane anchor: {}.</p>\n",
+            esc(&head.describe())
+        ),
+    };
     let Some(latest_run) = assessment.result_run() else {
         // R11 I2: a newer run this PC cannot authenticate (e.g. its
         // completion marker's HMAC stripped) — the previous completed run
@@ -393,7 +413,7 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
             _ => String::new(),
         };
         return format!(
-            "{broken_html}{withheld_html}{interrupted_html}{unauth_html}<p class=\"note warn\">No completed live source re-hash usable on this PC has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>"
+            "{broken_html}{head_html}{withheld_html}{interrupted_html}{unauth_html}<p class=\"note warn\">No completed live source re-hash usable on this PC has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>"
         );
     };
     let (latest, entries) = (latest_run.run_unix, &latest_run.entries);
@@ -491,7 +511,7 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
         hash_verify_banner(matched, mismatched, other)
     };
     format!(
-        "{broken_html}{interrupted_html}{unauth_html}<p class=note>Latest completed live re-hash run at {} (run {}, newest completed run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
+        "{broken_html}{head_html}{interrupted_html}{unauth_html}<p class=note>Latest completed live re-hash run at {} (run {}, newest completed run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
         ts(latest),
         esc(&latest_run.run_id),
         crate::anomaly::HASH_VERIFY_REL_PATH,

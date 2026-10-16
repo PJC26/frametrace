@@ -454,10 +454,19 @@ fn check_bound_import_entry(
                     .to_string(),
             );
         }
+        // R14 I5: a lane-repair marker after it — the cut tail may have
+        // held a newer import of this image.
+        if rows.repaired_after(index) {
+            return Err(E01_REPAIRED_AFTER_NOTE.to_string());
+        }
         return import_entry_authenticated(verification, index);
     }
     Err("완료 표식이 가리키는 E01 감사 항목이 감사 기록에 없습니다".to_string())
 }
+
+/// R14 I5: the E01 lane was repaired (`lane-repair`) after the newest
+/// import of an image — the cut tail may have held a newer one.
+pub const E01_REPAIRED_AFTER_NOTE: &str = "E01 감사 기록(e01-audit.jsonl)이 이 이미지의 최신 임포트 항목 뒤에서 수리됨(lane-repair) — 잘린 꼬리에 더 새 임포트가 있었을 수 있어 이 기록이 최신인지 알 수 없습니다 (재검증 필요: 다시 임포트하십시오)";
 
 /// The file name an `import-e01` entry's `raw_output_path` names.
 fn raw_output_name(value: &serde_json::Value) -> Option<String> {
@@ -758,6 +767,10 @@ pub fn recorded_raw_import_with_keys(
     let Some((index, value)) = newest_full_import_of(&lines, &name) else {
         return Ok(None);
     };
+    // R14 I5: not known to be the newest import after a lane repair.
+    if rows.repaired_after(index) {
+        return Err(E01_REPAIRED_AFTER_NOTE.to_string());
+    }
     import_entry_authenticated(verification, index)?;
     let e01 = value
         .get("e01_path")

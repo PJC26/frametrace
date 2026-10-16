@@ -153,6 +153,9 @@ pub fn read_indexed_rows_checked(
 
 /// Scan the case index for candidate anomalies and append a chained log.
 pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, String> {
+    // R14 P20: one scan at a time per case — two writers interleaving
+    // their runs is what made position-based run judgement unsafe.
+    let _lock = ScanLock::acquire(case_dir)?;
     let (rows, index_coverage) = read_indexed_rows_checked(case_dir)?;
     let mut findings = Vec::new();
     let mut coverage = RehashCoverage::default();
@@ -253,6 +256,48 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     })
 }
 
+/// R14 P20: the case-level exclusive lock of an anomaly / re-hash scan.
+pub const SCAN_LOCK_REL_PATH: &str = "db/anomaly-scan.lock";
+
+/// R14 P20: held (fs2 exclusive lock on [`SCAN_LOCK_REL_PATH`]) for the
+/// whole of [`scan_case`]; unlocks on drop. The sidecar file is never
+/// deleted (see `checkpoint::RunLock` for why), and `db/` top-level files
+/// enter a package only by explicit list.
+struct ScanLock {
+    file: std::fs::File,
+}
+
+impl ScanLock {
+    fn acquire(case_dir: &Path) -> Result<Self, String> {
+        use fs2::FileExt;
+        let path = case_dir.join(SCAN_LOCK_REL_PATH);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|err| format!("failed to open scan lock {}: {err}", path.display()))?;
+        file.try_lock_exclusive().map_err(|err| {
+            format!(
+                "이 케이스에서 다른 이상 징후 검사·원본 재검증이 실행 중입니다 — 끝난 뒤 다시 실행하십시오 ({}: {err})",
+                path.display()
+            )
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ScanLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 /// Load the video index into an id-keyed map so batch paths pay one read of
 /// `db/videos.jsonl` instead of one per item.
 pub fn index_by_id(
@@ -348,6 +393,10 @@ pub struct HashVerifySummary {
     pub newer_mismatched: usize,
     /// R13 P16: those mismatch rows.
     pub newer_mismatches: Vec<NewerMismatch>,
+    /// R14 I3: [`crate::report::HashVerifyHeadCheck::status`] — `absent`,
+    /// `intact`, `truncated`, `rewritten`, `unknown`, `not-authenticated`
+    /// (`""` only in a hand-built summary).
+    pub head_status: &'static str,
 }
 
 /// R13 P16: one usable `mismatch` row of a run without a completion
@@ -419,6 +468,9 @@ pub struct HashVerifyRun {
     /// R13 P16: lane index of the run's last usable entry (its marker
     /// when completed).
     pub last_index: usize,
+    /// R14 I3: the usable marker says the run anchored the lane in the
+    /// sign-off lane ([`crate::report::HASH_VERIFY_MARKER_HEAD_FIELD`]).
+    pub marker_wants_head: bool,
 }
 
 impl HashVerifyRun {
@@ -472,6 +524,7 @@ fn runs_from_lane(lane: &audit::LaneRows) -> Vec<HashVerifyRun> {
                     first_index: row.index,
                     marker_index: None,
                     last_index: row.index,
+                    marker_wants_head: false,
                 });
                 runs.len() - 1
             }
@@ -484,6 +537,9 @@ fn runs_from_lane(lane: &audit::LaneRows) -> Vec<HashVerifyRun> {
                 .get("records")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
+            runs[index].marker_wants_head = value
+                .get(crate::report::HASH_VERIFY_MARKER_HEAD_FIELD)
+                .is_some_and(|v| !v.is_null());
         } else {
             runs[index].entries.push(row.value_with_trust());
         }
@@ -511,8 +567,10 @@ pub struct HashVerifyAssessment {
     /// unless `withheld`.
     pub result: Option<usize>,
     /// Runs that never completed (no usable completion marker) with a
-    /// usable entry positioned after the last usable completion marker (or
-    /// every such run when no run completed) — cut short by a crash or
+    /// usable entry positioned after the last usable completion marker —
+    /// R14 P20: or whose first usable entry is after the result run's
+    /// first entry, or whose `run_unix` is greater (interleaved runs) —
+    /// (every such run when no run completed) — cut short by a crash or
     /// cancel, OR their marker was deleted (no key is needed for that).
     /// R13 P16: each one WITHHOLDS the result (an older completed run is
     /// not the current result) and its usable mismatch rows are shown.
@@ -529,6 +587,8 @@ pub struct HashVerifyAssessment {
     pub unauthenticated: usize,
     /// The lane as read ([`audit::read_lane_rows`]).
     pub lane: audit::LaneRows,
+    /// R14 I3: the sign-off lane's `hash-verify-head` against this lane.
+    pub head: crate::report::HashVerifyHeadCheck,
 }
 
 impl HashVerifyAssessment {
@@ -573,6 +633,7 @@ impl HashVerifyAssessment {
                     newer_records: self.newer_records(),
                     newer_mismatched: newer_mismatches.len(),
                     newer_mismatches,
+                    head_status: self.head.status(),
                     ..Default::default()
                 }
             });
@@ -586,6 +647,7 @@ impl HashVerifyAssessment {
             not_verified_reason: (!self.not_verified.is_empty())
                 .then(|| self.not_verified.join("; ")),
             lane_status,
+            head_status: self.head.status(),
             ..Default::default()
         };
         for entry in &run.entries {
@@ -616,10 +678,20 @@ pub fn hash_verify_assessment(case_dir: &Path) -> Result<HashVerifyAssessment, S
             path.display()
         )
     })?;
-    Ok(assess_runs(runs_from_lane(&lane), lane))
+    Ok(assess_runs(runs_from_lane(&lane), lane, |result| {
+        crate::report::hash_verify_head_check(
+            case_dir,
+            result.map(|run| run.run_id.as_str()),
+            result.is_some_and(|run| run.marker_wants_head),
+        )
+    }))
 }
 
-fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAssessment {
+fn assess_runs(
+    runs: Vec<HashVerifyRun>,
+    lane: audit::LaneRows,
+    head_check: impl FnOnce(Option<&HashVerifyRun>) -> crate::report::HashVerifyHeadCheck,
+) -> HashVerifyAssessment {
     // R12 P12: the candidate is the run whose usable completion marker sits
     // LAST in the lane; every decision about unusable lines is by position
     // (R11 compared run indices derived from an unusable line's `run_id`).
@@ -645,12 +717,25 @@ fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAss
     // last completed run's marker (every such run when none completed).
     // Deleting the newest run's marker needs no key — the newer run then
     // looks "interrupted"; R12 let the older run stand as the result.
+    // R14 P20: by SPAN, not position — runs interleave (two writers, or
+    // a crash mid-run before the lock existed), so B's last usable row can
+    // sit before A's marker once B's own marker is deleted. An unfinished
+    // run is also newer when its first row is after the result run's
+    // first row, or its `run_unix` is greater.
+    let result_first = latest.map(|index| runs[index].first_index);
+    let result_unix = latest.map(|index| runs[index].run_unix);
     let interrupted: Vec<usize> = (0..runs.len())
         .filter(|index| {
             let run = &runs[*index];
-            !run.completed && after_marker(run.last_index)
+            !run.completed
+                && (after_marker(run.last_index)
+                    || result_first.is_some_and(|first| run.first_index > first)
+                    || result_unix.is_some_and(|unix| run.run_unix > unix))
         })
         .collect();
+    // R14 I3: the newest `hash-verify-head` in the sign-off lane — a lane
+    // shorter than it lost its tail (two deleted lines need no key).
+    let head = head_check(latest.map(|index| &runs[index]));
     let newer_records: usize = interrupted.iter().map(|i| runs[*i].entries.len()).sum();
     let newer_mismatched: usize = interrupted
         .iter()
@@ -687,7 +772,7 @@ fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAss
         };
         reasons.push(match latest {
             Some(index) => format!(
-                "{NEWER_UNMARKED_RUN_REASON} — 마지막 완료 실행({}) 뒤에 완료 표식 없는 실행 {}개(기록 {newer_records}개{mismatch_note}): 완료 표식이 지워졌거나 실행이 중단됐을 수 있어 이전 실행을 현재 결과로 쓰지 않음 (원본 재검증을 다시 실행하십시오)",
+                "{NEWER_UNMARKED_RUN_REASON} — 마지막 완료 실행({}) 뒤에 있거나 그 뒤에 시작한 완료 표식 없는 실행 {}개(기록 {newer_records}개{mismatch_note}): 완료 표식이 지워졌거나 실행이 중단됐을 수 있어 이전 실행을 현재 결과로 쓰지 않음 (원본 재검증을 다시 실행하십시오)",
                 runs[index].run_id,
                 interrupted.len()
             ),
@@ -696,6 +781,11 @@ fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAss
                 interrupted.len()
             ),
         });
+    }
+    if lane.failure.is_none()
+        && let Some(reason) = head.withhold_reason()
+    {
+        reasons.push(reason);
     }
     let withheld = (!reasons.is_empty()).then(|| reasons.join("; "));
     let result = if withheld.is_some() { None } else { latest };
@@ -724,6 +814,7 @@ fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAss
             if let audit::LaneTrust::NotVerified { reason, .. } = &lane.lane {
                 not_verified.push(format!("재검증 기록 레인 NOT VERIFIED: {reason}"));
             }
+            not_verified.extend(head.not_verified_reason());
         }
     }
     HashVerifyAssessment {
@@ -734,6 +825,7 @@ fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAss
         not_verified,
         unauthenticated,
         lane,
+        head,
     }
 }
 
@@ -781,11 +873,16 @@ fn write_hash_verify_log(
         );
         audit::append_chained_jsonl(&log_path, &line)?;
     }
+    // R14 I3: the marker names where this run anchors the lane, then the
+    // anchor itself (`hash-verify-head` in the sign-off lane).
     let summary = format!(
-        "{{\"schema_version\":1,\"event\":\"hash-verify-run\",\"run_unix\":{run_unix},\"run_id\":\"{run_id}\",\"records\":{}}}",
-        checks.len()
+        "{{\"schema_version\":1,\"event\":\"hash-verify-run\",\"run_unix\":{run_unix},\"run_id\":\"{run_id}\",\"records\":{},\"{}\":\"{}\"}}",
+        checks.len(),
+        crate::report::HASH_VERIFY_MARKER_HEAD_FIELD,
+        crate::report::SIGNOFF_LOG_REL_PATH,
     );
     audit::append_chained_jsonl(&log_path, &summary)?;
+    crate::report::record_hash_verify_head(case_dir, &run_id, run_unix)?;
     Ok(run_id)
 }
 

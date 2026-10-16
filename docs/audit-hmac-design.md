@@ -458,6 +458,104 @@ older run). R11:
   the exit code is still the chain's).
 - Tail deletion past the last sign-off remains undetectable from the lane
   alone (I9); P16 only stops a deleted MARKER from promoting an older run.
+  (R14: see below — P16 was itself positional, and the two-line deletion
+  is now caught by the `hash-verify-head` anchor.)
+
+### Run spans, a scan lock, the re-verification lane head (R14)
+
+- **P20 — runs are judged by span, not position.** R13's P16 asked
+  whether an unfinished run's LAST usable row sits after the result
+  run's marker. Interleave two runs — A (match), B (mismatch), A's marker,
+  B's marker — and delete B's marker (the last line, no key): B's last row
+  is before A's marker, so A came back green with B's MISMATCH hidden
+  (reviewer PoC). Now an unfinished run is "newer" also when its FIRST
+  usable row is after the result run's first row, or its `run_unix` is
+  greater (`anomaly::assess_runs`). An unfinished run whose first row and
+  run time are both before the result run (an older crash) still does
+  not withhold. The case report's anomaly grouping applies the same rule
+  (`flushUnmarked` puts an interleaved unmarked run BEFORE the completed
+  run whose marker ended it; it is newer when its first entry is after
+  that run's first entry or its `scanned_unix` is greater).
+- **One scan at a time per case.** `anomaly::scan_case` (the only writer
+  of the anomaly and re-verification lanes) holds an fs2 exclusive lock
+  on `db/anomaly-scan.lock` for the whole scan; a second scan of the same
+  case is refused ("다른 이상 징후 검사·원본 재검증이 실행 중"), writing
+  nothing. Legitimate interleaving therefore no longer happens, and an
+  interleaved lane is either a pre-R14 race or an edit.
+- **I3 — the `hash-verify-head` anchor.** Deleting the newest run's
+  record AND its marker (two lines; the shorter lane still verifies) made
+  the previous run green again. Each completed live re-hash run now
+  writes its marker with `"head_in":"evidence/logs/signoff-log.jsonl"` and
+  then appends to the SIGN-OFF lane (keyed when a key is configured):
+
+  | `event` | fields |
+  |---|---|
+  | `hash-verify-head` | `lane` (`evidence/logs/hash-verify.jsonl`), `run_id`, `run_unix`, `entries` (the re-verification lane's entry count), `last_entry_sha256` |
+
+  `report::hash_verify_head_check(root, result_run_id, marker_wants_head)`
+  takes the newest USABLE head and checks it with the D13 anchor check
+  (`audit::check_lane_anchor`): `intact` (later appends fine), `truncated`
+  (fewer entries — **"꼬리 잘림 — 결과 없음"**, also a missing lane),
+  `rewritten` (another entry at that position), `not-authenticated`
+  (the lane up to the head is not usable here: NOT VERIFIED, not
+  withheld), `unknown` (an unusable sign-off-lane line after the newest
+  head — it may be a newer head, P12: its content is never read; a
+  `lane-repair` of the sign-off lane after it; a malformed head; or the
+  result run's marker says it anchored itself but no usable head names
+  it), `absent` (no head ever — cases from before R14: no check, the
+  custody statement says the tail cut cannot be detected). `truncated`,
+  `rewritten` and `unknown` WITHHOLD the result
+  (`HashVerifyAssessment.head`, `HashVerifySummary.head_status`); every
+  reader of the assessment follows — the custody statement (a red
+  "TAIL CUT" banner) and `/api/verify-sources` (`head_status`,
+  `withheld_reason`). `verify-package` checks the packaged lanes the same
+  way (subject `evidence/logs/hash-verify.jsonl`: PASS intact, FAIL
+  truncated/rewritten, NOT VERIFIED unknown/not-authenticated; nothing for
+  a package without a head). The next completed run anchors the lane
+  again. Head entries are not `signoff` entries: the sign-off position
+  check, "not the latest" and finalize pairing ignore them.
+  **Limit:** cutting BOTH lanes' tails (the re-verification lane's last
+  run and the sign-off lane's last head) still restores the previous
+  run — the same "tail past the last anchor" limit as I9; a later
+  sign-off's v4 anchors or a finalize package's copy are the evidence
+  then.
+- **I4.** The report's anomaly section: a lane written by a
+  marker-writing scanner (its entries carry `schema_version`) with NO
+  completed run has no current result (every marker may have been
+  deleted) — R13 showed the last unmarked run as "현재 결과". Legacy logs
+  without markers or schema still group by time. (The re-verification
+  lane already withheld in this case, R13.)
+- **I5 — "repaired after" and P7 for the remaining newest-record
+  readers.** The E01 lane's newest full import of an image positioned
+  before a usable `lane-repair` marker is refused
+  (`e01::E01_REPAIRED_AFTER_NOTE`, re-import) for reuse and for the
+  completion-marker check. Sound measurements: a measurement before a
+  usable repair marker of its lane is `chain_unverified`
+  (`audio_level::AUDIO_REPAIRED_AFTER_NOTE`); and P7 now applies — a
+  NEWER result that is not usable here (stripped HMAC, another PC's or a
+  forged key id, a line written without a key in a keyed case) replaces
+  the older usable one within its lane and from a proven continuation
+  lane, so the record reads "unverified" instead of rolling back to the
+  older level (R6-I3/R7-I1 kept the older one). An unproven (planted)
+  continuation lane still never replaces a verified measurement. The
+  transcode queue summary is the lane's NEWEST line only (an unusable
+  newer line or a repair marker → no summary).
+- **I6.** `audit_key::APP_ENV_VARS`: the `FRAMETRACE_*` variables the app
+  itself reads (token, instance file, key/keyring file paths, UI and test
+  switches, …) are refused as key sources even though the prefix is
+  allowed — adopting one removed it from the process and its children.
+  `FRAMETRACE_AUDIT_KEY` (key material itself) stays allowed.
+- **I7.** The `.removed` archive is hashed through ONE handle opened
+  without following a link (Windows `FILE_FLAG_OPEN_REPARSE_POINT` +
+  reparse attribute check; Unix the handle's inode must be the `lstat`'s),
+  and a verdict is cached per (path, size, mtime ns, recorded sha256) once
+  the mtime is ≥ 2 s old (racy timestamps are always re-hashed). Limit: a
+  same-size rewrite that restores the mtime exactly is not re-hashed
+  within the process (the cache lives for one process).
+- **I8.** Timeline events carry `"time_unaudited": true|false`
+  (`TimelineEvent.time_unaudited`) — true for a carve event timed from
+  `db/carve_results.json` (its lane entry has no `carved_unix`); the
+  detail text keeps `CARVE_TIME_UNAUDITED_NOTE`.
 
 **Implementation notes (what shipped):**
 

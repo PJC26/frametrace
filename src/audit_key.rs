@@ -447,15 +447,51 @@ pub fn is_system_env_var(name: &str) -> bool {
         || upper.starts_with("XDG_")
 }
 
+/// R14 I6: the `FRAMETRACE_*` variables the app itself reads for its own
+/// behaviour (paths, tokens, switches, test hooks). The `FRAMETRACE_`
+/// allow-list prefix (R13-I3) let them through as key sources — adopting
+/// one removes it from this process and its children (P10), e.g. the
+/// workstation's `FRAMETRACE_TOKEN`. Refused by [`key_source_var_refusal`].
+/// `FRAMETRACE_AUDIT_KEY` (itself key material) is not listed.
+pub const APP_ENV_VARS: &[&str] = &[
+    "FRAMETRACE_KEY_SOURCE",
+    "FRAMETRACE_AUDIT_KEY_ID",
+    "FRAMETRACE_AUDIT_KEY_FILE",
+    "FRAMETRACE_AUDIT_KEYRING_FILE",
+    "FRAMETRACE_EXPECTED_AUDIT_KEY",
+    "FRAMETRACE_PAGES_KEY_FILE",
+    "FRAMETRACE_TOKEN",
+    "FRAMETRACE_NO_TOKEN",
+    "FRAMETRACE_INSTANCE_FILE",
+    "FRAMETRACE_UI",
+    "FRAMETRACE_NO_BROWSER",
+    "FRAMETRACE_REQUIRE_BROWSER",
+    "FRAMETRACE_PARENT_WATCH_FD",
+    "FRAMETRACE_DEEPFAKE_LENS",
+    "FRAMETRACE_DEEPFAKE_LENS_HOME",
+    "FRAMETRACE_TOOL_PROBE_TIMEOUT",
+    "FRAMETRACE_STEP_WARNINGS",
+    "FRAMETRACE_DEBUG_LOCKS",
+    "FRAMETRACE_SHELL_SMOKE",
+    "FRAMETRACE_TEST_SPEW",
+    "FRAMETRACE_R10_S5_PROBE",
+    "FRAMETRACE_R11_STRICT",
+    "FRAMETRACE_PERF_RELAXED",
+    "FRAMETRACE_PERF_STRICT",
+    "FRAMETRACE_BENCH_BUDGET_MS",
+    "FRAMETRACE_IT",
+    "FRAMETRACE_BIN",
+];
+
 /// R13-I3: why `name` may not be a `--key-source env:VAR` /
 /// `FRAMETRACE_KEY_SOURCE=env:VAR` variable (`None` = it may). R12's
 /// deny-list ([`SYSTEM_ENV_VARS`]) let `DYLD_INSERT_LIBRARIES` through
 /// (measured), so the rule is now an ALLOW-list: the name is ASCII
 /// letters, digits and `_`, and starts with `FRAMETRACE_` or ends with
 /// `_SECRET` / `_KEY` (ASCII case ignored). Refused even then: a
-/// `DYLD_*` / `LD_*` loader variable and any [`SYSTEM_ENV_VARS`] name
-/// (`FRAMETRACE_KEY_SOURCE`, `FRAMETRACE_AUDIT_KEY_ID`). A refused
-/// variable is never adopted (removed from the environment).
+/// `DYLD_*` / `LD_*` loader variable, any [`SYSTEM_ENV_VARS`] name and
+/// (R14 I6) any [`APP_ENV_VARS`] name. A refused variable is never
+/// adopted (removed from the environment).
 pub fn key_source_var_refusal(name: &str) -> Option<String> {
     let name = name.trim();
     let upper = name.to_ascii_uppercase();
@@ -476,6 +512,11 @@ pub fn key_source_var_refusal(name: &str) -> Option<String> {
     if is_system_env_var(name) {
         return Some(format!(
             "{name} is a system environment variable, not a key secret"
+        ));
+    }
+    if APP_ENV_VARS.iter().any(|known| *known == upper) {
+        return Some(format!(
+            "{name} is one of FrameTrace's own setting variables, not a key secret"
         ));
     }
     if !(upper.starts_with("FRAMETRACE_") || upper.ends_with("_SECRET") || upper.ends_with("_KEY"))

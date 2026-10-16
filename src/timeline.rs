@@ -44,6 +44,10 @@ pub struct TimelineEvent {
     pub ts_unix: u64,
     pub source: &'static str,
     pub kind: &'static str,
+    /// R14 I8: the event's time is not the audit lane's (a carve entry
+    /// without `carved_unix`, timed from `db/carve_results.json`) —
+    /// `"time_unaudited": true` in the JSON (the viewer's badge).
+    pub time_unaudited: bool,
     pub path: String,
     pub detail: String,
 }
@@ -51,11 +55,12 @@ pub struct TimelineEvent {
 impl TimelineEvent {
     fn to_json(&self) -> String {
         format!(
-            "{{\"label\":\"{}\",\"ts_unix\":{},\"source\":\"{}\",\"kind\":\"{}\",\"path\":\"{}\",\"detail\":\"{}\"}}",
+            "{{\"label\":\"{}\",\"ts_unix\":{},\"source\":\"{}\",\"kind\":\"{}\",\"time_unaudited\":{},\"path\":\"{}\",\"detail\":\"{}\"}}",
             LABEL,
             self.ts_unix,
             json_escape(self.source),
             json_escape(self.kind),
+            self.time_unaudited,
             json_escape(&self.path),
             json_escape(&self.detail),
         )
@@ -172,6 +177,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             events.push(TimelineEvent {
                 ts_unix: mtime,
                 source: "index",
+                time_unaudited: false,
                 kind: "file-modified",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} filesystem mtime"),
@@ -186,6 +192,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             events.push(TimelineEvent {
                 ts_unix: stale_unix,
                 source: "index",
+                time_unaudited: false,
                 kind: "file-marked-stale",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} marked stale by rescan"),
@@ -209,6 +216,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 events.push(TimelineEvent {
                     ts_unix: ts,
                     source: "ffprobe",
+                    time_unaudited: false,
                     kind: "media-creation-time",
                     path: source_path.clone(),
                     detail: format!(
@@ -314,6 +322,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             None if snapshot => TimelineEvent {
                 ts_unix,
                 source: "carve",
+                time_unaudited: ts_unaudited,
                 kind: CARVED_UNAUDITED_KIND,
                 path: output_path,
                 detail: format!(
@@ -323,6 +332,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             None => TimelineEvent {
                 ts_unix,
                 source: "carve",
+                time_unaudited: ts_unaudited,
                 kind: "carved-candidate",
                 path: output_path,
                 detail,
@@ -331,6 +341,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             Some(note) => TimelineEvent {
                 ts_unix,
                 source: "carve",
+                time_unaudited: ts_unaudited,
                 kind: UNAUTHENTICATED_KIND,
                 path: output_path,
                 detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
@@ -505,6 +516,7 @@ fn audit_log_events(
                 None => TimelineEvent {
                     ts_unix: ts,
                     source: "audit-log",
+                    time_unaudited: false,
                     kind: if chained {
                         "audit-event"
                     } else {
@@ -516,6 +528,7 @@ fn audit_log_events(
                 Some(note) => TimelineEvent {
                     ts_unix: ts,
                     source: "audit-log",
+                    time_unaudited: false,
                     kind: UNAUTHENTICATED_KIND,
                     path,
                     detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
