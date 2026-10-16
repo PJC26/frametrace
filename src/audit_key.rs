@@ -355,34 +355,112 @@ const KEY_ENV: &str = "FRAMETRACE_AUDIT_KEY";
 /// raw key.
 const ADOPTED_KEY_VARS: &[&str] = &[KEY_ENV, KEY_FILE_ENV, KEYRING_ENV];
 
-/// R10-I14: what [`adopt_key_env`] took from the environment.
-static ADOPTED_KEY_ENV: OnceLock<BTreeMap<&'static str, std::ffi::OsString>> = OnceLock::new();
+/// R10-I14 / R11-I3: what [`adopt_key_env`] took from the environment.
+#[derive(Debug, Default)]
+struct AdoptedKeyEnv {
+    /// Every variable name adopted (present or not): [`ADOPTED_KEY_VARS`]
+    /// plus the `VAR` of each `--key-source env:VAR` /
+    /// `FRAMETRACE_KEY_SOURCE=env:VAR` spec.
+    names: Vec<String>,
+    /// The values that were present (removed from the environment).
+    values: BTreeMap<String, std::ffi::OsString>,
+}
+
+static ADOPTED_KEY_ENV: OnceLock<AdoptedKeyEnv> = OnceLock::new();
+
+/// R11-I3 (P10): the environment variables a key-source spec reads key
+/// MATERIAL from — `VAR` of every `env:VAR` spec this process will
+/// install: the `--key-source` global flag in `args` (`--key-source SPEC`
+/// or `--key-source=SPEC`, before a `--` separator) and the workstation's
+/// `FRAMETRACE_KEY_SOURCE` (`ambient`). `file:` specs name a path, not a
+/// secret.
+pub fn key_source_env_vars(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    ambient: Option<std::ffi::OsString>,
+) -> Vec<String> {
+    let mut specs: Vec<String> = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else { continue };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--key-source" {
+            if let Some(spec) = args.next().and_then(|spec| spec.into_string().ok()) {
+                specs.push(spec);
+            }
+        } else if let Some(spec) = arg.strip_prefix("--key-source=") {
+            specs.push(spec.to_string());
+        }
+    }
+    specs.extend(ambient.and_then(|spec| spec.into_string().ok()));
+    let mut vars: Vec<String> = Vec::new();
+    for spec in specs {
+        if let Some(("env", var)) = spec.trim().split_once(':')
+            && !var.trim().is_empty()
+            && !vars.iter().any(|known| known == var.trim())
+        {
+            vars.push(var.trim().to_string());
+        }
+    }
+    vars
+}
 
 /// R10-I14: keeps [`ADOPTED_KEY_VARS`] for this process and removes them
 /// from its environment, so no child inherits them. FrameTrace's own CLI
 /// step children get them back explicitly ([`forward_adopted_key_env`]).
 ///
+/// R11-I3 (P10): the variable an `env:VAR` key source names (the
+/// `--key-source` flag in this process's arguments, or the workstation's
+/// `FRAMETRACE_KEY_SOURCE`) is raw key material too and is adopted the
+/// same way — R10 left it in the environment, so every tool a step ran
+/// inherited the key. [`install_source_override`] then reads the kept
+/// value.
+///
 /// # Safety
 /// Removes environment variables: call it at the start of `main`, before
 /// any other thread exists (right after `util::adopt_step_warning_token`).
 pub unsafe fn adopt_key_env() {
-    let mut adopted = BTreeMap::new();
-    for var in ADOPTED_KEY_VARS {
-        if let Some(value) = std::env::var_os(var) {
-            // SAFETY: forwarded to the caller (single-threaded start).
-            unsafe { std::env::remove_var(var) };
-            adopted.insert(*var, value);
+    let source_vars = key_source_env_vars(
+        std::env::args_os().skip(1),
+        std::env::var_os("FRAMETRACE_KEY_SOURCE"),
+    );
+    // SAFETY: forwarded to the caller (single-threaded start).
+    unsafe { adopt_key_vars(source_vars) };
+}
+
+/// [`adopt_key_env`] for an explicit list of key-source variables.
+///
+/// # Safety
+/// As [`adopt_key_env`]: no other thread may exist.
+unsafe fn adopt_key_vars(source_vars: Vec<String>) {
+    let mut adopted = AdoptedKeyEnv::default();
+    let names = ADOPTED_KEY_VARS
+        .iter()
+        .map(|var| (*var).to_string())
+        .chain(source_vars);
+    for var in names {
+        if adopted.names.contains(&var) {
+            continue;
         }
+        if let Some(value) = std::env::var_os(&var) {
+            // SAFETY: forwarded to the caller (single-threaded start).
+            unsafe { std::env::remove_var(&var) };
+            adopted.values.insert(var.clone(), value);
+        }
+        adopted.names.push(var);
     }
     let _ = ADOPTED_KEY_ENV.set(adopted);
 }
 
 /// R10-I14: sets the adopted key variables on a FrameTrace CLI step child
 /// (the workstation's own steps need the key; nothing else gets it). A
-/// no-op when nothing was adopted.
+/// no-op when nothing was adopted. R11-I3: this includes the `env:VAR`
+/// variable of the workstation's key source — the step child is started
+/// with `--key-source env:VAR` and adopts it again at its own start.
 pub fn forward_adopted_key_env(command: &mut std::process::Command) {
     if let Some(adopted) = ADOPTED_KEY_ENV.get() {
-        for (var, value) in adopted {
+        for (var, value) in &adopted.values {
             command.env(var, value);
         }
     }
@@ -390,12 +468,13 @@ pub fn forward_adopted_key_env(command: &mut std::process::Command) {
 
 /// R10-I14: an audit key variable — the adopted value when the process
 /// adopted the key environment at start, the live environment otherwise
-/// (library callers, tests).
+/// (library callers, tests). R11-I3: the same for a `--key-source env:VAR`
+/// variable adopted at start.
 fn key_env_var(var: &str) -> Result<String, std::env::VarError> {
     if let Some(adopted) = ADOPTED_KEY_ENV.get()
-        && ADOPTED_KEY_VARS.contains(&var)
+        && adopted.names.iter().any(|name| name == var)
     {
-        return match adopted.get(var) {
+        return match adopted.values.get(var) {
             Some(value) => value
                 .clone()
                 .into_string()

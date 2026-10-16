@@ -256,6 +256,78 @@ Remaining limits: P7 keys are field-name based (a new lane or record field
 needs its key added to `recency_keys`); case folding assumes the default
 case-insensitive volumes on Windows / macOS.
 
+### Missing rows, secret adoption, canonical lane files (R11)
+
+R10's P7 only covered "a newer entry of the SAME record". Run-level
+records (a re-hash run and its completion marker) and chain breaks have no
+such key, and some consumers got BETTER results when an unusable row
+dropped out (R10 review: one stripped row turned the custody statement
+green; one stripped completion marker rolled the re-hash result back to an
+older run). R11:
+
+- **P9 — a missing row is not good news.** If a run holds an entry that is
+  not usable here, or the lane's chain is broken, no "all match / fully
+  complete / current value" claim comes out of that lane — the custody
+  banner, the API summary and the report alike.
+  - `anomaly::hash_verify_assessment` is THE decision for
+    `hash-verify.jsonl` (custody section 5, `/api/verify-sources`): the
+    result is the newest completed run, but there is **no result** when a
+    run newer than it holds an unusable entry (I2: a stripped completion
+    marker; R10 then showed the previous run as "latest") or the chain is
+    broken; the result is **not verified** when it or a newer run holds an
+    unusable entry, its marker's `records` count differs from its usable
+    records (I1), or the lane is NOT VERIFIED here. Only a verified run
+    with every file compared and equal gets the green banner.
+  - `recency_keys` adds `run_id=<id>` to `hash-verify` / `hash-verify-run`
+    entries (a stripped marker supersedes its run's records).
+  - The report's anomaly section: an unusable anomaly entry after the
+    newest usable `anomaly-scan-run` marker → "현재 결과 없음(결과 아님)",
+    no older run as current.
+  - **I4:** in a lane whose chain does not verify, the entries BEFORE the
+    break are not usable either (`LaneRow::lane_broken_at`, code `unauth`,
+    `trust_note` starting `체인 파손 레인`, `trust_lane_broken_at: <line>`).
+    R10 used the verified prefix, so editing a record's newest entry rolled
+    it back to the previous value (P7 defeated). A sign-off anchored before
+    the break is `AnchorStatus::NotAuthenticated` (R10: Intact). A torn
+    final line counts as a break too — repair it to use the lane again
+    (fail closed; R10 kept the prefix).
+- **P10 — a secret leaves the environment as soon as it is read.**
+  `audit_key::adopt_key_env` also adopts the variable an `env:VAR` key
+  source names — from the process's `--key-source` argument (either
+  spelling, before `--`) and from the workstation's
+  `FRAMETRACE_KEY_SOURCE` (`audit_key::key_source_env_vars`). The value is
+  kept, removed from the process environment, read by
+  `install_source_override`, and handed back only to FrameTrace's own step
+  children (`forward_adopted_key_env`; they get `--key-source env:VAR` and
+  adopt it again). R10 left that variable in the environment (I3).
+- **P11 (lane part, I6/I7).** The timeline's `.jsonl` test uses
+  `lane_rel_key` (so `X.JSONL` is the lane on Windows / macOS). A file
+  spelled unlike its canonical lane name that is NOT the file the
+  canonical spelling opens (a copy beside the real lane in a
+  case-sensitive folder) is not the lane: `lane_location` reports it
+  location-unverified (`정규 표기와 다른 이름의 레인 파일`, NOT VERIFIED),
+  `case_lane_paths` lists it as itself, and the timeline always reads the
+  real lane (R10 read whichever spelling sorted first and skipped the
+  other). `audit::is_canonical_lane_file` decides.
+- **I8.** Clip-family lanes (`artifacts/clips/export-log`,
+  `artifacts/proxies/proxy-log`, `artifacts/thumbnails/thumbnail-log`,
+  `transcode-queue-item` entries) key P7 on `output_path` only — their
+  `selector` names the source that many clips share.
+- **I5.** The carve page's run summary (scan complete, candidate limit,
+  source size, warnings) comes from `db/carve_results.json`, which no
+  audit lane covers: those metrics read "감사 안 됨" and are never
+  ok-coloured.
+- **I9 — the limit that remains: deleting rows.** Every rule above acts on
+  rows that are still in the lane. Removing the TAIL of a lane (the newest
+  run's records and marker, the newest entry of a record) leaves a valid,
+  shorter chain — the older run or value then really is the newest the
+  lane shows, on any PC, keyed or not. Only the sign-off truncation
+  anchors (below) reveal it, and only for what was recorded before the
+  sign-off; after the last sign-off, a cut tail is undetectable from the
+  lane alone (package manifests and external timestamping are the
+  controls). Deleting a row in the MIDDLE breaks the chain (I4: nothing
+  from the lane is used).
+
 **Implementation notes (what shipped):**
 
 - `src/hmac.rs` — HMAC-SHA-256 hand-assembled over the existing `sha2`
@@ -294,7 +366,9 @@ case-insensitive volumes on Windows / macOS.
 - `--key-source env:VAR_NAME` / `--key-source file:PATH` (global flag)
   overrides every ambient key source for one invocation. `env:` is the
   documented hand-off from an external secret store — the key is injected
-  into the process environment and never touches disk.
+  into the process environment and never touches disk. R11-I3: the
+  process removes `VAR` from its environment at start (P10) and passes it
+  on only to its own step children.
 - **Still not wired:** OS-keystore integration (macOS Keychain / DPAPI). No
   new heavyweight dependency was taken for it; the `0600` key file and
   keyring remain the portable store, and `--key-source env:` covers

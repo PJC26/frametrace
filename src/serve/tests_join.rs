@@ -1029,7 +1029,15 @@ fn records_meta_carries_join_log_and_bound_audio_levels() {
     // U2: the derived record id, from the output bytes (not the name).
     assert_eq!(join_log[0]["record_id"], "join:abababababababab");
     // R9 P3 (contract with track U): every log entry carries `trust`.
-    assert_eq!(join_log[0]["trust"], "sc", "{meta}");
+    // R11-I4: a lane whose chain fails (here a torn final line) is not
+    // usable before the break either — shown as "unauth".
+    assert_eq!(join_log[0]["trust"], "unauth", "{meta}");
+    assert!(
+        join_log[0]["trust_note"]
+            .as_str()
+            .is_some_and(|note| note.starts_with(crate::audit::LANE_BROKEN_NOTE)),
+        "{meta}"
+    );
     assert_eq!(meta["logChains"]["joinLog"]["status"], "failed", "{meta}");
     assert_eq!(computed(), before + 1);
     // B9: unchanged lane + index → the cached map, not a recomputation.

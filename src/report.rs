@@ -304,7 +304,13 @@ const thumbnailLog = usableLog("thumbnail", {thumbnail_lines});
 const carveLog = usableLog("carve", {carve_lines});
 const filesystemLog = usableLog("filesystem", {filesystem_lines});
 const validationLog = usableLog("validation", {validation_lines});
-const anomalyLog = usableLog("anomaly", {anomaly_lines});
+const anomalyAll = (rows => Array.isArray(rows) ? rows : [])({anomaly_lines});
+const anomalyLog = usableLog("anomaly", anomalyAll);
+// R11-I2 (P9): an anomaly entry this PC cannot use AFTER the newest usable
+// run marker (e.g. the newest run's marker HMAC stripped) means the newest
+// run's outcome is unknown — no older run stands in as "current".
+const lastUsableAnomalyMarker = anomalyAll.map(item => item?.event === "anomaly-scan-run" && usableEntry(item)).lastIndexOf(true);
+const anomalyResultWithheld = anomalyAll.some((item, index) => index > lastUsableAnomalyMarker && !usableEntry(item));
 const batchLog = usableLog("batch", {batch_lines});
 const joinLog = usableLog("join", {join_lines});
 const audioLevels = {audio_levels};
@@ -615,7 +621,7 @@ const anomalyRuns = [];
   flushUnmarked(pending);
 }}
 const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(true);
-const currentAnomalyIndex = latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
+const currentAnomalyIndex = anomalyResultWithheld ? -1 : latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
 const currentAnomalyRun = anomalyRuns[currentAnomalyIndex] || null;
 // R8: a newer run without its completion marker (cut short) exists, so the
 // "current" result is an OLDER completed run — say so instead of letting
@@ -654,7 +660,9 @@ const anomalyRunLine = run => {{
 const anomalyRows = currentAnomalyRun ? findingRows(currentAnomalyRun) : [];
 document.getElementById("anomaly-findings").innerHTML = currentAnomalyRun
   ? `${{anomalyInterruptedNotice}}<p class="muted">현재 결과 — ${{anomalyRunLine(currentAnomalyRun)}} · ${{escapeHtml(chainLabel("anomaly"))}}</p>${{anomalyRows.length ? anomalyTable(anomalyRows) : "<p>이 실행에서 이상 징후 후보가 없습니다.</p>"}}`
-  : emptyOr("anomaly", "<p>이상 징후 후보가 없습니다.</p>");
+  : anomalyResultWithheld
+    ? `<div class="note"><strong>현재 결과 없음(결과 아님)</strong> — 가장 최근 이상 징후 실행의 항목(완료 표식 포함 가능)을 이 PC에서 인증할 수 없어 그 결과를 알 수 없습니다. 이전 실행을 현재 결과로 보이지 않습니다 (아래 "인증 안 된 감사 항목" 참조).</div>`
+    : emptyOr("anomaly", "<p>이상 징후 후보가 없습니다.</p>");
 const pastAnomalyRuns = anomalyRuns.filter((_, index) => index !== currentAnomalyIndex).reverse();
 document.getElementById("anomaly-history").innerHTML = pastAnomalyRuns.length ? `<details><summary>이전 실행 ${{pastAnomalyRuns.length}}회 — 현재 결과 아님</summary>${{pastAnomalyRuns.map(run => `<p class="muted">${{anomalyRunLine(run)}}</p>${{findingRows(run).length ? anomalyTable(findingRows(run)) : "<p>후보 없음</p>"}}`).join("")}}</details>` : "";
 

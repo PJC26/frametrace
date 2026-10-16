@@ -677,6 +677,8 @@ pub fn render_carve_report_html(
     .kv {{ font-size: 12px; margin: 3px 0; word-break: break-all; }}
     .kv b {{ display: inline-block; min-width: 110px; color: #667085; }}
     .muted {{ color: #98a2b3; }}
+    .unaudited {{ color: #b54708; font-weight: 600; }}
+    html[data-theme="dark"] .unaudited {{ color: #f0b429; }}
     a {{ color: #1f6feb; }}
   </style>
 </head>
@@ -799,7 +801,8 @@ const fmtCarveTime = unix => {{
   return `${{utc}} (현지 ${{local}} UTC${{off < 0 ? "-" : "+"}}${{p(Math.floor(Math.abs(off) / 60))}}:${{p(Math.abs(off) % 60)}})`;
 }};
 document.getElementById("sourceInfo").textContent =
-  (R.source_path || "") + (R.carved_unix ? "  ·  " + fmtCarveTime(R.carved_unix) : "");
+  (R.source_path || "") + (R.carved_unix ? "  ·  " + fmtCarveTime(R.carved_unix) : "") +
+  (R.source_path || R.carved_unix ? "  ·  실행 요약 감사 안 됨 (db/carve_results.json)" : "");
 const exts = [...new Set(ARTIFACTS.map(a => a.extension || "?"))].sort();
 const warnN = (R.warnings || []).length;
 // R10-I1: only entries usable here (trust_ok) are carve results; the rest
@@ -809,15 +812,22 @@ const RESULT_ARTIFACTS = ARTIFACTS.filter(trusted);
 const unauthN = ARTIFACTS.length - RESULT_ARTIFACTS.length;
 const dupN = RESULT_ARTIFACTS.filter(a => INDEXED_SHAS.has(a.sha256)).length;
 const newN = RESULT_ARTIFACTS.length - dupN;
+// R11-I5: the run summary (scan complete, candidate limit, source size,
+// warnings) comes from db/carve_results.json, which is NOT an audit lane:
+// nothing authenticates it, so those metrics carry "감사 안 됨" and are
+// never shown in the ok colour (a bad value still warns — the safe
+// direction).
+const UNAUDITED_LABEL = "감사 안 됨";
+const unaudited = k => `${{k}} <span class="unaudited" title="db/carve_results.json — 감사 체인 밖 (인증되지 않음)">· ${{UNAUDITED_LABEL}}</span>`;
 document.getElementById("metrics").innerHTML = [
   ["아티팩트", RESULT_ARTIFACTS.length, ""],
   ...(unauthN ? [["인증 안 됨(결과 아님)", unauthN, "fail"]] : []),
   ["라이브FS 미존재", newN, newN ? "warn" : ""],
   ["인덱스 동일", dupN, ""],
-  ["스캔 완료", R.scan_complete ? "전체 완료" : "부분 스캔", R.scan_complete ? "ok" : "fail"],
-  ["상한 도달", R.candidate_limit_reached ? "예" : "아니오", R.candidate_limit_reached ? "fail" : ""],
-  ["원본 크기", fmtSize(R.source_size_bytes), ""],
-  ["경고", warnN, warnN ? "warn" : ""],
+  [unaudited("스캔 완료"), R.scan_complete ? "전체 완료" : "부분 스캔", R.scan_complete ? "" : "fail"],
+  [unaudited("상한 도달"), R.candidate_limit_reached ? "예" : "아니오", R.candidate_limit_reached ? "fail" : ""],
+  [unaudited("원본 크기"), fmtSize(R.source_size_bytes), ""],
+  [unaudited("경고"), warnN, warnN ? "warn" : ""],
 ].map(([k,v,c]) => `<div class="metric ${{c}}"><b>${{v}}</b>${{k}}</div>`).join("");
 
 // filters

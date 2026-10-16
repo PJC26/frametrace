@@ -372,7 +372,15 @@ fn audit_log_events(
         // spelling the file system treats as the lane (letter case on
         // Windows / macOS) — and read once.
         let lane_rel = audit::canonical_lane_rel(&rel);
-        if lane_rel
+        // R11-I7: only the canonical lane file (spelled canonically, or the
+        // very file that spelling opens) counts as "the lane" for the
+        // once-per-lane rule; a differently-spelled copy beside it in a
+        // case-sensitive folder is read as itself — the reader reports it
+        // NOT VERIFIED — and never hides the real lane.
+        let identity = lane_rel
+            .clone()
+            .filter(|_| audit::is_canonical_lane_file(case_dir, &rel, &file));
+        if identity
             .as_ref()
             .is_some_and(|rel| !seen_lanes.insert(rel.clone()))
         {
@@ -496,7 +504,9 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String>
         if file_type.is_dir() {
             collect_jsonl_files(&path, out)?;
         } else if file_type.is_file()
-            && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            // R11-I6: `X.JSONL` is a lane on case-insensitive volumes
+            // (R10 P6 identity) — the extension compares the same way.
+            && audit::lane_rel_key(&entry.file_name().to_string_lossy()).ends_with(".jsonl")
         {
             out.push(path);
         }

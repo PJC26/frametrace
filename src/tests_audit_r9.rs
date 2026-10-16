@@ -75,7 +75,10 @@ fn r9_p3_rows_carry_their_trust() {
     assert!(broken.failure.is_some());
     assert_eq!(broken.status(), "failed");
     assert_eq!(broken.rows[1].trust, LineTrust::ChainBroken);
-    assert_eq!(broken.usable().count(), 1);
+    // R11-I4 (P9): the prefix before the break is not usable either.
+    assert_eq!(broken.usable().count(), 0);
+    assert_eq!(broken.rows[0].lane_broken_at, Some(1));
+    assert_eq!(broken.rows[0].code(), "unauth");
     // Missing lane: present = false, no rows.
     let absent = read_lane_rows_with_keys(&dir.join("evidence/logs/scan-log.jsonl"), &[]).unwrap();
     assert!(!absent.present && absent.rows.is_empty());

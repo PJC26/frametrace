@@ -297,12 +297,16 @@ fn verify_audit_logs(case_dir: &Path) -> Vec<LogRow> {
 /// workstation's 원본 재검증 button runs). The statement itself never
 /// hashes anything; when no run exists it says so instead of implying the
 /// sources were verified.
+///
+/// R11 P9: the decision is [`crate::anomaly::hash_verify_assessment`]'s —
+/// a missing (unusable) row is not good news: no green banner for a run
+/// that is not `verified`, and no older run as "latest" when a newer one
+/// cannot be authenticated (banner states: see `hash_verify_banner`).
 fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor>) -> String {
     let esc = |text: &str| esc_with(redactor, text);
-    let path = case_dir.join(crate::anomaly::HASH_VERIFY_REL_PATH);
     // D11: an unreadable log is an error, never "no run recorded".
-    let runs = match crate::anomaly::hash_verify_runs(case_dir) {
-        Ok(runs) => runs,
+    let assessment = match crate::anomaly::hash_verify_assessment(case_dir) {
+        Ok(assessment) => assessment,
         Err(err) => {
             return format!(
                 "<p class=\"note bad\">The live source re-hash log could not be read — re-verification status unknown: {}</p>",
@@ -310,13 +314,15 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
             );
         }
     };
+    let lane = &assessment.lane;
     // D4: runs are grouped by run id; only the newest COMPLETED run is the
     // result, and a newer run without its completion marker is disclosed
     // as interrupted instead of being mixed into (or shown as) the result.
-    let (latest_run, interrupted) = crate::anomaly::latest_completed_and_interrupted(&runs);
-    let interrupted_html = interrupted
+    let interrupted_html = assessment
+        .interrupted
         .iter()
-        .map(|run| {
+        .map(|index| {
+            let run = &assessment.runs[*index];
             format!(
                 "<p class=\"note warn\">Interrupted run started {} ({} record(s) logged, no completion marker): not a result — its partial records are not shown as the latest re-verification.</p>\n",
                 ts(run.run_unix),
@@ -324,66 +330,53 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
             )
         })
         .collect::<String>();
-    let Some(latest_run) = latest_run else {
-        let unauthenticated: usize = runs.iter().map(|run| run.unauthenticated).sum();
-        let unauth_html = if unauthenticated > 0 {
-            format!(
-                "<p class=\"note warn\">{unauthenticated} re-hash log entr{} cannot be authenticated on this PC and are NOT used as re-verification results (unauthenticated).</p>",
-                if unauthenticated == 1 { "y" } else { "ies" }
-            )
-        } else {
-            String::new()
-        };
-        // A chain that does not verify: say so (nothing from it is used).
-        let broken_html = match audit::read_lane_rows(&path) {
-            Ok(lane) if lane.failure.is_some() => "<p class=\"banner bad\">The live re-hash log (hash-verify.jsonl) does not verify as a chain — no re-verification result from it is relied on.</p>".to_string(),
-            _ => String::new(),
-        };
-        return format!(
-            "{broken_html}{interrupted_html}{unauth_html}<p class=\"note warn\">No completed live source re-hash has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>"
-        );
-    };
-    let (latest, entries) = (latest_run.run_unix, &latest_run.entries);
-    // R8-I10 (P0/P1): the re-hash results are only as good as the log
-    // they are read from. R7 printed a green "all re-hashed and equal"
-    // banner next to "log chain verification FAILED" or an unauthenticated
-    // log. R9 P3: the run's records are only the entries usable here
-    // (`hash_verify_runs` reads rows through `audit::read_lane_rows`);
-    // entries this PC cannot authenticate are counted, never results.
-    let lane = audit::read_lane_rows(&path);
-    let verification: Result<(), String> = match &lane {
-        Ok(lane) => lane.failure.clone().map_or(Ok(()), Err),
-        Err(err) => Err(err.clone()),
-    };
-    let trust = lane.as_ref().ok().map(|lane| lane.lane.clone());
-    let chain = match &lane {
-        Ok(lane) if lane.failure.is_none() => format!(
-            "log chain: {} ({} entries){}",
-            lane.lane.label(),
-            lane.rows.len(),
-            Some(lane.lane.reason())
-                .filter(|reason| !reason.is_empty())
-                .map(|reason| format!(" — {reason}"))
-                .unwrap_or_default()
-        ),
-        Ok(lane) => format!(
-            "log chain verification FAILED: {}",
-            lane.failure.clone().unwrap_or_default()
-        ),
-        Err(err) => format!("log chain verification FAILED: {err}"),
-    };
-    let unauthenticated: usize = runs.iter().map(|run| run.unauthenticated).sum();
-    let self_consistent_rows = entries
-        .iter()
-        .any(|entry| entry.get("trust").and_then(|t| t.as_str()) != Some("auth"));
+    let unauthenticated = assessment.unauthenticated;
     let unauth_html = if unauthenticated > 0 {
         format!(
-            "<p class=\"note warn\">{unauthenticated} re-hash log entr{} cannot be authenticated on this PC (not HMAC-authenticated here while this PC holds audit keys, signed under another PC's key, or after a chain break) — NOT used as re-verification results anywhere below (unauthenticated; not a tampering verdict for another PC's key: check it on the PC holding that key).</p>\n",
+            "<p class=\"note warn\">{unauthenticated} re-hash log entr{} cannot be authenticated on this PC (not HMAC-authenticated here while this PC holds audit keys, signed under another PC's key, superseded by a newer entry this PC cannot authenticate, or in a log whose chain does not verify) — NOT used as re-verification results anywhere below, and a record missing for that reason is NOT counted as a match (unauthenticated; not a tampering verdict for another PC's key: check it on the PC holding that key).</p>\n",
             if unauthenticated == 1 { "y" } else { "ies" }
         )
     } else {
         String::new()
     };
+    // A chain that does not verify: say so (nothing from it is used).
+    let broken_html = if lane.failure.is_some() {
+        "<p class=\"banner bad\">The live re-hash log (hash-verify.jsonl) does not verify as a chain — no re-verification result from it is relied on.</p>\n".to_string()
+    } else {
+        String::new()
+    };
+    let Some(latest_run) = assessment.result_run() else {
+        // R11 I2: a newer run this PC cannot authenticate (e.g. its
+        // completion marker's HMAC stripped) — the previous completed run
+        // is NOT the current result.
+        let withheld_html = match &assessment.withheld {
+            Some(reason) if lane.failure.is_none() => format!(
+                "<p class=\"banner warn\">No current re-verification result: the newest re-hash run recorded in hash-verify.jsonl cannot be authenticated on this PC, so its outcome is unknown — an earlier completed run is NOT presented as the latest result (결과 아님: {}).</p>\n",
+                esc(reason)
+            ),
+            _ => String::new(),
+        };
+        return format!(
+            "{broken_html}{withheld_html}{interrupted_html}{unauth_html}<p class=\"note warn\">No completed live source re-hash usable on this PC has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>"
+        );
+    };
+    let (latest, entries) = (latest_run.run_unix, &latest_run.entries);
+    // R8-I10 (P0/P1): the re-hash results are only as good as the log
+    // they are read from. R9 P3: the run's records are only the entries
+    // usable here; entries this PC cannot authenticate are counted, never
+    // results.
+    let chain = format!(
+        "log chain: {} ({} entries){}",
+        lane.lane.label(),
+        lane.rows.len(),
+        Some(lane.lane.reason())
+            .filter(|reason| !reason.is_empty())
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default()
+    );
+    let self_consistent_rows = entries
+        .iter()
+        .any(|entry| entry.get("trust").and_then(|t| t.as_str()) != Some("auth"));
     // Error text quotes the log's absolute path: escaped (and redacted).
     let chain = esc(&chain);
     let mut rows = String::new();
@@ -427,25 +420,42 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
             dash(get("observed_sha256")),
         ));
     }
-    let banner = match (&verification, &trust) {
-        (Err(_), _) => "<p class=\"banner bad\">The live re-hash log (hash-verify.jsonl) does not verify as a chain — the results below are shown as recorded but are NOT relied on as a re-verification.</p>".to_string(),
-        (_, Some(audit::LaneTrust::SelfConsistentOnly(_))) => hash_verify_banner(matched, mismatched, other).replacen(
+    let banner = if !assessment.not_verified.is_empty() && mismatched == 0 {
+        // R11 P9: never green (nor "re-hashed and equal") for a run that
+        // is not verified here — rows may be missing from it.
+        format!(
+            "<p class=\"banner warn\">This re-hash run is NOT VERIFIED on this PC — {matched} file(s) shown as matching, but the run cannot be relied on as a complete re-verification (missing or unauthenticated rows are not good news): {}. It does not confirm that the sources are unchanged.</p>",
+            esc(&assessment.not_verified.join("; "))
+        )
+    } else if !assessment.not_verified.is_empty() {
+        hash_verify_banner(matched, mismatched, other).replacen(
+            "</p>",
+            &format!(
+                " This run is also NOT VERIFIED on this PC: {}.</p>",
+                esc(&assessment.not_verified.join("; "))
+            ),
+            1,
+        )
+    } else if let audit::LaneTrust::SelfConsistentOnly(_) = &lane.lane {
+        hash_verify_banner(matched, mismatched, other).replacen(
             "</p>",
             " (Self-consistency only, not authentication: the re-hash log is not HMAC-authenticated on this PC.)</p>",
             1,
-        ),
+        )
+    } else if self_consistent_rows {
         // R9 P3: the run shown is built from usable entries only; when
         // some of them are only self-consistent (the pre-key prefix) the
         // banner says so.
-        _ if self_consistent_rows => hash_verify_banner(matched, mismatched, other).replacen(
+        hash_verify_banner(matched, mismatched, other).replacen(
             "</p>",
             " (Self-consistency only for entries written before audit keying was introduced — not authentication.)</p>",
             1,
-        ),
-        _ => hash_verify_banner(matched, mismatched, other),
+        )
+    } else {
+        hash_verify_banner(matched, mismatched, other)
     };
     format!(
-        "{interrupted_html}{unauth_html}<p class=note>Latest completed live re-hash run at {} (run {}, newest completed run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
+        "{broken_html}{interrupted_html}{unauth_html}<p class=note>Latest completed live re-hash run at {} (run {}, newest completed run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
         ts(latest),
         esc(&latest_run.run_id),
         crate::anomaly::HASH_VERIFY_REL_PATH,
@@ -455,7 +465,8 @@ fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor
 /// Section-5 banner. Green ("ok") only when at least one file was actually
 /// compared and every file was comparable (SHOULD-FIX 4): a run where
 /// nothing matched — or some files could not be compared — must never read
-/// as a clean re-verification.
+/// as a clean re-verification. R11 P9: the caller never uses it unchanged
+/// for a run that is not verified here.
 fn hash_verify_banner(matched: usize, mismatched: usize, other: usize) -> String {
     if mismatched > 0 {
         format!(

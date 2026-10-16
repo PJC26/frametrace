@@ -3208,16 +3208,36 @@ pub(crate) fn verify_sources_with_exe(state: &SharedState, exe: &Path) -> String
     }
     match crate::anomaly::latest_hash_verify_summary(&case_dir) {
         Some(summary) => {
+            // R11 P9/I2: a summary that is not verified (rows this PC
+            // cannot authenticate, a withheld result) is said so in the
+            // log and the response — never "모두 일치".
+            let tail = match (&summary.not_verified_reason, summary.is_result) {
+                (_, false) => format!(
+                    " — 현재 결과 없음(결과 아님): {}",
+                    summary.not_verified_reason.as_deref().unwrap_or_default()
+                ),
+                (Some(reason), true) => format!(" — 확인 불가(NOT VERIFIED): {reason}"),
+                (None, true) => String::new(),
+            };
             state_lock(state).logs.push(format!(
-                "원본 재검증 완료: 일치 {} · 불일치 {} · 비교 불가 {}",
-                summary.matched, summary.mismatched, summary.not_comparable
+                "원본 재검증 완료: 일치 {} · 불일치 {} · 비교 불가 {} · 인증 안 됨 {}{tail}",
+                summary.matched,
+                summary.mismatched,
+                summary.not_comparable,
+                summary.unauthenticated
             ));
             serde_json::json!({
                 "ok": true,
                 "run_unix": summary.run_unix,
+                "run_id": summary.run_id,
                 "matched": summary.matched,
                 "mismatched": summary.mismatched,
                 "not_comparable": summary.not_comparable,
+                "unauthenticated": summary.unauthenticated,
+                "verified": summary.verified,
+                "is_result": summary.is_result,
+                "not_verified_reason": summary.not_verified_reason,
+                "lane_status": summary.lane_status,
                 "log": crate::anomaly::HASH_VERIFY_REL_PATH,
                 "custody_url": "case/reports/custody-statement.html",
             })

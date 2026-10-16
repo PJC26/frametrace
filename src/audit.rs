@@ -242,6 +242,10 @@ pub const LOCATION_UNVERIFIED_NOTE: &str = "레인 위치를 확인할 수 없�
 /// but has a NEWER entry for the same record that is not usable here.
 pub const SUPERSEDED_NOTE: &str = "더 최근 인증 안 된 항목 있음";
 
+/// R11-I4: the start of the `trust_note` of an entry before the break of a
+/// lane whose chain does not verify.
+pub const LANE_BROKEN_NOTE: &str = "체인 파손 레인";
+
 /// R10-I11: the `trust_note` of an authenticated entry without lane/case
 /// binding (written before R9). Its code stays `auth`.
 pub const UNBOUND_LEGACY_NOTE: &str = "레인·케이스 결합 없음(레거시) — 이 PC의 감사 키로 인증됐으나 다른 레인·케이스에서 옮겨 온 항목인지 확인할 수 없는 이전 형식";
@@ -490,6 +494,13 @@ pub struct LaneRow {
     /// R10-I11: authenticated, but without lane/case binding (written
     /// before R9) — code stays `auth`, `trust_note` says "레거시".
     pub unbound: bool,
+    /// R11-I4 (P9): the lane's chain does not verify and this entry sits
+    /// BEFORE the break (entries from the break on are
+    /// [`LineTrust::ChainBroken`]) — the index of the first broken entry.
+    /// Not usable either: with a broken chain the newest state of a record
+    /// is unknown, so a prefix value is never "current" (R10 rolled back to
+    /// it, defeating P7).
+    pub lane_broken_at: Option<usize>,
 }
 
 impl LaneRow {
@@ -501,13 +512,14 @@ impl LaneRow {
     /// after a chain break, or (R10 P7) an entry a newer unusable entry of
     /// the same record supersedes.
     pub fn usable(&self) -> bool {
-        self.trust.is_usable() && self.superseded_by.is_none()
+        self.trust.is_usable() && self.superseded_by.is_none() && self.lane_broken_at.is_none()
     }
 
     /// The per-entry trust code ([`LineTrust::code`]); `unauth` for an
-    /// entry superseded under P7.
+    /// entry superseded under P7 or (R11-I4) in a lane whose chain breaks
+    /// after it.
     pub fn code(&self) -> String {
-        if self.superseded_by.is_some() {
+        if self.superseded_by.is_some() || self.lane_broken_at.is_some() {
             "unauth".to_string()
         } else {
             self.trust.code()
@@ -516,6 +528,12 @@ impl LaneRow {
 
     /// Why the entry is or is not relied on here (one Korean sentence).
     pub fn note(&self) -> String {
+        if let Some(index) = self.lane_broken_at {
+            return format!(
+                "{LANE_BROKEN_NOTE} — 이 레인의 감사 체인이 {}번째 줄에서 깨져, 그 앞 항목도 현재값·확인됨으로 쓰지 않음 (기록의 최신 상태를 알 수 없음)",
+                index + 1
+            );
+        }
         match &self.superseded_by {
             Some((index, key)) => format!(
                 "{SUPERSEDED_NOTE} — 같은 기록({key})의 더 새 항목({}번째 줄)이 이 PC에서 인증되지 않아, 이 이전 항목을 현재·확인됨으로 쓰지 않음 (최신 항목이 인증되지 않으면 이전 인증 항목으로 되돌리지 않음)",
@@ -543,6 +561,9 @@ impl LaneRow {
         if let Some((index, _)) = &self.superseded_by {
             value["trust_superseded_by"] = serde_json::json!(index + 1);
         }
+        if let Some(index) = self.lane_broken_at {
+            value["trust_lane_broken_at"] = serde_json::json!(index + 1);
+        }
         value
     }
 }
@@ -567,6 +588,22 @@ pub fn recency_keys(lane_rel: &str, value: &serde_json::Value) -> Vec<String> {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
     };
+    // R11-I8: clip-family lanes name the SOURCE in `selector` (many clips
+    // of one source share it): the record is the output file only — R10
+    // keyed by selector too, so one unusable clip entry made every earlier
+    // clip of that source unusable.
+    let clip_family = matches!(
+        lane_rel,
+        "artifacts/clips/export-log.jsonl"
+            | "artifacts/proxies/proxy-log.jsonl"
+            | "artifacts/thumbnails/thumbnail-log.jsonl"
+    ) || (lane_rel == "artifacts/logs/transcode-queue-log.jsonl"
+        && text("event").as_deref() == Some("transcode-queue-item"));
+    if clip_family {
+        return text("output_path")
+            .map(|path| vec![format!("output_path={path}")])
+            .unwrap_or_default();
+    }
     let mut keys: Vec<String> = ["id", "record_id", "selector", "target_path", "output_path"]
         .iter()
         .filter_map(|field| text(field).map(|value| format!("{field}={value}")))
@@ -585,6 +622,19 @@ pub fn recency_keys(lane_rel: &str, value: &serde_json::Value) -> Vec<String> {
                 scalar("partition_offset").unwrap_or_else(|| "0".to_string())
             ));
         }
+    }
+    // R11-I2 (P9): a run-scoped record — a re-hash run's records and its
+    // completion marker are one record per `run_id`, so an unusable newer
+    // entry of the run (its stripped marker) supersedes the run's earlier
+    // entries.
+    if lane_rel == "evidence/logs/hash-verify.jsonl"
+        && matches!(
+            text("event").as_deref(),
+            Some("hash-verify" | "hash-verify-run")
+        )
+        && let Some(run_id) = text("run_id")
+    {
+        keys.push(format!("run_id={run_id}"));
     }
     // A summary event without a record id (one per lane, newest wins).
     if keys.is_empty() && text("event").as_deref() == Some("transcode-queue") {
@@ -818,6 +868,7 @@ pub fn is_key_config_error(err: &str) -> bool {
 /// skipping it).
 pub fn case_lane_paths(case_dir: &Path) -> Vec<PathBuf> {
     let mut rels = collect_chain_lanes(case_dir);
+    let mut copies: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(case_dir.join("evidence").join("logs")) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -826,12 +877,22 @@ pub fn case_lane_paths(case_dir: &Path) -> Vec<PathBuf> {
                 .is_ok_and(|kind| kind.is_file() || kind.is_symlink());
             if listed && lane_rel_key(&name).ends_with(".jsonl") {
                 let rel = format!("evidence/logs/{name}");
-                rels.push(canonical_lane_rel(&rel).unwrap_or(rel));
+                match canonical_lane_rel(&rel) {
+                    // R11-I7: a differently-spelled copy beside the real
+                    // lane (case-sensitive folder) is checked too — as
+                    // itself (NOT VERIFIED), never in place of the lane.
+                    Some(_) if !is_canonical_lane_file(case_dir, &rel, &entry.path()) => {
+                        copies.push(rel)
+                    }
+                    Some(canonical) => rels.push(canonical),
+                    None => rels.push(rel),
+                }
             }
         }
     }
     let mut seen = std::collections::BTreeSet::new();
     rels.retain(|rel| seen.insert(lane_rel_key(rel)));
+    rels.extend(copies);
     rels.sort();
     rels.iter().map(|rel| join_rel(case_dir, rel)).collect()
 }
@@ -934,6 +995,8 @@ fn read_lane_rows_inner(
             },
             superseded_by: None,
             unbound: outcome.unbound.contains(&index),
+            // R11-I4: a broken chain makes its prefix unusable too.
+            lane_broken_at: (failure.is_some() && index < verified).then_some(verified),
         })
         .collect();
     // R10 P7: a newer unusable entry of the same record supersedes older
@@ -1120,11 +1183,62 @@ pub fn lane_location(path: &Path) -> LaneLocation {
                 ));
             }
         }
+        // R11-I7: a lane file spelled differently from the canonical lane
+        // name (letter case) that is NOT the file the canonical spelling
+        // opens — a copy beside the real lane in a case-sensitive folder
+        // — is not the lane: NOT VERIFIED (the real lane is read through
+        // the canonical path).
+        let spelled = rel.to_string_lossy().replace('\\', "/");
+        if spelled != binding.rel {
+            let canonical = join_rel(root, &binding.rel);
+            let same = match (
+                std::fs::canonicalize(&canonical),
+                std::fs::canonicalize(&absolute),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                // Not on disk (yet): compare nothing — the spelling only
+                // matters for a file that exists.
+                (_, Err(_)) => true,
+                (Err(_), Ok(_)) => false,
+            };
+            if !same {
+                return Some(format!(
+                    "{NONCANONICAL_LANE_NOTE}: {} — 진짜 레인은 {}",
+                    absolute.display(),
+                    canonical.display()
+                ));
+            }
+        }
         None
     });
     LaneLocation {
         binding: Some(binding),
         unverified,
+    }
+}
+
+/// R11-I7: why a lane file spelled unlike its canonical name, distinct
+/// from the canonical lane file, is NOT VERIFIED.
+pub const NONCANONICAL_LANE_NOTE: &str = "정규 표기와 다른 이름의 레인 파일(진짜 레인과 다른 파일)";
+
+/// R11-I7: whether `path` (found under `root` as `rel`) is the canonical
+/// lane file of its lane identity — spelled canonically, or the very file
+/// the canonical spelling opens. `false` for a differently-spelled copy
+/// beside the real lane (case-sensitive folders).
+pub fn is_canonical_lane_file(root: &Path, rel: &str, path: &Path) -> bool {
+    let rel = rel.replace('\\', "/");
+    let Some(canonical) = canonical_lane_rel(&rel) else {
+        return false;
+    };
+    if rel.trim_start_matches("./") == canonical {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(join_rel(root, &canonical)),
+        std::fs::canonicalize(path),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -1663,6 +1777,13 @@ fn check_lane_anchor_rows(rows: Result<LaneRows, String>, head: &LaneHead) -> An
         .any(|row| row.trust == LineTrust::ChainBroken)
     {
         return AnchorStatus::Rewritten;
+    }
+    // R11-I4: the chain breaks AFTER the anchor — what was signed still
+    // reads intact, but the lane cannot be confirmed here: NOT VERIFIED.
+    if let Some(failure) = &rows.failure {
+        return AnchorStatus::NotAuthenticated(format!(
+            "앵커 지점(항목 {anchored}개) 뒤에서 감사 체인이 깨짐 — 레인을 확인할 수 없음: {failure}"
+        ));
     }
     if let Some(err) = &rows.key_error {
         return AnchorStatus::NotAuthenticated(err.clone());
@@ -3623,3 +3744,7 @@ mod tests_r9;
 #[cfg(test)]
 #[path = "tests_audit_r10.rs"]
 mod tests_r10;
+
+#[cfg(test)]
+#[path = "tests_audit_r11.rs"]
+mod tests_r11;

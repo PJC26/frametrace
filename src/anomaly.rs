@@ -276,12 +276,40 @@ pub struct HashCheck {
 pub const HASH_VERIFY_REL_PATH: &str = "evidence/logs/hash-verify.jsonl";
 
 /// Counts from the newest run recorded in `hash-verify.jsonl`.
+///
+/// R11 P9: the counts are only the run's USABLE records — a record that
+/// cannot be authenticated here is missing from them, and a missing row is
+/// not good news. "All match" may be claimed only when `verified` is true
+/// AND `mismatched == 0 && not_comparable == 0 && matched > 0`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HashVerifySummary {
     pub run_unix: i64,
+    /// The result run's id (`None` when `is_result` is false).
+    pub run_id: Option<String>,
     pub matched: usize,
     pub mismatched: usize,
     pub not_comparable: usize,
+    /// R11 P9: `hash-verify` / `hash-verify-run` entries that may not feed
+    /// a result here (not authenticated where keys are held, another PC's,
+    /// superseded under P7, in a lane whose chain is broken) in the result
+    /// run and every newer run — or in every run when there is no result.
+    pub unauthenticated: usize,
+    /// R11 P9: the result run may be relied on as a whole — the lane's
+    /// chain verifies and the lane is not NOT VERIFIED here, no entry of
+    /// this run or a newer one is unusable, and the completion marker's
+    /// `records` count equals the usable records.
+    pub verified: bool,
+    /// R11 I2: false = there is NO current result (a newer run holds an
+    /// entry this PC cannot use, e.g. its completion marker's HMAC was
+    /// stripped, or the chain is broken): the counts are zero and no older
+    /// run stands in for it.
+    pub is_result: bool,
+    /// Why `verified` is false (Korean, `; `-joined), `None` when verified.
+    pub not_verified_reason: Option<String>,
+    /// The lane's status word ([`audit::LaneRows::status`]): `keyed`,
+    /// `structural` (self-consistency only), `not-verified`, `failed`,
+    /// `absent`.
+    pub lane_status: &'static str,
 }
 
 /// One run in `hash-verify.jsonl`, grouped by its run id (D4).
@@ -300,6 +328,9 @@ pub struct HashVerifyRun {
     /// audit keys, another PC's, or past a chain break. They are left out
     /// of `entries` / `completed` and only counted.
     pub unauthenticated: usize,
+    /// R11 I1: the `records` count the (usable) completion marker states —
+    /// `None` without a marker, or for a marker written before the field.
+    pub marker_records: Option<usize>,
 }
 
 /// Every run in `hash-verify.jsonl`, in first-appearance order. Entries are
@@ -308,14 +339,10 @@ pub struct HashVerifyRun {
 /// result (D4). `Ok(empty)` when there is no log; an unreadable log is an
 /// error, never "no run" (D11).
 pub fn hash_verify_runs(case_dir: &Path) -> Result<Vec<HashVerifyRun>, String> {
-    let path = case_dir.join(HASH_VERIFY_REL_PATH);
-    // R9 P3: rows come through the one lane reader, each with its trust.
-    let lane = audit::read_lane_rows(&path).map_err(|err| {
-        format!(
-            "원본 재검증 기록을 읽지 못했습니다 {}: {err}",
-            path.display()
-        )
-    })?;
+    Ok(hash_verify_assessment(case_dir)?.runs)
+}
+
+fn runs_from_lane(lane: &audit::LaneRows) -> Vec<HashVerifyRun> {
     let mut runs: Vec<HashVerifyRun> = Vec::new();
     for row in &lane.rows {
         let value = &row.value;
@@ -338,6 +365,7 @@ pub fn hash_verify_runs(case_dir: &Path) -> Result<Vec<HashVerifyRun>, String> {
                     entries: Vec::new(),
                     completed: false,
                     unauthenticated: 0,
+                    marker_records: None,
                 });
                 runs.len() - 1
             }
@@ -346,50 +374,180 @@ pub fn hash_verify_runs(case_dir: &Path) -> Result<Vec<HashVerifyRun>, String> {
             runs[index].unauthenticated += 1;
         } else if event == Some("hash-verify-run") {
             runs[index].completed = true;
+            runs[index].marker_records = value
+                .get("records")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
         } else {
             runs[index].entries.push(row.value_with_trust());
         }
     }
-    Ok(runs)
+    runs
 }
 
-/// The newest completed run and the runs after it that never completed
-/// (interrupted — shown separately, never as the result).
-pub fn latest_completed_and_interrupted(
-    runs: &[HashVerifyRun],
-) -> (Option<&HashVerifyRun>, Vec<&HashVerifyRun>) {
+/// R11 P9: what `hash-verify.jsonl` may be relied on for — THE decision
+/// every consumer (custody statement section 5, `/api/verify-sources`)
+/// uses.
+#[derive(Debug, Clone)]
+pub struct HashVerifyAssessment {
+    /// Every run, in first-appearance order ([`hash_verify_runs`]).
+    pub runs: Vec<HashVerifyRun>,
+    /// Index into `runs` of the current result: the newest completed run,
+    /// unless `withheld`.
+    pub result: Option<usize>,
+    /// Newer runs after the result (or every run when there is none) that
+    /// never completed and hold only usable entries — cut short by a crash
+    /// or cancel, disclosed, never the result.
+    pub interrupted: Vec<usize>,
+    /// R11 I2: why there is no current result although runs exist — a run
+    /// newer than every completed one holds an entry this PC cannot use
+    /// (a stripped completion marker), or the chain is broken. An older
+    /// run is then NOT presented as the latest result.
+    pub withheld: Option<String>,
+    /// R11 P9: why the result run may not be relied on as a whole (empty =
+    /// it may).
+    pub not_verified: Vec<String>,
+    /// See [`HashVerifySummary::unauthenticated`].
+    pub unauthenticated: usize,
+    /// The lane as read ([`audit::read_lane_rows`]).
+    pub lane: audit::LaneRows,
+}
+
+impl HashVerifyAssessment {
+    pub fn result_run(&self) -> Option<&HashVerifyRun> {
+        self.result.map(|index| &self.runs[index])
+    }
+
+    /// The API summary; `None` when nothing usable was ever recorded and
+    /// nothing is withheld.
+    pub fn summary(&self) -> Option<HashVerifySummary> {
+        let lane_status = self.lane.status();
+        let Some(run) = self.result_run() else {
+            return self.withheld.as_ref().map(|reason| HashVerifySummary {
+                unauthenticated: self.unauthenticated,
+                not_verified_reason: Some(reason.clone()),
+                lane_status,
+                ..Default::default()
+            });
+        };
+        let mut summary = HashVerifySummary {
+            run_unix: run.run_unix,
+            run_id: Some(run.run_id.clone()),
+            unauthenticated: self.unauthenticated,
+            verified: self.not_verified.is_empty(),
+            is_result: true,
+            not_verified_reason: (!self.not_verified.is_empty())
+                .then(|| self.not_verified.join("; ")),
+            lane_status,
+            ..Default::default()
+        };
+        for entry in &run.entries {
+            match entry.get("status").and_then(|v| v.as_str()) {
+                Some("match") => summary.matched += 1,
+                Some("mismatch") => summary.mismatched += 1,
+                _ => summary.not_comparable += 1,
+            }
+        }
+        Some(summary)
+    }
+}
+
+/// R11 P9: reads `hash-verify.jsonl` through the lane reader and decides
+/// the current result: the newest completed run — but no result at all
+/// when a NEWER run holds an unusable entry (I2: stripping the newest
+/// run's completion-marker HMAC must not roll the result back to the
+/// previous run) or the chain is broken (I4); and the result is not
+/// `verified` when it or a newer run holds an unusable entry, its marker's
+/// `records` count disagrees with its usable records (I1), or the lane is
+/// NOT VERIFIED here.
+pub fn hash_verify_assessment(case_dir: &Path) -> Result<HashVerifyAssessment, String> {
+    let path = case_dir.join(HASH_VERIFY_REL_PATH);
+    // R9 P3: rows come through the one lane reader, each with its trust.
+    let lane = audit::read_lane_rows(&path).map_err(|err| {
+        format!(
+            "원본 재검증 기록을 읽지 못했습니다 {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(assess_runs(runs_from_lane(&lane), lane))
+}
+
+fn assess_runs(runs: Vec<HashVerifyRun>, lane: audit::LaneRows) -> HashVerifyAssessment {
     let latest = runs.iter().rposition(|run| run.completed);
-    let after = latest.map_or(0, |index| index + 1);
-    (
-        latest.map(|index| &runs[index]),
-        runs[after..].iter().filter(|run| !run.completed).collect(),
-    )
+    let newest_unusable = runs.iter().rposition(|run| run.unauthenticated > 0);
+    let mut withheld = None;
+    if let Some(failure) = &lane.failure {
+        withheld = Some(format!(
+            "재검증 기록의 감사 체인 검증 실패 — 어떤 실행도 현재 결과로 쓰지 않음: {failure}"
+        ));
+    } else if let Some(unusable) = newest_unusable
+        && latest.is_none_or(|latest| unusable > latest)
+    {
+        let run = &runs[unusable];
+        withheld = Some(format!(
+            "더 새 재검증 실행({})의 항목 {}개를 이 PC에서 인증할 수 없음 (완료 표식일 수 있음) — 그 실행의 결과를 알 수 없어 이전 완료 실행을 현재 결과로 쓰지 않음",
+            run.run_id, run.unauthenticated
+        ));
+    }
+    let result = if withheld.is_some() { None } else { latest };
+    let unauthenticated = runs[result.unwrap_or(0)..]
+        .iter()
+        .map(|run| run.unauthenticated)
+        .sum();
+    let interrupted = (result.map_or(0, |index| index + 1)..runs.len())
+        .filter(|index| !runs[*index].completed && runs[*index].unauthenticated == 0)
+        .collect();
+    let mut not_verified = Vec::new();
+    match result {
+        None => not_verified.extend(withheld.clone()),
+        Some(index) => {
+            let run = &runs[index];
+            if unauthenticated > 0 {
+                not_verified.push(format!(
+                    "이 실행 또는 그 뒤 실행의 항목 {unauthenticated}개를 이 PC에서 인증할 수 없음 — 빠진 항목은 일치로 보지 않음"
+                ));
+            }
+            if let Some(records) = run.marker_records
+                && records != run.entries.len()
+            {
+                not_verified.push(format!(
+                    "완료 표식의 기록 수({records})와 사용 가능한 기록 수({})가 다름",
+                    run.entries.len()
+                ));
+            }
+            if let audit::LaneTrust::NotVerified { reason, .. } = &lane.lane {
+                not_verified.push(format!("재검증 기록 레인 NOT VERIFIED: {reason}"));
+            }
+        }
+    }
+    HashVerifyAssessment {
+        runs,
+        result,
+        interrupted,
+        withheld,
+        not_verified,
+        unauthenticated,
+        lane,
+    }
 }
 
 /// Newest *completed* run in `hash-verify.jsonl`: per-record entries are
 /// followed by a `hash-verify-run` marker, so a run cut short by a crash or
 /// cancel (records without a marker) is never presented as a result. Only
 /// the completed run's own records are returned (grouped by run id).
+/// R11 I2: `None` when the result is withheld ([`hash_verify_assessment`]).
 pub fn latest_hash_verify_run(case_dir: &Path) -> Option<(i64, Vec<serde_json::Value>)> {
-    let runs = hash_verify_runs(case_dir).ok()?;
-    let (latest, _) = latest_completed_and_interrupted(&runs);
-    latest.map(|run| (run.run_unix, run.entries.clone()))
+    let assessment = hash_verify_assessment(case_dir).ok()?;
+    assessment
+        .result_run()
+        .map(|run| (run.run_unix, run.entries.clone()))
 }
 
+/// R11 P9: the API summary ([`HashVerifyAssessment::summary`]). `None`
+/// when the log cannot be read or nothing was ever recorded; `Some` with
+/// `is_result: false` when the result is withheld.
 pub fn latest_hash_verify_summary(case_dir: &Path) -> Option<HashVerifySummary> {
-    let (run_unix, entries) = latest_hash_verify_run(case_dir)?;
-    let mut summary = HashVerifySummary {
-        run_unix,
-        ..Default::default()
-    };
-    for entry in &entries {
-        match entry.get("status").and_then(|v| v.as_str()) {
-            Some("match") => summary.matched += 1,
-            Some("mismatch") => summary.mismatched += 1,
-            _ => summary.not_comparable += 1,
-        }
-    }
-    Some(summary)
+    hash_verify_assessment(case_dir).ok()?.summary()
 }
 
 fn write_hash_verify_log(
