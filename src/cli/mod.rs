@@ -174,7 +174,13 @@ pub enum Commands {
     /// Verify a package written by package-case: manifest.sha256 entries vs
     /// files, package-manifest.json, audit chains, database snapshot and
     /// sign-off consistency; reports what is verified vs not verified
-    VerifyPackage { package_dir: PathBuf },
+    VerifyPackage {
+        package_dir: PathBuf,
+        /// Exit with code 3 (not 0) when every file checks out but the
+        /// package is from a finalize that did not complete
+        #[arg(long)]
+        strict: bool,
+    },
     /// Export an indexed video or selected range as a client-deliverable MP4/AVI
     ExportVideo {
         case_dir: PathBuf,
@@ -569,6 +575,21 @@ pub enum QaCommands {
     Anomalies { case_dir: PathBuf },
 }
 
+/// R11-S8: a non-zero exit code a command that SUCCEEDED asks for
+/// (`verify-package --strict` on an incomplete finalize: 3); `main` exits
+/// with it after `run` returns `Ok`.
+static REQUESTED_EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn request_exit_code(code: i32) {
+    REQUESTED_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// R11-S8: the exit code for a successful [`run`] (0 unless a command
+/// asked for another).
+pub fn requested_exit_code() -> i32 {
+    REQUESTED_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub fn run(args: Vec<String>) -> Result<(), String> {
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
@@ -748,7 +769,14 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             let options = PackageOptions { output_dir: output };
             package_case_with_pending(&case_dir, options, allow_pending)
         }
-        Commands::VerifyPackage { package_dir } => verify_package(&package_dir),
+        Commands::VerifyPackage {
+            package_dir,
+            strict,
+        } => {
+            let code = crate::cli::handlers::verify_package_with(&package_dir, strict)?;
+            request_exit_code(code);
+            Ok(())
+        }
         Commands::ExportVideo {
             case_dir,
             selector,

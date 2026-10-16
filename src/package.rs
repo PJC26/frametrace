@@ -202,7 +202,16 @@ pub fn package_case(case_dir: &Path, output_dir: Option<&Path>) -> Result<Packag
         }
         fs::rename(from, to)
     };
-    if let Err(err) = rename_with_retry(&work_dir, &final_dir, &publish) {
+    let mut reported = 0u64;
+    let mut waiting = |waited: std::time::Duration| {
+        // R11-S7: the workstation shows a step's stderr in its job log.
+        let secs = waited.as_secs();
+        if secs > reported {
+            reported = secs;
+            eprintln!("package-case: 패키지 폴더가 사용 중입니다, 재시도 {secs}초");
+        }
+    };
+    if let Err(err) = rename_with_retry(&work_dir, &final_dir, &publish, &mut waiting) {
         // R6-S5: the marker sits BESIDE the kept folder, never inside it:
         // a file inside made the finished package fail verify-package
         // (an unlisted file), so keeping it "safe" broke it.
@@ -425,6 +434,18 @@ pub(crate) fn retry_within(
     op: &mut dyn FnMut() -> std::io::Result<()>,
     final_err: &dyn Fn(&std::io::Error) -> bool,
 ) -> std::io::Result<()> {
+    retry_within_notify(budget, op, final_err, &mut |_| {})
+}
+
+/// R11-S7: [`retry_within`] that calls `waiting(elapsed)` before each wait
+/// (callers log "file in use, retrying n s" — a silent 12 s wait looked
+/// like a hang).
+pub(crate) fn retry_within_notify(
+    budget: std::time::Duration,
+    op: &mut dyn FnMut() -> std::io::Result<()>,
+    final_err: &dyn Fn(&std::io::Error) -> bool,
+    waiting: &mut dyn FnMut(std::time::Duration),
+) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let mut attempt = 0usize;
     loop {
@@ -441,21 +462,35 @@ pub(crate) fn retry_within(
         if attempt >= RENAME_BACKOFF_MS.len() && started.elapsed() + delay > budget {
             return Err(err);
         }
+        waiting(started.elapsed() + delay);
         std::thread::sleep(delay);
         attempt += 1;
     }
 }
 
+/// R11-S7: a rename error waiting cannot cure — the source (or the
+/// target's folder) does not exist. R10 retried even that for the whole
+/// budget (12 s) before reporting it.
+pub(crate) fn is_final_rename_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound
+}
+
 /// R5-S12: `rename(from, to)` retried with backoff; R10-S4: for
-/// [`rename_retry_budget`] in all (also used to promote a finalize's
-/// sign-off, R10-S1). The last error is returned when every attempt
-/// failed.
+/// [`rename_retry_budget`] in all. R11-S7: NotFound is final
+/// ([`is_final_rename_error`]) and each wait is reported to `waiting`.
+/// The last error is returned when every attempt failed.
 pub(crate) fn rename_with_retry(
     from: &Path,
     to: &Path,
     rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    waiting: &mut dyn FnMut(std::time::Duration),
 ) -> std::io::Result<()> {
-    retry_within(rename_retry_budget(), &mut || rename(from, to), &|_| false)
+    retry_within_notify(
+        rename_retry_budget(),
+        &mut || rename(from, to),
+        &is_final_rename_error,
+        waiting,
+    )
 }
 
 #[cfg(test)]
@@ -1270,10 +1305,45 @@ pub fn finalize_incomplete_marker(package_dir: &Path) -> PathBuf {
     package_dir.with_file_name(name)
 }
 
+/// R11-S2: what a folder copy appends to a name — Windows Explorer's
+/// ` - 복사본` / ` - Copy` (any case) and ` (n)`, as often as copies of
+/// copies add them — with the trailing dots and spaces Windows drops from
+/// a name. Returns the name without them.
+pub fn strip_copy_tails(name: &str) -> &str {
+    let mut rest = name;
+    loop {
+        let trimmed = rest.trim_end_matches([' ', '.']);
+        let next = strip_numbered_tail(trimmed)
+            .or_else(|| strip_suffix_ignore_ascii_case(trimmed, " - 복사본"))
+            .or_else(|| strip_suffix_ignore_ascii_case(trimmed, " - copy"));
+        match next {
+            Some(shorter) => rest = shorter,
+            None => return trimmed,
+        }
+    }
+}
+
+/// ` (n)` at the end of `name` (n = one or more ASCII digits).
+fn strip_numbered_tail(name: &str) -> Option<&str> {
+    let inner = name.strip_suffix(')')?;
+    let open = inner.rfind(" (")?;
+    let digits = &inner[open + 2..];
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| &name[..open])
+}
+
+fn strip_suffix_ignore_ascii_case<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = name.len().checked_sub(suffix.len())?;
+    let tail = name.get(cut..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &name[..cut])
+}
+
 /// R10-S2: whether a folder NAME marks an incomplete finalize
-/// (`…_INCOMPLETE` or `…_INCOMPLETE_<n>`, any case).
+/// (`…_INCOMPLETE` or `…_INCOMPLETE_<n>`, any case). R11-S2: also with
+/// copy tails ([`strip_copy_tails`]: `…_INCOMPLETE - 복사본`,
+/// `…_INCOMPLETE (2)`, `…_INCOMPLETE_2 - Copy (3)`) and trailing dots or
+/// spaces — a copy of an incomplete package is still one.
 pub fn is_incomplete_package_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
+    let upper = strip_copy_tails(name).to_ascii_uppercase();
     match upper.rfind(INCOMPLETE_PACKAGE_SUFFIX) {
         Some(at) => {
             let rest = &upper[at + INCOMPLETE_PACKAGE_SUFFIX.len()..];
@@ -1286,27 +1356,76 @@ pub fn is_incomplete_package_name(name: &str) -> bool {
     }
 }
 
+/// R11-S2: the folder `package_dir` really names — canonicalized (`.`,
+/// `..`, symlinks / junctions, 8.3 short names and Windows' dropped
+/// trailing dots and spaces all resolved to the long name on disk) with
+/// the `\\?\` prefix removed. A path that cannot be canonicalized (gone,
+/// no access) is normalized lexically: `.`/`..` components folded and the
+/// trailing dots and spaces of its last name dropped (as Windows does).
+pub fn canonical_package_dir(package_dir: &Path) -> PathBuf {
+    if let Ok(dir) = crate::util::canonicalize_display(package_dir) {
+        return dir;
+    }
+    let mut out = PathBuf::new();
+    for component in package_dir.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if cfg!(windows)
+        && let Some(name) = out.file_name().and_then(|n| n.to_str())
+    {
+        let trimmed = name.trim_end_matches([' ', '.']).to_string();
+        if !trimmed.is_empty() && trimmed != name {
+            out.set_file_name(trimmed);
+        }
+    }
+    out
+}
+
 /// R10-S2: why `package_dir` is from an incomplete finalize — its name
 /// ([`is_incomplete_package_name`], which survives copying the folder
 /// alone) or the marker beside it — or `None`.
+///
+/// R11-S2 (P11): judged on the CANONICAL folder ([`canonical_package_dir`]).
+/// R10 read the name of the path as given: `verify-package .` inside the
+/// package, `…\package_1_INCOMPLETE\..\package_1_INCOMPLETE`, the 8.3
+/// name `PACKAG~1`, or `package_1_INCOMPLETE.` (Windows opens the same
+/// folder) all read as a final package. The marker is looked for beside
+/// the canonical folder under its own name and under the name without
+/// copy tails (a copy made next to the original).
 pub fn finalize_incomplete_reason(package_dir: &Path) -> Option<String> {
-    let name = package_dir
+    let dir = canonical_package_dir(package_dir);
+    let name = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     if is_incomplete_package_name(&name) {
         return Some(format!("folder name ends with {INCOMPLETE_PACKAGE_SUFFIX}"));
     }
-    let marker = finalize_incomplete_marker(package_dir);
-    fs::symlink_metadata(&marker).is_ok().then(|| {
-        format!(
-            "marker {} beside the folder",
-            marker
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
-        )
-    })
+    let original = strip_copy_tails(&name);
+    [name.as_str(), original]
+        .into_iter()
+        .filter(|candidate| !candidate.is_empty())
+        .map(|candidate| {
+            dir.with_file_name(format!("{candidate}{FINALIZE_INCOMPLETE_MARKER_SUFFIX}"))
+        })
+        .find(|marker| fs::symlink_metadata(marker).is_ok())
+        .map(|marker| {
+            format!(
+                "marker {} beside the folder",
+                marker
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            )
+        })
 }
 
 impl PackageVerification {
@@ -3364,6 +3483,169 @@ mod tests {
             "its files still check out: {:?}",
             checked.checks
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The 8.3 short form of an existing path (Windows; `None` when the
+    /// volume keeps no short names — the caller then says SKIPPED).
+    #[cfg(windows)]
+    fn short_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::os::windows::process::CommandExt;
+        let output = std::process::Command::new("cmd")
+            .raw_arg(format!(
+                "/C for %I in (\"{}\") do @echo %~sI",
+                path.display()
+            ))
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let short = std::path::PathBuf::from(text);
+        (short.file_name() != path.file_name() && short.exists()).then_some(short)
+    }
+
+    /// R11-S2 (P11, real file system): the `_INCOMPLETE` judgement is made
+    /// on the canonical folder. R10 read the name of the path as given, so
+    /// `verify-package .` run inside an incomplete package, a `..` path,
+    /// the 8.3 short name, a trailing dot or space (Windows opens the same
+    /// folder) and an Explorer copy (` - 복사본`, ` (2)`) all read as a
+    /// final package.
+    #[test]
+    fn r11_s2_incomplete_judgement_uses_the_canonical_folder() {
+        let (root, case_dir) = minimal_packageable_case("r11-s2");
+        let result = package_case(&case_dir, None).expect("package");
+        let incomplete = result.output_dir.with_file_name(format!(
+            "{}_INCOMPLETE",
+            result.output_dir.file_name().unwrap().to_string_lossy()
+        ));
+        fs::rename(&result.output_dir, &incomplete).unwrap();
+        let reason = |path: &std::path::Path| super::finalize_incomplete_reason(path);
+        let mut spellings = vec![
+            incomplete.join("."),
+            incomplete.join("review").join(".."),
+            incomplete
+                .parent()
+                .unwrap()
+                .join(".")
+                .join(incomplete.file_name().unwrap()),
+        ];
+        #[cfg(windows)]
+        {
+            let name = incomplete
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            spellings.push(incomplete.with_file_name(format!("{name}.")));
+            spellings.push(incomplete.with_file_name(format!("{name} ")));
+            spellings.push(incomplete.with_file_name(format!("{name}. .")));
+            match short_path(&incomplete) {
+                Some(short) => {
+                    assert!(
+                        !short.to_string_lossy().contains("_INCOMPLETE"),
+                        "{}",
+                        short.display()
+                    );
+                    spellings.push(short);
+                }
+                None => eprintln!("SKIPPED (8.3): no short names on this volume"),
+            }
+        }
+        for path in &spellings {
+            assert!(
+                path.exists(),
+                "the spelling opens the folder: {}",
+                path.display()
+            );
+            assert!(reason(path).is_some(), "read as final: {}", path.display());
+            // verify-package itself, as `verify-package <spelling>` runs it.
+            let checked = super::verify_package(path).unwrap();
+            assert!(checked.finalize_incomplete, "{}", path.display());
+        }
+        // The canonical folder is the long name without `\\?\`.
+        let canonical = super::canonical_package_dir(&incomplete.join("."));
+        assert_eq!(canonical.file_name(), incomplete.file_name());
+        assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
+        // Copies of an incomplete package are incomplete packages.
+        let reports = incomplete.parent().unwrap();
+        for copy in [
+            "package_7_INCOMPLETE - 복사본",
+            "package_7_INCOMPLETE - 복사본 (2)",
+            "package_7_INCOMPLETE (3)",
+            "package_7_incomplete_2 - Copy",
+            "package_7_INCOMPLETE_2 - Copy (4) - 복사본",
+        ] {
+            let dir = reports.join(copy);
+            fs::create_dir_all(&dir).unwrap();
+            assert!(reason(&dir).is_some(), "{copy}");
+        }
+        // A copy made beside a package marked only by its marker.
+        let marked = reports.join("package_8");
+        fs::create_dir_all(&marked).unwrap();
+        fs::write(super::finalize_incomplete_marker(&marked), "x").unwrap();
+        let copy = reports.join("package_8 - 복사본");
+        fs::create_dir_all(&copy).unwrap();
+        assert!(reason(&copy).is_some(), "marker of the original");
+        // Not incomplete: a plain name, near misses, a copy of a plain one.
+        for plain in [
+            "package_9",
+            "package_9 - 복사본",
+            "package_9_INCOMPLETEX",
+            "package_9_INCOMPLETE_x (2)",
+            "package_9 (2)_INCOMPLETEness",
+        ] {
+            let dir = reports.join(plain);
+            fs::create_dir_all(&dir).unwrap();
+            assert!(reason(&dir).is_none(), "{plain}");
+        }
+        // A missing path is normalized lexically.
+        let gone = reports.join("package_5_INCOMPLETE").join("sub").join("..");
+        assert!(reason(&gone).is_some());
+        assert_eq!(super::strip_copy_tails("a - 복사본 (2). "), "a");
+        assert_eq!(super::strip_copy_tails("a (b)"), "a (b)");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// R11-S7: a rename whose source is gone fails at once (R10 retried
+    /// NotFound for the whole 12 s budget), and a busy file reports each
+    /// wait to the caller.
+    #[test]
+    fn r11_s7_not_found_is_final_and_waits_are_reported() {
+        let root = std::env::temp_dir().join(format!("ft-r11-s7-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let started = std::time::Instant::now();
+        let mut waits = 0usize;
+        let err = super::rename_with_retry(
+            &root.join("missing"),
+            &root.join("target"),
+            &|from, to| fs::rename(from, to),
+            &mut |_| waits += 1,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(waits, 0, "never waited");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Busy three times, then free: three waits reported, then success.
+        let left = std::cell::Cell::new(3usize);
+        let mut reported = Vec::new();
+        super::rename_with_retry(
+            &root.join("a"),
+            &root.join("b"),
+            &|_, _| {
+                if left.get() > 0 {
+                    left.set(left.get() - 1);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "in use",
+                    ));
+                }
+                Ok(())
+            },
+            &mut |waited| reported.push(waited),
+        )
+        .unwrap();
+        assert_eq!(reported.len(), 3);
+        assert!(reported.windows(2).all(|w| w[0] <= w[1]));
         let _ = fs::remove_dir_all(root);
     }
 

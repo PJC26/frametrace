@@ -1432,3 +1432,331 @@ fn parameter_set_only_packets_are_accounted_for() {
     assert_eq!(rest, expected, "picture packets hash as in the plain file");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// R11-S1: a 10 fps H.264 clip with `bframes` B-frames (key frame every
+/// 10): decode order is not presentation order, so pts ≠ dts.
+fn bframe_gop_clip(path: &Path, seconds: &str, bframes: &str) {
+    ffmpeg_fixture(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x120:rate=10",
+        "-t",
+        seconds,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-g",
+        "10",
+        "-bf",
+        bframes,
+        "-pix_fmt",
+        "yuv420p",
+        path.to_str().unwrap(),
+    ]);
+}
+
+/// R11-S1: stream copy of `input` through the `noise` filter, dropping
+/// the packets for which `drop` (an ffmpeg expression over `pts`, `n`…)
+/// is non-zero — the exact packet set an edit-list-applying muxer keeps.
+/// `extra`: muxer options before the output.
+fn drop_packets(input: &Path, drop: &str, extra: &[&str], output: &Path) {
+    let filter = format!("noise=drop={}", drop.replace(',', "\\,"));
+    let mut args = vec![
+        "-copyts",
+        "-i",
+        input.to_str().unwrap(),
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        "-copyinkf",
+        "-bsf:v",
+        &filter,
+        // A kept pre-roll frame presents before the first kept frame:
+        // without the shift Matroska cannot store its (negative) pts.
+        "-avoid_negative_ts",
+        "make_zero",
+    ];
+    args.extend_from_slice(extra);
+    args.push(output.to_str().unwrap());
+    ffmpeg_fixture(&args);
+}
+
+/// `pts` per video packet of `path` (`None` for `N/A`), file order.
+fn packet_pts(path: &Path) -> Vec<Option<i64>> {
+    packet_fields(path, "pts")
+        .lines()
+        .map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .collect()
+}
+
+/// R11-S1 (real ffmpeg): B-frame sources whose normalized payload hashes
+/// need the timestamp alignment of R10-S8 (packets of only parameter
+/// sets). ffprobe prints `pts,dts` in that order whatever order
+/// `-show_entries` names them in, and R10 read the pair as `(dts, pts)`:
+/// with B-frames the two differ, every packet "differed from ffmpeg's
+/// timestamps" and every such join was refused as unverifiable. In
+/// Matroska ffprobe also reports no dts (`N/A`) for the first packets
+/// while ffmpeg's framehash computes one. Now the correct join passes in
+/// MP4 and Matroska output (`-bf 2` and `-bf 3`) and a one-frame shift
+/// with the same packet count is refused frame by frame. (MPEG-TS cannot
+/// carry a parameter-set-only packet — its demuxer folds it into the next
+/// access unit — so TS is covered by the timestamp test below.)
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn bframe_parameter_set_packets_join_is_compared_frame_by_frame() {
+    if !require_tools() {
+        return;
+    }
+    let mut passed: Vec<String> = Vec::new();
+    let mut unverifiable: Vec<String> = Vec::new();
+    for bframes in ["2", "3"] {
+        let root = unique_dir(&format!("ft_join_r11_s1_bf{bframes}"));
+        let plain = root.join("plain.mp4");
+        bframe_gop_clip(&plain, "3", bframes);
+        let plain_mkv = root.join("plain.mkv");
+        ffmpeg_fixture(&[
+            "-i",
+            plain.to_str().unwrap(),
+            "-c",
+            "copy",
+            plain_mkv.to_str().unwrap(),
+        ]);
+        let ps = root.join("ps.mkv");
+        ffmpeg_fixture(&[
+            "-i",
+            plain.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-bsf:v",
+            "h264_mp4toannexb,filter_units=pass_types=7|8",
+            "-f",
+            "matroska",
+            ps.to_str().unwrap(),
+        ]);
+        // Source 1: the B-frame stream, parameter-set-only packets, the
+        // stream again. `joined`: the same followed by source 2 (`plain`)
+        // — the material of the output, laid out by clean key-frame joins.
+        let mixed = root.join("mixed.mp4");
+        concat_keep_leading(&[&plain_mkv, &ps, &plain_mkv], &mixed, "mp4");
+        let joined = root.join("joined.mp4");
+        concat_keep_leading(&[&plain_mkv, &ps, &plain_mkv, &plain_mkv], &joined, "mp4");
+        // Cut mid-GOP by stream copy: an edit list whose pre-roll
+        // (discard) packets are interleaved with kept ones in decode
+        // order, as B-frames put them.
+        let cut = |input: &Path, output: &Path| {
+            ffmpeg_fixture(&[
+                "-ss",
+                "1.5",
+                "-i",
+                input.to_str().unwrap(),
+                "-c",
+                "copy",
+                output.to_str().unwrap(),
+            ])
+        };
+        let edited = root.join("edited.mp4");
+        cut(&mixed, &edited);
+        let edited_joined = root.join("edited-joined.mp4");
+        cut(&joined, &edited_joined);
+        let flags: Vec<String> = packet_fields(&edited, "flags")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let pts = packet_pts(&edited);
+        assert_eq!(flags.len(), pts.len());
+        let discard: Vec<i64> = flags
+            .iter()
+            .zip(&pts)
+            .filter(|(f, _)| f.contains('D'))
+            .map(|(_, p)| p.expect("pts"))
+            .collect();
+        assert!(discard.len() >= 2, "fixture without pre-roll: {flags:?}");
+        // The premise: B-frames (a packet presented before an earlier
+        // one) and pts ≠ dts as ffprobe lists them.
+        assert!(
+            pts.windows(2).any(|w| w[1] < w[0]),
+            "bf {bframes}: not reordered"
+        );
+        let listed = packet_fields(&edited, "pts,dts");
+        assert!(
+            listed.lines().any(|l| {
+                let mut f = l.split(',');
+                f.next() != f.next()
+            }),
+            "bf {bframes}: pts == dts everywhere: {listed}"
+        );
+        let edited_packets =
+            frametrace::join::normalized_video_packets("ffprobe", "ffmpeg", &edited, None)
+                .unwrap_or_else(|e| panic!("bf {bframes}: B-frame source refused: {e}"));
+        let empty = edited_packets
+            .iter()
+            .filter(|p| p.hash == Some(frametrace::join::EMPTY_PAYLOAD_HASH))
+            .count();
+        assert_eq!(empty, 3, "bf {bframes}: parameter-set-only packets");
+        // The output material starts with exactly source 1's packets.
+        let joined_pts = packet_pts(&edited_joined);
+        assert_eq!(joined_pts[..pts.len()], pts[..], "bf {bframes}: prefix");
+        let plain_count = packet_pts(&plain).len();
+        assert_eq!(joined_pts.len(), pts.len() + plain_count);
+        let kept = flags.iter().filter(|f| !f.contains('D')).count();
+        let last_preroll = *discard.iter().max().unwrap();
+        let sources = [edited.clone(), plain.clone()];
+        let offsets = [0.0, probe_duration(&edited)];
+        let check = |output: &Path| {
+            frametrace::join::verify_segments_with(
+                &sources,
+                &offsets,
+                output,
+                &mut |path, hashes| {
+                    if hashes {
+                        frametrace::join::normalized_video_packets("ffprobe", "ffmpeg", path, None)
+                    } else {
+                        frametrace::join::video_packets("ffprobe", path, None, false)
+                    }
+                },
+                &mut |path| frametrace::join::stream_packet_counts("ffprobe", path, None),
+            )
+        };
+        // The output an edit-list-applying muxer writes (every packet the
+        // edit list does not discard, then source 2), and a one-frame
+        // shift of source 1's segment (the last pre-roll frame kept, its
+        // last packet lost — same count). Built from `edited_joined` by
+        // dropping packets, not by a second concat: a concat of a part
+        // that starts mid-GOP with B-frames makes ffmpeg collide
+        // timestamps at the junction (Matroska stores no dts), which the
+        // check rightly refuses as unverifiable.
+        for (format, ext, extra) in [
+            ("mp4", "mp4", &["-use_editlist", "0"][..]),
+            ("matroska", "mkv", &[][..]),
+        ] {
+            let good = root.join(format!("out-good.{ext}"));
+            drop_packets(
+                &edited_joined,
+                &format!("lt(pts,{})", last_preroll + 1),
+                extra,
+                &good,
+            );
+            assert_eq!(packet_pts(&good).len(), kept + plain_count, "{format}");
+            // Matroska stores no decode times; for a segment that starts
+            // mid-GOP with a deep B-frame pyramid the derived dts can
+            // repeat (ffprobe lists them non-increasing) and ffmpeg then
+            // rewrites a pts to keep them ordered. That packet's hash
+            // cannot be located — the check must refuse to run (never
+            // pass on a guess), and only for such a file.
+            let verdict = match check(&good) {
+                Ok(verdict) => verdict,
+                Err(err) => {
+                    let dts: Vec<i64> = packet_fields(&good, "dts")
+                        .lines()
+                        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+                        .collect();
+                    assert!(
+                        ext == "mkv"
+                            && dts.windows(2).any(|w| w[1] <= w[0])
+                            && err.contains("differ from ffprobe's"),
+                        "bf {bframes} {format}: the check could not run: {err}"
+                    );
+                    unverifiable.push(format!("bf {bframes} {format}"));
+                    continue;
+                }
+            };
+            assert!(verdict.ok, "bf {bframes} {format}: {:?}", verdict.problems);
+            passed.push(format!("bf {bframes} {format}"));
+            assert_eq!(verdict.mode, "edit-list-applied", "bf {bframes} {format}");
+            let bad = root.join(format!("out-shifted.{ext}"));
+            drop_packets(
+                &edited_joined,
+                &format!("lt(pts,{})+eq(n,{})", last_preroll, pts.len() - 1),
+                extra,
+                &bad,
+            );
+            assert_eq!(packet_pts(&bad).len(), kept + plain_count, "{format}");
+            let verdict = check(&bad)
+                .unwrap_or_else(|e| panic!("bf {bframes} {format}: the check could not run: {e}"));
+            assert!(
+                !verdict.ok,
+                "bf {bframes} {format}: a one-frame shift passed"
+            );
+            assert!(
+                verdict.problems.iter().any(|p| p.contains("유지 프레임")),
+                "bf {bframes} {format}: {:?}",
+                verdict.problems
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    eprintln!(
+        "R11-S1 compared frame by frame: {passed:?}; refused as unverifiable: {unverifiable:?}"
+    );
+    // Both containers really ran the frame-by-frame comparison.
+    for format in ["mp4", "matroska"] {
+        assert!(
+            passed.iter().any(|p| p.ends_with(format)),
+            "{format} never compared: {passed:?} / {unverifiable:?}"
+        );
+    }
+    assert!(passed.iter().filter(|p| p.ends_with("mp4")).count() == 2);
+}
+
+/// R11-S1 (real ffprobe/ffmpeg): `packet_stamps` reads every B-frame
+/// packet's pts and dts as ffmpeg's framehash prints them, in MP4,
+/// Matroska and MPEG-TS (`-bf 2` and `-bf 3`). R10 read ffprobe's
+/// `pts,dts` line as `dts,pts`. Matroska lists no dts (`N/A`) for the
+/// first packets; framehash computes one — that dts is the only one not
+/// compared.
+#[test]
+#[ignore = "requires FRAMETRACE_IT=1 and ffmpeg/ffprobe"]
+fn bframe_packet_timestamps_are_read_by_name() {
+    if !require_tools() {
+        return;
+    }
+    let root = unique_dir("ft_join_r11_s1_stamps");
+    for bframes in ["2", "3"] {
+        let plain = root.join(format!("bf{bframes}.mp4"));
+        bframe_gop_clip(&plain, "2", bframes);
+        for ext in ["mp4", "mkv", "ts"] {
+            let file = root.join(format!("bf{bframes}-copy.{ext}"));
+            ffmpeg_fixture(&[
+                "-i",
+                plain.to_str().unwrap(),
+                "-c",
+                "copy",
+                file.to_str().unwrap(),
+            ]);
+            let stamps = frametrace::join::packet_stamps("ffprobe", &file, None).unwrap();
+            let output = Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-copyts", "-i"])
+                .arg(&file)
+                .args(["-map", "0:v:0", "-c", "copy", "-copyinkf"])
+                .args(["-f", "framehash", "-hash", "sha256", "-"])
+                .output()
+                .unwrap();
+            let lines =
+                frametrace::join::parse_framehash_lines(&String::from_utf8_lossy(&output.stdout))
+                    .unwrap();
+            assert_eq!(stamps.len(), lines.len(), "bf {bframes} {ext}");
+            assert!(
+                stamps.iter().any(|s| s.pts != s.dts),
+                "bf {bframes} {ext}: pts == dts everywhere"
+            );
+            for (i, (stamp, line)) in stamps.iter().zip(&lines).enumerate() {
+                assert_eq!(stamp.pts, line.pts, "bf {bframes} {ext} packet {i}");
+                if stamp.dts.is_some() {
+                    assert_eq!(stamp.dts, line.dts, "bf {bframes} {ext} packet {i}");
+                }
+            }
+            if ext == "mkv" {
+                assert!(
+                    stamps.iter().any(|s| s.dts.is_none()),
+                    "bf {bframes}: Matroska fixture lists every dts"
+                );
+            } else {
+                assert!(stamps.iter().all(|s| s.dts.is_some()), "bf {bframes} {ext}");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

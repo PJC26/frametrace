@@ -19,7 +19,8 @@ fn cli_main() -> i32 {
         eprintln!("error: {error}");
         return 1;
     }
-    0
+    // R11-S8: `verify-package --strict` exits 3 for an incomplete finalize.
+    cli::requested_exit_code()
 }
 
 fn main() {
