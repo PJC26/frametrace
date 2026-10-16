@@ -888,13 +888,17 @@ fn r13_i3_key_source_env_takes_only_key_secret_names() {
     fs::create_dir_all(dir.join("evidence/logs")).unwrap();
     let case = dir.to_string_lossy().to_string();
     let material = "33".repeat(32);
-    let run_with = |var: &str| {
-        Command::new(frametrace())
-            .args(["--key-source", &format!("env:{var}"), "verify-audit", &case])
-            .isolated()
-            .env(var, &material)
-            .output()
-            .expect("frametrace binary should run")
+    // A refused name is never read, so the refused runs leave the
+    // variable unset: setting DYLD_INSERT_LIBRARIES / LD_PRELOAD for
+    // real would make the loader abort the child before main.
+    let run_with = |var: &str, set: bool| {
+        let mut cmd = Command::new(frametrace());
+        cmd.args(["--key-source", &format!("env:{var}"), "verify-audit", &case])
+            .isolated();
+        if set {
+            cmd.env(var, &material);
+        }
+        cmd.output().expect("frametrace binary should run")
     };
     for (var, why) in [
         ("DYLD_INSERT_LIBRARIES", "dynamic-loader"),
@@ -903,7 +907,7 @@ fn r13_i3_key_source_env_takes_only_key_secret_names() {
         ("PATH", "system environment variable"),
         ("MY_TOKEN", "not a key-secret variable name"),
     ] {
-        let output = run_with(var);
+        let output = run_with(var, false);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{var}: {stderr}");
         assert!(
@@ -916,7 +920,7 @@ fn r13_i3_key_source_env_takes_only_key_secret_names() {
         "R13_AUDIT_KEY",
         "R13_SECRET",
     ] {
-        let output = run_with(var);
+        let output = run_with(var, true);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("refused"), "{var}: {stderr}");
     }
