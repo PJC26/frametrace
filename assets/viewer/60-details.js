@@ -156,7 +156,7 @@ function renderDetails() {
     [t("detail.len"), fmtDuration(record.duration)],
     [t("detail.size"), fmtBytes(record.size)],
     [t("detail.audio"), audioDetailFor(record)],
-    [t("detail.anomaly"), record.hasAnomaly ? record.anomalies.map(item => item.kind).join(", ") : "-"],
+    [t("detail.anomaly"), record.anomalies && record.anomalies.length ? record.anomalies.map(item => item.kind).join(", ") + (record.hasAnomaly ? "" : " (" + t("anomaly.unauth") + ")") : "-"],
     [t("detail.dfl"), record.dfl ? (record.dfl.band
         ? tf("detail.dflScore", { label: record.dfl.band_label || record.dfl.band, score: record.dfl.score ?? "?" }) + (record.dfl.signal_titles?.length ? ": " + record.dfl.signal_titles.slice(0, 3).join(", ") : "")
         : (record.dfl.error ? tf("detail.dflFail", { error: record.dfl.error }) : t("detail.dflNone"))) : "-"]
@@ -383,9 +383,7 @@ function renderMetrics() {
   const counts = staticMetricCounts();
   els.metricVerified.textContent = counts.verified;
   els.metricFailed.textContent = counts.failed;
-  if (els.metricAnomaly) {
-    els.metricAnomaly.textContent = String(counts.anomaly);
-  }
+  if (els.metricAnomaly) anomalyPillUpdate(els.metricAnomaly, counts);
   const markCount = markTallyNow().all; // R7 U4: kept by changed id, not a walk of the mark map per render
   els.selectionCount.textContent = tf("sel.count", { n: state.selectedIds.size, m: markCount });
   if (typeof syncJoinButton === "function") syncJoinButton();
@@ -407,14 +405,36 @@ function renderMetrics() {
 let staticMetricCountsCache = null;
 function staticMetricCounts() {
   if (staticMetricCountsCache) return staticMetricCountsCache;
-  let verified = 0, failed = 0, anomaly = 0;
+  let verified = 0, failed = 0, anomaly = 0, anomalyUnauth = 0;
   records.forEach(record => {
     if (record.status === "ffprobe-video-stream-confirmed" || record.status === "ffprobe-confirmed") verified += 1;
     else if (record.status === "validation-failed") failed += 1;
     if (record.hasAnomaly) anomaly += 1;
+    else if (record.hasUnauthAnomaly) anomalyUnauth += 1;
   });
-  staticMetricCountsCache = { verified, failed, anomaly };
+  staticMetricCountsCache = { verified, failed, anomaly, anomalyUnauth };
   return staticMetricCountsCache;
+}
+// R17 U2: the "이상 N" pill — N counts records with an authenticated (auth /
+// sc) anomaly row only; " · 확인 불가" while the anomaly head withholds;
+// the unauthenticated ones are named in the tooltip (their own chip).
+function anomalyPillUpdate(el, counts) {
+  const unverified = anomalyUnverified();
+  const text = String(counts.anomaly) + (unverified ? " · " + t("anomalyHead.badge") : "");
+  if (el.textContent !== text) el.textContent = text;
+  const pill = el.closest ? el.closest("button") : null;
+  if (!pill) return;
+  pill.classList.toggle("anomaly-unverified", unverified);
+  const tip = [t("tip.badgeAnom"), counts.anomalyUnauth ? tf("anomaly.unauthCount", { n: counts.anomalyUnauth }) : "",
+    unverified ? t(anomalyHead.level === "err" ? "anomalyHead.cut" : "anomalyHead.unknown") : ""].filter(Boolean).join("\n");
+  if (pill.title !== tip) pill.title = tip;
+}
+// R17 U2: a rail chip's label — the anomaly chip carries "확인 불가" while
+// the head withholds; the unauthenticated chip carries its count.
+function presetChipLabel(value, label) {
+  if (value === "anomaly" && anomalyUnverified()) return t(label) + " · " + t("anomalyHead.badge");
+  if (value === "anomaly:unauth") return t(label) + " " + staticMetricCounts().anomalyUnauth;
+  return t(label);
 }
 
 // One entry point for preset filters: rail chips and the count pills.
@@ -438,10 +458,12 @@ function renderChips() {
   let hidden = 0;
   for (const [value, label, secondary] of PRESET_CHIPS) {
     if (value.startsWith("tag:")) continue;
+    // R17 U2: the unauthenticated-anomaly chip only when there are some.
+    if (value === "anomaly:unauth" && !staticMetricCounts().anomalyUnauth && state.chip !== value) continue;
     if (secondary && !state.chipsExpanded && state.chip !== value) { hidden += 1; continue; }
     const tip = t(`chip.tip.${label.slice(5)}`);
     const on = state.chip === value;
-    parts.push(`<button type="button" class="quiet toggle rail-chip ${on ? "active" : ""}" data-chip="${escapeHtml(value)}" aria-pressed="${on}" title="${escapeHtml(tip)}">${escapeHtml(t(label))}</button>`);
+    parts.push(`<button type="button" class="quiet toggle rail-chip ${on ? "active" : ""}" data-chip="${escapeHtml(value)}" aria-pressed="${on}" title="${escapeHtml(tip)}">${escapeHtml(presetChipLabel(value, label))}</button>`);
   }
   if (hidden || state.chipsExpanded) {
     parts.push(`<button type="button" class="quiet rail-chip chip-more" id="chipMore" aria-expanded="${!!state.chipsExpanded}">${escapeHtml(t(state.chipsExpanded ? "chip.less" : "chip.more"))}</button>`);
@@ -487,7 +509,7 @@ function activeFilterList() {
   const chip = state.chip || "";
   if (chip && !chip.startsWith("status:")) {
     const preset = PRESET_CHIPS.find(([value]) => value === chip);
-    list.push(["chip", preset ? t(preset[1]) : chip.startsWith("tag:") ? tf("filter.tag.named", { tag: chip.slice(4) }) : chip]);
+    list.push(["chip", preset ? presetChipLabel(preset[0], preset[1]) : chip.startsWith("tag:") ? tf("filter.tag.named", { tag: chip.slice(4) }) : chip]);
   }
   if (state.status) list.push(["status", tf("layout.afStatus", { v: statusLabel(state.status) })]);
   if (state.kind) list.push(["kind", tf("layout.afKind", { v: kindLabels[state.kind] || state.kind })]);

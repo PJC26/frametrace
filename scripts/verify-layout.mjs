@@ -663,6 +663,49 @@ try {
       await context.close();
     }
   }
+  // R17 U1/U2: a withheld anomaly head (marker-unusable) and one
+  // authenticated + one unauthenticated anomaly row, injected into
+  // records-meta at 1366x768: the pill reads "이상 1 · 확인 불가" and stays
+  // on screen / uncovered with every top-bar control, the banner says
+  // "변조 가능성", the unauthenticated record has its own badge.
+  {
+    const context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+    const page = await context.newPage();
+    page.on('pageerror', (e) => pageErrors.push(`R17: ${e.message}`));
+    await page.route('**/api/records-meta*', async (route) => {
+      const res = await route.fetch();
+      const body = await res.json();
+      // records-meta carries no videos (they come paged from /api/records).
+      const first = await getJson('/api/records?offset=0&limit=2');
+      const ids = ((first && first.videos) || []).map((v) => v.id).filter(Boolean);
+      body.logChains = Object.assign({}, body.logChains, { anomaly: { head: { status: 'unknown', reason_code: 'marker-unusable', withhold_reason: '표식 HMAC 없음', detail: 'marker' } } });
+      body.anomalyLog = [{ event: 'anomaly-scan', kind: 'gop-gap', selector: ids[0], label: 'candidate-finding', detail: 'gap', trust: 'auth' },
+        { event: 'anomaly-scan', kind: 'ts-gap', selector: ids[1], label: 'candidate-finding', detail: 'gap', trust: 'unauth' }];
+      return route.fulfill({ response: res, body: JSON.stringify(body), headers: Object.assign({}, res.headers(), { 'content-type': 'application/json' }) });
+    });
+    await page.goto(`${base}/?token=${token}`);
+    await openProject(page);
+    const r17 = await page.evaluate(() => {
+      const pill = document.getElementById('pillAnomaly');
+      const bar = document.querySelector('.ft-viewer .topbar');
+      const ctl = bar ? [...bar.querySelectorAll('button')].filter((b) => b.getClientRects().length && getComputedStyle(b).visibility !== 'hidden') : [];
+      const bad = [];
+      for (const b of ctl) {
+        const r = b.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        if (r.left < 0 || r.right > innerWidth + 0.5 || !hit || !(hit === b || b.contains(hit)) || b.scrollWidth > b.clientWidth + 1) bad.push(b.id || b.textContent.trim().slice(0, 20));
+      }
+      return { pill: pill ? pill.textContent.replace(/\s+/g, ' ').trim() : null, pillTip: pill ? pill.title : '', bad, n: ctl.length,
+        hscroll: document.documentElement.scrollWidth > innerWidth + 1,
+        banner: (document.getElementById('anomalyHeadBanner') || {}).textContent || '',
+        unauth: document.querySelectorAll('#recordGrid .badge.anomaly-unauth').length, auth: document.querySelectorAll('#recordGrid .badge.anomaly.anomaly-unverified').length };
+    });
+    check('R17 U2: the anomaly pill reads "이상 1 · 확인 불가", the unauthenticated row counted apart (tooltip)', r17.pill === '이상 1 · 확인 불가' && /인증 안 된 후보 1건/.test(r17.pillTip), JSON.stringify(r17));
+    check('R17 U2: 1366x768 — every viewer top-bar control on screen, uncovered, unclipped; no sideways scroll', r17.n > 0 && !r17.bad.length && !r17.hscroll, JSON.stringify(r17.bad));
+    check('R17 U1: marker-unusable banner "변조 가능성", no rescan hint', /변조 가능성/.test(r17.banner) && !/다시 스캔/.test(r17.banner), r17.banner);
+    check('R17 U2: badges — 이상 후보 · 확인 불가 1, 인증 안 된 후보 1', r17.auth === 1 && r17.unauth === 1, JSON.stringify(r17));
+    await context.close();
+  }
   check('no page errors', pageErrors.length === 0, pageErrors.slice(0, 5).join(' | '));
 } catch (err) {
   console.error(err);

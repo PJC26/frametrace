@@ -2154,6 +2154,10 @@ document.getElementById("btnTranscodeQueue").addEventListener("click", async (ev
 // badge on the first row of a run of such rows only — n > 1 says how many,
 // 0 = a later row of the run (no badge; the row tooltip says it).
 // Absent = one badge per row.
+// R17 (track I7): an audited event whose lane is self-consistent only
+// (`time_self_consistent: true`; absent = false) gets a weak mark
+// "자기 일관성만" — anyone can rewrite such a lane's time. Never together
+// with "시각 감사 안 됨" (the server sends false then).
 function timelineKindHtml(kind, ev, group) {
   let k = String(kind || "");
   if (k === "carved-candidate-unaudited") {
@@ -2161,6 +2165,9 @@ function timelineKindHtml(kind, ev, group) {
   }
   const timeUnaudited = timelineTimeUnaudited(ev, k);
   if (/-time-unaudited$/.test(k)) k = k.slice(0, -"-time-unaudited".length);
+  if (!timeUnaudited && ev && ev.time_self_consistent === true) {
+    return escapeHtml(k) + ` <span class="badge candidate tl-time-sc" title="${escapeHtml(t("timeline.tip.timeSc"))}">${escapeHtml(t("timeline.badge.timeSc"))}</span>`;
+  }
   if (!timeUnaudited || group === 0) return escapeHtml(k);
   const label = Number(group) > 1 ? tf("timeline.badge.timeUnauditedN", { n: Number(group) }) : t("timeline.badge.timeUnaudited");
   return escapeHtml(k) + ` <span class="badge warn tl-time-unaudited" title="${escapeHtml(t("timeline.tip.timeUnaudited"))}">${escapeHtml(label)}</span>`;

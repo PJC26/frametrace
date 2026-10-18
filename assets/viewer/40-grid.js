@@ -51,6 +51,7 @@ const PRESET_CHIPS = [
   ["mark:none", "chip.markNone"],
   ["marked:any", "chip.marked", true],
   ["anomaly", "chip.anomaly", true],
+  ["anomaly:unauth", "chip.anomalyUnauth", true],
   ["warning", "chip.warning", true],
   ["status:validation-failed", "chip.failed", true],
   ["status:duplicate-candidate", "chip.duplicate", true],
@@ -225,6 +226,7 @@ function passesDate(record) {
 function passesRest(record, chip, query) {
   if (state.status && record.status !== state.status) return false;
   if (chip === "anomaly" && !record.hasAnomaly) return false;
+  if (chip === "anomaly:unauth" && !record.hasUnauthAnomaly) return false;
   if (chip === "warning" && !(record.warnings || []).length) return false;
   if (chip === "kind:recovery" && record.kind !== "candidate" && record.kind !== "filesystem") return false;
   if (chip === "marked:any" && !state.marks[record.id] && !(state.tags[record.id] || []).length && !(state.notes[record.id] || "").trim()) return false;

@@ -682,25 +682,42 @@ function logChainItems(chains, lanes) {
 // "확인 불가". not-authenticated → "note" (a caveat line only) unless
 // `withhold_reason` is a string — a withheld head is never current ("warn"
 // at least). null when absent / intact (or older server, bundle).
-// reason_code mixed-version is an older build's scan, not tampering.
-const ANOMALY_HEAD_REASON = { "mixed-version": "anomalyHead.reason.mixedVersion", "scan-mismatch": "anomalyHead.reason.scanMismatch" };
+// reason_code mixed-version is an older build's scan, not tampering (the
+// only code with the rescan hint). R17 U1 (track I1): marker-unusable — the
+// marker could not be used, tampering is possible: never "note", never the
+// rescan hint. R17 U4 (track I6): the standalone bundle carries the same
+// head — "이 PC" in its words reads "생성 PC" there (t() picks the @bundle twin).
+const ANOMALY_HEAD_REASON = { "mixed-version": "anomalyHead.reason.mixedVersion", "scan-mismatch": "anomalyHead.reason.scanMismatch", "marker-unusable": "anomalyHead.reason.markerUnusable" };
 function anomalyHeadState(chains) {
   const lane = chains && typeof chains === "object" ? (chains.anomaly || chains.anomalyLog) : null;
   const h = lane && typeof lane === "object" && lane.head && typeof lane.head === "object" ? lane.head : null;
   const st = h && h.status != null ? String(h.status) : "";
   const withheld = !!h && typeof h.withhold_reason === "string" && !!h.withhold_reason.trim();
-  if (!st || ((st === "absent" || st === "intact") && !withheld)) return null;
-  const code = h.reason_code == null ? "" : String(h.reason_code);
+  const code = h && h.reason_code != null ? String(h.reason_code) : "";
+  const markerBad = code === "marker-unusable";
+  if (!st || ((st === "absent" || st === "intact") && !withheld && !markerBad)) return null;
   const why = ANOMALY_HEAD_REASON[code] ? t(ANOMALY_HEAD_REASON[code]) : "";
-  const tip = [why, "status " + st + (code ? " · " + code : ""), h.withhold_reason, h.detail].filter(v => v != null && String(v).trim()).map(String).join("\n");
-  const level = st === "truncated" || st === "rewritten" ? "err" : st === "not-authenticated" && !withheld ? "note" : "warn";
+  const pc = (v) => (viewerTrustFromBundle() ? String(v).replace(/이 PC/g, "생성 PC") : String(v));
+  const tip = [why, "status " + st + (code ? " · " + code : ""), h.withhold_reason, h.detail].filter(v => v != null && String(v).trim()).map(pc).join("\n");
+  const level = st === "truncated" || st === "rewritten" ? "err" : st === "not-authenticated" && !withheld && !markerBad ? "note" : "warn";
   return { level, status: st, code, tip };
 }
 var anomalyHead = anomalyHeadState(logChains);
+// R17 U2: the anomaly head withholds (cut / unknown / withheld) — every
+// anomaly count, chip and badge says "확인 불가".
+function anomalyUnverified() {
+  return !!(anomalyHead && (anomalyHead.level === "err" || anomalyHead.level === "warn"));
+}
 // The record's anomaly badge (grid card, detail header); `title` = the kinds.
+// R17 U2: a record whose anomaly rows are all unauthenticated (trust not
+// auth / sc) gets "인증 안 된 후보" instead — never counted as 이상 후보.
 function anomalyBadgeHtml(record, withTitle) {
+  if (record && !record.hasAnomaly && record.hasUnauthAnomaly) {
+    const ukinds = withTitle ? record.anomalies.map(item => item.kind).join(", ") : "";
+    return `<span class="badge candidate anomaly-unauth"${ukinds ? ` title="${escapeHtml(ukinds)}"` : ""}>${ftIcon("lock")}${escapeHtml(t("anomaly.unauth"))}</span>`;
+  }
   if (!record || !record.hasAnomaly) return "";
-  const cut = !!(anomalyHead && (anomalyHead.level === "err" || anomalyHead.level === "warn"));
+  const cut = anomalyUnverified();
   const kinds = record.anomalies.map(item => item.kind).join(", ");
   const title = [withTitle ? kinds : "", cut ? t(anomalyHead.level === "err" ? "anomalyHead.cut" : "anomalyHead.unknown") + (anomalyHead.tip ? "\n" + anomalyHead.tip : "") : ""].filter(Boolean).join("\n");
   return `<span class="badge anomaly${cut ? " anomaly-unverified" : ""}"${title ? ` title="${escapeHtml(title)}"` : ""}>${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}` +
@@ -943,6 +960,29 @@ function serverProxyOf(row) {
   if (!row || !Object.prototype.hasOwnProperty.call(row, "proxy_path")) return undefined;
   return typeof row.proxy_path === "string" ? row.proxy_path : "";
 }
+// The record's anomaly rows (anomaly log by selector + the validation's
+// anomaly_flags, one per kind). R17 U2: only rows whose trust is auth / sc
+// (or absent: older server, bundle — as before) make an 이상 후보
+// (`hasAnomaly`); a record with rows but none of them usable is counted
+// apart (`hasUnauthAnomaly`, "인증 안 된 후보"). A validation flag carries
+// its validation line's trust; of two rows of one kind a usable one wins.
+function recordAnomalies(record) {
+  const usable = (item) => logTrustUsable(logTrustOf(item));
+  const fromId = anomaliesBySelector.get(record.id) || [];
+  const vTrust = record.validation && record.validation.trust != null ? { trust: record.validation.trust } : {};
+  const fromValidation = Array.isArray(record.validation?.anomaly_flags)
+    ? record.validation.anomaly_flags.map(kind => Object.assign({ kind, selector: record.id, detail: "validation anomaly_flags" }, vTrust))
+    : [];
+  const merged = [...fromId];
+  for (const item of fromValidation) {
+    const at = merged.findIndex(existing => existing.kind === item.kind);
+    if (at < 0) merged.push(item);
+    else if (!usable(merged[at]) && usable(item)) merged[at] = item;
+  }
+  record.anomalies = merged;
+  record.hasAnomaly = merged.some(usable);
+  record.hasUnauthAnomaly = !record.hasAnomaly && merged.length > 0;
+}
 const records = [
   ...videos.map(video => {
     const validation = validationsByPath.get(normalizePath(video.source_path));
@@ -1155,16 +1195,7 @@ records.forEach(record => {
   // inode_<off>_<ino>) — mirror the same mapping for the lookup.
   record.dfl = DATA.deepfake?.[String(record.id).replace(/[:\\\/]/g, "_")] || null;
   record.telemetry = DATA.telemetry?.[String(record.id).replace(/[:\\\/]/g, "_")] || null;
-  const fromId = anomaliesBySelector.get(record.id) || [];
-  const fromValidation = Array.isArray(record.validation?.anomaly_flags)
-    ? record.validation.anomaly_flags.map(kind => ({ kind, selector: record.id, detail: "validation anomaly_flags" }))
-    : [];
-  const merged = [...fromId];
-  for (const item of fromValidation) {
-    if (!merged.some(existing => existing.kind === item.kind)) merged.push(item);
-  }
-  record.anomalies = merged;
-  record.hasAnomaly = record.anomalies.length > 0;
+  recordAnomalies(record);
 });
 // A joined record's recording time is its first segment's (§1.8).
 {

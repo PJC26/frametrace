@@ -811,7 +811,7 @@ const FTStore = {
 
 ### 17.3 trust_note · logChains (U3)
 - 쓸 수 없는 항목의 `trust_note`: 상태 배지 툴팁(`statusNote`)·상세 목록 신뢰 배지 툴팁·항목 아래 `.trust-note` 줄(30-records `logTrustNote`, 40-grid `logTrustNoteHtml`).
-- `/api/records-meta` `logChains`는 로더가 그대로 넘기고(`data.logChains`), 상세 로그 목록(`#validationList`) 머리에 그 기록의 레인(검증 + 카빙/복구/조인 + 이상 있으면 이상 탐지)마다 문제가 있을 때만 한 줄 `.log-chain[data-lane]`: "검증 로그 체인 검증 실패 / 자기 일관성만(인증 아님) / 인증 안 된 줄 N개 / 인증 불가(변조 판정 아님) / 읽지 못함", 툴팁 = 서버 `detail`. `absent`·인증 줄만 있는 `keyed`는 표시 없음, 모르는 상태는 "인증 불가". `logChains` 없음(구 서버·번들) = 표시 없음.
+- `/api/records-meta` `logChains`는 로더가 그대로 넘기고(`data.logChains`), 상세 로그 목록(`#validationList`) 머리에 그 기록의 레인(검증 + 카빙/복구/조인 + 이상 있으면 이상 탐지)마다 문제가 있을 때만 한 줄 `.log-chain[data-lane]`: "검증 로그 체인 검증 실패 / 자기 일관성만(인증 아님) / 인증 안 된 줄 N개 / 인증 불가(변조 판정 아님) / 읽지 못함", 툴팁 = 서버 `detail`. `absent`·인증 줄만 있는 `keyed`는 표시 없음, 모르는 상태는 "인증 불가". `logChains` 없음(구 서버) = 표시 없음. 독립 번들의 `logChains`는 `{anomaly:{head}}`만(R17 트랙 I6, §24.4) — 레인 줄은 없음.
 
 ### 17.4 최종화 미완료 패키지 (U4, 트랙 S2)
 - `packageIncomplete(dir, flag)`(10-core): 폴더 이름이 `…_INCOMPLETE`(또는 `*.finalize-incomplete.txt`)이거나 서버가 명시 필드(`package_incomplete`·`finalize_incomplete`)를 보내면 참. 표시는 "최종화 미완료"(`H_PKG_INCOMPLETE`).
@@ -990,3 +990,27 @@ const FTStore = {
 ### 23.4 하네스 (U5)
 - verify-range-sync ㉓: 편집(keydown)과 `FTViewer.save` 호출을 한 페이지 작업에서 한다. 실제 키 입력 뒤 하네스가 2.5 s 이상 멈추면 자동 저장(디바운스)이 먼저 보내 save가 그 요청을 기다렸다(시험 시각 문제, 저장 경로는 정상). 호출 시점 상태 `pending`도 확인.
 - 하네스: verify-review-batch --unit "R16 U1"·"R16 U3"·"R16 U4"(82a6cb1 자산, 후속은 첫 R16 U 커밋 자산에서 각각 실패 확인).
+
+## 24. R17 트랙 U 추가 계약 (2026-10-19, docs/PLAN_R17_2026-10-18.md)
+
+### 24.1 표식 사용 불가 (U1, 트랙 I1)
+- 이상 징후 머리 `reason_code: "marker-unusable"` → 경고(`warn`, role=status) "이상 징후 기록: 표식 확인 불가 — 변조 가능성, 현재 결과 없음"(`anomalyHead.reason.markerUnusable`, ko·en). 상태가 `not-authenticated`·`intact`여도 참고(note)·없음으로 떨어지지 않고 경고 + 배지 "확인 불가". "다시 스캔하면 해소"는 `mixed-version`만.
+- `marker-unusable`은 이상 징후 머리에만 온다(records-meta·보고서·번들; `/api/verify-sources`에는 없음). `withhold_reason`은 "이상 징후 머리 확인 불가 — 결과 없음: 완료 표식을 쓸 수 없음 — …"(tooltip).
+
+### 24.2 이상 후보 개수·칩 (U2)
+- 이상 후보(`record.hasAnomaly`)는 `trust`가 auth·sc인 이상 징후 행(필드 없음 = 옛 서버·번들, 이전 그대로)이 하나라도 있는 기록만. 행은 있으나 모두 그 밖(unauth·`pc:<키>`)이면 `hasUnauthAnomaly` — "인증 안 된 후보"로 따로 센다(배지 `.badge.candidate.anomaly-unauth` "인증 안 된 후보", 개수 알약 tooltip "인증 안 된 후보 N건(따로 셈)", 더보기 칩 `anomaly:unauth` "인증 안 된 후보 N" — N>0일 때만). 검증 기록의 `anomaly_flags`는 그 검증 줄의 `trust`를 따르고, 같은 kind 두 행 중 쓸 수 있는 쪽이 남는다(`recordAnomalies`).
+- 머리가 보류(§23.1 err·warn)면 알약 "이상 N · 확인 불가"(`.anomaly-unverified`, tooltip에 사유), 칩 "이상 징후 후보 · 확인 불가"(활성 필터 줄 같음).
+
+### 24.3 강제 치우기·작성자 없음 복구 (U3·U5, 트랙 S8·S2)
+- `in_progress_code: "live-writer"`(검증된 작성자)는 `--force` 줄 없음(서버 null; 옛 서버 문자열도 보이지 않음; 그 `reason`은 기다리라는 안내뿐). 그 밖에 `force_dismiss_command(_cmd)`가 있으면 마지막 줄 옆에 고정 문구 "저널만 옮김 — 아무것도 되돌리거나 기록하지 않음(서명·패키지 그대로)"(`FIN_FORCE_NOTE`; 결과 줄 `.h-fin-note`, 점검 목록 sub는 괄호).
+- `*_cmd`(cmd.exe 형식)는 `%`가 든 경로면 null — PowerShell 줄 하나만("…: …", 라벨 괄호 없음).
+- `manifest_check: "withheld"`(`completed-unrecorded`·`completed`) → `[data-journal="unrecordedwithheld"]` "이전 최종화 확인 보류 — 완료 확정 아님"(경고, info 아님; 차단은 `blocks_finalize` 그대로 — 서버 false). legacy 점검 목록 `warn` 같은 문구.
+- `writer_gone_command`(PowerShell)·`writer_gone_command_cmd`(cmd.exe) → "작성자 없음 확인 시 복구(PowerShell): …"/"(명령 프롬프트): …", 하나면 "작성자 없음 확인 시 복구: …". 서버 필드에서만(뷰어가 만들지 않음; 서버는 unverified-writer·other-account에만 보냄). 순서: 치우기 → 작성자 없음 복구 → 강제 치우기. 결과 줄·점검 목록(앱 셸·legacy) 모두.
+
+### 24.4 번들 머리 (U4, 트랙 I6)
+- 독립 번들의 `logChains.anomaly.head`도 §23.1과 같은 배너·배지. 번들에서는 사유·detail의 "이 PC"를 "생성 PC"로(`anomalyHead.reason.mixedVersion@bundle` "… 생성 PC에서 다시 스캔하면 해소").
+
+### 24.5 트랙 I(7095fce) 후속
+- 타임라인 행 `time_self_consistent: true`(없으면 false) → kind 옆 약한 표시 "자기 일관성만"(`.badge.candidate.tl-time-sc`, tooltip `timeline.tip.timeSc`, ko·en) — "시각 감사 안 됨"과 구별, 같이 붙지 않음(`time_unaudited` 우선).
+- `head_reason: "unusable-line"`은 코드 그대로 "쓸 수 없는 줄"(서버 문장 "모양상 다른 이벤트이나 내용은 인증 안 됨 — …"은 사유·hint에 그대로).
+- 하네스: verify-review-batch --unit "R17 U1"–"R17 U5"(9bac14c 자산), "R17 track I follow-up"(7095fce 자산에서 실패 확인); verify-layout "R17 U1/U2"(1366×768, records-meta 주입).

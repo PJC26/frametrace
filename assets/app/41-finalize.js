@@ -482,7 +482,7 @@ async function gatherFinalizeChecks() {
       : journal.kind === "otheraccount" || journal.kind === "unverifiedwriter" ? [finJournalOtherHost(jj), journal.detail ? finShortDetail(journal.detail) : ""].filter(Boolean).join(" — ")
       : journal.kind === "unreadable" || journal.kind === "unpaired" ? cmds || (journal.detail ? finShortDetail(journal.detail) : "")
       : journal.detail ? finShortDetail(journal.detail) : "결과 아래 안내를 확인하십시오.";
-    const force = finJournalForceLines(st, journal.kind).map(l => `${l.label}: ${l.cmd}`).join(" · ");
+    const force = finJournalCmdText(finJournalWriterGoneLines(st).concat(finJournalForceLines(st, journal.kind)));
     add("block", "최종화 차단: " + finJournalHead(journal), [sub, force].filter(Boolean).join(" — "));
   }
   let meta = null;
@@ -626,6 +626,9 @@ function finJournalState(st) {
   // R15 U4 (track S6): the complete record could not be written again — it
   // blocks (absent / false = info as before).
   if (kind === "unrecorded" && j.blocks_finalize === true) kind = "unrecordedblocked";
+  // R17 (track S9): the manifest was too large to hash on the status path
+  // (`manifest_check: "withheld"`) — "확인 보류", never shown as complete.
+  if ((kind === "unrecorded" || kind === "completed") && j.manifest_check === "withheld") kind = "unrecordedwithheld";
   // R15 (track S10): maybe another account's FrameTrace — blocks, no dismiss hint.
   if (kind === "inprogress" && j.in_progress_code === "other-account") kind = "otheraccount";
   // R16 U4 (track S2, P25): a live process that may be this case's writer — never rolled back automatically.
@@ -661,6 +664,7 @@ const FIN_JOURNAL_HEAD = {
   closedsuperseded: "이전 최종화 대체됨 — 기록만 남음",
   unrecorded: "이전 최종화 완료 — 완료 기록만 빠짐",
   unrecordedblocked: "이전 최종화 완료 — 완료 기록 못 씀",
+  unrecordedwithheld: "이전 최종화 확인 보류 — 완료 확정 아님",
   closed: "이전 최종화 끝남 — 확인 필요",
   inprogress: "다른 FrameTrace에서 최종화 중",
   otheraccount: "다른 계정의 최종화일 수 있음 — 차단 중",
@@ -694,14 +698,33 @@ function finJournalDismissLines(st, kind) {
 }
 // R16 U4 (track S 2e3a4e4): the `--force` dismiss hint — ONLY the server's
 // `force_dismiss_command` (PowerShell) / `force_dismiss_command_cmd`
-// (cmd.exe) strings (unverified-writer, live-writer, other-account); never
-// built here. `kind` is unused (the fields decide).
+// (cmd.exe) strings; never built here. R17 U3 (track S8): never for a
+// verified live writer (`in_progress_code: "live-writer"` — the server
+// sends null; an older server's string is not shown either); the last line
+// carries the fixed note FIN_FORCE_NOTE.
+const FIN_FORCE_NOTE = "저널만 옮김 — 아무것도 되돌리거나 기록하지 않음(서명·패키지 그대로)";
 function finJournalForceLines(st, kind) {
   const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  if (j.in_progress_code === "live-writer") return [];
   const ps = typeof j.force_dismiss_command === "string" ? j.force_dismiss_command.trim() : "";
   const cmd = typeof j.force_dismiss_command_cmd === "string" ? j.force_dismiss_command_cmd.trim() : "";
-  if (ps && cmd) return [{ label: "확인 뒤 강제 치우기(PowerShell)", cmd: ps }, { label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd }];
-  return ps || cmd ? [{ label: "확인 뒤 강제 치우기", cmd: ps || cmd }] : [];
+  const out = ps && cmd ? [{ label: "확인 뒤 강제 치우기(PowerShell)", cmd: ps }, { label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd }]
+    : ps || cmd ? [{ label: "확인 뒤 강제 치우기", cmd: ps || cmd }] : [];
+  if (out.length) out[out.length - 1].note = FIN_FORCE_NOTE;
+  return out;
+}
+// R17 U5 (track S2): "작성자 없음 확인 시 복구" — ONLY the server's
+// `writer_gone_command` (PowerShell) / `writer_gone_command_cmd` (cmd.exe).
+function finJournalWriterGoneLines(st) {
+  const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  const ps = typeof j.writer_gone_command === "string" ? j.writer_gone_command.trim() : "";
+  const cmd = typeof j.writer_gone_command_cmd === "string" ? j.writer_gone_command_cmd.trim() : "";
+  if (ps && cmd) return [{ label: "작성자 없음 확인 시 복구(PowerShell)", cmd: ps }, { label: "작성자 없음 확인 시 복구(명령 프롬프트)", cmd }];
+  return ps || cmd ? [{ label: "작성자 없음 확인 시 복구", cmd: ps || cmd }] : [];
+}
+// One checklist text of command lines; a line's note follows it in brackets.
+function finJournalCmdText(lines) {
+  return lines.map(l => `${l.label}: ${l.cmd}` + (l.note ? ` (${l.note})` : "")).join(" · ");
 }
 // Tooltip words for `local_record` / `unpaired_code`.
 function finJournalTipExtra(j) {
@@ -766,11 +789,12 @@ function finJournalRow(st) {
   else if (s.kind === "unpaired") lines.push("아무것도 바뀌지 않았습니다");
   // R13 U3 (track S6): an unreadable or unpaired journal (R12 journals read
   // unpaired) is set aside with the CLI.
-  const cmds = finJournalDismissLines(st, s.kind).concat(finJournalForceLines(st, s.kind));
+  const cmds = finJournalDismissLines(st, s.kind).concat(finJournalWriterGoneLines(st), finJournalForceLines(st, s.kind));
   return `<li class="h-fin-journal-row" data-journal="${s.kind}"${tip.length ? ` title="${esc(tip.join("\n"))}"` : ""}>` +
     `<span class="${FIN_JOURNAL_INFO.has(s.kind) && !(s.kind !== "recovering" && finJournalBlocks(s)) ? "h-fin-info" : "h-fin-incomplete"}">${esc(head)}</span>` +
     lines.map(b => `<small class="h-fin-detail muted">${esc(b)}</small>`).join("") +
-    cmds.map(l => `<small class="h-fin-detail h-fin-cmd">${esc(l.label)}: <code class="mono">${esc(l.cmd)}</code></small>`).join("") + `</li>`;
+    cmds.map(l => `<small class="h-fin-detail h-fin-cmd">${esc(l.label)}: <code class="mono">${esc(l.cmd)}</code>` +
+      (l.note ? ` <span class="muted h-fin-note">${esc(l.note)}</span>` : "") + `</small>`).join("") + `</li>`;
 }
 function finResultHtml() {
   const r = FIN.result;
