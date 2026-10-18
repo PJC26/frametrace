@@ -106,8 +106,9 @@ function looksLargeSource(src) {
   return /^[A-Za-z]:[\\/]?$/.test(v) || /^\\\\[?.]\\/.test(v) || v === "/" ||
     /^\/(dev|media|mnt|Volumes|run\/media\/[^/]+)\/[^/]+\/?$/.test(v);
 }
+// R19 (track S1): the server writes a drive root as `E:\.` — read as `E:`.
 function normPath(p) {
-  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([a-z]:)\/\.$/i, "$1").toLowerCase();
 }
 // True when `child` is `parent` or lies beneath it (case-insensitive,
 // separator-agnostic — the workstation is primarily Windows).

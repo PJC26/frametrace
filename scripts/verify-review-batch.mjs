@@ -834,6 +834,34 @@ async function r19TrackU({ fn, source, runInNewContext, assert }) {
   const mixed = verdict(['kid-1', 'Evil ID']);
   assert.ok(/키 kid-1 보유 PC에서 확인 · 알 수 없는 키 id/.test(mixed) && !mixed.includes('Evil ID'), 'R19 track I3 shell: mixed ids: ' + mixed);
   console.log('PASS VM R19 track I3 follow-up: pc:unknown / unquotable key ids read "알 수 없는 키 id" (status, trust tag, sound, shell audit verdict)');
+
+  // Track S1 follow-up: case paths from the server are normalized (absolute,
+  // no trailing separator, `\`, drive root `E:\.`); the recent list is
+  // canonical (drive root `E:\`). The shell matches server values only —
+  // a legacy (typed, localStorage) entry is listed by the server's canonical
+  // form — and a drive root reads the same in both forms.
+  const { appBundleJs } = await import('./lib/app-bundle.mjs');
+  const appJs = appBundleJs();
+  const sfn = (name) => appJs.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const pctx = {};
+  runInNewContext(['normPath', 'pathInside', 'samePathish', 'recentState', 'hLegacyRecentItem'].map((n) => { const f = sfn(n); assert.ok(f, `R19 track S1: ${n} exists (shell)`); return f; }).join('\n') + '\nfunction hBaseName(p) { return String(p).split(/[\\\\/]/).filter(Boolean).pop() || ""; }', pctx);
+  const pr = (expr) => runInNewContext(expr, pctx);
+  assert.ok(pr('samePathish("E:\\\\.", "E:\\\\")') && pr('samePathish("E:\\\\.", "e:/")') && pr('normPath("E:\\\\.") === normPath("E:\\\\")'), 'R19 track S1: drive root E:\\. (status) is E:\\ (recent list)');
+  assert.ok(pr('pathInside("E:\\\\x", "E:\\\\.")') && !pr('samePathish("E:\\\\.", "F:\\\\")') && pr('samePathish("C:\\\\cases\\\\c1", "C:\\\\cases\\\\c1")'), 'R19 track S1: root containment / other drive');
+  assert.equal(pr('recentState({ case_dir: "E:\\\\" }, { case_dir: "E:\\\\.", phase: "running" }).action'), 'progress', 'R19 track S1: the running case on a drive root is found in the recent list');
+  const leg = plain(pr('hLegacyRecentItem("c:/Cases/C1/", { is_case: true, canonical: "C:\\\\Cases\\\\C1" })'));
+  assert.ok(leg.case_dir === 'C:\\Cases\\C1' && leg.legacyPath === 'c:/Cases/C1/' && leg.legacy === true, 'R19 track S1: a legacy entry is listed by the server\'s canonical path: ' + JSON.stringify(leg));
+  assert.equal(pr('hLegacyRecentItem("x", { is_case: false })'), null, 'R19 track S1: a non-case legacy entry is dropped');
+  assert.ok(/normPath\(p\) !== normPath\(it\.legacyPath\)/.test(appJs), 'R19 track S1: forgetting a legacy entry removes the typed text it was stored as');
+  // Draft keys of a case without case_id: the drive root reads the same key before and after normalization.
+  const hostSrc = readFileSync(new URL('../assets/viewer/00-host.js', import.meta.url), 'utf8');
+  const hctx = { EventTarget, AbortController, CustomEvent: class extends Event {}, crypto: globalThis.crypto, Uint32Array, location: { origin: 'http://127.0.0.1:1', pathname: '/viewer/' },
+    document: { documentElement: { hasAttribute: () => true, dataset: {} } }, localStorage: { setItem() {} }, setInterval, clearInterval };
+  hctx.window = hctx;
+  runInNewContext(hostSrc, hctx);
+  const ck = (d) => runInNewContext('FTViewer.caseStorageKey(null, d)', Object.assign(hctx, { d }));
+  assert.ok(ck('E:\\.') === ck('E:\\') && ck('E:\\') === ck('E:/') && ck('C:\\cases\\c1') === ck('C:/cases/c1/') && ck('E:\\.') !== ck('F:\\.'), 'R19 track S1: caseStorageKey — E:\\. keeps the E:\\ key');
+  console.log('PASS VM R19 track S1 follow-up: normalized case paths (E:\\.) match the recent list / draft keys via server values only');
 }
 
 // ---- R18 track U (docs/PLAN_R18_2026-10-19.md, P30) ------------------------

@@ -90,7 +90,8 @@ const FTViewer = (() => {
     const id = manifest && typeof manifest === "object" ? manifest.case_id : null;
     if ((typeof id === "string" && id.trim()) || (typeof id === "number" && Number.isFinite(id))) return String(id);
     const dir = typeof caseDir === "string" ? caseDir.trim() : "";
-    let seed = dir && dir !== "<case>" ? "dir|" + dir.replace(/\\/g, "/").replace(/\/+$/, "") : "";
+    // R19 (track S1): the server's drive root `E:\.` keeps the `E:\` key.
+    let seed = dir && dir !== "<case>" ? "dir|" + dir.replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([A-Za-z]:)\/\.$/, "$1") : "";
     if (!seed) { try { seed = "page|" + location.origin + location.pathname; } catch (e) { seed = "page|?"; } }
     const fnv = (text, h) => {
       for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }

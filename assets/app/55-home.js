@@ -108,6 +108,15 @@ function samePathish(a, b) {
   if (!x || !y) return false;
   return x === y || x.endsWith("/" + y.replace(/^\/+/, "")) || y.endsWith("/" + x.replace(/^\/+/, ""));
 }
+// Pure: a path remembered only by this browser (typed, older builds) and
+// its /api/browse answer → a recent-list entry named by the SERVER's
+// canonical path (R19 track S1: never matched as typed); `legacyPath` is the
+// stored text, for forgetting it. null when it is not a case folder.
+function hLegacyRecentItem(p, browse) {
+  if (!browse || !browse.is_case) return null;
+  const dir = typeof browse.canonical === "string" && browse.canonical ? browse.canonical : p;
+  return { case_dir: dir, name: hBaseName(dir) || dir, exists: true, phase_hint: "", legacy: true, legacyPath: p };
+}
 // Pure: one entry → { state, action: open|resume|progress|forget, label }.
 function recentState(it, st) {
   const live = st && st.case_dir && samePathish(st.case_dir, it.case_dir);
@@ -148,13 +157,14 @@ async function renderRecentCases() {
         const r = await jget("/api/browse?path=" + encodeURIComponent(p));
         // The server's canonical form dedupes symlinked / differently
         // spelled paths against the (canonical) server list.
-        return r.is_case ? { p, key: normPath(r.canonical || p) } : null;
+        return hLegacyRecentItem(p, r);
       } catch (e) { return null; }
     }));
-    for (const c of checks.filter(Boolean)) {
-      if (known.has(c.key)) continue;
-      known.add(c.key);
-      items.push({ case_dir: c.p, name: hBaseName(c.p) || c.p, exists: true, phase_hint: "", legacy: true });
+    for (const item of checks.filter(Boolean)) {
+      const key = normPath(item.case_dir);
+      if (known.has(key)) continue;
+      known.add(key);
+      items.push(item);
     }
   }
   if (seq !== recentSeq) return;
@@ -227,7 +237,7 @@ async function recentAction(i, btn) {
     else toast("목록에서 지웠습니다 — 폴더는 그대로입니다.");
     if (it.legacy) {
       const prefs = loadPrefs();
-      prefs.recentCases = (prefs.recentCases || []).filter(p => normPath(p) !== normPath(it.case_dir));
+      prefs.recentCases = (prefs.recentCases || []).filter(p => normPath(p) !== normPath(it.legacyPath));
       try { localStorage.setItem(LS_KEY, JSON.stringify(prefs)); } catch (e) {}
     }
     renderRecentCases();
