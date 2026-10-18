@@ -676,25 +676,33 @@ function logChainItems(chains, lanes) {
 }
 
 // R16 U1 (track I2): records-meta `logChains.anomaly.head` = {status,
-// reason_code, withhold_reason, detail}. truncated / rewritten → "err" (the
-// findings shown are not a current result: error banner, every anomaly
-// badge "확인 불가"); any other status but absent / intact → "warn" (banner
-// only). null when absent (older server, bundle) or fine.
+// reason_code, withhold_reason, detail} (track I 4c95f30). truncated /
+// rewritten → "err" (error banner); unknown or any other status → "warn";
+// both: the findings are not a current result — every anomaly badge
+// "확인 불가". not-authenticated → "note" (a caveat line only) unless
+// `withhold_reason` is a string — a withheld head is never current ("warn"
+// at least). null when absent / intact (or older server, bundle).
+// reason_code mixed-version is an older build's scan, not tampering.
+const ANOMALY_HEAD_REASON = { "mixed-version": "anomalyHead.reason.mixedVersion", "scan-mismatch": "anomalyHead.reason.scanMismatch" };
 function anomalyHeadState(chains) {
   const lane = chains && typeof chains === "object" ? (chains.anomaly || chains.anomalyLog) : null;
   const h = lane && typeof lane === "object" && lane.head && typeof lane.head === "object" ? lane.head : null;
   const st = h && h.status != null ? String(h.status) : "";
-  if (!st || st === "absent" || st === "intact") return null;
-  const tip = ["status " + st, h.reason_code, h.withhold_reason, h.detail].filter(v => v != null && String(v).trim()).map(String).join("\n");
-  return { level: st === "truncated" || st === "rewritten" ? "err" : "warn", status: st, tip };
+  const withheld = !!h && typeof h.withhold_reason === "string" && !!h.withhold_reason.trim();
+  if (!st || ((st === "absent" || st === "intact") && !withheld)) return null;
+  const code = h.reason_code == null ? "" : String(h.reason_code);
+  const why = ANOMALY_HEAD_REASON[code] ? t(ANOMALY_HEAD_REASON[code]) : "";
+  const tip = [why, "status " + st + (code ? " · " + code : ""), h.withhold_reason, h.detail].filter(v => v != null && String(v).trim()).map(String).join("\n");
+  const level = st === "truncated" || st === "rewritten" ? "err" : st === "not-authenticated" && !withheld ? "note" : "warn";
+  return { level, status: st, code, tip };
 }
 var anomalyHead = anomalyHeadState(logChains);
 // The record's anomaly badge (grid card, detail header); `title` = the kinds.
 function anomalyBadgeHtml(record, withTitle) {
   if (!record || !record.hasAnomaly) return "";
-  const cut = !!(anomalyHead && anomalyHead.level === "err");
+  const cut = !!(anomalyHead && (anomalyHead.level === "err" || anomalyHead.level === "warn"));
   const kinds = record.anomalies.map(item => item.kind).join(", ");
-  const title = [withTitle ? kinds : "", cut ? t("anomalyHead.cut") + (anomalyHead.tip ? "\n" + anomalyHead.tip : "") : ""].filter(Boolean).join("\n");
+  const title = [withTitle ? kinds : "", cut ? t(anomalyHead.level === "err" ? "anomalyHead.cut" : "anomalyHead.unknown") + (anomalyHead.tip ? "\n" + anomalyHead.tip : "") : ""].filter(Boolean).join("\n");
   return `<span class="badge anomaly${cut ? " anomaly-unverified" : ""}"${title ? ` title="${escapeHtml(title)}"` : ""}>${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}` +
     (cut ? ` · ${escapeHtml(t("anomalyHead.badge"))}` : "") + `</span>`;
 }

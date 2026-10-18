@@ -98,18 +98,16 @@ function finJournalDismissLines(st, kind) {
   if (kind === "otherhost" || Object.prototype.hasOwnProperty.call(j, "dismiss_command")) return [];
   return [{ label: "치우기", cmd: finJournalDismissCmd(st) }];
 }
-// R16 U4 (track S2/S4): other-account / unverified-writer block until the
-// examiner confirms the process is not this case's writer — the `--force`
-// form of the dismiss command (the server's `force_command` when it sends one).
+// R16 U4 (track S 2e3a4e4): the `--force` dismiss hint — ONLY the server's
+// `force_dismiss_command` (PowerShell) / `force_dismiss_command_cmd`
+// (cmd.exe) strings (unverified-writer, live-writer, other-account); never
+// built here. `kind` is unused (the fields decide).
 function finJournalForceLines(st, kind) {
-  if (kind !== "otheraccount" && kind !== "unverifiedwriter") return [];
   const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
-  const f = (c) => (/\s--force\b/.test(c) ? c : c + " --force");
-  if (typeof j.force_command === "string" && j.force_command.trim()) return [{ label: "확인 뒤 강제 치우기", cmd: j.force_command.trim() }];
-  const cmd = typeof j.dismiss_command_cmd === "string" ? j.dismiss_command_cmd.trim() : "";
-  const out = [{ label: cmd ? "확인 뒤 강제 치우기(PowerShell)" : "확인 뒤 강제 치우기", cmd: f(finJournalDismissCmd(st)) }];
-  if (cmd) out.push({ label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd: f(cmd) });
-  return out;
+  const ps = typeof j.force_dismiss_command === "string" ? j.force_dismiss_command.trim() : "";
+  const cmd = typeof j.force_dismiss_command_cmd === "string" ? j.force_dismiss_command_cmd.trim() : "";
+  if (ps && cmd) return [{ label: "확인 뒤 강제 치우기(PowerShell)", cmd: ps }, { label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd }];
+  return ps || cmd ? [{ label: "확인 뒤 강제 치우기", cmd: ps || cmd }] : [];
 }
 // Tooltip words for `local_record` / `unpaired_code`.
 function finJournalTipExtra(j) {
@@ -474,7 +472,7 @@ function verifySourcesVerdict(res) {
   })();
   // R15 (track I5): why the head is unknown (`head_reason`), short.
   const hr = res.head_reason == null ? "" : String(res.head_reason);
-  const hrWord = { "other-pc": "다른 PC 머리일 수 있음", "unusable-line": "쓸 수 없는 줄", "chain-failed": "체인 실패", "repaired": "레인 수리", "malformed": "형식 오류", "own-head-missing": "결과 실행 머리 없음", "unreadable": "읽지 못함", "mixed-version": "버전 섞인 머리", "scan-mismatch": "다른 스캔의 머리" }[hr] || hr;
+  const hrWord = { "other-pc": "다른 PC 머리일 수 있음", "unusable-line": "쓸 수 없는 줄", "chain-failed": "체인 실패", "repaired": "레인 수리", "malformed": "형식 오류", "own-head-missing": "결과 실행 머리 없음", "unreadable": "읽지 못함", "mixed-version": "이전 버전이 스캔함 — 이 PC에서 다시 스캔하면 해소", "scan-mismatch": "다른 스캔의 머리" }[hr] || hr;
   if (head) v.tip = [v.tip || "", `재검증 머리 ${head}` + (hrWord ? ` (${hrWord})` : "")].filter(Boolean).join(" · ");
   // R15 (track I4): "시계 이상" — its own warning, never withholds the result.
   const clock = typeof res.clock_note === "string" ? res.clock_note.trim() : "";

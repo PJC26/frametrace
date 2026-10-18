@@ -2406,7 +2406,8 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
 
 // R16 U1 (track I2): the anomaly log's head (30-records anomalyHeadState) —
 // cut / rewritten: role=alert error banner (the findings are not a current
-// result); another non-intact state: a role=status warning. Tooltip = the
+// result); unknown / withheld: a role=status warning (mixed-version /
+// scan-mismatch say why — never as tampering); not-authenticated: a caveat. Tooltip = the
 // server's status, reason code, withhold reason and detail.
 (function showAnomalyHead() {
   if (!anomalyHead) return;
@@ -2417,7 +2418,8 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
   bar.dataset.headStatus = anomalyHead.status;
   bar.dataset.level = anomalyHead.level;
   bar.setAttribute("role", err ? "alert" : "status");
-  const msg = noticeMessage(err ? "anomalyHead.cut" : "anomalyHead.unknown");
+  const key = err ? "anomalyHead.cut" : anomalyHead.level === "note" ? "anomalyHead.note" : ANOMALY_HEAD_REASON[anomalyHead.code] || "anomalyHead.unknown";
+  const msg = noticeMessage(key);
   if (anomalyHead.tip) msg.title = anomalyHead.tip;
   bar.appendChild(msg);
   noticeAppend(bar);
