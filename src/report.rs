@@ -584,7 +584,13 @@ const supersededValidations = [];
 // marker is not known to be the latest (the repair cut a tail that may
 // have held a newer one) — shown as "알 수 없음", never as current.
 const unknownValidations = currentValidations.filter(item => (validationPosition.get(item) ?? -1) < validationRepairAt);
-currentValidations.splice(0, currentValidations.length, ...currentValidations.filter(item => !unknownValidations.includes(item)));
+// R19 I4: no `splice(..., ...arr)` (RangeError at ~130k arguments).
+{{
+  const unknownSet = new Set(unknownValidations);
+  const known = currentValidations.filter(item => !unknownSet.has(item));
+  currentValidations.length = 0;
+  for (const item of known) currentValidations.push(item);
+}}
 const validationRow = (item, withTime) => `<tr>
       ${{withTime ? `<td>${{fmtUnix(item.validated_unix)}}</td>` : ""}}
       <td>${{escapeHtml(item.validation_status || "-")}}</td>
@@ -647,6 +653,38 @@ const anomalyRuns = [];
     }}
   }});
   flushUnmarked(pending);
+  // R19 I1: interleaved runs (A's finding @100, B's finding @200, A's
+  // marker @100, B's marker @200) flushed B's finding as an unmarked run
+  // before A's run — B's completed run read "후보 0건". An unmarked run
+  // whose scanned_unix equals a LATER completed run's belongs to it (the
+  // nearest one; its entries go ahead of the run's own, lane order).
+  // Same rule as `report::anomaly_lane_withheld`.
+  const nearest = new Map();
+  const chunks = new Map();
+  const merged = new Set();
+  for (let index = anomalyRuns.length - 1; index >= 0; index--) {{
+    const run = anomalyRuns[index];
+    if (!Number.isFinite(run.ts)) continue;
+    if (run.run !== null) {{
+      nearest.set(run.ts, run);
+    }} else if (nearest.has(run.ts)) {{
+      const target = nearest.get(run.ts);
+      if (!chunks.has(target)) chunks.set(target, []);
+      chunks.get(target).push(run.entries);
+      merged.add(run);
+    }}
+  }}
+  chunks.forEach((parts, target) => {{
+    const entries = [];
+    for (let at = parts.length - 1; at >= 0; at--) for (const item of parts[at]) entries.push(item);
+    for (const item of target.entries) entries.push(item);
+    target.entries = entries;
+  }});
+  if (merged.size) {{
+    const kept = anomalyRuns.filter(run => !merged.has(run));
+    anomalyRuns.length = 0;
+    for (const run of kept) anomalyRuns.push(run);
+  }}
 }}
 const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(true);
 // R13 P16: a newer run without its completion marker after the last
@@ -657,11 +695,27 @@ const latestCompleted = anomalyRuns.map(run => run.run !== null).lastIndexOf(tru
 // unmarked run BEFORE the completed run whose marker ended it, so an
 // unmarked run is also newer when its first entry is after the completed
 // run's first entry or its scanned_unix is greater.
-const anomalyRunFirst = run => Math.min(...run.entries.map(item => anomalyPosition.get(item) ?? Infinity), run.run ? (anomalyPosition.get(run.run) ?? Infinity) : Infinity);
+// R19 I4: loops, not `Math.min(...arr)` — a spread of ~130k arguments
+// throws RangeError and blanked the report.
+const anomalyRunFirst = run => {{
+  let first = run.run ? (anomalyPosition.get(run.run) ?? Infinity) : Infinity;
+  for (const item of run.entries) {{
+    const at = anomalyPosition.get(item) ?? Infinity;
+    if (at < first) first = at;
+  }}
+  return first;
+}};
 // R15 I4: the run's last lane position — a run stamped later but placed
 // wholly before the completed run's first entry is an older crash with a
 // clock set in the future, not a newer run.
-const anomalyRunLast = run => Math.max(...run.entries.map(item => anomalyPosition.get(item) ?? -Infinity), run.run ? (anomalyPosition.get(run.run) ?? -Infinity) : -Infinity);
+const anomalyRunLast = run => {{
+  let last = run.run ? (anomalyPosition.get(run.run) ?? -Infinity) : -Infinity;
+  for (const item of run.entries) {{
+    const at = anomalyPosition.get(item) ?? -Infinity;
+    if (at > last) last = at;
+  }}
+  return last;
+}};
 // R15 I4: "시계 이상" — a run stamped more than 600 s after this viewer's
 // clock.
 const anomalyClockAhead = run => Number.isFinite(run.ts) && run.ts > Date.now() / 1000 + 600;
@@ -1036,7 +1090,10 @@ const chainStatusText = chain => {{
   }}
 }};
 // R9 P3: entries this PC could not authenticate — listed, never results.
-const unauthTrustText = trust => typeof trust === "string" && trust.startsWith("pc:") ? `이 PC에서 인증 불가 — 키 "${{trust.slice(3)}}" 보유 PC에서 확인 (변조 판정 아님)` : "인증 안 됨";
+// R19 I3: a key id is forgeable (outside entry_sha256) — quoted only when
+// it matches ^[0-9a-z-]{{1,64}}$ (and is not "unknown").
+const quotableKeyPhrase = id => /^[0-9a-z-]{{1,64}}$/.test(id) && id !== "unknown" ? `키 "${{id}}"` : "알 수 없는 키 id";
+const unauthTrustText = trust => typeof trust === "string" && trust.startsWith("pc:") ? `이 PC에서 인증 불가 — ${{quotableKeyPhrase(trust.slice(3))}} 보유 PC에서 확인 (변조 판정 아님)` : "인증 안 됨";
 const unauthSubject = item => item?.output_path || item?.target_path || item?.source_path || item?.selector || item?.record_id || item?.id || "-";
 document.getElementById("unauthenticated-entries").innerHTML = unauthenticatedEntries.length ? `<div class="note"><strong>인증 안 된 감사 항목 ${{unauthenticatedEntries.length}}건</strong> — 이 PC에서 인증되지 않아 위 표·집계·검증 결과에 쓰지 않았습니다 (결과·근거로 보지 마십시오).</div><table>
   <thead><tr><th>로그</th><th>항목</th><th>대상</th><th>신뢰</th><th>사유</th></tr></thead>
@@ -1601,9 +1658,13 @@ impl SignoffAuditRecord {
                 integrity,
                 authenticated: false,
                 unchecked_key_id: Some(key_id),
-            } => format!(
-                "서명 기록이 감사 체인(signoff-log, {integrity})에 있음 — {SELF_CONSISTENT_ONLY} 이 항목은 감사 키 \"{key_id}\"로 HMAC 서명되어 있으나 이 PC에는 감사 키가 없습니다 — 키 \"{key_id}\"를 가진 PC에서 확인하십시오"
-            ),
+            } => {
+                // R19 I3: a forgeable id is quoted only when quotable.
+                let phrase = crate::audit::key_id_phrase(key_id);
+                format!(
+                    "서명 기록이 감사 체인(signoff-log, {integrity})에 있음 — {SELF_CONSISTENT_ONLY} 이 항목은 감사 {phrase}로 HMAC 서명되어 있으나 이 PC에는 감사 키가 없습니다 — {phrase}를 가진 PC에서 확인하십시오"
+                )
+            }
             Self::Verified {
                 integrity,
                 authenticated: false,
@@ -1857,7 +1918,8 @@ pub fn signoff_audit_record_with_keys(
 fn signoff_entry_not_authenticated(trust: &crate::audit::LineTrust) -> String {
     match trust {
         crate::audit::LineTrust::OtherPc { key_id } => format!(
-            "이 서명의 감사 항목은 이 PC에서 인증 불가 — 키 \"{key_id}\" 보유 PC에서 확인하십시오 (다른 PC의 감사 키로 서명됨, 변조 판정 아님)"
+            "이 서명의 감사 항목은 이 PC에서 인증 불가 — {} 보유 PC에서 확인하십시오 (다른 PC의 감사 키로 서명됨, 변조 판정 아님)",
+            crate::audit::key_id_phrase(key_id)
         ),
         crate::audit::LineTrust::NotAuthenticated {
             retired_unproven: true,
@@ -2958,8 +3020,8 @@ pub use hash_verify_head::{
 mod anomaly_withheld;
 pub use anomaly_withheld::{
     ANOMALY_REPAIRED_AFTER_REASON, ANOMALY_UNUSABLE_AFTER_REASON, ANOMALY_UNUSABLE_IN_RUN_NOTE,
-    AnomalyWithheld, anomaly_lane_withheld, anomaly_lane_withheld_json, anomaly_withheld_json,
-    bundle_log_chains_json,
+    AnomalyWithheld, anomaly_lane_read_withheld_json, anomaly_lane_withheld,
+    anomaly_lane_withheld_json, anomaly_unreadable_withheld_json, bundle_log_chains_json,
 };
 
 /// A JSON array literal; anything else (empty input, garbage) is `[]`.

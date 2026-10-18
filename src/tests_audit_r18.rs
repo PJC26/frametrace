@@ -6,7 +6,7 @@ use crate::audit_key::{AuditKey, fingerprint_id, with_test_keys};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn r18_case(name: &str) -> PathBuf {
+pub(super) fn r18_case(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft-audit-r18-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("evidence/logs")).unwrap();
@@ -19,12 +19,12 @@ fn r18_case(name: &str) -> PathBuf {
     dir
 }
 
-fn key(seed: u8) -> AuditKey {
+pub(super) fn key(seed: u8) -> AuditKey {
     AuditKey::new(&fingerprint_id(&[seed; 32]), &[seed; 32])
 }
 
 /// A case with one indexed source file whose recorded hash is its bytes'.
-fn indexed_case(name: &str) -> (PathBuf, PathBuf) {
+pub(super) fn indexed_case(name: &str) -> (PathBuf, PathBuf) {
     let dir = r18_case(name);
     let source = dir.join("media/a.mp4");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -197,7 +197,7 @@ fn r18_i4_unusable_line_never_embeds_unknown_event_names() {
 
 /// Runs the case report script under node with a stub `document`; returns
 /// every element it touched.
-fn run_report_script(html: &str) -> serde_json::Value {
+pub(super) fn run_report_script(html: &str) -> serde_json::Value {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let script = html
@@ -226,7 +226,7 @@ fn run_report_script(html: &str) -> serde_json::Value {
 }
 
 /// The report's anomaly section with `chains` as its `auditChains`.
-fn report_anomaly_section(dir: &Path, chains: &str) -> String {
+pub(super) fn report_anomaly_section(dir: &Path, chains: &str) -> String {
     let rows = super::read_lane_rows(&dir.join(crate::report::ANOMALY_LOG_REL_PATH)).unwrap();
     let anomaly = rows.jsonl_with_trust();
     let html = crate::report::render_case_report_with_chains(
@@ -269,7 +269,10 @@ fn escape_html(text: &str) -> String {
 /// I2: the report script's OWN lane rules (no head, no server verdict)
 /// and `report::anomaly_lane_withheld` agree on `dir`'s anomaly lane —
 /// withheld or not, and with the same sentences. Returns the verdict.
-fn assert_report_agrees(dir: &Path, label: &str) -> Option<crate::report::AnomalyWithheld> {
+pub(super) fn assert_report_agrees(
+    dir: &Path,
+    label: &str,
+) -> Option<crate::report::AnomalyWithheld> {
     let rows = super::read_lane_rows(&dir.join(crate::report::ANOMALY_LOG_REL_PATH)).unwrap();
     let verdict = crate::report::anomaly_lane_withheld(&rows.values_with_trust());
     let js_only = report_anomaly_section(dir, r#"{"anomaly":{}}"#);
@@ -415,7 +418,7 @@ fn r18_i2_shared_withheld_verdict_agrees_with_the_report() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-fn anomaly_of(dir: &Path) -> PathBuf {
+pub(super) fn anomaly_of(dir: &Path) -> PathBuf {
     dir.join(crate::report::ANOMALY_LOG_REL_PATH)
 }
 

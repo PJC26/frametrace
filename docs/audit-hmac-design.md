@@ -804,8 +804,11 @@ a cause ("not tampering", "older build").
   line — P7 makes the real finding `unauth`, the head stays `intact`, and
   the viewer counted nothing. Now `/api/records-meta` and
   `review/data-bundle.js` carry `logChains.anomaly.withheld` (computed
-  from the very `anomalyLog` rows sent; an unreadable lane →
-  `reason_code: "unreadable"`), and the report's
+  from the very lane read the `anomalyLog` rows come from — R19 I2: R18
+  code read the lane a second time for the bundle, and again for an
+  unreadable lane in records-meta; now one read, and a lane that cannot be
+  read is `reason_code: "unreadable"` with that read's error, next to an
+  empty `anomalyLog`), and the report's
   `auditChains.anomaly.withheld` carries it to the report script, which
   also computes the same rules itself: withheld when either says so. A
   test renders the report with no server verdict and checks the script's
@@ -824,6 +827,41 @@ a cause ("not tampering", "older build").
   otherwise it becomes `head: {status: "unknown", reason_code:
   "bundle-unreadable", …}` and `withheld: {reason_code:
   "bundle-unreadable", …}` (R17 dropped the field and the banner with it).
+
+### Interleaved runs, one read, unquotable key ids (R19)
+
+- **I1 — a flushed row joins the later run with its `scanned_unix`.**
+  Interleaved scans (A's finding @100, B's finding @200, A's marker @100,
+  B's marker @200): the grouping flushed B's finding as an unmarked run
+  placed before A's run, so B's completed run — the newest — read
+  "후보 0건" and nothing withheld. Now, after grouping, an unmarked run
+  whose finite `scanned_unix` equals that of a LATER completed run
+  belongs to it (the nearest such run; its entries go ahead of the run's
+  own, lane order). Same rule in `report::anomaly_lane_withheld` and the
+  report script (`anomalyRuns`); the agreement test covers five
+  interleaved shapes. Merging only moves rows INTO a completed run, which
+  moves that run's first position earlier — the span checks
+  (`newer-unmarked-run`, `unusable-in-run`) then catch more, never less
+  (a crashed run C @300 interleaved before both markers now withholds).
+- **I2 — one lane read per reader.** `/api/records-meta`, the review
+  bundle and the report's `auditChains.anomaly` build `withheld` from the
+  same `audit::read_lane_rows` result as the rows / chain status they
+  send (`report::anomaly_lane_read_withheld_json`); the shared module no
+  longer reads the lane. (The report's own anomaly rows are still a
+  separate read in `make-report`; the report script recomputes the rules
+  from those rows and withholds on either verdict.)
+- **I3 — a key id is quoted only when it matches `^[0-9a-z-]{1,64}$`.**
+  `entry_hmac_key_id` lies outside `entry_sha256` and needs no key to
+  write. `AuditChainVerification::line_trust` carries a quotable id
+  (fingerprint ids `kid-<hex>` are) or `"unknown"`; trust code
+  `pc:unknown`; every sentence (entry note, lane reason, rewrite warning,
+  head `other-pc`, sign-off notes, carve trust, report script) says
+  "알 수 없는 키 id" instead. A user-chosen id with capitals or spaces
+  (`FRAMETRACE_AUDIT_KEY_ID`) is also not quoted — the line still is what
+  it is (another PC's key), only the name is not repeated.
+- **I4.** The report script finds a run's first / last lane position with
+  loops (`Math.min(...arr)` and `splice(..., ...arr)` threw RangeError at
+  ~130k entries and blanked the report).
 
 **Implementation notes (what shipped):**
 

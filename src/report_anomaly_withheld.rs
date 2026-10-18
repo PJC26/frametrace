@@ -23,6 +23,11 @@
 //! carries it to the report script, which also computes the same rules
 //! itself and withholds when either says so (fail closed). The reason
 //! sentences are the report's, word for word.
+//!
+//! R19: interleaved runs are grouped by their marker's `scanned_unix`
+//! (I1, [`merge_interleaved`]); every reader computes the verdict from the
+//! same lane read as the rows it sends ([`anomaly_lane_read_withheld_json`],
+//! I2) — this module never reads the lane itself.
 
 /// One reason the anomaly lane withholds its current result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +180,44 @@ fn group_runs(all: &[serde_json::Value], log: &[usize]) -> Vec<Run> {
         }
     }
     flush_unmarked(&mut runs, &pending);
+    merge_interleaved(&mut runs);
     runs
+}
+
+/// R19 I1: interleaved runs (A's finding @100, B's finding @200, A's
+/// marker @100, B's marker @200) — the grouping flushes B's finding as an
+/// unmarked run BEFORE A's run, and B's completed run read "후보 0건".
+/// An unmarked run whose (finite) `scanned_unix` equals that of a LATER
+/// completed run belongs to it: its entries join that run (the nearest
+/// such one, in lane order, ahead of the run's own entries). The report
+/// script does the same (`anomalyRuns`).
+fn merge_interleaved(runs: &mut Vec<Run>) {
+    // `+0.0` and `-0.0` are one key (JavaScript `Map`, SameValueZero).
+    let key = |ts: f64| if ts == 0.0 { 0u64 } else { ts.to_bits() };
+    // Walking back: the nearest later completed run per time, and the
+    // chunks (latest first) each completed run receives.
+    let mut nearest: std::collections::HashMap<u64, usize> = Default::default();
+    let mut chunks: Vec<Vec<Vec<usize>>> = runs.iter().map(|_| Vec::new()).collect();
+    let mut keep = vec![true; runs.len()];
+    for index in (0..runs.len()).rev() {
+        let Some(ts) = runs[index].ts else { continue };
+        if runs[index].marker.is_some() {
+            nearest.insert(key(ts), index);
+        } else if let Some(&target) = nearest.get(&key(ts)) {
+            chunks[target].push(std::mem::take(&mut runs[index].entries));
+            keep[index] = false;
+        }
+    }
+    for (run, chunks) in runs.iter_mut().zip(chunks) {
+        if chunks.is_empty() {
+            continue;
+        }
+        let mut entries: Vec<usize> = chunks.into_iter().rev().flatten().collect();
+        entries.append(&mut run.entries);
+        run.entries = entries;
+    }
+    let mut keep = keep.into_iter();
+    runs.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// R18 I2 / I5 (P9): the anomaly lane's own withholding verdict from its
@@ -261,16 +303,26 @@ pub fn anomaly_lane_withheld_json(all: &[serde_json::Value]) -> serde_json::Valu
     anomaly_lane_withheld(all).map_or(serde_json::Value::Null, |w| w.to_json())
 }
 
-/// [`anomaly_lane_withheld_json`] for `root`'s anomaly lane read here
-/// (`unreadable` lane: withheld — nothing can be said about its result).
-pub fn anomaly_withheld_json(root: &std::path::Path) -> serde_json::Value {
-    match crate::audit::read_lane_rows(&root.join(super::ANOMALY_LOG_REL_PATH)) {
+/// The `withheld` object of an anomaly lane that could not be read (`err`:
+/// the read error) — withheld, nothing can be said about its result.
+pub fn anomaly_unreadable_withheld_json(err: &str) -> serde_json::Value {
+    serde_json::json!({
+        "reason_code": "unreadable",
+        "codes": ["unreadable"],
+        "reason": format!("이상 징후 레인을 읽지 못해 현재 결과를 알 수 없습니다: {err}"),
+    })
+}
+
+/// R19 I2: the `withheld` object from the SAME read of the anomaly lane
+/// the caller's rows come from (`lane`: what `audit::read_lane_rows`
+/// returned) — never a second read, which a scan in between could make
+/// disagree with the rows sent. An unreadable lane is `unreadable`.
+pub fn anomaly_lane_read_withheld_json(
+    lane: &Result<crate::audit::LaneRows, String>,
+) -> serde_json::Value {
+    match lane {
         Ok(lane) => anomaly_lane_withheld_json(&lane.values_with_trust()),
-        Err(err) => serde_json::json!({
-            "reason_code": "unreadable",
-            "codes": ["unreadable"],
-            "reason": format!("이상 징후 레인을 읽지 못해 현재 결과를 알 수 없습니다: {err}"),
-        }),
+        Err(err) => anomaly_unreadable_withheld_json(err),
     }
 }
 

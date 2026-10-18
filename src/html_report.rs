@@ -1071,8 +1071,10 @@ fn carve_entry_trust(item: &serde_json::Value) -> (bool, String) {
         Some("sc") => (true, crate::audit::SELF_CONSISTENT_NOTE.to_string()),
         Some(code) => {
             let base = match code.strip_prefix("pc:") {
+                // R19 I3: quoted only when quotable (`pc:unknown` otherwise).
                 Some(key_id) => format!(
-                    "인증 안 됨 — 이 PC에서 인증 불가, 키 \"{key_id}\" 보유 PC에서 확인 (변조 판정 아님)"
+                    "인증 안 됨 — 이 PC에서 인증 불가, {} 보유 PC에서 확인 (변조 판정 아님)",
+                    crate::audit::key_id_phrase(key_id)
                 ),
                 None => "인증 안 됨".to_string(),
             };

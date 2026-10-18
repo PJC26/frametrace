@@ -696,12 +696,20 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // Only "auth"/"sc" entries may be shown as confirmed / derived
     // results. `logChains` carries each lane's status for the same arrays.
     let mut log_chains = serde_json::Map::new();
+    // R19 I2: the anomaly lane's `withheld` verdict from the very read its
+    // rows come from (never a second read: a scan in between made the two
+    // disagree; an unreadable lane is `unreadable`, not re-read).
+    let mut anomaly_withheld = serde_json::Value::Null;
     let mut lane_values = |name: &str, path: PathBuf| -> Vec<serde_json::Value> {
         let rel = path
             .strip_prefix(&case_dir)
             .map(|rel| rel.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        match crate::audit::read_lane_rows(&path) {
+        let lane = crate::audit::read_lane_rows(&path);
+        if name == "anomalyLog" {
+            anomaly_withheld = crate::report::anomaly_lane_read_withheld_json(&lane);
+        }
+        match lane {
             Ok(lane) => {
                 log_chains.insert(name.to_string(), lane.chain_json(&rel));
                 lane.values_with_trust()
@@ -749,16 +757,9 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // a repair after it, an unmarked newer run), computed by the one shared
     // function from the very `anomalyLog` rows sent here: `null`, or
     // `{reason_code, codes, reason}`. A P7-superseded finding is then never
-    // silently missing from a "current" count.
-    let withheld = if log_chains
-        .get("anomalyLog")
-        .is_some_and(|chain| chain["status"] == "unreadable")
-    {
-        // No rows to judge: nothing can be said about the current result.
-        crate::report::anomaly_withheld_json(&case_dir)
-    } else {
-        crate::report::anomaly_lane_withheld_json(&anomaly_log)
-    };
+    // silently missing from a "current" count. R19 I2: computed in
+    // `lane_values` from the same read as `anomalyLog`.
+    let withheld = anomaly_withheld;
     log_chains.insert(
         "anomaly".to_string(),
         serde_json::json!({
@@ -1002,3 +1003,7 @@ pub(crate) fn newest_tsk_inspection(case_dir: &Path) -> Option<(PathBuf, u64)> {
 #[cfg(test)]
 #[path = "tests_r18_records.rs"]
 mod tests_r18_records;
+
+#[cfg(test)]
+#[path = "tests_r19_records.rs"]
+mod tests_r19_records;

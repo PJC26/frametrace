@@ -375,11 +375,16 @@ fn unusable_unknown(
                 _ => None,
             })
             .collect();
-        let keys = keys.into_iter().collect::<Vec<_>>().join(", ");
+        // R19 I3: a forgeable id is quoted only when quotable.
+        let keys = keys
+            .iter()
+            .map(|id| crate::audit::key_id_quoted(id))
+            .collect::<Vec<_>>()
+            .join(", ");
         return HashVerifyHeadCheck::Unknown {
             code: "other-pc",
             why: format!(
-                "{HEAD_OTHER_PC_NOTE} — 서명 감사 레인의 {where_} 다른 PC의 키(\"{keys}\")로 서명된 줄 {count}개: 그 PC가 쓴 더 새 {head}일 수 있어 이 PC에서는 비교할 머리를 알 수 없음 (키 보유 PC에서 확인하거나 이 PC에서 다시 실행; 변조 판정 아님)"
+                "{HEAD_OTHER_PC_NOTE} — 서명 감사 레인의 {where_} 다른 PC의 키({keys})로 서명된 줄 {count}개: 그 PC가 쓴 더 새 {head}일 수 있어 이 PC에서는 비교할 머리를 알 수 없음 (키 보유 PC에서 확인하거나 이 PC에서 다시 실행; 변조 판정 아님)"
             ),
         };
     }

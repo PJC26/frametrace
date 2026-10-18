@@ -130,6 +130,52 @@ pub fn trust_policy_here() -> Result<(AuthRequirement, Vec<AuditKey>), String> {
 /// P1 wording: what a match proves on a PC without audit keys.
 pub const SELF_CONSISTENT_NOTE: &str = "자기 일관성만 확인(인증 아님)";
 
+/// R19 I3: the key id carried for an entry whose `entry_hmac_key_id`
+/// cannot be quoted (the field is outside `entry_sha256` and forgeable
+/// without any key) — trust code `pc:unknown`.
+pub const UNKNOWN_KEY_ID: &str = "unknown";
+
+/// R19 I3: what the sentences say instead of quoting such an id.
+pub const UNKNOWN_KEY_ID_TEXT: &str = "알 수 없는 키 id";
+
+/// R19 I3: whether a recorded key id may be quoted in a sentence, a trust
+/// code or a JSON field shown to the examiner: `^[0-9a-z-]{1,64}$` (the
+/// fingerprint ids `kid-<hex>` this build writes match).
+pub fn quotable_key_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'-')
+}
+
+/// R19 I3: `id` when quotable, else [`UNKNOWN_KEY_ID`].
+pub fn shown_key_id(id: &str) -> String {
+    if quotable_key_id(id) {
+        id.to_string()
+    } else {
+        UNKNOWN_KEY_ID.to_string()
+    }
+}
+
+/// R19 I3: `키 "<id>"`, or [`UNKNOWN_KEY_ID_TEXT`] for an id that cannot
+/// be quoted (and for [`UNKNOWN_KEY_ID`] itself).
+pub fn key_id_phrase(id: &str) -> String {
+    if quotable_key_id(id) && id != UNKNOWN_KEY_ID {
+        format!("키 \"{id}\"")
+    } else {
+        UNKNOWN_KEY_ID_TEXT.to_string()
+    }
+}
+
+/// R19 I3: `"<id>"` in a list of ids, or `(알 수 없는 키 id)`.
+pub fn key_id_quoted(id: &str) -> String {
+    if quotable_key_id(id) && id != UNKNOWN_KEY_ID {
+        format!("\"{id}\"")
+    } else {
+        format!("({UNKNOWN_KEY_ID_TEXT})")
+    }
+}
+
 /// R8: what one audit entry may be relied on for, under this PC's policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineTrust {
@@ -203,7 +249,8 @@ impl LineTrust {
         match self {
             Self::Authenticated => "이 PC의 감사 키로 인증됨".to_string(),
             Self::SelfConsistentOnly { key_id: Some(id) } => format!(
-                "{SELF_CONSISTENT_NOTE} — 이 PC에 감사 키가 없어 HMAC을 확인하지 않음 (키 \"{id}\" 보유 PC에서 확인)"
+                "{SELF_CONSISTENT_NOTE} — 이 PC에 감사 키가 없어 HMAC을 확인하지 않음 ({} 보유 PC에서 확인)",
+                key_id_phrase(id)
             ),
             Self::SelfConsistentOnly { key_id: None } => {
                 format!("{SELF_CONSISTENT_NOTE} — 감사 키 HMAC이 없는 항목")
@@ -212,7 +259,8 @@ impl LineTrust {
                 "{SELF_CONSISTENT_NOTE} — 감사 키 도입 이전에 기록된 항목 (키 도입 표식이 그 앞부분을 고정)"
             ),
             Self::OtherPc { key_id } => format!(
-                "이 PC에서 인증 불가 — 키 \"{key_id}\" 보유 PC에서 확인 (다른 PC의 키로 서명됨, 변조 판정 아님)"
+                "이 PC에서 인증 불가 — {} 보유 PC에서 확인 (다른 PC의 키로 서명됨, 변조 판정 아님)",
+                key_id_phrase(key_id)
             ),
             Self::NotAuthenticated {
                 retired_unproven: true,
@@ -225,9 +273,12 @@ impl LineTrust {
             Self::ChainBroken => {
                 "감사 체인 검증이 실패한 지점 이후의 항목 — 믿을 수 없음".to_string()
             }
-            Self::RewriteNotExcluded { key_id } => format!(
-                "이 PC에서 인증되지 않음 — 재작성 배제 불가: 이 PC가 인증한 항목 뒤에 이 PC에 없는 키 \"{key_id}\"로 서명된 항목 (다른 PC가 이어 썼거나 꾸며 낸 키 id로 끝부분이 재작성됐을 수 있음; 키 \"{key_id}\" 보유 PC에서 확인)"
-            ),
+            Self::RewriteNotExcluded { key_id } => {
+                let phrase = key_id_phrase(key_id);
+                format!(
+                    "이 PC에서 인증되지 않음 — 재작성 배제 불가: 이 PC가 인증한 항목 뒤에 이 PC에 없는 {phrase}로 서명된 항목 (다른 PC가 이어 썼거나 꾸며 낸 키 id로 끝부분이 재작성됐을 수 있음; {phrase} 보유 PC에서 확인)"
+                )
+            }
             Self::LocationUnverified => format!(
                 "{LOCATION_UNVERIFIED_NOTE} — NOT VERIFIED (변조 판정 아님)"
             ),
@@ -307,7 +358,13 @@ impl LaneTrust {
 impl AuditChainVerification {
     /// R8: the trust of audit line `index + 1` under this PC's policy.
     pub fn line_trust(&self, index: usize) -> LineTrust {
-        let key_id = self.entry_key_ids.get(index).cloned().flatten();
+        // R19 I3: the recorded id is outside `entry_sha256` (forgeable
+        // without a key) — only a quotable id is carried, else "unknown".
+        let key_id = self
+            .entry_key_ids
+            .get(index)
+            .and_then(|id| id.as_deref())
+            .map(shown_key_id);
         // R10 P8: a lane whose location could not be confirmed is NOT
         // VERIFIED on every PC.
         if self.location_unverified.is_some() {
@@ -321,11 +378,11 @@ impl AuditChainVerification {
             // R10-I6: after an entry this PC authenticated — not P2.
             Some(EntryAuth::UnknownKey) if self.rewrite_suspect_lines.contains(&index) => {
                 LineTrust::RewriteNotExcluded {
-                    key_id: key_id.unwrap_or_default(),
+                    key_id: key_id.unwrap_or_else(|| UNKNOWN_KEY_ID.to_string()),
                 }
             }
             Some(EntryAuth::UnknownKey) => LineTrust::OtherPc {
-                key_id: key_id.unwrap_or_default(),
+                key_id: key_id.unwrap_or_else(|| UNKNOWN_KEY_ID.to_string()),
             },
             Some(EntryAuth::RetiredUnproven) => LineTrust::NotAuthenticated {
                 retired_unproven: true,
@@ -340,11 +397,12 @@ impl AuditChainVerification {
                     .is_some_and(|(len, _)| index < *len) =>
             {
                 LineTrust::OtherPc {
-                    key_id: self
-                        .pre_key_other_pc
-                        .as_ref()
-                        .map(|(_, id)| id.clone())
-                        .unwrap_or_default(),
+                    key_id: shown_key_id(
+                        self.pre_key_other_pc
+                            .as_ref()
+                            .map(|(_, id)| id.as_str())
+                            .unwrap_or_default(),
+                    ),
                 }
             }
             Some(EntryAuth::Unkeyed | EntryAuth::NoKey) | None => LineTrust::NotAuthenticated {
@@ -408,7 +466,7 @@ impl AuditChainVerification {
         }
         let quoted = |ids: Vec<&String>| {
             ids.iter()
-                .map(|id| format!("\"{id}\""))
+                .map(|id| key_id_quoted(id))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -2735,7 +2793,8 @@ pub fn verify_chained_jsonl_text(
                         }
                     }
                     Err(format!(
-                        "audit line {line_number} is signed under retired audit key \"{key_id}\" but {}: an entry signed with a key after it was retired is not authentic",
+                        "audit line {line_number} is signed under retired audit key {} but {}: an entry signed with a key after it was retired is not authentic",
+                        key_id_quoted(&key_id),
                         refusal.unwrap_or_default()
                     ))
                 }
@@ -2848,10 +2907,13 @@ pub fn verify_chained_jsonl_text(
     // in-log rotation marker can excuse it: a marker naming the new id
     // would itself be signed by that unknown key, i.e. forgeable by the
     // same rewriter.
+    // R19 I3: the id is quoted only when `quotable_key_id`.
     let rewrite_not_excluded = unknown_after_authenticated.first().map(|(line, key_id)| {
         format!(
-            "이 PC에 없는 키 — 재작성 배제 불가 (이 PC에서 인증 불가 — 키 \"{key_id}\" 보유 PC에서 확인): audit line {line} (and {} more) is signed under key id \"{key_id}\" that this PC does not hold, after audit line {} that this PC authenticated — another PC may have continued the log, or the tail was re-written under an invented key id; NOT VERIFIED here (check it on the PC that holds that key)",
+            "이 PC에 없는 키 — 재작성 배제 불가 (이 PC에서 인증 불가 — {} 보유 PC에서 확인): audit line {line} (and {} more) is signed under key id {} that this PC does not hold, after audit line {} that this PC authenticated — another PC may have continued the log, or the tail was re-written under an invented key id; NOT VERIFIED here (check it on the PC that holds that key)",
+            key_id_phrase(key_id),
             unknown_after_authenticated.len() - 1,
+            key_id_quoted(key_id),
             first_authenticated.unwrap_or(0)
         )
     });
@@ -2866,7 +2928,7 @@ pub fn verify_chained_jsonl_text(
             if unknown_key_entries == 1 { "y" } else { "ies" },
             unknown_key_ids
                 .iter()
-                .map(|id| format!("\"{id}\""))
+                .map(|id| key_id_quoted(id))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -4370,3 +4432,7 @@ mod tests_r17;
 #[cfg(test)]
 #[path = "tests_audit_r18.rs"]
 mod tests_r18;
+
+#[cfg(test)]
+#[path = "tests_audit_r19.rs"]
+mod tests_r19;

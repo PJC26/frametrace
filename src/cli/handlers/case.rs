@@ -376,7 +376,9 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let validation_log = redact(&review_lane(case_dir, "evidence/logs/validation-log.jsonl").0);
     // Prefer an existing anomaly log; scan on demand so make-review stays usable
     // without forcing a full-case digest pass (make-report / qa anomalies refresh).
-    let anomaly_log = redact(&review_lane(case_dir, "evidence/logs/anomaly-log.jsonl").0);
+    // R19 I2: rows and `withheld` verdict from one read of the lane.
+    let (anomaly_log_raw, anomaly_withheld) = review_anomaly_lane(case_dir);
+    let anomaly_log = redact(&anomaly_log_raw);
     let fls_entries = redact(&latest_fls_entries_jsonl(case_dir));
     // Optional proxy pre-build: browser-unplayable containers (AVI, DAV,
     // proprietary recorder exports) can't decode in the review page at all,
@@ -412,7 +414,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
             "anomaly": {
                 "head": crate::report::anomaly_head_check(case_dir)
                     .to_json_in(crate::report::HeadLane::Anomaly),
-                "withheld": crate::report::anomaly_withheld_json(case_dir),
+                "withheld": anomaly_withheld,
             },
         })
         .to_string(),
@@ -1041,7 +1043,23 @@ const REPORT_AUDIT_LOGS: &[(&str, &str)] = &[
 /// code (JSONL), and only the entries usable here (JSONL). Unreadable =
 /// empty (the bundle has no error slot; make-report names read errors).
 fn review_lane(case_dir: &Path, rel: &str) -> (String, String) {
-    match crate::audit::read_lane_rows(&case_dir.join(rel)) {
+    review_lane_of(rel, &crate::audit::read_lane_rows(&case_dir.join(rel)))
+}
+
+/// R19 I2: the review bundle's anomaly lane (every entry with its `trust`,
+/// JSONL) and its `logChains.anomaly.withheld` verdict, both from ONE read
+/// of the lane (a scan between two reads made them disagree; an unreadable
+/// lane is `unreadable` without a second read).
+fn review_anomaly_lane(case_dir: &Path) -> (String, serde_json::Value) {
+    let rel = crate::report::ANOMALY_LOG_REL_PATH;
+    let lane = crate::audit::read_lane_rows(&case_dir.join(rel));
+    let withheld = crate::report::anomaly_lane_read_withheld_json(&lane);
+    (review_lane_of(rel, &lane).0, withheld)
+}
+
+/// [`review_lane`] over a lane already read.
+fn review_lane_of(rel: &str, lane: &Result<crate::audit::LaneRows, String>) -> (String, String) {
+    match lane {
         Ok(lane) => {
             let usable = lane
                 .usable()
@@ -1264,7 +1282,8 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
         // status and the cause-specific `detail` (chain break, key
         // configuration unreadable — not tampering —, unauthenticated
         // entries, legacy unbound entries) describe exactly those rows.
-        let mut entry = match crate::audit::read_lane_rows(&path) {
+        let lane = crate::audit::read_lane_rows(&path);
+        let mut entry = match &lane {
             Ok(lane) => lane.chain_json(rel),
             Err(err) => serde_json::json!({
                 "path": rel,
@@ -1279,7 +1298,8 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
                 .to_json_in(crate::report::HeadLane::Anomaly);
             // R18 I2: the lane's own P9 verdict (one Rust function; the
             // report script withholds when it or its own rules say so).
-            entry["withheld"] = crate::report::anomaly_withheld_json(case_dir);
+            // R19 I2: from the same read as this lane's chain status.
+            entry["withheld"] = crate::report::anomaly_lane_read_withheld_json(&lane);
         }
         map.insert((*name).to_string(), entry);
     }
