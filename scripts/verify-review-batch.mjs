@@ -435,7 +435,7 @@ async function unitTests() {
     reportStorageError: () => { storageReports += 1; }, ftSignal: { aborted: false },
   });
   grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }], revisions: { a: 3, b: 1, c: 2 } };
-  const hydrateSrc = [fn('aliveKey'), fn('draftKey'), fn('parseDraftKey'), fn('writerVerdict'), fn('storedDraftEntries'), fn('migrateAliasDrafts'), fn('migrateLegacyDrafts'), fn('applyDraftValues'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations'), fn('adoptOrphanDrafts'), fn('adoptDeadWriters'), fn('flushDraftsNow'), fn('applyAppliedIds'), fn('dropJournalIds'), fn('draftNormRange'), fn('draftSameValues'), fn('serverDraftValues'), fn('noteOrphanDraft'), fn('migrateLegacyRanges')].join('\n');
+  const hydrateSrc = [fn('aliveKey'), fn('draftKey'), fn('parseDraftKey'), fn('writerVerdict'), fn('storedDraftEntries'), fn('migrateAliasDrafts'), fn('migrateLegacyDrafts'), fn('applyDraftValues'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations'), fn('adoptOrphanDrafts'), fn('adoptDeadWriters'), fn('flushDraftsNow'), fn('applyAppliedIds'), fn('dropJournalIds'), fn('draftNormRange'), fn('draftSameValues'), fn('serverDraftValues'), fn('noteOrphanDraft'), fn('migrateLegacyRanges'), fn('migrateAliasRanges'), fn('aliasWriterAlive'), fn('spareDraftKey'), fn('storageMoveVerified')].join('\n');
   runInNewContext('orphanDrafts=new Map();legacyRangesLeft=null;annotationsError="";markRowMaybe=new Set();skippedDraftWriters=new Set();restoredConflictIds=[];draftAdoptedFrom=new Map();orphanCheck=null;draftsUnpersisted=false;draftFlushTimer=null;\n' + touch + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
   assert.equal(state.marks.a, undefined, 'own draft (cleared mark) replays over the DB row');
   assert.equal(state.notes.b, 'DB memo');
@@ -762,6 +762,197 @@ async function unitTests() {
   await r18TrackU({ fn, source, runInNewContext, assert, ex });
   await r19TrackU({ fn, source, runInNewContext, assert });
   await r20TrackU({ fn, source, runInNewContext, assert });
+  await r21TrackU({ fn, source, runInNewContext, assert });
+}
+
+// ---- R21 track U (docs/PLAN_R21_2026-10-20.md) -----------------------------
+// Each row runs on its own and reports PASS / FAIL; any FAIL fails the run.
+async function r21TrackU({ fn, source, runInNewContext, assert }) {
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  const { readFileSync } = await import('node:fs');
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  const word = (k, nth = 0) => [...i18n.matchAll(new RegExp(`"${k.replace(/[.@]/g, (c) => '\\' + c)}": "([^"]*)"`, 'g'))][nth]?.[1];
+  const t = (k) => word(k) ?? k;
+  const failed = [];
+  const row = async (name, body) => {
+    try { await body(); console.log('PASS VM ' + name); } catch (err) { failed.push(name); console.log('FAIL VM ' + name + ': ' + (err && err.message || err)); }
+  };
+  const load = (names, ctx, tag) => { runInNewContext(names.map((n) => { const f = fn(n); assert.ok(f, `${tag}: ${n} exists`); return f; }).join('\n'), ctx); return ctx; };
+
+  // U1: an unkeyed newer validation line (even `anomaly_flags: []`) never
+  // turns the authenticated flagged line into "대체됨 — 현재 아님".
+  await row('R21 U1 a newer unauthenticated line makes an older flag "더 최근 인증 안 된 항목 있음", not 대체됨', () => {
+    const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'logRepairs', 'logPosOf', 'logSlots', 'splitValidationSlots', 'validationFlagRows', 'recordAnomalies',
+      'logTrustNote', 'pcKeyQuotable', 'trustOtherPcText', 'logTrustTagHtml'];
+    const ctx = load(names, { anomaliesBySelector: new Map(), t, tf: (k) => t(k), viewerTrustFromBundle: () => false, escapeHtml: (x) => String(x), ftIcon: () => '' }, 'R21 U1');
+    const run = (vl) => plain(runInNewContext(`(() => { const key = (i) => i.target_path || '';
+      const sp = splitValidationSlots(logSlots(vl, key, null));
+      const rows = validationFlagRows(vl, key, sp.usable).get('X') || [];
+      const r = { id: 'carve:1', validation: sp.usable.get('X'), validationFlags: rows };
+      recordAnomalies(r);
+      return { rows, tags: r.anomalies.map(logTrustTagHtml), flag: (r.hasAnomaly ? 'A' : '') + (r.hasUnauthAnomaly ? 'U' : '') + (r.hasPcAnomaly ? 'P' : '') }; })()`, Object.assign(ctx, { vl })));
+    const v = (trust, flags, extra) => Object.assign({ target_path: 'X', validation_status: 'ffprobe-confirmed', trust }, flags ? { anomaly_flags: flags } : {}, extra || {});
+    const newer = word('status.tip.newer');
+    // The R20 reviewer's reproduction: the server marks the real line superseded by an unkeyed `anomaly_flags: []` line.
+    for (const [label, vl] of [
+      ['server-marked', [v('auth', ['frame-gap'], { trust_superseded_by: 2 }), v('unauth', [])]],
+      ['unmarked', [v('auth', ['frame-gap']), v('unauth', [])]],
+      ['no flags field', [v('auth', ['frame-gap']), v('unauth')]],
+    ]) {
+      const r = run(vl);
+      assert.ok(r.rows.length === 1 && r.rows[0].superseded !== true && r.rows[0].newerUnauth === true, `R21 U1 (${label}): not superseded, newerUnauth: ` + JSON.stringify(r.rows));
+      assert.ok(r.tags[0].includes(newer) && r.tags[0].includes(t('trust.unauth')) && !r.tags[0].includes(t('anomaly.superseded')) && !r.tags[0].includes(t('anomaly.tip.superseded')), `R21 U1 (${label}): 더 최근 인증 안 된 항목 있음 + 인증 안 됨 badge: ` + r.tags[0]);
+      assert.equal(r.flag, 'AU', `R21 U1 (${label}): still counted 인증 안 됨`);
+    }
+    const p = run([v('auth', ['frame-gap']), v('pc:k2')]);
+    assert.ok(p.rows[0].newerUnauth === true && p.tags[0].includes(newer) && p.tags[0].includes(t('status.otherPc')) === false && p.tags[0].includes(t('trust.unauth')), 'R21 U1: a newer other-PC line → the same newer wording: ' + p.tags[0]);
+    const ok = run([v('auth', ['frame-gap']), v('auth')]);
+    assert.ok(ok.rows[0].superseded === true && ok.tags[0].includes(t('anomaly.tip.superseded')) && ok.flag === 'AU', 'R21 U1: an authenticated newer line still says 대체됨');
+    const sc = run([v('auth', ['frame-gap']), v('sc')]);
+    assert.ok(sc.rows[0].superseded === true, 'R21 U1: an sc newer line still says 대체됨');
+  });
+
+  // U2: the case-name regex is linear and gives the same names as before.
+  await row('R21 U2 case names: 1000 separators < 50 ms, same names as before', async () => {
+    const { appBundleJs } = await import('./lib/app-bundle.mjs');
+    const appJs = appBundleJs();
+    const sfn = (name) => appJs.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'))?.[0];
+    const sctx = {};
+    runInNewContext(['hBaseName', 'caseBaseName'].map((n) => { const f = sfn(n); assert.ok(f, `R21 U2: ${n} exists`); return f; }).join('\n'), sctx);
+    const before = (d) => String(d || '').replace(/(?:[\\/]+\.?)+$/, '').split(/[\\/]/).filter(Boolean).pop() || '';
+    for (const name of ['E:\\.', 'E:\\', 'E:', 'C:\\cases\\c1\\.', 'C:\\cases\\c1\\', 'C:\\cases\\c1', '/srv/x/..', '/srv/x/.', 'a/././/', 'a//.//.', '사건1', '', 'x.', '.', '/', '/.', 'C:\\a\\.\\.\\', '\\\\server\\share\\', 'a\\.b', 'a/.b/', 'a/..', 'C:/c1/.x', null]) {
+      for (const f of ['hBaseName', 'caseBaseName']) assert.equal(runInNewContext(`${f}(x)`, Object.assign(sctx, { x: name })), before(name), `R21 U2: ${f}(${JSON.stringify(name)}) as before`);
+    }
+    for (const bad of ['C:' + '\\'.repeat(1000) + 'x', '/'.repeat(1000) + '\u0000', 'a' + '/.'.repeat(1000) + 'x', '\\'.repeat(1000)]) {
+      for (const f of ['hBaseName', 'caseBaseName']) {
+        const t0 = performance.now();
+        runInNewContext(`${f}(x)`, Object.assign(sctx, { x: bad }), { timeout: 2000 });
+        const ms = performance.now() - t0;
+        assert.ok(ms < 50, `R21 U2: ${f} on ${bad.length} chars took ${ms.toFixed(1)} ms`);
+      }
+    }
+    assert.ok(!/\(\?:\[\\\\\/\]\+\\\.\?\)\+\$/.test(appJs), 'R21 U2: the nested regex is gone from the app shell');
+  });
+
+  // U3: a cell with ";" (semicolon-separator locales) is quoted too.
+  await row('R21 U3 CSV cells with ";" are quoted', () => {
+    const cctx = {};
+    runInNewContext(fn('csvCell'), cctx);
+    const cell = (x) => runInNewContext('csvCell(x)', Object.assign(cctx, { x }));
+    assert.equal(cell('a;b'), '"a;b"', 'R21 U3: ; quoted');
+    assert.equal(cell('x;=1+1'), '"x;=1+1"', 'R21 U3: ;= quoted');
+    assert.equal(cell('=a;b'), "\"'=a;b\"", 'R21 U3: prefixed, then quoted');
+    assert.equal(cell('plain'), 'plain', 'R21 U3: plain text as before');
+    assert.equal(cell('a,b'), '"a,b"', 'R21 U3: , as before');
+  });
+
+  // U4: only superseded / repaired-after rows left → the detail summary says
+  // 현재 아님 / 최신 여부 알 수 없음, not 인증 안 됨 (counting unchanged).
+  await row('R21 U4 detail summary: 현재 아님 / 최신 여부 알 수 없음 for old flag rows', () => {
+    const ctx = load(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'recordAnomalies', 'anomalySummaryNote'], { anomaliesBySelector: new Map(), t }, 'R21 U4');
+    const note = (rows) => plain(runInNewContext(`(() => { const r = { id: 'v1', validation: null, validationFlags: rows }; recordAnomalies(r); return { note: anomalySummaryNote(r), u: r.hasUnauthAnomaly, p: r.hasPcAnomaly, a: r.hasAnomaly }; })()`, Object.assign(ctx, { rows })));
+    const sup = note([{ kind: 'frame-gap', trust: 'auth', superseded: true }]);
+    assert.ok(sup.a && sup.u, 'R21 U4: still counted');
+    assert.equal(sup.note, word('anomaly.notCurrent'), 'R21 U4: superseded only → 현재 아님');
+    assert.equal(word('anomaly.notCurrent'), '현재 아님', 'R21 U4: ko words');
+    assert.ok(word('anomaly.notCurrent', 1) && word('anomaly.notCurrent', 1) !== '현재 아님', 'R21 U4: en words');
+    assert.equal(note([{ kind: 'frame-gap', trust: 'auth', repairedAfter: true }]).note, t('status.repairedAfter'), 'R21 U4: repaired-after → 최신 여부 알 수 없음');
+    assert.equal(note([{ kind: 'frame-gap', trust: 'auth', superseded: true }, { kind: 'ts-gap', trust: 'auth', repairedAfter: true }]).note, t('status.repairedAfter'), 'R21 U4: mixed → 최신 여부 알 수 없음');
+    assert.equal(note([{ kind: 'frame-gap', trust: 'auth', superseded: true }, { kind: 'ts-gap', trust: 'unauth' }]).note, t('anomaly.unauthShort'), 'R21 U4: a real unauth row → 인증 안 됨');
+    assert.equal(note([{ kind: 'frame-gap', trust: 'auth', newerUnauth: true }]).note, t('anomaly.unauthShort'), 'R21 U4: a newer unauth line → 인증 안 됨');
+    assert.equal(note([{ kind: 'frame-gap', trust: 'pc:k2' }]).note, t('anomaly.pcTip'), 'R21 U4: other PC as before');
+    assert.equal(note([{ kind: 'frame-gap', trust: 'auth' }]).note, '', 'R21 U4: usable → no note');
+    const details = readFileSync(new URL('../assets/viewer/60-details.js', import.meta.url), 'utf8');
+    assert.ok(/anomalySummaryNote\(record\)/.test(details), 'R21 U4: the detail summary uses anomalySummaryNote');
+  });
+
+  // U5 + U6: alias migration of drafts, annotations.v1, ranges, examiner.
+  const hostSrc = readFileSync(new URL('../assets/viewer/00-host.js', import.meta.url), 'utf8');
+  const hctx = { EventTarget, AbortController, CustomEvent: class extends Event {}, crypto: globalThis.crypto, Uint32Array, location: { origin: 'http://127.0.0.1:1', pathname: '/viewer/' },
+    document: { documentElement: { hasAttribute: () => true, dataset: {} } }, localStorage: { setItem() {} }, setInterval, clearInterval };
+  hctx.window = hctx;
+  runInNewContext(hostSrc, hctx);
+  const ck = (dd) => runInNewContext('FTViewer.caseStorageKey(null, dd)', Object.assign(hctx, { dd }));
+  const KEY = ck('C:\\Cases\\c1'), OLD = ck('C:\\Cases\\c1\\.');
+  const P = 'ft.draft.' + KEY + '.', OP = 'ft.draft.' + OLD + '.';
+  const mk = (init, failSet) => {
+    const m = new Map(Object.entries(init));
+    return { m, get length() { return m.size; }, key: (i) => [...m.keys()][i] ?? null, getItem: (k) => (m.has(k) ? m.get(k) : null),
+      setItem: (k, val) => { if (failSet && failSet(k)) { const err = new Error('quota'); err.name = 'QuotaExceededError'; throw err; } m.set(k, String(val)); }, removeItem: (k) => { m.delete(k); } };
+  };
+  const migNames = ['migrateAliasDrafts', 'migrateLegacyDrafts', 'migrateLegacyRanges', 'migrateAliasRanges', 'storageMoveVerified', 'spareDraftKey', 'aliasWriterAlive', 'noteOrphanDraft',
+    'writerId', 'aliveKey', 'draftKey', 'parseDraftKey', 'writerVerdict', 'draftNormRange', 'draftRangeOf', 'draftValuesOf', 'draftSameValues', 'serverDraftValues', 'annotationMarkId', 'nextDraftSeq'];
+  const migCtx = (ls, extra) => {
+    const mc = Object.assign({ localStorage: ls, FTViewer: { writerToken: 'me1' }, CASE_KEY: KEY, DRAFT_PREFIX: P, ALIVE_PREFIX: 'ft.alive:' + KEY + ':', ALIVE_CLOSED: 'closed', ALIVE_STALE_MS: 300000,
+      ANNOTATIONS_KEY: 'ft.viewer.' + KEY + '.annotations.v1', RANGES_KEY: 'ft.viewer.' + KEY + '.ranges', RANGES_HELD_KEY: 'ft.viewer.' + KEY + '.ranges.held', EXAMINER_KEY: 'ft.viewer.' + KEY + '.examiner',
+      location: { protocol: 'http:' }, annotationsError: '', draftSeq: 0, orphanDrafts: new Map(), restoredConflictIds: [], recordById: new Map([['rec:1', {}], ['rec:2', {}]]),
+      state: { drafts: {}, marks: {}, notes: {}, tags: {}, examiners: {}, ranges: {}, revisions: {}, examiner: '' }, errors: 0, reportStorageError() { mc.errors += 1; }, Date }, extra || {});
+    for (const n of migNames) { const f = fn(n); if (f) runInNewContext(f, mc); }
+    return mc;
+  };
+  const missing = migNames.filter((n) => !fn(n));
+  await row('R21 U5 alias migration also moves annotations.v1 / .ranges / .examiner; conflicts become closed-window edits', () => {
+    assert.deepEqual(missing, [], 'R21 U5: migration helpers exist');
+    // ft.draft conflict: the old value moves to a spare closed-writer key (A7), the old entry goes only after.
+    const ls1 = mk({ [OP + 'w1.rec:1']: '{"note":"old"}', [P + 'w1.rec:1']: '{"note":"new"}', [OP + 'w1.rec:2']: '{"note":"b"}' });
+    const m1 = migCtx(ls1);
+    runInNewContext('migrateAliasDrafts([OLD])', Object.assign(m1, { OLD }));
+    assert.equal(ls1.m.get(P + 'w1.rec:1'), '{"note":"new"}', 'R21 U5: the new key keeps its value');
+    assert.equal(ls1.m.get(P + 'legacy-1.rec:1'), '{"note":"old"}', 'R21 U5: the conflicting old draft is kept under a spare key');
+    assert.ok(!ls1.m.has(OP + 'w1.rec:1') && ls1.m.get(P + 'w1.rec:2') === '{"note":"b"}', 'R21 U5: old entries go once copied');
+    assert.equal(runInNewContext('writerVerdict("legacy-1")', m1), 'closed', 'R21 U5: a spare writer is a closed window (orphan UI, A7)');
+    // annotations.v1 of the old key → per-id drafts of the new key.
+    const OA = 'ft.viewer.' + OLD + '.annotations.v1';
+    const ls2 = mk({ [OA]: JSON.stringify({ 'rec:1': { note: 'a', writer: 'w9' }, 'rec:2': { note: 'b2', writer: 'w1' } }), [P + 'w1.rec:2']: JSON.stringify({ note: 'other', mark: null, tags: [] }) });
+    const m2 = migCtx(ls2);
+    runInNewContext('migrateAliasDrafts([OLD])', Object.assign(m2, { OLD }));
+    assert.equal(JSON.parse(ls2.m.get(P + 'w9.rec:1') || '{}').note, 'a', 'R21 U5: annotations.v1 entry moved under the new key');
+    assert.equal(JSON.parse(ls2.m.get(P + 'legacy-1.rec:2') || '{}').note, 'b2', 'R21 U5: a conflicting annotations.v1 entry kept under a spare key');
+    assert.equal(JSON.parse(ls2.m.get(P + 'w1.rec:2')).note, 'other', 'R21 U5: the newer draft is untouched');
+    assert.ok(!ls2.m.has(OA), 'R21 U5: the old annotations.v1 goes once every entry is stored');
+    // examiner: moved when the new key has none; a different name stays where it is.
+    const OE = 'ft.viewer.' + OLD + '.examiner', NE = 'ft.viewer.' + KEY + '.examiner';
+    const ls3 = mk({ [OE]: '"kim"' });
+    const m3 = migCtx(ls3);
+    runInNewContext('migrateAliasDrafts([OLD])', Object.assign(m3, { OLD }));
+    assert.ok(ls3.m.get(NE) === '"kim"' && !ls3.m.has(OE) && m3.state.examiner === 'kim', 'R21 U5: examiner moved (and used)');
+    const ls4 = mk({ [OE]: '"kim"', [NE]: '"lee"' });
+    runInNewContext('migrateAliasDrafts([OLD])', Object.assign(migCtx(ls4), { OLD }));
+    assert.ok(ls4.m.get(NE) === '"lee"' && ls4.m.get(OE) === '"kim"', 'R21 U5: a different examiner name: both kept');
+    // a failed write keeps the old entries.
+    const ls5 = mk({ [OP + 'w1.rec:1']: '{"note":"old"}', [P + 'w1.rec:1']: '{"note":"new"}', [OA]: JSON.stringify({ 'rec:1': { note: 'a', writer: 'w9' } }) }, (k) => k.startsWith(P));
+    const m5 = migCtx(ls5);
+    runInNewContext('migrateAliasDrafts([OLD])', Object.assign(m5, { OLD }));
+    assert.ok(ls5.m.get(OP + 'w1.rec:1') === '{"note":"old"}' && ls5.m.has(OA) && m5.errors > 0, 'R21 U5: a failed write keeps every old entry');
+    // .ranges of the old key: a range that differs from the server → a conflict draft; one under an
+    // existing draft that differs → a closed-window edit (orphanDrafts); unknown ids held.
+    const OR = 'ft.viewer.' + OLD + '.ranges';
+    const ls6 = mk({ [OR]: JSON.stringify({ 'rec:1': { in: 1, out: 2 }, 'rec:2': { in: 3, out: 4 }, 'rec:9': { in: 5, out: 6 } }) });
+    const m6 = migCtx(ls6);
+    m6.state.drafts['rec:2'] = { mark: { status: 'reviewed' }, note: 'n', tags: [], examiner: null, range: { in: 7, out: 8 }, seq: 1, base: 0 };
+    m6.state.ranges['rec:2'] = { in: 7, out: 8 };
+    m6.state.marks['rec:2'] = { status: 'reviewed' };
+    m6.state.notes['rec:2'] = 'n';
+    runInNewContext('migrateAliasRanges({ marks: [], tags: [] }, [OLD])', Object.assign(m6, { OLD }));
+    const d1 = JSON.parse(ls6.m.get(P + 'me1.rec:1') || 'null');
+    assert.ok(d1 && d1.range.in === 1 && d1.conflict && d1.conflict.legacy === true, 'R21 U5: an old range → a conflict draft (examiner picks)');
+    const o2 = m6.orphanDrafts.get('rec:2');
+    assert.ok(o2 && o2.draft.range.in === 3 && o2.draft.note === 'n' && ls6.m.get(o2.key), 'R21 U5: an old range under a newer draft → a closed-window edit: ' + JSON.stringify(o2));
+    assert.ok(!ls6.m.has(OR) && JSON.parse(ls6.m.get(OR + '.held') || '{}')['rec:9'], 'R21 U5: old ranges key goes; an unknown id is held');
+  });
+
+  await row('R21 U6 a writer still heart-beating under the old key keeps its drafts there', () => {
+    const now = Date.now();
+    const ls = mk({ [OP + 'wa.rec:1']: '{"note":"live"}', ['ft.alive:' + OLD + ':wa']: String(now - 1000),
+      [OP + 'wb.rec:1']: '{"note":"closed"}', ['ft.alive:' + OLD + ':wb']: 'closed',
+      [OP + 'wc.rec:1']: '{"note":"stale"}', ['ft.alive:' + OLD + ':wc']: String(now - 10 * 60 * 1000),
+      [OP + 'wd.rec:1']: '{"note":"none"}' });
+    runInNewContext('migrateAliasDrafts([OLD])', Object.assign(migCtx(ls), { OLD }));
+    assert.ok(ls.m.get(OP + 'wa.rec:1') === '{"note":"live"}' && !ls.m.has(P + 'wa.rec:1'), 'R21 U6: a live writer\'s drafts stay under the old key');
+    assert.ok(ls.m.get(P + 'wb.rec:1') === '{"note":"closed"}' && ls.m.get(P + 'wc.rec:1') === '{"note":"stale"}' && ls.m.get(P + 'wd.rec:1') === '{"note":"none"}', 'R21 U6: closed / stale / no-heartbeat writers move');
+  });
+
+  if (failed.length) throw new Error('R21 track U failed: ' + failed.join('; '));
 }
 
 // ---- R20 track U (docs/PLAN_R20_2026-10-19.md) -----------------------------
@@ -789,7 +980,8 @@ async function r20TrackU({ fn, source, runInNewContext, assert }) {
   assert.ok(a.tags[0].includes('대체된 이전 검증 — 현재 아님') && !a.tags[0].includes('이 PC의 키로 인증되지 않아'), 'R20 U1: the tag says 대체된 이전 검증, not "이 PC의 키로 인증되지 않아": ' + a.tags[0]);
   assert.equal(a.flag, 'AU', 'R20 U1: still counted (fail closed)');
   const b = run([v('unauth', ['frame-gap'], { trust_superseded_by: 2 }), v('unauth')]);
-  assert.ok(b.rows[0].superseded === true && b.tags[0].includes('대체된 이전 검증') && b.flag === 'AU', 'R20 U1: a server-marked superseded line → 대체됨');
+  // R21 U1: superseded by an unusable newer line → "더 최근 인증 안 된 항목 있음", never 대체됨.
+  assert.ok(b.rows[0].newerUnauth === true && !b.rows[0].superseded && b.tags[0].includes(t('status.tip.newer')) && b.flag === 'AU', 'R20 U1 (R21 U1 rule): a line superseded by an unusable one → newer unauth');
   const c = run([v('auth'), v('pc:K2', ['ts-gap'])]);
   assert.ok(c.rows[0].trust === 'pc:K2' && !c.rows[0].superseded && c.flag === 'AP', 'R20 U1: the latest untrusted line is not "superseded"');
   const d = run([v('unauth', ['ts-gap'])]);
@@ -878,13 +1070,16 @@ async function r20TrackU({ fn, source, runInNewContext, assert }) {
   const P = 'ft.draft.' + ck(dir) + '.', OP = 'ft.draft.' + ck('C:\\Cases\\c1\\.') + '.';
   const mfn = fn('migrateAliasDrafts');
   assert.ok(mfn, 'R20 U6: migrateAliasDrafts exists');
-  const mig = (ls) => { const mc = { localStorage: ls, DRAFT_PREFIX: P, errors: 0, reportStorageError() { mc.errors += 1; }, al: aliases }; runInNewContext(mfn, mc); return { n: runInNewContext('migrateAliasDrafts(al)', mc), mc }; };
+  // R21 U5/U6 helpers (spare key, heartbeat, verified move, annotations.v1 / examiner).
+  const helpers = ['aliasWriterAlive', 'spareDraftKey', 'storageMoveVerified', 'migrateLegacyDrafts', 'draftKey', 'draftSameValues', 'draftNormRange'].map(fn).filter(Boolean).join('\n');
+  const mig = (ls) => { const mc = { localStorage: ls, DRAFT_PREFIX: P, ANNOTATIONS_KEY: 'ft.viewer.x.annotations.v1', EXAMINER_KEY: 'ft.viewer.x.examiner', ALIVE_CLOSED: 'closed', ALIVE_STALE_MS: 300000, state: { examiner: '' }, Date, errors: 0, reportStorageError() { mc.errors += 1; }, al: aliases }; runInNewContext(mfn + '\n' + helpers, mc); return { n: runInNewContext('migrateAliasDrafts(al)', mc), mc }; };
   const ls1 = mk({ [OP + 'w1.rec:1']: '{"note":"a"}', [OP + 'w1.rec:2']: '{"note":"b"}', 'ft.draft.other.w1.rec:3': '{"note":"x"}' });
   assert.equal(mig(ls1).n, 2, 'R20 U6: two drafts moved');
   assert.ok(ls1.m.get(P + 'w1.rec:1') === '{"note":"a"}' && ls1.m.get(P + 'w1.rec:2') === '{"note":"b"}' && !ls1.m.has(OP + 'w1.rec:1') && ls1.m.has('ft.draft.other.w1.rec:3'), 'R20 U6: moved under the new key, others untouched');
   const ls2 = mk({ [OP + 'w1.rec:1']: '{"note":"old"}', [P + 'w1.rec:1']: '{"note":"new"}' });
   mig(ls2);
-  assert.ok(ls2.m.get(P + 'w1.rec:1') === '{"note":"new"}' && ls2.m.get(OP + 'w1.rec:1') === '{"note":"old"}', 'R20 U6: a different value under the new key: both kept');
+  // R21 U5: the old value is kept under a spare closed-writer key (A7), never hidden under the old key.
+  assert.ok(ls2.m.get(P + 'w1.rec:1') === '{"note":"new"}' && ls2.m.get(P + 'legacy-1.rec:1') === '{"note":"old"}', 'R20 U6 (R21 U5 rule): a different value under the new key: both kept');
   const ls3 = mk({ [OP + 'w1.rec:1']: '{"note":"a"}' }, true);
   const r3 = mig(ls3);
   assert.ok(r3.n === 0 && ls3.m.get(OP + 'w1.rec:1') === '{"note":"a"}' && r3.mc.errors === 1, 'R20 U6: a failed write keeps the old draft');

@@ -1053,3 +1053,13 @@ const FTStore = {
 - **U6**: case_id 없는 케이스의 초안은 시작 시(`hydrateAnnotations`, 초안 읽기 전) 옛 키 후보(`FTViewer.caseStorageKeyAliases` — 끝 `\.`, 드라이브 문자 대소문자, 겹친 구분자)의 `ft.draft.<옛 키>.*`를 새 키로 옮긴다(`migrateAliasDrafts`). 새 키에 쓰고 다시 읽어 같을 때만 옛 항목을 지운다; 새 키에 다른 값이 있거나 쓰기가 실패하면 둘 다 남는다(손실 없음).
 - **트랙 I(b9067ba)**: 머리 `reason_code: "lane-changed"`(status unknown, withhold_reason 있음) → 경고(확인 불가) "이상 징후 기록이 읽는 중 바뀜 — 다시 확인"(`anomalyHead.reason.laneChanged`; 변조 판정 아님). 보류 코드로 오면 "읽는 중 바뀜 — 다시 확인"(`anomalyHead.held.laneChanged`). `anomalyLog`의 `scan_id`는 뷰어가 쓰지 않는다.
 - 하네스: verify-review-batch --unit "R20 U1"–"R20 U6", "R20 track I lane-changed"(1593a61 자산에서 각각 실패 확인).
+
+## 27. R21 트랙 U 추가 계약 (2026-10-20, docs/PLAN_R21_2026-10-20.md)
+
+- **U1** (§26 U1 보충): 현재 아닌 검증 줄의 플래그 행은 경로의 마지막 줄이 쓸 수 있는 줄(auth·sc)일 때만 `superseded`("대체됨"). 마지막 줄이 쓸 수 없으면(키 없는 `anomaly_flags: []` 줄 포함, `trust_superseded_by`가 있어도) `newerUnauth: true` → 배지 "인증 안 됨"(행 trust가 `pc:`면 "다른 PC 키"), tooltip "더 최근 인증 안 된 항목 있음"(`status.tip.newer`). 쓸 수 없는 행으로 센다.
+- **U2**: 케이스 이름의 끝 구분자·`\.` 제거는 중첩 없는 정규식 `/[\\/](?:\.?[\\/])*\.?$/`(`hBaseName`·`caseBaseName`). 결과는 이전과 같다.
+- **U3**: `csvCell`은 `;`가 든 셀도 따옴표로 감싼다(`;` 구분 로캘).
+- **U4**: 상세 요약 이상 징후 줄의 괄호 말(`anomalySummaryNote`): 모든 행이 `superseded`/`repairedAfter`면 "현재 아님"(`anomaly.notCurrent`) 또는(하나라도 repairedAfter) "최신 여부 알 수 없음". 그 밖은 "인증 안 됨"/"다른 PC 키 — 키 보유 PC에서 확인" 그대로. 카운트·배지·칩은 그대로.
+- **U5**: 별칭 이전(`migrateAliasDrafts`)이 옛 키의 `ft.viewer.<옛 키>.annotations.v1`(`migrateLegacyDrafts(key)`), `.examiner`(새 키에 없을 때만; 다른 이름이면 둘 다 남음), `.ranges`(`migrateAliasRanges`, 초안 채택 뒤)도 옮긴다. 새 키에 다른 값이 있어 옮기지 못한 초안·annotations.v1 항목은 예비 키 `ft.draft.<키>.legacy-<n>.<id>`(닫힌 창, `writerVerdict` "closed")에 써서 닫힌 창의 편집(A7)으로 보인다. 옛 `.ranges` 값이 다른 범위의 초안 아래 있으면 예비 키 + `orphanDrafts`. 옛 항목은 새 값을 쓰고 다시 읽어 같을 때만 지운다; 읽지 못한 값은 남긴다.
+- **U6**: 옛 키의 `ft.alive:<옛 키>:<writer>`가 최근(`ALIVE_STALE_MS` 안, "closed" 아님)이면 그 writer의 초안은 옮기지 않는다(`aliasWriterAlive`).
+- 하네스: verify-review-batch --unit "R21 U1"–"R21 U6"(74a7b82 자산에서 각각 실패 확인).

@@ -98,7 +98,8 @@ const FTStore = (() => {
 
 // R20 U5: a trailing `\.` is the folder itself (`E:\.` → "E:", never ".").
 function hBaseName(dir) {
-  return String(dir || "").replace(/(?:[\\/]+\.?)+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  // R21 U2: no nested quantifier (the old one was exponential on input).
+  return String(dir || "").replace(/[\\/](?:\.?[\\/])*\.?$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
 }
 // The name a case is shown by: a given name unless it is "." / "..".
 function hCaseName(name, dir) {

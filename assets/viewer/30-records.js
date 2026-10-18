@@ -892,8 +892,13 @@ function validationFlagRows(list, keyOf, usable) {
     const key = keyOf(item);
     if (!key || (usable && usable.get(key) === item)) continue;
     const trust = logTrustOf(item);
-    const superseded = logTrustSuperseded(item) || lastOf.get(key) !== item;
-    const mark = superseded ? { superseded: true } : logTrustUsable(trust) ? { repairedAfter: true } : {};
+    // R21 U1: "대체됨" only when the path's latest line is usable (auth / sc);
+    // a newer line this PC could not use (even `anomaly_flags: []`) makes
+    // the row `newerUnauth` ("더 최근 인증 안 된 항목 있음", unauth badge).
+    const newest = lastOf.get(key);
+    const notCurrent = logTrustSuperseded(item) || newest !== item;
+    const newestUsable = newest !== item && logTrustUsable(logTrustOf(newest));
+    const mark = notCurrent ? (newestUsable ? { superseded: true } : { newerUnauth: true }) : logTrustUsable(trust) ? { repairedAfter: true } : {};
     const rows = out.get(key) || [];
     for (const kind of item.anomaly_flags) {
       if (kind == null || kind === "") continue;
@@ -1044,7 +1049,7 @@ function serverProxyOf(row) {
 // lines (validationFlagRows), "인증 안 됨" unless a usable row of the kind.
 function recordAnomalies(record) {
   // R20 U1: a superseded / repaired-after row keeps its trust but is never usable.
-  const usable = (item) => !(item && (item.superseded === true || item.repairedAfter === true)) && logTrustUsable(logTrustOf(item));
+  const usable = (item) => !(item && (item.superseded === true || item.repairedAfter === true || item.newerUnauth === true)) && logTrustUsable(logTrustOf(item));
   const fromId = anomaliesBySelector.get(record.id) || [];
   const vTrust = record.validation && record.validation.trust != null ? { trust: record.validation.trust } : {};
   const fromValidation = Array.isArray(record.validation?.anomaly_flags)
@@ -1062,6 +1067,17 @@ function recordAnomalies(record) {
   const apart = merged.length > 0 && !merged.some(usable);
   record.hasUnauthAnomaly = apart && merged.some(item => !logTrustPcKey(logTrustOf(item)));
   record.hasPcAnomaly = apart && !record.hasUnauthAnomaly;
+}
+// R21 U4: the detail summary's note after the kinds (counting unchanged):
+// rows that are all superseded / repaired-after (a normal re-validation)
+// read "현재 아님" / "최신 여부 알 수 없음", not "인증 안 됨".
+function anomalySummaryNote(record) {
+  if (!record || !(record.hasUnauthAnomaly || record.hasPcAnomaly)) return "";
+  const rows = Array.isArray(record.anomalies) ? record.anomalies : [];
+  if (rows.length && rows.every(item => item && (item.superseded === true || item.repairedAfter === true))) {
+    return t(rows.some(item => item.repairedAfter === true) ? "status.repairedAfter" : "anomaly.notCurrent");
+  }
+  return t(record.hasUnauthAnomaly ? "anomaly.unauthShort" : "anomaly.pcTip");
 }
 const records = [
   ...videos.map(video => {
@@ -1600,7 +1616,8 @@ function parseDraftKey(key) {
 // another writer's drafts. "stale" (no heartbeat for ALIVE_STALE_MS, or
 // none at all) still needs an unanswered ping before adoption.
 function writerVerdict(writer) {
-  if (!writer || writer === "legacy") return "closed";
+  // R21 U5: "legacy-<n>" = a spare key of a value that could not move (spareDraftKey).
+  if (!writer || writer === "legacy" || /^legacy-\d+$/.test(writer)) return "closed";
   if (writer === writerId()) return "mine";
   let raw = null;
   try { raw = localStorage.getItem(aliveKey(writer)); } catch (error) { raw = null; }
@@ -1675,6 +1692,13 @@ function storedDraftEntries() {
 // 00-host caseStorageKeyAliases) move to DRAFT_PREFIX. An old entry goes
 // only after its copy is written and read back; when the new key already
 // holds something else, both stay (never overwritten, never lost).
+// R21 U5: the old key's annotations.v1 (migrateLegacyDrafts), examiner name
+// and (after the drafts, migrateAliasRanges) ranges move too. A draft the
+// new key already holds differently goes to a spare closed-writer key
+// (spareDraftKey) — a closed window's edit (A7), never hidden. A different
+// examiner name stays under the old key.
+// R21 U6: a writer still heart-beating under the old key (aliasWriterAlive)
+// keeps its drafts there — that window is open.
 function migrateAliasDrafts(aliases) {
   let moved = 0;
   for (const alias of Array.isArray(aliases) ? aliases : []) {
@@ -1687,19 +1711,68 @@ function migrateAliasDrafts(aliases) {
         if (key && key.startsWith(prefix)) keys.push(key);
       }
     } catch (error) { keys = []; }
-    for (const key of keys) {
-      try {
+    try {
+      for (const key of keys) {
         const value = localStorage.getItem(key);
         if (value == null) continue;
-        const next = DRAFT_PREFIX + key.slice(prefix.length);
+        const rest = key.slice(prefix.length);
+        const dot = rest.indexOf(".");
+        const id = dot > 0 && dot < rest.length - 1 ? rest.slice(dot + 1) : "";
+        if (dot > 0 && aliasWriterAlive(alias, rest.slice(0, dot))) continue;
+        const next = DRAFT_PREFIX + rest;
         const held = localStorage.getItem(next);
-        if (held == null) localStorage.setItem(next, value);
-        if (localStorage.getItem(next) === value) { localStorage.removeItem(key); moved += 1; }
-      } catch (error) {
-        reportStorageError(error);
-        return moved; // the rest stay under their old keys: retried next boot
+        if (held === value) { localStorage.removeItem(key); moved += 1; continue; }
+        const to = held == null ? next : id ? spareDraftKey(id, value) : "";
+        if (to && storageMoveVerified(key, to, value)) moved += 1;
       }
+      migrateLegacyDrafts("ft.viewer." + alias + ".annotations.v1");
+      const oldExaminer = "ft.viewer." + alias + ".examiner";
+      const name = localStorage.getItem(oldExaminer);
+      const now = name == null ? null : localStorage.getItem(EXAMINER_KEY);
+      if (name != null && now === name) localStorage.removeItem(oldExaminer);
+      else if (name != null && (now == null || now === '""') && storageMoveVerified(oldExaminer, EXAMINER_KEY, name) && !state.examiner) {
+        try { const v = JSON.parse(name); if (typeof v === "string") state.examiner = v; } catch (error) { /* not a name */ }
+      }
+    } catch (error) {
+      reportStorageError(error);
+      return moved; // the rest stay under their old keys: retried next boot
     }
+  }
+  return moved;
+}
+// R21 U6: the old key's heartbeat of `writer` is recent (not "closed").
+function aliasWriterAlive(alias, writer) {
+  let raw = null;
+  try { raw = localStorage.getItem("ft.alive:" + alias + ":" + writer); } catch (error) { return true; }
+  if (raw == null || raw === ALIVE_CLOSED) return false;
+  const ts = Number(raw);
+  return Number.isFinite(ts) && ts > 0 && Date.now() - ts < ALIVE_STALE_MS;
+}
+// R21 U5: a free draft key of a closed spare writer ("legacy-<n>", see
+// writerVerdict) for a value that cannot take its own key — or the one that
+// already holds `value` (a retried pass) ; "" = none.
+function spareDraftKey(id, value) {
+  for (let n = 1; n <= 99; n++) {
+    const key = draftKey("legacy-" + n, id);
+    const held = localStorage.getItem(key);
+    if (held == null || (value != null && held === value)) return key;
+  }
+  return "";
+}
+// Writes `value` to `to`, reads it back, and only then removes `from`.
+function storageMoveVerified(from, to, value) {
+  localStorage.setItem(to, value);
+  if (localStorage.getItem(to) !== value) return false;
+  localStorage.removeItem(from);
+  return true;
+}
+// R21 U5: the old keys' ranges (after this key's own, migrateLegacyRanges).
+function migrateAliasRanges(annotations, aliases) {
+  let moved = 0;
+  for (const alias of Array.isArray(aliases) ? aliases : []) {
+    const key = "ft.viewer." + alias + ".ranges";
+    if (!alias || key === RANGES_KEY) continue;
+    moved += migrateLegacyRanges(annotations, key, key + ".held", true);
   }
   return moved;
 }
@@ -1709,13 +1782,19 @@ function migrateAliasDrafts(aliases) {
 // base 0, so a value the server already holds comes back as a conflict
 // (or a no-op when identical) instead of being overwritten. The old key
 // goes only once every entry is stored under its new key.
-function migrateLegacyDrafts() {
+// R21 U5: `key` = another annotations.v1 key (an old key of this folder,
+// migrateAliasDrafts). An entry whose per-id key already holds a different
+// draft goes to a spare key (spareDraftKey: a closed window's edit, A7) —
+// never dropped; each write is read back before the old key goes, and an
+// unreadable old value stays.
+function migrateLegacyDrafts(key) {
+  const from = key || ANNOTATIONS_KEY;
   let legacy = null;
   try {
-    const raw = localStorage.getItem(ANNOTATIONS_KEY);
+    const raw = localStorage.getItem(from);
     if (raw == null) return 0;
     legacy = JSON.parse(raw);
-  } catch (error) { legacy = null; }
+  } catch (error) { return 0; }
   let moved = 0;
   let complete = true;
   for (const [id, draft] of Object.entries(legacy && typeof legacy === "object" ? legacy : {})) {
@@ -1728,7 +1807,16 @@ function migrateLegacyDrafts() {
     };
     if (Object.prototype.hasOwnProperty.call(draft, "range")) record.range = draft.range || null;
     try {
-      if (localStorage.getItem(draftKey(writer, id)) == null) localStorage.setItem(draftKey(writer, id), JSON.stringify(record));
+      const value = JSON.stringify(record);
+      const held = localStorage.getItem(draftKey(writer, id));
+      let same = false;
+      if (held != null) { try { same = draftSameValues(JSON.parse(held), record); } catch (error) { same = false; } }
+      const to = held == null ? draftKey(writer, id) : same ? "" : spareDraftKey(id, value);
+      if (held != null && !same && !to) { complete = false; continue; }
+      if (to) {
+        localStorage.setItem(to, value);
+        if (localStorage.getItem(to) !== value) { complete = false; continue; }
+      }
       moved += 1;
     } catch (error) {
       reportStorageError(error);
@@ -1736,7 +1824,7 @@ function migrateLegacyDrafts() {
       break;
     }
   }
-  if (complete) { try { localStorage.removeItem(ANNOTATIONS_KEY); } catch (error) { /* retried next boot */ } }
+  if (complete) { try { localStorage.removeItem(from); } catch (error) { /* retried next boot */ } }
   return moved;
 }
 
@@ -1945,13 +2033,18 @@ function noteOrphanDraft(entry) {
 // R5 U3: an id this case does not list (yet: a live index still growing)
 //   is moved to RANGES_HELD_KEY — never dropped with the retired key — and
 //   every later boot re-checks the held entries.
-function migrateLegacyRanges(annotations) {
+// R21 U5: `rangesKey` / `heldKey` / `alias` = an old key of this folder
+// (migrateAliasRanges): left alone standalone; a range under a draft that
+// holds another range becomes a closed window's edit (spare key, A7).
+function migrateLegacyRanges(annotations, rangesKey, heldKey, alias) {
   if (typeof annotationsError !== "undefined" && annotationsError) return 0;
+  const RK = rangesKey || RANGES_KEY;
+  const HK = heldKey || (typeof RANGES_HELD_KEY === "string" ? RANGES_HELD_KEY : "");
   let raw = null;
   let heldRaw = null;
   try {
-    raw = localStorage.getItem(RANGES_KEY);
-    heldRaw = typeof RANGES_HELD_KEY === "string" ? localStorage.getItem(RANGES_HELD_KEY) : null;
+    raw = localStorage.getItem(RK);
+    heldRaw = HK ? localStorage.getItem(HK) : null;
   } catch (error) { return 0; }
   if (raw == null && heldRaw == null) return 0;
   const parseMap = text => {
@@ -1961,7 +2054,7 @@ function migrateLegacyRanges(annotations) {
   const entries = Object.entries(parseMap(raw)).map(([id, r]) => [id, draftNormRange(r)]).filter(([, r]) => r);
   const served = location.protocol === "http:" || location.protocol === "https:";
   if (!served) {
-    if (raw == null) return 0;
+    if (raw == null || alias) return 0;
     if (entries.length) legacyRangesLeft = { count: entries.length, ranges: Object.fromEntries(entries) };
     else { try { localStorage.removeItem(RANGES_KEY); } catch (error) { /* harmless */ } }
     return 0;
@@ -1974,7 +2067,24 @@ function migrateLegacyRanges(annotations) {
   let complete = true;
   for (const [id, range] of all) {
     if (!recordById.has(id)) { stillHeld[id] = range; continue; } // U3: held, re-checked next boot
-    if (state.drafts[id]) continue; // a draft is newer
+    if (state.drafts[id]) {
+      // a draft is newer; R21 U5: an old key's other range is kept beside it (A7).
+      if (!alias || JSON.stringify(draftNormRange(state.drafts[id].range)) === JSON.stringify(range)) continue;
+      const values = Object.assign(draftValuesOf(id), { range, seq: 0, base: Number.isFinite(state.drafts[id].base) ? state.drafts[id].base : 0 });
+      const text = JSON.stringify(values);
+      const spare = spareDraftKey(id, text);
+      try {
+        if (spare) localStorage.setItem(spare, text);
+        if (!spare || localStorage.getItem(spare) !== text) { complete = false; break; }
+      } catch (error) {
+        reportStorageError(error);
+        complete = false;
+        break;
+      }
+      noteOrphanDraft({ key: spare, writer: spare.slice(DRAFT_PREFIX.length).split(".")[0], id, draft: values });
+      moved += 1;
+      continue;
+    }
     const server = serverDraftValues(annotations, id);
     if (JSON.stringify(server.range) === JSON.stringify(range)) continue;
     const known = Number.isFinite(state.revisions[id]) ? state.revisions[id] : 0;
@@ -2001,13 +2111,16 @@ function migrateLegacyRanges(annotations) {
   }
   if (!complete) return moved; // both keys stay: retried next boot
   try {
-    if (Object.keys(stillHeld).length) localStorage.setItem(RANGES_HELD_KEY, JSON.stringify(stillHeld));
-    else if (heldRaw != null) localStorage.removeItem(RANGES_HELD_KEY);
+    if (Object.keys(stillHeld).length) {
+      const text = JSON.stringify(stillHeld);
+      localStorage.setItem(HK, text);
+      if (localStorage.getItem(HK) !== text) return moved;
+    } else if (heldRaw != null) localStorage.removeItem(HK);
   } catch (error) {
     reportStorageError(error);
     return moved; // the unknown ids could not be held: RANGES_KEY stays
   }
-  if (raw != null) { try { localStorage.removeItem(RANGES_KEY); } catch (error) { /* retried next boot */ } }
+  if (raw != null) { try { localStorage.removeItem(RK); } catch (error) { /* retried next boot */ } }
   return moved;
 }
 
@@ -2066,6 +2179,7 @@ function hydrateAnnotations(annotations) {
     } else skippedDraftWriters.add(entry.writer);
   }
   migrateLegacyRanges(annotations);
+  migrateAliasRanges(annotations, typeof CASE_KEY_ALIASES !== "undefined" ? CASE_KEY_ALIASES : []);
   if (draftFlushKeys.size) scheduleDraftFlush();
 }
 

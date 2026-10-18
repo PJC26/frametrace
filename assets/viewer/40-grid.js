@@ -920,6 +920,12 @@ function logTrustTagHtml(item) {
   const trust = logTrustOf(item);
   // R20 U1: a validation flag row that is not current says so, whatever its trust.
   if (item && item.superseded === true) return ` <span class="badge candidate" title="${escapeHtml(t("anomaly.tip.superseded"))}">${ftIcon("lock")}${escapeHtml(t("anomaly.superseded"))}</span>`;
+  // R21 U1: a newer line of the path is not authenticated — never "대체됨".
+  if (item && item.newerUnauth === true) {
+    const npc = logTrustPcKey(trust);
+    const ntip = t("status.tip.newer") + (npc ? " · " + trustOtherPcText(npc) : "");
+    return ` <span class="badge candidate" title="${escapeHtml(ntip)}">${ftIcon("lock")}${escapeHtml(npc ? t("status.otherPc") : t("trust.unauth"))}</span>`;
+  }
   if (item && item.repairedAfter === true) return ` <span class="badge candidate" title="${escapeHtml(t("status.tip.repairedAfter"))}">${ftIcon("lock")}${escapeHtml(t("status.repairedAfter"))}</span>`;
   // R11 U2: a usable entry's own note (legacy: `auth` + "레거시") as a tooltip.
   const own = logTrustUsable(trust) ? logTrustNote(item, true) : "";

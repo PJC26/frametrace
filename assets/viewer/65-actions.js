@@ -147,7 +147,8 @@ function downloadText(filename, text, mime) {
 function csvCell(value) {
   let text = String(value ?? "");
   if (/^[=+\-@\t\r]/.test(text) && text !== "-" && !/^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(text)) text = "'" + text;
-  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  // R21 U3: ";" too — the field separator of semicolon locales.
+  return /[",;\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function isoTime(unix) {

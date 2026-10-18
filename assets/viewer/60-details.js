@@ -156,7 +156,7 @@ function renderDetails() {
     [t("detail.len"), fmtDuration(record.duration)],
     [t("detail.size"), fmtBytes(record.size)],
     [t("detail.audio"), audioDetailFor(record)],
-    [t("detail.anomaly"), record.anomalies && record.anomalies.length ? record.anomalies.map(item => item.kind).join(", ") + (record.hasUnauthAnomaly ? " (" + t("anomaly.unauthShort") + ")" : record.hasPcAnomaly ? " (" + t("anomaly.pcTip") + ")" : "") : "-"],
+    [t("detail.anomaly"), record.anomalies && record.anomalies.length ? record.anomalies.map(item => item.kind).join(", ") + (anomalySummaryNote(record) ? " (" + anomalySummaryNote(record) + ")" : "") : "-"],
     [t("detail.dfl"), record.dfl ? (record.dfl.band
         ? tf("detail.dflScore", { label: record.dfl.band_label || record.dfl.band, score: record.dfl.score ?? "?" }) + (record.dfl.signal_titles?.length ? ": " + record.dfl.signal_titles.slice(0, 3).join(", ") : "")
         : (record.dfl.error ? tf("detail.dflFail", { error: record.dfl.error }) : t("detail.dflNone"))) : "-"]
