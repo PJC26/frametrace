@@ -1365,13 +1365,60 @@ directories squatting the two state-file names: `r17_s1_record_that_cannot_advan
   its journal (R16 swept it by age alone).
 - **S9.** The status path hashes a reserved package's manifest only up to
   16 MiB; a larger one is "확인 보류" (`manifest_check: "withheld"`, the
-  record's word shown, `blocks_finalize: false`) — the 1 GiB streaming
-  hash runs in recoveries only (R16 ran it on every status cache miss).
+  record's word shown, `blocks_finalize: false` — R18-S2: `null`, below)
+  — the 1 GiB streaming hash runs in recoveries only (R16 ran it on every
+  status cache miss).
 - **S10.** The `cmd.exe` form of a command is not offered when the case
   path holds `%`: `cmd.exe` expands `%VAR%` inside double quotes and has no
   escape for it at its interactive prompt (`%%` is a batch-file escape and
   stays `%%` there), so the pasted command could name another folder. The
   PowerShell form is single-quoted (no expansion).
+
+#### R18 (P29 / P31): a pasted command is paste-safe or absent; unknown is not "no block"
+
+- **S1 (High, R17 reviewer PoC, confirmed with PowerShell's own parser).**
+  The commands offered for pasting doubled only the ASCII `'`, but
+  PowerShell also reads U+2018/U+2019/U+201A/U+201B as single quotes: a
+  case folder named `x’; calc; ’` yielded a `--dismiss` / `--dismiss
+  --force` / `--writer-gone` command that parsed as four statements and ran
+  `calc` when pasted. **P29:** a command is built only when every character
+  of the case path is on a whitelist (letters and digits of any script,
+  ASCII space, `- _ . , / \ : ( ) [ ] + = @ ~ #`; not starting with `-`);
+  nothing is ever escaped. Otherwise every command field of
+  `/api/status.finalize_journal` (PowerShell and `cmd.exe` forms) is null,
+  `command_unavailable_reason` is "경로에 특수 문자 — 명령을 직접
+  입력하십시오", and the CLI / recovery texts show only
+  `frametrace finalize-journal <케이스 폴더> <flags>` with that reason. The
+  whitelist also covers `cmd.exe`'s `%` (R17-S10) and `!` (delayed
+  expansion, S8). Regression parses each offered command with
+  `System.Management.Automation.Language.Parser::ParseInput` (Windows):
+  one statement, one command, the path a single-quoted constant equal to
+  the case folder.
+- **S2 (P31).** The status path does not hash a manifest over 16 MiB, and
+  R17 then showed `completed-unrecorded` / `blocks_finalize: false` even
+  after a recovery (full hash) had judged the package CHANGED and kept the
+  journal. Now each full-hash assessment of a record past `open` remembers
+  its verdict (finished / package changed) in memory per (finalize id,
+  manifest size + mtime, equal before and after the hash); the status path
+  shows a remembered verdict (`manifest_check: "recovery-verdict"`) and
+  otherwise says `blocks_finalize: null` (unknown — the finalize hashes in
+  full first). `finalize-journal <case>` (CLI) shows the full-hash
+  assessment. Residual: a same-size rewrite with its mtime restored after
+  the recovery keeps a remembered verdict on the status screen (the
+  finalize's own full hash still decides).
+- **S3.** `--writer-gone` looks at the journal twice (as it is, then as if
+  the writer were gone): the two must name the same finalize id, writer pid
+  and start time and sign-off SHA, else nothing is done; a writer verified
+  as this program is refused in the second look as well.
+- **S7.** While a live process holds the writer's pid AND started when the
+  journal says its writer did (both known, ± 2 s — always so for an
+  unverified writer), `--writer-gone` also needs `--i-am-sure`; the offered
+  command then carries it (`writer_gone_i_am_sure: true`).
+- **S4 / S5 / S6.** `--writer-gone` prints the recovery's log lines;
+  another account's block says recovery happens in THAT account (here,
+  without its local record, the journal can only be moved); the
+  finalize's torn-lane refusal reads `{rel}에 이어 쓸 수 없음: {err}`
+  (not the anomaly scan's wording).
 
 ## Retired keys
 

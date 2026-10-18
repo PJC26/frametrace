@@ -2899,11 +2899,13 @@ pub(crate) fn finalize_with_exe(
     // such a case is refused before anything at all is written — no
     // recovery of an earlier journal, no superseded entry (R16 ran the
     // check after them), no begin entry, journal or local record.
-    if let Err(err) = crate::anomaly::preflight_scan_lanes(case_dir, true) {
+    // R18-S6: in the finalize's own words (R17 said "이상 징후 검사를
+    // 시작하지 않았습니다" here).
+    if let Err((rel, err)) = crate::anomaly::scan_lanes_appendable(case_dir, true) {
         return finalize_refused(
             state,
             format!(
-                "최종화 차단: {err} — 최종화는 아무것도 쓰지 않았습니다 (그 감사 로그 파일이 읽기 전용이거나 다른 프로그램이 잡고 있지 않은지, 마지막 줄이 찢기지 않았는지 확인하십시오)."
+                "최종화 차단: {rel}에 이어 쓸 수 없음: {err} — 최종화는 아무것도 쓰지 않았습니다 (그 감사 로그 파일이 읽기 전용이거나 다른 프로그램이 잡고 있지 않은지, 마지막 줄이 찢기지 않았는지 확인하십시오)."
             ),
         );
     }

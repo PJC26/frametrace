@@ -305,6 +305,21 @@ thread_local! {
 /// (with `rehash`), the anomaly lane and the sign-off lane (its head) —
 /// all accept an append, checked before the scan writes anything.
 pub(crate) fn preflight_scan_lanes(case_dir: &Path, rehash: bool) -> Result<(), String> {
+    scan_lanes_appendable(case_dir, rehash).map_err(|(rel, err)| {
+        format!(
+            "이상 징후 검사를 시작하지 않았습니다 — {rel}에 항목을 이어 쓸 수 없어(결과 레인을 건드리기 전에 확인) 결과와 머리를 함께 남길 수 없습니다: {err}"
+        )
+    })
+}
+
+/// [`preflight_scan_lanes`] without the scan's wording: the first lane
+/// that refuses an append and why (R18-S6: the finalize says it in its
+/// own words — R17 told a refused finalize "이상 징후 검사를 시작하지
+/// 않았습니다").
+pub(crate) fn scan_lanes_appendable(
+    case_dir: &Path,
+    rehash: bool,
+) -> Result<(), (&'static str, String)> {
     let mut lanes = vec![
         crate::report::SIGNOFF_LOG_REL_PATH,
         crate::report::ANOMALY_LOG_REL_PATH,
@@ -313,11 +328,7 @@ pub(crate) fn preflight_scan_lanes(case_dir: &Path, rehash: bool) -> Result<(), 
         lanes.push(HASH_VERIFY_REL_PATH);
     }
     for rel in lanes {
-        audit::check_appendable(&case_dir.join(rel)).map_err(|err| {
-            format!(
-                "이상 징후 검사를 시작하지 않았습니다 — {rel}에 항목을 이어 쓸 수 없어(결과 레인을 건드리기 전에 확인) 결과와 머리를 함께 남길 수 없습니다: {err}"
-            )
-        })?;
+        audit::check_appendable(&case_dir.join(rel)).map_err(|err| (rel, err))?;
     }
     Ok(())
 }

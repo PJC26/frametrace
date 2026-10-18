@@ -761,25 +761,24 @@ fn r14_s10_panicking_startup_recovery_releases_everything() {
 
 /// R14-S11: the dismiss command is single-quoted (PowerShell expands
 /// `$(…)` inside the double quotes 40126c3 used), with a cmd.exe form on
-/// Windows.
+/// Windows. R18-S1 (P29): a path holding `'` or `$` gets no command at all
+/// (R14 doubled `'`; R17's PoC showed PowerShell's other single quotes).
 #[test]
 fn r14_s11_dismiss_command_is_single_quoted() {
-    let case = Path::new("C:/cases/it's $(calc)");
-    let command = super::finalize_journal::dismiss_command(case);
+    let hostile = Path::new("C:/cases/it's $(calc)");
+    assert!(super::finalize_journal::dismiss_command(hostile).is_none());
+    assert!(super::finalize_journal::dismiss_command_cmd(hostile).is_none());
+    let case = Path::new("C:/cases/홍길동 사건 (1)");
+    assert_eq!(
+        super::finalize_journal::dismiss_command(case).unwrap(),
+        "frametrace finalize-journal 'C:/cases/홍길동 사건 (1)' --dismiss"
+    );
     if cfg!(windows) {
         assert_eq!(
-            command,
-            "frametrace finalize-journal 'C:/cases/it''s $(calc)' --dismiss"
-        );
-        assert_eq!(
             super::finalize_journal::dismiss_command_cmd(case).unwrap(),
-            "frametrace finalize-journal \"C:/cases/it's $(calc)\" --dismiss"
+            "frametrace finalize-journal \"C:/cases/홍길동 사건 (1)\" --dismiss"
         );
     } else {
-        assert_eq!(
-            command,
-            "frametrace finalize-journal 'C:/cases/it'\\''s $(calc)' --dismiss"
-        );
         assert!(super::finalize_journal::dismiss_command_cmd(case).is_none());
     }
 }

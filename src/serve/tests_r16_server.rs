@@ -804,7 +804,11 @@ fn r16_s4_other_account_needs_the_begin_entrys_pid() {
     );
     // The force hint is what the block offers (never a plain dismiss).
     let case = Path::new("C:/cases/a b");
-    assert!(super::finalize_journal::force_dismiss_command(case).ends_with("--dismiss --force"));
+    assert!(
+        super::finalize_journal::force_dismiss_command(case)
+            .unwrap()
+            .ends_with("--dismiss --force")
+    );
 }
 
 /// R16-S6: the remembered complete-entry failures drop the OLDEST when

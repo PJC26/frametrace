@@ -1661,6 +1661,9 @@ pub(crate) struct Recovery {
 pub(crate) struct UnpairedWhy {
     pub(crate) code: &'static str,
     pub(crate) reason: String,
+    /// R18-S2: the status path shows a recovery's remembered verdict
+    /// (`manifest_check: "recovery-verdict"`), not one judged now.
+    pub(crate) remembered: bool,
 }
 
 impl UnpairedWhy {
@@ -1668,6 +1671,7 @@ impl UnpairedWhy {
         Self {
             code,
             reason: reason.into(),
+            remembered: false,
         }
     }
 }
@@ -1737,15 +1741,90 @@ pub(crate) enum Assessment {
         journal: FinalizeJournal,
         why: String,
         manifest_sha256: Option<String>,
-        /// R17-S9: false only on the status path, when the reserved
-        /// package's manifest is over [`MANIFEST_MAX_BYTES`] and was not
-        /// hashed ("확인 보류"); a recovery always hashes it (streaming).
-        checked: bool,
+        /// R17-S9 / R18-S2: how the manifest was judged — not `Hashed`
+        /// only on the status path (over [`MANIFEST_MAX_BYTES`]); a
+        /// recovery always hashes it (streaming).
+        check: ManifestCheck,
     },
     /// An interrupted finalize of this PC: journal, local record (`open`)
     /// and the lane's begin entry agree.
     Open(FinalizeJournal, FinalizeBegin),
 }
+
+/// R18-S2 (P31): how a finished finalize's manifest was judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestCheck {
+    /// Hashed now (in full on a recovery; up to 16 MiB on the status path).
+    Hashed,
+    /// Status path, over [`MANIFEST_MAX_BYTES`], no recovery verdict
+    /// remembered for that manifest: unknown ("확인 보류",
+    /// `blocks_finalize: null`).
+    Withheld,
+    /// Status path, over [`MANIFEST_MAX_BYTES`]: the verdict a recovery
+    /// reached hashing it in full, remembered for that manifest's size and
+    /// mtime ([`remembered_verdict`]).
+    Remembered,
+}
+
+/// R18-S2 (P31): what a recovery (the manifest hashed in full) concluded
+/// about a finalize whose local record is past `open` — remembered in
+/// memory per (finalize id, manifest size + mtime) so the status path,
+/// which never hashes a manifest over 16 MiB, shows it instead of "no
+/// block". 891f180's status kept showing `completed-unrecorded` /
+/// `blocks_finalize: false` while the recovery had judged the package
+/// CHANGED and kept the journal.
+#[derive(Debug, Clone)]
+enum RecoveryVerdict {
+    Finished { why: String },
+    PackageChanged(UnpairedWhy),
+}
+
+type VerdictKey = (String, (u64, SystemTime));
+
+fn recovery_verdicts() -> &'static Mutex<Vec<(VerdictKey, RecoveryVerdict)>> {
+    static VERDICTS: Mutex<Vec<(VerdictKey, RecoveryVerdict)>> = Mutex::new(Vec::new());
+    &VERDICTS
+}
+
+/// Remembers a full-hash assessment's verdict for the manifest stamped
+/// `stamp` (taken before AND after the hash, equal — else nothing is
+/// remembered). Any other assessment of that finalize forgets it.
+fn remember_verdict(finalize_id: &str, stamp: Option<(u64, SystemTime)>, assessment: &Assessment) {
+    let verdict = match assessment {
+        Assessment::Finished {
+            why,
+            check: ManifestCheck::Hashed,
+            ..
+        } => Some(RecoveryVerdict::Finished { why: why.clone() }),
+        Assessment::Unpaired(_, why) if why.code == UNPAIRED_PACKAGE_CHANGED => {
+            Some(RecoveryVerdict::PackageChanged(why.clone()))
+        }
+        _ => None,
+    };
+    if let Ok(mut verdicts) = recovery_verdicts().lock() {
+        verdicts.retain(|((id, _), _)| id != finalize_id);
+        if let (Some(verdict), Some(stamp)) = (verdict, stamp) {
+            keep_newest(&mut verdicts, 16);
+            verdicts.push(((finalize_id.to_string(), stamp), verdict));
+        }
+    }
+}
+
+fn remembered_verdict(
+    finalize_id: &str,
+    stamp: Option<(u64, SystemTime)>,
+) -> Option<RecoveryVerdict> {
+    let stamp = stamp?;
+    recovery_verdicts().lock().ok().and_then(|verdicts| {
+        verdicts
+            .iter()
+            .find(|((id, at), _)| id == finalize_id && *at == stamp)
+            .map(|(_, verdict)| verdict.clone())
+    })
+}
+
+/// The words a remembered verdict is shown with.
+const REMEMBERED_NOTE: &str = " (복구가 manifest.sha256 전체를 해시해 내린 판정 — 상태 확인은 16 MiB보다 큰 manifest를 다시 해시하지 않으며, 그 뒤 크기·수정 시각이 바뀌면 이 판정은 쓰지 않습니다)";
 
 fn journal_age(journal: &FinalizeJournal) -> Option<Duration> {
     let now = crate::util::now_unix().ok()?;
@@ -1859,25 +1938,51 @@ struct Inputs {
     /// [`MANIFEST_MAX_BYTES`]) — `manifest_sha256` is then `None` and
     /// means nothing.
     manifest_withheld: bool,
+    /// R18-S2: size and mtime of the reserved package's manifest when it
+    /// was judged (a full hash: equal before and after it, else `None`) —
+    /// what a recovery's verdict is remembered by.
+    manifest_stamp: Option<(u64, SystemTime)>,
+}
+
+/// The reserved package's `manifest.sha256` (published, unmarked).
+fn reserved_manifest_path(case_dir: &Path, package_name: &str) -> Option<PathBuf> {
+    published_reserved(case_dir, package_name).map(|dir| dir.join("manifest.sha256"))
+}
+
+fn manifest_stamp(case_dir: &Path, package_name: &str) -> Option<(u64, SystemTime)> {
+    let meta = std::fs::metadata(reserved_manifest_path(case_dir, package_name)?).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 /// R16-S7: SHA-256 of the manifest of the published reserved package
-/// `package_name` (streaming, see [`manifest_sha256_streaming`]).
-fn reserved_manifest_sha256(case_dir: &Path, package_name: &str) -> Option<String> {
-    published_reserved(case_dir, package_name).and_then(|dir| manifest_sha256_streaming(&dir))
+/// `package_name` (streaming, see [`manifest_sha256_streaming`]) and
+/// (R18-S2) its stamp — `None` unless the same before and after the hash.
+fn reserved_manifest_sha256(
+    case_dir: &Path,
+    package_name: &str,
+) -> (Option<String>, Option<(u64, SystemTime)>) {
+    let before = manifest_stamp(case_dir, package_name);
+    let sha =
+        published_reserved(case_dir, package_name).and_then(|dir| manifest_sha256_streaming(&dir));
+    let after = manifest_stamp(case_dir, package_name);
+    (sha, before.filter(|_| before == after))
 }
 
 /// R17-S9: the status path's view of the reserved package's manifest —
 /// hashed only up to [`MANIFEST_MAX_BYTES`]; a larger one is
-/// `(None, true)` ("확인 보류", never the 1 GiB streaming hash a recovery
-/// does: R16 ran that on every status cache miss).
-fn status_manifest_sha256(case_dir: &Path, package_name: &str) -> (Option<String>, bool) {
+/// `(None, true, stamp)` ("확인 보류", never the 1 GiB streaming hash a
+/// recovery does: R16 ran that on every status cache miss).
+fn status_manifest_sha256(
+    case_dir: &Path,
+    package_name: &str,
+) -> (Option<String>, bool, Option<(u64, SystemTime)>) {
     let Some(dir) = published_reserved(case_dir, package_name) else {
-        return (None, false);
+        return (None, false, None);
     };
-    match std::fs::metadata(dir.join("manifest.sha256")) {
-        Ok(meta) if meta.len() > MANIFEST_MAX_BYTES => (None, true),
-        _ => (manifest_sha256_capped(&dir), false),
+    let stamp = manifest_stamp(case_dir, package_name);
+    match stamp {
+        Some((len, _)) if len > MANIFEST_MAX_BYTES => (None, true, stamp),
+        _ => (manifest_sha256_capped(&dir), false, stamp),
     }
 }
 
@@ -1890,13 +1995,12 @@ fn gather(case_dir: &Path, journal: &FinalizeJournal, full: bool) -> Inputs {
             local: Ok(None),
             manifest_sha256: None,
             manifest_withheld: false,
+            manifest_stamp: None,
         };
     }
-    let (manifest_sha256, manifest_withheld) = if full {
-        (
-            reserved_manifest_sha256(case_dir, &journal.package_name),
-            false,
-        )
+    let (manifest_sha256, manifest_withheld, manifest_stamp) = if full {
+        let (sha, stamp) = reserved_manifest_sha256(case_dir, &journal.package_name);
+        (sha, false, stamp)
     } else {
         status_manifest_sha256(case_dir, &journal.package_name)
     };
@@ -1905,6 +2009,7 @@ fn gather(case_dir: &Path, journal: &FinalizeJournal, full: bool) -> Inputs {
         local: read_local_record(&journal.finalize_id),
         manifest_sha256,
         manifest_withheld,
+        manifest_stamp,
     }
 }
 
@@ -1984,6 +2089,7 @@ fn classify(
         local,
         manifest_sha256,
         manifest_withheld,
+        manifest_stamp,
     } = inputs(&journal);
     let closed = matches!(
         pairing,
@@ -1992,8 +2098,9 @@ fn classify(
         &local,
         Ok(Some(record)) if record.state == LOCAL_COMPLETED || record.state == LOCAL_RESOLVED
     );
-    let in_progress = journal.state == STATE_IN_PROGRESS && !closed && !assume_gone;
+    let in_progress = journal.state == STATE_IN_PROGRESS && !closed;
     if in_progress
+        && !assume_gone
         && let Some(image) = writer_other_account(
             &journal,
             begin_pid(&pairing),
@@ -2011,10 +2118,17 @@ fn classify(
             image,
         };
     }
-    let liveness = if in_progress {
-        writer_liveness(&journal)
-    } else {
-        WriterLiveness::Gone
+    // R18-S3: `assume_gone` takes only an UNVERIFIED writer as gone — a
+    // writer verified as this program (folder and SHA-256) is still a
+    // live writer, whatever the examiner said (the journal may have been
+    // replaced since the CLI's first look).
+    let liveness = match (in_progress, assume_gone) {
+        (false, _) => WriterLiveness::Gone,
+        (true, false) => writer_liveness(&journal),
+        (true, true) => match writer_liveness(&journal) {
+            WriterLiveness::Verified => WriterLiveness::Verified,
+            _ => WriterLiveness::Gone,
+        },
     };
     let alive = liveness != WriterLiveness::Gone;
     if matches!(local, Ok(Some(_))) {
@@ -2096,7 +2210,29 @@ fn classify(
     };
     // R17-S9: the status path did not hash a manifest over 16 MiB — what
     // the record says is shown "확인 보류" (a recovery hashes it fully).
+    // R18-S2 (P31): unknown (`blocks_finalize: null`) unless a recovery's
+    // verdict for that very manifest (size + mtime) is remembered — then
+    // that verdict, package changed included.
     let withheld = |journal: FinalizeJournal, manifest_sha256: Option<String>| {
+        match remembered_verdict(&journal.finalize_id, manifest_stamp) {
+            Some(RecoveryVerdict::PackageChanged(why)) => {
+                let why = UnpairedWhy {
+                    reason: format!("{}{REMEMBERED_NOTE}", why.reason),
+                    remembered: true,
+                    ..why
+                };
+                return Assessment::Unpaired(journal, why);
+            }
+            Some(RecoveryVerdict::Finished { why }) => {
+                return Assessment::Finished {
+                    journal,
+                    why: format!("{why}{REMEMBERED_NOTE}"),
+                    manifest_sha256,
+                    check: ManifestCheck::Remembered,
+                };
+            }
+            None => {}
+        }
         let why = format!(
             "확인 보류 — 이 PC의 로컬 기록에는 이 최종화의 패키지 단계가 끝났다고 남아 있지만, 예약 패키지 reports/{}의 manifest.sha256이 {} MiB보다 커서 상태 확인에서는 해시하지 않았습니다 (케이스를 다시 열거나 최종화하면 전체를 해시해 확인합니다)",
             journal.package_name,
@@ -2106,7 +2242,7 @@ fn classify(
             journal,
             why,
             manifest_sha256,
-            checked: false,
+            check: ManifestCheck::Withheld,
         }
     };
     match local.state.as_str() {
@@ -2125,7 +2261,7 @@ fn classify(
                 journal,
                 why: "이 PC의 로컬 기록에 이 최종화가 끝났다고 남아 있습니다 (서명 감사 레인의 완료 기록만 없음)".to_string(),
                 manifest_sha256: local.manifest_sha256,
-                checked: true,
+                check: ManifestCheck::Hashed,
             };
         }
         LOCAL_RESOLVED => {
@@ -2142,7 +2278,7 @@ fn classify(
                     journal,
                     why,
                     manifest_sha256: local.manifest_sha256,
-                    checked: true,
+                    check: ManifestCheck::Hashed,
                 };
             }
             return package_changed(journal);
@@ -2186,69 +2322,148 @@ fn assess_with(case_dir: &Path, assume_gone: bool) -> Option<Assessment> {
         Ok(Some(journal)) => Ok(journal),
         Err(err) => Err(err),
     };
-    Some(classify(
+    // R18-S2 (P31): the verdict of this full-hash assessment is
+    // remembered for the status path (see [`RecoveryVerdict`]).
+    let mut judged: Option<(String, Option<(u64, SystemTime)>)> = None;
+    let assessment = classify(
         case_dir,
         journal,
-        |journal| gather(case_dir, journal, true),
+        |journal| {
+            let inputs = gather(case_dir, journal, true);
+            judged = Some((journal.finalize_id.clone(), inputs.manifest_stamp));
+            inputs
+        },
         assume_gone,
-    ))
+    );
+    if let Some((finalize_id, stamp)) = judged {
+        remember_verdict(&finalize_id, stamp, &assessment);
+    }
+    Some(assessment)
+}
+
+/// R18-S1 (P29): `/api/status.finalize_journal.command_unavailable_reason`
+/// and the CLI's words when a case path is not paste-safe — no command is
+/// given at all.
+pub(crate) const COMMAND_UNAVAILABLE_REASON: &str = "경로에 특수 문자 — 명령을 직접 입력하십시오";
+
+/// R18-S1 (P29): the characters a case path may hold for a command to be
+/// offered for pasting — a WHITELIST. Letters and digits of any script
+/// (Hangul folder names), the ASCII space and `- _ . , / \ : ( ) [ ] + = @
+/// ~ #`. Everything else is refused, notably: PowerShell's single quotes
+/// `'` U+2018 U+2019 U+201A U+201B (R17 PoC: 891f180 doubled only ASCII
+/// `'`, so `x’; calc; ’` ended the quoted string and ran `calc`), its
+/// double quotes, `$` and the backtick; `cmd.exe`'s `%` (no escape at its
+/// prompt, R17-S10), `!` (delayed expansion, S8), `^ & | < > "`; `;`, `'`
+/// for POSIX shells; every control character and every non-ASCII space,
+/// dash or quote (none of them is a letter or a digit).
+pub(crate) fn paste_safe_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            ' ' | '-'
+                | '_'
+                | '.'
+                | ','
+                | '/'
+                | '\\'
+                | ':'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '+'
+                | '='
+                | '@'
+                | '~'
+                | '#'
+        )
+}
+
+/// The case path as it goes, unescaped, between the command's quotes —
+/// `None` (no command) when any character is not [`paste_safe_char`] or
+/// it starts with `-` (it would read as an option). Nothing is ever
+/// escaped: an escape is a promise about one shell's parser, and R17
+/// showed that promise broken.
+fn paste_safe_path(case_dir: &Path) -> Option<String> {
+    let path = case_dir.display().to_string();
+    (!path.is_empty() && !path.starts_with('-') && path.chars().all(paste_safe_char))
+        .then_some(path)
 }
 
 /// R14-S11: the dismiss command as the examiner pastes it — single-quoted
 /// (PowerShell, the Windows default shell, expands `$(…)` inside double
-/// quotes; a case path holding one ran it). Windows: PowerShell form
-/// (`'` doubled); elsewhere POSIX (`'\''`).
-pub(crate) fn dismiss_command(case_dir: &Path) -> String {
+/// quotes; a case path holding one ran it). R18-S1 (P29): `None` unless
+/// the path is paste-safe ([`paste_safe_char`]); the path is then put in
+/// as it is (it holds no quote of any kind).
+pub(crate) fn dismiss_command(case_dir: &Path) -> Option<String> {
     journal_command(case_dir, "--dismiss")
 }
 
 /// `frametrace finalize-journal '<case>' <flags>` (see [`dismiss_command`]).
-fn journal_command(case_dir: &Path, flags: &str) -> String {
-    let path = case_dir.display().to_string();
-    let quoted = if cfg!(windows) {
-        format!("'{}'", path.replace('\'', "''"))
-    } else {
-        format!("'{}'", path.replace('\'', "'\\''"))
-    };
-    format!("frametrace finalize-journal {quoted} {flags}")
+fn journal_command(case_dir: &Path, flags: &str) -> Option<String> {
+    let path = paste_safe_path(case_dir)?;
+    Some(format!("frametrace finalize-journal '{path}' {flags}"))
 }
 
-/// R14-S11: the same for `cmd.exe` (double quotes; Windows paths cannot
-/// hold `"`). `None` off Windows. R17-S10: also `None` when the path
-/// holds `%` — `cmd.exe` expands `%VAR%` even inside double quotes, and at
-/// its interactive prompt (where the examiner pastes) there is no escape
-/// for it (`%%` stays `%%` there; only batch files read it as `%`), so a
-/// case folder named `%USERPROFILE%x` would name ANOTHER folder. The
-/// PowerShell form (single-quoted, no expansion) is then the only one.
+/// R14-S11: the same for `cmd.exe` (double quotes). `None` off Windows,
+/// and (R18-S1, P29) whenever the PowerShell form is `None` — the
+/// whitelist also refuses `%` (R17-S10: `cmd.exe` expands `%VAR%` inside
+/// double quotes with no escape at its prompt) and `!` (S8: delayed
+/// expansion).
 pub(crate) fn dismiss_command_cmd(case_dir: &Path) -> Option<String> {
     journal_command_cmd(case_dir, "--dismiss")
 }
 
 fn journal_command_cmd(case_dir: &Path, flags: &str) -> Option<String> {
-    let path = case_dir.display().to_string();
-    (cfg!(windows) && !path.contains('%'))
-        .then(|| format!("frametrace finalize-journal \"{path}\" {flags}"))
+    if !cfg!(windows) {
+        return None;
+    }
+    let path = paste_safe_path(case_dir)?;
+    Some(format!("frametrace finalize-journal \"{path}\" {flags}"))
 }
 
 /// R17-S2: `--writer-gone` — the examiner confirmed the journal's writer
-/// is gone: the normal recovery runs as if it were.
-pub(crate) fn writer_gone_command(case_dir: &Path) -> String {
-    journal_command(case_dir, "--writer-gone")
+/// is gone: the normal recovery runs as if it were. R18-S7: `sure` adds
+/// `--i-am-sure` (a live process still matches the writer's pid and start
+/// time, see [`writer_gone_needs_sure`]).
+pub(crate) fn writer_gone_command(case_dir: &Path, sure: bool) -> Option<String> {
+    journal_command(case_dir, writer_gone_flags(sure))
 }
 
-pub(crate) fn writer_gone_command_cmd(case_dir: &Path) -> Option<String> {
-    journal_command_cmd(case_dir, "--writer-gone")
+pub(crate) fn writer_gone_command_cmd(case_dir: &Path, sure: bool) -> Option<String> {
+    journal_command_cmd(case_dir, writer_gone_flags(sure))
+}
+
+fn writer_gone_flags(sure: bool) -> &'static str {
+    if sure {
+        "--writer-gone --i-am-sure"
+    } else {
+        "--writer-gone"
+    }
+}
+
+/// Both forms of a command for examiner-facing text; R18-S1 (P29): when
+/// the path is not paste-safe, the command's shape with a placeholder and
+/// [`COMMAND_UNAVAILABLE_REASON`] (never the path between quotes).
+fn command_text(powershell: Option<String>, cmd: Option<String>, flags: &str) -> String {
+    match (powershell, cmd) {
+        (Some(powershell), Some(cmd)) => {
+            format!("PowerShell: {powershell} / 명령 프롬프트: {cmd}")
+        }
+        (Some(powershell), None) => powershell,
+        _ => format!(
+            "frametrace finalize-journal <케이스 폴더> {flags} ({COMMAND_UNAVAILABLE_REASON})"
+        ),
+    }
 }
 
 /// Both forms for examiner-facing text.
 fn dismiss_hint(case_dir: &Path) -> String {
-    match dismiss_command_cmd(case_dir) {
-        Some(cmd) => format!(
-            "PowerShell: {} / 명령 프롬프트: {cmd}",
-            dismiss_command(case_dir)
-        ),
-        None => dismiss_command(case_dir),
-    }
+    command_text(
+        dismiss_command(case_dir),
+        dismiss_command_cmd(case_dir),
+        "--dismiss",
+    )
 }
 
 /// R12-S2 / R13: recovers the interrupted finalize `case_dir`'s journal
@@ -2540,14 +2755,14 @@ thread_local! {
 /// R15-S10: the examiner-facing text of another account's finalize.
 /// R17-S2/S3: waiting comes first — the block lifts by itself 24 h after
 /// the journal's start, and only then the ways out.
-fn other_account_text(
+pub(crate) fn other_account_text(
     journal: &FinalizeJournal,
     image: &str,
     until_unix: u64,
     case_dir: &Path,
 ) -> String {
     format!(
-        "이 케이스의 최종화 저널에 적힌 작성자(pid {}, {image})는 이 PC의 다른 계정의 FrameTrace 프로세스일 수 있습니다 — 이 계정으로는 그 프로세스를 확인할 수 없어 아무것도 바꾸지 않았고 최종화를 막습니다. 기다리면 저절로 풀립니다: unix {until_unix}(저널 시작 24시간 뒤)부터는 이 PC가 정상 복구합니다. 그 전에는 그 계정에서 최종화가 끝났는지 확인하십시오. {}",
+        "이 케이스의 최종화 저널에 적힌 작성자(pid {}, {image})는 이 PC의 다른 계정의 FrameTrace 프로세스일 수 있습니다 — 이 계정으로는 그 프로세스를 확인할 수 없어 아무것도 바꾸지 않았고 최종화를 막습니다. 기다리면 저절로 풀립니다: unix {until_unix}(저널 시작 24시간 뒤)부터는 이 계정에서도 막지 않습니다 — 그 계정에서 케이스를 열면 그 계정의 로컬 기록으로 정상 복구되고, 이 계정에는 그 최종화의 로컬 기록이 없으면 저널을 옮기기만 할 수 있습니다(되돌리거나 완료로 기록하지 않음). 그 전에는 그 계정에서 최종화가 끝났는지 확인하십시오. {}",
         journal.writer.pid,
         writer_hint(case_dir, journal)
     )
@@ -2573,8 +2788,9 @@ fn live_writer_text(journal: &FinalizeJournal) -> String {
 }
 
 /// R16-S2/S4: `--dismiss --force` (moves the journal of a writer that may
-/// still run — nothing is rolled back or recorded).
-pub(crate) fn force_dismiss_command(case_dir: &Path) -> String {
+/// still run — nothing is rolled back or recorded). R18-S1: `None` unless
+/// the path is paste-safe.
+pub(crate) fn force_dismiss_command(case_dir: &Path) -> Option<String> {
     journal_command(case_dir, "--dismiss --force")
 }
 
@@ -2582,12 +2798,27 @@ pub(crate) fn force_dismiss_command_cmd(case_dir: &Path) -> Option<String> {
     journal_command_cmd(case_dir, "--dismiss --force")
 }
 
-/// Both forms of a command for examiner-facing text.
-fn both_forms(powershell: String, cmd: Option<String>) -> String {
-    match cmd {
-        Some(cmd) => format!("PowerShell: {powershell} / 명령 프롬프트: {cmd}"),
-        None => powershell,
+/// R18-S7: a live process holds the journal's writer pid AND started when
+/// the journal says its writer did (both times known, within the usual
+/// slack) — `--writer-gone` then needs `--i-am-sure`: the examiner says
+/// that very process is not this case's finalize. (An unverified writer
+/// always matches: that is how it was found; another account's process
+/// matches when its start time can be read.)
+pub(crate) fn writer_gone_needs_sure(journal: &FinalizeJournal) -> bool {
+    let writer = &journal.writer;
+    if writer.pid == 0 || writer.pid == std::process::id() {
+        return false;
     }
+    let Some(recorded) = writer.started_ms else {
+        return false;
+    };
+    crate::util::process_start_time(writer.pid).is_some_and(|started| {
+        let started_ms = started
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        started_ms.abs_diff(recorded) <= crate::util::START_TIME_SLACK.as_millis() as u64
+    })
 }
 
 /// R17-S2: what `--dismiss --force` leaves in place for `journal` — the
@@ -2629,16 +2860,29 @@ const LEFT_IN_PLACE_READ_MAX_BYTES: u64 = 1024 * 1024;
 /// the "wait" sentence the caller puts first: `--writer-gone` (the normal
 /// recovery once the examiner confirmed the writer is gone), then
 /// `--dismiss --force` with what it leaves in place.
+/// R18-S7: with `--i-am-sure` when [`writer_gone_needs_sure`]. R18-S1:
+/// no path between quotes unless it is paste-safe.
 fn writer_hint(case_dir: &Path, journal: &FinalizeJournal) -> String {
+    let sure = writer_gone_needs_sure(journal);
+    let sure_note = if sure {
+        format!(
+            " (실행 중인 프로세스 pid {}가 저널에 적힌 작성자의 시작 시각과 맞아 --i-am-sure가 필요합니다 — 그 프로세스가 이 케이스의 FrameTrace 최종화가 아님을 직접 확인했을 때만 쓰십시오)",
+            journal.writer.pid
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "그 프로세스가 이 최종화의 작성자가 아니라고(작성자는 이미 끝났다고) 확인했다면 `{}`로 작성자 없음으로 보고 정상 복구를 실행할 수 있습니다. `{}`는 저널만 옮기고 아무것도 되돌리거나 기록하지 않습니다 — {}.",
-        both_forms(
-            writer_gone_command(case_dir),
-            writer_gone_command_cmd(case_dir)
+        "그 프로세스가 이 최종화의 작성자가 아니라고(작성자는 이미 끝났다고) 확인했다면 `{}`로 작성자 없음으로 보고 정상 복구를 실행할 수 있습니다{sure_note}. `{}`는 저널만 옮기고 아무것도 되돌리거나 기록하지 않습니다 — {}.",
+        command_text(
+            writer_gone_command(case_dir, sure),
+            writer_gone_command_cmd(case_dir, sure),
+            writer_gone_flags(sure)
         ),
-        both_forms(
+        command_text(
             force_dismiss_command(case_dir),
-            force_dismiss_command_cmd(case_dir)
+            force_dismiss_command_cmd(case_dir),
+            "--dismiss --force"
         ),
         left_in_place(case_dir, journal)
     )
@@ -3156,8 +3400,11 @@ fn cached_journal(case_dir: &Path) -> Option<Assessment> {
             Ok(Some(record)) if record.state != LOCAL_OPEN && record.state != LOCAL_RESOLVED
         );
         if judged_by_manifest && let Ok(journal) = &journal {
-            (inputs.manifest_sha256, inputs.manifest_withheld) =
-                status_manifest_sha256(case_dir, &journal.package_name);
+            (
+                inputs.manifest_sha256,
+                inputs.manifest_withheld,
+                inputs.manifest_stamp,
+            ) = status_manifest_sha256(case_dir, &journal.package_name);
         }
         inputs
     });
@@ -3178,8 +3425,18 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
     if active {
         return serde_json::Value::Null;
     }
-    let base = |state: &str| {
-        serde_json::json!({
+    if recovering {
+        return status_base(STATE_RECOVERING);
+    }
+    match cached_journal(case_dir) {
+        Some(assessment) => status_of(case_dir, assessment),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Every `finalize_journal` field, at its "nothing known" value.
+fn status_base(state: &str) -> serde_json::Value {
+    serde_json::json!({
             "path": FINALIZE_JOURNAL_REL_PATH,
             "state": state,
             "examiner": null,
@@ -3205,31 +3462,45 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
             "force_dismiss_command_cmd": null,
             "writer_gone_command": null,
             "writer_gone_command_cmd": null,
+            "writer_gone_i_am_sure": null,
+            "command_unavailable_reason": null,
             "manifest_check": null,
-        })
+    })
+}
+
+/// [`status_value`] of an assessment already made (R18-S2: the CLI's is
+/// the full-hash one, never the status path's).
+fn status_of(case_dir: &Path, assessment: Assessment) -> serde_json::Value {
+    let base = status_base;
+    // R18-S1 (P29): a command is offered only for a paste-safe path;
+    // otherwise every command field stays null and this says why.
+    let unavailable = |value: &mut serde_json::Value| {
+        if paste_safe_path(case_dir).is_none() {
+            value["command_unavailable_reason"] = COMMAND_UNAVAILABLE_REASON.into();
+        }
     };
     // R14-S5: the dismiss command is offered only where moving the journal
     // aside is the examiner's way out (nothing a recovery could clean up).
     let offer_dismiss = |value: &mut serde_json::Value| {
         value["dismiss_command"] = dismiss_command(case_dir).into();
         value["dismiss_command_cmd"] = dismiss_command_cmd(case_dir).into();
+        unavailable(value);
     };
     // R16-S2/S4: where a writer may still run, only `--dismiss --force`
     // moves the journal (nothing is rolled back or recorded). R17-S8: only
     // for a writer this PC could NOT verify (unverified, other account) —
     // a verified live writer gets no command at all (wait) — and R17-S2
     // with `--writer-gone` (the normal recovery, writer confirmed gone).
-    let offer_writer_ways = |value: &mut serde_json::Value| {
+    // R18-S7: with `--i-am-sure` while a live process matches the writer's
+    // pid and start time.
+    let offer_writer_ways = |value: &mut serde_json::Value, journal: &FinalizeJournal| {
+        let sure = writer_gone_needs_sure(journal);
         value["force_dismiss_command"] = force_dismiss_command(case_dir).into();
         value["force_dismiss_command_cmd"] = force_dismiss_command_cmd(case_dir).into();
-        value["writer_gone_command"] = writer_gone_command(case_dir).into();
-        value["writer_gone_command_cmd"] = writer_gone_command_cmd(case_dir).into();
-    };
-    if recovering {
-        return base(STATE_RECOVERING);
-    }
-    let Some(assessment) = cached_journal(case_dir) else {
-        return serde_json::Value::Null;
+        value["writer_gone_command"] = writer_gone_command(case_dir, sure).into();
+        value["writer_gone_command_cmd"] = writer_gone_command_cmd(case_dir, sure).into();
+        value["writer_gone_i_am_sure"] = sure.into();
+        unavailable(value);
     };
     let with = |state: &str, journal: &FinalizeJournal| {
         let mut value = base(state);
@@ -3291,7 +3562,7 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
             value["reason"] = unverified_writer_text(&journal, case_dir).into();
             value["local_record"] = true.into();
             value["in_progress_code"] = IN_PROGRESS_UNVERIFIED_WRITER.into();
-            offer_writer_ways(&mut value);
+            offer_writer_ways(&mut value, &journal);
             value
         }
         // R15-S10: blocks; no dismiss command (the examiner is not led to
@@ -3306,7 +3577,7 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
             value["in_progress_code"] = IN_PROGRESS_OTHER_ACCOUNT.into();
             value["blocked_until_unix"] = until_unix.into();
             value["local_record"] = serde_json::Value::Null;
-            offer_writer_ways(&mut value);
+            offer_writer_ways(&mut value, &journal);
             value
         }
         Assessment::Unpaired(journal, why) => {
@@ -3314,6 +3585,9 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
             value["reason"] = why.reason.into();
             value["unpaired_code"] = why.code.into();
             value["local_record"] = (why.code != UNPAIRED_NO_LOCAL_RECORD).into();
+            if why.remembered {
+                value["manifest_check"] = "recovery-verdict".into();
+            }
             offer_dismiss(&mut value);
             value
         }
@@ -3334,16 +3608,26 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
         Assessment::Finished {
             journal,
             why,
-            checked,
+            check,
             ..
         } => {
             let mut value = with(STATE_COMPLETED_UNRECORDED, &journal);
             value["outcome"] = STATE_COMPLETED.into();
             value["local_record"] = true.into();
             // R17-S9: "확인 보류" — the manifest was not hashed here.
-            if !checked {
-                value["manifest_check"] = "withheld".into();
-            }
+            // R18-S2 (P31): then whether it blocks is unknown (null),
+            // unless a recovery's full-hash verdict is remembered.
+            let blocks = match check {
+                ManifestCheck::Hashed => serde_json::Value::Bool(false),
+                ManifestCheck::Withheld => {
+                    value["manifest_check"] = "withheld".into();
+                    serde_json::Value::Null
+                }
+                ManifestCheck::Remembered => {
+                    value["manifest_check"] = "recovery-verdict".into();
+                    serde_json::Value::Bool(false)
+                }
+            };
             // R15-S6: a recovery that could not write the missing entry
             // blocks the finalize — said here in the same words.
             match complete_failure(&journal.finalize_id) {
@@ -3353,7 +3637,7 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
                 }
                 None => {
                     value["reason"] = why.into();
-                    value["blocks_finalize"] = false.into();
+                    value["blocks_finalize"] = blocks;
                 }
             }
             value
@@ -3389,7 +3673,9 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
             journal_path(case_dir).display()
         ));
     };
-    let status = status_value(case_dir, false, false);
+    // R18-S2 (P31): the CLI shows the FULL-hash assessment (the status
+    // path withholds manifests over 16 MiB).
+    let status = status_of(case_dir, assessment.clone());
     let mut out = format!(
         "finalize journal: {}\nstate: {}\n",
         journal_path(case_dir).display(),
@@ -3423,6 +3709,10 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
             if let Some(cmd) = status["dismiss_command_cmd"].as_str() {
                 out.push_str(&format!("  (cmd.exe: {cmd})\n"));
             }
+        } else if let Some(why) = status["command_unavailable_reason"].as_str() {
+            out.push_str(&format!(
+                "to move it aside (never deleted): frametrace finalize-journal <케이스 폴더> --dismiss ({why})\n"
+            ));
         }
         return Ok(out);
     }
@@ -3456,10 +3746,12 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
         // R14-S5: cleaned up first, as opening the case would.
         Assessment::Open(..) | Assessment::Finished { .. } | Assessment::Closed(..) => {
             let state: SharedState = Arc::new(Mutex::new(JobState::new()));
-            if let Some(recovery) = recover(case_dir, &state, crate::package::rename_retry_budget())
-            {
-                out.push_str(&format!("cleanup: {}\n", recovery.detail));
+            let detail = recover(case_dir, &state, crate::package::rename_retry_budget())
+                .map(|recovery| recovery.detail);
+            if let Some(detail) = &detail {
+                out.push_str(&format!("cleanup: {detail}\n"));
             }
+            push_logs(&mut out, &state, detail.as_deref());
             match assess(case_dir) {
                 None => {
                     out.push_str("저널이 정리되어 옮길 것이 없습니다.\n");
@@ -3546,22 +3838,60 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
 /// moves the journal and leaves the sign-off and package as they are; this
 /// is the way to actually clean an interrupted finalize up. A VERIFIED live
 /// writer (this program's folder and SHA-256) is refused: wait for it.
-pub(crate) fn cli_writer_gone(case_dir: &Path) -> Result<String, String> {
+///
+/// R18-S3: the second look (as if gone) must see the SAME journal as the
+/// first — finalize id and writer (pid, start time) — else nothing is
+/// done; and a writer verified as this program is refused there too.
+/// R18-S7: while a live process still matches the writer's pid and start
+/// time ([`writer_gone_needs_sure`]), `i_am_sure` is required. R18-S4: the
+/// recovery's warnings (`state.logs`) are printed at the end.
+pub(crate) fn cli_writer_gone(case_dir: &Path, i_am_sure: bool) -> Result<String, String> {
     let Some(assessment) = assess(case_dir) else {
         return Ok(format!(
             "finalize journal: none ({} does not exist)\n",
             journal_path(case_dir).display()
         ));
     };
-    if let Assessment::LiveWriter(journal) = &assessment {
-        return Err(format!(
+    let live_refusal = |journal: &FinalizeJournal| {
+        format!(
             "{} 저널의 작성자가 이 프로그램과 같은 실행 파일로 확인된 실행 중 프로세스여서 --writer-gone을 적용하지 않았습니다.",
             live_writer_text(journal)
+        )
+    };
+    if let Assessment::LiveWriter(journal) = &assessment {
+        return Err(live_refusal(journal));
+    }
+    let first = assessment_journal(&assessment).map(writer_key);
+    if let Assessment::UnverifiedWriter(journal) | Assessment::OtherAccount { journal, .. } =
+        &assessment
+        && writer_gone_needs_sure(journal)
+        && !i_am_sure
+    {
+        return Err(format!(
+            "저널에 적힌 작성자 pid {}와 시작 시각이 같은 프로세스가 아직 실행 중입니다 — 진행 중인 최종화일 수 있어 --writer-gone을 적용하지 않았습니다. 그 프로세스가 이 케이스의 FrameTrace 최종화가 아님을 직접 확인했다면 --writer-gone --i-am-sure로 다시 실행하십시오{}.",
+            journal.writer.pid,
+            writer_gone_command(case_dir, true)
+                .map(|command| format!(" (`{command}`)"))
+                .unwrap_or_else(|| format!(" ({COMMAND_UNAVAILABLE_REASON})"))
         ));
     }
+    #[cfg(test)]
+    BETWEEN_WRITER_GONE_LOOKS.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(case_dir);
+        }
+    });
     let Some(assumed) = assess_with(case_dir, true) else {
         return Ok("저널이 없어졌습니다 (그 사이에 정리됨).\n".to_string());
     };
+    if let Assessment::LiveWriter(journal) = &assumed {
+        return Err(live_refusal(journal));
+    }
+    if assessment_journal(&assumed).map(writer_key) != first {
+        return Err(
+            "처음 확인한 뒤 최종화 저널이 바뀌었습니다(최종화 ID 또는 작성자가 다름) — 아무것도 바꾸지 않았습니다. 상태를 다시 확인한 뒤 실행하십시오.".to_string(),
+        );
+    }
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     let recovery = recover_assessed(
         case_dir,
@@ -3576,8 +3906,8 @@ pub(crate) fn cli_writer_gone(case_dir: &Path) -> Result<String, String> {
     );
     match assess(case_dir) {
         None => out.push_str("저널이 정리되었습니다.\n"),
-        Some(_) => {
-            let status = status_value(case_dir, false, false);
+        Some(left) => {
+            let status = status_of(case_dir, left);
             out.push_str(&format!(
                 "journal kept: state {}{}\n",
                 status["state"].as_str().unwrap_or_default(),
@@ -3588,10 +3918,60 @@ pub(crate) fn cli_writer_gone(case_dir: &Path) -> Result<String, String> {
             ));
         }
     }
+    push_logs(&mut out, &state, Some(&recovery.detail));
     if recovery.blocking {
         return Err(format!(
             "{out}정리 뒤에도 확인할 것이 남았습니다 (위 내용 참고) — 다음 최종화는 막힙니다."
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// R18-S3 test hook: runs in [`cli_writer_gone`] between its first
+    /// look and the one as if the writer were gone (this thread only).
+    #[allow(clippy::type_complexity)]
+    pub(crate) static BETWEEN_WRITER_GONE_LOOKS: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// R18-S4: what a CLI recovery logged (`state.logs`: warnings such as a
+/// dropped local record, a rename retried) — R17's `--writer-gone`
+/// printed none of it. The lock is held only to take the lines.
+/// The recovery's own summary (`경고: {detail}`, already printed) is
+/// skipped.
+fn push_logs(out: &mut String, state: &SharedState, detail: Option<&str>) {
+    let logs = std::mem::take(&mut state_lock(state).logs);
+    let summary = detail.map(|detail| format!("경고: {detail}"));
+    for line in logs {
+        if summary.as_deref() != Some(line.as_str()) {
+            out.push_str(&format!("log: {line}\n"));
+        }
+    }
+}
+
+/// The journal an assessment judged (`None`: unreadable).
+fn assessment_journal(assessment: &Assessment) -> Option<&FinalizeJournal> {
+    match assessment {
+        Assessment::Unreadable(_) => None,
+        Assessment::OtherHost { journal, .. }
+        | Assessment::LiveWriter(journal)
+        | Assessment::UnverifiedWriter(journal)
+        | Assessment::OtherAccount { journal, .. }
+        | Assessment::Unpaired(journal, _)
+        | Assessment::Closed(journal, _)
+        | Assessment::Finished { journal, .. }
+        | Assessment::Open(journal, _) => Some(journal),
+    }
+}
+
+/// R18-S3: what the two looks of `--writer-gone` must agree on.
+fn writer_key(journal: &FinalizeJournal) -> (String, u32, Option<u64>, String) {
+    (
+        journal.finalize_id.clone(),
+        journal.writer.pid,
+        journal.writer.started_ms,
+        journal.signoff_sha256.clone(),
+    )
 }

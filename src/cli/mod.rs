@@ -201,6 +201,11 @@ pub enum Commands {
         /// journal. Refused while the writer is verified as this program
         #[arg(long, conflicts_with_all = ["dismiss", "force"])]
         writer_gone: bool,
+        /// With --writer-gone: required while a live process still matches
+        /// the writer's pid and start time — you confirmed it is not a
+        /// FrameTrace finalize of this case
+        #[arg(long = "i-am-sure", requires = "writer_gone")]
+        i_am_sure: bool,
     },
     /// Verify a package written by package-case: manifest.sha256 entries vs
     /// files, package-manifest.json, audit chains, database snapshot and
@@ -819,9 +824,15 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             dismiss,
             force,
             writer_gone,
+            i_am_sure,
         } => {
-            let text =
-                crate::serve::finalize_journal_command(&case_dir, dismiss, force, writer_gone)?;
+            let text = crate::serve::finalize_journal_command(
+                &case_dir,
+                dismiss,
+                force,
+                writer_gone,
+                i_am_sure,
+            )?;
             print!("{text}");
             Ok(())
         }

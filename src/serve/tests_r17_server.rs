@@ -467,14 +467,17 @@ fn r17_s2_writer_gone_runs_the_normal_recovery() {
             ] {
                 assert!(shown[key].is_null(), "{key}: {shown}");
             }
-            assert!(super::finalize_journal::cli_writer_gone(&case).is_err());
+            // R18-S3: refused even with --i-am-sure.
+            assert!(super::finalize_journal::cli_writer_gone(&case, true).is_err());
             // Unverified: waiting first, then the two commands.
             journal.writer_image_sha256 = Some("0".repeat(64));
             journal.write(&case).unwrap();
             let shown = parse(&api_status(&bound_state(&case)))["finalize_journal"].clone();
             assert_eq!(shown["in_progress_code"], "unverified-writer", "{shown}");
             let gone = shown["writer_gone_command"].as_str().unwrap();
-            assert!(gone.ends_with("--writer-gone"), "{gone}");
+            // R18-S7: the live process matches pid and start time.
+            assert!(gone.ends_with("--writer-gone --i-am-sure"), "{gone}");
+            assert_eq!(shown["writer_gone_i_am_sure"], true, "{shown}");
             assert!(shown["force_dismiss_command"].is_string(), "{shown}");
             if cfg!(windows) {
                 assert!(shown["writer_gone_command_cmd"].is_string(), "{shown}");
@@ -488,7 +491,11 @@ fn r17_s2_writer_gone_runs_the_normal_recovery() {
                 "{reason}"
             );
             assert!(reason.contains("review/signoff.json"), "{reason}");
-            let out = super::finalize_journal::cli_writer_gone(&case).unwrap();
+            // R18-S7: without --i-am-sure nothing is done.
+            let refused = super::finalize_journal::cli_writer_gone(&case, false).unwrap_err();
+            assert!(refused.contains("--i-am-sure"), "{refused}");
+            assert!(super::finalize_journal::journal_path(&case).exists());
+            let out = super::finalize_journal::cli_writer_gone(&case, true).unwrap();
             assert!(out.contains("--writer-gone"), "{out}");
             assert_eq!(
                 signoff_sha(&case),
@@ -624,7 +631,8 @@ fn r17_s9_status_withholds_large_manifests() {
         let shown = parse(&api_status(&state))["finalize_journal"].clone();
         assert_eq!(shown["state"], "completed-unrecorded", "{shown}");
         assert_eq!(shown["manifest_check"], "withheld", "{shown}");
-        assert_eq!(shown["blocks_finalize"], false, "{shown}");
+        // R18-S2 (P31): unknown, not "does not block".
+        assert!(shown["blocks_finalize"].is_null(), "{shown}");
         assert!(
             shown["reason"].as_str().unwrap().starts_with("확인 보류"),
             "{shown}"
@@ -644,7 +652,8 @@ fn r17_s9_status_withholds_large_manifests() {
 
 /// R17-S10: `cmd.exe` expands `%VAR%` inside double quotes and has no
 /// escape for it at its prompt — a case path holding `%` gets no
-/// `cmd.exe` form (the PowerShell one is single-quoted, never expanded).
+/// `cmd.exe` form. R18-S1 (P29): no PowerShell form either — `%` is not
+/// on the paste-safe whitelist.
 #[test]
 fn r17_s10_percent_paths_get_no_cmd_form() {
     let plain = Path::new("C:/cases/a b");
@@ -656,11 +665,9 @@ fn r17_s10_percent_paths_get_no_cmd_form() {
     for cmd in [
         super::finalize_journal::dismiss_command_cmd(percent),
         super::finalize_journal::force_dismiss_command_cmd(percent),
-        super::finalize_journal::writer_gone_command_cmd(percent),
+        super::finalize_journal::writer_gone_command_cmd(percent, false),
+        super::finalize_journal::dismiss_command(percent),
     ] {
         assert!(cmd.is_none(), "{cmd:?}");
     }
-    assert!(
-        super::finalize_journal::dismiss_command(percent).contains("'C:/cases/%USERPROFILE%x'")
-    );
 }
