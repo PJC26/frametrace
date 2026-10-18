@@ -1,0 +1,309 @@
+//! R18 I2 / I5 (P9): the anomaly lane's OWN withholding verdict — the
+//! rules the case report's anomaly section applies to the lane rows
+//! before the sign-off head is consulted:
+//!
+//! - `unusable-after`: an entry this PC cannot use after the newest usable
+//!   `anomaly-scan-run` marker (anywhere, when there is none) — it may be a
+//!   newer run's marker (R11-I2);
+//! - `unusable-in-run` (R18 I5): an entry this PC cannot use INSIDE the
+//!   newest completed run (after the previous usable marker, before its
+//!   own, and after the run's first entry or stamped with its
+//!   `scanned_unix`) — that run's candidates may be missing from what is
+//!   shown;
+//! - `repaired-after`: a usable `lane-repair` marker after it (R13 I2);
+//! - `newer-unmarked-run`: a run without a completion marker that is newer
+//!   than the newest completed run by position, span or time (R13 P16,
+//!   R14 P20, R15 I4), or — in a lane written by a marker-writing scanner —
+//!   no completed run at all (R14 I4).
+//!
+//! ONE function, [`anomaly_lane_withheld`], computes it from the very rows
+//! every reader receives (`LaneRows::values_with_trust`, each with its
+//! `trust` code): `/api/records-meta` and the review bundle export it as
+//! `logChains.anomaly.withheld`, the report's `auditChains.anomaly.withheld`
+//! carries it to the report script, which also computes the same rules
+//! itself and withholds when either says so (fail closed). The reason
+//! sentences are the report's, word for word.
+
+/// One reason the anomaly lane withholds its current result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnomalyWithheld {
+    /// Machine codes, in the report's order: `unusable-after`,
+    /// `unusable-in-run`, `repaired-after`, `newer-unmarked-run`.
+    pub codes: Vec<&'static str>,
+    /// The report's Korean sentences, one per code.
+    pub reasons: Vec<String>,
+}
+
+impl AnomalyWithheld {
+    /// `{"reason_code": <first code>, "codes": [...], "reason": "<sentences
+    /// joined by "; ">"}` — the `logChains.anomaly.withheld` object.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reason_code": self.codes.first(),
+            "codes": self.codes,
+            "reason": self.reasons.join("; "),
+        })
+    }
+}
+
+/// The `unusable-after` sentence (the report's text).
+pub const ANOMALY_UNUSABLE_AFTER_REASON: &str = "가장 최근 완료 실행의 완료 표식 뒤에 이 PC에서 인증할 수 없는 항목이 있어(더 새 실행의 완료 표식일 수 있음) 그 결과를 알 수 없습니다 (아래 \"인증 안 된 감사 항목\" 참조)";
+
+/// The `repaired-after` sentence (the report's text).
+pub const ANOMALY_REPAIRED_AFTER_REASON: &str = "마지막 완료 실행 뒤에 레인 수리(lane-repair) 표식이 있어 — 잘린 꼬리에 더 새 실행이 있었을 수 있어 — 최신 실행을 알 수 없습니다 (이상 징후 검사를 다시 실행하십시오)";
+
+/// R18 I5: the start of the `unusable-in-run` sentence.
+pub const ANOMALY_UNUSABLE_IN_RUN_NOTE: &str =
+    "가장 최근 완료 실행의 기록 범위 안에 이 PC에서 인증할 수 없는 항목";
+
+fn unusable_in_run_reason(count: usize) -> String {
+    format!(
+        "{ANOMALY_UNUSABLE_IN_RUN_NOTE} {count}개 — 그 실행의 후보가 빠졌을 수 있어 그 결과를 알 수 없습니다 (아래 \"인증 안 된 감사 항목\" 참조)"
+    )
+}
+
+fn newer_run_reason(count: usize, completed: bool) -> String {
+    if completed {
+        format!(
+            "표식 없는 더 새 실행 있음 — 마지막 완료 실행 뒤에 있거나 그 뒤에 시작한 완료 표식 없는 실행 {count}회: 완료 표식이 지워졌거나 실행이 중단됐을 수 있습니다 (이상 징후 검사를 다시 실행하십시오)"
+        )
+    } else {
+        format!(
+            "표식 없는 더 새 실행 있음 — 완료된 실행이 없고 완료 표식 없는 실행 {count}회만 있습니다: 완료 표식이 지워졌거나 실행이 중단됐을 수 있어 결과가 아닙니다 (이상 징후 검사를 다시 실행하십시오)"
+        )
+    }
+}
+
+/// The report script's `usableEntry`: no `trust` (an unclassified caller),
+/// `auth` or `sc`.
+fn usable(item: &serde_json::Value) -> bool {
+    match item.get("trust") {
+        None => true,
+        Some(trust) => matches!(trust.as_str(), Some("auth" | "sc")),
+    }
+}
+
+fn event(item: &serde_json::Value) -> Option<&str> {
+    item.get("event").and_then(|v| v.as_str())
+}
+
+/// JavaScript `a === b` for two (possibly missing) JSON field values of
+/// two different entries (objects / arrays are never `===`).
+fn js_strict_eq(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (None, None) => true,
+        (Some(Value::Null), Some(Value::Null)) => true,
+        (Some(Value::Bool(a)), Some(Value::Bool(b))) => a == b,
+        (Some(Value::Number(a)), Some(Value::Number(b))) => a.as_f64() == b.as_f64(),
+        (Some(Value::String(a)), Some(Value::String(b))) => a == b,
+        _ => false,
+    }
+}
+
+/// A finite JSON number (JavaScript `Number.isFinite`).
+fn finite(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(|v| v.as_f64())
+}
+
+/// One run of the report's grouping (`anomalyRuns`).
+struct Run {
+    /// Lane position of its `anomaly-scan-run` marker (`None`: unmarked).
+    marker: Option<usize>,
+    /// `ts` when it is a finite number.
+    ts: Option<f64>,
+    /// Lane positions of its entries.
+    entries: Vec<usize>,
+}
+
+impl Run {
+    fn first(&self) -> f64 {
+        self.entries
+            .iter()
+            .chain(self.marker.iter())
+            .map(|at| *at as f64)
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    fn last(&self) -> f64 {
+        self.entries
+            .iter()
+            .chain(self.marker.iter())
+            .map(|at| *at as f64)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+}
+
+/// The report's `anomalyRuns` grouping over the usable non-repair entries
+/// (`anomalyLog`), with lane positions into `all`.
+fn group_runs(all: &[serde_json::Value], log: &[usize]) -> Vec<Run> {
+    let mut runs = Vec::new();
+    let flush_unmarked = |runs: &mut Vec<Run>, items: &[usize]| {
+        let mut by_time: Vec<(Option<f64>, Vec<usize>)> = Vec::new();
+        for &at in items {
+            let key = finite(all[at].get("scanned_unix"));
+            match by_time.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, entries)) => entries.push(at),
+                None => by_time.push((key, vec![at])),
+            }
+        }
+        for (ts, entries) in by_time {
+            runs.push(Run {
+                marker: None,
+                ts,
+                entries,
+            });
+        }
+    };
+    let mut pending: Vec<usize> = Vec::new();
+    for &at in log {
+        let item = &all[at];
+        if event(item) == Some("anomaly-scan-run") {
+            let stamp = item.get("scanned_unix");
+            let (same, other): (Vec<usize>, Vec<usize>) = pending
+                .iter()
+                .partition(|entry| js_strict_eq(all[**entry].get("scanned_unix"), stamp));
+            flush_unmarked(&mut runs, &other);
+            runs.push(Run {
+                marker: Some(at),
+                ts: finite(stamp),
+                entries: same,
+            });
+            pending.clear();
+        } else {
+            pending.push(at);
+        }
+    }
+    flush_unmarked(&mut runs, &pending);
+    runs
+}
+
+/// R18 I2 / I5 (P9): the anomaly lane's own withholding verdict from its
+/// rows as every reader receives them (`values_with_trust`, lane order) —
+/// `None` when the lane itself does not withhold (the sign-off head is a
+/// separate check, `logChains.anomaly.head`).
+pub fn anomaly_lane_withheld(all: &[serde_json::Value]) -> Option<AnomalyWithheld> {
+    let is_marker = |item: &serde_json::Value| event(item) == Some("anomaly-scan-run");
+    let is_repair = |item: &serde_json::Value| event(item) == Some("lane-repair") && usable(item);
+    let usable_markers: Vec<usize> = (0..all.len())
+        .filter(|at| is_marker(&all[*at]) && usable(&all[*at]))
+        .collect();
+    let last_marker = usable_markers.last().copied();
+    let after = |at: usize| last_marker.is_none_or(|marker| at > marker);
+    let mut out = AnomalyWithheld {
+        codes: Vec::new(),
+        reasons: Vec::new(),
+    };
+    if (0..all.len()).any(|at| after(at) && !usable(&all[at])) {
+        out.codes.push("unusable-after");
+        out.reasons.push(ANOMALY_UNUSABLE_AFTER_REASON.to_string());
+    }
+    let log: Vec<usize> = (0..all.len())
+        .filter(|at| usable(&all[*at]) && !is_repair(&all[*at]))
+        .collect();
+    let runs = group_runs(all, &log);
+    let latest = runs.iter().rposition(|run| run.marker.is_some());
+    // R18 I5: inside the newest completed run — between the previous usable
+    // marker and its own, and after its first entry or stamped with its
+    // `scanned_unix` (a stripped HMAC keeps the content; an older line
+    // appended before the run started is not the run's).
+    if let (Some(marker), Some(latest_at)) = (last_marker, latest) {
+        let start = usable_markers
+            .len()
+            .checked_sub(2)
+            .map_or(0, |prev| usable_markers[prev] + 1);
+        let first = runs[latest_at].first();
+        let stamp = all[marker].get("scanned_unix");
+        let inside = (start..marker)
+            .filter(|at| {
+                !usable(&all[*at])
+                    && (*at as f64 > first || js_strict_eq(all[*at].get("scanned_unix"), stamp))
+            })
+            .count();
+        if inside > 0 {
+            out.codes.push("unusable-in-run");
+            out.reasons.push(unusable_in_run_reason(inside));
+        }
+    }
+    if (0..all.len()).any(|at| after(at) && is_repair(&all[at])) {
+        out.codes.push("repaired-after");
+        out.reasons.push(ANOMALY_REPAIRED_AFTER_REASON.to_string());
+    }
+    let marked_lane = log
+        .iter()
+        .any(|at| all[*at].get("schema_version").is_some());
+    let newer = match latest {
+        Some(latest_at) => {
+            let latest = &runs[latest_at];
+            runs.iter()
+                .enumerate()
+                .filter(|(index, run)| {
+                    run.marker.is_none()
+                        && (*index > latest_at
+                            || run.first() > latest.first()
+                            || matches!((run.ts, latest.ts), (Some(ts), Some(latest_ts))
+                                if ts > latest_ts && run.last() > latest.first()))
+                })
+                .count()
+        }
+        None if marked_lane => runs.len(),
+        None => 0,
+    };
+    if newer > 0 {
+        out.codes.push("newer-unmarked-run");
+        out.reasons.push(newer_run_reason(newer, latest.is_some()));
+    }
+    (!out.codes.is_empty()).then_some(out)
+}
+
+/// [`anomaly_lane_withheld`] as JSON: the object, or `null`.
+pub fn anomaly_lane_withheld_json(all: &[serde_json::Value]) -> serde_json::Value {
+    anomaly_lane_withheld(all).map_or(serde_json::Value::Null, |w| w.to_json())
+}
+
+/// [`anomaly_lane_withheld_json`] for `root`'s anomaly lane read here
+/// (`unreadable` lane: withheld — nothing can be said about its result).
+pub fn anomaly_withheld_json(root: &std::path::Path) -> serde_json::Value {
+    match crate::audit::read_lane_rows(&root.join(super::ANOMALY_LOG_REL_PATH)) {
+        Ok(lane) => anomaly_lane_withheld_json(&lane.values_with_trust()),
+        Err(err) => serde_json::json!({
+            "reason_code": "unreadable",
+            "codes": ["unreadable"],
+            "reason": format!("이상 징후 레인을 읽지 못해 현재 결과를 알 수 없습니다: {err}"),
+        }),
+    }
+}
+
+/// R18 I6: the review bundle's `logChains` after redaction. A redacted
+/// text that is no longer one JSON object with an `anomaly.head` object
+/// (the redactor rewrote it into something unparsable) is NOT dropped
+/// silently (R17: the field vanished and so did the viewer's banner): it
+/// becomes `{"anomaly":{"head":{"status":"unknown","reason_code":
+/// "bundle-unreadable",…},"withheld":{…"bundle-unreadable"…}}}`.
+pub fn bundle_log_chains_json(redacted: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(redacted.trim())
+        .ok()
+        .filter(|value| value["anomaly"]["head"].is_object());
+    match parsed {
+        Some(value) => value.to_string(),
+        None => {
+            let why = "번들의 이상 징후 머리 판정을 읽을 수 없음(리댁션 뒤 형식이 깨짐) — 현재 결과를 확인할 수 없음 (make-review를 다시 실행하십시오)";
+            serde_json::json!({
+                "anomaly": {
+                    "head": {
+                        "status": "unknown",
+                        "reason_code": "bundle-unreadable",
+                        "withhold_reason": why,
+                        "detail": "the bundle's anomaly head verdict could not be read after redaction",
+                    },
+                    "withheld": {
+                        "reason_code": "bundle-unreadable",
+                        "codes": ["bundle-unreadable"],
+                        "reason": why,
+                    },
+                },
+            })
+            .to_string()
+        }
+    }
+}

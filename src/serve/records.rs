@@ -744,11 +744,27 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // — the same check the report's anomaly "현재 결과" uses
     // (`{status, reason_code, withhold_reason, detail}`); the viewer's
     // anomaly badge withholds / warns on it.
+    // R18 I2 (P9, track U): `withheld` — the report's lane rules (an entry
+    // this PC cannot use after the newest usable marker or inside its run,
+    // a repair after it, an unmarked newer run), computed by the one shared
+    // function from the very `anomalyLog` rows sent here: `null`, or
+    // `{reason_code, codes, reason}`. A P7-superseded finding is then never
+    // silently missing from a "current" count.
+    let withheld = if log_chains
+        .get("anomalyLog")
+        .is_some_and(|chain| chain["status"] == "unreadable")
+    {
+        // No rows to judge: nothing can be said about the current result.
+        crate::report::anomaly_withheld_json(&case_dir)
+    } else {
+        crate::report::anomaly_lane_withheld_json(&anomaly_log)
+    };
     log_chains.insert(
         "anomaly".to_string(),
         serde_json::json!({
             "head": crate::report::anomaly_head_check(&case_dir)
                 .to_json_in(crate::report::HeadLane::Anomaly),
+            "withheld": withheld,
         }),
     );
     let body = serde_json::json!({
@@ -982,3 +998,7 @@ pub(crate) fn newest_tsk_inspection(case_dir: &Path) -> Option<(PathBuf, u64)> {
     let offset = value.get("partition_offset")?.as_u64()?;
     Some((PathBuf::from(image), offset))
 }
+
+#[cfg(test)]
+#[path = "tests_r18_records.rs"]
+mod tests_r18_records;

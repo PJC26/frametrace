@@ -1507,7 +1507,8 @@ pub fn append_chained_jsonl_keyed(
 /// touching other lanes, so a multi-lane write does not stop half done.
 /// R17 I4: the lane is opened for APPEND (as the append opens it, without
 /// creating it), so a read-only lane file or a folder that refuses writes
-/// is refused here too (R16 opened it read-only).
+/// is refused here too (R16 opened it read-only). R18 I3: read under an
+/// exclusive lock on that handle, like the append itself.
 pub fn check_appendable(path: &Path) -> Result<(), String> {
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
@@ -1523,9 +1524,21 @@ pub fn check_appendable(path: &Path) -> Result<(), String> {
             ));
         }
     };
-    last_committed_line(&mut file)
+    // R18 I3: the last line is read under the append's own exclusive lock,
+    // through the SAME handle (Windows locks are mandatory: a second handle
+    // would be refused) — an append in progress is waited for, never read
+    // half written and called torn.
+    file.lock_exclusive().map_err(|err| {
+        format!(
+            "failed to lock audit log {} (another worker may be writing): {err}",
+            path.display()
+        )
+    })?;
+    let result = last_committed_line(&mut file)
         .map(|_| ())
-        .map_err(|err| format!("audit log {} cannot be appended to: {err}", path.display()))
+        .map_err(|err| format!("audit log {} cannot be appended to: {err}", path.display()));
+    let _ = file.unlock();
+    result
 }
 
 /// The bytes of the last non-blank line of `file`, read backwards from the
@@ -4353,3 +4366,7 @@ mod tests_r16;
 #[cfg(test)]
 #[path = "tests_audit_r17.rs"]
 mod tests_r17;
+
+#[cfg(test)]
+#[path = "tests_audit_r18.rs"]
+mod tests_r18;

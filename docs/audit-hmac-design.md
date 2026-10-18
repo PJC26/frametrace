@@ -770,6 +770,61 @@ a cause ("not tampering", "older build").
   candidates with their own `carved_unix`): anyone can rewrite such a lane
   with any time. `false` whenever `time_unaudited` is true.
 
+### One withholding verdict for every reader; a version mix needs position (R18)
+
+- **I1 — `mixed-version` needs the marker AFTER the head (P27).**
+  Reviewer PoC-A: an older build's usable marker without `scan_id`, then
+  an R17 scan (marker with `scan_id` + v2 head); stripping only the newest
+  marker's HMAC made the marker selection fall back to the old marker and
+  R17 said `mixed-version` ("… 다시 스캔하면 해소"). Now `anomaly_head_check`
+  also passes the marker's lane index and whether a line this PC cannot
+  use follows it. A usable marker without `scan_id` is `mixed-version` only
+  when it lies past the newest usable v2 head's anchored range
+  (`index >= entries`) and no unusable anomaly-lane line follows it;
+  otherwise `unknown` / `marker-unusable` (`HEAD_MARKER_UNUSABLE_NOTE`;
+  the sentence says which: "그 머리가 기록한 범위 안 — 그 머리의 스캔보다
+  오래된 실행" or "뒤에 이 PC에서 쓸 수 없는 줄이 있음"; never the rescan
+  note). A malformed newest v2 anchor counts as "inside" (fail closed).
+- **I2 / I5 — the lane's own P9 verdict, one function.**
+  `report::anomaly_lane_withheld(values)` takes the anomaly lane rows
+  exactly as every reader receives them (`LaneRows::values_with_trust`,
+  `trust` codes) and applies the report's rules: `unusable-after` (an
+  entry not `auth`/`sc` after the newest usable `anomaly-scan-run`
+  marker, anywhere without one), **`unusable-in-run`** (R18 I5: such an
+  entry between the previous usable marker and the newest one, after the
+  newest run's first entry or stamped with its `scanned_unix` — a
+  legacy lane without a head showed the run as "현재 결과" with the
+  finding missing; an older line appended before the run started is not
+  the run's, so a rescan clears it), `repaired-after`, `newer-unmarked-run`
+  (R13 P16 / R14 P20 / R15 I4 / R14 I4 — position, span, time; no completed
+  run in a marker-written lane). It returns `{reason_code, codes, reason}`
+  (reason = the report's sentences joined by "; ") or `null`.
+  Reviewer PoC-B (server side): a keyed re-hash finding, then ONE
+  unkeyed `{"event":"anomaly-scan","kind":"none","selector":"vid_a"}`
+  line — P7 makes the real finding `unauth`, the head stays `intact`, and
+  the viewer counted nothing. Now `/api/records-meta` and
+  `review/data-bundle.js` carry `logChains.anomaly.withheld` (computed
+  from the very `anomalyLog` rows sent; an unreadable lane →
+  `reason_code: "unreadable"`), and the report's
+  `auditChains.anomaly.withheld` carries it to the report script, which
+  also computes the same rules itself: withheld when either says so. A
+  test renders the report with no server verdict and checks the script's
+  own verdict and sentences equal the function's on eight lane shapes.
+- **I3.** `audit::check_appendable` takes `lock_exclusive` on its handle
+  before reading the last line (the append's lock, same handle — Windows
+  locks are mandatory), so an append in progress is waited for, not
+  called a torn lane.
+- **I4.** The `unusable-line` sentence quotes only event names this build
+  writes to the sign-off lane (`KNOWN_SIGNOFF_EVENTS`: `signoff`,
+  `signoff-abandoned`, `finalize-begin`, `finalize-complete`,
+  `finalize-resolved`, `lane-repair`); any other (unauthenticated) name is
+  only counted ("알려지지 않은 이름 N개(표시하지 않음)").
+- **I6.** `report::bundle_log_chains_json`: the bundle's redacted
+  `logChains` must still parse as an object with an `anomaly.head` object;
+  otherwise it becomes `head: {status: "unknown", reason_code:
+  "bundle-unreadable", …}` and `withheld: {reason_code:
+  "bundle-unreadable", …}` (R17 dropped the field and the banner with it).
+
 **Implementation notes (what shipped):**
 
 - `src/hmac.rs` — HMAC-SHA-256 hand-assembled over the existing `sha2`

@@ -321,8 +321,10 @@ const anomalyPosition = new Map(anomalyAll.map((item, at) => [item, at]));
 // R11-I2 (P9): an anomaly entry this PC cannot use AFTER the newest usable
 // run marker (e.g. the newest run's marker HMAC stripped) means the newest
 // run's outcome is unknown — no older run stands in as "current".
-const lastUsableAnomalyMarker = anomalyAll.map(item => item?.event === "anomaly-scan-run" && usableEntry(item)).lastIndexOf(true);
+const usableAnomalyMarkers = anomalyAll.map((item, index) => item?.event === "anomaly-scan-run" && usableEntry(item) ? index : -1).filter(index => index >= 0);
+const lastUsableAnomalyMarker = usableAnomalyMarkers.length ? usableAnomalyMarkers[usableAnomalyMarkers.length - 1] : -1;
 const anomalyUnusableAfter = anomalyAll.some((item, index) => index > lastUsableAnomalyMarker && !usableEntry(item));
+const previousUsableAnomalyMarker = usableAnomalyMarkers.length > 1 ? usableAnomalyMarkers[usableAnomalyMarkers.length - 2] : -1;
 // R13 I2: a repair marker after it — the cut tail may have held a newer run.
 const anomalyRepairedAfter = anomalyAll.some((item, index) => index > lastUsableAnomalyMarker && isLaneRepair(item));
 const batchLog = usableLog("batch", {batch_lines});
@@ -669,6 +671,12 @@ const anomalyClockAhead = run => Number.isFinite(run.ts) && run.ts > Date.now() 
 const anomalyHead = auditChains && auditChains.anomaly && typeof auditChains.anomaly.head === "object" ? auditChains.anomaly.head : null;
 const anomalyHeadReason = anomalyHead && typeof anomalyHead.withhold_reason === "string" ? anomalyHead.withhold_reason : "";
 const latestAnomalyRun = anomalyRuns[latestCompleted] || null;
+// R18 I5: an entry this PC cannot use INSIDE the newest completed run —
+// between the previous usable marker and its own, and after the run's
+// first entry or stamped with its scanned_unix (a stripped HMAC keeps the
+// content) — that run's candidates may be missing, head or no head.
+const anomalyUnusableInRun = latestAnomalyRun ? anomalyAll.filter((item, index) => index > previousUsableAnomalyMarker && index < lastUsableAnomalyMarker && !usableEntry(item)
+  && (index > anomalyRunFirst(latestAnomalyRun) || item.scanned_unix === latestAnomalyRun.run.scanned_unix)).length : 0;
 // R14 I4: no completed run at all in a lane written by a marker-writing
 // scanner (its entries carry schema_version — every scanner since run
 // markers exist): every marker may have been deleted, so the last unmarked
@@ -681,11 +689,19 @@ const newerAnomalyRuns = latestAnomalyRun
       || (Number.isFinite(run.ts) && Number.isFinite(latestAnomalyRun.ts) && run.ts > latestAnomalyRun.ts
         && anomalyRunLast(run) > anomalyRunFirst(latestAnomalyRun))))
   : anomalyMarkedLane ? anomalyRuns.slice() : [];
-const anomalyWithheldReasons = [
+// R18 I2: the same lane rules computed by the server
+// (`report::anomaly_lane_withheld`, also `/api/records-meta` and the
+// bundle's `logChains.anomaly.withheld`) — withheld when either says so.
+const anomalyLaneVerdict = auditChains && auditChains.anomaly && auditChains.anomaly.withheld && typeof auditChains.anomaly.withheld === "object" && typeof auditChains.anomaly.withheld.reason === "string" ? auditChains.anomaly.withheld : null;
+const anomalyLaneReasons = [
   anomalyUnusableAfter ? "가장 최근 완료 실행의 완료 표식 뒤에 이 PC에서 인증할 수 없는 항목이 있어(더 새 실행의 완료 표식일 수 있음) 그 결과를 알 수 없습니다 (아래 \"인증 안 된 감사 항목\" 참조)" : "",
+  anomalyUnusableInRun ? `가장 최근 완료 실행의 기록 범위 안에 이 PC에서 인증할 수 없는 항목 ${{anomalyUnusableInRun}}개 — 그 실행의 후보가 빠졌을 수 있어 그 결과를 알 수 없습니다 (아래 "인증 안 된 감사 항목" 참조)` : "",
   anomalyRepairedAfter ? "마지막 완료 실행 뒤에 레인 수리(lane-repair) 표식이 있어 — 잘린 꼬리에 더 새 실행이 있었을 수 있어 — 최신 실행을 알 수 없습니다 (이상 징후 검사를 다시 실행하십시오)" : "",
   newerAnomalyRuns.length && latestAnomalyRun ? `표식 없는 더 새 실행 있음 — 마지막 완료 실행 뒤에 있거나 그 뒤에 시작한 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회: 완료 표식이 지워졌거나 실행이 중단됐을 수 있습니다 (이상 징후 검사를 다시 실행하십시오)` : "",
   newerAnomalyRuns.length && !latestAnomalyRun ? `표식 없는 더 새 실행 있음 — 완료된 실행이 없고 완료 표식 없는 실행 ${{newerAnomalyRuns.length}}회만 있습니다: 완료 표식이 지워졌거나 실행이 중단됐을 수 있어 결과가 아닙니다 (이상 징후 검사를 다시 실행하십시오)` : "",
+].filter(Boolean);
+const anomalyWithheldReasons = [
+  ...(anomalyLaneReasons.length ? anomalyLaneReasons : anomalyLaneVerdict ? [anomalyLaneVerdict.reason] : []),
   anomalyHeadReason,
 ].filter(Boolean);
 const currentAnomalyIndex = anomalyWithheldReasons.length ? -1 : latestCompleted >= 0 ? latestCompleted : anomalyRuns.length - 1;
@@ -2932,8 +2948,18 @@ pub use hash_verify_head::{
     ANOMALY_LOG_REL_PATH, HASH_VERIFY_HEAD_EVENT, HASH_VERIFY_HEAD_TRUNCATED,
     HASH_VERIFY_MARKER_HEAD_FIELD, HEAD_MARKER_UNUSABLE_NOTE, HEAD_MIXED_VERSION_NOTE,
     HEAD_OTHER_EVENT_NOTE, HEAD_OTHER_PC_NOTE, HEAD_RESCAN_NOTE, HEAD_SCAN_MISMATCH_NOTE,
-    HEAD_SCHEMA_VERSION, HashVerifyHeadCheck, HeadLane, anomaly_head_check, hash_verify_head_check,
-    lane_head_check, record_scan_head,
+    HEAD_SCHEMA_VERSION, HashVerifyHeadCheck, HeadLane, KNOWN_SIGNOFF_EVENTS, anomaly_head_check,
+    hash_verify_head_check, lane_head_check, record_scan_head,
+};
+
+// R18 I2 / I5 / I6 (track I): the anomaly lane's own withholding verdict,
+// shared by the report, `/api/records-meta` and the review bundle.
+#[path = "report_anomaly_withheld.rs"]
+mod anomaly_withheld;
+pub use anomaly_withheld::{
+    ANOMALY_REPAIRED_AFTER_REASON, ANOMALY_UNUSABLE_AFTER_REASON, ANOMALY_UNUSABLE_IN_RUN_NOTE,
+    AnomalyWithheld, anomaly_lane_withheld, anomaly_lane_withheld_json, anomaly_withheld_json,
+    bundle_log_chains_json,
 };
 
 /// A JSON array literal; anything else (empty input, garbage) is `[]`.

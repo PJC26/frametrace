@@ -25,6 +25,11 @@
 //! — no usable marker is `marker-unusable`; unauthenticated content is
 //! never a reason to name a cause.
 //!
+//! R18 I1: that marker must also lie after the newest v2 head's anchored
+//! range with no unusable line after it — an older marker the selection
+//! fell back to is `marker-unusable`. I4: only known sign-off event names
+//! are quoted in a reason.
+//!
 //! Kept apart from the finalize pairing code in `report.rs` (track S).
 
 use std::path::Path;
@@ -315,6 +320,37 @@ fn other_event_line(row: &crate::audit::LaneRow) -> bool {
         .is_some_and(|event| event != HASH_VERIFY_HEAD_EVENT)
 }
 
+/// R18 I4: the sign-off-lane event names this build writes — the only
+/// unauthenticated `event` strings a reason sentence may quote.
+pub const KNOWN_SIGNOFF_EVENTS: &[&str] = &[
+    "signoff",
+    "signoff-abandoned",
+    "finalize-begin",
+    "finalize-complete",
+    "finalize-resolved",
+    "lane-repair",
+];
+
+/// R18 I4: the "적힌 event" part of the `unusable-line` sentence — known
+/// names ([`KNOWN_SIGNOFF_EVENTS`]) quoted, any other name only counted
+/// (unauthenticated text is never embedded in a reason).
+fn quoted_event_names(events: &std::collections::BTreeSet<&str>) -> String {
+    let known: Vec<&str> = events
+        .iter()
+        .copied()
+        .filter(|event| KNOWN_SIGNOFF_EVENTS.contains(event))
+        .collect();
+    let other = events.len() - known.len();
+    match (known.is_empty(), other) {
+        (false, 0) => format!("적힌 event: {}", known.join(", ")),
+        (false, other) => format!(
+            "적힌 event: {} 외 알려지지 않은 이름 {other}개(표시하지 않음)",
+            known.join(", ")
+        ),
+        (true, other) => format!("적힌 event는 알려지지 않은 이름 {other}개(표시하지 않음)"),
+    }
+}
+
 /// R16 I4: what resolves an `unknown` head on this PC.
 pub const HEAD_RESCAN_NOTE: &str = "이 PC에서 다시 스캔하면 새 머리가 기록돼 해소";
 
@@ -352,11 +388,11 @@ fn unusable_unknown(
             .iter()
             .filter_map(|row| row.value.get("event").and_then(|v| v.as_str()))
             .collect();
-        let events = events.into_iter().collect::<Vec<_>>().join(", ");
+        let events = quoted_event_names(&events);
         return HashVerifyHeadCheck::Unknown {
             code: "unusable-line",
             why: format!(
-                "{HEAD_OTHER_EVENT_NOTE} — 서명 감사 레인의 {where_} 이 PC에서 인증할 수 없는 줄 {count}개(적힌 event: {events}): 내용이 인증되지 않아 머리인지 아닌지·누가 왜 썼는지 판단하지 않으며 현재 결과를 보류함 ({HEAD_RESCAN_NOTE})"
+                "{HEAD_OTHER_EVENT_NOTE} — 서명 감사 레인의 {where_} 이 PC에서 인증할 수 없는 줄 {count}개({events}): 내용이 인증되지 않아 머리인지 아닌지·누가 왜 썼는지 판단하지 않으며 현재 결과를 보류함 ({HEAD_RESCAN_NOTE})"
             ),
         };
     }
@@ -420,7 +456,8 @@ pub fn anomaly_head_check(root: &Path) -> HashVerifyHeadCheck {
     });
     // R17 I1 (P27): whether a USABLE marker exists decides between an
     // older build's run (`mixed-version`) and a marker this PC cannot use
-    // (`marker-unusable` — possibly stripped).
+    // (`marker-unusable` — possibly stripped). R18 I1: where it sits, and
+    // whether a line this PC cannot use follows it, too.
     lane_head_check_for(
         root,
         HeadLane::Anomaly,
@@ -428,6 +465,9 @@ pub fn anomaly_head_check(root: &Path) -> HashVerifyHeadCheck {
             id: scan_id.as_deref(),
             wants_head: wants,
             usable_marker: marker.is_some(),
+            marker_index: marker.map(|row| row.index),
+            unusable_after_marker: marker
+                .is_some_and(|marker| lane.unusable().any(|row| row.index > marker.index)),
         },
     )
 }
@@ -443,6 +483,10 @@ struct ResultRun<'a> {
     /// The lane holds a usable completion marker at all (`id` may still be
     /// `None`: an older build's marker without `scan_id`).
     usable_marker: bool,
+    /// R18 I1: the lane index of that marker.
+    marker_index: Option<usize>,
+    /// R18 I1: the result lane holds a line this PC cannot use after it.
+    unusable_after_marker: bool,
 }
 
 /// R16 P26: a usable head's anchor for `lane` — `Ok(Some((entries,
@@ -515,6 +559,8 @@ pub fn lane_head_check(
             id: result_id,
             wants_head: result_marker_wants_head,
             usable_marker: result_id.is_some(),
+            marker_index: None,
+            unusable_after_marker: false,
         },
     )
 }
@@ -718,7 +764,9 @@ fn lane_head_check_for(root: &Path, lane: HeadLane, result: ResultRun<'_>) -> Ha
             };
         }
         _ => {
-            if lane == HeadLane::Anomaly && heads.iter().any(|row| is_v2_head(&row.value)) {
+            if lane == HeadLane::Anomaly
+                && let Some(newest_v2) = heads.iter().rev().find(|row| is_v2_head(&row.value))
+            {
                 // R17 I1 (P27): an older build's run is a USABLE marker
                 // without `scan_id`; no usable marker at all while a v2 head
                 // anchors the lane is a marker removed or not authenticated
@@ -730,6 +778,44 @@ fn lane_head_check_for(root: &Path, lane: HeadLane, result: ResultRun<'_>) -> Ha
                             "{HEAD_MARKER_UNUSABLE_NOTE} — 서명 감사 레인에 R15 형식 {head_word}가 있는데 이상 징후 레인에 이 PC에서 쓸 수 있는 완료 표식(anomaly-scan-run)이 없음: 완료 표식이 지워졌거나 HMAC이 제거됐거나 인증되지 않음(변조 가능성 — 버전 혼재로 보지 않음) — 어느 실행이 현재 결과인지 확인할 수 없음"
                         ),
                     };
+                }
+                // R18 I1 (P27): a usable marker without `scan_id` is an
+                // older build's run AFTER the newest v2 head only — it lies
+                // past that head's anchored range and no line this PC
+                // cannot use follows it. One inside the range is OLDER than
+                // the head's own scan, whose marker is then gone or not
+                // usable here (R17 fell back to it and said
+                // `mixed-version`: the reviewer's PoC-A); a line this PC
+                // cannot use after it may be a newer marker.
+                if result_id.is_none() {
+                    // A malformed newest v2 anchor: fail closed (inside).
+                    let anchored = head_anchor(&newest_v2.value, lane)
+                        .ok()
+                        .flatten()
+                        .map(|(entries, _)| entries);
+                    let at = result.marker_index.unwrap_or(0);
+                    let inside = anchored.is_none_or(|entries| (at as u64) < entries);
+                    if inside || result.unusable_after_marker {
+                        let place = if inside {
+                            format!(
+                                "scan_id 없는 완료 표식(이상 징후 레인 {}번째 줄)은 그 머리가 기록한 범위(항목 {}개) 안 — 그 머리의 스캔보다 오래된 실행이라 현재 결과가 아님",
+                                at + 1,
+                                anchored.map_or_else(|| "?".to_string(), |e| e.to_string())
+                            )
+                        } else {
+                            format!(
+                                "scan_id 없는 완료 표식(이상 징후 레인 {}번째 줄) 뒤에 이 PC에서 쓸 수 없는 줄이 있음 — 더 새 완료 표식일 수 있음",
+                                at + 1
+                            )
+                        };
+                        return HashVerifyHeadCheck::Unknown {
+                            code: "marker-unusable",
+                            why: format!(
+                                "{HEAD_MARKER_UNUSABLE_NOTE} — 서명 감사 레인의 R15 형식 {head_word}(서명 감사 레인 {}번째 줄)의 스캔 완료 표식(anomaly-scan-run)을 이 PC에서 쓸 수 없음; {place}: 완료 표식이 지워졌거나 HMAC이 제거됐거나 인증되지 않음(변조 가능성 — 버전 혼재로 보지 않음) — 어느 실행이 현재 결과인지 확인할 수 없음",
+                                newest_v2.index + 1
+                            ),
+                        };
+                    }
                 }
                 return HashVerifyHeadCheck::Unknown {
                     code: "mixed-version",

@@ -405,15 +405,18 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     // the workstation — `logChains.anomaly.head`, the very object
     // `/api/records-meta` and the report's `auditChains.anomaly.head`
     // carry (as of this make-review; redacted like the rest).
-    let log_chains = redact(
+    // R18 I2: plus the lane's own P9 verdict (`withheld`); I6: a redacted
+    // text that no longer parses becomes an explicit "bundle-unreadable".
+    let log_chains = crate::report::bundle_log_chains_json(&redact(
         &serde_json::json!({
             "anomaly": {
                 "head": crate::report::anomaly_head_check(case_dir)
                     .to_json_in(crate::report::HeadLane::Anomaly),
+                "withheld": crate::report::anomaly_withheld_json(case_dir),
             },
         })
         .to_string(),
-    );
+    ));
     // The viewer page stays slim; the (potentially huge) record payload
     // lives in data-bundle.js beside it. Standalone file:// use loads the
     // bundle through a script tag; workstation serving pages the same
@@ -1274,6 +1277,9 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
         if *name == "anomaly" {
             entry["head"] = crate::report::anomaly_head_check(case_dir)
                 .to_json_in(crate::report::HeadLane::Anomaly);
+            // R18 I2: the lane's own P9 verdict (one Rust function; the
+            // report script withholds when it or its own rules say so).
+            entry["withheld"] = crate::report::anomaly_withheld_json(case_dir);
         }
         map.insert((*name).to_string(), entry);
     }
