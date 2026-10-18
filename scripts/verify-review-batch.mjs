@@ -818,12 +818,14 @@ async function r21TrackU({ fn, source, runInNewContext, assert }) {
     const appJs = appBundleJs();
     const sfn = (name) => appJs.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'))?.[0];
     const sctx = {};
-    runInNewContext(['hBaseName', 'caseBaseName'].map((n) => { const f = sfn(n); assert.ok(f, `R21 U2: ${n} exists`); return f; }).join('\n'), sctx);
-    const before = (d) => String(d || '').replace(/(?:[\\/]+\.?)+$/, '').split(/[\\/]/).filter(Boolean).pop() || '';
+    runInNewContext(['hTrimTail', 'hBaseName', 'caseBaseName'].map((n) => { const f = sfn(n); assert.ok(f, `R21 U2: ${n} exists`); return f; }).join('\n'), sctx);
+    const before =(d) => String(d || '').replace(/(?:[\\/]+\.?)+$/, '').split(/[\\/]/).filter(Boolean).pop() || '';
     for (const name of ['E:\\.', 'E:\\', 'E:', 'C:\\cases\\c1\\.', 'C:\\cases\\c1\\', 'C:\\cases\\c1', '/srv/x/..', '/srv/x/.', 'a/././/', 'a//.//.', '사건1', '', 'x.', '.', '/', '/.', 'C:\\a\\.\\.\\', '\\\\server\\share\\', 'a\\.b', 'a/.b/', 'a/..', 'C:/c1/.x', null]) {
       for (const f of ['hBaseName', 'caseBaseName']) assert.equal(runInNewContext(`${f}(x)`, Object.assign(sctx, { x: name })), before(name), `R21 U2: ${f}(${JSON.stringify(name)}) as before`);
     }
-    for (const bad of ['C:' + '\\'.repeat(1000) + 'x', '/'.repeat(1000) + '\u0000', 'a' + '/.'.repeat(1000) + 'x', '\\'.repeat(1000)]) {
+    // R21 follow-up: also 30,000 chars — the regex form was quadratic (1.3 s).
+    for (const bad of ['C:' + '\\'.repeat(1000) + 'x', '/'.repeat(1000) + '\u0000', 'a' + '/.'.repeat(1000) + 'x', '\\'.repeat(1000),
+      'C:' + '\\'.repeat(30000) + 'x', 'C:' + '/.'.repeat(30000), 'a' + '/.'.repeat(30000) + 'x']) {
       for (const f of ['hBaseName', 'caseBaseName']) {
         const t0 = performance.now();
         runInNewContext(`${f}(x)`, Object.assign(sctx, { x: bad }), { timeout: 2000 });
@@ -1034,7 +1036,7 @@ async function r20TrackU({ fn, source, runInNewContext, assert }) {
   const appJs = appBundleJs();
   const sfn = (name) => appJs.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'))?.[0];
   const sctx = {};
-  runInNewContext(['hBaseName', 'caseBaseName'].map((n) => { const f = sfn(n); assert.ok(f, `R20 U5: ${n} exists`); return f; }).join('\n') + '\n' + (sfn('hCaseName') || ''), sctx);
+  runInNewContext(['hTrimTail', 'hBaseName', 'caseBaseName'].map((n) => { const f = sfn(n); assert.ok(f, `R20 U5: ${n} exists`); return f; }).join('\n') + '\n' + (sfn('hCaseName') || ''), sctx);
   const se = (x) => runInNewContext(x, sctx);
   assert.equal(se('hBaseName("E:\\\\.")'), 'E:', 'R20 U5: hBaseName(E:\\.) → E:');
   assert.equal(se('caseBaseName("E:\\\\.")'), 'E:', 'R20 U5: caseBaseName(E:\\.) → E:');
@@ -1059,6 +1061,11 @@ async function r20TrackU({ fn, source, runInNewContext, assert }) {
   for (const old of ['C:\\Cases\\c1\\.', 'c:\\Cases\\c1', 'C:\\\\Cases\\\\c1', 'C://Cases//c1/', 'c:\\Cases\\c1\\.\\']) {
     assert.ok(aliases.includes(ck(old)), `R20 U6: an old key candidate covers ${old}`);
   }
+  // R21 follow-up: R20 bound `\\?\C:\…` verbatim; R21 binds it plain.
+  for (const old of ['\\\\?\\C:\\Cases\\c1', '\\\\?\\c:\\Cases\\c1']) {
+    assert.ok(aliases.includes(ck(old)), `R21: the verbatim spelling ${old} is an old key candidate`);
+  }
+  assert.ok(al('E:\\.').includes(ck('\\\\?\\E:\\')), 'R21: the verbatim drive root \\\\?\\E:\\ is an old key candidate of E:\\.');
   assert.ok(!aliases.includes(ck(dir)) && aliases.length > 0, 'R20 U6: never the current key');
   assert.deepEqual(al(dir, { case_id: 'k1' }), [], 'R20 U6: a case with case_id has no aliases');
   assert.deepEqual(al('<case>'), [], 'R20 U6: a redacted bundle has none');

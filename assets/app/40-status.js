@@ -14,8 +14,16 @@ const POLL_BUSY_MS = 1000, POLL_IDLE_MS = 5000;
 const REVIEW_PHASES = ["review-partial", "review-ready", "done", "finalized"];
 function caseBaseName(caseDir) {
   // R20 U5: `E:\.` → "E:" (a trailing `\.` is the folder itself).
-  // R21 U2: no nested quantifier (01-store hBaseName).
-  return String(caseDir || "").replace(/[\\/](?:\.?[\\/])*\.?$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  // R21 U2: linear loop, same result as 01-store hTrimTail.
+  const s = String(caseDir || "");
+  const sep = (c) => c === "\\" || c === "/";
+  let end = s.length;
+  for (;;) {
+    if (end > 0 && sep(s[end - 1])) { end--; continue; }
+    if (end > 1 && s[end - 1] === "." && sep(s[end - 2])) { end--; continue; }
+    break;
+  }
+  return s.slice(0, end).split(/[\\/]/).filter(Boolean).pop() || "";
 }
 
 // Store access is optional so a page without the store (legacy bundle,

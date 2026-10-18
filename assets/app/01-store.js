@@ -97,9 +97,22 @@ const FTStore = (() => {
 })();
 
 // R20 U5: a trailing `\.` is the folder itself (`E:\.` → "E:", never ".").
+// R21 U2 (follow-up): strip trailing separators and single `.` steps with
+// a loop — linear time (the regex form was quadratic on long input). Same
+// result as /[\\/](?:\.?[\\/])*\.?$/ ; a `..` is kept.
+function hTrimTail(text) {
+  const s = String(text || "");
+  const sep = (c) => c === "\\" || c === "/";
+  let end = s.length;
+  for (;;) {
+    if (end > 0 && sep(s[end - 1])) { end--; continue; }
+    if (end > 1 && s[end - 1] === "." && sep(s[end - 2])) { end--; continue; }
+    break;
+  }
+  return s.slice(0, end);
+}
 function hBaseName(dir) {
-  // R21 U2: no nested quantifier (the old one was exponential on input).
-  return String(dir || "").replace(/[\\/](?:\.?[\\/])*\.?$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  return hTrimTail(dir).split(/[\\/]/).filter(Boolean).pop() || "";
 }
 // The name a case is shown by: a given name unless it is "." / "..".
 function hCaseName(name, dir) {

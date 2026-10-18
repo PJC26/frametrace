@@ -115,7 +115,11 @@ const FTViewer = (() => {
     const p = dir.replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([A-Za-z]:)\/\.$/, "$1");
     const toggled = /^[A-Za-z]:/.test(p) ? (p[0] === p[0].toUpperCase() ? p[0].toLowerCase() : p[0].toUpperCase()) + p.slice(1) : p;
     const out = [];
-    for (const base of new Set([p, toggled])) {
+    // R21 (follow-up): R20 bound `\\?\C:\…` as typed; R21 binds it plain,
+    // so the verbatim spelling of the same folder is an old key too.
+    const bases = [p, toggled];
+    for (const b of [p, toggled]) if (/^[A-Za-z]:(\/|$)/.test(b)) bases.push("//?/" + b, "//?/" + b + "/");
+    for (const base of new Set(bases)) {
       const doubled = base.replace(/\//g, "//");
       for (const s of new Set([base, base + "/.", doubled, doubled + "/."])) {
         const key = keyOfSeed("dir|" + s);
