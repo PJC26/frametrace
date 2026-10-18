@@ -732,29 +732,38 @@ try {
   // abandoned by an explicit save at its budget; the close flush's hard
   // budget still answers on time; a genuinely stalled request (no reply)
   // times out after the stall window; save() with no budget is <= 4 s.
+  //
+  // R16 U5: the edit and the save call run in ONE page task (`key`). With a
+  // real key press first, a harness that stalls >= 2.5 s between the two
+  // (load) let the autosave debounce (AUTOSAVE_DEBOUNCE_MS) send the edit
+  // before the save was called — the save then waited for THAT request
+  // (sent earlier, or already answered), so its timing / answer was not the
+  // one under test (reproduced: a 4 s gap → the hard save answers true;
+  // the stall save answers at its 0.5 s budget). `pre` = what the save saw
+  // at its call: nothing in flight, the edit pending (checked).
   const timed = (expr) => page.evaluate(async (e) => {
     const opts = e.opts;
+    if (e.key) document.dispatchEvent(new KeyboardEvent('keydown', { key: e.key, bubbles: true, cancelable: true }));
+    const pre = FTViewer.saveState();
     const t0 = performance.now();
     const saved = await (opts ? FTViewer.save(opts) : FTViewer.save(/* no-budget: the shell fallback under test */));
-    return { saved, timedOut: !!(opts && opts.timedOut), ms: Math.round(performance.now() - t0) };
+    return { saved, timedOut: !!(opts && opts.timedOut), ms: Math.round(performance.now() - t0), pre };
   }, expr);
   mock.delayMs = 2500;
   await select(A);
-  await page.keyboard.press('2');
-  const r23a = await timed({ opts: { patient: true, timeoutMs: 1000, stallMs: 5000 } });
-  check('㉓ R8 U2: save({ patient: true, timeoutMs: 1000 }) waits for the slow reply (2.5 s) and lands', r23a.saved === true && r23a.ms >= 2300 && row(A).status === 'important', JSON.stringify({ r23a, A: row(A).status }));
+  const sent23a = imports.length;
+  const r23a = await timed({ key: '2', opts: { patient: true, timeoutMs: 1000, stallMs: 5000 } });
+  check('㉓ R8 U2: save({ patient: true, timeoutMs: 1000 }) waits for the slow reply (2.5 s) and lands', r23a.pre === 'pending' && imports.length === sent23a + 1 && r23a.saved === true && r23a.ms >= 2300 && row(A).status === 'important', JSON.stringify({ r23a, A: row(A).status }));
   await waitState('saved', 15000);
   await select(A);
-  await page.keyboard.press('3');
-  const r23b = await timed({ opts: { timeoutMs: 1000 } });
-  check('㉓ R8 U2: the hard save({ timeoutMs: 1000 }) still answers false at its budget (timedOut)', r23b.saved === false && r23b.timedOut && r23b.ms < 1400, JSON.stringify(r23b));
+  const r23b = await timed({ key: '3', opts: { timeoutMs: 1000 } });
+  check('㉓ R8 U2: the hard save({ timeoutMs: 1000 }) still answers false at its budget (timedOut)', r23b.pre === 'pending' && r23b.saved === false && r23b.timedOut && r23b.ms >= 900 && r23b.ms < 1400, JSON.stringify(r23b));
   await waitState('saved', 15000);
   mock.delayMs = 0;
   Object.assign(mock, { hang: true, hung: [] });
   await select(A);
-  await page.keyboard.press('1');
-  const r23c = await timed({ opts: { patient: true, timeoutMs: 500, stallMs: 1500 } });
-  check('㉓ R8 U2: a stalled request (no reply) — the patient save times out after the stall window', r23c.saved === false && r23c.timedOut && r23c.ms >= 1300 && r23c.ms < 2600, JSON.stringify(r23c));
+  const r23c = await timed({ key: '1', opts: { patient: true, timeoutMs: 500, stallMs: 1500 } });
+  check('㉓ R8 U2: a stalled request (no reply) — the patient save times out after the stall window', r23c.pre === 'pending' && r23c.saved === false && r23c.timedOut && r23c.ms >= 1300 && r23c.ms < 2600, JSON.stringify(r23c));
   const r23d = await timed({ opts: null });
   check("㉓ R8 U2: save() with no budget (the desktop shell's fallback) answers within 4 s while the request hangs", r23d.saved === false && r23d.ms <= 4300, JSON.stringify(r23d));
   mock.hang = false;

@@ -141,7 +141,7 @@ function renderDetails() {
   document.getElementById("detailBadges").innerHTML = [
     statusBadgeHtml(record.status, record),
     (record.warnings || []).length ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}">${tf("warn.count", { n: record.warnings.length })}</span>` : "",
-    record.hasAnomaly ? `<span class="badge anomaly">${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}</span>` : "",
+    anomalyBadgeHtml(record, false),
     record.dfl && record.dfl.band ? `<span class="badge dfl dfl-${escapeHtml(record.dfl.band)}">${escapeHtml(tf("dfl.badge", { band: record.dfl.band_label || record.dfl.band }))}</span>` : "",
     mark ? markChipHtml(mark.status) : "",
     ...recordTags.map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`),

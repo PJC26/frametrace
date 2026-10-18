@@ -992,9 +992,7 @@ function renderCard(record) {
   const tagsHtml = tagListFor(record).length
     ? `<div class="tag-row">${tagListFor(record).map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("")}</div>`
     : "";
-  const anomalyChip = record.hasAnomaly
-    ? `<span class="badge anomaly" title="${escapeHtml(record.anomalies.map(item => item.kind).join(", "))}">${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}</span>`
-    : "";
+  const anomalyChip = anomalyBadgeHtml(record, true);
   const kindChip = `<span class="kind-badge kind-${escapeHtml(record.kind || "video")}" title="${t("tree.kind")}">${escapeHtml(KIND_SHORT[record.kind] || record.kind || "?")}</span>`;
   const warnChip = (record.warnings || []).length
     ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}">${ftIcon("info")}${tf("warn.count", { n: record.warnings.length })}</span>`

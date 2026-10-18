@@ -757,6 +757,104 @@ async function unitTests() {
   await r15TrackU({ fn, runInNewContext, assert, ex });
   await r15TrackIFollowUp({ fn, runInNewContext, assert, ex });
   await r15TrackSFollowUp({ runInNewContext, assert, ex });
+  await r16TrackU({ fn, source, runInNewContext, assert, ex });
+}
+
+// ---- R16 track U (docs/PLAN_R16_2026-10-18.md) -----------------------------
+async function r16TrackU({ fn, source, runInNewContext, assert, ex }) {
+  const { readFileSync } = await import('node:fs');
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  // U1 (track I2): logChains.anomaly.head → banner level + "확인 불가" badge.
+  const words = { 'anomalyHead.cut': '이상 징후 기록 꼬리 잘림 — 현재 결과 없음', 'anomalyHead.unknown': '이상 징후 기록 머리 확인 불가', 'anomalyHead.badge': '확인 불가', 'header.anomaly': '이상 후보' };
+  const u1 = (chains) => {
+    const vm = { logChains: chains, t: (k) => words[k] || k, ftIcon: () => '', escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;') };
+    const parts = [fn('anomalyHeadState'), source.match(/^var anomalyHead = .*$/m)?.[0], fn('anomalyBadgeHtml')];
+    assert.ok(parts.every(Boolean), 'R16 U1: anomalyHeadState / anomalyHead / anomalyBadgeHtml exist');
+    runInNewContext(parts.join('\n'), vm);
+    return vm;
+  };
+  const rec = { hasAnomaly: true, anomalies: [{ kind: 'gop-gap' }] };
+  for (const st of ['truncated', 'rewritten']) {
+    const vm = u1({ anomaly: { head: { status: st, reason_code: 'tail-cut', withhold_reason: '앵커보다 짧음', detail: 'lines 3 < 5' } } });
+    const h = plain(runInNewContext('anomalyHead', vm));
+    assert.ok(h.level === 'err' && h.status === st && /tail-cut/.test(h.tip) && /앵커보다 짧음/.test(h.tip), `R16 U1 ${st} → err: ` + JSON.stringify(h));
+    const b = runInNewContext('anomalyBadgeHtml(r, true)', Object.assign(vm, { r: rec }));
+    assert.ok(/anomaly-unverified/.test(b) && /이상 후보 · 확인 불가</.test(b) && /gop-gap/.test(b) && /꼬리 잘림/.test(b), `R16 U1 ${st}: badge "확인 불가": ` + b);
+  }
+  const unk = u1({ anomaly: { head: { status: 'unknown', reason_code: 'other-pc' } } });
+  assert.equal(plain(runInNewContext('anomalyHead', unk)).level, 'warn', 'R16 U1 unknown → warn');
+  assert.ok(!/확인 불가/.test(runInNewContext('anomalyBadgeHtml(r, true)', Object.assign(unk, { r: rec }))), 'R16 U1 unknown: badge unchanged');
+  for (const c of [null, {}, { anomaly: {} }, { anomaly: { head: { status: 'intact' } } }, { anomaly: { head: { status: 'absent' } } }]) {
+    const vm = u1(c);
+    assert.equal(runInNewContext('anomalyHead', vm), null, 'R16 U1 absent / intact → nothing: ' + JSON.stringify(c));
+    assert.equal(runInNewContext('anomalyBadgeHtml(r, true)', Object.assign(vm, { r: rec })), '<span class="badge anomaly" title="gop-gap">이상 후보</span>', 'R16 U1: badge as before');
+  }
+  // The banner: role=alert (err) / role=status (warn), tooltip = the server's words.
+  const banner = source.match(/^\(function showAnomalyHead\(\) \{[^]*?^\}\)\(\);/m)?.[0];
+  assert.ok(banner, 'R16 U1: showAnomalyHead banner exists');
+  const bannerOf = (head) => {
+    const appended = [];
+    const el = () => ({ attrs: {}, dataset: {}, children: [], setAttribute(k, v) { this.attrs[k] = v; }, appendChild(c) { this.children.push(c); } });
+    const emitted = [];
+    runInNewContext(banner, { anomalyHead: head, document: { createElement: el }, noticeMessage: (k) => ({ key: k }), noticeAppend: (b) => appended.push(b), t: (k) => words[k] || k, FTViewer: { _emit: (n, d) => emitted.push([n, d]) } });
+    return { b: appended[0], emitted };
+  };
+  const eb = bannerOf({ level: 'err', status: 'truncated', tip: 'status truncated\ntail-cut' });
+  assert.ok(eb.b && eb.b.id === 'anomalyHeadBanner' && eb.b.attrs.role === 'alert' && eb.b.children[0].key === 'anomalyHead.cut' && eb.b.children[0].title === 'status truncated\ntail-cut' && eb.emitted.length === 1, 'R16 U1 err banner: ' + JSON.stringify(eb));
+  const wb = bannerOf({ level: 'warn', status: 'unknown', tip: '' });
+  assert.ok(wb.b && wb.b.attrs.role === 'status' && wb.b.children[0].key === 'anomalyHead.unknown' && !wb.emitted.length, 'R16 U1 warn banner: ' + JSON.stringify(wb));
+  assert.equal(bannerOf(null).b, undefined, 'R16 U1: no head state → no banner');
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  for (const k of ['anomalyHead.cut', 'anomalyHead.unknown', 'anomalyHead.badge']) assert.equal((i18n.match(new RegExp(`"${k.replace('.', '\\.')}": `, 'g')) || []).length, 2, `R16 U1: ${k} in ko + en`);
+  assert.ok(/anomalyBadgeHtml\(record, true\)/.test(source) && /anomalyBadgeHtml\(record, false\)/.test(source), 'R16 U1: grid card and detail header use the badge');
+  console.log('PASS VM R16 U1 anomaly head: truncated / rewritten → error banner + "확인 불가" badge, unknown → warning, absent / intact → nothing');
+
+  // U3: the timeline row keeps " — " between the kind and the file name.
+  assert.ok(/timelineKindHtml\(ev\.kind, ev, groups\[i\]\)\} — \$\{escapeHtml\(/.test(source), 'R16 U3: timeline row " — " spacing');
+  console.log('PASS VM R16 U3 timeline row spacing');
+
+  // U4 (tracks S2 / S4 / I1): unverified-writer, --force hints, head_reason words.
+  const legacySrc = readFileSync(new URL('../assets/legacy/app/70-finalize.js', import.meta.url), 'utf8');
+  const lfn = (name) => legacySrc.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const lconst = (name) => legacySrc.match(new RegExp(`^(?:const|let) ${name} = .*;$`, 'm'))?.[0] || legacySrc.match(new RegExp(`^(?:const|let) ${name} = \\{[^]*?^\\};`, 'm'))?.[0];
+  const lvm = {};
+  runInNewContext(['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT'].map(lconst).concat(['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finJournalForceLines', 'finJournalTipExtra', 'finShortDetail', 'finJournalChecks', 'verifySourcesVerdict'].map(lfn)).filter(Boolean).join('\n'), lvm);
+  const jn = (extra) => Object.assign({ path: 'review/finalize.inprogress.json', state: 'in-progress', examiner: 'Hong', started_unix: 1760000000, signoff_sha256: 'ab12', error: null, blocked_until_unix: 1760086400 }, extra);
+  const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
+  const lck = (st) => plain(runInNewContext('finJournalChecks(st)', Object.assign(lvm, { st })));
+  const FORCE = "frametrace finalize-journal 'C:/cases/c9' --dismiss --force";
+  const uw = { ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn({ in_progress_code: 'unverified-writer', reason: '살아 있는 프로세스(pid 4410) — 폴더·해시 다름', dismiss_command: null, dismiss_command_cmd: null }) };
+  const uh = js(uw);
+  assert.ok(/data-journal="unverifiedwriter"/.test(uh) && /class="h-fin-incomplete">확인 불가 작성자 — 자동 복구 안 함</.test(uh) && /pid 4410/.test(uh) && /까지 차단/.test(uh)
+    && uh.includes(`확인 뒤 강제 치우기: <code class="mono">${FORCE.replace(/'/g, '&#39;')}</code>`) && !/(?<!강제 )치우기[:(]/.test(uh), 'R16 U4 unverified-writer row (shell): ' + uh);
+  for (const [i, vm] of [ex, lvm].entries()) {
+    const tag = i ? 'legacy' : 'shell';
+    assert.equal(runInNewContext('finJournalHead(finJournalState(s))', Object.assign(vm, { s: uw })), '확인 불가 작성자 — 자동 복구 안 함', `R16 U4 head (${tag})`);
+    assert.ok(runInNewContext('finJournalBlocks(finJournalState(s))', Object.assign(vm, { s: { finalize_journal: jn({ in_progress_code: 'unverified-writer' }) } })), `R16 U4: unverified-writer blocks without blocks_finalize (${tag})`);
+    // other-account now also says how to force it; the server's force_command wins; cmd.exe form too.
+    const oa = { ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn({ in_progress_code: 'other-account', blocks_finalize: true, dismiss_command: null }) };
+    const fl = plain(runInNewContext('finJournalForceLines(s, finJournalState(s).kind)', Object.assign(vm, { s: oa })));
+    assert.ok(fl.length === 1 && fl[0].cmd === FORCE, `R16 U4 other-account --force hint (${tag}): ` + JSON.stringify(fl));
+    const sv = plain(runInNewContext('finJournalForceLines(s, "unverifiedwriter")', Object.assign(vm, { s: { finalize_journal: jn({ force_command: "frametrace finalize-journal 'X' --dismiss --force" }) } })));
+    assert.ok(sv.length === 1 && sv[0].cmd === "frametrace finalize-journal 'X' --dismiss --force", `R16 U4 server force_command (${tag})`);
+    const two = plain(runInNewContext('finJournalForceLines(s, "otheraccount")', Object.assign(vm, { s: { finalize_journal: jn({ dismiss_command: "frametrace finalize-journal 'C:\\c' --dismiss", dismiss_command_cmd: 'frametrace finalize-journal "C:\\c" --dismiss' }) } })));
+    assert.ok(two.length === 2 && two[0].cmd.endsWith("'C:\\c' --dismiss --force") && two[1].cmd.endsWith('"C:\\c" --dismiss --force') && /PowerShell/.test(two[0].label) && /명령 프롬프트/.test(two[1].label), `R16 U4 both shells (${tag}): ` + JSON.stringify(two));
+    assert.equal(plain(runInNewContext('finJournalForceLines(s, "unpaired")', Object.assign(vm, { s: uw }))).length, 0, `R16 U4: no --force hint elsewhere (${tag})`);
+    // head_reason mixed-version / scan-mismatch (track I1, P26).
+    for (const [code, w] of [['mixed-version', '버전 섞인 머리'], ['scan-mismatch', '다른 스캔의 머리']]) {
+      const r = plain(runInNewContext('verifySourcesVerdict(o)', Object.assign(vm, { o: { ok: true, matched: 0, mismatched: 0, not_comparable: 0, unauthenticated: 0, verified: false, is_result: false, run_id: '9-z', lane_status: 'keyed', head_status: 'unknown', head_reason: code, withheld_reason: '재검증 머리 확인 불가 — 결과 없음: x' } })));
+      assert.ok(r.level === 'warn' && r.tip.includes(`재검증 머리 unknown (${w})`), `R16 U4 head_reason ${code} (${tag}): ` + JSON.stringify(r));
+    }
+  }
+  const lr = lck(uw);
+  assert.ok(lr.length === 1 && lr[0].level === 'block' && lr[0].text === '최종화 차단: 확인 불가 작성자 — 자동 복구 안 함' && lr[0].sub.includes('확인 뒤 강제 치우기: ' + FORCE) && /까지 차단/.test(lr[0].sub), 'R16 U4 legacy block row: ' + JSON.stringify(lr));
+  const loa = lck({ ok: true, phase: 'review-ready', case_dir: 'C:/cases/c9', finalize_journal: jn({ in_progress_code: 'other-account', blocks_finalize: true, dismiss_command: null }) });
+  assert.ok(loa.length === 1 && loa[0].sub.includes('확인 뒤 강제 치우기: ' + FORCE), 'R16 U4 legacy other-account --force hint: ' + JSON.stringify(loa));
+  runInNewContext(`jget = async (u) => (u === '/api/status' ? st : { ok: true, manifest: { case_id: 'c1' }, annotations: { marks: [] } }); FIN.audit = { level: 'ok', text: '감사 로그 인증됨' }; FIN.verify = null;`, Object.assign(ex, { st: uw }));
+  const sc = plain((await runInNewContext('gatherFinalizeChecks()', ex)).checks);
+  assert.ok(sc.some((c) => c.level === 'block' && c.text === '최종화 차단: 확인 불가 작성자 — 자동 복구 안 함' && c.sub.includes('확인 뒤 강제 치우기: ' + FORCE)), 'R16 U4 shell checklist block + --force: ' + JSON.stringify(sc));
+  runInNewContext('FIN.status = null; FIN.audit = null;', ex);
+  console.log('PASS VM R16 U4 unverified-writer blocks ("확인 불가 작성자 — 자동 복구 안 함"), --force hint for it and other-account, head_reason mixed-version / scan-mismatch (shell + legacy)');
 }
 
 // ---- R15 track S (8b523ba) follow-up ---------------------------------------
@@ -767,7 +865,7 @@ async function r15TrackSFollowUp({ runInNewContext, assert, ex }) {
   const lfn = (name) => legacySrc.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, 'm'))?.[0];
   const lconst = (name) => legacySrc.match(new RegExp(`^(?:const|let) ${name} = .*;$`, 'm'))?.[0] || legacySrc.match(new RegExp(`^(?:const|let) ${name} = \\{[^]*?^\\};`, 'm'))?.[0];
   const lvm = {};
-  runInNewContext(['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT'].map(lconst).concat(['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finJournalTipExtra', 'finShortDetail', 'finJournalChecks'].map(lfn)).filter(Boolean).join('\n'), lvm);
+  runInNewContext(['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT'].map(lconst).concat(['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finJournalForceLines', 'finJournalTipExtra', 'finShortDetail', 'finJournalChecks'].map(lfn)).filter(Boolean).join('\n'), lvm);
   const jn = (state, extra) => Object.assign({ path: 'review/finalize.inprogress.json', state, examiner: 'Hong', started_unix: 1760000000, signoff_sha256: 'ab12', error: null }, extra || {});
   const js = (st) => runInNewContext(`FIN.status = st; FIN.incomplete = null; FIN.reportStale = null; FIN.result = null; finResultHtml()`, Object.assign(ex, { st }));
   const lck = (st) => plain(runInNewContext('finJournalChecks(st)', Object.assign(lvm, { st })));
@@ -779,10 +877,10 @@ async function r15TrackSFollowUp({ runInNewContext, assert, ex }) {
   // in_progress_code other-account: blocks, no dismiss hint.
   const oa = { ok: true, phase: 'review-ready', finalize_journal: jn('in-progress', { in_progress_code: 'other-account', blocks_finalize: true, blocked_until_unix: 1760086400, reason: '이 PC의 다른 계정 FrameTrace 프로세스(pid 812)일 수 있음', dismiss_command: null, dismiss_command_cmd: null }) };
   const oh = js(oa);
-  assert.ok(/data-journal="otheraccount"/.test(oh) && /class="h-fin-incomplete">다른 계정의 최종화일 수 있음 — 차단 중</.test(oh) && /pid 812/.test(oh) && /까지 차단/.test(oh) && !/치우기/.test(oh) && /진행 중 코드 other-account/.test(oh), 'R15 S other-account row: ' + oh);
+  assert.ok(/data-journal="otheraccount"/.test(oh) && /class="h-fin-incomplete">다른 계정의 최종화일 수 있음 — 차단 중</.test(oh) && /pid 812/.test(oh) && /까지 차단/.test(oh) && !/(?<!강제 )치우기[:(]/.test(oh) && /진행 중 코드 other-account/.test(oh), 'R15 S other-account row: ' + oh);
   assert.equal(runInNewContext('finJournalHead(finJournalState(st))', Object.assign(ex, { st: oa })), '다른 계정의 최종화일 수 있음 — 차단 중', 'R15 S other-account checklist head (shell)');
   const lo = lck(oa);
-  assert.ok(lo.length === 1 && lo[0].level === 'block' && lo[0].text === '최종화 차단: 다른 계정의 최종화일 수 있음 — 차단 중' && !/치우기/.test(lo[0].sub) && /까지 차단/.test(lo[0].sub), 'R15 S other-account legacy block row: ' + JSON.stringify(lo));
+  assert.ok(lo.length === 1 && lo[0].level === 'block' && lo[0].text === '최종화 차단: 다른 계정의 최종화일 수 있음 — 차단 중' && !/(?<!강제 )치우기[:(]/.test(lo[0].sub) && /까지 차단/.test(lo[0].sub), 'R15 S other-account legacy block row: ' + JSON.stringify(lo));
   assert.ok(runInNewContext('finJournalBlocks(finJournalState(st))', Object.assign(ex, { st: { finalize_journal: jn('in-progress', { in_progress_code: 'other-account' }) } })), 'R15 S: other-account blocks even without blocks_finalize');
   assert.ok(/data-journal="inprogress"/.test(js({ ok: true, phase: 'review-ready', finalize_journal: jn('in-progress', { in_progress_code: 'live-writer', blocks_finalize: true }) })), 'R15 S: live-writer stays in-progress');
   // unpaired_code package-changed / local-state; local_record_state in the tooltip.
@@ -930,7 +1028,7 @@ async function r15TrackU({ fn, runInNewContext, assert, ex }) {
   assert.ok(/data-journal="unrecordedblocked"/.test(h) && /class="h-fin-incomplete">이전 최종화 완료 — 완료 기록 못 씀</.test(h) && /액세스 거부/.test(h) && !/치우기/.test(h), 'R15 U4 completed-unrecorded + blocks → warning row: ' + h);
   const ok = runInNewContext(`FIN.status = st; finResultHtml()`, Object.assign(ex, { st: { ok: true, phase: 'review-ready', finalize_journal: jn('completed-unrecorded', { reason: 'r' }) } }));
   assert.ok(/data-journal="unrecorded"/.test(ok) && /class="h-fin-info">이전 최종화 완료 — 완료 기록만 빠짐</.test(ok), 'R15 U4: blocks_finalize absent → info as before: ' + ok);
-  const lparts = ['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT'].map(lconst).concat(['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finShortDetail', 'finJournalChecks'].map(lfn)).filter(Boolean);
+  const lparts = ['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT'].map(lconst).concat(['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finJournalForceLines', 'finShortDetail', 'finJournalChecks'].map(lfn)).filter(Boolean);
   const ljv = {};
   runInNewContext(lparts.join('\n'), ljv);
   const lrows = plain(runInNewContext('finJournalChecks(st)', Object.assign(ljv, { st: ub })));
@@ -969,7 +1067,7 @@ async function r14TrackU({ fn, runInNewContext, assert, ex }) {
 
   // U1: the legacy shell blocks on the journal like the app shell, with the
   // dismiss command. Its whole gatherFinalizeChecks runs against a stub server.
-  const lnames = ['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finShortDetail', 'finJournalChecks', 'verifyChecks', 'unsavedMarksChecks', 'readLs', 'viewerWindow', 'viewerSaveState', 'gatherFinalizeChecks'];
+  const lnames = ['finJournalState', 'finJournalBlocks', 'finJournalHead', 'finJournalDismissCmd', 'finJournalDismissQuote', 'finJournalUnpairedCode', 'finJournalDismissLines', 'finJournalForceLines', 'finShortDetail', 'finJournalChecks', 'verifyChecks', 'unsavedMarksChecks', 'readLs', 'viewerWindow', 'viewerSaveState', 'gatherFinalizeChecks'];
   // (Helpers are optional here so a shell without them fails on behaviour.)
   assert.ok(lfn('gatherFinalizeChecks'), 'R14 U1: legacy gatherFinalizeChecks exists');
   const lparts = ['FIN_JOURNAL_HEAD', 'FIN_JOURNAL_INFO', 'FIN_UNPAIRED_SHORT', 'lastVerifyVerdict'].map(lconst).concat(lnames.map(lfn)).filter(Boolean);

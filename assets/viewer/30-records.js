@@ -675,6 +675,30 @@ function logChainItems(chains, lanes) {
   }).filter(Boolean);
 }
 
+// R16 U1 (track I2): records-meta `logChains.anomaly.head` = {status,
+// reason_code, withhold_reason, detail}. truncated / rewritten → "err" (the
+// findings shown are not a current result: error banner, every anomaly
+// badge "확인 불가"); any other status but absent / intact → "warn" (banner
+// only). null when absent (older server, bundle) or fine.
+function anomalyHeadState(chains) {
+  const lane = chains && typeof chains === "object" ? (chains.anomaly || chains.anomalyLog) : null;
+  const h = lane && typeof lane === "object" && lane.head && typeof lane.head === "object" ? lane.head : null;
+  const st = h && h.status != null ? String(h.status) : "";
+  if (!st || st === "absent" || st === "intact") return null;
+  const tip = ["status " + st, h.reason_code, h.withhold_reason, h.detail].filter(v => v != null && String(v).trim()).map(String).join("\n");
+  return { level: st === "truncated" || st === "rewritten" ? "err" : "warn", status: st, tip };
+}
+var anomalyHead = anomalyHeadState(logChains);
+// The record's anomaly badge (grid card, detail header); `title` = the kinds.
+function anomalyBadgeHtml(record, withTitle) {
+  if (!record || !record.hasAnomaly) return "";
+  const cut = !!(anomalyHead && anomalyHead.level === "err");
+  const kinds = record.anomalies.map(item => item.kind).join(", ");
+  const title = [withTitle ? kinds : "", cut ? t("anomalyHead.cut") + (anomalyHead.tip ? "\n" + anomalyHead.tip : "") : ""].filter(Boolean).join("\n");
+  return `<span class="badge anomaly${cut ? " anomaly-unverified" : ""}"${title ? ` title="${escapeHtml(title)}"` : ""}>${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}` +
+    (cut ? ` · ${escapeHtml(t("anomalyHead.badge"))}` : "") + `</span>`;
+}
+
 function statusLabel(status) {
   if (status === "unauthenticated") return t("status.unauth");
   if (status === "auth-other-pc") return t("status.otherPc");

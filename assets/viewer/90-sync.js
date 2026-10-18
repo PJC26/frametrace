@@ -2220,7 +2220,7 @@ async function loadTimeline(regenerate) {
       return `<div class="timeline-row" data-id="${escapeHtml(recId || "")}">
         <span class="ts">${escapeHtml(isoTime(ev.ts_unix))}</span>
         <span class="src">${escapeHtml(ev.source || "")}</span>
-        <span class="desc" title="${escapeHtml(tip)}">${timelineKindHtml(ev.kind, ev, groups[i])} —${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
+        <span class="desc" title="${escapeHtml(tip)}">${timelineKindHtml(ev.kind, ev, groups[i])} — ${escapeHtml((ev.path || "").split(/[\\/]/).pop() || ev.path || "")}</span>
       </div>`;
     }).join("") + (events.length > cap ? `<div class="timeline-row"><span class="desc muted">${tf("timeline.ellipsis", { n: events.length - cap })}</span></div>` : "");
     list.querySelectorAll(".timeline-row[data-id]").forEach(row => {
@@ -2402,6 +2402,26 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
   const host = noticesHost();
   host.insertBefore(bar, host.firstChild);
   FTViewer._emit("error", { message: text, detail: caseInputProblems.join(","), stage: "load" });
+})();
+
+// R16 U1 (track I2): the anomaly log's head (30-records anomalyHeadState) —
+// cut / rewritten: role=alert error banner (the findings are not a current
+// result); another non-intact state: a role=status warning. Tooltip = the
+// server's status, reason code, withhold reason and detail.
+(function showAnomalyHead() {
+  if (!anomalyHead) return;
+  const err = anomalyHead.level === "err";
+  const bar = document.createElement("div");
+  bar.id = "anomalyHeadBanner";
+  bar.className = "ft-banner";
+  bar.dataset.headStatus = anomalyHead.status;
+  bar.dataset.level = anomalyHead.level;
+  bar.setAttribute("role", err ? "alert" : "status");
+  const msg = noticeMessage(err ? "anomalyHead.cut" : "anomalyHead.unknown");
+  if (anomalyHead.tip) msg.title = anomalyHead.tip;
+  bar.appendChild(msg);
+  noticeAppend(bar);
+  if (err) FTViewer._emit("error", { message: t("anomalyHead.cut"), detail: anomalyHead.tip, stage: "load" });
 })();
 
 // --- U9: drafts left under another origin ---------------------------------

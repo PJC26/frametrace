@@ -70,6 +70,7 @@ const FIN_JOURNAL_HEAD = {
   closed: "이전 최종화 끝남 — 확인 필요",
   inprogress: "다른 FrameTrace에서 최종화 중",
   otheraccount: "다른 계정의 최종화일 수 있음 — 차단 중",
+  unverifiedwriter: "확인 불가 작성자 — 자동 복구 안 함",
   check: "이전 최종화 중단됨 — 확인 필요",
   recovered: "이전 최종화 중단됨 — 복구됨",
 };
@@ -97,6 +98,19 @@ function finJournalDismissLines(st, kind) {
   if (kind === "otherhost" || Object.prototype.hasOwnProperty.call(j, "dismiss_command")) return [];
   return [{ label: "치우기", cmd: finJournalDismissCmd(st) }];
 }
+// R16 U4 (track S2/S4): other-account / unverified-writer block until the
+// examiner confirms the process is not this case's writer — the `--force`
+// form of the dismiss command (the server's `force_command` when it sends one).
+function finJournalForceLines(st, kind) {
+  if (kind !== "otheraccount" && kind !== "unverifiedwriter") return [];
+  const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  const f = (c) => (/\s--force\b/.test(c) ? c : c + " --force");
+  if (typeof j.force_command === "string" && j.force_command.trim()) return [{ label: "확인 뒤 강제 치우기", cmd: j.force_command.trim() }];
+  const cmd = typeof j.dismiss_command_cmd === "string" ? j.dismiss_command_cmd.trim() : "";
+  const out = [{ label: cmd ? "확인 뒤 강제 치우기(PowerShell)" : "확인 뒤 강제 치우기", cmd: f(finJournalDismissCmd(st)) }];
+  if (cmd) out.push({ label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd: f(cmd) });
+  return out;
+}
 // Tooltip words for `local_record` / `unpaired_code`.
 function finJournalTipExtra(j) {
   const out = [];
@@ -123,6 +137,8 @@ function finJournalState(st) {
   if (kind === "unrecorded" && j.blocks_finalize === true) kind = "unrecordedblocked";
   // R15 (track S10): maybe another account's FrameTrace — blocks, no dismiss hint.
   if (kind === "inprogress" && j.in_progress_code === "other-account") kind = "otheraccount";
+  // R16 U4 (track S2, P25): a live process that may be this case's writer — never rolled back automatically.
+  if (kind === "inprogress" && j.in_progress_code === "unverified-writer") kind = "unverifiedwriter";
   if (j && kind) return { kind, journal: j, detail: reason || detail, code: kind === "unpaired" ? finJournalUnpairedCode(j, reason) : "" };
   if (j && jState !== "recovered") return { kind: "check", journal: j, detail: reason || detail };
   if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j, detail };
@@ -131,7 +147,7 @@ function finJournalState(st) {
 function finJournalBlocks(s) {
   if (!s || !s.journal) return false;
   if (typeof s.journal.blocks_finalize === "boolean") return s.journal.blocks_finalize;
-  return s.kind === "recovering" || s.kind === "otherhost" || s.kind === "otheraccount";
+  return s.kind === "recovering" || s.kind === "otherhost" || s.kind === "otheraccount" || s.kind === "unverifiedwriter";
 }
 function finJournalHead(s) {
   if (s && s.kind === "unpaired" && FIN_UNPAIRED_SHORT[s.code]) return `이전 최종화 짝 없음(${FIN_UNPAIRED_SHORT[s.code]}) — 확인 필요`;
@@ -160,8 +176,8 @@ function finJournalChecks(st) {
   if (!s) return [];
   const j = s.journal || {};
   const until = Number(j.blocked_until_unix);
-  const host = s.kind === "otherhost" || s.kind === "otheraccount" ? [j.host ? "PC " + String(j.host) : "", until > 0 ? new Date(until * 1000).toLocaleString() + "까지 차단" : ""].filter(Boolean).join(" · ") : "";
-  const cmd = finJournalDismissLines(st, s.kind).map(l => `${l.label}: ${l.cmd}`).join(" · ");
+  const host = s.kind === "otherhost" || s.kind === "otheraccount" || s.kind === "unverifiedwriter" ? [j.host ? "PC " + String(j.host) : "", until > 0 ? new Date(until * 1000).toLocaleString() + "까지 차단" : ""].filter(Boolean).join(" · ") : "";
+  const cmd = finJournalDismissLines(st, s.kind).concat(finJournalForceLines(st, s.kind)).map(l => `${l.label}: ${l.cmd}`).join(" · ");
   const sub = [host, s.detail ? finShortDetail(s.detail) : "", cmd].filter(Boolean).join(" — ");
   if (finJournalBlocks(s)) {
     if (s.kind === "recovering") return [{ level: "block", text: "이전 최종화 복구 중", sub: "끝나면 '다시 확인'을 누르십시오." }];
@@ -458,7 +474,7 @@ function verifySourcesVerdict(res) {
   })();
   // R15 (track I5): why the head is unknown (`head_reason`), short.
   const hr = res.head_reason == null ? "" : String(res.head_reason);
-  const hrWord = { "other-pc": "다른 PC 머리일 수 있음", "unusable-line": "쓸 수 없는 줄", "chain-failed": "체인 실패", "repaired": "레인 수리", "malformed": "형식 오류", "own-head-missing": "결과 실행 머리 없음", "unreadable": "읽지 못함" }[hr] || hr;
+  const hrWord = { "other-pc": "다른 PC 머리일 수 있음", "unusable-line": "쓸 수 없는 줄", "chain-failed": "체인 실패", "repaired": "레인 수리", "malformed": "형식 오류", "own-head-missing": "결과 실행 머리 없음", "unreadable": "읽지 못함", "mixed-version": "버전 섞인 머리", "scan-mismatch": "다른 스캔의 머리" }[hr] || hr;
   if (head) v.tip = [v.tip || "", `재검증 머리 ${head}` + (hrWord ? ` (${hrWord})` : "")].filter(Boolean).join(" · ");
   // R15 (track I4): "시계 이상" — its own warning, never withholds the result.
   const clock = typeof res.clock_note === "string" ? res.clock_note.trim() : "";

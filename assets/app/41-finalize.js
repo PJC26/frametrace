@@ -221,7 +221,7 @@ function verifySourcesVerdict(res) {
   })();
   // R15 (track I5): why the head is unknown (`head_reason`), short.
   const hr = res.head_reason == null ? "" : String(res.head_reason);
-  const hrWord = { "other-pc": "다른 PC 머리일 수 있음", "unusable-line": "쓸 수 없는 줄", "chain-failed": "체인 실패", "repaired": "레인 수리", "malformed": "형식 오류", "own-head-missing": "결과 실행 머리 없음", "unreadable": "읽지 못함" }[hr] || hr;
+  const hrWord = { "other-pc": "다른 PC 머리일 수 있음", "unusable-line": "쓸 수 없는 줄", "chain-failed": "체인 실패", "repaired": "레인 수리", "malformed": "형식 오류", "own-head-missing": "결과 실행 머리 없음", "unreadable": "읽지 못함", "mixed-version": "버전 섞인 머리", "scan-mismatch": "다른 스캔의 머리" }[hr] || hr;
   if (head) v.tip = [v.tip || "", `재검증 머리 ${head}` + (hrWord ? ` (${hrWord})` : "")].filter(Boolean).join(" · ");
   // R15 (track I4): "시계 이상" — its own warning, never withholds the result.
   const clock = typeof res.clock_note === "string" ? res.clock_note.trim() : "";
@@ -479,7 +479,7 @@ async function gatherFinalizeChecks() {
     const jj = journal.journal || {};
     const cmds = finJournalDismissLines(st, journal.kind).map(l => `${l.label}: ${l.cmd}`).join(" · ");
     const sub = journal.kind === "otherhost" ? [finJournalOtherHost(jj), "그 PC에서 끝난 뒤 다시 확인하십시오.", cmds].filter(Boolean).join(" — ")
-      : journal.kind === "otheraccount" ? [finJournalOtherHost(jj), journal.detail ? finShortDetail(journal.detail) : ""].filter(Boolean).join(" — ")
+      : journal.kind === "otheraccount" || journal.kind === "unverifiedwriter" ? [finJournalOtherHost(jj), journal.detail ? finShortDetail(journal.detail) : "", finJournalForceLines(st, journal.kind).map(l => `${l.label}: ${l.cmd}`).join(" · ")].filter(Boolean).join(" — ")
       : journal.kind === "unreadable" || journal.kind === "unpaired" ? cmds || (journal.detail ? finShortDetail(journal.detail) : "")
       : journal.detail ? finShortDetail(journal.detail) : "결과 아래 안내를 확인하십시오.";
     add("block", "최종화 차단: " + finJournalHead(journal), sub);
@@ -627,6 +627,8 @@ function finJournalState(st) {
   if (kind === "unrecorded" && j.blocks_finalize === true) kind = "unrecordedblocked";
   // R15 (track S10): maybe another account's FrameTrace — blocks, no dismiss hint.
   if (kind === "inprogress" && j.in_progress_code === "other-account") kind = "otheraccount";
+  // R16 U4 (track S2, P25): a live process that may be this case's writer — never rolled back automatically.
+  if (kind === "inprogress" && j.in_progress_code === "unverified-writer") kind = "unverifiedwriter";
   if (j && kind) return { kind, journal: j, detail: reason || detail, code: kind === "unpaired" ? finJournalUnpairedCode(j, reason) : "" };
   if (j && jState !== "recovered") return { kind: "check", journal: j, detail: reason || detail };
   if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j, detail };
@@ -637,7 +639,7 @@ function finJournalState(st) {
 function finJournalBlocks(s) {
   if (!s || !s.journal) return false;
   if (typeof s.journal.blocks_finalize === "boolean") return s.journal.blocks_finalize;
-  return s.kind === "recovering" || s.kind === "otherhost" || s.kind === "otheraccount";
+  return s.kind === "recovering" || s.kind === "otherhost" || s.kind === "otheraccount" || s.kind === "unverifiedwriter";
 }
 // The body shows what is left first: from "확인 필요:" on when the detail has it.
 function finJournalBody(detail) {
@@ -661,6 +663,7 @@ const FIN_JOURNAL_HEAD = {
   closed: "이전 최종화 끝남 — 확인 필요",
   inprogress: "다른 FrameTrace에서 최종화 중",
   otheraccount: "다른 계정의 최종화일 수 있음 — 차단 중",
+  unverifiedwriter: "확인 불가 작성자 — 자동 복구 안 함",
   check: "이전 최종화 중단됨 — 확인 필요",
   recovered: "이전 최종화 중단됨 — 복구됨",
 };
@@ -687,6 +690,19 @@ function finJournalDismissLines(st, kind) {
   // for an older server that does not send the field.
   if (kind === "otherhost" || Object.prototype.hasOwnProperty.call(j, "dismiss_command")) return [];
   return [{ label: "치우기", cmd: finJournalDismissCmd(st) }];
+}
+// R16 U4 (track S2/S4): other-account / unverified-writer block until the
+// examiner confirms the process is not this case's writer — the `--force`
+// form of the dismiss command (the server's `force_command` when it sends one).
+function finJournalForceLines(st, kind) {
+  if (kind !== "otheraccount" && kind !== "unverifiedwriter") return [];
+  const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  const f = (c) => (/\s--force\b/.test(c) ? c : c + " --force");
+  if (typeof j.force_command === "string" && j.force_command.trim()) return [{ label: "확인 뒤 강제 치우기", cmd: j.force_command.trim() }];
+  const cmd = typeof j.dismiss_command_cmd === "string" ? j.dismiss_command_cmd.trim() : "";
+  const out = [{ label: cmd ? "확인 뒤 강제 치우기(PowerShell)" : "확인 뒤 강제 치우기", cmd: f(finJournalDismissCmd(st)) }];
+  if (cmd) out.push({ label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd: f(cmd) });
+  return out;
 }
 // Tooltip words for `local_record` / `unpaired_code`.
 function finJournalTipExtra(j) {
@@ -746,12 +762,12 @@ function finJournalRow(st) {
   if (s.detail) tip.push(s.detail);
   const head = s.kind === "unpaired" ? finJournalHead(s) : FIN_JOURNAL_HEAD[s.kind] || FIN_JOURNAL_HEAD.recovered;
   const lines = [];
-  if (s.kind === "otherhost" || s.kind === "otheraccount") { const o = finJournalOtherHost(j); if (o) lines.push(o); }
+  if (s.kind === "otherhost" || s.kind === "otheraccount" || s.kind === "unverifiedwriter") { const o = finJournalOtherHost(j); if (o) lines.push(o); }
   if (s.detail) lines.push(finJournalBody(s.detail));
   else if (s.kind === "unpaired") lines.push("아무것도 바뀌지 않았습니다");
   // R13 U3 (track S6): an unreadable or unpaired journal (R12 journals read
   // unpaired) is set aside with the CLI.
-  const cmds = finJournalDismissLines(st, s.kind);
+  const cmds = finJournalDismissLines(st, s.kind).concat(finJournalForceLines(st, s.kind));
   return `<li class="h-fin-journal-row" data-journal="${s.kind}"${tip.length ? ` title="${esc(tip.join("\n"))}"` : ""}>` +
     `<span class="${FIN_JOURNAL_INFO.has(s.kind) ? "h-fin-info" : "h-fin-incomplete"}">${esc(head)}</span>` +
     lines.map(b => `<small class="h-fin-detail muted">${esc(b)}</small>`).join("") +

@@ -971,3 +971,21 @@ const FTStore = {
 - `unpaired_code` 추가: package-changed "패키지 변경됨" · local-state "로컬 기록 상태 불일치"(`FIN_UNPAIRED_SHORT`).
 - title에 `local_record_state` "로컬 기록 상태 <값>", `in_progress_code` "진행 중 코드 <값>".
 - 하네스: verify-review-batch --unit "R15 track S follow-up"(이전 커밋 자산에서 실패 확인).
+
+## 23. R16 트랙 U 추가 계약 (2026-10-18, docs/PLAN_R16_2026-10-18.md)
+
+### 23.1 이상 징후 기록 머리 (U1, 트랙 I2)
+- records-meta `logChains.anomaly.head`(없으면 `logChains.anomalyLog.head`) = {status, reason_code, withhold_reason, detail}. `truncated`/`rewritten` → 알림 줄 `#anomalyHeadBanner`(role=alert) "이상 징후 기록 꼬리 잘림 — 현재 결과 없음", 모든 이상 후보 배지에 " · 확인 불가"(`.anomaly-unverified`, 그리드·상세 같음). 그 밖의 값(unknown 등) → 같은 줄 role=status "이상 징후 기록 머리 확인 불가"(배지 그대로). 없음·`absent`·`intact` → 아무것도 없음. title = status·reason_code·withhold_reason·detail (`anomalyHead.*`, ko·en).
+
+### 23.2 레인 간 위치 비교 (U2)
+- 줄 번호는 같은 레인 안에서만 순서다. 서버가 레인 간 순서를 주지 않는 한 다른 레인 사이의 "수리 뒤" 판정은 §22.2의 시각 비교로 남는다(뷰어가 레인 간 위치를 만들지 않음).
+
+### 23.3 문구 (U3·U4, 트랙 S2·S4·I1)
+- 타임라인 행: kind와 파일 이름 사이 " — "(양쪽 공백).
+- `in_progress_code: "unverified-writer"` → `[data-journal="unverifiedwriter"]` "확인 불가 작성자 — 자동 복구 안 함"(경고), 본문 = 차단 시각 · `reason`. 점검 목록 `block` "최종화 차단: 확인 불가 작성자 — 자동 복구 안 함". `blocks_finalize`가 없어도 막음. legacy 같음.
+- unverified-writer·other-account는 `--force` 안내 줄 "확인 뒤 강제 치우기: <명령>"(`finJournalForceLines`): 서버 `force_command`가 있으면 그것, 없으면 치우기 명령(§22.6의 서버 값 또는 내장 작은따옴표 형식)에 ` --force`; `dismiss_command_cmd`가 있으면 "(PowerShell)"/"(명령 프롬프트)" 두 줄. 점검 목록 sub에도 같은 줄. 일반 "치우기:" 줄은 §22.6 그대로(없음).
+- `head_reason` 추가: mixed-version "버전 섞인 머리" · scan-mismatch "다른 스캔의 머리"(§22.5 tip 형식).
+
+### 23.4 하네스 (U5)
+- verify-range-sync ㉓: 편집(keydown)과 `FTViewer.save` 호출을 한 페이지 작업에서 한다. 실제 키 입력 뒤 하네스가 2.5 s 이상 멈추면 자동 저장(디바운스)이 먼저 보내 save가 그 요청을 기다렸다(시험 시각 문제, 저장 경로는 정상). 호출 시점 상태 `pending`도 확인.
+- 하네스: verify-review-batch --unit "R16 U1"·"R16 U3"·"R16 U4"(82a6cb1 자산에서 각각 실패 확인).
