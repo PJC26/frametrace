@@ -858,6 +858,28 @@ function splitValidationSlots(slots) {
 const validationSplit = splitValidationSlots(validationSlots);
 const validationsByPath = validationSplit.usable;
 const untrustedValidationsByPath = validationSplit.untrusted;
+// R19 U1 (P33): a validation's anomaly_flags may be a record's only finding
+// source (a carved record has no anomaly-lane rows). Per path, the flags of
+// every validation line that is not its current usable one (the untrusted
+// latest line, superseded earlier lines, lines before a lane repair) stay —
+// trust "unauth" (a `pc:<key>` line keeps its key), never dropped.
+function validationFlagRows(list, keyOf, usable) {
+  const out = new Map();
+  for (const item of Array.isArray(list) ? list : []) {
+    if (!item || typeof item !== "object" || !Array.isArray(item.anomaly_flags)) continue;
+    const key = keyOf(item);
+    if (!key || (usable && usable.get(key) === item)) continue;
+    const pc = logTrustPcKey(logTrustOf(item));
+    const rows = out.get(key) || [];
+    for (const kind of item.anomaly_flags) {
+      if (kind == null || kind === "") continue;
+      rows.push({ kind: String(kind), detail: "validation anomaly_flags (not current)", trust: pc ? "pc:" + pc : "unauth" });
+    }
+    if (rows.length) out.set(key, rows);
+  }
+  return out;
+}
+const validationFlagsByPath = validationFlagRows(validationLog, item => normalizePath(item.target_path), validationsByPath);
 const recoveredFilesystemLog = currentLogEntries(
   filesystemLog.filter(item => item && item.event === "recover-inode" && item.output_path),
   item => `${item.partition_offset ?? 0}:${item.inode || normalizePath(item.output_path)}`,
@@ -993,7 +1015,9 @@ function serverProxyOf(row) {
 // record with no usable (auth / sc / absent) row is marked apart:
 // `hasUnauthAnomaly` (some row not another PC's key) or else `hasPcAnomaly`
 // (U2: all rows `pc:<key>`). A validation flag carries its validation
-// line's trust; of two rows of one kind a usable one wins.
+// line's trust; of two rows of one kind a usable one wins. R19 U1 (P33):
+// plus `record.validationFlags` — the flags of the path's other validation
+// lines (validationFlagRows), "인증 안 됨" unless a usable row of the kind.
 function recordAnomalies(record) {
   const usable = (item) => logTrustUsable(logTrustOf(item));
   const fromId = anomaliesBySelector.get(record.id) || [];
@@ -1001,6 +1025,7 @@ function recordAnomalies(record) {
   const fromValidation = Array.isArray(record.validation?.anomaly_flags)
     ? record.validation.anomaly_flags.map(kind => Object.assign({ kind, selector: record.id, detail: "validation anomaly_flags" }, vTrust))
     : [];
+  for (const row of Array.isArray(record.validationFlags) ? record.validationFlags : []) fromValidation.push(Object.assign({ selector: record.id }, row));
   const merged = [...fromId];
   for (const item of fromValidation) {
     const at = merged.findIndex(existing => existing.kind === item.kind);
@@ -1043,7 +1068,8 @@ const records = [
       inode: video.inode,
       fps: videoFps(video),
       serverProxy: serverProxyOf(video),
-      validation
+      validation,
+      validationFlags: validationFlagsByPath.get(normalizePath(video.source_path)) || []
     };
   }),
   ...carveLog.map(item => {
@@ -1076,7 +1102,8 @@ const records = [
       offset: item.offset,
       indexStatus: "active",
       serverProxy: serverProxyOf(item),
-      validation
+      validation,
+      validationFlags: validationFlagsByPath.get(normalizePath(item.output_path)) || []
     };
   }),
   ...(DATA.flsEntries || [])
@@ -1139,7 +1166,8 @@ const records = [
       warnings: Array.isArray(item.warnings) ? item.warnings : [],
       indexStatus: "active",
       serverProxy: serverProxyOf(item),
-      validation
+      validation,
+      validationFlags: validationFlagsByPath.get(normalizePath(item.output_path)) || []
     };
   }),
   ...joinLog.map(item => {

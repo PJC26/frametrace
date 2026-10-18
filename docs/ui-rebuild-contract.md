@@ -1019,6 +1019,7 @@ const FTStore = {
 
 ### 25.1 이상 후보는 안전한 쪽으로 센다 (U1, P30 — §24.2를 대신함)
 - 이상 징후 발견 행(`kind` ≠ none)이 하나라도 있는 기록은 `trust`와 무관하게 이상 후보(`record.hasAnomaly`). 인증 안 된 줄·대체된 줄이 기록을 깨끗하게 보이게 하지 않는다.
+- 검증 `anomaly_flags`(R19 U1, P33 — §24.2 "그 검증 줄의 trust"를 대신함): 경로의 현재 쓸 수 있는 검증 줄 플래그는 그 줄의 trust. 그 밖의 모든 검증 줄(인증 안 된 최신 줄, 대체된 이전 줄 — 인증됐던 줄 포함, 레인 수리 전 줄)의 플래그도 남아 "인증 안 됨"으로 센다(`pc:<키>` 줄은 "다른 PC 키"). 같은 kind는 한 번만, 쓸 수 있는 행이 있으면 그쪽(`validationFlagRows` → `record.validationFlags` → `recordAnomalies`). 하네스: verify-review-batch --unit "R19 U1"(16f4c67 자산에서 실패 확인).
 - 쓸 수 있는 행(auth·sc·필드 없음)이 하나도 없는 기록만 표시를 구분: 그중 `pc:<키>`가 아닌 행이 있으면 `hasUnauthAnomaly`("인증 안 됨"), 모두 `pc:`면 `hasPcAnomaly`("다른 PC 키", §25.2).
 - 알약: "이상 N (인증 안 됨 M · 다른 PC 키 K)" — 괄호 안 각 부분은 0보다 클 때만; 보류 중이면 뒤에 " · 확인 불가". tooltip "인증 안 됨 M건 포함(표시만 구분)".
 - 배지: `.badge.anomaly` "이상 후보" + " · 인증 안 됨"(`.anomaly-unauth`) 또는 " · 다른 PC 키"(`.anomaly-pc`) + " · 확인 불가"(`.anomaly-unverified`). 상세 이상 징후 줄도 같은 표시.

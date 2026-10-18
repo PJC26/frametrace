@@ -760,6 +760,45 @@ async function unitTests() {
   await r16TrackU({ fn, source, runInNewContext, assert, ex });
   await r17TrackU({ fn, source, runInNewContext, assert, ex });
   await r18TrackU({ fn, source, runInNewContext, assert, ex });
+  await r19TrackU({ fn, source, runInNewContext, assert });
+}
+
+// ---- R19 track U (docs/PLAN_R19_2026-10-19.md, P33) ------------------------
+// U1 (R18 reviewer): a validation's anomaly_flags are a carved record's only
+// finding source — a newer unkeyed validation line (P7 recency) or a lane
+// repair must not make them vanish. Built through the REAL
+// logSlots → splitValidationSlots → validationFlagRows → recordAnomalies.
+async function r19TrackU({ fn, source, runInNewContext, assert }) {
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'logRepairs', 'logPosOf', 'logSlots', 'splitValidationSlots', 'recordAnomalies'];
+  const ctx = { anomaliesBySelector: new Map() };
+  runInNewContext(names.map((n) => { const f = fn(n); assert.ok(f, `R19 U1: ${n} exists`); return f; }).concat([fn('validationFlagRows') || '']).join('\n'), ctx);
+  // The record as the builders make it: the path's usable validation + the flags of its other lines.
+  const rec = (vl, chain) => plain(runInNewContext(`(() => { const key = (i) => i.target_path || '';
+    const sp = splitValidationSlots(logSlots(vl, key, chain));
+    const rows = typeof validationFlagRows === 'function' ? validationFlagRows(vl, key, sp.usable) : new Map();
+    const r = { id: 'carve:1', validation: sp.usable.get('X'), validationFlags: rows.get('X') || [] };
+    recordAnomalies(r);
+    return { kinds: r.anomalies.map((a) => a.kind), flag: (r.hasAnomaly ? 'A' : '') + (r.hasUnauthAnomaly ? 'U' : '') + (r.hasPcAnomaly ? 'P' : '') }; })()`, Object.assign(ctx, { vl, chain: chain || null })));
+  const v = (trust, flags, extra) => Object.assign({ target_path: 'X', validation_status: 'ffprobe-confirmed', trust }, flags ? { anomaly_flags: flags } : {}, extra || {});
+  // PoC: authenticated flagged line, then one unkeyed line (the server marks the older one unauth by recency).
+  assert.deepEqual(rec([v('unauth', ['frame-gap'], { trust_superseded_by: 2 }), v('unauth')]), { kinds: ['frame-gap'], flag: 'AU' }, 'R19 U1 PoC (P33): the flag of the superseded validation stays, counted 인증 안 됨');
+  assert.deepEqual(rec([v('auth', ['frame-gap']), v('unauth')]), { kinds: ['frame-gap'], flag: 'AU' }, 'R19 U1: older server (no trust_superseded_by) — the same');
+  // Lane repair after the flagged line: not current, still counted.
+  assert.deepEqual(rec([v('auth', ['frame-gap'])], { repairs: [{ line: 1, logged_unix: 10 }] }), { kinds: ['frame-gap'], flag: 'AU' }, 'R19 U1: after a lane repair (ftRepairedAfter) the flag stays, 인증 안 됨');
+  // The unusable latest line's own flags count (a pc: line stays "다른 PC 키").
+  assert.deepEqual(rec([v('auth'), v('pc:K2', ['ts-gap'])]), { kinds: ['ts-gap'], flag: 'AP' }, 'R19 U1: the untrusted latest validation\'s own flags count (pc:)');
+  assert.deepEqual(rec([v('unauth', ['ts-gap'])]), { kinds: ['ts-gap'], flag: 'AU' }, 'R19 U1: an unauth-only validation\'s flags count');
+  // Display distinct; a usable current flag of the same kind wins.
+  assert.deepEqual(rec([v('auth', ['frame-gap', 'frame-gap']), v('unauth', ['frame-gap'])]), { kinds: ['frame-gap'], flag: 'AU' }, 'R19 U1: kinds shown once');
+  assert.deepEqual(rec([v('auth', ['frame-gap']), v('auth', ['frame-gap'])]), { kinds: ['frame-gap'], flag: 'A' }, 'R19 U1: the current usable flag wins over the superseded one');
+  assert.deepEqual(rec([v('auth', ['x']), v('auth')]), { kinds: ['x'], flag: 'AU' }, 'R19 U1 (P33): a superseded authenticated flag counts 인증 안 됨');
+  assert.deepEqual(rec([v('auth', ['frame-gap'])]), { kinds: ['frame-gap'], flag: 'A' }, 'R19 U1: the current usable flag as before');
+  assert.deepEqual(rec([v('auth'), v('unauth')]), { kinds: [], flag: '' }, 'R19 U1: no flags → clean');
+  // Every validated record kind passes its path's other flags.
+  const n = (source.match(/validationFlags: validationFlagsByPath\.get\(normalizePath\(/g) || []).length;
+  assert.equal(n, 3, 'R19 U1: video / carved / filesystem records carry validationFlags');
+  console.log('PASS VM R19 U1 (P33) validation anomaly_flags survive P7 recency and lane repair, counted 인증 안 됨');
 }
 
 // ---- R18 track U (docs/PLAN_R18_2026-10-19.md, P30) ------------------------
@@ -1002,7 +1041,14 @@ async function r17TrackU({ fn, source, runInNewContext, assert, ex }) {
   const rec = (id, rows, validation) => ({ id, validation });
   const byId = new Map([['a', [{ kind: 'gop-gap', trust: 'auth' }]], ['b', [{ kind: 'gop-gap', trust: 'unauth' }]], ['c', [{ kind: 'ts-gap', trust: 'pc:K2' }, { kind: 'x', trust: 'sc' }]],
     ['d', [{ kind: 'gop-gap', trust: 'pc:K2' }]], ['e', [{ kind: 'old' }]]]);
-  const recs = [rec('a'), rec('b'), rec('c'), rec('d'), rec('e'), rec('f', null, { trust: 'unauth', anomaly_flags: ['vf'] }), rec('g', null, { trust: 'auth', anomaly_flags: ['gop-gap'] }), rec('h')];
+  // (f) through the real path (R19 U1): an authenticated flagged validation, then one unkeyed line.
+  const vctx = {};
+  runInNewContext(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'logRepairs', 'logPosOf', 'logSlots', 'splitValidationSlots', 'validationFlagRows'].map((n) => {
+    const f = fn(n); assert.ok(f, `R17 U2 (f): ${n} exists`); return f; }).join('\n'), vctx);
+  const fRec = runInNewContext(`(() => { const vl = [{ target_path: 'f', trust: 'unauth', trust_superseded_by: 2, anomaly_flags: ['vf'] }, { target_path: 'f', trust: 'unauth' }];
+    const key = (i) => i.target_path; const sp = splitValidationSlots(logSlots(vl, key, null));
+    return { id: 'f', validation: sp.usable.get('f'), validationFlags: validationFlagRows(vl, key, sp.usable).get('f') || [] }; })()`, vctx);
+  const recs = [rec('a'), rec('b'), rec('c'), rec('d'), rec('e'), fRec, rec('g', null, { trust: 'auth', anomaly_flags: ['gop-gap'] }), rec('h')];
   byId.set('g', [{ kind: 'gop-gap', trust: 'unauth' }]);
   const withheld = { anomaly: { head: { status: 'unknown', reason_code: 'other-pc', withhold_reason: '머리 확인 불가' } } };
   const u2 = vv(withheld, false, { anomaliesBySelector: byId, records: recs });
@@ -1019,7 +1065,7 @@ async function r17TrackU({ fn, source, runInNewContext, assert, ex }) {
   assert.equal(runInNewContext('presetChipLabel("anomaly", "chip.anomaly")', u2), '이상 징후 후보 · 확인 불가', 'R17 U2: the anomaly chip carries "확인 불가"');
   assert.equal(runInNewContext('presetChipLabel("anomaly:unauth", "chip.anomalyUnauth")', u2), '인증 안 된 후보 2', 'R17 U2: the unauthenticated chip carries its count');
   assert.ok(/class="badge anomaly anomaly-unauth anomaly-unverified"/.test(runInNewContext('anomalyBadgeHtml(r, true)', Object.assign(u2, { r: recs[1] }))) && /인증 안 됨 · 확인 불가</.test(runInNewContext('anomalyBadgeHtml(r, true)', u2)), 'R17 U2 (R18 P30): an unauthenticated-only record stays 이상 후보, marked 인증 안 됨');
-  const clean = vv(null, false, { anomaliesBySelector: byId, records: recs.map((r) => ({ id: r.id, validation: r.validation })) });
+  const clean = vv(null, false, { anomaliesBySelector: byId, records: recs.map((r) => ({ id: r.id, validation: r.validation, validationFlags: r.validationFlags })) });
   runInNewContext('records.forEach(recordAnomalies)', clean);
   const n2 = { textContent: '', closest: () => pill };
   runInNewContext('anomalyPillUpdate(n, staticMetricCounts())', Object.assign(clean, { n: n2 }));
