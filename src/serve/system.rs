@@ -1151,7 +1151,12 @@ pub(crate) fn api_case_info(request: &Request, state: &SharedState) -> String {
     if !case_dir.join("case.json").is_file() {
         return api_err("해당 폴더에 case.json이 없습니다 — 케이스 폴더가 아닙니다.");
     }
-    let is_bound = bound.as_deref() == Some(case_dir.as_path());
+    // R21-S3: the bound folder is in normalized (plain) form; the typed
+    // text is compared in that form too (lexical — no disk).
+    let is_bound = bound.as_deref().is_some_and(|bound| {
+        bound == case_dir
+            || crate::paste_path::normalize_checked(&case_dir).as_deref() == Some(bound)
+    });
     let video_count = if is_bound {
         cached_index(state, &case_dir)
             .ok()
@@ -1346,15 +1351,26 @@ pub(crate) fn api_preflight(request: &Request) -> String {
 
 /// `path` resolved through its nearest existing ancestor, so a case folder
 /// that does not exist yet still compares against the canonical source.
-fn canonical_via_ancestor(path: &Path) -> PathBuf {
+/// R21-S5: the missing tail is joined as TEXT (one separator per name) —
+/// `PathBuf::push` replaced the canonical buffer for a typed name that
+/// parses as a prefix or root (`…\missing\D:` became `D:`).
+pub(crate) fn canonical_via_ancestor(path: &Path) -> PathBuf {
     let mut missing = Vec::new();
     let mut cursor = path.to_path_buf();
     loop {
         if let Ok(canonical) = cursor.canonicalize() {
-            return missing
-                .iter()
-                .rev()
-                .fold(canonical, |acc: PathBuf, part| acc.join(part));
+            let mut joined = canonical.into_os_string();
+            for part in missing.iter().rev() {
+                let ends_with_separator = joined
+                    .as_encoded_bytes()
+                    .last()
+                    .is_some_and(|&byte| std::path::is_separator(char::from(byte)));
+                if !ends_with_separator {
+                    joined.push(std::path::MAIN_SEPARATOR_STR);
+                }
+                joined.push(part);
+            }
+            return PathBuf::from(joined);
         }
         match (
             cursor.file_name().map(|n| n.to_os_string()),

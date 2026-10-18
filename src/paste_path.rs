@@ -56,8 +56,11 @@ pub const UNBINDABLE_REASON: &str = "경로 구성 요소에 '/' 또는 ':'가 �
 /// as rooted or prefixed (`\\?\C:\x\//srv/sh` became the UNC path
 /// `//srv/sh`, `C:\x\D:` the drive-relative `D:`). A verbatim (`\\?\…`) or
 /// device-namespace (`\\.\…`) path is not reassembled at all: only its
-/// trailing separators are dropped (its root separator kept). Whether the
-/// result may be BOUND (opened, made a root) is [`normalize_checked`].
+/// trailing separators are dropped (its root separator kept). R21-S3: a
+/// bindable verbatim LOCAL DRIVE path (`\\?\C:\…`) whose every name means
+/// the same in Win32 form is returned in that plain form (`C:\…`, the
+/// root `C:\.`). Whether the result may be BOUND (opened, made a root) is
+/// [`normalize_checked`].
 pub fn normalize(path: &Path) -> PathBuf {
     normalize_parts(path).0
 }
@@ -67,6 +70,8 @@ pub fn normalize(path: &Path) -> PathBuf {
 /// — in a verbatim path `/` is no separator, so such a component would be
 /// re-read as a UNC / device / drive path by anything that reassembles or
 /// strips the prefix; elsewhere `:` is a drive switch or an NTFS stream.
+/// R21-S2: also when a component after a verbatim / device prefix is `.`,
+/// `..` or empty (kept as a name there, resolved once the prefix is gone).
 /// A caller that binds the result must still run the remote / device /
 /// reserved-name checks on it (the text changed).
 pub fn normalize_checked(path: &Path) -> Option<PathBuf> {
@@ -77,6 +82,20 @@ pub fn normalize_checked(path: &Path) -> Option<PathBuf> {
 /// Whether a Windows path component (after the prefix) holds `/` or `:`.
 fn bad_component(component: &[u8]) -> bool {
     component.iter().any(|byte| matches!(byte, b'/' | b':'))
+}
+
+/// R21-S3: the longest plain form a verbatim local drive path is bound
+/// in. A longer one stays verbatim: a child program handed the plain text
+/// would hit MAX_PATH (260, less room for a file name under the folder).
+const PLAIN_MAX_LEN: usize = 240;
+
+/// R21-S3: whether a name under `\\?\C:\` means the same without the
+/// prefix — not empty, no trailing `.` or space (Win32 strips them) and no
+/// reserved device base name (`aux.mp4` is a file only under the prefix).
+/// Empty `names` (the drive root) splits to one `""`, which is stable.
+fn plain_stable(name: &str) -> bool {
+    name.is_empty()
+        || (!name.ends_with(['.', ' ']) && !crate::util::has_reserved_device_component(name))
 }
 
 /// Whether `path` starts with a verbatim (`\\?\`) or device-namespace
@@ -122,7 +141,33 @@ fn normalize_parts(path: &Path) -> (PathBuf, bool) {
         } else {
             kept
         };
-        let bindable = !kept.split('\\').any(|part| bad_component(part.as_bytes()));
+        // R21-S2: under the prefix `.`, `..` and an empty component are
+        // NAMES (Win32 never resolves them), so whatever strips the prefix
+        // later would resolve them to another folder — not bindable.
+        let names = kept.strip_prefix('\\').unwrap_or(kept);
+        let bindable = names.is_empty()
+            || !names
+                .split('\\')
+                .any(|part| matches!(part, "" | "." | "..") || bad_component(part.as_bytes()));
+        // R21-S3: a verbatim local drive path is bound in its PLAIN form,
+        // so `\\?\C:\cases\c1` and `C:\cases\c1` are one binding (and
+        // compare equal on reopen) — unless plain Win32 parsing would
+        // change what a name means (see `plain_stable`).
+        if bindable
+            && let Prefix::VerbatimDisk(_) = prefix.kind()
+            && kept.starts_with('\\')
+            && names.split('\\').all(plain_stable)
+        {
+            let drive = &whole[4..head];
+            let plain = if names.is_empty() {
+                format!("{drive}\\.")
+            } else {
+                format!("{drive}\\{names}")
+            };
+            if plain.len() <= PLAIN_MAX_LEN {
+                return (PathBuf::from(plain), true);
+            }
+        }
         return (PathBuf::from(format!("{}{kept}", &whole[..head])), bindable);
     }
     let mut out = OsString::new();
@@ -172,7 +217,9 @@ fn normalize_parts(path: &Path) -> (PathBuf, bool) {
 /// escaped closing quote — R20-S2) or ends in `\` at all.
 pub fn paste_safe(path: &Path) -> Option<String> {
     let normalized = normalize_checked(path)?;
-    if special_prefix(&normalized) {
+    // R21-S3: a typed verbatim path now normalizes to its plain form; the
+    // typed text itself still gets no command (as in R20).
+    if special_prefix(path) || special_prefix(&normalized) {
         return None;
     }
     let text = normalized.display().to_string();

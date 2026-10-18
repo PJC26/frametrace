@@ -2568,7 +2568,9 @@ mod tests_origin_and_paths {
             r"\cases\a.mp4",
             "relative/a.mp4",
             r"\\?\C:\cases\a.mp4",
-            r"\\?\d:",
+            // R21-S1: the root separator makes it the drive, not the
+            // volume device (`\\?\d:` is refused — tests_r21_server).
+            r"\\?\d:\",
             "",
         ] {
             assert_eq!(

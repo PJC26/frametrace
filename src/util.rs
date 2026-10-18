@@ -226,17 +226,20 @@ pub(crate) fn is_remote_or_device_path(text: &str, windows: bool) -> bool {
             && is_separator(bytes[3]))
 }
 
-/// `\\?\C:` / `\\?\C:\…` — the verbatim spelling of a local drive path.
+/// `\\?\C:\…` — the verbatim spelling of a local drive path. R21-S1: the
+/// root separator is required — `\\?\C:` alone names the raw VOLUME
+/// device (like `\\.\C:`; its metadata fails with ERROR_INVALID_FUNCTION),
+/// not the drive's root folder, so it is a device path.
 pub(crate) fn is_verbatim_local_drive(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.len() >= 6
+    bytes.len() >= 7
         && bytes[0] == b'\\'
         && bytes[1] == b'\\'
         && bytes[2] == b'?'
         && bytes[3] == b'\\'
         && bytes[4].is_ascii_alphabetic()
         && bytes[5] == b':'
-        && (bytes.len() == 6 || bytes[6] == b'\\')
+        && bytes[6] == b'\\'
 }
 
 /// Lowercased `\\server\share[\rest]` form of a UNC path (separators

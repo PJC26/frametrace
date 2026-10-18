@@ -62,6 +62,8 @@ mod tests_r19_server;
 #[cfg(test)]
 mod tests_r20_server;
 #[cfg(test)]
+mod tests_r21_server;
+#[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
 mod tests_r4_jobs;
@@ -235,9 +237,12 @@ pub fn run_with_listener(options: ServeOptions, listener: TcpListener) -> Result
     run_on(options, Some(listener))
 }
 
-/// R20-S3: the `serve --case` folder as bound — [`state::bind_path`] under
-/// the `/api/start` policy (a typed UNC share admitted; device, reserved
-/// and verbatim-reassembled paths refused with an error, never silently).
+/// R20-S3: the [`ServeOptions::case_dir`] folder as bound —
+/// [`state::bind_path`] under the `/api/start` policy (a typed UNC share
+/// admitted; device, reserved and verbatim-reassembled paths refused with
+/// an error, never silently). R21-S4: no production entry point sets it
+/// (`main.rs`, `app.rs` and `shell.rs` pass `None`; there is no
+/// `serve --case` flag) — tests and library callers only.
 pub(crate) fn bind_cli_case(typed: &Path) -> Result<PathBuf, String> {
     state::bind_path(typed, http::reject_device_path)
         .map_err(|reason| format!("--case {}: {reason}", typed.display()))
@@ -247,7 +252,7 @@ fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), Strin
     proc::install_process_guard();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     if let Some(typed) = &options.case_dir {
-        // R20-S3 (P34): `--case` is bound like a typed `/api/start` case
+        // R20-S3 (P34): `case_dir` is bound like a typed `/api/start` case
         // folder — normalized and checked again on the normalized path —
         // so it compares equal to the same folder bound any other way.
         let case_dir = bind_cli_case(typed)?;

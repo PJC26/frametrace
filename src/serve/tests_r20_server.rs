@@ -178,8 +178,9 @@ fn r20_s1_bind_path_refuses_what_normalizing_would_reroot() {
         (r"C:\cases\c1\", r"C:\cases\c1"),
         (r"C:/cases//c1/", r"C:\cases\c1"),
         (r"E:\", r"E:\."),
-        (r"\\?\C:\cases\c1\\", r"\\?\C:\cases\c1"),
-        (r"\\?\C:\", r"\\?\C:\"),
+        // R21-S3: a verbatim local drive path binds in plain form.
+        (r"\\?\C:\cases\c1\\", r"C:\cases\c1"),
+        (r"\\?\C:\", r"C:\."),
         (r"\\?\C:\cases\aux.mp4", r"\\?\C:\cases\aux.mp4"),
     ] {
         assert_eq!(
