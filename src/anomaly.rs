@@ -185,6 +185,17 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     let mut nonce = [0u8; 2];
     getrandom::fill(&mut nonce).map_err(|err| format!("failed to draw a run id: {err}"))?;
     let scan_id = format!("{scanned_unix}-{:02x}{:02x}", nonce[0], nonce[1]);
+    #[cfg(test)]
+    BEFORE_RESULT_WRITE.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(case_dir);
+        }
+    });
+    // R17 I4: re-hashing can take long after the first check — every lane
+    // is checked again (opened for append) right before the first result
+    // row, so a lane torn or made read-only meanwhile still refuses the
+    // scan before any result lane is touched.
+    preflight_scan_lanes(case_dir, rehash)?;
     let hash_verify_run_id = if rehash {
         write_hash_verify_log(case_dir, scanned_unix, &scan_id, &checks)?;
         Some(scan_id.clone())
@@ -278,6 +289,16 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         checks,
         hash_verify_run_id,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// R17 I4 test hook: runs in [`scan_case`] after the findings are
+    /// computed, right before the second lane check and the first result
+    /// write (on the calling thread only).
+    #[allow(clippy::type_complexity)]
+    pub(crate) static BEFORE_RESULT_WRITE: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// R16 I5: the lanes [`scan_case`] appends to — the re-verification lane

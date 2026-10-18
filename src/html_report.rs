@@ -417,6 +417,7 @@ fn evidence_viewer_data(
     proxies_json: &str,
     join_log_jsonl: &str,
     audio_levels_json: &str,
+    log_chains_json: &str,
     case_dir: &std::path::Path,
 ) -> String {
     // Carve/recovery logs may carry relative artifact paths; the viewer
@@ -424,7 +425,7 @@ fn evidence_viewer_data(
     let case_dir_json =
         serde_json::to_string(&crate::audit::path_string(case_dir)).unwrap_or_default();
     format!(
-        "window.__FRAMETRACE_DATA__ = {{manifest:{manifest},caseDir:{case_dir},scan:{index},carveLog:{carve_lines},filesystemLog:{filesystem_lines},validationLog:{validation_lines},anomalyLog:{anomaly_lines},flsEntries:{fls_lines},thumbs:{thumbs_lines},annotations:{annotations_lines},deepfake:{deepfake_map},telemetry:{telemetry_map},proxies:{proxies_map},joinLog:{join_lines},audioLevels:{audio_levels}}};",
+        "window.__FRAMETRACE_DATA__ = {{manifest:{manifest},caseDir:{case_dir},scan:{index},carveLog:{carve_lines},filesystemLog:{filesystem_lines},validationLog:{validation_lines},anomalyLog:{anomaly_lines},flsEntries:{fls_lines},thumbs:{thumbs_lines},annotations:{annotations_lines},deepfake:{deepfake_map},telemetry:{telemetry_map},proxies:{proxies_map},joinLog:{join_lines},audioLevels:{audio_levels}{log_chains}}};",
         case_dir = json_for_script(&case_dir_json),
         manifest = json_for_script(manifest_json),
         index = json_for_script(index_json),
@@ -443,7 +444,22 @@ fn evidence_viewer_data(
         proxies_map = json_for_script(proxies_json),
         join_lines = json_for_script(&jsonl_to_array(join_log_jsonl)),
         audio_levels = json_for_script(&crate::report::audio_levels_object(audio_levels_json)),
+        // R17 I6: `logChains` (only the anomaly head, `{anomaly:{head}}` —
+        // the records-meta / report object) when the caller has one; an
+        // empty or non-object value leaves the key out (older bundles).
+        log_chains = log_chains_field(log_chains_json),
     )
+}
+
+/// R17 I6: `,logChains:<object>` for the data block, or "" when `chains`
+/// is empty or not one JSON object.
+fn log_chains_field(chains: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(chains.trim()) {
+        Ok(value) if value.is_object() => {
+            format!(",logChains:{}", json_for_script(&value.to_string()))
+        }
+        _ => String::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -481,6 +497,7 @@ pub fn render_evidence_viewer_html(
         proxies_json,
         join_log_jsonl,
         audio_levels_json,
+        "",
         case_dir,
     );
     fill_viewer_template(&data)
@@ -546,6 +563,7 @@ pub fn render_data_bundle_js(
     proxies_json: &str,
     join_log_jsonl: &str,
     audio_levels_json: &str,
+    log_chains_json: &str,
     case_dir: &std::path::Path,
 ) -> String {
     evidence_viewer_data(
@@ -563,6 +581,7 @@ pub fn render_data_bundle_js(
         proxies_json,
         join_log_jsonl,
         audio_levels_json,
+        log_chains_json,
         case_dir,
     )
 }
@@ -1275,9 +1294,17 @@ mod tests {
             "[]",
             join,
             levels,
+            r#"{"anomaly":{"head":{"status":"truncated"}}}"#,
             Path::new("C:\\case"),
         );
         assert!(bundle.contains("joinLog:[{") && bundle.contains("audioLevels:{\"vid_1\""));
+        // R17 I6: the anomaly head rides along as `logChains`; the inline
+        // page (no chains given) has none.
+        assert!(
+            bundle.contains(r#"logChains:{"anomaly":{"head":{"status":"truncated"}}}"#),
+            "{bundle}"
+        );
+        assert!(!plain.contains(",logChains:"));
     }
 
     /// R7-S6: a `case.json` / index that is not one JSON value is

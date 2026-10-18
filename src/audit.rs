@@ -1503,10 +1503,17 @@ pub fn append_chained_jsonl_keyed(
 /// R16 I5: would [`append_chained_jsonl`] be able to chain onto `path`
 /// now? A missing lane is fine (it is created); a lane ending in a torn
 /// line, or one that cannot be opened / read, is refused with the same
-/// words the append would use. Read-only — a writer calls it BEFORE
+/// words the append would use. Writes nothing — a writer calls it BEFORE
 /// touching other lanes, so a multi-lane write does not stop half done.
+/// R17 I4: the lane is opened for APPEND (as the append opens it, without
+/// creating it), so a read-only lane file or a folder that refuses writes
+/// is refused here too (R16 opened it read-only).
 pub fn check_appendable(path: &Path) -> Result<(), String> {
-    let mut file = match File::open(path) {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+    {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
@@ -4342,3 +4349,7 @@ mod tests_r15;
 #[cfg(test)]
 #[path = "tests_audit_r16.rs"]
 mod tests_r16;
+
+#[cfg(test)]
+#[path = "tests_audit_r17.rs"]
+mod tests_r17;

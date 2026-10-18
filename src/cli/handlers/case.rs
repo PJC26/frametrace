@@ -401,6 +401,19 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         &review_lane(case_dir, "artifacts/joined/join-log.jsonl").0,
     ));
     let audio_levels_json = measured_audio_levels_json(case_dir)?;
+    // R17 I6: the standalone viewer shows the same anomaly-head banner as
+    // the workstation — `logChains.anomaly.head`, the very object
+    // `/api/records-meta` and the report's `auditChains.anomaly.head`
+    // carry (as of this make-review; redacted like the rest).
+    let log_chains = redact(
+        &serde_json::json!({
+            "anomaly": {
+                "head": crate::report::anomaly_head_check(case_dir)
+                    .to_json_in(crate::report::HeadLane::Anomaly),
+            },
+        })
+        .to_string(),
+    );
     // The viewer page stays slim; the (potentially huge) record payload
     // lives in data-bundle.js beside it. Standalone file:// use loads the
     // bundle through a script tag; workstation serving pages the same
@@ -420,6 +433,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
         &proxies_json,
         &join_log,
         &audio_levels_json,
+        &log_chains,
         page_case_dir,
     );
     // D12: a redacted bundle says so on its first line, so package-case can

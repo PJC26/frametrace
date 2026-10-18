@@ -51,7 +51,18 @@ pub struct TimelineEvent {
     /// `"time_unaudited": true` in the JSON (the viewer's badge). R16 I7:
     /// also every event no chain vouches for — an unchained log's entry,
     /// an entry not authenticated here, a snapshot-only carve artifact.
+    ///
+    /// R17 I7: an audit-lane entry usable here only by self-consistency
+    /// (trust `sc`: no audit key on this PC, or the documented pre-key
+    /// prefix) stays `false` — its time IS the audit lane's (the viewer
+    /// badge "감사 기록에 없는 시각" would be wrong), but no HMAC vouches for
+    /// it: [`Self::time_self_consistent`] says so.
     pub time_unaudited: bool,
+    /// R17 I7: `"time_self_consistent": true` — the time comes from an
+    /// audit-lane entry that is usable here by self-consistency only (P1:
+    /// anyone can rewrite such a lane with any time; not authenticated).
+    /// Always `false` when `time_unaudited` is true.
+    pub time_self_consistent: bool,
     pub path: String,
     pub detail: String,
 }
@@ -59,12 +70,13 @@ pub struct TimelineEvent {
 impl TimelineEvent {
     fn to_json(&self) -> String {
         format!(
-            "{{\"label\":\"{}\",\"ts_unix\":{},\"source\":\"{}\",\"kind\":\"{}\",\"time_unaudited\":{},\"path\":\"{}\",\"detail\":\"{}\"}}",
+            "{{\"label\":\"{}\",\"ts_unix\":{},\"source\":\"{}\",\"kind\":\"{}\",\"time_unaudited\":{},\"time_self_consistent\":{},\"path\":\"{}\",\"detail\":\"{}\"}}",
             LABEL,
             self.ts_unix,
             json_escape(self.source),
             json_escape(self.kind),
             self.time_unaudited,
+            self.time_self_consistent,
             json_escape(&self.path),
             json_escape(&self.detail),
         )
@@ -182,6 +194,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 ts_unix: mtime,
                 source: "index",
                 time_unaudited: true,
+                time_self_consistent: false,
                 kind: "file-modified",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} filesystem mtime"),
@@ -197,6 +210,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 ts_unix: stale_unix,
                 source: "index",
                 time_unaudited: true,
+                time_self_consistent: false,
                 kind: "file-marked-stale",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} marked stale by rescan"),
@@ -221,6 +235,7 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                     ts_unix: ts,
                     source: "ffprobe",
                     time_unaudited: true,
+                    time_self_consistent: false,
                     kind: "media-creation-time",
                     path: source_path.clone(),
                     detail: format!(
@@ -296,6 +311,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                     ts_unaudited: bool,
                     unauthenticated: Option<String>,
                     snapshot: bool,
+                    self_consistent: bool,
                     skipped: &mut usize| {
         let (id, output_path) = key_of(artifact);
         if output_path.is_empty() {
@@ -329,6 +345,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 ts_unix,
                 source: "carve",
                 time_unaudited: true,
+                time_self_consistent: false,
                 kind: CARVED_UNAUDITED_KIND,
                 path: output_path,
                 detail: format!(
@@ -339,6 +356,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 ts_unix,
                 source: "carve",
                 time_unaudited: ts_unaudited,
+                time_self_consistent: self_consistent,
                 kind: "carved-candidate",
                 path: output_path,
                 detail,
@@ -349,6 +367,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 ts_unix,
                 source: "carve",
                 time_unaudited: true,
+                time_self_consistent: false,
                 kind: UNAUTHENTICATED_KIND,
                 path: output_path,
                 detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
@@ -363,12 +382,15 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
         let own = value.get("carved_unix").and_then(serde_json::Value::as_u64);
         let ts = own.or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(value))));
         let unauthenticated = (!row.usable()).then(|| row.note());
+        // R17 I7: a usable entry vouched by self-consistency only (`sc`).
+        let self_consistent = row.usable() && own.is_some() && row.code() == "sc";
         emit(
             value,
             ts,
             own.is_none() && ts.is_some(),
             unauthenticated,
             false,
+            self_consistent,
             &mut skipped,
         );
     }
@@ -380,7 +402,7 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 .get("carved_unix")
                 .and_then(serde_json::Value::as_u64)
                 .or(snapshot_unix);
-            emit(artifact, ts, false, None, true, &mut skipped);
+            emit(artifact, ts, false, None, true, false, &mut skipped);
         }
     } else if !snapshot_artifacts.is_empty() {
         skipped += snapshot_artifacts.len();
@@ -447,14 +469,16 @@ fn audit_log_events(
             continue;
         }
         let chained = lane_rel.is_some();
-        let rows: Vec<(serde_json::Value, Option<String>)> = if chained {
+        // (value, why not usable here, R17 I7: usable by self-consistency only)
+        let rows: Vec<(serde_json::Value, Option<String>, bool)> = if chained {
             let lane = audit::read_lane_rows(&file)
                 .map_err(|err| format!("failed to read audit log {}: {err}", file.display()))?;
             lane.rows
                 .into_iter()
                 .map(|row| {
                     let note = (!row.usable()).then(|| row.note());
-                    (row.value, note)
+                    let self_consistent = row.usable() && row.code() == "sc";
+                    (row.value, note, self_consistent)
                 })
                 .collect()
         } else {
@@ -475,11 +499,12 @@ fn audit_log_events(
                     (
                         serde_json::from_str(line).unwrap_or(serde_json::Value::Null),
                         note.clone(),
+                        false,
                     )
                 })
                 .collect()
         };
-        for (value, unauthenticated) in rows {
+        for (value, unauthenticated, self_consistent) in rows {
             let Some(object) = value.as_object() else {
                 skipped += 1;
                 continue;
@@ -525,6 +550,7 @@ fn audit_log_events(
                     ts_unix: ts,
                     source: "audit-log",
                     time_unaudited: !chained,
+                    time_self_consistent: chained && self_consistent,
                     kind: if chained {
                         "audit-event"
                     } else {
@@ -538,6 +564,7 @@ fn audit_log_events(
                     ts_unix: ts,
                     source: "audit-log",
                     time_unaudited: true,
+                    time_self_consistent: false,
                     kind: UNAUTHENTICATED_KIND,
                     path,
                     detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),

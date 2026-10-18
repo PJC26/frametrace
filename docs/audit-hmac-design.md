@@ -718,6 +718,58 @@ older run). R11:
 - **Limit (unchanged):** cutting the result lane's tail AND every newer
   head (the sign-off lane's tail) still restores the previous run.
 
+### Certain is certain, unknown is neutral (R17)
+
+**P27.** An anchor comparison (tail cut / rewritten) is made against the
+newest head whose own trust is usable, also before a sign-off chain break
+and whatever P7 recency says; nothing unauthenticated is a reason to name
+a cause ("not tampering", "older build").
+
+- **I1 — `marker-unusable`.** `anomaly_head_check` now tells the head
+  check whether the anomaly lane holds a USABLE `anomaly-scan-run` marker
+  at all. `mixed-version` needs one without `scan_id` (an older build's
+  run; "이 PC에서 다시 스캔하면 해소"). No usable marker while a v2 head
+  anchors the lane — the marker's HMAC stripped (no key needed) or the
+  marker deleted — is `unknown` / **`marker-unusable`**
+  (`HEAD_MARKER_UNUSABLE_NOTE` "완료 표식을 쓸 수 없음 … 변조 가능성 — 버전
+  혼재로 보지 않음"; no rescan note). R16 showed that tamper as a version
+  mix.
+- **I2 — anchors across a chain break.** Step (1) picks its candidate
+  from sign-off head rows with `trust.is_usable()` (R11-I4
+  `lane_broken_at` ignored — the rule `check_lane_anchor` already uses);
+  rows from the break on are `ChainBroken` and never candidates. A result
+  lane shorter than such a head is `truncated` / `rewritten`. R16 used
+  `usable()` only, so one chain-breaking line after the heads turned a
+  certain tail cut into `unknown` / `own-head-missing`. Steps (2)/(3) still
+  use fully usable heads (an `intact` anchor from a broken prefix never
+  escapes: with a break there is no usable head, so (2) returns
+  `chain-failed` / `own-head-missing`).
+- **I3 — neutral wording.** `HEAD_OTHER_EVENT_NOTE` is now
+  "모양상 다른 이벤트이나 내용은 인증 안 됨"; the sentence no longer says
+  "변조 판정 아님" or names a likely writer — the event name it quotes is
+  unauthenticated. Code and verdict unchanged (`unusable-line`, withheld,
+  `HEAD_RESCAN_NOTE`). (`other-pc` keeps its P2 wording.)
+- **I4.** `audit::check_appendable` opens the lane for append (read +
+  append, never create) — a read-only lane is refused up front — and
+  `scan_case` runs `preflight_scan_lanes` again right before the first
+  result-lane write (re-hashing can take long after the first check).
+- **I5.** Re-verification lane, result run without a head of its own (no
+  `head_in`, unpaired): a v2 head naming another non-null `run_id` →
+  `unknown` / `scan-mismatch` (neutral: "지워졌거나 인증되지 않았거나 이전
+  버전 빌드가 그 뒤에 스캔함"). R16 checked pairing only after a paired head.
+- **I6.** `make-review`'s `review/data-bundle.js` carries
+  `logChains: {anomaly: {head}}` — the same object as `/api/records-meta`
+  `logChains.anomaly.head` and the report's `auditChains.anomaly.head`, as
+  of that make-review (redacted with the bundle). No other `logChains`
+  lane is in the bundle; the inline full page has none.
+- **I7 — decision.** `time_unaudited` stays `false` for an audit-lane
+  entry usable by self-consistency only (`sc`: no keys on this PC, or the
+  pre-key prefix): its time IS the lane's, and the viewer's badge says
+  "감사 기록에 없는 시각". New field **`time_self_consistent`** (always a
+  boolean) is `true` for exactly those events (audit events and carve
+  candidates with their own `carved_unix`): anyone can rewrite such a lane
+  with any time. `false` whenever `time_unaudited` is true.
+
 **Implementation notes (what shipped):**
 
 - `src/hmac.rs` — HMAC-SHA-256 hand-assembled over the existing `sha2`

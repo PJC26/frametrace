@@ -2930,10 +2930,10 @@ pub(crate) fn audio_levels_object(json: &str) -> String {
 mod hash_verify_head;
 pub use hash_verify_head::{
     ANOMALY_LOG_REL_PATH, HASH_VERIFY_HEAD_EVENT, HASH_VERIFY_HEAD_TRUNCATED,
-    HASH_VERIFY_MARKER_HEAD_FIELD, HEAD_MIXED_VERSION_NOTE, HEAD_OTHER_EVENT_NOTE,
-    HEAD_OTHER_PC_NOTE, HEAD_RESCAN_NOTE, HEAD_SCAN_MISMATCH_NOTE, HEAD_SCHEMA_VERSION,
-    HashVerifyHeadCheck, HeadLane, anomaly_head_check, hash_verify_head_check, lane_head_check,
-    record_scan_head,
+    HASH_VERIFY_MARKER_HEAD_FIELD, HEAD_MARKER_UNUSABLE_NOTE, HEAD_MIXED_VERSION_NOTE,
+    HEAD_OTHER_EVENT_NOTE, HEAD_OTHER_PC_NOTE, HEAD_RESCAN_NOTE, HEAD_SCAN_MISMATCH_NOTE,
+    HEAD_SCHEMA_VERSION, HashVerifyHeadCheck, HeadLane, anomaly_head_check, hash_verify_head_check,
+    lane_head_check, record_scan_head,
 };
 
 /// A JSON array literal; anything else (empty input, garbage) is `[]`.
