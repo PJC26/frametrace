@@ -840,17 +840,22 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     if dir_text.trim().is_empty() {
         return "{\"ok\":false,\"error\":\"케이스 폴더 경로를 입력하십시오.\"}".to_string();
     }
-    if let Err(reason) =
-        super::http::reject_remote_path(&dir_text, &super::http::approved_path_roots(state))
-    {
-        return api_err(reason);
-    }
     // R19-S1 (P32): the bound case folder is normalized — absolute, no
     // trailing separator, a drive root `X:\.` — so every path the status
     // shows and every command built from it is the same, argv-safe text
     // (`E:\` or `C:\cases\c 1\` typed with a trailing backslash made the
     // pasted command's closing quote literal). Lexical only (no disk).
-    let case_dir = crate::paste_path::normalize(Path::new(dir_text.trim()));
+    // R20-S1 (P34): the UNC/device/reserved check runs on the typed text
+    // AND on the normalized path, before any filesystem call — the R19
+    // check on the text alone let `\\?\C:\x\//srv/sh` normalize to the
+    // UNC `//srv/sh` and the `case.json` probe below open an SMB session.
+    let roots = super::http::approved_path_roots(state);
+    let case_dir = match super::state::bind_path(Path::new(dir_text.trim()), |text| {
+        super::http::reject_remote_path(text, &roots)
+    }) {
+        Ok(case_dir) => case_dir,
+        Err(reason) => return api_err(reason),
+    };
     if !case_dir.join("case.json").is_file() {
         return "{\"ok\":false,\"error\":\"해당 폴더에 case.json이 없습니다 — 기존 케이스 폴더가 아닙니다.\"}"
             .to_string();
@@ -888,6 +893,13 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     } else {
         None
     };
+    // Reopening the same case must keep extra media roots the earlier
+    // session recorded (e.g. a carving workspace linked into the case) —
+    // resetting to just the case dir would 403 artifacts that resolve
+    // through that root. Read (file + probes) before the state lock.
+    let prior_roots = restore_session()
+        .and_then(|(dir, roots)| (dir == case_dir).then_some(roots))
+        .unwrap_or_else(|| vec![case_dir.clone()]);
     let mut guard = state_lock(state);
     // R13-S10: a refusal that still comes now (a job or a clip export
     // started meanwhile) carries what the recovery did.
@@ -917,13 +929,6 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
         super::jobs::apply_recovery_locked(&mut guard, recovery);
     }
     guard.case_dir = Some(case_dir.clone());
-    // Reopening the same case must keep extra media roots the earlier
-    // session recorded (e.g. a carving workspace linked into the case) —
-    // resetting to just the case dir would 403 artifacts that resolve
-    // through that root.
-    let prior_roots = restore_session()
-        .and_then(|(dir, roots)| (dir == case_dir).then_some(roots))
-        .unwrap_or_else(|| vec![case_dir.clone()]);
     let extra_root = prior_roots.iter().find(|root| **root != case_dir).cloned();
     guard.media_roots = prior_roots;
     // An explicit open is a deliberate choice — the restored-session

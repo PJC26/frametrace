@@ -60,6 +60,8 @@ mod tests_r18_server;
 #[cfg(test)]
 mod tests_r19_server;
 #[cfg(test)]
+mod tests_r20_server;
+#[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
 mod tests_r4_jobs;
@@ -233,25 +235,40 @@ pub fn run_with_listener(options: ServeOptions, listener: TcpListener) -> Result
     run_on(options, Some(listener))
 }
 
+/// R20-S3: the `serve --case` folder as bound — [`state::bind_path`] under
+/// the `/api/start` policy (a typed UNC share admitted; device, reserved
+/// and verbatim-reassembled paths refused with an error, never silently).
+pub(crate) fn bind_cli_case(typed: &Path) -> Result<PathBuf, String> {
+    state::bind_path(typed, http::reject_device_path)
+        .map_err(|reason| format!("--case {}: {reason}", typed.display()))
+}
+
 fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), String> {
     proc::install_process_guard();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
-    if let Some(case_dir) = &options.case_dir {
-        let mut guard = state_lock(&state);
-        guard.case_dir = Some(case_dir.clone());
+    if let Some(typed) = &options.case_dir {
+        // R20-S3 (P34): `--case` is bound like a typed `/api/start` case
+        // folder — normalized and checked again on the normalized path —
+        // so it compares equal to the same folder bound any other way.
+        let case_dir = bind_cli_case(typed)?;
         // An explicit --case binding still honors extra media roots the
         // session recorded for that case (linked carving workspaces).
-        guard.media_roots = restore_session()
-            .and_then(|(dir, roots)| (dir == *case_dir).then_some(roots))
+        // Read before the state lock.
+        let roots = restore_session()
+            .and_then(|(dir, roots)| (dir == case_dir).then_some(roots))
             .unwrap_or_else(|| vec![case_dir.clone()]);
+        let mut guard = state_lock(&state);
+        guard.case_dir = Some(case_dir);
+        guard.media_roots = roots;
     } else if let Some((case_dir, roots)) = restore_session() {
         // Upgrading from a build without the recent list: the restored
         // case is at least the first entry.
         record_recent_case(&case_dir, None);
+        let has_review = case_dir.join("review/index.html").is_file();
         let mut guard = state_lock(&state);
         guard.case_dir = Some(case_dir.clone());
         guard.media_roots = roots;
-        if case_dir.join("review/index.html").is_file() {
+        if has_review {
             guard.phase = "review-ready";
             guard.steps = [StepStatus::Done; 5];
             guard.restored = true;

@@ -173,6 +173,24 @@ fn r19_s1_pasted_commands_reach_the_program_as_separate_arguments() {
             checked += 1;
         }
     }
+    // R20-S2: a device root keeps its trailing `\` (`\\.\C:\` — cmd merged
+    // the flags into the path, measured): no command is offered at all.
+    for typed in [r"\\.\C:\", r"\\.\C:", r"\\.\C:\cases\c1\"] {
+        let case = Path::new(typed);
+        for command in [
+            super::finalize_journal::dismiss_command(case),
+            super::finalize_journal::dismiss_command_cmd(case),
+            super::finalize_journal::force_dismiss_command(case),
+            super::finalize_journal::force_dismiss_command_cmd(case),
+            super::finalize_journal::writer_gone_command(case, false),
+            super::finalize_journal::writer_gone_command_cmd(case, true),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            wrong.push(format!("{typed}: a device path was offered `{command}`"));
+        }
+    }
     assert!(checked > 0, "no shell could be run");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

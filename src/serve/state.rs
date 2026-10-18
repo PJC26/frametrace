@@ -777,6 +777,27 @@ pub(crate) fn session_file() -> Option<PathBuf> {
     crate::audit_key::config_dir().map(|dir| dir.join("workstation-session.json"))
 }
 
+/// R20-S1/S3 (P34: what is checked is what is used): the path a binding
+/// stores — the case folder of `/api/open-case`, `/api/start`,
+/// `serve --case` and the restored session, and a start's source. `check`
+/// (the route's remote / device / reserved-name policy:
+/// [`super::http::reject_remote_path`] or
+/// [`super::http::reject_device_path`]) runs on the text as given, then
+/// the path is [`crate::paste_path::normalize_checked`] and `check` runs
+/// AGAIN on the result; only a path that passes both is returned. Lexical
+/// only — nothing on disk is read, so it is safe before any filesystem
+/// call (and needs no lock).
+pub(crate) fn bind_path(
+    raw: &Path,
+    check: impl Fn(&str) -> Result<(), &'static str>,
+) -> Result<PathBuf, &'static str> {
+    check(&raw.to_string_lossy())?;
+    let normalized =
+        crate::paste_path::normalize_checked(raw).ok_or(crate::paste_path::UNBINDABLE_REASON)?;
+    check(&normalized.to_string_lossy())?;
+    Ok(normalized)
+}
+
 pub(crate) fn save_session(case_dir: &Path, source_path: Option<&Path>) {
     let Some(file) = session_file() else { return };
     if let Some(parent) = file.parent() {
@@ -800,16 +821,36 @@ pub(crate) fn save_session(case_dir: &Path, source_path: Option<&Path>) {
 /// exists on disk.
 pub(crate) fn restore_session() -> Option<(PathBuf, Vec<PathBuf>)> {
     let text = std::fs::read_to_string(session_file()?).ok()?;
-    let case_dir = PathBuf::from(body_value(&text, "case_dir")?);
-    if !case_dir.join("case.json").is_file() {
+    restore_session_from(&text, &|path| path.is_file(), &|path| path.is_dir())
+}
+
+/// [`restore_session`] on the session file's text, the filesystem probes
+/// injected (tests). R20-S3 (P34): both paths are bound through
+/// [`bind_path`] under the `/api/start` policy that wrote them (a typed UNC
+/// share admitted, device / verbatim-reassembled / reserved paths refused)
+/// BEFORE either probe touches them, so the restored binding is in the
+/// same normalized form every other binding uses.
+pub(crate) fn restore_session_from(
+    text: &str,
+    is_file: &dyn Fn(&Path) -> bool,
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let bind = |raw: String| {
+        let raw = raw.trim().to_string();
+        (!raw.is_empty())
+            .then(|| bind_path(Path::new(&raw), super::http::reject_device_path).ok())
+            .flatten()
+    };
+    let case_dir = bind(body_value(text, "case_dir")?)?;
+    if !is_file(&case_dir.join("case.json")) {
         return None;
     }
     let mut roots = vec![case_dir.clone()];
-    if let Some(source) = body_value(&text, "source_path") {
-        let source = PathBuf::from(source);
-        if source.is_dir() && source != case_dir {
-            roots.push(source);
-        }
+    if let Some(source) = body_value(text, "source_path").and_then(bind)
+        && source != case_dir
+        && is_dir(&source)
+    {
+        roots.push(source);
     }
     Some((case_dir, roots))
 }

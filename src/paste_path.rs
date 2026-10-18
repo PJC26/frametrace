@@ -43,40 +43,144 @@ pub fn paste_safe_char(c: char) -> bool {
         )
 }
 
+/// Refusal text for a path [`normalize_checked`] will not bind (R20-S1).
+pub const UNBINDABLE_REASON: &str = "경로 구성 요소에 '/' 또는 ':'가 들어 있어 이 경로는 쓸 수 없습니다 — 일반 로컬 경로(예: C:\\cases\\c1)를 입력하십시오. / A path component holding '/' or ':' is refused.";
+
 /// R19-S1 (P32): `path` made absolute (against this process's current
 /// directory, lexically — nothing on disk is read) with no trailing
 /// separator; a drive root becomes `X:\.` (`X:` alone is drive-relative),
-/// a UNC share root `\\server\share`. A verbatim (`\\?\`) path keeps its
-/// root as it is.
+/// a UNC share root `\\server\share`.
+///
+/// R20-S1 (P34): the result is joined as TEXT — never by
+/// `PathBuf::push`, which REPLACES the buffer for a component that parses
+/// as rooted or prefixed (`\\?\C:\x\//srv/sh` became the UNC path
+/// `//srv/sh`, `C:\x\D:` the drive-relative `D:`). A verbatim (`\\?\…`) or
+/// device-namespace (`\\.\…`) path is not reassembled at all: only its
+/// trailing separators are dropped (its root separator kept). Whether the
+/// result may be BOUND (opened, made a root) is [`normalize_checked`].
 pub fn normalize(path: &Path) -> PathBuf {
+    normalize_parts(path).0
+}
+
+/// R20-S1 (P34): [`normalize`], or `None` when the path must not be bound:
+/// it is empty, or (Windows) a component after the prefix holds `/` or `:`
+/// — in a verbatim path `/` is no separator, so such a component would be
+/// re-read as a UNC / device / drive path by anything that reassembles or
+/// strips the prefix; elsewhere `:` is a drive switch or an NTFS stream.
+/// A caller that binds the result must still run the remote / device /
+/// reserved-name checks on it (the text changed).
+pub fn normalize_checked(path: &Path) -> Option<PathBuf> {
+    let (normalized, bindable) = normalize_parts(path);
+    bindable.then_some(normalized)
+}
+
+/// Whether a Windows path component (after the prefix) holds `/` or `:`.
+fn bad_component(component: &[u8]) -> bool {
+    component.iter().any(|byte| matches!(byte, b'/' | b':'))
+}
+
+/// Whether `path` starts with a verbatim (`\\?\`) or device-namespace
+/// (`\\.\`) prefix.
+fn special_prefix(path: &Path) -> bool {
+    use std::path::Prefix;
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(
+            prefix.kind(),
+            Prefix::Verbatim(_) | Prefix::VerbatimUNC(..) | Prefix::VerbatimDisk(_) | Prefix::DeviceNS(_)
+        )
+    )
+}
+
+/// `(normalized, bindable)` — see [`normalize`] / [`normalize_checked`].
+fn normalize_parts(path: &Path) -> (PathBuf, bool) {
+    use std::ffi::OsString;
+    use std::path::Prefix;
     if path.as_os_str().is_empty() {
-        return PathBuf::new();
+        return (PathBuf::new(), false);
     }
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    // Collecting the components drops trailing (and repeated) separators.
-    let collected: PathBuf = absolute.components().collect();
-    let mut components = collected.components();
-    let root_only = matches!(
-        (components.next(), components.next(), components.next()),
-        (Some(Component::Prefix(_)), Some(Component::RootDir), None)
-    );
-    if root_only && let Some(Component::Prefix(prefix)) = collected.components().next() {
-        return match prefix.kind() {
-            std::path::Prefix::Disk(_) => collected.join("."),
-            std::path::Prefix::UNC(..) => PathBuf::from(prefix.as_os_str()),
-            _ => collected,
-        };
+    if !cfg!(windows) {
+        // No prefixes, `/` is the only separator: collecting the
+        // components only drops trailing (and repeated) separators.
+        return (absolute.components().collect(), true);
     }
-    collected
+    if special_prefix(&absolute) {
+        let Some(Component::Prefix(prefix)) = absolute.components().next() else {
+            unreachable!("special_prefix saw a prefix");
+        };
+        // Sliced as text: a path that is not valid Unicode is kept as it
+        // is and never bound.
+        let Some(whole) = absolute.to_str() else {
+            return (absolute, false);
+        };
+        let head = prefix.as_os_str().len();
+        let rest = &whole[head..];
+        let kept = rest.trim_end_matches('\\');
+        let kept = if kept.is_empty() && !rest.is_empty() {
+            "\\"
+        } else {
+            kept
+        };
+        let bindable = !kept.split('\\').any(|part| bad_component(part.as_bytes()));
+        return (PathBuf::from(format!("{}{kept}", &whole[..head])), bindable);
+    }
+    let mut out = OsString::new();
+    let mut kind = None;
+    let mut rooted = false;
+    let mut names: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut bindable = true;
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) if kind.is_none() && !rooted && names.is_empty() => {
+                kind = Some(prefix.kind());
+                out.push(prefix.as_os_str());
+            }
+            Component::Prefix(_) => bindable = false,
+            Component::RootDir => rooted = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) => {
+                let name = component.as_os_str();
+                bindable &= !bad_component(name.as_encoded_bytes());
+                names.push(name);
+            }
+        }
+    }
+    match (kind, names.is_empty()) {
+        (Some(Prefix::Disk(_)), true) if rooted => out.push("\\."),
+        (Some(Prefix::UNC(..)), true) => {}
+        _ => {
+            if rooted {
+                out.push("\\");
+            }
+            for (index, name) in names.iter().enumerate() {
+                if index > 0 {
+                    out.push("\\");
+                }
+                out.push(name);
+            }
+        }
+    }
+    (PathBuf::from(out), bindable)
 }
 
 /// The [`normalize`]d path as it goes, unescaped, between a command's
 /// quotes — `None` when it is empty, starts with `-` (it would read as an
-/// option) or holds any character that is not [`paste_safe_char`].
+/// option), holds any character that is not [`paste_safe_char`], would not
+/// be bound ([`normalize_checked`]), has a verbatim / device prefix
+/// (`\\.\C:\` kept its root `\`, which Win32 argv conversion reads as an
+/// escaped closing quote — R20-S2) or ends in `\` at all.
 pub fn paste_safe(path: &Path) -> Option<String> {
-    let text = normalize(path).display().to_string();
-    (!text.is_empty() && !text.starts_with('-') && text.chars().all(paste_safe_char))
-        .then_some(text)
+    let normalized = normalize_checked(path)?;
+    if special_prefix(&normalized) {
+        return None;
+    }
+    let text = normalized.display().to_string();
+    (!text.is_empty()
+        && !text.starts_with('-')
+        && !text.ends_with('\\')
+        && text.chars().all(paste_safe_char))
+    .then_some(text)
 }
 
 /// One word of a hint command ([`hint_command`]).

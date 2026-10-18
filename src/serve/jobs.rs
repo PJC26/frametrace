@@ -9,22 +9,32 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
         Some("e01") => InputKind::E01,
         _ => InputKind::Folder,
     };
-    let source_path = match body_value(&request.body, "source_path") {
-        Some(path) if !path.trim().is_empty() => PathBuf::from(path.trim()),
+    let source_text = match body_value(&request.body, "source_path") {
+        Some(path) if !path.trim().is_empty() => path.trim().to_string(),
         _ => {
             return "{\"ok\":false,\"error\":\"증거 소스 경로를 입력하십시오.\"}".to_string();
         }
     };
     // Item 8 policy (see http::reject_remote_path): a typed UNC share is
     // honoured on this nonce-gated POST, device-namespace paths are not.
-    // Checked before `exists()` touches the filesystem.
-    for field in ["source_path", "case_dir"] {
-        if let Some(text) = body_value(&request.body, field)
-            && let Err(reason) = super::http::reject_device_path(&text)
-        {
-            return api_err(reason);
+    // R20-S1/S3 (P34): both paths are normalized and checked again on the
+    // normalized text (`bind_path`) — before `exists()` touches the
+    // filesystem — so the bound case compares equal to the same folder
+    // bound by /api/open-case, `--case` or the restored session.
+    let source_path =
+        match super::state::bind_path(Path::new(&source_text), super::http::reject_device_path) {
+            Ok(path) => path,
+            Err(reason) => return api_err(reason),
+        };
+    let typed_case_dir = match body_value(&request.body, "case_dir") {
+        Some(dir) if !dir.trim().is_empty() => {
+            match super::state::bind_path(Path::new(dir.trim()), super::http::reject_device_path) {
+                Ok(dir) => Some(dir),
+                Err(reason) => return api_err(reason),
+            }
         }
-    }
+        _ => None,
+    };
     if !source_path.exists() {
         return format!(
             "{{\"ok\":false,\"error\":{}}}",
@@ -54,9 +64,15 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
     // option only takes effect together with with_ffprobe (default off).
     let with_audio = body_value(&request.body, "with_audio").as_deref() == Some("true");
     let skip_e01_verify = body_value(&request.body, "skip_e01_verify").as_deref() == Some("true");
-    let (case_dir, case_dir_warning) = match body_value(&request.body, "case_dir") {
-        Some(dir) if !dir.trim().is_empty() => (PathBuf::from(dir.trim()), None),
-        _ => default_case_dir_checked(),
+    let (case_dir, case_dir_warning) = match typed_case_dir {
+        Some(dir) => (dir, None),
+        None => {
+            let (dir, warning) = default_case_dir_checked();
+            match super::state::bind_path(&dir, super::http::reject_device_path) {
+                Ok(dir) => (dir, warning),
+                Err(reason) => return api_err(reason),
+            }
+        }
     };
     let job = PipelineJob {
         kind: input_kind,
