@@ -157,6 +157,7 @@ fn lane_events_for(case: &Path, id: &str) -> Vec<String> {
 }
 
 /// `<32 hex>.json` — the name of a finalize's first (`open`) local record.
+#[cfg(windows)]
 fn is_open_record_name(name: &str) -> bool {
     name.strip_suffix(".json").is_some_and(|stem| {
         stem.len() == 32 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
