@@ -1258,6 +1258,65 @@ reviewer PoC, reproduced with the real CLI and a real locked handle).
   in R15. A crash while a state file is half written leaves it unparseable:
   `local-unreadable` (blocks, dismiss), never a rollback. Forging the local
   record folder stays out of scope (examiner profile write access).
+  (R17 closes the first half of this residual — next section.)
+
+#### R17 (P28): a record that cannot advance loses its `open` file
+
+R16's residual: a local folder that took the `open` file but then refused
+both `packaged` and `completed` (disk full, ACL change) left the record
+`open` beside a `completed-unrecorded` journal, and a cut lane tail plus a
+rebuilt journal rolled the good finalize back (reproduced for R17 with
+directories squatting the two state-file names: `r17_s1_record_that_cannot_advance_is_dropped`).
+
+- **P28.** Wherever the record must move past `open` (after the complete
+  entry → `completed`; after a resolved entry → `resolved`; the failed
+  complete entry → `completed-unrecorded`) and the state file cannot be
+  created while the record still reads `open` (or cannot be read), the
+  `<id>.json` file is deleted on the spot — deleting needs no free space.
+  No record means any journal naming that finalize is `unpaired`
+  (`no-local-record`): never rolled back, never recorded complete. The
+  journal then goes as usual (lane closed). Only when the deletion fails
+  too is the journal kept (`completed-unrecorded`, or the lane-closed
+  journal, `blocks_finalize: true`) — the one residual: creation AND
+  deletion both refused, then a cut tail before the next recovery. A
+  record already past `open` keeps the R16 behavior (journal kept until
+  `completed` can be created; a cut tail finds it "finished").
+- **S4.** The `resolved` advance after a `finalize-resolved` entry (failure
+  path, superseded journal, recovery's close, `--dismiss`) follows P28;
+  R16 ignored its failure and removed the journal with the record `open`.
+- **S7.** A finalize the lane closed (complete / resolved) or whose record
+  reads `completed` / `resolved` has no writer to wait for: the liveness
+  and other-account checks are skipped (a journal a completed finalize
+  failed to remove no longer blocks `--dismiss` while its workstation
+  runs).
+- **S2 / S8.** `finalize-journal <case> --writer-gone`: the examiner
+  confirmed the journal's writer is gone — the journal is judged as if it
+  were and the NORMAL recovery runs (refused for a verified live writer).
+  `--dismiss --force` still only moves the journal and now names the
+  sign-off and package it leaves in place. Every block on a maybe-live
+  writer says "wait" first (it lifts when the process ends; another
+  account's block 24 h after the journal's start). A verified live writer
+  is offered no command; unverified / other-account get both.
+- **S3.** "Another account's FrameTrace writer" also needs the live
+  process's start time, when it can be read (Windows: the system process
+  list, `NtQuerySystemInformation(SystemProcessInformation)`, readable
+  without opening the process; Linux `/proc/<pid>/stat`), to be the
+  journal's `writer_started_ms` (± 2 s): a pid reused since no longer
+  blocks for 24 h.
+- **S5.** The torn-scan-lane preflight runs before the finalize's journal
+  check and recovery (nothing at all is written for a case it refuses).
+- **S6.** An unreadable record is swept (30 days) only when one of its
+  files parses and every such file's case is reachable and no longer holds
+  its journal (R16 swept it by age alone).
+- **S9.** The status path hashes a reserved package's manifest only up to
+  16 MiB; a larger one is "확인 보류" (`manifest_check: "withheld"`, the
+  record's word shown, `blocks_finalize: false`) — the 1 GiB streaming
+  hash runs in recoveries only (R16 ran it on every status cache miss).
+- **S10.** The `cmd.exe` form of a command is not offered when the case
+  path holds `%`: `cmd.exe` expands `%VAR%` inside double quotes and has no
+  escape for it at its interactive prompt (`%%` is a batch-file escape and
+  stays `%%` there), so the pasted command could name another folder. The
+  PowerShell form is single-quoted (no expansion).
 
 ## Retired keys
 

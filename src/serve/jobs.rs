@@ -2893,6 +2893,20 @@ pub(crate) fn finalize_with_exe(
     examiner: &str,
     state: &SharedState,
 ) -> String {
+    // R16 (track I, I5): make-report --rehash refuses to start when a lane
+    // its scan appends to (sign-off, anomaly, re-verification) cannot take
+    // an append (a torn last line). R17-S5: checked FIRST, read-only, so
+    // such a case is refused before anything at all is written — no
+    // recovery of an earlier journal, no superseded entry (R16 ran the
+    // check after them), no begin entry, journal or local record.
+    if let Err(err) = crate::anomaly::preflight_scan_lanes(case_dir, true) {
+        return finalize_refused(
+            state,
+            format!(
+                "최종화 차단: {err} — 최종화는 아무것도 쓰지 않았습니다 (그 감사 로그 파일이 읽기 전용이거나 다른 프로그램이 잡고 있지 않은지, 마지막 줄이 찢기지 않았는지 확인하십시오)."
+            ),
+        );
+    }
     // R12-S2: an earlier finalize of this case that was interrupted (its
     // journal is still on disk) is cleaned up first — the caller holds
     // `busy`, so it is not this workstation's live finalize.
@@ -2947,6 +2961,8 @@ pub(crate) fn finalize_with_exe(
             None => {}
             Some(super::finalize_journal::Assessment::Open(journal, _)) => {
                 // R15 (P21): `resolved` before the journal goes, then removed.
+                // R17-S4 (P28): a record that cannot advance loses its
+                // `open` file; when that fails too the journal stays.
                 let resolved = match crate::report::record_finalize_resolved(
                     case_dir,
                     &journal.finalize_id,
@@ -2954,11 +2970,25 @@ pub(crate) fn finalize_with_exe(
                     "superseded",
                 ) {
                     Ok(()) => {
-                        let _ = journal.advance_local(
+                        match super::finalize_journal::advance_or_drop(
+                            &journal,
                             case_dir,
                             super::finalize_journal::LOCAL_RESOLVED,
                             None,
-                        );
+                        ) {
+                            Ok(super::finalize_journal::Settled::Advanced) => {}
+                            Ok(super::finalize_journal::Settled::Dropped) => {
+                                state_lock(state).logs.push(format!(
+                                    "경고: {}",
+                                    super::finalize_journal::dropped_note(&journal.finalize_id)
+                                ));
+                            }
+                            Err(err) => {
+                                return api_err(&format!(
+                                    "최종화 차단: 이전 최종화를 이 PC의 로컬 기록에 '정리됨'으로 남기지 못했고 열린 기록도 지우지 못했습니다 — {err} (로컬 설정 폴더에 쓸 수 있는지 확인한 뒤 다시 시도하십시오)"
+                                ));
+                            }
+                        }
                         true
                     }
                     Err(err) => {
@@ -3093,15 +3123,7 @@ pub(crate) fn finalize_with_exe(
             ),
         )
     };
-    // R16 (track I, I5): make-report --rehash now refuses to start when a
-    // lane its scan appends to (sign-off, anomaly, re-verification) cannot
-    // take an append (a torn last line). Checked here first, read-only, so
-    // such a case is refused before anything of the finalize is written —
-    // no begin entry, journal or local record to clean up, no sign-off to
-    // abandon.
-    if let Err(err) = crate::anomaly::preflight_scan_lanes(case_dir, true) {
-        return refuse_unjournaled(err, state);
-    }
+    // (R16-I5 / R17-S5: the scan-lane preflight ran first of all, above.)
     // R14 (P18): this PC's local open-finalize record first — outside the
     // case folder, so a copy or share of the case never carries it; a
     // recovery acts only where it agrees with the journal and the lane.
@@ -3366,6 +3388,10 @@ pub(crate) fn finalize_with_exe(
             // R13 (P15): cleaned up — the begin entry is closed first.
             // R14 (P18): the local record goes once the lane says so;
             // R15 (P21): rewritten `resolved` before the journal goes.
+            // R17-S4 (P28): a record that cannot advance loses its `open`
+            // file; when that fails too the journal is KEPT (R16 removed it
+            // with the record still `open`).
+            let mut settled = Ok(());
             let resolved = match crate::report::record_finalize_resolved(
                 case_dir,
                 &journal.finalize_id,
@@ -3373,11 +3399,21 @@ pub(crate) fn finalize_with_exe(
                 "failed",
             ) {
                 Ok(()) => {
-                    let _ = journal.advance_local(
+                    match super::finalize_journal::advance_or_drop(
+                        &journal,
                         case_dir,
                         super::finalize_journal::LOCAL_RESOLVED,
                         None,
-                    );
+                    ) {
+                        Ok(super::finalize_journal::Settled::Advanced) => {}
+                        Ok(super::finalize_journal::Settled::Dropped) => {
+                            state_lock(state).logs.push(format!(
+                                "경고: {}",
+                                super::finalize_journal::dropped_note(&journal.finalize_id)
+                            ));
+                        }
+                        Err(err) => settled = Err(err),
+                    }
                     true
                 }
                 Err(err) => {
@@ -3385,11 +3421,27 @@ pub(crate) fn finalize_with_exe(
                     false
                 }
             };
-            let removed = super::finalize_journal::remove_journal(case_dir, &journal.finalize_id);
-            if removed.is_ok() && resolved {
-                let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
+            match settled {
+                Err(err) => {
+                    let detail = format!(
+                        "이 PC의 최종화 로컬 기록에 '정리됨'을 남기지 못했고 열린 기록도 지우지 못해({err}) 최종화 저널을 남겼습니다 — 로컬 설정 폴더에 쓸 수 있는지 확인한 뒤 케이스를 다시 여십시오."
+                    );
+                    super::finalize_journal::remember_complete_failure(
+                        &journal.finalize_id,
+                        &detail,
+                    );
+                    leftover.push(detail);
+                    Ok(())
+                }
+                Ok(()) => {
+                    let removed =
+                        super::finalize_journal::remove_journal(case_dir, &journal.finalize_id);
+                    if removed.is_ok() && resolved {
+                        let _ = super::finalize_journal::remove_local_record(&journal.finalize_id);
+                    }
+                    removed
+                }
             }
-            removed
         };
         if let Err(err) = journal_result {
             state_lock(state).logs.push(format!(
@@ -3442,11 +3494,28 @@ pub(crate) fn finalize_with_exe(
                     // cannot be created the journal is KEPT as
                     // `completed-unrecorded` (the next recovery records it
                     // here; the lane already holds the complete entry).
-                    match journal.advance_local(
+                    // R17-S1 (P28): when neither `packaged` nor `completed`
+                    // could be created (a full disk) the `open` file is
+                    // deleted on the spot — the record is then gone (a
+                    // rebuilt journal is "로컬 기록 없음", never rolled
+                    // back) and the journal goes; R16 left the record
+                    // `open` beside a `completed-unrecorded` journal, and a
+                    // cut lane tail rolled the good finalize back. Only when
+                    // that deletion fails too is the journal kept.
+                    match super::finalize_journal::advance_or_drop(
+                        &journal,
                         case_dir,
                         super::finalize_journal::LOCAL_COMPLETED,
                         manifest_sha256.clone(),
-                    ) {
+                    )
+                    .map(|settled| {
+                        if settled == super::finalize_journal::Settled::Dropped {
+                            state_lock(state).logs.push(format!(
+                                "경고: 최종화는 끝났습니다. {}",
+                                super::finalize_journal::dropped_note(&journal.finalize_id)
+                            ));
+                        }
+                    }) {
                         Err(err) => {
                             state_lock(state).logs.push(format!(
                                 "경고: 최종화는 끝났지만 이 PC의 최종화 로컬 기록에 'completed'를 남기지 못했습니다 ({err}) — 최종화 저널을 'completed-unrecorded'로 남겼고, 다음에 케이스를 열 때 다시 남깁니다."
@@ -3478,11 +3547,23 @@ pub(crate) fn finalize_with_exe(
                     }
                 }
                 Some(lane) => {
-                    let _ = journal.advance_local(
-                        case_dir,
-                        super::finalize_journal::STATE_COMPLETED_UNRECORDED,
-                        None,
-                    );
+                    // R17-S1 (P28): `completed-unrecorded` not creatable
+                    // with the record still `open` → the `open` file goes
+                    // (the kept journal then reads "로컬 기록 없음": never
+                    // rolled back, never recorded complete — dismiss it).
+                    if let Ok(super::finalize_journal::Settled::Dropped) =
+                        super::finalize_journal::advance_or_drop(
+                            &journal,
+                            case_dir,
+                            super::finalize_journal::STATE_COMPLETED_UNRECORDED,
+                            None,
+                        )
+                    {
+                        state_lock(state).logs.push(format!(
+                            "경고: {} 남은 최종화 저널은 '짝 없음(로컬 기록 없음)'으로 보이며, 이 PC는 그 완료를 다시 기록하지 않습니다 — review/signoff.json과 이번 패키지를 확인한 뒤 저널을 옮기십시오.",
+                            super::finalize_journal::dropped_note(&journal.finalize_id)
+                        ));
+                    }
                     journal
                         .rewrite_as(
                             super::finalize_journal::STATE_COMPLETED_UNRECORDED,

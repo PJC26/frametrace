@@ -54,6 +54,8 @@ mod tests_r14_server;
 #[cfg(test)]
 mod tests_r16_server;
 #[cfg(test)]
+mod tests_r17_server;
+#[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
 mod tests_r4_jobs;
@@ -388,12 +390,17 @@ pub(crate) fn kill_all_tracked() {
 }
 
 /// R13-S6: `frametrace finalize-journal <case> [--dismiss]` (the CLI's
-/// view of a case's finalize journal; `--dismiss` moves it aside).
+/// view of a case's finalize journal; `--dismiss` moves it aside). R17-S2:
+/// `--writer-gone` runs the normal recovery as if the writer were gone.
 pub fn finalize_journal_command(
     case_dir: &Path,
     dismiss: bool,
     force: bool,
+    writer_gone: bool,
 ) -> Result<String, String> {
+    if writer_gone {
+        return finalize_journal::cli_writer_gone(case_dir);
+    }
     finalize_journal::cli_command(case_dir, dismiss, force)
 }
 

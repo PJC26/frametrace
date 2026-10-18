@@ -193,6 +193,14 @@ pub enum Commands {
         /// seems to run, or one whose cleanup left something to check
         #[arg(long, requires = "dismiss")]
         force: bool,
+        /// You confirmed that the process the journal names as its writer
+        /// is not a finalize still running (another FrameTrace install,
+        /// another account): run the normal recovery as if it were gone —
+        /// an interrupted finalize is cleaned up (sign-off taken back,
+        /// package marked), unlike --dismiss --force, which only moves the
+        /// journal. Refused while the writer is verified as this program
+        #[arg(long, conflicts_with_all = ["dismiss", "force"])]
+        writer_gone: bool,
     },
     /// Verify a package written by package-case: manifest.sha256 entries vs
     /// files, package-manifest.json, audit chains, database snapshot and
@@ -810,8 +818,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             case_dir,
             dismiss,
             force,
+            writer_gone,
         } => {
-            let text = crate::serve::finalize_journal_command(&case_dir, dismiss, force)?;
+            let text =
+                crate::serve::finalize_journal_command(&case_dir, dismiss, force, writer_gone)?;
             print!("{text}");
             Ok(())
         }

@@ -4,7 +4,7 @@
 
 use super::*;
 
-fn scratch(tag: &str) -> PathBuf {
+pub(super) fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft-r16s-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -12,7 +12,7 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// The real CLI binary next to the test executable (`None`: skipped).
-fn cli_bin() -> Option<PathBuf> {
+pub(super) fn cli_bin() -> Option<PathBuf> {
     let exe = std::env::current_exe().unwrap();
     let dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
     let bin = dir.join(if cfg!(windows) {
@@ -41,7 +41,7 @@ fn run_cli(bin: &Path, args: &[&str]) {
 }
 
 /// A case with one indexed source (real CLI). `None` without the binary.
-fn finalize_case(tag: &str) -> Option<(PathBuf, PathBuf)> {
+pub(super) fn finalize_case(tag: &str) -> Option<(PathBuf, PathBuf)> {
     let bin = cli_bin()?;
     let root = scratch(tag);
     let src = root.join("src");
@@ -62,17 +62,17 @@ fn finalize_case(tag: &str) -> Option<(PathBuf, PathBuf)> {
     Some((root, case))
 }
 
-fn bound_state(case: &Path) -> SharedState {
+pub(super) fn bound_state(case: &Path) -> SharedState {
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     state_lock(&state).case_dir = Some(case.to_path_buf());
     state
 }
 
-fn parse(text: &str) -> serde_json::Value {
+pub(super) fn parse(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid JSON {err}: {text}"))
 }
 
-fn package_entries(case: &Path) -> Vec<String> {
+pub(super) fn package_entries(case: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(case.join("reports"))
         .map(|entries| {
             entries
@@ -86,22 +86,22 @@ fn package_entries(case: &Path) -> Vec<String> {
     names
 }
 
-fn lane_path(case: &Path) -> PathBuf {
+pub(super) fn lane_path(case: &Path) -> PathBuf {
     case.join(crate::report::SIGNOFF_LOG_REL_PATH)
 }
 
-fn lane_text(case: &Path) -> String {
+pub(super) fn lane_text(case: &Path) -> String {
     std::fs::read_to_string(lane_path(case)).unwrap_or_default()
 }
 
-fn finalize_ok(bin: &Path, case: &Path, examiner: &str) -> Vec<u8> {
+pub(super) fn finalize_ok(bin: &Path, case: &Path, examiner: &str) -> Vec<u8> {
     let state = bound_state(case);
     let response = parse(&finalize_with_exe(bin, case, examiner, &state));
     assert_eq!(response["ok"], true, "{response}");
     std::fs::read(case.join(crate::report::SIGNOFF_REL_PATH)).unwrap()
 }
 
-fn last_begin(case: &Path) -> serde_json::Value {
+pub(super) fn last_begin(case: &Path) -> serde_json::Value {
     lane_text(case)
         .lines()
         .rev()
@@ -111,7 +111,9 @@ fn last_begin(case: &Path) -> serde_json::Value {
 }
 
 /// The journal an attacker rebuilds from the plaintext begin entry.
-fn journal_from_begin(begin: &serde_json::Value) -> super::finalize_journal::FinalizeJournal {
+pub(super) fn journal_from_begin(
+    begin: &serde_json::Value,
+) -> super::finalize_journal::FinalizeJournal {
     super::finalize_journal::FinalizeJournal {
         finalize_id: begin["finalize_id"].as_str().unwrap().into(),
         host_id: begin["host_id"].as_str().unwrap().into(),
@@ -129,7 +131,7 @@ fn journal_from_begin(begin: &serde_json::Value) -> super::finalize_journal::Fin
 }
 
 /// Drops the lane's last line (the tail of an append-only chain can be cut).
-fn drop_last_lane_line(case: &Path) -> String {
+pub(super) fn drop_last_lane_line(case: &Path) -> String {
     let text = lane_text(case);
     let mut lines: Vec<&str> = text.lines().collect();
     let last = lines.pop().unwrap().to_string();
@@ -139,15 +141,15 @@ fn drop_last_lane_line(case: &Path) -> String {
     last
 }
 
-fn keyless<R>(f: impl FnOnce() -> R) -> R {
+pub(super) fn keyless<R>(f: impl FnOnce() -> R) -> R {
     crate::audit_key::with_test_keys(&[], f)
 }
 
-fn signoff_sha(case: &Path) -> String {
+pub(super) fn signoff_sha(case: &Path) -> String {
     crate::sha256::digest_bytes(&std::fs::read(case.join(crate::report::SIGNOFF_REL_PATH)).unwrap())
 }
 
-fn lane_events_for(case: &Path, id: &str) -> Vec<String> {
+pub(super) fn lane_events_for(case: &Path, id: &str) -> Vec<String> {
     lane_text(case)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -289,7 +291,7 @@ fn r16_s1_locked_local_record_still_advances() {
 }
 
 /// A finalize (김철수) that "dies" at `stop`; returns its journal.
-fn interrupted_finalize(
+pub(super) fn interrupted_finalize(
     bin: &Path,
     case: &Path,
     stop: super::jobs::FinalizeStop,
@@ -304,7 +306,7 @@ fn interrupted_finalize(
         .expect("the journal is on disk")
 }
 
-fn local_state(id: &str) -> Option<String> {
+pub(super) fn local_state(id: &str) -> Option<String> {
     super::finalize_journal::read_local_record(id)
         .unwrap()
         .map(|record| record.state)
@@ -312,7 +314,7 @@ fn local_state(id: &str) -> Option<String> {
 
 /// A live FrameTrace process in this executable's folder with this
 /// executable's bytes (the test binary running the ignored R15 helper).
-fn spawn_live_writer() -> std::process::Child {
+pub(super) fn spawn_live_writer() -> std::process::Child {
     std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -329,7 +331,7 @@ fn spawn_live_writer() -> std::process::Child {
 
 /// The identity a journal records for `pid` once its start time and image
 /// name can be read.
-fn live_writer_of(pid: u32) -> crate::util::WriterIdentity {
+pub(super) fn live_writer_of(pid: u32) -> crate::util::WriterIdentity {
     let read = || {
         let started_ms = match crate::util::probe_process(pid) {
             crate::util::ProcessProbe::Running {
@@ -360,7 +362,7 @@ fn live_writer_of(pid: u32) -> crate::util::WriterIdentity {
 /// An interrupted finalize (stopped after package-case, record `open`)
 /// whose journal names a live FrameTrace process as its writer, with
 /// `image_sha256` as the writer's executable SHA-256.
-fn journal_of_live_writer(
+pub(super) fn journal_of_live_writer(
     bin: &Path,
     case: &Path,
     child: &std::process::Child,

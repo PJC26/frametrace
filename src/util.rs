@@ -1803,7 +1803,7 @@ pub fn probe_process(pid: u32) -> ProcessProbe {
 
 /// Slack for clock granularity when comparing a process start time with a
 /// file's birth (R5-S5).
-const START_TIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+pub const START_TIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// R5-S5 (pure): may the process `probe` describes still be the writer of
 /// a file born at `born`? A live process that started AFTER the file was
@@ -2065,6 +2065,120 @@ pub fn inaccessible_process_name(pid: u32) -> Option<String> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// R17-S3: the start time of process `pid`, also for a process this
+/// account may not open (another account's): [`probe_process`] first,
+/// then on Windows the system process list (`NtQuerySystemInformation`
+/// `SystemProcessInformation`, which reports every process's creation time
+/// without opening it — the Toolhelp snapshot carries none). Linux reads
+/// `/proc/<pid>/stat` in `probe_process` already (world-readable). `None`
+/// when unknown.
+pub fn process_start_time(pid: u32) -> Option<SystemTime> {
+    if let ProcessProbe::Running {
+        started: Some(started),
+    } = probe_process(pid)
+    {
+        return Some(started);
+    }
+    #[cfg(windows)]
+    {
+        system_process_start_time(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// R17-S3: `CreateTime` of process `pid` from
+/// `NtQuerySystemInformation(SystemProcessInformation)` (no handle to the
+/// process needed). The entry layout is the documented prefix of
+/// `SYSTEM_PROCESS_INFORMATION` (winternl.h: `NextEntryOffset`,
+/// `NumberOfThreads`, 48 reserved bytes holding — at their offset 24 —
+/// `CreateTime`, then `ImageName`, `BasePriority`, `UniqueProcessId`).
+#[cfg(windows)]
+pub(crate) fn system_process_start_time(pid: u32) -> Option<SystemTime> {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(
+            class: u32,
+            info: *mut std::ffi::c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    #[repr(C)]
+    #[allow(dead_code)] // layout only: the fields before `create_time` / the id
+    struct Entry {
+        next_entry_offset: u32,
+        number_of_threads: u32,
+        working_set_private_size: i64,
+        hard_fault_count: u32,
+        number_of_threads_high_watermark: u32,
+        cycle_time: u64,
+        create_time: i64,
+        user_time: i64,
+        kernel_time: i64,
+        image_name_length: u16,
+        image_name_maximum_length: u16,
+        image_name_buffer: *const u16,
+        base_priority: i32,
+        unique_process_id: usize,
+    }
+    const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+    const EPOCH_DIFF_TICKS: u64 = 116_444_736_000_000_000;
+    if pid == 0 {
+        return None;
+    }
+    // u64 words: the entries are 8-byte aligned in the buffer.
+    let mut buffer: Vec<u64> = vec![0; 64 * 1024];
+    loop {
+        let bytes = buffer.len() * 8;
+        let mut returned = 0u32;
+        // SAFETY: the buffer is `bytes` long and writable; the call writes
+        // at most that many bytes.
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SYSTEM_PROCESS_INFORMATION,
+                buffer.as_mut_ptr().cast(),
+                bytes as u32,
+                &mut returned,
+            )
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            let wanted = (returned as usize).max(bytes * 2) + 64 * 1024;
+            if wanted > MAX_BYTES {
+                return None;
+            }
+            buffer.resize(wanted.div_ceil(8), 0);
+            continue;
+        }
+        if status < 0 {
+            return None;
+        }
+        let filled = (returned as usize).min(bytes);
+        let base = buffer.as_ptr().cast::<u8>();
+        let mut offset = 0usize;
+        while offset + std::mem::size_of::<Entry>() <= filled {
+            // SAFETY: the entry lies inside the filled part of the buffer;
+            // read unaligned (only plain integers are used).
+            let entry: Entry = unsafe { std::ptr::read_unaligned(base.add(offset).cast()) };
+            if entry.unique_process_id == pid as usize {
+                let ticks = u64::try_from(entry.create_time).ok()?;
+                return ticks.checked_sub(EPOCH_DIFF_TICKS).map(|since| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(since * 100)
+                });
+            }
+            if entry.next_entry_offset == 0 {
+                return None;
+            }
+            offset += entry.next_entry_offset as usize;
+        }
+        return None;
     }
 }
 
