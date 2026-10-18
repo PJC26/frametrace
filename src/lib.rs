@@ -24,6 +24,7 @@ pub mod join;
 pub mod known_hash;
 pub mod model;
 pub mod package;
+pub mod paste_path;
 pub mod qa;
 pub mod rectime;
 pub mod redact;

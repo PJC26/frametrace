@@ -144,7 +144,7 @@ fn default_host() -> Option<String> {
 mod batch;
 mod case;
 mod doctor;
-mod forensic;
+pub(crate) mod forensic;
 mod join_audio;
 mod media;
 mod merge;

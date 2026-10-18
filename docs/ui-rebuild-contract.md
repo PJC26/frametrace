@@ -886,7 +886,7 @@ const FTStore = {
 - 보관 이력서 요약(src/custody.rs)은 트랙 I 소유 — 뷰어는 "보관 이력서 5절"로 안내만.
 
 ### 20.3 읽을 수 없는 저널 치우기 (U3, 트랙 S6)
-- `state: "unreadable"` 줄에 `<small class="h-fin-detail h-fin-cmd">치우기: <code>…</code></small>`: 서버가 `finalize_journal.dismiss_command`(문자열)를 보내면 그것, 없으면 `frametrace finalize-journal --dismiss "<status.case_dir>"`(`finJournalDismissCmd`). 다른 상태엔 없음.
+- `state: "unreadable"` 줄에 `<small class="h-fin-detail h-fin-cmd">치우기: <code>…</code></small>`: 서버가 `finalize_journal.dismiss_command`(문자열)를 보내면 그것, 없으면 ~~`frametrace finalize-journal --dismiss "<status.case_dir>"`(`finJournalDismissCmd`)~~ **(§25.5로 폐기 — 내장 명령 없음, 서버 필드가 null이면 줄 없음)**. 다른 상태엔 없음.
 
 ### 20.4 보관본 상태 (U4, 트랙 I5)
 - `logChains[lane].removed_archive`(수리된 레인; 없으면 `repairs[].removed_archive` 중 가장 나쁜 것: differs > 알 수 없는 값 > missing > match) → 30-records `logChainArchiveText`: "보관본 일치"/"보관본 없음"/"보관본 다름"/"보관본 확인 안 됨"(i18n `chain.archive.*`, ko·en). "수리됨(…)" 바로 뒤, 더 나쁜 상태면 "… · 수리됨 · 보관본 …". 필드 없음(구 서버) = 덧붙이지 않음.
@@ -906,7 +906,7 @@ const FTStore = {
 ## 21. R14 트랙 U 추가 계약 (2026-10-16, docs/PLAN_R14_2026-10-16.md)
 
 ### 21.1 legacy 셸의 최종화 저널 (U1)
-- legacy 70-finalize `gatherFinalizeChecks`가 `/api/status.finalize_journal`을 앱 셸과 같은 규칙(`finJournalState`·`finJournalBlocks`·`finJournalHead`, 머리말 `FIN_JOURNAL_HEAD` 동일)으로 읽는다(`finJournalChecks`): 막으면 `block` "최종화 차단: <머리말>"(recovering은 "이전 최종화 복구 중" — 이때 "다른 작업이 진행 중"은 빠짐), sub = other-host "PC <host> · <시각>까지 차단" · 사유(짧게) · unreadable/unpaired는 "치우기: <dismiss_command 또는 `frametrace finalize-journal --dismiss "<case_dir>"`>". 막지 않고 정보(완료·복구됨·복구 중)가 아니면 `warn` 줄(같은 머리말). 결과 목록은 legacy에 없음.
+- legacy 70-finalize `gatherFinalizeChecks`가 `/api/status.finalize_journal`을 앱 셸과 같은 규칙(`finJournalState`·`finJournalBlocks`·`finJournalHead`, 머리말 `FIN_JOURNAL_HEAD` 동일)으로 읽는다(`finJournalChecks`): 막으면 `block` "최종화 차단: <머리말>"(recovering은 "이전 최종화 복구 중" — 이때 "다른 작업이 진행 중"은 빠짐), sub = other-host "PC <host> · <시각>까지 차단" · 사유(짧게) · unreadable/unpaired는 "치우기: <dismiss_command ~~또는 `frametrace finalize-journal --dismiss "<case_dir>"`~~>" **(내장 형식은 §25.5로 폐기 — dismiss_command가 null이면 이 sub 없음)**. 막지 않고 정보(완료·복구됨·복구 중)가 아니면 `warn` 줄(같은 머리말). 결과 목록은 legacy에 없음.
 
 ### 21.2 닫힌 저널의 `outcome` · 로컬 기록 없음 (U2, 트랙 S9/P18)
 - `state: "completed"` + `outcome`: `completed`(또는 없음) → `[data-journal="completed"]` "이전 최종화 완료 — 기록만 남음"(info) · `recovered` → `closedrecovered` "이전 최종화 복구됨 — 기록만 남음"(info) · `failed` → `closedfailed` "이전 최종화 실패 — 기록만 남음"(경고 `.h-fin-incomplete`) · `dismissed` → `closeddismissed` "이전 최종화 치워짐 — 기록만 남음"(경고) · 그 밖 → `closed` "이전 최종화 끝남 — 확인 필요"(경고). 실패·치움은 "완료"라 쓰지 않는다. 차단 여부는 여전히 `blocks_finalize`.
@@ -950,7 +950,7 @@ const FTStore = {
 - "수리 뒤" 판정: 검증과 수리가 **같은 레인**이면 줄 번호(`줄 > 수리 줄`)만 본다(시각 무시). 다른 레인(보통: own은 carve/filesystem/join 레인, 검증은 validation 레인)은 공통 위치가 없어 §21.4의 시각 비교(`validated_unix` > 수리 시각, 같은 초 아님)가 남는다.
 
 ### 22.3 내장 치우기 명령은 작은따옴표 (U3)
-- 서버 명령이 둘 다 null일 때의 내장 형식(두 셸 `finJournalDismissCmd`): `frametrace finalize-journal '<case_dir>' --dismiss` — Windows 경로(드라이브 문자 또는 `\`)는 `'`→`''`(PowerShell), 그 밖은 `'\''`(POSIX). case_dir 없으면 `frametrace finalize-journal --dismiss`. (§20.3·§21.1의 큰따옴표 형식을 대신한다.)
+- **(§25.5로 폐기 — 아래 내장 형식은 더 이상 없음; 서버 명령이 null이면 줄 없음)** ~~서버 명령이 둘 다 null일 때의 내장 형식(두 셸 `finJournalDismissCmd`):~~ `frametrace finalize-journal '<case_dir>' --dismiss` — Windows 경로(드라이브 문자 또는 `\`)는 `'`→`''`(PowerShell), 그 밖은 `'\''`(POSIX). case_dir 없으면 `frametrace finalize-journal --dismiss`. (§20.3·§21.1의 큰따옴표 형식을 대신한다.)
 
 ### 22.4 문구 (U4, 트랙 S6·I4·I5)
 - `state: "completed-unrecorded"` + `blocks_finalize: true` → `[data-journal="unrecordedblocked"]` "이전 최종화 완료 — 완료 기록 못 씀"(경고 `.h-fin-incomplete`, 본문 = `reason`), 점검 목록 `block` "최종화 차단: 이전 최종화 완료 — 완료 기록 못 씀"(legacy 같음). `blocks_finalize`가 없거나 false면 §21.7 그대로(info).

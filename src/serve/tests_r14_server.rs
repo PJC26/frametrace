@@ -769,14 +769,17 @@ fn r14_s11_dismiss_command_is_single_quoted() {
     assert!(super::finalize_journal::dismiss_command(hostile).is_none());
     assert!(super::finalize_journal::dismiss_command_cmd(hostile).is_none());
     let case = Path::new("C:/cases/홍길동 사건 (1)");
+    // R19-S1 (P32): the path as normalized (on Windows `C:\cases\…`).
+    let shown = crate::paste_path::normalize(case).display().to_string();
     assert_eq!(
         super::finalize_journal::dismiss_command(case).unwrap(),
-        "frametrace finalize-journal 'C:/cases/홍길동 사건 (1)' --dismiss"
+        format!("frametrace finalize-journal '{shown}' --dismiss")
     );
     if cfg!(windows) {
+        assert_eq!(shown, "C:\\cases\\홍길동 사건 (1)");
         assert_eq!(
             super::finalize_journal::dismiss_command_cmd(case).unwrap(),
-            "frametrace finalize-journal \"C:/cases/홍길동 사건 (1)\" --dismiss"
+            format!("frametrace finalize-journal \"{shown}\" --dismiss")
         );
     } else {
         assert!(super::finalize_journal::dismiss_command_cmd(case).is_none());

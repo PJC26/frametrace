@@ -1779,7 +1779,11 @@ enum RecoveryVerdict {
     PackageChanged(UnpairedWhy),
 }
 
-type VerdictKey = (String, (u64, SystemTime));
+/// R19-S4: (normalized case folder, finalize id, manifest size + mtime) —
+/// R18 keyed only the finalize id, so a copy of the case (same journal,
+/// same id, a manifest with the same size and mtime) was shown the
+/// original's verdict.
+type VerdictKey = (PathBuf, String, (u64, SystemTime));
 
 fn recovery_verdicts() -> &'static Mutex<Vec<(VerdictKey, RecoveryVerdict)>> {
     static VERDICTS: Mutex<Vec<(VerdictKey, RecoveryVerdict)>> = Mutex::new(Vec::new());
@@ -1788,8 +1792,14 @@ fn recovery_verdicts() -> &'static Mutex<Vec<(VerdictKey, RecoveryVerdict)>> {
 
 /// Remembers a full-hash assessment's verdict for the manifest stamped
 /// `stamp` (taken before AND after the hash, equal — else nothing is
-/// remembered). Any other assessment of that finalize forgets it.
-fn remember_verdict(finalize_id: &str, stamp: Option<(u64, SystemTime)>, assessment: &Assessment) {
+/// remembered) of `case_dir`. Any other assessment of that finalize in
+/// that case forgets it.
+fn remember_verdict(
+    case_dir: &Path,
+    finalize_id: &str,
+    stamp: Option<(u64, SystemTime)>,
+    assessment: &Assessment,
+) {
     let verdict = match assessment {
         Assessment::Finished {
             why,
@@ -1801,24 +1811,27 @@ fn remember_verdict(finalize_id: &str, stamp: Option<(u64, SystemTime)>, assessm
         }
         _ => None,
     };
+    let case = crate::paste_path::normalize(case_dir);
     if let Ok(mut verdicts) = recovery_verdicts().lock() {
-        verdicts.retain(|((id, _), _)| id != finalize_id);
+        verdicts.retain(|((dir, id, _), _)| !(id == finalize_id && *dir == case));
         if let (Some(verdict), Some(stamp)) = (verdict, stamp) {
             keep_newest(&mut verdicts, 16);
-            verdicts.push(((finalize_id.to_string(), stamp), verdict));
+            verdicts.push(((case, finalize_id.to_string(), stamp), verdict));
         }
     }
 }
 
 fn remembered_verdict(
+    case_dir: &Path,
     finalize_id: &str,
     stamp: Option<(u64, SystemTime)>,
 ) -> Option<RecoveryVerdict> {
     let stamp = stamp?;
+    let case = crate::paste_path::normalize(case_dir);
     recovery_verdicts().lock().ok().and_then(|verdicts| {
         verdicts
             .iter()
-            .find(|((id, at), _)| id == finalize_id && *at == stamp)
+            .find(|((dir, id, at), _)| *dir == case && id == finalize_id && *at == stamp)
             .map(|(_, verdict)| verdict.clone())
     })
 }
@@ -2214,7 +2227,7 @@ fn classify(
     // verdict for that very manifest (size + mtime) is remembered — then
     // that verdict, package changed included.
     let withheld = |journal: FinalizeJournal, manifest_sha256: Option<String>| {
-        match remembered_verdict(&journal.finalize_id, manifest_stamp) {
+        match remembered_verdict(case_dir, &journal.finalize_id, manifest_stamp) {
             Some(RecoveryVerdict::PackageChanged(why)) => {
                 let why = UnpairedWhy {
                     reason: format!("{}{REMEMBERED_NOTE}", why.reason),
@@ -2336,7 +2349,7 @@ fn assess_with(case_dir: &Path, assume_gone: bool) -> Option<Assessment> {
         assume_gone,
     );
     if let Some((finalize_id, stamp)) = judged {
-        remember_verdict(&finalize_id, stamp, &assessment);
+        remember_verdict(case_dir, &finalize_id, stamp, &assessment);
     }
     Some(assessment)
 }
@@ -2344,56 +2357,24 @@ fn assess_with(case_dir: &Path, assume_gone: bool) -> Option<Assessment> {
 /// R18-S1 (P29): `/api/status.finalize_journal.command_unavailable_reason`
 /// and the CLI's words when a case path is not paste-safe — no command is
 /// given at all.
-pub(crate) const COMMAND_UNAVAILABLE_REASON: &str = "경로에 특수 문자 — 명령을 직접 입력하십시오";
-
-/// R18-S1 (P29): the characters a case path may hold for a command to be
-/// offered for pasting — a WHITELIST. Letters and digits of any script
-/// (Hangul folder names), the ASCII space and `- _ . , / \ : ( ) [ ] + = @
-/// ~ #`. Everything else is refused, notably: PowerShell's single quotes
-/// `'` U+2018 U+2019 U+201A U+201B (R17 PoC: 891f180 doubled only ASCII
-/// `'`, so `x’; calc; ’` ended the quoted string and ran `calc`), its
-/// double quotes, `$` and the backtick; `cmd.exe`'s `%` (no escape at its
-/// prompt, R17-S10), `!` (delayed expansion, S8), `^ & | < > "`; `;`, `'`
-/// for POSIX shells; every control character and every non-ASCII space,
-/// dash or quote (none of them is a letter or a digit).
-pub(crate) fn paste_safe_char(c: char) -> bool {
-    c.is_alphanumeric()
-        || matches!(
-            c,
-            ' ' | '-'
-                | '_'
-                | '.'
-                | ','
-                | '/'
-                | '\\'
-                | ':'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '+'
-                | '='
-                | '@'
-                | '~'
-                | '#'
-        )
-}
+pub(crate) const COMMAND_UNAVAILABLE_REASON: &str = crate::paste_path::UNSAFE_REASON;
 
 /// The case path as it goes, unescaped, between the command's quotes —
-/// `None` (no command) when any character is not [`paste_safe_char`] or
-/// it starts with `-` (it would read as an option). Nothing is ever
-/// escaped: an escape is a promise about one shell's parser, and R17
-/// showed that promise broken.
+/// `None` (no command) when any character is not paste-safe or it starts
+/// with `-` (it would read as an option). Nothing is ever escaped: an
+/// escape is a promise about one shell's parser, and R17 showed that
+/// promise broken. R19-S1 (P32): the path is first normalized
+/// ([`crate::paste_path::normalize`]: absolute, no trailing separator, a
+/// drive root `X:\.`) — a trailing `\` made the closing quote literal in
+/// Win32 argv conversion and the flags landed inside the path argument.
 fn paste_safe_path(case_dir: &Path) -> Option<String> {
-    let path = case_dir.display().to_string();
-    (!path.is_empty() && !path.starts_with('-') && path.chars().all(paste_safe_char))
-        .then_some(path)
+    crate::paste_path::paste_safe(case_dir)
 }
 
 /// R14-S11: the dismiss command as the examiner pastes it — single-quoted
 /// (PowerShell, the Windows default shell, expands `$(…)` inside double
 /// quotes; a case path holding one ran it). R18-S1 (P29): `None` unless
-/// the path is paste-safe ([`paste_safe_char`]); the path is then put in
+/// the path is paste-safe ([`crate::paste_path::paste_safe_char`]); the path is then put in
 /// as it is (it holds no quote of any kind).
 pub(crate) fn dismiss_command(case_dir: &Path) -> Option<String> {
     journal_command(case_dir, "--dismiss")
@@ -3966,12 +3947,59 @@ fn assessment_journal(assessment: &Assessment) -> Option<&FinalizeJournal> {
     }
 }
 
-/// R18-S3: what the two looks of `--writer-gone` must agree on.
-fn writer_key(journal: &FinalizeJournal) -> (String, u32, Option<u64>, String) {
+/// R18-S3: what the two looks of `--writer-gone` must agree on. R19-S5:
+/// the whole identity of the finalize and its writer — also the package
+/// name, the host id and the writer's executable hash (R18 compared only
+/// id, pid, start time and sign-off hash).
+#[allow(clippy::type_complexity)]
+fn writer_key(
+    journal: &FinalizeJournal,
+) -> (
+    String,
+    String,
+    String,
+    u32,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+    String,
+) {
     (
         journal.finalize_id.clone(),
+        journal.package_name.clone(),
+        journal.host_id.clone(),
         journal.writer.pid,
         journal.writer.started_ms,
+        journal.writer.image.clone(),
+        journal.writer_image_sha256.clone(),
         journal.signoff_sha256.clone(),
     )
+}
+
+/// R19-S4 test hook: remembers a package-changed verdict for (`case_dir`,
+/// `finalize_id`, `stamp`) as a recovery would.
+#[cfg(test)]
+pub(crate) fn remember_package_changed_for_test(
+    case_dir: &Path,
+    finalize_id: &str,
+    stamp: (u64, SystemTime),
+) {
+    let case = crate::paste_path::normalize(case_dir);
+    let why = UnpairedWhy::new(UNPAIRED_PACKAGE_CHANGED, "test");
+    if let Ok(mut verdicts) = recovery_verdicts().lock() {
+        verdicts.push((
+            (case, finalize_id.to_string(), stamp),
+            RecoveryVerdict::PackageChanged(why),
+        ));
+    }
+}
+
+/// R19-S4 test hook: whether a verdict is remembered for that key.
+#[cfg(test)]
+pub(crate) fn verdict_remembered_for_test(
+    case_dir: &Path,
+    finalize_id: &str,
+    stamp: (u64, SystemTime),
+) -> bool {
+    remembered_verdict(case_dir, finalize_id, Some(stamp)).is_some()
 }

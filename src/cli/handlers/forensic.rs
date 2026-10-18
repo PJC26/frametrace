@@ -134,10 +134,10 @@ pub fn import_e01(case_dir: &Path, e01_file: &Path, options: E01Options) -> Resu
         println!("verify log: {}", path.display());
     }
     println!("export log: {}", result.ewfexport_log_path.display());
+    // R19-S2 (P29/P32): the paths are quoted, or named by a placeholder.
     println!(
-        "next: carve-file {} {}",
-        case_dir.display(),
-        result.raw_output_path.display()
+        "{}",
+        next_carve_file_hint(case_dir, &result.raw_output_path)
     );
     Ok(())
 }
@@ -352,15 +352,39 @@ pub fn recover_inode(
         println!("warning: {warning}");
     }
     println!(
-        "next: scan-folder {} {} --no-ffprobe",
-        case_dir.display(),
-        result
-            .output_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .display()
+        "{}",
+        next_scan_folder_hint(
+            case_dir,
+            result
+                .output_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+        )
     );
     Ok(())
+}
+
+/// R19-S2: `next: carve-file "<case>" "<raw>"` — each path quoted when
+/// paste-safe, else `<케이스 폴더>` / `<파일>` and the reason
+/// ([`crate::paste_path::hint_command`]).
+pub(crate) fn next_carve_file_hint(case_dir: &Path, raw: &Path) -> String {
+    use crate::paste_path::{Arg, hint_command};
+    hint_command(&[
+        Arg::Word("next: carve-file"),
+        Arg::Path(case_dir, "<케이스 폴더>"),
+        Arg::Path(raw, "<파일>"),
+    ])
+}
+
+/// R19-S2: `next: scan-folder "<case>" "<folder>" --no-ffprobe`.
+pub(crate) fn next_scan_folder_hint(case_dir: &Path, folder: &Path) -> String {
+    use crate::paste_path::{Arg, hint_command};
+    hint_command(&[
+        Arg::Word("next: scan-folder"),
+        Arg::Path(case_dir, "<케이스 폴더>"),
+        Arg::Path(folder, "<폴더>"),
+        Arg::Word("--no-ffprobe"),
+    ])
 }
 
 pub fn recover_batch(

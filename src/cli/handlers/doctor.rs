@@ -522,9 +522,13 @@ pub fn deepfake_scan(case_dir: &Path, force: bool, retry_failed: bool) -> Result
         "artifacts: {}",
         case_dir.join("artifacts/deepfake").display()
     );
+    // R19-S2: the case path quoted, or `<케이스 폴더>` and the reason.
     println!(
-        "next: make-review {} — 뷰어에 '합성의심' 배지로 표시됩니다",
-        case_dir.display()
+        "{} — 뷰어에 '합성의심' 배지로 표시됩니다",
+        crate::paste_path::hint_command(&[
+            crate::paste_path::Arg::Word("next: make-review"),
+            crate::paste_path::Arg::Path(case_dir, "<케이스 폴더>"),
+        ])
     );
     Ok(())
 }

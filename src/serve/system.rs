@@ -845,7 +845,12 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     {
         return api_err(reason);
     }
-    let case_dir = PathBuf::from(dir_text.trim());
+    // R19-S1 (P32): the bound case folder is normalized — absolute, no
+    // trailing separator, a drive root `X:\.` — so every path the status
+    // shows and every command built from it is the same, argv-safe text
+    // (`E:\` or `C:\cases\c 1\` typed with a trailing backslash made the
+    // pasted command's closing quote literal). Lexical only (no disk).
+    let case_dir = crate::paste_path::normalize(Path::new(dir_text.trim()));
     if !case_dir.join("case.json").is_file() {
         return "{\"ok\":false,\"error\":\"해당 폴더에 case.json이 없습니다 — 기존 케이스 폴더가 아닙니다.\"}"
             .to_string();

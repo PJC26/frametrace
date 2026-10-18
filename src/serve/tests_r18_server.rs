@@ -261,16 +261,26 @@ fn r18_s1_whitelist_refuses_every_shell_character() {
             assert!(command.is_none(), "{bad:?}: {command:?}");
         }
     }
-    assert!(fj::dismiss_command(Path::new("-x")).is_none(), "an option");
+    // R19-S1 (P32): a relative `-x` is made absolute first — the path in
+    // the command never starts with `-` (it cannot read as an option).
+    if let Some(command) = fj::dismiss_command(Path::new("-x")) {
+        assert!(!command.contains(" '-"), "an option: {command}");
+    }
     for good in [
         "C:\\cases\\홍길동 사건 (1)",
         "C:\\Users\\DAERYU~1\\AppData\\Local\\Temp\\ft-r18s-a_b.c",
         "/home/user/cases/a+b=c@d#e[1],2",
     ] {
         let command = fj::dismiss_command(Path::new(good)).expect(good);
+        // R19-S1 (P32): the path as normalized (absolute, no trailing
+        // separator).
+        let normalized = crate::paste_path::normalize(Path::new(good));
         assert_eq!(
             command,
-            format!("frametrace finalize-journal '{good}' --dismiss")
+            format!(
+                "frametrace finalize-journal '{}' --dismiss",
+                normalized.display()
+            )
         );
         assert_eq!(
             fj::dismiss_command_cmd(Path::new(good)).is_some(),
@@ -280,7 +290,10 @@ fn r18_s1_whitelist_refuses_every_shell_character() {
     }
     assert_eq!(
         fj::writer_gone_command(Path::new("C:\\a"), true).unwrap(),
-        "frametrace finalize-journal 'C:\\a' --writer-gone --i-am-sure"
+        format!(
+            "frametrace finalize-journal '{}' --writer-gone --i-am-sure",
+            crate::paste_path::normalize(Path::new("C:\\a")).display()
+        )
     );
 }
 

@@ -58,6 +58,8 @@ mod tests_r17_server;
 #[cfg(test)]
 mod tests_r18_server;
 #[cfg(test)]
+mod tests_r19_server;
+#[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
 mod tests_r4_jobs;
