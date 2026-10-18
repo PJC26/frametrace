@@ -1014,3 +1014,30 @@ const FTStore = {
 - 타임라인 행 `time_self_consistent: true`(없으면 false) → kind 옆 약한 표시 "자기 일관성만"(`.badge.candidate.tl-time-sc`, tooltip `timeline.tip.timeSc`, ko·en) — "시각 감사 안 됨"과 구별, 같이 붙지 않음(`time_unaudited` 우선).
 - `head_reason: "unusable-line"`은 코드 그대로 "쓸 수 없는 줄"(서버 문장 "모양상 다른 이벤트이나 내용은 인증 안 됨 — …"은 사유·hint에 그대로).
 - 하네스: verify-review-batch --unit "R17 U1"–"R17 U5"(9bac14c 자산), "R17 track I follow-up"(7095fce 자산에서 실패 확인); verify-layout "R17 U1/U2"(1366×768, records-meta 주입).
+
+## 25. R18 트랙 U 추가 계약 (2026-10-19, docs/PLAN_R18_2026-10-19.md)
+
+### 25.1 이상 후보는 안전한 쪽으로 센다 (U1, P30 — §24.2를 대신함)
+- 이상 징후 발견 행(`kind` ≠ none)이 하나라도 있는 기록은 `trust`와 무관하게 이상 후보(`record.hasAnomaly`). 인증 안 된 줄·대체된 줄이 기록을 깨끗하게 보이게 하지 않는다.
+- 쓸 수 있는 행(auth·sc·필드 없음)이 하나도 없는 기록만 표시를 구분: 그중 `pc:<키>`가 아닌 행이 있으면 `hasUnauthAnomaly`("인증 안 됨"), 모두 `pc:`면 `hasPcAnomaly`("다른 PC 키", §25.2).
+- 알약: "이상 N (인증 안 됨 M · 다른 PC 키 K)" — 괄호 안 각 부분은 0보다 클 때만; 보류 중이면 뒤에 " · 확인 불가". tooltip "인증 안 됨 M건 포함(표시만 구분)".
+- 배지: `.badge.anomaly` "이상 후보" + " · 인증 안 됨"(`.anomaly-unauth`) 또는 " · 다른 PC 키"(`.anomaly-pc`) + " · 확인 불가"(`.anomaly-unverified`). 상세 이상 징후 줄도 같은 표시.
+- 칩: `anomaly`(이상 징후 후보) 필터는 모든 이상 후보. `anomaly:unauth` "인증 안 된 후보 M"은 M>0이면 레일에 늘 보임(더보기 뒤가 아님). `anomaly:pc` "다른 PC 키 후보 K"는 K>0일 때만(더보기).
+- 서버(트랙 I2) records-meta `logChains.anomaly.withheld`(또는 `anomalyLog.withheld`) = `{reason}`: null·false·없음이면 무시, 그 밖(빈 객체 포함)은 보류 — 머리가 intact여도 경고(`warn`): 알약·칩·배지 "확인 불가", 배너 `#anomalyHeadBanner`(role=status) "이상 징후 확인 불가 — {reason}"(`anomalyHead.withheld`; 사유 없으면 `anomalyHead.unknown`). 순서: 머리 err(꼬리 잘림) > withheld > reason_code 문구. tooltip 첫 줄 = reason.
+- 트랙 I(5a75e30) 모양 `{reason_code, codes[], reason}`: 배너 {reason}은 `codes`가 모두 아는 코드면 짧은 말(`anomalyHead.held.*`, " · "로 이음) — unusable-after "완료 표식 뒤 인증 안 된 줄" · unusable-in-run "최근 실행 안 인증 안 된 줄" · repaired-after "레인 수리 뒤 — 다시 검사" · newer-unmarked-run "표식 없는 더 새 실행" · unreadable "레인 읽지 못함" · bundle-unreadable "번들 머리 읽지 못함 — make-review를 다시 실행"; 모르는 코드가 있으면 서버 문장. 전체 문장은 배너 title. `head.withhold_reason`만 있어도 보류(§23.1 그대로) — 둘 중 하나면 "확인 불가".
+- 머리 `reason_code: "bundle-unreadable"`(번들만) → "이상 징후 기록: 번들 머리 읽지 못함 — make-review를 다시 실행"(`anomalyHead.reason.bundleUnreadable`; 다시 스캔 안내 아님). `marker-unusable`은 §24.1 그대로. unusable-line 문장의 "(적힌 event: …)"에 기대지 않는다.
+
+### 25.2 다른 PC 키 (U2)
+- `pc:` trust만 있는 이상 후보는 "인증 안 됨"으로 묶지 않는다: "다른 PC 키 — 키 보유 PC에서 확인"(`anomaly.pcTip`, ko·en).
+
+### 25.3 명령 없음 (U3, 트랙 S1 P29)
+- `finalize_journal.command_unavailable_reason`이 있으면(null·false 아님) 치우기·작성자 없음 복구·강제 치우기 줄을 하나도 보이지 않고 사유를 보인다: 비ASCII 문장이면 그대로, 코드면 고정 문구 "경로에 특수 문자 — 명령을 직접 입력하십시오"(`FIN_NO_COMMAND`). 결과 줄 `.h-fin-detail`, 점검 목록 sub(앱 셸·legacy).
+
+### 25.4 차단 여부 모름 (U4, 트랙 S2 P31)
+- `blocks_finalize: null`(필드가 있고 null)이면서 다른 규칙으로 막지 않는 저널 → 차단 가능: 결과 줄은 경고(info 아님, `data-maybe-blocks="true"`) + "확인 필요 — 최종화가 거부될 수 있음"(`FIN_MAYBE_BLOCKS`), 점검 목록 `warn`(두 셸). 버튼은 막지 않는다(서버가 거부한다).
+- 기억된 복구 판정: `finalize_journal.recovery_verdict`(문자열 또는 `{text}`/`{reason}`)를 결과 줄·점검 목록 sub에 짧게. 트랙 S(a9d26a3)는 따로 필드를 보내지 않고 `manifest_check: "recovery-verdict"` + `reason`(판정 문장)으로 보낸다 → 본문 = `reason`, 덧줄 "기억된 판정(복구가 전체 해시로 확인)"(`FIN_VERDICT_LABEL`); "확인 보류"(§24.3 `unrecordedwithheld`)는 `"withheld"`일 때만. completed-unrecorded(+false)는 info 그대로, unpaired/package-changed(+true)는 차단.
+- `null`은 `finJournalBlocks`/`finJournalMaybeBlocks`로만 읽는다(두 셸 어디에도 `if (blocks_finalize)` 같은 참거짓 검사 없음).
+
+### 25.5 명령은 서버 문자열만 (U5, 트랙 S7)
+- 뷰어·셸은 명령을 만들지 않는다. §22.3의 내장 작은따옴표 형식(`finJournalDismissCmd`/`finJournalDismissQuote`)은 없앴다 — `’` 같은 따옴표 문자를 막지 못했다. 서버 필드가 없거나 null이면 줄 없음. `--i-am-sure`는 서버가 보낸 명령 문자열 안에서만 나온다(그대로 표시). `writer_gone_i_am_sure: true`면 작성자 없음 복구 마지막 줄 옆에 경고 "이 케이스의 진행 중 최종화가 아닌지 확인"(`FIN_SURE_NOTE`; 결과 줄 `.h-fin-note`, 점검 목록 sub는 괄호). other-account·최종화 거부 문장은 키로 쓰지 않는다.
+- 하네스: verify-review-batch --unit "R18 U1"–"R18 U5"(ff898f5 자산에서 각각 실패 확인), verify-layout "R18 U1/U2"(1366×768, records-meta 주입: auth·unauth·pc 3행 + withheld).

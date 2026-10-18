@@ -83,21 +83,42 @@ function finJournalUnpairedCode(j, reason) {
   const c = j && j.unpaired_code != null ? String(j.unpaired_code) : "";
   return c || (String(reason || "").includes("로컬 기록 없음") ? "no-local-record" : "");
 }
+// R18 U3 (track S1, P29): no server command (path a shell could read) →
+// `command_unavailable_reason` instead of any command line (same as the
+// app shell, assets/app/41-finalize.js).
+const FIN_NO_COMMAND = "경로에 특수 문자 — 명령을 직접 입력하십시오";
+function finJournalNoCommand(j) {
+  const v = j && typeof j === "object" ? j.command_unavailable_reason : null;
+  if (v == null || v === false) return "";
+  const r = String(v).trim();
+  return /[^\x00-\x7f]/.test(r) ? r : FIN_NO_COMMAND;
+}
+// R18 U4 (track S2, P31): `blocks_finalize: null` → possibly blocking (warning).
+const FIN_MAYBE_BLOCKS = "확인 필요 — 최종화가 거부될 수 있음";
+function finJournalMaybeBlocks(s) {
+  return !!(s && s.journal && Object.prototype.hasOwnProperty.call(s.journal, "blocks_finalize") && s.journal.blocks_finalize === null && !finJournalBlocks(s));
+}
+// R18 U4: the remembered recovery verdict (`recovery_verdict`: text or {text | reason}).
+// Track S (a9d26a3): `manifest_check: "recovery-verdict"` — the remembered
+// verdict is the `reason` (shown as the body): labelled "기억된 판정".
+function finJournalVerdict(j) {
+  const v = j && typeof j === "object" ? j.recovery_verdict : null;
+  if (typeof v === "string" && v.trim()) return v.trim();
+  if (v && typeof v === "object") { const x = String(v.text != null ? v.text : v.reason != null ? v.reason : "").trim(); if (x) return x; }
+  return j && j.manifest_check === "recovery-verdict" ? FIN_VERDICT_LABEL : "";
+}
+const FIN_VERDICT_LABEL = "기억된 판정(복구가 전체 해시로 확인)";
 // The dismiss command lines (unreadable / unpaired / other-host): the
 // server's PowerShell (single-quoted) and cmd.exe forms when both come, one
-// line when one does, the built-in form only when neither does
-// (unreadable / unpaired).
+// line when one does. R18 U5 (P29): never built here.
 function finJournalDismissLines(st, kind) {
   if (!["unreadable", "unpaired", "otherhost"].includes(kind)) return [];
   const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  if (finJournalNoCommand(j)) return [];
   const ps = typeof j.dismiss_command === "string" ? j.dismiss_command.trim() : "";
   const cmd = typeof j.dismiss_command_cmd === "string" ? j.dismiss_command_cmd.trim() : "";
   if (ps && cmd) return [{ label: "치우기(PowerShell)", cmd: ps }, { label: "치우기(명령 프롬프트)", cmd }];
-  if (ps || cmd) return [{ label: "치우기", cmd: ps || cmd }];
-  // R15 (track S): null = no dismiss hint on purpose; the built-in form only
-  // for an older server that does not send the field.
-  if (kind === "otherhost" || Object.prototype.hasOwnProperty.call(j, "dismiss_command")) return [];
-  return [{ label: "치우기", cmd: finJournalDismissCmd(st) }];
+  return ps || cmd ? [{ label: "치우기", cmd: ps || cmd }] : [];
 }
 // R16 U4 (track S 2e3a4e4): the `--force` dismiss hint — ONLY the server's
 // `force_dismiss_command` (PowerShell) / `force_dismiss_command_cmd`
@@ -108,7 +129,7 @@ function finJournalDismissLines(st, kind) {
 const FIN_FORCE_NOTE = "저널만 옮김 — 아무것도 되돌리거나 기록하지 않음(서명·패키지 그대로)";
 function finJournalForceLines(st, kind) {
   const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
-  if (j.in_progress_code === "live-writer") return [];
+  if (j.in_progress_code === "live-writer" || finJournalNoCommand(j)) return [];
   const ps = typeof j.force_dismiss_command === "string" ? j.force_dismiss_command.trim() : "";
   const cmd = typeof j.force_dismiss_command_cmd === "string" ? j.force_dismiss_command_cmd.trim() : "";
   const out = ps && cmd ? [{ label: "확인 뒤 강제 치우기(PowerShell)", cmd: ps }, { label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd }]
@@ -118,13 +139,20 @@ function finJournalForceLines(st, kind) {
 }
 // R17 U5 (track S2): "작성자 없음 확인 시 복구" — ONLY the server's
 // `writer_gone_command` (PowerShell) / `writer_gone_command_cmd` (cmd.exe).
+// R18 U5 (track S7): `--i-am-sure` only ever comes inside these strings.
 function finJournalWriterGoneLines(st) {
   const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  if (finJournalNoCommand(j)) return [];
   const ps = typeof j.writer_gone_command === "string" ? j.writer_gone_command.trim() : "";
   const cmd = typeof j.writer_gone_command_cmd === "string" ? j.writer_gone_command_cmd.trim() : "";
-  if (ps && cmd) return [{ label: "작성자 없음 확인 시 복구(PowerShell)", cmd: ps }, { label: "작성자 없음 확인 시 복구(명령 프롬프트)", cmd }];
-  return ps || cmd ? [{ label: "작성자 없음 확인 시 복구", cmd: ps || cmd }] : [];
+  const out = ps && cmd ? [{ label: "작성자 없음 확인 시 복구(PowerShell)", cmd: ps }, { label: "작성자 없음 확인 시 복구(명령 프롬프트)", cmd }]
+    : ps || cmd ? [{ label: "작성자 없음 확인 시 복구", cmd: ps || cmd }] : [];
+  // R18 (track S7): `writer_gone_i_am_sure: true` — the server's command already
+  // carries --i-am-sure (a live process matches the writer): a warning next to it.
+  if (out.length && j.writer_gone_i_am_sure === true) out[out.length - 1].note = FIN_SURE_NOTE;
+  return out;
 }
+const FIN_SURE_NOTE = "이 케이스의 진행 중 최종화가 아닌지 확인";
 // One checklist text of command lines; a line's note follows it in brackets.
 function finJournalCmdText(lines) {
   return lines.map(l => `${l.label}: ${l.cmd}` + (l.note ? ` (${l.note})` : "")).join(" · ");
@@ -174,17 +202,6 @@ function finJournalHead(s) {
   if (s && s.kind === "unpaired" && FIN_UNPAIRED_SHORT[s.code]) return `이전 최종화 짝 없음(${FIN_UNPAIRED_SHORT[s.code]}) — 확인 필요`;
   return FIN_JOURNAL_HEAD[s && s.kind] || FIN_JOURNAL_HEAD.check;
 }
-function finJournalDismissCmd(st) {
-  const j = st && st.finalize_journal;
-  if (j && typeof j.dismiss_command === "string" && j.dismiss_command.trim()) return j.dismiss_command.trim();
-  const dir = st && typeof st.case_dir === "string" ? st.case_dir : "";
-  return dir ? `frametrace finalize-journal ${finJournalDismissQuote(dir)} --dismiss` : "frametrace finalize-journal --dismiss";
-}
-// R15 U3: single quotes like the server's form (assets/app/41-finalize.js).
-function finJournalDismissQuote(dir) {
-  const d = String(dir);
-  return "'" + (/^[A-Za-z]:|\\/.test(d) ? d.replace(/'/g, "''") : d.replace(/'/g, "'\\''")) + "'";
-}
 function finShortDetail(text, max) {
   const lim = max || 90;
   const t = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
@@ -199,11 +216,14 @@ function finJournalChecks(st) {
   const until = Number(j.blocked_until_unix);
   const host = s.kind === "otherhost" || s.kind === "otheraccount" || s.kind === "unverifiedwriter" ? [j.host ? "PC " + String(j.host) : "", until > 0 ? new Date(until * 1000).toLocaleString() + "까지 차단" : ""].filter(Boolean).join(" · ") : "";
   const cmd = finJournalCmdText(finJournalDismissLines(st, s.kind).concat(finJournalWriterGoneLines(st), finJournalForceLines(st, s.kind)));
-  const sub = [host, s.detail ? finShortDetail(s.detail) : "", cmd].filter(Boolean).join(" — ");
+  const verdict = finJournalVerdict(j);
+  const sub = [host, s.detail ? finShortDetail(s.detail) : "", verdict ? finShortDetail(verdict) : "", cmd, finJournalNoCommand(j)].filter(Boolean).join(" — ");
   if (finJournalBlocks(s)) {
     if (s.kind === "recovering") return [{ level: "block", text: "이전 최종화 복구 중", sub: "끝나면 '다시 확인'을 누르십시오." }];
     return [{ level: "block", text: "최종화 차단: " + finJournalHead(s), sub: sub || "결과 안내를 확인하십시오.", cmd: !!cmd }];
   }
+  // R18 U4 (P31): unknown → possibly blocking, a warning (never hidden as info).
+  if (finJournalMaybeBlocks(s)) return [{ level: "warn", text: finJournalHead(s), sub: [FIN_MAYBE_BLOCKS, sub].filter(Boolean).join(" — "), cmd: !!cmd }];
   if (FIN_JOURNAL_INFO.has(s.kind)) return [];
   return [{ level: "warn", text: finJournalHead(s), sub, cmd: !!cmd }];
 }

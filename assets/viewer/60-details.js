@@ -156,7 +156,7 @@ function renderDetails() {
     [t("detail.len"), fmtDuration(record.duration)],
     [t("detail.size"), fmtBytes(record.size)],
     [t("detail.audio"), audioDetailFor(record)],
-    [t("detail.anomaly"), record.anomalies && record.anomalies.length ? record.anomalies.map(item => item.kind).join(", ") + (record.hasAnomaly ? "" : " (" + t("anomaly.unauth") + ")") : "-"],
+    [t("detail.anomaly"), record.anomalies && record.anomalies.length ? record.anomalies.map(item => item.kind).join(", ") + (record.hasUnauthAnomaly ? " (" + t("anomaly.unauthShort") + ")" : record.hasPcAnomaly ? " (" + t("anomaly.pcTip") + ")" : "") : "-"],
     [t("detail.dfl"), record.dfl ? (record.dfl.band
         ? tf("detail.dflScore", { label: record.dfl.band_label || record.dfl.band, score: record.dfl.score ?? "?" }) + (record.dfl.signal_titles?.length ? ": " + record.dfl.signal_titles.slice(0, 3).join(", ") : "")
         : (record.dfl.error ? tf("detail.dflFail", { error: record.dfl.error }) : t("detail.dflNone"))) : "-"]
@@ -405,35 +405,40 @@ function renderMetrics() {
 let staticMetricCountsCache = null;
 function staticMetricCounts() {
   if (staticMetricCountsCache) return staticMetricCountsCache;
-  let verified = 0, failed = 0, anomaly = 0, anomalyUnauth = 0;
+  let verified = 0, failed = 0, anomaly = 0, anomalyUnauth = 0, anomalyPc = 0;
   records.forEach(record => {
     if (record.status === "ffprobe-video-stream-confirmed" || record.status === "ffprobe-confirmed") verified += 1;
     else if (record.status === "validation-failed") failed += 1;
     if (record.hasAnomaly) anomaly += 1;
-    else if (record.hasUnauthAnomaly) anomalyUnauth += 1;
+    if (record.hasUnauthAnomaly) anomalyUnauth += 1;
+    else if (record.hasPcAnomaly) anomalyPc += 1;
   });
-  staticMetricCountsCache = { verified, failed, anomaly, anomalyUnauth };
+  staticMetricCountsCache = { verified, failed, anomaly, anomalyUnauth, anomalyPc };
   return staticMetricCountsCache;
 }
-// R17 U2: the "이상 N" pill — N counts records with an authenticated (auth /
-// sc) anomaly row only; " · 확인 불가" while the anomaly head withholds;
-// the unauthenticated ones are named in the tooltip (their own chip).
+// R18 U1 (P30): the "이상 N" pill — N counts every record with an anomaly
+// finding row; "(인증 안 됨 M · 다른 PC 키 K)" names the ones without a
+// usable row (each part only when > 0); " · 확인 불가" while the head or
+// the server (`anomaly.withheld`) withholds.
 function anomalyPillUpdate(el, counts) {
   const unverified = anomalyUnverified();
-  const text = String(counts.anomaly) + (unverified ? " · " + t("anomalyHead.badge") : "");
+  const apart = [counts.anomalyUnauth ? tf("anomaly.unauthN", { n: counts.anomalyUnauth }) : "", counts.anomalyPc ? tf("anomaly.pcN", { n: counts.anomalyPc }) : ""].filter(Boolean);
+  const text = String(counts.anomaly) + (apart.length ? " (" + apart.join(" · ") + ")" : "") + (unverified ? " · " + t("anomalyHead.badge") : "");
   if (el.textContent !== text) el.textContent = text;
   const pill = el.closest ? el.closest("button") : null;
   if (!pill) return;
   pill.classList.toggle("anomaly-unverified", unverified);
   const tip = [t("tip.badgeAnom"), counts.anomalyUnauth ? tf("anomaly.unauthCount", { n: counts.anomalyUnauth }) : "",
-    unverified ? t(anomalyHead.level === "err" ? "anomalyHead.cut" : "anomalyHead.unknown") : ""].filter(Boolean).join("\n");
+    counts.anomalyPc ? t("anomaly.pcTip") : "",
+    unverified ? t(anomalyHead.level === "err" ? "anomalyHead.cut" : "anomalyHead.unknown") + (anomalyHead.tip ? "\n" + anomalyHead.tip : "") : ""].filter(Boolean).join("\n");
   if (pill.title !== tip) pill.title = tip;
 }
 // R17 U2: a rail chip's label — the anomaly chip carries "확인 불가" while
-// the head withholds; the unauthenticated chip carries its count.
+// the head withholds; the unauthenticated / other-PC-key chips carry their count.
 function presetChipLabel(value, label) {
   if (value === "anomaly" && anomalyUnverified()) return t(label) + " · " + t("anomalyHead.badge");
   if (value === "anomaly:unauth") return t(label) + " " + staticMetricCounts().anomalyUnauth;
+  if (value === "anomaly:pc") return t(label) + " " + staticMetricCounts().anomalyPc;
   return t(label);
 }
 
@@ -458,9 +463,13 @@ function renderChips() {
   let hidden = 0;
   for (const [value, label, secondary] of PRESET_CHIPS) {
     if (value.startsWith("tag:")) continue;
-    // R17 U2: the unauthenticated-anomaly chip only when there are some.
+    // R17 U2: the unauthenticated-anomaly chip only when there are some —
+    // R18 U1 (P30): then always on the rail (primary), never behind "더보기".
+    // The other-PC-key chip (U2) likewise only when there are some.
     if (value === "anomaly:unauth" && !staticMetricCounts().anomalyUnauth && state.chip !== value) continue;
-    if (secondary && !state.chipsExpanded && state.chip !== value) { hidden += 1; continue; }
+    if (value === "anomaly:pc" && !staticMetricCounts().anomalyPc && state.chip !== value) continue;
+    const primary = value === "anomaly:unauth" && staticMetricCounts().anomalyUnauth > 0;
+    if (secondary && !primary && !state.chipsExpanded && state.chip !== value) { hidden += 1; continue; }
     const tip = t(`chip.tip.${label.slice(5)}`);
     const on = state.chip === value;
     parts.push(`<button type="button" class="quiet toggle rail-chip ${on ? "active" : ""}" data-chip="${escapeHtml(value)}" aria-pressed="${on}" title="${escapeHtml(tip)}">${escapeHtml(presetChipLabel(value, label))}</button>`);

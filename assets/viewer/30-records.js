@@ -687,40 +687,66 @@ function logChainItems(chains, lanes) {
 // marker could not be used, tampering is possible: never "note", never the
 // rescan hint. R17 U4 (track I6): the standalone bundle carries the same
 // head — "이 PC" in its words reads "생성 PC" there (t() picks the @bundle twin).
-const ANOMALY_HEAD_REASON = { "mixed-version": "anomalyHead.reason.mixedVersion", "scan-mismatch": "anomalyHead.reason.scanMismatch", "marker-unusable": "anomalyHead.reason.markerUnusable" };
+// R18 (track I6): bundle-unreadable (bundle only) — "make-review를 다시 실행".
+const ANOMALY_HEAD_REASON = { "mixed-version": "anomalyHead.reason.mixedVersion", "scan-mismatch": "anomalyHead.reason.scanMismatch", "marker-unusable": "anomalyHead.reason.markerUnusable", "bundle-unreadable": "anomalyHead.reason.bundleUnreadable" };
 function anomalyHeadState(chains) {
   const lane = chains && typeof chains === "object" ? (chains.anomaly || chains.anomalyLog) : null;
   const h = lane && typeof lane === "object" && lane.head && typeof lane.head === "object" ? lane.head : null;
+  // R18 U1 (track I2): records-meta `anomaly.withheld` = {reason} — the
+  // server holds the findings back (the report's P9 rule); absent / null /
+  // false = none. Any other value withholds ("" when it gives no reason).
+  const wv = lane && typeof lane === "object" ? lane.withheld : null;
+  const laneWithheld = wv != null && wv !== false;
+  const whyHeld = !laneWithheld ? "" : typeof wv === "string" ? wv.trim() : wv && typeof wv === "object" && wv.reason != null ? String(wv.reason).trim() : "";
   const st = h && h.status != null ? String(h.status) : "";
   const withheld = !!h && typeof h.withhold_reason === "string" && !!h.withhold_reason.trim();
   const code = h && h.reason_code != null ? String(h.reason_code) : "";
   const markerBad = code === "marker-unusable";
-  if (!st || ((st === "absent" || st === "intact") && !withheld && !markerBad)) return null;
+  if (!laneWithheld && (!st || ((st === "absent" || st === "intact") && !withheld && !markerBad))) return null;
   const why = ANOMALY_HEAD_REASON[code] ? t(ANOMALY_HEAD_REASON[code]) : "";
   const pc = (v) => (viewerTrustFromBundle() ? String(v).replace(/이 PC/g, "생성 PC") : String(v));
-  const tip = [why, "status " + st + (code ? " · " + code : ""), h.withhold_reason, h.detail].filter(v => v != null && String(v).trim()).map(pc).join("\n");
-  const level = st === "truncated" || st === "rewritten" ? "err" : st === "not-authenticated" && !withheld && !markerBad ? "note" : "warn";
-  return { level, status: st, code, tip };
+  const tip = [whyHeld, why, st ? "status " + st + (code ? " · " + code : "") : "", h && h.withhold_reason, h && h.detail].filter(v => v != null && String(v).trim()).map(pc).join("\n");
+  const level = st === "truncated" || st === "rewritten" ? "err" : st === "not-authenticated" && !withheld && !markerBad && !laneWithheld ? "note" : "warn";
+  const out = { level, status: st || "withheld", code, tip };
+  if (laneWithheld) {
+    out.withheld = pc(whyHeld);
+    // Track I (5a75e30): {reason_code, codes[], reason} — the banner names
+    // the known codes in short words (the full reason stays in the tooltip).
+    const codes = wv && typeof wv === "object" ? (Array.isArray(wv.codes) ? wv.codes : wv.reason_code != null ? [wv.reason_code] : []) : [];
+    out.withheldCodes = codes.map(String).filter(Boolean);
+  }
+  return out;
+}
+// The banner's short words of the server's withholding codes; "" when any
+// code is unknown (the server's sentence is shown then).
+const ANOMALY_WITHHELD_CODE = { "unusable-after": "anomalyHead.held.unusableAfter", "unusable-in-run": "anomalyHead.held.unusableInRun", "repaired-after": "anomalyHead.held.repairedAfter",
+  "newer-unmarked-run": "anomalyHead.held.newerUnmarkedRun", "unreadable": "anomalyHead.held.unreadable", "bundle-unreadable": "anomalyHead.held.bundleUnreadable" };
+function anomalyWithheldShort(head) {
+  const codes = head && Array.isArray(head.withheldCodes) ? head.withheldCodes : [];
+  if (!codes.length || !codes.every(c => ANOMALY_WITHHELD_CODE[c])) return "";
+  return [...new Set(codes)].map(c => t(ANOMALY_WITHHELD_CODE[c])).join(" · ");
 }
 var anomalyHead = anomalyHeadState(logChains);
 // R17 U2: the anomaly head withholds (cut / unknown / withheld) — every
-// anomaly count, chip and badge says "확인 불가".
+// anomaly count, chip and badge says "확인 불가". R18 U1: so does the
+// server's `anomaly.withheld` (level "warn").
 function anomalyUnverified() {
   return !!(anomalyHead && (anomalyHead.level === "err" || anomalyHead.level === "warn"));
 }
 // The record's anomaly badge (grid card, detail header); `title` = the kinds.
-// R17 U2: a record whose anomaly rows are all unauthenticated (trust not
-// auth / sc) gets "인증 안 된 후보" instead — never counted as 이상 후보.
+// R18 U1 (P30, supersedes R17 U2): every record with an anomaly finding row
+// is an 이상 후보 — all rows unauthenticated → "· 인증 안 됨"
+// (`.anomaly-unauth`), all another PC's key → "· 다른 PC 키" (`.anomaly-pc`,
+// U2: "키 보유 PC에서 확인"). Marked, never left out.
 function anomalyBadgeHtml(record, withTitle) {
-  if (record && !record.hasAnomaly && record.hasUnauthAnomaly) {
-    const ukinds = withTitle ? record.anomalies.map(item => item.kind).join(", ") : "";
-    return `<span class="badge candidate anomaly-unauth"${ukinds ? ` title="${escapeHtml(ukinds)}"` : ""}>${ftIcon("lock")}${escapeHtml(t("anomaly.unauth"))}</span>`;
-  }
   if (!record || !record.hasAnomaly) return "";
   const cut = anomalyUnverified();
   const kinds = record.anomalies.map(item => item.kind).join(", ");
-  const title = [withTitle ? kinds : "", cut ? t(anomalyHead.level === "err" ? "anomalyHead.cut" : "anomalyHead.unknown") + (anomalyHead.tip ? "\n" + anomalyHead.tip : "") : ""].filter(Boolean).join("\n");
-  return `<span class="badge anomaly${cut ? " anomaly-unverified" : ""}"${title ? ` title="${escapeHtml(title)}"` : ""}>${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}` +
+  const mark = record.hasUnauthAnomaly ? "unauth" : record.hasPcAnomaly ? "pc" : "";
+  const title = [withTitle ? kinds : "", mark === "unauth" ? t("chip.tip.anomalyUnauth") : mark === "pc" ? t("anomaly.pcTip") : "",
+    cut ? t(anomalyHead.level === "err" ? "anomalyHead.cut" : "anomalyHead.unknown") + (anomalyHead.tip ? "\n" + anomalyHead.tip : "") : ""].filter(Boolean).join("\n");
+  return `<span class="badge anomaly${mark ? " anomaly-" + mark : ""}${cut ? " anomaly-unverified" : ""}"${title ? ` title="${escapeHtml(title)}"` : ""}>${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}` +
+    (mark ? ` · ${escapeHtml(t(mark === "unauth" ? "anomaly.unauthShort" : "anomaly.pcShort"))}` : "") +
     (cut ? ` · ${escapeHtml(t("anomalyHead.badge"))}` : "") + `</span>`;
 }
 
@@ -961,11 +987,13 @@ function serverProxyOf(row) {
   return typeof row.proxy_path === "string" ? row.proxy_path : "";
 }
 // The record's anomaly rows (anomaly log by selector + the validation's
-// anomaly_flags, one per kind). R17 U2: only rows whose trust is auth / sc
-// (or absent: older server, bundle — as before) make an 이상 후보
-// (`hasAnomaly`); a record with rows but none of them usable is counted
-// apart (`hasUnauthAnomaly`, "인증 안 된 후보"). A validation flag carries
-// its validation line's trust; of two rows of one kind a usable one wins.
+// anomaly_flags, one per kind). R18 U1 (P30, supersedes R17 U2): every
+// finding row makes an 이상 후보 (`hasAnomaly`) whatever its trust — an
+// unauthenticated or superseded line never makes the record look clean. A
+// record with no usable (auth / sc / absent) row is marked apart:
+// `hasUnauthAnomaly` (some row not another PC's key) or else `hasPcAnomaly`
+// (U2: all rows `pc:<key>`). A validation flag carries its validation
+// line's trust; of two rows of one kind a usable one wins.
 function recordAnomalies(record) {
   const usable = (item) => logTrustUsable(logTrustOf(item));
   const fromId = anomaliesBySelector.get(record.id) || [];
@@ -980,8 +1008,10 @@ function recordAnomalies(record) {
     else if (!usable(merged[at]) && usable(item)) merged[at] = item;
   }
   record.anomalies = merged;
-  record.hasAnomaly = merged.some(usable);
-  record.hasUnauthAnomaly = !record.hasAnomaly && merged.length > 0;
+  record.hasAnomaly = merged.length > 0;
+  const apart = merged.length > 0 && !merged.some(usable);
+  record.hasUnauthAnomaly = apart && merged.some(item => !logTrustPcKey(logTrustOf(item)));
+  record.hasPcAnomaly = apart && !record.hasUnauthAnomaly;
 }
 const records = [
   ...videos.map(video => {

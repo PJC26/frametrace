@@ -676,11 +676,13 @@ try {
       const res = await route.fetch();
       const body = await res.json();
       // records-meta carries no videos (they come paged from /api/records).
-      const first = await getJson('/api/records?offset=0&limit=2');
+      const first = await getJson('/api/records?offset=0&limit=3');
       const ids = ((first && first.videos) || []).map((v) => v.id).filter(Boolean);
       body.logChains = Object.assign({}, body.logChains, { anomaly: { head: { status: 'unknown', reason_code: 'marker-unusable', withhold_reason: '표식 HMAC 없음', detail: 'marker' } } });
+      // R18 U1/U2 (P30): the unauthenticated and the other-PC-key rows count too.
       body.anomalyLog = [{ event: 'anomaly-scan', kind: 'gop-gap', selector: ids[0], label: 'candidate-finding', detail: 'gap', trust: 'auth' },
-        { event: 'anomaly-scan', kind: 'ts-gap', selector: ids[1], label: 'candidate-finding', detail: 'gap', trust: 'unauth' }];
+        { event: 'anomaly-scan', kind: 'ts-gap', selector: ids[1], label: 'candidate-finding', detail: 'gap', trust: 'unauth' },
+        { event: 'anomaly-scan', kind: 'ts-gap', selector: ids[2], label: 'candidate-finding', detail: 'gap', trust: 'pc:K2' }];
       return route.fulfill({ response: res, body: JSON.stringify(body), headers: Object.assign({}, res.headers(), { 'content-type': 'application/json' }) });
     });
     await page.goto(`${base}/?token=${token}`);
@@ -698,12 +700,42 @@ try {
       return { pill: pill ? pill.textContent.replace(/\s+/g, ' ').trim() : null, pillTip: pill ? pill.title : '', bad, n: ctl.length,
         hscroll: document.documentElement.scrollWidth > innerWidth + 1,
         banner: (document.getElementById('anomalyHeadBanner') || {}).textContent || '',
-        unauth: document.querySelectorAll('#recordGrid .badge.anomaly-unauth').length, auth: document.querySelectorAll('#recordGrid .badge.anomaly.anomaly-unverified').length };
+        unauth: document.querySelectorAll('#recordGrid .badge.anomaly.anomaly-unauth').length, pc: document.querySelectorAll('#recordGrid .badge.anomaly.anomaly-pc').length,
+        auth: document.querySelectorAll('#recordGrid .badge.anomaly.anomaly-unverified').length,
+        unauthChip: (() => { const c = document.querySelector('#presetChips [data-chip="anomaly:unauth"]'); return c && c.getClientRects().length ? c.textContent.trim() : ''; })(),
+        badgeBad: [...document.querySelectorAll('#recordGrid .badge.anomaly')].filter((b) => b.getClientRects().length && b.scrollWidth > b.clientWidth + 1).length };
     });
-    check('R17 U2: the anomaly pill reads "이상 1 · 확인 불가", the unauthenticated row counted apart (tooltip)', r17.pill === '이상 1 · 확인 불가' && /인증 안 된 후보 1건/.test(r17.pillTip), JSON.stringify(r17));
-    check('R17 U2: 1366x768 — every viewer top-bar control on screen, uncovered, unclipped; no sideways scroll', r17.n > 0 && !r17.bad.length && !r17.hscroll, JSON.stringify(r17.bad));
+    check('R18 U1 (P30): the anomaly pill reads "이상 3 (인증 안 됨 1 · 다른 PC 키 1) · 확인 불가"', r17.pill === '이상 3 (인증 안 됨 1 · 다른 PC 키 1) · 확인 불가' && /인증 안 됨 1건/.test(r17.pillTip), JSON.stringify(r17));
+    check('R17/R18 U2: 1366x768 — every viewer top-bar control on screen, uncovered, unclipped; no sideways scroll', r17.n > 0 && !r17.bad.length && !r17.hscroll, JSON.stringify(r17.bad));
     check('R17 U1: marker-unusable banner "변조 가능성", no rescan hint', /변조 가능성/.test(r17.banner) && !/다시 스캔/.test(r17.banner), r17.banner);
-    check('R17 U2: badges — 이상 후보 · 확인 불가 1, 인증 안 된 후보 1', r17.auth === 1 && r17.unauth === 1, JSON.stringify(r17));
+    check('R18 U1/U2: badges — 이상 후보 · 확인 불가 3 (인증 안 됨 1, 다른 PC 키 1), none clipped', r17.auth === 3 && r17.unauth === 1 && r17.pc === 1 && !r17.badgeBad, JSON.stringify(r17));
+    check('R18 U1: the "인증 안 된 후보 1" chip is on the rail without "더보기"', r17.unauthChip === '인증 안 된 후보 1', JSON.stringify(r17.unauthChip));
+    await context.close();
+  }
+  // R18 U1 (track I2): records-meta `logChains.anomaly.withheld: {reason}`
+  // with an intact head — the banner gives the reason, the pill "확인 불가".
+  {
+    const context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+    const page = await context.newPage();
+    page.on('pageerror', (e) => pageErrors.push(`R18: ${e.message}`));
+    await page.route('**/api/records-meta*', async (route) => {
+      const res = await route.fetch();
+      const body = await res.json();
+      const first = await getJson('/api/records?offset=0&limit=1');
+      const ids = ((first && first.videos) || []).map((v) => v.id).filter(Boolean);
+      body.logChains = Object.assign({}, body.logChains, { anomaly: { head: { status: 'intact', reason_code: null, withhold_reason: null }, withheld: { reason_code: 'unusable-after', codes: ['unusable-after'], reason: '가장 최근 완료 실행의 완료 표식 뒤에 이 PC에서 인증할 수 없는 항목이 있어 그 결과를 알 수 없습니다' } } });
+      body.anomalyLog = [{ event: 'anomaly-scan', kind: 'gop-gap', selector: ids[0], label: 'candidate-finding', detail: 'gap', trust: 'unauth' }];
+      return route.fulfill({ response: res, body: JSON.stringify(body), headers: Object.assign({}, res.headers(), { 'content-type': 'application/json' }) });
+    });
+    await page.goto(`${base}/?token=${token}`);
+    await openProject(page);
+    const r18 = await page.evaluate(() => ({
+      pill: (document.getElementById('pillAnomaly') || {}).textContent?.replace(/\s+/g, ' ').trim() || null,
+      banner: (document.getElementById('anomalyHeadBanner') || {}).textContent || '',
+      bannerTip: ((document.getElementById('anomalyHeadBanner') || { querySelector: () => null }).querySelector('[title]') || {}).title || '',
+      role: (document.getElementById('anomalyHeadBanner') || { getAttribute: () => '' }).getAttribute('role'),
+      hscroll: document.documentElement.scrollWidth > innerWidth + 1 }));
+    check('R18 U1: withheld → pill "이상 1 (인증 안 됨 1) · 확인 불가", banner shows the reason', r18.pill === '이상 1 (인증 안 됨 1) · 확인 불가' && r18.banner.trim() === '이상 징후 확인 불가 — 완료 표식 뒤 인증 안 된 줄' && r18.bannerTip.includes('완료 표식 뒤에 이 PC에서 인증할 수 없는 항목') && r18.role === 'status' && !r18.hscroll, JSON.stringify(r18));
     await context.close();
   }
   check('no page errors', pageErrors.length === 0, pageErrors.slice(0, 5).join(' | '));

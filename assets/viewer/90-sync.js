@@ -2425,8 +2425,13 @@ const ANNOTATION_EDIT_CONTROLS = ["btnMarkReviewed", "btnMarkImportant", "btnMar
   bar.dataset.headStatus = anomalyHead.status;
   bar.dataset.level = anomalyHead.level;
   bar.setAttribute("role", err ? "alert" : "status");
-  const key = err ? "anomalyHead.cut" : anomalyHead.level === "note" ? "anomalyHead.note" : ANOMALY_HEAD_REASON[anomalyHead.code] || "anomalyHead.unknown";
-  const msg = noticeMessage(key);
+  // R18 U1 (track I2): the server's `anomaly.withheld` — the banner says why.
+  // Known codes → short words (anomalyWithheldShort), else the server's sentence; full text in the title.
+  const held = !err && typeof anomalyHead.withheld === "string";
+  const why = held ? anomalyWithheldShort(anomalyHead) || anomalyHead.withheld : "";
+  const key = err ? "anomalyHead.cut" : held ? (why ? "anomalyHead.withheld" : "anomalyHead.unknown")
+    : anomalyHead.level === "note" ? "anomalyHead.note" : ANOMALY_HEAD_REASON[anomalyHead.code] || "anomalyHead.unknown";
+  const msg = why ? noticeMessage(key, { reason: why }) : noticeMessage(key);
   if (anomalyHead.tip) msg.title = anomalyHead.tip;
   bar.appendChild(msg);
   noticeAppend(bar);

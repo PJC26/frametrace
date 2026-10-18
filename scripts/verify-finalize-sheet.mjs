@@ -536,9 +536,15 @@ await check('4g R13 U1–U3: 짝 없음 / 다른 PC 차단 / 복구 중; --dismi
   const ib = await blockRows();
   assert.ok(ib.length === 1 && /최종화 차단: 이전 최종화 중단됨/.test(ib[0].text) && (await btnState(page)).disabled, 'interrupted + blocks_finalize → block: ' + JSON.stringify(ib));
   // unreadable: the dismiss command, inside the sheet, AA in both themes.
-  S.status = Object.assign({}, before, base, { case_dir: 'C:/cases/c1', finalize_journal: jn('unreadable', { error: 'JSON 파싱 실패: line 1' }) });
+  // R18 U3/U5: no server command → none built, the server's sentence instead.
+  S.status = Object.assign({}, before, base, { case_dir: 'C:/cases/a\u2019b', finalize_journal: jn('unreadable', { error: 'JSON 파싱 실패: line 1', dismiss_command: null, dismiss_command_cmd: null, command_unavailable_reason: '경로에 특수 문자 — 명령을 직접 입력하십시오' }) });
   await page.click('#btnFinalRecheck');
   await page.waitForFunction(() => document.querySelector('#finalLinks .h-fin-journal-row')?.dataset.journal === 'unreadable', null, { timeout: 5000 });
+  j = await journalRow();
+  assert.ok(/경로에 특수 문자 — 명령을 직접 입력하십시오/.test(j.text) && !/frametrace/.test(j.text) && j.inside, 'R18 U3: no command, the reason: ' + JSON.stringify(j));
+  S.status = Object.assign({}, before, base, { case_dir: 'C:/cases/c1', finalize_journal: jn('unreadable', { error: 'JSON 파싱 실패: line 1', dismiss_command: "frametrace finalize-journal 'C:/cases/c1' --dismiss" }) });
+  await page.click('#btnFinalRecheck');
+  await page.waitForFunction(() => !!document.querySelector('#finalLinks .h-fin-journal-row .h-fin-cmd code'), null, { timeout: 5000 });
   j = await journalRow();
   const cmd = await page.textContent('#finalLinks .h-fin-journal-row .h-fin-cmd code');
   assert.ok(cmd === "frametrace finalize-journal 'C:/cases/c1' --dismiss" && j.inside, 'dismiss command: ' + cmd + ' ' + JSON.stringify(j));
