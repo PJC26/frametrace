@@ -6,6 +6,9 @@
 //! Nothing here touches the network or a raw volume: the refusals are
 //! lexical, and only temp folders this test creates are probed.
 
+// Only the Windows-only tests use the serve items; the S1 text test runs
+// everywhere and names its imports itself.
+#[cfg(windows)]
 use super::*;
 
 /// S1: `\\?\C:` without a root separator is the raw VOLUME device (like
