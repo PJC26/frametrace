@@ -398,7 +398,13 @@ function auditVerdict(res) {
   const count = `(${res.verified}개 로그, ${res.entries}항목)`;
   const others = [...new Set(logs.flatMap(l => Array.isArray(l.other_pc_key_ids) ? l.other_pc_key_ids : []).map(String))];
   const title = logs.map(l => `${l.name}: ${l.integrity}, ${l.entries}항목${l.trust ? " — " + l.trust : ""}`).join("\n");
-  const where = others.length ? ` — 키 ${others.slice(0, 3).join(", ")}${others.length > 3 ? " 외" : ""} 보유 PC에서 확인` : "";
+  // R19 (track I3): only an id matching ^[0-9a-z-]{1,64}$ (not "unknown")
+  // is quoted; any other reads "알 수 없는 키 id".
+  const quoted = others.filter(id => id !== "unknown" && /^[0-9a-z-]{1,64}$/.test(id));
+  const unknownKey = quoted.length < others.length ? "알 수 없는 키 id" : "";
+  const where = quoted.length
+    ? ` — 키 ${quoted.slice(0, 3).join(", ")}${quoted.length > 3 ? " 외" : ""} 보유 PC에서 확인${unknownKey ? " · " + unknownKey : ""}`
+    : unknownKey ? ` — ${unknownKey}` : "";
   if (res.integrity === "integrity-keyed") return { level: "ok", text: `감사 로그 인증됨 ${count}`, title };
   if (res.integrity === "integrity-not-verified") {
     // R9 U4: lines without a valid HMAC here come first ("인증 안 된 줄 N개");

@@ -926,7 +926,7 @@ function logTrustTagHtml(item) {
   const pc = logTrustPcKey(trust);
   // R10 U3: the server's own reason (trust_note) in the tooltip.
   const note = logTrustNote(item);
-  const tip = (pc ? tf("trust.otherPc", { key: pc }) : t("status.tip.unauth")) + (note ? "\n" + note : "");
+  const tip = (pc ? trustOtherPcText(pc) : t("status.tip.unauth")) + (note ? "\n" + note : "");
   return ` <span class="badge candidate" title="${escapeHtml(tip)}">${ftIcon("lock")}${escapeHtml(pc ? t("status.otherPc") : t("trust.unauth"))}</span>`;
 }
 // R10 U3: the trust_note of an entry this PC could not use, as a detail

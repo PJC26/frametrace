@@ -799,6 +799,41 @@ async function r19TrackU({ fn, source, runInNewContext, assert }) {
   const n = (source.match(/validationFlags: validationFlagsByPath\.get\(normalizePath\(/g) || []).length;
   assert.equal(n, 3, 'R19 U1: video / carved / filesystem records carry validationFlags');
   console.log('PASS VM R19 U1 (P33) validation anomaly_flags survive P7 recency and lane repair, counted 인증 안 됨');
+
+  // Track I3 follow-up: `pc:unknown` (and any id outside ^[0-9a-z-]{1,64}$)
+  // reads "알 수 없는 키 id"; the raw id is never quoted.
+  const { readFileSync } = await import('node:fs');
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  const word = (k, nth = 0) => [...i18n.matchAll(new RegExp(`"${k.replace(/[.@]/g, (c) => '\\' + c)}": "([^"]*)"`, 'g'))][nth]?.[1];
+  const kctx = { t: (k) => word(k) ?? k, tf: (k, s) => Object.entries(s || {}).reduce((a, [n, x]) => a.split('{' + n + '}').join(String(x)), word(k) ?? k),
+    viewerTrustFromBundle: () => false, escapeHtml: (x) => String(x), ftIcon: () => '' };
+  const kn = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustNote', 'pcKeyQuotable', 'trustOtherPcText', 'statusTitle', 'audioTrustNote'];
+  runInNewContext(kn.map((n) => { const f = fn(n); assert.ok(f, `R19 track I3: ${n} exists`); return f; }).join('\n'), kctx);
+  const UNK = word('trust.otherPcUnknown');
+  assert.ok(UNK && /알 수 없는 키 id/.test(UNK) && word('trust.otherPcUnknown', 1) && word('trust.otherPcUnknown@bundle') && word('trust.otherPcUnknown@bundle', 1), 'R19 track I3: trust.otherPcUnknown (+@bundle) in ko + en');
+  assert.equal(runInNewContext('logTrustOf({ trust: "pc:unknown" })', kctx), 'pc:unknown', 'R19 track I3: pc:unknown is another PC\'s key (not unauth)');
+  const title = (trust) => runInNewContext('statusTitle(r)', Object.assign(kctx, { r: { status: 'auth-other-pc', statusTrust: trust } }));
+  assert.ok(/키 kid-ab12 보유 PC에서 확인/.test(title('pc:kid-ab12')), 'R19 track I3: a quotable id is quoted: ' + title('pc:kid-ab12'));
+  for (const bad of ['pc:unknown', 'pc:Evil ID', 'pc:evil‮x', 'pc:' + 'a'.repeat(65), 'pc:KID-1']) {
+    const tx = title(bad);
+    assert.ok(tx.includes(UNK) && !tx.includes(bad.slice(3)), `R19 track I3: ${JSON.stringify(bad)} → "알 수 없는 키 id", id not quoted: ` + tx);
+  }
+  const an = (k) => runInNewContext('audioTrustNote(r)', Object.assign(kctx, { r: { audioState: 'track', audioPcKey: k } }));
+  assert.ok(an('unknown').includes(UNK) && an('Bad Id').includes(UNK) && !an('Bad Id').includes('Bad Id') && /키 k-9/.test(an('k-9')), 'R19 track I3: sound-level pc "unknown" / unquotable → "알 수 없는 키 id"');
+  const grid = readFileSync(new URL('../assets/viewer/40-grid.js', import.meta.url), 'utf8');
+  assert.ok(/pc \? trustOtherPcText\(pc\)/.test(grid) && !/tf\("trust\.otherPc"/.test(grid + source.replace(/^function trustOtherPcText[^]*?^}/m, '')), 'R19 track I3: every other-PC text goes through trustOtherPcText');
+  // Shell audit verdict: other_pc_key_ids may carry "unknown".
+  const app = readFileSync(new URL('../assets/app/41-finalize.js', import.meta.url), 'utf8');
+  const afn = (name) => app.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const actx = {};
+  runInNewContext(['auditVerdict', 'auditKeyConfigError', 'auditNotHereCounts'].map((n) => { const f = afn(n); assert.ok(f, `R19 track I3: ${n} exists (41-finalize.js)`); return f; }).join('\n'), actx);
+  const verdict = (ids) => runInNewContext('auditVerdict(res).text', Object.assign(actx, { res: { ok: true, integrity: 'integrity-not-verified', verified: 1, entries: 2,
+    logs: [{ name: 'v', integrity: 'integrity-not-verified', entries: 2, other_pc_lines: 2, other_pc_key_ids: ids }] } }));
+  assert.ok(/키 kid-1 보유 PC에서 확인/.test(verdict(['kid-1'])), 'R19 track I3 shell: quotable id quoted: ' + verdict(['kid-1']));
+  assert.ok(/— 알 수 없는 키 id/.test(verdict(['unknown'])) && !/키 unknown/.test(verdict(['unknown'])), 'R19 track I3 shell: "unknown" → 알 수 없는 키 id: ' + verdict(['unknown']));
+  const mixed = verdict(['kid-1', 'Evil ID']);
+  assert.ok(/키 kid-1 보유 PC에서 확인 · 알 수 없는 키 id/.test(mixed) && !mixed.includes('Evil ID'), 'R19 track I3 shell: mixed ids: ' + mixed);
+  console.log('PASS VM R19 track I3 follow-up: pc:unknown / unquotable key ids read "알 수 없는 키 id" (status, trust tag, sound, shell audit verdict)');
 }
 
 // ---- R18 track U (docs/PLAN_R18_2026-10-19.md, P30) ------------------------
@@ -1616,7 +1651,7 @@ async function r14TrackU({ fn, runInNewContext, assert, ex }) {
   const au = { t: (k) => ({ 'audio.tip.trackUnverified': '오디오 트랙 있음 · 측정 기록 검증 실패 — 미확인', 'audio.detail.trackUnverified': '오디오 트랙 · 측정 기록 검증 실패{codec}', 'audio.unknown': '미확인' })[k] || k,
     tf: (k, s) => (au.t(k)).replace('{codec}', (s && s.codec) || ''), audioLevelsError: '',
     audioLevels: { a1: { r: 'unverified', note: NOTE, trust: 'unauth' }, a2: { r: 'unverified', error: 'chain: ' + NOTE, trust: 'unauth' }, a3: { r: 'unverified', trust: 'unauth' } } };
-  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', 'audioReasonNote', 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map((n) => fn(n) || '').join('\n') +
+  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', 'pcKeyQuotable', 'trustOtherPcText', 'audioReasonNote', 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map((n) => fn(n) || '').join('\n') +
     '\nthis.view = (id) => { const r = { id, audioCodec: "aac", probeOk: true }; const a = audioInfoFor(r); Object.assign(r, { audioState: a.state, audioLevel: a.level, audioReason: a.reason, audioTrust: a.trust || "", audioPcKey: a.pcKey || "", audioNote: a.note || "" }); return { tip: audioTipFor(r), detail: audioDetailFor(r) }; };', au);
   const a1 = plain(runInNewContext('view("a1")', au));
   assert.ok(a1.tip === '오디오 트랙 있음 · 측정 기록 검증 실패 — 미확인\n' + NOTE && a1.detail.endsWith(' · ' + NOTE), 'R14 I5 sound tooltip / detail carry the note: ' + JSON.stringify(a1));
@@ -1920,7 +1955,7 @@ async function r11TrackU({ fn, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logPosOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'ftIcon', 'logTrustTagHtml'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logPosOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'pcKeyQuotable', 'trustOtherPcText', 'ftIcon', 'logTrustTagHtml'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R11 U1/U2: ${n} exists (viewer)`);
@@ -2047,7 +2082,7 @@ async function r10TrackU({ fn, source, runInNewContext, assert, ex }) {
     escapeHtml: (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     bundle: false,
   };
-  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logPosOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'logChainArchiveText', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logPosOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'splitValidationSlots', 'statusTitle', 'pcKeyQuotable', 'trustOtherPcText', 'logChainArchiveText', 'logChainSummary', 'logChainLanesOf', 'logChainItems'];
   runInNewContext('function viewerTrustFromBundle() { return bundle; }\n' + names.map((n) => {
     const src = fn(n);
     assert.ok(src, `R10 U1/U3: ${n} exists (30-records.js)`);
@@ -2154,7 +2189,7 @@ async function r9TrackU({ fn, source, runInNewContext, assert, ex }) {
     t: (k) => ({ 'status.unauth': '인증 안 됨', 'status.otherPc': '이 PC에서 인증 불가', 'status.tip.unauth': '인증 안 됨 — …', 'trust.sc': '자기 일관성만(인증 아님)' })[k] || k,
     tf: (k, s) => (k === 'trust.otherPc' ? `이 PC에서 인증 불가(변조 판정 아님) — 키 ${s.key} 보유 PC에서 확인` : k),
   };
-  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logPosOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'statusLabel'].map((n) => {
+  runInNewContext('function viewerTrustFromBundle() { return false; }\n' + ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'untrustedStatusOf', 'logRepairs', 'logPosOf', 'logSlots', 'currentLogEntries', 'logTrustNote', 'recordStatusOf', 'statusTitle', 'pcKeyQuotable', 'trustOtherPcText', 'statusLabel'].map((n) => {
     const src = fn(n);
     assert.ok(src, `R9 U1: ${n} exists (30-records.js)`);
     return src;
@@ -2428,7 +2463,7 @@ async function r8TrackU({ fn, source, runInNewContext, assert }) {
     t: (k) => i18nKo[k] || k,
     tf: (k, subs) => Object.entries(subs || {}).reduce((x, [n, v]) => x.split('{' + n + '}').join(String(v)), i18nKo[k] || k),
   };
-  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', ...(fn('audioReasonNote') ? ['audioReasonNote'] : []), 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map(fn).join('\n') +
+  runInNewContext(['audioInfoFor', 'fmtDb', 'audioTrustNote', 'pcKeyQuotable', 'trustOtherPcText', ...(fn('audioReasonNote') ? ['audioReasonNote'] : []), 'audioTipFor', 'audioTipBase', 'audioDetailFor', 'audioDetailBase'].map(fn).join('\n') +
     '\nthis.view = (id) => { const r = { id, audioCodec: "aac", probeOk: true }; const a = audioInfoFor(r); Object.assign(r, { audioState: a.state, audioLevel: a.level, audioReason: a.reason, audioTrust: a.trust || "", audioPcKey: a.pcKey || "" }); return { state: a.state, tip: audioTipFor(r), detail: audioDetailFor(r) }; };', au);
   const v = (id) => runInNewContext(`view(${JSON.stringify(id)})`, au);
   const s1 = v('s1'), s2 = v('s2'), u1 = v('u1'), u2 = v('u2');

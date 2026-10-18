@@ -423,6 +423,16 @@ function logTrustUsable(trust) {
 function logTrustPcKey(trust) {
   return typeof trust === "string" && trust.startsWith("pc:") ? trust.slice(3) : "";
 }
+// R19 (track I3): a key id is quoted only when it matches the server's
+// `^[0-9a-z-]{1,64}$` and is not "unknown" (`pc:unknown`); otherwise
+// "알 수 없는 키 id". Never keyed on the server's sentences.
+function pcKeyQuotable(id) {
+  const s = id == null ? "" : String(id);
+  return s !== "unknown" && /^[0-9a-z-]{1,64}$/.test(s);
+}
+function trustOtherPcText(id) {
+  return pcKeyQuotable(id) ? tf("trust.otherPc", { key: String(id) }) : t("trust.otherPcUnknown");
+}
 // The pseudo status of a record whose result comes only from a line this
 // PC could not authenticate: never confirmed / derived / verified.
 function untrustedStatusOf(trust) {
@@ -599,7 +609,7 @@ function statusTitle(record) {
   const note = record && record.statusNote ? "\n" + record.statusNote : "";
   const newer = !!(record && record.statusNewer);
   const head = newer ? t("status.tip.newer") + " · " : "";
-  if (status === "auth-other-pc") return head + tf("trust.otherPc", { key: logTrustPcKey(trust) || "?" }) + note;
+  if (status === "auth-other-pc") return head + trustOtherPcText(logTrustPcKey(trust)) + note;
   if (status === "unauthenticated") return head + t(newer ? "status.unauth" : "status.tip.unauth") + note;
   if (status === "unknown-after-repair") return head + t("status.tip.repairedAfter") + note;
   if (trust === "sc") return status + " · " + t("trust.sc") + note;
@@ -964,7 +974,7 @@ function fmtDb(value, digits) {
 // a record without a probed track (state unknown) too.
 function audioTrustNote(record) {
   if (record.audioTrust === "sc" && (record.audioState === "sound" || record.audioState === "silent")) return " · " + t("audio.selfConsistent");
-  if (record.audioPcKey) return " · " + tf("trust.otherPc", { key: record.audioPcKey });
+  if (record.audioPcKey) return " · " + trustOtherPcText(record.audioPcKey);
   return "";
 }
 function audioTipFor(record) {
