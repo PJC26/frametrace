@@ -203,10 +203,15 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         None
     };
     let log_path = case_dir.join(crate::report::ANOMALY_LOG_REL_PATH);
+    // R20 I2: every finding row carries the scan's `scan_id` (its marker's)
+    // — `scanned_unix` has second resolution, so two runs in one second
+    // were ambiguous. Readers group by it when present and fall back to
+    // `scanned_unix` for older rows; an older reader ignores the field.
     for finding in &findings {
         let line = format!(
-            "{{\"schema_version\":1,\"event\":\"anomaly-scan\",\"scanned_unix\":{},\"label\":\"{}\",\"kind\":\"{}\",\"selector\":\"{}\",\"source_path\":\"{}\",\"detail\":\"{}\"}}",
+            "{{\"schema_version\":1,\"event\":\"anomaly-scan\",\"scanned_unix\":{},\"scan_id\":\"{}\",\"label\":\"{}\",\"kind\":\"{}\",\"selector\":\"{}\",\"source_path\":\"{}\",\"detail\":\"{}\"}}",
             scanned_unix,
+            json_escape(&scan_id),
             LABEL,
             json_escape(finding.kind),
             json_escape(&finding.selector),
@@ -217,8 +222,9 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     }
     if findings.is_empty() {
         let line = format!(
-            "{{\"schema_version\":1,\"event\":\"anomaly-scan\",\"scanned_unix\":{},\"label\":\"none\",\"kind\":\"none\",\"selector\":\"\",\"source_path\":\"\",\"detail\":\"no candidate findings on indexed videos\"}}",
-            scanned_unix
+            "{{\"schema_version\":1,\"event\":\"anomaly-scan\",\"scanned_unix\":{},\"scan_id\":\"{}\",\"label\":\"none\",\"kind\":\"none\",\"selector\":\"\",\"source_path\":\"\",\"detail\":\"no candidate findings on indexed videos\"}}",
+            scanned_unix,
+            json_escape(&scan_id),
         );
         audit::append_chained_jsonl(&log_path, &line)?;
     }

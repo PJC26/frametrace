@@ -218,7 +218,9 @@ impl HashVerifyHeadCheck {
     /// ([`HEAD_SCAN_MISMATCH_NOTE`]); R17 I1 (P27): `marker-unusable`
     /// ([`HEAD_MARKER_UNUSABLE_NOTE`] — a v2 head anchors the anomaly lane
     /// but no completion marker there is usable: possibly tampering, not a
-    /// version mix). `None` for every other state.
+    /// version mix); R20 I1: `lane-changed` ([`HEAD_LANE_CHANGED_NOTE`] —
+    /// the caller's anomaly rows are shorter than the head, the lane now
+    /// is not). `None` for every other state.
     pub fn reason_code(&self) -> Option<&'static str> {
         match self {
             Self::Unknown { code, .. } => Some(code),
@@ -436,8 +438,19 @@ pub fn hash_verify_head_check(
 /// result run is the anomaly lane's newest usable `anomaly-scan-run`
 /// marker (the report's "현재 결과" candidate); its `scan_id` / `head_in`
 /// decide whether its own head must be there.
-pub fn anomaly_head_check(root: &Path) -> HashVerifyHeadCheck {
-    let lane = match crate::audit::read_lane_rows(&root.join(ANOMALY_LOG_REL_PATH)) {
+///
+/// R20 I1: `lane` is the caller's ONE read of the anomaly lane
+/// (`audit::read_lane_rows(root/ANOMALY_LOG_REL_PATH)`, the read its rows
+/// and `withheld` verdict come from) — the marker search AND the head's
+/// anchor comparison use those rows; nothing here reads the anomaly lane
+/// again (R19 read it twice more, so a scan in between could make rows,
+/// `withheld` and `head` describe different lanes). Only the sign-off
+/// lane is read here.
+pub fn anomaly_head_check(
+    root: &Path,
+    lane: &Result<crate::audit::LaneRows, String>,
+) -> HashVerifyHeadCheck {
+    let lane = match lane {
         Ok(lane) => lane,
         Err(err) => {
             return HashVerifyHeadCheck::Unknown {
@@ -466,6 +479,7 @@ pub fn anomaly_head_check(root: &Path) -> HashVerifyHeadCheck {
     lane_head_check_for(
         root,
         HeadLane::Anomaly,
+        Some(lane),
         ResultRun {
             id: scan_id.as_deref(),
             wants_head: wants,
@@ -474,6 +488,16 @@ pub fn anomaly_head_check(root: &Path) -> HashVerifyHeadCheck {
             unusable_after_marker: marker
                 .is_some_and(|marker| lane.unusable().any(|row| row.index > marker.index)),
         },
+    )
+}
+
+/// [`anomaly_head_check`] for a caller that sends no anomaly rows of its
+/// own (`verify-package`, tests): reads the anomaly lane ONCE and checks
+/// the head against that read.
+pub fn read_anomaly_head_check(root: &Path) -> HashVerifyHeadCheck {
+    anomaly_head_check(
+        root,
+        &crate::audit::read_lane_rows(&root.join(ANOMALY_LOG_REL_PATH)),
     )
 }
 
@@ -532,6 +556,11 @@ pub const HEAD_MIXED_VERSION_NOTE: &str = "이전 버전 머리 섞임";
 /// another scan than the result run's.
 pub const HEAD_SCAN_MISMATCH_NOTE: &str = "다른 스캔의 머리";
 
+/// R20 I1: the start of the `lane-changed` reason — the anomaly rows the
+/// caller read are shorter than the head, but the lane as it is now is not
+/// (a scan finished between the two reads): unknown, not "꼬리 잘림".
+pub const HEAD_LANE_CHANGED_NOTE: &str = "읽는 사이에 레인이 바뀜";
+
 /// R17 I1 (P27): the start of the `marker-unusable` reason — a v2 head
 /// anchors the anomaly lane but the lane holds no completion marker this
 /// PC can use (its HMAC stripped, or it was deleted): possibly tampering,
@@ -560,6 +589,7 @@ pub fn lane_head_check(
     lane_head_check_for(
         root,
         lane,
+        None,
         ResultRun {
             id: result_id,
             wants_head: result_marker_wants_head,
@@ -570,7 +600,14 @@ pub fn lane_head_check(
     )
 }
 
-fn lane_head_check_for(root: &Path, lane: HeadLane, result: ResultRun<'_>) -> HashVerifyHeadCheck {
+/// `result_lane`: the result lane as the caller already read it (R20 I1 —
+/// the anchor comparison then uses those rows); `None` reads it here.
+fn lane_head_check_for(
+    root: &Path,
+    lane: HeadLane,
+    result_lane: Option<&crate::audit::LaneRows>,
+    result: ResultRun<'_>,
+) -> HashVerifyHeadCheck {
     use crate::audit::AnchorStatus;
     let (result_id, result_marker_wants_head) = (result.id, result.wants_head);
     let head_word = lane.head_word();
@@ -620,21 +657,52 @@ fn lane_head_check_for(root: &Path, lane: HeadLane, result: ResultRun<'_>) -> Ha
                 .flatten()
                 .map(|anchor| (row, anchor))
         });
-    let anchor_status = anchored.map(|(row, (entries, last))| {
+    let anchor_status = anchored.map(|(row, (entries, last))| -> Result<_, HashVerifyHeadCheck> {
         let status = if entries == 0 {
             // The lane was empty when the head was written: nothing to lose.
             AnchorStatus::Intact
         } else {
-            crate::audit::check_lane_anchor(
-                &root.join(lane.rel()),
-                &crate::audit::LaneHead {
-                    entries,
-                    last_entry_sha256: last,
+            let head = crate::audit::LaneHead {
+                entries,
+                last_entry_sha256: last,
+            };
+            match result_lane {
+                Some(rows) => match crate::audit::check_lane_anchor_in(rows, &head) {
+                    // R20 I1: the caller's rows are SHORTER than the head
+                    // — a cut tail, or a scan finished (rows, then head)
+                    // between the caller's read and this sign-off read.
+                    // Only this tamper verdict is confirmed against the
+                    // lane as it is now (append-only: a cut lane stays
+                    // short); a lane that grew is `lane-changed` (unknown,
+                    // withheld — never "intact" for rows not seen, never
+                    // "꼬리 잘림" for a lane that was not cut).
+                    status @ (AnchorStatus::Truncated { .. } | AnchorStatus::Missing) => {
+                        match crate::audit::check_lane_anchor(&root.join(lane.rel()), &head) {
+                            AnchorStatus::Truncated { .. } | AnchorStatus::Missing => status,
+                            AnchorStatus::Rewritten => AnchorStatus::Rewritten,
+                            _ => {
+                                return Err(HashVerifyHeadCheck::Unknown {
+                                    code: "lane-changed",
+                                    why: format!(
+                                        "{HEAD_LANE_CHANGED_NOTE} — 읽은 {}에는 항목 {}개, {head_word}는 {entries}개를 기록함(다른 검사가 그 사이에 끝났을 수 있음) — 다시 확인하십시오",
+                                        lane.noun(),
+                                        rows.rows.len()
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    status => status,
                 },
-            )
+                None => crate::audit::check_lane_anchor(&root.join(lane.rel()), &head),
+            }
         };
-        (row, entries, status)
+        Ok((row, entries, status))
     });
+    let anchor_status = match anchor_status.transpose() {
+        Ok(status) => status,
+        Err(check) => return check,
+    };
     match &anchor_status {
         Some((_, entries, AnchorStatus::Truncated { now })) => {
             return HashVerifyHeadCheck::Truncated {

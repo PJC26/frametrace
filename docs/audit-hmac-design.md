@@ -687,7 +687,8 @@ older run). R11:
 - **I2.** `/api/records-meta` carries the anomaly head as
   `logChains.anomaly.head` — the same `{status, reason_code,
   withhold_reason, detail}` object as the report's
-  `auditChains.anomaly.head` (`anomaly_head_check(case).to_json_in(Anomaly)`),
+  `auditChains.anomaly.head` (`anomaly_head_check(case).to_json_in(Anomaly)`;
+  R20 I1: `anomaly_head_check(case, &lane)` over the same read as the rows),
   for the viewer's anomaly badge. (`logChains.anomalyLog` is unchanged.)
 - **I4 — wording, not verdict.** In a shared case another examiner's
   sign-off written without this PC's key (or under a forged id) is still
@@ -862,6 +863,50 @@ a cause ("not tampering", "older build").
 - **I4.** The report script finds a run's first / last lane position with
   loops (`Math.min(...arr)` and `splice(..., ...arr)` threw RangeError at
   ~130k entries and blanked the report).
+
+### Head from the same read, findings carry `scan_id` (R20)
+
+- **I1 — the anomaly head comes from the same read as the rows and
+  `withheld`.** `report::anomaly_head_check(root, &lane)` takes the
+  caller's `audit::read_lane_rows` result: the result-run marker search
+  and the head's anchor comparison (`audit::check_lane_anchor_in`) use
+  those rows; R19 read the anomaly lane twice more (marker search, then
+  `check_lane_anchor`), so a scan in between could make rows, `withheld`
+  and `head` describe different lanes. `/api/records-meta` (in
+  `lane_values`, next to `anomalyLog` / `withheld`), the review bundle
+  (`review_anomaly_lane`) and the report's `auditChains.anomaly` (with
+  the chain status) all pass their one read; `verify-package` and tests
+  use `read_anomaly_head_check(root)` (one read, then the check). Only the
+  sign-off lane is read inside. A race remains between the two lanes (the
+  scan writes its anomaly rows, then the head LAST): rows read before a
+  scan finished are shorter than the newest head — so that one verdict
+  (`Truncated` / `Missing` on the caller's rows) is confirmed against the
+  lane as it is now; still short → "꼬리 잘림" (append-only lanes never
+  shrink), rewritten → `rewritten`, otherwise `unknown` with
+  `reason_code: "lane-changed"` ("읽는 사이에 레인이 바뀜 …", withheld,
+  never a tamper verdict, never "intact" for rows not seen). An unreadable
+  read is `unreadable` with that read's error. The structural test now
+  checks the WHOLE reader files (R19 cut them at the first
+  `#[cfg(test)]` — line 87 of records.rs) and that every
+  `anomaly_head_check(` call passes `&lane`.
+- **I2 — finding rows carry their scan's `scan_id`.** `scanned_unix` has
+  second resolution, so two runs in one second (interleaved) were
+  grouped by time into whichever marker came first (B, the newest, read
+  "후보 0건"; a crashed same-second run's finding showed as the current
+  run's). `scan_case` writes `"scan_id"` (the marker's, `<unix>-<hex4>`)
+  on every `anomaly-scan` row, the `none` row included — inside the
+  HMAC'd bytes like every field. A row with a string `scan_id` belongs to
+  the marker with the same `scan_id` only; unmarked rows group by it
+  (time = its first row's `scanned_unix`), and an unmarked group joins
+  only the later completed run with that `scan_id` (R19 I1's merge).
+  Rows without `scan_id` (older scanners) keep the `scanned_unix` rules,
+  also next to markers that have one. Same rule in
+  `report_anomaly_withheld.rs` (`same_run` / `run_key`) and the report
+  script (`sameAnomalyRun`); the agreement test covers six same-second /
+  legacy shapes. Older readers: every reader parses lane rows as JSON
+  objects and ignores fields it does not know (the R19 build rendered the
+  new rows, verified the chain, and agreed with itself — it only grouped
+  same-second runs by time).
 
 **Implementation notes (what shipped):**
 

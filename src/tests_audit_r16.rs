@@ -162,14 +162,14 @@ fn r16_i1_v1_head_after_the_result_runs_head_is_mixed_version() {
         crate::anomaly::scan_case(&dir, true).unwrap();
         let r15 = lane_len(&anomaly);
         assert!(matches!(
-            crate::report::anomaly_head_check(&dir),
+            crate::report::read_anomaly_head_check(&dir),
             crate::report::HashVerifyHeadCheck::Intact { .. }
         ));
         r14_build_scan(&dir, &mine, 4_000_000_000);
         // The R14 scan's anomaly rows and marker cut.
         delete_last_lines(&anomaly, lane_len(&anomaly) - r15);
         assert_eq!(super::read_lane_rows(&anomaly).unwrap().status(), "keyed");
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.status(), "unknown", "{check:?}");
         assert_eq!(check.reason_code(), Some("mixed-version"), "{check:?}");
         let current = report_anomaly_section(&dir);
@@ -214,7 +214,7 @@ fn r16_i3_anchor_comparison_comes_before_the_trailing_line() {
                 .is_some_and(|r| r.contains(crate::report::HASH_VERIFY_HEAD_TRUNCATED)),
             "{summary:?}"
         );
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.status(), "truncated", "{check:?}");
     });
     let _ = fs::remove_dir_all(&dir);
@@ -244,7 +244,7 @@ fn r16_p26_another_scans_head_after_the_result_is_scan_mismatch() {
         fs::write(&source, b"r16-source-bytes-TAMPERED").unwrap();
         crate::anomaly::scan_case(&dir, true).unwrap();
         strip_hmac(&anomaly, lane_len(&anomaly) - 1);
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.reason_code(), Some("scan-mismatch"), "{check:?}");
         let reason = check
             .withhold_reason_in(crate::report::HeadLane::Anomaly)
@@ -296,12 +296,12 @@ fn r16_p26_older_build_scan_is_withheld_until_the_next_scan() {
         assert!(summary.is_result, "{summary:?}");
         assert_eq!(summary.run_id.as_deref(), Some(run));
         assert_eq!(summary.head_status, "intact", "{summary:?}");
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.reason_code(), Some("mixed-version"), "{check:?}");
         // The next scan with this build: both lanes anchored again.
         crate::anomaly::scan_case(&dir, false).unwrap();
         assert!(matches!(
-            crate::report::anomaly_head_check(&dir),
+            crate::report::read_anomaly_head_check(&dir),
             crate::report::HashVerifyHeadCheck::Intact { .. }
         ));
         let summary = crate::anomaly::latest_hash_verify_summary(&dir).unwrap();

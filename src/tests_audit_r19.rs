@@ -146,16 +146,47 @@ fn r19_i2_readers_never_read_the_anomaly_lane_twice() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for rel in ["serve/records.rs", "cli/handlers/case.rs"] {
         let text = fs::read_to_string(root.join(rel)).unwrap();
-        let body = text.split("#[cfg(test)]").next().unwrap();
+        // R20: the whole file (R19 cut at the first `#[cfg(test)]`, which
+        // in records.rs is line 87 — the readers below it went unchecked;
+        // the test modules live in their own files).
+        let body = text.as_str();
         assert!(
             !body.contains("anomaly_withheld_json("),
             "{rel} re-reads the anomaly lane for its verdict"
         );
+        // R20 I1: the head too — from the same read (`&lane`), never the
+        // reading wrapper.
+        assert!(
+            !body.contains("read_anomaly_head_check("),
+            "{rel} re-reads the anomaly lane for its head"
+        );
+        let calls: Vec<&str> = body.split("anomaly_head_check(").skip(1).collect();
+        assert!(!calls.is_empty(), "{rel} has no anomaly head");
+        for call in calls {
+            let args = &call[..call.find(')').unwrap()];
+            assert!(
+                args.ends_with(", &lane"),
+                "{rel} computes the anomaly head from another read: anomaly_head_check({args})"
+            );
+        }
     }
     let shared = fs::read_to_string(root.join("report_anomaly_withheld.rs")).unwrap();
     assert!(
         !shared.contains("read_lane_rows("),
         "the shared verdict must not read the lane itself"
+    );
+    // R20 I1: the head check itself takes the caller's rows — its marker
+    // search and anchor comparison never read the anomaly lane (only the
+    // `lane-changed` confirmation of a "shorter than the head" verdict).
+    let head = fs::read_to_string(root.join("report_hash_verify_head.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let start = head.find("pub fn anomaly_head_check(").unwrap();
+    let body = &head[start..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(
+        !body.contains("read_lane_rows(") && body.contains("Some(lane)"),
+        "anomaly_head_check must use the caller's rows: {body}"
     );
 }
 
@@ -220,7 +251,7 @@ fn r19_i3_forged_key_ids_are_never_quoted() {
         crate::anomaly::scan_case(&dir, false).unwrap();
     });
     with_test_keys(std::slice::from_ref(&mine), || {
-        let head = crate::report::anomaly_head_check(&dir)
+        let head = crate::report::read_anomaly_head_check(&dir)
             .to_json_in(crate::report::HeadLane::Anomaly)
             .to_string();
         assert!(!head.contains(raw), "{head}");

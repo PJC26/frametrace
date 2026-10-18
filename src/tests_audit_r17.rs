@@ -83,7 +83,7 @@ fn r17_i1_stripped_marker_hmac_is_marker_unusable_not_mixed_version() {
     with_test_keys(std::slice::from_ref(&mine), || {
         crate::anomaly::scan_case(&dir, true).unwrap();
         strip_hmac(&anomaly, lane_len(&anomaly) - 1);
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.status(), "unknown", "{check:?}");
         assert_eq!(check.reason_code(), Some("marker-unusable"), "{check:?}");
         let reason = check
@@ -132,7 +132,7 @@ fn r17_i2_chain_break_after_the_heads_still_reports_truncated() {
         let summary = crate::anomaly::latest_hash_verify_summary(&dir).unwrap();
         assert!(!summary.is_result, "{summary:?}");
         assert_eq!(summary.head_status, "truncated", "{summary:?}");
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.status(), "truncated", "{check:?}");
     });
     let _ = fs::remove_dir_all(&dir);
@@ -151,7 +151,7 @@ fn r17_i1_usable_marker_without_scan_id_stays_mixed_version() {
         let marker = serde_json::json!({"schema_version":1,"event":"anomaly-scan-run",
             "scanned_unix":4_000_000_000u64,"hash_mode":"stored","finding_count":0});
         append_chained_jsonl_keyed(&anomaly, &marker.to_string(), Some(&mine)).unwrap();
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.reason_code(), Some("mixed-version"), "{check:?}");
         let reason = check
             .withhold_reason_in(crate::report::HeadLane::Anomaly)
@@ -164,7 +164,7 @@ fn r17_i1_usable_marker_without_scan_id_stays_mixed_version() {
         // A new scan here clears it.
         crate::anomaly::scan_case(&dir, false).unwrap();
         assert!(matches!(
-            crate::report::anomaly_head_check(&dir),
+            crate::report::read_anomaly_head_check(&dir),
             crate::report::HashVerifyHeadCheck::Intact { .. }
         ));
     });

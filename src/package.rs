@@ -2018,7 +2018,7 @@ fn verify_package_hash_verify_head(
                     why: err,
                 },
             },
-            HeadLane::Anomaly => crate::report::anomaly_head_check(package_dir),
+            HeadLane::Anomaly => crate::report::read_anomaly_head_check(package_dir),
         };
         let status = match &check {
             HashVerifyHeadCheck::Absent => continue,

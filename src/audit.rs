@@ -2404,11 +2404,19 @@ pub fn check_lane_anchor_with_keys(
 }
 
 fn check_lane_anchor_rows(rows: Result<LaneRows, String>, head: &LaneHead) -> AnchorStatus {
-    let rows = match rows {
-        Ok(rows) if !rows.present => return AnchorStatus::Missing,
-        Ok(rows) => rows,
-        Err(err) => return AnchorStatus::Unreadable(err),
-    };
+    match rows {
+        Ok(rows) => check_lane_anchor_in(&rows, head),
+        Err(err) => AnchorStatus::Unreadable(err),
+    }
+}
+
+/// R20 I1: [`check_lane_anchor`] over a lane the caller already read
+/// ([`read_lane_rows`]) — the head verdict then describes the very rows
+/// the caller sends (no second read a scan in between could change).
+pub fn check_lane_anchor_in(rows: &LaneRows, head: &LaneHead) -> AnchorStatus {
+    if !rows.present {
+        return AnchorStatus::Missing;
+    }
     let anchored = head.entries as usize;
     if anchored == 0 {
         return AnchorStatus::Intact;
@@ -4436,3 +4444,7 @@ mod tests_r18;
 #[cfg(test)]
 #[path = "tests_audit_r19.rs"]
 mod tests_r19;
+
+#[cfg(test)]
+#[path = "tests_audit_r20.rs"]
+mod tests_r20;

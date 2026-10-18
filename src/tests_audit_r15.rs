@@ -301,7 +301,7 @@ fn r15_p22_head_is_written_last_and_anchors_both_lanes() {
             crate::report::SIGNOFF_LOG_REL_PATH
         );
         assert!(matches!(
-            crate::report::anomaly_head_check(&dir),
+            crate::report::read_anomaly_head_check(&dir),
             crate::report::HashVerifyHeadCheck::Intact { .. }
         ));
         // A stored-hash scan writes a head too (no re-hash run id); the
@@ -316,7 +316,7 @@ fn r15_p22_head_is_written_last_and_anchors_both_lanes() {
         // The anomaly result run's own head cut (the sign-off lane's last
         // line): its marker says it wrote one → unknown, no result.
         delete_last_lines(&signoff, 1);
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.reason_code(), Some("own-head-missing"), "{check:?}");
         let current = report_anomaly_section(&dir);
         assert!(current.contains("현재 결과 없음(결과 아님)"), "{current}");

@@ -700,6 +700,8 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // rows come from (never a second read: a scan in between made the two
     // disagree; an unreadable lane is `unreadable`, not re-read).
     let mut anomaly_withheld = serde_json::Value::Null;
+    // R20 I1: and the head, from that same read.
+    let mut anomaly_head = serde_json::Value::Null;
     let mut lane_values = |name: &str, path: PathBuf| -> Vec<serde_json::Value> {
         let rel = path
             .strip_prefix(&case_dir)
@@ -708,6 +710,8 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         let lane = crate::audit::read_lane_rows(&path);
         if name == "anomalyLog" {
             anomaly_withheld = crate::report::anomaly_lane_read_withheld_json(&lane);
+            anomaly_head = crate::report::anomaly_head_check(&case_dir, &lane)
+                .to_json_in(crate::report::HeadLane::Anomaly);
         }
         match lane {
             Ok(lane) => {
@@ -763,8 +767,7 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     log_chains.insert(
         "anomaly".to_string(),
         serde_json::json!({
-            "head": crate::report::anomaly_head_check(&case_dir)
-                .to_json_in(crate::report::HeadLane::Anomaly),
+            "head": anomaly_head,
             "withheld": withheld,
         }),
     );

@@ -79,7 +79,7 @@ fn r18_i1_old_marker_before_the_head_is_marker_unusable() {
         old_build_marker(&anomaly, Some(&mine), 1_000);
         crate::anomaly::scan_case(&dir, false).unwrap();
         strip_hmac(&anomaly, lane_len(&anomaly) - 1);
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.status(), "unknown", "{check:?}");
         assert_eq!(check.reason_code(), Some("marker-unusable"), "{check:?}");
         let reason = check
@@ -142,12 +142,12 @@ fn r18_i1_old_marker_after_the_head_followed_by_an_unusable_line() {
         crate::anomaly::scan_case(&dir, false).unwrap();
         old_build_marker(&anomaly, Some(&mine), 4_000_000_000);
         assert_eq!(
-            crate::report::anomaly_head_check(&dir).reason_code(),
+            crate::report::read_anomaly_head_check(&dir).reason_code(),
             Some("mixed-version")
         );
         append_chained_jsonl_keyed(&anomaly, r#"{"event":"anomaly-scan","kind":"none"}"#, None)
             .unwrap();
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         assert_eq!(check.reason_code(), Some("marker-unusable"), "{check:?}");
         let reason = check
             .withhold_reason_in(crate::report::HeadLane::Anomaly)
@@ -186,7 +186,7 @@ fn r18_i4_unusable_line_never_embeds_unknown_event_names() {
                 && !reason.contains("<b>"),
             "{reason}"
         );
-        let check = crate::report::anomaly_head_check(&dir);
+        let check = crate::report::read_anomaly_head_check(&dir);
         let why = check
             .withhold_reason_in(crate::report::HeadLane::Anomaly)
             .unwrap();

@@ -632,21 +632,31 @@ const anomalyRuns = [];
 {{
   let pending = [];
   const flushUnmarked = items => {{
+    // R20 I2: by scan_id when the row has one ("id:" keys never equal a
+    // number key), else by scanned_unix (older scanners' rows).
     const byTime = new Map();
     items.forEach(item => {{
-      const key = Number.isFinite(item.scanned_unix) ? item.scanned_unix : null;
+      const key = typeof item.scan_id === "string" ? "id:" + item.scan_id : Number.isFinite(item.scanned_unix) ? item.scanned_unix : null;
       if (!byTime.has(key)) byTime.set(key, []);
       byTime.get(key).push(item);
     }});
-    byTime.forEach((entries, ts) => anomalyRuns.push({{run: null, ts, entries}}));
+    byTime.forEach((entries, key) => {{
+      const id = typeof entries[0].scan_id === "string" ? entries[0].scan_id : null;
+      const ts = id === null ? key : Number.isFinite(entries[0].scanned_unix) ? entries[0].scanned_unix : null;
+      anomalyRuns.push({{run: null, ts, id, entries}});
+    }});
   }};
+  // R20 I2: a row with a scan_id belongs to the marker with that scan_id
+  // only; a row without one (older scanners) to the marker with its
+  // scanned_unix. Same rule as `report::anomaly_lane_withheld`.
+  const sameAnomalyRun = (entry, marker) => typeof entry.scan_id === "string" ? entry.scan_id === marker.scan_id : entry.scanned_unix === marker.scanned_unix;
   anomalyLog.forEach(item => {{
     if (item.event === "anomaly-scan-run") {{
       // A run writes its findings and then its marker with one scanned_unix;
       // anything else still pending is an older unmarked (legacy or cut
       // short) run.
-      flushUnmarked(pending.filter(entry => entry.scanned_unix !== item.scanned_unix));
-      anomalyRuns.push({{run: item, ts: item.scanned_unix, entries: pending.filter(entry => entry.scanned_unix === item.scanned_unix)}});
+      flushUnmarked(pending.filter(entry => !sameAnomalyRun(entry, item)));
+      anomalyRuns.push({{run: item, ts: item.scanned_unix, id: typeof item.scan_id === "string" ? item.scan_id : null, entries: pending.filter(entry => sameAnomalyRun(entry, item))}});
       pending = [];
     }} else {{
       pending.push(item);
@@ -662,13 +672,18 @@ const anomalyRuns = [];
   const nearest = new Map();
   const chunks = new Map();
   const merged = new Set();
+  // R20 I2: an unmarked scan_id group joins only the completed run whose
+  // marker has that scan_id; one without keeps the time rule.
   for (let index = anomalyRuns.length - 1; index >= 0; index--) {{
     const run = anomalyRuns[index];
-    if (!Number.isFinite(run.ts)) continue;
     if (run.run !== null) {{
-      nearest.set(run.ts, run);
-    }} else if (nearest.has(run.ts)) {{
-      const target = nearest.get(run.ts);
+      if (Number.isFinite(run.ts)) nearest.set(run.ts, run);
+      if (run.id !== null) nearest.set("id:" + run.id, run);
+      continue;
+    }}
+    const key = run.id !== null ? "id:" + run.id : Number.isFinite(run.ts) ? run.ts : undefined;
+    if (key !== undefined && nearest.has(key)) {{
+      const target = nearest.get(key);
       if (!chunks.has(target)) chunks.set(target, []);
       chunks.get(target).push(run.entries);
       merged.add(run);
@@ -3008,10 +3023,11 @@ pub(crate) fn audio_levels_object(json: &str) -> String {
 mod hash_verify_head;
 pub use hash_verify_head::{
     ANOMALY_LOG_REL_PATH, HASH_VERIFY_HEAD_EVENT, HASH_VERIFY_HEAD_TRUNCATED,
-    HASH_VERIFY_MARKER_HEAD_FIELD, HEAD_MARKER_UNUSABLE_NOTE, HEAD_MIXED_VERSION_NOTE,
-    HEAD_OTHER_EVENT_NOTE, HEAD_OTHER_PC_NOTE, HEAD_RESCAN_NOTE, HEAD_SCAN_MISMATCH_NOTE,
-    HEAD_SCHEMA_VERSION, HashVerifyHeadCheck, HeadLane, KNOWN_SIGNOFF_EVENTS, anomaly_head_check,
-    hash_verify_head_check, lane_head_check, record_scan_head,
+    HASH_VERIFY_MARKER_HEAD_FIELD, HEAD_LANE_CHANGED_NOTE, HEAD_MARKER_UNUSABLE_NOTE,
+    HEAD_MIXED_VERSION_NOTE, HEAD_OTHER_EVENT_NOTE, HEAD_OTHER_PC_NOTE, HEAD_RESCAN_NOTE,
+    HEAD_SCAN_MISMATCH_NOTE, HEAD_SCHEMA_VERSION, HashVerifyHeadCheck, HeadLane,
+    KNOWN_SIGNOFF_EVENTS, anomaly_head_check, hash_verify_head_check, lane_head_check,
+    read_anomaly_head_check, record_scan_head,
 };
 
 // R18 I2 / I5 / I6 (track I): the anomaly lane's own withholding verdict,

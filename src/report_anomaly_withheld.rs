@@ -28,6 +28,11 @@
 //! (I1, [`merge_interleaved`]); every reader computes the verdict from the
 //! same lane read as the rows it sends ([`anomaly_lane_read_withheld_json`],
 //! I2) — this module never reads the lane itself.
+//!
+//! R20 I2: a finding row carries its scan's `scan_id` (the marker's); a
+//! row with a string `scan_id` belongs to the marker with that `scan_id`
+//! only, and unmarked rows group by it ([`run_key`]). Rows without one
+//! (older scanners) keep the `scanned_unix` rules.
 
 /// One reason the anomaly lane withholds its current result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,12 +116,47 @@ fn finite(value: Option<&serde_json::Value>) -> Option<f64> {
     value.and_then(|v| v.as_f64())
 }
 
+/// R20 I2: an entry's string `scan_id` (the report script's
+/// `typeof item.scan_id === "string"`).
+fn scan_id(item: &serde_json::Value) -> Option<&str> {
+    item.get("scan_id").and_then(|v| v.as_str())
+}
+
+/// R20 I2: the entry at `entry` belongs to the run whose marker is
+/// `marker` — by `scan_id` when the entry has one (only a marker with the
+/// same `scan_id`), else (an older scanner's row) by `scanned_unix`
+/// (JavaScript `===`). The report script's `sameAnomalyRun`.
+fn same_run(entry: &serde_json::Value, marker: &serde_json::Value) -> bool {
+    match scan_id(entry) {
+        Some(id) => scan_id(marker) == Some(id),
+        None => js_strict_eq(entry.get("scanned_unix"), marker.get("scanned_unix")),
+    }
+}
+
+/// R20 I2: how unmarked entries group (the report script's `byTime` key):
+/// by `scan_id` when present, else by finite `scanned_unix` (or none).
+#[derive(Debug, Clone, PartialEq)]
+enum RunKey {
+    Id(String),
+    Time(Option<f64>),
+}
+
+fn run_key(item: &serde_json::Value) -> RunKey {
+    match scan_id(item) {
+        Some(id) => RunKey::Id(id.to_string()),
+        None => RunKey::Time(finite(item.get("scanned_unix"))),
+    }
+}
+
 /// One run of the report's grouping (`anomalyRuns`).
 struct Run {
     /// Lane position of its `anomaly-scan-run` marker (`None`: unmarked).
     marker: Option<usize>,
     /// `ts` when it is a finite number.
     ts: Option<f64>,
+    /// R20 I2: the run's `scan_id` — the marker's (string) for a completed
+    /// run, the entries' for an unmarked run grouped by it.
+    id: Option<String>,
     /// Lane positions of its entries.
     entries: Vec<usize>,
 }
@@ -144,18 +184,24 @@ impl Run {
 fn group_runs(all: &[serde_json::Value], log: &[usize]) -> Vec<Run> {
     let mut runs = Vec::new();
     let flush_unmarked = |runs: &mut Vec<Run>, items: &[usize]| {
-        let mut by_time: Vec<(Option<f64>, Vec<usize>)> = Vec::new();
+        let mut by_key: Vec<(RunKey, Vec<usize>)> = Vec::new();
         for &at in items {
-            let key = finite(all[at].get("scanned_unix"));
-            match by_time.iter_mut().find(|(k, _)| *k == key) {
+            let key = run_key(&all[at]);
+            match by_key.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, entries)) => entries.push(at),
-                None => by_time.push((key, vec![at])),
+                None => by_key.push((key, vec![at])),
             }
         }
-        for (ts, entries) in by_time {
+        for (key, entries) in by_key {
+            // R20 I2: a `scan_id` group's time is its first entry's.
+            let (id, ts) = match key {
+                RunKey::Id(id) => (Some(id), finite(all[entries[0]].get("scanned_unix"))),
+                RunKey::Time(ts) => (None, ts),
+            };
             runs.push(Run {
                 marker: None,
                 ts,
+                id,
                 entries,
             });
         }
@@ -164,14 +210,14 @@ fn group_runs(all: &[serde_json::Value], log: &[usize]) -> Vec<Run> {
     for &at in log {
         let item = &all[at];
         if event(item) == Some("anomaly-scan-run") {
-            let stamp = item.get("scanned_unix");
             let (same, other): (Vec<usize>, Vec<usize>) = pending
                 .iter()
-                .partition(|entry| js_strict_eq(all[**entry].get("scanned_unix"), stamp));
+                .partition(|entry| same_run(&all[**entry], item));
             flush_unmarked(&mut runs, &other);
             runs.push(Run {
                 marker: Some(at),
-                ts: finite(stamp),
+                ts: finite(item.get("scanned_unix")),
+                id: scan_id(item).map(str::to_string),
                 entries: same,
             });
             pending.clear();
@@ -191,19 +237,40 @@ fn group_runs(all: &[serde_json::Value], log: &[usize]) -> Vec<Run> {
 /// completed run belongs to it: its entries join that run (the nearest
 /// such one, in lane order, ahead of the run's own entries). The report
 /// script does the same (`anomalyRuns`).
+///
+/// R20 I2: an unmarked run grouped by `scan_id` joins only the nearest
+/// later completed run whose marker has that `scan_id` (never one that
+/// merely shares the second); an unmarked run without one keeps the time
+/// rule.
 fn merge_interleaved(runs: &mut Vec<Run>) {
+    #[derive(PartialEq, Eq, Hash)]
+    enum Key {
+        Time(u64),
+        Id(String),
+    }
     // `+0.0` and `-0.0` are one key (JavaScript `Map`, SameValueZero).
-    let key = |ts: f64| if ts == 0.0 { 0u64 } else { ts.to_bits() };
-    // Walking back: the nearest later completed run per time, and the
-    // chunks (latest first) each completed run receives.
-    let mut nearest: std::collections::HashMap<u64, usize> = Default::default();
+    let time = |ts: f64| Key::Time(if ts == 0.0 { 0u64 } else { ts.to_bits() });
+    // Walking back: the nearest later completed run per time / `scan_id`,
+    // and the chunks (latest first) each completed run receives.
+    let mut nearest: std::collections::HashMap<Key, usize> = Default::default();
     let mut chunks: Vec<Vec<Vec<usize>>> = runs.iter().map(|_| Vec::new()).collect();
     let mut keep = vec![true; runs.len()];
     for index in (0..runs.len()).rev() {
-        let Some(ts) = runs[index].ts else { continue };
         if runs[index].marker.is_some() {
-            nearest.insert(key(ts), index);
-        } else if let Some(&target) = nearest.get(&key(ts)) {
+            if let Some(ts) = runs[index].ts {
+                nearest.insert(time(ts), index);
+            }
+            if let Some(id) = &runs[index].id {
+                nearest.insert(Key::Id(id.clone()), index);
+            }
+            continue;
+        }
+        let key = match (&runs[index].id, runs[index].ts) {
+            (Some(id), _) => Key::Id(id.clone()),
+            (None, Some(ts)) => time(ts),
+            (None, None) => continue,
+        };
+        if let Some(&target) = nearest.get(&key) {
             chunks[target].push(std::mem::take(&mut runs[index].entries));
             keep[index] = false;
         }

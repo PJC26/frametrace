@@ -377,7 +377,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     // Prefer an existing anomaly log; scan on demand so make-review stays usable
     // without forcing a full-case digest pass (make-report / qa anomalies refresh).
     // R19 I2: rows and `withheld` verdict from one read of the lane.
-    let (anomaly_log_raw, anomaly_withheld) = review_anomaly_lane(case_dir);
+    let (anomaly_log_raw, anomaly_withheld, anomaly_head) = review_anomaly_lane(case_dir);
     let anomaly_log = redact(&anomaly_log_raw);
     let fls_entries = redact(&latest_fls_entries_jsonl(case_dir));
     // Optional proxy pre-build: browser-unplayable containers (AVI, DAV,
@@ -412,8 +412,7 @@ pub fn make_review(case_dir: &Path, redact_paths: bool, build_proxies: bool) -> 
     let log_chains = crate::report::bundle_log_chains_json(&redact(
         &serde_json::json!({
             "anomaly": {
-                "head": crate::report::anomaly_head_check(case_dir)
-                    .to_json_in(crate::report::HeadLane::Anomaly),
+                "head": anomaly_head,
                 "withheld": anomaly_withheld,
             },
         })
@@ -1049,12 +1048,15 @@ fn review_lane(case_dir: &Path, rel: &str) -> (String, String) {
 /// R19 I2: the review bundle's anomaly lane (every entry with its `trust`,
 /// JSONL) and its `logChains.anomaly.withheld` verdict, both from ONE read
 /// of the lane (a scan between two reads made them disagree; an unreadable
-/// lane is `unreadable` without a second read).
-fn review_anomaly_lane(case_dir: &Path) -> (String, serde_json::Value) {
+/// lane is `unreadable` without a second read). R20 I1: and its
+/// `logChains.anomaly.head` (`to_json_in(Anomaly)`), from that read too.
+fn review_anomaly_lane(case_dir: &Path) -> (String, serde_json::Value, serde_json::Value) {
     let rel = crate::report::ANOMALY_LOG_REL_PATH;
     let lane = crate::audit::read_lane_rows(&case_dir.join(rel));
     let withheld = crate::report::anomaly_lane_read_withheld_json(&lane);
-    (review_lane_of(rel, &lane).0, withheld)
+    let head = crate::report::anomaly_head_check(case_dir, &lane)
+        .to_json_in(crate::report::HeadLane::Anomaly);
+    (review_lane_of(rel, &lane).0, withheld, head)
 }
 
 /// [`review_lane`] over a lane already read.
@@ -1294,7 +1296,8 @@ pub(crate) fn report_audit_chains_json(case_dir: &Path) -> String {
         // R15 P22 / I2: the sign-off lane's head against the anomaly lane
         // — the report's anomaly "현재 결과" is withheld when it is cut.
         if *name == "anomaly" {
-            entry["head"] = crate::report::anomaly_head_check(case_dir)
+            // R20 I1: the head from the same read as well.
+            entry["head"] = crate::report::anomaly_head_check(case_dir, &lane)
                 .to_json_in(crate::report::HeadLane::Anomaly);
             // R18 I2: the lane's own P9 verdict (one Rust function; the
             // report script withholds when it or its own rules say so).
