@@ -141,8 +141,12 @@ function downloadText(filename, text, mime) {
   toast(tf("toast.downloadStart", { name: filename }));
 }
 
+// R20 U3: a cell a spreadsheet would read as a formula (= + - @ tab CR
+// first) gets a leading ' (CSV formula injection) — a plain number
+// (-12.3) or the "-" placeholder is not a formula and stays as it is.
 function csvCell(value) {
-  const text = String(value ?? "");
+  let text = String(value ?? "");
+  if (/^[=+\-@\t\r]/.test(text) && text !== "-" && !/^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(text)) text = "'" + text;
   return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 

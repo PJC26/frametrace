@@ -1042,3 +1042,14 @@ const FTStore = {
 ### 25.5 명령은 서버 문자열만 (U5, 트랙 S7)
 - 뷰어·셸은 명령을 만들지 않는다. §22.3의 내장 작은따옴표 형식(`finJournalDismissCmd`/`finJournalDismissQuote`)은 없앴다 — `’` 같은 따옴표 문자를 막지 못했다. 서버 필드가 없거나 null이면 줄 없음. `--i-am-sure`는 서버가 보낸 명령 문자열 안에서만 나온다(그대로 표시). `writer_gone_i_am_sure: true`면 작성자 없음 복구 마지막 줄 옆에 경고 "이 케이스의 진행 중 최종화가 아닌지 확인"(`FIN_SURE_NOTE`; 결과 줄 `.h-fin-note`, 점검 목록 sub는 괄호). other-account·최종화 거부 문장은 키로 쓰지 않는다.
 - 하네스: verify-review-batch --unit "R18 U1"–"R18 U5"(ff898f5 자산에서 각각 실패 확인), verify-layout "R18 U1/U2"(1366×768, records-meta 주입: auth·unauth·pc 3행 + withheld).
+
+## 26. R20 트랙 U 추가 계약 (2026-10-19, docs/PLAN_R20_2026-10-19.md)
+
+- **U1** (§25.1 검증 `anomaly_flags` 보충): 현재 아닌 검증 줄의 플래그 행은 그 줄의 trust를 그대로 둔다(`auth`도). 경로의 마지막 줄이 아니거나 `trust_superseded_by`가 있으면 `superseded: true` → 상세 표시 "대체됨"(tooltip "대체된 이전 검증 — 현재 아님", `anomaly.superseded`/`anomaly.tip.superseded`) — "이 PC의 키로 인증되지 않아" 문구가 아니다. 마지막 줄인데 레인 수리 전이면 `repairedAfter: true` → "최신 여부 알 수 없음"(`status.repairedAfter`). 두 표식이 있는 행은 trust와 무관하게 쓸 수 없는 행으로 센다(fail closed, `hasUnauthAnomaly` — `pc:` 줄은 `hasPcAnomaly`).
+- **U2**: 플래그 행 설명은 i18n — `anomaly.validationFlag`(현재 줄)·`anomaly.validationFlagOld` "검증 anomaly_flags (현재 아님)"(ko·en).
+- **U3**: CSV(`csvCell`) 셀이 `= + - @ 탭 CR`로 시작하면 앞에 `'`를 붙인 뒤 따옴표 규칙을 적용한다(수식 주입). 수(`-12.3`, `+1`)와 자리 표시 `-`는 그대로.
+- **U4**: legacy 셸 `normPath`도 `E:\.` → `e:`(앱 셸 30-form과 같은 치환).
+- **U5**: 케이스 이름(`hBaseName`·`caseBaseName`)은 끝의 `\.`·구분자를 떼고 고른다 — `E:\.` → "E:", 절대 "."이 아님. 최근 목록은 `hCaseName(name, dir)`: 서버 이름이 "."·".."이면 폴더에서 다시 고른다.
+- **U6**: case_id 없는 케이스의 초안은 시작 시(`hydrateAnnotations`, 초안 읽기 전) 옛 키 후보(`FTViewer.caseStorageKeyAliases` — 끝 `\.`, 드라이브 문자 대소문자, 겹친 구분자)의 `ft.draft.<옛 키>.*`를 새 키로 옮긴다(`migrateAliasDrafts`). 새 키에 쓰고 다시 읽어 같을 때만 옛 항목을 지운다; 새 키에 다른 값이 있거나 쓰기가 실패하면 둘 다 남는다(손실 없음).
+- **트랙 I(b9067ba)**: 머리 `reason_code: "lane-changed"`(status unknown, withhold_reason 있음) → 경고(확인 불가) "이상 징후 기록이 읽는 중 바뀜 — 다시 확인"(`anomalyHead.reason.laneChanged`; 변조 판정 아님). 보류 코드로 오면 "읽는 중 바뀜 — 다시 확인"(`anomalyHead.held.laneChanged`). `anomalyLog`의 `scan_id`는 뷰어가 쓰지 않는다.
+- 하네스: verify-review-batch --unit "R20 U1"–"R20 U6", "R20 track I lane-changed"(1593a61 자산에서 각각 실패 확인).

@@ -698,7 +698,8 @@ function logChainItems(chains, lanes) {
 // rescan hint. R17 U4 (track I6): the standalone bundle carries the same
 // head — "이 PC" in its words reads "생성 PC" there (t() picks the @bundle twin).
 // R18 (track I6): bundle-unreadable (bundle only) — "make-review를 다시 실행".
-const ANOMALY_HEAD_REASON = { "mixed-version": "anomalyHead.reason.mixedVersion", "scan-mismatch": "anomalyHead.reason.scanMismatch", "marker-unusable": "anomalyHead.reason.markerUnusable", "bundle-unreadable": "anomalyHead.reason.bundleUnreadable" };
+// R20 (track I): "lane-changed" — the lane changed while the server read it (unknown, not a tamper verdict).
+const ANOMALY_HEAD_REASON = { "mixed-version": "anomalyHead.reason.mixedVersion", "scan-mismatch": "anomalyHead.reason.scanMismatch", "marker-unusable": "anomalyHead.reason.markerUnusable", "bundle-unreadable": "anomalyHead.reason.bundleUnreadable", "lane-changed": "anomalyHead.reason.laneChanged" };
 function anomalyHeadState(chains) {
   const lane = chains && typeof chains === "object" ? (chains.anomaly || chains.anomalyLog) : null;
   const h = lane && typeof lane === "object" && lane.head && typeof lane.head === "object" ? lane.head : null;
@@ -730,7 +731,7 @@ function anomalyHeadState(chains) {
 // The banner's short words of the server's withholding codes; "" when any
 // code is unknown (the server's sentence is shown then).
 const ANOMALY_WITHHELD_CODE = { "unusable-after": "anomalyHead.held.unusableAfter", "unusable-in-run": "anomalyHead.held.unusableInRun", "repaired-after": "anomalyHead.held.repairedAfter",
-  "newer-unmarked-run": "anomalyHead.held.newerUnmarkedRun", "unreadable": "anomalyHead.held.unreadable", "bundle-unreadable": "anomalyHead.held.bundleUnreadable" };
+  "newer-unmarked-run": "anomalyHead.held.newerUnmarkedRun", "unreadable": "anomalyHead.held.unreadable", "bundle-unreadable": "anomalyHead.held.bundleUnreadable", "lane-changed": "anomalyHead.held.laneChanged" };
 function anomalyWithheldShort(head) {
   const codes = head && Array.isArray(head.withheldCodes) ? head.withheldCodes : [];
   if (!codes.length || !codes.every(c => ANOMALY_WITHHELD_CODE[c])) return "";
@@ -872,18 +873,31 @@ const untrustedValidationsByPath = validationSplit.untrusted;
 // source (a carved record has no anomaly-lane rows). Per path, the flags of
 // every validation line that is not its current usable one (the untrusted
 // latest line, superseded earlier lines, lines before a lane repair) stay —
-// trust "unauth" (a `pc:<key>` line keeps its key), never dropped.
+// never dropped, never usable (fail closed: recordAnomalies counts them).
+// R20 U1: each row keeps its line's own trust; a line that is not the
+// path's latest (or the server marked `trust_superseded_by`) carries
+// `superseded: true` ("대체된 이전 검증 — 현재 아님", not "인증 안 됨" wording
+// about an authenticated line); the latest line itself, usable but before a
+// lane repair, carries `repairedAfter: true`.
 function validationFlagRows(list, keyOf, usable) {
-  const out = new Map();
-  for (const item of Array.isArray(list) ? list : []) {
+  const out = new Map(), lastOf = new Map();
+  const items = Array.isArray(list) ? list : [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const key = keyOf(item);
+    if (key) lastOf.set(key, item);
+  }
+  for (const item of items) {
     if (!item || typeof item !== "object" || !Array.isArray(item.anomaly_flags)) continue;
     const key = keyOf(item);
     if (!key || (usable && usable.get(key) === item)) continue;
-    const pc = logTrustPcKey(logTrustOf(item));
+    const trust = logTrustOf(item);
+    const superseded = logTrustSuperseded(item) || lastOf.get(key) !== item;
+    const mark = superseded ? { superseded: true } : logTrustUsable(trust) ? { repairedAfter: true } : {};
     const rows = out.get(key) || [];
     for (const kind of item.anomaly_flags) {
       if (kind == null || kind === "") continue;
-      rows.push({ kind: String(kind), detail: "validation anomaly_flags (not current)", trust: pc ? "pc:" + pc : "unauth" });
+      rows.push(Object.assign({ kind: String(kind), detail: t("anomaly.validationFlagOld"), trust: trust || "unauth" }, mark));
     }
     if (rows.length) out.set(key, rows);
   }
@@ -1029,11 +1043,12 @@ function serverProxyOf(row) {
 // plus `record.validationFlags` — the flags of the path's other validation
 // lines (validationFlagRows), "인증 안 됨" unless a usable row of the kind.
 function recordAnomalies(record) {
-  const usable = (item) => logTrustUsable(logTrustOf(item));
+  // R20 U1: a superseded / repaired-after row keeps its trust but is never usable.
+  const usable = (item) => !(item && (item.superseded === true || item.repairedAfter === true)) && logTrustUsable(logTrustOf(item));
   const fromId = anomaliesBySelector.get(record.id) || [];
   const vTrust = record.validation && record.validation.trust != null ? { trust: record.validation.trust } : {};
   const fromValidation = Array.isArray(record.validation?.anomaly_flags)
-    ? record.validation.anomaly_flags.map(kind => Object.assign({ kind, selector: record.id, detail: "validation anomaly_flags" }, vTrust))
+    ? record.validation.anomaly_flags.map(kind => Object.assign({ kind, selector: record.id, detail: t("anomaly.validationFlag") }, vTrust))
     : [];
   for (const row of Array.isArray(record.validationFlags) ? record.validationFlags : []) fromValidation.push(Object.assign({ selector: record.id }, row));
   const merged = [...fromId];
@@ -1656,6 +1671,39 @@ function storedDraftEntries() {
   return out;
 }
 
+// R20 U6: drafts stored under an older key of this folder (CASE_KEY_ALIASES,
+// 00-host caseStorageKeyAliases) move to DRAFT_PREFIX. An old entry goes
+// only after its copy is written and read back; when the new key already
+// holds something else, both stay (never overwritten, never lost).
+function migrateAliasDrafts(aliases) {
+  let moved = 0;
+  for (const alias of Array.isArray(aliases) ? aliases : []) {
+    const prefix = "ft.draft." + alias + ".";
+    if (!alias || prefix === DRAFT_PREFIX) continue;
+    let keys = [];
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith(prefix)) keys.push(key);
+      }
+    } catch (error) { keys = []; }
+    for (const key of keys) {
+      try {
+        const value = localStorage.getItem(key);
+        if (value == null) continue;
+        const next = DRAFT_PREFIX + key.slice(prefix.length);
+        const held = localStorage.getItem(next);
+        if (held == null) localStorage.setItem(next, value);
+        if (localStorage.getItem(next) === value) { localStorage.removeItem(key); moved += 1; }
+      } catch (error) {
+        reportStorageError(error);
+        return moved; // the rest stay under their old keys: retried next boot
+      }
+    }
+  }
+  return moved;
+}
+
 // One-time move of the pre-§10.3 single-key drafts ({id: draft}) into
 // per-id keys. Those drafts carry no base revision: they are migrated with
 // base 0, so a value the server already holds comes back as a conflict
@@ -1998,6 +2046,7 @@ function hydrateAnnotations(annotations) {
   restoredConflictIds = [];
   orphanDrafts = new Map();
   legacyRangesLeft = null;
+  migrateAliasDrafts(typeof CASE_KEY_ALIASES !== "undefined" ? CASE_KEY_ALIASES : []);
   migrateLegacyDrafts();
   // This window's own drafts first (a hosted destroy()+init() keeps the
   // writer token); a closed window's draft for the same id is an orphan (A7).

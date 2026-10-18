@@ -96,8 +96,14 @@ const FTStore = (() => {
   };
 })();
 
+// R20 U5: a trailing `\.` is the folder itself (`E:\.` → "E:", never ".").
 function hBaseName(dir) {
-  return String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  return String(dir || "").replace(/(?:[\\/]+\.?)+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+}
+// The name a case is shown by: a given name unless it is "." / "..".
+function hCaseName(name, dir) {
+  const n = String(name || "").trim();
+  return n && n !== "." && n !== ".." ? n : hBaseName(dir) || String(dir || "");
 }
 
 

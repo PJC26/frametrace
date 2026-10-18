@@ -918,6 +918,9 @@ const thumbDead = new Set();
 // nothing for authenticated / legacy entries.
 function logTrustTagHtml(item) {
   const trust = logTrustOf(item);
+  // R20 U1: a validation flag row that is not current says so, whatever its trust.
+  if (item && item.superseded === true) return ` <span class="badge candidate" title="${escapeHtml(t("anomaly.tip.superseded"))}">${ftIcon("lock")}${escapeHtml(t("anomaly.superseded"))}</span>`;
+  if (item && item.repairedAfter === true) return ` <span class="badge candidate" title="${escapeHtml(t("status.tip.repairedAfter"))}">${ftIcon("lock")}${escapeHtml(t("status.repairedAfter"))}</span>`;
   // R11 U2: a usable entry's own note (legacy: `auth` + "레거시") as a tooltip.
   const own = logTrustUsable(trust) ? logTrustNote(item, true) : "";
   if (trust === "sc") return ` <span class="badge candidate"${own ? ` title="${escapeHtml(own)}"` : ""}>${escapeHtml(t("trust.sc"))}</span>`;

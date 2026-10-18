@@ -13,7 +13,8 @@ const POLL_BUSY_MS = 1000, POLL_IDLE_MS = 5000;
 // Phases the viewer can be mounted in: the index exists (docs §3.1).
 const REVIEW_PHASES = ["review-partial", "review-ready", "done", "finalized"];
 function caseBaseName(caseDir) {
-  return String(caseDir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  // R20 U5: `E:\.` → "E:" (a trailing `\.` is the folder itself).
+  return String(caseDir || "").replace(/(?:[\\/]+\.?)+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
 }
 
 // Store access is optional so a page without the store (legacy bundle,

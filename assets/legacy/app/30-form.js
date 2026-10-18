@@ -103,7 +103,7 @@ function looksLargeSource(src) {
     /^\/(dev|media|mnt|Volumes|run\/media\/[^/]+)\/[^/]+\/?$/.test(v);
 }
 function normPath(p) {
-  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([a-z]:)\/\.$/i, "$1").toLowerCase();
 }
 // True when `child` is `parent` or lies beneath it (case-insensitive,
 // separator-agnostic — the workstation is primarily Windows).

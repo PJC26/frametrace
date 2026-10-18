@@ -38,6 +38,8 @@ const manifest = DATA.manifest && typeof DATA.manifest === "object" ? DATA.manif
 // (00-host.js caseStorageKey).
 const caseFileUnreadable = caseInputProblems.includes("manifest");
 const CASE_KEY = FTViewer.caseStorageKey(caseFileUnreadable ? null : manifest, DATA.caseDir);
+// R20 U6: older keys of this folder whose drafts are moved to CASE_KEY at boot.
+const CASE_KEY_ALIASES = FTViewer.caseStorageKeyAliases ? FTViewer.caseStorageKeyAliases(caseFileUnreadable ? null : manifest, DATA.caseDir) : [];
 const scan = DATA.scan && typeof DATA.scan === "object" ? DATA.scan : {};
 // The carve audit log is append-only across runs: a re-carve re-emits
 // the same id space, so earlier entries for an id are stale records of a

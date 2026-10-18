@@ -435,7 +435,7 @@ async function unitTests() {
     reportStorageError: () => { storageReports += 1; }, ftSignal: { aborted: false },
   });
   grid.annotations = { marks: [{ id: 'a', status: 'important', note: 'old' }, { id: 'b', status: 'reviewed', note: 'DB memo', examiner: 'Bob' }], tags: [{ id: 'b', tags: ['DB tag'] }], revisions: { a: 3, b: 1, c: 2 } };
-  const hydrateSrc = [fn('aliveKey'), fn('draftKey'), fn('parseDraftKey'), fn('writerVerdict'), fn('storedDraftEntries'), fn('migrateLegacyDrafts'), fn('applyDraftValues'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations'), fn('adoptOrphanDrafts'), fn('adoptDeadWriters'), fn('flushDraftsNow'), fn('applyAppliedIds'), fn('dropJournalIds'), fn('draftNormRange'), fn('draftSameValues'), fn('serverDraftValues'), fn('noteOrphanDraft'), fn('migrateLegacyRanges')].join('\n');
+  const hydrateSrc = [fn('aliveKey'), fn('draftKey'), fn('parseDraftKey'), fn('writerVerdict'), fn('storedDraftEntries'), fn('migrateAliasDrafts'), fn('migrateLegacyDrafts'), fn('applyDraftValues'), fn('adoptDraft'), fn('annotationMarkId'), fn('hydrateAnnotations'), fn('adoptOrphanDrafts'), fn('adoptDeadWriters'), fn('flushDraftsNow'), fn('applyAppliedIds'), fn('dropJournalIds'), fn('draftNormRange'), fn('draftSameValues'), fn('serverDraftValues'), fn('noteOrphanDraft'), fn('migrateLegacyRanges')].join('\n');
   runInNewContext('orphanDrafts=new Map();legacyRangesLeft=null;annotationsError="";markRowMaybe=new Set();skippedDraftWriters=new Set();restoredConflictIds=[];draftAdoptedFrom=new Map();orphanCheck=null;draftsUnpersisted=false;draftFlushTimer=null;\n' + touch + '\n' + hydrateSrc + '\nhydrateAnnotations(annotations);', grid);
   assert.equal(state.marks.a, undefined, 'own draft (cleared mark) replays over the DB row');
   assert.equal(state.notes.b, 'DB memo');
@@ -761,6 +761,150 @@ async function unitTests() {
   await r17TrackU({ fn, source, runInNewContext, assert, ex });
   await r18TrackU({ fn, source, runInNewContext, assert, ex });
   await r19TrackU({ fn, source, runInNewContext, assert });
+  await r20TrackU({ fn, source, runInNewContext, assert });
+}
+
+// ---- R20 track U (docs/PLAN_R20_2026-10-19.md) -----------------------------
+async function r20TrackU({ fn, source, runInNewContext, assert }) {
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+  const { readFileSync } = await import('node:fs');
+  const i18n = readFileSync(new URL('../assets/viewer/20-i18n.js', import.meta.url), 'utf8');
+  const word = (k, nth = 0) => [...i18n.matchAll(new RegExp(`"${k.replace(/[.@]/g, (c) => '\\' + c)}": "([^"]*)"`, 'g'))][nth]?.[1];
+  const t = (k) => word(k) ?? k;
+  // U1: a superseded authenticated validation line keeps its trust, says
+  // "대체된 이전 검증 — 현재 아님", and still counts (fail closed).
+  const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'logRepairs', 'logPosOf', 'logSlots', 'splitValidationSlots', 'validationFlagRows', 'recordAnomalies',
+    'logTrustNote', 'pcKeyQuotable', 'trustOtherPcText', 'logTrustTagHtml'];
+  const ctx = { anomaliesBySelector: new Map(), t, tf: (k) => t(k), viewerTrustFromBundle: () => false, escapeHtml: (x) => String(x), ftIcon: () => '' };
+  runInNewContext(names.map((n) => { const f = fn(n); assert.ok(f, `R20 U1: ${n} exists`); return f; }).join('\n'), ctx);
+  const run = (vl, chain) => plain(runInNewContext(`(() => { const key = (i) => i.target_path || '';
+    const sp = splitValidationSlots(logSlots(vl, key, chain));
+    const rows = validationFlagRows(vl, key, sp.usable).get('X') || [];
+    const r = { id: 'carve:1', validation: sp.usable.get('X'), validationFlags: rows };
+    recordAnomalies(r);
+    return { rows, tags: r.anomalies.map(logTrustTagHtml), flag: (r.hasAnomaly ? 'A' : '') + (r.hasUnauthAnomaly ? 'U' : '') + (r.hasPcAnomaly ? 'P' : '') }; })()`, Object.assign(ctx, { vl, chain: chain || null })));
+  const v = (trust, flags, extra) => Object.assign({ target_path: 'X', validation_status: 'ffprobe-confirmed', trust }, flags ? { anomaly_flags: flags } : {}, extra || {});
+  const a = run([v('auth', ['frame-gap']), v('auth')]);
+  assert.ok(a.rows.length === 1 && a.rows[0].trust === 'auth' && a.rows[0].superseded === true, 'R20 U1: a superseded authenticated line keeps trust "auth" + superseded: ' + JSON.stringify(a.rows));
+  assert.ok(a.tags[0].includes('대체된 이전 검증 — 현재 아님') && !a.tags[0].includes('이 PC의 키로 인증되지 않아'), 'R20 U1: the tag says 대체된 이전 검증, not "이 PC의 키로 인증되지 않아": ' + a.tags[0]);
+  assert.equal(a.flag, 'AU', 'R20 U1: still counted (fail closed)');
+  const b = run([v('unauth', ['frame-gap'], { trust_superseded_by: 2 }), v('unauth')]);
+  assert.ok(b.rows[0].superseded === true && b.tags[0].includes('대체된 이전 검증') && b.flag === 'AU', 'R20 U1: a server-marked superseded line → 대체됨');
+  const c = run([v('auth'), v('pc:K2', ['ts-gap'])]);
+  assert.ok(c.rows[0].trust === 'pc:K2' && !c.rows[0].superseded && c.flag === 'AP', 'R20 U1: the latest untrusted line is not "superseded"');
+  const d = run([v('unauth', ['ts-gap'])]);
+  assert.ok(!d.rows[0].superseded && d.tags[0].includes(t('status.tip.unauth')) && d.flag === 'AU', 'R20 U1: an unauth latest line keeps the 인증 안 됨 tip');
+  const e = run([v('auth', ['frame-gap'])], { repairs: [{ line: 1, logged_unix: 10 }] });
+  assert.ok(e.rows[0].trust === 'auth' && e.rows[0].repairedAfter === true && e.tags[0].includes(t('status.tip.repairedAfter')) && e.flag === 'AU', 'R20 U1: before a lane repair → 최신 여부 알 수 없음, counted: ' + JSON.stringify(e));
+  assert.equal(run([v('auth', ['frame-gap']), v('auth', ['frame-gap'])]).flag, 'A', 'R20 U1: the current usable flag still wins');
+  console.log('PASS VM R20 U1 superseded validation flags keep their trust, say 대체된 이전 검증, still count');
+
+  // U2: the not-current detail goes through i18n (ko + en).
+  assert.ok(!source.includes('"validation anomaly_flags (not current)"') || /"anomaly\.validationFlagOld": "validation anomaly_flags \(not current\)"/.test(source) && source.split('"validation anomaly_flags (not current)"').length === 2, 'R20 U2: no hard-coded "validation anomaly_flags (not current)" outside i18n');
+  const ko = word('anomaly.validationFlagOld', 0), en = word('anomaly.validationFlagOld', 1);
+  assert.ok(ko && en && ko !== en, 'R20 U2: ko + en text');
+  assert.equal(a.rows[0].detail, ko, 'R20 U2: the row detail is the i18n text');
+  console.log('PASS VM R20 U2 not-current validation flag detail via i18n');
+
+  // U3: CSV formula injection.
+  const cctx = {};
+  runInNewContext(fn('csvCell'), cctx);
+  const cell = (x) => runInNewContext('csvCell(x)', Object.assign(cctx, { x }));
+  assert.equal(cell('=1+1'), "'=1+1", 'R20 U3: = prefixed');
+  assert.equal(cell('+cmd'), "'+cmd", 'R20 U3: + prefixed');
+  assert.equal(cell('-2+3'), "'-2+3", 'R20 U3: - prefixed');
+  assert.equal(cell('@SUM(A1)'), "'@SUM(A1)", 'R20 U3: @ prefixed');
+  assert.equal(cell('\tx'), "'\tx", 'R20 U3: tab prefixed');
+  assert.equal(cell('\rx'), "\"'\rx\"", 'R20 U3: CR prefixed and quoted');
+  assert.equal(cell('=a,"b"'), "\"'=a,\"\"b\"\"\"", 'R20 U3: prefixed, then quoted');
+  assert.equal(cell('a=b'), 'a=b', 'R20 U3: a later = is fine');
+  assert.equal(cell(12), '12', 'R20 U3: numbers as before');
+  assert.equal(cell(-12.3), '-12.3', 'R20 U3: a negative number is not a formula');
+  assert.equal(cell('-38.04'), '-38.04', 'R20 U3: a negative number text is not a formula');
+  assert.equal(cell('-'), '-', 'R20 U3: the "-" placeholder as before');
+  assert.equal(cell('-1+2'), "'-1+2", 'R20 U3: a sum is prefixed');
+  assert.equal(cell('+1'), '+1', 'R20 U3: a signed number stays');
+  console.log('PASS VM R20 U3 CSV cells starting with = + - @ tab CR get a leading \'');
+
+  // U4: the legacy shell normPath maps E:\. like the app shell.
+  const legacy = readFileSync(new URL('../assets/legacy/app/30-form.js', import.meta.url), 'utf8');
+  const lnp = legacy.match(/^function normPath\([^]*?^}/m)?.[0];
+  assert.ok(lnp, 'R20 U4: legacy normPath exists');
+  const lctx = {};
+  runInNewContext(lnp, lctx);
+  const ln = (p) => runInNewContext('normPath(p)', Object.assign(lctx, { p }));
+  assert.ok(ln('E:\\.') === ln('E:\\') && ln('e:/.') === ln('E:') && ln('E:\\.') !== ln('F:\\'), 'R20 U4: legacy normPath E:\\. = E:\\');
+  assert.equal(ln('E:\\x\\.'), 'e:/x/.', 'R20 U4: only the drive root form');
+  console.log('PASS VM R20 U4 legacy normPath maps E:\\. like the app shell');
+
+  // U5: drive-root case names.
+  const { appBundleJs } = await import('./lib/app-bundle.mjs');
+  const appJs = appBundleJs();
+  const sfn = (name) => appJs.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'))?.[0];
+  const sctx = {};
+  runInNewContext(['hBaseName', 'caseBaseName'].map((n) => { const f = sfn(n); assert.ok(f, `R20 U5: ${n} exists`); return f; }).join('\n') + '\n' + (sfn('hCaseName') || ''), sctx);
+  const se = (x) => runInNewContext(x, sctx);
+  assert.equal(se('hBaseName("E:\\\\.")'), 'E:', 'R20 U5: hBaseName(E:\\.) → E:');
+  assert.equal(se('caseBaseName("E:\\\\.")'), 'E:', 'R20 U5: caseBaseName(E:\\.) → E:');
+  assert.equal(se('hBaseName("C:\\\\cases\\\\c1\\\\.")'), 'c1', 'R20 U5: a trailing \\. on a folder');
+  assert.equal(se('hBaseName("C:\\\\cases\\\\c1\\\\")'), 'c1', 'R20 U5: trailing separator as before');
+  assert.equal(se('hBaseName("/srv/x/..")'), '..', 'R20 U5: only a single dot is stripped');
+  assert.equal(se('typeof hCaseName === "function" ? hCaseName(".", "E:\\\\.") : "."'), 'E:', 'R20 U5: a server name "." shows the drive');
+  assert.equal(se('hCaseName("사건1", "E:\\\\.")'), '사건1', 'R20 U5: a real name is kept');
+  assert.equal((appJs.match(/hCaseName\(it\.name, it\.case_dir\)/g) || []).length, 2, 'R20 U5: both recent lists use hCaseName');
+  console.log('PASS VM R20 U5 drive-root case names show the drive, never "."');
+
+  // U6: drafts under an older key of the same folder move to the new key.
+  const hostSrc = readFileSync(new URL('../assets/viewer/00-host.js', import.meta.url), 'utf8');
+  const hctx = { EventTarget, AbortController, CustomEvent: class extends Event {}, crypto: globalThis.crypto, Uint32Array, location: { origin: 'http://127.0.0.1:1', pathname: '/viewer/' },
+    document: { documentElement: { hasAttribute: () => true, dataset: {} } }, localStorage: { setItem() {} }, setInterval, clearInterval };
+  hctx.window = hctx;
+  runInNewContext(hostSrc, hctx);
+  const ck = (dd, m) => runInNewContext('FTViewer.caseStorageKey(m, dd)', Object.assign(hctx, { dd, m: m || null }));
+  const al = (dd, m) => plain(runInNewContext('FTViewer.caseStorageKeyAliases ? FTViewer.caseStorageKeyAliases(m, dd) : []', Object.assign(hctx, { dd, m: m || null })));
+  const dir = 'C:\\Cases\\c1';
+  const aliases = al(dir);
+  for (const old of ['C:\\Cases\\c1\\.', 'c:\\Cases\\c1', 'C:\\\\Cases\\\\c1', 'C://Cases//c1/', 'c:\\Cases\\c1\\.\\']) {
+    assert.ok(aliases.includes(ck(old)), `R20 U6: an old key candidate covers ${old}`);
+  }
+  assert.ok(!aliases.includes(ck(dir)) && aliases.length > 0, 'R20 U6: never the current key');
+  assert.deepEqual(al(dir, { case_id: 'k1' }), [], 'R20 U6: a case with case_id has no aliases');
+  assert.deepEqual(al('<case>'), [], 'R20 U6: a redacted bundle has none');
+  const mk = (init, failSet) => {
+    const m = new Map(Object.entries(init));
+    return { m, get length() { return m.size; }, key: (i) => [...m.keys()][i] ?? null, getItem: (k) => (m.has(k) ? m.get(k) : null),
+      setItem: (k, val) => { if (failSet) { const err = new Error('quota'); err.name = 'QuotaExceededError'; throw err; } m.set(k, String(val)); }, removeItem: (k) => { m.delete(k); } };
+  };
+  const P = 'ft.draft.' + ck(dir) + '.', OP = 'ft.draft.' + ck('C:\\Cases\\c1\\.') + '.';
+  const mfn = fn('migrateAliasDrafts');
+  assert.ok(mfn, 'R20 U6: migrateAliasDrafts exists');
+  const mig = (ls) => { const mc = { localStorage: ls, DRAFT_PREFIX: P, errors: 0, reportStorageError() { mc.errors += 1; }, al: aliases }; runInNewContext(mfn, mc); return { n: runInNewContext('migrateAliasDrafts(al)', mc), mc }; };
+  const ls1 = mk({ [OP + 'w1.rec:1']: '{"note":"a"}', [OP + 'w1.rec:2']: '{"note":"b"}', 'ft.draft.other.w1.rec:3': '{"note":"x"}' });
+  assert.equal(mig(ls1).n, 2, 'R20 U6: two drafts moved');
+  assert.ok(ls1.m.get(P + 'w1.rec:1') === '{"note":"a"}' && ls1.m.get(P + 'w1.rec:2') === '{"note":"b"}' && !ls1.m.has(OP + 'w1.rec:1') && ls1.m.has('ft.draft.other.w1.rec:3'), 'R20 U6: moved under the new key, others untouched');
+  const ls2 = mk({ [OP + 'w1.rec:1']: '{"note":"old"}', [P + 'w1.rec:1']: '{"note":"new"}' });
+  mig(ls2);
+  assert.ok(ls2.m.get(P + 'w1.rec:1') === '{"note":"new"}' && ls2.m.get(OP + 'w1.rec:1') === '{"note":"old"}', 'R20 U6: a different value under the new key: both kept');
+  const ls3 = mk({ [OP + 'w1.rec:1']: '{"note":"a"}' }, true);
+  const r3 = mig(ls3);
+  assert.ok(r3.n === 0 && ls3.m.get(OP + 'w1.rec:1') === '{"note":"a"}' && r3.mc.errors === 1, 'R20 U6: a failed write keeps the old draft');
+  const at = source.indexOf('migrateAliasDrafts(typeof CASE_KEY_ALIASES');
+  assert.ok(at > 0 && at < source.indexOf('const entries = storedDraftEntries();'), 'R20 U6: migrated at boot before the drafts are read');
+  console.log('PASS VM R20 U6 drafts under pre-normalization keys move to the new key (nothing lost)');
+
+  // U7: (track I b9067ba) head reason_code "lane-changed" — unknown, its own short words, no tamper verdict.
+  const reasonConst = source.match(/^const ANOMALY_HEAD_REASON = [^]*?\};$/m)?.[0];
+  const heldConst = source.match(/^const ANOMALY_WITHHELD_CODE = [^]*?\};$/m)?.[0];
+  assert.ok(reasonConst && heldConst, 'R20 track I: ANOMALY_HEAD_REASON / ANOMALY_WITHHELD_CODE exist');
+  const hv = { logChains: { anomaly: { head: { status: 'unknown', reason_code: 'lane-changed', withhold_reason: 'lane changed during read', detail: null } } }, viewerTrustFromBundle: () => false, t };
+  runInNewContext([reasonConst, heldConst, fn('anomalyHeadState'), fn('anomalyWithheldShort'), source.match(/^var anomalyHead = .*$/m)?.[0]].join('\n'), hv);
+  const lh = plain(runInNewContext('anomalyHead', hv));
+  const lk = runInNewContext('ANOMALY_HEAD_REASON["lane-changed"]', hv);
+  assert.ok(lk && word(lk, 0) && word(lk, 1) && word(lk, 0) !== word(lk, 1), 'R20 track I: lane-changed has its own words (ko + en): ' + lk);
+  assert.equal(word(lk, 0), '이상 징후 기록이 읽는 중 바뀜 — 다시 확인', 'R20 track I: lane-changed ko words');
+  assert.ok(lh && lh.level === 'warn' && lh.code === 'lane-changed' && lh.tip.includes(word(lk, 0)) && !/변조/.test(lh.tip), 'R20 track I: lane-changed → warn (확인 불가), not a tamper verdict: ' + JSON.stringify(lh));
+  assert.equal(runInNewContext('anomalyWithheldShort({ withheldCodes: ["lane-changed"] })', hv), word('anomalyHead.held.laneChanged'), 'R20 track I: lane-changed as a withholding code reads short');
+  console.log('PASS VM R20 track I lane-changed head: 이상 징후 기록이 읽는 중 바뀜 — 다시 확인 (warn, no tamper verdict)');
 }
 
 // ---- R19 track U (docs/PLAN_R19_2026-10-19.md, P33) ------------------------
@@ -771,7 +915,7 @@ async function unitTests() {
 async function r19TrackU({ fn, source, runInNewContext, assert }) {
   const plain = (v) => JSON.parse(JSON.stringify(v));
   const names = ['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'logRepairs', 'logPosOf', 'logSlots', 'splitValidationSlots', 'recordAnomalies'];
-  const ctx = { anomaliesBySelector: new Map() };
+  const ctx = { anomaliesBySelector: new Map(), t: (k) => k };
   runInNewContext(names.map((n) => { const f = fn(n); assert.ok(f, `R19 U1: ${n} exists`); return f; }).concat([fn('validationFlagRows') || '']).join('\n'), ctx);
   // The record as the builders make it: the path's usable validation + the flags of its other lines.
   const rec = (vl, chain) => plain(runInNewContext(`(() => { const key = (i) => i.target_path || '';
@@ -1105,7 +1249,7 @@ async function r17TrackU({ fn, source, runInNewContext, assert, ex }) {
   const byId = new Map([['a', [{ kind: 'gop-gap', trust: 'auth' }]], ['b', [{ kind: 'gop-gap', trust: 'unauth' }]], ['c', [{ kind: 'ts-gap', trust: 'pc:K2' }, { kind: 'x', trust: 'sc' }]],
     ['d', [{ kind: 'gop-gap', trust: 'pc:K2' }]], ['e', [{ kind: 'old' }]]]);
   // (f) through the real path (R19 U1): an authenticated flagged validation, then one unkeyed line.
-  const vctx = {};
+  const vctx = { t: (k) => k };
   runInNewContext(['logTrustOf', 'logTrustUsable', 'logTrustPcKey', 'logTrustSuperseded', 'logRepairs', 'logPosOf', 'logSlots', 'splitValidationSlots', 'validationFlagRows'].map((n) => {
     const f = fn(n); assert.ok(f, `R17 U2 (f): ${n} exists`); return f; }).join('\n'), vctx);
   const fRec = runInNewContext(`(() => { const vl = [{ target_path: 'f', trust: 'unauth', trust_superseded_by: 2, anomaly_flags: ['vf'] }, { target_path: 'f', trust: 'unauth' }];

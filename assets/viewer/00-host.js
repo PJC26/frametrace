@@ -93,6 +93,9 @@ const FTViewer = (() => {
     // R19 (track S1): the server's drive root `E:\.` keeps the `E:\` key.
     let seed = dir && dir !== "<case>" ? "dir|" + dir.replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([A-Za-z]:)\/\.$/, "$1") : "";
     if (!seed) { try { seed = "page|" + location.origin + location.pathname; } catch (e) { seed = "page|?"; } }
+    return keyOfSeed(seed);
+  }
+  function keyOfSeed(seed) {
     const fnv = (text, h) => {
       for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
       return h.toString(16).padStart(8, "0");
@@ -100,10 +103,32 @@ const FTViewer = (() => {
     // Two independent 32-bit halves: the text forwards and backwards.
     return "nocase-" + fnv(seed, 0x811c9dc5) + fnv([...seed].reverse().join(""), 0x050c5d1f);
   }
+  // R20 U6: the keys the same folder may have had before the server
+  // normalized it (only for a case without case_id): a trailing `\.`, the
+  // other drive-letter case, doubled separators. Pure; never the current key.
+  function caseStorageKeyAliases(manifest, caseDir) {
+    const id = manifest && typeof manifest === "object" ? manifest.case_id : null;
+    if ((typeof id === "string" && id.trim()) || (typeof id === "number" && Number.isFinite(id))) return [];
+    const dir = typeof caseDir === "string" ? caseDir.trim() : "";
+    if (!dir || dir === "<case>") return [];
+    const now = caseStorageKey(manifest, caseDir);
+    const p = dir.replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([A-Za-z]:)\/\.$/, "$1");
+    const toggled = /^[A-Za-z]:/.test(p) ? (p[0] === p[0].toUpperCase() ? p[0].toLowerCase() : p[0].toUpperCase()) + p.slice(1) : p;
+    const out = [];
+    for (const base of new Set([p, toggled])) {
+      const doubled = base.replace(/\//g, "//");
+      for (const s of new Set([base, base + "/.", doubled, doubled + "/."])) {
+        const key = keyOfSeed("dir|" + s);
+        if (key !== now && !out.includes(key)) out.push(key);
+      }
+    }
+    return out;
+  }
 
   const api = {
     version: 2,
     caseStorageKey,
+    caseStorageKeyAliases,
     /** Channel names (contract §3.3). ft-review is the shell's (T2);
      *  ft-player:<case_id> is the popup-player bridge (70-player.js). */
     writerToken,

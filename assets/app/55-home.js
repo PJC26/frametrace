@@ -189,7 +189,7 @@ function drawRecentList() {
     const s = recentState(it, st);
     const li = document.createElement("li");
     li.className = "rc-row" + (it.exists === false ? " missing" : "");
-    const name = it.name || hBaseName(it.case_dir) || it.case_dir;
+    const name = hCaseName(it.name, it.case_dir);
     const when = fmtWhen(it.last_opened_unix);
     li.innerHTML =
       `<div class="rc-main"><span class="rc-name" title="${esc(it.case_dir)}">${esc(name)}</span>` +

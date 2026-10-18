@@ -38,7 +38,7 @@ function hProjectPopRender() {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "quiet h-mi";
-    const name = it.name || hBaseName(it.case_dir) || it.case_dir;
+    const name = hCaseName(it.name, it.case_dir);
     const st = recentState(it, lastStatus);
     btn.innerHTML = `<span title="${esc(it.case_dir)}">${esc(name)}</span><small>${esc([fmtWhen(it.last_opened_unix), st.state].filter(Boolean).join(" · "))}</small>`;
     if (it.exists === false) { btn.disabled = true; btn.title = "폴더를 찾을 수 없습니다"; }
