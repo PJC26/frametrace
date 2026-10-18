@@ -740,6 +740,17 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         "anomalyLog",
         case_dir.join("evidence/logs/anomaly-log.jsonl"),
     );
+    // R16 I2 (track U): the sign-off lane's head against the anomaly lane
+    // — the same check the report's anomaly "현재 결과" uses
+    // (`{status, reason_code, withhold_reason, detail}`); the viewer's
+    // anomaly badge withholds / warns on it.
+    log_chains.insert(
+        "anomaly".to_string(),
+        serde_json::json!({
+            "head": crate::report::anomaly_head_check(&case_dir)
+                .to_json_in(crate::report::HeadLane::Anomaly),
+        }),
+    );
     let body = serde_json::json!({
         "ok": true,
         "manifest": read_json(case_dir.join("case.json")),

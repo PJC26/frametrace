@@ -647,6 +647,77 @@ older run). R11:
   lane's last head still restores the previous run (its marker's
   `head_in` names a head that is still there).
 
+### Heads paired with their own scan; anchors first (R16)
+
+- **P26 — the reference head is the result run's own (I1).** Reviewer
+  PoC-A: an R15 scan (v2 head H1), then an R14 build's scan with the same
+  key — its v1 head H2 (no `lanes`) is written BEFORE its anomaly rows.
+  Cutting the R14 scan's anomaly rows + marker (no key) left H2 as the
+  newest head; it does not anchor the anomaly lane → `absent`, and the
+  report showed the R15 run as "현재 결과 — 후보 0건". Now
+  `report::lane_head_check` pairs: the reference is the newest usable head
+  naming the result id — for the anomaly lane a **v2** head whose
+  `scan_id` is the result marker's; for the re-verification lane the head
+  naming the result `run_id` (v1 or v2). After that head:
+  - a v1 head → `unknown` / `mixed-version` (`HEAD_MIXED_VERSION_NOTE`
+    "이전 버전 머리 섞임");
+  - a head naming another scan → `unknown` / `scan-mismatch`
+    (`HEAD_SCAN_MISMATCH_NOTE` "다른 스캔의 머리"); for the
+    re-verification lane only a head with a non-null `run_id` counts (a
+    scan without re-hash names no run).
+  - An anomaly result marker WITHOUT `scan_id` (an older build's run, or
+    no marker) while any usable v2 head exists → `mixed-version`.
+  - Result marker with `head_in` and no head naming it → `own-head-missing`
+    (R15, unchanged).
+  Consequence: running an R14 build on a case an R15+ build scanned
+  withholds the anomaly result until the next scan with this build (the
+  reason says "이 PC에서 다시 스캔하면 새 머리가 기록돼 해소",
+  `HEAD_RESCAN_NOTE`). The re-verification result of such an R14 re-hash
+  run stays anchored by its own v1 head.
+- **P26 — anchors before trailing lines (I3).** Reviewer PoC-B: the
+  re-verification lane was shorter than its newest head (truncation
+  certain), but one unkeyed line appended to the sign-off lane after the
+  head returned `unknown` / `unusable-line` first — the error "꼬리 잘림"
+  became a warning. Now step 1 compares the newest usable head that
+  anchors the lane (it recorded the most entries — a lane shorter than an
+  older head is shorter than it too): `truncated` / `rewritten` is
+  returned before the no-head, trailing-line, repair, malformed and
+  pairing rules. `intact`, `not-authenticated` and `unreadable` anchors
+  are only returned after those rules.
+- **I2.** `/api/records-meta` carries the anomaly head as
+  `logChains.anomaly.head` — the same `{status, reason_code,
+  withhold_reason, detail}` object as the report's
+  `auditChains.anomaly.head` (`anomaly_head_check(case).to_json_in(Anomaly)`),
+  for the viewer's anomaly badge. (`logChains.anomalyLog` is unchanged.)
+- **I4 — wording, not verdict.** In a shared case another examiner's
+  sign-off written without this PC's key (or under a forged id) is still
+  an unusable line after the head → still withheld (its content is not
+  relied on). The `unusable-line` reason now says which: every such line
+  is, by its own shape, another event (`HEAD_OTHER_EVENT_NOTE`
+  "구조적으로 다른 이벤트 … (event: …) … 변조 판정 아님") vs some line is
+  head-shaped or unreadable ("… HMAC이 제거된 머리 포함"). Both end with
+  `HEAD_RESCAN_NOTE`: a scan on this PC appends a new usable head after
+  them and clears it. `reason_code` stays `unusable-line`.
+- **I5.** `anomaly::scan_case` checks, under its scan lock and before
+  writing anything, that each lane it appends to (sign-off, anomaly, and
+  re-verification with `--rehash`) takes an append
+  (`audit::check_appendable`: a torn last line or an unopenable lane is
+  refused with the append's own words). R15 wrote both result lanes and
+  then failed on the head in a torn sign-off lane.
+- **I6.** `verify-package` (documented in `package.rs`): since R15 the
+  anomaly lane has its own anchor line and a re-verification line can be
+  NOT VERIFIED where R14 said PASS; since R16 FAIL (TAIL CUT /
+  REWRITTEN) wins over an unusable sign-off line after the head, and a
+  package whose result run is followed by an older build's or another
+  scan's head is NOT VERIFIED (`mixed-version` / `scan-mismatch`) —
+  re-scan and re-package.
+- **I7.** Timeline `time_unaudited: true` also for an unchained log's
+  entry (`unchained-log-entry`), an audit entry not authenticated here
+  (`audit-entry-unauthenticated`, carve lane included) and a carve
+  artifact only in `db/carve_results.json`.
+- **Limit (unchanged):** cutting the result lane's tail AND every newer
+  head (the sign-off lane's tail) still restores the previous run.
+
 **Implementation notes (what shipped):**
 
 - `src/hmac.rs` — HMAC-SHA-256 hand-assembled over the existing `sha2`

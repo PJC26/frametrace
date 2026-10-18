@@ -48,7 +48,9 @@ pub struct TimelineEvent {
     /// without `carved_unix`, timed from `db/carve_results.json`; R15 I8:
     /// every index event — file mtime, stale mark, ffprobe creation_time —
     /// read from `db/videos.jsonl`, which no audit chain covers) —
-    /// `"time_unaudited": true` in the JSON (the viewer's badge).
+    /// `"time_unaudited": true` in the JSON (the viewer's badge). R16 I7:
+    /// also every event no chain vouches for — an unchained log's entry,
+    /// an entry not authenticated here, a snapshot-only carve artifact.
     pub time_unaudited: bool,
     pub path: String,
     pub detail: String,
@@ -321,10 +323,12 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             detail.push_str(&format!(" — {CARVE_TIME_UNAUDITED_NOTE}"));
         }
         events.push(match unauthenticated {
+            // R16 I7: a snapshot-only artifact's time comes from
+            // db/carve_results.json — outside every chain.
             None if snapshot => TimelineEvent {
                 ts_unix,
                 source: "carve",
-                time_unaudited: ts_unaudited,
+                time_unaudited: true,
                 kind: CARVED_UNAUDITED_KIND,
                 path: output_path,
                 detail: format!(
@@ -340,10 +344,11 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
                 detail,
             },
             // R9 P3: shown, but distinguished — never a carved candidate.
+            // R16 I7: nothing vouches for an unauthenticated entry's time.
             Some(note) => TimelineEvent {
                 ts_unix,
                 source: "carve",
-                time_unaudited: ts_unaudited,
+                time_unaudited: true,
                 kind: UNAUTHENTICATED_KIND,
                 path: output_path,
                 detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
@@ -515,10 +520,11 @@ fn audit_log_events(
                 )
             };
             events.push(match unauthenticated {
+                // R16 I7: an unchained log's time is vouched by nothing.
                 None => TimelineEvent {
                     ts_unix: ts,
                     source: "audit-log",
-                    time_unaudited: false,
+                    time_unaudited: !chained,
                     kind: if chained {
                         "audit-event"
                     } else {
@@ -527,10 +533,11 @@ fn audit_log_events(
                     path,
                     detail,
                 },
+                // R16 I7: nor an unauthenticated entry's.
                 Some(note) => TimelineEvent {
                     ts_unix: ts,
                     source: "audit-log",
-                    time_unaudited: false,
+                    time_unaudited: true,
                     kind: UNAUTHENTICATED_KIND,
                     path,
                     detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),

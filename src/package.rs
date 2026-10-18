@@ -1986,6 +1986,17 @@ fn verify_package_manifest_json(
 /// there — R14 checked with no result run, so a cut head of the result
 /// run was not seen). Nothing is said for a lane not in the package or
 /// when there is no head and nothing could hide one (`Absent`).
+///
+/// R16 I6 — what changed for `verify-package` users (R15 → R16): these two
+/// lines are NEW in R15 for the anomaly lane (subject
+/// `evidence/logs/anomaly-log.jsonl`), and since R15 a re-verification
+/// line can be NOT VERIFIED where R14 printed PASS (the result run's own
+/// head missing: `own-head-missing`; no usable head but an unusable /
+/// broken / repaired sign-off lane). R16 P26: FAIL (TAIL CUT / REWRITTEN)
+/// now wins over an unusable sign-off line after the head (R15: NOT
+/// VERIFIED), and a package whose result run is followed by an older
+/// build's head or another scan's head is NOT VERIFIED
+/// (`mixed-version` / `scan-mismatch`; re-scan and re-package to clear).
 fn verify_package_hash_verify_head(
     package_dir: &Path,
     listed: &std::collections::BTreeMap<String, String>,

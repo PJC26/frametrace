@@ -156,6 +156,11 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
     // R14 P20: one scan at a time per case — two writers interleaving
     // their runs is what made position-based run judgement unsafe.
     let _lock = ScanLock::acquire(case_dir)?;
+    // R16 I5: every lane this scan appends to must take an append NOW —
+    // a torn sign-off lane made the scan write both result lanes and then
+    // fail on its head (a result without its anchor). Refused before any
+    // result lane is touched.
+    preflight_scan_lanes(case_dir, rehash)?;
     let (rows, index_coverage) = read_indexed_rows_checked(case_dir)?;
     let mut findings = Vec::new();
     let mut coverage = RehashCoverage::default();
@@ -273,6 +278,27 @@ pub fn scan_case(case_dir: &Path, rehash: bool) -> Result<AnomalyScanResult, Str
         checks,
         hash_verify_run_id,
     })
+}
+
+/// R16 I5: the lanes [`scan_case`] appends to — the re-verification lane
+/// (with `rehash`), the anomaly lane and the sign-off lane (its head) —
+/// all accept an append, checked before the scan writes anything.
+pub(crate) fn preflight_scan_lanes(case_dir: &Path, rehash: bool) -> Result<(), String> {
+    let mut lanes = vec![
+        crate::report::SIGNOFF_LOG_REL_PATH,
+        crate::report::ANOMALY_LOG_REL_PATH,
+    ];
+    if rehash {
+        lanes.push(HASH_VERIFY_REL_PATH);
+    }
+    for rel in lanes {
+        audit::check_appendable(&case_dir.join(rel)).map_err(|err| {
+            format!(
+                "이상 징후 검사를 시작하지 않았습니다 — {rel}에 항목을 이어 쓸 수 없어(결과 레인을 건드리기 전에 확인) 결과와 머리를 함께 남길 수 없습니다: {err}"
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// R14 P20: the case-level exclusive lock of an anomaly / re-hash scan.

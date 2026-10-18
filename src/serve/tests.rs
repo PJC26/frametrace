@@ -1406,3 +1406,42 @@ fn records_share_cached_index_and_meta_omits_videos() {
     assert_eq!(third["schema"], "y");
     let _ = std::fs::remove_dir_all(&case_dir);
 }
+
+/// R16 I2 (track U contract): records-meta carries the anomaly lane's
+/// head check as `logChains.anomaly.head` — `{status, reason_code,
+/// withhold_reason, detail}`, the same object as the report's
+/// `auditChains.anomaly.head`.
+#[test]
+fn records_meta_carries_the_anomaly_head() {
+    let case_dir = scratch_dir("records-meta-anomaly-head");
+    std::fs::create_dir_all(case_dir.join("db")).unwrap();
+    std::fs::write(case_dir.join("db/videos.jsonl"), b"").unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case_dir.clone());
+    crate::audit_key::with_test_keys(&[], || {
+        let meta =
+            || -> serde_json::Value { serde_json::from_str(&api_records_meta(&state)).unwrap() };
+        let head = meta()["logChains"]["anomaly"]["head"].clone();
+        assert_eq!(head["status"], "absent", "{head}");
+        crate::anomaly::scan_case(&case_dir, false).unwrap();
+        let head = meta()["logChains"]["anomaly"]["head"].clone();
+        assert_eq!(head["status"], "intact", "{head}");
+        assert!(head["reason_code"].is_null() && head["withhold_reason"].is_null());
+        // The scan's anomaly rows cut (no key): the lane is shorter than
+        // its head.
+        let lane = case_dir.join(crate::report::ANOMALY_LOG_REL_PATH);
+        let text = std::fs::read_to_string(&lane).unwrap();
+        let first_line = text.find('\n').unwrap() + 1;
+        std::fs::write(&lane, &text[..first_line]).unwrap();
+        let head = meta()["logChains"]["anomaly"]["head"].clone();
+        assert_eq!(head["status"], "truncated", "{head}");
+        assert!(
+            head["withhold_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains(crate::report::HASH_VERIFY_HEAD_TRUNCATED)),
+            "{head}"
+        );
+        assert!(head["detail"].is_string(), "{head}");
+    });
+    let _ = std::fs::remove_dir_all(&case_dir);
+}

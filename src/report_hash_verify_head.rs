@@ -13,6 +13,12 @@
 //! (withheld) — the unusable line may be the stripped head, and its
 //! content is never read.
 //!
+//! R16 P26: a head is paired with its own scan — the result run's head
+//! (same id; for the anomaly lane a v2 head with the marker's `scan_id`)
+//! is the reference, and an older build's (v1) head or another scan's
+//! head after it withholds. Anchor comparison (tail cut / rewritten) is
+//! judged before any trailing-line rule.
+//!
 //! Kept apart from the finalize pairing code in `report.rs` (track S).
 
 use std::path::Path;
@@ -196,8 +202,9 @@ impl HashVerifyHeadCheck {
     /// R15: why the head is `unknown` (`/api/verify-sources`
     /// `head_reason`): `other-pc` (the unusable sign-off lines are another
     /// PC's — [`HEAD_OTHER_PC_NOTE`]), `unusable-line`, `chain-failed`,
-    /// `repaired`, `malformed`, `own-head-missing`, `unreadable`. `None`
-    /// for every other state.
+    /// `repaired`, `malformed`, `own-head-missing`, `unreadable`; R16 P26:
+    /// `mixed-version` ([`HEAD_MIXED_VERSION_NOTE`]), `scan-mismatch`
+    /// ([`HEAD_SCAN_MISMATCH_NOTE`]). `None` for every other state.
     pub fn reason_code(&self) -> Option<&'static str> {
         match self {
             Self::Unknown { code, .. } => Some(code),
@@ -288,8 +295,26 @@ fn other_pc_line(row: &crate::audit::LaneRow) -> bool {
         && row.lane_broken_at.is_none()
 }
 
+/// R16 I4: an unusable line that is, by its own (unauthenticated) shape,
+/// another sign-off event — a JSON object whose `event` names something
+/// other than [`HASH_VERIFY_HEAD_EVENT`]. Only the WORDING depends on it
+/// (the content is not relied on: the result is withheld either way).
+fn other_event_line(row: &crate::audit::LaneRow) -> bool {
+    row.value
+        .get("event")
+        .and_then(|v| v.as_str())
+        .is_some_and(|event| event != HASH_VERIFY_HEAD_EVENT)
+}
+
+/// R16 I4: what resolves an `unknown` head on this PC.
+pub const HEAD_RESCAN_NOTE: &str = "이 PC에서 다시 스캔하면 새 머리가 기록돼 해소";
+
 /// `Unknown` for `count` unusable sign-off lines (`where_`: Korean
-/// position phrase), split by I5: all another PC's → `other-pc`.
+/// position phrase), split by I5: all another PC's → `other-pc`. R16 I4:
+/// the `unusable-line` wording says whether every line is, by its shape,
+/// another event (a shared case's sign-off written without this PC's key
+/// — "구조적으로 다른 이벤트", no tamper wording) or some line could be a
+/// head (head-shaped or unreadable — "알 수 없음", may be a stripped head).
 fn unusable_unknown(
     rows: &[&crate::audit::LaneRow],
     where_: &str,
@@ -313,13 +338,30 @@ fn unusable_unknown(
             ),
         };
     }
+    if rows.iter().all(|row| other_event_line(row)) {
+        let events: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .filter_map(|row| row.value.get("event").and_then(|v| v.as_str()))
+            .collect();
+        let events = events.into_iter().collect::<Vec<_>>().join(", ");
+        return HashVerifyHeadCheck::Unknown {
+            code: "unusable-line",
+            why: format!(
+                "{HEAD_OTHER_EVENT_NOTE} — 서명 감사 레인의 {where_} 이 PC에서 인증할 수 없는 다른 이벤트 줄 {count}개(event: {events}): 머리가 아닌 이벤트로 적혀 있으나 인증되지 않아 그 내용에 기대지 않으므로 현재 결과를 보류함 (공유 케이스에서 키 없이·다른 키로 쓴 서명 등; 변조 판정 아님 — {HEAD_RESCAN_NOTE})"
+            ),
+        };
+    }
     HashVerifyHeadCheck::Unknown {
         code: "unusable-line",
         why: format!(
-            "서명 감사 레인의 {where_} 이 PC에서 쓸 수 없는 줄 {count}개 — 더 새 {head}일 수 있어(HMAC이 제거된 머리 포함) 비교할 머리를 알 수 없음"
+            "서명 감사 레인의 {where_} 이 PC에서 쓸 수 없는 줄 {count}개 — 머리 모양이거나 내용을 알 수 없는 줄이 있어 더 새 {head}일 수 있음(HMAC이 제거된 머리 포함) — 비교할 머리를 알 수 없음 ({HEAD_RESCAN_NOTE})"
         ),
     }
 }
+
+/// R16 I4: the start of the `unusable-line` reason when every such line
+/// is, by its shape, another event (not a head).
+pub const HEAD_OTHER_EVENT_NOTE: &str = "구조적으로 다른 이벤트";
 
 /// R14 I3: the newest usable head against `root`'s re-verification lane
 /// (a case folder or a package). `result_marker_wants_head`: the result
@@ -368,14 +410,64 @@ pub fn anomaly_head_check(root: &Path) -> HashVerifyHeadCheck {
     lane_head_check(root, HeadLane::Anomaly, scan_id.as_deref(), wants)
 }
 
-/// The newest usable [`HASH_VERIFY_HEAD_EVENT`] in `root`'s sign-off lane
-/// against `root`'s `lane` (P22).
+/// R16 P26: a usable head's anchor for `lane` — `Ok(Some((entries,
+/// last_entry_sha256)))` (`(0, "")` for a lane empty at the time),
+/// `Ok(None)` when the head does not anchor `lane` (an R14 head and the
+/// anomaly lane), `Err` when it is malformed.
+fn head_anchor(value: &serde_json::Value, lane: HeadLane) -> Result<Option<(u64, String)>, String> {
+    // R15: a v2 head names every lane in `lanes`; an R14 head anchors the
+    // re-verification lane at the top level only.
+    let anchor = match value.get("lanes") {
+        Some(lanes) => match lanes.get(lane.rel()) {
+            Some(anchor) => anchor,
+            None => return Err(format!("lanes에 {}이 없음", lane.rel())),
+        },
+        None if lane == HeadLane::HashVerify => value,
+        None => return Ok(None),
+    };
+    let entries = anchor.get("entries").and_then(|v| v.as_u64());
+    let last = anchor.get("last_entry_sha256").and_then(|v| v.as_str());
+    match (entries, last) {
+        (Some(0), _) => Ok(Some((0, String::new()))),
+        (Some(entries), Some(last)) => Ok(Some((entries, last.to_string()))),
+        _ => Err("entries / last_entry_sha256이 없음".to_string()),
+    }
+}
+
+/// R16 P26: a v2 head (R15+: `lanes`, written at the END of the scan).
+fn is_v2_head(value: &serde_json::Value) -> bool {
+    value.get("lanes").is_some()
+}
+
+/// R16 P26: the start of the `mixed-version` reason — an older build's
+/// (v1) head after the result run's own head, or an anomaly result run
+/// without `scan_id` in a lane a v2 head anchors.
+pub const HEAD_MIXED_VERSION_NOTE: &str = "이전 버전 머리 섞임";
+
+/// R16 P26: the start of the `scan-mismatch` reason — a newer head names
+/// another scan than the result run's.
+pub const HEAD_SCAN_MISMATCH_NOTE: &str = "다른 스캔의 머리";
+
+/// The usable [`HASH_VERIFY_HEAD_EVENT`]s in `root`'s sign-off lane against
+/// `root`'s `lane` (P22; R16 P26).
+///
+/// R16 P26 order: (1) the newest usable head anchoring `lane` is compared
+/// FIRST — `Truncated` / `Rewritten` is certain whatever follows in the
+/// sign-off lane (R15 let one unusable line after it turn "꼬리 잘림" into
+/// `unknown`); (2) the R15 no-head / trailing-line / repair / malformed
+/// rules; (3) the head must pair with the result run — the newest usable
+/// head naming the result id (for the anomaly lane: a v2 head with the
+/// marker's `scan_id`) is the reference, and a v1 head (`mixed-version`)
+/// or a head naming another scan (`scan-mismatch`) AFTER it withholds; an
+/// anomaly result run without `scan_id` (an older build's marker) while a
+/// v2 head exists is `mixed-version` too.
 pub fn lane_head_check(
     root: &Path,
     lane: HeadLane,
     result_id: Option<&str>,
     result_marker_wants_head: bool,
 ) -> HashVerifyHeadCheck {
+    use crate::audit::AnchorStatus;
     let head_word = lane.head_word();
     let signoff = match crate::audit::read_lane_rows(&root.join(super::SIGNOFF_LOG_REL_PATH)) {
         Ok(rows) => rows,
@@ -386,14 +478,67 @@ pub fn lane_head_check(
             };
         }
     };
-    let is_head = |value: &serde_json::Value| {
-        value.get("event").and_then(|v| v.as_str()) == Some(HASH_VERIFY_HEAD_EVENT)
+    let heads: Vec<&crate::audit::LaneRow> = signoff
+        .usable()
+        .filter(|row| {
+            row.value.get("event").and_then(|v| v.as_str()) == Some(HASH_VERIFY_HEAD_EVENT)
+        })
+        .collect();
+    let id_of = |row: &crate::audit::LaneRow| {
+        row.value
+            .get(lane.id_field())
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     };
-    let names_result = |value: &serde_json::Value, result: &str| {
-        value.get(lane.id_field()).and_then(|v| v.as_str()) == Some(result)
-    };
-    let newest = signoff.usable().rev().find(|row| is_head(&row.value));
-    let Some(head_row) = newest else {
+
+    // (1) P26: anchors first — the newest usable head that anchors `lane`
+    // (it recorded the most entries: a lane shorter than an older head is
+    // shorter than this one too).
+    let anchored = heads.iter().rev().find_map(|row| {
+        head_anchor(&row.value, lane)
+            .ok()
+            .flatten()
+            .map(|anchor| (*row, anchor))
+    });
+    let anchor_status = anchored.map(|(row, (entries, last))| {
+        let status = if entries == 0 {
+            // The lane was empty when the head was written: nothing to lose.
+            AnchorStatus::Intact
+        } else {
+            crate::audit::check_lane_anchor(
+                &root.join(lane.rel()),
+                &crate::audit::LaneHead {
+                    entries,
+                    last_entry_sha256: last,
+                },
+            )
+        };
+        (row, entries, status)
+    });
+    match &anchor_status {
+        Some((_, entries, AnchorStatus::Truncated { now })) => {
+            return HashVerifyHeadCheck::Truncated {
+                entries: *entries,
+                now: *now,
+            };
+        }
+        Some((_, entries, AnchorStatus::Missing)) => {
+            return HashVerifyHeadCheck::Truncated {
+                entries: *entries,
+                now: 0,
+            };
+        }
+        Some((_, entries, AnchorStatus::Rewritten)) => {
+            return HashVerifyHeadCheck::Rewritten {
+                entries: *entries,
+                why: format!("{entries}번째 항목이 머리가 기록한 항목이 아님(레인 재작성)"),
+            };
+        }
+        _ => {}
+    }
+
+    // (2) No usable head at all.
+    let Some(newest) = heads.last().copied() else {
         if result_marker_wants_head {
             return HashVerifyHeadCheck::Unknown {
                 code: "own-head-missing",
@@ -406,7 +551,7 @@ pub fn lane_head_check(
         // R15 P22 (I1): no usable head — a line this PC cannot use, a chain
         // failure or a repair in the sign-off lane may BE the newest head
         // (its HMAC stripped, or cut by the repair). Its content is never
-        // read: unknown, not "absent".
+        // relied on: unknown, not "absent".
         if let Some(failure) = &signoff.failure {
             return HashVerifyHeadCheck::Unknown {
                 code: "chain-failed",
@@ -430,15 +575,15 @@ pub fn lane_head_check(
         return HashVerifyHeadCheck::Absent;
     };
     // P12 by position: an unusable line after the newest usable head may
-    // itself be a newer head — its content is never read.
+    // itself be a newer head — its content is never relied on.
     let unusable_after: Vec<&crate::audit::LaneRow> = signoff
         .unusable()
-        .filter(|row| row.index > head_row.index)
+        .filter(|row| row.index > newest.index)
         .collect();
     if !unusable_after.is_empty() {
         return unusable_unknown(&unusable_after, "마지막 머리 뒤에", lane);
     }
-    if signoff.repaired_after(head_row.index) {
+    if signoff.repaired_after(newest.index) {
         return HashVerifyHeadCheck::Unknown {
             code: "repaired",
             why: format!(
@@ -446,91 +591,95 @@ pub fn lane_head_check(
             ),
         };
     }
-    let value = &head_row.value;
-    let head_run = value
-        .get(lane.id_field())
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    // R15: a v2 head names every lane in `lanes`; an R14 head anchors the
-    // re-verification lane at the top level only.
-    let anchor = match value.get("lanes") {
-        Some(lanes) => match lanes.get(lane.rel()) {
-            Some(anchor) => anchor,
-            None => {
+    if let Err(why) = head_anchor(&newest.value, lane) {
+        return HashVerifyHeadCheck::Unknown {
+            code: "malformed",
+            why: format!(
+                "{head_word}(서명 감사 레인 {}번째 줄)에 {why}",
+                newest.index + 1
+            ),
+        };
+    }
+
+    // (3) P26: the head must pair with the result run.
+    let paired = result_id.and_then(|result| {
+        heads.iter().rposition(|row| {
+            id_of(row).as_deref() == Some(result)
+                && (lane == HeadLane::HashVerify || is_v2_head(&row.value))
+        })
+    });
+    match (result_id, paired) {
+        (Some(result), Some(at)) => {
+            for row in &heads[at + 1..] {
+                if !is_v2_head(&row.value) {
+                    return HashVerifyHeadCheck::Unknown {
+                        code: "mixed-version",
+                        why: format!(
+                            "{HEAD_MIXED_VERSION_NOTE} — 현재 결과 실행({result})의 {head_word}(서명 감사 레인 {}번째 줄) 뒤에 이전 버전(R14 형식, lanes 없음) 머리가 있음(서명 감사 레인 {}번째 줄): 이전 버전 빌드가 그 뒤에 스캔했는데 그 실행이 현재 결과가 아님 — 어느 실행이 현재 결과인지 머리로 확인할 수 없음 ({HEAD_RESCAN_NOTE})",
+                            heads[at].index + 1,
+                            row.index + 1
+                        ),
+                    };
+                }
+                let other = id_of(row);
+                let mismatch = match lane {
+                    HeadLane::Anomaly => other.as_deref() != Some(result),
+                    // A scan without re-hash names no re-verification run.
+                    HeadLane::HashVerify => other.as_deref().is_some_and(|id| id != result),
+                };
+                if mismatch {
+                    return HashVerifyHeadCheck::Unknown {
+                        code: "scan-mismatch",
+                        why: format!(
+                            "{HEAD_SCAN_MISMATCH_NOTE} — 현재 결과 실행({result})의 {head_word} 뒤에 다른 스캔({})의 머리가 있음(서명 감사 레인 {}번째 줄): 그 스캔의 완료 표식이 이 레인에서 쓸 수 있는 결과가 아님 — 지워졌거나 인증되지 않음 ({HEAD_RESCAN_NOTE})",
+                            other.as_deref().unwrap_or("?"),
+                            row.index + 1
+                        ),
+                    };
+                }
+            }
+        }
+        (Some(result), None) if result_marker_wants_head => {
+            // The result run says it anchored itself, but no usable head
+            // names it — its own head is gone (the sign-off lane's tail
+            // cut, or the head write failed).
+            return HashVerifyHeadCheck::Unknown {
+                code: "own-head-missing",
+                why: format!("현재 결과 실행({result})의 {head_word}가 서명 감사 레인에 없음"),
+            };
+        }
+        _ => {
+            if lane == HeadLane::Anomaly && heads.iter().any(|row| is_v2_head(&row.value)) {
                 return HashVerifyHeadCheck::Unknown {
-                    code: "malformed",
+                    code: "mixed-version",
                     why: format!(
-                        "{head_word}(서명 감사 레인 {}번째 줄)의 lanes에 {}이 없음",
-                        head_row.index + 1,
-                        lane.rel()
+                        "{HEAD_MIXED_VERSION_NOTE} — 현재 결과 후보인 이상 징후 완료 표식에 scan_id가 없음(이전 버전 빌드의 실행이거나 완료 표식 없음)인데 서명 감사 레인에 R15 형식 {head_word}가 있어 결과 실행과 머리를 짝지을 수 없음 ({HEAD_RESCAN_NOTE})"
                     ),
                 };
             }
-        },
-        None if lane == HeadLane::HashVerify => value,
-        // An R14 head: the anomaly lane was never anchored.
-        None => return HashVerifyHeadCheck::Absent,
-    };
-    let entries = anchor.get("entries").and_then(|v| v.as_u64());
-    let last = anchor.get("last_entry_sha256").and_then(|v| v.as_str());
-    let (entries, last) = match (entries, last) {
-        (Some(0), _) => (0, ""),
-        (Some(entries), Some(last)) => (entries, last),
-        _ => {
-            return HashVerifyHeadCheck::Unknown {
-                code: "malformed",
-                why: format!(
-                    "{head_word}(서명 감사 레인 {}번째 줄)에 entries / last_entry_sha256이 없음",
-                    head_row.index + 1
-                ),
-            };
         }
-    };
-    // The result run says it anchored itself, but no usable head names it
-    // — its own head is gone (the sign-off lane's tail cut, or the head
-    // write failed).
-    if result_marker_wants_head
-        && let Some(result) = result_id
-        && head_run.as_deref() != Some(result)
-        && !signoff
-            .usable()
-            .any(|row| is_head(&row.value) && names_result(&row.value, result))
-    {
-        return HashVerifyHeadCheck::Unknown {
-            code: "own-head-missing",
-            why: format!("현재 결과 실행({result})의 {head_word}가 서명 감사 레인에 없음"),
-        };
     }
-    if entries == 0 {
-        // The lane was empty when the head was written: nothing to lose.
-        return HashVerifyHeadCheck::Intact {
-            entries,
-            run_id: head_run,
-        };
-    }
-    let head = crate::audit::LaneHead {
-        entries,
-        last_entry_sha256: last.to_string(),
-    };
-    match crate::audit::check_lane_anchor(&root.join(lane.rel()), &head) {
-        crate::audit::AnchorStatus::Intact => HashVerifyHeadCheck::Intact {
-            entries,
-            run_id: head_run,
+
+    match anchor_status {
+        // Only R14 heads, and the anomaly lane: nothing anchors it.
+        None => HashVerifyHeadCheck::Absent,
+        Some((row, entries, status)) => match status {
+            AnchorStatus::Intact => HashVerifyHeadCheck::Intact {
+                entries,
+                run_id: id_of(row),
+            },
+            AnchorStatus::Unreadable(err) => HashVerifyHeadCheck::Unknown {
+                code: "unreadable",
+                why: format!("{}을 읽지 못함: {err}", lane.noun()),
+            },
+            AnchorStatus::NotAuthenticated(why) => HashVerifyHeadCheck::NotAuthenticated(why),
+            // Returned in (1).
+            AnchorStatus::Truncated { now } => HashVerifyHeadCheck::Truncated { entries, now },
+            AnchorStatus::Missing => HashVerifyHeadCheck::Truncated { entries, now: 0 },
+            AnchorStatus::Rewritten => HashVerifyHeadCheck::Rewritten {
+                entries,
+                why: format!("{entries}번째 항목이 머리가 기록한 항목이 아님(레인 재작성)"),
+            },
         },
-        crate::audit::AnchorStatus::Truncated { now } => {
-            HashVerifyHeadCheck::Truncated { entries, now }
-        }
-        crate::audit::AnchorStatus::Missing => HashVerifyHeadCheck::Truncated { entries, now: 0 },
-        crate::audit::AnchorStatus::Rewritten => HashVerifyHeadCheck::Rewritten {
-            entries,
-            why: format!("{entries}번째 항목이 머리가 기록한 항목이 아님(레인 재작성)"),
-        },
-        crate::audit::AnchorStatus::Unreadable(err) => HashVerifyHeadCheck::Unknown {
-            code: "unreadable",
-            why: format!("{}을 읽지 못함: {err}", lane.noun()),
-        },
-        crate::audit::AnchorStatus::NotAuthenticated(why) => {
-            HashVerifyHeadCheck::NotAuthenticated(why)
-        }
     }
 }

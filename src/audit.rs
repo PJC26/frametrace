@@ -1500,6 +1500,27 @@ pub fn append_chained_jsonl_keyed(
     result
 }
 
+/// R16 I5: would [`append_chained_jsonl`] be able to chain onto `path`
+/// now? A missing lane is fine (it is created); a lane ending in a torn
+/// line, or one that cannot be opened / read, is refused with the same
+/// words the append would use. Read-only — a writer calls it BEFORE
+/// touching other lanes, so a multi-lane write does not stop half done.
+pub fn check_appendable(path: &Path) -> Result<(), String> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "failed to open audit log {}: {err}",
+                path.display()
+            ));
+        }
+    };
+    last_committed_line(&mut file)
+        .map(|_| ())
+        .map_err(|err| format!("audit log {} cannot be appended to: {err}", path.display()))
+}
+
 /// The bytes of the last non-blank line of `file`, read backwards from the
 /// end in growing windows (a single 200-result audio entry can exceed one
 /// window). `Ok(None)` for an empty / all-blank log. A log whose final
@@ -4317,3 +4338,7 @@ mod tests_r14;
 #[cfg(test)]
 #[path = "tests_audit_r15.rs"]
 mod tests_r15;
+
+#[cfg(test)]
+#[path = "tests_audit_r16.rs"]
+mod tests_r16;
