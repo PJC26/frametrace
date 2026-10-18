@@ -52,6 +52,8 @@ mod tests_r13_server;
 #[cfg(test)]
 mod tests_r14_server;
 #[cfg(test)]
+mod tests_r16_server;
+#[cfg(test)]
 mod tests_r4_integration;
 #[cfg(test)]
 mod tests_r4_jobs;

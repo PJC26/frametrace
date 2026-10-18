@@ -1147,6 +1147,66 @@ sign-off made an interrupted finalize "finished").
   begin entry (`hash-verify-head`), so the pairing holds; an unkeyed line
   planted after the begin entry still unpairs it.
 
+#### R16 (P24/P25): states are sibling files; a maybe-live writer is never rolled back
+
+R15 advanced the record by atomically rewriting `<id>.json` (MoveFileEx
+over it, then `fs::rename`) and removed it with retries. A program that
+holds the file without delete sharing (an indexer, antivirus, backup) makes
+the rewrites and the removal fail alike: the record stayed `open` and the
+R14-S1 attack (cut the complete line, rebuild the journal, older bytes in
+`finalize.previous-signoff.bin`) rolled the good finalize back again (R15
+reviewer PoC, reproduced with the real CLI and a real locked handle).
+
+- **P24 — one file per state, never rewritten.** `<id>.json` (`open`),
+  `<id>.resolved.json`, `<id>.packaged.json`,
+  `<id>.completed-unrecorded.json`, `<id>.completed.json`, each created with
+  `create_new` (fsync'd, directory flushed; a retried advance finding its
+  own file is success). The state is the highest present, in that order. A
+  lock on one file does not stop the next one being created. Every file
+  present must parse, name its id and its own state and describe the same
+  finalize — otherwise the record is unreadable (`local-unreadable`, never a
+  lower state). Removal goes lowest first and stops at the first failure
+  (retry ≤ 3 s per file), so it never lowers the state.
+- **The journal goes only once the record is past `open`.** After the
+  complete entry, `completed` is created; when it cannot be, the journal is
+  kept as `completed-unrecorded` (the record is then `packaged`, which a
+  cut lane tail finds "finished", not "open"). A recovery that closes a
+  journal by the lane (complete / resolved) first creates `completed` /
+  `resolved` for a lower record; when that fails the journal stays and the
+  finalize is blocked (`blocks_finalize: true`, same reason).
+- **S3.** The complete entry a recovery writes again carries the manifest
+  SHA-256 the record holds; a `completed` / `completed-unrecorded` record
+  whose manifest is no longer the reserved package's is `package-changed`.
+- **S5/S7.** Manifests are hashed streaming (up to 1 GiB) when a record past
+  `open` is judged; the status poll re-hashes manifests up to 16 MiB on every
+  poll (the cache key is size + mtime, which a same-size rewrite can keep).
+  The sweep keeps a record in ANY state whose case is unreachable or still
+  holds its journal (P23 extended).
+- **P25 — maybe-live writer.** A live process matching the journal's pid,
+  start time and FrameTrace name, whose executable is not in this
+  executable's folder or does not hash to `writer_image_sha256` (another
+  FrameTrace install or build), with this PC's local record of the
+  finalize: `in-progress` / `unverified-writer`, nothing recovered, the
+  finalize blocked, `--dismiss` refused; `--dismiss --force` only moves the
+  journal. R15 took it as gone, so opening the case (or `--dismiss`) with
+  another build rolled a running finalize back.
+- **S4.** "Another account's FrameTrace writer" needs the lane's latest
+  trusted begin entry of that finalize to record the same pid (a planted
+  journal or a reused pid no longer blocks 24 h); the block offers
+  `--dismiss --force`.
+- **S8.** `--dismiss --force` of a journal whose writer may still run
+  (verified, unverified, other account) records no `finalize-resolved` and
+  keeps the local record — the writer may still write `finalize-complete`.
+  An `open` journal (writer gone) is still cleaned up first and closed with
+  `resolved (dismissed)`.
+- **Residual.** If the local record folder accepts the `open` file but then
+  refuses both `packaged` and `completed` (disk full, ACL change mid-run) the
+  record stays `open` while the journal stays `completed-unrecorded`; the
+  journal's own state is not trusted, so a cut lane tail then rolls back as
+  in R15. A crash while a state file is half written leaves it unparseable:
+  `local-unreadable` (blocks, dismiss), never a rollback. Forging the local
+  record folder stays out of scope (examiner profile write access).
+
 ## Retired keys
 
 Each key the keyring retires gets a retirement time (`retired` map in

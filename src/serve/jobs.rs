@@ -3093,6 +3093,15 @@ pub(crate) fn finalize_with_exe(
             ),
         )
     };
+    // R16 (track I, I5): make-report --rehash now refuses to start when a
+    // lane its scan appends to (sign-off, anomaly, re-verification) cannot
+    // take an append (a torn last line). Checked here first, read-only, so
+    // such a case is refused before anything of the finalize is written —
+    // no begin entry, journal or local record to clean up, no sign-off to
+    // abandon.
+    if let Err(err) = crate::anomaly::preflight_scan_lanes(case_dir, true) {
+        return refuse_unjournaled(err, state);
+    }
     // R14 (P18): this PC's local open-finalize record first — outside the
     // case folder, so a copy or share of the case never carries it; a
     // recovery acts only where it agrees with the journal and the lane.
@@ -3217,9 +3226,12 @@ pub(crate) fn finalize_with_exe(
     // case folder's own contents can be forged). A record that cannot be
     // advanced stays `open`: a crash before the complete entry then rolls
     // the finalize back (safe side).
+    // R16 (P24): the `packaged` state is its own file (created, never a
+    // rewrite — a program holding `<id>.json` cannot stop it); R16-S7: the
+    // manifest is hashed streaming (any size).
     if packaging.is_ok() {
         let manifest = super::finalize_journal::published_reserved(case_dir, &journal.package_name)
-            .and_then(|dir| super::finalize_journal::manifest_sha256_capped(&dir));
+            .and_then(|dir| package_manifest_sha256(&dir));
         if let Err(err) =
             journal.advance_local(case_dir, super::finalize_journal::LOCAL_PACKAGED, manifest)
         {
@@ -3419,32 +3431,51 @@ pub(crate) fn finalize_with_exe(
             // good) and the next recovery writes the entry.
             let journal_left = match &complete_error {
                 None => {
-                    // R15 (P21): `completed` (atomic rewrite) BEFORE the
-                    // journal goes — R14 left the record `open` when its
-                    // removal (the last step) failed, and a cut complete
-                    // entry plus a rebuilt journal then rolled the good
-                    // finalize back (R14 reviewer PoC A).
-                    if let Err(err) = journal.advance_local(
+                    // R15 (P21): `completed` BEFORE the journal goes — R14
+                    // left the record `open` when its removal (the last
+                    // step) failed, and a cut complete entry plus a rebuilt
+                    // journal then rolled the good finalize back (R14
+                    // reviewer PoC A). R16 (P24): `completed` is its own
+                    // file, created beside the others (R15 rewrote
+                    // `<id>.json`, which a program holding it without
+                    // delete sharing stopped — R15 reviewer PoC). When it
+                    // cannot be created the journal is KEPT as
+                    // `completed-unrecorded` (the next recovery records it
+                    // here; the lane already holds the complete entry).
+                    match journal.advance_local(
                         case_dir,
                         super::finalize_journal::LOCAL_COMPLETED,
-                        None,
+                        manifest_sha256.clone(),
                     ) {
-                        state_lock(state).logs.push(format!(
-                            "경고: 열린 최종화 로컬 기록을 'completed'로 갱신하지 못했습니다: {err}"
-                        ));
-                    }
-                    let left =
-                        super::finalize_journal::remove_journal(case_dir, &journal.finalize_id)
+                        Err(err) => {
+                            state_lock(state).logs.push(format!(
+                                "경고: 최종화는 끝났지만 이 PC의 최종화 로컬 기록에 'completed'를 남기지 못했습니다 ({err}) — 최종화 저널을 'completed-unrecorded'로 남겼고, 다음에 케이스를 열 때 다시 남깁니다."
+                            ));
+                            journal
+                                .rewrite_as(
+                                    super::finalize_journal::STATE_COMPLETED_UNRECORDED,
+                                    case_dir,
+                                )
+                                .err()
+                        }
+                        Ok(()) => {
+                            let left = super::finalize_journal::remove_journal(
+                                case_dir,
+                                &journal.finalize_id,
+                            )
                             .err();
-                    if left.is_none()
-                        && let Err(err) =
-                            super::finalize_journal::remove_local_record(&journal.finalize_id)
-                    {
-                        state_lock(state).logs.push(format!(
-                            "경고: 최종화는 끝났지만 이 PC의 최종화 로컬 기록을 지우지 못했습니다 ({err}) — 'completed'로 남아 있어 복구 대상이 아니며, 서버를 다시 시작하면 30일 뒤 정리됩니다."
-                        ));
+                            if left.is_none()
+                                && let Err(err) = super::finalize_journal::remove_local_record(
+                                    &journal.finalize_id,
+                                )
+                            {
+                                state_lock(state).logs.push(format!(
+                                    "경고: 최종화는 끝났지만 이 PC의 최종화 로컬 기록을 다 지우지 못했습니다 ({err}) — 'completed'로 남아 있어 복구 대상이 아니며, 서버를 다시 시작하면 30일 뒤 정리됩니다."
+                                ));
+                            }
+                            left
+                        }
                     }
-                    left
                 }
                 Some(lane) => {
                     let _ = journal.advance_local(

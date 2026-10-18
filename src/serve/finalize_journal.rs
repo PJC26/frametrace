@@ -68,6 +68,23 @@
 //! forged). P23: where the sweep cannot read a case or its journal it
 //! keeps the record ("unknown").
 //!
+//! R16 (P24): the state machine never REWRITES a file. R15 advanced it by
+//! an atomic rewrite of `<id>.json`; a program holding that file without
+//! delete sharing (an indexer, antivirus, backup) made the rewrite and the
+//! removal fail alike, the record stayed `open` and the R14-S1 attack
+//! rolled the good finalize back again (R15 reviewer PoC). Each state is
+//! now its own sibling file, created with `create_new` beside the others —
+//! `<id>.json` (open), `<id>.resolved.json`, `<id>.packaged.json`,
+//! `<id>.completed-unrecorded.json`, `<id>.completed.json` — and the
+//! record's state is the highest one present ([`LOCAL_STATE_ORDER`]). A
+//! lock on one file never stops the next one being created, and a removal
+//! goes lowest first and stops at the first failure, so neither can lower
+//! the state. The journal goes only once the record is past `open` (a
+//! `completed` that cannot be created keeps the journal as
+//! `completed-unrecorded`). P25: a live process that matches the writer's
+//! pid, start time and FrameTrace name but not its folder / SHA-256 is a
+//! "maybe-live" writer — never recovered, `--force` to move its journal.
+//!
 //! Disk work here never runs under the state lock.
 
 use super::*;
@@ -147,6 +164,29 @@ pub(crate) const LOCAL_RESOLVED: &str = "resolved";
 /// R14-S13: a local record older than this is swept at server start once
 /// it no longer stands for anything left to recover.
 pub(crate) const LOCAL_RECORD_EXPIRY: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// R16 (P24): the local record states from lowest to highest — each one a
+/// sibling file ([`local_state_path`]); the record's state is the highest
+/// present. `resolved` (a failure path cleaned up) ranks just above
+/// `open`: every state past `open` means "never roll back".
+pub(crate) const LOCAL_STATE_ORDER: [&str; 5] = [
+    LOCAL_OPEN,
+    LOCAL_RESOLVED,
+    LOCAL_PACKAGED,
+    STATE_COMPLETED_UNRECORDED,
+    LOCAL_COMPLETED,
+];
+
+fn local_rank(state: &str) -> Option<usize> {
+    LOCAL_STATE_ORDER.iter().position(|known| *known == state)
+}
+
+/// R16 (P24): a local record file removal is retried at most this long —
+/// a record left behind is safe once it is past `open`, so a held file
+/// must not stall the finalize for the full rename budget.
+fn local_removal_budget() -> Duration {
+    crate::package::rename_retry_budget().min(STARTUP_RETRY_BUDGET)
+}
 
 /// One finalize's journal (R13 format: schema 2).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -362,9 +402,10 @@ impl FinalizeJournal {
         }
     }
 
-    /// R15 (P21): rewrites this finalize's local record (atomically) in
-    /// `state`, keeping the manifest SHA-256 it carries (`packaged`
-    /// records it; the later states keep it for the examiner).
+    /// R15 (P21) / R16 (P24): advances this finalize's local record to
+    /// `state` by CREATING its sibling file (never a rewrite: a file another
+    /// program holds cannot stop it), keeping the manifest SHA-256 the
+    /// record carries (`packaged` records it; the later states keep it).
     pub(crate) fn advance_local(
         &self,
         case_dir: &Path,
@@ -548,18 +589,81 @@ impl LocalRecord {
         })
     }
 
-    /// Writes the record durably (temp file fsync'd, renamed, directory
-    /// flushed).
+    /// R16 (P24): records the state `self.state` by CREATING its sibling
+    /// file (`create_new`, fsync'd, directory flushed) — never by
+    /// rewriting one. A file already there for that state is success when
+    /// it is the same record's (a retried advance), an error otherwise; a
+    /// write that fails removes the file it created.
     pub(crate) fn write(&self) -> Result<(), String> {
-        let path = local_record_path(&self.finalize_id)
+        if local_rank(&self.state).is_none() {
+            return Err(format!(
+                "알 수 없는 로컬 기록 상태 '{}'는 쓰지 않습니다",
+                self.state
+            ));
+        }
+        let path = local_state_path(&self.finalize_id, &self.state)
             .ok_or("이 PC의 로컬 설정 폴더(LOCALAPPDATA / XDG_CONFIG_HOME)를 찾지 못했습니다")?;
-        crate::util::write_text_atomic(&path, &self.to_json()).map_err(|err| {
+        let fail = |err: &dyn std::fmt::Display| {
             format!(
-                "열린 최종화 로컬 기록 {}을(를) 쓰지 못했습니다: {err}",
+                "열린 최종화 로컬 기록 {}을(를) 만들지 못했습니다: {err}",
                 path.display()
             )
-        })
+        };
+        #[cfg(test)]
+        if FAIL_LOCAL_STATE.with(|cell| cell.get()) == Some(self.state.as_str()) {
+            return Err(fail(&"test: injected local record creation failure"));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| fail(&err))?;
+        }
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let mut file = match created {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return match read_local_file(&path) {
+                    Ok(existing)
+                        if existing.finalize_id == self.finalize_id
+                            && existing.state == self.state =>
+                    {
+                        Ok(())
+                    }
+                    Ok(_) => Err(fail(&"다른 기록이 이미 있습니다")),
+                    Err(err) => Err(fail(&err)),
+                };
+            }
+            Err(err) => return Err(fail(&err)),
+        };
+        let written = file
+            .write_all(self.to_json().as_bytes())
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&path);
+            return Err(fail(&err));
+        }
+        crate::util::sync_parent_directory(&path);
+        Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// R16 test hook: creating the local record file of this state fails
+    /// (on this thread).
+    pub(crate) static FAIL_LOCAL_STATE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// R16 (P24): one local record file, parsed (its name's state is checked by
+/// the caller).
+fn read_local_file(path: &Path) -> Result<LocalRecord, String> {
+    let bytes = read_capped(path, JOURNAL_MAX_BYTES).map_err(|err| err.to_string())?;
+    let text = String::from_utf8(bytes).map_err(|_| "UTF-8 텍스트가 아닙니다".to_string())?;
+    LocalRecord::parse(&text)
 }
 
 /// R14 (P18): the host-local state folder — `%LOCALAPPDATA%\frametrace`
@@ -608,57 +712,133 @@ fn valid_finalize_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn local_record_path(finalize_id: &str) -> Option<PathBuf> {
+/// R16 (P24): the file that records `state` of `finalize_id` — `<id>.json`
+/// for `open` (the R14 / R15 name), `<id>.<state>.json` for the others.
+fn local_state_path(finalize_id: &str, state: &str) -> Option<PathBuf> {
+    let name = if state == LOCAL_OPEN {
+        format!("{finalize_id}.json")
+    } else {
+        format!("{finalize_id}.{state}.json")
+    };
     valid_finalize_id(finalize_id)
-        .then(|| local_open_dir().map(|dir| dir.join(format!("{finalize_id}.json"))))
+        .then(|| local_open_dir().map(|dir| dir.join(name)))
         .flatten()
 }
 
-/// R14 (P18): this PC's local record of `finalize_id` (`Ok(None)`: none).
+/// R16 (P24): every file the local record of `finalize_id` may consist of,
+/// lowest state first.
+fn local_record_paths(finalize_id: &str) -> Vec<(&'static str, PathBuf)> {
+    LOCAL_STATE_ORDER
+        .iter()
+        .filter_map(|state| local_state_path(finalize_id, state).map(|path| (*state, path)))
+        .collect()
+}
+
+/// R14 (P18) / R16 (P24): this PC's local record of `finalize_id`
+/// (`Ok(None)`: none) — the HIGHEST state whose file is present. Every file
+/// present must parse, name that id and state and describe the same
+/// finalize; otherwise the record is unreadable (never "lower"). The
+/// manifest SHA-256 is the highest state's, or the closest lower one's.
 pub(crate) fn read_local_record(finalize_id: &str) -> Result<Option<LocalRecord>, String> {
-    let Some(path) = local_record_path(finalize_id) else {
-        return Ok(None);
-    };
-    match read_capped(&path, JOURNAL_MAX_BYTES) {
-        Ok(bytes) => String::from_utf8(bytes)
-            .map_err(|_| "UTF-8 텍스트가 아닙니다".to_string())
-            .and_then(|text| LocalRecord::parse(&text))
-            .and_then(|record| {
-                if record.finalize_id == finalize_id {
-                    Ok(record)
-                } else {
-                    Err("파일 이름과 finalize_id가 다릅니다".to_string())
-                }
-            })
-            .map(Some)
-            .map_err(|err| format!("{}: {err}", path.display())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(format!("{}: {err}", path.display())),
+    let mut found: Vec<LocalRecord> = Vec::new();
+    for (state, path) in local_record_paths(finalize_id) {
+        let record = match read_local_file(&path) {
+            Ok(record) => record,
+            Err(_) if std::fs::symlink_metadata(&path).is_err() => continue,
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
+        if record.finalize_id != finalize_id {
+            return Err(format!(
+                "{}: 파일 이름과 finalize_id가 다릅니다",
+                path.display()
+            ));
+        }
+        if record.state != state {
+            return Err(format!(
+                "{}: 파일 이름의 상태({state})와 기록의 상태({})가 다릅니다",
+                path.display(),
+                record.state
+            ));
+        }
+        if let Some(first) = found.first()
+            && (first.case_dir != record.case_dir
+                || first.signoff_sha256 != record.signoff_sha256
+                || first.previous_signoff_sha256 != record.previous_signoff_sha256
+                || first.package_name != record.package_name
+                || first.host_id != record.host_id)
+        {
+            return Err(format!(
+                "{}: 같은 최종화의 로컬 기록 파일들이 서로 다른 최종화를 가리킵니다",
+                path.display()
+            ));
+        }
+        found.push(record);
     }
+    let manifest = found
+        .iter()
+        .rev()
+        .find_map(|record| record.manifest_sha256.clone());
+    Ok(found.pop().map(|mut top| {
+        top.manifest_sha256 = top.manifest_sha256.or(manifest);
+        top
+    }))
 }
 
 /// R14 (P18): removes this PC's local record of `finalize_id` (NotFound is
-/// success). R15 (P21): retried like the journal's removal (an indexer or
-/// antivirus handle on the fresh file must not leave it behind; one left
-/// behind anyway is safe once it is past `open`).
+/// success). R15 (P21): retried (an indexer or antivirus handle on a fresh
+/// file). R16 (P24): file by file, LOWEST state first, stopping at the
+/// first that cannot be removed — what is left is never a lower state than
+/// what was there (a held `<id>.json` keeps `packaged` / `completed`).
 pub(crate) fn remove_local_record(finalize_id: &str) -> Result<(), String> {
-    let Some(path) = local_record_path(finalize_id) else {
-        return Ok(());
-    };
     #[cfg(test)]
     if FAIL_LOCAL_RECORD_REMOVAL.with(|cell| cell.get()) {
         return Err(format!(
-            "{}: test: injected local record removal failure",
-            path.display()
+            "{finalize_id}: test: injected local record removal failure"
         ));
     }
-    crate::package::retry_within_notify(
-        crate::package::rename_retry_budget(),
-        &mut || crate::util::remove_file_durable(&path),
-        &crate::package::is_final_rename_error,
-        &mut |_| {},
-    )
-    .map_err(|err| format!("{}: {err}", path.display()))
+    for (_, path) in local_record_paths(finalize_id) {
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        crate::package::retry_within_notify(
+            local_removal_budget(),
+            &mut || crate::util::remove_file_durable(&path),
+            &crate::package::is_final_rename_error,
+            &mut |_| {},
+        )
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// R16 (P24): the record of `finalize_id` is past `open` or absent once the
+/// finalize closed with `outcome` — `completed` for a complete entry,
+/// `resolved` otherwise — creating that state's file when the record is
+/// lower. Before a journal goes: a journal removed while the record still
+/// reads `open` is the R14-S1 / R15-S1 rollback again.
+fn close_local(
+    journal: &FinalizeJournal,
+    case_dir: &Path,
+    outcome: &str,
+    manifest_sha256: Option<String>,
+) -> Result<(), String> {
+    let Some(record) = read_local_record(&journal.finalize_id)? else {
+        return Ok(());
+    };
+    let target = if outcome == STATE_COMPLETED {
+        LOCAL_COMPLETED
+    } else {
+        LOCAL_RESOLVED
+    };
+    let done = if target == LOCAL_COMPLETED {
+        record.state == LOCAL_COMPLETED
+    } else {
+        record.state != LOCAL_OPEN
+    };
+    if done {
+        return Ok(());
+    }
+    journal.advance_local(case_dir, target, manifest_sha256)
 }
 
 #[cfg(test)]
@@ -709,11 +889,14 @@ fn lane_closed(record: &LocalRecord) -> bool {
 /// entry of it is closed at once (R15-S1: a finalize whose last step — the
 /// removal — failed). Otherwise a record older than
 /// [`LOCAL_RECORD_EXPIRY`] goes when it no longer stands for anything left
-/// to recover: one past `open`, an `open` one whose case is there and no
-/// longer holds its journal, or one that does not parse. P23: an `open`
-/// record whose case cannot be reached (a drive not plugged in) or whose
-/// journal does not parse is "unknown" — never swept. Returns how many
-/// were removed.
+/// to recover: its case is there and no longer holds its journal (R16-S7:
+/// whatever its state — R15 swept every record past `open` by age alone,
+/// so a `packaged` record of a case on an unplugged drive was gone when
+/// the drive came back and its finished finalize read "로컬 기록 없음"), or
+/// it does not parse. P23: a record whose case cannot be reached (a drive
+/// not plugged in) or whose journal does not parse is "unknown" — never
+/// swept. R16 (P24): one record is all its state files (removed lowest
+/// first). Returns how many records were removed.
 pub(crate) fn sweep_local_records() -> usize {
     let Some(dir) = local_open_dir() else {
         return 0;
@@ -723,12 +906,15 @@ pub(crate) fn sweep_local_records() -> usize {
     };
     let now = crate::util::now_unix().unwrap_or(0);
     let expired = |unix: u64| now.saturating_sub(unix) > LOCAL_RECORD_EXPIRY.as_secs();
-    let mut removed = 0;
+    // id → newest mtime of its files; other `.json` files on their own.
+    let mut ids: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut strays: Vec<(PathBuf, u64)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(stem) = name.strip_suffix(".json") else {
             continue;
-        }
+        };
         let modified_unix = entry
             .metadata()
             .ok()
@@ -736,20 +922,36 @@ pub(crate) fn sweep_local_records() -> usize {
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(now);
-        let stale = match read_capped(&path, JOURNAL_MAX_BYTES)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|text| LocalRecord::parse(&text).ok())
-        {
-            None => expired(modified_unix),
-            Some(record) if record.state == LOCAL_OPEN => {
+        let (id, state) = stem.split_once('.').unwrap_or((stem, LOCAL_OPEN));
+        if valid_finalize_id(id) && local_rank(state).is_some() {
+            let newest = ids.entry(id.to_string()).or_insert(0);
+            *newest = (*newest).max(modified_unix);
+        } else {
+            strays.push((path, modified_unix));
+        }
+    }
+    let mut removed = 0;
+    for (path, modified_unix) in strays {
+        let parses = read_local_file(&path).is_ok();
+        if !parses && expired(modified_unix) && crate::util::remove_file_durable(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    for (id, newest) in ids {
+        let stale = match read_local_record(&id) {
+            Ok(None) => false,
+            Err(_) => expired(newest),
+            Ok(Some(record)) if record.state == LOCAL_OPEN => {
                 lane_closed(&record)
                     || (expired(record.updated_unix.max(record.started_unix))
                         && matches!(case_verdict(&record), CaseVerdict::Done))
             }
-            Some(record) => expired(record.updated_unix.max(record.started_unix)),
+            Ok(Some(record)) => {
+                expired(record.updated_unix.max(record.started_unix))
+                    && matches!(case_verdict(&record), CaseVerdict::Done)
+            }
         };
-        if stale && crate::util::remove_file_durable(&path).is_ok() {
+        if stale && remove_local_record(&id).is_ok() {
             removed += 1;
         }
     }
@@ -869,6 +1071,45 @@ pub(crate) fn manifest_sha256_capped(package: &Path) -> Option<String> {
         .map(|bytes| crate::sha256::digest_bytes(&bytes))
 }
 
+/// R16-S7: a manifest is hashed (streaming) up to this size when a
+/// `packaged` record is judged.
+const MANIFEST_STREAM_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// R16-S5/S7: SHA-256 of `package`'s `manifest.sha256` computed STREAMING
+/// (constant memory) up to [`MANIFEST_STREAM_MAX_BYTES`] — what a
+/// `packaged` / `completed` record is compared with. R15 read it whole up
+/// to 16 MiB, so every package with a larger manifest read
+/// `package-changed`. The same value as
+/// [`super::jobs::package_manifest_sha256`].
+pub(crate) fn manifest_sha256_streaming(package: &Path) -> Option<String> {
+    let path = package.join("manifest.sha256");
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MANIFEST_STREAM_MAX_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(&path).ok()?;
+    let mut limited = std::io::BufReader::new(file).take(MANIFEST_STREAM_MAX_BYTES + 1);
+    let mut counted = CountingReader {
+        inner: &mut limited,
+        read: 0,
+    };
+    let sha = crate::sha256::digest_reader(&mut counted).ok()?;
+    (counted.read <= MANIFEST_STREAM_MAX_BYTES).then_some(sha)
+}
+
+struct CountingReader<'a, R: Read> {
+    inner: &'a mut R,
+    read: u64,
+}
+
+impl<R: Read> Read for CountingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+
 /// R15-S8: `package`'s packaged sign-off (`review/signoff.json`, read
 /// capped) hashes to `signoff_sha256` — the package is that finalize's,
 /// not another one published under the same name.
@@ -916,10 +1157,17 @@ fn image_sha256(path: &Path) -> Option<String> {
     let sha = crate::audit::digest_file(path).ok()?;
     if let Ok(mut cache) = CACHE.lock() {
         cache.retain(|(p, ..)| p != path);
-        cache.truncate(7);
+        keep_newest(&mut cache, 8);
         cache.push((path.to_path_buf(), len, modified, sha.clone()));
     }
     Some(sha)
+}
+
+/// R16-S6: makes room for one more entry in a small cache by dropping the
+/// OLDEST ones (R15's `truncate` kept the oldest and dropped the newer).
+fn keep_newest<T>(entries: &mut Vec<T>, capacity: usize) {
+    let excess = (entries.len() + 1).saturating_sub(capacity);
+    entries.drain(..excess.min(entries.len()));
 }
 
 /// R15-S4: two folders are the same one (canonical; case-insensitive on
@@ -1331,6 +1579,9 @@ pub(crate) const UNPAIRED_LOCAL_STATE: &str = "local-state";
 /// R15 `in_progress_code` values (`finalize_journal.state: "in-progress"`).
 pub(crate) const IN_PROGRESS_LIVE_WRITER: &str = "live-writer";
 pub(crate) const IN_PROGRESS_OTHER_ACCOUNT: &str = "other-account";
+/// R16-S2 (P25): a live FrameTrace process matches the writer's pid, start
+/// time and name, but not this executable's folder / SHA-256.
+pub(crate) const IN_PROGRESS_UNVERIFIED_WRITER: &str = "unverified-writer";
 
 /// R13: what a journal on disk is, judged without changing anything.
 #[derive(Debug, Clone)]
@@ -1346,6 +1597,12 @@ pub(crate) enum Assessment {
     /// Its writer (same PC) still runs, and this PC holds the local record
     /// of that finalize (R15-S4: without one a live writer is only a note).
     LiveWriter(FinalizeJournal),
+    /// R16-S2 (P25): a live process matches the writer's pid, start time
+    /// and FrameTrace name but not this executable's folder / SHA-256, and
+    /// this PC holds the local record — maybe a finalize still running
+    /// (another FrameTrace install). Never recovered; `--dismiss --force`
+    /// only moves its journal.
+    UnverifiedWriter(FinalizeJournal),
     /// R15-S10: the writer pid is a FrameTrace process this account may not
     /// inspect — possibly another account's finalize on this PC. Blocks
     /// (no dismiss offered) until `until_unix` ([`OTHER_HOST_BLOCK`] after
@@ -1362,8 +1619,14 @@ pub(crate) enum Assessment {
     Closed(FinalizeJournal, String),
     /// R14 (P19 / S2), R15 (P21): the finalize finished — only its complete
     /// entry is missing from the lane. Why it is known to have finished
-    /// (always this PC's local record past `open`).
-    Finished(FinalizeJournal, String),
+    /// (always this PC's local record past `open`) and (R16-S3) the
+    /// manifest SHA-256 THIS PC recorded — what the complete entry
+    /// written again carries (never the one on disk now).
+    Finished {
+        journal: FinalizeJournal,
+        why: String,
+        manifest_sha256: Option<String>,
+    },
     /// An interrupted finalize of this PC: journal, local record (`open`)
     /// and the lane's begin entry agree.
     Open(FinalizeJournal, FinalizeBegin),
@@ -1386,45 +1649,84 @@ fn journal_age(journal: &FinalizeJournal) -> Option<Duration> {
 /// process's executable is in this executable's folder and hashes to the
 /// SHA-256 the journal records. R14 trusted the file NAME: any program
 /// copied as `frametrace-x.exe` anywhere was a live writer.
-fn writer_alive(journal: &FinalizeJournal) -> bool {
+///
+/// R16-S2 (P25): a process that passes the R14 match (pid, start time,
+/// FrameTrace name) but not the folder / SHA-256 check is
+/// [`WriterLiveness::Unverified`] — maybe the writer (another FrameTrace
+/// install or build), maybe not; R15 took it as gone, and `--dismiss`
+/// from another folder's binary rolled a RUNNING finalize back.
+fn writer_liveness(journal: &FinalizeJournal) -> WriterLiveness {
     let writer = &journal.writer;
     if writer.pid == std::process::id() {
         // This process: its own finalize holds `busy`, so a journal seen
         // by a recovery is an earlier, interrupted one.
-        return false;
+        return WriterLiveness::Gone;
     }
     if !crate::util::writer_still_running(
         writer,
         crate::util::probe_process(writer.pid),
         crate::util::process_image_name(writer.pid).as_deref(),
     ) {
-        return false;
+        return WriterLiveness::Gone;
     }
     let Some(recorded) = journal.writer_image_sha256.as_deref() else {
-        return false;
+        return WriterLiveness::Unverified;
     };
     let Some(image) = crate::util::process_image_path(writer.pid) else {
-        return false;
+        return WriterLiveness::Unverified;
     };
     let own_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     match (image.parent(), own_dir) {
         (Some(dir), Some(own)) if same_folder(dir, &own) => {}
-        _ => return false,
+        _ => return WriterLiveness::Unverified,
     }
-    image_sha256(&image).as_deref() == Some(recorded)
+    if image_sha256(&image).as_deref() == Some(recorded) {
+        WriterLiveness::Verified
+    } else {
+        WriterLiveness::Unverified
+    }
+}
+
+/// R16-S2 (P25): what is known about a journal's writer process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterLiveness {
+    /// No live process matches the writer (or it is this process).
+    Gone,
+    /// A live FrameTrace process in this executable's folder with the
+    /// recorded SHA-256.
+    Verified,
+    /// A live process matching pid, start time and FrameTrace name whose
+    /// folder or SHA-256 could not be confirmed: maybe the writer.
+    Unverified,
 }
 
 /// R15-S10: the journal's writer pid is a FrameTrace process this account
-/// may not inspect (its executable name).
-fn writer_other_account(journal: &FinalizeJournal) -> Option<String> {
+/// may not inspect (its executable name). R16-S4: only when the lane's
+/// begin entry of the journal's finalize records that same pid
+/// (`begin_pid`) — R15 let a planted journal naming any such pid (or a
+/// reused one) block the case for 24 h.
+/// `inaccessible` is `util::inaccessible_process_name` (tests pass a fake).
+pub(crate) fn writer_other_account(
+    journal: &FinalizeJournal,
+    begin_pid: Option<u32>,
+    inaccessible: impl Fn(u32) -> Option<String>,
+) -> Option<String> {
     let writer = &journal.writer;
-    if writer.pid == 0 || writer.pid == std::process::id() {
+    if writer.pid == 0 || writer.pid == std::process::id() || begin_pid != Some(writer.pid) {
         return None;
     }
-    crate::util::inaccessible_process_name(writer.pid)
-        .filter(|name| crate::util::is_frametrace_image(name))
+    inaccessible(writer.pid).filter(|name| crate::util::is_frametrace_image(name))
+}
+
+/// R16-S4: the pid the lane's begin entry records for the journal's
+/// finalize (the latest unmatched trusted one).
+fn begin_pid(pairing: &FinalizeLanePairing) -> Option<u32> {
+    match pairing {
+        FinalizeLanePairing::Open(begin) => Some(begin.pid),
+        _ => None,
+    }
 }
 
 /// What [`classify`] judges a readable journal by (gathered from the disk
@@ -1436,8 +1738,14 @@ struct Inputs {
     /// This PC's local record of the id (P18).
     local: Result<Option<LocalRecord>, String>,
     /// R15 (P21): SHA-256 of the reserved package's manifest now (the
-    /// published, unmarked reserved package; read capped).
+    /// published, unmarked reserved package; R16-S7: hashed streaming).
     manifest_sha256: Option<String>,
+}
+
+/// R16-S7: SHA-256 of the manifest of the published reserved package
+/// `package_name` (streaming, see [`manifest_sha256_streaming`]).
+fn reserved_manifest_sha256(case_dir: &Path, package_name: &str) -> Option<String> {
+    published_reserved(case_dir, package_name).and_then(|dir| manifest_sha256_streaming(&dir))
 }
 
 fn gather(case_dir: &Path, journal: &FinalizeJournal) -> Inputs {
@@ -1451,16 +1759,17 @@ fn gather(case_dir: &Path, journal: &FinalizeJournal) -> Inputs {
     Inputs {
         pairing: crate::report::finalize_lane_pairing(case_dir, &journal.finalize_id),
         local: read_local_record(&journal.finalize_id),
-        manifest_sha256: published_reserved(case_dir, &journal.package_name)
-            .and_then(|dir| manifest_sha256_capped(&dir)),
+        manifest_sha256: reserved_manifest_sha256(case_dir, &journal.package_name),
     }
 }
 
-/// R13/R14/R15: classifies the journal read from disk. Order: unreadable →
-/// host unknown → another PC → (in-progress) live writer with this PC's
-/// local record / another account's FrameTrace writer → lane complete /
-/// resolved → local record (none → "로컬 기록 없음") → local record past
-/// `open` (P21: never Open) → lane unpaired → begin mismatch → Open.
+/// R13/R14/R15/R16: classifies the journal read from disk. Order:
+/// unreadable → host unknown → another PC → legacy → (in-progress)
+/// another account's FrameTrace writer the lane's begin names (R16-S4) /
+/// live or maybe-live writer with this PC's local record (R16-S2) → lane
+/// complete / resolved → local record (none → "로컬 기록 없음") → local
+/// record past `open` (P21: never Open; R16-S3: its manifest must still
+/// be the package's) → lane unpaired → begin mismatch → Open.
 fn classify(
     case_dir: &Path,
     journal: Result<FinalizeJournal, String>,
@@ -1489,18 +1798,6 @@ fn classify(
             journal,
         };
     }
-    let in_progress = journal.state == STATE_IN_PROGRESS;
-    if in_progress
-        && let Some(image) = writer_other_account(&journal)
-        && journal_age(&journal).is_some_and(|age| age < OTHER_HOST_BLOCK)
-    {
-        return Assessment::OtherAccount {
-            until_unix: journal.started_unix + OTHER_HOST_BLOCK.as_secs(),
-            journal,
-            image,
-        };
-    }
-    let alive = in_progress && writer_alive(&journal);
     if journal.finalize_id.is_empty() {
         return Assessment::Unpaired(
             journal,
@@ -1515,8 +1812,33 @@ fn classify(
         local,
         manifest_sha256,
     } = inputs(&journal);
-    if alive && matches!(local, Ok(Some(_))) {
-        return Assessment::LiveWriter(journal);
+    let in_progress = journal.state == STATE_IN_PROGRESS;
+    if in_progress
+        && let Some(image) = writer_other_account(
+            &journal,
+            begin_pid(&pairing),
+            crate::util::inaccessible_process_name,
+        )
+        && journal_age(&journal).is_some_and(|age| age < OTHER_HOST_BLOCK)
+    {
+        return Assessment::OtherAccount {
+            until_unix: journal.started_unix + OTHER_HOST_BLOCK.as_secs(),
+            journal,
+            image,
+        };
+    }
+    let liveness = if in_progress {
+        writer_liveness(&journal)
+    } else {
+        WriterLiveness::Gone
+    };
+    let alive = liveness != WriterLiveness::Gone;
+    if matches!(local, Ok(Some(_))) {
+        match liveness {
+            WriterLiveness::Verified => return Assessment::LiveWriter(journal),
+            WriterLiveness::Unverified => return Assessment::UnverifiedWriter(journal),
+            WriterLiveness::Gone => {}
+        }
     }
     // R15-S4: a live writer without this PC's local record of the
     // finalize is only a note (a planted journal naming any FrameTrace
@@ -1581,13 +1903,27 @@ fn classify(
     // is this PC's own word that the finalize got that far — the lane's
     // tail (cut) and the case folder's contents (forgeable) never
     // override it.
+    let package_changed = |journal: FinalizeJournal| {
+        let reason = format!(
+            "이 PC의 로컬 기록에는 이 최종화의 패키지 단계가 끝났다고 남아 있지만, 예약 패키지 reports/{}의 manifest.sha256이 그때 기록한 것과 다릅니다(바뀌었거나 없음) — 되돌리지도 완료로 기록하지도 않습니다",
+            journal.package_name
+        );
+        Assessment::Unpaired(journal, UnpairedWhy::new(UNPAIRED_PACKAGE_CHANGED, reason))
+    };
     match local.state.as_str() {
         LOCAL_OPEN => {}
         STATE_COMPLETED_UNRECORDED | LOCAL_COMPLETED => {
-            return Assessment::Finished(
+            // R16-S3: the complete entry written again carries the
+            // manifest this PC recorded — and only while it is still the
+            // package's (R15 wrote whatever manifest was there now).
+            if local.manifest_sha256.is_some() && local.manifest_sha256 != manifest_sha256 {
+                return package_changed(journal);
+            }
+            return Assessment::Finished {
                 journal,
-                "이 PC의 로컬 기록에 이 최종화가 끝났다고 남아 있습니다 (서명 감사 레인의 완료 기록만 없음)".to_string(),
-            );
+                why: "이 PC의 로컬 기록에 이 최종화가 끝났다고 남아 있습니다 (서명 감사 레인의 완료 기록만 없음)".to_string(),
+                manifest_sha256: local.manifest_sha256,
+            };
         }
         LOCAL_RESOLVED => {
             return Assessment::Closed(journal, LOCAL_RESOLVED.to_string());
@@ -1599,16 +1935,13 @@ fn classify(
                     journal.package_name,
                     short(local.manifest_sha256.as_deref().unwrap_or_default())
                 );
-                return Assessment::Finished(journal, why);
+                return Assessment::Finished {
+                    journal,
+                    why,
+                    manifest_sha256: local.manifest_sha256,
+                };
             }
-            let reason = format!(
-                "이 PC의 로컬 기록에는 이 최종화의 패키지 단계가 끝났다고 남아 있지만, 예약 패키지 reports/{}의 manifest.sha256이 그때 기록한 것과 다릅니다(바뀌었거나 없음) — 되돌리지도 완료로 기록하지도 않습니다",
-                journal.package_name
-            );
-            return Assessment::Unpaired(
-                journal,
-                UnpairedWhy::new(UNPAIRED_PACKAGE_CHANGED, reason),
-            );
+            return package_changed(journal);
         }
         other => {
             let reason = format!("이 PC의 열린 최종화 로컬 기록의 상태 '{other}'를 알 수 없습니다");
@@ -1738,12 +2071,21 @@ pub(crate) fn recover(case_dir: &Path, state: &SharedState, budget: Duration) ->
             blocking: true,
             ..Recovery::default()
         },
+        Assessment::UnverifiedWriter(journal) => Recovery {
+            detail: unverified_writer_text(&journal, case_dir),
+            blocking: true,
+            ..Recovery::default()
+        },
         Assessment::OtherAccount {
             journal,
             image,
             until_unix,
         } => Recovery {
-            detail: other_account_text(&journal, &image, until_unix),
+            detail: format!(
+                "{} {}",
+                other_account_text(&journal, &image, until_unix),
+                force_hint(case_dir)
+            ),
             blocking: true,
             ..Recovery::default()
         },
@@ -1757,21 +2099,12 @@ pub(crate) fn recover(case_dir: &Path, state: &SharedState, budget: Duration) ->
             blocking: true,
             ..Recovery::default()
         },
-        Assessment::Closed(journal, outcome) => Recovery {
-            detail: match remove_journal_within(case_dir, &journal.finalize_id, budget) {
-                Ok(()) => {
-                    let _ = remove_local_record(&journal.finalize_id);
-                    format!(
-                        "이전 최종화는 서명 감사 레인에 '{outcome}'(으)로 기록되어 있어, 남아 있던 최종화 저널만 지웠습니다 (다른 것은 바꾸지 않음)."
-                    )
-                }
-                Err(err) => format!(
-                    "이전 최종화는 서명 감사 레인에 '{outcome}'(으)로 기록되어 있지만 남은 최종화 저널을 지우지 못했습니다: {err}"
-                ),
-            },
-            ..Recovery::default()
-        },
-        Assessment::Finished(journal, why) => record_finished(case_dir, &journal, &why, budget),
+        Assessment::Closed(journal, outcome) => close_journal(case_dir, &journal, &outcome, budget),
+        Assessment::Finished {
+            journal,
+            why,
+            manifest_sha256,
+        } => record_finished(case_dir, &journal, &why, manifest_sha256, budget),
         Assessment::Open(journal, begin) => resolve(
             case_dir,
             &journal,
@@ -1791,14 +2124,59 @@ pub(crate) fn recover(case_dir: &Path, state: &SharedState, budget: Duration) ->
 /// missing — the entry is written, the journal and the local record go;
 /// nothing else is touched. When the entry still cannot be written both
 /// are kept as [`STATE_COMPLETED_UNRECORDED`] for the next attempt.
+/// A journal the lane (or this PC's record) closes: only the journal goes —
+/// R16 (P24): once this PC's local record of it is past `open` (`completed`
+/// for a complete entry). When that state file cannot be created the
+/// journal is KEPT and the finalize blocked: removing it while the record
+/// still reads `open` lets a cut lane tail plus a rebuilt journal roll the
+/// finalize back (R15-S1).
+fn close_journal(
+    case_dir: &Path,
+    journal: &FinalizeJournal,
+    outcome: &str,
+    budget: Duration,
+) -> Recovery {
+    if let Err(err) = close_local(journal, case_dir, outcome, None) {
+        let detail = format!(
+            "이전 최종화는 서명 감사 레인에 '{outcome}'(으)로 기록되어 있지만 이 PC의 로컬 기록에 그 상태를 남기지 못해({err}) 최종화 저널을 그대로 두었습니다 — 로컬 설정 폴더({})에 쓸 수 있는지 확인한 뒤 케이스를 다시 여십시오 (다른 것은 바꾸지 않음).",
+            local_open_dir()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|| LOCAL_OPEN_DIR_NAME.to_string())
+        );
+        remember_complete_failure(&journal.finalize_id, &detail);
+        return Recovery {
+            detail,
+            blocking: true,
+            ..Recovery::default()
+        };
+    }
+    forget_complete_failure(&journal.finalize_id);
+    Recovery {
+        detail: match remove_journal_within(case_dir, &journal.finalize_id, budget) {
+            Ok(()) => {
+                let _ = remove_local_record(&journal.finalize_id);
+                format!(
+                    "이전 최종화는 서명 감사 레인에 '{outcome}'(으)로 기록되어 있어, 남아 있던 최종화 저널만 지웠습니다 (다른 것은 바꾸지 않음)."
+                )
+            }
+            Err(err) => format!(
+                "이전 최종화는 서명 감사 레인에 '{outcome}'(으)로 기록되어 있지만 남은 최종화 저널을 지우지 못했습니다: {err}"
+            ),
+        },
+        ..Recovery::default()
+    }
+}
+
+/// R16-S3: `manifest` is the SHA-256 this PC's local record holds (the
+/// classification checked it is still the package's) — R15 recorded the
+/// manifest on disk at recovery time.
 fn record_finished(
     case_dir: &Path,
     journal: &FinalizeJournal,
     why: &str,
+    manifest: Option<String>,
     budget: Duration,
 ) -> Recovery {
-    let manifest = published_reserved(case_dir, &journal.package_name)
-        .and_then(|dir| manifest_sha256_capped(&dir));
     let head = format!(
         "이전 최종화(검토자 입력값: {}, 서명 SHA-256 {})는 끝나 있었습니다 — {why}.",
         journal.examiner,
@@ -1821,9 +2199,23 @@ fn record_finished(
     };
     match complete {
         Ok(()) => {
+            // P21 / R16 (P24): `completed` before the journal goes, then
+            // removed; when `completed` cannot be created the journal is
+            // kept as `completed-unrecorded` (the lane holds the complete
+            // entry now: the next recovery only has to record it here).
+            if let Err(err) = journal.advance_local(case_dir, LOCAL_COMPLETED, manifest) {
+                let _ = journal.rewrite_as(STATE_COMPLETED_UNRECORDED, case_dir);
+                let detail = format!(
+                    "{head} 서명 감사 레인에 빠져 있던 완료 기록을 남겼지만 이 PC의 로컬 기록에 완료를 남기지 못해({err}) 최종화 저널을 'completed-unrecorded'로 두었습니다 — 로컬 설정 폴더에 쓸 수 있는지 확인한 뒤 케이스를 다시 여십시오 (다른 것은 바꾸지 않음)."
+                );
+                remember_complete_failure(&journal.finalize_id, &detail);
+                return Recovery {
+                    detail,
+                    blocking: true,
+                    ..Recovery::default()
+                };
+            }
             forget_complete_failure(&journal.finalize_id);
-            // P21: `completed` before the journal goes, then removed.
-            let _ = journal.advance_local(case_dir, LOCAL_COMPLETED, None);
             let left = remove_journal_within(case_dir, &journal.finalize_id, budget)
                 .err()
                 .map(|err| format!(" 최종화 저널은 지우지 못했습니다: {err}"))
@@ -1863,10 +2255,10 @@ fn complete_failures() -> &'static Mutex<Vec<(String, String)>> {
     &FAILURES
 }
 
-fn remember_complete_failure(finalize_id: &str, detail: &str) {
+pub(crate) fn remember_complete_failure(finalize_id: &str, detail: &str) {
     if let Ok(mut failures) = complete_failures().lock() {
         failures.retain(|(id, _)| id != finalize_id);
-        failures.truncate(15);
+        keep_newest(&mut failures, 16);
         failures.push((finalize_id.to_string(), detail.to_string()));
     }
 }
@@ -1877,7 +2269,7 @@ fn forget_complete_failure(finalize_id: &str) {
     }
 }
 
-fn complete_failure(finalize_id: &str) -> Option<String> {
+pub(crate) fn complete_failure(finalize_id: &str) -> Option<String> {
     complete_failures().lock().ok().and_then(|failures| {
         failures
             .iter()
@@ -1900,6 +2292,36 @@ fn other_account_text(journal: &FinalizeJournal, image: &str, until_unix: u64) -
         "이 케이스의 최종화 저널에 적힌 작성자(pid {}, {image})는 이 PC의 다른 계정의 FrameTrace 프로세스일 수 있습니다 — 이 계정으로는 그 프로세스를 확인할 수 없어 아무것도 바꾸지 않았고 최종화를 막습니다 (unix {until_unix}까지). 그 계정에서 최종화가 끝났는지 확인하십시오.",
         journal.writer.pid
     )
+}
+
+/// R16-S2 (P25): the examiner-facing text of a maybe-live writer.
+fn unverified_writer_text(journal: &FinalizeJournal, case_dir: &Path) -> String {
+    format!(
+        "이 케이스의 최종화 저널에 적힌 작성자(pid {})가 아직 실행 중인 FrameTrace 프로세스이지만, 실행 파일이 이 프로그램과 다른 폴더에 있거나 내용(SHA-256)이 달라 같은 최종화인지 확인할 수 없습니다 — 진행 중인 최종화일 수 있어 아무것도 되돌리지 않았고 최종화를 막습니다. 그 프로세스(다른 FrameTrace 설치)에서 최종화가 끝나기를 기다리십시오. 그 프로세스가 이 최종화와 무관하다고 확인했다면: {}",
+        journal.writer.pid,
+        force_hint(case_dir)
+    )
+}
+
+/// R16-S2/S4: `--dismiss --force` (moves the journal of a writer that may
+/// still run — nothing is rolled back or recorded).
+pub(crate) fn force_dismiss_command(case_dir: &Path) -> String {
+    format!("{} --force", dismiss_command(case_dir))
+}
+
+pub(crate) fn force_dismiss_command_cmd(case_dir: &Path) -> Option<String> {
+    dismiss_command_cmd(case_dir).map(|cmd| format!("{cmd} --force"))
+}
+
+fn force_hint(case_dir: &Path) -> String {
+    let command = match force_dismiss_command_cmd(case_dir) {
+        Some(cmd) => format!(
+            "PowerShell: {} / 명령 프롬프트: {cmd}",
+            force_dismiss_command(case_dir)
+        ),
+        None => force_dismiss_command(case_dir),
+    };
+    format!("확인했다면 `{command}`로 저널만 옮길 수 있습니다 (아무것도 되돌리거나 기록하지 않음).")
 }
 
 fn short(text: &str) -> &str {
@@ -2178,7 +2600,9 @@ fn close_and_remove(
         outcome,
     ) {
         Ok(()) => {
-            let _ = journal.advance_local(case_dir, LOCAL_RESOLVED, None);
+            if let Err(err) = journal.advance_local(case_dir, LOCAL_RESOLVED, None) {
+                state_lock(state).logs.push(format!("경고: {err}"));
+            }
             true
         }
         Err(err) => {
@@ -2254,8 +2678,11 @@ pub(crate) fn clear_if_resolved(case_dir: &Path, state: &SharedState) {
     };
     let (journal, begin) = match assessment {
         Assessment::Open(journal, begin) => (journal, begin),
-        Assessment::Closed(journal, _) => {
-            if remove_journal(case_dir, &journal.finalize_id).is_ok() {
+        Assessment::Closed(journal, outcome) => {
+            // R16 (P24): the record past `open` before the journal goes.
+            if close_local(&journal, case_dir, &outcome, None).is_ok()
+                && remove_journal(case_dir, &journal.finalize_id).is_ok()
+            {
                 let _ = remove_local_record(&journal.finalize_id);
             }
             return;
@@ -2298,7 +2725,8 @@ pub(crate) fn clear_if_resolved(case_dir: &Path, state: &SharedState) {
 /// local record file itself (R14 missed a change INSIDE the package — a
 /// listed file removed — which P19 / P21 judge by).
 type Stamp = Option<(u64, SystemTime)>;
-type StatusCacheKey = (PathBuf, [Stamp; 8], String);
+/// R16 (P24): the local record is all its state files — one stamp each.
+type StatusCacheKey = (PathBuf, [Stamp; 7], Vec<Stamp>, String);
 
 /// One cached answer: the key, the journal read and what it was judged by.
 type StatusCacheEntry = (
@@ -2341,11 +2769,16 @@ fn cached_journal(case_dir: &Path) -> Option<Assessment> {
             package
                 .as_deref()
                 .and_then(|dir| file_stamp(&dir.join("manifest.sha256"))),
-            named
-                .as_ref()
-                .and_then(|journal| local_record_path(&journal.finalize_id))
-                .and_then(|path| file_stamp(&path)),
         ],
+        named
+            .as_ref()
+            .map(|journal| {
+                local_record_paths(&journal.finalize_id)
+                    .iter()
+                    .map(|(_, path)| file_stamp(path))
+                    .collect()
+            })
+            .unwrap_or_default(),
         crate::audit_key::verification_fingerprint(),
     );
     let hit = status_cache().lock().ok().and_then(|cache| {
@@ -2368,12 +2801,32 @@ fn cached_journal(case_dir: &Path) -> Option<Assessment> {
                 .map(|journal| gather(case_dir, journal));
             if let Ok(mut cache) = status_cache().lock() {
                 cache.retain(|(cached, ..)| cached.0 != key.0);
-                cache.truncate(15);
+                keep_newest(&mut cache, 16);
                 cache.push((key, journal.clone(), inputs.clone()));
             }
             (journal, inputs)
         }
     };
+    // R16-S5: a record past `open` is judged by the manifest's BYTES — a
+    // same-size rewrite with its mtime restored keeps the cache key. Up to
+    // 16 MiB it is hashed again on every poll; a larger one keeps the hash
+    // of the key's (size, mtime) here (display only: every recovery hashes
+    // it again, streaming).
+    let inputs = inputs.map(|mut inputs| {
+        let judged_by_manifest = matches!(
+            &inputs.local,
+            Ok(Some(record)) if record.state != LOCAL_OPEN && record.state != LOCAL_RESOLVED
+        );
+        if judged_by_manifest
+            && let Ok(journal) = &journal
+            && let Some(dir) = published_reserved(case_dir, &journal.package_name)
+            && std::fs::metadata(dir.join("manifest.sha256"))
+                .is_ok_and(|meta| meta.len() <= MANIFEST_MAX_BYTES)
+        {
+            inputs.manifest_sha256 = manifest_sha256_capped(&dir);
+        }
+        inputs
+    });
     Some(classify(case_dir, journal, |journal| {
         inputs.unwrap_or_else(|| gather(case_dir, journal))
     }))
@@ -2411,6 +2864,8 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
             "blocked_until_unix": null,
             "dismiss_command": null,
             "dismiss_command_cmd": null,
+            "force_dismiss_command": null,
+            "force_dismiss_command_cmd": null,
         })
     };
     // R14-S5: the dismiss command is offered only where moving the journal
@@ -2418,6 +2873,12 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
     let offer_dismiss = |value: &mut serde_json::Value| {
         value["dismiss_command"] = dismiss_command(case_dir).into();
         value["dismiss_command_cmd"] = dismiss_command_cmd(case_dir).into();
+    };
+    // R16-S2/S4: where a writer may still run, only `--dismiss --force`
+    // moves the journal (nothing is rolled back or recorded).
+    let offer_force = |value: &mut serde_json::Value| {
+        value["force_dismiss_command"] = force_dismiss_command(case_dir).into();
+        value["force_dismiss_command_cmd"] = force_dismiss_command_cmd(case_dir).into();
     };
     if recovering {
         return base(STATE_RECOVERING);
@@ -2480,6 +2941,17 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
             .into();
             value["local_record"] = true.into();
             value["in_progress_code"] = IN_PROGRESS_LIVE_WRITER.into();
+            offer_force(&mut value);
+            value
+        }
+        // R16-S2 (P25): blocks; no plain dismiss (it would clean up a
+        // finalize that may still run), only `--force`.
+        Assessment::UnverifiedWriter(journal) => {
+            let mut value = with(STATE_IN_PROGRESS, &journal);
+            value["reason"] = unverified_writer_text(&journal, case_dir).into();
+            value["local_record"] = true.into();
+            value["in_progress_code"] = IN_PROGRESS_UNVERIFIED_WRITER.into();
+            offer_force(&mut value);
             value
         }
         // R15-S10: blocks; no dismiss command (the examiner is not led to
@@ -2494,6 +2966,7 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
             value["in_progress_code"] = IN_PROGRESS_OTHER_ACCOUNT.into();
             value["blocked_until_unix"] = until_unix.into();
             value["local_record"] = serde_json::Value::Null;
+            offer_force(&mut value);
             value
         }
         Assessment::Unpaired(journal, why) => {
@@ -2507,10 +2980,18 @@ pub(crate) fn status_value(case_dir: &Path, active: bool, recovering: bool) -> s
         Assessment::Closed(journal, outcome) => {
             let mut value = with(STATE_COMPLETED, &journal);
             value["outcome"] = outcome.into();
-            value["blocks_finalize"] = false.into();
+            // R16 (P24): a recovery that could not record the closed
+            // state locally kept the journal and blocks — said here.
+            match complete_failure(&journal.finalize_id) {
+                Some(detail) => {
+                    value["reason"] = detail.into();
+                    value["blocks_finalize"] = true.into();
+                }
+                None => value["blocks_finalize"] = false.into(),
+            }
             value
         }
-        Assessment::Finished(journal, why) => {
+        Assessment::Finished { journal, why, .. } => {
             let mut value = with(STATE_COMPLETED_UNRECORDED, &journal);
             value["outcome"] = STATE_COMPLETED.into();
             value["local_record"] = true.into();
@@ -2597,6 +3078,13 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
         return Ok(out);
     }
     let assessment = match assessment {
+        // R16-S2 (P25): maybe still running — never cleaned up here.
+        Assessment::UnverifiedWriter(journal) if !force => {
+            return Err(format!(
+                "{} 저널을 옮기지 않았습니다.",
+                unverified_writer_text(&journal, case_dir)
+            ));
+        }
         Assessment::LiveWriter(journal) if !force => {
             return Err(format!(
                 "다른 FrameTrace 프로세스(pid {})가 이 케이스를 최종화하고 있어 저널을 옮기지 않았습니다 — 그 최종화가 끝난 뒤 다시 실행하십시오 (그 프로세스가 FrameTrace가 아니라고 확인했다면 --dismiss --force).",
@@ -2616,7 +3104,7 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
             ));
         }
         // R14-S5: cleaned up first, as opening the case would.
-        Assessment::Open(..) | Assessment::Finished(..) | Assessment::Closed(..) => {
+        Assessment::Open(..) | Assessment::Finished { .. } | Assessment::Closed(..) => {
             let state: SharedState = Arc::new(Mutex::new(JobState::new()));
             if let Some(recovery) = recover(case_dir, &state, crate::package::rename_retry_budget())
             {
@@ -2639,12 +3127,25 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
         }
         other => other,
     };
+    // R16-S8: a writer that may still run (verified or not) is left to
+    // finish: only its journal moves — no `finalize-resolved`, its local
+    // record kept (R15 recorded `dismissed` and the live finalize then
+    // wrote `finalize-complete` after it).
     let closing = match &assessment {
-        Assessment::Open(journal, _) | Assessment::LiveWriter(journal) => Some(journal.clone()),
+        Assessment::Open(journal, _) => Some(journal.clone()),
         _ => None,
     };
+    let still_running = matches!(
+        assessment,
+        Assessment::LiveWriter(_)
+            | Assessment::UnverifiedWriter(_)
+            | Assessment::OtherAccount { .. }
+    );
     let moved = set_aside(case_dir, "dismissed")?;
     out.push_str(&format!("moved to: {}\n", moved.display()));
+    if still_running {
+        out.push_str("writer may still be running: nothing recorded in the sign-off lane, its local record kept\n");
+    }
     if let Some(journal) = closing {
         match crate::report::record_finalize_resolved(
             case_dir,
@@ -2653,6 +3154,8 @@ pub(crate) fn cli_command(case_dir: &Path, dismiss: bool, force: bool) -> Result
             "dismissed",
         ) {
             Ok(()) => {
+                // R16 (P24): `resolved` first, then removed.
+                let _ = journal.advance_local(case_dir, LOCAL_RESOLVED, None);
                 let _ = remove_local_record(&journal.finalize_id);
                 out.push_str("sign-off lane: finalize-resolved (dismissed) recorded\n");
             }
