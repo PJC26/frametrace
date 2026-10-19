@@ -497,6 +497,10 @@ pub fn private_venv_executable(name: &str) -> Option<PathBuf> {
 pub struct ToolStatus {
     /// `(binary, resolved absolute path)` per provided binary.
     pub paths: Vec<(String, Option<String>)>,
+    /// `(binary, PATH copy)` per provided binary: the different copy on
+    /// PATH that the tools/bin one takes precedence over
+    /// ([`crate::tool_policy::shadowed_by`]), else `None`.
+    pub shadowed_by: Vec<(String, Option<String>)>,
 }
 
 impl ToolStatus {
@@ -517,9 +521,14 @@ impl ToolStatus {
     }
 }
 
-/// Resolution-only status (PATH, then `tools/bin`, as the pipeline would
+/// Resolution-only status (`tools/bin`, then PATH, as the pipeline would
 /// run the tool) — never spawns anything.
 pub fn status(tool: &ToolEntry) -> ToolStatus {
+    let shadowed_by = tool
+        .provides
+        .iter()
+        .map(|binary| (binary.clone(), crate::tool_policy::shadowed_by(binary)))
+        .collect();
     let paths = tool
         .provides
         .iter()
@@ -532,7 +541,7 @@ pub fn status(tool: &ToolEntry) -> ToolStatus {
             (binary.clone(), path)
         })
         .collect();
-    ToolStatus { paths }
+    ToolStatus { paths, shadowed_by }
 }
 
 /// Doctor/UI hint for a missing binary: the install command when the
@@ -586,6 +595,14 @@ pub fn tool_json(tool: &ToolEntry, status: &ToolStatus) -> serde_json::Value {
         "installed": status.installed(),
         "paths": status
             .paths
+            .iter()
+            .map(|(binary, path)| (binary.clone(), serde_json::json!(path)))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+        // Per binary: a different copy on PATH that the tools/bin one
+        // takes precedence over (not used by FrameTrace; the UI warns so
+        // the examiner can check it is not planted), else null.
+        "shadowed_by": status
+            .shadowed_by
             .iter()
             .map(|(binary, path)| (binary.clone(), serde_json::json!(path)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
@@ -762,6 +779,13 @@ pub struct InstallOutcome {
     /// Set when the audit line could not be written (the install itself
     /// succeeded — reported, never swallowed).
     pub audit_warning: Option<String>,
+    /// A staging directory (or the replaced venv) that could not be removed
+    /// after a successful install — typically because the old
+    /// `tools/bin/ffmpeg.exe` was still running when it was moved into the
+    /// backup. The install is complete; the leftover is swept by the next
+    /// install or server start (`.staging-*`) once nothing holds it.
+    /// Recorded in the audit line and shown by the CLI and the API.
+    pub staging_left: Option<PathBuf>,
 }
 
 // ------------------------------------------------------------- net policy
@@ -864,6 +888,46 @@ pub(crate) fn redact_query(url: &str) -> String {
 
 // ---------------------------------------------------------------- install
 
+/// `not_installable` on Windows, `unsupported_platform` elsewhere (the
+/// code a [`not_installable_reason`] refusal is audited with).
+pub fn not_installable_code() -> &'static str {
+    if cfg!(windows) {
+        "not_installable"
+    } else {
+        "unsupported_platform"
+    }
+}
+
+/// The CLI's checks before it shows the install prompt: the tool exists
+/// and can be installed here. Each refusal is appended to the install
+/// audit log (`result: "refused"`, chained) like the API's; `Err` carries
+/// the message (plus the audit warning when the line could not be
+/// written).
+pub fn preflight<'a>(
+    manifest: &'a Manifest,
+    name: &str,
+    dirs: &InstallDirs,
+) -> Result<&'a ToolEntry, String> {
+    let with_warning = |message: String, audit: Result<(), String>| match audit {
+        Ok(()) => message,
+        Err(warning) => format!("{message}\n경고: 설치 기록을 남기지 못했습니다 — {warning}"),
+    };
+    let Some(tool) = find_tool(manifest, name) else {
+        let err = format!("unknown tool '{name}' (see frametrace tools list)");
+        let audit = audit_refusal(dirs, name, "unknown_tool", &err);
+        return Err(with_warning(err, audit));
+    };
+    if let Some(reason) = not_installable_reason(tool) {
+        let err = match &tool.manual_hint {
+            Some(hint) => format!("{name}: 자동 설치 불가 — {reason}\n수동 설치: {hint}"),
+            None => format!("{name}: 자동 설치 불가 — {reason}"),
+        };
+        let audit = audit_refusal(dirs, &tool.name, not_installable_code(), &err);
+        return Err(with_warning(err, audit));
+    }
+    Ok(tool)
+}
+
 /// Installs manifest tool `name` into `<exe dir>/tools` (T3: callers are
 /// user actions only). Blocking: network and disk work happen on the
 /// calling thread — never call this under the workstation's state lock.
@@ -888,12 +952,7 @@ pub(crate) fn install_entry(
 ) -> Result<InstallOutcome, String> {
     if let Some(reason) = not_installable_reason(tool) {
         let err = format!("{} cannot be installed automatically: {reason}", tool.name);
-        let code = if cfg!(windows) {
-            "not_installable"
-        } else {
-            "unsupported_platform"
-        };
-        let _ = audit_refusal(dirs, &tool.name, code, &err);
+        let _ = audit_refusal(dirs, &tool.name, not_installable_code(), &err);
         return Err(err);
     }
     if !cfg!(windows) {
@@ -911,7 +970,7 @@ pub(crate) fn install_entry(
     } else {
         Stage::Failed
     });
-    let audit = audit_line(tool, result.as_ref().map(|o| o.installed_files.as_slice()));
+    let audit = audit_line(tool, result.as_ref());
     let audit_result = append_audit(&dirs.audit_log(), &audit);
     match result {
         Ok(mut outcome) => {
@@ -985,6 +1044,8 @@ impl InstallLock {
 /// (recursively) when dropped — on success and on every failure path.
 pub(crate) struct StagingDir {
     path: PathBuf,
+    /// Set by [`StagingDir::close`] (removal already attempted).
+    closed: bool,
 }
 
 impl StagingDir {
@@ -994,7 +1055,12 @@ impl StagingDir {
         for _ in 0..8 {
             let path = parent.join(format!("{prefix}{}", random_hex()));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        closed: false,
+                    });
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
                     return Err(format!(
@@ -1009,15 +1075,29 @@ impl StagingDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+    /// Removes the directory now (the success path) and reports it when it
+    /// could not be removed — e.g. `backup/0.bak` is the previous
+    /// `ffmpeg.exe`, still running: Windows lets a running image be renamed
+    /// but not deleted. `None` when nothing is left behind.
+    pub(crate) fn close(mut self) -> Option<PathBuf> {
+        self.closed = true;
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(self.path.clone()),
+        }
+    }
 }
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if !self.closed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
-fn audit_line(tool: &ToolEntry, result: Result<&[PathBuf], &String>) -> String {
+fn audit_line(tool: &ToolEntry, result: Result<&InstallOutcome, &String>) -> String {
     let host = tool.url.as_deref().map(|url| {
         let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
         rest.split(['/', '?']).next().unwrap_or("").to_string()
@@ -1037,12 +1117,16 @@ fn audit_line(tool: &ToolEntry, result: Result<&[PathBuf], &String>) -> String {
         "host_id": crate::util::host_id(),
     });
     match result {
-        Ok(files) => {
+        Ok(outcome) => {
             value["result"] = "ok".into();
-            value["files"] = files
+            value["files"] = outcome
+                .installed_files
                 .iter()
                 .map(|f| serde_json::Value::from(f.display().to_string()))
                 .collect();
+            if let Some(left) = &outcome.staging_left {
+                value["staging_left"] = left.display().to_string().into();
+            }
         }
         Err(err) => {
             value["result"] = "failed".into();

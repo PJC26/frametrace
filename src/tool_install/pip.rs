@@ -236,12 +236,17 @@ pub(crate) fn install_pip(
     })();
     match built {
         Ok(exe) => {
-            if let Some(backup) = backup {
-                let _ = std::fs::remove_dir_all(backup);
-            }
+            // The replaced venv, when it cannot be removed (a process still
+            // runs from it), is reported like a leftover staging dir.
+            let old_left = backup.filter(|backup| {
+                std::fs::remove_dir_all(backup).is_err()
+                    && std::fs::symlink_metadata(backup).is_ok()
+            });
+            let staging_left = staging.close();
             Ok(InstallOutcome {
                 installed_files: vec![exe],
                 audit_warning: None,
+                staging_left: old_left.or(staging_left),
             })
         }
         Err(err) => {

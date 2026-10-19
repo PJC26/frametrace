@@ -395,10 +395,22 @@ fn audit_line_records_source_hash_and_result_without_signed_query() {
     let mut tool = base_entry();
     tool.url = Some("https://github.com/o/r/fake.zip".into());
     tool.sha256 = Some("b".repeat(64));
-    let ok = audit_line(&tool, Ok(&[PathBuf::from("x/fake.exe")]));
+    let mut outcome = InstallOutcome {
+        installed_files: vec![PathBuf::from("x/fake.exe")],
+        ..Default::default()
+    };
+    let ok = audit_line(&tool, Ok(&outcome));
     let value: serde_json::Value = serde_json::from_str(&ok).unwrap();
     assert_eq!(value["event"], "tool-install");
     assert_eq!(value["result"], "ok");
+    assert!(value.get("staging_left").is_none(), "{value}");
+    outcome.staging_left = Some(PathBuf::from("tools/.staging-x"));
+    let left: serde_json::Value = serde_json::from_str(&audit_line(&tool, Ok(&outcome))).unwrap();
+    assert_eq!(left["result"], "ok");
+    assert_eq!(
+        left["staging_left"],
+        PathBuf::from("tools/.staging-x").display().to_string()
+    );
     assert_eq!(value["host"], "github.com");
     assert_eq!(value["sha256"], "b".repeat(64));
     let failed = audit_line(&tool, Err(&"boom".to_string()));
@@ -1456,6 +1468,73 @@ mod windows_installs {
             .unwrap();
         assert!(!dead.exists(), "stale staging left behind");
         fx.assert_clean_staging_only();
+    }
+
+    /// Kills the held process on every exit path of a test.
+    struct Running(std::process::Child);
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_running_old_binary_is_reported_as_staging_left_not_silently_ok() {
+        let bytes = fake::good_zip();
+        let source = fake::serve(HashMap::from([(
+            "/fake.zip".to_string(),
+            Reply::Body(bytes.clone()),
+        )]));
+        let fx = Fixture::new("held");
+        // The previous tools/bin/fake.exe is running (a copy of cmd.exe):
+        // Windows lets the install rename it into the
+        // staging backup, but not delete it.
+        std::fs::create_dir_all(fx.dirs.bin()).unwrap();
+        let old = fx.dirs.bin().join("fake.exe");
+        std::fs::copy(archive::system32_tool("cmd.exe").unwrap(), &old).unwrap();
+        let mut command = std::process::Command::new(&old);
+        // An interactive cmd reading its (open, idle) stdin pipe: runs
+        // until killed, starts nothing else.
+        command
+            .args(["/d", "/q", "/k"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let running = Running(command.spawn().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let outcome = fx
+            .install(&archive_entry(&source.url("/fake.zip"), &bytes))
+            .unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), b"MZ fake binary");
+        let left = outcome
+            .staging_left
+            .clone()
+            .expect("the held backup must be reported");
+        assert!(left.starts_with(&fx.dirs.tools_dir), "{}", left.display());
+        assert!(
+            left.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".staging-")
+        );
+        assert!(left.join("backup").join("0.bak").is_file());
+        // The audit line says "ok" and names the leftover.
+        let text = std::fs::read_to_string(fx.dirs.audit_log()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(line["result"], "ok");
+        assert_eq!(line["staging_left"], left.display().to_string());
+
+        // Once the old binary exits, the next sweep removes the leftover.
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            clean_stale_staging(&fx.dirs.tools_dir, std::time::SystemTime::now()),
+            1
+        );
+        assert!(!left.exists());
     }
 
     #[test]

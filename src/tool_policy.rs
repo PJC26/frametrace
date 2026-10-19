@@ -256,15 +256,84 @@ fn is_allowed_tool_name(candidate: &str, allowed_names: &[&str]) -> bool {
 /// evidence media. When the tool cannot be found, `None` is returned: the
 /// caller must refuse to spawn rather than fall back to a bare name, which
 /// would reintroduce the planting vector this resolver exists to prevent.
+///
+/// Order: a tool the pinned manifest provides (`tools/manifest.json`
+/// `provides`: ffmpeg, ffprobe, the libewf / Sleuth Kit binaries,
+/// deepfake-lens) resolves from `<exe dir>/tools/bin` FIRST — that is the
+/// hash-pinned install tree — and only then from PATH, because the default
+/// user PATH holds user-writable directories (WindowsApps, Python Scripts,
+/// npm, .cargo\bin) where a planted `ffmpeg.exe` would otherwise shadow the
+/// verified one. Any other tool keeps PATH first, then tools/bin.
 fn resolve_bare_tool_path(name: &str, allowed_names: &[&str]) -> Option<String> {
     let path_var = std::env::var("PATH").unwrap_or_default();
-    if let Some(path) = find_in_path_dirs(name, allowed_names, &path_var) {
-        return Some(path.to_string_lossy().to_string());
+    resolve_bare_in(
+        name,
+        allowed_names,
+        &path_var,
+        tools_bin_dir().as_deref(),
+        is_manifest_tool(name),
+    )
+}
+
+/// Whether the pinned tool manifest provides `name` (`ffmpeg` or
+/// `ffmpeg.exe`).
+fn is_manifest_tool(name: &str) -> bool {
+    let bare = name.strip_suffix(".exe").unwrap_or(name);
+    crate::tool_install::tool_for_binary(bare).is_some()
+}
+
+/// [`resolve_bare_tool_path`] against an explicit PATH value and tools/bin
+/// directory (unit tests).
+fn resolve_bare_in(
+    name: &str,
+    allowed_names: &[&str],
+    path_var: &str,
+    tools_bin: Option<&Path>,
+    tools_bin_first: bool,
+) -> Option<String> {
+    // Portable layout: `<exe dir>/tools/bin` ships forensic tools next to
+    // the binary so examiners never need admin rights to extend PATH. The
+    // directory is part of the trusted install tree, unlike the CWD.
+    let from_tools_bin = || tools_bin.and_then(|dir| find_in_dir(dir, name, allowed_names));
+    let from_path = || {
+        find_in_path_dirs(name, allowed_names, path_var)
+            .map(|path| path.to_string_lossy().to_string())
+    };
+    if tools_bin_first {
+        from_tools_bin().or_else(from_path)
+    } else {
+        from_path().or_else(from_tools_bin)
     }
-    // Portable layout: `<exe dir>/tools/bin` ships optional forensic tools
-    // next to the binary so examiners never need admin rights to extend PATH.
-    // The directory is part of the trusted install tree, unlike the CWD.
-    find_in_tools_bin(name, allowed_names)
+}
+
+/// For a manifest tool that resolves from `<exe dir>/tools/bin`: the
+/// different copy on PATH that tools/bin takes precedence over — the one a
+/// PATH-first lookup (older FrameTrace builds, other programs, a shell)
+/// would run. FrameTrace does not use it; doctor, `tools list --json` and
+/// `GET /api/tools` report it as `shadowed_by` so the examiner can check it
+/// is not a planted binary. `None` when the tool does not resolve from
+/// tools/bin or PATH has no other copy.
+pub fn shadowed_by(name: &str) -> Option<String> {
+    if !is_manifest_tool(name) {
+        return None;
+    }
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    shadow_in(name, &[name], &path_var, tools_bin_dir().as_deref())
+}
+
+fn shadow_in(
+    name: &str,
+    allowed_names: &[&str],
+    path_var: &str,
+    tools_bin: Option<&Path>,
+) -> Option<String> {
+    let used = find_in_dir(tools_bin?, name, allowed_names)?;
+    let other = find_in_path_dirs(name, allowed_names, path_var)?;
+    let same = match (Path::new(&used).canonicalize(), other.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => Path::new(&used) == other.as_path(),
+    };
+    (!same).then(|| other.to_string_lossy().to_string())
 }
 
 /// Whether an optional forensic tool has been dropped into the portable
@@ -283,8 +352,7 @@ fn tools_bin_dir() -> Option<PathBuf> {
     Some(exe.parent()?.join("tools").join("bin"))
 }
 
-fn find_in_tools_bin(name: &str, allowed_names: &[&str]) -> Option<String> {
-    let dir = tools_bin_dir()?;
+fn find_in_dir(dir: &Path, name: &str, allowed_names: &[&str]) -> Option<String> {
     for candidate_name in [name.to_string(), format!("{name}.exe")] {
         let candidate = dir.join(&candidate_name);
         let Ok(metadata) = std::fs::metadata(&candidate) else {
@@ -503,6 +571,60 @@ mod tests {
         let absolute = tool_dir.display().to_string();
         assert!(find_in_path_dirs("ffprobe", &["ffprobe"], &absolute).is_some());
         let _ = fs::remove_dir_all(cwd.join(rel));
+    }
+
+    /// B-7 (Fix round 2): a manifest tool installed in tools/bin is used
+    /// even when a (possibly planted) copy sits on PATH; that PATH copy is
+    /// reported as `shadowed_by`. Other tools keep PATH first.
+    #[test]
+    fn manifest_tools_resolve_from_tools_bin_before_path_and_report_the_shadow() {
+        use super::{is_manifest_tool, resolve_bare_in, shadow_in};
+        let base =
+            std::env::temp_dir().join(format!("frametrace-tools-bin-first-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let tools_bin = base.join("tools").join("bin");
+        let planted = base.join("user-writable");
+        fs::create_dir_all(&tools_bin).unwrap();
+        fs::create_dir_all(&planted).unwrap();
+        let exe = if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        fs::write(tools_bin.join(exe), b"pinned").unwrap();
+        fs::write(planted.join(exe), b"planted").unwrap();
+        let path_var = planted.display().to_string();
+        let canon = |p: &Path| p.canonicalize().unwrap();
+
+        assert!(is_manifest_tool("ffmpeg") && is_manifest_tool("ffprobe.exe"));
+        assert!(is_manifest_tool("fls") && is_manifest_tool("deepfake-lens"));
+        assert!(!is_manifest_tool("python") && !is_manifest_tool("frametrace-probe-icat"));
+
+        let used = resolve_bare_in("ffmpeg", &["ffmpeg"], &path_var, Some(&tools_bin), true)
+            .expect("resolves");
+        assert_eq!(canon(Path::new(&used)), canon(&tools_bin.join(exe)));
+        let shadow = shadow_in("ffmpeg", &["ffmpeg"], &path_var, Some(&tools_bin))
+            .expect("the PATH copy is reported");
+        assert_eq!(canon(Path::new(&shadow)), canon(&planted.join(exe)));
+
+        // A non-manifest tool: PATH first, as before.
+        let used =
+            resolve_bare_in("ffmpeg", &["ffmpeg"], &path_var, Some(&tools_bin), false).unwrap();
+        assert_eq!(canon(Path::new(&used)), canon(&planted.join(exe)));
+
+        // Nothing in tools/bin: PATH is the fallback and nothing is shadowed.
+        let empty_bin = base.join("empty-bin");
+        fs::create_dir_all(&empty_bin).unwrap();
+        let used =
+            resolve_bare_in("ffmpeg", &["ffmpeg"], &path_var, Some(&empty_bin), true).unwrap();
+        assert_eq!(canon(Path::new(&used)), canon(&planted.join(exe)));
+        assert!(shadow_in("ffmpeg", &["ffmpeg"], &path_var, Some(&empty_bin)).is_none());
+        // tools/bin itself on PATH is the same file, not a shadow.
+        let same = tools_bin.display().to_string();
+        assert!(shadow_in("ffmpeg", &["ffmpeg"], &same, Some(&tools_bin)).is_none());
+        // No PATH copy: nothing shadowed.
+        assert!(shadow_in("ffmpeg", &["ffmpeg"], "", Some(&tools_bin)).is_none());
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

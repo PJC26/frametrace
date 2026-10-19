@@ -108,8 +108,8 @@ pub(crate) fn probe_env_outcome() -> (String, bool) {
     let media = has("ffmpeg") && has("ffprobe");
     let ewf = has("ewfinfo") && has("ewfverify") && has("ewfexport");
     let tsk = has("mmls") && has("fls") && has("icat");
-    // deepfake-lens resolves via FRAMETRACE_DEEPFAKE_LENS first, then PATH /
-    // tools/bin — mirror that order so the badge matches what the pipeline
+    // deepfake-lens resolves via FRAMETRACE_DEEPFAKE_LENS first, then tools/bin /
+    // PATH — mirror that order so the badge matches what the pipeline
     // would actually run.
     let deepfake = std::env::var("FRAMETRACE_DEEPFAKE_LENS")
         .ok()

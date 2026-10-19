@@ -82,8 +82,8 @@ pub fn screen(path: &Path) -> DeepfakeSummary {
 
 /// The deepfake-lens binary the lane runs: `FRAMETRACE_DEEPFAKE_LENS`,
 /// else the private venv `frametrace tools install deepfake-lens` built
-/// (`<exe dir>/tools/python/deepfake-lens`), else the bare name (PATH,
-/// then tools/bin).
+/// (`<exe dir>/tools/python/deepfake-lens`), else the bare name (tools/bin,
+/// then PATH — a manifest tool, see `tool_policy`).
 pub fn configured_lens_binary() -> String {
     if let Ok(value) = std::env::var("FRAMETRACE_DEEPFAKE_LENS")
         && !value.trim().is_empty()

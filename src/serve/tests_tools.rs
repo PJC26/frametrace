@@ -154,6 +154,7 @@ fn cancel_during_a_non_cancellable_stage_is_refused_with_its_own_code() {
             finished_unix: None,
             installed_files: Vec::new(),
             audit_warning: None,
+            staging_left: None,
         });
     }
     // Downloading: honoured.
@@ -313,6 +314,8 @@ mod windows {
         let status = parse(&tools::api_tools_install_status(&state));
         assert_eq!(status["install"]["state"], "done", "{status}");
         assert_eq!(status["install"]["stage"], "done");
+        assert_eq!(status["install"]["cancelled"], false);
+        assert!(status["install"]["staging_left"].is_null(), "{status}");
         assert_eq!(
             status["install"]["installed_files"]
                 .as_array()
@@ -360,6 +363,7 @@ mod windows {
             status["install"]["error"],
             crate::tool_install::INSTALL_CANCELLED
         );
+        assert_eq!(status["install"]["cancelled"], true, "{status}");
         assert!(!state_lock(&state).busy);
         assert!(!base.join("tools/bin/fake.exe").exists());
         let staged = std::fs::read_dir(base.join("tools"))

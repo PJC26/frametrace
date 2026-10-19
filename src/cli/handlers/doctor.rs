@@ -584,20 +584,34 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
         ("fls", "삭제 파일 나열"),
         ("icat", "inode 내용 복구"),
     ] {
+        // A different copy on PATH that the pinned tools/bin one takes
+        // precedence over (B-7): not used, shown so it can be checked.
+        let shadow = crate::tool_policy::shadowed_by(name)
+            .map(|other| {
+                format!(" · 주의: PATH의 다른 {name}({other})는 쓰지 않음(tools/bin 우선)")
+            })
+            .unwrap_or_default();
         match crate::tool_policy::resolve_tool_binary(name, &[name]) {
             Ok(found) if name == "ffmpeg" => {
                 // The bundled LGPL build has no libx264: say which H.264
-                // encoder proxies/exports will use instead.
+                // encoder proxies/exports will use instead (and when
+                // h264_mf is listed but cannot start — Windows N/KN without
+                // the Media Feature Pack).
                 let encoders = crate::ffmpeg_encoders::for_binary(&found);
                 checks.push(match encoders.build_note() {
                     Some(note) if !encoders.video().is_h264() => {
-                        DoctorCheck::warn(name, format!("{found} — {feature} · {note}"))
+                        DoctorCheck::warn(name, format!("{found} — {feature} · {note}{shadow}"))
                     }
-                    Some(note) => DoctorCheck::ok(name, format!("{found} — {feature} · {note}")),
-                    None => DoctorCheck::ok(name, format!("{found} — {feature}")),
+                    Some(note) => {
+                        DoctorCheck::ok(name, format!("{found} — {feature} · {note}{shadow}"))
+                    }
+                    None => DoctorCheck::ok(name, format!("{found} — {feature}{shadow}")),
                 });
             }
-            Ok(found) => checks.push(DoctorCheck::ok(name, format!("{found} — {feature}"))),
+            Ok(found) => checks.push(DoctorCheck::ok(
+                name,
+                format!("{found} — {feature}{shadow}"),
+            )),
             Err(err) => checks.push(DoctorCheck::warn(
                 name,
                 // Track S3: point at the pinned installer (or the

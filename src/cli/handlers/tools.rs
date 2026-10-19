@@ -37,6 +37,13 @@ pub fn tools_list(json: bool, all: bool) -> Result<(), String> {
                 println!("  참고: {note}");
             }
         }
+        for (binary, other) in &status.shadowed_by {
+            if let Some(other) = other {
+                println!(
+                    "  주의: PATH에 다른 {binary}가 있습니다 — {other} (쓰지 않음, tools/bin 우선). 직접 둔 것이 아니면 확인하십시오."
+                );
+            }
+        }
         if !status.installed() {
             match tool_install::not_installable_reason(tool) {
                 None => println!("  설치: frametrace tools install {}", tool.name),
@@ -53,16 +60,14 @@ pub fn tools_list(json: bool, all: bool) -> Result<(), String> {
 }
 
 pub fn tools_install(name: &str, yes: bool) -> Result<(), String> {
+    tools_install_in(name, yes, &InstallDirs::for_current_exe()?)
+}
+
+fn tools_install_in(name: &str, yes: bool, dirs: &InstallDirs) -> Result<(), String> {
     let manifest = tool_install::manifest()?;
-    let tool = tool_install::find_tool(manifest, name)
-        .ok_or_else(|| format!("unknown tool '{name}' (see frametrace tools list)"))?;
-    if let Some(reason) = tool_install::not_installable_reason(tool) {
-        return Err(match &tool.manual_hint {
-            Some(hint) => format!("{name}: 자동 설치 불가 — {reason}\n수동 설치: {hint}"),
-            None => format!("{name}: 자동 설치 불가 — {reason}"),
-        });
-    }
-    let dirs = InstallDirs::for_current_exe()?;
+    // Unknown / not installable: refused here, before the prompt, and
+    // recorded in the chained install audit log like the API's refusals.
+    let tool = tool_install::preflight(manifest, name, dirs)?;
     // T3: name, source and size are shown before anything is fetched.
     println!(
         "도구: {} {}",
@@ -88,12 +93,15 @@ pub fn tools_install(name: &str, yes: bool) -> Result<(), String> {
         println!("라이선스: {license}");
     }
     println!("설치 위치: {}", dirs.tools_dir.display());
-    // PATH is searched before tools/bin (tool_policy): say which copy wins.
+    // Manifest tools resolve from tools/bin first (tool_policy): a copy
+    // on PATH stops being used once this install lands.
     for (binary, path) in &tool_install::status(tool).paths {
         if let Some(path) = path
             && !std::path::Path::new(path).starts_with(&dirs.tools_dir)
         {
-            println!("참고: {binary}는 이미 {path}에 있고 PATH가 tools/bin보다 먼저 쓰입니다.");
+            println!(
+                "참고: 지금은 PATH의 {binary}({path})가 쓰입니다 — 설치하면 tools/bin의 것이 먼저 쓰입니다."
+            );
         }
     }
     if !yes {
@@ -144,9 +152,53 @@ pub fn tools_install(name: &str, yes: bool) -> Result<(), String> {
     if let Some(warning) = &outcome.audit_warning {
         println!("경고: 설치 기록을 남기지 못했습니다 — {warning}");
     }
+    if let Some(left) = &outcome.staging_left {
+        println!(
+            "참고: 이전 파일이 아직 실행 중이라 임시 폴더를 지우지 못했습니다 — {} (다음 설치·서버 시작 때 정리)",
+            left.display()
+        );
+    }
     println!(
         "완료: {name} 설치 (감사 기록: {})",
         dirs.audit_log().display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `frametrace tools install` refusals before the prompt (unknown tool,
+    /// not installable here) are appended to the chained install audit log,
+    /// like the API's — and nothing else is written.
+    #[test]
+    fn cli_refusals_are_audited_before_the_prompt() {
+        let base = std::env::temp_dir().join(format!("ft-cli-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs = InstallDirs {
+            tools_dir: base.join("tools"),
+        };
+        let err = tools_install_in("no-such-tool", true, &dirs).unwrap_err();
+        assert!(err.contains("unknown tool 'no-such-tool'"), "{err}");
+        // libewf has no published checksum: never installable.
+        let err = tools_install_in("libewf", true, &dirs).unwrap_err();
+        assert!(err.contains("자동 설치 불가"), "{err}");
+        crate::tool_install::tests::assert_only_refusals(
+            &dirs,
+            &["unknown_tool", crate::tool_install::not_installable_code()],
+        );
+        let text = std::fs::read_to_string(dirs.audit_log()).unwrap();
+        let tools: Vec<String> = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["tool"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(tools, ["no-such-tool", "libewf"]);
+        let _ = std::fs::remove_dir_all(base);
+    }
 }

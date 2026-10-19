@@ -98,9 +98,14 @@ pub(crate) fn install_archive(
     }
     moves.extend(own_moves);
     move_all_or_nothing(&moves, &staging.path().join("backup"))?;
+    // The replaced files sit in staging/backup; a still-running old
+    // ffmpeg.exe cannot be deleted, so say what was left (never "ok"
+    // with a silent leftover).
+    let staging_left = staging.close();
     Ok(InstallOutcome {
         installed_files: moves.into_iter().map(|(_, dest)| dest).collect(),
         audit_warning: None,
+        staging_left,
     })
 }
 

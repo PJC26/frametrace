@@ -34,6 +34,9 @@ pub(crate) struct ToolInstallJob {
     pub(crate) finished_unix: Option<u64>,
     pub(crate) installed_files: Vec<String>,
     pub(crate) audit_warning: Option<String>,
+    /// A staging dir the finished install could not remove (old binary
+    /// still running); the install itself succeeded.
+    pub(crate) staging_left: Option<String>,
 }
 
 pub(crate) fn install_job_json(job: &ToolInstallJob) -> serde_json::Value {
@@ -52,6 +55,11 @@ pub(crate) fn install_job_json(job: &ToolInstallJob) -> serde_json::Value {
         "finished_unix": job.finished_unix,
         "installed_files": job.installed_files,
         "audit_warning": job.audit_warning,
+        "staging_left": job.staging_left,
+        // A failed job that stopped on the user's cancel (not an error),
+        // so the UI need not match the error text.
+        "cancelled": job.state == "failed"
+            && job.error.as_deref() == Some(tool_install::INSTALL_CANCELLED),
     })
 }
 
@@ -265,6 +273,7 @@ pub(crate) fn start_install(state: &SharedState, name: &str, env: InstallEnv) ->
             finished_unix: None,
             installed_files: Vec::new(),
             audit_warning: None,
+            staging_left: None,
         };
         let snapshot = install_job_json(&job);
         guard.tool_install = Some(job);
@@ -293,6 +302,8 @@ pub(crate) fn start_install(state: &SharedState, name: &str, env: InstallEnv) ->
                                 .map(|path| path.display().to_string())
                                 .collect();
                             job.audit_warning = outcome.audit_warning;
+                            job.staging_left =
+                                outcome.staging_left.map(|path| path.display().to_string());
                         }
                         Err(err) => {
                             job.state = "failed";

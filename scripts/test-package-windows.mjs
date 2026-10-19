@@ -167,6 +167,10 @@ const source = await serve({
   '/evil': { redirect: () => `http://localhost:${outside.address().port}/x.zip` },
   '/evil-https': { redirect: () => 'https://example.com/x.zip' },
   '/loop': { redirect: (s) => `http://127.0.0.1:${s.address().port}/loop` },
+  // curl resolves a plain relative Location itself; one it leaves as is
+  // ("http:x" is not an absolute URI) must be refused as a URL, not crash.
+  '/relative': { redirect: () => 'http:x' },
+  '/relative-ok': { redirect: () => 'real/ffmpeg.zip' },
 });
 const base = `http://127.0.0.1:${source.address().port}`;
 const roots = [];
@@ -216,6 +220,23 @@ try {
     const root = fakeRepo(manifestFor(`${base}/loop`)); roots.push(root);
     const { code, out } = await runPackage(root);
     check(code !== 0 && /more than 5 redirects/.test(out), 'redirect loop bounded', out);
+  }
+  // 3b. A Location that is not an absolute URI is refused by the URL gate
+  // (Fix round 2: it used to hit a [Uri] cast error first); a relative one
+  // curl resolves against the current URL is followed on the same host.
+  {
+    const root = fakeRepo(manifestFor(`${base}/relative`)); roots.push(root);
+    const hits = source.hits;
+    const { code, out } = await runPackage(root);
+    check(code !== 0 && /refused URL \(not absolute\)/.test(out), 'non-absolute redirect Location refused as a URL', out);
+    check(!/GetLeftPart|relative URI/.test(out), 'no Uri cast error', out);
+    check(source.hits - hits === 1, 'nothing contacted after the refused hop', `hits ${source.hits - hits}`);
+    check(!existsSync(join(root, 'dist/FrameTrace')), 'nothing staged after a refused Location');
+  }
+  {
+    const root = fakeRepo(manifestFor(`${base}/relative-ok`)); roots.push(root);
+    const { code, out } = await runPackage(root);
+    check(code === 0, 'relative Location resolved by curl is followed', out);
   }
   // 4. A hash mismatch packages nothing.
   {

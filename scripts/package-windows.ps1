@@ -124,7 +124,11 @@ function Invoke-PinnedDownload([string]$curl, [string]$url, [string]$out, [int64
         if ($code -eq 200) { return }
         if (@(301, 302, 303, 307, 308) -contains $code) {
             if (-not $location) { throw "download failed: HTTP $code without a Location" }
-            Write-Host "redirect $hop -> $(([System.Uri]$location).GetLeftPart([System.UriPartial]::Path))"
+            # Gate the hop before anything else touches it: a Location curl
+            # left unresolved (e.g. "http:x") is not an absolute URI and is
+            # refused here as a URL, never cast first.
+            $next = Assert-AllowedUrl $location
+            Write-Host "redirect $hop -> $($next.GetLeftPart([System.UriPartial]::Path))"
             $current = $location
             continue
         }
