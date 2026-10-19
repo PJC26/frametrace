@@ -956,11 +956,16 @@ function finApplyEnv() {
   const btn = mount && mount.querySelector("button[data-adv='deepfake']");
   if (!btn || !FIN.env) return;
   const ok = FIN.env.deepfake === true;
-  // §28: a server that can install deepfake-lens keeps the button — the
-  // click shows the install prompt instead of running.
+  // §28: only a server that can install deepfake-lens here
+  // (installable === true) keeps the button — the click shows the install
+  // prompt instead of running. Otherwise it stays disabled with the
+  // server's short manual_hint as the tooltip.
   const ask = !ok && typeof htNeedsTool === "function" && htNeedsTool("deepfake-lens");
   btn.dataset.envOff = ok || ask ? "" : "1";
-  if (!ok && !ask) { btn.disabled = true; btn.title = "deepfake-lens 미설치 — PyPI에 없음: 받은 패키지를 pip install <경로>로 설치하거나 FRAMETRACE_DEEPFAKE_LENS 경로 설정"; }
+  if (!ok && !ask) {
+    btn.disabled = true;
+    btn.title = (typeof htToolHint === "function" && htToolHint("deepfake-lens")) || "deepfake-lens 미설치 — PyPI에 없음: 받은 패키지를 pip install <경로>로 설치하거나 FRAMETRACE_DEEPFAKE_LENS 경로 설정";
+  }
   else {
     if (ask) btn.title = "deepfake-lens 미설치 — 누르면 설치를 안내합니다";
     if (!FIN.advBusy) btn.disabled = false;
