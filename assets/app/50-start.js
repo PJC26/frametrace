@@ -36,6 +36,13 @@ $("btnStart").addEventListener("click", async () => {
     });
     if (!go) { $("caseDir").focus(); return; }
   }
+  // §28: deepfake screening ticked but deepfake-lens is not installed —
+  // offer the install here instead of starting.
+  if (typeof htHidePrompt === "function") htHidePrompt($("startToolPrompt"));
+  if ($("withDeepfake").checked && typeof htNeedsTool === "function" && htNeedsTool("deepfake-lens")) {
+    htShowToolPrompt($("startToolPrompt"), "deepfake-lens", () => $("btnStart").click(), "retryStart");
+    return;
+  }
   starting = true;
   $("btnStart").disabled = true;
   const hint = $("startHint");
@@ -55,6 +62,10 @@ $("btnStart").addEventListener("click", async () => {
       skip_e01_verify: $("skipE01Verify").checked,
       e01_direct: inputKind() === "e01" && $("directE01").checked
     });
+    if (!res.ok && res.tool_missing && typeof htShowToolPrompt === "function") {
+      htShowToolPrompt($("startToolPrompt"), String(res.tool_missing), () => $("btnStart").click(), "retryStart");
+      return;
+    }
     if (!res.ok) {
       $("startErr").classList.add("show");
       $("startErr").innerHTML = errorHtml(res.error || "시작 실패");

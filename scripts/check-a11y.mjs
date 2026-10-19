@@ -34,6 +34,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { startIsolatedServer } from './lib/isolated-server.mjs';
+import { routeTools } from './lib/tools-mock.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -359,6 +360,21 @@ const PAGES = [
     await page.waitForSelector('#inputCard:not([hidden])');
     await page.waitForTimeout(500);
   } },
+  // Contract §28: the 도구 panel (mocked /api/tools) and its confirm dialog.
+  { id: 'shell-empty-tools', path: '/', route: (page) => routeTools(page), prep: async (page) => {
+    await page.waitForSelector('#hViewerHost:not([hidden]), #inputCard:not([hidden])', { timeout: 20000 });
+    if (await page.locator('#hViewerHost').isVisible()) { await page.click('#hProjectBtn'); await page.click('#hProjectNew'); }
+    await page.waitForSelector('#hToolsPanel:not([hidden])', { timeout: 8000 });
+    await page.waitForTimeout(300);
+  } },
+  { id: 'shell-empty-tools-dialog', path: '/', route: (page) => routeTools(page), prep: async (page) => {
+    await page.waitForSelector('#hViewerHost:not([hidden]), #inputCard:not([hidden])', { timeout: 20000 });
+    if (await page.locator('#hViewerHost').isVisible()) { await page.click('#hProjectBtn'); await page.click('#hProjectNew'); }
+    await page.waitForSelector('#hToolsPanel:not([hidden])', { timeout: 8000 });
+    await page.click('#hToolsList button[data-tool-install="libewf"]');
+    await page.waitForSelector('#dlgBackdrop:not([hidden])');
+    await page.waitForTimeout(300);
+  } },
   { id: 'shell-project', path: '/', prep: waitProject },
   { id: 'shell-project-sheets-finalize', path: '/', prep: async (page) => { await waitProject(page); await page.click('#hBtnFinalize'); await page.waitForSelector('#hFinalizeSheet:not([hidden])'); await page.waitForTimeout(300); } },
   { id: 'shell-project-sheets-jobs', path: '/', prep: async (page) => { await waitProject(page); await page.click('#hBtnJobs'); await page.waitForSelector('#hJobsSheet:not([hidden])'); await page.waitForTimeout(300); } },
@@ -392,6 +408,7 @@ for (const theme of THEMES) {
       const page = await context.newPage();
       const ctx0 = { page: pg.id, theme, viewport: `${vp.width}x${vp.height}` };
       try {
+        if (pg.route) await pg.route(page);
         await page.goto(`${base}${pg.path}?token=${token}`, { waitUntil: 'load' });
         await pg.prep(page);
       } catch (e) {

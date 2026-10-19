@@ -267,4 +267,5 @@ $("withDeepfake").addEventListener("change", updateOptSummary);
 // Called whenever the empty state comes back on screen.
 function onHomeShown() {
   renderRecentCases();
+  if (typeof htLoad === "function") htLoad();
 }

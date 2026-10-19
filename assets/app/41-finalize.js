@@ -561,6 +561,10 @@ async function gatherFinalizeChecks() {
   }
   if (!FIN.audit && st && ["review-ready", "done", "finalized"].includes(phase)) await finRunAudit();
   if (FIN.audit) add(FIN.audit.level === "ok" ? "ok" : "warn", FIN.audit.text, "");
+  // §28: a missing required tool (FFmpeg) — a warning, not a block.
+  if (typeof htFinalizeChecks === "function") {
+    try { (await htFinalizeChecks()).forEach(c => checks.push(c)); } catch (e) {}
+  }
   return { checks, caseId, status: st };
 }
 
@@ -899,6 +903,7 @@ function finBuild() {
     `<input type="file" id="marksFile" accept=".json" hidden>` +
     `<button type="button" id="btnImportMarks" title="다른 PC·오프라인 뷰어에서 내보낸 마크 JSON을 가져올 때만 사용합니다 — 이 화면의 뷰어 마크는 자동으로 케이스에 반영됩니다">외부 마크 파일 가져오기 (보고서 갱신)</button>` +
     `<pre class="h-fin-out mono" id="advOut" hidden></pre><div id="advLink"></div>` +
+    `<div class="h-toolprompt" id="advToolPrompt" role="group" aria-label="필요한 도구" hidden></div>` +
     `</div></details>` +
     `</div>` +
     `<div class="h-sheet-foot h-fin-foot"><span class="h-fin-hint muted" id="finalHint" role="status"></span>` +
@@ -951,9 +956,15 @@ function finApplyEnv() {
   const btn = mount && mount.querySelector("button[data-adv='deepfake']");
   if (!btn || !FIN.env) return;
   const ok = FIN.env.deepfake === true;
-  btn.dataset.envOff = ok ? "" : "1";
-  if (!ok) { btn.disabled = true; btn.title = "deepfake-lens 미설치 — pip install deepfake-lens 또는 FRAMETRACE_DEEPFAKE_LENS 경로 설정"; }
-  else if (!FIN.advBusy) btn.disabled = false;
+  // §28: a server that can install deepfake-lens keeps the button — the
+  // click shows the install prompt instead of running.
+  const ask = !ok && typeof htNeedsTool === "function" && htNeedsTool("deepfake-lens");
+  btn.dataset.envOff = ok || ask ? "" : "1";
+  if (!ok && !ask) { btn.disabled = true; btn.title = "deepfake-lens 미설치 — pip install deepfake-lens 또는 FRAMETRACE_DEEPFAKE_LENS 경로 설정"; }
+  else {
+    if (ask) btn.title = "deepfake-lens 미설치 — 누르면 설치를 안내합니다";
+    if (!FIN.advBusy) btn.disabled = false;
+  }
 }
 // Repaints everything that depends on state; never touches the typed
 // examiner name or the <details> open state.
@@ -1064,7 +1075,7 @@ function finResetSheet() {
   FIN.incomplete = null; FIN.reportStale = null;
   FIN.result = null; FIN.verify = null; FIN.audit = null; FIN.checks = []; FIN.status = null;
   FIN.caseId = null; FIN.examinerTouched = false; FIN.gen++;
-  if (FIN.built) { finEl("finalExaminer").value = ""; finHint(""); finEl("advOut").hidden = true; finEl("advOut").textContent = ""; finEl("advLink").innerHTML = ""; finPaint(); }
+  if (FIN.built) { finEl("finalExaminer").value = ""; finHint(""); finEl("advOut").hidden = true; finEl("advOut").textContent = ""; if (typeof htHidePrompt === "function") htHidePrompt(finEl("advToolPrompt")); finEl("advLink").innerHTML = ""; finPaint(); }
   if (FIN.open) finRefresh();
 }
 function finSetFinalizing(on) {
@@ -1222,11 +1233,24 @@ async function finAdvanced(btn) {
     });
     if (!go) return;
   }
+  // §28: deepfake-lens known missing here → the install prompt, no run.
+  const prompt = finEl("advToolPrompt");
+  if (typeof htHidePrompt === "function") htHidePrompt(prompt);
+  if (tool === "deepfake" && typeof htNeedsTool === "function" && htNeedsTool("deepfake-lens")) {
+    out.hidden = true; out.textContent = "";
+    htShowToolPrompt(prompt, "deepfake-lens", () => finAdvanced(btn));
+    return;
+  }
   btn.disabled = true; FIN.advBusy = true;
   out.hidden = false; out.textContent = "실행 중…";
   finEl("advLink").innerHTML = "";
   try {
     const res = await jpost("/api/advanced", { tool, extra });
+    if (!res.ok && res.tool_missing && typeof htShowToolPrompt === "function") {
+      out.hidden = true; out.textContent = "";
+      htShowToolPrompt(prompt, String(res.tool_missing), () => finAdvanced(btn));
+      return;
+    }
     out.textContent = res.ok ? (res.output || "완료") : "실패: " + (res.error || "알 수 없는 오류");
     if (res.ok && res.url) finEl("advLink").innerHTML = `<a href="/case/${esc(res.url)}" target="_blank" rel="noopener">산출물 열기: ${esc(res.url)}${finIcon("i-external")}</a>`;
   } finally {

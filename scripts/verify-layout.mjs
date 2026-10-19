@@ -41,6 +41,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { startIsolatedServer } from './lib/isolated-server.mjs';
+import { routeTools } from './lib/tools-mock.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -736,6 +737,69 @@ try {
       role: (document.getElementById('anomalyHeadBanner') || { getAttribute: () => '' }).getAttribute('role'),
       hscroll: document.documentElement.scrollWidth > innerWidth + 1 }));
     check('R18 U1: withheld → pill "이상 1 (인증 안 됨 1) · 확인 불가", banner shows the reason', r18.pill === '이상 1 (인증 안 됨 1) · 확인 불가' && r18.banner.trim() === '이상 징후 확인 불가 — 완료 표식 뒤 인증 안 된 줄' && r18.bannerTip.includes('완료 표식 뒤에 이 PC에서 인증할 수 없는 항목') && r18.role === 'status' && !r18.hscroll, JSON.stringify(r18));
+    await context.close();
+  }
+  // Tools U1/U2 (contract §28): the empty state's 도구 panel against a
+  // mocked /api/tools at 1366x768, both themes — rows, sizes, no sideways
+  // scroll, [이어서 검토] still on screen; keyboard: Enter opens the confirm
+  // dialog (file · source · size · license), Tab stays inside, Esc sends
+  // nothing and returns focus; OK sends one POST, progress is announced,
+  // buttons are disabled without dropping focus to <body>, the result shows.
+  for (const theme of ['light', 'dark']) {
+    const context = await browser.newContext({ viewport: { width: 1366, height: 768 }, colorScheme: theme });
+    await context.addInitScript((t) => { try { localStorage.setItem('ft-theme', t); } catch { /* blocked */ } }, theme);
+    const page = await context.newPage();
+    page.on('pageerror', (e) => pageErrors.push(`tools ${theme}: ${e.message}`));
+    const mock = await routeTools(page, { steps: 2 });
+    await page.goto(`${base}/?token=${token}`);
+    await page.waitForSelector('#hViewerHost:not([hidden]), #inputCard:not([hidden])', { timeout: 20000 });
+    if (await page.locator('#hViewerHost').isVisible()) { await page.click('#hProjectBtn'); await page.click('#hProjectNew'); }
+    await page.waitForSelector('#inputCard:not([hidden])');
+    await page.waitForSelector('#hToolsPanel:not([hidden])', { timeout: 8000 }).catch(() => {});
+    await until(() => page.locator('#recentCaseRow li').count(), 8000);
+    const t1 = await page.evaluate(() => {
+      const panel = document.getElementById('hToolsPanel');
+      const vis = (el) => !!el && el.getClientRects().length > 0;
+      const rows = [...document.querySelectorAll('#hToolsList > li')].map((li) => ({ tool: li.dataset.tool, cls: li.className, text: li.textContent.replace(/\s+/g, ' ').trim() }));
+      const btns = [...document.querySelectorAll('#hToolsList button')].map((b) => { const r = b.getBoundingClientRect(); return { tool: b.dataset.toolInstall, h: r.height, w: r.width }; });
+      const top = document.querySelector('#recentCaseRow li button.primary');
+      const blocks = [...document.querySelectorAll('#inputCard .sblock')].filter(vis).length;
+      const p = panel.getBoundingClientRect(), col = document.querySelector('#inputCard .h-col').getBoundingClientRect();
+      return { shown: vis(panel), rows, btns, blocks, inCol: p.left >= col.left - 0.5 && p.right <= col.right + 0.5,
+        topBottom: top ? top.getBoundingClientRect().bottom : null, vh: innerHeight, hscroll: document.documentElement.scrollWidth > innerWidth + 1 };
+    });
+    check(`tools ${theme}: panel shows FFmpeg (warning), libewf (info + 설치), Sleuth Kit (reason, no button)`,
+      t1.shown && t1.rows.length === 3 && /h-tool-warn/.test(t1.rows[0].cls) && /필수/.test(t1.rows[0].text) && /h-tool-info/.test(t1.rows[1].cls) && /공식 체크섬/.test(t1.rows[2].text) && t1.btns.map((b) => b.tool).join() === 'ffmpeg,libewf', JSON.stringify(t1.rows));
+    check(`tools ${theme}: install buttons >= 24px, panel inside the column, still two blocks, [이어서 검토] on screen, no sideways scroll`,
+      t1.btns.every((b) => b.h >= 24 && b.w >= 24) && t1.inCol && t1.blocks === 2 && t1.topBottom !== null && t1.topBottom <= t1.vh && !t1.hscroll, JSON.stringify(t1));
+    await page.locator('#hToolsList button[data-tool-install="libewf"]').focus();
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('#dlgBackdrop:not([hidden])', { timeout: 4000 }).catch(() => {});
+    const inside = [];
+    for (let i = 0; i < 4; i++) { await page.keyboard.press('Tab'); inside.push(await page.evaluate(() => document.getElementById('dlgBackdrop').contains(document.activeElement))); }
+    const dlg = await page.evaluate(() => ({ open: !document.getElementById('dlgBackdrop').hidden, title: document.getElementById('dlgTitle').textContent, body: document.getElementById('dlgBody').textContent.replace(/\s+/g, ' ') }));
+    check(`tools ${theme}: Enter opens the confirm dialog with file · source · size · license; Tab stays inside`,
+      dlg.open && dlg.title === 'libewf 설치' && /libewf 20231119/.test(dlg.body) && /github\.com/.test(dlg.body) && /4\.0 MB/.test(dlg.body) && /LGPL-3\.0/.test(dlg.body) && inside.every(Boolean), JSON.stringify({ dlg, inside }));
+    await page.keyboard.press('Escape');
+    await sleep(200);
+    const esc1 = await page.evaluate(() => ({ closed: document.getElementById('dlgBackdrop').hidden, focus: document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.toolInstall : '' }));
+    check(`tools ${theme}: Esc closes the dialog, sends nothing, focus back on 설치`, esc1.closed && esc1.focus === 'libewf' && mock.posts.length === 0, JSON.stringify({ esc1, posts: mock.posts }));
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('#dlgBackdrop:not([hidden])', { timeout: 4000 });
+    await page.click('#dlgOk');
+    await page.waitForFunction(() => /내려받는 중|해시 확인 중/.test(document.getElementById('hToolsList').textContent), null, { timeout: 6000 }).catch(() => {});
+    const mid = await page.evaluate(() => ({
+      prog: (document.querySelector('#hToolsList li[data-tool="libewf"] .h-tool-prog') || {}).textContent || '',
+      disabled: [...document.querySelectorAll('#hToolsList button')].every((b) => b.disabled),
+      live: document.getElementById('hToolsLive').textContent,
+      focusBody: document.activeElement === document.body || !document.activeElement,
+    }));
+    check(`tools ${theme}: OK → one POST {name:"libewf"}, progress shown + announced, every 설치 disabled, focus not dropped to <body>`,
+      mock.posts.length === 1 && mock.posts[0].name === 'libewf' && /내려받는 중|해시 확인 중/.test(mid.prog) && mid.disabled && /libewf/.test(mid.live) && !mid.focusBody, JSON.stringify({ mid, posts: mock.posts }));
+    await page.waitForFunction(() => /libewf 설치됨/.test(document.getElementById('hToolsList').textContent), null, { timeout: 15000 }).catch(() => {});
+    const done = await page.evaluate(() => ({ text: document.getElementById('hToolsList').textContent, live: document.getElementById('hToolsLive').textContent, ffBtn: !!document.querySelector('#hToolsList button[data-tool-install="ffmpeg"]:not([disabled])') }));
+    check(`tools ${theme}: the result "libewf 설치됨" is shown and announced; FFmpeg's 설치 is usable again`, /libewf 설치됨/.test(done.text) && /설치됨/.test(done.live) && done.ffBtn && mock.posts.length === 1, JSON.stringify(done));
+    if (shots) { mkdirSync(shots, { recursive: true }); await page.screenshot({ path: join(shots, `tools-1366-${theme}.png`) }); }
     await context.close();
   }
   check('no page errors', pageErrors.length === 0, pageErrors.slice(0, 5).join(' | '));
