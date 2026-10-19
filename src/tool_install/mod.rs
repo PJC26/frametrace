@@ -1197,13 +1197,16 @@ fn sweep_dir(
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
+    // Listed first: the sweep renames entries.
+    let paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| matches(&entry.file_name().to_string_lossy()))
+        .map(|entry| entry.path())
+        .collect();
     let mut removed = 0;
-    for entry in entries.flatten() {
-        if !matches(&entry.file_name().to_string_lossy()) {
-            continue;
-        }
+    for path in paths {
         // Never follow a link out of tools/.
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
         if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -1213,11 +1216,79 @@ fn sweep_dir(
             .modified()
             .map(|modified| modified < started_before)
             .unwrap_or(false);
-        if stale && std::fs::remove_dir_all(entry.path()).is_ok() {
+        if stale && remove_dir_unless_in_use(&path).is_none() {
             removed += 1;
         }
     }
     removed
+}
+
+/// Removes the directory `dir` only when nothing uses a file in it, never
+/// half of it (a venv the server runs deepfake-lens from, under a busy
+/// lease this process cannot see). On Windows a running program or DLL in
+/// it is found first (opening a mapped image for writing is a sharing
+/// violation; nothing is written); then the directory is renamed to
+/// `<dir>.rm`, which Windows refuses while any file under it is open. In
+/// either case it is left whole and tried again next time. Only the renamed
+/// copy is deleted. Returns the path left behind, if any (`<dir>` when in
+/// use, `<dir>.rm` when its removal failed — both match the sweep's
+/// patterns and are retried by it).
+pub(crate) fn remove_dir_unless_in_use(dir: &Path) -> Option<PathBuf> {
+    let mut doomed = dir.as_os_str().to_owned();
+    doomed.push(".rm");
+    let doomed = PathBuf::from(doomed);
+    if image_in_use_under(dir) || std::fs::rename(dir, &doomed).is_err() {
+        return std::fs::symlink_metadata(dir)
+            .is_ok()
+            .then(|| dir.to_path_buf());
+    }
+    match std::fs::remove_dir_all(&doomed) {
+        Ok(()) => None,
+        Err(_) => std::fs::symlink_metadata(&doomed).is_ok().then_some(doomed),
+    }
+}
+
+/// Whether a file under `dir` is a running program / loaded DLL (or held
+/// without write sharing): opening it for writing — shared, nothing is
+/// written — is then a sharing or lock violation. Links are not followed.
+#[cfg(windows)]
+fn image_in_use_under(dir: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+    const SHARE_ALL: u32 = 0x7;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let Ok(kind) = entry.file_type() else {
+            return false;
+        };
+        if kind.is_symlink() {
+            false
+        } else if kind.is_dir() {
+            image_in_use_under(&entry.path())
+        } else {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(SHARE_ALL)
+                .open(entry.path())
+            {
+                Ok(_) => false,
+                Err(err) => matches!(
+                    err.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ),
+            }
+        }
+    })
+}
+
+/// Elsewhere a file in use can be unlinked without breaking its user.
+#[cfg(not(windows))]
+fn image_in_use_under(_dir: &Path) -> bool {
+    false
 }
 
 /// Server start: sweeps stale staging dirs under `<exe dir>/tools` when

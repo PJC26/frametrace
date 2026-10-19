@@ -177,3 +177,29 @@
 구현 계획·행 목록은 `docs/PLAN_TOOLS_C_2026-10-20.md`.
 
 §S5·§Fix round 1 #2·#3의 패키징·소스 제공 부분은 이 결정으로 폐기(이력).
+## §Fix round 4 (2026-10-19, 3차 리뷰 확인 반영, 기준 e90257d)
+
+3차 확인 리뷰의 항목을 모두 고쳤다. 번들·라이선스 결정(고지 문구, 매니페스트 `license`, CI 인코더 게이트, 인코더 선호 순서)은 손대지 않았다. 새 테스트는 e90257d에서 실패함을 확인했다(아래 "확인 방법").
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 (중) | 시험 인코딩 **시간 초과가 영구 `Fails`로 캐시**됐다(`(encoders, true)`). 한 번 느린 순간(첫 MF 초기화, 백신이 MFT DLL 검사)이면 정상 h264_mf가 프로세스가 끝날 때까지 빠지고, 조용히 libopenh264(라이선스상 피해야 할 빌드)가 선택되며 "Media Feature Pack 필요" 오진이 고정됐다. libopenh264가 성공하면 mpeg4 대조군도 돌지 않았다. | `ffmpeg_encoders`: 시간 초과는 새 `Trial::TimedOut`. 그 후보를 **2배 제한(20 s)으로 한 번 더** 시험하고, 성공하면 정상 선택(영구 캐시). 또 시간 초과면 이번에는 건너뛰되(`trial_failed`에 넣고 새 **`trial_timed_out`**에도 넣음) 결과는 **`TIMED_OUT_TTL` = 10분**만 재사용 — 만료 뒤 다시 시험한다(정말 멈춘 h264_mf가 매분 30 s씩 붙잡지 않도록 60 s보다 길게). 영구 캐시는 0이 아닌 종료 코드로 실패한 경우뿐. note는 시간 초과면 "h264_mf 시험 인코딩 시간 초과 — 잠시 뒤 다시 확인"(MF 팩 문구 아님). `FlightGuard::finish`가 `bool` 대신 TTL(`Option<Duration>`)을 받는다. | `a_timed_out_trial_is_retried_once_and_not_cached_for_good`(가짜 ffmpeg: h264_mf 35 s 잠 → 10 s + 20 s 재시도 뒤 건너뜀, 호출 4회, `trial_timed_out`, MF 문구 없음, 만료 시각 ≈ 10분(영구 아님), TTL 안 재실행 0회; `awake` 표시 파일을 만들고 만료 → 다시 시험해 h264_mf 선택, 이번엔 영구), `a_slow_first_trial_succeeds_on_the_retry`(13 s → 재시도에서 성공, libopenh264 시험 없음, 영구), `a_listed_encoder_that_fails_its_trial_is_skipped`(확장: 진짜 0이 아닌 종료 → 영구, 만료시켜도 재실행 없음). 기존 "no second probe" 테스트(`a_hung_trial_encode_fails_within_the_trial_bound_and_is_cached`)는 위 첫 테스트로 대체. |
+| 2 (하) | mpeg4 대조군: 목록에 없어도 시험했고, 시간 초과도 하네스 결함으로 봤다. `Unknown`은 앞선 실패 기록을 남긴 채 반환했다. `-encoders`가 버전 확인용 60 s 제한을 썼다. | 하네스 결함은 **mpeg4가 목록에 있고 0이 아닌 코드로 끝날 때만**(실패 기록 모두 지우고 `INCONCLUSIVE_TTL`). 목록에 없으면 대조군을 돌리지 않고 앞선 실패는 그대로(영구), mpeg4 시간 초과는 다른 후보와 같은 시간 초과 처리(앞선 진짜 실패 유지, TTL). `Unknown`(실행 불가)도 실패 기록을 지운 뒤 반환(결론 없음 → 목록 기반 선택). `-encoders`는 자체 제한 **`ENCODERS_TIMEOUT_SECS` = 10 s**. | `a_failing_mpeg4_control_is_a_harness_defect_and_is_negative_cached`(바뀜: 목록에 없는 mpeg4 → 대조군 없음, 호출 2회, h264_mf 실패 영구; 목록에 있는 mpeg4 성공 → h264_mf 실패 영구), `a_timed_out_mpeg4_is_not_a_harness_defect`(h264_mf 실패 + mpeg4 35 s 잠 → h264_mf 실패 유지, MF 문구, mpeg4 `trial_timed_out`, TTL) |
+| 3 (하) | 옛 venv(`tools/python/.<이름>.old-*`)·`.staging-*` 정리와 pip의 옛 venv 삭제가 `remove_dir_all`이라, 서버가 쓰는 중인 venv(CLI는 서버의 busy lease를 모름)를 **반쯤 지울** 수 있었다. | 새 `tool_install::remove_dir_unless_in_use(dir)`: (Windows) 먼저 그 아래 파일마다 **쓰기용으로(공유 허용, 아무것도 쓰지 않음) 열어 보아** 공유·잠금 위반이면(실행 중인 프로그램·로드된 DLL) 통째로 건너뛴다 — **실행 중인 exe는 디렉터리 이름 바꾸기를 막지 못한다**(이 PC에서 확인: 이름 바꾸기만 쓴 첫 구현은 실행 중인 `python.exe` 옆의 `lens.py`를 지웠고 새 테스트가 잡았다). 그다음 `<dir>.rm`으로 이름을 바꾸고(Windows는 그 아래 파일 하나라도 열린 핸들이 있으면 거부 — FILE_SHARE_DELETE로 연 핸들도; 직접 확인) 실패하면 통째로 건너뛴다. 바꾼 사본만 지우고, 그것도 실패하면 `<dir>.rm`이 남는다(이름이 정리 패턴과 맞아 다음 정리에서 다시 시도). 정리(`sweep_dir`: 목록을 먼저 모은 뒤 처리)와 pip의 옛 venv 삭제(`staging_left` 보고)가 이것을 쓴다. 설치 자신의 `StagingDir::close()`는 그대로(남이 쓰지 않는 자기 폴더). | Windows `the_sweep_skips_a_dir_in_use_whole_instead_of_half_deleting_it`(옛 venv의 `Scripts/python.exe`(복사한 cmd.exe)를 실행해 두고 `.staging-held`의 파일을 std로 열어 둔 채 정리 → 0개, 모든 파일 그대로, `.rm` 없음, `remove_dir_unless_in_use`가 venv 경로를 돌려줌; 놓은 뒤 정리 → 2개, `.rm` 없음), `stale_staging_dirs_are_swept_but_not_live_or_foreign_entries`(확장: 남은 `.staging-*.rm`·`.<이름>.old-*.rm`도 정리) |
+| 4a (하·UI) | POST 응답이 5xx이고 본문이 JSON이 아니면(`malformed`) "상태를 알 수 없음"(lost) 분기로 갔다. | 순수 함수 `htPostLost(res)`: HTTP 상태 ≥ 400이면 JSON이든 아니든 **서버의 답 = 거부**; lost는 응답 없음·`network`·status 0·해석 못 한 2xx뿐. | unit "Tools round 4: a 5xx POST reply with a non-JSON body is a refusal"(502+`malformed`, 500, 503+`network` → "설치 요청 실패: …", 추가 GET 없음) |
+| 4b (하·UI) | lost 뒤 `htLoad()`가 **다른 도구**의 설치를 따라가게 되면 `HT.busy`가 차 있어 `name`의 설치 성공(`true`)으로 처리됐다. | `HT.busy === name`일 때만 성공. 다른 도구를 따라가게 됐으면 그 설치는 계속 따라가되 `name` 줄에는 "설치 상태를 알 수 없습니다 — 다시 시도하십시오"(알림 assertive), `false` 반환. | unit "Tools round 4: a lost POST whose htLoad() adopts ANOTHER tool's install …" |
+| 4c (하·UI·a11y) | 그림자 경로가 `title`에만 있어 키보드·스크린리더로는 알 수 없었다. | `<small class="h-tool-shadow">` 안에 `<span class="sr-only"> — <경로 포함 전체 문장></span>`(title은 마우스용으로 유지). | unit "Tools round 4: the shadow path is in the row text … (sr-only)" |
+| 5 (하·서버) | `install-cancel`이 id가 맞는 작업이 **이미 끝났는데**(작업자가 단계를 done/failed로 바꾸고 감사 줄을 쓰는 동안, `state`는 아직 `running`) 취소를 받아들여 UI가 끝난 설치에 "중단하는 중…"을 보였다. | 실행 중 판정 = `state == "running"` **그리고** 단계가 `Done`/`Failed`가 아님. 아니면 `no_install`. | `serve::tests_tools::a_cancel_of_a_finished_job_is_no_install`(단계 Done/Failed × id 있음/없음, 게시된 done/failed → `no_install`, 취소 플래그 안 섬; 실행 중이면 종전대로 수락) |
+
+### API 변경 (트랙 U)
+- ffmpeg `encoders`에 **`trial_timed_out`**: `trial_failed` 중 시간 초과(10 s + 재시도 20 s)로만 건너뛴 이름(보통 `[]`). 이때 `note`는 "… · h264_mf 시험 인코딩 시간 초과 — 잠시 뒤 다시 확인"이고 결과는 10분 뒤 다시 시험한다. `trial_failed`의 다른 이름은 0이 아닌 종료 코드(진짜 실패)다.
+- `POST /api/tools/install-cancel`: 작업자가 이미 끝낸 작업(단계 done/failed)이면 `{"ok":false,"code":"no_install"}`.
+- UI: HTTP 오류 응답(≥ 400)은 본문과 관계없이 거부 문구. 그림자 경로는 sr-only 텍스트로도 읽힌다.
+
+### 확인 방법
+- e90257d를 `C:/s/r4old`에 풀고(git archive) 옛 API로 컴파일되는 새 테스트를 옮겨(`r4_slow_first_trial_succeeds_on_the_retry`, `r4_timeout_is_not_permanent`, `r4_unlisted_mpeg4_runs_no_control`, `a_cancel_of_a_finished_job_is_no_install`, `the_sweep_skips_…`(`remove_dir_unless_in_use` 줄 제외)) 별도 target(`C:/s/t4`)에서 실행 → 모두 FAIL. `trial_timed_out`·`expiry_of`·`TIMED_OUT_TTL`을 쓰는 원래 테스트는 옛 코드에서 컴파일되지 않는다(= 실패).
+- JS: `assets/app/56-tools.js`만 e90257d 것으로 바꾸고 `verify-review-batch --unit` → 새 행 3개 모두 FAIL, 되돌리면 PASS.
+
+### 확인 못 한 것
+- 실제 h264_mf가 느리거나 멈추는 상황(첫 MF 초기화, 백신 검사, N/KN)은 재현하지 못했다 — 가짜 ffmpeg의 잠자는 시험으로만 확인.
+- Linux/macOS clippy·테스트는 이 PC(Windows)에서 돌리지 못했다 — 바꾼 `cfg(not(windows))` 코드는 테스트용 가짜 ffmpeg 스크립트의 `[ -e awake ] || sleep` 한 줄뿐이고, 새 `remove_dir_unless_in_use`는 플랫폼 공통 코드(유닉스에서는 이름 바꾸기가 항상 되므로 종전처럼 지운다 — 열린 파일도 지울 수 있는 OS).

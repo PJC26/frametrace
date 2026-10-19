@@ -21,21 +21,27 @@
 //! tried once with a 1-frame encode of a 64×64 black frame using the very
 //! options a proxy uses (`-f lavfi -i color=… -frames:v 1 <video args>
 //! -f null -`); one that fails is skipped and the next one tried. A trial
-//! has its own short bound ([`TRIAL_TIMEOUT_SECS`]): an encoder that cannot
-//! do one 64×64 frame in that time (h264_mf stuck in `MFStartup`) is
-//! unusable, so a timeout counts as a failure. A trial that cannot be
-//! spawned at all proves nothing: the candidate is kept (the pre-trial
-//! behaviour). When even native `mpeg4` — the last resort, built into every
-//! ffmpeg and tried as the control after any failure — fails its trial, the
-//! harness itself is suspect, not the encoders: no failure is recorded and
-//! the list-based pick is used (no "Media Feature Pack" misdiagnosis).
+//! has its own short bound ([`TRIAL_TIMEOUT_SECS`]); one that times out is
+//! tried once more at twice the bound (the first Media Foundation start,
+//! or an antivirus scanning its DLLs, can be slow once). A candidate that
+//! still times out is skipped for now — the next candidate is used — but
+//! only for [`TIMED_OUT_TTL`]: a slow moment never pins a working h264_mf
+//! as failed (nor the libopenh264 pick, nor the "Media Feature Pack"
+//! hint) for the process lifetime. Only a trial that exits non-zero is a
+//! failure kept for good. A trial that cannot be spawned at all proves
+//! nothing: no failure is recorded and the list-based pick is used (the
+//! pre-trial behaviour). When native `mpeg4` — the last resort, built into
+//! every ffmpeg — is listed and exits non-zero too, the harness itself is
+//! suspect, not the encoders: again no failure is recorded (no "Media
+//! Feature Pack" misdiagnosis).
 //!
 //! The probe and the trials are cached together per ffmpeg path + mtime +
 //! size and run through the bounded
-//! [`crate::util::run_with_timeout_detailed`] (console hidden). A
-//! conclusive result is kept for the binary's lifetime; an inconclusive one
-//! (probe failed, trial not spawnable, harness defect) for
-//! [`INCONCLUSIVE_TTL`] only, so a wedged ffmpeg does not make every
+//! [`crate::util::run_with_timeout_detailed`] (console hidden; `-encoders`
+//! has its own [`ENCODERS_TIMEOUT_SECS`]). A conclusive result is kept for
+//! the binary's lifetime; an inconclusive one (probe failed, trial not
+//! spawnable, harness defect) for [`INCONCLUSIVE_TTL`], one with a
+//! timed-out trial for [`TIMED_OUT_TTL`], so a wedged ffmpeg does not make every
 //! `/api/tools`, doctor, proxy and export wait again. Concurrent callers
 //! for the same binary share one probe (single flight). Callers must not
 //! hold the server's state lock while calling [`for_binary`].
@@ -47,11 +53,20 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Bound of one trial encode. One 64×64 frame normally takes well under a
-/// second; an encoder still busy after this is treated as failed.
+/// second; an encoder still busy after this is tried once more at twice
+/// the bound, then skipped (for [`TIMED_OUT_TTL`] only).
 pub const TRIAL_TIMEOUT_SECS: u64 = 10;
+
+/// Bound of `ffmpeg -encoders` (a listing; no device is opened).
+pub const ENCODERS_TIMEOUT_SECS: u64 = 10;
 
 /// How long an inconclusive probe result is reused before probing again.
 pub const INCONCLUSIVE_TTL: Duration = Duration::from_secs(60);
+
+/// How long a result with a timed-out trial is reused: long enough that a
+/// truly wedged encoder (30 s per probe) does not stall a caller every
+/// minute, short enough that one slow moment is not permanent.
+pub const TIMED_OUT_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// H.264-or-fallback video encoders, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +116,9 @@ pub struct Encoders {
     probed: bool,
     /// Listed video encoders whose 1-frame trial encode failed.
     failed: BTreeSet<String>,
+    /// Those of `failed` that only timed out (twice): skipped for now, not
+    /// known to be broken.
+    timed_out: BTreeSet<String>,
 }
 
 impl Encoders {
@@ -115,6 +133,7 @@ impl Encoders {
                 .collect(),
             probed: false,
             failed: BTreeSet::new(),
+            timed_out: BTreeSet::new(),
         }
     }
 
@@ -141,6 +160,7 @@ impl Encoders {
             names,
             probed: true,
             failed: BTreeSet::new(),
+            timed_out: BTreeSet::new(),
         }
     }
 
@@ -152,6 +172,18 @@ impl Encoders {
     /// Records a failed trial encode (the encoder is then skipped).
     pub fn mark_failed(&mut self, encoder: VideoEncoder) {
         self.failed.insert(encoder.name().to_string());
+    }
+
+    /// Whether `name` was skipped only because its trial timed out (it is
+    /// tried again once the result expires).
+    pub fn trial_timed_out(&self, name: &str) -> bool {
+        self.timed_out.contains(name)
+    }
+
+    /// Forgets every recorded trial failure (nothing was proven).
+    fn clear_failures(&mut self) {
+        self.failed.clear();
+        self.timed_out.clear();
     }
 
     pub fn probed(&self) -> bool {
@@ -218,7 +250,10 @@ impl Encoders {
             }
             other => format!("LGPL 빌드 — H.264는 {} 사용", other.name()),
         };
-        if self.trial_failed(VideoEncoder::H264Mf.name()) {
+        let mf = VideoEncoder::H264Mf.name();
+        if self.trial_timed_out(mf) {
+            note.push_str(" · h264_mf 시험 인코딩 시간 초과 — 잠시 뒤 다시 확인");
+        } else if self.trial_failed(mf) {
             note.push_str(
                 " · h264_mf 사용 불가 — Media Feature Pack 필요 (Windows N/KN 에디션·Server Core)",
             );
@@ -236,6 +271,8 @@ impl Encoders {
             "note": self.build_note(),
             // Listed encoders whose 1-frame trial encode failed (skipped).
             "trial_failed": self.failed.iter().collect::<Vec<_>>(),
+            // Those of trial_failed that only timed out (tried again later).
+            "trial_timed_out": self.timed_out.iter().collect::<Vec<_>>(),
         })
     }
 }
@@ -359,8 +396,8 @@ struct FlightGuard {
 }
 
 impl FlightGuard {
-    fn finish(&mut self, encoders: &Encoders, conclusive: bool) {
-        let expires = (!conclusive).then(|| Instant::now() + INCONCLUSIVE_TTL);
+    fn finish(&mut self, encoders: &Encoders, ttl: Option<Duration>) {
+        let expires = ttl.map(|ttl| Instant::now() + ttl);
         cache().lock().unwrap_or_else(|e| e.into_inner()).insert(
             self.key.clone(),
             Slot::Ready {
@@ -389,7 +426,8 @@ impl Drop for FlightGuard {
 
 /// The encoders of the ffmpeg at `binary` (a resolved absolute path).
 /// Cached per path + mtime + size (an inconclusive result only for
-/// [`INCONCLUSIVE_TTL`]); a failed probe yields [`Encoders::assumed_full`].
+/// [`INCONCLUSIVE_TTL`], one with a timed-out trial for [`TIMED_OUT_TTL`]);
+/// a failed probe yields [`Encoders::assumed_full`].
 /// Concurrent callers for the same binary share one probe.
 pub fn for_binary(binary: &str) -> Encoders {
     let meta = std::fs::metadata(Path::new(binary)).ok();
@@ -427,60 +465,73 @@ pub fn for_binary(binary: &str) -> Encoders {
         flight,
         done: false,
     };
-    let (encoders, conclusive) = probe(binary);
-    guard.finish(&encoders, conclusive);
+    let (encoders, ttl) = probe(binary);
+    guard.finish(&encoders, ttl);
     encoders
 }
 
-/// `-encoders`, then the trial encodes. The flag says whether the result
-/// may be cached for good.
-fn probe(binary: &str) -> (Encoders, bool) {
-    let secs = crate::util::version_probe_timeout_secs();
+/// `-encoders`, then the trial encodes. The second value is how long the
+/// result may be reused (`None`: for the binary's lifetime).
+fn probe(binary: &str) -> (Encoders, Option<Duration>) {
     let result = crate::util::run_with_timeout_detailed(
         Command::new(binary).args(["-hide_banner", "-encoders"]),
-        Some(secs),
+        Some(ENCODERS_TIMEOUT_SECS),
     );
     let mut encoders = match result {
         Ok(output) if output.status.success() => {
             Encoders::from_listing(&String::from_utf8_lossy(&output.stdout))
         }
-        _ => return (Encoders::assumed_full(), false),
+        _ => return (Encoders::assumed_full(), Some(INCONCLUSIVE_TTL)),
     };
     if encoders.names.is_empty() {
-        return (Encoders::assumed_full(), false);
+        return (Encoders::assumed_full(), Some(INCONCLUSIVE_TTL));
     }
-    // Trial-encode the listed candidates, best first, until one works.
-    // After any failure native mpeg4 is tried last (listed or not): it is
-    // the control that tells a broken encoder from a broken trial.
-    let mut any_failed = false;
+    // Trial-encode the listed candidates, best first, until one works. A
+    // timed-out trial is tried once more at twice the bound; a candidate
+    // that still times out is skipped, but the result is then reused for
+    // TIMED_OUT_TTL only — never pinned for the process lifetime.
+    let mut timed_out = false;
     for candidate in VideoEncoder::PREFERENCE {
-        let control = candidate == VideoEncoder::Mpeg4 && any_failed;
-        if !encoders.has(candidate.name()) && !control {
+        if !encoders.has(candidate.name()) {
             continue;
         }
-        match trial_encode(binary, candidate, TRIAL_TIMEOUT_SECS) {
-            Trial::Works => return (encoders, true),
+        let mut trial = trial_encode(binary, candidate, TRIAL_TIMEOUT_SECS);
+        if trial == Trial::TimedOut {
+            trial = trial_encode(binary, candidate, 2 * TRIAL_TIMEOUT_SECS);
+        }
+        match trial {
+            Trial::Works => break,
             Trial::Fails if candidate == VideoEncoder::Mpeg4 => {
-                // Even the built-in encoder fails: the trial harness is at
-                // fault (an odd build, lavfi missing), not the encoders.
-                // Keep the list-based pick and blame nothing.
-                encoders.failed.clear();
-                return (encoders, false);
+                // Even the listed built-in encoder exits non-zero: the trial
+                // harness is at fault (an odd build, lavfi missing), not
+                // the encoders. Keep the list-based pick and blame nothing.
+                encoders.clear_failures();
+                return (encoders, Some(INCONCLUSIVE_TTL));
             }
-            Trial::Fails => {
+            Trial::Fails => encoders.mark_failed(candidate),
+            Trial::TimedOut => {
                 encoders.mark_failed(candidate);
-                any_failed = true;
+                encoders.timed_out.insert(candidate.name().to_string());
+                timed_out = true;
             }
-            Trial::Unknown => return (encoders, false),
+            Trial::Unknown => {
+                // This probe proves nothing: blame nothing (earlier
+                // failures are tried again with the rest next time).
+                encoders.clear_failures();
+                return (encoders, Some(INCONCLUSIVE_TTL));
+            }
         }
     }
-    (encoders, true)
+    (encoders, timed_out.then_some(TIMED_OUT_TTL))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trial {
     Works,
-    /// Exited non-zero, or still running after the trial bound.
+    /// Exited non-zero.
     Fails,
+    /// Still running after the bound (killed): slow, not proven broken.
+    TimedOut,
     /// Could not be spawned: proves nothing.
     Unknown,
 }
@@ -520,9 +571,8 @@ fn trial_encode(binary: &str, encoder: VideoEncoder, secs: u64) -> Trial {
     ) {
         Ok(output) if output.status.success() => Trial::Works,
         Ok(_) => Trial::Fails,
-        // One 64×64 frame within the bound or the encoder is unusable
-        // (h264_mf wedged in MFStartup): a timeout is a failure.
-        Err(crate::util::RunError::TimedOut(_)) => Trial::Fails,
+        // h264_mf wedged in MFStartup — or only a slow first start.
+        Err(crate::util::RunError::TimedOut(_)) => Trial::TimedOut,
         Err(crate::util::RunError::Failed(_)) => Trial::Unknown,
     }
 }
@@ -553,7 +603,8 @@ pub(crate) mod tests {
 
     /// [`fake_ffmpeg_failing`] whose trial encode of each `(encoder,
     /// seconds)` in `sleeping` first sleeps that long, then succeeds
-    /// (h264_mf wedged in MFStartup, or just slow).
+    /// (h264_mf wedged in MFStartup, or just slow) — unless a file `awake`
+    /// exists next to it (the slow moment has passed).
     pub fn fake_ffmpeg_slow(
         dir: &Path,
         listing: &str,
@@ -583,7 +634,8 @@ pub(crate) mod tests {
             for (name, secs) in sleeping {
                 // `timeout` refuses redirected stdin; ping waits ~1 s per echo.
                 body.push_str(&format!(
-                    "echo %*| findstr /c:\"-c:v {name} \" >nul && ping -n {} 127.0.0.1 >nul\r\n",
+                    "echo %*| findstr /c:\"-c:v {name} \" >nul && if not exist \"{}\" ping -n {} 127.0.0.1 >nul\r\n",
+                    dir.join("awake").display(),
                     secs + 1
                 ));
             }
@@ -607,7 +659,8 @@ pub(crate) mod tests {
             }
             for (name, secs) in sleeping {
                 script.push_str(&format!(
-                    "case \" $* \" in *\" -c:v {name} \"*) sleep {secs};; esac\n"
+                    "case \" $* \" in *\" -c:v {name} \"*) [ -e '{}' ] || sleep {secs};; esac\n",
+                    dir.join("awake").display()
                 ));
             }
             script.push_str("exit 0\n");
@@ -757,6 +810,11 @@ pub(crate) mod tests {
         // Cached with the probe: no further run.
         assert_eq!(for_binary(&fake), enc);
         assert_eq!(std::fs::read_to_string(&log).unwrap(), calls);
+        // Fix round 4: a genuine non-zero exit is kept for good (no expiry).
+        assert_eq!(expiry_of(&fake), Some(None), "permanent");
+        expire(&fake);
+        assert_eq!(for_binary(&fake), enc);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), calls);
 
         // Every H.264 candidate fails → mpeg4, with the MF hint.
         let fake = fake_ffmpeg_failing(&dir.join("none"), LGPL, &["h264_mf", "h264_nvenc"]);
@@ -783,39 +841,139 @@ pub(crate) mod tests {
         std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
     }
 
-    /// Lets the cached (inconclusive) result of `binary` expire now.
+    /// Lets the cached result of `binary` expire now — only one cached with
+    /// a TTL (a permanent one stays).
     fn expire(binary: &str) {
         for (key, slot) in cache().lock().unwrap().iter_mut() {
-            if let (true, Slot::Ready { expires, .. }) = (key.0 == binary, slot) {
+            if let (true, Slot::Ready { expires, .. }) = (key.0 == binary, slot)
+                && expires.is_some()
+            {
                 *expires = Some(Instant::now());
             }
         }
     }
 
-    /// Fix round 3: a trial that hangs (h264_mf wedged in MFStartup) is a
-    /// failure after TRIAL_TIMEOUT_SECS — not "unknown" re-probed for 60 s
-    /// on every call — and the result is cached like any other.
+    /// The cached result's expiry: `None` = not cached, `Some(None)` =
+    /// kept for good, `Some(Some(t))` = reused until `t`.
+    fn expiry_of(binary: &str) -> Option<Option<Instant>> {
+        cache()
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(key, slot)| match slot {
+                Slot::Ready { expires, .. } if key.0 == binary => Some(*expires),
+                _ => None,
+            })
+    }
+
+    /// Fix round 4: a trial that hangs (h264_mf wedged in MFStartup — or a
+    /// loaded moment: first MF start, antivirus scanning MFT DLLs) is tried
+    /// once more at twice the bound, then skipped — but only for
+    /// TIMED_OUT_TTL, never for the process lifetime; no "Media Feature
+    /// Pack" hint. Once the TTL is over the probe runs again, and a working
+    /// h264_mf is then picked and kept for good.
     #[test]
-    fn a_hung_trial_encode_fails_within_the_trial_bound_and_is_cached() {
+    fn a_timed_out_trial_is_retried_once_and_not_cached_for_good() {
         let dir = std::env::temp_dir().join(format!("ft-enc-hung-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let fake = fake_ffmpeg_slow(&dir, BTBN_LGPL, &[], &[("h264_mf", 25)]);
+        let fake = fake_ffmpeg_slow(&dir, BTBN_LGPL, &[], &[("h264_mf", 35)]);
         let started = Instant::now();
         let enc = for_binary(&fake);
         let took = started.elapsed();
         assert!(
-            took < Duration::from_secs(TRIAL_TIMEOUT_SECS + 8),
-            "the hung trial must stop at the trial bound: {took:?}"
+            took < Duration::from_secs(3 * TRIAL_TIMEOUT_SECS + 8),
+            "the hung trial must stop at the bound + one retry at twice it: {took:?}"
         );
-        assert!(enc.trial_failed("h264_mf"), "{enc:?}");
+        assert!(
+            enc.trial_failed("h264_mf") && enc.trial_timed_out("h264_mf"),
+            "{enc:?}"
+        );
         assert_eq!(enc.video(), VideoEncoder::Libopenh264);
+        assert_eq!(
+            enc.to_json()["trial_timed_out"],
+            serde_json::json!(["h264_mf"])
+        );
+        let note = enc.build_note().unwrap();
+        assert!(
+            note.contains("시간 초과") && !note.contains("Media Feature Pack"),
+            "{note}"
+        );
         let calls = calls_of(&dir);
-        // -encoders, the hung h264_mf trial, the libopenh264 trial.
-        assert_eq!(calls.lines().count(), 3, "{calls}");
+        // -encoders, the h264_mf trial, its retry, the libopenh264 trial.
+        assert_eq!(calls.lines().count(), 4, "{calls}");
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("-c:v h264_mf"))
+                .count(),
+            2,
+            "{calls}"
+        );
+        // Not permanent: reused only for TIMED_OUT_TTL.
+        let expires = expiry_of(&fake).expect("cached").expect("with a TTL");
+        assert!(expires > Instant::now() + TIMED_OUT_TTL - Duration::from_secs(60));
         let again = Instant::now();
         assert_eq!(for_binary(&fake), enc);
-        assert!(again.elapsed() < Duration::from_secs(2), "cached");
-        assert_eq!(calls_of(&dir), calls, "no second probe");
+        assert!(
+            again.elapsed() < Duration::from_secs(2),
+            "cached within the TTL"
+        );
+        assert_eq!(calls_of(&dir), calls, "no second probe within the TTL");
+        // The slow moment has passed: after the TTL h264_mf is tried again,
+        // works, and that result is kept for good.
+        std::fs::write(dir.join("awake"), b"").unwrap();
+        expire(&fake);
+        let enc = for_binary(&fake);
+        assert_eq!(enc.video(), VideoEncoder::H264Mf, "{enc:?}");
+        assert!(!enc.trial_failed("h264_mf") && !enc.trial_timed_out("h264_mf"));
+        assert_eq!(calls_of(&dir).lines().count(), 6, "{}", calls_of(&dir));
+        assert_eq!(expiry_of(&fake), Some(None), "a working pick is permanent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix round 4: a slow first trial (longer than the bound, shorter than
+    /// twice it) succeeds on the retry — h264_mf is kept, for good.
+    #[test]
+    fn a_slow_first_trial_succeeds_on_the_retry() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = fake_ffmpeg_slow(&dir, BTBN_LGPL, &[], &[("h264_mf", 13)]);
+        let enc = for_binary(&fake);
+        assert_eq!(enc.video(), VideoEncoder::H264Mf, "{enc:?}");
+        assert!(!enc.trial_failed("h264_mf"));
+        let calls = calls_of(&dir);
+        // -encoders, the timed-out h264_mf trial, the successful retry.
+        assert_eq!(calls.lines().count(), 3, "{calls}");
+        assert!(!calls.contains("libopenh264"), "{calls}");
+        assert_eq!(expiry_of(&fake), Some(None), "permanent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix round 4: a listed mpeg4 that only times out is not a harness
+    /// defect — the genuine failures before it are kept (inconclusive TTL).
+    #[test]
+    fn a_timed_out_mpeg4_is_not_a_harness_defect() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-mpeg4slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = fake_ffmpeg_slow(
+            &dir,
+            " ------\n V....D h264_mf  MF\n V.S... mpeg4  MPEG-4 part 2\n",
+            &["h264_mf"],
+            &[("mpeg4", 35)],
+        );
+        let enc = for_binary(&fake);
+        assert!(
+            enc.trial_failed("h264_mf") && !enc.trial_timed_out("h264_mf"),
+            "{enc:?}"
+        );
+        assert!(enc.trial_timed_out("mpeg4"), "{enc:?}");
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4);
+        assert!(
+            enc.build_note().unwrap().contains("Media Feature Pack"),
+            "{:?}",
+            enc.build_note()
+        );
+        assert!(matches!(expiry_of(&fake), Some(Some(_))), "not permanent");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -848,7 +1006,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Fix round 3: when even native mpeg4 (the control) fails its trial,
+    /// Fix round 3: when even a listed native mpeg4 exits non-zero,
     /// the harness is at fault — no encoder is blamed, the list-based pick
     /// stays, no Media Feature Pack hint; the inconclusive result is reused
     /// only for INCONCLUSIVE_TTL. A probe that lists nothing is also
@@ -883,7 +1041,9 @@ pub(crate) mod tests {
         let _ = for_binary(&fake);
         assert_eq!(calls_of(&dir).lines().count(), 8);
 
-        // mpeg4 not listed: still tried as the control after a failure.
+        // Fix round 4: mpeg4 not listed — no control is run (an unlisted
+        // encoder failing proves nothing), and h264_mf's non-zero exit is a
+        // real failure, kept for good.
         let dir = base.join("unlisted");
         let fake = fake_ffmpeg_failing(
             &dir,
@@ -891,16 +1051,23 @@ pub(crate) mod tests {
             &["h264_mf", "mpeg4"],
         );
         let enc = for_binary(&fake);
-        assert_eq!(enc.video(), VideoEncoder::H264Mf);
-        assert!(!enc.trial_failed("h264_mf"));
+        assert!(enc.trial_failed("h264_mf"), "{enc:?}");
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4);
         let calls = calls_of(&dir);
-        assert_eq!(calls.lines().count(), 3, "{calls}");
-        // A broken h264_mf with a working control is still a real failure.
+        assert_eq!(calls.lines().count(), 2, "{calls}");
+        assert!(!calls.contains("-c:v mpeg4"), "{calls}");
+        assert_eq!(expiry_of(&fake), Some(None), "permanent");
+        // A broken h264_mf with a working listed mpeg4 is a real failure.
         let dir = base.join("control-ok");
-        let fake = fake_ffmpeg_failing(&dir, " ------\n V....D h264_mf  MF\n", &["h264_mf"]);
+        let fake = fake_ffmpeg_failing(
+            &dir,
+            " ------\n V....D h264_mf  MF\n V.S... mpeg4  M\n",
+            &["h264_mf"],
+        );
         let enc = for_binary(&fake);
         assert!(enc.trial_failed("h264_mf"));
         assert_eq!(enc.video(), VideoEncoder::Mpeg4);
+        assert_eq!(expiry_of(&fake), Some(None), "permanent");
 
         // An empty listing (probe proves nothing): assumed, negative-cached.
         let dir = base.join("empty");

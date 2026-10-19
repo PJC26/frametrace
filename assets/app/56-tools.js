@@ -267,6 +267,14 @@ function htHintHtml(text, homepage, locale) {
   if (!found && home) out += (s ? " — " : "") + esc(htT("manual", null, locale)) + " " + link(home);
   return out;
 }
+// Pure: a POST reply that never arrived (network, status 0, an unreadable
+// 2xx body) — the server may have acted on it. Any HTTP error status
+// (a 5xx included, JSON body or not) is the server's answer: a refusal.
+function htPostLost(res) {
+  if (!res) return true;
+  if (Number(res.status) >= 400) return false;
+  return !!(res.network || res.malformed || (!res.ok && res.status === 0));
+}
 // Pure: a refused POST /api/tools/install → { text (short, by code),
 // hint (manual_hint), homepage, title (the server's full message) }.
 function htRefusal(res, t, locale) {
@@ -339,7 +347,8 @@ function htRowHtml(m, locale) {
     `<span class="sr-only">${esc((HT_WORD[loc] || HT_WORD.ko)[m.level] || "")}: </span><b>${esc(m.text)}</b>` +
     (m.why ? `<small>${esc(m.why)}</small>` : "") + (m.progress ? `<small class="h-tool-prog">${esc(m.progress)}</small>` : "") +
     (m.note ? `<small>${esc(m.note)}</small>` : "") + htHintSmall(m, loc) +
-    (m.shadow ? `<small class="h-tool-shadow" title="${esc(m.shadow.title)}">${esc(m.shadow.text)}</small>` : "") +
+    // The paths are in the text too (sr-only), not only in a hover title.
+    (m.shadow ? `<small class="h-tool-shadow" title="${esc(m.shadow.title)}">${esc(m.shadow.text)}<span class="sr-only"> — ${esc(m.shadow.title)}</span></small>` : "") +
     `</span>${btn}</li>`;
 }
 // Pure: the confirm dialog body — file (download.file_name), source host,
@@ -594,13 +603,16 @@ async function htInstall(name) {
   htRenderAll();
   // Not announced: the POST reply's state follows within milliseconds.
   const res = await jpost("/api/tools/install", { name });
-  if (!res || res.network || res.malformed || (!res.ok && res.status === 0)) {
+  if (htPostLost(res)) {
     // The reply was lost, not refused: the server may well have started
     // the install. Ask it, and follow what is running (or report it).
     HT.busy = "";
     const p = await htLoad();
-    if (HT.busy) return true;
-    const i = p.install;
+    // Following this tool's install: started after all.
+    if (HT.busy === name) return true;
+    // Another tool's install was adopted (another tab, the CLI): it is
+    // followed, but this tool's request is still unknown — say so.
+    const i = HT.busy ? null : p.install;
     if (i && i.tool === name && !htActive(i) && htRecent(i)) { await htFinish(name, i); return false; }
     HT.result = { name, ok: false, text: htT("lost") };
     htRenderAll();

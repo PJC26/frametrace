@@ -204,6 +204,46 @@ fn running_job(state: &SharedState, id: u64) -> Arc<crate::tool_install::Progres
     progress
 }
 
+/// Fix round 4: a cancel naming the current job after it already ended —
+/// published (`done` / `failed`), or finished by the worker (stage done /
+/// failed) while it still writes the audit line — is `no_install`, never
+/// accepted ("중단하는 중…" for a finished install).
+#[test]
+fn a_cancel_of_a_finished_job_is_no_install() {
+    let state = new_state();
+    let cancel = |body: &str| {
+        parse(&tools::api_tools_install_cancel(
+            &request("POST", "/api/tools/install-cancel", "", body),
+            &state,
+        ))
+    };
+    for stage in [
+        crate::tool_install::Stage::Done,
+        crate::tool_install::Stage::Failed,
+    ] {
+        for body in [r#"{"id":5}"#, "{}"] {
+            let progress = running_job(&state, 5);
+            progress.set_stage(stage);
+            let reply = cancel(body);
+            assert_eq!(reply["ok"], false, "{stage:?} {body}: {reply}");
+            assert_eq!(reply["code"], "no_install", "{stage:?} {body}: {reply}");
+            assert!(!progress.cancelled(), "{stage:?} {body}");
+        }
+    }
+    for published in ["done", "failed"] {
+        let progress = running_job(&state, 6);
+        progress.set_stage(crate::tool_install::Stage::Download);
+        state_lock(&state).tool_install.as_mut().unwrap().state = published;
+        let reply = cancel(r#"{"id":6}"#);
+        assert_eq!(reply["code"], "no_install", "{published}: {reply}");
+        assert!(!progress.cancelled());
+    }
+    // Still running: accepted as before.
+    let progress = running_job(&state, 7);
+    assert_eq!(cancel(r#"{"id":7}"#)["ok"], true);
+    assert!(progress.cancelled());
+}
+
 /// Fix round 3: a late [중단] from tab A (still showing job 1) never stops
 /// job 2 that tab B started meanwhile — the body names the job.
 #[test]

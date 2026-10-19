@@ -65,7 +65,7 @@ const json = (route, body) => route.fulfill({ status: 200, contentType: 'applica
 // J as the server sends it: age_s by the server's clock (null while running).
 const withAge = (i) => (i ? { ...i, age_s: i.finished_unix ? Math.max(0, nowUnix() - i.finished_unix) : null } : null);
 // GET /api/tools encoders of an installed LGPL ffmpeg (src/ffmpeg_encoders.rs to_json).
-const LGPL_ENCODERS = { probed: true, libx264: false, h264: 'h264_mf', aac: 'aac', avi_audio: 'mp2', note: 'LGPL 빌드 — H.264는 h264_mf 사용', trial_failed: [] };
+const LGPL_ENCODERS = { probed: true, libx264: false, h264: 'h264_mf', aac: 'aac', avi_audio: 'mp2', note: 'LGPL 빌드 — H.264는 h264_mf 사용', trial_failed: [], trial_timed_out: [] };
 
 // opts.steps: status polls per install stage (default 2); opts.fail: an
 // error string → the job ends `failed`; opts.tools: a fixture override;
