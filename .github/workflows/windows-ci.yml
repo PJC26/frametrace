@@ -111,67 +111,102 @@ jobs:
         run: cargo run --locked --bin frametrace -- qa performance target/frametrace-ci-performance --rows 1000
       - name: Release build
         run: cargo build --release --locked
+      # Option C (docs/PLAN_TOOLS_C_2026-10-20.md): the Windows zip contains
+      # FrameTrace only — never ffmpeg/ffprobe. make-portable.ps1 skips them
+      # and fails on an FFmpeg entry; the smoke step checks the zip again.
+      - name: Portable package offline test (planted ffmpeg is never packaged)
+        run: node scripts/test-make-portable.mjs
+        shell: pwsh
       - name: Portable package smoke (make-portable.ps1)
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1 -SkipBuild
           if ($LASTEXITCODE -ne 0) { throw "make-portable.ps1 failed ($LASTEXITCODE)" }
-          if (-not (Get-ChildItem dist -Filter *.zip)) { throw 'no zip produced in dist/' }
+          $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $zip = "dist/FrameTrace-$ver-win64.zip"
+          if (-not (Test-Path $zip)) { throw "missing $zip" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try { $names = @($archive.Entries | ForEach-Object { $_.FullName }) } finally { $archive.Dispose() }
+          $bad = @($names | Where-Object { $_ -match '(^|[/\\])(ffmpeg|ffprobe)\.exe$' })
+          if ($bad) { throw "the package contains FFmpeg: $($bad -join ', ')" }
+          $slash = @($names | Where-Object { $_.Contains('\') })
+          if ($slash) { throw "backslash entry names: $($slash -join ', ')" }
+          if ($names -notcontains "FrameTrace-$ver-win64/THIRD_PARTY_NOTICES.md") { throw 'THIRD_PARTY_NOTICES.md is missing from the package' }
           $bytes = [System.IO.File]::ReadAllBytes('dist/SHA256SUMS')
           if ($bytes.Length -eq 0) { throw 'SHA256SUMS is empty' }
           if ($bytes -contains 13) { throw 'SHA256SUMS contains CR' }
           Get-Content dist/SHA256SUMS
         shell: pwsh
-      # Tools track S5: the distribution with FFmpeg bundled. The script takes
-      # FFmpeg only from tools/manifest.json (pinned URL, HTTPS, host
-      # allowlist) and fails on any size / SHA-256 mismatch or unsafe archive
-      # entry, so a changed upstream file fails this job instead of shipping.
-      - name: Packaging script offline test (fake FFmpeg zip, local redirects)
-        run: node scripts/test-package-windows.mjs
-        shell: pwsh
-      - name: Bundled package (package-windows.ps1, hash-pinned FFmpeg)
-        run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -SkipBuild
-          if ($LASTEXITCODE -ne 0) { throw "package-windows.ps1 failed ($LASTEXITCODE)" }
-          foreach ($f in @('dist/FrameTrace/tools/bin/ffmpeg.exe', 'dist/FrameTrace/tools/bin/ffprobe.exe', 'dist/FrameTrace/tools/bin/licenses/ffmpeg-LICENSE.txt', 'dist/FrameTrace/THIRD_PARTY_NOTICES.md')) {
-            if (-not (Test-Path $f)) { throw "missing $f in the bundled package" }
-          }
-          $ver = & dist/FrameTrace/tools/bin/ffmpeg.exe -hide_banner -version
-          if ($LASTEXITCODE -ne 0) { throw 'bundled ffmpeg.exe does not run' }
-          $ver | Select-Object -First 1
-        shell: pwsh
-      # Fix round 1: the pinned BtbN LGPL build links a source-built
-      # libopenh264 (not covered by Cisco's patent licence). Record what the
-      # bundle really offers and which H.264 encoder FrameTrace itself picks
-      # for it (PATH reduced to System32 so the bundled tools/bin ffmpeg is
-      # the one resolved, not choco's); fail if that pick is libopenh264.
-      - name: Bundled FFmpeg encoder pick (must not be libopenh264)
-        run: |
-          $ff = (Resolve-Path dist/FrameTrace/tools/bin/ffmpeg.exe).Path
-          $enc = & $ff -hide_banner -encoders
-          if ($LASTEXITCODE -ne 0) { throw 'bundled ffmpeg -encoders failed' }
-          Write-Host '--- H.264 encoders in the bundle:'
-          $enc | Select-String -Pattern '\(codec h264\)' | ForEach-Object { Write-Host $_.Line }
-          Write-Host '--- configure line:'
-          & $ff -hide_banner -buildconf | Select-String -Pattern 'enable-(libopenh264|chromaprint|gpl|version3|nonfree)' | ForEach-Object { Write-Host $_.Line.Trim() }
-          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-          $list = & dist/FrameTrace/frametrace.exe tools list --json | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'frametrace tools list --json failed' }
-          $tool = $list.tools | Where-Object { $_.name -eq 'ffmpeg' }
-          $resolved = $tool.paths.ffmpeg
-          Write-Host "FrameTrace resolves ffmpeg to: $resolved"
-          if (-not $resolved -or ((Resolve-Path $resolved).Path -ne $ff)) { throw "FrameTrace did not resolve the bundled ffmpeg ($resolved)" }
-          $pick = $tool.encoders.h264
-          Write-Host "FrameTrace H.264 pick for the bundle: $pick (probed: $($tool.encoders.probed); note: $($tool.encoders.note))"
-          if (-not $tool.encoders.probed) { throw 'the encoder probe did not run against the bundled ffmpeg' }
-          if ($pick -eq 'libopenh264') { throw 'FrameTrace would encode H.264 with the source-built libopenh264 (not covered by the Cisco patent licence)' }
-          "h264_encoder=$pick" | Out-File -Encoding utf8 dist/ffmpeg-encoder-pick.txt
-        shell: pwsh
-      - name: Upload bundled package
+      - name: Upload portable package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: FrameTrace-win64-bundled
+          name: FrameTrace-win64
           path: |
-            dist/FrameTrace-*-win64-bundled.zip
+            dist/FrameTrace-*-win64.zip
             dist/SHA256SUMS
-            dist/ffmpeg-encoder-pick.txt
           if-no-files-found: error
+      # The guided install path, run once for real (verification only — not a
+      # distribution): a COPY of the unpacked package in RUNNER_TEMP (dist/ and
+      # the uploaded artifact never see ffmpeg) installs the pinned BtbN asset
+      # with PATH reduced to System32 (choco's ffmpeg out of the way). Checks
+      # the installed files, the pinned GPLv3 text, the audit line and the
+      # encoder pick, and records -buildconf (round-2 B-6: --enable-version3
+      # must be there, --enable-gpl / --enable-nonfree must not, so a re-pin
+      # cannot make the licence mix worse unnoticed). Only a text file is
+      # uploaded; the binary never leaves the runner.
+      - name: "Install-path smoke: tools install ffmpeg (real BtbN asset, verification only)"
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $manifest = Get-Content -Raw -Encoding UTF8 tools/manifest.json | ConvertFrom-Json
+          $pin = $manifest.tools | Where-Object { $_.name -eq 'ffmpeg' }
+          $copy = Join-Path $env:RUNNER_TEMP 'ft-install-smoke'
+          Remove-Item -Recurse -Force $copy -ErrorAction SilentlyContinue
+          Copy-Item -Recurse "dist/FrameTrace-$ver-win64" $copy
+          $report = Join-Path $env:RUNNER_TEMP 'ffmpeg-install-smoke.txt'
+          $log = { param($line) Write-Host $line; Add-Content -Encoding utf8 -Path $report -Value $line }
+          Set-Content -Encoding utf8 -Path $report -Value "FrameTrace $ver install-path smoke ($($pin.url))"
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $exe = Join-Path $copy 'frametrace.exe'
+          & $exe tools install ffmpeg --yes
+          if ($LASTEXITCODE -ne 0) { throw "tools install ffmpeg failed ($LASTEXITCODE)" }
+          $bin = Join-Path $copy 'tools/bin'
+          foreach ($f in @('ffmpeg.exe', 'ffprobe.exe', 'licenses/ffmpeg-LICENSE.txt', 'licenses/ffmpeg-COPYING.GPLv3.txt')) {
+            if (-not (Test-Path (Join-Path $bin $f))) { throw "missing tools/bin/$f after the install" }
+          }
+          $gpl = (Get-FileHash -Algorithm SHA256 (Join-Path $bin 'licenses/ffmpeg-COPYING.GPLv3.txt')).Hash.ToLowerInvariant()
+          if ($gpl -ne $pin.bundled_licenses[0].sha256) { throw "installed GPLv3 text $gpl does not match the manifest pin" }
+          if (Get-ChildItem -Force (Join-Path $copy 'tools') -Filter '.staging-*' -ErrorAction SilentlyContinue) { throw 'a tools/.staging-* directory was left behind' }
+          $auditLine = @(Get-Content (Join-Path $copy 'tools/install-audit.jsonl'))[-1]
+          $audit = $auditLine | ConvertFrom-Json
+          if ($audit.result -ne 'ok') { throw "last audit line is not ok: $auditLine" }
+          if ($audit.sha256 -ne $pin.sha256) { throw "audit sha256 $($audit.sha256) is not the pinned $($pin.sha256)" }
+          & $log "audit: result=$($audit.result) sha256=$($audit.sha256) size=$($audit.size) host=$($audit.host)"
+          $list = & $exe tools list --json | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'tools list --json failed' }
+          $tool = $list.tools | Where-Object { $_.name -eq 'ffmpeg' }
+          $ff = (Resolve-Path (Join-Path $bin 'ffmpeg.exe')).Path
+          $resolved = $tool.paths.ffmpeg
+          if (-not $resolved -or ((Resolve-Path $resolved).Path -ne $ff)) { throw "FrameTrace did not resolve the installed ffmpeg ($resolved)" }
+          $enc = $tool.encoders
+          & $log "h264 pick: $($enc.h264) (probed: $($enc.probed); trial_failed: [$(@($enc.trial_failed) -join ', ')]; note: $($enc.note))"
+          if (-not $enc.probed) { throw 'the encoder probe did not run against the installed ffmpeg' }
+          if ($enc.h264 -eq 'libopenh264') { throw 'FrameTrace would encode H.264 with the source-built libopenh264 (not covered by the Cisco patent licence)' }
+          if (@($enc.trial_failed).Count -ne 0) { throw "trial encodes failed: $(@($enc.trial_failed) -join ', ')" }
+          $buildconf = @(& $ff -hide_banner -buildconf | ForEach-Object { $_.Trim() })
+          if ($LASTEXITCODE -ne 0) { throw 'ffmpeg -buildconf failed' }
+          & $log '--- buildconf (selected):'
+          $buildconf | Where-Object { $_ -match 'enable-(version3|gpl|nonfree|libopenh264|chromaprint|libzvbi)' } | ForEach-Object { & $log "  $_" }
+          & $log '--- H.264 encoders:'
+          & $ff -hide_banner -encoders | Select-String -Pattern '\(codec h264\)' | ForEach-Object { & $log "  $($_.Line.Trim())" }
+          if ($buildconf -notcontains '--enable-version3') { throw 'buildconf lacks --enable-version3' }
+          $forbidden = @($buildconf | Where-Object { $_ -eq '--enable-gpl' -or $_ -eq '--enable-nonfree' })
+          if ($forbidden) { throw "buildconf has $($forbidden -join ', ') — the pinned asset's licence mix got worse" }
+      - name: Upload install-path smoke record (text only)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ffmpeg-install-smoke
+          path: ${{ runner.temp }}/ffmpeg-install-smoke.txt
+          if-no-files-found: warn
