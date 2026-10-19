@@ -175,11 +175,12 @@ pub(crate) fn api_tools_install_cancel(request: &Request, state: &SharedState) -
             serde_json::json!({"install": install_job_json(job)}),
         );
     }
-    match guard
-        .tool_install
-        .as_ref()
-        .filter(|job| job.state == "running")
-    {
+    // A job whose worker already finished (stage done / failed, the audit
+    // line being written before the state is published) is not running:
+    // never "중단하는 중…" for a finished install.
+    match guard.tool_install.as_ref().filter(|job| {
+        job.state == "running" && !matches!(job.progress.stage(), Stage::Done | Stage::Failed)
+    }) {
         Some(job) => match job.progress.request_cancel() {
             Ok(()) => serde_json::json!({"ok": true, "install": install_job_json(job)}).to_string(),
             Err(message) => refusal(

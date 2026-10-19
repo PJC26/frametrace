@@ -616,5 +616,43 @@ export async function toolsTrackU() {
     assert.deepEqual(ff.encoders.trial_failed, [], 'encoders.trial_failed: ' + JSON.stringify(ff.encoders));
   });
 
+  await row('Tools round 4: a 5xx POST reply with a non-JSON body is a refusal ("설치 요청 실패"), never "상태를 알 수 없습니다"', async () => {
+    for (const post of [{ ok: false, status: 502, malformed: true, error: '서버 오류 (HTTP 502)' }, { ok: false, status: 500, error: '서버 오류 (HTTP 500)' }, { ok: false, status: 503, network: true, error: '서버 오류 (HTTP 503)' }]) {
+      const v = make({ replies: [reply([OPT])], post });
+      await v.run('htLoad()');
+      const gets = v.calls.gets.length;
+      assert.equal(await v.run('htInstall("x-opt")'), false);
+      const list = v.els.hToolsList.innerHTML;
+      assert.ok(list.includes('설치 요청 실패: ' + post.error) && !list.includes(LOST), JSON.stringify(post) + ': ' + list);
+      assert.equal(v.calls.gets.length, gets, JSON.stringify(post) + ': a refusal does not ask the server again');
+    }
+    assert.equal(make().run('htPostLost({ ok: false, network: true, status: 0 })'), true);
+    assert.equal(make().run('htPostLost({ ok: false, malformed: true })'), true, 'an unreadable 2xx reply is lost');
+    assert.equal(make().run('htPostLost(null)'), true);
+  });
+
+  await row('Tools round 4: a lost POST whose htLoad() adopts ANOTHER tool\'s install is not success for this tool — "상태를 알 수 없습니다" for it, the other install followed', async () => {
+    const lost = { ok: false, network: true, status: 0, error: '서버에 연결할 수 없습니다' };
+    const v = make({ replies: [reply([FF, OPT]), reply([FF, OPT], J('downloading', 'ffmpeg', { bytes: 1, total: 4 }))], post: lost });
+    await v.run('htLoad()');
+    assert.equal(await v.run('htInstall("x-opt")'), false, 'not started for x-opt');
+    assert.equal(v.run('HT.busy'), 'ffmpeg', 'the other install is followed');
+    const list = v.els.hToolsList.innerHTML;
+    const opt = (list.match(/<li[^>]*data-tool="x-opt"[^]*?<\/li>/) || [''])[0];
+    assert.ok(opt.includes(LOST), 'x-opt row says lost: ' + list);
+    assert.ok(v.calls.announced.some(([m, a]) => m === LOST && a), JSON.stringify(v.calls.announced));
+  });
+
+  await row('Tools round 4: the shadow path is in the row text for keyboard / screen-reader users (sr-only), not only in a title', async () => {
+    const shadowPath = 'C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\ffmpeg.exe';
+    const v = make({ replies: [reply([{ ...FF, installed: true, status: 'installed', shadowed_by: { ffmpeg: shadowPath, ffprobe: null } }])] });
+    await v.run('htLoad()');
+    const ff = (v.els.hToolsList.innerHTML.match(/<li[^>]*data-tool="ffmpeg"[^]*?<\/li>/) || [''])[0];
+    const small = (ff.match(/<small class="h-tool-shadow"[^]*?<\/small>/) || [''])[0];
+    const text = small.replace(/<small[^>]*>/, '').replace(/<[^>]+>/g, '');
+    assert.ok(text.includes('WindowsApps\\ffmpeg.exe') && text.includes('PATH의 다른 사본 무시됨'), 'path in the text: ' + small);
+    assert.ok(/<span class="sr-only">[^<]*WindowsApps\\ffmpeg\.exe/.test(small), 'sr-only: ' + small);
+  });
+
   if (failed.length) throw new Error('Tools track U failed: ' + failed.join('; '));
 }

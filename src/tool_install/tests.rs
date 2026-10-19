@@ -538,13 +538,26 @@ fn stale_staging_dirs_are_swept_but_not_live_or_foreign_entries() {
     std::fs::create_dir_all(python.join(".deepfake-lens.old-0123abcd/Scripts")).unwrap();
     std::fs::create_dir_all(python.join("deepfake-lens/Scripts")).unwrap();
     std::fs::write(python.join(".x.old-file"), b"not a dir").unwrap();
+    // Fix round 4: a `<dir>.rm` whose removal failed earlier is swept too.
+    std::fs::create_dir_all(tools.join(".staging-old3.rm/x")).unwrap();
+    std::fs::create_dir_all(python.join(".y.old-0a.rm")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let run_started = std::time::SystemTime::now();
     std::thread::sleep(std::time::Duration::from_millis(50));
     // Created by "this" run: newer than its start, kept.
     std::fs::create_dir_all(tools.join(".staging-live")).unwrap();
     std::fs::create_dir_all(python.join(".other.old-live")).unwrap();
-    assert_eq!(clean_stale_staging(&tools, run_started), 3);
+    assert_eq!(clean_stale_staging(&tools, run_started), 5);
+    assert!(!tools.join(".staging-old3.rm").exists());
+    assert!(!python.join(".y.old-0a.rm").exists());
+    for dir in [&tools, &python] {
+        let rm: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".rm"))
+            .collect();
+        assert!(rm.is_empty(), "no .rm left: {rm:?}");
+    }
     assert!(!tools.join(".staging-old1").exists());
     assert!(!tools.join(".staging-old2").exists());
     assert!(!python.join(".deepfake-lens.old-0123abcd").exists());
@@ -1547,6 +1560,75 @@ mod windows_installs {
             1
         );
         assert!(!left.exists());
+    }
+
+    /// Fix round 4: the sweep never half-deletes a directory still in use
+    /// — an old venv a process runs from (the server's deepfake-lens,
+    /// whose busy lease the CLI cannot see) or a staging dir with a file
+    /// held open. A running program does NOT stop a directory rename (seen
+    /// here: the first version of this fix deleted `lens.py` under the
+    /// running `python.exe`), so mapped images are checked first; an open
+    /// handle makes the rename to `<dir>.rm` fail. Either way the dir is
+    /// skipped whole; once released, it is removed (no `.rm` is left).
+    #[test]
+    fn the_sweep_skips_a_dir_in_use_whole_instead_of_half_deleting_it() {
+        let base = scratch("sweep-held");
+        let tools = base.join("tools");
+        let venv = tools.join("python").join(".deepfake-lens.old-0123abcd");
+        let scripts = venv.join("Scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::create_dir_all(venv.join("Lib").join("site-packages")).unwrap();
+        let module = venv.join("Lib").join("site-packages").join("lens.py");
+        std::fs::write(&module, b"print('lens')").unwrap();
+        let exe = scripts.join("python.exe");
+        std::fs::copy(archive::system32_tool("cmd.exe").unwrap(), &exe).unwrap();
+        let staging = tools.join(".staging-held");
+        std::fs::create_dir_all(staging.join("x")).unwrap();
+        let held_file = staging.join("x").join("download.part");
+        std::fs::write(&held_file, b"partial").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let run_started = std::time::SystemTime::now();
+
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args(["/d", "/q", "/k"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let running = Running(command.spawn().unwrap());
+        // std opens with FILE_SHARE_READ | WRITE | DELETE — still a handle.
+        let held = std::fs::File::open(&held_file).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(clean_stale_staging(&tools, run_started), 0);
+        assert!(module.is_file(), "the venv in use is left whole");
+        assert!(exe.is_file());
+        assert!(held_file.is_file(), "the staging dir in use is left whole");
+        assert!(
+            !tools
+                .join("python")
+                .join(".deepfake-lens.old-0123abcd.rm")
+                .exists()
+        );
+        assert!(!tools.join(".staging-held.rm").exists());
+        // The pip path reports the whole venv as left behind.
+        assert_eq!(remove_dir_unless_in_use(&venv), Some(venv.clone()));
+        assert!(module.is_file());
+
+        drop(held);
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(clean_stale_staging(&tools, run_started), 2);
+        assert!(!venv.exists() && !staging.exists());
+        let left: Vec<_> = std::fs::read_dir(&tools)
+            .unwrap()
+            .chain(std::fs::read_dir(tools.join("python")).unwrap())
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".rm"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
