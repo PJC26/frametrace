@@ -221,6 +221,10 @@ pub(crate) struct JobState {
     /// recovery is cleaning up right now (it holds `busy`) — status
     /// `finalize_journal.state: "recovering"`.
     pub(crate) finalize_recovering: Option<PathBuf>,
+    /// Track S4: the last guided tool install (`/api/tools/install`). It
+    /// runs under the busy lease; its progress is lock-free.
+    pub(crate) tool_install: Option<super::tools::ToolInstallJob>,
+    pub(crate) tool_install_seq: u64,
 }
 
 /// R5-S6: the pending "raw 불일치 — 재임포트 필요" decision.
@@ -389,6 +393,8 @@ impl JobState {
             finalize_incomplete: None,
             finalize_recovered: None,
             finalize_recovering: None,
+            tool_install: None,
+            tool_install_seq: 0,
         }
     }
 }

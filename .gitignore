@@ -41,8 +41,11 @@
 /dist/
 
 # Locally staged third-party tool binaries (libewf, Sleuth Kit, ffmpeg).
-# These are deployed per-workstation, never committed.
-/tools
+# These are deployed per-workstation, never committed. The pinned tool
+# manifest (versions, URLs, SHA-256) is versioned.
+/tools/*
+!/tools/manifest.json
+!/tools/*.requirements.txt
 /target3
 /chrome-test-profile
 /tmp/

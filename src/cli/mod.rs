@@ -570,6 +570,33 @@ pub enum Commands {
         #[command(subcommand)]
         command: QaCommands,
     },
+    /// List or install the pinned external tools (tools/manifest.json)
+    Tools {
+        #[command(subcommand)]
+        command: ToolsCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ToolsCommands {
+    /// Show each pinned tool, whether it is installed and how to install it
+    List {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Include on-demand tools (deepfake-lens)
+        #[arg(long)]
+        all: bool,
+    },
+    /// Download a pinned tool, verify its size and SHA-256, and install it
+    /// into <exe dir>/tools/bin (Windows only)
+    Install {
+        /// Tool name from `frametrace tools list`
+        name: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1091,6 +1118,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         Commands::Inspect { case_dir } => inspect(&case_dir),
         Commands::Doctor { case, json } => doctor(case.as_deref(), json),
         Commands::Qa { command } => run_qa(command),
+        Commands::Tools { command } => match command {
+            ToolsCommands::List { json, all } => tools_list(json, all),
+            ToolsCommands::Install { name, yes } => tools_install(&name, yes),
+        },
     }
 }
 

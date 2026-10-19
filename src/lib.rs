@@ -37,6 +37,7 @@ pub mod sha256;
 pub mod shell;
 pub mod telemetry;
 pub mod timeline;
+pub mod tool_install;
 pub mod tool_policy;
 pub mod transcode;
 pub mod tsk;

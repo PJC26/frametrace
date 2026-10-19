@@ -1513,11 +1513,16 @@ pub(crate) fn api_advanced(request: &Request, state: &SharedState) -> String {
         return "{\"ok\":false,\"error\":\"먼저 케이스를 열거나 분석을 실행하십시오.\"}"
             .to_string();
     };
+    let tool = body_value(&request.body, "tool").unwrap_or_default();
+    if tool == "deepfake"
+        && let Some(refusal) = super::tools::deepfake_missing_refusal()
+    {
+        return refusal;
+    }
     let _busy = match try_acquire_busy(state) {
         Ok(guard) => guard,
         Err(err) => return api_err(&err),
     };
-    let tool = body_value(&request.body, "tool").unwrap_or_default();
     let extra = body_value(&request.body, "extra").unwrap_or_default();
     let case_text = case_dir.to_string_lossy().to_string();
     let (args, output_rel): (Vec<String>, &str) = match tool.as_str() {

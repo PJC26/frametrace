@@ -86,6 +86,11 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/recent-cases/forget"),
     // R5-S6.
     ("POST", "/api/reimport-raw"),
+    // Track S4 (guided tool installs): the POSTs are nonce-gated below.
+    ("GET", "/api/tools"),
+    ("GET", "/api/tools/install-status"),
+    ("POST", "/api/tools/install"),
+    ("POST", "/api/tools/install-cancel"),
 ];
 
 #[test]

@@ -12,7 +12,9 @@
 //!
 //! Resolution order for the tool binary:
 //!   1. `FRAMETRACE_DEEPFAKE_LENS` env var (full path or bare name)
-//!   2. `deepfake-lens` on PATH (i.e. `pip install deepfake-lens`)
+//!   2. the private venv of an on-demand install
+//!      (`<exe dir>/tools/python/deepfake-lens`, src/tool_install)
+//!   3. `deepfake-lens` on PATH (i.e. `pip install deepfake-lens`)
 //!
 //! Install: `pip install deepfake-lens` (or `pip install -e D:\devin\deepfake-lens`
 //! for the local checkout). Optional model weights live under the
@@ -73,9 +75,43 @@ struct ForensicReport {
 
 /// Screen `path` through the deepfake-lens forensic report.
 pub fn screen(path: &Path) -> DeepfakeSummary {
-    let configured =
-        std::env::var("FRAMETRACE_DEEPFAKE_LENS").unwrap_or_else(|_| "deepfake-lens".to_string());
-    screen_with_binary(&configured, path)
+    screen_with_binary(&configured_lens_binary(), path)
+}
+
+/// The deepfake-lens binary the lane runs: `FRAMETRACE_DEEPFAKE_LENS`,
+/// else the private venv `frametrace tools install deepfake-lens` built
+/// (`<exe dir>/tools/python/deepfake-lens`), else the bare name (PATH,
+/// then tools/bin).
+pub fn configured_lens_binary() -> String {
+    if let Ok(value) = std::env::var("FRAMETRACE_DEEPFAKE_LENS")
+        && !value.trim().is_empty()
+    {
+        return value;
+    }
+    if let Some(exe) = crate::tool_install::private_venv_executable("deepfake-lens") {
+        return exe.to_string_lossy().into_owned();
+    }
+    "deepfake-lens".to_string()
+}
+
+/// Absolute path of the deepfake-lens console script the lane would run,
+/// or `None` (resolution only — nothing is spawned).
+pub fn resolved_lens_binary() -> Option<String> {
+    resolve_tool_binary(
+        configured_lens_binary().trim(),
+        &["deepfake-lens", "deepfake-lens.exe"],
+    )
+    .ok()
+}
+
+/// Whether screening can run: a resolvable console script, or an
+/// operator-configured source checkout (`FRAMETRACE_DEEPFAKE_LENS_HOME`)
+/// plus an interpreter for `python -m deepfake_lens.cli`.
+pub fn lens_available() -> bool {
+    resolved_lens_binary().is_some()
+        || (std::env::var("FRAMETRACE_DEEPFAKE_LENS_HOME")
+            .is_ok_and(|home| !home.trim().is_empty())
+            && resolve_tool_binary("python", &["python", "python3", "py"]).is_ok())
 }
 
 pub fn screen_with_binary(binary: &str, path: &Path) -> DeepfakeSummary {

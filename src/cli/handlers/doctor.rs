@@ -588,7 +588,12 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
             Ok(found) => checks.push(DoctorCheck::ok(name, format!("{found} — {feature}"))),
             Err(err) => checks.push(DoctorCheck::warn(
                 name,
-                format!("미설치 — {feature} 불가 ({err})"),
+                // Track S3: point at the pinned installer (or the
+                // manual-install hint when the tool has no checksum).
+                match crate::tool_install::install_hint_for_binary(name) {
+                    Some(hint) => format!("미설치 — {feature} 불가 ({err}) · {hint}"),
+                    None => format!("미설치 — {feature} 불가 ({err})"),
+                },
             )),
         }
     }

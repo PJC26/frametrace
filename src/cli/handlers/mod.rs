@@ -148,6 +148,7 @@ pub(crate) mod forensic;
 mod join_audio;
 mod media;
 mod merge;
+mod tools;
 
 #[derive(Debug, Clone)]
 struct BatchOutcome {
@@ -284,3 +285,4 @@ pub(crate) use media::{
     transcode_queue, validate_artifact,
 };
 pub(crate) use merge::{compare_cases, export_dfxml, known_hash_filter, merge_cases, timeline};
+pub(crate) use tools::{tools_install, tools_list};

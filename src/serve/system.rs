@@ -32,8 +32,15 @@ pub(crate) const PROBED_TOOLS: &[(&str, &str)] = &[
 /// single-flight lock), and a result with a timed-out probe is not cached
 /// — the next call re-probes instead of pinning "timed out" for the
 /// session.
+static ENV_CACHE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Drops the cached env probe (a guided tool install just changed what is
+/// installed — track S4), so the next `/api/env` re-probes.
+pub(crate) fn invalidate_env_cache() {
+    *ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 pub(crate) fn api_env(request: &Request) -> String {
-    static ENV_CACHE: Mutex<Option<String>> = Mutex::new(None);
     static PROBING: Mutex<()> = Mutex::new(());
     let refresh = query_value(&request.query, "refresh").as_deref() == Some("1");
     let cached = || ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -110,7 +117,9 @@ pub(crate) fn probe_env_outcome() -> (String, bool) {
         .filter(|v| !v.is_empty())
         .map(|v| PathBuf::from(&v).is_file() || tool_available(&v, ""))
         .unwrap_or(false)
-        || has("deepfake-lens");
+        || has("deepfake-lens")
+        // Track S: the private venv of an on-demand install.
+        || crate::tool_install::private_venv_executable("deepfake-lens").is_some();
     let tools_map: serde_json::Map<String, serde_json::Value> = tools
         .iter()
         .map(|(name, ok)| (name.to_string(), serde_json::Value::Bool(*ok)))

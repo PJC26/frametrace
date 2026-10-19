@@ -60,6 +60,11 @@ pub(crate) fn api_start(request: &Request, state: &SharedState) -> String {
     let with_hash = body_value(&request.body, "with_hash").as_deref() == Some("true");
     let with_ffprobe = body_value(&request.body, "with_ffprobe").as_deref() == Some("true");
     let with_deepfake = body_value(&request.body, "with_deepfake").as_deref() == Some("true");
+    // Track S: a missing deepfake-lens is a distinct, actionable refusal
+    // (`code: "tool_missing"`) instead of a pipeline that fails per file.
+    if with_deepfake && let Some(refusal) = super::tools::deepfake_missing_refusal() {
+        return refusal;
+    }
     // Plan §2.2: measuring sound needs ffprobe to pick the targets, so the
     // option only takes effect together with with_ffprobe (default off).
     let with_audio = body_value(&request.body, "with_audio").as_deref() == Some("true");

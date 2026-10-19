@@ -121,3 +121,26 @@ jobs:
           if ($bytes -contains 13) { throw 'SHA256SUMS contains CR' }
           Get-Content dist/SHA256SUMS
         shell: pwsh
+      # Tools track S5: the distribution with FFmpeg bundled. The script takes
+      # FFmpeg only from tools/manifest.json (pinned URL, HTTPS, host
+      # allowlist) and fails on any size / SHA-256 mismatch or unsafe archive
+      # entry, so a changed upstream file fails this job instead of shipping.
+      - name: Bundled package (package-windows.ps1, hash-pinned FFmpeg)
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -SkipBuild
+          if ($LASTEXITCODE -ne 0) { throw "package-windows.ps1 failed ($LASTEXITCODE)" }
+          foreach ($f in @('dist/FrameTrace/tools/bin/ffmpeg.exe', 'dist/FrameTrace/tools/bin/ffprobe.exe', 'dist/FrameTrace/tools/bin/licenses/ffmpeg-LICENSE.txt', 'dist/FrameTrace/THIRD_PARTY_NOTICES.md')) {
+            if (-not (Test-Path $f)) { throw "missing $f in the bundled package" }
+          }
+          $ver = & dist/FrameTrace/tools/bin/ffmpeg.exe -hide_banner -version
+          if ($LASTEXITCODE -ne 0) { throw 'bundled ffmpeg.exe does not run' }
+          $ver | Select-Object -First 1
+        shell: pwsh
+      - name: Upload bundled package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: FrameTrace-win64-bundled
+          path: |
+            dist/FrameTrace-*-win64-bundled.zip
+            dist/SHA256SUMS
+          if-no-files-found: error

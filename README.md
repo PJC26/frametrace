@@ -90,7 +90,19 @@ It binds `http://127.0.0.1:8477/` (next free port if taken), opens the default b
 
 For the remaining Windows-only work, start with `docs/WINDOWS_IMPLEMENTATION_HANDOFF.md`. It is the handoff checklist for cloning the repo on Windows, validating the current engine, testing E01/raw-image workflows, and then implementing the production Windows GUI shell.
 
-Install Rust and FFmpeg first. `ffmpeg.exe` and `ffprobe.exe` must be available in `PATH`.
+Install Rust and FFmpeg first. `ffmpeg.exe` and `ffprobe.exe` must be available in `PATH` or in `tools\bin` next to `frametrace.exe`.
+
+### External tools (bundled FFmpeg, guided installs)
+
+The Windows distribution built by `scripts/package-windows.ps1` (`FrameTrace-<version>-win64-bundled.zip`, also a Windows CI artifact) ships an LGPL FFmpeg build in `tools\bin`, so basic review works offline. Optional tools are installed only when you ask:
+
+```powershell
+.\frametrace.exe tools list                # what is installed, what can be installed here
+.\frametrace.exe tools install ffmpeg      # shows file, source, size, SHA-256, license, then asks
+.\frametrace.exe tools install ffmpeg --yes
+```
+
+Every tool is pinned in `tools/manifest.json` (version, URL, size and the publisher's SHA-256, compiled into the binary). Downloads use Windows' own `curl.exe` (HTTPS only, every redirect checked against the manifest's host allowlist) and `tar.exe`; a size or hash mismatch, or an archive entry that is absolute, climbs with `..` or is a link, refuses the install and leaves nothing behind. Each attempt appends one line to `tools\install-audit.jsonl`. Tools without a published checksum (libewf, The Sleuth Kit, deepfake-lens today) show a manual-install hint instead. PATH is still searched before `tools\bin`. Licenses: `THIRD_PARTY_NOTICES.md` and `tools\bin\licenses\`.
 
 ```powershell
 cargo build --release

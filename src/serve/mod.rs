@@ -83,6 +83,9 @@ mod tests_r9_server;
 mod tests_recent;
 #[cfg(test)]
 mod tests_review3;
+#[cfg(test)]
+mod tests_tools;
+mod tools;
 
 pub(crate) use discovery::{
     find_running_server, publish_local_server, token_for_port, write_instance_file,
@@ -1603,6 +1606,10 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/audio-measure") => json(api_audio_measure(request, state)),
         ("GET", "/api/recent-cases") => json(api_recent_cases()),
         ("POST", "/api/recent-cases/forget") => json(api_recent_cases_forget(request)),
+        ("GET", "/api/tools") => json(tools::api_tools(request, state)),
+        ("GET", "/api/tools/install-status") => json(tools::api_tools_install_status(state)),
+        ("POST", "/api/tools/install") => json(tools::api_tools_install(request, state)),
+        ("POST", "/api/tools/install-cancel") => json(tools::api_tools_install_cancel(state)),
         _ => plain(404, b"not found".to_vec()),
     }
 }

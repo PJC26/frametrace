@@ -1,0 +1,113 @@
+{
+  "schema": 1,
+  "note": "Pinned external tools (docs/PLAN_TOOLS_2026-10-20.md, T1-T6). Every sha256/size below is copied from the checksum source named next to it; nothing is guessed. sha256 null = no installable official checksum, install is disabled and only manual_hint is shown. Compiled into the binary (include_str!), never read from disk at run time.",
+  "allowed_hosts": [
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com"
+  ],
+  "tools": [
+    {
+      "name": "ffmpeg",
+      "title": "FFmpeg (LGPL build)",
+      "kind": "archive",
+      "required": true,
+      "on_demand": false,
+      "platform": "windows-x86_64",
+      "version": "n8.1.3-9-g29e619e767",
+      "license": "LGPL-3.0-or-later",
+      "homepage": "https://ffmpeg.org/",
+      "source_url": "https://github.com/FFmpeg/FFmpeg/tree/29e619e767",
+      "build_url": "https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-09-30-13-08",
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1.zip",
+      "file_name": "ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1.zip",
+      "format": "zip",
+      "size": 170611883,
+      "sha256": "4a7642b2264c03e8a0ce8a3825b933ee5580656f45695a086fe7e294045ffc0a",
+      "checksum_source": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/checksums.sha256",
+      "checksum_cross_check": "GitHub release asset digest and size, https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/autobuild-2026-09-30-13-08 (read 2026-10-19; both sources agree)",
+      "layout_source": "https://github.com/BtbN/FFmpeg-Builds/blob/master/build.sh (zip root = build name, LICENSE.txt = COPYING.LGPLv3) and variants/windows-install-static.sh (bin/*)",
+      "files": [
+        { "from": "ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1/bin/ffmpeg.exe", "to": "ffmpeg.exe" },
+        { "from": "ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1/bin/ffprobe.exe", "to": "ffprobe.exe" }
+      ],
+      "license_files": [
+        { "from": "ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1/LICENSE.txt", "to": "ffmpeg-LICENSE.txt" }
+      ],
+      "provides": ["ffmpeg", "ffprobe"],
+      "manual_hint": "https://ffmpeg.org/download.html 에서 LGPL 빌드를 받아 ffmpeg.exe·ffprobe.exe를 tools/bin에 복사하십시오."
+    },
+    {
+      "name": "libewf",
+      "title": "libewf (E01)",
+      "kind": "archive",
+      "required": false,
+      "on_demand": false,
+      "platform": "windows-x86_64",
+      "version": "20260924",
+      "license": "LGPL-3.0-or-later",
+      "homepage": "https://github.com/libyal/libewf",
+      "source_url": "https://github.com/libyal/libewf/releases/tag/20260924",
+      "url": null,
+      "file_name": null,
+      "format": null,
+      "size": null,
+      "sha256": null,
+      "checksum_source": null,
+      "unavailable_reason": "The official release (https://github.com/libyal/libewf/releases/tag/20260924) publishes only a source tarball and its PGP signature, no Windows binaries.",
+      "files": [],
+      "license_files": [],
+      "provides": ["ewfinfo", "ewfverify", "ewfexport"],
+      "manual_hint": "libewf는 공식 Windows 실행 파일이 없습니다 — scripts/build-libewf-tools.ps1로 소스에서 빌드하거나 직접 설치한 뒤 ewfinfo·ewfverify·ewfexport(와 DLL)를 tools/bin에 복사하십시오: https://github.com/libyal/libewf"
+    },
+    {
+      "name": "sleuthkit",
+      "title": "The Sleuth Kit (삭제 파일 복구)",
+      "kind": "archive",
+      "required": false,
+      "on_demand": false,
+      "platform": "windows-x86_64",
+      "version": "4.15.0",
+      "license": "IPL-1.0 / CPL-1.0 (core; per-file, see https://www.sleuthkit.org/sleuthkit/licenses.php)",
+      "homepage": "https://www.sleuthkit.org/sleuthkit/",
+      "source_url": "https://github.com/sleuthkit/sleuthkit/releases/tag/sleuthkit-4.15.0",
+      "url": null,
+      "file_name": null,
+      "format": null,
+      "size": null,
+      "sha256": null,
+      "checksum_source": null,
+      "reference": {
+        "url": "https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-4.15.0/sleuthkit-4.15.0-win32.zip",
+        "size": 17728689,
+        "github_asset_digest": "sha256:c2ebab8105b893d97bd8ce35b88e01985e2a106efc97f03adf95840a631b20ce",
+        "digest_source": "https://api.github.com/repos/sleuthkit/sleuthkit/releases/tags/sleuthkit-4.15.0 (read 2026-10-19)",
+        "signature_url": "https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-4.15.0/sleuthkit-4.15.0-win32.zip.asc"
+      },
+      "unavailable_reason": "The maintainers publish a PGP signature (.asc), not a checksum file, and the archive's file list (exe + DLL set) could not be verified without downloading it. The GitHub-computed digest under \"reference\" is recorded for manual verification only.",
+      "files": [],
+      "license_files": [],
+      "provides": ["mmls", "fls", "icat"],
+      "manual_hint": "sleuthkit-4.15.0-win32.zip을 공식 배포처에서 받아 PGP 서명(.asc)을 확인한 뒤 mmls·fls·icat과 함께 들어 있는 DLL을 tools/bin에 복사하십시오: https://www.sleuthkit.org/sleuthkit/download.php"
+    },
+    {
+      "name": "deepfake-lens",
+      "title": "deepfake-lens (합성 영상 스크리닝)",
+      "kind": "pip",
+      "required": false,
+      "on_demand": true,
+      "platform": "windows-x86_64",
+      "version": null,
+      "license": null,
+      "homepage": null,
+      "package": "deepfake-lens",
+      "index_url": "https://pypi.org/simple",
+      "requirements_file": null,
+      "unavailable_reason": "deepfake-lens is not published on PyPI (https://pypi.org/pypi/deepfake-lens/json returned 404 on 2026-10-19), so no hash-pinned requirements file can be built from PyPI's published digests.",
+      "files": [],
+      "license_files": [],
+      "provides": ["deepfake-lens"],
+      "manual_hint": "deepfake-lens는 PyPI에 공개되지 않아 자동 설치할 수 없습니다 — 받은 패키지를 직접 설치(pip install <경로>)하고 FRAMETRACE_DEEPFAKE_LENS에 deepfake-lens.exe 경로를 지정하십시오."
+    }
+  ]
+}
