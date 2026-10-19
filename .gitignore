@@ -46,6 +46,8 @@
 /tools/*
 !/tools/manifest.json
 !/tools/*.requirements.txt
+# Hash-pinned license texts FrameTrace ships (manifest bundled/package_licenses).
+!/tools/licenses/
 /target3
 /chrome-test-profile
 /tmp/

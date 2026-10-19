@@ -125,6 +125,9 @@ jobs:
       # FFmpeg only from tools/manifest.json (pinned URL, HTTPS, host
       # allowlist) and fails on any size / SHA-256 mismatch or unsafe archive
       # entry, so a changed upstream file fails this job instead of shipping.
+      - name: Packaging script offline test (fake FFmpeg zip, local redirects)
+        run: node scripts/test-package-windows.mjs
+        shell: pwsh
       - name: Bundled package (package-windows.ps1, hash-pinned FFmpeg)
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -SkipBuild
@@ -136,6 +139,33 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'bundled ffmpeg.exe does not run' }
           $ver | Select-Object -First 1
         shell: pwsh
+      # Fix round 1: the pinned BtbN LGPL build links a source-built
+      # libopenh264 (not covered by Cisco's patent licence). Record what the
+      # bundle really offers and which H.264 encoder FrameTrace itself picks
+      # for it (PATH reduced to System32 so the bundled tools/bin ffmpeg is
+      # the one resolved, not choco's); fail if that pick is libopenh264.
+      - name: Bundled FFmpeg encoder pick (must not be libopenh264)
+        run: |
+          $ff = (Resolve-Path dist/FrameTrace/tools/bin/ffmpeg.exe).Path
+          $enc = & $ff -hide_banner -encoders
+          if ($LASTEXITCODE -ne 0) { throw 'bundled ffmpeg -encoders failed' }
+          Write-Host '--- H.264 encoders in the bundle:'
+          $enc | Select-String -Pattern '\(codec h264\)' | ForEach-Object { Write-Host $_.Line }
+          Write-Host '--- configure line:'
+          & $ff -hide_banner -buildconf | Select-String -Pattern 'enable-(libopenh264|chromaprint|gpl|version3|nonfree)' | ForEach-Object { Write-Host $_.Line.Trim() }
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $list = & dist/FrameTrace/frametrace.exe tools list --json | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'frametrace tools list --json failed' }
+          $tool = $list.tools | Where-Object { $_.name -eq 'ffmpeg' }
+          $resolved = $tool.paths.ffmpeg
+          Write-Host "FrameTrace resolves ffmpeg to: $resolved"
+          if (-not $resolved -or ((Resolve-Path $resolved).Path -ne $ff)) { throw "FrameTrace did not resolve the bundled ffmpeg ($resolved)" }
+          $pick = $tool.encoders.h264
+          Write-Host "FrameTrace H.264 pick for the bundle: $pick (probed: $($tool.encoders.probed); note: $($tool.encoders.note))"
+          if (-not $tool.encoders.probed) { throw 'the encoder probe did not run against the bundled ffmpeg' }
+          if ($pick -eq 'libopenh264') { throw 'FrameTrace would encode H.264 with the source-built libopenh264 (not covered by the Cisco patent licence)' }
+          "h264_encoder=$pick" | Out-File -Encoding utf8 dist/ffmpeg-encoder-pick.txt
+        shell: pwsh
       - name: Upload bundled package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -143,4 +173,5 @@ jobs:
           path: |
             dist/FrameTrace-*-win64-bundled.zip
             dist/SHA256SUMS
+            dist/ffmpeg-encoder-pick.txt
           if-no-files-found: error

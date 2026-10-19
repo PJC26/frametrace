@@ -19,8 +19,11 @@
 //! * T5 — license files listed in the manifest land in `tools/bin/licenses`.
 //!
 //! Every failure removes the staging directory, so no partial file is left
-//! behind; every attempt (success or failure) appends one line to
-//! `<exe dir>/tools/install-audit.jsonl`.
+//! behind (stale `tools/.staging-*` left by a killed run are swept before
+//! each install and at server start); every attempt — success, failure or
+//! a refusal before anything started — appends one hash-chained line
+//! (`audit::append_chained_jsonl`, `previous_entry_sha256`/`entry_sha256`)
+//! to `<exe dir>/tools/install-audit.jsonl`.
 
 // The installers only run on Windows; the pure parts (manifest, URL and
 // entry checks) are compiled and unit-tested everywhere.
@@ -34,7 +37,7 @@ pub(crate) mod tests;
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// The pinned manifest, compiled in (never read from disk at run time).
 pub const MANIFEST_JSON: &str = include_str!("../../tools/manifest.json");
@@ -44,6 +47,15 @@ pub const MANIFEST_JSON: &str = include_str!("../../tools/manifest.json");
 /// when a pip tool becomes publishable with every digest pinned; a
 /// manifest `requirements_file` missing from this table is not installable.
 const REQUIREMENTS: &[(&str, &str)] = &[];
+
+/// License texts FrameTrace ships itself (by manifest path), installed
+/// next to a tool's own license files. The manifest pins each file's
+/// SHA-256; `validate_manifest` refuses a mismatch, so the compiled-in
+/// text is exactly the pinned one.
+const BUNDLED_LICENSES: &[(&str, &str)] = &[(
+    "tools/licenses/COPYING.GPLv3",
+    include_str!("../../tools/licenses/COPYING.GPLv3"),
+)];
 
 /// Platform key the manifest's `platform` field is matched against.
 pub const PLATFORM: &str = if cfg!(all(windows, target_arch = "x86_64")) {
@@ -92,6 +104,15 @@ pub struct FileMap {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct BundledLicense {
+    /// Repository path (a key of the compiled-in license table).
+    pub file: String,
+    /// Plain file name under `tools/bin/licenses`.
+    pub to: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ToolEntry {
     pub name: String,
     pub title: String,
@@ -115,6 +136,15 @@ pub struct ToolEntry {
     pub files: Vec<FileMap>,
     #[serde(default)]
     pub license_files: Vec<FileMap>,
+    /// Repository license texts installed with the tool (e.g. the GPLv3
+    /// text the LGPLv3 incorporates, which the upstream zip lacks).
+    #[serde(default)]
+    pub bundled_licenses: Vec<BundledLicense>,
+    /// Repository license files only the packaged distribution carries
+    /// (`scripts/package-windows.ps1` checks their SHA-256); a guided
+    /// install downloads the upstream zip itself and does not need them.
+    #[serde(default)]
+    pub package_licenses: Vec<BundledLicense>,
     pub provides: Vec<String>,
     pub manual_hint: Option<String>,
     // pip tools
@@ -286,6 +316,31 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
                 )));
             }
         }
+        for license in &tool.package_licenses {
+            if !plain_file_name(&license.to)
+                || !is_sha256_hex(&license.sha256)
+                || !license.file.starts_with("tools/licenses/")
+                || license.file.contains("..")
+            {
+                return Err(ctx(&format!(
+                    "bad package license {:?} -> {:?}",
+                    license.file, license.to
+                )));
+            }
+        }
+        for license in &tool.bundled_licenses {
+            if !plain_file_name(&license.to) {
+                return Err(ctx(&format!("unsafe license name {:?}", license.to)));
+            }
+            let text = bundled_license_text(&license.file)
+                .ok_or_else(|| ctx(&format!("{} is not compiled in", license.file)))?;
+            if crate::sha256::digest_bytes(text.as_bytes()) != license.sha256 {
+                return Err(ctx(&format!(
+                    "{} does not match its pinned sha256",
+                    license.file
+                )));
+            }
+        }
         if let Some(sha) = &tool.sha256 {
             if !is_sha256_hex(sha) {
                 return Err(ctx("sha256 must be 64 lowercase hex digits"));
@@ -379,6 +434,13 @@ pub fn python_missing_reason(tool: &ToolEntry) -> Option<String> {
         return None;
     }
     pip::RealPython::resolve().err()
+}
+
+pub(crate) fn bundled_license_text(file: &str) -> Option<&'static str> {
+    BUNDLED_LICENSES
+        .iter()
+        .find(|(path, _)| *path == file)
+        .map(|(_, text)| *text)
 }
 
 pub(crate) fn requirements_text(tool: &ToolEntry) -> Option<&'static str> {
@@ -601,13 +663,32 @@ impl Stage {
 
 /// Lock-free install progress, readable while the install runs (the
 /// workstation's status poll never waits on the installer).
+///
+/// Cancellation is a three-state latch: none → requested (the worker
+/// stops at the next check: curl is killed, or the next stage boundary
+/// refuses to start) or none → locked (the worker entered a stage that
+/// must run to the end — moving files into place, building the venv,
+/// pip). The two transitions race on one compare-exchange, so a cancel
+/// is either honoured or refused with [`NOT_CANCELLABLE`], never
+/// silently dropped.
 #[derive(Debug, Default)]
 pub struct Progress {
     stage: AtomicU8,
     bytes_done: AtomicU64,
     bytes_total: AtomicU64,
-    cancel: AtomicBool,
+    cancel: AtomicU8,
 }
+
+const CANCEL_NONE: u8 = 0;
+const CANCEL_REQUESTED: u8 = 1;
+const CANCEL_LOCKED: u8 = 2;
+
+/// `POST /api/tools/install-cancel` during a stage that cannot stop.
+pub const NOT_CANCELLABLE: &str =
+    "지금 단계(파일 이동·Python 환경 구성)는 취소할 수 없습니다 — 끝날 때까지 기다리십시오.";
+
+/// The worker's error when it stopped on a cancel request.
+pub const INSTALL_CANCELLED: &str = "install cancelled";
 
 impl Progress {
     pub fn stage(&self) -> Stage {
@@ -626,11 +707,50 @@ impl Progress {
         self.bytes_done.store(done, Ordering::SeqCst);
         self.bytes_total.store(total, Ordering::SeqCst);
     }
-    pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+    /// Asks the worker to stop. `Err(NOT_CANCELLABLE)` once it entered a
+    /// non-cancellable stage (nothing changes then).
+    pub fn request_cancel(&self) -> Result<(), &'static str> {
+        match self.cancel.compare_exchange(
+            CANCEL_NONE,
+            CANCEL_REQUESTED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) | Err(CANCEL_REQUESTED) => Ok(()),
+            Err(_) => Err(NOT_CANCELLABLE),
+        }
     }
     pub fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst)
+        self.cancel.load(Ordering::SeqCst) == CANCEL_REQUESTED
+    }
+    /// Whether a cancel request would still be honoured now.
+    pub fn cancellable(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst) != CANCEL_LOCKED
+    }
+    /// Stage boundary: `Err(INSTALL_CANCELLED)` when a cancel was requested.
+    pub(crate) fn check_cancel(&self) -> Result<(), String> {
+        if self.cancelled() {
+            Err(INSTALL_CANCELLED.to_string())
+        } else {
+            Ok(())
+        }
+    }
+    /// Enters a stage that must run to the end: from now on a cancel
+    /// request is refused. `Err(INSTALL_CANCELLED)` (and nothing entered)
+    /// when a cancel won the race.
+    pub(crate) fn enter_non_cancellable(&self, stage: Stage) -> Result<(), String> {
+        match self.cancel.compare_exchange(
+            CANCEL_NONE,
+            CANCEL_LOCKED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) | Err(CANCEL_LOCKED) => {
+                self.set_stage(stage);
+                Ok(())
+            }
+            Err(_) => Err(INSTALL_CANCELLED.to_string()),
+        }
     }
 }
 
@@ -749,9 +869,12 @@ pub(crate) fn redact_query(url: &str) -> String {
 /// calling thread — never call this under the workstation's state lock.
 pub fn install(name: &str, progress: &Progress) -> Result<InstallOutcome, String> {
     let manifest = manifest()?;
-    let tool = find_tool(manifest, name)
-        .ok_or_else(|| format!("unknown tool '{name}' (see frametrace tools list)"))?;
     let dirs = InstallDirs::for_current_exe()?;
+    let Some(tool) = find_tool(manifest, name) else {
+        let err = format!("unknown tool '{name}' (see frametrace tools list)");
+        let _ = audit_refusal(&dirs, name, "unknown_tool", &err);
+        return Err(err);
+    };
     install_entry(tool, &dirs, &NetPolicy::for_manifest(manifest), progress)
 }
 
@@ -764,12 +887,22 @@ pub(crate) fn install_entry(
     progress: &Progress,
 ) -> Result<InstallOutcome, String> {
     if let Some(reason) = not_installable_reason(tool) {
-        return Err(format!(
-            "{} cannot be installed automatically: {reason}",
-            tool.name
-        ));
+        let err = format!("{} cannot be installed automatically: {reason}", tool.name);
+        let code = if cfg!(windows) {
+            "not_installable"
+        } else {
+            "unsupported_platform"
+        };
+        let _ = audit_refusal(dirs, &tool.name, code, &err);
+        return Err(err);
     }
     if !cfg!(windows) {
+        let _ = audit_refusal(
+            dirs,
+            &tool.name,
+            "unsupported_platform",
+            UNSUPPORTED_PLATFORM,
+        );
         return Err(UNSUPPORTED_PLATFORM.to_string());
     }
     let result = run_platform_install(tool, dirs, net, progress);
@@ -796,7 +929,11 @@ fn run_platform_install(
     net: &NetPolicy,
     progress: &Progress,
 ) -> Result<InstallOutcome, String> {
+    // Anything older than this run is a stale staging dir of a killed one.
+    let run_started = std::time::SystemTime::now();
     let _lock = InstallLock::acquire(&dirs.tools_dir)?;
+    clean_stale_staging(&dirs.tools_dir, run_started);
+    progress.check_cancel()?;
     match tool.kind {
         ToolKind::Archive => archive::install_archive(tool, dirs, net, progress),
         ToolKind::Pip => {
@@ -915,19 +1052,95 @@ fn audit_line(tool: &ToolEntry, result: Result<&[PathBuf], &String>) -> String {
     value.to_string()
 }
 
+/// Appends one install-audit line, hash-chained like FrameTrace's other
+/// audit logs (`previous_entry_sha256` = SHA-256 of the previous line,
+/// `entry_sha256` over this line; keyed HMAC when an audit key is
+/// configured), so a removed or edited line breaks the chain.
 fn append_audit(path: &Path, line: &str) -> Result<(), String> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| format!("install audit log {} not writable: {err}", path.display()))?;
-    writeln!(file, "{line}")
-        .and_then(|()| file.sync_all())
+    crate::audit::append_chained_jsonl(path, line)
         .map_err(|err| format!("install audit log {} not written: {err}", path.display()))
+}
+
+/// Records an install refused before anything started (unknown tool,
+/// not installable, busy, another install running, ...). `Err` carries
+/// the warning when the line could not be written.
+pub fn audit_refusal(
+    dirs: &InstallDirs,
+    tool: &str,
+    code: &str,
+    message: &str,
+) -> Result<(), String> {
+    // The name may be anything a caller typed: bounded here, escaped by
+    // serde.
+    let tool: String = tool.chars().take(64).collect();
+    let line = serde_json::json!({
+        "ts_unix": crate::util::now_unix().unwrap_or(0),
+        "event": "tool-install",
+        "tool": tool,
+        "result": "refused",
+        "code": code,
+        "error": message,
+        "host_id": crate::util::host_id(),
+    })
+    .to_string();
+    append_audit(&dirs.audit_log(), &line)
+}
+
+/// Removes `tools/.staging-*` directories last modified before
+/// `started_before` — leftovers of an install that was killed. The caller
+/// holds the [`InstallLock`] (every live staging dir belongs to a locked
+/// install), so none of them is in use; one that cannot be removed (a file
+/// in it still open) is skipped and tried again next time. Returns how
+/// many were removed.
+pub(crate) fn clean_stale_staging(
+    tools_dir: &Path,
+    started_before: std::time::SystemTime,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(tools_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(".staging-") {
+            continue;
+        }
+        // Never follow a link out of tools/.
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .map(|modified| modified < started_before)
+            .unwrap_or(false);
+        if stale && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Server start: sweeps stale staging dirs under `<exe dir>/tools` when
+/// no install holds the lock (another process installing → skipped).
+/// Never creates the tools dir.
+pub fn clean_stale_staging_at_start() -> usize {
+    let Ok(dirs) = InstallDirs::for_current_exe() else {
+        return 0;
+    };
+    clean_stale_staging_if_unlocked(&dirs.tools_dir)
+}
+
+pub(crate) fn clean_stale_staging_if_unlocked(tools_dir: &Path) -> usize {
+    if !tools_dir.is_dir() {
+        return 0;
+    }
+    let started = std::time::SystemTime::now();
+    match InstallLock::acquire(tools_dir) {
+        Ok(_lock) => clean_stale_staging(tools_dir, started),
+        Err(_) => 0,
+    }
 }
 
 /// 64 random bits as hex (staging-directory names).

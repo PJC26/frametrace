@@ -54,9 +54,11 @@ pub(crate) fn install_archive(
     progress.set_bytes(0, size);
     download(&curl, url, &archive, size, net, progress)?;
 
+    progress.check_cancel()?;
     progress.set_stage(Stage::Verify);
     verify_file(&archive, size, sha256)?;
 
+    progress.check_cancel()?;
     progress.set_stage(Stage::Extract);
     let members: Vec<&str> = tool
         .files
@@ -71,8 +73,22 @@ pub(crate) fn install_archive(
     std::fs::create_dir(&out).map_err(|err| format!("cannot create {}: {err}", out.display()))?;
     extract_members(&tar, &archive, &out, &members)?;
     check_extracted_tree(&out, &members)?;
+    // FrameTrace's own pinned license texts (validated against the
+    // manifest's sha256 when the manifest was loaded).
+    let own = staging.path().join("own-licenses");
+    std::fs::create_dir(&own).map_err(|err| format!("cannot create {}: {err}", own.display()))?;
+    let mut own_moves = Vec::new();
+    for license in &tool.bundled_licenses {
+        let text = bundled_license_text(&license.file)
+            .ok_or_else(|| format!("{} is not compiled in", license.file))?;
+        let src = own.join(&license.to);
+        std::fs::write(&src, text)
+            .map_err(|err| format!("cannot write {}: {err}", src.display()))?;
+        own_moves.push((src, dirs.licenses().join(&license.to)));
+    }
 
-    progress.set_stage(Stage::Install);
+    // Last cancellable point: from here the files move into place.
+    progress.enter_non_cancellable(Stage::Install)?;
     let mut moves = Vec::new();
     for map in &tool.files {
         moves.push((out.join(&map.from), dirs.bin().join(&map.to)));
@@ -80,6 +96,7 @@ pub(crate) fn install_archive(
     for map in &tool.license_files {
         moves.push((out.join(&map.from), dirs.licenses().join(&map.to)));
     }
+    moves.extend(own_moves);
     move_all_or_nothing(&moves, &staging.path().join("backup"))?;
     Ok(InstallOutcome {
         installed_files: moves.into_iter().map(|(_, dest)| dest).collect(),
@@ -100,6 +117,7 @@ pub(crate) fn download(
 ) -> Result<(), String> {
     let mut current = url.to_string();
     for _ in 0..=MAX_HOPS {
+        progress.check_cancel()?;
         let parsed = check_url(&current, net)?;
         let _ = std::fs::remove_file(out);
         let (code, location) = curl_hop(curl, &current, parsed.https, out, size, progress)?;
@@ -126,22 +144,8 @@ fn curl_hop(
     progress: &Progress,
 ) -> Result<(u16, String), String> {
     let mut command = Command::new(curl);
-    // `--disable` must come first: no ~/.curlrc may add options
-    // (`--insecure`, `--location`, ...) behind our back.
     command
-        .arg("--disable")
-        .args(["--silent", "--show-error", "--fail"])
-        .args(["--proto", if https { "=https" } else { "=http" }])
-        .arg("--tlsv1.2")
-        .args(["--max-redirs", "0"])
-        .args(["--connect-timeout", "30"])
-        .args(["--speed-limit", "1024", "--speed-time", "60"])
-        .args(["--max-time", &MAX_TRANSFER_SECS.to_string()])
-        .args(["--max-filesize", &size.to_string()])
-        .arg("--output")
-        .arg(out)
-        .args(["--write-out", "%{http_code} %{redirect_url}"])
-        .args(["--url", url])
+        .args(curl_args(url, https, out, size))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -175,7 +179,7 @@ fn curl_hop(
                     return Err(if expired {
                         "download timed out".to_string()
                     } else {
-                        "download cancelled".to_string()
+                        INSTALL_CANCELLED.to_string()
                     });
                 }
             }
@@ -207,6 +211,49 @@ fn curl_hop(
         .parse()
         .map_err(|_| format!("download failed: unexpected curl output {written:?}"))?;
     Ok((code, location.trim().to_string()))
+}
+
+/// curl's argv for one hop. `--disable` must come first: no ~/.curlrc may
+/// add options (`--insecure`, `--location`, ...) behind our back.
+/// `--globoff`: `[]`/`{}` in a URL are literal, never a curl range glob
+/// that would fetch other URLs. No `--location` (hops are followed by
+/// [`download`]) and no `--proxy`/`--noproxy`: curl honours the user's
+/// proxy environment (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) so the
+/// install works behind a corporate proxy; TLS still terminates at the
+/// allowlisted host and the pinned SHA-256 decides (T1/T2).
+pub(crate) fn curl_args(url: &str, https: bool, out: &Path, size: u64) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = [
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--globoff",
+        "--proto",
+        if https { "=https" } else { "=http" },
+        "--tlsv1.2",
+        "--max-redirs",
+        "0",
+        "--connect-timeout",
+        "30",
+        "--speed-limit",
+        "1024",
+        "--speed-time",
+        "60",
+        "--max-time",
+    ]
+    .iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    args.push(MAX_TRANSFER_SECS.to_string().into());
+    args.push("--max-filesize".into());
+    args.push(size.to_string().into());
+    args.push("--output".into());
+    args.push(out.as_os_str().to_os_string());
+    args.push("--write-out".into());
+    args.push("%{http_code} %{redirect_url}".into());
+    args.push("--url".into());
+    args.push(url.into());
+    args
 }
 
 /// Size, then SHA-256, against the manifest — before anything is

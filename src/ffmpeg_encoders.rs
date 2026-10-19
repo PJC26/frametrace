@@ -4,8 +4,13 @@
 //! libx264 (GPL). Proxies and MP4 exports therefore never hard-code an
 //! encoder: the resolved ffmpeg is asked once for `-encoders` and the
 //! best H.264 encoder it really has is used, in the order
-//! libx264 → libopenh264 → h264_mf (Windows Media Foundation) → mpeg4
-//! (MPEG-4 Part 2, built into every ffmpeg). Audio prefers the native,
+//! libx264 → h264_mf (Windows Media Foundation) → libopenh264 → mpeg4
+//! (MPEG-4 Part 2, built into every ffmpeg). h264_mf comes before
+//! libopenh264 on purpose: the pinned BtbN LGPL build links openh264
+//! built from source, and Cisco's patent licence covers only Cisco's own
+//! prebuilt openh264 binaries — Media Foundation's encoder is licensed
+//! with Windows. (h264_mf exists only on Windows, so elsewhere the order
+//! is effectively libx264 → libopenh264 → mpeg4.) Audio prefers the native,
 //! LGPL-safe `aac`. The pick is recorded in the audit log lines so an
 //! output stays reproducible.
 //!
@@ -32,8 +37,8 @@ pub enum VideoEncoder {
 impl VideoEncoder {
     pub const PREFERENCE: [VideoEncoder; 4] = [
         VideoEncoder::Libx264,
-        VideoEncoder::Libopenh264,
         VideoEncoder::H264Mf,
+        VideoEncoder::Libopenh264,
         VideoEncoder::Mpeg4,
     ];
 
@@ -292,6 +297,9 @@ pub(crate) mod tests {
 
     pub const FULL: &str = "Encoders:\n V..... = Video\n A..... = Audio\n S..... = Subtitle\n .F.... = Frame-level multithreading\n ------\n V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)\n V....D h264_mf              H264 via MediaFoundation (codec h264)\n V.S... mpeg4                MPEG-4 part 2\n A....D aac                  AAC (Advanced Audio Coding)\n A....D libmp3lame           libmp3lame MP3 (MPEG audio layer 3) (codec mp3)\n";
     pub const LGPL: &str = "Encoders:\n V..... = Video\n A..... = Audio\n ------\n V....D h264_mf              H264 via MediaFoundation (codec h264)\n V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)\n V.S... mpeg4                MPEG-4 part 2\n A....D aac                  AAC (Advanced Audio Coding)\n A....D mp2                  MP2 (MPEG audio layer 2)\n";
+    /// What the pinned BtbN win64-lgpl build lists (libopenh264 built in
+    /// from source, Media Foundation, hardware encoders).
+    pub const BTBN_LGPL: &str = "Encoders:\n V..... = Video\n ------\n V....D libopenh264          OpenH264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)\n V....D h264_amf             AMD AMF H.264 Encoder (codec h264)\n V....D h264_mf              H264 via MediaFoundation (codec h264)\n V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)\n V....D h264_qsv             H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (Intel Quick Sync Video acceleration) (codec h264)\n V.S... mpeg4                MPEG-4 part 2\n A....D aac                  AAC (Advanced Audio Coding)\n";
     pub const BARE: &str = "Encoders:\n V..... = Video\n ------\n V.S... mpeg4                MPEG-4 part 2\n A....D mp2                  MP2 (MPEG audio layer 2)\n";
 
     /// A fake ffmpeg whose `-encoders` prints `listing`.
@@ -332,11 +340,35 @@ pub(crate) mod tests {
         assert_eq!(Encoders::from_listing(FULL).video(), VideoEncoder::Libx264);
         assert_eq!(Encoders::from_listing(LGPL).video(), VideoEncoder::H264Mf);
         assert_eq!(Encoders::from_listing(BARE).video(), VideoEncoder::Mpeg4);
-        let openh264 =
+        // The pinned BtbN LGPL build has both: Media Foundation wins over
+        // the source-built openh264 (not covered by Cisco's patent licence).
+        let both =
             Encoders::from_listing(" ------\n V....D libopenh264  OpenH264\n V....D h264_mf  MF\n");
-        assert_eq!(openh264.video(), VideoEncoder::Libopenh264);
+        assert_eq!(both.video(), VideoEncoder::H264Mf);
+        // openh264 is still used when it is the only H.264 encoder.
+        let openh264_only = Encoders::from_listing(" ------\n V....D libopenh264  OpenH264\n");
+        assert_eq!(openh264_only.video(), VideoEncoder::Libopenh264);
+        let x264_and_mf =
+            Encoders::from_listing(" ------\n V....D h264_mf  MF\n V....D libx264  x264\n");
+        assert_eq!(x264_and_mf.video(), VideoEncoder::Libx264);
+        assert_eq!(
+            VideoEncoder::PREFERENCE.map(VideoEncoder::name),
+            ["libx264", "h264_mf", "libopenh264", "mpeg4"]
+        );
         assert_eq!(Encoders::from_listing("").video(), VideoEncoder::Mpeg4);
         assert_eq!(Encoders::assumed_full().video(), VideoEncoder::Libx264);
+    }
+
+    #[test]
+    fn btbn_lgpl_bundle_never_picks_libopenh264() {
+        let enc = Encoders::from_listing(BTBN_LGPL);
+        assert!(enc.has("libopenh264") && enc.has("h264_mf"));
+        assert_eq!(enc.video(), VideoEncoder::H264Mf);
+        assert_eq!(
+            enc.build_note().as_deref(),
+            Some("LGPL 빌드 — H.264는 h264_mf 사용")
+        );
+        assert_eq!(enc.to_json()["h264"], "h264_mf");
     }
 
     #[test]

@@ -188,8 +188,8 @@ pub fn export_video(
     })
 }
 
-/// The encoders for one export: MP4 = best H.264 (libx264 -> libopenh264 ->
-/// h264_mf -> mpeg4) + aac; AVI = mpeg4 + MP3 (libmp3lame) or native MP2.
+/// The encoders for one export: MP4 = best H.264 (libx264 -> h264_mf ->
+/// libopenh264 -> mpeg4) + aac; AVI = mpeg4 + MP3 (libmp3lame) or native MP2.
 fn export_codecs(
     encoders: &crate::ffmpeg_encoders::Encoders,
     format: ExportFormat,

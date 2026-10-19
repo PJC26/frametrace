@@ -306,8 +306,13 @@ fn find_in_tools_bin(name: &str, allowed_names: &[&str]) -> Option<String> {
 
 fn find_in_path_dirs(name: &str, allowed_names: &[&str], path_var: &str) -> Option<PathBuf> {
     for dir in std::env::split_paths(path_var) {
-        // An empty PATH entry conventionally means the current directory.
-        if dir.as_os_str().is_empty() {
+        // An empty PATH entry conventionally means the current directory,
+        // and a relative one (`.`, `bin`, `..\tools`) is resolved against
+        // it too — the planted-binary vector this resolver exists to
+        // close. Only absolute entries are searched (on Windows a
+        // root-relative `\bin` is not absolute either: it follows the
+        // current drive).
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
             continue;
         }
         let Ok(dir) = dir.canonicalize() else {
@@ -465,6 +470,39 @@ mod tests {
         assert!(find_in_path_dirs("ffprobe", &["ffprobe"], &impostor_path).is_none());
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn relative_path_entries_are_never_searched() {
+        // A tool reachable only through relative PATH entries — resolved
+        // against the current directory, i.e. the cargo package root
+        // here — must not be found; the same directory given absolutely
+        // is.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = Path::new("target").join(format!("ft-relpath-test-{}", std::process::id()));
+        let tool_dir = cwd.join(&rel).join("bin");
+        fs::create_dir_all(&tool_dir).unwrap();
+        fs::write(tool_dir.join("ffprobe.exe"), b"planted").unwrap();
+        fs::write(tool_dir.join("ffprobe"), b"planted").unwrap();
+        let relative_entries = [rel.join("bin"), Path::new(".").join(&rel).join("bin")];
+        for entry in &relative_entries {
+            assert!(entry.is_relative());
+            let path_var = std::env::join_paths([entry]).unwrap();
+            assert!(
+                find_in_path_dirs("ffprobe", &["ffprobe"], &path_var.to_string_lossy()).is_none(),
+                "relative PATH entry {} was searched",
+                entry.display()
+            );
+        }
+        // `.` and `bin` style entries mixed with nothing absolute.
+        let mixed = std::env::join_paths([Path::new("."), Path::new("bin"), &rel.join("bin")])
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(find_in_path_dirs("ffprobe", &["ffprobe"], &mixed).is_none());
+        let absolute = tool_dir.display().to_string();
+        assert!(find_in_path_dirs("ffprobe", &["ffprobe"], &absolute).is_some());
+        let _ = fs::remove_dir_all(cwd.join(rel));
     }
 
     #[test]

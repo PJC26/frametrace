@@ -206,6 +206,9 @@ pub(crate) fn install_pip(
         .map_err(|err| format!("cannot write requirements: {err}"))?;
     std::fs::create_dir_all(&parent)
         .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+    // From here the venv is rebuilt in place: not cancellable (a cancel
+    // that won the race stops the install before anything moved).
+    progress.enter_non_cancellable(Stage::Venv)?;
     let backup = if std::fs::symlink_metadata(&target).is_ok() {
         let backup = parent.join(format!(".{}.old-{}", tool.name, random_hex()));
         std::fs::rename(&target, &backup).map_err(|err| {
@@ -219,7 +222,6 @@ pub(crate) fn install_pip(
         None
     };
     let built = (|| {
-        progress.set_stage(Stage::Venv);
         python.create_venv(&target)?;
         progress.set_stage(Stage::Pip);
         python.pip_install(&target, &req_path)?;

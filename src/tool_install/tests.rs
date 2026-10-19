@@ -32,6 +32,8 @@ fn base_entry() -> ToolEntry {
             from: "pkg/LICENSE.txt".into(),
             to: "fake-LICENSE.txt".into(),
         }],
+        bundled_licenses: Vec::new(),
+        package_licenses: Vec::new(),
         provides: vec!["fake".into()],
         manual_hint: Some("manual".into()),
         package: None,
@@ -300,8 +302,41 @@ fn null_sha256_tool_is_refused_before_touching_disk() {
     )
     .unwrap_err();
     assert!(err.contains("cannot be installed automatically"), "{err}");
-    assert!(!dirs.tools_dir.exists(), "nothing may be created");
+    assert_only_refusals(
+        &dirs,
+        &[if cfg!(windows) {
+            "not_installable"
+        } else {
+            "unsupported_platform"
+        }],
+    );
     let _ = std::fs::remove_dir_all(base);
+}
+
+/// Nothing but the install audit log exists under `tools/`, and it holds
+/// one chained `refused` line per expected code.
+pub(crate) fn assert_only_refusals(dirs: &InstallDirs, codes: &[&str]) {
+    let names: Vec<String> = std::fs::read_dir(&dirs.tools_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["install-audit.jsonl"], "a refusal touched the disk");
+    let text = std::fs::read_to_string(dirs.audit_log()).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let got: Vec<&str> = lines.iter().map(|l| l["code"].as_str().unwrap()).collect();
+    assert_eq!(got, codes, "{text}");
+    for line in &lines {
+        assert_eq!(line["event"], "tool-install");
+        assert_eq!(line["result"], "refused");
+        assert!(line["previous_entry_sha256"].is_string(), "{line}");
+        assert!(line["entry_sha256"].is_string(), "{line}");
+    }
+    let verified = crate::audit::verify_chained_jsonl_keyed(&dirs.audit_log(), &[]).unwrap();
+    assert_eq!(verified.entries, codes.len());
 }
 
 #[cfg(not(windows))]
@@ -321,7 +356,7 @@ fn installs_report_unsupported_platform_off_windows() {
     )
     .unwrap_err();
     assert!(err.contains("unsupported on this platform"), "{err}");
-    assert!(!dirs.tools_dir.exists());
+    assert_only_refusals(&dirs, &["unsupported_platform"]);
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -370,6 +405,195 @@ fn audit_line_records_source_hash_and_result_without_signed_query() {
     let value: serde_json::Value = serde_json::from_str(&failed).unwrap();
     assert_eq!(value["result"], "failed");
     assert_eq!(value["error"], "boom");
+}
+
+#[test]
+fn shipped_ffmpeg_entry_installs_the_pinned_gplv3_text() {
+    let manifest = manifest().unwrap();
+    let ffmpeg = find_tool(manifest, "ffmpeg").unwrap();
+    assert_eq!(ffmpeg.bundled_licenses.len(), 1);
+    let gpl = &ffmpeg.bundled_licenses[0];
+    assert_eq!(gpl.file, "tools/licenses/COPYING.GPLv3");
+    assert_eq!(gpl.to, "ffmpeg-COPYING.GPLv3.txt");
+    let text = bundled_license_text(&gpl.file).unwrap();
+    assert_eq!(crate::sha256::digest_bytes(text.as_bytes()), gpl.sha256);
+    assert!(text.contains("GNU GENERAL PUBLIC LICENSE"));
+    assert!(text.contains("Version 3, 29 June 2007"));
+    assert!(
+        !text.contains('\r'),
+        "kept byte-exact (LF), see .gitattributes"
+    );
+}
+
+#[test]
+fn package_only_license_files_exist_with_their_pinned_hash() {
+    let manifest = manifest().unwrap();
+    let ffmpeg = find_tool(manifest, "ffmpeg").unwrap();
+    assert!(
+        ffmpeg
+            .package_licenses
+            .iter()
+            .any(|l| l.to == "ffmpeg-THIRD-PARTY-LICENSES.txt"),
+        "the statically linked libraries' license texts are packaged"
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for license in &ffmpeg.package_licenses {
+        let bytes = std::fs::read(root.join(&license.file)).unwrap();
+        assert_eq!(
+            crate::sha256::digest_bytes(&bytes),
+            license.sha256,
+            "{} differs from its manifest pin (update the pin deliberately)",
+            license.file
+        );
+    }
+    let mut tool = base_entry();
+    tool.package_licenses = vec![BundledLicense {
+        file: "../outside.txt".into(),
+        to: "x.txt".into(),
+        sha256: "a".repeat(64),
+    }];
+    let err = validate_manifest(&manifest_with(tool)).unwrap_err();
+    assert!(err.contains("bad package license"), "{err}");
+}
+
+#[test]
+fn bundled_license_must_match_its_pin_and_be_compiled_in() {
+    let mut tool = base_entry();
+    tool.bundled_licenses = vec![BundledLicense {
+        file: "tools/licenses/COPYING.GPLv3".into(),
+        to: "x-COPYING.GPLv3.txt".into(),
+        sha256: "0".repeat(64),
+    }];
+    let err = validate_manifest(&manifest_with(tool.clone())).unwrap_err();
+    assert!(err.contains("does not match its pinned sha256"), "{err}");
+    tool.bundled_licenses[0].file = "tools/licenses/NOPE".into();
+    let err = validate_manifest(&manifest_with(tool.clone())).unwrap_err();
+    assert!(err.contains("is not compiled in"), "{err}");
+    tool.bundled_licenses[0].file = "tools/licenses/COPYING.GPLv3".into();
+    tool.bundled_licenses[0].sha256 =
+        "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903".into();
+    tool.bundled_licenses[0].to = "../escape.txt".into();
+    let err = validate_manifest(&manifest_with(tool.clone())).unwrap_err();
+    assert!(err.contains("unsafe license name"), "{err}");
+    tool.bundled_licenses[0].to = "x-COPYING.GPLv3.txt".into();
+    validate_manifest(&manifest_with(tool)).unwrap();
+}
+
+#[test]
+fn cancel_is_honoured_until_a_non_cancellable_stage_then_refused() {
+    // Requested first: the next boundary stops, the locked stage is never
+    // entered.
+    let progress = Progress::default();
+    assert!(progress.cancellable());
+    progress.check_cancel().unwrap();
+    progress.request_cancel().unwrap();
+    progress.request_cancel().unwrap(); // idempotent
+    assert!(progress.cancelled());
+    assert_eq!(progress.check_cancel().unwrap_err(), INSTALL_CANCELLED);
+    assert_eq!(
+        progress.enter_non_cancellable(Stage::Install).unwrap_err(),
+        INSTALL_CANCELLED
+    );
+    assert_ne!(progress.stage(), Stage::Install);
+
+    // Locked first: the cancel is refused and changes nothing.
+    let progress = Progress::default();
+    progress.set_stage(Stage::Extract);
+    progress.enter_non_cancellable(Stage::Install).unwrap();
+    assert_eq!(progress.stage(), Stage::Install);
+    assert!(!progress.cancellable());
+    assert_eq!(progress.request_cancel().unwrap_err(), NOT_CANCELLABLE);
+    assert!(!progress.cancelled());
+    progress.check_cancel().unwrap();
+    // A later non-cancellable stage (pip after venv) stays entered.
+    progress.enter_non_cancellable(Stage::Pip).unwrap();
+    assert_eq!(progress.stage(), Stage::Pip);
+}
+
+#[test]
+fn stale_staging_dirs_are_swept_but_not_live_or_foreign_entries() {
+    let base = scratch("stale");
+    let tools = base.join("tools");
+    std::fs::create_dir_all(tools.join(".staging-old1/x")).unwrap();
+    std::fs::write(tools.join(".staging-old1/x/download.part"), b"partial").unwrap();
+    std::fs::create_dir_all(tools.join(".staging-old2")).unwrap();
+    std::fs::write(tools.join(".staging-file"), b"not a dir").unwrap();
+    std::fs::create_dir_all(tools.join("bin")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let run_started = std::time::SystemTime::now();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Created by "this" run: newer than its start, kept.
+    std::fs::create_dir_all(tools.join(".staging-live")).unwrap();
+    assert_eq!(clean_stale_staging(&tools, run_started), 2);
+    assert!(!tools.join(".staging-old1").exists());
+    assert!(!tools.join(".staging-old2").exists());
+    assert!(tools.join(".staging-live").is_dir());
+    assert!(tools.join(".staging-file").is_file());
+    assert!(tools.join("bin").is_dir());
+    // A missing tools dir is fine and is not created.
+    assert_eq!(clean_stale_staging(&base.join("nope"), run_started), 0);
+    assert_eq!(clean_stale_staging_if_unlocked(&base.join("nope")), 0);
+    assert!(!base.join("nope").exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn server_start_sweep_skips_while_another_install_holds_the_lock() {
+    let base = scratch("stale-locked");
+    let tools = base.join("tools");
+    std::fs::create_dir_all(tools.join(".staging-dead")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    {
+        let _held = InstallLock::acquire(&tools).unwrap();
+        assert_eq!(clean_stale_staging_if_unlocked(&tools), 0);
+        assert!(
+            tools.join(".staging-dead").is_dir(),
+            "swept under a held lock"
+        );
+    }
+    assert_eq!(clean_stale_staging_if_unlocked(&tools), 1);
+    assert!(!tools.join(".staging-dead").exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn refusals_are_chained_onto_existing_install_audit_lines() {
+    let base = scratch("refusal-chain");
+    let dirs = InstallDirs {
+        tools_dir: base.join("tools"),
+    };
+    let tool = base_entry();
+    append_audit(
+        &dirs.audit_log(),
+        &audit_line(&tool, Err(&"boom".to_string())),
+    )
+    .unwrap();
+    let long_name = "x".repeat(500);
+    audit_refusal(&dirs, &long_name, "unknown_tool", "no such tool").unwrap();
+    audit_refusal(&dirs, "ffmpeg", "busy", "busy \"quoted\"\nline").unwrap();
+    let text = std::fs::read_to_string(dirs.audit_log()).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "one line per event, no injected lines");
+    assert_eq!(lines[0]["result"], "failed");
+    assert_eq!(lines[0]["previous_entry_sha256"], "GENESIS");
+    assert_eq!(lines[1]["result"], "refused");
+    assert_eq!(lines[1]["tool"].as_str().unwrap().len(), 64, "name bounded");
+    assert_eq!(lines[2]["code"], "busy");
+    assert_eq!(lines[2]["error"], "busy \"quoted\"\nline");
+    let first = text.lines().next().unwrap();
+    assert_eq!(
+        lines[1]["previous_entry_sha256"],
+        crate::sha256::digest_bytes(first.as_bytes())
+    );
+    let verified = crate::audit::verify_chained_jsonl_keyed(&dirs.audit_log(), &[]).unwrap();
+    assert_eq!(verified.entries, 3);
+    // Editing a line breaks the chain.
+    std::fs::write(dirs.audit_log(), text.replace("\"busy\"", "\"ok\"")).unwrap();
+    assert!(crate::audit::verify_chained_jsonl_keyed(&dirs.audit_log(), &[]).is_err());
+    let _ = std::fs::remove_dir_all(base);
 }
 
 // ------------------------------------------------------------------- pip
@@ -1121,6 +1345,117 @@ mod windows_installs {
             .unwrap_err();
         assert_eq!(err, INSTALL_LOCKED);
         assert_eq!(source.hits(), 0);
+    }
+
+    #[test]
+    fn installs_the_pinned_gplv3_text_next_to_the_archive_license() {
+        let bytes = fake::good_zip();
+        let source = fake::serve(HashMap::from([(
+            "/fake.zip".to_string(),
+            Reply::Body(bytes.clone()),
+        )]));
+        let mut tool = archive_entry(&source.url("/fake.zip"), &bytes);
+        tool.bundled_licenses = vec![BundledLicense {
+            file: "tools/licenses/COPYING.GPLv3".into(),
+            to: "fake-COPYING.GPLv3.txt".into(),
+            sha256: "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903".into(),
+        }];
+        let fx = Fixture::new("gplv3");
+        let outcome = fx.install(&tool).unwrap();
+        let installed = std::fs::read(fx.dirs.licenses().join("fake-COPYING.GPLv3.txt")).unwrap();
+        assert_eq!(
+            crate::sha256::digest_bytes(&installed),
+            "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+        );
+        assert!(fx.dirs.licenses().join("fake-LICENSE.txt").is_file());
+        assert_eq!(outcome.installed_files.len(), 3);
+        fx.assert_clean_staging_only();
+    }
+
+    #[test]
+    fn a_cancel_before_the_first_hop_contacts_nothing_and_cleans_up() {
+        let bytes = fake::good_zip();
+        let source = fake::serve(HashMap::from([(
+            "/fake.zip".to_string(),
+            Reply::Body(bytes.clone()),
+        )]));
+        let tool = archive_entry(&source.url("/fake.zip"), &bytes);
+        let fx = Fixture::new("cancel-early");
+        let progress = Progress::default();
+        progress.request_cancel().unwrap();
+        let err = install_entry(
+            &tool,
+            &fx.dirs,
+            &NetPolicy::test_loopback(&["127.0.0.1"]),
+            &progress,
+        )
+        .unwrap_err();
+        assert_eq!(err, INSTALL_CANCELLED);
+        assert_eq!(source.hits(), 0);
+        assert_eq!(progress.stage(), Stage::Failed);
+        fx.assert_clean();
+        assert_eq!(fx.audit_results(), ["failed"]);
+    }
+
+    #[test]
+    fn curl_never_globs_follows_redirects_or_overrides_the_proxy() {
+        let args: Vec<String> = archive::curl_args(
+            "https://github.com/o/r/a[1]{x}.zip",
+            true,
+            Path::new("C:/t/out.part"),
+            42,
+        )
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(args[0], "--disable", "curlrc must be ignored first");
+        assert!(args.contains(&"--globoff".to_string()));
+        assert!(args.windows(2).any(|w| w == ["--proto", "=https"]));
+        assert!(args.windows(2).any(|w| w == ["--max-redirs", "0"]));
+        assert!(args.windows(2).any(|w| w == ["--max-filesize", "42"]));
+        for banned in [
+            "--location",
+            "-L",
+            "--proxy",
+            "--noproxy",
+            "--insecure",
+            "-k",
+        ] {
+            assert!(!args.contains(&banned.to_string()), "{banned} in {args:?}");
+        }
+        assert_eq!(args.last().unwrap(), "https://github.com/o/r/a[1]{x}.zip");
+    }
+
+    #[test]
+    fn bracketed_urls_are_fetched_literally_not_as_a_curl_glob() {
+        let bytes = fake::good_zip();
+        let source = fake::serve(HashMap::new());
+        source.route("/pkg[1].zip", Reply::Body(bytes.clone()));
+        // Without --globoff curl would expand `[1]` and ask for /pkg1.zip.
+        source.route("/pkg1.zip", Reply::Status(500));
+        let tool = archive_entry(&source.url("/pkg[1].zip"), &bytes);
+        let fx = Fixture::new("globoff");
+        fx.install(&tool).unwrap();
+        assert!(fx.dirs.bin().join("fake.exe").is_file());
+        assert_eq!(source.hits(), 1);
+    }
+
+    #[test]
+    fn stale_staging_of_a_killed_install_is_swept_before_installing() {
+        let bytes = fake::good_zip();
+        let source = fake::serve(HashMap::from([(
+            "/fake.zip".to_string(),
+            Reply::Body(bytes.clone()),
+        )]));
+        let fx = Fixture::new("sweep");
+        let dead = fx.dirs.tools_dir.join(".staging-deadbeef00000000");
+        std::fs::create_dir_all(dead.join("x/pkg")).unwrap();
+        std::fs::write(dead.join("download.part"), b"half").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fx.install(&archive_entry(&source.url("/fake.zip"), &bytes))
+            .unwrap();
+        assert!(!dead.exists(), "stale staging left behind");
+        fx.assert_clean_staging_only();
     }
 
     #[test]

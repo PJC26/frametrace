@@ -4,7 +4,7 @@
 
 ## 원칙
 - **T1. 고정 버전·고정 해시.** 번들이든 다운로드든 도구마다 버전·URL·SHA-256을 저장소의 매니페스트(`tools/manifest.json`)에 고정한다. 해시가 다르면 설치하지 않는다(부분 파일도 남기지 않음). "latest" URL 금지.
-- **T2. 허용된 출처만, HTTPS만.** 매니페스트의 호스트 허용 목록 밖으로는 내려받지 않는다. 리다이렉트도 허용 목록 안이어야 한다. 프록시·인증서 오류는 그대로 실패.
+- **T2. 허용된 출처만, HTTPS만.** 매니페스트의 호스트 허용 목록 밖으로는 내려받지 않는다. 리다이렉트도 허용 목록 안이어야 한다(FrameTrace·패키징 스크립트가 홉마다 직접 확인, curl에 `--location` 없음; `--globoff`로 URL의 `[]{}`는 글자 그대로). 인증서 오류는 그대로 실패. **프록시**: 사용자/시스템 프록시 환경 변수(`HTTPS_PROXY`·`ALL_PROXY`·`NO_PROXY`)는 회사망을 위해 **그대로 따른다** — 프록시는 허용 호스트로 가는 TLS를 중계할 뿐이고(인증서는 그 호스트의 것으로 확인), 무결성은 언제나 고정 크기·SHA-256이 결정한다(§Fix round 1).
 - **T3. 사용자가 누를 때만.** 앱은 스스로 인터넷에 나가지 않는다. 설치는 사용자가 버튼/명령으로 시작하고, 받을 파일 이름·출처·크기를 먼저 보여 준다.
 - **T4. 새 의존성 없이.** HTTP는 Windows 내장 `curl.exe`(10 1803+), 압축 해제는 내장 `tar.exe`(bsdtar). 둘 다 `tool_policy`로 절대 경로 해석. 압축 해제는 임시 폴더에서 하고 경로 탈출(zip-slip·절대 경로·`..`·링크) 항목이 있으면 전체 거부, 매니페스트에 적힌 파일만 `tools/bin`으로 옮긴다.
 - **T5. 라이선스 고지.** 번들·설치하는 도구마다 라이선스와 소스 위치를 `THIRD_PARTY_NOTICES.md`와 `tools/bin/licenses/`에 둔다. FFmpeg는 **LGPL 빌드**만(FrameTrace는 MIT).
@@ -68,13 +68,48 @@
 
 ### LGPL FFmpeg와 인코더 (통합 수정, 2026-10-19)
 - 번들 FFmpeg는 LGPL 빌드라 **libx264(GPL)가 없다**. 프록시·MP4 내보내기가 `-c:v libx264`로 고정돼 있어 번들만 있으면 실패했다.
-- `src/ffmpeg_encoders.rs`: 해석된 ffmpeg에 `-hide_banner -encoders`를 한 번 묻고(`run_with_timeout_detailed`·콘솔 숨김·버전 확인 시간 제한, ffmpeg 경로+mtime+크기별 캐시, state_lock 밖) 순서 libx264 → libopenh264 → h264_mf → mpeg4로 고른다. 인코더별 옵션: libx264 `-preset veryfast -crf 28/20`(종전 그대로), libopenh264 `-b:v 2M/8M`, h264_mf `-rate_control quality -quality 55/75`, mpeg4 `-q:v 5/3`; 모두 `-pix_fmt yuv420p`. 오디오는 네이티브 `aac`(없고 libfdk_aac만 있으면 그것), AVI는 libmp3lame 있으면 그것, 없으면 네이티브 `mp2`. 확인 자체가 실패하면 종전 가정(libx264)으로 두어 ffmpeg가 직접 오류를 낸다.
+- `src/ffmpeg_encoders.rs`: 해석된 ffmpeg에 `-hide_banner -encoders`를 한 번 묻고(`run_with_timeout_detailed`·콘솔 숨김·버전 확인 시간 제한, ffmpeg 경로+mtime+크기별 캐시, state_lock 밖) 순서 libx264 → h264_mf → libopenh264 → mpeg4(§Fix round 1에서 h264_mf를 openh264 앞으로)로 고른다. 인코더별 옵션: libx264 `-preset veryfast -crf 28/20`(종전 그대로), libopenh264 `-b:v 2M/8M`, h264_mf `-rate_control quality -quality 55/75`, mpeg4 `-q:v 5/3`; 모두 `-pix_fmt yuv420p`. 오디오는 네이티브 `aac`(없고 libfdk_aac만 있으면 그것), AVI는 libmp3lame 있으면 그것, 없으면 네이티브 `mp2`. 확인 자체가 실패하면 종전 가정(libx264)으로 두어 ffmpeg가 직접 오류를 낸다.
 - 감사 줄(`proxy-log.jsonl`의 `make-proxy`, `export-log.jsonl`의 `export-video`)에 `video_encoder`·`audio_encoder`·`encoder_source`를 추가(`command_args`도 실제 인자). 출력 이름·컨테이너(mp4/avi)는 그대로.
 - `frametrace doctor`의 ffmpeg 줄, `frametrace tools list`, `GET /api/tools`의 ffmpeg 항목 `encoders{probed,libx264,h264,aac,avi_audio,note}`이 libx264 없는 빌드를 알린다(예: "LGPL 빌드 — H.264는 h264_mf 사용"; H.264가 하나도 없으면 doctor는 WARN).
 - deepfake-lens는 **PyPI에 없다** → README·`docs/DEEPFAKE_LENS.md`·`src/deepfake.rs`의 `pip install deepfake-lens` 안내를 "받은 체크아웃/휠에서 `pip install <경로>`, 또는 `FRAMETRACE_DEEPFAKE_LENS`/`FRAMETRACE_DEEPFAKE_LENS_HOME`"으로 고쳤다.
-- 확인 못 한 것: 실제 BtbN LGPL zip의 `-encoders` 목록(libopenh264 포함 여부)은 내려받지 않아 직접 보지 않았다 — 어느 쪽이든 h264_mf(Windows 기본)로 떨어진다. h264_mf 인자는 이 PC의 full 빌드(7.1)로 실제 인코딩해 확인했다.
+- (§Fix round 1에서 정정) 고정한 BtbN 태그의 `scripts.d/50-openh264.sh`는 lgpl 변형에서도 켜져 있어(`ffbuild_enabled`가 항상 0) **libopenh264가 소스에서 빌드되어 정적으로 들어간다** — 처음 순서(openh264 우선)라면 번들은 h264_mf가 아니라 libopenh264를 골랐다. 소스 빌드 openh264는 Cisco 특허 라이선스(Cisco가 배포한 바이너리에만 적용)를 받지 못하므로 순서를 libx264 → h264_mf → libopenh264 → mpeg4로 바꿨고, windows-ci가 번들 ffmpeg의 `-encoders`로 실제 선택을 기록하며 libopenh264면 실패한다. h264_mf 인자는 이 PC의 full 빌드(7.1)로 실제 인코딩해 확인했다.
 
 ### 남은 일
 - 실제 FFmpeg zip으로의 설치·패키징은 이 세션에서 내려받지 않았다 → windows-ci의 package 단계와 Windows 실기 `frametrace tools install ffmpeg`로 첫 확인 필요.
 - libewf·Sleuth Kit·deepfake-lens는 공식 체크섬(또는 PyPI 배포)이 생기면 매니페스트·`REQUIREMENTS` 표에 추가.
 - PATH가 tools/bin보다 먼저 검색된다(기존 `tool_policy` 동작) — 설치해도 PATH의 다른 ffmpeg가 쓰일 수 있음(CLI는 안내 출력).
+
+## §Fix round 1 (2026-10-19, 공급망 리뷰 반영, 기준 ff96d9b)
+
+리뷰어가 확인한 7개 항목을 모두 고쳤다. 테스트는 모두 가짜 출처(127.0.0.1)·가짜 zip만 쓰고 실제 인터넷·실제 바이너리를 받지 않는다.
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 (중) | 고정한 BtbN 태그의 `scripts.d/50-openh264.sh`가 lgpl에서도 켜져 있어 번들 ffmpeg에 **소스 빌드 libopenh264**가 정적으로 들어 있다 → 종전 순서(openh264 우선)면 번들은 h264_mf가 아니라 openh264를 골랐다. 소스 빌드 openh264는 Cisco 특허 라이선스 대상이 아니다. | 순서를 **libx264 → h264_mf → libopenh264 → mpeg4**로(`VideoEncoder::PREFERENCE`; h264_mf는 Windows에만 있으므로 다른 OS에서는 사실상 libx264 → libopenh264 → mpeg4). README·THIRD_PARTY_NOTICES·위 "LGPL FFmpeg와 인코더" 절 정정. windows-ci에 "Bundled FFmpeg encoder pick" 단계: 번들 `ffmpeg -hide_banner -encoders`의 H.264 목록과 `-buildconf`(openh264·chromaprint·gpl·version3) 기록, PATH를 System32로 줄여 `dist/FrameTrace/frametrace.exe tools list --json`이 번들 ffmpeg를 해석하는지 확인하고 그 `encoders.h264`를 `dist/ffmpeg-encoder-pick.txt`로 남김 — **libopenh264면 실패**. | `ffmpeg_encoders::tests::picks_in_preference_order`(둘 다 있으면 h264_mf, openh264만 있으면 openh264, x264 최우선, 순서 배열), `btbn_lgpl_bundle_never_picks_libopenh264`(BtbN lgpl 형태 목록). CI 단계는 이 PC의 full 빌드로 같은 스크립트를 돌려 확인(해석·probe·기록 동작). |
+| 2 (중) | 번들에 `LICENSE.txt`(COPYING.LGPLv3)만 있었다 — LGPLv3는 GPLv3를 참조로 포함하므로 GPLv3 원문도 필요. | `tools/licenses/COPYING.GPLv3` = FFmpeg 저장소의 그 커밋(`29e619e767cde9045a75c29bc9a8278ae7b3a98b`) 원본(35 147 B, SHA-256 `8ceb4b9e…5b903`; gnu.org 현재본과는 fsf.org 주소의 http/https만 다름). 매니페스트 `bundled_licenses`에 SHA-256 고정, `include_str!`로 컴파일, `validate_manifest`가 해시 불일치·미포함을 거부. 가이드 설치와 패키징 모두 `tools/bin/licenses/ffmpeg-COPYING.GPLv3.txt`로 설치. `.gitattributes`에 `tools/licenses/** -text`(autocrlf가 바이트를 바꾸지 않게). | `shipped_ffmpeg_entry_installs_the_pinned_gplv3_text`, `bundled_license_must_match_its_pin_and_be_compiled_in`, Windows `installs_the_pinned_gplv3_text_next_to_the_archive_license`, `scripts/test-package-windows.mjs`(zip에 들어가고 바이트가 고정값). |
+| 3 (중) | 정적 링크된 서드파티 라이브러리·라이선스·고지·소스 제공이 문서화되지 않았다. | BtbN 태그 `autobuild-2026-09-30-13-08`(커밋 `6c9aec5f…`)의 `scripts.d`를 받아 `generate.sh`의 선택 규칙(win64 · lgpl · 8.1 addin, `ffbuild_enabled`, 디렉터리 단계는 마지막 스크립트가 켜져야 빌드)대로 켜진 단계를 뽑고, 각 `SCRIPT_REPO`·`SCRIPT_COMMIT`(또는 태그/SVN rev)을 THIRD_PARTY_NOTICES.md 표에 라이선스와 함께 적었다. 각 업스트림의 라이선스 파일(그 커밋)을 모은 `tools/licenses/ffmpeg-THIRD-PARTY-LICENSES.txt`(매니페스트 `package_licenses`, SHA-256 고정; 패키징만)를 `tools/bin/licenses/`에 넣는다. 3년 서면 소스 제공 문구 추가, 포함/불포함 범위 명시. | `package_only_license_files_exist_with_their_pinned_hash`, `test-package-windows.mjs`. |
+| 4a (하) | curl URL 글로빙. | `curl --globoff`(`archive::curl_args`로 분리). | `curl_never_globs_follows_redirects_or_overrides_the_proxy`, `bracketed_urls_are_fetched_literally_not_as_a_curl_glob`(`/pkg[1].zip`을 글자 그대로 요청, 1회). |
+| 4b (하) | 프록시 동작 미정. | **사용자/시스템 프록시 환경 변수는 그대로 따른다**(회사망). `--proxy`/`--noproxy`를 주지 않는다. 프록시는 TLS를 중계할 뿐 인증서는 허용 호스트의 것이고, 무결성은 고정 크기·SHA-256이 결정한다. T2와 README에 기록. | `curl_never_globs_…`(`--proxy`/`--noproxy`/`--location`/`--insecure` 없음). |
+| 4c (하) | `package-windows.ps1`이 `--location`으로 임의 호스트까지 따라갔고 `Compress-Archive`(역슬래시 항목)를 썼다. | 홉마다 `Assert-AllowedUrl`(https·기본 포트·자격 증명 없음·허용 호스트)로 확인한 뒤 `--max-redirs 0`으로 한 홉씩(최대 5), `--globoff`. zip은 `[IO.Compression.ZipFile]::CreateFromDirectory` — Windows PowerShell 5.1(.NET Framework)은 기본값으로 **역슬래시를 써서**(실제로 확인) `Switch.System.IO.Compression.ZipFile.UseBackslash`를 끄고, 쓴 뒤 모든 항목 이름을 다시 열어 `\`가 있으면 실패. `-Version`, `-TestLoopbackHttp`(127.0.0.1의 http만, 오프라인 테스트용) 매개변수 추가. | `node scripts/test-package-windows.mjs`(가짜 zip·가짜 저장소 루트): 허용 리다이렉트 1홉 성공, 항목 이름 전부 `/`, 필요한 파일·라이선스 포함·목록 외 파일 제외, SHA256SUMS 일치, 허용 밖 호스트로의 리다이렉트는 연결 0회로 거부, https 다른 호스트 리다이렉트 거부, 루프 5회 제한, 해시 불일치 시 아무것도 안 남음, 허용 밖 매니페스트 URL 거부. windows-ci에 단계 추가. |
+| 4d (하) | 취소가 다운로드 중에만 동작하고 다른 단계에서는 조용히 무시됐다. | `Progress`의 취소를 3상태 래치(none/requested/locked, compare-exchange 하나)로. 단계 경계(잠금 직후, 홉마다, 검증 전, 압축 해제 전)에서 확인, 다운로드 중에는 curl 종료. 파일 이동(`Install`)·venv·pip에 들어갈 때 `enter_non_cancellable` — 그 뒤 취소는 **`{"ok":false,"code":"not_cancellable","error":…,"install":J}`**. 경쟁에서 취소가 먼저면 그 단계에 들어가지 않고 `install cancelled`로 끝난다. | `cancel_is_honoured_until_a_non_cancellable_stage_then_refused`, `cancel_during_a_non_cancellable_stage_is_refused_with_its_own_code`(API), Windows `a_cancel_before_the_first_hop_contacts_nothing_and_cleans_up`, `a_cancel_mid_download_stops_the_install_and_cleans_up`(API, 진행 중 취소 → failed·busy 해제·스테이징 없음). |
+| 4e (하) | 강제 종료된 설치의 `tools/.staging-*`가 남았다. | `clean_stale_staging`: 설치 잠금(`tools/.install.lock`)을 잡은 뒤 이번 실행 시작 전에 수정된 `.staging-*` 디렉터리만 지운다(링크·파일은 건드리지 않음, 지우지 못한 것은 다음에). 설치 직전과 **서버 시작 시**(`serve::run_on`; tools 폴더가 있고 잠금이 비어 있을 때만, 폴더를 만들지 않음). | `stale_staging_dirs_are_swept_but_not_live_or_foreign_entries`, `server_start_sweep_skips_while_another_install_holds_the_lock`, Windows `stale_staging_of_a_killed_install_is_swept_before_installing`. |
+| 4f (하) | 시작 전 거부가 감사 로그에 없었고, 로그가 체인이 아니었다. | 모든 거부(`unknown_tool`·`not_installable`·`unsupported_platform`·`python_required`·`install_running`·`shutdown`·`busy`, CLI의 unknown/not installable 포함)를 한 줄씩 기록 — 상태 잠금을 놓은 뒤. 쓰기 실패는 거부 응답의 `audit_warning`. 로그 쓰기는 다른 감사 로그와 같은 `audit::append_chained_jsonl`. | `refusals_are_chained_onto_existing_install_audit_lines`(체인 검증·편집 시 검증 실패·이름 64자 제한·줄 주입 없음), `install_refusals_carry_stable_codes_and_start_nothing`·`busy_workstation_refuses_…`·`null_sha256_…`·`installs_report_unsupported_platform_off_windows`(거부 줄만 생기고 다른 파일 없음, 체인 검증). |
+| 4g (하) | `tool_policy` PATH 검색이 상대 항목(`.`, `bin`)도 현재 폴더 기준으로 찾았다. | 절대 경로 항목만 검색(Windows의 `\bin`처럼 드라이브 상대인 것도 제외). | `tool_policy::tests::relative_path_entries_are_never_searched`. |
+
+### `tools/install-audit.jsonl` 형식 (변경)
+한 줄 = JSON 객체 하나, 다른 감사 로그와 같은 체인: 본문 필드 뒤에 `previous_entry_sha256`(직전 줄 바이트의 SHA-256, 첫 줄은 `GENESIS`)과 `entry_sha256`(그 필드까지의 줄의 SHA-256), 감사 키가 설정돼 있으면 `entry_hmac_sha256`·`entry_hmac_key_id`. 본문:
+- 설치 시도: `ts_unix, event:"tool-install", tool, kind, version, url, host, size, sha256, checksum_source, requirements_sha256, host_id, result:"ok"|"failed", files[] | error`
+- 시작 전 거부: `ts_unix, event:"tool-install", tool(최대 64자), result:"refused", code, error, host_id`
+종전(체인 없는) 줄이 있는 파일에도 이어 쓴다(첫 체인 줄의 `previous_entry_sha256`이 마지막 옛 줄의 해시).
+
+### API 변경 (트랙 U)
+- `POST /api/tools/install-cancel`: 새 거부 코드 **`not_cancellable`** — `{"ok":false,"code":"not_cancellable","error":"지금 단계(파일 이동·Python 환경 구성)는 취소할 수 없습니다 — 끝날 때까지 기다리십시오.","install":J}`. UI는 이때 취소 버튼을 비활성/안내로 바꾸면 된다(J.stage가 `install|venv|pip`).
+- 취소된 설치는 `state:"failed"`, `error:"install cancelled"`.
+- `POST /api/tools/install` 거부 응답에 `audit_warning`(감사 줄을 못 쓴 경우만)이 붙을 수 있다.
+- `GET /api/tools`의 ffmpeg `encoders.h264`는 번들에서 `h264_mf`가 된다(종전 `libopenh264`).
+
+### 확인 못 한 것 / 남은 일
+- 정적 라이브러리 목록은 BtbN 스크립트에서 **생성 규칙대로 도출**한 것이다(바이너리를 받지 않음). windows-ci의 새 단계가 실제 `-buildconf`를 기록하므로 첫 CI 실행에서 목록과 대조할 것.
+- **FFTW3(GPL-2.0-or-later)** 가 chromaprint(`-DFFT_LIB=fftw3`, `--enable-chromaprint`)를 통해 lgpl 변형에도 정적으로 들어간다(libzvbi도 COPYING.md상 대부분 GPL-2.0-or-later, `src/packet-830.*`·`src/pdc.*`는 GPL-2.0) — 이름과 달리 번들 `ffmpeg.exe` 전체는 GPL 조건으로 재배포되는 것으로 다뤄야 한다(FrameTrace 자체는 별도 프로그램으로 실행하므로 MIT 그대로). THIRD_PARTY_NOTICES에 적었다. 원치 않으면 다음 라운드에서 다른 빌드(예: chromaprint 없는 빌드)로 바꾸는 결정이 필요.
+- 서면 소스 제공(3년)은 문구만 넣었다 — 실제로 소스를 낼 수 있도록 소유자가 BtbN 태그의 전체 소스(각 `SCRIPT_COMMIT` + FFmpeg `29e619e767`)를 보관해야 한다. 연락 창구는 저장소 이슈로 적었다(소유자 확인 필요).
+- h264_mf 인코딩 품질/호환은 이 PC의 full 빌드로 확인한 것이고, 번들 바이너리로의 실제 인코딩은 Windows CI/실기 확인이 필요.

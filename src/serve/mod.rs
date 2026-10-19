@@ -253,6 +253,9 @@ pub(crate) fn bind_cli_case(typed: &Path) -> Result<PathBuf, String> {
 
 fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), String> {
     proc::install_process_guard();
+    // Leftover `tools/.staging-*` of a killed install (skipped while
+    // another process holds the install lock).
+    crate::tool_install::clean_stale_staging_at_start();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     if let Some(typed) = &options.case_dir {
         // R20-S3 (P34): `case_dir` is bound like a typed `/api/start` case

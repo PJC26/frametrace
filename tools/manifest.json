@@ -34,6 +34,13 @@
       "license_files": [
         { "from": "ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1/LICENSE.txt", "to": "ffmpeg-LICENSE.txt" }
       ],
+      "bundled_licenses_note": "LICENSE.txt in the zip is COPYING.LGPLv3, which incorporates the GPLv3 by reference; the GPLv3 text is shipped from this repository (copied from FFmpeg's COPYING.GPLv3 at commit 29e619e767cde9045a75c29bc9a8278ae7b3a98b, https://raw.githubusercontent.com/FFmpeg/FFmpeg/29e619e767cde9045a75c29bc9a8278ae7b3a98b/COPYING.GPLv3, read 2026-10-19). ffmpeg-THIRD-PARTY-LICENSES.txt (the statically linked libraries' license files) is packaged by scripts/package-windows.ps1 only.",
+      "bundled_licenses": [
+        { "file": "tools/licenses/COPYING.GPLv3", "to": "ffmpeg-COPYING.GPLv3.txt", "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903" }
+      ],
+      "package_licenses": [
+        { "file": "tools/licenses/ffmpeg-THIRD-PARTY-LICENSES.txt", "to": "ffmpeg-THIRD-PARTY-LICENSES.txt", "sha256": "bddbe636f1f87f4a0908e51fafaeececbf4720f35203a0dab36f870195417cfe" }
+      ],
       "provides": ["ffmpeg", "ffprobe"],
       "manual_hint": "https://ffmpeg.org/download.html 에서 LGPL 빌드를 받아 ffmpeg.exe·ffprobe.exe를 tools/bin에 복사하십시오."
     },

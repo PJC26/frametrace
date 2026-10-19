@@ -117,17 +117,63 @@ fn install_refusals_carry_stable_codes_and_start_nothing() {
     };
     assert_eq!(libewf["code"], expected);
     assert!(libewf["manual_hint"].as_str().is_some());
+    let mut codes = vec!["unknown_tool", expected];
     if !cfg!(windows) {
         assert_eq!(refused("ffmpeg")["code"], "unsupported_platform");
+        codes.push("unsupported_platform");
     }
     assert!(state_lock(&state).tool_install.is_none());
     assert!(!state_lock(&state).busy);
-    assert!(!base.join("tools").exists(), "a refusal touched the disk");
+    // Each refusal is one chained audit line; nothing else is written.
+    crate::tool_install::tests::assert_only_refusals(
+        &InstallDirs {
+            tools_dir: base.join("tools"),
+        },
+        &codes,
+    );
     assert_eq!(
         parse(&tools::api_tools_install_cancel(&state))["code"],
         "no_install"
     );
     let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn cancel_during_a_non_cancellable_stage_is_refused_with_its_own_code() {
+    let state = new_state();
+    let progress = Arc::new(crate::tool_install::Progress::default());
+    {
+        let mut guard = state_lock(&state);
+        guard.tool_install = Some(tools::ToolInstallJob {
+            id: 1,
+            name: "ffmpeg".into(),
+            state: "running",
+            error: None,
+            progress: Arc::clone(&progress),
+            started_unix: 0,
+            finished_unix: None,
+            installed_files: Vec::new(),
+            audit_warning: None,
+        });
+    }
+    // Downloading: honoured.
+    progress.set_stage(crate::tool_install::Stage::Download);
+    let ok = parse(&tools::api_tools_install_cancel(&state));
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert!(progress.cancelled());
+
+    // Moving files into place: refused, nothing changes.
+    let progress = Arc::new(crate::tool_install::Progress::default());
+    progress
+        .enter_non_cancellable(crate::tool_install::Stage::Install)
+        .unwrap();
+    state_lock(&state).tool_install.as_mut().unwrap().progress = Arc::clone(&progress);
+    let refused = parse(&tools::api_tools_install_cancel(&state));
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["code"], "not_cancellable", "{refused}");
+    assert_eq!(refused["install"]["stage"], "install");
+    assert_eq!(refused["install"]["state"], "extracting");
+    assert!(!progress.cancelled());
 }
 
 #[test]
@@ -205,7 +251,12 @@ mod windows {
         ));
         assert_eq!(refused["code"], "busy", "{refused}");
         assert!(state_lock(&state).tool_install.is_none());
-        assert!(!base.join("tools").exists());
+        crate::tool_install::tests::assert_only_refusals(
+            &InstallDirs {
+                tools_dir: base.join("tools"),
+            },
+            &["busy"],
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -271,6 +322,56 @@ mod windows {
         );
         assert!(!state_lock(&state).busy, "busy released");
         assert!(base.join("tools/bin/fake.exe").is_file());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_cancel_mid_download_stops_the_install_and_cleans_up() {
+        let bytes = fake::big_zip();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let source = fake::serve(HashMap::new());
+        source.route("/fake.zip", Reply::Gated(bytes.clone(), Arc::clone(&gate)));
+        let tool = crate::tool_install::tests::test_archive_entry(&source.url("/fake.zip"), &bytes);
+        let base = scratch("cancel");
+        let state = new_state();
+        let started = parse(&tools::start_install(
+            &state,
+            "faketool",
+            fake_env(base.join("tools"), tool),
+        ));
+        assert_eq!(started["ok"], true, "{started}");
+        wait_until("download progress", || {
+            let status = parse(&tools::api_tools_install_status(&state));
+            status["install"]["stage"] == "download"
+                && status["install"]["bytes"].as_u64().unwrap_or(0) > 0
+        });
+        let cancel = parse(&tools::api_tools_install_cancel(&state));
+        assert_eq!(cancel["ok"], true, "{cancel}");
+        wait_until("install stopped", || {
+            state_lock(&state)
+                .tool_install
+                .as_ref()
+                .is_some_and(|job| job.state != "running")
+        });
+        fake::open_gate(&gate);
+        let status = parse(&tools::api_tools_install_status(&state));
+        assert_eq!(status["install"]["state"], "failed", "{status}");
+        assert_eq!(
+            status["install"]["error"],
+            crate::tool_install::INSTALL_CANCELLED
+        );
+        assert!(!state_lock(&state).busy);
+        assert!(!base.join("tools/bin/fake.exe").exists());
+        let staged = std::fs::read_dir(base.join("tools"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(".staging-"));
+        assert!(!staged, "staging left behind");
+        // A finished job has nothing to cancel.
+        assert_eq!(
+            parse(&tools::api_tools_install_cancel(&state))["code"],
+            "no_install"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

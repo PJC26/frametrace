@@ -6,7 +6,15 @@
 //! * `POST /api/tools/install` `{"name": "<tool>"}` — nonce-gated like every
 //!   POST; takes the busy lease, then downloads/extracts on a worker thread.
 //! * `GET  /api/tools/install-status` — cheap poll of that job.
-//! * `POST /api/tools/install-cancel` — asks a running download to stop.
+//! * `POST /api/tools/install-cancel` — asks a running install to stop:
+//!   honoured while downloading / verifying / extracting (checked between
+//!   stages, curl killed mid-download), refused with
+//!   `{"ok":false,"code":"not_cancellable"}` once files are being moved
+//!   into place or the venv / pip runs.
+//!
+//! Every refusal of `POST /api/tools/install` is also recorded in
+//! `tools/install-audit.jsonl` (`result: "refused"`, `code`), written
+//! after the state lock is released.
 //!
 //! State-lock rule: the lock is held only to check/record the job; tool
 //! resolution, network and disk work never run under it, and progress is
@@ -136,10 +144,14 @@ pub(crate) fn api_tools_install_cancel(state: &SharedState) -> String {
         .as_ref()
         .filter(|job| job.state == "running")
     {
-        Some(job) => {
-            job.progress.request_cancel();
-            serde_json::json!({"ok": true, "install": install_job_json(job)}).to_string()
-        }
+        Some(job) => match job.progress.request_cancel() {
+            Ok(()) => serde_json::json!({"ok": true, "install": install_job_json(job)}).to_string(),
+            Err(message) => refusal(
+                "not_cancellable",
+                message,
+                serde_json::json!({"install": install_job_json(job)}),
+            ),
+        },
         None => refusal(
             "no_install",
             "진행 중인 도구 설치가 없습니다.",
@@ -157,10 +169,30 @@ pub(crate) fn api_tools_install(request: &Request, state: &SharedState) -> Strin
     start_install(state, name.trim(), env)
 }
 
+/// A refusal that is also appended to the install audit log (never under
+/// the state lock). A failed audit write is reported in `audit_warning`.
+fn audited_refusal(
+    env: &InstallEnv,
+    tool: &str,
+    code: &str,
+    message: &str,
+    extra: serde_json::Value,
+) -> String {
+    let mut extra = extra;
+    if let Err(warning) = tool_install::audit_refusal(&env.dirs, tool, code, message)
+        && let serde_json::Value::Object(map) = &mut extra
+    {
+        map.insert("audit_warning".into(), warning.into());
+    }
+    refusal(code, message, extra)
+}
+
 /// Validates, takes the busy lease and starts the install worker.
 pub(crate) fn start_install(state: &SharedState, name: &str, env: InstallEnv) -> String {
     let Some(tool) = tool_install::find_tool(&env.manifest, name).cloned() else {
-        return refusal(
+        return audited_refusal(
+            &env,
+            name,
             "unknown_tool",
             &format!("알 수 없는 도구입니다: {name}"),
             serde_json::json!({}),
@@ -172,7 +204,9 @@ pub(crate) fn start_install(state: &SharedState, name: &str, env: InstallEnv) ->
         } else {
             "unsupported_platform"
         };
-        return refusal(
+        return audited_refusal(
+            &env,
+            &tool.name,
             code,
             &format!("{} 자동 설치 불가: {reason}", tool.name),
             serde_json::json!({"manual_hint": tool.manual_hint, "homepage": tool.homepage}),
@@ -180,34 +214,45 @@ pub(crate) fn start_install(state: &SharedState, name: &str, env: InstallEnv) ->
     }
     // Resolution only (PATH stat), before the lock.
     if let Some(reason) = tool_install::python_missing_reason(&tool) {
-        return refusal("python_required", &reason, serde_json::json!({}));
+        return audited_refusal(
+            &env,
+            &tool.name,
+            "python_required",
+            &reason,
+            serde_json::json!({}),
+        );
     }
     let progress = Arc::new(Progress::default());
-    let (lease, id, snapshot) = {
+    // Locked checks only decide; the refusal is audited after the guard
+    // is dropped (disk work never runs under the state lock).
+    let started = {
         let mut guard = state_lock(state);
         if guard
             .tool_install
             .as_ref()
             .is_some_and(|job| job.state == "running")
         {
-            return refusal(
-                "install_running",
-                tool_install::INSTALL_LOCKED,
-                serde_json::json!({}),
-            );
+            Err(("install_running", tool_install::INSTALL_LOCKED.to_string()))
+        } else if let Some(reason) = shutdown_refusal(&guard) {
+            Err(("shutdown", reason))
+        } else if let Some(reason) = side_work_refusal(&guard, "도구를 설치하십시오") {
+            // Clip exports / joins run ffmpeg from tools/bin: never swap
+            // it underneath them.
+            Err(("busy", reason))
+        } else {
+            match lease_busy_locked(&mut guard, state) {
+                Ok(lease) => Ok((guard, lease)),
+                Err(err) => Err(("busy", err)),
+            }
         }
-        if let Some(reason) = shutdown_refusal(&guard) {
-            return refusal("shutdown", &reason, serde_json::json!({}));
+    };
+    let (mut guard, lease) = match started {
+        Ok(started) => started,
+        Err((code, message)) => {
+            return audited_refusal(&env, &tool.name, code, &message, serde_json::json!({}));
         }
-        // Clip exports / joins run ffmpeg from tools/bin: never swap it
-        // underneath them.
-        if let Some(reason) = side_work_refusal(&guard, "도구를 설치하십시오") {
-            return refusal("busy", &reason, serde_json::json!({}));
-        }
-        let lease = match lease_busy_locked(&mut guard, state) {
-            Ok(lease) => lease,
-            Err(err) => return refusal("busy", &err, serde_json::json!({})),
-        };
+    };
+    let (lease, id, snapshot) = {
         guard.tool_install_seq += 1;
         let id = guard.tool_install_seq;
         let job = ToolInstallJob {
@@ -223,6 +268,7 @@ pub(crate) fn start_install(state: &SharedState, name: &str, env: InstallEnv) ->
         };
         let snapshot = install_job_json(&job);
         guard.tool_install = Some(job);
+        drop(guard);
         (lease, id, snapshot)
     };
     let spawned = thread::Builder::new()

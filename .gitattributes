@@ -4,3 +4,6 @@ contracts/** -text
 # Embedded UI assets feed the byte-compared evidence viewer; keep them LF on
 # every platform so Windows checkouts (autocrlf) embed identical bytes.
 assets/** text eol=lf
+# Pinned license texts are hashed (tools/manifest.json bundled_licenses) and
+# compiled in; keep their bytes exactly as upstream on every checkout.
+tools/licenses/** -text
