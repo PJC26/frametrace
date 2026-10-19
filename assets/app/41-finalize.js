@@ -964,10 +964,10 @@ function finApplyEnv() {
   btn.dataset.envOff = ok || ask ? "" : "1";
   if (!ok && !ask) {
     btn.disabled = true;
-    btn.title = (typeof htToolHint === "function" && htToolHint("deepfake-lens")) || "deepfake-lens 미설치 — PyPI에 없음: 받은 패키지를 pip install <경로>로 설치하거나 FRAMETRACE_DEEPFAKE_LENS 경로 설정";
+    btn.title = (typeof htToolHint === "function" && htToolHint("deepfake-lens")) || htT("dfManual");
   }
   else {
-    if (ask) btn.title = "deepfake-lens 미설치 — 누르면 설치를 안내합니다";
+    if (ask) btn.title = htT("dfAskBtn");
     if (!FIN.advBusy) btn.disabled = false;
   }
 }

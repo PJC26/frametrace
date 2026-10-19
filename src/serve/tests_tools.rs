@@ -404,6 +404,7 @@ mod windows {
         let status = parse(&tools::api_tools_install_status(&state));
         assert_eq!(status["install"]["state"], "failed");
         assert_eq!(status["install"]["stage"], "failed");
+        assert_eq!(status["install"]["cancelled"], false);
         assert!(
             status["install"]["error"]
                 .as_str()

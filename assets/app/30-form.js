@@ -34,13 +34,12 @@ async function loadEnv() {
     // first-time user click into a per-file "tool not found" storm.
     const dfOk = env.deepfake === true;
     setEnvOff($("withDeepfake"), !dfOk);
-    $("withDeepfake").closest("label")?.setAttribute("title",
-      dfOk ? "" : "deepfake-lens 미설치 — PyPI에 없음: 받은 패키지를 pip install <경로>로 설치하거나 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
+    // Tooltips follow the viewer language (HT_STR in 56-tools.js).
+    $("withDeepfake").closest("label")?.setAttribute("title", dfOk ? "" : htT("dfManual"));
     const dfBtn = document.querySelector("button[data-adv='deepfake']");
     if (dfBtn) {
       setEnvOff(dfBtn, !dfOk);
-      dfBtn.setAttribute("title",
-        dfOk ? "케이스의 모든 파일을 deepfake-lens로 스크리닝 — 결과는 '합성의심' 배지로 표시" : "deepfake-lens 미설치 — PyPI에 없음: 받은 패키지를 pip install <경로>로 설치하거나 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
+      dfBtn.setAttribute("title", htT(dfOk ? "dfReady" : "dfManual"));
     }
     // §28: /api/tools may have answered first — re-apply its verdict
     // (re-enabled only when deepfake-lens is installable here).
