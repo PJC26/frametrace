@@ -16,7 +16,9 @@
 //!   extraction and refused whole when any entry is absolute, climbs with
 //!   `..`, is a link, or is otherwise unsafe; only the manifest's files are
 //!   extracted and moved into `<exe dir>/tools/bin`.
-//! * T5 — license files listed in the manifest land in `tools/bin/licenses`.
+//! * T5 — nothing is bundled; an installable tool carries a distribution
+//!   notice (shown before download) and its license files land in
+//!   `tools/bin/licenses` (docs/PLAN_TOOLS_C_2026-10-20.md).
 //!
 //! Every failure removes the staging directory, so no partial file is left
 //! behind (stale `tools/.staging-*` left by a killed run, and replaced pip
@@ -124,6 +126,15 @@ pub struct ToolEntry {
     pub platform: String,
     pub version: Option<String>,
     pub license: Option<String>,
+    /// Distribution notice shown before anything is downloaded (CLI
+    /// prompt, UI confirm dialog): the examiner fetches the file from the
+    /// publisher, FrameTrace does not distribute it (T5). Required for
+    /// every installable archive tool (`validate_manifest`).
+    #[serde(default)]
+    pub notice: Option<String>,
+    /// English variant of `notice` (UI locale `en`).
+    #[serde(default)]
+    pub notice_en: Option<String>,
     pub homepage: Option<String>,
     pub source_url: Option<String>,
     pub url: Option<String>,
@@ -141,11 +152,6 @@ pub struct ToolEntry {
     /// text the LGPLv3 incorporates, which the upstream zip lacks).
     #[serde(default)]
     pub bundled_licenses: Vec<BundledLicense>,
-    /// Repository license files only the packaged distribution carries
-    /// (`scripts/package-windows.ps1` checks their SHA-256); a guided
-    /// install downloads the upstream zip itself and does not need them.
-    #[serde(default)]
-    pub package_licenses: Vec<BundledLicense>,
     pub provides: Vec<String>,
     pub manual_hint: Option<String>,
     // pip tools
@@ -317,18 +323,6 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
                 )));
             }
         }
-        for license in &tool.package_licenses {
-            if !plain_file_name(&license.to)
-                || !is_sha256_hex(&license.sha256)
-                || !license.file.starts_with("tools/licenses/")
-                || license.file.contains("..")
-            {
-                return Err(ctx(&format!(
-                    "bad package license {:?} -> {:?}",
-                    license.file, license.to
-                )));
-            }
-        }
         for license in &tool.bundled_licenses {
             if !plain_file_name(&license.to) {
                 return Err(ctx(&format!("unsafe license name {:?}", license.to)));
@@ -378,6 +372,20 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             if !plain_file_name(file_name) || last != file_name {
                 return Err(ctx("file_name must be the URL's last path segment"));
             }
+            // T5: the examiner downloads the file from the publisher; the
+            // prompt and the dialog say so before anything is fetched.
+            if tool.notice.as_deref().is_none_or(|n| n.trim().is_empty()) {
+                return Err(ctx(
+                    "installable tools must carry a distribution notice (T5)",
+                ));
+            }
+        }
+        if tool
+            .notice_en
+            .as_deref()
+            .is_some_and(|n| n.trim().is_empty())
+        {
+            return Err(ctx("notice_en must not be empty when present"));
         }
         if tool.kind == ToolKind::Pip {
             if let Some(index) = &tool.index_url
@@ -588,6 +596,9 @@ pub fn tool_json(tool: &ToolEntry, status: &ToolStatus) -> serde_json::Value {
         "on_demand": tool.on_demand,
         "version": tool.version,
         "license": tool.license,
+        // T5: shown by the confirm dialog before anything is fetched.
+        "notice": tool.notice,
+        "notice_en": tool.notice_en,
         "homepage": tool.homepage,
         "source_url": tool.source_url,
         "provides": tool.provides,
@@ -609,8 +620,9 @@ pub fn tool_json(tool: &ToolEntry, status: &ToolStatus) -> serde_json::Value {
         "installable": reason.is_none(),
         "not_installable_reason": reason,
         "manual_hint": tool.manual_hint,
-        // The resolved ffmpeg's encoders (an LGPL build has no libx264;
-        // `note` says which H.264 encoder is used instead). Probed once
+        // The resolved ffmpeg's encoders (a build without libx264 — e.g.
+        // the BtbN one the installer fetches — uses another H.264 encoder;
+        // `note` says which). Probed once
         // per binary (cached), never under the server's state lock.
         "encoders": status
             .paths

@@ -71,7 +71,18 @@ fn api_tools_lists_pinned_tools_and_flags_on_demand_ones() {
     assert_eq!(ffmpeg["source_host"], "github.com");
     assert_eq!(ffmpeg["size_bytes"], 170_611_883u64);
     assert_eq!(ffmpeg["pinned_version"], "n8.1.3-9-g29e619e767");
-    assert_eq!(ffmpeg["license"], "LGPL-3.0-or-later");
+    assert!(
+        ffmpeg["license"]
+            .as_str()
+            .is_some_and(|l| l.starts_with("LGPL-3.0-or-later (FFmpeg)")),
+        "{}",
+        ffmpeg["license"]
+    );
+    assert_eq!(ffmpeg["title"], "FFmpeg");
+    assert_eq!(ffmpeg["label"], "FFmpeg");
+    // Option C (T5): the distribution notice the dialog shows.
+    assert!(ffmpeg["notice"].as_str().is_some_and(|n| !n.is_empty()));
+    assert!(ffmpeg["notice_en"].as_str().is_some_and(|n| !n.is_empty()));
     assert_eq!(ffmpeg["on_demand"], false);
     let libewf = &body["tools"][1];
     assert_eq!(libewf["installable"], false);

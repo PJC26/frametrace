@@ -68,41 +68,8 @@ fn tools_install_in(name: &str, yes: bool, dirs: &InstallDirs) -> Result<(), Str
     // Unknown / not installable: refused here, before the prompt, and
     // recorded in the chained install audit log like the API's refusals.
     let tool = tool_install::preflight(manifest, name, dirs)?;
-    // T3: name, source and size are shown before anything is fetched.
-    println!(
-        "도구: {} {}",
-        tool.title,
-        tool.version.as_deref().unwrap_or("")
-    );
-    if let Some(file) = &tool.file_name {
-        println!("파일: {file}");
-    }
-    if let Some(url) = &tool.url {
-        println!("출처: {url}");
-    }
-    if let Some(size) = tool.size {
-        println!(
-            "크기: {size} 바이트 ({:.1} MB)",
-            size as f64 / (1024.0 * 1024.0)
-        );
-    }
-    if let Some(sha) = &tool.sha256 {
-        println!("SHA-256: {sha}");
-    }
-    if let Some(license) = &tool.license {
-        println!("라이선스: {license}");
-    }
-    println!("설치 위치: {}", dirs.tools_dir.display());
-    // Manifest tools resolve from tools/bin first (tool_policy): a copy
-    // on PATH stops being used once this install lands.
-    for (binary, path) in &tool_install::status(tool).paths {
-        if let Some(path) = path
-            && !std::path::Path::new(path).starts_with(&dirs.tools_dir)
-        {
-            println!(
-                "참고: 지금은 PATH의 {binary}({path})가 쓰입니다 — 설치하면 tools/bin의 것이 먼저 쓰입니다."
-            );
-        }
+    for line in install_prompt_lines(tool, dirs, &tool_install::status(tool)) {
+        println!("{line}");
     }
     if !yes {
         if !std::io::stdin().is_terminal() {
@@ -162,6 +129,55 @@ fn tools_install_in(name: &str, yes: bool, dirs: &InstallDirs) -> Result<(), Str
     Ok(())
 }
 
+/// What `tools install` shows before asking (T3): name, file, source,
+/// size, SHA-256, licence, the distribution notice (T5: the examiner
+/// downloads the file from the publisher; FrameTrace does not distribute
+/// it), the install location, and a note per binary currently resolved
+/// from PATH (`status`), which stops being used once tools/bin has it.
+fn install_prompt_lines(
+    tool: &tool_install::ToolEntry,
+    dirs: &InstallDirs,
+    status: &tool_install::ToolStatus,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "도구: {} {}",
+        tool.title,
+        tool.version.as_deref().unwrap_or("")
+    )];
+    if let Some(file) = &tool.file_name {
+        lines.push(format!("파일: {file}"));
+    }
+    if let Some(url) = &tool.url {
+        lines.push(format!("출처: {url}"));
+    }
+    if let Some(size) = tool.size {
+        lines.push(format!(
+            "크기: {size} 바이트 ({:.1} MB)",
+            size as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    if let Some(sha) = &tool.sha256 {
+        lines.push(format!("SHA-256: {sha}"));
+    }
+    if let Some(license) = &tool.license {
+        lines.push(format!("라이선스: {license}"));
+    }
+    if let Some(notice) = &tool.notice {
+        lines.push(format!("고지: {notice}"));
+    }
+    lines.push(format!("설치 위치: {}", dirs.tools_dir.display()));
+    for (binary, path) in &status.paths {
+        if let Some(path) = path
+            && !std::path::Path::new(path).starts_with(&dirs.tools_dir)
+        {
+            lines.push(format!(
+                "참고: 지금은 PATH의 {binary}({path})가 쓰입니다 — 설치하면 tools/bin의 것이 먼저 쓰입니다."
+            ));
+        }
+    }
+    lines
+}
+
 /// The note for a leftover the install could not remove (an old binary or
 /// venv still running). It is swept by the next install or server start
 /// only once nothing runs from it any more.
@@ -184,6 +200,55 @@ mod tests {
         assert!(note.contains(".deepfake-lens.old-0123"), "{note}");
         assert!(note.contains("그 프로그램을 닫으면"), "{note}");
         assert!(!note.contains("(다음 설치·서버 시작 때 정리)"), "{note}");
+    }
+
+    /// T5: the prompt shows the manifest's distribution notice exactly
+    /// once, after the licence line and before the install location; a
+    /// PATH copy gets its own note. (Not-installable tools never reach
+    /// the prompt — `cli_refusals_are_audited_before_the_prompt`.)
+    #[test]
+    fn install_prompt_shows_the_distribution_notice() {
+        let manifest = crate::tool_install::manifest().unwrap();
+        let ffmpeg = crate::tool_install::find_tool(manifest, "ffmpeg").unwrap();
+        let dirs = InstallDirs {
+            tools_dir: std::path::PathBuf::from("C:/FrameTrace/tools"),
+        };
+        let status = crate::tool_install::ToolStatus {
+            paths: vec![
+                (
+                    "ffmpeg".to_string(),
+                    Some("C:/ProgramData/chocolatey/bin/ffmpeg.exe".to_string()),
+                ),
+                ("ffprobe".to_string(), None),
+            ],
+            shadowed_by: Vec::new(),
+        };
+        let lines = install_prompt_lines(ffmpeg, &dirs, &status);
+        assert_eq!(
+            lines[0],
+            format!("도구: FFmpeg {}", ffmpeg.version.as_deref().unwrap())
+        );
+        let notices: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("고지: "))
+            .collect();
+        assert_eq!(notices.len(), 1, "{lines:#?}");
+        let at = notices[0];
+        assert_eq!(
+            lines[at],
+            format!("고지: {}", ffmpeg.notice.as_deref().unwrap())
+        );
+        assert!(lines[at].contains("배포하지 않"), "{}", lines[at]);
+        assert!(lines[at - 1].starts_with("라이선스: "), "{lines:#?}");
+        assert!(lines[at + 1].starts_with("설치 위치: "), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("SHA-256: 4a7642b2")));
+        let path_notes: Vec<&String> = lines.iter().filter(|l| l.starts_with("참고: ")).collect();
+        assert_eq!(path_notes.len(), 1, "{lines:#?}");
+        assert!(path_notes[0].contains("chocolatey"), "{}", path_notes[0]);
+        // A tool without a notice prints no "고지:" line.
+        let mut plain = ffmpeg.clone();
+        plain.notice = None;
+        let lines = install_prompt_lines(&plain, &dirs, &status);
+        assert!(!lines.iter().any(|l| l.starts_with("고지:")), "{lines:#?}");
     }
 
     /// `frametrace tools install` refusals before the prompt (unknown tool,

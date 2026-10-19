@@ -15,6 +15,9 @@ fn base_entry() -> ToolEntry {
         platform: PLATFORM.into(),
         version: Some("1.0".into()),
         license: Some("MIT".into()),
+        // Installable fixtures (sha256 set by the tests) need one (T5).
+        notice: Some("Fake tool: downloaded from its publisher.".into()),
+        notice_en: None,
         homepage: Some("https://example.invalid/".into()),
         source_url: None,
         url: None,
@@ -33,7 +36,6 @@ fn base_entry() -> ToolEntry {
             to: "fake-LICENSE.txt".into(),
         }],
         bundled_licenses: Vec::new(),
-        package_licenses: Vec::new(),
         provides: vec!["fake".into()],
         manual_hint: Some("manual".into()),
         package: None,
@@ -78,7 +80,28 @@ fn shipped_manifest_is_valid_and_pins_only_published_checksums() {
     );
     assert!(
         ffmpeg.url.as_deref().unwrap().contains("-lgpl-"),
-        "LGPL build only (T5)"
+        "the pinned BtbN asset is the win64-lgpl variant (same file the examiner downloads)"
+    );
+    // Option C: the title names no licence, the licence names the mix and
+    // the notice says FrameTrace does not distribute the file (T5).
+    assert_eq!(ffmpeg.title, "FFmpeg");
+    let license = ffmpeg.license.as_deref().unwrap();
+    assert!(
+        license.starts_with("LGPL-3.0-or-later (FFmpeg)"),
+        "{license}"
+    );
+    assert!(license.contains("GPL-2.0-only"), "{license}");
+    assert!(
+        ffmpeg
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("배포하지 않"))
+    );
+    assert!(
+        ffmpeg
+            .notice_en
+            .as_deref()
+            .is_some_and(|n| n.contains("does not distribute"))
     );
     assert_eq!(ffmpeg.provides, ["ffmpeg", "ffprobe"]);
     assert!(
@@ -182,6 +205,57 @@ fn manifest_validation_refuses_unpinned_or_foreign_sources() {
         let err = validate_manifest(&manifest_with(tool)).unwrap_err();
         assert!(err.contains(why), "{why}: {err}");
     }
+}
+
+/// Option C (T5): an installable archive tool must say, before anything is
+/// downloaded, that FrameTrace does not distribute it. A tool without a
+/// pinned checksum (never installable) needs no notice.
+#[test]
+fn installable_tools_must_carry_a_distribution_notice() {
+    let mut tool = base_entry();
+    tool.url = Some("https://github.com/o/r/releases/download/v1/fake.zip".into());
+    tool.file_name = Some("fake.zip".into());
+    tool.size = Some(10);
+    tool.sha256 = Some("a".repeat(64));
+    validate_manifest(&manifest_with(tool.clone())).unwrap();
+    for missing in [None, Some(String::new()), Some("  \n".to_string())] {
+        let mut bad = tool.clone();
+        bad.notice = missing.clone();
+        let err = validate_manifest(&manifest_with(bad)).unwrap_err();
+        assert!(err.contains("distribution notice"), "{missing:?}: {err}");
+        assert!(err.contains("\"faketool\""), "{err}");
+    }
+    let mut blank_en = tool.clone();
+    blank_en.notice_en = Some(String::new());
+    let err = validate_manifest(&manifest_with(blank_en)).unwrap_err();
+    assert!(err.contains("notice_en"), "{err}");
+    // libewf-like: no published checksum, not installable, no notice needed.
+    let mut manual = base_entry();
+    manual.notice = None;
+    assert!(manual.sha256.is_none());
+    validate_manifest(&manifest_with(manual)).unwrap();
+}
+
+#[test]
+fn tool_json_carries_the_distribution_notice() {
+    let status = ToolStatus {
+        paths: Vec::new(),
+        shadowed_by: Vec::new(),
+    };
+    let manifest = manifest().unwrap();
+    let ffmpeg = find_tool(manifest, "ffmpeg").unwrap();
+    let json = tool_json(ffmpeg, &status);
+    assert_eq!(json["notice"].as_str(), ffmpeg.notice.as_deref());
+    assert_eq!(json["notice_en"].as_str(), ffmpeg.notice_en.as_deref());
+    assert!(json["notice"].as_str().is_some_and(|n| !n.is_empty()));
+    assert!(json["notice_en"].as_str().is_some_and(|n| !n.is_empty()));
+    // Top level only: the CLI prompt and the dialog read it from there.
+    assert!(json["download"].is_object(), "{json}");
+    assert!(json["download"].get("notice").is_none(), "{json}");
+    assert!(json["download"].get("notice_en").is_none(), "{json}");
+    let libewf = tool_json(find_tool(manifest, "libewf").unwrap(), &status);
+    assert!(libewf["notice"].is_null(), "{libewf}");
+    assert!(libewf["notice_en"].is_null(), "{libewf}");
 }
 
 // ------------------------------------------------------------- URL policy
@@ -435,37 +509,6 @@ fn shipped_ffmpeg_entry_installs_the_pinned_gplv3_text() {
         !text.contains('\r'),
         "kept byte-exact (LF), see .gitattributes"
     );
-}
-
-#[test]
-fn package_only_license_files_exist_with_their_pinned_hash() {
-    let manifest = manifest().unwrap();
-    let ffmpeg = find_tool(manifest, "ffmpeg").unwrap();
-    assert!(
-        ffmpeg
-            .package_licenses
-            .iter()
-            .any(|l| l.to == "ffmpeg-THIRD-PARTY-LICENSES.txt"),
-        "the statically linked libraries' license texts are packaged"
-    );
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for license in &ffmpeg.package_licenses {
-        let bytes = std::fs::read(root.join(&license.file)).unwrap();
-        assert_eq!(
-            crate::sha256::digest_bytes(&bytes),
-            license.sha256,
-            "{} differs from its manifest pin (update the pin deliberately)",
-            license.file
-        );
-    }
-    let mut tool = base_entry();
-    tool.package_licenses = vec![BundledLicense {
-        file: "../outside.txt".into(),
-        to: "x.txt".into(),
-        sha256: "a".repeat(64),
-    }];
-    let err = validate_manifest(&manifest_with(tool)).unwrap_err();
-    assert!(err.contains("bad package license"), "{err}");
 }
 
 #[test]
