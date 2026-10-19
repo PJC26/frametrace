@@ -65,6 +65,10 @@ const HT_STR = {
     noApi: "tools/bin 또는 PATH에 설치하십시오.",
     retry: "다시 검사",
     retryStart: "다시 시작",
+    dfAskStart: "deepfake-lens 미설치 — 시작하면 설치를 안내합니다",
+    dfAskBtn: "deepfake-lens 미설치 — 누르면 설치를 안내합니다",
+    dfManual: "deepfake-lens 미설치 — PyPI에 없음: 받은 패키지를 pip install <경로>로 설치하거나 FRAMETRACE_DEEPFAKE_LENS 경로 설정",
+    dfReady: "케이스의 모든 파일을 deepfake-lens로 스크리닝 — 결과는 '합성의심' 배지로 표시",
   },
   en: {
     title: "Tools",
@@ -118,13 +122,26 @@ const HT_STR = {
     noApi: "Install it into tools/bin or PATH.",
     retry: "Run again",
     retryStart: "Start again",
+    dfAskStart: "deepfake-lens is not installed — starting offers to install it",
+    dfAskBtn: "deepfake-lens is not installed — click to install it",
+    dfManual: "deepfake-lens is not installed — not on PyPI: install the package you received with pip install <path> or set FRAMETRACE_DEEPFAKE_LENS",
+    dfReady: "Screen every file in the case with deepfake-lens — results show as a 'suspected synthetic' badge",
   },
 };
 const HT_ACTIVE = ["downloading", "verifying", "extracting"];
 const HT_POLL_MS = 700;
+// The worker's error after an honoured cancel (src/tool_install/mod.rs
+// INSTALL_CANCELLED); newer servers also send `cancelled: true`.
+const HT_CANCELLED = "install cancelled";
+// Stages the server refuses to cancel (moving files into place, venv, pip).
+const HT_LOCKED_STAGES = ["install", "venv", "pip"];
+// Consecutive failed status polls before the tab gives up following.
+const HT_MAX_POLL_FAILS = 20;
+// A `failed` job from before this tab looked is shown only this long.
+const HT_RECENT_S = 300;
 // busy: the tool whose install this tab follows (clicked here, or adopted
 // from the server after a refresh / in a second tab); job: its install id.
-const HT = { res: null, seq: 0, timer: 0, polling: false, busy: "", job: null, confirming: false, stopping: "", stopAsked: false, note: null, result: null, prompt: null, written: new Map(), live: "" };
+const HT = { res: null, seq: 0, timer: 0, polling: false, busy: "", job: null, confirming: false, stopping: "", stopAsked: false, note: null, result: null, prompt: null, written: new Map(), live: "", fails: 0 };
 
 function htLocale() {
   const l = typeof hLocalePref === "function" ? hLocalePref() : "";
@@ -138,8 +155,28 @@ function htT(key, subs, locale) {
 // Pure: an install record (J) → the fields the UI reads, or null.
 function htParseInstall(i) {
   if (!i || typeof i !== "object") return null;
-  return { id: i.id ?? null, state: String(i.state || "idle"), stage: i.stage || null, tool: i.tool || null, bytes: i.bytes ?? null, total: i.total ?? null, error: i.error || null };
+  const fin = i.finished_unix === null || i.finished_unix === undefined || i.finished_unix === "" ? NaN : Number(i.finished_unix);
+  return { id: i.id ?? null, state: String(i.state || "idle"), stage: i.stage || null, tool: i.tool || null, bytes: i.bytes ?? null, total: i.total ?? null, error: i.error || null,
+    finished_unix: Number.isFinite(fin) ? fin : null, cancelled: typeof i.cancelled === "boolean" ? i.cancelled : null };
 }
+// Pure: a `failed` job that ended on a cancel (any tab, the CLI). An older
+// server has no `cancelled` field: its INSTALL_CANCELLED error, or a stop
+// this tab asked for, counts.
+function htCancelledJob(install, asked) {
+  if (!install || install.state !== "failed") return false;
+  if (install.cancelled === true || install.error === HT_CANCELLED) return true;
+  return install.cancelled !== false && !!asked;
+}
+// Pure: a finished job recent enough to report (an old `failed` job is
+// not re-shown on every refresh / in every tab).
+function htRecent(install, nowS) {
+  const f = install && install.finished_unix;
+  if (f === null || f === undefined || !Number.isFinite(f)) return false;
+  const now = nowS === undefined || nowS === null ? Date.now() / 1000 : nowS;
+  return now - f <= HT_RECENT_S;
+}
+// Pure: the running stage cannot be cancelled ([중단] disabled).
+function htStopLocked(install) { return !!(install && HT_LOCKED_STAGES.includes(install.stage)); }
 // Pure: a GET /api/tools reply → { supported, tools, install }.
 // supported:false = an older server (no endpoint) or no answer — the
 // panel stays hidden, never an error.
@@ -183,6 +220,7 @@ function htProgressText(install, label, locale) {
   }
   if (st === "verifying" || st === "extracting") return htT(st, null, locale) + "…";
   if (st === "done") return htT("done", { label }, locale);
+  if (st === "failed" && htCancelledJob(install)) return htT("stopped", { label }, locale);
   if (st === "failed") return htT("failed", { error: install.error || htT("unknown", null, locale) }, locale);
   return "";
 }
@@ -247,10 +285,11 @@ function htRowModel(t, install, ctx, locale) {
     model.busy = running || sending || !!c.busy || htActive(install);
     model.stop = running && c.busy === t.name;
     model.stopBusy = model.stop && c.stopping === t.name;
+    model.stopLocked = model.stop && !model.stopBusy && htStopLocked(install);
     model.progress = running ? htProgressText(install, label, locale) + (model.stopBusy ? " — " + htT("stopping", null, locale) : "")
       : sending ? htT("sending", null, locale)
         : res && !res.ok ? res.text
-          : mine && install.state === "failed" ? htProgressText(install, label, locale) : "";
+          : mine && install.state === "failed" && htRecent(install, c.now) ? htProgressText(install, label, locale) : "";
     if (!running && !sending && res && !res.ok) { model.hint = res.hint || ""; model.homepage = res.homepage || ""; model.reason = res.title || ""; }
     if (c.note && c.note.name === t.name && running) model.note = c.note.text;
   } else {
@@ -270,7 +309,7 @@ function htRowHtml(m, locale) {
   const loc = locale || htLocale();
   const ic = `<svg class="ic" aria-hidden="true"><use href="#${HT_ICON[m.level] || "i-info"}"/></svg>`;
   const btn = m.action !== "install" ? ""
-    : m.stop ? `<button type="button" data-tool-cancel="${esc(m.name)}" aria-label="${esc(htT("stopAria", { label: m.label }, loc))}"${m.stopBusy ? ' disabled aria-busy="true"' : ""}>${esc(htT("stop", null, loc))}</button>`
+    : m.stop ? `<button type="button" data-tool-cancel="${esc(m.name)}" aria-label="${esc(htT("stopAria", { label: m.label }, loc))}"${m.stopBusy ? ' disabled aria-busy="true"' : m.stopLocked ? ` disabled title="${esc(htT("notCancellable", null, loc))}"` : ""}>${esc(htT("stop", null, loc))}</button>`
       : `<button type="button" data-tool-install="${esc(m.name)}" aria-label="${esc(htT("installAria", { label: m.label }, loc))}"${m.busy ? ' disabled aria-busy="true"' : ""}${m.busy ? ` title="${esc(htT("busy", null, loc))}"` : ""}>${esc(m.busy && m.progress ? htT("installing", null, loc) : htT("install", null, loc))}</button>`;
   return `<li class="h-tool h-tool-${esc(m.level)}" data-tool="${esc(m.name)}">${ic}<span class="h-tool-text" tabindex="-1" data-ht-focus>` +
     `<span class="sr-only">${esc((HT_WORD[loc] || HT_WORD.ko)[m.level] || "")}: </span><b>${esc(m.text)}</b>` +
@@ -307,8 +346,9 @@ function htPromptModel(name, parsed, ctx, locale) {
   const detail = running ? htProgressText(install, label, locale) + (stopBusy ? " — " + htT("stopping", null, locale) : "")
     : sending ? htT("sending", null, locale)
       : res && !res.ok ? res.text
-        : install && install.tool === name && install.state === "failed" ? htProgressText(install, label, locale) : "";
-  const m = { name, label, text, action: running && c.busy === name ? "stop" : "install", detail, busy: running || sending || !!c.busy || htActive(install), stopBusy };
+        : install && install.tool === name && install.state === "failed" && htRecent(install, c.now) ? htProgressText(install, label, locale) : "";
+  const stopLocked = running && c.busy === name && !stopBusy && htStopLocked(install);
+  const m = { name, label, text, action: running && c.busy === name ? "stop" : "install", detail, busy: running || sending || !!c.busy || htActive(install), stopBusy, stopLocked };
   if (!running && !sending && res && !res.ok) { m.hint = res.hint || ""; m.homepage = res.homepage || ""; m.reason = res.title || ""; }
   if (running && c.note && c.note.name === name) m.note = c.note.text;
   return m;
@@ -317,7 +357,7 @@ function htPromptHtml(m, retryLabel, locale) {
   const loc = locale || htLocale();
   const btn = m.action === "install"
     ? `<button type="button" data-ht-prompt="install" aria-label="${esc(htT("installAria", { label: m.label }, loc))}"${m.busy ? ' disabled aria-busy="true"' : ""}>${esc(m.busy && m.detail ? htT("installing", null, loc) : htT("install", null, loc))}</button>`
-    : m.action === "stop" ? `<button type="button" data-ht-prompt="stop" aria-label="${esc(htT("stopAria", { label: m.label }, loc))}"${m.stopBusy ? ' disabled aria-busy="true"' : ""}>${esc(htT("stop", null, loc))}</button>`
+    : m.action === "stop" ? `<button type="button" data-ht-prompt="stop" aria-label="${esc(htT("stopAria", { label: m.label }, loc))}"${m.stopBusy ? ' disabled aria-busy="true"' : m.stopLocked ? ` disabled title="${esc(htT("notCancellable", null, loc))}"` : ""}>${esc(htT("stop", null, loc))}</button>`
       : m.action === "retry" ? `<button type="button" data-ht-prompt="retry">${esc(retryLabel || htT("retry", null, loc))}</button>` : "";
   return `<svg class="ic" aria-hidden="true"><use href="#${m.ok ? "i-check" : "i-warning"}"/></svg>` +
     `<span class="h-tool-text" tabindex="-1" data-ht-focus><b>${esc(m.text)}</b>${m.detail ? `<small>${esc(m.detail)}</small>` : ""}` +
@@ -335,7 +375,7 @@ function htToolHint(name) { return htHint(htFind(name)); }
 function htCtx() { return { busy: HT.busy, result: HT.result, stopping: HT.stopping, note: HT.note }; }
 // Writes markup only when it changed and keeps keyboard focus: the same
 // button again, or — when it is gone or disabled — that row's text
-// (tabindex=-1), never <body>.
+// (tabindex=-1; also when focus was on a row's text), never <body>.
 function htWrite(el, html) {
   if (!el || HT.written.get(el) === html) return;
   const a = document.activeElement;
@@ -343,7 +383,8 @@ function htWrite(el, html) {
   const ds = had && a.dataset ? a.dataset : {};
   const kind = ds.toolInstall ? "toolInstall" : ds.toolCancel ? "toolCancel" : ds.htPrompt ? "htPrompt" : "";
   const key = kind ? ds[kind] : "";
-  const tool = ds.toolInstall || ds.toolCancel || "";
+  const li = !kind && had && typeof a.closest === "function" ? a.closest("li[data-tool]") : null;
+  const tool = ds.toolInstall || ds.toolCancel || (li && li.dataset ? li.dataset.tool || "" : "");
   HT.written.set(el, html);
   el.innerHTML = html;
   if (!had || typeof el.querySelector !== "function") return;
@@ -397,7 +438,7 @@ function htSyncDeepfake() {
     const lab = typeof box.closest === "function" ? box.closest("label") : null;
     if (htNeedsTool("deepfake-lens")) {
       if (typeof setEnvOff === "function") setEnvOff(box, false); else { box.disabled = false; delete box.dataset.envOff; }
-      if (lab && typeof lab.setAttribute === "function") lab.setAttribute("title", "deepfake-lens 미설치 — 시작하면 설치를 안내합니다");
+      if (lab && typeof lab.setAttribute === "function") lab.setAttribute("title", htT("dfAskStart"));
     } else {
       box.disabled = true;
       const hint = htToolHint("deepfake-lens");
@@ -411,7 +452,7 @@ function htSyncDeepfake() {
 function htAdopt(p) {
   const i = p && p.install;
   if (HT.busy || HT.timer || HT.polling || !htActive(i) || !i.tool) return;
-  HT.busy = i.tool; HT.job = i.id; HT.result = null; HT.note = null; HT.stopping = ""; HT.stopAsked = false;
+  HT.busy = i.tool; HT.job = i.id; HT.result = null; HT.note = null; HT.stopping = ""; HT.stopAsked = false; HT.fails = 0;
   HT.timer = setTimeout(htPoll, HT_POLL_MS);
 }
 async function htLoad() {
@@ -423,7 +464,8 @@ async function htLoad() {
   // older server (no endpoint) hides the feature.
   const gone = res && res.ok === false && (typeof endpointMissing === "function" ? endpointMissing(res) : res.status === 404);
   if (parsed.supported || gone || !(HT.res && HT.res.supported)) HT.res = parsed;
-  htAdopt(HT.res);
+  // Only a fresh answer starts following a job (never the kept, stale one).
+  if (parsed.supported) htAdopt(parsed);
   htRenderAll();
   return HT.res;
 }
@@ -433,6 +475,9 @@ function htSetInstall(install) {
 }
 // Polls GET /api/tools/install-status. A failed poll keeps the last state
 // (no flicker) and tries again; only the server's `failed` is a failure.
+// A 401 or HT_MAX_POLL_FAILS failures in a row stop following ("lost").
+// A different running job (another tab, the CLI, a restarted server) is
+// adopted and followed.
 async function htPoll() {
   htStopPoll();
   const name = HT.busy;
@@ -447,9 +492,24 @@ async function htPoll() {
     res = p.supported ? { ok: true, install: p.install } : null;
     if (HT.busy !== name) return;
   }
-  if (!res || res.ok !== true || !("install" in res)) { HT.timer = setTimeout(htPoll, HT_POLL_MS); return; }
+  if (res && res.ok === false && res.status === 401) { await htFinish(name, null); return; }
+  if (!res || res.ok !== true || !("install" in res)) {
+    HT.fails += 1;
+    if (HT.fails >= HT_MAX_POLL_FAILS) { await htFinish(name, null); return; }
+    HT.timer = setTimeout(htPoll, HT_POLL_MS);
+    return;
+  }
+  HT.fails = 0;
   const install = htParseInstall(res.install);
   const ours = !!(install && install.tool === name && (HT.job === null || HT.job === undefined || install.id === null || install.id === HT.job));
+  if (!ours && htActive(install) && install.tool) {
+    HT.busy = install.tool; HT.job = install.id; HT.stopAsked = false; HT.stopping = ""; HT.note = null; HT.result = null;
+    htSetInstall(install);
+    htRenderAll();
+    htAnnounce(htT(install.state) + " — " + htLabel(htFind(install.tool) || { name: install.tool }));
+    HT.timer = setTimeout(htPoll, HT_POLL_MS);
+    return;
+  }
   if (ours && htActive(install)) {
     const prev = htParsed().install;
     htSetInstall(install);
@@ -462,14 +522,20 @@ async function htPoll() {
   await htFinish(name, ours ? install : null);
 }
 async function htFinish(name, install) {
+  // Idle before reloading, so htLoad can adopt an install that is running
+  // again (another tab) instead of leaving every button disabled.
+  const asked = HT.stopAsked || HT.stopping === name;
+  HT.busy = ""; HT.job = null; HT.stopping = ""; HT.stopAsked = false; HT.note = null; HT.fails = 0;
+  htStopPoll();
+  // Lost: the last running record is no longer true.
+  if (!install) htSetInstall(null);
   await htLoad();
   const t = htFind(name);
   const label = t ? htLabel(t) : name;
   const done = !!(install && install.state === "done");
   const failed = !!(install && install.state === "failed");
   const ok = done || (!failed && !!(t && t.installed));
-  const stopped = failed && HT.stopAsked;
-  HT.busy = ""; HT.job = null; HT.stopping = ""; HT.stopAsked = false; HT.note = null;
+  const stopped = failed && htCancelledJob(install, asked);
   const text = ok ? htT("done", { label }) : stopped ? htT("stopped", { label }) : failed ? htProgressText(install, label) : htT("lost");
   HT.result = { name, ok, text };
   htRenderAll();
@@ -492,9 +558,9 @@ async function htInstall(name) {
     go = await askDialog({ title: htT("confirmTitle", { label }), html: htConfirmHtml(t), okLabel: htT("confirmOk"), cancelLabel: htT("cancel"), focus: "dlgCancel" });
   } finally { HT.confirming = false; }
   if (!go || HT.busy) return false;
-  HT.busy = name; HT.job = null; HT.result = null; HT.note = null; HT.stopping = ""; HT.stopAsked = false;
+  HT.busy = name; HT.job = null; HT.result = null; HT.note = null; HT.stopping = ""; HT.stopAsked = false; HT.fails = 0;
   htRenderAll();
-  htAnnounce(htT("sending"));
+  // Not announced: the POST reply's state follows within milliseconds.
   const res = await jpost("/api/tools/install", { name });
   if (!res || !res.ok) {
     HT.busy = "";

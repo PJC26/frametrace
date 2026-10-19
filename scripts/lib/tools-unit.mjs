@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 import { appBundleJs } from './app-bundle.mjs';
-import { TOOLS_FIXTURE } from './tools-mock.mjs';
+import { TOOLS_FIXTURE, routeTools } from './tools-mock.mjs';
 
 const read = (rel) => readFileSync(new URL('../../' + rel, import.meta.url), 'utf8');
 
@@ -33,7 +33,7 @@ export async function toolsTrackU() {
   const [FF, EWF, TSK, DF] = TOOLS_FIXTURE();
   const OPT = { ...EWF, name: 'x-opt', label: 'X 도구', installable: true, unavailable_reason: null, not_installable_reason: null, manual_hint: null, source_host: 'github.com', size_bytes: 4 * 1048576, download: { file_name: 'x-opt-1.0-win64.zip', url: 'https://github.com/x/x-opt-1.0-win64.zip', host: 'github.com', size: 4 * 1048576, sha256: 'a'.repeat(64), checksum_source: 'https://github.com/x/SHA256SUMS' } };
   const DFI = { ...DF, installable: true, unavailable_reason: null, not_installable_reason: null, size_bytes: 2048, version: '0.4.2', pinned_version: '0.4.2', license: 'MIT' };
-  const J = (state, tool, extra = {}) => ({ id: 7, tool, state, stage: { downloading: 'download', verifying: 'verify', extracting: 'install', done: 'done', failed: 'failed' }[state], bytes: null, total: null, error: null, started_unix: 1, finished_unix: null, installed_files: [], audit_warning: null, ...extra });
+  const J = (state, tool, extra = {}) => ({ id: 7, tool, state, stage: { downloading: 'download', verifying: 'verify', extracting: 'extract', done: 'done', failed: 'failed' }[state], bytes: null, total: null, error: null, started_unix: 1, finished_unix: null, installed_files: [], audit_warning: null, ...extra });
   const el = (id, calls) => {
     const e = { id, hidden: true, innerHTML: '', textContent: '', dataset: {}, classList: { toggle() {} }, listeners: [], attrs: {}, addEventListener(t, f) { this.listeners.push(f); }, contains: () => false, querySelectorAll: () => [], setAttribute(k, v) { this.attrs[k] = v; }, closest: () => null };
     e.querySelector = (sel) => (sel === '[data-ht-focus]' && /data-ht-focus/.test(e.innerHTML) ? { focus: () => calls.focused.push(id) } : null);
@@ -308,6 +308,194 @@ export async function toolsTrackU() {
     assert.ok(/id="startToolPrompt"/.test(html) && /id="advToolPrompt"/.test(finSrc), 'U2: prompt mounts');
     assert.ok(!/class="sblock[^"]*" id="hToolsPanel"/.test(html), 'the empty state keeps exactly two blocks');
     assert.equal((legacyHtml.match(/frametrace tools list/g) || []).length, 1, 'U2: legacy hint');
+  });
+
+  // ---- round-2 review fixes ----
+  const nowS = () => Math.floor(Date.now() / 1000);
+  const LOST = '설치 상태를 알 수 없습니다 — 다시 시도하십시오';
+
+  await row('Tools job id replaced mid-poll (another tab / restarted server): the new job is adopted and followed, never "상태를 알 수 없습니다" + a stuck panel', async () => {
+    for (const [tool, label] of [['ffmpeg', 'FFmpeg (LGPL build)'], ['x-opt', 'X 도구']]) {
+      const v = make({
+        replies: [reply([FF, OPT])],
+        status: [st(J('downloading', 'x-opt', { bytes: 1, total: 4 })), st({ ...J('downloading', tool, { bytes: 2, total: 4 }), id: 8 }), st({ ...J('verifying', tool), id: 8 })],
+      });
+      await v.run('htLoad()');
+      await v.run('htInstall("x-opt")');
+      await v.fire();
+      await v.fire(); await tick();
+      assert.ok(!v.calls.toasts.some(([m]) => m === LOST), tool + ': no "lost" toast: ' + JSON.stringify(v.calls.toasts));
+      assert.equal(v.run('HT.busy'), tool, tool + ': the new job is followed');
+      assert.equal(v.run('HT.job'), 8, tool + ': its id');
+      assert.equal(v.calls.timers.length, 1, tool + ': polling continues');
+      assert.ok(new RegExp('data-tool-cancel="' + tool + '"').test(v.els.hToolsList.innerHTML), tool + ': [중단] for the new job: ' + v.els.hToolsList.innerHTML);
+      await v.fire();
+      assert.ok(v.els.hToolsList.innerHTML.includes('해시 확인 중'), tool + ': its progress: ' + v.els.hToolsList.innerHTML);
+      assert.ok(v.calls.announced.some(([m]) => m.includes(label)), tool + ': announced');
+    }
+    // Our job ended while another tab already started the next one: the
+    // result is shown AND the new job is adopted (busy is reset before
+    // the reload, so htAdopt runs).
+    const v = make({
+      replies: [reply([FF, OPT]), reply([FF, { ...OPT, installed: true }], { ...J('downloading', 'ffmpeg', { bytes: 1, total: 4 }), id: 9 })],
+      status: [st(J('done', 'x-opt'))],
+    });
+    await v.run('htLoad()');
+    await v.run('htInstall("x-opt")');
+    await v.fire(); await tick();
+    assert.ok(v.calls.toasts.some(([m, k]) => m === 'X 도구 설치됨' && k === 'ok'), 'result toast');
+    assert.equal(v.run('HT.busy'), 'ffmpeg', 'the other tab\'s install is adopted after ours ended');
+    assert.ok(v.calls.timers.length >= 1 && /data-tool-cancel="ffmpeg"/.test(v.els.hToolsList.innerHTML), 'and polled: ' + v.els.hToolsList.innerHTML);
+  });
+
+  await row('Tools second tab cancels: a `failed` job that ended on a cancel (cancelled:true, or the INSTALL_CANCELLED error from an older server, or before our cancel reply) is "설치를 중단했습니다" (warn), never "설치 실패: install cancelled"', async () => {
+    for (const extra of [{ error: 'install cancelled', cancelled: true }, { error: 'install cancelled' }]) {
+      const fj = J('failed', 'x-opt', { ...extra, finished_unix: nowS() });
+      const v = make({ replies: [reply([OPT], J('downloading', 'x-opt', { bytes: 1, total: 4 })), reply([OPT], fj)], status: [st(fj)] });
+      await v.run('htLoad()');
+      await v.fire(); await tick();
+      const list = v.els.hToolsList.innerHTML;
+      assert.ok(list.includes('X 도구 설치를 중단했습니다') && !/설치 실패/.test(list) && !/install cancelled/.test(list), JSON.stringify(extra) + ': ' + list);
+      assert.ok(v.calls.toasts.some(([m, k]) => m === 'X 도구 설치를 중단했습니다' && k === 'warn') && !v.calls.toasts.some(([, k]) => k === 'err'), 'warn toast: ' + JSON.stringify(v.calls.toasts));
+    }
+    // A refresh right after: the recent cancelled job reads as stopped too.
+    const r = make({ replies: [reply([OPT], J('failed', 'x-opt', { error: 'install cancelled', cancelled: true, finished_unix: nowS() }))] });
+    await r.run('htLoad()');
+    assert.ok(r.els.hToolsList.innerHTML.includes('X 도구 설치를 중단했습니다') && !/설치 실패/.test(r.els.hToolsList.innerHTML), 'refresh: ' + r.els.hToolsList.innerHTML);
+    // The poll's failed arrives while our cancel is still in flight.
+    const pj = J('failed', 'x-opt', { error: '설치가 취소되었습니다', finished_unix: nowS() });
+    const p = make({ replies: [reply([OPT], J('downloading', 'x-opt')), reply([OPT], pj)], status: [st(pj)] });
+    await p.run('htLoad()');
+    p.run('HT.stopping = "x-opt"');
+    await p.fire(); await tick();
+    assert.ok(p.calls.toasts.some(([m, k]) => /중단했습니다/.test(m) && k === 'warn'), 'in-flight cancel: ' + JSON.stringify(p.calls.toasts));
+    // A new server says cancelled:false: a real failure stays a failure.
+    const fj2 = J('failed', 'x-opt', { error: 'SHA-256 불일치', cancelled: false, finished_unix: nowS() });
+    const f = make({ replies: [reply([OPT], J('downloading', 'x-opt')), reply([OPT], fj2)], status: [st(fj2)] });
+    await f.run('htLoad()');
+    f.run('HT.stopAsked = true');
+    await f.fire(); await tick();
+    assert.ok(f.calls.toasts.some(([m, k]) => m === '설치 실패: SHA-256 불일치' && k === 'err'), 'cancelled:false: ' + JSON.stringify(f.calls.toasts));
+  });
+
+  await row('Tools stale failed job not re-shown: an old `failed` job (finished minutes ago, or no finished_unix) shows no "설치 실패" on refresh / in another tab; a recent one does', async () => {
+    for (const fin of [nowS() - 3600, null]) {
+      const v = make({ replies: [reply([OPT, DFI], J('failed', 'x-opt', { error: 'SHA-256 불일치', finished_unix: fin }))] });
+      await v.run('htLoad()');
+      assert.ok(!/설치 실패/.test(v.els.hToolsList.innerHTML) && /data-tool-install="x-opt"/.test(v.els.hToolsList.innerHTML), fin + ': panel: ' + v.els.hToolsList.innerHTML);
+      const d = make({ replies: [reply([FF, DFI], J('failed', 'deepfake-lens', { error: 'pip 실패', finished_unix: fin }))] });
+      await d.run('htShowToolPrompt($("advToolPrompt"), "deepfake-lens", () => 0)');
+      assert.ok(!/설치 실패/.test(d.ctx.$('advToolPrompt').innerHTML), fin + ': prompt: ' + d.ctx.$('advToolPrompt').innerHTML);
+    }
+    const recent = make({ replies: [reply([OPT], J('failed', 'x-opt', { error: 'SHA-256 불일치', finished_unix: nowS() - 30 }))] });
+    await recent.run('htLoad()');
+    assert.ok(recent.els.hToolsList.innerHTML.includes('설치 실패: SHA-256 불일치'), 'recent: ' + recent.els.hToolsList.innerHTML);
+  });
+
+  await row('Tools focus stays on the same row: a re-render while focus is on a row\'s text ([data-ht-focus]) keeps it on that row, not the first one', async () => {
+    const v = make({ replies: [reply([FF, OPT])] });
+    await v.run('htLoad()');
+    const list = v.els.hToolsList;
+    const li = (tool) => ({ dataset: { tool }, querySelector: (s) => (s === '[data-ht-focus]' ? { focus: () => v.calls.focused.push('row:' + tool) } : null) });
+    list.contains = () => true;
+    list.querySelectorAll = (s) => (s === 'li' ? [li('ffmpeg'), li('x-opt')] : []);
+    v.ctx.document.activeElement = { dataset: {}, closest: (s) => (s === 'li[data-tool]' ? { dataset: { tool: 'x-opt' } } : null) };
+    v.run('HT.written.clear(); htRenderPanel()');
+    assert.deepEqual(v.calls.focused, ['row:x-opt'], 'focus restored to the x-opt row');
+  });
+
+  await row('Tools [중단] disabled (title "이 단계는 중단할 수 없습니다") while stage is install / venv / pip; enabled in download / verify / extract', async () => {
+    const v = make({ replies: [reply([OPT])] });
+    for (const [stage, locked] of [['download', false], ['verify', false], ['extract', false], ['install', true], ['venv', true], ['pip', true]]) {
+      const state = stage === 'download' ? 'downloading' : stage === 'verify' ? 'verifying' : 'extracting';
+      const inst = JSON.stringify(J(state, 'x-opt', { stage }));
+      const html = v.run(`htRowHtml(htRowModel(${JSON.stringify(OPT)}, htParseInstall(${inst}), { busy: "x-opt" }))`);
+      const btn = html.match(/<button[^>]*data-tool-cancel[^>]*>/)[0];
+      assert.equal(/ disabled/.test(btn) && /title="이 단계는 중단할 수 없습니다"/.test(btn), locked, stage + ': ' + btn);
+      const pr = v.run(`htPromptHtml(htPromptModel("x-opt", { supported: true, tools: [${JSON.stringify(OPT)}], install: htParseInstall(${inst}) }, { busy: "x-opt" }))`);
+      const pbtn = pr.match(/<button[^>]*data-ht-prompt="stop"[^>]*>/)[0];
+      assert.equal(/ disabled/.test(pbtn) && /title="이 단계는 중단할 수 없습니다"/.test(pbtn), locked, stage + ' prompt: ' + pbtn);
+    }
+  });
+
+  await row('Tools polling gives up: a 401, or 20 failed polls in a row, stops following ("설치 상태를 알 수 없습니다") instead of polling forever; a success resets the count', async () => {
+    const auth = make({ replies: [reply([OPT], J('downloading', 'x-opt')), { ok: false, status: 401, auth: true, error: 'x' }], status: [{ ok: false, status: 401, auth: true, error: 'x' }] });
+    await auth.run('htLoad()');
+    await auth.fire(); await tick();
+    assert.equal(auth.run('HT.busy'), '', '401: idle');
+    assert.equal(auth.calls.timers.length, 0, '401: no more polls');
+    assert.ok(auth.calls.toasts.some(([m]) => m === LOST), '401: lost toast');
+    const down = { ok: false, network: true, status: 0 };
+    const v = make({ replies: [reply([OPT], J('downloading', 'x-opt')), down], status: [...Array(19).fill(down), st(J('downloading', 'x-opt', { bytes: 1, total: 4 })), down] });
+    await v.run('htLoad()');
+    for (let i = 0; i < 20; i++) await v.fire();
+    assert.equal(v.run('HT.busy'), 'x-opt', '19 failures + a success: still following');
+    for (let i = 0; i < 19; i++) await v.fire();
+    assert.equal(v.run('HT.busy'), 'x-opt', '19 more failures: still following');
+    await v.fire(); await tick();
+    assert.equal(v.run('HT.busy'), '', '20 in a row: stopped');
+    assert.equal(v.calls.timers.length, 0, 'no more polls');
+    assert.ok(v.calls.toasts.some(([m]) => m === LOST), 'lost toast');
+  });
+
+  await row('Tools announcements: "설치 요청 중…" is not announced (the POST reply\'s state follows at once); the reply state is', async () => {
+    const v = make({ replies: [reply([OPT])] });
+    await v.run('htLoad()');
+    await v.run('htInstall("x-opt")');
+    assert.ok(!v.calls.announced.some(([m]) => /설치 요청 중/.test(m)), JSON.stringify(v.calls.announced));
+    assert.ok(v.calls.announced.some(([m]) => m === '내려받는 중 — X 도구'), JSON.stringify(v.calls.announced));
+  });
+
+  await row('Tools deepfake tooltips follow the viewer language (HT_STR keys, no Korean literals in 30-form.js / 41-finalize.js / htSyncDeepfake)', async () => {
+    const tsrc = read('assets/app/56-tools.js');
+    for (const [f, src] of [['30-form.js', formSrc], ['41-finalize.js', finSrc], ['56-tools.js htSyncDeepfake', tsrc.match(/function htSyncDeepfake\(\) \{[^]*?^}/m)[0]]]) {
+      assert.ok(!/"deepfake-lens 미설치|"케이스의 모든 파일을/.test(src), f + ': a hard-coded Korean deepfake tooltip remains');
+    }
+    const fin = 'var FIN = { built: true, env: { deepfake: false }, advBusy: false }; var __btn = { dataset: {}, disabled: true, title: "" }; function finApplyAudioEnv() {} function finMount() { return { querySelector: () => __btn }; }\n' + finApplyEnvSrc;
+    for (const [loc, df, want] of [['en', DFI, 'deepfake-lens is not installed — click to install it'], ['ko', DFI, 'deepfake-lens 미설치 — 누르면 설치를 안내합니다'], ['en', { ...DF, manual_hint: '' }, 'deepfake-lens is not installed — not on PyPI']]) {
+      const v = make({ replies: [reply([FF, df])], extra: fin });
+      v.ctx.__locale = loc;
+      const box = v.ctx.$('withDeepfake');
+      const lab = { attrs: {}, setAttribute(k, s) { this.attrs[k] = s; } };
+      box.closest = () => lab;
+      v.run('setEnvOff($("withDeepfake"), true); __btn.dataset.envOff = "1"; __btn.disabled = true;');
+      await v.run('htLoad()');
+      assert.ok(v.run('__btn.title').startsWith(want), loc + ': finalize title: ' + v.run('__btn.title'));
+      if (df === DFI) assert.equal(lab.attrs.title, loc === 'en' ? 'deepfake-lens is not installed — starting offers to install it' : 'deepfake-lens 미설치 — 시작하면 설치를 안내합니다', loc + ': start option title');
+    }
+  });
+
+  await row('Tools mock (tools-mock.mjs) cancels like the real server: refused only in stage install|venv|pip (not while extracting / extract); accepted → job unchanged, `failed` + cancelled:true on the NEXT poll', async () => {
+    const fakePage = () => {
+      const routes = [];
+      return {
+        routes,
+        route: async (pat, fn) => { routes.push([pat, fn]); },
+        call: async (path, method = 'GET', body = null) => {
+          const hit = routes.find(([pat]) => pat === '**' + path);
+          let out = null;
+          await hit[1]({ request: () => ({ method: () => method, postData: () => (body ? JSON.stringify(body) : '') }), fulfill: (r) => { out = JSON.parse(r.body); } });
+          return out;
+        },
+      };
+    };
+    const pg = fakePage();
+    const m = await routeTools(pg, { steps: 2 });
+    assert.equal((await pg.call('/api/tools/install', 'POST', { name: 'ffmpeg' })).ok, true);
+    let s;
+    do { s = (await pg.call('/api/tools/install-status')).install; } while (s.state !== 'extracting');
+    assert.equal(s.stage, 'extract', 'extracting starts in stage extract');
+    const c1 = await pg.call('/api/tools/install-cancel', 'POST', {});
+    assert.ok(c1.ok === true && c1.install.state === 'extracting', 'extract is cancellable; reply = job unchanged: ' + JSON.stringify(c1));
+    s = (await pg.call('/api/tools/install-status')).install;
+    assert.ok(s.state === 'failed' && s.error === 'install cancelled' && s.cancelled === true, 'next poll: failed/cancelled: ' + JSON.stringify(s));
+    assert.equal((await pg.call('/api/tools/install', 'POST', { name: 'ffmpeg' })).ok, true);
+    do { s = (await pg.call('/api/tools/install-status')).install; } while (s.stage !== 'install' && s.state !== 'done');
+    assert.equal(s.stage, 'install', 'files are moved in stage install');
+    const c2 = await pg.call('/api/tools/install-cancel', 'POST', {});
+    assert.equal(c2.code, 'not_cancellable', 'stage install refuses: ' + JSON.stringify(c2));
+    assert.equal((await pg.call('/api/tools/install-status')).install.state, 'done', 'and the install finishes');
+    assert.equal(m.cancels, 2);
   });
 
   if (failed.length) throw new Error('Tools track U failed: ' + failed.join('; '));

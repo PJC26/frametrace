@@ -6,7 +6,11 @@
 //   GET  /api/tools/install-status  {ok:true, install: J|null}
 //   POST /api/tools/install-cancel  {ok:true, install: J} | {ok:false, code:"no_install"|"not_cancellable"}
 // Nothing is downloaded: the install walks downloading → verifying →
-// extracting → done over the next status polls.
+// extracting (stage extract, then install on its last poll) → done over the
+// next status polls. Like the real server, a cancel is refused
+// (`not_cancellable`) only in stage install|venv|pip; an accepted cancel
+// replies with the job unchanged and the NEXT poll shows it `failed` with
+// error "install cancelled" and `cancelled: true`.
 const FF_ZIP = 'ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1.zip';
 export const TOOLS_FIXTURE = () => ([
   {
@@ -49,19 +53,31 @@ export const TOOLS_FIXTURE = () => ([
   },
 ]);
 
-const STAGE = { downloading: 'download', verifying: 'verify', extracting: 'install', done: 'done', failed: 'failed' };
+const STAGE = { downloading: 'download', verifying: 'verify', extracting: 'extract', done: 'done', failed: 'failed' };
+// src/tool_install/mod.rs INSTALL_CANCELLED / the non-cancellable stages.
+export const INSTALL_CANCELLED = 'install cancelled';
+const LOCKED_STAGES = ['install', 'venv', 'pip'];
+const nowUnix = () => Math.floor(Date.now() / 1000);
 const json = (route, body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
 
 // opts.steps: status polls per install stage (default 2); opts.fail: an
 // error string → the job ends `failed`; opts.tools: a fixture override;
 // opts.install: a job already running when the page loads (a refresh).
-// Returns the live mock state { posts: [{name}], cancels, tools, install }.
+// Returns the live mock state { posts: [{name}], cancels, tools, install,
+// cancelRequested } — set `cancelRequested = true` to stop the job from
+// "another tab / the CLI".
 export async function routeTools(page, opts = {}) {
   const steps = opts.steps || 2;
-  const m = { posts: [], cancels: 0, tools: opts.tools || TOOLS_FIXTURE(), install: opts.install || null, polls: 0, seq: 0 };
+  const m = { posts: [], cancels: 0, tools: opts.tools || TOOLS_FIXTURE(), install: opts.install || null, polls: 0, seq: 0, cancelRequested: false };
+  if (m.install && !('cancelled' in m.install)) m.install.cancelled = false;
   const advance = () => {
     const i = m.install;
     if (!i || i.state === 'done' || i.state === 'failed') return;
+    if (m.cancelRequested) {
+      m.cancelRequested = false;
+      Object.assign(i, { state: 'failed', stage: 'failed', error: INSTALL_CANCELLED, cancelled: true, finished_unix: nowUnix() });
+      return;
+    }
     m.polls += 1;
     const t = m.tools.find((x) => x.name === i.tool);
     if (i.state === 'downloading') {
@@ -71,7 +87,7 @@ export async function routeTools(page, opts = {}) {
       if (m.polls > steps) { i.state = 'extracting'; m.polls = 0; }
     } else if (i.state === 'extracting') {
       if (m.polls > steps) {
-        i.finished_unix = 1760000100;
+        i.finished_unix = nowUnix();
         if (opts.fail) { i.state = 'failed'; i.error = opts.fail; } else {
           i.state = 'done'; t.installed = true; t.status = 'installed';
           for (const k of Object.keys(t.paths)) t.paths[k] = 'C:\\FrameTrace\\tools\\bin\\' + k + '.exe';
@@ -79,7 +95,8 @@ export async function routeTools(page, opts = {}) {
         }
       }
     }
-    i.stage = STAGE[i.state];
+    // Files are moved into place (non-cancellable) on extracting's last poll.
+    i.stage = i.state === 'extracting' && m.polls >= steps ? 'install' : STAGE[i.state];
   };
   await page.route('**/api/tools/install', async (route) => {
     const req = route.request();
@@ -92,8 +109,9 @@ export async function routeTools(page, opts = {}) {
     if (!t.installable) return json(route, { ok: false, code: 'not_installable', error: `${t.name} 자동 설치 불가: ${t.unavailable_reason}`, manual_hint: t.manual_hint, homepage: t.homepage });
     if (m.install && m.install.state !== 'done' && m.install.state !== 'failed') return json(route, { ok: false, code: 'install_running', error: '다른 도구 설치가 진행 중입니다.' });
     m.seq += 1;
-    m.install = { id: m.seq, tool: t.name, state: 'downloading', stage: 'queued', bytes: 0, total: t.size_bytes, error: null, started_unix: 1760000000, finished_unix: null, installed_files: [], audit_warning: null };
+    m.install = { id: m.seq, tool: t.name, state: 'downloading', stage: 'queued', bytes: 0, total: t.size_bytes, error: null, cancelled: false, started_unix: nowUnix(), finished_unix: null, installed_files: [], audit_warning: null };
     m.polls = 0;
+    m.cancelRequested = false;
     return json(route, { ok: true, install: m.install });
   });
   await page.route('**/api/tools/install-status', async (route) => { advance(); return json(route, { ok: true, install: m.install }); });
@@ -101,8 +119,9 @@ export async function routeTools(page, opts = {}) {
     m.cancels += 1;
     const i = m.install;
     if (!i || i.state === 'done' || i.state === 'failed') return json(route, { ok: false, code: 'no_install', error: '진행 중인 도구 설치가 없습니다.' });
-    if (i.state === 'extracting') return json(route, { ok: false, code: 'not_cancellable', error: '이 단계는 중단할 수 없습니다.' });
-    i.state = 'failed'; i.stage = 'failed'; i.error = '사용자가 설치를 중단했습니다.'; i.finished_unix = 1760000050;
+    if (LOCKED_STAGES.includes(i.stage)) return json(route, { ok: false, code: 'not_cancellable', error: '지금 단계(파일 이동·Python 환경 구성)는 취소할 수 없습니다 — 끝날 때까지 기다리십시오.', install: i });
+    // Honoured by the worker at its next check: the job ends on the next poll.
+    m.cancelRequested = true;
     return json(route, { ok: true, install: i });
   });
   await page.route('**/api/tools', async (route) => json(route, { ok: true, platform: 'windows-x86_64', platform_supported: true, tools: m.tools, install: m.install }));

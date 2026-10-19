@@ -360,6 +360,7 @@ mod windows {
             status["install"]["error"],
             crate::tool_install::INSTALL_CANCELLED
         );
+        assert_eq!(status["install"]["cancelled"], true, "{status}");
         assert!(!state_lock(&state).busy);
         assert!(!base.join("tools/bin/fake.exe").exists());
         let staged = std::fs::read_dir(base.join("tools"))
@@ -400,6 +401,7 @@ mod windows {
         let status = parse(&tools::api_tools_install_status(&state));
         assert_eq!(status["install"]["state"], "failed");
         assert_eq!(status["install"]["stage"], "failed");
+        assert_eq!(status["install"]["cancelled"], false);
         assert!(
             status["install"]["error"]
                 .as_str()

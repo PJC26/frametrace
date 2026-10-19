@@ -48,6 +48,10 @@ pub(crate) fn install_job_json(job: &ToolInstallJob) -> serde_json::Value {
         "bytes": done,
         "total": total,
         "error": job.error,
+        // True only for a job that ended because a cancel was honoured
+        // (from any tab or the CLI), so the UI never shows it as a failure.
+        "cancelled": job.state == "failed"
+            && job.error.as_deref() == Some(tool_install::INSTALL_CANCELLED),
         "started_unix": job.started_unix,
         "finished_unix": job.finished_unix,
         "installed_files": job.installed_files,
