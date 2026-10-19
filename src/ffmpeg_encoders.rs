@@ -21,20 +21,37 @@
 //! tried once with a 1-frame encode of a 64×64 black frame using the very
 //! options a proxy uses (`-f lavfi -i color=… -frames:v 1 <video args>
 //! -f null -`); one that fails is skipped and the next one tried. A trial
-//! that cannot run at all (spawn error, timeout) proves nothing: the
-//! candidate is kept (the pre-trial behaviour) and the result is not
-//! cached, so the next call tries again.
+//! has its own short bound ([`TRIAL_TIMEOUT_SECS`]): an encoder that cannot
+//! do one 64×64 frame in that time (h264_mf stuck in `MFStartup`) is
+//! unusable, so a timeout counts as a failure. A trial that cannot be
+//! spawned at all proves nothing: the candidate is kept (the pre-trial
+//! behaviour). When even native `mpeg4` — the last resort, built into every
+//! ffmpeg and tried as the control after any failure — fails its trial, the
+//! harness itself is suspect, not the encoders: no failure is recorded and
+//! the list-based pick is used (no "Media Feature Pack" misdiagnosis).
 //!
 //! The probe and the trials are cached together per ffmpeg path + mtime +
 //! size and run through the bounded
-//! [`crate::util::run_with_timeout_detailed`] (console hidden). Callers
-//! must not hold the server's state lock while calling [`for_binary`].
+//! [`crate::util::run_with_timeout_detailed`] (console hidden). A
+//! conclusive result is kept for the binary's lifetime; an inconclusive one
+//! (probe failed, trial not spawnable, harness defect) for
+//! [`INCONCLUSIVE_TTL`] only, so a wedged ffmpeg does not make every
+//! `/api/tools`, doctor, proxy and export wait again. Concurrent callers
+//! for the same binary share one probe (single flight). Callers must not
+//! hold the server's state lock while calling [`for_binary`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Bound of one trial encode. One 64×64 frame normally takes well under a
+/// second; an encoder still busy after this is treated as failed.
+pub const TRIAL_TIMEOUT_SECS: u64 = 10;
+
+/// How long an inconclusive probe result is reused before probing again.
+pub const INCONCLUSIVE_TTL: Duration = Duration::from_secs(60);
 
 /// H.264-or-fallback video encoders, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,14 +310,87 @@ impl CodecChoice {
 
 type CacheKey = (String, Option<SystemTime>, u64);
 
-fn cache() -> &'static Mutex<HashMap<CacheKey, Encoders>> {
-    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Encoders>>> = OnceLock::new();
+/// One cache entry: a finished result (an inconclusive one expires), or a
+/// probe in progress that other callers wait for.
+enum Slot {
+    Ready {
+        encoders: Encoders,
+        expires: Option<Instant>,
+    },
+    Pending(Arc<Flight>),
+}
+
+/// A probe in progress (single flight): its result, once published.
+#[derive(Default)]
+struct Flight {
+    result: Mutex<Option<Encoders>>,
+    done: Condvar,
+}
+
+impl Flight {
+    fn publish(&self, encoders: Encoders) {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoders);
+        self.done.notify_all();
+    }
+
+    fn wait(&self) -> Encoders {
+        let mut result = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(encoders) = result.as_ref() {
+                return encoders.clone();
+            }
+            result = self.done.wait(result).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, Slot>> {
+    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Slot>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Publishes the probe's result to the cache and to the waiting callers —
+/// also when the probe panicked (then the assumption, uncached), so nobody
+/// waits forever.
+struct FlightGuard {
+    key: CacheKey,
+    flight: Arc<Flight>,
+    done: bool,
+}
+
+impl FlightGuard {
+    fn finish(&mut self, encoders: &Encoders, conclusive: bool) {
+        let expires = (!conclusive).then(|| Instant::now() + INCONCLUSIVE_TTL);
+        cache().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            self.key.clone(),
+            Slot::Ready {
+                encoders: encoders.clone(),
+                expires,
+            },
+        );
+        self.flight.publish(encoders.clone());
+        self.done = true;
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(cache.get(&self.key), Some(Slot::Pending(_))) {
+            cache.remove(&self.key);
+        }
+        drop(cache);
+        self.flight.publish(Encoders::assumed_full());
+    }
+}
+
 /// The encoders of the ffmpeg at `binary` (a resolved absolute path).
-/// Cached per path + mtime + size; a failed probe is not cached and
-/// yields [`Encoders::assumed_full`].
+/// Cached per path + mtime + size (an inconclusive result only for
+/// [`INCONCLUSIVE_TTL`]); a failed probe yields [`Encoders::assumed_full`].
+/// Concurrent callers for the same binary share one probe.
 pub fn for_binary(binary: &str) -> Encoders {
     let meta = std::fs::metadata(Path::new(binary)).ok();
     let key: CacheKey = (
@@ -308,10 +398,43 @@ pub fn for_binary(binary: &str) -> Encoders {
         meta.as_ref().and_then(|m| m.modified().ok()),
         meta.as_ref().map(|m| m.len()).unwrap_or(0),
     );
-    if let Some(hit) = cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return hit.clone();
-    }
-    // Probe outside the cache lock.
+    let flight = {
+        let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get(&key) {
+            Some(Slot::Ready { encoders, expires }) => {
+                let fresh = match expires {
+                    Some(expires) => Instant::now() < *expires,
+                    None => true,
+                };
+                if fresh {
+                    return encoders.clone();
+                }
+            }
+            Some(Slot::Pending(flight)) => {
+                let flight = Arc::clone(flight);
+                drop(cache);
+                return flight.wait();
+            }
+            None => {}
+        }
+        let flight = Arc::new(Flight::default());
+        cache.insert(key.clone(), Slot::Pending(Arc::clone(&flight)));
+        flight
+    };
+    // Probe outside the cache lock; other callers wait on the flight only.
+    let mut guard = FlightGuard {
+        key,
+        flight,
+        done: false,
+    };
+    let (encoders, conclusive) = probe(binary);
+    guard.finish(&encoders, conclusive);
+    encoders
+}
+
+/// `-encoders`, then the trial encodes. The flag says whether the result
+/// may be cached for good.
+fn probe(binary: &str) -> (Encoders, bool) {
     let secs = crate::util::version_probe_timeout_secs();
     let result = crate::util::run_with_timeout_detailed(
         Command::new(binary).args(["-hide_banner", "-encoders"]),
@@ -321,39 +444,44 @@ pub fn for_binary(binary: &str) -> Encoders {
         Ok(output) if output.status.success() => {
             Encoders::from_listing(&String::from_utf8_lossy(&output.stdout))
         }
-        _ => return Encoders::assumed_full(),
+        _ => return (Encoders::assumed_full(), false),
     };
     if encoders.names.is_empty() {
-        return Encoders::assumed_full();
+        return (Encoders::assumed_full(), false);
     }
     // Trial-encode the listed candidates, best first, until one works.
-    let mut conclusive = true;
+    // After any failure native mpeg4 is tried last (listed or not): it is
+    // the control that tells a broken encoder from a broken trial.
+    let mut any_failed = false;
     for candidate in VideoEncoder::PREFERENCE {
-        if !encoders.has(candidate.name()) {
+        let control = candidate == VideoEncoder::Mpeg4 && any_failed;
+        if !encoders.has(candidate.name()) && !control {
             continue;
         }
-        match trial_encode(binary, candidate, secs) {
-            Trial::Works => break,
-            Trial::Fails => encoders.mark_failed(candidate),
-            Trial::Unknown => {
-                conclusive = false;
-                break;
+        match trial_encode(binary, candidate, TRIAL_TIMEOUT_SECS) {
+            Trial::Works => return (encoders, true),
+            Trial::Fails if candidate == VideoEncoder::Mpeg4 => {
+                // Even the built-in encoder fails: the trial harness is at
+                // fault (an odd build, lavfi missing), not the encoders.
+                // Keep the list-based pick and blame nothing.
+                encoders.failed.clear();
+                return (encoders, false);
             }
+            Trial::Fails => {
+                encoders.mark_failed(candidate);
+                any_failed = true;
+            }
+            Trial::Unknown => return (encoders, false),
         }
     }
-    if conclusive {
-        cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, encoders.clone());
-    }
-    encoders
+    (encoders, true)
 }
 
 enum Trial {
     Works,
+    /// Exited non-zero, or still running after the trial bound.
     Fails,
-    /// Could not run (spawn error, timeout): proves nothing.
+    /// Could not be spawned: proves nothing.
     Unknown,
 }
 
@@ -392,7 +520,10 @@ fn trial_encode(binary: &str, encoder: VideoEncoder, secs: u64) -> Trial {
     ) {
         Ok(output) if output.status.success() => Trial::Works,
         Ok(_) => Trial::Fails,
-        Err(_) => Trial::Unknown,
+        // One 64×64 frame within the bound or the encoder is unusable
+        // (h264_mf wedged in MFStartup): a timeout is a failure.
+        Err(crate::util::RunError::TimedOut(_)) => Trial::Fails,
+        Err(crate::util::RunError::Failed(_)) => Trial::Unknown,
     }
 }
 
@@ -417,6 +548,18 @@ pub(crate) mod tests {
     /// encoders (e.g. h264_mf on Windows N without the Media Feature
     /// Pack). Every call is logged to `calls.log` next to it.
     pub fn fake_ffmpeg_failing(dir: &Path, listing: &str, failing: &[&str]) -> String {
+        fake_ffmpeg_slow(dir, listing, failing, &[])
+    }
+
+    /// [`fake_ffmpeg_failing`] whose trial encode of each `(encoder,
+    /// seconds)` in `sleeping` first sleeps that long, then succeeds
+    /// (h264_mf wedged in MFStartup, or just slow).
+    pub fn fake_ffmpeg_slow(
+        dir: &Path,
+        listing: &str,
+        failing: &[&str],
+        sleeping: &[(&str, u32)],
+    ) -> String {
         std::fs::create_dir_all(dir).unwrap();
         #[cfg(windows)]
         {
@@ -437,6 +580,13 @@ pub(crate) mod tests {
                     "echo %*| findstr /c:\"-c:v {name} \" >nul && exit /b 1\r\n"
                 ));
             }
+            for (name, secs) in sleeping {
+                // `timeout` refuses redirected stdin; ping waits ~1 s per echo.
+                body.push_str(&format!(
+                    "echo %*| findstr /c:\"-c:v {name} \" >nul && ping -n {} 127.0.0.1 >nul\r\n",
+                    secs + 1
+                ));
+            }
             body.push_str("exit /b 0\r\n");
             std::fs::write(&path, body).unwrap();
             path.to_string_lossy().into_owned()
@@ -453,6 +603,11 @@ pub(crate) mod tests {
             for name in failing {
                 script.push_str(&format!(
                     "case \" $* \" in *\" -c:v {name} \"*) exit 1;; esac\n"
+                ));
+            }
+            for (name, secs) in sleeping {
+                script.push_str(&format!(
+                    "case \" $* \" in *\" -c:v {name} \"*) sleep {secs};; esac\n"
                 ));
             }
             script.push_str("exit 0\n");
@@ -622,6 +777,138 @@ pub(crate) mod tests {
             Some("LGPL 빌드 — H.264는 h264_mf 사용")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn calls_of(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
+    }
+
+    /// Lets the cached (inconclusive) result of `binary` expire now.
+    fn expire(binary: &str) {
+        for (key, slot) in cache().lock().unwrap().iter_mut() {
+            if let (true, Slot::Ready { expires, .. }) = (key.0 == binary, slot) {
+                *expires = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Fix round 3: a trial that hangs (h264_mf wedged in MFStartup) is a
+    /// failure after TRIAL_TIMEOUT_SECS — not "unknown" re-probed for 60 s
+    /// on every call — and the result is cached like any other.
+    #[test]
+    fn a_hung_trial_encode_fails_within_the_trial_bound_and_is_cached() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-hung-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = fake_ffmpeg_slow(&dir, BTBN_LGPL, &[], &[("h264_mf", 25)]);
+        let started = Instant::now();
+        let enc = for_binary(&fake);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(TRIAL_TIMEOUT_SECS + 8),
+            "the hung trial must stop at the trial bound: {took:?}"
+        );
+        assert!(enc.trial_failed("h264_mf"), "{enc:?}");
+        assert_eq!(enc.video(), VideoEncoder::Libopenh264);
+        let calls = calls_of(&dir);
+        // -encoders, the hung h264_mf trial, the libopenh264 trial.
+        assert_eq!(calls.lines().count(), 3, "{calls}");
+        let again = Instant::now();
+        assert_eq!(for_binary(&fake), enc);
+        assert!(again.elapsed() < Duration::from_secs(2), "cached");
+        assert_eq!(calls_of(&dir), calls, "no second probe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix round 3: concurrent callers (GET /api/tools, doctor, proxies,
+    /// exports) for the same binary share one probe.
+    #[test]
+    fn concurrent_callers_share_one_probe() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-flight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = fake_ffmpeg_slow(&dir, LGPL, &[], &[("h264_mf", 2)]);
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let fake = fake.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for_binary(&fake)
+                })
+            })
+            .collect();
+        let results: Vec<Encoders> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for enc in &results {
+            assert_eq!(enc.video(), VideoEncoder::H264Mf, "{enc:?}");
+            assert_eq!(enc, &results[0]);
+        }
+        let calls = calls_of(&dir);
+        // One -encoders and one h264_mf trial for all four callers.
+        assert_eq!(calls.lines().count(), 2, "{calls}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix round 3: when even native mpeg4 (the control) fails its trial,
+    /// the harness is at fault — no encoder is blamed, the list-based pick
+    /// stays, no Media Feature Pack hint; the inconclusive result is reused
+    /// only for INCONCLUSIVE_TTL. A probe that lists nothing is also
+    /// negative-cached.
+    #[test]
+    fn a_failing_mpeg4_control_is_a_harness_defect_and_is_negative_cached() {
+        let base = std::env::temp_dir().join(format!("ft-enc-harness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("all");
+        let fake = fake_ffmpeg_failing(&dir, BTBN_LGPL, &["h264_mf", "libopenh264", "mpeg4"]);
+        let enc = for_binary(&fake);
+        assert!(enc.probed());
+        assert!(!enc.trial_failed("h264_mf"), "{enc:?}");
+        assert_eq!(enc.to_json()["trial_failed"], serde_json::json!([]));
+        assert_eq!(enc.video(), VideoEncoder::H264Mf);
+        assert!(
+            !enc.build_note()
+                .unwrap_or_default()
+                .contains("Media Feature Pack"),
+            "{:?}",
+            enc.build_note()
+        );
+        let calls = calls_of(&dir);
+        // -encoders, h264_mf, libopenh264, the mpeg4 control.
+        assert_eq!(calls.lines().count(), 4, "{calls}");
+        assert!(calls.lines().last().unwrap().contains("-c:v mpeg4"));
+        // Negative-cached: no new run within the TTL …
+        assert_eq!(for_binary(&fake), enc);
+        assert_eq!(calls_of(&dir), calls);
+        // … probed again once it expired.
+        expire(&fake);
+        let _ = for_binary(&fake);
+        assert_eq!(calls_of(&dir).lines().count(), 8);
+
+        // mpeg4 not listed: still tried as the control after a failure.
+        let dir = base.join("unlisted");
+        let fake = fake_ffmpeg_failing(
+            &dir,
+            " ------\n V....D h264_mf  MF\n",
+            &["h264_mf", "mpeg4"],
+        );
+        let enc = for_binary(&fake);
+        assert_eq!(enc.video(), VideoEncoder::H264Mf);
+        assert!(!enc.trial_failed("h264_mf"));
+        let calls = calls_of(&dir);
+        assert_eq!(calls.lines().count(), 3, "{calls}");
+        // A broken h264_mf with a working control is still a real failure.
+        let dir = base.join("control-ok");
+        let fake = fake_ffmpeg_failing(&dir, " ------\n V....D h264_mf  MF\n", &["h264_mf"]);
+        let enc = for_binary(&fake);
+        assert!(enc.trial_failed("h264_mf"));
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4);
+
+        // An empty listing (probe proves nothing): assumed, negative-cached.
+        let dir = base.join("empty");
+        let fake = fake_ffmpeg(&dir, "");
+        assert!(!for_binary(&fake).probed());
+        assert!(!for_binary(&fake).probed());
+        assert_eq!(calls_of(&dir).lines().count(), 1, "{}", calls_of(&dir));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

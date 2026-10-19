@@ -6,7 +6,8 @@
 //! * `POST /api/tools/install` `{"name": "<tool>"}` — nonce-gated like every
 //!   POST; takes the busy lease, then downloads/extracts on a worker thread.
 //! * `GET  /api/tools/install-status` — cheap poll of that job.
-//! * `POST /api/tools/install-cancel` — asks a running install to stop:
+//! * `POST /api/tools/install-cancel` `{"id"}` — asks a running install to
+//!   stop (an `id` that is not the current job → `stale_job`):
 //!   honoured while downloading / verifying / extracting (checked between
 //!   stages, curl killed mid-download), refused with
 //!   `{"ok":false,"code":"not_cancellable"}` once files are being moved
@@ -60,11 +61,17 @@ pub(crate) fn install_job_json(job: &ToolInstallJob) -> serde_json::Value {
         "installed_files": job.installed_files,
         "audit_warning": job.audit_warning,
         "staging_left": job.staging_left,
-        // A failed job that stopped on the user's cancel (not an error),
-        // so the UI need not match the error text.
-        "cancelled": job.state == "failed"
-            && job.error.as_deref() == Some(tool_install::INSTALL_CANCELLED),
+        // Seconds since the job finished, by the server's clock (null while
+        // running), so a tab never judges "recent" by its own clock.
+        "age_s": job
+            .finished_unix
+            .map(|finished| now_unix().saturating_sub(finished)),
     })
+}
+
+/// The server's clock (`now_unix` in GET /api/tools and install-status).
+fn now_unix() -> u64 {
+    crate::util::now_unix().unwrap_or(0)
 }
 
 /// The coarse install state track U polls: downloading | verifying |
@@ -141,16 +148,33 @@ pub(crate) fn api_tools(request: &Request, state: &SharedState) -> String {
         "platform_supported": cfg!(all(windows, target_arch = "x86_64")),
         "tools": tools,
         "install": job_snapshot(state),
+        "now_unix": now_unix(),
     })
     .to_string()
 }
 
 pub(crate) fn api_tools_install_status(state: &SharedState) -> String {
-    serde_json::json!({"ok": true, "install": job_snapshot(state)}).to_string()
+    serde_json::json!({"ok": true, "install": job_snapshot(state), "now_unix": now_unix()})
+        .to_string()
 }
 
-pub(crate) fn api_tools_install_cancel(state: &SharedState) -> String {
+/// `POST /api/tools/install-cancel` `{"id": <job id>}` (`id` optional for
+/// older clients): a cancel naming another job than the current one — a
+/// late [중단] from a tab still showing an install that already ended while
+/// another tab started the next — is refused with `stale_job`, never
+/// applied to the new install.
+pub(crate) fn api_tools_install_cancel(request: &Request, state: &SharedState) -> String {
+    let wanted = body_value(&request.body, "id");
     let guard = state_lock(state);
+    if let (Some(wanted), Some(job)) = (wanted.as_deref(), guard.tool_install.as_ref())
+        && wanted.trim() != job.id.to_string()
+    {
+        return refusal(
+            "stale_job",
+            "그 설치는 이미 끝났습니다 — 지금 진행 중인 설치는 중단하지 않았습니다.",
+            serde_json::json!({"install": install_job_json(job)}),
+        );
+    }
     match guard
         .tool_install
         .as_ref()

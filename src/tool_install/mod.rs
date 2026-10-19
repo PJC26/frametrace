@@ -19,8 +19,9 @@
 //! * T5 — license files listed in the manifest land in `tools/bin/licenses`.
 //!
 //! Every failure removes the staging directory, so no partial file is left
-//! behind (stale `tools/.staging-*` left by a killed run are swept before
-//! each install and at server start); every attempt — success, failure or
+//! behind (stale `tools/.staging-*` left by a killed run, and replaced pip
+//! venvs `tools/python/.<name>.old-*` that were still in use, are swept
+//! before each install and at server start); every attempt — success, failure or
 //! a refusal before anything started — appends one hash-chained line
 //! (`audit::append_chained_jsonl`, `previous_entry_sha256`/`entry_sha256`)
 //! to `<exe dir>/tools/install-audit.jsonl`.
@@ -523,24 +524,23 @@ impl ToolStatus {
 
 /// Resolution-only status (`tools/bin`, then PATH, as the pipeline would
 /// run the tool) — never spawns anything.
+/// PATH is walked once for all of the tool's binaries.
 pub fn status(tool: &ToolEntry) -> ToolStatus {
-    let shadowed_by = tool
-        .provides
-        .iter()
-        .map(|binary| (binary.clone(), crate::tool_policy::shadowed_by(binary)))
-        .collect();
-    let paths = tool
-        .provides
-        .iter()
-        .map(|binary| {
-            let path = if binary == "deepfake-lens" {
-                crate::deepfake::resolved_lens_binary()
-            } else {
-                crate::tool_policy::resolve_tool_binary(binary, &[binary.as_str()]).ok()
-            };
-            (binary.clone(), path)
-        })
-        .collect();
+    let path = crate::tool_policy::PathDirs::from_env();
+    let mut paths = Vec::new();
+    let mut shadowed_by = Vec::new();
+    for binary in &tool.provides {
+        if binary == "deepfake-lens" {
+            // Its own order (FRAMETRACE_DEEPFAKE_LENS, the private venv,
+            // then tools/bin / PATH): no tools/bin-vs-PATH shadow.
+            paths.push((binary.clone(), crate::deepfake::resolved_lens_binary()));
+            shadowed_by.push((binary.clone(), None));
+            continue;
+        }
+        let lookup = crate::tool_policy::lookup_bare(binary, &path);
+        paths.push((binary.clone(), lookup.used));
+        shadowed_by.push((binary.clone(), lookup.shadowed_by));
+    }
     ToolStatus { paths, shadowed_by }
 }
 
@@ -1170,22 +1170,36 @@ pub fn audit_refusal(
     append_audit(&dirs.audit_log(), &line)
 }
 
-/// Removes `tools/.staging-*` directories last modified before
-/// `started_before` — leftovers of an install that was killed. The caller
-/// holds the [`InstallLock`] (every live staging dir belongs to a locked
-/// install), so none of them is in use; one that cannot be removed (a file
-/// in it still open) is skipped and tried again next time. Returns how
-/// many were removed.
+/// Removes `tools/.staging-*` directories — and the replaced pip venvs
+/// `tools/python/.<name>.old-*` that could not be removed while a process
+/// still ran from them — last modified before `started_before`: leftovers
+/// of an install that was killed or whose old files were still in use. The
+/// caller holds the [`InstallLock`] (every live staging dir and venv backup
+/// belongs to a locked install), so none of them is in use by an install;
+/// one that cannot be removed (a file in it still open) is skipped and
+/// tried again next time. Returns how many were removed.
 pub(crate) fn clean_stale_staging(
     tools_dir: &Path,
     started_before: std::time::SystemTime,
 ) -> usize {
-    let Ok(entries) = std::fs::read_dir(tools_dir) else {
+    let staging = |name: &str| name.starts_with(".staging-");
+    // pip.rs: `.<tool>.old-<hex>` next to the tool's venv.
+    let old_venv = |name: &str| name.starts_with('.') && name.contains(".old-");
+    sweep_dir(tools_dir, &staging, started_before)
+        + sweep_dir(&tools_dir.join("python"), &old_venv, started_before)
+}
+
+fn sweep_dir(
+    dir: &Path,
+    matches: &dyn Fn(&str) -> bool,
+    started_before: std::time::SystemTime,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     let mut removed = 0;
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with(".staging-") {
+        if !matches(&entry.file_name().to_string_lossy()) {
             continue;
         }
         // Never follow a link out of tools/.

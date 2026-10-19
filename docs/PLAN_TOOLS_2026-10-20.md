@@ -135,3 +135,34 @@
 
 ### 확인 못 한 것
 - Windows N/KN·Server Core 실기에서의 h264_mf 실패는 재현하지 못했다(이 PC는 일반 에디션) — 가짜 ffmpeg로 분기만 확인. 실제 MF 실패의 종료 코드가 0이 아닌지는 실기 확인 필요(ffmpeg는 인코더 열기 실패 시 0이 아닌 코드로 끝난다).
+
+## §Fix round 3 (2026-10-19, 2차 리뷰 확인 반영, 기준 f321d0b)
+
+리뷰어가 확인한 항목을 모두 고쳤다. 번들·라이선스 결정(고지 문구, 매니페스트 `license`, CI 인코더 게이트, 인코더 선호 순서)은 손대지 않았다. 각 수정의 테스트는 f321d0b에서 실패함을 확인했다(아래 "확인 방법").
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 (중) | 시험 인코딩이 **멈추면**(h264_mf가 `MFStartup`에서 대기) `Trial::Unknown`이 되어 캐시되지 않았고, 시험 시간 제한이 버전 확인과 같은 60 s라 `for_binary`를 부르는 모든 곳(GET /api/tools, doctor, tools list, 모든 프록시·내보내기)이 매번 60 s를 기다렸다. 동시에 부르면 각자 따로 실행했다. | `ffmpeg_encoders`: 시험 전용 제한 **`TRIAL_TIMEOUT_SECS` = 10 s**, 시간 초과는 **`Fails`**(64×64 한 프레임을 10 s 안에 못 하면 쓸 수 없음). 실행 자체를 못 하면(`RunError::Failed`) `Unknown`. 결론 없는 결과(`-encoders` 실패·빈 목록, `Unknown`, 아래 하네스 결함)는 **`INCONCLUSIVE_TTL` = 60 s 동안 음성 캐시**. 캐시 항목이 `Ready{encoders, expires}` / `Pending(flight)`이 되어 같은 바이너리를 **동시에 부르면 한 번만 실행**(single flight; 나머지는 Condvar로 기다림, 실행 쪽이 패닉해도 guard가 가정값을 알리고 Pending을 지움). 어떤 후보든 실패한 뒤에는 **네이티브 mpeg4를 대조군으로 마지막에 반드시 시험**(목록에 없어도) — mpeg4마저 실패하면 인코더가 아니라 시험 하네스 문제로 보고 실패 기록을 모두 지운 채 목록 기반 선택을 유지(→ "Media Feature Pack 필요" 오진 없음), 결론 없음으로 TTL 캐시. | `a_hung_trial_encode_fails_within_the_trial_bound_and_is_cached`(가짜 ffmpeg: h264_mf 시험이 25 s 잠 → ~10 s에 `Fails`, libopenh264 선택, 호출 3회, 재호출 즉시·실행 0회), `concurrent_callers_share_one_probe`(4 스레드 동시 → `-encoders` 1회 + 시험 1회), `a_failing_mpeg4_control_is_a_harness_defect_and_is_negative_cached`(모두 실패 → `trial_failed: []`, h264_mf 유지, MF 문구 없음, TTL 안 재실행 0회·만료 뒤 재실행; mpeg4가 목록에 없어도 대조군 시험; 대조군 성공이면 h264_mf 실패는 진짜; 빈 목록도 음성 캐시) |
+| 2a (하) | `install-cancel`에 작업 id가 없어, 탭 A의 늦은 [중단]이 탭 B가 새로 시작한 설치를 멈췄다. | 본문 `{"id": <작업 id>}`(선택; 숫자·문자열). 현재 작업 id와 다르면 **`{"ok":false,"code":"stale_job","error":…,"install":J}`**, 아무것도 멈추지 않음. `id`가 없으면(옛 UI) 종전 동작. UI는 `HT.job`을 보내고 `stale_job`을 `no_install`처럼 다룬다(오류 문구 없음). | `serve::tests_tools::a_cancel_naming_another_job_is_refused_as_stale`, unit "Tools [중단] names the job", 흉내 서버 `stale_job` |
+| 2b (하) | `install_job_json`의 `json!`에 `"cancelled"` 키가 두 번. | 하나 삭제. | `tool_replies_carry_the_server_clock_and_the_job_age`(함수 본문에 `"cancelled":` 1회) |
+| 2c (하) | pip이 지우지 못한 옛 venv `tools/python/.<name>.old-*`는 아무도 치우지 않는데 CLI는 "(다음 설치·서버 시작 때 정리)"라고 했다. | `clean_stale_staging`이 `tools/.staging-*`와 함께 **`tools/python/.<이름>.old-*`**(디렉터리, 링크 아님, 이번 실행 전 수정)도 지운다(설치 잠금 아래, 설치 직전·서버 시작 때). CLI 문구: "… (그 프로그램을 닫으면 다음 설치·서버 시작 때 정리됩니다)" — 실행 중인 동안은 지울 수 없으므로. | `stale_staging_dirs_are_swept_but_not_live_or_foreign_entries`(옛 venv 삭제, 현재 venv·파일·이번 실행 것 유지), `cli::handlers::tools::tests::staging_left_note_says_when_it_is_cleaned` |
+| 2d (하) | `shadowed_by("deepfake-lens")`가 실제 순서(개인 venv 먼저)와 맞지 않았고, `status()`가 바이너리마다 PATH를 두 번씩 훑었다. | `tool_policy::shadowed_by`는 deepfake-lens에 항상 `None`. 새 `PathDirs`(PATH의 절대·존재 디렉터리를 한 번 정규화)와 `lookup_bare(name, &PathDirs) → {used, shadowed_by}`(해석과 그림자를 같은 탐색에서). `tool_install::status`는 도구당 **PATH 탐색 1회**, deepfake-lens는 `resolved_lens_binary()` + 그림자 `None`. | `tool_policy::tests::manifest_tools_resolve_from_tools_bin_before_path_and_report_the_shadow`(확장: deepfake-lens는 tools/bin·PATH 둘 다 있어도 `None`), `tool_install::tests::status_walks_path_once_and_never_shadows_deepfake_lens`(테스트용 스레드 카운터) |
+| 2e (하·UI) | 확인 대화상자가 떠 있는 동안 다른 설치를 따라가게 되면 OK가 조용히 아무것도 안 했다. | `htAdopt`가 대화상자 중이면 "다른 설치가 진행 중입니다"를 알리고, OK 뒤에도 POST 없이 같은 문구를 다시 알린다(`htAnnounceBusy`, 같은 문구 연속도 알림). | unit "Tools confirm dialog open while another install is adopted" |
+| 2f (하·UI) | `htRecent`가 브라우저 시계로 "최근 5분"을 판단했다. | 서버가 **`now_unix`**(GET /api/tools·install-status)와 J의 **`age_s`**(끝난 뒤 초, 서버 시계; 실행 중 null)를 보낸다. `htParseInstall(i, now_unix)`가 `age_s`(없으면 `now_unix - finished_unix`)를 만들고 `htRecent`는 그것만 쓴다 — 브라우저 시계는 두 값이 다 없는 옛 서버에서만. | `tool_replies_carry_the_server_clock_and_the_job_age`, unit "Tools \"recent\" is judged by the server clock"(서버 시계가 한 시간 늦음/빠름, `age_s` 우선) |
+| 2g (하·UI) | POST 응답이 사라지면(네트워크·status 0) 서버가 설치를 시작했어도 "설치 요청 실패"로 보였다. | 응답 없음·`network`·`malformed`·status 0이면 `htLoad()`로 묻고 그 도구의 실행 중 작업을 따라간다; 방금 끝났으면 그 결과(`htFinish`), 아무것도 없으면 "설치 상태를 알 수 없습니다 — 다시 시도하십시오". HTTP 오류 응답(5xx 등)은 종전대로 거부 문구. | unit "Tools a lost POST reply" |
+| 2h (하·UI·문서) | 계약 §28·흉내 서버에 `shadowed_by`·`encoders.trial_failed`·`staging_left`·`now_unix`·`stale_job`이 없었고, UI가 그림자를 보이지 않았다. | `docs/ui-rebuild-contract.md` §28에 모두 추가. `tools-mock.mjs`: 픽스처 T에 `shadowed_by`(paths와 같은 키), 설치 뒤 ffmpeg `encoders{…, trial_failed: []}`, J에 `staging_left`·`age_s`, 두 GET에 `now_unix`, 다른 id의 취소에 `stale_job`. UI: `shadowed_by`에 값이 있으면 그 줄에 `<small class="h-tool-shadow">` **"PATH의 다른 사본 무시됨"**(title: 경로 + "직접 둔 것이 아니면 확인하십시오"); 설치된 도구도 이때만 정보 줄로 보인다. | unit "Tools shadow warning", "Tools mock + fixture carry the round-3 fields" |
+
+### API 변경 (트랙 U)
+- `GET /api/tools`·`GET /api/tools/install-status`: 최상위 **`now_unix`**(서버 시계).
+- 설치 작업 J: **`age_s`**(끝난 지 몇 초, 서버 시계; 실행 중 `null`). `cancelled` 키는 하나.
+- `POST /api/tools/install-cancel`: 본문 **`{"id": <J.id>}`**(선택). 다르면 `{"ok":false,"code":"stale_job","error":"그 설치는 이미 끝났습니다 — 지금 진행 중인 설치는 중단하지 않았습니다.","install":J}`.
+- deepfake-lens의 `shadowed_by`는 항상 `null`.
+- ffmpeg `encoders.trial_failed`: 시간 초과(10 s)도 실패로 들어간다. mpeg4 대조군까지 실패하면 `[]`(하네스 결함, 목록 기반 선택).
+
+### 확인 방법
+- f321d0b를 `C:/s/r3old`에 풀고(git archive) 새 Rust 테스트를 옛 API에 맞춰 옮겨(`api_tools_install_cancel(&state)`, `shadow_in(…)`, 캐시 만료 생략) 별도 target(`C:/s/t3`)에서 실행 → 아래 "f321d0b에서" 열 참고. 새 API에만 있는 것(`staging_left_note`, `path_walks`)은 옛 코드에서 컴파일되지 않는다(= 실패).
+- JS: `assets/app/56-tools.js`·`scripts/lib/tools-mock.mjs`만 f321d0b 것으로 바꾸고 `verify-review-batch --unit`을 돌려 새 행 7개(기존 [중단] 행의 `{id}` 확인 포함)가 모두 FAIL, 되돌리면 모두 PASS.
+
+### 확인 못 한 것
+- 실제 h264_mf가 `MFStartup`에서 멈추는 상황(Windows N/KN·Server Core)은 재현하지 못했다 — 가짜 ffmpeg의 잠자는 시험으로만 확인.
+- Linux/macOS clippy·테스트는 이 PC(Windows)에서 돌리지 못했다 — 바꾼 `cfg(not(windows))` 코드는 테스트용 가짜 ffmpeg의 `sleep` 분기뿐이다.

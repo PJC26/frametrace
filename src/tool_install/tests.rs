@@ -531,14 +531,26 @@ fn stale_staging_dirs_are_swept_but_not_live_or_foreign_entries() {
     std::fs::create_dir_all(tools.join(".staging-old2")).unwrap();
     std::fs::write(tools.join(".staging-file"), b"not a dir").unwrap();
     std::fs::create_dir_all(tools.join("bin")).unwrap();
+    // Fix round 3: a replaced pip venv that could not be removed (a
+    // process still ran from it) — reported as staging_left — is swept
+    // too; the live venv and other python/ entries are not.
+    let python = tools.join("python");
+    std::fs::create_dir_all(python.join(".deepfake-lens.old-0123abcd/Scripts")).unwrap();
+    std::fs::create_dir_all(python.join("deepfake-lens/Scripts")).unwrap();
+    std::fs::write(python.join(".x.old-file"), b"not a dir").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let run_started = std::time::SystemTime::now();
     std::thread::sleep(std::time::Duration::from_millis(50));
     // Created by "this" run: newer than its start, kept.
     std::fs::create_dir_all(tools.join(".staging-live")).unwrap();
-    assert_eq!(clean_stale_staging(&tools, run_started), 2);
+    std::fs::create_dir_all(python.join(".other.old-live")).unwrap();
+    assert_eq!(clean_stale_staging(&tools, run_started), 3);
     assert!(!tools.join(".staging-old1").exists());
     assert!(!tools.join(".staging-old2").exists());
+    assert!(!python.join(".deepfake-lens.old-0123abcd").exists());
+    assert!(python.join("deepfake-lens/Scripts").is_dir());
+    assert!(python.join(".x.old-file").is_file());
+    assert!(python.join(".other.old-live").is_dir());
     assert!(tools.join(".staging-live").is_dir());
     assert!(tools.join(".staging-file").is_file());
     assert!(tools.join("bin").is_dir());
@@ -1556,3 +1568,25 @@ mod windows_installs {
 
 #[cfg(windows)]
 pub(crate) use windows_installs::archive_entry as test_archive_entry;
+
+/// Fix round 3: `status()` walks PATH once for all of a tool's binaries
+/// (it runs for every tool on each GET /api/tools), and never reports a
+/// tools/bin-vs-PATH shadow for deepfake-lens (its private venv comes
+/// first).
+#[test]
+fn status_walks_path_once_and_never_shadows_deepfake_lens() {
+    let manifest = manifest().unwrap();
+    let libewf = find_tool(manifest, "libewf").unwrap();
+    assert_eq!(libewf.provides.len(), 3);
+    let before = crate::tool_policy::path_walks();
+    let status = status(libewf);
+    assert_eq!(crate::tool_policy::path_walks() - before, 1);
+    assert_eq!(status.paths.len(), 3);
+    assert_eq!(status.shadowed_by.len(), 3);
+    let lens = find_tool(manifest, "deepfake-lens").unwrap();
+    let status = super::status(lens);
+    assert_eq!(
+        status.shadowed_by,
+        vec![("deepfake-lens".to_string(), None::<String>)]
+    );
+}

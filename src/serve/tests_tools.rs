@@ -132,7 +132,10 @@ fn install_refusals_carry_stable_codes_and_start_nothing() {
         &codes,
     );
     assert_eq!(
-        parse(&tools::api_tools_install_cancel(&state))["code"],
+        parse(&tools::api_tools_install_cancel(
+            &request("POST", "/api/tools/install-cancel", "", "{}"),
+            &state
+        ))["code"],
         "no_install"
     );
     let _ = std::fs::remove_dir_all(base);
@@ -159,7 +162,10 @@ fn cancel_during_a_non_cancellable_stage_is_refused_with_its_own_code() {
     }
     // Downloading: honoured.
     progress.set_stage(crate::tool_install::Stage::Download);
-    let ok = parse(&tools::api_tools_install_cancel(&state));
+    let ok = parse(&tools::api_tools_install_cancel(
+        &request("POST", "/api/tools/install-cancel", "", "{}"),
+        &state,
+    ));
     assert_eq!(ok["ok"], true, "{ok}");
     assert!(progress.cancelled());
 
@@ -169,12 +175,107 @@ fn cancel_during_a_non_cancellable_stage_is_refused_with_its_own_code() {
         .enter_non_cancellable(crate::tool_install::Stage::Install)
         .unwrap();
     state_lock(&state).tool_install.as_mut().unwrap().progress = Arc::clone(&progress);
-    let refused = parse(&tools::api_tools_install_cancel(&state));
+    let refused = parse(&tools::api_tools_install_cancel(
+        &request("POST", "/api/tools/install-cancel", "", "{}"),
+        &state,
+    ));
     assert_eq!(refused["ok"], false);
     assert_eq!(refused["code"], "not_cancellable", "{refused}");
     assert_eq!(refused["install"]["stage"], "install");
     assert_eq!(refused["install"]["state"], "extracting");
     assert!(!progress.cancelled());
+}
+
+fn running_job(state: &SharedState, id: u64) -> Arc<crate::tool_install::Progress> {
+    let progress = Arc::new(crate::tool_install::Progress::default());
+    progress.set_stage(crate::tool_install::Stage::Download);
+    state_lock(state).tool_install = Some(tools::ToolInstallJob {
+        id,
+        name: "ffmpeg".into(),
+        state: "running",
+        error: None,
+        progress: Arc::clone(&progress),
+        started_unix: 0,
+        finished_unix: None,
+        installed_files: Vec::new(),
+        audit_warning: None,
+        staging_left: None,
+    });
+    progress
+}
+
+/// Fix round 3: a late [중단] from tab A (still showing job 1) never stops
+/// job 2 that tab B started meanwhile — the body names the job.
+#[test]
+fn a_cancel_naming_another_job_is_refused_as_stale() {
+    let state = new_state();
+    let cancel = |body: &str| {
+        parse(&tools::api_tools_install_cancel(
+            &request("POST", "/api/tools/install-cancel", "", body),
+            &state,
+        ))
+    };
+    let progress = running_job(&state, 2);
+    let stale = cancel(r#"{"id":1}"#);
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["code"], "stale_job", "{stale}");
+    assert_eq!(stale["install"]["id"], 2);
+    assert!(!progress.cancelled(), "the new job keeps running");
+    // The current id (number or string) is honoured.
+    let ok = cancel(r#"{"id":2}"#);
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert!(progress.cancelled());
+    let progress = running_job(&state, 3);
+    assert_eq!(cancel(r#"{"id":"3"}"#)["ok"], true);
+    assert!(progress.cancelled());
+    // No id (an older client): the running job, as before.
+    let progress = running_job(&state, 4);
+    assert_eq!(cancel("{}")["ok"], true);
+    assert!(progress.cancelled());
+    // Nothing installed at all: no_install, whatever the id.
+    let empty = new_state();
+    let none = parse(&tools::api_tools_install_cancel(
+        &request("POST", "/api/tools/install-cancel", "", r#"{"id":9}"#),
+        &empty,
+    ));
+    assert_eq!(none["code"], "no_install");
+}
+
+/// Fix round 3: the server's clock travels with the job (`now_unix` on
+/// both GETs, `age_s` on a finished job) so a tab never judges "recent"
+/// by its own clock; the job JSON has one `cancelled` key.
+#[test]
+fn tool_replies_carry_the_server_clock_and_the_job_age() {
+    let state = new_state();
+    let now = crate::util::now_unix().unwrap();
+    for body in [
+        tools::api_tools(&request("GET", "/api/tools", "", ""), &state),
+        tools::api_tools_install_status(&state),
+    ] {
+        let value = parse(&body);
+        let server_now = value["now_unix"].as_u64().expect("now_unix");
+        assert!(server_now.abs_diff(now) <= 5, "{value}");
+    }
+    let progress = running_job(&state, 1);
+    let running = parse(&tools::api_tools_install_status(&state));
+    assert!(running["install"]["age_s"].is_null(), "{running}");
+    {
+        let mut guard = state_lock(&state);
+        let job = guard.tool_install.as_mut().unwrap();
+        job.state = "failed";
+        job.error = Some(crate::tool_install::INSTALL_CANCELLED.into());
+        job.finished_unix = Some(now - 400);
+    }
+    progress.set_stage(crate::tool_install::Stage::Failed);
+    let done = parse(&tools::api_tools_install_status(&state));
+    let age = done["install"]["age_s"].as_u64().expect("age_s");
+    assert!((400..=410).contains(&age), "{done}");
+    assert_eq!(done["install"]["cancelled"], true);
+    // One `cancelled` key in the job JSON (a duplicate would silently win).
+    let src = include_str!("tools.rs");
+    let body = &src[src.find("fn install_job_json").unwrap()..];
+    let body = &body[..body.find("\n}").unwrap()];
+    assert_eq!(body.matches("\"cancelled\":").count(), 1, "{body}");
 }
 
 #[test]
@@ -348,7 +449,10 @@ mod windows {
             status["install"]["stage"] == "download"
                 && status["install"]["bytes"].as_u64().unwrap_or(0) > 0
         });
-        let cancel = parse(&tools::api_tools_install_cancel(&state));
+        let cancel = parse(&tools::api_tools_install_cancel(
+            &request("POST", "/api/tools/install-cancel", "", "{}"),
+            &state,
+        ));
         assert_eq!(cancel["ok"], true, "{cancel}");
         wait_until("install stopped", || {
             state_lock(&state)
@@ -373,7 +477,10 @@ mod windows {
         assert!(!staged, "staging left behind");
         // A finished job has nothing to cancel.
         assert_eq!(
-            parse(&tools::api_tools_install_cancel(&state))["code"],
+            parse(&tools::api_tools_install_cancel(
+                &request("POST", "/api/tools/install-cancel", "", "{}"),
+                &state
+            ))["code"],
             "no_install"
         );
         let _ = std::fs::remove_dir_all(base);

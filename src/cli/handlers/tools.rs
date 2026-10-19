@@ -153,10 +153,7 @@ fn tools_install_in(name: &str, yes: bool, dirs: &InstallDirs) -> Result<(), Str
         println!("경고: 설치 기록을 남기지 못했습니다 — {warning}");
     }
     if let Some(left) = &outcome.staging_left {
-        println!(
-            "참고: 이전 파일이 아직 실행 중이라 임시 폴더를 지우지 못했습니다 — {} (다음 설치·서버 시작 때 정리)",
-            left.display()
-        );
+        println!("{}", staging_left_note(left));
     }
     println!(
         "완료: {name} 설치 (감사 기록: {})",
@@ -165,9 +162,29 @@ fn tools_install_in(name: &str, yes: bool, dirs: &InstallDirs) -> Result<(), Str
     Ok(())
 }
 
+/// The note for a leftover the install could not remove (an old binary or
+/// venv still running). It is swept by the next install or server start
+/// only once nothing runs from it any more.
+fn staging_left_note(left: &std::path::Path) -> String {
+    format!(
+        "참고: 이전 파일이 아직 실행 중이라 임시 폴더를 지우지 못했습니다 — {} (그 프로그램을 닫으면 다음 설치·서버 시작 때 정리됩니다)",
+        left.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_left_note_says_when_it_is_cleaned() {
+        let note = staging_left_note(std::path::Path::new(
+            "C:/FrameTrace/tools/python/.deepfake-lens.old-0123",
+        ));
+        assert!(note.contains(".deepfake-lens.old-0123"), "{note}");
+        assert!(note.contains("그 프로그램을 닫으면"), "{note}");
+        assert!(!note.contains("(다음 설치·서버 시작 때 정리)"), "{note}");
+    }
 
     /// `frametrace tools install` refusals before the prompt (unknown tool,
     /// not installable here) are appended to the chained install audit log,

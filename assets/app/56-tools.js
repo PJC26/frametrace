@@ -49,6 +49,8 @@ const HT_STR = {
     stopFail: "중단 요청 실패: {error}",
     notCancellable: "이 단계는 중단할 수 없습니다",
     lost: "설치 상태를 알 수 없습니다 — 다시 시도하십시오",
+    shadow: "PATH의 다른 사본 무시됨",
+    shadowTitle: "FrameTrace는 tools/bin의 것을 씁니다. PATH의 다른 사본(사용 안 함): {paths} — 직접 둔 것이 아니면 확인하십시오.",
     "code.not_installable": "여기서 자동 설치할 수 없습니다",
     "code.unsupported_platform": "이 운영체제에서는 자동 설치를 지원하지 않습니다",
     "code.python_required": "Python이 필요합니다",
@@ -106,6 +108,8 @@ const HT_STR = {
     stopFail: "Stop request failed: {error}",
     notCancellable: "This step cannot be stopped",
     lost: "Install state unknown — try again",
+    shadow: "Other copy on PATH ignored",
+    shadowTitle: "FrameTrace uses the one in tools/bin. Other copy on PATH (not used): {paths} — check it if you did not put it there.",
     "code.not_installable": "Cannot be installed automatically here",
     "code.unsupported_platform": "Automatic install is not supported on this OS",
     "code.python_required": "Python is required",
@@ -137,7 +141,8 @@ const HT_CANCELLED = "install cancelled";
 const HT_LOCKED_STAGES = ["install", "venv", "pip"];
 // Consecutive failed status polls before the tab gives up following.
 const HT_MAX_POLL_FAILS = 20;
-// A `failed` job from before this tab looked is shown only this long.
+// A `failed` job from before this tab looked is shown only this long
+// (judged by the server's clock: J.age_s, or now_unix - finished_unix).
 const HT_RECENT_S = 300;
 // busy: the tool whose install this tab follows (clicked here, or adopted
 // from the server after a refresh / in a second tab); job: its install id.
@@ -152,12 +157,17 @@ function htT(key, subs, locale) {
   const s = key in table ? table[key] : (HT_STR.ko[key] || key);
   return Object.entries(subs || {}).reduce((acc, [k, v]) => acc.split("{" + k + "}").join(String(v)), s);
 }
+const htNum = (v) => (v === null || v === undefined || v === "" ? NaN : Number(v));
 // Pure: an install record (J) → the fields the UI reads, or null.
-function htParseInstall(i) {
+// `serverNow`: the reply's `now_unix` (the server's clock). `age_s` is how
+// long ago the job finished by that clock (J.age_s, else now_unix -
+// finished_unix; null when the server sent neither — an older server).
+function htParseInstall(i, serverNow) {
   if (!i || typeof i !== "object") return null;
-  const fin = i.finished_unix === null || i.finished_unix === undefined || i.finished_unix === "" ? NaN : Number(i.finished_unix);
+  const fin = htNum(i.finished_unix), now = htNum(serverNow), age = htNum(i.age_s);
+  const ageS = Number.isFinite(age) ? age : Number.isFinite(fin) && Number.isFinite(now) ? Math.max(0, now - fin) : null;
   return { id: i.id ?? null, state: String(i.state || "idle"), stage: i.stage || null, tool: i.tool || null, bytes: i.bytes ?? null, total: i.total ?? null, error: i.error || null,
-    finished_unix: Number.isFinite(fin) ? fin : null, cancelled: typeof i.cancelled === "boolean" ? i.cancelled : null };
+    finished_unix: Number.isFinite(fin) ? fin : null, age_s: ageS, cancelled: typeof i.cancelled === "boolean" ? i.cancelled : null };
 }
 // Pure: a `failed` job that ended on a cancel (any tab, the CLI). An older
 // server has no `cancelled` field: its INSTALL_CANCELLED error, or a stop
@@ -168,10 +178,13 @@ function htCancelledJob(install, asked) {
   return install.cancelled !== false && !!asked;
 }
 // Pure: a finished job recent enough to report (an old `failed` job is
-// not re-shown on every refresh / in every tab).
+// not re-shown on every refresh / in every tab). Judged by the server's
+// clock (`age_s`); only an older server without `now_unix` / `age_s` falls
+// back to this browser's clock.
 function htRecent(install, nowS) {
   const f = install && install.finished_unix;
   if (f === null || f === undefined || !Number.isFinite(f)) return false;
+  if (install.age_s !== null && install.age_s !== undefined && Number.isFinite(install.age_s)) return install.age_s <= HT_RECENT_S;
   const now = nowS === undefined || nowS === null ? Date.now() / 1000 : nowS;
   return now - f <= HT_RECENT_S;
 }
@@ -183,7 +196,13 @@ function htStopLocked(install) { return !!(install && HT_LOCKED_STAGES.includes(
 function htParse(res) {
   if (!res || res.ok === false || !Array.isArray(res.tools)) return { supported: false, tools: [], install: null };
   const tools = res.tools.filter(t => t && typeof t === "object" && typeof t.name === "string" && t.name);
-  return { supported: true, tools, install: htParseInstall(res.install) };
+  return { supported: true, tools, install: htParseInstall(res.install, res.now_unix) };
+}
+// Pure: the other copies on PATH that tools/bin takes precedence over
+// (T.shadowed_by values; FrameTrace does not run them).
+function htShadows(t) {
+  const s = t && t.shadowed_by && typeof t.shadowed_by === "object" ? t.shadowed_by : {};
+  return Object.values(s).filter(v => typeof v === "string" && v.trim()).map(v => v.trim());
 }
 // The panel lists binary tools only; on-demand / pip tools (deepfake-lens)
 // are offered only in the in-context prompt.
@@ -274,12 +293,17 @@ function htRowModel(t, install, ctx, locale) {
   const running = mine && htActive(install);
   const sending = c.busy === t.name && !running;
   const res = c.result && c.result.name === t.name ? c.result : null;
+  const shadows = htShadows(t);
+  const shadow = shadows.length ? { text: htT("shadow", null, locale), title: htT("shadowTitle", { paths: shadows.join(", ") }, locale) } : null;
   if (t.installed) {
-    if (res && res.ok) return { name: t.name, label, level: "ok", text: htT("done", { label }, locale), why: "", action: "", progress: "", busy: false };
+    if (res && res.ok) return { name: t.name, label, level: "ok", text: htT("done", { label }, locale), why: "", action: "", progress: "", busy: false, shadow };
+    // Installed from tools/bin, but another copy sits on PATH: one short
+    // line so the examiner can check it is not planted.
+    if (shadow) return { name: t.name, label, level: "info", text: label, why: "", action: "", progress: "", busy: false, shadow };
     return null;
   }
   const level = t.required ? "warn" : "info";
-  const model = { name: t.name, label, level, text: htT(t.required ? "req" : "opt", { label }, locale), why: htWhy(t, locale), action: "", progress: "", busy: false, stop: false, stopBusy: false, note: "", hint: "", reason: "", homepage: "" };
+  const model = { name: t.name, label, level, text: htT(t.required ? "req" : "opt", { label }, locale), why: htWhy(t, locale), action: "", progress: "", busy: false, stop: false, stopBusy: false, note: "", hint: "", reason: "", homepage: "", shadow };
   if (t.installable === true) {
     model.action = "install";
     model.busy = running || sending || !!c.busy || htActive(install);
@@ -315,6 +339,7 @@ function htRowHtml(m, locale) {
     `<span class="sr-only">${esc((HT_WORD[loc] || HT_WORD.ko)[m.level] || "")}: </span><b>${esc(m.text)}</b>` +
     (m.why ? `<small>${esc(m.why)}</small>` : "") + (m.progress ? `<small class="h-tool-prog">${esc(m.progress)}</small>` : "") +
     (m.note ? `<small>${esc(m.note)}</small>` : "") + htHintSmall(m, loc) +
+    (m.shadow ? `<small class="h-tool-shadow" title="${esc(m.shadow.title)}">${esc(m.shadow.text)}</small>` : "") +
     `</span>${btn}</li>`;
 }
 // Pure: the confirm dialog body — file (download.file_name), source host,
@@ -454,7 +479,11 @@ function htAdopt(p) {
   if (HT.busy || HT.timer || HT.polling || !htActive(i) || !i.tool) return;
   HT.busy = i.tool; HT.job = i.id; HT.result = null; HT.note = null; HT.stopping = ""; HT.stopAsked = false; HT.fails = 0;
   HT.timer = setTimeout(htPoll, HT_POLL_MS);
+  // A confirm dialog is open here: its OK will not start a second install.
+  if (HT.confirming) htAnnounceBusy();
 }
+// "다른 설치가 진행 중입니다" — announced again even right after itself.
+function htAnnounceBusy() { HT.live = ""; htAnnounce(htT("busy"), false); }
 async function htLoad() {
   const seq = ++HT.seq;
   const res = typeof jgetSoft === "function" ? await jgetSoft("/api/tools") : null;
@@ -500,7 +529,7 @@ async function htPoll() {
     return;
   }
   HT.fails = 0;
-  const install = htParseInstall(res.install);
+  const install = htParseInstall(res.install, res.now_unix);
   const ours = !!(install && install.tool === name && (HT.job === null || HT.job === undefined || install.id === null || install.id === HT.job));
   if (!ours && htActive(install) && install.tool) {
     HT.busy = install.tool; HT.job = install.id; HT.stopAsked = false; HT.stopping = ""; HT.note = null; HT.result = null;
@@ -549,7 +578,7 @@ async function htFinish(name, install) {
 async function htInstall(name) {
   const t = htFind(name);
   if (!t || t.installable !== true || t.installed) return false;
-  if (HT.busy || HT.confirming || htActive(htParsed().install)) { htAnnounce(htT("busy"), false); return false; }
+  if (HT.busy || HT.confirming || htActive(htParsed().install)) { htAnnounceBusy(); return false; }
   const label = htLabel(t);
   // A double click must not open (and so cancel) a second dialog.
   HT.confirming = true;
@@ -557,12 +586,28 @@ async function htInstall(name) {
   try {
     go = await askDialog({ title: htT("confirmTitle", { label }), html: htConfirmHtml(t), okLabel: htT("confirmOk"), cancelLabel: htT("cancel"), focus: "dlgCancel" });
   } finally { HT.confirming = false; }
-  if (!go || HT.busy) return false;
+  if (!go) return false;
+  // An install was adopted while the dialog was open (another tab, the
+  // CLI): OK does not start a second one — and says so.
+  if (HT.busy || htActive(htParsed().install)) { htAnnounceBusy(); return false; }
   HT.busy = name; HT.job = null; HT.result = null; HT.note = null; HT.stopping = ""; HT.stopAsked = false; HT.fails = 0;
   htRenderAll();
   // Not announced: the POST reply's state follows within milliseconds.
   const res = await jpost("/api/tools/install", { name });
-  if (!res || !res.ok) {
+  if (!res || res.network || res.malformed || (!res.ok && res.status === 0)) {
+    // The reply was lost, not refused: the server may well have started
+    // the install. Ask it, and follow what is running (or report it).
+    HT.busy = "";
+    const p = await htLoad();
+    if (HT.busy) return true;
+    const i = p.install;
+    if (i && i.tool === name && !htActive(i) && htRecent(i)) { await htFinish(name, i); return false; }
+    HT.result = { name, ok: false, text: htT("lost") };
+    htRenderAll();
+    htAnnounce(HT.result.text, true);
+    return false;
+  }
+  if (!res.ok) {
     HT.busy = "";
     const r = htRefusal(res, t);
     HT.result = Object.assign({ name, ok: false }, r);
@@ -572,7 +617,7 @@ async function htInstall(name) {
     if (res && res.code === "install_running") await htLoad();
     return false;
   }
-  const install = htParseInstall(res.install);
+  const install = htParseInstall(res.install, res.now_unix);
   if (install && install.tool === name) { HT.job = install.id; htSetInstall(install); htRenderAll(); if (htActive(install)) htAnnounce(htT(install.state) + " — " + label); }
   HT.timer = setTimeout(htPoll, HT_POLL_MS);
   return true;
@@ -583,18 +628,21 @@ async function htCancel(name) {
   if (!name || HT.busy !== name || HT.stopping) return false;
   HT.stopping = name; HT.note = null;
   htRenderAll();
-  const res = await jpost("/api/tools/install-cancel", {});
+  // The job id: a late click never stops another tab's newer install
+  // (the server answers `stale_job`).
+  const res = await jpost("/api/tools/install-cancel", HT.job === null || HT.job === undefined ? {} : { id: HT.job });
   if (HT.busy !== name) { HT.stopping = ""; return false; }
   if (res && res.ok) {
     HT.stopAsked = true;
-    const install = htParseInstall(res.install);
+    const install = htParseInstall(res.install, res.now_unix);
     if (install && install.tool === name) htSetInstall(install);
     htRenderAll();
     htAnnounce(htT("stopping"));
     return true;
   }
   HT.stopping = "";
-  if (res && res.code === "no_install") { htRenderAll(); return false; } // already ended: the next poll shows it
+  // Already ended (or replaced by another job): the next poll shows it.
+  if (res && (res.code === "no_install" || res.code === "stale_job")) { htRenderAll(); return false; }
   HT.note = { name, text: res && res.code === "not_cancellable" ? htT("notCancellable") : htT("stopFail", { error: (res && res.error) || htT("unknown") }) };
   htRenderAll();
   htAnnounce(HT.note.text, false);

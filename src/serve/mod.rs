@@ -1612,7 +1612,9 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("GET", "/api/tools") => json(tools::api_tools(request, state)),
         ("GET", "/api/tools/install-status") => json(tools::api_tools_install_status(state)),
         ("POST", "/api/tools/install") => json(tools::api_tools_install(request, state)),
-        ("POST", "/api/tools/install-cancel") => json(tools::api_tools_install_cancel(state)),
+        ("POST", "/api/tools/install-cancel") => {
+            json(tools::api_tools_install_cancel(request, state))
+        }
         _ => plain(404, b"not found".to_vec()),
     }
 }
