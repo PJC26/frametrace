@@ -42,6 +42,9 @@ async function loadEnv() {
       dfBtn.setAttribute("title",
         dfOk ? "케이스의 모든 파일을 deepfake-lens로 스크리닝 — 결과는 '합성의심' 배지로 표시" : "deepfake-lens 미설치 — PyPI에 없음: 받은 패키지를 pip install <경로>로 설치하거나 FRAMETRACE_DEEPFAKE_LENS 경로 설정");
     }
+    // §28: /api/tools may have answered first — re-apply its verdict
+    // (re-enabled only when deepfake-lens is installable here).
+    if (!dfOk && typeof htSyncDeepfake === "function") htSyncDeepfake();
   } catch (e) { console.error("loadEnv failed:", e); }
 }
 

@@ -371,8 +371,15 @@ const PAGES = [
     await page.waitForSelector('#hViewerHost:not([hidden]), #inputCard:not([hidden])', { timeout: 20000 });
     if (await page.locator('#hViewerHost').isVisible()) { await page.click('#hProjectBtn'); await page.click('#hProjectNew'); }
     await page.waitForSelector('#hToolsPanel:not([hidden])', { timeout: 8000 });
-    await page.click('#hToolsList button[data-tool-install="libewf"]');
+    await page.click('#hToolsList button[data-tool-install="ffmpeg"]');
     await page.waitForSelector('#dlgBackdrop:not([hidden])');
+    await page.waitForTimeout(300);
+  } },
+  // A running install (followed after a reload): progress + [중단].
+  { id: 'shell-empty-tools-running', path: '/', route: (page) => routeTools(page, { steps: 100000, install: { id: 1, tool: 'ffmpeg', state: 'downloading', stage: 'download', bytes: 1048576, total: 4194304, error: null, started_unix: 1, finished_unix: null, installed_files: [], audit_warning: null } }), prep: async (page) => {
+    await page.waitForSelector('#hViewerHost:not([hidden]), #inputCard:not([hidden])', { timeout: 20000 });
+    if (await page.locator('#hViewerHost').isVisible()) { await page.click('#hProjectBtn'); await page.click('#hProjectNew'); }
+    await page.waitForSelector('#hToolsList button[data-tool-cancel="ffmpeg"]', { timeout: 8000 });
     await page.waitForTimeout(300);
   } },
   { id: 'shell-project', path: '/', prep: waitProject },
