@@ -104,6 +104,8 @@ The Windows distribution built by `scripts/package-windows.ps1` (`FrameTrace-<ve
 
 Every tool is pinned in `tools/manifest.json` (version, URL, size and the publisher's SHA-256, compiled into the binary). Downloads use Windows' own `curl.exe` (HTTPS only, every redirect checked against the manifest's host allowlist) and `tar.exe`; a size or hash mismatch, or an archive entry that is absolute, climbs with `..` or is a link, refuses the install and leaves nothing behind. Each attempt appends one line to `tools\install-audit.jsonl`. Tools without a published checksum (libewf, The Sleuth Kit, deepfake-lens today) show a manual-install hint instead. PATH is still searched before `tools\bin`. Licenses: `THIRD_PARTY_NOTICES.md` and `tools\bin\licenses\`.
 
+The bundled LGPL FFmpeg has no libx264 (GPL). FrameTrace asks the resolved `ffmpeg -encoders` once and encodes proxies and MP4 clips with the best H.264 encoder that build really has — `libx264` → `libopenh264` → `h264_mf` (Windows Media Foundation) → `mpeg4` as a last resort — with `aac` audio (AVI clips: `libmp3lame`, else native `mp2`). The chosen encoders are written to each proxy/export audit line (`video_encoder`, `audio_encoder`), and `frametrace doctor` / `GET /api/tools` say when the build lacks libx264 (e.g. "LGPL 빌드 — H.264는 h264_mf 사용"). Output names and containers (`.mp4`, `.avi`) do not change.
+
 ```powershell
 cargo build --release
 .\target\release\frametrace.exe init-case C:\Cases\case-001 --title "Sample CCTV review"
@@ -189,7 +191,7 @@ For file-system-aware deleted-file triage, install Sleuth Kit tools in `PATH` an
 
 ## Deepfake Screening (deepfake-lens sidecar)
 
-FrameTrace can screen evidence for synthetic-media signals through the optional deepfake-lens sidecar (`pip install deepfake-lens`, or point `FRAMETRACE_DEEPFAKE_LENS` at the binary). It runs as a local subprocess — the same boundary as ffprobe — and its scores are review-priority signals, not authenticity verdicts: `high` means "review first", never "confirmed synthetic".
+FrameTrace can screen evidence for synthetic-media signals through the optional deepfake-lens sidecar. deepfake-lens is **not published on PyPI** (`pip install deepfake-lens` does not work): install the package you were given from its checkout or wheel (`pip install <path-to-deepfake-lens>`, which puts `deepfake-lens` on PATH), point `FRAMETRACE_DEEPFAKE_LENS` at the `deepfake-lens` executable, or set `FRAMETRACE_DEEPFAKE_LENS_HOME=<checkout root>` so FrameTrace can run `python -m deepfake_lens.cli`. It runs as a local subprocess — the same boundary as ffprobe — and its scores are review-priority signals, not authenticity verdicts: `high` means "review first", never "confirmed synthetic".
 
 ```bash
 cargo run -- scan-folder ./case-001 /path/to/evidence --deepfake

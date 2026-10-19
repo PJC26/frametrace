@@ -20,6 +20,11 @@ the binaries in `tools/bin/licenses/`.
 - Binary: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1.zip
   (SHA-256 `4a7642b2264c03e8a0ce8a3825b933ee5580656f45695a086fe7e294045ffc0a`,
   from that release's `checksums.sha256`).
+- Being an LGPL build, it contains **no GPL encoders such as libx264**. FrameTrace
+  detects the encoders of whichever ffmpeg it resolves and uses libx264 only
+  when that build has it; with this bundle H.264 comes from `libopenh264`
+  (BSD-2-Clause, Cisco) or `h264_mf` (Windows Media Foundation, part of
+  Windows), and audio from FFmpeg's native `aac`.
 - FrameTrace runs `ffmpeg.exe` / `ffprobe.exe` as separate programs; it does
   not link FFmpeg's libraries. You may replace them with another build in
   `tools/bin` (or on `PATH`).
@@ -30,4 +35,4 @@ the binaries in `tools/bin/licenses/`.
 | --- | --- | --- | --- |
 | libewf (`ewfinfo`, `ewfverify`, `ewfexport`) | LGPL-3.0-or-later | https://github.com/libyal/libewf | Manual — no official Windows binaries (`scripts/build-libewf-tools.ps1` builds from source). |
 | The Sleuth Kit (`mmls`, `fls`, `icat`) | IPL-1.0 / CPL-1.0 core, per-file licenses (https://www.sleuthkit.org/sleuthkit/licenses.php) | https://www.sleuthkit.org/sleuthkit/ | Manual — the project publishes PGP signatures, not checksums. |
-| deepfake-lens | per its distribution | not on PyPI | Manual (`FRAMETRACE_DEEPFAKE_LENS`); the on-demand pip installer stays disabled until every wheel can be hash-pinned. |
+| deepfake-lens | per its distribution | not on PyPI — the checkout or wheel you were given | Manual (`FRAMETRACE_DEEPFAKE_LENS`); the on-demand pip installer stays disabled until every wheel can be hash-pinned. |

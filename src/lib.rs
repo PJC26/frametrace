@@ -16,6 +16,7 @@ pub mod detector;
 pub mod dfxml;
 pub mod diskspace;
 pub mod e01;
+pub mod ffmpeg_encoders;
 pub mod ffprobe;
 pub mod hikvision;
 pub mod hmac;

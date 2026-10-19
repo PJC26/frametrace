@@ -14,10 +14,12 @@
 //!   1. `FRAMETRACE_DEEPFAKE_LENS` env var (full path or bare name)
 //!   2. the private venv of an on-demand install
 //!      (`<exe dir>/tools/python/deepfake-lens`, src/tool_install)
-//!   3. `deepfake-lens` on PATH (i.e. `pip install deepfake-lens`)
+//!   3. `deepfake-lens` on PATH
 //!
-//! Install: `pip install deepfake-lens` (or `pip install -e D:\devin\deepfake-lens`
-//! for the local checkout). Optional model weights live under the
+//! Install: deepfake-lens is not published on PyPI, so install it from
+//! its checkout or wheel (`pip install -e <checkout>` / `pip install
+//! <wheel>`), or set `FRAMETRACE_DEEPFAKE_LENS_HOME=<checkout root>` for
+//! the `python -m deepfake_lens.cli` fallback. Optional model weights live under the
 //! package's models/ dir; missing weights degrade to heuristic scoring.
 
 use crate::tool_policy::resolve_tool_binary;

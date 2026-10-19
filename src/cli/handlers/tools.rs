@@ -29,6 +29,13 @@ pub fn tools_list(json: bool, all: bool) -> Result<(), String> {
         println!("{} {version} [{need}] — {}", tool.name, status.label());
         for (binary, path) in &status.paths {
             println!("  {binary}: {}", path.as_deref().unwrap_or("없음"));
+            if binary == "ffmpeg"
+                && let Some(note) = path
+                    .as_deref()
+                    .and_then(|path| crate::ffmpeg_encoders::for_binary(path).build_note())
+            {
+                println!("  참고: {note}");
+            }
         }
         if !status.installed() {
             match tool_install::not_installable_reason(tool) {

@@ -87,9 +87,13 @@ pub fn generate_proxy(
     };
     ensure_parent(&output_path)?;
 
-    let args = proxy_ffmpeg_args(&source_path, &output_path, options);
     let ffmpeg = resolve_tool_binary("ffmpeg", &["ffmpeg"])
         .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
+    // The bundled LGPL ffmpeg has no libx264: use the best H.264 encoder
+    // this build really has (recorded in the proxy log).
+    let encoders = crate::ffmpeg_encoders::for_binary(&ffmpeg);
+    let codecs = encoders.choice(encoders.video(), encoders.aac());
+    let args = proxy_ffmpeg_args(&source_path, &output_path, options, &codecs);
     let mut command = Command::new(&ffmpeg);
     command.args(&args);
     let output = crate::util::run_with_timeout(
@@ -135,6 +139,7 @@ pub fn generate_proxy(
         "artifacts/proxies/proxy-log.jsonl",
         &artifact,
         &args,
+        Some(&codecs),
     )?;
     Ok(artifact)
 }
@@ -217,6 +222,7 @@ pub fn generate_thumbnail(
         "artifacts/thumbnails/thumbnail-log.jsonl",
         &artifact,
         &args,
+        None,
     )?;
     Ok(artifact)
 }
@@ -355,9 +361,10 @@ fn proxy_ffmpeg_args(
     source_path: &Path,
     output_path: &Path,
     options: &ProxyOptions,
+    codecs: &crate::ffmpeg_encoders::CodecChoice,
 ) -> Vec<String> {
     let scale = format!("scale='min({},{})':-2", options.max_width, "iw");
-    vec![
+    let mut args = vec![
         // Output path was exclusively claimed by unique_path's O_EXCL
         // reservation; -y overwrites our own placeholder by design.
         "-y".to_string(),
@@ -370,20 +377,16 @@ fn proxy_ffmpeg_args(
         "0:v:0".to_string(),
         "-map".to_string(),
         "0:a?".to_string(),
-        "-c:v".to_string(),
-        "libx264".to_string(),
-        "-preset".to_string(),
-        "veryfast".to_string(),
-        "-crf".to_string(),
-        "28".to_string(),
-        "-pix_fmt".to_string(),
-        "yuv420p".to_string(),
+    ];
+    args.extend(codecs.video_args(crate::ffmpeg_encoders::Purpose::Proxy));
+    args.extend([
         "-c:a".to_string(),
-        "aac".to_string(),
+        codecs.audio.to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
         audit::path_string(output_path),
-    ]
+    ]);
+    args
 }
 
 fn thumbnail_ffmpeg_args(
@@ -421,6 +424,7 @@ fn append_artifact_log(
     relative_log: &str,
     artifact: &DerivedArtifact,
     command_args: &[String],
+    codecs: Option<&crate::ffmpeg_encoders::CodecChoice>,
 ) -> Result<(), String> {
     let path = case_dir.join(relative_log);
     let source_sha256 = audit::indexed_source_hash(
@@ -430,7 +434,7 @@ fn append_artifact_log(
     );
     let output_sha256 = audit::digest_file(&artifact.output_path)?;
     let line = format!(
-        "{{\"schema_version\":2,\"event\":\"make-{}\",\"created_unix\":{},\"kind\":\"{}\",\"source_path\":\"{}\",\"source_index_sha256\":{},\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"ffmpeg_version\":\"{}\",\"command\":\"ffmpeg\",\"command_args\":{}}}",
+        "{{\"schema_version\":2,\"event\":\"make-{}\",\"created_unix\":{},\"kind\":\"{}\",\"source_path\":\"{}\",\"source_index_sha256\":{},\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"ffmpeg_version\":\"{}\",\"command\":\"ffmpeg\",\"command_args\":{}{}}}",
         json_escape(&artifact.kind),
         artifact.created_unix,
         json_escape(&artifact.kind),
@@ -439,7 +443,10 @@ fn append_artifact_log(
         json_escape(&artifact.output_path.to_string_lossy()),
         json_escape(&output_sha256),
         json_escape(&command_version("ffmpeg", &["ffmpeg"], "-version")),
-        audit::json_string_array(command_args)
+        audit::json_string_array(command_args),
+        codecs
+            .map(|codecs| codecs.audit_fields())
+            .unwrap_or_default()
     );
     audit::append_chained_jsonl(&path, &line)
 }
@@ -540,6 +547,7 @@ mod tests {
             Path::new("in.mp4"),
             Path::new("proxy.mp4"),
             &ProxyOptions::default(),
+            &crate::ffmpeg_encoders::CodecChoice::legacy_h264(),
         );
         assert!(proxy_args.contains(&"libx264".to_string()));
         assert_eq!(proxy_args.last().map(String::as_str), Some("proxy.mp4"));
@@ -551,5 +559,48 @@ mod tests {
         );
         assert!(thumb_args.contains(&"-frames:v".to_string()));
         assert_eq!(thumb_args.last().map(String::as_str), Some("thumb.jpg"));
+    }
+
+    /// LGPL-like fake ffmpeg (no libx264, has h264_mf and aac) → h264_mf;
+    /// a full build keeps libx264; a build with no H.264 → mpeg4.
+    #[test]
+    fn proxy_args_follow_detected_encoders() {
+        use crate::ffmpeg_encoders::{self as enc, tests as fixtures};
+        let dir = std::env::temp_dir().join(format!("ft-proxy-enc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let build = |name: &str, listing: &str| {
+            let encoders = enc::for_binary(&fixtures::fake_ffmpeg(&dir.join(name), listing));
+            assert!(encoders.probed());
+            let codecs = encoders.choice(encoders.video(), encoders.aac());
+            proxy_ffmpeg_args(
+                Path::new("in.mp4"),
+                Path::new("proxy.mp4"),
+                &ProxyOptions::default(),
+                &codecs,
+            )
+        };
+        let lgpl = build("lgpl", fixtures::LGPL);
+        assert!(
+            lgpl.windows(2).any(|w| w == ["-c:v", "h264_mf"]),
+            "{lgpl:?}"
+        );
+        assert!(!lgpl.contains(&"libx264".to_string()));
+        assert!(!lgpl.contains(&"-crf".to_string()));
+        assert!(lgpl.windows(2).any(|w| w == ["-c:a", "aac"]));
+        let full = build("full", fixtures::FULL);
+        assert_eq!(
+            full,
+            proxy_ffmpeg_args(
+                Path::new("in.mp4"),
+                Path::new("proxy.mp4"),
+                &ProxyOptions::default(),
+                &enc::CodecChoice::legacy_h264(),
+            ),
+            "a full build keeps the historical libx264 command"
+        );
+        let bare = build("bare", fixtures::BARE);
+        assert!(bare.windows(2).any(|w| w == ["-c:v", "mpeg4"]), "{bare:?}");
+        assert_eq!(bare.last().map(String::as_str), Some("proxy.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

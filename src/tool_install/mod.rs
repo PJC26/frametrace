@@ -530,6 +530,15 @@ pub fn tool_json(tool: &ToolEntry, status: &ToolStatus) -> serde_json::Value {
         "installable": reason.is_none(),
         "not_installable_reason": reason,
         "manual_hint": tool.manual_hint,
+        // The resolved ffmpeg's encoders (an LGPL build has no libx264;
+        // `note` says which H.264 encoder is used instead). Probed once
+        // per binary (cached), never under the server's state lock.
+        "encoders": status
+            .paths
+            .iter()
+            .find(|(binary, _)| binary == "ffmpeg")
+            .and_then(|(_, path)| path.as_deref())
+            .map(|path| crate::ffmpeg_encoders::for_binary(path).to_json()),
         "download": if tool.kind == ToolKind::Archive && tool.sha256.is_some() {
             serde_json::json!({
                 "file_name": tool.file_name,

@@ -34,8 +34,11 @@ measured false-positive/false-negative behaviour (see
 ## Resolution order
 
 1. `FRAMETRACE_DEEPFAKE_LENS` env var — full path or bare tool name
-2. `deepfake-lens` on PATH (`pip install deepfake-lens`)
-3. Fallback: `python -m deepfake_lens.cli` — for source checkouts set
+2. the private venv of an on-demand install (`<exe dir>/tools/python/deepfake-lens`;
+   disabled until deepfake-lens has hash-pinnable published wheels)
+3. `deepfake-lens` on PATH — deepfake-lens is **not on PyPI**, so install it
+   from the checkout or wheel you were given (`pip install <path>`)
+4. Fallback: `python -m deepfake_lens.cli` — for source checkouts set
    `FRAMETRACE_DEEPFAKE_LENS_HOME=<repo root>` so PYTHONPATH resolves.
 
 ## CLI

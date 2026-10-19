@@ -137,14 +137,21 @@ pub fn export_video(
     // C4: ffmpeg writes a pid-tagged `.part`; only a complete, non-empty
     // clip ever gets the deliverable's name (a killed export leaves the
     // `.part`, which the server sweeps).
+    let ffmpeg = resolve_tool_binary("ffmpeg", &["ffmpeg"])
+        .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
+    // The bundled LGPL ffmpeg has no libx264: pick the encoders this build
+    // really has, and log the same pick (reproducible command line).
+    let codecs = export_codecs(&crate::ffmpeg_encoders::for_binary(&ffmpeg), options.format);
     let part = crate::join::pid_part_path(&output_path, std::process::id());
     if let Err(err) = run_ffmpeg_export(
+        &ffmpeg,
         case_dir,
         &source_path,
         &output_path,
         &part,
         options,
         label_sha256,
+        &codecs,
     ) {
         let _ = crate::join::remove_file_retry(&part);
         return Err(err);
@@ -171,6 +178,7 @@ pub fn export_video(
         options,
         indexed_sha256.as_deref(),
         export_sha256.as_deref(),
+        &codecs,
     )?;
 
     Ok(ExportResult {
@@ -180,15 +188,40 @@ pub fn export_video(
     })
 }
 
+/// The encoders for one export: MP4 = best H.264 (libx264 -> libopenh264 ->
+/// h264_mf -> mpeg4) + aac; AVI = mpeg4 + MP3 (libmp3lame) or native MP2.
+fn export_codecs(
+    encoders: &crate::ffmpeg_encoders::Encoders,
+    format: ExportFormat,
+) -> crate::ffmpeg_encoders::CodecChoice {
+    match format {
+        ExportFormat::Mp4 => encoders.choice(encoders.video(), encoders.aac()),
+        ExportFormat::Avi => encoders.choice(
+            crate::ffmpeg_encoders::VideoEncoder::Mpeg4,
+            encoders.avi_audio(),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_export(
+    ffmpeg: &str,
     case_dir: &Path,
     source_path: &Path,
     output_path: &Path,
     write_path: &Path,
     options: &ExportOptions,
     source_sha256: Option<&str>,
+    codecs: &crate::ffmpeg_encoders::CodecChoice,
 ) -> Result<(), String> {
-    let mut args = ffmpeg_export_args(case_dir, source_path, output_path, options, source_sha256);
+    let mut args = ffmpeg_export_args(
+        case_dir,
+        source_path,
+        output_path,
+        options,
+        source_sha256,
+        codecs,
+    );
     // The container is named by `-f` (the `.part` name has no usable
     // extension); ffmpeg writes to the in-progress name.
     if let Some(last) = args.last_mut() {
@@ -196,8 +229,6 @@ fn run_ffmpeg_export(
     }
     let final_path = output_path;
     let output_path = write_path;
-    let ffmpeg = resolve_tool_binary("ffmpeg", &["ffmpeg"])
-        .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
     // Windows ffmpeg builds neither accept non-ASCII argv text nor resolve
     // absolute font paths inside filter options (any scheme — C:/, /c/ —
     // silently falls back to a Latin-only font, boxing Hangul). The label
@@ -224,7 +255,7 @@ fn run_ffmpeg_export(
     } else {
         None
     };
-    let mut command = Command::new(&ffmpeg);
+    let mut command = Command::new(ffmpeg);
     command.args(&args);
     if let Some(dir) = &label_cwd {
         command.current_dir(dir);
@@ -267,6 +298,7 @@ fn ffmpeg_export_args(
     output_path: &Path,
     options: &ExportOptions,
     source_sha256: Option<&str>,
+    codecs: &crate::ffmpeg_encoders::CodecChoice,
 ) -> Vec<String> {
     let mut args = vec![
         // The output path was claimed exclusively by unique_path's O_EXCL
@@ -312,28 +344,18 @@ fn ffmpeg_export_args(
 
     match options.format {
         ExportFormat::Mp4 => {
+            args.extend(codecs.video_args(crate::ffmpeg_encoders::Purpose::Export));
             args.extend(
-                [
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "20",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-movflags",
-                    "+faststart",
-                ]
-                .iter()
-                .map(|arg| arg.to_string()),
+                ["-c:a", codecs.audio, "-movflags", "+faststart"]
+                    .iter()
+                    .map(|arg| arg.to_string()),
             );
         }
         ExportFormat::Avi => {
+            // Historical AVI line (no -pix_fmt); only the audio encoder
+            // depends on the build.
             args.extend(
-                ["-c:v", "mpeg4", "-q:v", "3", "-c:a", "libmp3lame"]
+                ["-c:v", "mpeg4", "-q:v", "3", "-c:a", codecs.audio]
                     .iter()
                     .map(|arg| arg.to_string()),
             );
@@ -653,6 +675,7 @@ fn resolve_through_records(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_export_log(
     case_dir: &Path,
     selector: &str,
@@ -661,17 +684,18 @@ fn write_export_log(
     options: &ExportOptions,
     source_index_sha256: Option<&str>,
     source_export_sha256: Option<&str>,
+    codecs: &crate::ffmpeg_encoders::CodecChoice,
 ) -> Result<(), String> {
     let path = case_dir.join("artifacts/clips/export-log.jsonl");
     let exported_unix = now_unix()?;
     let output_sha256 = audit::digest_file(output_path)?;
-    let args = ffmpeg_export_args(case_dir, source_path, output_path, options, None);
+    let args = ffmpeg_export_args(case_dir, source_path, output_path, options, None, codecs);
     let source_hash_mismatch = match (source_index_sha256, source_export_sha256) {
         (Some(indexed), Some(live)) => Some(indexed != live),
         _ => None,
     };
     let line = format!(
-        "{{\"schema_version\":2,\"event\":\"export-video\",\"exported_unix\":{},\"selector\":\"{}\",\"source_path\":\"{}\",\"source_index_sha256\":{},\"source_sha256\":{},\"source_hash_mismatch\":{},\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"format\":\"{}\",\"start_seconds\":{},\"duration_seconds\":{},\"burn_in\":{},\"ffmpeg_version\":\"{}\",\"command\":\"ffmpeg\",\"command_args\":{}}}",
+        "{{\"schema_version\":2,\"event\":\"export-video\",\"exported_unix\":{},\"selector\":\"{}\",\"source_path\":\"{}\",\"source_index_sha256\":{},\"source_sha256\":{},\"source_hash_mismatch\":{},\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"format\":\"{}\",\"start_seconds\":{},\"duration_seconds\":{},\"burn_in\":{},\"ffmpeg_version\":\"{}\",\"command\":\"ffmpeg\",\"command_args\":{}{}}}",
         exported_unix,
         json_escape(selector),
         json_escape(&source_path.to_string_lossy()),
@@ -691,7 +715,8 @@ fn write_export_log(
             .map(|spec| format!("{{\"exhibit\":\"{}\"}}", json_escape(&spec.exhibit)))
             .unwrap_or_else(|| "null".to_string()),
         json_escape(&command_version("ffmpeg", &["ffmpeg"], "-version")),
-        audit::json_string_array(&args)
+        audit::json_string_array(&args),
+        codecs.audit_fields()
     );
     audit::append_chained_jsonl(&path, &line)
 }
@@ -803,11 +828,75 @@ mod tests {
             Path::new("out.mp4"),
             &options,
             None,
+            &crate::ffmpeg_encoders::CodecChoice::legacy_h264(),
         );
         assert!(args.contains(&"-y".to_string()));
         assert!(!args.contains(&"-n".to_string()));
         assert!(args.contains(&"libx264".to_string()));
         assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+    }
+
+    /// LGPL-like fake ffmpeg -> h264_mf + aac; full -> libx264 unchanged;
+    /// no H.264 -> mpeg4 (still mp4). AVI uses MP2 when libmp3lame is absent.
+    #[test]
+    fn export_args_follow_detected_encoders() {
+        use crate::ffmpeg_encoders::{self as enc, tests as fixtures};
+        let dir = std::env::temp_dir().join(format!("ft-export-enc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut options = ExportOptions {
+            format: ExportFormat::Mp4,
+            start_seconds: None,
+            duration_seconds: None,
+            output_path: None,
+            timeout_secs: None,
+            burn_in: None,
+            hash_source: false,
+        };
+        let args_for = |name: &str, listing: &str, options: &ExportOptions| {
+            let encoders = enc::for_binary(&fixtures::fake_ffmpeg(&dir.join(name), listing));
+            assert!(encoders.probed());
+            let codecs = super::export_codecs(&encoders, options.format);
+            ffmpeg_export_args(
+                Path::new("."),
+                Path::new("in.mp4"),
+                Path::new("out.mp4"),
+                options,
+                None,
+                &codecs,
+            )
+        };
+        let lgpl = args_for("lgpl", fixtures::LGPL, &options);
+        assert!(
+            lgpl.windows(2).any(|w| w == ["-c:v", "h264_mf"]),
+            "{lgpl:?}"
+        );
+        assert!(lgpl.windows(2).any(|w| w == ["-rate_control", "quality"]));
+        assert!(!lgpl.contains(&"libx264".to_string()) && !lgpl.contains(&"-crf".to_string()));
+        assert!(lgpl.windows(2).any(|w| w == ["-c:a", "aac"]));
+        assert!(lgpl.windows(2).any(|w| w == ["-f", "mp4"]));
+        let full = args_for("full", fixtures::FULL, &options);
+        assert_eq!(
+            full,
+            ffmpeg_export_args(
+                Path::new("."),
+                Path::new("in.mp4"),
+                Path::new("out.mp4"),
+                &options,
+                None,
+                &enc::CodecChoice::legacy_h264(),
+            )
+        );
+        assert!(full.windows(2).any(|w| w == ["-crf", "20"]));
+        let bare = args_for("bare", fixtures::BARE, &options);
+        assert!(bare.windows(2).any(|w| w == ["-c:v", "mpeg4"]), "{bare:?}");
+        assert!(bare.windows(2).any(|w| w == ["-f", "mp4"]));
+
+        options.format = ExportFormat::Avi;
+        let avi = args_for("lgpl", fixtures::LGPL, &options);
+        assert!(avi.windows(2).any(|w| w == ["-c:a", "mp2"]), "{avi:?}");
+        let avi_full = args_for("full", fixtures::FULL, &options);
+        assert!(avi_full.windows(2).any(|w| w == ["-c:a", "libmp3lame"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

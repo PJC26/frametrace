@@ -66,6 +66,14 @@
   - 설치 중에는 busy를 잡으므로 분석 시작 등은 기존 busy 오류로 거부된다. 성공하면 `/api/env` 캐시가 비워져 다음 호출이 다시 확인한다.
 - 합성 영상 검사(`POST /api/start` + `with_deepfake:true`, `POST /api/advanced` + `tool:"deepfake"`)에서 deepfake-lens가 없으면 → `{"ok":false,"code":"tool_missing","tool_missing":"deepfake-lens","error":"…","installable":bool,"not_installable_reason":…,"manual_hint":…,"install":{"method":"POST","path":"/api/tools/install","body":{"name":"deepfake-lens"}}}` (busy를 잡기 전에 반환).
 
+### LGPL FFmpeg와 인코더 (통합 수정, 2026-10-19)
+- 번들 FFmpeg는 LGPL 빌드라 **libx264(GPL)가 없다**. 프록시·MP4 내보내기가 `-c:v libx264`로 고정돼 있어 번들만 있으면 실패했다.
+- `src/ffmpeg_encoders.rs`: 해석된 ffmpeg에 `-hide_banner -encoders`를 한 번 묻고(`run_with_timeout_detailed`·콘솔 숨김·버전 확인 시간 제한, ffmpeg 경로+mtime+크기별 캐시, state_lock 밖) 순서 libx264 → libopenh264 → h264_mf → mpeg4로 고른다. 인코더별 옵션: libx264 `-preset veryfast -crf 28/20`(종전 그대로), libopenh264 `-b:v 2M/8M`, h264_mf `-rate_control quality -quality 55/75`, mpeg4 `-q:v 5/3`; 모두 `-pix_fmt yuv420p`. 오디오는 네이티브 `aac`(없고 libfdk_aac만 있으면 그것), AVI는 libmp3lame 있으면 그것, 없으면 네이티브 `mp2`. 확인 자체가 실패하면 종전 가정(libx264)으로 두어 ffmpeg가 직접 오류를 낸다.
+- 감사 줄(`proxy-log.jsonl`의 `make-proxy`, `export-log.jsonl`의 `export-video`)에 `video_encoder`·`audio_encoder`·`encoder_source`를 추가(`command_args`도 실제 인자). 출력 이름·컨테이너(mp4/avi)는 그대로.
+- `frametrace doctor`의 ffmpeg 줄, `frametrace tools list`, `GET /api/tools`의 ffmpeg 항목 `encoders{probed,libx264,h264,aac,avi_audio,note}`이 libx264 없는 빌드를 알린다(예: "LGPL 빌드 — H.264는 h264_mf 사용"; H.264가 하나도 없으면 doctor는 WARN).
+- deepfake-lens는 **PyPI에 없다** → README·`docs/DEEPFAKE_LENS.md`·`src/deepfake.rs`의 `pip install deepfake-lens` 안내를 "받은 체크아웃/휠에서 `pip install <경로>`, 또는 `FRAMETRACE_DEEPFAKE_LENS`/`FRAMETRACE_DEEPFAKE_LENS_HOME`"으로 고쳤다.
+- 확인 못 한 것: 실제 BtbN LGPL zip의 `-encoders` 목록(libopenh264 포함 여부)은 내려받지 않아 직접 보지 않았다 — 어느 쪽이든 h264_mf(Windows 기본)로 떨어진다. h264_mf 인자는 이 PC의 full 빌드(7.1)로 실제 인코딩해 확인했다.
+
 ### 남은 일
 - 실제 FFmpeg zip으로의 설치·패키징은 이 세션에서 내려받지 않았다 → windows-ci의 package 단계와 Windows 실기 `frametrace tools install ffmpeg`로 첫 확인 필요.
 - libewf·Sleuth Kit·deepfake-lens는 공식 체크섬(또는 PyPI 배포)이 생기면 매니페스트·`REQUIREMENTS` 표에 추가.

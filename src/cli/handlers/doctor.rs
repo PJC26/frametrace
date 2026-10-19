@@ -585,6 +585,18 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
         ("icat", "inode 내용 복구"),
     ] {
         match crate::tool_policy::resolve_tool_binary(name, &[name]) {
+            Ok(found) if name == "ffmpeg" => {
+                // The bundled LGPL build has no libx264: say which H.264
+                // encoder proxies/exports will use instead.
+                let encoders = crate::ffmpeg_encoders::for_binary(&found);
+                checks.push(match encoders.build_note() {
+                    Some(note) if !encoders.video().is_h264() => {
+                        DoctorCheck::warn(name, format!("{found} — {feature} · {note}"))
+                    }
+                    Some(note) => DoctorCheck::ok(name, format!("{found} — {feature} · {note}")),
+                    None => DoctorCheck::ok(name, format!("{found} — {feature}")),
+                });
+            }
             Ok(found) => checks.push(DoctorCheck::ok(name, format!("{found} — {feature}"))),
             Err(err) => checks.push(DoctorCheck::warn(
                 name,
