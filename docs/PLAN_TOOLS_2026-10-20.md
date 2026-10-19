@@ -203,3 +203,39 @@
 ### 확인 못 한 것
 - 실제 h264_mf가 느리거나 멈추는 상황(첫 MF 초기화, 백신 검사, N/KN)은 재현하지 못했다 — 가짜 ffmpeg의 잠자는 시험으로만 확인.
 - Linux/macOS clippy·테스트는 이 PC(Windows)에서 돌리지 못했다 — 바꾼 `cfg(not(windows))` 코드는 테스트용 가짜 ffmpeg 스크립트의 `[ -e awake ] || sleep` 한 줄뿐이고, 새 `remove_dir_unless_in_use`는 플랫폼 공통 코드(유닉스에서는 이름 바꾸기가 항상 되므로 종전처럼 지운다 — 열린 파일도 지울 수 있는 OS).
+
+## §옵션 C as implemented (2026-10-20)
+
+계획: `docs/PLAN_TOOLS_C_2026-10-20.md`. 문서 행(THIRD_PARTY_NOTICES·README·WINDOWS_USAGE·repro-build·security-review·HANDOFF·이 문서의 T5/T6·§옵션 C·구성 요소 표)은 a8b7f69. 코드·스크립트·CI·테스트는 아래 세 커밋.
+
+### 패키징·CI (P1–P6)
+- `scripts/make-portable.ps1`이 유일한 패키지 스크립트: .NET SHA-256(`Get-Sha256Hex`), `ZipFile.CreateFromDirectory`(UseBackslash off) + 쓴 뒤 항목 검사(`\`·안전하지 않은 이름), `-SkipBuild`·`-Version`(경로 같은 값 거부), BOM 유지. 스테이지에 `LICENSE`·`THIRD_PARTY_NOTICES.md` 추가. `README-tools.txt` 3번째 줄은 계획 문구 그대로.
+- **FFmpeg 배제**: `tools/bin`/`target/release/tools/bin`을 파일 단위로 복사하며 `ffmpeg*.exe`·`ffprobe*.exe`·`ffplay*.exe`·FFmpeg 공유 DLL(`avcodec-N.dll` 등)·`licenses/ffmpeg-*`는 건너뛰고 `WARNING: ffmpeg/ffprobe are never packaged (…) — skipped: <경로>`. zip을 쓴 뒤 같은 규칙에 걸리는 항목이 하나라도 있으면 zip을 지우고 실패. 우회 스위치 없음. (계획의 ffmpeg/ffprobe에 ffplay·공유 DLL을 더한 것은 공유 빌드를 tools/bin에 둔 경우까지 막기 위해서다.)
+- `scripts/package-windows.ps1`·`scripts/test-package-windows.mjs` 삭제(옵션 A에서 e90257d로 복원).
+- 새 오프라인 테스트 `scripts/test-make-portable.mjs`: 가짜 저장소 두 벌(도구가 `tools/bin`에 / `target/release/tools/bin`에)에 `ffmpeg.exe`·`ffprobe.exe`·`ffplay.exe`·`avcodec-61.dll`·`licenses/ffmpeg-LICENSE.txt`를 심고, zip에 없음·`mmls.exe`·`libewf.dll`·`THIRD_PARTY_NOTICES.md`·`README-tools.txt` 있음·모든 항목 `/`·`SHA256SUMS` 한 줄(LF, BOM 없음)·"never packaged" 경고·`-Version ../x` 거부를 확인.
+- `windows-ci.yml`: 번들 4단계 삭제. Release build 뒤 "Portable package offline test" → "Portable package smoke"(`-SkipBuild`; zip에 ffmpeg/ffprobe 없음, 항목 `/`, `FrameTrace-<ver>-win64/THIRD_PARTY_NOTICES.md`, SHA256SUMS CR 없음) → "Upload portable package"(아티팩트 `FrameTrace-win64`: zip + SHA256SUMS) → **"Install-path smoke"**(20분, pwsh): `dist/FrameTrace-<ver>-win64`를 `RUNNER_TEMP/ft-install-smoke`로 복사, PATH = System32만, `frametrace.exe tools install ffmpeg --yes`; 파일 4개, 설치된 GPLv3 = 매니페스트 핀, `.staging-*` 없음, 감사 마지막 줄 `result: ok`·`sha256` = 핀, `tools list --json`의 `paths.ffmpeg` = 사본, `encoders.probed`, h264 ≠ libopenh264, `trial_failed` = []; `-buildconf`에 `--enable-version3` 있음·`--enable-gpl`/`--enable-nonfree` 없음, version3/gpl/nonfree/libopenh264/chromaprint/libzvbi 줄과 `(codec h264)` 인코더 줄을 `ffmpeg-install-smoke.txt`에 기록 → 아티팩트 `ffmpeg-install-smoke`(텍스트만, `if: always()`). 바이너리는 어떤 아티팩트에도 올라가지 않는다.
+
+### 매니페스트·서버·CLI·UI (L4, M1–M4, M6)
+- 매니페스트 ffmpeg: `title` "FFmpeg", `license` 혼합 명시, `notice`/`notice_en`(계획 M1 값 그대로), `manual_hint`(BtbN 릴리스 + ffmpeg.org), `note`의 계획 포인터; `package_licenses`·`bundled_licenses_note`의 package-windows 문장·`tools/licenses/ffmpeg-THIRD-PARTY-LICENSES.txt` 삭제. url·sha256·size·files·license_files·bundled_licenses·허용 호스트는 그대로.
+- `ToolEntry.notice`/`notice_en`(serde default). `validate_manifest`: sha256이 있는(설치 가능) 도구는 공백 아닌 `notice` 필수(`installable tools must carry a distribution notice (T5)`), `notice_en`은 있으면 공백 금지. `tool_json` 최상위에 `notice`·`notice_en`(`download` 안에는 없음). `ToolEntry.package_licenses`와 그 검증 삭제.
+- CLI: 프롬프트 줄을 `install_prompt_lines(tool, dirs, status) -> Vec<String>`로 뽑고 `라이선스:` 다음에 `고지: <notice>`.
+- UI `htConfirmHtml`: `</dl>` 뒤 `<p class="h-tool-notice">`(영어 화면은 `notice_en`, 없으면 `notice`; 둘 다 없으면 문단 없음; `esc`). CSS `.dlg-body .h-tool-notice`는 기존 토큰(`--muted`·`--fs-xs`·`--lh-ctl`)만 — 계획의 `--fs-small`/`--fg-muted`는 없는 이름이라 쓰지 않았다. §28·`tools-mock.mjs` 갱신(round 4의 `trial_timed_out`과 합침).
+
+### 인코더·문구 (E1, E2, D2)
+- 순서 그대로. `build_note` "libx264 없음 — H.264는 {} 사용". 모듈·artifacts·doctor·tool_json 주석에서 "bundled LGPL" 제거. 테스트 이름 `btbn_lgpl_build_never_picks_libopenh264`. doctor 코드 변경 없음.
+
+### 테스트
+- 추가: `tool_install::tests::installable_tools_must_carry_a_distribution_notice`, `tool_install::tests::tool_json_carries_the_distribution_notice`, `cli::handlers::tools::tests::install_prompt_shows_the_distribution_notice`, `scripts/test-make-portable.mjs`, tools-unit "Tools confirm dialog carries the distribution notice (ko/en)"(+ U2 행의 영어 대화상자), verify-layout tools "the confirm dialog shows the distribution notice … readable"(두 테마, 문단이 목록 뒤·대화상자 안·대비 ≥ 4.5:1), CI 설치 경로 스모크.
+- 갱신: `shipped_manifest_is_valid_and_pins_only_published_checksums`(메시지, title·license·notice·notice_en), `serve::tests_tools` 목록 테스트(license 접두·title/label·notice), `ffmpeg_encoders` note 3곳, tools-unit·verify-layout의 "FFmpeg (LGPL build)" 전부, tools-mock.
+- 삭제: `package_only_license_files_exist_with_their_pinned_hash`, `scripts/test-package-windows.mjs`, CI 번들 4단계.
+
+### 게이트 (이 PC, Windows 11)
+- 기준: tools-bundle 5599b4b(fix round 4 + 문서 행 a8b7f69) 위에 다시 쌓음.
+- `cargo fmt --check` ok · `cargo clippy --locked --all-targets -- -D warnings` ok(Windows만 — Linux/macOS 타깃이 이 PC에 없어 돌리지 못함; 이번 변경에 `cfg` 분기 코드는 없다) · `cargo test --locked` 1234 passed / 0 failed / 30 ignored · `cargo build --locked` ok.
+- `node scripts/check-ps-bom.mjs` ok · `check-js` ok · `check-css` ok · `node scripts/test-make-portable.mjs` all checks passed · `verify-review-batch --unit` 147 PASS(Tools 33).
+- `FRAMETRACE_R11_STRICT=1`: verify-layout 171/171(새 고지 행: 대비 light 6.76 · dark 7.32) · check-a11y(`FRAMETRACE_REQUIRE_BROWSER=1`) axe 0 · verify-buttons 173 · verify-i18n 770/770 · verify-start-screen 85/85 · 셸 스모크(`FRAMETRACE_SHELL_SMOKE=1`, APPDATA/LOCALAPPDATA 격리) exit 0.
+
+### 남은 일
+- 첫 CI 실행의 설치 경로 스모크 결과(h264 pick, buildconf 요약)를 여기에 한 줄로 적을 것 — 아직 push하지 않아 돌지 않았다. 러너(Windows Server)에서 h264_mf 시험 인코딩이 실패하면(Media Foundation 미설치) pick이 libopenh264가 되어 이 단계가 실패한다 — 그 경우의 처리(러너에 기능 추가 또는 게이트 완화)는 소유자 결정.
+- 리다이렉트 호스트가 허용 목록 밖이면 설치가 거부된다 — 허용 목록 확장은 별도 결정.
+- L1·M1 고지 문구의 "(Owner to confirm)" 확인.

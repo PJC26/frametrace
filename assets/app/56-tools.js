@@ -352,14 +352,20 @@ function htRowHtml(m, locale) {
     `</span>${btn}</li>`;
 }
 // Pure: the confirm dialog body — file (download.file_name), source host,
-// size, license (T3).
+// size, license (T3), then the distribution notice (T5, option C: the
+// examiner downloads the file from the publisher, FrameTrace does not
+// distribute it; `notice_en` for locale en, else `notice`; omitted when the
+// tool has none).
 function htConfirmHtml(t, locale) {
   const d = t.download && typeof t.download === "object" ? t.download : {};
   const file = String(d.file_name || "") || [htLabel(t), t.pinned_version || t.version || ""].filter(Boolean).join(" ");
   const row = (k, v) => `<dt>${esc(htT(k, null, locale))}</dt><dd>${esc(v)}</dd>`;
+  const loc = locale || htLocale();
+  const notice = String((loc === "en" && t.notice_en) || t.notice || "").trim();
   return `<p>${esc(htT("confirmNote", null, locale))}</p><dl class="h-tool-dl">` +
     row("dFile", file) + row("dHost", d.host || t.source_host || htT("unknown", null, locale)) +
-    row("dSize", htSize(d.size ?? t.size_bytes, locale)) + row("dLicense", t.license || htT("unknown", null, locale)) + `</dl>`;
+    row("dSize", htSize(d.size ?? t.size_bytes, locale)) + row("dLicense", t.license || htT("unknown", null, locale)) + `</dl>` +
+    (notice ? `<p class="h-tool-notice">${esc(notice)}</p>` : "");
 }
 // Pure: the in-context prompt for a run that needs `name`.
 // action: "install" | "stop" | "retry" | "" (hint only).

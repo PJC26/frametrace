@@ -1,12 +1,13 @@
 //! Encoder selection for the resolved ffmpeg.
 //!
-//! The bundled FFmpeg is an LGPL build (FrameTrace is MIT), so it has no
-//! libx264 (GPL). Proxies and MP4 exports therefore never hard-code an
-//! encoder: the resolved ffmpeg is asked once for `-encoders` and the
+//! FrameTrace bundles no FFmpeg. The build the guided installer fetches
+//! (BtbN win64-lgpl) has no libx264 (GPL), and the examiner may use any
+//! other build, so proxies and MP4 exports never hard-code an encoder: the
+//! resolved ffmpeg is asked once for `-encoders` and the
 //! best H.264 encoder it really has is used, in the order
 //! libx264 → h264_mf (Windows Media Foundation) → libopenh264 → mpeg4
 //! (MPEG-4 Part 2, built into every ffmpeg). h264_mf comes before
-//! libopenh264 on purpose: the pinned BtbN LGPL build links openh264
+//! libopenh264 on purpose: the BtbN build the installer fetches links openh264
 //! built from source, and Cisco's patent licence covers only Cisco's own
 //! prebuilt openh264 binaries — Media Foundation's encoder is licensed
 //! with Windows. (h264_mf exists only on Windows, so elsewhere the order
@@ -16,7 +17,7 @@
 //!
 //! Being listed is not enough: `h264_mf` is listed by every Windows build
 //! but fails at `MFStartup` on Windows N/KN editions without the Media
-//! Feature Pack and on Server Core — the bundle (no libx264) would then
+//! Feature Pack and on Server Core — a build without libx264 would then
 //! fail every proxy and export. So each listed candidate, best first, is
 //! tried once with a 1-frame encode of a 64×64 black frame using the very
 //! options a proxy uses (`-f lavfi -i color=… -frames:v 1 <video args>
@@ -248,7 +249,7 @@ impl Encoders {
             other if self.has("libx264") => {
                 format!("libx264 실행 실패 — H.264는 {} 사용", other.name())
             }
-            other => format!("LGPL 빌드 — H.264는 {} 사용", other.name()),
+            other => format!("libx264 없음 — H.264는 {} 사용", other.name()),
         };
         let mf = VideoEncoder::H264Mf.name();
         if self.trial_timed_out(mf) {
@@ -684,7 +685,7 @@ pub(crate) mod tests {
         assert_eq!(Encoders::from_listing(FULL).video(), VideoEncoder::Libx264);
         assert_eq!(Encoders::from_listing(LGPL).video(), VideoEncoder::H264Mf);
         assert_eq!(Encoders::from_listing(BARE).video(), VideoEncoder::Mpeg4);
-        // The pinned BtbN LGPL build has both: Media Foundation wins over
+        // The pinned BtbN win64-lgpl build has both: Media Foundation wins over
         // the source-built openh264 (not covered by Cisco's patent licence).
         let both =
             Encoders::from_listing(" ------\n V....D libopenh264  OpenH264\n V....D h264_mf  MF\n");
@@ -704,13 +705,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn btbn_lgpl_bundle_never_picks_libopenh264() {
+    fn btbn_lgpl_build_never_picks_libopenh264() {
         let enc = Encoders::from_listing(BTBN_LGPL);
         assert!(enc.has("libopenh264") && enc.has("h264_mf"));
         assert_eq!(enc.video(), VideoEncoder::H264Mf);
         assert_eq!(
             enc.build_note().as_deref(),
-            Some("LGPL 빌드 — H.264는 h264_mf 사용")
+            Some("libx264 없음 — H.264는 h264_mf 사용")
         );
         assert_eq!(enc.to_json()["h264"], "h264_mf");
     }
@@ -770,7 +771,7 @@ pub(crate) mod tests {
         assert_eq!(Encoders::assumed_full().build_note(), None);
         assert_eq!(
             Encoders::from_listing(LGPL).build_note().as_deref(),
-            Some("LGPL 빌드 — H.264는 h264_mf 사용")
+            Some("libx264 없음 — H.264는 h264_mf 사용")
         );
         assert!(
             Encoders::from_listing(BARE)
@@ -832,7 +833,7 @@ pub(crate) mod tests {
         assert_eq!(calls.lines().count(), 2, "{calls}");
         assert_eq!(
             enc.build_note().as_deref(),
-            Some("LGPL 빌드 — H.264는 h264_mf 사용")
+            Some("libx264 없음 — H.264는 h264_mf 사용")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -28,3 +28,5 @@
 .dlg-body .h-tool-dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0 0 8px; }
 .dlg-body .h-tool-dl dt { color: var(--muted); font-size: var(--fs-xs); font-weight: 600; align-self: baseline; }
 .dlg-body .h-tool-dl dd { margin: 0; overflow-wrap: anywhere; }
+/* distribution notice (T5): the file comes from the publisher, not FrameTrace */
+.dlg-body .h-tool-notice { margin: 8px 0; color: var(--muted); font-size: var(--fs-xs); line-height: var(--lh-ctl); overflow-wrap: anywhere; }

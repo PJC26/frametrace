@@ -89,8 +89,9 @@ pub fn generate_proxy(
 
     let ffmpeg = resolve_tool_binary("ffmpeg", &["ffmpeg"])
         .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
-    // The bundled LGPL ffmpeg has no libx264: use the best H.264 encoder
-    // this build really has (recorded in the proxy log).
+    // A build without libx264 (e.g. the BtbN build the installer fetches):
+    // use the best H.264 encoder this build really has (recorded in the
+    // proxy log).
     let encoders = crate::ffmpeg_encoders::for_binary(&ffmpeg);
     let codecs = encoders.choice(encoders.video(), encoders.aac());
     let args = proxy_ffmpeg_args(&source_path, &output_path, options, &codecs);

@@ -593,7 +593,8 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
             .unwrap_or_default();
         match crate::tool_policy::resolve_tool_binary(name, &[name]) {
             Ok(found) if name == "ffmpeg" => {
-                // The bundled LGPL build has no libx264: say which H.264
+                // A build without libx264 (e.g. the BtbN build the installer
+                // fetches): say which H.264
                 // encoder proxies/exports will use instead (and when
                 // h264_mf is listed but cannot start — Windows N/KN without
                 // the Media Feature Pack).

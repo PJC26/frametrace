@@ -744,7 +744,8 @@ try {
   // rows, sizes, no sideways scroll, [이어서 검토] still on screen; libewf /
   // Sleuth Kit show the Korean manual_hint (the English reason only as a
   // title); keyboard: Enter opens the confirm dialog (file name · source ·
-  // size · license), Tab stays inside, Esc sends nothing and returns focus;
+  // size · license + the option-C distribution notice, readable), Tab
+  // stays inside, Esc sends nothing and returns focus;
   // OK sends one POST, progress is announced through #srStatus, [중단] is
   // offered, focus never drops to <body>, the result shows. A reload while
   // an install runs keeps following it without a click.
@@ -794,7 +795,29 @@ try {
     for (let i = 0; i < 4; i++) { await page.keyboard.press('Tab'); inside.push(await page.evaluate(() => document.getElementById('dlgBackdrop').contains(document.activeElement))); }
     const dlg = await page.evaluate(() => ({ open: !document.getElementById('dlgBackdrop').hidden, title: document.getElementById('dlgTitle').textContent, body: document.getElementById('dlgBody').textContent.replace(/\s+/g, ' ') }));
     check(`tools ${theme}: Enter opens the confirm dialog with the file name · source · size · license; Tab stays inside`,
-      dlg.open && dlg.title === 'FFmpeg (LGPL build) 설치' && /ffmpeg-n8\.1\.3-9-g29e619e767-win64-lgpl-8\.1\.zip/.test(dlg.body) && /github\.com/.test(dlg.body) && /4\.0 MB/.test(dlg.body) && /LGPL-3\.0/.test(dlg.body) && inside.every(Boolean), JSON.stringify({ dlg, inside }));
+      dlg.open && dlg.title === 'FFmpeg 설치' && /ffmpeg-n8\.1\.3-9-g29e619e767-win64-lgpl-8\.1\.zip/.test(dlg.body) && /github\.com/.test(dlg.body) && /4\.0 MB/.test(dlg.body) && /LGPL-3\.0/.test(dlg.body) && inside.every(Boolean), JSON.stringify({ dlg, inside }));
+    // Option C (T5): the distribution notice is on screen inside the dialog,
+    // after the file list, and readable (contrast >= 4.5:1) in this theme.
+    const notice = await page.evaluate(() => {
+      const p = document.querySelector('#dlgBody p.h-tool-notice');
+      if (!p) return null;
+      const rgb = (c) => (c.match(/[\d.]+/g) || []).map(Number);
+      const lum = ([r, g, b]) => { const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); };
+      let el = p; let bg = '';
+      for (; el; el = el.parentElement) { bg = getComputedStyle(el).backgroundColor; const a = rgb(bg); if (a.length === 3 || (a.length === 4 && a[3] > 0)) break; }
+      const fg = lum(rgb(getComputedStyle(p).color)); const back = lum(rgb(bg));
+      const r = p.getBoundingClientRect();
+      const box = document.querySelector('#dlgBackdrop .h-modal').getBoundingClientRect();
+      const dl = document.querySelector('#dlgBody .h-tool-dl');
+      return {
+        text: p.textContent, h: r.height,
+        inBox: r.left >= box.left - 1 && r.right <= box.right + 1 && r.top >= box.top - 1,
+        afterList: !!dl && (dl.compareDocumentPosition(p) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        contrast: Math.round(((Math.max(fg, back) + 0.05) / (Math.min(fg, back) + 0.05)) * 100) / 100,
+      };
+    });
+    check(`tools ${theme}: the confirm dialog shows the distribution notice ("FrameTrace는 … 배포하지 않으며") after the list, readable`,
+      !!notice && /배포하지 않/.test(notice.text) && notice.h > 0 && notice.inBox && notice.afterList && notice.contrast >= 4.5, JSON.stringify(notice));
     await page.keyboard.press('Escape');
     await sleep(200);
     const esc1 = await page.evaluate(() => ({ closed: document.getElementById('dlgBackdrop').hidden, focus: document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.toolInstall : '' }));
@@ -817,10 +840,10 @@ try {
     });
     check(`tools ${theme}: OK → one POST {name:"ffmpeg"}, progress shown + announced via #srStatus, [중단] (>= 24px) in place of 설치, focus not dropped to <body>`,
       mock.posts.length === 1 && mock.posts[0].name === 'ffmpeg' && /내려받는 중|해시 확인 중/.test(mid.prog) && mid.stop && mid.noInstall && /FFmpeg/.test(mid.ann) && !mid.focusBody, JSON.stringify({ mid, posts: mock.posts }));
-    await page.waitForFunction(() => /FFmpeg \(LGPL build\) 설치됨/.test(document.getElementById('hToolsList').textContent), null, { timeout: 15000 }).catch(() => {});
+    await page.waitForFunction(() => /FFmpeg 설치됨/.test(document.getElementById('hToolsList').textContent), null, { timeout: 15000 }).catch(() => {});
     await page.waitForFunction(() => /설치됨/.test(window.__ann.join(' ')), null, { timeout: 3000 }).catch(() => {});
     const done = await page.evaluate(() => ({ text: document.getElementById('hToolsList').textContent, ann: window.__ann.join(' | '), stop: !!document.querySelector('#hToolsList button[data-tool-cancel]') }));
-    check(`tools ${theme}: the result "FFmpeg (LGPL build) 설치됨" is shown and announced; [중단] gone`, /FFmpeg \(LGPL build\) 설치됨/.test(done.text) && /설치됨/.test(done.ann) && !done.stop && mock.posts.length === 1, JSON.stringify(done));
+    check(`tools ${theme}: the result "FFmpeg 설치됨" is shown and announced; [중단] gone`, /FFmpeg 설치됨/.test(done.text) && /설치됨/.test(done.ann) && !done.stop && mock.posts.length === 1, JSON.stringify(done));
     if (shots) { mkdirSync(shots, { recursive: true }); await page.screenshot({ path: join(shots, `tools-1366-${theme}.png`) }); }
     // A reload while an install runs (or a second tab): progress resumes
     // without a click; [중단] posts install-cancel and the row says so.
@@ -837,7 +860,7 @@ try {
     await page2.waitForFunction(() => /설치를 중단했습니다/.test(document.getElementById('hToolsList').textContent), null, { timeout: 8000 }).catch(() => {});
     const r2 = await page2.evaluate(() => ({ text: document.getElementById('hToolsList').textContent.replace(/\s+/g, ' '), install: !!document.querySelector('#hToolsList button[data-tool-install="ffmpeg"]:not([disabled])') }));
     check(`tools ${theme}: after a reload a running install is followed without a click; [중단] → install-cancel → "설치를 중단했습니다", 설치 usable again`,
-      /내려받는 중 .*\(\d+%\)/.test(r1.text) && mock2.posts.length === 0 && mock2.cancels === 1 && /FFmpeg \(LGPL build\) 설치를 중단했습니다/.test(r2.text) && r2.install, JSON.stringify({ r1, r2, cancels: mock2.cancels }));
+      /내려받는 중 .*\(\d+%\)/.test(r1.text) && mock2.posts.length === 0 && mock2.cancels === 1 && /FFmpeg 설치를 중단했습니다/.test(r2.text) && r2.install, JSON.stringify({ r1, r2, cancels: mock2.cancels }));
     await context.close();
   }
   check('no page errors', pageErrors.length === 0, pageErrors.slice(0, 5).join(' | '));

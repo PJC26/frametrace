@@ -76,7 +76,7 @@ export async function toolsTrackU() {
     await v.run('htLoad()');
     const list = v.els.hToolsList.innerHTML;
     assert.equal(v.els.hToolsPanel.hidden, false, 'U1: shown when a tool is missing');
-    assert.ok(/h-tool-warn" data-tool="ffmpeg"/.test(list) && list.includes('FFmpeg (LGPL build) 없음 — 필수') && /data-tool-install="ffmpeg"[^>]*>설치</.test(list), 'U1: FFmpeg missing is a warning: ' + list);
+    assert.ok(/h-tool-warn" data-tool="ffmpeg"/.test(list) && list.includes('FFmpeg 없음 — 필수') && /data-tool-install="ffmpeg"[^>]*>설치</.test(list), 'U1: FFmpeg missing is a warning: ' + list);
     assert.ok(/h-tool-info" data-tool="libewf"/.test(list) && !/data-tool-install="libewf"/.test(list), 'U1: libewf info, no button');
     const ewfHint = list.match(/<li[^>]*data-tool="libewf"[^]*?<\/li>/)[0];
     assert.ok(ewfHint.includes('libewf는 공식 Windows 실행 파일이 없습니다') && ewfHint.includes('<a href="https://github.com/libyal/libewf"'), 'U1: manual_hint shown, its URL linked: ' + ewfHint);
@@ -100,11 +100,37 @@ export async function toolsTrackU() {
     assert.equal(await v.run('htInstall("ffmpeg")'), false);
     assert.equal(v.calls.posts.length, 0, 'U1: cancel → no POST');
     const d = v.calls.dialogs[0];
-    assert.ok(d && d.title === 'FFmpeg (LGPL build) 설치' && d.html.includes('<dd>ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1.zip</dd>') && d.html.includes('github.com') && d.html.includes('4.0 MB') && d.html.includes('LGPL-3.0-or-later'), 'U1: dialog body: ' + (d && d.html));
+    assert.ok(d && d.title === 'FFmpeg 설치' && d.html.includes('<dd>ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1.zip</dd>') && d.html.includes('github.com') && d.html.includes('4.0 MB') && d.html.includes('LGPL-3.0-or-later (FFmpeg)') && d.html.includes('배포하지 않'), 'U1: dialog body: ' + (d && d.html));
     const x = v.run('htConfirmHtml(' + JSON.stringify({ ...OPT, download: null, size_bytes: null, pinned_version: '1.2', license: '<b>x</b>' }) + ')');
     assert.ok(x.includes('X 도구 1.2') && x.includes('알 수 없음') && x.includes('&lt;b&gt;x&lt;/b&gt;'), 'U1: fallbacks: ' + x);
     assert.equal(await v.run('htInstall("sleuthkit")'), false, 'U1: not installable → nothing');
     assert.equal(v.calls.dialogs.length, 1, 'U1: no dialog for a tool without a button');
+  });
+
+  await row('Tools confirm dialog carries the distribution notice (ko/en)', async () => {
+    const v = make({ replies: [reply([FF])] });
+    const para = (html) => (html.match(/<p class="h-tool-notice">([^]*?)<\/p>/g) || []);
+    const ko = v.run('htConfirmHtml(' + JSON.stringify(FF) + ', "ko")');
+    assert.equal(para(ko).length, 1, 'ko: one notice paragraph: ' + ko);
+    assert.ok(ko.includes(`<p class="h-tool-notice">${FF.notice}</p>`) && ko.indexOf('h-tool-notice') > ko.indexOf('</dl>'), 'ko: the notice after the list: ' + ko);
+    assert.ok(ko.includes('확인을 누르면 내려받습니다'), 'ko: the confirm note stays');
+    const en = v.run('htConfirmHtml(' + JSON.stringify(FF) + ', "en")');
+    assert.ok(en.includes(`<p class="h-tool-notice">${FF.notice_en}</p>`) && !en.includes(FF.notice), 'en: notice_en: ' + en);
+    // English falls back to the Korean notice when the tool has no notice_en.
+    const enKo = v.run('htConfirmHtml(' + JSON.stringify({ ...FF, notice_en: null }) + ', "en")');
+    assert.ok(enKo.includes(`<p class="h-tool-notice">${FF.notice}</p>`), 'en without notice_en: ' + enKo);
+    // An installable tool without either notice: no paragraph at all.
+    for (const loc of ['ko', 'en']) {
+      const none = v.run('htConfirmHtml(' + JSON.stringify({ ...EWF, installable: true, notice: null, notice_en: null }) + ', "' + loc + '")');
+      assert.equal(para(none).length, 0, loc + ': no notice → no paragraph: ' + none);
+      assert.ok(!none.includes('h-tool-notice'), loc + ': no empty paragraph');
+    }
+    // Escaped like every other server string.
+    const evil = v.run('htConfirmHtml(' + JSON.stringify({ ...FF, notice: '<img src=x onerror=alert(1)> & "q"' }) + ', "ko")');
+    assert.ok(evil.includes('&lt;img src=x onerror=alert(1)&gt; &amp; ') && !evil.includes('<img'), 'escaped: ' + evil);
+    // Without a locale argument it follows the viewer language.
+    v.ctx.__locale = 'en';
+    assert.ok(v.run('htConfirmHtml(' + JSON.stringify(FF) + ')').includes(FF.notice_en), 'viewer language en');
   });
 
   await row('Tools U1 install: one POST {name}, POST {ok,install} shown at once, progress polled from /api/tools/install-status, [중단] while running, result + env refreshed', async () => {
@@ -186,7 +212,7 @@ export async function toolsTrackU() {
     await v.fire();
     assert.ok(v.els.hToolsList.innerHTML.includes('압축 푸는 중'), v.els.hToolsList.innerHTML);
     await v.fire(); await tick();
-    assert.ok(v.els.hToolsList.innerHTML.includes('FFmpeg (LGPL build) 설치됨') && v.calls.loadEnv === 1 && v.calls.toasts.some(([, k]) => k === 'ok'), 'U1: result + loadEnv: ' + v.els.hToolsList.innerHTML);
+    assert.ok(v.els.hToolsList.innerHTML.includes('FFmpeg 설치됨') && v.calls.loadEnv === 1 && v.calls.toasts.some(([, k]) => k === 'ok'), 'U1: result + loadEnv: ' + v.els.hToolsList.innerHTML);
     const idle = make({ replies: [reply([FF], J('failed', 'ffmpeg', { error: 'x' }))] });
     await idle.run('htLoad()');
     assert.equal(idle.calls.timers.length, 0, 'U1: a finished job is not polled');
@@ -256,7 +282,7 @@ export async function toolsTrackU() {
   await row('Tools U1 finalize checklist: one warning line per missing required tool only', async () => {
     const v = make({ replies: [reply([FF, EWF, DF])] });
     const c = plain(await v.run('htFinalizeChecks()'));
-    assert.deepEqual(c.map((x) => [x.level, x.text]), [['warn', 'FFmpeg (LGPL build) 없음 — 영상 검증·프록시를 만들 수 없음']]);
+    assert.deepEqual(c.map((x) => [x.level, x.text]), [['warn', 'FFmpeg 없음 — 영상 검증·프록시를 만들 수 없음']]);
     const none = make({ replies: [{ ok: false, status: 404 }] });
     assert.equal((await none.run('htFinalizeChecks()')).length, 0, 'U1: older server → no line');
     assert.ok(/htFinalizeChecks\(\)/.test(finSrc), 'U1: gatherFinalizeChecks uses it');
@@ -303,7 +329,14 @@ export async function toolsTrackU() {
     assert.deepEqual(Object.keys(v.run('HT_STR.en')).sort(), Object.keys(v.run('HT_STR.ko')).sort(), 'U2: same keys');
     v.ctx.__locale = 'en';
     await v.run('htLoad()');
-    assert.ok(v.els.hToolsList.innerHTML.includes('FFmpeg (LGPL build) missing — required') && v.els.hToolsPanelTitle.textContent === 'Tools', 'U2: English');
+    assert.ok(v.els.hToolsList.innerHTML.includes('FFmpeg missing — required') && v.els.hToolsPanelTitle.textContent === 'Tools', 'U2: English');
+    // The English dialog carries notice_en (option C), not the Korean notice.
+    const ve = make({ replies: [reply([FF])], confirm: false });
+    ve.ctx.__locale = 'en';
+    await ve.run('htLoad()');
+    assert.equal(await ve.run('htInstall("ffmpeg")'), false);
+    const de = ve.calls.dialogs[0];
+    assert.ok(de && de.title === 'Install FFmpeg' && de.html.includes('FrameTrace does not distribute it') && !de.html.includes('배포하지 않'), 'U2: English dialog notice: ' + (de && de.html));
     assert.ok(/id="hToolsPanel"[^>]*aria-labelledby="hToolsPanelTitle"[^>]*hidden/.test(html), 'U2: markup');
     assert.ok(/id="startToolPrompt"/.test(html) && /id="advToolPrompt"/.test(finSrc), 'U2: prompt mounts');
     assert.ok(!/class="sblock[^"]*" id="hToolsPanel"/.test(html), 'the empty state keeps exactly two blocks');
@@ -315,7 +348,7 @@ export async function toolsTrackU() {
   const LOST = '설치 상태를 알 수 없습니다 — 다시 시도하십시오';
 
   await row('Tools job id replaced mid-poll (another tab / restarted server): the new job is adopted and followed, never "상태를 알 수 없습니다" + a stuck panel', async () => {
-    for (const [tool, label] of [['ffmpeg', 'FFmpeg (LGPL build)'], ['x-opt', 'X 도구']]) {
+    for (const [tool, label] of [['ffmpeg', 'FFmpeg'], ['x-opt', 'X 도구']]) {
       const v = make({
         replies: [reply([FF, OPT])],
         status: [st(J('downloading', 'x-opt', { bytes: 1, total: 4 })), st({ ...J('downloading', tool, { bytes: 2, total: 4 }), id: 8 }), st({ ...J('verifying', tool), id: 8 })],

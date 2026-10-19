@@ -5,9 +5,10 @@
 //   POST /api/tools/install {name}  {ok:true, install: J} | {ok:false, code, error[, manual_hint, homepage]}
 //   GET  /api/tools/install-status  {ok:true, install: J|null, now_unix}
 //   POST /api/tools/install-cancel {id?}  {ok:true, install: J} | {ok:false, code:"no_install"|"not_cancellable"|"stale_job"}
-// T carries shadowed_by {<binary>: path|null} and, for ffmpeg once
-// installed, encoders {…, trial_failed: []}; J carries staging_left and
-// age_s (seconds since it finished, by the server's clock).
+// T carries notice / notice_en (option C distribution notice; null for
+// tools that cannot be installed), shadowed_by {<binary>: path|null} and,
+// for ffmpeg once installed, encoders {…, trial_failed: []}; J carries
+// staging_left and age_s (seconds since it finished, by the server's clock).
 // Nothing is downloaded: the install walks downloading → verifying →
 // extracting (stage extract, then install on its last poll) → done over the
 // next status polls. Like the real server, a cancel is refused
@@ -17,17 +18,19 @@
 const FF_ZIP = 'ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-8.1.zip';
 export const TOOLS_FIXTURE = () => ([
   {
-    name: 'ffmpeg', title: 'FFmpeg (LGPL build)', label: 'FFmpeg (LGPL build)', kind: 'archive', required: true, on_demand: false,
-    version: 'n8.1.3-9-g29e619e767', pinned_version: 'n8.1.3-9-g29e619e767', license: 'LGPL-3.0-or-later', homepage: 'https://ffmpeg.org/',
+    name: 'ffmpeg', title: 'FFmpeg', label: 'FFmpeg', kind: 'archive', required: true, on_demand: false,
+    version: 'n8.1.3-9-g29e619e767', pinned_version: 'n8.1.3-9-g29e619e767', license: 'LGPL-3.0-or-later (FFmpeg); the BtbN win64-lgpl binary also contains GPL-2.0-only (zvbi), GPL-2.0-or-later (FFTW3), Apache-2.0 and BSD/MIT components', homepage: 'https://ffmpeg.org/',
+    notice: '이 파일은 BtbN FFmpeg-Builds(github.com)에서 사용자가 직접 내려받습니다. FrameTrace는 이 바이너리를 배포하지 않으며 소스 제공·특허 사용권도 제공하지 않습니다. 빌드 이름은 lgpl이지만 GPL-2.0-only 구성 요소(zvbi)가 들어 있어 파일 전체는 GPL 조건을 따릅니다 — 내 PC에서 쓰는 데는 제한이 없고, 이 파일을 다른 사람에게 복사해 주면 GPL 의무(소스 제공 등)는 복사하는 사람에게 있습니다.',
+    notice_en: 'You download this file yourself from BtbN FFmpeg-Builds (github.com). FrameTrace does not distribute it, offers no source for it and grants no patent licence. Although the build is named lgpl, it contains GPL-2.0-only components (zvbi), so the file as a whole is under GPL terms: using it on your own PC is unrestricted; if you pass the file on to others, the GPL obligations (source availability etc.) are yours.',
     source_url: 'https://github.com/FFmpeg/FFmpeg/tree/29e619e767', provides: ['ffmpeg', 'ffprobe'], status: 'missing', installed: false,
     paths: { ffmpeg: null, ffprobe: null }, shadowed_by: { ffmpeg: null, ffprobe: null }, installable: true, unavailable_reason: null, not_installable_reason: null,
-    manual_hint: 'https://ffmpeg.org/download.html 에서 LGPL 빌드를 받아 ffmpeg.exe·ffprobe.exe를 tools/bin에 복사하십시오.',
+    manual_hint: 'https://github.com/BtbN/FFmpeg-Builds/releases 또는 https://ffmpeg.org/download.html 에서 Windows 빌드를 받아 ffmpeg.exe·ffprobe.exe를 tools/bin에 복사하십시오.',
     source_host: 'github.com', size_bytes: 4194304, encoders: null,
     download: { file_name: FF_ZIP, url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/' + FF_ZIP, host: 'github.com', size: 4194304, sha256: '4a7642b2264c03e8a0ce8a3825b933ee5580656f45695a086fe7e294045ffc0a', checksum_source: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/checksums.sha256' },
   },
   {
     name: 'libewf', title: 'libewf (E01)', label: 'libewf (E01)', kind: 'archive', required: false, on_demand: false,
-    version: '20260924', pinned_version: '20260924', license: 'LGPL-3.0-or-later', homepage: 'https://github.com/libyal/libewf',
+    version: '20260924', pinned_version: '20260924', license: 'LGPL-3.0-or-later', notice: null, notice_en: null, homepage: 'https://github.com/libyal/libewf',
     source_url: 'https://github.com/libyal/libewf/releases/tag/20260924', provides: ['ewfinfo', 'ewfverify', 'ewfexport'], status: 'missing', installed: false,
     paths: { ewfinfo: null, ewfverify: null, ewfexport: null }, shadowed_by: { ewfinfo: null, ewfverify: null, ewfexport: null }, installable: false,
     unavailable_reason: 'The official release (https://github.com/libyal/libewf/releases/tag/20260924) publishes only a source tarball and its PGP signature, no Windows binaries.',
@@ -37,7 +40,7 @@ export const TOOLS_FIXTURE = () => ([
   },
   {
     name: 'sleuthkit', title: 'The Sleuth Kit (삭제 파일 복구)', label: 'The Sleuth Kit (삭제 파일 복구)', kind: 'archive', required: false, on_demand: false,
-    version: '4.15.0', pinned_version: '4.15.0', license: 'IPL-1.0 / CPL-1.0', homepage: 'https://www.sleuthkit.org/sleuthkit/',
+    version: '4.15.0', pinned_version: '4.15.0', license: 'IPL-1.0 / CPL-1.0', notice: null, notice_en: null, homepage: 'https://www.sleuthkit.org/sleuthkit/',
     source_url: 'https://github.com/sleuthkit/sleuthkit/releases/tag/sleuthkit-4.15.0', provides: ['mmls', 'fls', 'icat'], status: 'missing', installed: false,
     paths: { mmls: null, fls: null, icat: null }, shadowed_by: { mmls: null, fls: null, icat: null }, installable: false,
     unavailable_reason: 'The maintainers publish a PGP signature (.asc), not a checksum file, and the archive\'s file list could not be verified without downloading it.',
@@ -47,7 +50,7 @@ export const TOOLS_FIXTURE = () => ([
   },
   {
     name: 'deepfake-lens', title: 'deepfake-lens (합성 영상 스크리닝)', label: 'deepfake-lens (합성 영상 스크리닝)', kind: 'pip', required: false, on_demand: true,
-    version: null, pinned_version: null, license: null, homepage: null, source_url: null, provides: ['deepfake-lens'], status: 'missing', installed: false,
+    version: null, pinned_version: null, license: null, notice: null, notice_en: null, homepage: null, source_url: null, provides: ['deepfake-lens'], status: 'missing', installed: false,
     paths: { 'deepfake-lens': null }, shadowed_by: { 'deepfake-lens': null }, installable: false,
     unavailable_reason: 'deepfake-lens is not published on PyPI, so no hash-pinned requirements file can be built.',
     not_installable_reason: 'deepfake-lens is not published on PyPI, so no hash-pinned requirements file can be built.',
@@ -64,8 +67,9 @@ const nowUnix = () => Math.floor(Date.now() / 1000);
 const json = (route, body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
 // J as the server sends it: age_s by the server's clock (null while running).
 const withAge = (i) => (i ? { ...i, age_s: i.finished_unix ? Math.max(0, nowUnix() - i.finished_unix) : null } : null);
-// GET /api/tools encoders of an installed LGPL ffmpeg (src/ffmpeg_encoders.rs to_json).
-const LGPL_ENCODERS = { probed: true, libx264: false, h264: 'h264_mf', aac: 'aac', avi_audio: 'mp2', note: 'LGPL 빌드 — H.264는 h264_mf 사용', trial_failed: [], trial_timed_out: [] };
+// GET /api/tools encoders of an installed ffmpeg without libx264 (the BtbN
+// build the installer fetches; src/ffmpeg_encoders.rs to_json).
+const LGPL_ENCODERS = { probed: true, libx264: false, h264: 'h264_mf', aac: 'aac', avi_audio: 'mp2', note: 'libx264 없음 — H.264는 h264_mf 사용', trial_failed: [], trial_timed_out: [] };
 
 // opts.steps: status polls per install stage (default 2); opts.fail: an
 // error string → the job ends `failed`; opts.tools: a fixture override;
