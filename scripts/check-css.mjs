@@ -18,7 +18,7 @@ const files = ["assets/evidence_viewer.css", layoutCss];
 // These have no token block of their own (kit.css is bundled right after
 // tokens.css, the rest after the page stylesheet): only brace balance is
 // checked. Optional ones are skipped until their track lands.
-for (const extra of ["assets/kit.css", "assets/viewer/controls.css", "assets/app/30-jobs.css", "assets/app/40-finalize.css"]) {
+for (const extra of ["assets/kit.css", "assets/viewer/controls.css", "assets/app/30-jobs.css", "assets/app/40-finalize.css", "assets/app/56-tools.css"]) {
   if (!existsSync(join(root, extra))) {
     if (extra === "assets/kit.css" || extra === "assets/viewer/controls.css") {
       console.error(`${extra}: missing`);

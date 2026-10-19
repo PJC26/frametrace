@@ -1,0 +1,30 @@
+/* 도구 panel, install prompt and confirm dialog (56-tools.js, contract §28).
+   Layout and state colours only; button looks come from assets/kit.css.
+   Tokens: docs/ui-rebuild-contract.md 5.1 names only. */
+.h-tools:not([hidden]) { display: grid; gap: var(--sp-1); min-width: 0; }
+.h-tools-title { margin: 0; font-size: var(--fs-sm); font-weight: 600; color: var(--text); }
+.h-tools-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-1); }
+.h-tool, .h-toolprompt:not([hidden]) { display: flex; gap: var(--sp-2); align-items: center; padding: var(--sp-2) var(--sp-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: var(--fs-sm); line-height: var(--lh-body); min-width: 0; }
+.h-tool .ic, .h-toolprompt .ic { flex: none; align-self: flex-start; margin-top: 2px; }
+.h-tool-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.h-tool-text:focus { outline: none; }
+.h-tool-text:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); border-radius: 2px; }
+.h-tool-text b { font-weight: 600; }
+.h-tool-text small { display: block; margin-top: 2px; color: var(--muted); font-size: var(--fs-xs); line-height: var(--lh-ctl); }
+.h-tool-text a { color: var(--accent-ink); overflow-wrap: anywhere; }
+.h-tool > button, .h-toolprompt > button { flex: none; }
+.h-tool-warn, .h-toolprompt:not([hidden]) { border-color: var(--warn-fg); background: var(--warn-bg); color: var(--warn-fg); }
+.h-tool-warn .h-tool-text small, .h-toolprompt .h-tool-text small { color: var(--warn-fg); }
+.h-tool-warn .h-tool-text a, .h-toolprompt .h-tool-text a { color: var(--warn-fg); }
+.h-toolprompt.ok:not([hidden]) { border-color: var(--verified-fg); background: var(--verified-bg); color: var(--verified-fg); }
+.h-toolprompt.ok .h-tool-text small { color: var(--verified-fg); }
+.h-tool-info .ic { color: var(--info); }
+.h-tool-ok .ic { color: var(--ok); }
+.h-tool-prog { font-variant-numeric: tabular-nums; }
+.h-fin-adv-body .h-toolprompt:not([hidden]) { margin-top: var(--sp-2); }
+#blkEvidence .h-toolprompt:not([hidden]) { margin-top: var(--sp-2); }
+
+/* confirm dialog: file · source · size · license */
+.dlg-body .h-tool-dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0 0 8px; }
+.dlg-body .h-tool-dl dt { color: var(--muted); font-size: var(--fs-xs); font-weight: 600; align-self: baseline; }
+.dlg-body .h-tool-dl dd { margin: 0; overflow-wrap: anywhere; }
