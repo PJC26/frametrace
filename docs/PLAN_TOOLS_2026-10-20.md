@@ -7,8 +7,8 @@
 - **T2. 허용된 출처만, HTTPS만.** 매니페스트의 호스트 허용 목록 밖으로는 내려받지 않는다. 리다이렉트도 허용 목록 안이어야 한다(FrameTrace·패키징 스크립트가 홉마다 직접 확인, curl에 `--location` 없음; `--globoff`로 URL의 `[]{}`는 글자 그대로). 인증서 오류는 그대로 실패. **프록시**: 사용자/시스템 프록시 환경 변수(`HTTPS_PROXY`·`ALL_PROXY`·`NO_PROXY`)는 회사망을 위해 **그대로 따른다** — 프록시는 허용 호스트로 가는 TLS를 중계할 뿐이고(인증서는 그 호스트의 것으로 확인), 무결성은 언제나 고정 크기·SHA-256이 결정한다(§Fix round 1).
 - **T3. 사용자가 누를 때만.** 앱은 스스로 인터넷에 나가지 않는다. 설치는 사용자가 버튼/명령으로 시작하고, 받을 파일 이름·출처·크기를 먼저 보여 준다.
 - **T4. 새 의존성 없이.** HTTP는 Windows 내장 `curl.exe`(10 1803+), 압축 해제는 내장 `tar.exe`(bsdtar). 둘 다 `tool_policy`로 절대 경로 해석. 압축 해제는 임시 폴더에서 하고 경로 탈출(zip-slip·절대 경로·`..`·링크) 항목이 있으면 전체 거부, 매니페스트에 적힌 파일만 `tools/bin`으로 옮긴다.
-- **T5. 라이선스 고지.** 번들·설치하는 도구마다 라이선스와 소스 위치를 `THIRD_PARTY_NOTICES.md`와 `tools/bin/licenses/`에 둔다. FFmpeg는 **LGPL 빌드**만(FrameTrace는 MIT).
-- **T6. 오프라인에서도 동작.** 번들된 FFmpeg로 기본 기능은 인터넷 없이 동작. 다운로드 실패는 기능 안내만 하고 앱을 막지 않는다.
+- **T5. 라이선스 고지 — FrameTrace는 외부 도구를 배포하지 않는다.** 배포 zip(`scripts/make-portable.ps1`)에는 FrameTrace 자신의 실행 파일만 들어가고 `ffmpeg.exe`·`ffprobe.exe`는 절대 넣지 않는다. 도구 설치는 사용자가 매니페스트에 고정된 **공식 출처에서 직접** 내려받는 것이며, 앱은 내려받기 **전에** 파일·출처 호스트·크기·라이선스 구성·“FrameTrace가 배포하지 않음”(`notice`)을 보여 준다. 설치된 도구의 라이선스 원문은 `tools/bin/licenses/`에 복사한다(LGPLv3 `LICENSE.txt` + 저장소에 해시 고정한 GPLv3 원문). `THIRD_PARTY_NOTICES.md`는 FrameTrace가 **실제로 배포하는 것**에 대한 고지만 담고, 사용자가 설치하는 도구는 “배포하지 않음” 절로 안내한다. 자체 빌드 LGPL FFmpeg 번들은 옵션 A(별도 PR) 전까지 없다.
+- **T6. 오프라인에서도 동작.** FFmpeg가 설치돼 있으면(tools/bin 또는 PATH) 기본 기능은 인터넷 없이 동작한다. 없으면 doctor·첫 화면이 설치 안내만 하고 앱을 막지 않는다. 다운로드 실패도 기능 안내만 한다.
 
 ## 트랙 S — 서버·CLI·패키징 (Opus)
 | ID | 내용 |
@@ -166,3 +166,14 @@
 ### 확인 못 한 것
 - 실제 h264_mf가 `MFStartup`에서 멈추는 상황(Windows N/KN·Server Core)은 재현하지 못했다 — 가짜 ffmpeg의 잠자는 시험으로만 확인.
 - Linux/macOS clippy·테스트는 이 PC(Windows)에서 돌리지 못했다 — 바꾼 `cfg(not(windows))` 코드는 테스트용 가짜 ffmpeg의 `sleep` 분기뿐이다.
+
+## §옵션 C (2026-10-20)
+
+소유자 결정(2026-10-20): **옵션 C.**
+- 고정한 BtbN `win64-lgpl` 빌드는 이름과 달리 **GPL-2.0-only(zvbi `src/packet-830.*`·`src/pdc.*`) + GPL-2.0-or-later(FFTW3) + LGPLv3 + Apache-2.0(openssl 등)** 이 섞여 있어 FrameTrace가 재배포할 수 없다(2차 Fable 공급망 리뷰 **B-1 Blocker**). 따라서 **배포 zip에 FFmpeg를 넣지 않는다.**
+- 앱 안의 해시 고정 설치(`frametrace tools install ffmpeg`, 첫 화면 [설치] 버튼)는 **그대로 둔다** — 사용자가 BtbN GitHub 릴리스에서 **직접** 내려받으므로 FrameTrace는 배포자가 아니다.
+- 자체 빌드한 진짜 LGPL FFmpeg 번들(옵션 A)은 **별도 PR**(부록 A).
+
+구현 계획·행 목록은 `docs/PLAN_TOOLS_C_2026-10-20.md`.
+
+§S5·§Fix round 1 #2·#3의 패키징·소스 제공 부분은 이 결정으로 폐기(이력).

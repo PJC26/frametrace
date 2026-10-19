@@ -118,3 +118,5 @@ alongside the release record; that triplet is the complete build input.
 - **SHA256SUMS is self-asserted.** It anchors integrity only when the
   signature/attestation over it is verified; an unsigned manifest proves
   nothing about who produced it.
+
+The Windows zip contains no FFmpeg; it is installed by the user from the pinned BtbN release (tools/manifest.json).

@@ -71,7 +71,7 @@ This produces `dist/FrameTrace-<version>-win64/` + `.zip` + `SHA256SUMS`.
 The package contains both executables, docs, `install.ps1`, and `tools/bin`.
 The bundled tools come from `tools/bin` if it exists, otherwise from
 `target/release/tools/bin` (where `build-libewf-tools.ps1` installs them).
-Drop `ffmpeg.exe`/`ffprobe.exe` into `tools/bin` too for a fully turnkey bundle.
+The package never contains ffmpeg/ffprobe (they are not redistributable by us): run `frametrace.exe tools install ffmpeg` after unzipping (or use the home screen's install button), or keep them on PATH.
 
 **Two ways to run it:**
 
@@ -281,4 +281,4 @@ Open `reports\case-report.html` from the package and print to PDF when a PDF del
 
 The prototype calls `ffmpeg` and `ffprobe` by name, so Windows must be able to find them through `PATH`.
 
-If a future GUI bundles FFmpeg, the app should validate the bundled binary path and log the exact binary/version used for every export.
+FrameTrace does not bundle FFmpeg. Every proxy/export audit line records the resolved binary's encoders (`video_encoder`, `audio_encoder`) and the exact arguments; `frametrace doctor` shows which ffmpeg is used and whether another copy on PATH is ignored.
