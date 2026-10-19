@@ -40,6 +40,16 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 # call. The entry names are checked after the zip is written regardless.
 [System.AppContext]::SetSwitch('Switch.System.IO.Compression.ZipFile.UseBackslash', $false)
 
+# SHA-256 through .NET directly: `Get-FileHash` lives in a module that
+# Windows PowerShell 5.1 fails to auto-load when started from pwsh 7 with
+# its PSModulePath (GitHub runners) — CommandNotFoundException.
+function Get-Sha256Hex([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $Path).ProviderPath)
+    try { ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
+
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
@@ -126,7 +136,7 @@ function Invoke-PinnedDownload([string]$curl, [string]$url, [string]$out, [int64
 # One of FrameTrace's own license files, checked against its manifest pin.
 function Get-PinnedRepoFile($file, $sha) {
     if (-not (Test-Path -LiteralPath $file)) { throw "missing $file" }
-    $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actual = (Get-Sha256Hex $file)
     if ($actual -ne $sha) { throw "$file does not match its pinned sha256 (got $actual, manifest $sha)" }
     return (Resolve-Path -LiteralPath $file).Path
 }
@@ -154,7 +164,7 @@ try {
     # ---- verify size + SHA-256 before opening the archive ----------------------
     $len = (Get-Item $archive).Length
     if ($len -ne [int64]$ffmpeg.size) { throw "size mismatch: $len bytes, the manifest pins $($ffmpeg.size)" }
-    $sha = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sha = (Get-Sha256Hex $archive)
     if ($sha -ne $ffmpeg.sha256) { throw "SHA-256 mismatch: got $sha, the manifest pins $($ffmpeg.sha256)" }
     Write-Host "verified $($ffmpeg.file_name) ($len bytes, sha256 $sha)"
     if ($CacheDir -and $archive -ne (Join-Path $CacheDir $ffmpeg.file_name)) {
@@ -245,7 +255,7 @@ try {
 }
 $dist = (Resolve-Path "dist").Path
 $sumLines = @(Get-ChildItem $dist -Filter *.zip | ForEach-Object {
-    "{0}  {1}" -f ((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()), $_.Name
+    "{0}  {1}" -f (Get-Sha256Hex $_.FullName), $_.Name
 })
 [System.IO.File]::WriteAllText((Join-Path $dist "SHA256SUMS"), (($sumLines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "package: $zipPath"

@@ -120,6 +120,9 @@ function fakeRepo(manifest) {
 function runPackage(root) {
   const env = { ...process.env, NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost' };
   for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) delete env[k];
+  // A pwsh-7 parent (GitHub's `shell: pwsh`) leaves a PSModulePath that Windows
+  // PowerShell 5.1 cannot auto-load modules from; unset it so 5.1 rebuilds its own.
+  for (const k of Object.keys(env)) if (k.toLowerCase() === 'psmodulepath') delete env[k];
   return new Promise((ok) => {
     const child = spawn('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts/package-windows.ps1'),
