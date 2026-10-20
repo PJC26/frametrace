@@ -27,8 +27,13 @@ pub fn write_fake(dir: &Path, unix_body: &str, cmd_body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let _ = cmd_body;
         let path = dir.join("fake-frametrace.sh");
-        std::fs::write(&path, format!("#!/bin/sh\n{unix_body}\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\n{unix_body}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&path);
         path
     }
     #[cfg(not(unix))]

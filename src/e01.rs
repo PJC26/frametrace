@@ -1681,8 +1681,13 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         let script = |name: &str, body: &str| {
             let path = bin.join(name);
-            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::write(
+                &path,
+                format!("#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\n{body}\n"),
+            )
+            .unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::warm_unix_script(&path);
             path.to_string_lossy().to_string()
         };
         let ewfinfo = script("ewfinfo", "echo 'Media size: 1 KiB (16 bytes)'");

@@ -1378,8 +1378,13 @@ Units are in 512-byte sectors
             let dir = case.join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("icat");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\n{body}\n"),
+            )
+            .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::warm_unix_script(&path);
             path.to_string_lossy().to_string()
         };
         let options = |bin: String| TskRecoverOptions {

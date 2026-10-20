@@ -780,10 +780,11 @@ fn r10_s5_real_step_binary_keeps_the_token_from_its_grandchildren() {
         let script = root.join("deepfake-lens");
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '{\"verdict\":\"token=[%s] probe=[%s]\"}\\n' \"$FRAMETRACE_STEP_WARNINGS\" \"$FRAMETRACE_R10_S5_PROBE\"\n",
+            "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nprintf '{\"verdict\":\"token=[%s] probe=[%s]\"}\\n' \"$FRAMETRACE_STEP_WARNINGS\" \"$FRAMETRACE_R10_S5_PROBE\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&script);
         command.env("FRAMETRACE_DEEPFAKE_LENS", &script);
     }
     #[cfg(windows)]
