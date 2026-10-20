@@ -234,6 +234,22 @@ else
         fi
     done
 
+    # duplicated entry name: a marked first copy behind a clean last copy.
+    # zipfile's read(name) returns only the LAST copy, so a reader that
+    # iterates namelist() would pass this zip as clean (round-10 review).
+    dup_readers=("" python)
+    if [ "$HAVE_UNZIP" -eq 1 ]; then dup_readers+=(unzip); fi
+    for reader in "${dup_readers[@]}"; do
+        label="${reader:-default}"
+        fresh_repo
+        make_zip_n "$REPO/dist/FrameTrace-9.9.9-win64.zip" \
+            "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$MARKER_TEXT" \
+            "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT" 2>/dev/null
+        run_script FRAMETRACE_ZIP_READER="$reader"
+        check "duplicate name (marker first), reader $label: exit 1" [ "$RC" -eq 1 ]
+        check "duplicate name (marker first), reader $label: names the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+    done
+
     # lower-case entry name at the zip root, odd zip name
     fresh_repo
     make_zip "$REPO/dist/renamed.zip" "third_party_notices.md" $'x\n(owner TO\n\tconfirm)\n'

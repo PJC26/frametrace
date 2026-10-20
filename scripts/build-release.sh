@@ -82,9 +82,12 @@ read_notices_with() {
 import sys, zipfile
 try:
     with zipfile.ZipFile(sys.argv[1]) as z:
-        for n in z.namelist():
-            if n.replace("\\", "/").rsplit("/", 1)[-1].lower() == "third_party_notices.md":
-                sys.stdout.buffer.write(z.read(n) + b"\n")
+        # infolist(), not namelist(): z.read(name) returns only the LAST
+        # entry of a duplicated name, which would hide a marked copy
+        # behind a clean one. Reading by ZipInfo emits every copy.
+        for info in z.infolist():
+            if info.filename.replace("\\", "/").rsplit("/", 1)[-1].lower() == "third_party_notices.md":
+                sys.stdout.buffer.write(z.read(info) + b"\n")
     sys.stdout.flush()
 except BaseException as e:
     sys.stderr.write("zipfile: %s: %r\n" % (sys.argv[1], e))
@@ -97,6 +100,7 @@ except BaseException as e:
             # own wildcards do not reliably cross '/'.
             list="$(unzip -Z1 "$zip" 2>/dev/null)" || return 1
             while IFS= read -r entry; do
+                entry="${entry%$'\r'}" # a CRLF-listing unzip (native Win32 builds)
                 [ -n "$entry" ] || continue
                 base="$(printf '%s' "${entry##*/}" | tr '[:upper:]' '[:lower:]')"
                 [ "$base" = "third_party_notices.md" ] || continue

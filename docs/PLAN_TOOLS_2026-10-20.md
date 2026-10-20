@@ -399,3 +399,9 @@ round 9 확인 리뷰의 Medium 하나·Low 하나와 값싼 짐작 둘을 처�
 
 ### 확인 못 한 것
 - 진짜 Alpine/BSD bsdtar(Windows 동봉 bsdtar 3.8.9로 대신)·BusyBox unzip 실물. 암호화 zip 픽스처는 여전히 없음(`-P ''`는 코드 읽기와 보통 zip 회귀만).
+
+### Fix round 10 추가 (2026-10-20, 10차 확인 리뷰 반영, 기준 f6c1781)
+- Medium(PR 전체): Python 읽기가 `namelist()` + `z.read(name)`이라 같은 이름 항목이 둘이면 **마지막 복사본만** 읽어, 앞의 마커 복사본이 뒤의 깨끗한 복사본에 가려 통과했다(기본 순서가 Python 먼저라 서명까지 갈 수 있었음). `infolist()` + `z.read(info)`로 모든 복사본을 읽는다. 하네스에 "중복 이름(마커가 먼저)" 경우를 default·python·unzip 읽기마다 추가 — 옛 스크립트로 돌리면 default·python 4건이 실패(113 ok / 4 failed), 새 스크립트는 117 ok / 0 failed(`FRAMETRACE_TEST_BSDTAR` 지정, bsdtar 3.8.9).
+- Low: unzip 목록 루프에도 `\r` 제거를 넣었다(CRLF로 목록을 내는 네이티브 Win32 unzip에서 고지 항목이 마지막 줄이 아니면 건너뛰어 열린 쪽 실패). 실물 CRLF unzip으로는 확인하지 못했고, Python이 있으면 이 경로에 오지 않는다.
+- 확인 못 한 것: Windows bsdtar는 비ASCII 항목 이름을 CP949로 출력해 그 이름으로 꺼내면 "Not found in archive"(rc 1, 닫힌 쪽 실패 → 잘못 거부). Git Bash 기본 tar는 GNU라 하네스 경로에서만 생긴다. crypt 없이 빌드된 Info-ZIP에서 `-P ''`가 사용법 오류가 되면 unzip 읽기가 실패해 다음 도구로 넘어간다(닫힌 쪽).
+- 범위 밖 메모(10차 리뷰 짐작): `build-release.sh`의 서명 단계가 `python3`를 탐침 없이 부르고(Store 별칭이면 `COSIGN_KEY` 경로가 깨짐), `mktemp -t … ` 뒤 `.json`을 붙여 확장자 없는 빈 임시 파일이 남는다. 옵션 A PR에서 다룬다.
