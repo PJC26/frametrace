@@ -155,6 +155,16 @@ impl RealPython {
     }
 }
 
+/// The refusal when a program runs from the venv to be replaced (audited
+/// with code `busy`).
+pub(crate) fn venv_in_use(target: &Path) -> String {
+    format!(
+        "{}{} is in use (a program runs from it) — close it and try again; nothing was changed",
+        super::BUSY_PREFIX,
+        target.display()
+    )
+}
+
 fn run_python(command: &mut Command, secs: u64, what: &str) -> Result<(), String> {
     command
         .env_remove("PYTHONPATH")
@@ -200,6 +210,13 @@ pub(crate) fn install_pip(
     let script_name = tool.provides.first().ok_or("tool provides nothing")?;
     let target = dirs.python_env(&tool.name);
     let parent = target.parent().ok_or("bad venv path")?.to_path_buf();
+    // A program running from the live venv (the server's deepfake-lens,
+    // whose busy lease the CLI cannot see) does not stop the rename below
+    // on Windows — the env would be rebuilt underneath it. Refuse instead;
+    // nothing has been touched yet.
+    if super::image_in_use_under(&target) {
+        return Err(venv_in_use(&target));
+    }
     let staging = StagingDir::create(&dirs.tools_dir, ".staging-")?;
     let req_path = staging.path().join("requirements.txt");
     std::fs::write(&req_path, requirements)

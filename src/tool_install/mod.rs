@@ -719,6 +719,10 @@ pub const NOT_CANCELLABLE: &str =
 /// The worker's error when it stopped on a cancel request.
 pub const INSTALL_CANCELLED: &str = "install cancelled";
 
+/// Start of an install error that refused because something is in use
+/// (the audit line then carries `"code": "busy"`).
+pub const BUSY_PREFIX: &str = "busy: ";
+
 impl Progress {
     pub fn stage(&self) -> Stage {
         Stage::from_u8(self.stage.load(Ordering::SeqCst))
@@ -1143,6 +1147,9 @@ fn audit_line(tool: &ToolEntry, result: Result<&InstallOutcome, &String>) -> Str
         Err(err) => {
             value["result"] = "failed".into();
             value["error"] = err.as_str().into();
+            if err.starts_with(BUSY_PREFIX) {
+                value["code"] = "busy".into();
+            }
         }
     }
     value.to_string()
@@ -1244,20 +1251,49 @@ fn sweep_dir(
 /// either case it is left whole and tried again next time. Only the renamed
 /// copy is deleted. Returns the path left behind, if any (`<dir>` when in
 /// use, `<dir>.rm` when its removal failed — both match the sweep's
-/// patterns and are retried by it).
+/// patterns and are retried by it). A `<dir>` already named `….rm` is such
+/// a leftover: it is not renamed again (`.rm.rm.rm…` would grow every
+/// sweep), only its removal is retried.
 pub(crate) fn remove_dir_unless_in_use(dir: &Path) -> Option<PathBuf> {
-    let mut doomed = dir.as_os_str().to_owned();
-    doomed.push(".rm");
-    let doomed = PathBuf::from(doomed);
-    if image_in_use_under(dir) || std::fs::rename(dir, &doomed).is_err() {
-        return std::fs::symlink_metadata(dir)
+    let left = |path: &Path| {
+        std::fs::symlink_metadata(path)
             .is_ok()
-            .then(|| dir.to_path_buf());
+            .then(|| path.to_path_buf())
+    };
+    if image_in_use_under(dir) {
+        return left(dir);
     }
-    match std::fs::remove_dir_all(&doomed) {
+    let doomed = if dir.to_string_lossy().ends_with(".rm") {
+        dir.to_path_buf()
+    } else {
+        let mut doomed = dir.as_os_str().to_owned();
+        doomed.push(".rm");
+        let doomed = PathBuf::from(doomed);
+        if std::fs::rename(dir, &doomed).is_err() {
+            return left(dir);
+        }
+        doomed
+    };
+    match remove_doomed_dir(&doomed) {
         Ok(()) => None,
-        Err(_) => std::fs::symlink_metadata(&doomed).is_ok().then_some(doomed),
+        Err(_) => left(&doomed),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: makes [`remove_doomed_dir`] fail on this thread (a removal
+    /// that keeps failing — ACL, a scanner holding a file).
+    pub(crate) static FAIL_DOOMED_REMOVAL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn remove_doomed_dir(doomed: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DOOMED_REMOVAL.with(|fail| fail.get()) {
+        return Err(std::io::Error::other("test: removal fails"));
+    }
+    std::fs::remove_dir_all(doomed)
 }
 
 /// Whether a file under `dir` is a running program / loaded DLL (or held

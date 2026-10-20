@@ -857,6 +857,47 @@ fn pip_install_builds_private_venv_and_restores_the_old_one_on_failure() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Fix round 5 (L5): a renamed `<dir>.rm` whose removal keeps failing is
+/// retried as it is — never renamed again to `.rm.rm`, `.rm.rm.rm`, … on
+/// every sweep — and removed once the removal works.
+#[test]
+fn a_leftover_rm_dir_is_retried_not_renamed_again() {
+    let base = scratch("rm-loop");
+    let tools = base.join("tools");
+    let staging = tools.join(".staging-stuck");
+    std::fs::create_dir_all(staging.join("x")).unwrap();
+    std::fs::write(staging.join("x").join("f"), b"x").unwrap();
+    let rm = tools.join(".staging-stuck.rm");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let names = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&tools)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    FAIL_DOOMED_REMOVAL.with(|fail| fail.set(true));
+    assert_eq!(remove_dir_unless_in_use(&staging), Some(rm.clone()));
+    assert_eq!(remove_dir_unless_in_use(&rm), Some(rm.clone()));
+    for _ in 0..3 {
+        assert_eq!(clean_stale_staging(&tools, later), 0);
+    }
+    assert_eq!(names(), vec![".staging-stuck.rm".to_string()]);
+    assert!(rm.join("x").join("f").is_file());
+    // The same for a replaced venv's leftover.
+    let old = tools.join("python").join(".lens.old-00ff.rm");
+    std::fs::create_dir_all(&old).unwrap();
+    assert_eq!(clean_stale_staging(&tools, later), 0);
+    assert!(old.is_dir() && !tools.join("python").join(".lens.old-00ff.rm.rm").exists());
+    FAIL_DOOMED_REMOVAL.with(|fail| fail.set(false));
+    assert_eq!(clean_stale_staging(&tools, later), 2);
+    assert_eq!(names(), vec!["python".to_string()]);
+    assert!(!old.exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
 // ------------------------------------------- Windows: curl + tar, fake source
 
 #[cfg(windows)]
@@ -1671,6 +1712,75 @@ mod windows_installs {
             .filter(|name| name.ends_with(".rm"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Fix round 5 (L2): a program running from the live venv does not
+    /// stop the rename on Windows, so a reinstall would rebuild the env
+    /// underneath it. It is refused (`busy`) before anything is touched;
+    /// once the program exits the reinstall works.
+    #[test]
+    fn a_pip_reinstall_refuses_while_a_program_runs_from_the_live_venv() {
+        let base = scratch("pip-busy");
+        let dirs = InstallDirs {
+            tools_dir: base.join("tools"),
+        };
+        let tool = pip_tool();
+        let req = good_requirements();
+        let python = || FakePython {
+            fail_pip: false,
+            write_script: true,
+            calls: Default::default(),
+        };
+        pip::install_pip(&tool, &req, &dirs, &python(), &Progress::default()).unwrap();
+        let venv = dirs.python_env("lens");
+        let module = venv.join("Lib").join("site-packages").join("lens.py");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, b"print('lens')").unwrap();
+        let exe = venv.join("Scripts").join("held.exe");
+        std::fs::copy(archive::system32_tool("cmd.exe").unwrap(), &exe).unwrap();
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args(["/d", "/q", "/k"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let running = Running(command.spawn().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let again = python();
+        let err = pip::install_pip(&tool, &req, &dirs, &again, &Progress::default()).unwrap_err();
+        assert!(
+            err.starts_with(BUSY_PREFIX) && err.contains("in use"),
+            "{err}"
+        );
+        assert!(again.calls.lock().unwrap().is_empty(), "python never ran");
+        assert!(
+            module.is_file() && exe.is_file(),
+            "the live venv is untouched"
+        );
+        let python_dir: Vec<String> = std::fs::read_dir(venv.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(python_dir, vec!["lens".to_string()], "no .lens.old-*");
+        assert!(
+            !std::fs::read_dir(&dirs.tools_dir)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".staging-")),
+            "no staging dir"
+        );
+        // The failed audit line carries the busy code.
+        let line: serde_json::Value = serde_json::from_str(&audit_line(&tool, Err(&err))).unwrap();
+        assert_eq!(line["result"], "failed");
+        assert_eq!(line["code"], "busy");
+
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        pip::install_pip(&tool, &req, &dirs, &python(), &Progress::default()).unwrap();
+        assert!(!module.exists(), "rebuilt once nothing runs from it");
         let _ = std::fs::remove_dir_all(base);
     }
 
