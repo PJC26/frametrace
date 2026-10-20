@@ -62,7 +62,7 @@ find_python() {
     local cand
     for cand in python3 python; do
         command -v "$cand" >/dev/null 2>&1 || continue
-        if "$cand" -c 'import zipfile' >/dev/null 2>&1; then
+        if "$cand" -I -c 'import zipfile' >/dev/null 2>&1; then
             printf '%s\n' "$cand"
             return 0
         fi
@@ -106,7 +106,7 @@ except BaseException as e:
                 case "$entry" in
                     *'['*|*']'*|*'*'*|*'?'*|*'\'*) return 1 ;;
                 esac
-                unzip -p "$zip" "$entry" 2>/dev/null || return 1
+                unzip -p -P '' "$zip" "$entry" 2>/dev/null || return 1
                 echo
             done <<< "$list"
             ;;
@@ -116,7 +116,22 @@ except BaseException as e:
                 *[Bb][Ss][Dd][Tt][Aa][Rr]*) ;;
                 *) return 3 ;;
             esac
-            tar -xOf "$zip" --include='*THIRD_PARTY_NOTICES.md' 2>/dev/null || return 1
+            # Same as the unzip reader: list, pick the notices by
+            # case-insensitive basename, read only that entry. No notices
+            # entry is clean (rc 0) — e.g. the zips this script builds.
+            list="$(tar -tf "$zip" 2>/dev/null)" || return 1
+            while IFS= read -r entry; do
+                entry="${entry%$'\r'}"
+                [ -n "$entry" ] || continue
+                base="$(printf '%s' "${entry##*/}" | tr '[:upper:]' '[:lower:]')"
+                [ "$base" = "third_party_notices.md" ] || continue
+                # bsdtar matches its name arguments as patterns, like unzip.
+                case "$entry" in
+                    *'['*|*']'*|*'*'*|*'?'*|*'\'*) return 1 ;;
+                esac
+                tar -xOf "$zip" -- "$entry" 2>/dev/null || return 1
+                echo
+            done <<< "$list"
             ;;
         *)
             return 3
