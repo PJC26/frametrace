@@ -28,8 +28,8 @@ GPL-2.0-or-later (via chromaprint), OpenSSL and others under Apache-2.0, and a
 libopenh264 compiled from source (Cisco's H.264 patent licence covers only the
 binaries Cisco distributes). The component list derived from BtbN's build
 scripts is in `docs/ffmpeg-btbn-components-autobuild-2026-09-30.md`
-(informational). Using the file on your own computer is not restricted by any
-of these licenses. If **you** pass the file on to someone else (for example by
+(informational). These licenses do not restrict using the file on your own
+computer (patents are a separate matter: no patent licence comes with it). If **you** pass the file on to someone else (for example by
 copying a FrameTrace folder that contains `tools/bin/ffmpeg.exe`), the GPL's
 conditions — including making the complete corresponding source available —
 fall on you; the sources are at the upstream locations named in the manifest
