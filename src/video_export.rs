@@ -139,8 +139,10 @@ pub fn export_video(
     // `.part`, which the server sweeps).
     let ffmpeg = resolve_tool_binary("ffmpeg", &["ffmpeg"])
         .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
-    // The bundled LGPL ffmpeg has no libx264: pick the encoders this build
-    // really has, and log the same pick (reproducible command line).
+    // The resolved ffmpeg may lack libx264 (the BtbN build the guided
+    // installer fetches does; FrameTrace bundles none): pick the encoders
+    // this build really has, and log the same pick (reproducible command
+    // line).
     let codecs = export_codecs(&crate::ffmpeg_encoders::for_binary(&ffmpeg), options.format);
     let part = crate::join::pid_part_path(&output_path, std::process::id());
     if let Err(err) = run_ffmpeg_export(

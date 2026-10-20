@@ -16,7 +16,7 @@ Status: **UNBLOCKED (user-local SDK)** — thin shell builds
 
 - MSIX store packaging / code signing
 - Full four-pane forensic GUI (viewer remains generated HTML)
-- Auto-bundle of FFmpeg/libewf into the shell
+- Auto-bundle of libewf into the shell (FFmpeg is never bundled — guided install or PATH, `docs/PLAN_TOOLS_C_2026-10-20.md`)
 
 ## Run
 

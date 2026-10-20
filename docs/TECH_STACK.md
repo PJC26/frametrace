@@ -29,7 +29,7 @@ Evidence stays on the examiner PC or attached storage. The application owns a lo
 - Ship the Rust core as either:
   - a standalone engine executable called by the GUI, or
   - a Rust library exposed through a narrow FFI boundary after the command contract stabilizes.
-- Bundle or validate FFmpeg/ffprobe explicitly. The prototype expects them in `PATH`.
+- Validate FFmpeg/ffprobe explicitly. FrameTrace does not bundle them (option C, `docs/PLAN_TOOLS_C_2026-10-20.md`): the user installs the pinned build with `frametrace tools install ffmpeg` (into `tools/bin`) or keeps them on `PATH`.
 - Use admin elevation only for raw physical-drive access. Folder scans, copied evidence, and mounted SD cards should run without elevation.
 - Keep all case writes inside the selected case folder, never beside the source evidence by default.
 - Treat vendor EXE players as evidence/export packages; do not execute them automatically.

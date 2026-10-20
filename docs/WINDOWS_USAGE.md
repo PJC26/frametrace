@@ -69,8 +69,9 @@ powershell -ExecutionPolicy Bypass -File scripts/make-portable.ps1
 
 This produces `dist/FrameTrace-<version>-win64/` + `.zip` + `SHA256SUMS`.
 The package contains both executables, docs, `install.ps1`, and `tools/bin`.
-The bundled tools come from `tools/bin` if it exists, otherwise from
-`target/release/tools/bin` (where `build-libewf-tools.ps1` installs them).
+The packaged libewf / Sleuth Kit tools come from `tools/bin` if it exists,
+otherwise from `target/release/tools/bin` (where `build-libewf-tools.ps1`
+installs them); FFmpeg files found there are skipped, never packaged.
 The package never contains ffmpeg/ffprobe (they are not redistributable by us): run `frametrace.exe tools install ffmpeg` after unzipping (or use the home screen's install button), or keep them on PATH.
 
 **Two ways to run it:**

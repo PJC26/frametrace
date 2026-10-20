@@ -287,7 +287,7 @@ GUI 규칙:
 - GUI executable
 - startup diagnostic 또는 dependency check 화면
   - 최종 사용자는 Rust가 필요 없어야 한다.
-  - FFmpeg/ffprobe는 bundle 또는 discovery가 필요하다.
+  - FFmpeg/ffprobe는 bundle 또는 discovery가 필요하다. (2026-10-20 옵션 C: 번들하지 않음 — `tools install ffmpeg` 안내 설치 또는 PATH 탐색, `docs/PLAN_TOOLS_C_2026-10-20.md`.)
   - libewf/Sleuth Kit은 bundle하거나 missing 상태를 명확히 알려야 한다.
 - 예제 workflow 문서
 - versioned release notes
