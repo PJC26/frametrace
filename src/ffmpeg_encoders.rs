@@ -49,11 +49,14 @@
 //!
 //! Fix round 5: a timed-out `-encoders` is retried once at twice its bound
 //! (antivirus scanning a freshly installed 170 MB exe). When it still
-//! gives no listing and the binary is the one the guided installer put in
-//! `<exe dir>/tools/bin` (the manifest-pinned build), the pinned build's
-//! candidates (h264_mf, libopenh264, mpeg4 — no libx264) are assumed and
-//! trialled instead of [`Encoders::assumed_full`], whose libx264 that build
-//! lacks; the note says the listing could not be read. The whole probe
+//! gives no listing — whatever the ffmpeg's location (Fix round 6: PATH,
+//! a copy in `<exe dir>/tools/bin`, the guided install alike) — every
+//! candidate (libx264, h264_mf, libopenh264, mpeg4; aac) is assumed
+//! ([`Encoders::assumed_candidates`]) and trial-encoded best first, so a
+//! build without libx264 (its trial fails in well under a second) gets the
+//! next encoder that really works instead of a libx264 every proxy and
+//! export would fail on; the note says the listing could not be read and
+//! which encoder the trial chose. The whole probe
 //! (`-encoders` and every trial) has one [`PROBE_BUDGET`]: once it is used
 //! up no further trial runs — a remaining mpeg4 is used untried, any other
 //! remaining candidate counts as timed out — and whenever anything timed
@@ -61,7 +64,7 @@
 //! [`INCONCLUSIVE_TTL`].
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -139,10 +142,12 @@ pub struct Encoders {
     /// Those of `failed` that only timed out (twice): skipped for now, not
     /// known to be broken.
     timed_out: BTreeSet<String>,
-    /// `-encoders` gave no listing (`probed` false) and the binary is the
-    /// manifest-pinned build in `<exe dir>/tools/bin`: `names` are that
-    /// build's candidates, not [`Encoders::assumed_full`].
-    pinned_assumed: bool,
+    /// `-encoders` gave no listing (`probed` false): `names` are every
+    /// candidate ([`Encoders::assumed_candidates`]), trial-encoded best
+    /// first.
+    assumed_candidates: bool,
+    /// A trial encode worked and chose [`Encoders::video`].
+    chosen_by_trial: bool,
     /// `-encoders` timed out (twice) — the reason `probed` is false.
     listing_timed_out: bool,
 }
@@ -160,26 +165,29 @@ impl Encoders {
             probed: false,
             failed: BTreeSet::new(),
             timed_out: BTreeSet::new(),
-            pinned_assumed: false,
+            assumed_candidates: false,
+            chosen_by_trial: false,
             listing_timed_out: false,
         }
     }
 
-    /// The assumption for the manifest-pinned build (BtbN win64-lgpl) when
-    /// its `-encoders` gave no listing: what that build lists among the
-    /// candidates — Media Foundation, the source-built openh264, native
-    /// mpeg4 and aac; no libx264, no libmp3lame assumed (AVI gets native
-    /// mp2). The candidates are still trial-encoded.
-    pub fn assumed_pinned(listing_timed_out: bool) -> Self {
+    /// The assumption when `-encoders` gave no listing, whatever the build:
+    /// every video candidate ([`VideoEncoder::PREFERENCE`]) and native aac,
+    /// to be trial-encoded best first (a missing encoder fails its trial
+    /// at once). No libmp3lame is assumed (AVI gets native mp2).
+    pub fn assumed_candidates(listing_timed_out: bool) -> Self {
+        let mut names: BTreeSet<String> = VideoEncoder::PREFERENCE
+            .iter()
+            .map(|encoder| encoder.name().to_string())
+            .collect();
+        names.insert("aac".to_string());
         Self {
-            names: ["h264_mf", "libopenh264", "mpeg4", "aac"]
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
+            names,
             probed: false,
             failed: BTreeSet::new(),
             timed_out: BTreeSet::new(),
-            pinned_assumed: true,
+            assumed_candidates: true,
+            chosen_by_trial: false,
             listing_timed_out,
         }
     }
@@ -208,7 +216,8 @@ impl Encoders {
             probed: true,
             failed: BTreeSet::new(),
             timed_out: BTreeSet::new(),
-            pinned_assumed: false,
+            assumed_candidates: false,
+            chosen_by_trial: false,
             listing_timed_out: false,
         }
     }
@@ -236,10 +245,15 @@ impl Encoders {
         self.timed_out.insert(encoder.name().to_string());
     }
 
-    /// Whether the encoders are the pinned build's assumed candidates
-    /// (`-encoders` gave no listing).
-    pub fn pinned_assumed(&self) -> bool {
-        self.pinned_assumed
+    /// Whether the encoders are the assumed candidate set (`-encoders`
+    /// gave no listing).
+    pub fn candidates_assumed(&self) -> bool {
+        self.assumed_candidates
+    }
+
+    /// Whether a trial encode worked and chose [`Encoders::video`].
+    pub fn chosen_by_trial(&self) -> bool {
+        self.chosen_by_trial
     }
 
     /// Whether `-encoders` timed out (twice).
@@ -301,37 +315,17 @@ impl Encoders {
     /// A one-line note when libx264 is not used (doctor, `tools list`,
     /// /api/tools), naming the H.264 encoder used instead and — when
     /// h264_mf is listed but its trial failed — that Windows needs the
-    /// Media Feature Pack. Also when `-encoders` gave no listing and the
-    /// pick is only assumed (timed out, or the pinned build's candidates).
+    /// Media Feature Pack. Also when `-encoders` gave no listing: that it
+    /// timed out (or failed) and which encoder the trial chose.
     pub fn build_note(&self) -> Option<String> {
         let video = self.video();
-        if !self.probed && !self.pinned_assumed {
-            // The historical full-build assumption: only a timeout is worth
-            // a note (a missing or broken ffmpeg is reported elsewhere).
-            return self.listing_timed_out.then(|| {
-                "ffmpeg -encoders 확인 시간 초과 — libx264로 가정 · 잠시 뒤 다시 확인".to_string()
-            });
+        if !self.probed {
+            return self.assumed_note(video);
         }
-        if self.probed && video == VideoEncoder::Libx264 {
+        if video == VideoEncoder::Libx264 {
             return None;
         }
         let mut note = match video {
-            _ if self.pinned_assumed => {
-                let pick = match video {
-                    VideoEncoder::Mpeg4 => {
-                        "프록시·MP4 내보내기는 mpeg4(MPEG-4 Part 2) 사용".to_string()
-                    }
-                    other => format!("H.264는 {} 사용", other.name()),
-                };
-                format!(
-                    "ffmpeg -encoders 확인 {} — 설치한 고정 빌드(libx264 없음) 기준으로 {pick}",
-                    if self.listing_timed_out {
-                        "시간 초과"
-                    } else {
-                        "실패"
-                    }
-                )
-            }
             VideoEncoder::Mpeg4 => {
                 "쓸 수 있는 H.264 인코더 없음 — 프록시·MP4 내보내기는 mpeg4(MPEG-4 Part 2) 사용"
                     .to_string()
@@ -349,9 +343,36 @@ impl Encoders {
                 " · h264_mf 사용 불가 — Media Feature Pack 필요 (Windows N/KN 에디션·Server Core)",
             );
         }
-        if self.pinned_assumed && !note.contains("잠시 뒤 다시 확인") {
-            note.push_str(" · 잠시 뒤 다시 확인");
+        Some(note)
+    }
+
+    /// The note when `-encoders` gave no listing. None for the historical
+    /// full-build assumption and for a missing or broken ffmpeg whose
+    /// listing failed and whose trials proved nothing (reported
+    /// elsewhere). No Media Feature Pack hint: an assumed h264_mf that
+    /// fails may simply not be in the build.
+    fn assumed_note(&self, video: VideoEncoder) -> Option<String> {
+        if !self.assumed_candidates || (!self.listing_timed_out && !self.chosen_by_trial) {
+            return None;
         }
+        let reason = if self.listing_timed_out {
+            "시간 초과"
+        } else {
+            "실패"
+        };
+        let name = match video {
+            VideoEncoder::Mpeg4 => "mpeg4(MPEG-4 Part 2)",
+            other => other.name(),
+        };
+        let mut note = if self.chosen_by_trial {
+            format!("ffmpeg -encoders 확인 {reason} — 시험 인코딩으로 {name} 선택")
+        } else {
+            format!("ffmpeg -encoders 확인 {reason} — 시험 인코딩 결론 없음, {name} 가정")
+        };
+        if !self.timed_out.is_empty() {
+            note.push_str(" · 일부 시험 인코딩 시간 초과");
+        }
+        note.push_str(" · 잠시 뒤 다시 확인");
         Some(note)
     }
 
@@ -367,9 +388,9 @@ impl Encoders {
             "trial_failed": self.failed.iter().collect::<Vec<_>>(),
             // Those of trial_failed that only timed out (tried again later).
             "trial_timed_out": self.timed_out.iter().collect::<Vec<_>>(),
-            // `-encoders` gave no listing; the pinned build's candidates
-            // were assumed (probed is then false).
-            "assumed_pinned_build": self.pinned_assumed,
+            // `-encoders` gave no listing; every candidate was assumed and
+            // trial-encoded (probed is then false; the note names the pick).
+            "assumed_candidates": self.assumed_candidates,
             // `-encoders` timed out (twice).
             "listing_timed_out": self.listing_timed_out,
         })
@@ -596,36 +617,6 @@ fn run_listing(binary: &str, secs: u64) -> Listing {
     }
 }
 
-#[cfg(test)]
-static PINNED_TEST_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-/// Whether `binary` is the guided installer's copy: it lives directly in
-/// `<exe dir>/tools/bin` (where only the manifest-pinned build is
-/// installed). Tests register their own directories.
-fn is_pinned_install(binary: &str) -> bool {
-    let Some(parent) = Path::new(binary)
-        .parent()
-        .and_then(|dir| std::fs::canonicalize(dir).ok())
-    else {
-        return false;
-    };
-    #[allow(unused_mut)]
-    let mut dirs: Vec<PathBuf> = crate::tool_install::InstallDirs::for_current_exe()
-        .map(|dirs| vec![dirs.bin()])
-        .unwrap_or_default();
-    #[cfg(test)]
-    dirs.extend(
-        PINNED_TEST_DIRS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned(),
-    );
-    dirs.iter()
-        .filter_map(|dir| std::fs::canonicalize(dir).ok())
-        .any(|dir| dir == parent)
-}
-
 /// `-encoders`, then the trial encodes. The second value is how long the
 /// result may be reused (`None`: for the binary's lifetime).
 fn probe(binary: &str) -> (Encoders, Option<Duration>) {
@@ -644,15 +635,11 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
         other => {
             let listing_timed_out = matches!(other, Listing::TimedOut);
             timed_out |= listing_timed_out;
-            if !is_pinned_install(binary) {
-                let mut encoders = Encoders::assumed_full();
-                encoders.listing_timed_out = listing_timed_out;
-                return (encoders, Some(inconclusive_ttl(timed_out)));
-            }
-            // The manifest-pinned build has no libx264: assume its
-            // candidates and trial them, rather than a libx264 that every
-            // proxy and export would then fail on.
-            Encoders::assumed_pinned(listing_timed_out)
+            // Whatever the build or its location: assume every candidate
+            // and trial them within what is left of the budget (a missing
+            // libx264 fails at once), rather than a libx264 that every
+            // proxy and export might then fail on.
+            Encoders::assumed_candidates(listing_timed_out)
         }
     };
     // Trial-encode the listed candidates, best first, until one works. A
@@ -671,7 +658,10 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
             trial = bounded_trial(binary, candidate, 2 * TRIAL_TIMEOUT_SECS, left());
         }
         match trial {
-            Trial::Works => break,
+            Trial::Works => {
+                encoders.chosen_by_trial = true;
+                break;
+            }
             Trial::OverBudget if candidate == VideoEncoder::Mpeg4 => {
                 timed_out = true;
                 break;
@@ -699,7 +689,7 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
     let ttl = if timed_out {
         Some(TIMED_OUT_TTL)
     } else if !encoders.probed {
-        // The pinned build's candidates, assumed: never kept for good.
+        // The candidates, assumed (no listing): never kept for good.
         Some(INCONCLUSIVE_TTL)
     } else {
         None
@@ -1257,62 +1247,79 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Fix round 5 (M3): `-encoders` of the guided installer's copy (in
-    /// `<exe dir>/tools/bin`) still times out on the retry → the pinned
-    /// build's candidates are assumed and trialled (no libx264, which that
-    /// build lacks), with a note; reused for TIMED_OUT_TTL.
+    /// Fix round 6 (M): an ffmpeg anywhere (PATH here — no location rule)
+    /// whose `-encoders` still times out on the retry, and which has no
+    /// libx264 but a working h264_mf: every candidate is assumed and
+    /// trialled — libx264 fails at once, h264_mf is chosen — with a note
+    /// naming the timeout and the pick; reused for TIMED_OUT_TTL.
     #[test]
-    fn a_timed_out_listing_of_the_pinned_build_assumes_its_candidates() {
-        let dir = std::env::temp_dir().join(format!("ft-enc-list-pinned-{}", std::process::id()));
+    fn a_timed_out_listing_trials_the_candidates_and_skips_a_missing_libx264() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-list-nox264-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let fake = fake_ffmpeg_full(&dir, BTBN_LGPL, &[], &[], 35);
-        PINNED_TEST_DIRS.lock().unwrap().push(dir.clone());
-        assert!(is_pinned_install(&fake));
+        let fake = fake_ffmpeg_full(&dir, BTBN_LGPL, &["libx264"], &[], 35);
         let started = Instant::now();
         let enc = for_binary(&fake);
         let took = started.elapsed();
         assert!(took < PROBE_BUDGET + Duration::from_secs(8), "{took:?}");
-        assert!(!enc.probed() && enc.pinned_assumed() && enc.listing_timed_out());
-        assert!(!enc.has("libx264"), "{enc:?}");
+        assert!(!enc.probed() && enc.candidates_assumed() && enc.listing_timed_out());
+        assert!(enc.chosen_by_trial(), "{enc:?}");
+        assert!(enc.trial_failed("libx264") && !enc.trial_timed_out("libx264"));
         assert_eq!(enc.video(), VideoEncoder::H264Mf, "{enc:?}");
+        assert_eq!(enc.aac(), "aac");
         assert_eq!(enc.avi_audio(), "mp2");
         let note = enc.build_note().expect("a note");
-        assert!(
-            note.contains("시간 초과") && note.contains("고정 빌드") && note.contains("h264_mf"),
-            "{note}"
+        assert_eq!(
+            note,
+            "ffmpeg -encoders 확인 시간 초과 — 시험 인코딩으로 h264_mf 선택 · 잠시 뒤 다시 확인"
         );
-        assert!(note.contains("잠시 뒤 다시 확인"), "{note}");
+        assert!(!note.contains("Media Feature Pack") && !note.contains("고정 빌드"));
         let json = enc.to_json();
         assert_eq!(json["probed"], false);
-        assert_eq!(json["assumed_pinned_build"], true);
+        assert_eq!(json["assumed_candidates"], true);
         assert_eq!(json["listing_timed_out"], true);
         assert_eq!(json["h264"], "h264_mf");
+        assert_eq!(
+            json["libx264"], true,
+            "assumed (listed) — trial_failed says why"
+        );
+        assert_eq!(json["trial_failed"], serde_json::json!(["libx264"]));
+        assert!(json.get("assumed_pinned_build").is_none(), "{json}");
         let calls = calls_of(&dir);
-        // -encoders, its retry, the (working) h264_mf trial.
+        // -encoders, its retry, the failed libx264 trial, the h264_mf trial.
         assert_eq!(count_calls(&calls, "-encoders"), 2, "{calls}");
-        assert_eq!(calls.lines().count(), 3, "{calls}");
+        assert_eq!(count_calls(&calls, "-c:v libx264"), 1, "{calls}");
+        assert_eq!(count_calls(&calls, "-c:v h264_mf"), 1, "{calls}");
+        assert_eq!(calls.lines().count(), 4, "{calls}");
         assert_timed_out_ttl(&fake);
-        PINNED_TEST_DIRS.lock().unwrap().retain(|d| d != &dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Fix round 5 (M3): any other ffmpeg (PATH, a copy elsewhere) keeps the
-    /// historical full-build assumption — but now with a note, and the
-    /// timeout keeps it for TIMED_OUT_TTL.
+    /// Fix round 6 (M): the same timed-out listing on a build that has
+    /// libx264: its trial works and libx264 is chosen (no other trial); the
+    /// note still says the listing timed out. A missing ffmpeg is not a
+    /// timeout: its trial cannot be spawned — no note, the short TTL.
     #[test]
-    fn a_timed_out_listing_elsewhere_assumes_a_full_build_with_a_note() {
-        let dir = std::env::temp_dir().join(format!("ft-enc-list-path-{}", std::process::id()));
+    fn a_timed_out_listing_chooses_a_working_libx264_by_trial() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-list-x264-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let fake = fake_ffmpeg_full(&dir, BTBN_LGPL, &[], &[], 35);
-        assert!(!is_pinned_install(&fake));
+        let fake = fake_ffmpeg_full(&dir, FULL, &[], &[], 35);
         let enc = for_binary(&fake);
-        assert!(!enc.probed() && !enc.pinned_assumed() && enc.listing_timed_out());
+        assert!(!enc.probed() && enc.candidates_assumed() && enc.listing_timed_out());
+        assert!(enc.chosen_by_trial() && enc.to_json()["trial_failed"] == serde_json::json!([]));
         assert_eq!(enc.video(), VideoEncoder::Libx264);
-        let note = enc.build_note().expect("a note");
-        assert!(note.contains("시간 초과"), "{note}");
+        assert_eq!(
+            enc.build_note().as_deref(),
+            Some(
+                "ffmpeg -encoders 확인 시간 초과 — 시험 인코딩으로 libx264 선택 · 잠시 뒤 다시 확인"
+            )
+        );
         let calls = calls_of(&dir);
         assert_eq!(count_calls(&calls, "-encoders"), 2, "{calls}");
-        assert_eq!(calls.lines().count(), 2, "no trial: {calls}");
+        assert_eq!(calls.lines().count(), 3, "one trial: {calls}");
+        assert!(
+            calls.lines().last().unwrap().contains("-c:v libx264"),
+            "{calls}"
+        );
         assert_timed_out_ttl(&fake);
         // A missing ffmpeg is not a timeout: no note, short TTL.
         let missing = dir
@@ -1321,8 +1328,15 @@ pub(crate) mod tests {
             .to_string_lossy()
             .into_owned();
         let enc = for_binary(&missing);
-        assert!(!enc.probed() && !enc.listing_timed_out());
+        assert!(!enc.probed() && !enc.listing_timed_out() && !enc.chosen_by_trial());
+        assert_eq!(
+            enc.video(),
+            VideoEncoder::Libx264,
+            "nothing proven, nothing blamed"
+        );
         assert_eq!(enc.build_note(), None);
+        let expires = expiry_of(&missing).expect("cached").expect("with a TTL");
+        assert!(expires < Instant::now() + INCONCLUSIVE_TTL + Duration::from_secs(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1481,12 +1495,26 @@ pub(crate) mod tests {
         assert_eq!(enc.video(), VideoEncoder::Mpeg4);
         assert_eq!(expiry_of(&fake), Some(None), "permanent");
 
-        // An empty listing (probe proves nothing): assumed, negative-cached.
+        // An empty listing (the listing proves nothing): every candidate is
+        // assumed and trialled (Fix round 6), negative-cached.
         let dir = base.join("empty");
         let fake = fake_ffmpeg(&dir, "");
+        let enc = for_binary(&fake);
+        assert!(!enc.probed() && enc.candidates_assumed() && !enc.listing_timed_out());
+        assert_eq!(
+            enc.video(),
+            VideoEncoder::Libx264,
+            "chosen by trial: {enc:?}"
+        );
+        assert_eq!(
+            enc.build_note().as_deref(),
+            Some("ffmpeg -encoders 확인 실패 — 시험 인코딩으로 libx264 선택 · 잠시 뒤 다시 확인")
+        );
         assert!(!for_binary(&fake).probed());
-        assert!(!for_binary(&fake).probed());
-        assert_eq!(calls_of(&dir).lines().count(), 1, "{}", calls_of(&dir));
+        // -encoders and the libx264 trial, once.
+        assert_eq!(calls_of(&dir).lines().count(), 2, "{}", calls_of(&dir));
+        let expires = expiry_of(&fake).expect("cached").expect("with a TTL");
+        assert!(expires < Instant::now() + INCONCLUSIVE_TTL + Duration::from_secs(1));
         let _ = std::fs::remove_dir_all(&base);
     }
 
