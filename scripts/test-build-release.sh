@@ -9,8 +9,9 @@
 # Runs from Git Bash on Windows and from bash on Linux/macOS:
 #   bash scripts/test-build-release.sh
 # Needs: shasum (the script under test), python3 or python (to make the
-# marker fixture zips; those cases are skipped without it), unzip
-# (optional: the unzip-reader case is skipped without it).
+# fixture zips and as the script's first zip reader; without it the marker
+# cases are skipped and the rest run with FRAMETRACE_SKIP_NOTICES_CHECK=1),
+# unzip (optional: the unzip-reader cases are skipped without it).
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -52,8 +53,18 @@ echo "host: x86_64-unknown-linux-gnu"
 EOF
 cat > "$STUBS/zip" <<'EOF'
 #!/usr/bin/env bash
-# zip -qr <out.zip> <dir>: a placeholder file is enough for SHA256SUMS.
-echo "stub zip of $3" > "$2"
+# zip -qr <out.zip> <dir>: a real (readable) zip with one README entry, so
+# the content check before SHA256SUMS can read it; an empty zip without
+# python.
+if [ -n "${FT_PY:-}" ]; then
+    "$FT_PY" -I -c '
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    z.writestr(sys.argv[2] + "/README.md", "stub\n")
+' "$2" "$3"
+else
+    { printf 'PK\005\006'; head -c 18 /dev/zero; } > "$2"
+fi
 EOF
 chmod +x "$STUBS/cargo" "$STUBS/rustc" "$STUBS/zip"
 
@@ -64,6 +75,17 @@ import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], "w") as z:
     z.writestr(sys.argv[2], sys.argv[3].encode("utf-8"))
 ' "$1" "$2" "$3"
+}
+# empty_zip <out.zip>: a valid zip with no entries (end-of-central-directory only).
+empty_zip() { { printf 'PK\005\006'; head -c 18 /dev/zero; } > "$1"; }
+# stub_dir <name> <script body>: a new directory with one executable stub
+# <name>, for XPATH (put before the shared stubs on PATH).
+stub_dir() {
+    local d="$WORK/x-$1-$RANDOM$RANDOM"
+    mkdir -p "$d"
+    printf '#!/usr/bin/env bash\n%s\n' "$2" > "$d/$1"
+    chmod +x "$d/$1"
+    printf '%s' "$d"
 }
 MARKER_TEXT=$'# Third-party notices\r\n\r\nFFmpeg is not bundled. (Owner to\r\n   confirm this paragraph.)\r\n'
 CLEAN_TEXT=$'# Third-party notices\r\n\r\nFFmpeg is not bundled; the owner confirmed this paragraph.\r\n'
@@ -85,8 +107,12 @@ fresh_repo() {
     : > "$WORK/log$n"
 }
 # run_script [env...]: runs the copy; sets RC, OUT, CARGO_CALLS.
+# XPATH (optional, colon-separated) goes before the shared stubs on PATH.
+SKIP_DEFAULT=""
+[ -n "$PY" ] || SKIP_DEFAULT=1
 run_script() {
-    OUT="$(env PATH="$STUBS:$PATH" FT_LOG="$WORK/log$n" FT_MARKER_ZIP="$MARKER_ZIP" "$@" \
+    OUT="$(env PATH="${XPATH:+$XPATH:}$STUBS:$PATH" FT_LOG="$WORK/log$n" FT_MARKER_ZIP="$MARKER_ZIP" \
+        FT_PY="$PY" FRAMETRACE_SKIP_NOTICES_CHECK="$SKIP_DEFAULT" "$@" \
         bash "$REPO/scripts/build-release.sh" 2>&1)"
     RC=$?
     CARGO_CALLS="$(grep -c '^cargo ' "$WORK/log$n" || true)"
@@ -106,7 +132,7 @@ for name in \
     "복사본 - FrameTrace-9.9.9-win64-Unconfirmed.ZIP"; do
     fresh_repo
     : > "$REPO/dist/$name"
-    : > "$REPO/dist/other-1.0-aarch64.zip"
+    empty_zip "$REPO/dist/other-1.0-aarch64.zip"
     run_script
     check "name '$name': exit 1" [ "$RC" -eq 1 ]
     check "name '$name': cargo not run" [ "$CARGO_CALLS" -eq 0 ]
@@ -124,7 +150,7 @@ check "planted copy name: no SHA256SUMS" no_sums
 
 # --- clean dist/ -----------------------------------------------------------
 fresh_repo
-: > "$REPO/dist/other-1.0-aarch64.zip"
+empty_zip "$REPO/dist/other-1.0-aarch64.zip"
 run_script
 check "clean: exit 0" [ "$RC" -eq 0 ]
 check "clean: SHA256SUMS written" has_sums
@@ -169,8 +195,19 @@ else
         cp "$MARKER_ZIP" "$REPO/dist/FrameTrace-9.9.9-win64.zip"
         run_script FRAMETRACE_ZIP_READER="$reader"
         if [ "$reader" = none ]; then
-            check "marker, reader none: exit 0 (cannot look inside)" [ "$RC" -eq 0 ]
-            check "marker, reader none: warns that it did not check" out_has "NOT checked for the 'Owner to confirm' marker"
+            # No reader: fail closed by default ...
+            check "marker, reader none: exit 1 (cannot look inside)" [ "$RC" -eq 1 ]
+            check "marker, reader none: cargo not run" [ "$CARGO_CALLS" -eq 0 ]
+            check "marker, reader none: no SHA256SUMS" no_sums
+            check "marker, reader none: says cannot verify" out_has "cannot verify — no zip reader"
+            check "marker, reader none: names the override" out_has "FRAMETRACE_SKIP_NOTICES_CHECK=1"
+            # ... and only warns with FRAMETRACE_SKIP_NOTICES_CHECK=1.
+            fresh_repo
+            cp "$MARKER_ZIP" "$REPO/dist/FrameTrace-9.9.9-win64.zip"
+            run_script FRAMETRACE_ZIP_READER=none FRAMETRACE_SKIP_NOTICES_CHECK=1
+            check "marker, reader none + SKIP=1: exit 0" [ "$RC" -eq 0 ]
+            check "marker, reader none + SKIP=1: warns that it did not check" out_has "NOT checked for the 'Owner to confirm' marker"
+            check "marker, reader none + SKIP=1: SHA256SUMS written" has_sums
         else
             check "marker, reader $label: exit 1" [ "$RC" -eq 1 ]
             check "marker, reader $label: cargo not run" [ "$CARGO_CALLS" -eq 0 ]
@@ -192,17 +229,108 @@ else
     check "planted marker zip: cargo ran once" [ "$CARGO_CALLS" -eq 1 ]
     check "planted marker zip: no SHA256SUMS" no_sums
 
-    # confirmed notices and an unreadable zip pass and are listed
+    # confirmed notices pass and are listed (default reader and each one)
+    for reader in "" python unzip; do
+        [ "$reader" = unzip ] && [ "$HAVE_UNZIP" -eq 0 ] && continue
+        label="${reader:-default}"
+        fresh_repo
+        make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
+        run_script FRAMETRACE_ZIP_READER="$reader"
+        check "confirmed notices, reader $label: exit 0" [ "$RC" -eq 0 ]
+        if has_sums; then
+            check "confirmed notices, reader $label: listed in SHA256SUMS" sums_has "FrameTrace-9.9.9-win64.zip"
+        else
+            bad "confirmed notices, reader $label: SHA256SUMS missing"
+        fi
+    done
+
+    # an unreadable zip cannot be verified: refused, not passed as clean
     fresh_repo
-    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
     echo "not a zip" > "$REPO/dist/broken.zip"
     run_script
-    check "confirmed notices: exit 0" [ "$RC" -eq 0 ]
-    if has_sums; then
-        check "confirmed notices: listed in SHA256SUMS" sums_has "FrameTrace-9.9.9-win64.zip"
-        check "unreadable zip: listed in SHA256SUMS" sums_has "broken.zip"
+    check "unreadable zip: exit 1" [ "$RC" -eq 1 ]
+    check "unreadable zip: cargo not run" [ "$CARGO_CALLS" -eq 0 ]
+    check "unreadable zip: says every reader failed" out_has "broken.zip (THIRD_PARTY_NOTICES.md: cannot verify — every zip reader failed on it)"
+
+    # an entry path with '[x]': `unzip -p` would read the name as a wildcard
+    BRACKET_ENTRY="FrameTrace-9.9.9-win64[x]/THIRD_PARTY_NOTICES.md"
+    fresh_repo
+    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "$BRACKET_ENTRY" "$MARKER_TEXT"
+    run_script
+    check "'[x]' entry, default reader: exit 1" [ "$RC" -eq 1 ]
+    check "'[x]' entry, default reader: names the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+    fresh_repo
+    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "$BRACKET_ENTRY" "$CLEAN_TEXT"
+    run_script
+    check "'[x]' entry, confirmed, default reader: exit 0" [ "$RC" -eq 0 ]
+    if [ "$HAVE_UNZIP" -eq 1 ]; then
+        for what in marker confirmed; do
+            text="$MARKER_TEXT"; [ "$what" = confirmed ] && text="$CLEAN_TEXT"
+            fresh_repo
+            make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "$BRACKET_ENTRY" "$text"
+            run_script FRAMETRACE_ZIP_READER=unzip
+            check "'[x]' entry ($what), unzip only: exit 1 (cannot verify, not clean)" [ "$RC" -eq 1 ]
+            check "'[x]' entry ($what), unzip only: no SHA256SUMS" no_sums
+            check "'[x]' entry ($what), unzip only: says cannot verify" out_has "cannot verify — every zip reader failed on it"
+        done
     else
-        bad "confirmed notices: SHA256SUMS missing"
+        skp "'[x]' entry with the unzip reader (no unzip)"
+    fi
+
+    # a failing reader: stub unzip that exits 1; Store-alias python stubs
+    FAILING_UNZIP="$(stub_dir unzip 'echo "unzip: stub failure" >&2; exit 1')"
+    STORE_MSG='echo "Python was not found; run without arguments to install from the Microsoft Store" >&2; exit 9009'
+    STORE_PY3="$(stub_dir python3 "$STORE_MSG")"
+    STORE_PY="$(stub_dir python "$STORE_MSG")"
+    REAL_PY="$(stub_dir python "exec \"$PY\" \"\$@\"")"
+    HAVE_BSDTAR=0
+    case "$(tar --version 2>/dev/null)" in *[Bb][Ss][Dd][Tt][Aa][Rr]*) HAVE_BSDTAR=1 ;; esac
+    for what in marker confirmed; do
+        text="$MARKER_TEXT"; [ "$what" = confirmed ] && text="$CLEAN_TEXT"
+        fresh_repo
+        make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$text"
+        XPATH="$FAILING_UNZIP" run_script FRAMETRACE_ZIP_READER=unzip
+        check "failing unzip ($what), unzip only: exit 1 (cannot verify, not clean)" [ "$RC" -eq 1 ]
+        check "failing unzip ($what), unzip only: cargo not run" [ "$CARGO_CALLS" -eq 0 ]
+        check "failing unzip ($what), unzip only: says cannot verify" out_has "cannot verify — every zip reader failed on it"
+        # no working python either (both Store stubs) + failing unzip: no
+        # reader left that can read it (bsdtar exists only on macOS/BSD).
+        if [ "$HAVE_BSDTAR" -eq 0 ]; then
+            fresh_repo
+            make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$text"
+            XPATH="$STORE_PY3:$STORE_PY:$FAILING_UNZIP" run_script
+            check "Store pythons + failing unzip ($what), default: exit 1" [ "$RC" -eq 1 ]
+            check "Store pythons + failing unzip ($what), default: says cannot verify" out_has "cannot verify — every zip reader failed on it"
+        else
+            skp "Store pythons + failing unzip ($what) (bsdtar present)"
+        fi
+    done
+
+    # python3 is the Microsoft Store alias stub (exit 9009): probed and
+    # skipped, `python` reads the zip (unzip is failing, so a found marker
+    # proves python did the reading).
+    fresh_repo
+    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$MARKER_TEXT"
+    XPATH="$STORE_PY3:$REAL_PY:$FAILING_UNZIP" run_script
+    check "Store python3: exit 1" [ "$RC" -eq 1 ]
+    check "Store python3: python found the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+    fresh_repo
+    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
+    XPATH="$STORE_PY3:$REAL_PY:$FAILING_UNZIP" run_script
+    check "Store python3, confirmed: exit 0 via python" [ "$RC" -eq 0 ]
+    # both pythons are Store stubs: falls to the next reader (real unzip)
+    if [ "$HAVE_UNZIP" -eq 1 ]; then
+        fresh_repo
+        make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$MARKER_TEXT"
+        XPATH="$STORE_PY3:$STORE_PY" run_script
+        check "Store python3 + python: exit 1 via unzip" [ "$RC" -eq 1 ]
+        check "Store python3 + python: unzip found the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+        fresh_repo
+        make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
+        XPATH="$STORE_PY3:$STORE_PY" run_script
+        check "Store python3 + python, confirmed: exit 0 via unzip" [ "$RC" -eq 0 ]
+    else
+        skp "Store python3 + python falling to unzip (no unzip)"
     fi
 fi
 

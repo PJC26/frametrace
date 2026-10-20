@@ -44,8 +44,14 @@ from `make-portable.ps1 -AllowUnconfirmedNotices`: any zip whose name
 contains `unconfirmed` in any case (so a browser/Explorer copy such as
 `…-UNCONFIRMED (1).zip` or `…-UNCONFIRMED - 복사본.zip` counts), or any zip
 whose `THIRD_PARTY_NOTICES.md` still matches `Owner\s+to\s+confirm`
-(read with `unzip`, else Python's `zipfile`, else bsdtar; with none of them
-it warns and skips the content check). It never lists such a name in
+(read with Python's `zipfile` — `python3`, else `python`, each probed with
+`import zipfile` so the Microsoft Store alias stub is skipped — else
+`unzip -Z1`/`-p`, else bsdtar). The content check fails closed: a reader
+that exits non-zero on a zip hands it to the next one, and a zip that no
+available reader can read (broken, encrypted, unsupported compression) is
+refused as "cannot verify", never passed as clean. With no reader at all
+the run also stops (exit 1); `FRAMETRACE_SKIP_NOTICES_CHECK=1` lets it
+proceed with a warning and the name check only. It never lists such a name in
 SHA256SUMS — so `--sign` can never cosign it. Fixture test (stub
 cargo/rustc/zip, no build): `bash scripts/test-build-release.sh`.
 

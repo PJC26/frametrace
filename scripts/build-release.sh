@@ -3,7 +3,7 @@
 #   dist/frametrace-<version>-<target-triple>.zip
 # plus a dist/SHA256SUMS manifest covering every zip in dist/ (refuses to
 # run while dist/ holds a Windows *UNCONFIRMED*.zip test package or any
-# zip whose THIRD_PARTY_NOTICES.md says "Owner to confirm").
+# zip whose THIRD_PARTY_NOTICES.md says "Owner to confirm" or cannot be read).
 #
 # Options:
 #   --sign   also runs `cosign sign-blob` on the zip and SHA256SUMS
@@ -42,39 +42,42 @@ done
 # caught too) and by content: any dist/*.zip whose THIRD_PARTY_NOTICES.md
 # still carries the "(Owner to confirm ...)" marker, whatever it is called.
 #
-# FRAMETRACE_ZIP_READER (unzip|python|tar|none) forces the zip reader;
-# it exists for scripts/test-build-release.sh. Default: the first that works.
+# The content check fails closed: a zip it cannot read is refused
+# ("cannot verify"), never treated as clean. Readers, in order: Python's
+# zipfile (python3, then python — each probed with `import zipfile` first,
+# so the Microsoft Store alias stub that exits 9009 is skipped), then
+# Info-ZIP `unzip` (-Z1 to list, -p to read), then bsdtar. A reader that
+# fails on a zip (non-zero exit: BusyBox unzip without -Z1, encrypted or
+# unsupported compression, an entry name unzip would read as a wildcard)
+# hands the zip to the next one; when every available reader failed, the
+# zip is refused. With no reader at all the run stops too, unless
+# FRAMETRACE_SKIP_NOTICES_CHECK=1 (then only a warning; names are still
+# checked).
+#
+# FRAMETRACE_ZIP_READER (python|unzip|tar|none) forces a single zip reader
+# (no fallback); it exists for scripts/test-build-release.sh.
 
-# Prints the THIRD_PARTY_NOTICES.md entries of zip $1 to stdout (nothing
-# if the zip has none). Returns 3 when no zip reader is available.
-notices_of_zip() {
-    local zip="$1" reader="${FRAMETRACE_ZIP_READER:-}" py
-    if [ -z "$reader" ]; then
-        if command -v unzip >/dev/null 2>&1; then
-            reader=unzip
-        elif command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
-            reader=python
-        elif tar --version 2>/dev/null | grep -qi bsdtar; then
-            reader=tar
-        else
-            reader=none
+# Prints a Python interpreter that can `import zipfile`; fails if none.
+find_python() {
+    local cand
+    for cand in python3 python; do
+        command -v "$cand" >/dev/null 2>&1 || continue
+        if "$cand" -c 'import zipfile' >/dev/null 2>&1; then
+            printf '%s\n' "$cand"
+            return 0
         fi
-    fi
+    done
+    return 1
+}
+
+# read_notices_with <reader> <zip>: prints the THIRD_PARTY_NOTICES.md
+# entries (any folder, any case; nothing if there are none). Returns 0 on
+# success, 1 when the reader failed on this zip, 3 when it is unavailable.
+read_notices_with() {
+    local reader="$1" zip="$2" py list entry base
     case "$reader" in
-        unzip)
-            # List the entries and pick the notices by basename (any case,
-            # any folder) — unzip's own wildcards do not reliably cross '/'.
-            local entry base
-            while IFS= read -r entry; do
-                base="$(printf '%s' "${entry##*/}" | tr '[:upper:]' '[:lower:]')"
-                [ "$base" = "third_party_notices.md" ] || continue
-                unzip -p "$zip" "$entry" 2>/dev/null || true
-                echo
-            done < <(unzip -Z1 "$zip" 2>/dev/null || true)
-            ;;
         python)
-            py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-            [ -n "$py" ] || return 3
+            py="$(find_python)" || return 3
             "$py" -I -c '
 import sys, zipfile
 try:
@@ -82,14 +85,38 @@ try:
         for n in z.namelist():
             if n.replace("\\", "/").rsplit("/", 1)[-1].lower() == "third_party_notices.md":
                 sys.stdout.buffer.write(z.read(n) + b"\n")
-except zipfile.BadZipFile:
-    pass
-' "$zip" 2>/dev/null || true
+    sys.stdout.flush()
+except BaseException as e:
+    sys.stderr.write("zipfile: %s: %r\n" % (sys.argv[1], e))
+    sys.exit(1)
+' "$zip" 2>/dev/null || return 1
+            ;;
+        unzip)
+            command -v unzip >/dev/null 2>&1 || return 3
+            # List the entries and pick the notices by basename — unzip's
+            # own wildcards do not reliably cross '/'.
+            list="$(unzip -Z1 "$zip" 2>/dev/null)" || return 1
+            while IFS= read -r entry; do
+                [ -n "$entry" ] || continue
+                base="$(printf '%s' "${entry##*/}" | tr '[:upper:]' '[:lower:]')"
+                [ "$base" = "third_party_notices.md" ] || continue
+                # `unzip -p` treats its name argument as a wildcard pattern:
+                # `a[x]/…` would match `ax/…` (or nothing). Not addressable
+                # reliably → this reader fails, the next one gets the zip.
+                case "$entry" in
+                    *'['*|*']'*|*'*'*|*'?'*|*'\'*) return 1 ;;
+                esac
+                unzip -p "$zip" "$entry" 2>/dev/null || return 1
+                echo
+            done <<< "$list"
             ;;
         tar)
             # bsdtar (macOS/BSD) reads zip archives; GNU tar does not.
-            tar -xOf "$zip" --include='*THIRD_PARTY_NOTICES.md' 2>/dev/null \
-                || tar -xOf "$zip" '*THIRD_PARTY_NOTICES.md' 2>/dev/null || true
+            case "$(tar --version 2>/dev/null)" in
+                *[Bb][Ss][Dd][Tt][Aa][Rr]*) ;;
+                *) return 3 ;;
+            esac
+            tar -xOf "$zip" --include='*THIRD_PARTY_NOTICES.md' 2>/dev/null || return 1
             ;;
         *)
             return 3
@@ -97,8 +124,29 @@ except zipfile.BadZipFile:
     esac
 }
 
+# Prints the THIRD_PARTY_NOTICES.md entries of zip $1 from the first
+# reader that succeeds. Returns 3 when no reader is available, 4 when every
+# available reader failed on this zip (the caller refuses it).
+notices_of_zip() {
+    local zip="$1" readers reader rc out tried=0
+    readers="${FRAMETRACE_ZIP_READER:-python unzip tar}"
+    for reader in $readers; do
+        rc=0
+        out="$(read_notices_with "$reader" "$zip")" || rc=$?
+        case "$rc" in
+            0) printf '%s\n' "$out"; return 0 ;;
+            3) ;;
+            *) tried=1 ;;
+        esac
+    done
+    if [ "$tried" -eq 1 ]; then
+        return 4
+    fi
+    return 3
+}
+
 refuse_unconfirmed() {
-    local found="" zip lower notices warned=0 rc
+    local found="" zip lower notices warned=0 noreader=0 rc
     if [ -d dist ]; then
         for zip in dist/*; do
             [ -f "$zip" ] || continue
@@ -116,10 +164,18 @@ refuse_unconfirmed() {
             rc=0
             notices="$(notices_of_zip "$zip")" || rc=$?
             if [ "$rc" -eq 3 ]; then
-                if [ "$warned" -eq 0 ]; then
-                    echo "warning: no zip reader (unzip, python3, bsdtar) — THIRD_PARTY_NOTICES.md inside dist/*.zip NOT checked for the 'Owner to confirm' marker" >&2
-                    warned=1
+                if [ "${FRAMETRACE_SKIP_NOTICES_CHECK:-}" = 1 ]; then
+                    if [ "$warned" -eq 0 ]; then
+                        echo "warning: no zip reader (python3/python with zipfile, unzip, bsdtar) and FRAMETRACE_SKIP_NOTICES_CHECK=1 — THIRD_PARTY_NOTICES.md inside dist/*.zip NOT checked for the 'Owner to confirm' marker" >&2
+                        warned=1
+                    fi
+                else
+                    found="${found}${zip} (THIRD_PARTY_NOTICES.md: cannot verify — no zip reader)"$'\n'
+                    noreader=1
                 fi
+                continue
+            elif [ "$rc" -ne 0 ]; then
+                found="${found}${zip} (THIRD_PARTY_NOTICES.md: cannot verify — every zip reader failed on it)"$'\n'
                 continue
             fi
             # The marker may be re-wrapped across lines: fold whitespace and
@@ -132,8 +188,11 @@ refuse_unconfirmed() {
     fi
     if [ -n "$found" ]; then
         {
-            echo "error: dist/ holds an UNCONFIRMED test package — NOT FOR RELEASE:"
+            echo "error: dist/ holds an UNCONFIRMED (or unverifiable) test package — NOT FOR RELEASE:"
             printf '%s' "$found" | sed 's/^/  /'
+            if [ "$noreader" -eq 1 ]; then
+                echo "no zip reader (python3/python with zipfile, unzip, bsdtar) to look inside: install one, or set FRAMETRACE_SKIP_NOTICES_CHECK=1 to proceed with the name check only."
+            fi
             echo "remove it (and SHA256SUMS.unconfirmed) and run again; no SHA256SUMS was written and nothing was signed."
         } >&2
         exit 1
