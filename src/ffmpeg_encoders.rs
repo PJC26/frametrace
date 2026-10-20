@@ -62,6 +62,13 @@
 //! remaining candidate counts as timed out — and whenever anything timed
 //! out the result is reused for [`TIMED_OUT_TTL`], never the shorter
 //! [`INCONCLUSIVE_TTL`].
+//!
+//! Fix round 7: when the assumed candidates' trials prove nothing (the
+//! mpeg4 control exits non-zero — a minimal build without lavfi — or a
+//! trial cannot be spawned), mpeg4 is used, not an untried libx264, and
+//! the note says so ("시험 인코딩 증거 없음, mpeg4 가정") whenever a trial
+//! ran; a listing that failed (not timed out) followed by timed-out trials
+//! is named in the note too.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -150,6 +157,13 @@ pub struct Encoders {
     chosen_by_trial: bool,
     /// `-encoders` timed out (twice) — the reason `probed` is false.
     listing_timed_out: bool,
+    /// A trial encode ran to an outcome (exit status or timeout): the
+    /// binary at least runs.
+    trial_ran: bool,
+    /// Assumed candidates whose trials proved nothing (the mpeg4 control
+    /// failed, or a trial could not be spawned): mpeg4, built into every
+    /// ffmpeg, is used rather than an untried libx264 (Fix round 7).
+    no_evidence: bool,
 }
 
 impl Encoders {
@@ -168,6 +182,8 @@ impl Encoders {
             assumed_candidates: false,
             chosen_by_trial: false,
             listing_timed_out: false,
+            trial_ran: false,
+            no_evidence: false,
         }
     }
 
@@ -189,6 +205,8 @@ impl Encoders {
             assumed_candidates: true,
             chosen_by_trial: false,
             listing_timed_out,
+            trial_ran: false,
+            no_evidence: false,
         }
     }
 
@@ -219,6 +237,8 @@ impl Encoders {
             assumed_candidates: false,
             chosen_by_trial: false,
             listing_timed_out: false,
+            trial_ran: false,
+            no_evidence: false,
         }
     }
 
@@ -267,6 +287,20 @@ impl Encoders {
         self.timed_out.clear();
     }
 
+    /// The trials of the assumed candidates proved nothing: blame no
+    /// encoder (the timed-out ones stay skipped for now) and use mpeg4 —
+    /// with no listing, nothing says libx264 is there (Fix round 7).
+    fn assume_mpeg4_without_evidence(&mut self) {
+        let timed_out = &self.timed_out;
+        self.failed.retain(|name| timed_out.contains(name));
+        self.no_evidence = true;
+    }
+
+    /// Whether the assumed candidates' trials proved nothing (mpeg4 used).
+    pub fn no_trial_evidence(&self) -> bool {
+        self.no_evidence
+    }
+
     pub fn probed(&self) -> bool {
         self.probed
     }
@@ -278,6 +312,9 @@ impl Encoders {
     /// The best available video encoder — listed and not failed its trial
     /// encode; mpeg4 is native to every ffmpeg.
     pub fn video(&self) -> VideoEncoder {
+        if self.no_evidence {
+            return VideoEncoder::Mpeg4;
+        }
         VideoEncoder::PREFERENCE
             .into_iter()
             .find(|encoder| self.has(encoder.name()) && !self.trial_failed(encoder.name()))
@@ -347,12 +384,19 @@ impl Encoders {
     }
 
     /// The note when `-encoders` gave no listing. None for the historical
-    /// full-build assumption and for a missing or broken ffmpeg whose
-    /// listing failed and whose trials proved nothing (reported
-    /// elsewhere). No Media Feature Pack hint: an assumed h264_mf that
-    /// fails may simply not be in the build.
+    /// full-build assumption and for a missing ffmpeg whose listing
+    /// failed and none of whose trials ran (reported elsewhere) — but
+    /// whenever a trial ran (also one that only timed out, or a failed
+    /// mpeg4 control: Fix round 7) the assumed pick is named. No Media
+    /// Feature Pack hint: an assumed h264_mf that fails may simply not be
+    /// in the build.
     fn assumed_note(&self, video: VideoEncoder) -> Option<String> {
-        if !self.assumed_candidates || (!self.listing_timed_out && !self.chosen_by_trial) {
+        if !self.assumed_candidates
+            || (!self.listing_timed_out
+                && !self.chosen_by_trial
+                && !self.trial_ran
+                && self.timed_out.is_empty())
+        {
             return None;
         }
         let reason = if self.listing_timed_out {
@@ -366,6 +410,8 @@ impl Encoders {
         };
         let mut note = if self.chosen_by_trial {
             format!("ffmpeg -encoders 확인 {reason} — 시험 인코딩으로 {name} 선택")
+        } else if self.no_evidence {
+            format!("ffmpeg -encoders 확인 {reason} — 시험 인코딩 증거 없음, {name} 가정")
         } else {
             format!("ffmpeg -encoders 확인 {reason} — 시험 인코딩 결론 없음, {name} 가정")
         };
@@ -657,6 +703,9 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
         if trial == Trial::TimedOut {
             trial = bounded_trial(binary, candidate, 2 * TRIAL_TIMEOUT_SECS, left());
         }
+        if matches!(trial, Trial::Works | Trial::Fails | Trial::TimedOut) {
+            encoders.trial_ran = true;
+        }
         match trial {
             Trial::Works => {
                 encoders.chosen_by_trial = true;
@@ -669,8 +718,9 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
             Trial::Fails if candidate == VideoEncoder::Mpeg4 => {
                 // Even the listed built-in encoder exits non-zero: the trial
                 // harness is at fault (an odd build, lavfi missing), not
-                // the encoders. Keep the list-based pick and blame nothing.
-                encoders.clear_failures();
+                // the encoders. Keep the list-based pick and blame nothing
+                // — with no listing, mpeg4 (Fix round 7).
+                give_up(&mut encoders);
                 return (encoders, Some(inconclusive_ttl(timed_out)));
             }
             Trial::Fails => encoders.mark_failed(candidate),
@@ -680,8 +730,9 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
             }
             Trial::Unknown => {
                 // This probe proves nothing: blame nothing (earlier
-                // failures are tried again with the rest next time).
-                encoders.clear_failures();
+                // failures are tried again with the rest next time) —
+                // with no listing, mpeg4 (Fix round 7).
+                give_up(&mut encoders);
                 return (encoders, Some(inconclusive_ttl(timed_out)));
             }
         }
@@ -695,6 +746,19 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
         None
     };
     (encoders, ttl)
+}
+
+/// The trials proved nothing. Listed encoders: keep the list-based pick,
+/// blame nothing. Assumed candidates (no listing): nothing says libx264
+/// (or any H.264 encoder) is there, so mpeg4 — native to every ffmpeg —
+/// rather than an untried libx264 that every proxy and export might fail
+/// on for the TTL.
+fn give_up(encoders: &mut Encoders) {
+    if encoders.assumed_candidates {
+        encoders.assume_mpeg4_without_evidence();
+    } else {
+        encoders.clear_failures();
+    }
 }
 
 /// The reuse time of an inconclusive result: the longer one when anything
@@ -1329,11 +1393,11 @@ pub(crate) mod tests {
             .into_owned();
         let enc = for_binary(&missing);
         assert!(!enc.probed() && !enc.listing_timed_out() && !enc.chosen_by_trial());
-        assert_eq!(
-            enc.video(),
-            VideoEncoder::Libx264,
-            "nothing proven, nothing blamed"
-        );
+        // Fix round 7 (L2): nothing proven, nothing blamed — and no
+        // untried libx264: mpeg4.
+        assert!(enc.no_trial_evidence(), "{enc:?}");
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4, "{enc:?}");
+        assert_eq!(enc.to_json()["trial_failed"], serde_json::json!([]));
         assert_eq!(enc.build_note(), None);
         let expires = expiry_of(&missing).expect("cached").expect("with a TTL");
         assert!(expires < Instant::now() + INCONCLUSIVE_TTL + Duration::from_secs(1));
@@ -1400,6 +1464,137 @@ pub(crate) mod tests {
         assert_eq!(count_calls(&calls, "-c:v h264_mf"), 2, "{calls}");
         assert_eq!(count_calls(&calls, "-c:v mpeg4"), 1, "{calls}");
         assert_timed_out_ttl(&fake);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix round 7 (L1): the listing failed (not timed out), then every
+    /// trial timed out or the budget ran out: mpeg4 is used untried for
+    /// TIMED_OUT_TTL — and the note says so (it was None before).
+    #[test]
+    fn a_failed_listing_with_timed_out_trials_has_a_note() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-fail-slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = fake_ffmpeg_slow(&dir, "", &[], &[("libx264", 60), ("h264_mf", 60)]);
+        let started = Instant::now();
+        let enc = for_binary(&fake);
+        assert!(started.elapsed() < PROBE_BUDGET + Duration::from_secs(8));
+        assert!(!enc.probed() && enc.candidates_assumed() && !enc.listing_timed_out());
+        assert!(
+            !enc.chosen_by_trial() && !enc.no_trial_evidence(),
+            "{enc:?}"
+        );
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4, "{enc:?}");
+        assert!(enc.trial_timed_out("libx264"), "{enc:?}");
+        assert_eq!(
+            enc.build_note().as_deref(),
+            Some(
+                "ffmpeg -encoders 확인 실패 — 시험 인코딩 결론 없음, mpeg4(MPEG-4 Part 2) 가정 · 일부 시험 인코딩 시간 초과 · 잠시 뒤 다시 확인"
+            )
+        );
+        assert_eq!(count_calls(&calls_of(&dir), "-c:v mpeg4"), 0);
+        assert_timed_out_ttl(&fake);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same note logic without running anything: assumed candidates
+    /// after a failed listing, every candidate timed out.
+    #[test]
+    fn the_assumed_note_names_timed_out_trials_after_a_failed_listing() {
+        let mut enc = Encoders::assumed_candidates(false);
+        assert_eq!(enc.build_note(), None, "nothing ran: a missing ffmpeg");
+        for encoder in VideoEncoder::PREFERENCE {
+            enc.mark_timed_out(encoder);
+        }
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4);
+        assert!(
+            enc.build_note()
+                .unwrap()
+                .contains("일부 시험 인코딩 시간 초과")
+        );
+    }
+
+    /// Fix round 7 (L2): no listing, and even the mpeg4 control exits
+    /// non-zero (a minimal build without lavfi: every trial fails). Nothing
+    /// is blamed — and mpeg4 is used, not an untried libx264; the note
+    /// says there is no evidence. Reused for INCONCLUSIVE_TTL.
+    #[test]
+    fn a_failed_listing_and_a_failing_mpeg4_control_assume_mpeg4() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-fail-nolavfi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = fake_ffmpeg_failing(&dir, "", &["libx264", "h264_mf", "libopenh264", "mpeg4"]);
+        let enc = for_binary(&fake);
+        assert!(!enc.probed() && enc.candidates_assumed() && enc.no_trial_evidence());
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4, "{enc:?}");
+        let json = enc.to_json();
+        assert_eq!(json["h264"], "mpeg4");
+        assert_eq!(
+            json["trial_failed"],
+            serde_json::json!([]),
+            "nothing blamed"
+        );
+        assert_eq!(
+            enc.build_note().as_deref(),
+            Some(
+                "ffmpeg -encoders 확인 실패 — 시험 인코딩 증거 없음, mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인"
+            )
+        );
+        let calls = calls_of(&dir);
+        // -encoders and all four trials (the mpeg4 control last).
+        assert_eq!(calls.lines().count(), 5, "{calls}");
+        assert!(calls.lines().last().unwrap().contains("-c:v mpeg4"));
+        let expires = expiry_of(&fake).expect("cached").expect("with a TTL");
+        assert!(expires < Instant::now() + INCONCLUSIVE_TTL + Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix round 7 (L2): no listing, the libx264 trial runs (and fails),
+    /// then the next trial cannot be spawned (the binary is gone — here
+    /// the fake deletes itself): `Unknown`, nothing proven — mpeg4, not
+    /// the untried libx264, with a note (a trial did run).
+    #[test]
+    fn a_failed_listing_and_an_unknown_trial_assume_mpeg4() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-fail-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls.log");
+        #[cfg(windows)]
+        let fake = {
+            let path = dir.join("ffmpeg.cmd");
+            let body = format!(
+                "@echo off\r\n>>\"{}\" echo %*\r\necho %*| findstr /c:\"-encoders\" >nul && exit /b 1\r\n(del \"%~f0\" & exit /b 1)\r\n",
+                log.display()
+            );
+            std::fs::write(&path, body).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        #[cfg(not(windows))]
+        let fake = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("ffmpeg");
+            let script = format!(
+                "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\necho \"$*\" >> '{}'\ncase \" $* \" in *\" -encoders \"*) exit 1;; esac\nrm -f \"$0\"\nexit 1\n",
+                log.display()
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::warm_unix_script(&path);
+            path.to_string_lossy().into_owned()
+        };
+        let enc = for_binary(&fake);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        // -encoders (failed) and the libx264 trial; then the binary is gone.
+        assert_eq!(calls.lines().count(), 2, "{calls}");
+        assert!(calls.lines().last().unwrap().contains("-c:v libx264"));
+        assert!(!Path::new(&fake).exists());
+        assert!(!enc.probed() && enc.candidates_assumed() && enc.no_trial_evidence());
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4, "{enc:?}");
+        assert_eq!(enc.to_json()["trial_failed"], serde_json::json!([]));
+        assert_eq!(
+            enc.build_note().as_deref(),
+            Some(
+                "ffmpeg -encoders 확인 실패 — 시험 인코딩 증거 없음, mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인"
+            )
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
