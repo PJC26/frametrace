@@ -38,6 +38,11 @@ dist/frametrace-<version>-<target>.zip
 dist/SHA256SUMS                     # covers every zip in dist/
 ```
 
+`build-release.sh` refuses to run (exit 1, before building and again
+before writing SHA256SUMS) while `dist/` holds a `*-UNCONFIRMED.zip` test
+package from `make-portable.ps1 -AllowUnconfirmedNotices`, and never lists
+one in SHA256SUMS — so `--sign` can never cosign it.
+
 On Windows, `scripts/make-portable.ps1` already stages the portable
 layout (`tools/bin` for external tools); it now also writes
 `dist/SHA256SUMS` with the same `sha256sum -c`-compatible format — listing

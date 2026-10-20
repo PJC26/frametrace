@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the FrameTrace release binaries and packages them as
 #   dist/frametrace-<version>-<target-triple>.zip
-# plus a dist/SHA256SUMS manifest covering every zip in dist/.
+# plus a dist/SHA256SUMS manifest covering every zip in dist/ (refuses to
+# run while dist/ holds a Windows *-UNCONFIRMED.zip test package).
 #
 # Options:
 #   --sign   also runs `cosign sign-blob` on the zip and SHA256SUMS
@@ -24,12 +25,30 @@ for arg in "$@"; do
         --sign) SIGN=1 ;;
         --sbom) SBOM=1 ;;
         -h|--help)
-            sed -n '2,15p' "$0"
+            sed -n '2,16p' "$0"
             exit 0
             ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
+
+# A Windows test package (make-portable.ps1 -AllowUnconfirmedNotices:
+# dist/*-UNCONFIRMED.zip, THIRD_PARTY_NOTICES not confirmed by the owner)
+# must never reach a release run: it would be listed in SHA256SUMS and
+# signed with it. Checked before the build and again before the sums.
+refuse_unconfirmed() {
+    local found
+    found="$(find dist -maxdepth 1 -type f -iname '*-UNCONFIRMED.zip' 2>/dev/null || true)"
+    if [ -n "$found" ]; then
+        {
+            echo "error: dist/ holds an UNCONFIRMED test package — NOT FOR RELEASE:"
+            echo "$found" | sed 's/^/  /'
+            echo "remove it (and SHA256SUMS.unconfirmed) and run again; no SHA256SUMS was written and nothing was signed."
+        } >&2
+        exit 1
+    fi
+}
+refuse_unconfirmed
 
 # Pinned toolchain + locked dependencies: the two inputs that decide the
 # build (see docs/repro-build.md).
@@ -50,8 +69,21 @@ rm -f "dist/${ARTIFACT}.zip"
 (cd dist && zip -qr "${ARTIFACT}.zip" "$ARTIFACT")
 
 # SHA256SUMS covers every zip present in dist/, so a multi-target release
-# directory accumulates one manifest consumers can `sha256sum -c`.
-(cd dist && shasum -a 256 -- ./*.zip | sed 's|\./||' > SHA256SUMS)
+# directory accumulates one manifest consumers can `sha256sum -c` — never
+# an UNCONFIRMED test package (refused above; excluded here regardless).
+refuse_unconfirmed
+(
+    cd dist
+    zips=()
+    for zip in ./*.zip; do
+        [ -f "$zip" ] || continue
+        case "$(printf '%s' "$zip" | tr '[:upper:]' '[:lower:]')" in
+            *-unconfirmed.zip) continue ;;
+        esac
+        zips+=("$zip")
+    done
+    shasum -a 256 -- "${zips[@]}" | sed 's|\./||' > SHA256SUMS
+)
 
 if [ "$SBOM" -eq 1 ]; then
     command -v cargo-sbom >/dev/null 2>&1 || {
