@@ -5,8 +5,17 @@
 # fetches is not redistributable by us (docs/PLAN_TOOLS_C_2026-10-20.md T5).
 # The examiner runs `frametrace.exe tools install ffmpeg` (or the home
 # screen's install button) after unzipping, or keeps ffmpeg on PATH. Any
-# such file found in the tools folder is skipped with a warning, and the
-# written zip is checked again — one FFmpeg entry deletes it and fails.
+# such file found in the tools folder is skipped with a warning (by name:
+# any name containing ffmpeg/ffprobe/ffplay or an FFmpeg library name, any
+# case, trailing dots/spaces ignored), every staged .exe/.dll whose version
+# information names FFmpeg fails the run, and the written zip is checked
+# again — one FFmpeg entry deletes it and fails. A zip from an earlier run
+# left in dist/ that contains FFmpeg also fails the run; SHA256SUMS lists
+# only the zip written by this run.
+#
+# Release guard: THIRD_PARTY_NOTICES.md still containing "Owner to confirm"
+# (a paragraph the owner has not confirmed yet) fails the run unless
+# -AllowUnconfirmedNotices is passed (CI test packages only).
 #
 # The zip is written with [IO.Compression.ZipFile]::CreateFromDirectory and
 # every entry name is checked to use forward slashes. SHA-256 is computed
@@ -14,12 +23,15 @@
 # started from pwsh 7 — GitHub runners).
 #
 # Usage:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1 [-SkipBuild] [-Version <ver>]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1 [-SkipBuild] [-Version <ver>] [-AllowUnconfirmedNotices]
 #   -SkipBuild  use the existing target/release binaries (CI builds them first)
 #   -Version    package version (default: Cargo.toml via cargo metadata)
+#   -AllowUnconfirmedNotices  package although THIRD_PARTY_NOTICES.md still
+#               says "Owner to confirm" (not for a release)
 param(
     [switch]$SkipBuild,
-    [string]$Version = ""
+    [string]$Version = "",
+    [switch]$AllowUnconfirmedNotices
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -47,17 +59,57 @@ function Test-SafeEntry([string]$name) {
     return $true
 }
 
-# FFmpeg files that must never be packaged (relative, `/`-separated path).
+# FFmpeg files that must never be packaged (relative, `/`-separated path):
+# any leaf whose name — trimmed of spaces and trailing dots, any case —
+# contains ffmpeg/ffprobe/ffplay or an FFmpeg library name (renamed copies,
+# `ffmpeg.exe.bak`, `libavcodec-61.dll`, licenses/ffmpeg-*).
 function Test-FfmpegFile([string]$rel) {
-    $leaf = ($rel.TrimEnd('/') -split '/')[-1]
-    if ($leaf -match '^(ffmpeg|ffprobe|ffplay)[^/]*\.exe$') { return $true }
-    if ($leaf -match '^(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|postproc)-\d+\.dll$') { return $true }
-    if ($rel -match '(^|/)licenses/ffmpeg-') { return $true }
+    $leaf = (($rel.TrimEnd('/') -split '/')[-1]).Trim().TrimEnd('.', ' ').ToLowerInvariant()
+    if ($leaf -match 'ffmpeg|ffprobe|ffplay') { return $true }
+    if ($leaf -match 'av(codec|format|util|device|filter)|swscale|swresample|postproc') { return $true }
     return $false
+}
+
+# Whether a PE file's version information names FFmpeg (a renamed binary).
+function Test-FfmpegVersionInfo([string]$path) {
+    $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+    $text = @($info.ProductName, $info.FileDescription, $info.CompanyName, $info.InternalName, $info.OriginalFilename) -join ' '
+    return ($text -match '(?i)ffmpeg|ffprobe|ffplay')
+}
+
+# The first FFmpeg entry of a zip, or $null.
+function Get-ZipFfmpegEntry([string]$path) {
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if (Test-FfmpegFile $entry.FullName) { return $entry.FullName }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    return $null
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+
+# Release guard (docs/PLAN_TOOLS_2026-10-20.md §Fix round 5, M2).
+if ((Get-Content -Raw -Encoding UTF8 -LiteralPath THIRD_PARTY_NOTICES.md) -match 'Owner to confirm') {
+    if (-not $AllowUnconfirmedNotices) {
+        throw "THIRD_PARTY_NOTICES.md still contains 'Owner to confirm' — the owner has not confirmed that paragraph; no release package until then (pass -AllowUnconfirmedNotices for a test package)"
+    }
+    Write-Warning "THIRD_PARTY_NOTICES.md still contains 'Owner to confirm' — test package only (-AllowUnconfirmedNotices), not for release"
+}
+
+# A zip left in dist/ by an earlier packager (e.g. the old *-bundled.zip) must
+# not sit next to this package with FFmpeg in it.
+if (Test-Path dist) {
+    foreach ($old in @(Get-ChildItem -LiteralPath (Resolve-Path dist).ProviderPath -Filter *.zip -File)) {
+        $hit = $null
+        try { $hit = Get-ZipFfmpegEntry $old.FullName } catch { throw "cannot read $($old.FullName): $($_.Exception.Message) — remove it from dist/" }
+        if ($hit) { throw "dist/$($old.Name) contains FFmpeg ('$hit') — remove it; ffmpeg/ffprobe are never packaged (docs/PLAN_TOOLS_C_2026-10-20.md T5)" }
+    }
+}
 
 if (-not $SkipBuild) {
     cargo build --release --locked
@@ -125,9 +177,16 @@ FrameTrace portable package
 5. 실 Dahua DAV 샘플 검증: scripts/validate-dav-samples.ps1 -Samples <폴더>
 '@ | Out-File -Encoding utf8 "$stage/tools/bin/README-tools.txt"
 
+# ---- no renamed FFmpeg binary (PE version information) ----------------------
+$fullStage = (Resolve-Path -LiteralPath $stage).ProviderPath
+foreach ($pe in @(Get-ChildItem -LiteralPath $fullStage -Recurse -File | Where-Object { $_.Extension -match '^\.(exe|dll)$' })) {
+    if (Test-FfmpegVersionInfo $pe.FullName) {
+        throw "$($pe.FullName) is an FFmpeg binary by its version information — ffmpeg/ffprobe are never packaged (docs/PLAN_TOOLS_C_2026-10-20.md T5)"
+    }
+}
+
 # ---- zip (forward-slash entry names, no FFmpeg — both checked) ----------------
 $dist = (Resolve-Path "dist").ProviderPath
-$fullStage = (Resolve-Path -LiteralPath $stage).ProviderPath
 $fullZip = Join-Path $dist "FrameTrace-$Version-win64.zip"
 Remove-Item -Force -LiteralPath $fullZip -ErrorAction SilentlyContinue
 [System.IO.Compression.ZipFile]::CreateFromDirectory($fullStage, $fullZip, [System.IO.Compression.CompressionLevel]::Optimal, $true)
@@ -148,12 +207,11 @@ if ($problem) {
     throw $problem
 }
 
-# SHA256SUMS covering every zip in dist/ — same manifest convention as
-# scripts/build-release.sh; consumers verify with `sha256sum -c` (see
-# docs/repro-build.md). LF endings, no BOM (`sha256sum -c` on Linux/macOS).
-$sumLines = @(Get-ChildItem $dist -Filter *.zip | Sort-Object Name | ForEach-Object {
-    "{0}  {1}" -f (Get-Sha256Hex $_.FullName), $_.Name
-})
-[System.IO.File]::WriteAllText((Join-Path $dist "SHA256SUMS"), (($sumLines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+# SHA256SUMS for the zip written by this run only (a stale zip in dist/ is
+# never vouched for) — same manifest convention as scripts/build-release.sh;
+# consumers verify with `sha256sum -c` (see docs/repro-build.md). LF endings,
+# no BOM (`sha256sum -c` on Linux/macOS).
+$sumLine = "{0}  {1}" -f (Get-Sha256Hex $fullZip), (Split-Path -Leaf $fullZip)
+[System.IO.File]::WriteAllText((Join-Path $dist "SHA256SUMS"), ($sumLine + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "package: $fullZip"
 Write-Host "sums: $(Join-Path $dist 'SHA256SUMS')"

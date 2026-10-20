@@ -117,9 +117,14 @@ jobs:
       - name: Portable package offline test (planted ffmpeg is never packaged)
         run: node scripts/test-make-portable.mjs
         shell: pwsh
+      # -AllowUnconfirmedNotices: THIRD_PARTY_NOTICES.md still has the
+      # "(Owner to confirm this paragraph.)" marker (owner item M2,
+      # docs/PLAN_TOOLS_2026-10-20.md §Fix round 5). This CI zip is a test
+      # artifact, not a release; a run without the switch fails until the
+      # owner confirms the paragraph and removes the marker.
       - name: Portable package smoke (make-portable.ps1)
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1 -SkipBuild
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1 -SkipBuild -AllowUnconfirmedNotices
           if ($LASTEXITCODE -ne 0) { throw "make-portable.ps1 failed ($LASTEXITCODE)" }
           $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           $zip = "dist/FrameTrace-$ver-win64.zip"
@@ -127,7 +132,7 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
           try { $names = @($archive.Entries | ForEach-Object { $_.FullName }) } finally { $archive.Dispose() }
-          $bad = @($names | Where-Object { $_ -match '(^|[/\\])(ffmpeg|ffprobe)\.exe$' })
+          $bad = @($names | Where-Object { (($_ -split '[/\\]')[-1]) -match '(?i)ffmpeg|ffprobe|ffplay|av(codec|format|util|device|filter)|swscale|swresample|postproc' })
           if ($bad) { throw "the package contains FFmpeg: $($bad -join ', ')" }
           $slash = @($names | Where-Object { $_.Contains('\') })
           if ($slash) { throw "backslash entry names: $($slash -join ', ')" }

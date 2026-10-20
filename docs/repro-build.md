@@ -40,7 +40,12 @@ dist/SHA256SUMS                     # covers every zip in dist/
 
 On Windows, `scripts/make-portable.ps1` already stages the portable
 layout (`tools/bin` for external tools); it now also writes
-`dist/SHA256SUMS` with the same `sha256sum -c`-compatible format.
+`dist/SHA256SUMS` with the same `sha256sum -c`-compatible format — listing
+only the zip that run wrote (it fails when another zip in `dist/` contains
+FFmpeg). It also refuses to package while `THIRD_PARTY_NOTICES.md` still
+contains "Owner to confirm" (a paragraph the owner has not confirmed);
+`-AllowUnconfirmedNotices` overrides that for CI test packages only, never
+for a release.
 
 ## Verifying a release
 
