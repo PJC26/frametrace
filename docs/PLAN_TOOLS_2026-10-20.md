@@ -243,3 +243,40 @@
 
 ### 남은 일
 - L1·M1 고지 문구의 "(Owner to confirm)" 확인.
+
+## §Fix round 5 (2026-10-20, 기준 8e21db1)
+
+8e21db1 적대적 리뷰의 항목을 모두 고쳤다(소유자 요청으로 Low 포함). M2(“Owner to confirm”)는 소유자 확인 전까지 문구를 그대로 두고 릴리스 가드만 더했다.
+
+| # | 문제 | 수정 | 확인 |
+|---|---|---|---|
+| M1 | `notice`/`notice_en`이 “내 PC에서 쓰는 데는 제한이 없다”고 하면서 같은 문장에서 특허 사용권은 없다고 함(소스 빌드 libopenh264는 Cisco 특허 라이선스 밖). | 주장을 라이선스로 한정: ko “이 라이선스들은 내 PC에서의 사용을 제한하지 않습니다(특허는 별개).”, en “These licenses do not restrict use on your own PC (patents are a separate matter)”. `tools/manifest.json`·`scripts/lib/tools-mock.mjs`, `THIRD_PARTY_NOTICES.md`의 같은 문장(“patents are a separate matter: no patent licence comes with it”, Owner-to-confirm 표시는 그대로). | tools-unit·verify-layout은 mock의 `FF.notice`를 그대로 비교하므로 문구 고정 없음 — `verify-review-batch --unit` 147 PASS, verify-layout 고지 행 통과(대비 light 6.76 · dark 7.32), verify-i18n 770/770. |
+| M3 | `-encoders`가 10 s 안에 안 끝나면(백신이 새 170 MB exe 검사) `assumed_full`(libx264) → BtbN 빌드에서 프록시·내보내기가 “Unknown encoder libx264”로 60 s 동안 실패, `probed:false`라 note 없음. | `ffmpeg_encoders::probe`: 시간 초과면 **2배(20 s)로 한 번 더**. 그래도 목록이 없고 바이너리가 `<exe>/tools/bin` 바로 아래(안내 설치 = 매니페스트 고정 빌드)면 새 **`Encoders::assumed_pinned`**(h264_mf·libopenh264·mpeg4·aac, libx264·libmp3lame 없음)를 가정하고 **시험 인코딩은 그대로** 한다. note: “ffmpeg -encoders 확인 시간 초과 — 설치한 고정 빌드(libx264 없음) 기준으로 H.264는 h264_mf 사용 · 잠시 뒤 다시 확인”(시간 초과가 아니면 “확인 실패”). 다른 위치의 ffmpeg는 종전대로 `assumed_full`이되 시간 초과면 note “ffmpeg -encoders 확인 시간 초과 — libx264로 가정 · 잠시 뒤 다시 확인”. 가정한 결과는 영구 캐시하지 않는다(시간 초과 있음 → `TIMED_OUT_TTL`, 아니면 `INCONCLUSIVE_TTL`). | 가짜 ffmpeg(`fake_ffmpeg_full`: `-encoders`도 잠들 수 있게; Windows `.cmd`·유닉스 `sh` 두 분기): `a_timed_out_listing_is_retried_once`(13 s → 재시도 성공, `-encoders` 2회, 영구), `a_timed_out_listing_of_the_pinned_build_assumes_its_candidates`(35 s, 테스트용 고정 디렉터리 등록 → h264_mf, `probed` false, `assumed_pinned_build`/`listing_timed_out` true, libx264 없음, note, 호출 3회, TTL ≈ 10분, 45 s+8 s 안), `a_timed_out_listing_elsewhere_assumes_a_full_build_with_a_note`(libx264 가정 + note, 시험 없음, TTL 10분; 없는 바이너리는 note 없음). |
+| L1 | 최악의 동기 프로브 ≈ 100 s(후보마다 10 + 20 s), 10분마다 반복 — GET /api/tools·doctor·프록시가 모두 기다림. 앞 후보 시간 초과 뒤 mpeg4가 0이 아닌 코드/`Unknown`이면 TTL이 60 s로 줄어듦. | **`PROBE_BUDGET` = 45 s**를 `-encoders`(재시도 포함)와 모든 시험에 공통으로: 각 시험 제한은 남은 예산으로 자르고, 다 쓰면 시험을 더 돌리지 않는다 — 남은 mpeg4는 **시험 없이** 사용, 그 밖의 남은 후보는 `trial_timed_out`(새 `Trial::OverBudget`). 무엇이든 시간 초과가 있었으면 결과는 **`TIMED_OUT_TTL`(10분)** — 하네스 결함·`Unknown`으로 결론이 없어도(`inconclusive_ttl(timed_out)`). | `the_probe_budget_stops_trialling`(libx264·h264_mf 60 s 잠: libx264 2회, h264_mf ≥ 1회, libopenh264·mpeg4 시험 0회, 셋 다 `trial_timed_out`, mpeg4 선택, 예산+8 s 안, TTL 10분), `a_harness_defect_after_a_timeout_keeps_the_longer_ttl`(h264_mf 35 s 잠 + mpeg4 실패 → 실패 기록 지움, 목록 기반 h264_mf, TTL 10분). |
+| L2 | pip 재설치가 살아 있는 venv를 사용 중 확인 없이 이름 바꿈(실행 중인 exe는 Windows에서 디렉터리 이름 바꾸기를 막지 못함). | `pip::install_pip`: 아무것도 만들기 전에 `image_in_use_under(&target)` → 사용 중이면 `Err("busy: <venv> is in use (a program runs from it) — close it and try again; nothing was changed")`. 새 `tool_install::BUSY_PREFIX`; 실패 감사 줄에 `"code":"busy"`. | Windows `a_pip_reinstall_refuses_while_a_program_runs_from_the_live_venv`(venv의 `Scripts/held.exe`(복사한 cmd.exe) 실행 중 → busy 오류, 가짜 python 호출 0, venv 파일 그대로, `.lens.old-*`·`.staging-*` 없음, 감사 줄 `failed`+`busy`; 종료 뒤 재설치 성공). |
+| L3 | `Test-FfmpegFile`이 이름 패턴만: `ffmpeg.exe.bak`, 끝 공백 `ffmpeg.EXE `, `avcodec.dll`, `libavcodec-61.dll`, 이름 바꾼 사본을 놓침. | 잎 이름을 공백·끝 점 제거·소문자로 보고 `ffmpeg|ffprobe|ffplay` 또는 `av(codec|format|util|device|filter)|swscale|swresample|postproc`를 **포함**하면 건너뜀. 스테이지의 모든 .exe/.dll은 `FileVersionInfo`(ProductName·FileDescription·CompanyName·InternalName·OriginalFilename)에 FFmpeg가 있으면 실패. CI 스모크의 zip 검사도 같은 이름 규칙. | `test-make-portable.mjs`: `ffmpeg.exe.bak`·`FFProbe-Old.EXE`·`avcodec.dll`·`libavcodec-61.dll`·`swscale-8.dll`·`my-ffmpeg-copy.exe`·`\\?\`로 만든 진짜 끝 공백 `ffmpeg.EXE ` → zip에 없음·경고 있음·어떤 항목 이름에도 FFmpeg 없음; `Add-Type`으로 만든 .NET DLL(AssemblyProduct “FFmpeg”)을 `renamed-tool.dll`로 → 실패·zip 없음. |
+| L4 | SHA256SUMS가 dist/의 모든 zip을 나열 → 옛 패키저의 `*-bundled.zip`이 함께 실림. | 이번 실행이 쓴 zip 한 줄만. 시작할 때 dist/의 다른 zip 중 FFmpeg 항목(같은 규칙)이 있거나 읽을 수 없으면 실패. `docs/repro-build.md` 갱신. | 깨끗한 `old-notes.zip`이 있어도 SHA256SUMS는 우리 zip 한 줄; `…-bundled.zip`(안에 ffmpeg.exe) → “contains FFmpeg”로 실패, SHA256SUMS 없음. |
+| L5 | 지우기가 계속 실패하는 `.rm` 디렉터리가 정리 때마다 `.rm.rm.rm…`로 바뀜(MAX_PATH까지). | `remove_dir_unless_in_use`: 이름이 이미 `.rm`으로 끝나면 이름을 바꾸지 않고 `remove_dir_all`만 다시(사용 중 확인은 그대로). | `a_leftover_rm_dir_is_retried_not_renamed_again`(플랫폼 공통; 테스트 전용 스레드 로컬 `FAIL_DOOMED_REMOVAL`로 삭제 실패를 흉내: `.staging-stuck` → `.staging-stuck.rm`, 정리 3번 뒤에도 그 이름 하나뿐, `.lens.old-00ff.rm`도 `.rm.rm` 없음; 풀면 정리 2개). |
+| L6 | `src/video_export.rs` “The bundled LGPL ffmpeg”, `docs/WINDOWS_USAGE.md` “The bundled tools”가 옵션 C와 모순. | 둘 다 고침. 저장소 grep으로 `docs/TECH_STACK.md`(“Bundle or validate”), `docs/WINUI_BLOCKER.md`, `docs/WINDOWS_IMPLEMENTATION_HANDOFF.md`(날짜 붙인 주석)도. `docs/security-review.md`의 round 1 행(“Residual … the bundle is gone”)과 계획 문서의 이력 절은 그대로. 매니페스트 필드명 `bundled_licenses`(코드 식별자)는 그대로. | grep `bundl|번들` × `ffmpeg|lgpl` — 남은 것은 이력 행·식별자뿐. |
+| M2 | `THIRD_PARTY_NOTICES.md:36` “(Owner to confirm this paragraph.)”. | **문구는 그대로**(소유자 항목). `make-portable.ps1`이 이 표시가 있으면 실패하고, `-AllowUnconfirmedNotices`일 때만 경고 후 진행. `windows-ci.yml` 패키지 단계에 스위치 + 소유자 항목을 가리키는 주석. | `test-make-portable.mjs`: 표시 있음 → 실패(메시지에 `Owner to confirm`·`AllowUnconfirmedNotices`), zip 없음; 스위치 → 0, “test package only” 경고, zip 있음. |
+
+### API 변경 (트랙 U)
+- ffmpeg `encoders`에 **`assumed_pinned_build`**(bool: `-encoders`가 목록을 주지 않아 고정 빌드 후보를 가정; 이때 `probed` false)와 **`listing_timed_out`**(bool). `note`는 위 M3 문구. UI는 `note`를 그대로 보여 주므로 변경 없음.
+- 설치 실패 오류가 `busy: `로 시작할 수 있다(pip venv 사용 중). 감사 줄 `result: failed`, `code: busy`.
+- `make-portable.ps1 -AllowUnconfirmedNotices`(CI 테스트 패키지 전용).
+
+### 확인 방법
+- 새 Rust 테스트는 새 API(`fake_ffmpeg_full`, `PINNED_TEST_DIRS`, `FAIL_DOOMED_REMOVAL`, `BUSY_PREFIX`)를 써서 8e21db1에서는 컴파일되지 않는다(= 실패). 동작 근거: 8e21db1의 `probe`는 시간 초과 뒤 mpeg4 실패 시 `INCONCLUSIVE_TTL`, 예산 없이 모든 후보를 시험, `-encoders` 재시도 없음 — 각 테스트의 단언과 정면으로 어긋난다.
+- `test-make-portable.mjs`(새 판)를 8e21db1의 `make-portable.ps1`로 돌림 → 9 실패(끝 공백 파일로 패키지 실패, stale zip·버전 정보·Owner 가드 미검출), 새 판으로 되돌리면 all checks passed.
+
+### 게이트 (이 PC, Windows 11, 기준 8e21db1 + 이 라운드 커밋)
+- `cargo fmt --check` ok · `cargo clippy --locked --all-targets -- -D warnings` ok(Windows만) · `cargo test --locked` 1241 passed / 0 failed / 30 ignored.
+- `node scripts/check-ps-bom.mjs` ok · `check-css` ok · `check-js` ok · `verify-review-batch --unit` 147 PASS · `node scripts/test-make-portable.mjs` all checks passed.
+- `FRAMETRACE_R11_STRICT=1`: verify-i18n 770/770 · verify-layout 171/171(고지 행 light 6.76 · dark 7.32).
+
+### 확인 못 한 것
+- Linux/macOS clippy·테스트는 돌리지 못했다. 바뀐 `cfg(not(windows))` 코드는 가짜 ffmpeg 스크립트의 `-encoders` 분기 앞 `[ -e awake ] || sleep N; ` 한 조각뿐이고(같은 `sleep` 방식은 기존 시험 테스트가 CI에서 씀), `is_pinned_install`·예산·L5는 플랫폼 공통, L2 테스트는 Windows 전용(유닉스의 `image_in_use_under`는 늘 false).
+- 실제 백신이 `-encoders`를 늦추는 상황, 실제 BtbN `ffmpeg.exe`의 버전 정보 문자열은 재현·확인하지 못했다(L3 검사는 .NET 픽스처로만). BtbN DLL/EXE에 버전 정보가 없더라도 이름 규칙이 먼저 걸러 낸다.
+
+### 메모 — BtbN 보존 기간 (2026-10-20, 리뷰어 추정)
+- 리뷰어 추정: BtbN FFmpeg-Builds는 autobuild 릴리스를 정리하면서 **매달 마지막 빌드만 약 2년 보존**한다. 고정한 `autobuild-2026-09-30-13-08`은 9월의 마지막 빌드라 남겠지만 2028-09 무렵 지워질 수 있다 → **~2028-09 전에 매니페스트를 새 빌드로 다시 고정**(url·sha256·size·checksum_source·`docs/ffmpeg-btbn-components-*.md`·CI 설치 경로 스모크). 확인되지 않은 추정이다 — 재고정 시 BtbN README의 보존 정책을 다시 읽을 것.
