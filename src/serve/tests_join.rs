@@ -171,7 +171,7 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
         // C13: the job tag (`--job-tag`) is found once; `Append` writes
         // it into staged log lines (`@TAG@`) like the real CLI does.
         let mut body = String::from(
-            "#!/bin/sh\nif [ \"$1\" != \"join-video\" ]; then echo ok; exit 0; fi\n\
+            "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nif [ \"$1\" != \"join-video\" ]; then echo ok; exit 0; fi\n\
              tag=\"\"; prev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--job-tag\" ]; then tag=\"$a\"; fi; prev=\"$a\"; done\n",
         );
         for step in steps {
@@ -213,6 +213,7 @@ fn fake_cli(dir: &Path, steps: &[Step]) -> PathBuf {
         let path = dir.join("fake-frametrace.sh");
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&path);
         path
     }
     #[cfg(windows)]

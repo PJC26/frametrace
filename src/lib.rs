@@ -37,6 +37,8 @@ pub mod sha256;
 #[cfg(target_os = "windows")]
 pub mod shell;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod timeline;
 pub mod tool_install;
 pub mod tool_policy;

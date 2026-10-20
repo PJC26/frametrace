@@ -989,11 +989,16 @@ mod tests {
             path
         } else {
             let path = dir.join("hang.sh");
-            std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            std::fs::write(
+                &path,
+                "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nexec sleep 60\n",
+            )
+            .unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::warm_unix_script(&path);
             }
             path
         };

@@ -237,7 +237,7 @@ fn fake_cli(dir: &Path, lines: &[String]) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut body = String::from("#!/bin/sh\n");
+        let mut body = String::from("#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\n");
         for line in lines {
             body.push_str(&format!("echo \"{line}\" >&2\n"));
         }
@@ -245,6 +245,7 @@ fn fake_cli(dir: &Path, lines: &[String]) -> PathBuf {
         let path = dir.join("fake-r8.sh");
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&path);
         path
     }
     #[cfg(windows)]

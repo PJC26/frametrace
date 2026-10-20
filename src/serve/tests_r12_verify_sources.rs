@@ -17,10 +17,11 @@ fn fake_cli(dir: &Path, printed: Option<&str>) -> PathBuf {
         let path = dir.join("fake-frametrace.sh");
         std::fs::write(
             &path,
-            format!("#!/bin/sh\nif [ \"$1\" = \"qa\" ]; then\n{echo}echo done\nfi\nexit 0\n"),
+            format!("#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nif [ \"$1\" = \"qa\" ]; then\n{echo}echo done\nfi\nexit 0\n"),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&path);
         path
     }
     #[cfg(not(unix))]

@@ -87,7 +87,7 @@ fn fake_cli(dir: &Path, exits: &[(&str, i32)]) -> PathBuf {
     {
         use std::os::unix::fs::PermissionsExt;
         let mut body = String::from(
-            "#!/bin/sh\necho \"ARGS: $*\"\necho \"KEYTAG: $FRAMETRACE_EXPECTED_AUDIT_KEY\"\nsub=\"$1\"\nif [ \"$1\" = \"--key-source\" ]; then sub=\"$3\"; fi\n",
+            "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\necho \"ARGS: $*\"\necho \"KEYTAG: $FRAMETRACE_EXPECTED_AUDIT_KEY\"\nsub=\"$1\"\nif [ \"$1\" = \"--key-source\" ]; then sub=\"$3\"; fi\n",
         );
         for (sub, code) in exits {
             body.push_str(&format!(
@@ -98,6 +98,7 @@ fn fake_cli(dir: &Path, exits: &[(&str, i32)]) -> PathBuf {
         let path = dir.join("fake-r4.sh");
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&path);
         path
     }
     #[cfg(windows)]

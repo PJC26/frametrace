@@ -74,8 +74,9 @@ fn fake_cli(dir: &Path, body: &[String]) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut text =
-            String::from("#!/bin/sh\nif [ \"$1\" != \"join-video\" ]; then echo ok; exit 0; fi\n");
+        let mut text = String::from(
+            "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nif [ \"$1\" != \"join-video\" ]; then echo ok; exit 0; fi\n",
+        );
         for line in body {
             text.push_str(line);
             text.push('\n');
@@ -84,6 +85,7 @@ fn fake_cli(dir: &Path, body: &[String]) -> PathBuf {
         let path = dir.join("fake-r4c.sh");
         std::fs::write(&path, text).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&path);
         path
     }
     #[cfg(windows)]
@@ -494,10 +496,11 @@ fn part_writing_step(dir: &Path) -> PathBuf {
         let path = dir.join("fake-step.sh");
         std::fs::write(
             &path,
-            "#!/bin/sh\necho torn > \"$2/evidence/images/.evidence.raw.ft$$.part.raw\"\nsleep 30\n",
+            "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\necho torn > \"$2/evidence/images/.evidence.raw.ft$$.part.raw\"\nsleep 30\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::warm_unix_script(&path);
         path
     }
     #[cfg(windows)]
