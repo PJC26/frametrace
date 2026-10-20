@@ -253,7 +253,7 @@ to each proxy/export audit line (`video_encoder`, `audio_encoder`), and
 1. P1 → P2 → P5 → P3(옮긴 뒤 삭제) → P4 → P6.
 2. L4 → M2 → M1 → M3 → M4 → M6 → T1–T7.
 3. E1 → E2 → L3 → L1/L2 → D1 → D3 → D4 → P7 → M5.
-4. 게이트(각 커밋): `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, `node scripts/check-ps-bom.mjs`, `node scripts/check-css.mjs`, `node scripts/check-js.mjs`, `node scripts/verify-review-batch.mjs --unit`(tools-unit 포함), `node scripts/test-make-portable.mjs`, `node scripts/verify-layout.mjs`(tools 구간), 그리고 **push 후 windows-ci 전체**(P6의 실제 다운로드 포함 — 첫 실행 결과를 `docs/PLAN_TOOLS_2026-10-20.md` §옵션 C 절에 한 줄로 적는다: h264 pick, buildconf 요약).
+4. 게이트(각 커밋): `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, `node scripts/check-ps-bom.mjs`, `node scripts/check-css.mjs`, `node scripts/check-js.mjs`, `node scripts/verify-review-batch.mjs --unit`(tools-unit 포함), `node scripts/test-make-portable.mjs`, `bash scripts/test-build-release.sh`(Git Bash/Linux/macOS, 가짜 cargo·rustc·zip — Fix round 8), `node scripts/verify-layout.mjs`(tools 구간), 그리고 **push 후 windows-ci 전체**(P6의 실제 다운로드 포함 — 첫 실행 결과를 `docs/PLAN_TOOLS_2026-10-20.md` §옵션 C 절에 한 줄로 적는다: h264 pick, buildconf 요약).
 5. 커밋 분할 권장: ① 패키징·CI(P*) ② 고지·매니페스트·notice(L*·M*·T1–T4) ③ 문구(E*·D*·M5·M6·T5–T7). PR #5에 이어서 push; 설명에 “옵션 C: 번들 중단” 요약과 이 문서 링크.
 6. 마지막에 `grep -rn "bundled\|번들" README.md THIRD_PARTY_NOTICES.md tools/manifest.json src/tool_install src/ffmpeg_encoders.rs src/cli/handlers/doctor.rs assets/app/56-tools.js scripts/make-portable.ps1 .github/workflows/windows-ci.yml` → FFmpeg를 번들한다는 뜻의 문장 0개(`bundled_licenses` 식별자·rusqlite `bundled`·CSS/JS “bundled” 빌드 용어는 무관).
 

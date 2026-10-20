@@ -39,9 +39,15 @@ dist/SHA256SUMS                     # covers every zip in dist/
 ```
 
 `build-release.sh` refuses to run (exit 1, before building and again
-before writing SHA256SUMS) while `dist/` holds a `*-UNCONFIRMED.zip` test
-package from `make-portable.ps1 -AllowUnconfirmedNotices`, and never lists
-one in SHA256SUMS — so `--sign` can never cosign it.
+before writing SHA256SUMS) while `dist/` holds an UNCONFIRMED test package
+from `make-portable.ps1 -AllowUnconfirmedNotices`: any zip whose name
+contains `unconfirmed` in any case (so a browser/Explorer copy such as
+`…-UNCONFIRMED (1).zip` or `…-UNCONFIRMED - 복사본.zip` counts), or any zip
+whose `THIRD_PARTY_NOTICES.md` still matches `Owner\s+to\s+confirm`
+(read with `unzip`, else Python's `zipfile`, else bsdtar; with none of them
+it warns and skips the content check). It never lists such a name in
+SHA256SUMS — so `--sign` can never cosign it. Fixture test (stub
+cargo/rustc/zip, no build): `bash scripts/test-build-release.sh`.
 
 On Windows, `scripts/make-portable.ps1` already stages the portable
 layout (`tools/bin` for external tools); it now also writes
