@@ -46,14 +46,19 @@ contains `unconfirmed` in any case (so a browser/Explorer copy such as
 whose `THIRD_PARTY_NOTICES.md` still matches `Owner\s+to\s+confirm`
 (read with Python's `zipfile` — `python3`, else `python`, each probed with
 `import zipfile` so the Microsoft Store alias stub is skipped — else
-`unzip -Z1`/`-p`, else bsdtar). The content check fails closed: a reader
+`unzip -Z1`/`-p`, else bsdtar `-tf`/`-xOf`; each reader lists the entries and
+reads only those named `THIRD_PARTY_NOTICES.md` in any case — a zip with
+none, like the ones this script builds, is clean). The content check fails closed: a reader
 that exits non-zero on a zip hands it to the next one, and a zip that no
 available reader can read (broken, encrypted, unsupported compression) is
 refused as "cannot verify", never passed as clean. With no reader at all
 the run also stops (exit 1); `FRAMETRACE_SKIP_NOTICES_CHECK=1` lets it
 proceed with a warning and the name check only. It never lists such a name in
 SHA256SUMS — so `--sign` can never cosign it. Fixture test (stub
-cargo/rustc/zip, no build): `bash scripts/test-build-release.sh`.
+cargo/rustc/zip, no build): `bash scripts/test-build-release.sh`
+(the bsdtar cases run when `tar` is bsdtar or with
+`FRAMETRACE_TEST_BSDTAR=<path>`, e.g. `C:/Windows/System32/tar.exe`; the
+summary prints `SKIPPED n` when cases were skipped).
 
 On Windows, `scripts/make-portable.ps1` already stages the portable
 layout (`tools/bin` for external tools); it now also writes

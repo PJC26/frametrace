@@ -11,7 +11,10 @@
 # Needs: shasum (the script under test), python3 or python (to make the
 # fixture zips and as the script's first zip reader; without it the marker
 # cases are skipped and the rest run with FRAMETRACE_SKIP_NOTICES_CHECK=1),
-# unzip (optional: the unzip-reader cases are skipped without it).
+# unzip (optional: the unzip-reader cases are skipped without it), bsdtar
+# (optional: `tar` when it is bsdtar, or FRAMETRACE_TEST_BSDTAR=<path>, e.g.
+# C:/Windows/System32/tar.exe; the tar-reader cases are skipped without it).
+# Skipped cases are counted and shown as "SKIPPED n" in the summary.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,8 +32,13 @@ check() { # check <description> <command...>
     if "$@"; then ok "$d"; else bad "$d"; fi
 }
 
-PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-if [ -n "$PY" ] && ! "$PY" -c 'import zipfile' >/dev/null 2>&1; then PY=""; fi
+# Same probe as the script's find_python: the first of python3/python that
+# can `import zipfile` (a Microsoft Store alias python3 is skipped).
+PY=""
+for c in python3 python; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    if "$c" -I -c 'import zipfile' >/dev/null 2>&1; then PY="$(command -v "$c")"; break; fi
+done
 HAVE_UNZIP=0
 command -v unzip >/dev/null 2>&1 && HAVE_UNZIP=1
 
@@ -75,6 +83,16 @@ import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], "w") as z:
     z.writestr(sys.argv[2], sys.argv[3].encode("utf-8"))
 ' "$1" "$2" "$3"
+}
+# make_zip_n <out.zip> <name> <content> [<name> <content>...]: several entries.
+make_zip_n() {
+    "$PY" -I -c '
+import sys, zipfile
+a = sys.argv[2:]
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    for i in range(0, len(a), 2):
+        z.writestr(a[i], a[i + 1].encode("utf-8"))
+' "$@"
 }
 # empty_zip <out.zip>: a valid zip with no entries (end-of-central-directory only).
 empty_zip() { { printf 'PK\005\006'; head -c 18 /dev/zero; } > "$1"; }
@@ -334,6 +352,80 @@ else
     fi
 fi
 
+# --- the bsdtar reader (FRAMETRACE_ZIP_READER=tar) ---------------------------
+# Uses `tar` when it is bsdtar, else FRAMETRACE_TEST_BSDTAR (a stub `tar`
+# that execs it goes first on PATH).
+BSDTAR_DIR=""
+if [ -n "${FRAMETRACE_TEST_BSDTAR:-}" ]; then
+    case "$("$FRAMETRACE_TEST_BSDTAR" --version 2>/dev/null)" in
+        *[Bb][Ss][Dd][Tt][Aa][Rr]*) BSDTAR_DIR="$(stub_dir tar "exec \"$FRAMETRACE_TEST_BSDTAR\" \"\$@\"")" ;;
+        *) bad "FRAMETRACE_TEST_BSDTAR=$FRAMETRACE_TEST_BSDTAR is not bsdtar" ;;
+    esac
+fi
+HAVE_TAR_READER=0
+if [ -n "$BSDTAR_DIR" ]; then
+    HAVE_TAR_READER=1
+else
+    case "$(tar --version 2>/dev/null)" in *[Bb][Ss][Dd][Tt][Aa][Rr]*) HAVE_TAR_READER=1 ;; esac
+fi
+if [ "$HAVE_TAR_READER" -eq 0 ]; then
+    skp "bsdtar reader cases (no bsdtar; set FRAMETRACE_TEST_BSDTAR=<path>)"
+elif [ -z "$PY" ]; then
+    skp "bsdtar reader cases (no python3/python to build fixture zips)"
+else
+    # The zips this script builds hold only binaries + README: no notices
+    # entry is clean, in the first check and the second.
+    fresh_repo
+    make_zip "$REPO/dist/other-1.0-aarch64.zip" "other-1.0/README.md" "readme"
+    XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
+    check "tar reader, zips without notices: exit 0" [ "$RC" -eq 0 ]
+    check "tar reader, zips without notices: SHA256SUMS written" has_sums
+    if has_sums; then
+        check "tar reader, zips without notices: sums list our zip" sums_has "frametrace-9.9.9-x86_64-unknown-linux-gnu.zip"
+    fi
+
+    fresh_repo
+    cp "$MARKER_ZIP" "$REPO/dist/FrameTrace-9.9.9-win64.zip"
+    XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
+    check "tar reader, marker: exit 1" [ "$RC" -eq 1 ]
+    check "tar reader, marker: cargo not run" [ "$CARGO_CALLS" -eq 0 ]
+    check "tar reader, marker: names the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+
+    # planted during the build: the second check reads it with tar too
+    fresh_repo
+    XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar PLANT=marker
+    check "tar reader, planted marker zip: exit 1" [ "$RC" -eq 1 ]
+    check "tar reader, planted marker zip: cargo ran once" [ "$CARGO_CALLS" -eq 1 ]
+    check "tar reader, planted marker zip: names the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+
+    fresh_repo
+    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
+    XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
+    check "tar reader, confirmed notices: exit 0" [ "$RC" -eq 0 ]
+
+    # upper-case clean entry + lower-case marker entry: both are read
+    fresh_repo
+    make_zip_n "$REPO/dist/FrameTrace-9.9.9-win64.zip" \
+        "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT" \
+        "FrameTrace-9.9.9-win64/docs/third_party_notices.md" "$MARKER_TEXT"
+    XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
+    check "tar reader, upper clean + lower marker: exit 1" [ "$RC" -eq 1 ]
+    check "tar reader, upper clean + lower marker: names the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+
+    # '[x]' in the entry path: bsdtar reads name arguments as patterns too
+    fresh_repo
+    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64[x]/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
+    XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
+    check "tar reader, '[x]' entry: exit 1 (cannot verify, not clean)" [ "$RC" -eq 1 ]
+    check "tar reader, '[x]' entry: says cannot verify" out_has "cannot verify — every zip reader failed on it"
+
+    fresh_repo
+    echo "not a zip" > "$REPO/dist/broken.zip"
+    XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
+    check "tar reader, unreadable zip: exit 1" [ "$RC" -eq 1 ]
+    check "tar reader, unreadable zip: says cannot verify" out_has "cannot verify — every zip reader failed on it"
+fi
+
 # --- --help prints the header only -------------------------------------------
 fresh_repo
 run_script
@@ -343,5 +435,6 @@ check "--help: stops before code" bash -c '! printf "%s" "$1" | grep -q "set -eu
 
 echo
 echo "build-release fixture: $pass ok, $fail failed, $skip skipped"
+[ "$skip" -eq 0 ] || echo "SKIPPED $skip (see the 'skip' lines above)"
 [ "$fail" -eq 0 ] || exit 1
-echo "all checks passed"
+if [ "$skip" -eq 0 ]; then echo "all checks passed"; else echo "all run checks passed ($skip SKIPPED)"; fi
