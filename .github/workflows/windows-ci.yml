@@ -141,7 +141,7 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
           try { $names = @($archive.Entries | ForEach-Object { $_.FullName }) } finally { $archive.Dispose() }
-          $bad = @($names | Where-Object { (($_ -split '[/\]')[-1]) -match '(?i)ffmpeg|ffprobe|ffplay|av(codec|format|util|device|filter)|swscale|swresample|postproc' })
+          $bad = @($names | Where-Object { (($_ -split '[/\\]')[-1]) -match '(?i)ffmpeg|ffprobe|ffplay|av(codec|format|util|device|filter)|swscale|swresample|postproc' })
           if ($bad) { throw "the package contains FFmpeg: $($bad -join ', ')" }
           $slash = @($names | Where-Object { $_.Contains('\') })
           if ($slash) { throw "backslash entry names: $($slash -join ', ')" }
