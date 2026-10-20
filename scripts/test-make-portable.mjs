@@ -7,6 +7,12 @@
 // its PE version information (L3), a stale FFmpeg zip in dist/ and
 // SHA256SUMS listing only this run's zip (L4), and the "Owner to confirm"
 // release guard (M2).
+// Fix round 6: renamed FFmpeg files found by signature strings in their bytes
+// under any extension (.exe, .bin, none; one match straddles the 4 MiB chunk
+// boundary) while our own docs (the real README.md / WINDOWS_USAGE.md, prose
+// that says "ffmpeg") still pass (L3b); an -AllowUnconfirmedNotices package is
+// named *-UNCONFIRMED.zip with SHA256SUMS.unconfirmed and no SHA256SUMS, and
+// the marker is found across a line break (L-CI).
 // Windows only (needs Windows PowerShell).
 //
 //   node scripts/test-make-portable.mjs
@@ -105,9 +111,12 @@ function fakeRepo({ toolsDir = 'tools/bin', notices = null } = {}) {
   for (const d of ['scripts', 'target/release', 'docs', `${toolsDir}/licenses`]) mkdirSync(join(root, d), { recursive: true });
   copyFileSync(join(repo, 'scripts/make-portable.ps1'), join(root, 'scripts/make-portable.ps1'));
   for (const f of ['frametrace.exe', 'frametrace-app.exe']) writeFileSync(join(root, 'target/release', f), 'MZ fake');
-  for (const f of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md']) writeFileSync(join(root, f), `fake ${f}\n`);
+  for (const f of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) writeFileSync(join(root, f), `fake ${f}\n`);
   if (notices !== null) writeFileSync(join(root, 'THIRD_PARTY_NOTICES.md'), notices);
-  writeFileSync(join(root, 'docs/WINDOWS_USAGE.md'), 'fake\n');
+  // Our real docs: they mention ffmpeg in prose ("FFmpeg version text") and
+  // must pass the signature scan.
+  copyFileSync(join(repo, 'README.md'), join(root, 'README.md'));
+  copyFileSync(join(repo, 'docs/WINDOWS_USAGE.md'), join(root, 'docs/WINDOWS_USAGE.md'));
   writeFileSync(join(root, 'scripts/install.ps1'), '﻿# fake\n');
   // Planted on purpose: none of these may reach the zip.
   for (const f of ['ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe', 'avcodec-61.dll']) writeFileSync(join(root, toolsDir, f), 'MZ planted ffmpeg');
@@ -117,6 +126,9 @@ function fakeRepo({ toolsDir = 'tools/bin', notices = null } = {}) {
   // A vendored tool that must still be packaged.
   writeFileSync(join(root, toolsDir, 'mmls.exe'), 'MZ fake mmls');
   writeFileSync(join(root, toolsDir, 'libewf.dll'), 'MZ fake dll');
+  // Prose that names ffmpeg (no signature string, harmless name): packaged.
+  writeFileSync(join(root, toolsDir, 'NOTES.txt'),
+    'ffmpeg and ffprobe are not included; run frametrace tools install ffmpeg.\nThe log keeps the FFmpeg version text. Trial encodes use -f lavfi.\n');
   return root;
 }
 
@@ -179,13 +191,38 @@ try {
     for (const want of [
       'frametrace.exe', 'frametrace-app.exe', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
       'docs/WINDOWS_USAGE.md', 'install.ps1',
-      'tools/bin/mmls.exe', 'tools/bin/libewf.dll', 'tools/bin/README-tools.txt',
+      'tools/bin/mmls.exe', 'tools/bin/libewf.dll', 'tools/bin/README-tools.txt', 'tools/bin/NOTES.txt',
     ]) check(names.includes(PREFIX + want), `[${toolsDir}] zip has ${PREFIX}${want}`, names.join('\n'));
     const readme = readFileSync(join(root, 'dist/FrameTrace-0.0.0-test-win64/tools/bin/README-tools.txt'), 'utf8');
     check(readme.includes('ffmpeg.exe / ffprobe.exe — 패키지에 포함되지 않음'), `[${toolsDir}] README-tools says ffmpeg is not included`, readme);
     const sums = readFileSync(join(root, 'dist/SHA256SUMS'));
     check(sums[0] !== 0xef, `[${toolsDir}] SHA256SUMS has no BOM`);
     check(sums.toString('utf8') === `${sha256(bytes)}  FrameTrace-0.0.0-test-win64.zip\n`, `[${toolsDir}] SHA256SUMS is this run's zip hash only (not old-notes.zip), one LF line`, sums.toString('utf8'));
+    check(!existsSync(join(root, 'dist/SHA256SUMS.unconfirmed')) && !existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64-UNCONFIRMED.zip')),
+      `[${toolsDir}] a confirmed package has no *.unconfirmed / *-UNCONFIRMED.zip`);
+  }
+  // L3b: a renamed FFmpeg file is found by signature strings in its bytes,
+  // whatever its extension (real static ffmpeg.exe has empty version info).
+  {
+    const CHUNK = 4 * 1024 * 1024;
+    const straddle = Buffer.alloc(CHUNK + 1024, 0x20);
+    Buffer.from('Lavf61.7.100').copy(straddle, CHUNK - 5); // across the 4 MiB chunk boundary
+    for (const [name, content, sig] of [
+      ['my-tool.exe', Buffer.from('MZ\0\0Copyright (c) 2000-2024 the FFmpeg developers\0'), 'the FFmpeg developers'],
+      ['payload.bin', straddle, 'Lavf61.7'],
+      ['blob', Buffer.from('\0\0\0FFMPEG VERSION 7.1-full_build-www.gyan.dev\0'), 'FFMPEG VERSION 7'],
+      ['helper.dat', Buffer.from('\0ident\0libavcodec\0Lavc61.19.1\0'), 'libavcodec'],
+    ]) {
+      const root = fakeRepo(); roots.push(root);
+      writeFileSync(join(root, 'tools/bin', name), content);
+      const started = Date.now();
+      const { code, out } = await runPortable(root);
+      const escaped = name.replace(/\./g, '\\.');
+      check(code !== 0 && new RegExp(`${escaped} contains the FFmpeg signature`).test(out) && out.includes(sig),
+        `a renamed FFmpeg file "${name}" (signature ${JSON.stringify(sig)}) fails the run`, out);
+      check(!existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64.zip')), `no zip written for "${name}"`);
+      check(Date.now() - started < 60000, `"${name}" scan is quick (${Date.now() - started} ms)`);
+    }
   }
   // L4: a stale zip in dist/ that contains FFmpeg (the old *-bundled.zip) fails the run.
   {
@@ -212,10 +249,40 @@ try {
     const blocked = await runPortable(root);
     check(blocked.code !== 0 && /Owner to confirm/.test(blocked.out) && /AllowUnconfirmedNotices/.test(blocked.out), 'unconfirmed notices block the package', blocked.out);
     check(!existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64.zip')), 'no zip while the notices are unconfirmed');
-    // … unless -AllowUnconfirmedNotices (CI test package), with a warning.
+    // … unless -AllowUnconfirmedNotices (CI test package), with a warning —
+    // and marked (L-CI): *-UNCONFIRMED.zip, SHA256SUMS.unconfirmed, no
+    // SHA256SUMS (a stale one from an earlier run is removed).
+    mkdirSync(join(root, 'dist'), { recursive: true });
+    writeFileSync(join(root, 'dist/SHA256SUMS'), 'stale  FrameTrace-0.0.0-test-win64.zip\n');
     const allowed = await runPortable(root, '0.0.0-test', ['-AllowUnconfirmedNotices']);
     check(allowed.code === 0 && /test package only/.test(allowed.out), '-AllowUnconfirmedNotices packages with a warning', allowed.out);
-    check(existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64.zip')), 'zip written with -AllowUnconfirmedNotices');
+    check(/UNCONFIRMED TEST PACKAGE/.test(allowed.out) && /NOT FOR RELEASE/.test(allowed.out), '-AllowUnconfirmedNotices prints the loud warning', allowed.out);
+    const unconfirmedZip = join(root, 'dist/FrameTrace-0.0.0-test-win64-UNCONFIRMED.zip');
+    check(existsSync(unconfirmedZip), 'zip written as *-UNCONFIRMED.zip with -AllowUnconfirmedNotices', allowed.out);
+    check(!existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64.zip')), 'no plain (release-looking) zip with -AllowUnconfirmedNotices');
+    check(!existsSync(join(root, 'dist/SHA256SUMS')), 'no SHA256SUMS with -AllowUnconfirmedNotices (the stale one removed)');
+    const usums = join(root, 'dist/SHA256SUMS.unconfirmed');
+    check(existsSync(usums) && existsSync(unconfirmedZip)
+      && readFileSync(usums, 'utf8') === `${sha256(readFileSync(unconfirmedZip))}  FrameTrace-0.0.0-test-win64-UNCONFIRMED.zip\n`,
+    'SHA256SUMS.unconfirmed lists the UNCONFIRMED zip', existsSync(usums) ? readFileSync(usums, 'utf8') : 'missing');
+  }
+  // L-CI: the marker reflowed across a line break (CRLF + indent) still blocks.
+  {
+    const notices = 'Notices\r\n\r\nSome paragraph. (Owner to\r\n   confirm this paragraph.)\r\n';
+    const root = fakeRepo({ notices }); roots.push(root);
+    const blocked = await runPortable(root);
+    check(blocked.code !== 0 && /AllowUnconfirmedNotices/.test(blocked.out), 'a line-broken "Owner to / confirm" marker blocks the package', blocked.out);
+    check(!existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64.zip')), 'no zip for the line-broken marker');
+  }
+  // The real THIRD_PARTY_NOTICES.md: blocked while it carries the marker, and
+  // its text (prose about FFmpeg) passes the signature scan as a test package.
+  {
+    const real = readFileSync(join(repo, 'THIRD_PARTY_NOTICES.md'), 'utf8');
+    const root = fakeRepo({ notices: real }); roots.push(root);
+    const marked = /Owner\s+to\s+confirm/i.test(real);
+    const run = await runPortable(root, '0.0.0-test', marked ? ['-AllowUnconfirmedNotices'] : []);
+    const zip = join(root, `dist/FrameTrace-0.0.0-test-win64${marked ? '-UNCONFIRMED' : ''}.zip`);
+    check(run.code === 0 && existsSync(zip), `the real THIRD_PARTY_NOTICES.md passes the signature scan (${marked ? 'unconfirmed' : 'confirmed'})`, run.out);
   }
   // A malformed -Version is refused before anything is staged.
   {

@@ -2697,7 +2697,13 @@ mod tests {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let name = path.file_name().unwrap().to_string_lossy();
-                if name == "tests.rs" || name.starts_with("tests_") || rel.starts_with("tests/") {
+                // Test-only files (`test_support.rs` is `#[cfg(test)]` in
+                // lib.rs as a whole, so it has no inner `#[cfg(test)]`).
+                if name == "tests.rs"
+                    || name.starts_with("tests_")
+                    || name == "test_support.rs"
+                    || rel.starts_with("tests/")
+                {
                     continue;
                 }
                 if DEFINES_HELPERS.contains(&rel.as_str()) || PENDING.contains(&rel.as_str()) {

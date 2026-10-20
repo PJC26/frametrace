@@ -8,14 +8,28 @@
 # such file found in the tools folder is skipped with a warning (by name:
 # any name containing ffmpeg/ffprobe/ffplay or an FFmpeg library name, any
 # case, trailing dots/spaces ignored), every staged .exe/.dll whose version
-# information names FFmpeg fails the run, and the written zip is checked
-# again — one FFmpeg entry deletes it and fails. A zip from an earlier run
-# left in dist/ that contains FFmpeg also fails the run; SHA256SUMS lists
-# only the zip written by this run.
+# information names FFmpeg fails the run, EVERY staged file (any extension,
+# docs included) containing an FFmpeg signature string fails the run (a
+# renamed copy: real static ffmpeg.exe builds have empty version info), and
+# the written zip is checked again — one FFmpeg entry deletes it and fails.
+# A zip from an earlier run left in dist/ that contains FFmpeg also fails the
+# run; SHA256SUMS lists only the zip written by this run.
+#
+# Signature scan (Fix round 6): case-insensitive `the FFmpeg developers`,
+# `ffmpeg version <digit|n|N->`, `libavcodec`, `Lavf<NN>.<N>` (the
+# libavformat ident, e.g. Lavf61.7.100). They are chosen not to occur in our
+# own staged files: "FFmpeg version text" (docs/WINDOWS_USAGE.md) and
+# "lavfi" (frametrace.exe's trial encode) do not match. The manifest pins only
+# the archive's SHA-256, not per-file ffmpeg.exe/ffprobe.exe hashes, so no
+# per-file hash comparison is made.
 #
 # Release guard: THIRD_PARTY_NOTICES.md still containing "Owner to confirm"
-# (a paragraph the owner has not confirmed yet) fails the run unless
-# -AllowUnconfirmedNotices is passed (CI test packages only).
+# (any whitespace between the words — a reflowed line still counts; a
+# paragraph the owner has not confirmed yet) fails the run unless
+# -AllowUnconfirmedNotices is passed (CI test packages only). With the switch
+# the zip is named FrameTrace-<ver>-win64-UNCONFIRMED.zip, no SHA256SUMS is
+# written (SHA256SUMS.unconfirmed instead; a stale SHA256SUMS is removed) and
+# a warning says it is not a release.
 #
 # The zip is written with [IO.Compression.ZipFile]::CreateFromDirectory and
 # every entry name is checked to use forward slashes. SHA-256 is computed
@@ -77,6 +91,38 @@ function Test-FfmpegVersionInfo([string]$path) {
     return ($text -match '(?i)ffmpeg|ffprobe|ffplay')
 }
 
+# FFmpeg signature strings (see the header): case-insensitive, ASCII.
+$script:FfmpegSignature = New-Object System.Text.RegularExpressions.Regex(
+    'the FFmpeg developers|ffmpeg version (?:n|N-)?[0-9]|libavcodec|Lavf[0-9]{2}\.[0-9]',
+    ([System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant))
+# Longer than any signature: a match across a chunk boundary is not missed.
+$script:SignatureOverlap = 64
+
+# The first FFmpeg signature string in a file (any extension), or $null. Read
+# in 4 MiB chunks; each chunk is decoded as Latin-1 (one char per byte) and
+# keeps the last $SignatureOverlap bytes of the previous chunk in front.
+function Get-FfmpegSignature([string]$path) {
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $chunk = 4MB
+    $buffer = New-Object byte[] ($chunk + $script:SignatureOverlap)
+    $stream = [System.IO.File]::OpenRead($path)
+    try {
+        $kept = 0
+        while ($true) {
+            $read = $stream.Read($buffer, $kept, $chunk)
+            if ($read -le 0) { break }
+            $total = $kept + $read
+            $match = $script:FfmpegSignature.Match($latin1.GetString($buffer, 0, $total))
+            if ($match.Success) { return $match.Value }
+            $kept = [Math]::Min($script:SignatureOverlap, $total)
+            [System.Array]::Copy($buffer, $total - $kept, $buffer, 0, $kept)
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    return $null
+}
+
 # The first FFmpeg entry of a zip, or $null.
 function Get-ZipFfmpegEntry([string]$path) {
     $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
@@ -93,12 +139,15 @@ function Get-ZipFfmpegEntry([string]$path) {
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-# Release guard (docs/PLAN_TOOLS_2026-10-20.md §Fix round 5, M2).
-if ((Get-Content -Raw -Encoding UTF8 -LiteralPath THIRD_PARTY_NOTICES.md) -match 'Owner to confirm') {
+# Release guard (docs/PLAN_TOOLS_2026-10-20.md §Fix round 5 M2, §Fix round 6
+# L-CI): any whitespace (a reflowed line break) between the words counts.
+$unconfirmed = $false
+if ((Get-Content -Raw -Encoding UTF8 -LiteralPath THIRD_PARTY_NOTICES.md) -match '(?i)Owner\s+to\s+confirm') {
     if (-not $AllowUnconfirmedNotices) {
         throw "THIRD_PARTY_NOTICES.md still contains 'Owner to confirm' — the owner has not confirmed that paragraph; no release package until then (pass -AllowUnconfirmedNotices for a test package)"
     }
-    Write-Warning "THIRD_PARTY_NOTICES.md still contains 'Owner to confirm' — test package only (-AllowUnconfirmedNotices), not for release"
+    $unconfirmed = $true
+    Write-Warning "THIRD_PARTY_NOTICES.md still contains 'Owner to confirm' — test package only (-AllowUnconfirmedNotices), not for release: the zip is named *-UNCONFIRMED.zip and no SHA256SUMS is written"
 }
 
 # A zip left in dist/ by an earlier packager (e.g. the old *-bundled.zip) must
@@ -185,9 +234,22 @@ foreach ($pe in @(Get-ChildItem -LiteralPath $fullStage -Recurse -File | Where-O
     }
 }
 
+# ---- no renamed FFmpeg file (signature strings, every staged file) ----------
+foreach ($file in @(Get-ChildItem -LiteralPath $fullStage -Recurse -File -Force)) {
+    $sig = Get-FfmpegSignature $file.FullName
+    if ($sig) {
+        throw "$($file.FullName) contains the FFmpeg signature '$sig' — a renamed FFmpeg file? ffmpeg/ffprobe are never packaged (docs/PLAN_TOOLS_C_2026-10-20.md T5)"
+    }
+}
+
 # ---- zip (forward-slash entry names, no FFmpeg — both checked) ----------------
 $dist = (Resolve-Path "dist").ProviderPath
-$fullZip = Join-Path $dist "FrameTrace-$Version-win64.zip"
+$zipName = if ($unconfirmed) { "FrameTrace-$Version-win64-UNCONFIRMED.zip" } else { "FrameTrace-$Version-win64.zip" }
+$fullZip = Join-Path $dist $zipName
+# Never leave the other kind of zip of this version next to this one.
+foreach ($other in @("FrameTrace-$Version-win64.zip", "FrameTrace-$Version-win64-UNCONFIRMED.zip")) {
+    Remove-Item -Force -LiteralPath (Join-Path $dist $other) -ErrorAction SilentlyContinue
+}
 Remove-Item -Force -LiteralPath $fullZip -ErrorAction SilentlyContinue
 [System.IO.Compression.ZipFile]::CreateFromDirectory($fullStage, $fullZip, [System.IO.Compression.CompressionLevel]::Optimal, $true)
 $problem = $null
@@ -211,7 +273,21 @@ if ($problem) {
 # never vouched for) — same manifest convention as scripts/build-release.sh;
 # consumers verify with `sha256sum -c` (see docs/repro-build.md). LF endings,
 # no BOM (`sha256sum -c` on Linux/macOS).
+# An unconfirmed (test) package gets SHA256SUMS.unconfirmed instead, and a
+# SHA256SUMS left by an earlier run is removed: nothing vouches for it as a
+# release.
 $sumLine = "{0}  {1}" -f (Get-Sha256Hex $fullZip), (Split-Path -Leaf $fullZip)
-[System.IO.File]::WriteAllText((Join-Path $dist "SHA256SUMS"), ($sumLine + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+$sumsName = if ($unconfirmed) { "SHA256SUMS.unconfirmed" } else { "SHA256SUMS" }
+foreach ($old in @("SHA256SUMS", "SHA256SUMS.unconfirmed")) {
+    Remove-Item -Force -LiteralPath (Join-Path $dist $old) -ErrorAction SilentlyContinue
+}
+[System.IO.File]::WriteAllText((Join-Path $dist $sumsName), ($sumLine + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "package: $fullZip"
-Write-Host "sums: $(Join-Path $dist 'SHA256SUMS')"
+Write-Host "sums: $(Join-Path $dist $sumsName)"
+if ($unconfirmed) {
+    Write-Warning "=================================================================="
+    Write-Warning " UNCONFIRMED TEST PACKAGE — NOT FOR RELEASE"
+    Write-Warning " THIRD_PARTY_NOTICES.md still says 'Owner to confirm'."
+    Write-Warning " $zipName / $sumsName (no SHA256SUMS written)"
+    Write-Warning "=================================================================="
+}
