@@ -357,3 +357,27 @@
 - Linux/macOS clippy·테스트는 돌리지 못했다. 새 `cfg(not(windows))` 코드는 `unrunnable_ffmpeg`의 0644 파일 하나(루트로 돌아도 실행 비트가 없으면 EACCES).
 - `test-build-release.sh`는 Git Bash(bash 5.2, Info-ZIP unzip, Windows Python 3.12)에서만 돌렸다. bsdtar 읽기 경로는 이 PC에 bsdtar가 없어 돌리지 못했다(GNU tar는 zip을 못 읽어 자동 선택에서 제외). macOS bash 3.2에서는 하네스의 `readers+=()`·`$'..'`는 동작하지만 실행해 보지 않았다.
 - 실제 백신 차단·다른 아키텍처 exe로는 L3를 재현하지 않았다(0바이트 `.exe` = ERROR_BAD_EXE_FORMAT로만).
+
+## §Fix round 9 (2026-10-20, 기준 d54f002)
+
+round 8 확인 리뷰의 Low 넷(L1–L4)을 처리했다.
+
+| # | 문제 | 수정 | 확인 |
+|---|---|---|---|
+| L1 | `build-release.sh`의 내용 검사가 읽기 도구의 실패를 `2>/dev/null \|\| true`로 삼켜, 도구는 있는데 실패하면 “깨끗함”으로 통과: 항목 경로의 `[x]`(Info-ZIP `unzip -p`가 이름을 와일드카드로 읽어 아무것도 못 읽음, exit 11), `-Z1` 없는 BusyBox식 unzip, Microsoft Store 별칭 `python3`(exit 9009), 암호화·지원 안 되는 압축. | 읽기 도구 순서를 **Python 먼저**: `find_python`이 `python3`, 다음 `python`을 `-c 'import zipfile'`로 확인한 뒤 사용(Store 별칭은 건너뜀) → `unzip`(`-Z1` 목록, `-p` 읽기) → bsdtar(`tar --version`을 `case`로 — `grep -q`+pipefail 회피). `read_notices_with <reader> <zip>`: 0 = 성공, 1 = 이 zip에서 실패, 3 = 없음. Python 읽기는 **모든 예외**(`BaseException`; `BadZipFile` 포함)에 exit 1. `unzip -Z1`·`-p`가 0이 아니면 실패; 항목 이름에 `[ ] * ? \`가 있으면 `unzip -p`로 정확히 가리킬 수 없으므로 실패(다음 도구로). `notices_of_zip`은 각 도구의 출력을 따로 받아(실패한 도구의 일부 출력은 버림) 첫 성공을 쓰고, 있는 도구가 모두 실패하면 4 → 호출부가 “`<zip> (THIRD_PARTY_NOTICES.md: cannot verify — every zip reader failed on it)`”로 **거부(exit 1)**. `FRAMETRACE_ZIP_READER`는 이제 도구 하나만 강제(대체 없음). 머리 주석 6행 “… or cannot be read”(`--help` 범위 `2,17p` 그대로). **동작 변경**: 깨진 zip(`not a zip`)은 종전엔 통과·SHA256SUMS에 실렸으나 이제 거부. | `bash scripts/test-build-release.sh` **95 ok, 0 failed, 0 skipped**(종전 58). 새 경우: `FrameTrace-9.9.9-win64[x]/THIRD_PARTY_NOTICES.md` — 기본 읽기는 마커 발견(exit 1)·확인된 고지는 exit 0, `unzip`만 강제하면 마커/확인 모두 exit 1 “cannot verify”(깨끗함 아님); 실패하는 가짜 `unzip`(exit 1) 강제 → 마커/확인 모두 exit 1·cargo 0회; Store 가짜 `python3`·`python`(9009) + 실패 `unzip` → exit 1 “cannot verify”(bsdtar 있으면 skip); Store 가짜 `python3` + 진짜 `python` + 실패 `unzip` → 마커 발견(=python이 읽음)·확인은 exit 0; 두 Python 모두 Store 가짜 → 진짜 `unzip`이 마커 발견·확인은 exit 0; 확인된 고지를 기본·python·unzip 각각으로 exit 0; 깨진 zip → exit 1·cargo 0회·“every zip reader failed”. 가짜 `zip`은 이제 진짜 zip(README 항목 하나, Python 없으면 빈 zip)을 쓴다 — 두 번째 검사가 읽을 수 있어야 하므로; `other-1.0-aarch64.zip`도 빈 zip(`empty_zip`). 같은 하네스를 d54f002의 `build-release.sh`로 돌리면 **28 실패**(67 ok). |
+| L2 | 읽기 도구가 하나도 없으면 경고만 하고 SHA256SUMS·`--sign`까지 진행. | 기본은 **실패(exit 1)**: 각 zip을 “`cannot verify — no zip reader`”로 나열하고 “install one, or set FRAMETRACE_SKIP_NOTICES_CHECK=1 …” 안내. `FRAMETRACE_SKIP_NOTICES_CHECK=1`일 때만 종전 경고(“NOT checked for the 'Owner to confirm' marker”) 후 진행(이름 검사는 그대로). `docs/repro-build.md` 갱신(순서·실패 시 거부·환경 변수). | 하네스 `none`: 기본 → exit 1·cargo 0회·SHA256SUMS 없음·“cannot verify — no zip reader”·`FRAMETRACE_SKIP_NOTICES_CHECK=1` 안내; `FRAMETRACE_SKIP_NOTICES_CHECK=1` → exit 0·경고·SHA256SUMS 있음. 하네스는 Python이 없으면 나머지 경우를 `FRAMETRACE_SKIP_NOTICES_CHECK=1`로 돌린다(마커 경우는 skip). |
+| L3 | note “ffmpeg 실행 실패 — mpeg4(MPEG-4 Part 2) 가정 …”이 프록시가 mpeg4로 만들어진다는 뜻으로 읽히지만, 실행할 수 없는 ffmpeg는 spawn에서 실패한다. §28은 조건을 “둘 다 spawn 실패”로만 적었다. | note → “**ffmpeg 실행 실패 — 클립·프록시·내보내기가 실패할 수 있음 · 잠시 뒤 다시 확인**”(`src/ffmpeg_encoders.rs` `assumed_note`; 영어 쪽 없음 — 서버 note는 한국어만, verify-i18n 픽스처에 이 문구 없음). `spawn_failed` 필드 문서에 정확한 조건. `docs/ui-rebuild-contract.md` §28 Fix round 8 줄: 문구 교체 + 조건 = 파일 있음 **그리고** `-encoders` 목록 실패(0이 아닌 종료 **또는** 빈 목록 **또는** spawn 실패, 시간 초과 아님) **그리고** 첫 시험 spawn 실패(`Trial::Unknown`, 그 전에 돈 시험 없음). | `an_existing_ffmpeg_that_cannot_run_has_a_note`·doctor `an_unrunnable_ffmpeg_is_a_warning`의 기대 문구를 새 문구로. |
+| L4 | doctor `ffmpeg_check`의 `\|\| encoders.spawn_failed()`는 중복(spawn_failed ⇒ no_evidence ⇒ mpeg4 ⇒ !is_h264). | 그대로 두고 한 줄 주석 “redundant on purpose: pins the intent even if the mpeg4 fallback changes”. | 코드 읽기. |
+
+### API 변경 (트랙 U)
+- 없음(JSON 키 그대로). `encoders.note`(실행할 수 없는 ffmpeg) 문구만: “ffmpeg 실행 실패 — 클립·프록시·내보내기가 실패할 수 있음 · 잠시 뒤 다시 확인”. UI는 `note`를 그대로 보여 준다.
+- 릴리스 절차: `build-release.sh`가 zip 읽기 도구 없음/읽기 실패에 exit 1. 우회는 `FRAMETRACE_SKIP_NOTICES_CHECK=1`(읽기 도구 없음에만).
+
+### 게이트 (이 PC, Windows 11, 기준 d54f002 + 이 라운드 커밋, CARGO_TARGET_DIR=target-fix9)
+- `cargo fmt --check` ok · `cargo clippy --locked --all-targets -- -D warnings` ok(Windows만) · `cargo test --locked` **1247 passed / 0 failed / 30 ignored**(lib 1224 + 통합 14·5·4).
+- `node scripts/check-ps-bom.mjs` ok · `check-js` ok(54) · `check-css` ok · `verify-review-batch --unit` 147 PASS · `node scripts/test-make-portable.mjs` all checks passed(112 ok) · **`bash scripts/test-build-release.sh` 95 ok, 0 failed, 0 skipped**.
+- `FRAMETRACE_R11_STRICT=1` verify-i18n 770 ko / 770 en(UI 키 변경 없음).
+
+### 확인 못 한 것
+- bsdtar 읽기 경로(이 PC는 GNU tar)와 BusyBox unzip 실물은 돌리지 못했다 — BusyBox는 “`unzip -Z1` 실패 → 다음 도구”와 같은 경로라 가짜 실패 `unzip`으로 대신했다. 암호화 zip 픽스처는 만들지 않았다(Python `zipfile`은 쓰기 암호화를 못 함; 읽기 예외 → exit 1 경로는 깨진 zip으로 확인).
+- Linux/macOS에서 하네스·clippy·테스트는 돌리지 못했다.
