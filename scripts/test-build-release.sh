@@ -311,6 +311,47 @@ else
         skp "'[x]' entry with the unzip reader (no unzip)"
     fi
 
+    # a backslash separator (hand-made PS 5.1 Compress-Archive zips): Info-ZIP
+    # lists it verbatim, so a basename compare on the raw name would skip the
+    # notices and pass the zip as clean. The unzip reader must refuse it
+    # (wildcard-unsafe name → cannot verify), python/bsdtar normalise and read.
+    BS_ENTRY='FrameTrace-9.9.9-win64\THIRD_PARTY_NOTICES.md'
+    fresh_repo
+    make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "$BS_ENTRY" "$MARKER_TEXT"
+    run_script
+    check "backslash entry, default reader: exit 1" [ "$RC" -eq 1 ]
+    check "backslash entry, default reader: names the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
+    if [ "$HAVE_UNZIP" -eq 1 ]; then
+        # Two correct outcomes, depending on the unzip build: one that lists
+        # the backslash verbatim must refuse (cannot verify); one that
+        # normalises it to '/' reads the notices and judges them. The wrong
+        # outcome — skipping the entry and calling the zip clean — is what
+        # the marker run rules out.
+        fresh_repo
+        make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "$BS_ENTRY" "$MARKER_TEXT"
+        run_script FRAMETRACE_ZIP_READER=unzip
+        check "backslash entry (marker), unzip only: exit 1" [ "$RC" -eq 1 ]
+        check "backslash entry (marker), unzip only: no SHA256SUMS" no_sums
+        if out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"; then
+            UNZIP_READS_BACKSLASH=1
+        else
+            UNZIP_READS_BACKSLASH=0
+            check "backslash entry (marker), unzip only: says cannot verify" out_has "cannot verify — every zip reader failed on it"
+        fi
+        fresh_repo
+        make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "$BS_ENTRY" "$CLEAN_TEXT"
+        run_script FRAMETRACE_ZIP_READER=unzip
+        if [ "$UNZIP_READS_BACKSLASH" -eq 1 ]; then
+            check "backslash entry (confirmed), unzip normalises: exit 0" [ "$RC" -eq 0 ]
+            check "backslash entry (confirmed), unzip normalises: SHA256SUMS written" has_sums
+        else
+            check "backslash entry (confirmed), unzip verbatim: exit 1 (cannot verify, not clean)" [ "$RC" -eq 1 ]
+            check "backslash entry (confirmed), unzip verbatim: no SHA256SUMS" no_sums
+        fi
+    else
+        skp "backslash entry with the unzip reader (no unzip)"
+    fi
+
     # a failing reader: stub unzip that exits 1; Store-alias python stubs
     FAILING_UNZIP="$(stub_dir unzip 'echo "unzip: stub failure" >&2; exit 1')"
     STORE_MSG='echo "Python was not found; run without arguments to install from the Microsoft Store" >&2; exit 9009'

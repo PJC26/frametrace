@@ -74,7 +74,7 @@ find_python() {
 # entries (any folder, any case; nothing if there are none). Returns 0 on
 # success, 1 when the reader failed on this zip, 3 when it is unavailable.
 read_notices_with() {
-    local reader="$1" zip="$2" py list entry base
+    local reader="$1" zip="$2" py list entry base norm
     case "$reader" in
         python)
             py="$(find_python)" || return 3
@@ -102,7 +102,12 @@ except BaseException as e:
             while IFS= read -r entry; do
                 entry="${entry%$'\r'}" # a CRLF-listing unzip (native Win32 builds)
                 [ -n "$entry" ] || continue
-                base="$(printf '%s' "${entry##*/}" | tr '[:upper:]' '[:lower:]')"
+                # Info-ZIP lists backslash separators verbatim (`a\x.md`);
+                # compare the basename on a '/'-normalised copy so such an
+                # entry reaches the wildcard refusal below instead of being
+                # skipped as "not the notices file".
+                norm="${entry//\\//}"
+                base="$(printf '%s' "${norm##*/}" | tr '[:upper:]' '[:lower:]')"
                 [ "$base" = "third_party_notices.md" ] || continue
                 # `unzip -p` treats its name argument as a wildcard pattern:
                 # `a[x]/…` would match `ax/…` (or nothing). Not addressable
