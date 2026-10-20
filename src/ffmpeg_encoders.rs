@@ -649,8 +649,14 @@ pub(crate) mod tests {
             use std::os::unix::fs::PermissionsExt;
             let path = dir.join("ffmpeg");
             let log = dir.join("calls.log");
+            // `--warm` (first, never logged) lets the loop below make sure
+            // the script can be exec'd before the test runs it: on Linux a
+            // parallel test's fork may still hold the just-written file
+            // open, and exec then fails with ETXTBSY (os error 26) — the
+            // probe would fall back to `assumed_full` and the test would
+            // see libx264 (ubuntu CI run 39228894042).
             let mut script = format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \" $* \" in *\" -encoders \"*) cat <<'EOF'\n{listing}EOF\nexit 0;; esac\n",
+                "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\necho \"$*\" >> '{}'\ncase \" $* \" in *\" -encoders \"*) cat <<'EOF'\n{listing}EOF\nexit 0;; esac\n",
                 log.display()
             );
             for name in failing {
@@ -667,6 +673,17 @@ pub(crate) mod tests {
             script.push_str("exit 0\n");
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match Command::new(&path).arg("--warm").output() {
+                    Ok(out) if out.status.success() => break,
+                    Ok(out) => panic!("fake ffmpeg --warm failed: {out:?}"),
+                    Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("fake ffmpeg --warm: {e}"),
+                }
+            }
             path.to_string_lossy().into_owned()
         }
     }
