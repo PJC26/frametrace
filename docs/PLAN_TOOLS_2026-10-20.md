@@ -235,7 +235,11 @@
 - `node scripts/check-ps-bom.mjs` ok · `check-js` ok · `check-css` ok · `node scripts/test-make-portable.mjs` all checks passed · `verify-review-batch --unit` 147 PASS(Tools 33).
 - `FRAMETRACE_R11_STRICT=1`: verify-layout 171/171(새 고지 행: 대비 light 6.76 · dark 7.32) · check-a11y(`FRAMETRACE_REQUIRE_BROWSER=1`) axe 0 · verify-buttons 173 · verify-i18n 770/770 · verify-start-screen 85/85 · 셸 스모크(`FRAMETRACE_SHELL_SMOKE=1`, APPDATA/LOCALAPPDATA 격리) exit 0.
 
+### 첫 CI 설치 경로 스모크 결과 (dd9ef61, windows-msvc run 39228894226, 2026-10-19)
+- 실제 BtbN 자산 다운로드·검증·설치 성공: `audit: result=ok sha256=4a7642b2…ffc0a size=170611883 host=github.com`(리다이렉트 모두 허용 목록 안 — 허용 목록 확장 불필요).
+- h264 pick: **h264_mf**(probed true, trial_failed `[]`, note "libx264 없음 — H.264는 h264_mf 사용") — Windows Server 러너에서도 Media Foundation 시험 인코딩이 통과했으므로 게이트(≠ libopenh264) 유지.
+- buildconf: `--enable-version3`, `--enable-chromaprint`, `--enable-libopenh264`, `--enable-libzvbi` 출력, `--enable-gpl`·`--enable-nonfree` 없음. `(codec h264)` 줄: libopenh264, h264_amf, h264_d3d12va, h264_mf, h264_nvenc, h264_qsv, h264_vaapi, h264_vulkan.
+- 같은 푸시의 ubuntu 잡은 `ffmpeg_encoders::tests::a_listed_encoder_that_fails_its_trial_is_skipped`가 한 번 실패(Linux에서 병렬 테스트의 fork가 방금 쓴 가짜 ffmpeg 스크립트를 쥐고 있어 exec가 ETXTBSY → 프로브가 `assumed_full`로 떨어져 libx264) — e50f8ea에서 헬퍼가 `--warm` 실행으로 exec 가능해질 때까지 재시도하도록 고침.
+
 ### 남은 일
-- 첫 CI 실행의 설치 경로 스모크 결과(h264 pick, buildconf 요약)를 여기에 한 줄로 적을 것 — 아직 push하지 않아 돌지 않았다. 러너(Windows Server)에서 h264_mf 시험 인코딩이 실패하면(Media Foundation 미설치) pick이 libopenh264가 되어 이 단계가 실패한다 — 그 경우의 처리(러너에 기능 추가 또는 게이트 완화)는 소유자 결정.
-- 리다이렉트 호스트가 허용 목록 밖이면 설치가 거부된다 — 허용 목록 확장은 별도 결정.
 - L1·M1 고지 문구의 "(Owner to confirm)" 확인.
