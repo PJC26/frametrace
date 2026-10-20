@@ -164,6 +164,14 @@ pub struct Encoders {
     /// failed, or a trial could not be spawned): mpeg4, built into every
     /// ffmpeg, is used rather than an untried libx264 (Fix round 7).
     no_evidence: bool,
+    /// The probe gave up because a trial could not be spawned
+    /// ([`Trial::Unknown`]), not because the mpeg4 control failed.
+    gave_up_unknown: bool,
+    /// The file exists but nothing could be spawned from it (no listing,
+    /// no trial ran: antivirus block, wrong architecture, not executable):
+    /// mpeg4 is assumed and the note says so (Fix round 8). False for a
+    /// missing file.
+    spawn_failed: bool,
 }
 
 impl Encoders {
@@ -184,6 +192,8 @@ impl Encoders {
             listing_timed_out: false,
             trial_ran: false,
             no_evidence: false,
+            gave_up_unknown: false,
+            spawn_failed: false,
         }
     }
 
@@ -207,6 +217,8 @@ impl Encoders {
             listing_timed_out,
             trial_ran: false,
             no_evidence: false,
+            gave_up_unknown: false,
+            spawn_failed: false,
         }
     }
 
@@ -239,6 +251,8 @@ impl Encoders {
             listing_timed_out: false,
             trial_ran: false,
             no_evidence: false,
+            gave_up_unknown: false,
+            spawn_failed: false,
         }
     }
 
@@ -299,6 +313,16 @@ impl Encoders {
     /// Whether the assumed candidates' trials proved nothing (mpeg4 used).
     pub fn no_trial_evidence(&self) -> bool {
         self.no_evidence
+    }
+
+    /// Whether the probe gave up on a trial that could not be spawned.
+    pub fn gave_up_on_unknown_trial(&self) -> bool {
+        self.gave_up_unknown
+    }
+
+    /// Whether the ffmpeg file exists but could not be run at all.
+    pub fn spawn_failed(&self) -> bool {
+        self.spawn_failed
     }
 
     pub fn probed(&self) -> bool {
@@ -384,13 +408,19 @@ impl Encoders {
     }
 
     /// The note when `-encoders` gave no listing. None for the historical
-    /// full-build assumption and for a missing ffmpeg whose listing
+    /// full-build assumption and for a missing ffmpeg file whose listing
     /// failed and none of whose trials ran (reported elsewhere) — but
     /// whenever a trial ran (also one that only timed out, or a failed
-    /// mpeg4 control: Fix round 7) the assumed pick is named. No Media
-    /// Feature Pack hint: an assumed h264_mf that fails may simply not be
-    /// in the build.
+    /// mpeg4 control: Fix round 7) the assumed pick is named, and an
+    /// existing file that cannot be run at all says so (Fix round 8). No
+    /// Media Feature Pack hint: an assumed h264_mf that fails may simply
+    /// not be in the build.
     fn assumed_note(&self, video: VideoEncoder) -> Option<String> {
+        if self.spawn_failed {
+            return Some(
+                "ffmpeg 실행 실패 — mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인".to_string(),
+            );
+        }
         if !self.assumed_candidates
             || (!self.listing_timed_out
                 && !self.chosen_by_trial
@@ -631,7 +661,7 @@ pub fn for_binary(binary: &str) -> Encoders {
         flight,
         done: false,
     };
-    let (encoders, ttl) = probe(binary);
+    let (encoders, ttl) = probe(binary, meta.is_some());
     guard.finish(&encoders, ttl);
     encoders
 }
@@ -664,8 +694,9 @@ fn run_listing(binary: &str, secs: u64) -> Listing {
 }
 
 /// `-encoders`, then the trial encodes. The second value is how long the
-/// result may be reused (`None`: for the binary's lifetime).
-fn probe(binary: &str) -> (Encoders, Option<Duration>) {
+/// result may be reused (`None`: for the binary's lifetime). `exists`:
+/// the file is there (a spawn failure then gets a note).
+fn probe(binary: &str, exists: bool) -> (Encoders, Option<Duration>) {
     let started = Instant::now();
     // Whole seconds left of the budget (0: used up).
     let left = || PROBE_BUDGET.saturating_sub(started.elapsed()).as_secs();
@@ -731,8 +762,15 @@ fn probe(binary: &str) -> (Encoders, Option<Duration>) {
             Trial::Unknown => {
                 // This probe proves nothing: blame nothing (earlier
                 // failures are tried again with the rest next time) —
-                // with no listing, mpeg4 (Fix round 7).
+                // with no listing, mpeg4 (Fix round 7). An existing file
+                // from which nothing at all could be run is named in the
+                // note (Fix round 8).
                 give_up(&mut encoders);
+                encoders.gave_up_unknown = true;
+                encoders.spawn_failed = exists
+                    && encoders.assumed_candidates
+                    && !encoders.trial_ran
+                    && !encoders.listing_timed_out;
                 return (encoders, Some(inconclusive_ttl(timed_out)));
             }
         }
@@ -822,6 +860,10 @@ pub(crate) fn trial_args(encoder: VideoEncoder) -> Vec<String> {
 }
 
 fn trial_encode(binary: &str, encoder: VideoEncoder, secs: u64) -> Trial {
+    #[cfg(test)]
+    if tests::trial_forced_unknown(binary) {
+        return Trial::Unknown;
+    }
     match crate::util::run_with_timeout_detailed(
         Command::new(binary).args(trial_args(encoder)),
         Some(secs),
@@ -844,6 +886,17 @@ pub(crate) mod tests {
     /// from source, Media Foundation, hardware encoders).
     pub const BTBN_LGPL: &str = "Encoders:\n V..... = Video\n ------\n V....D libopenh264          OpenH264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)\n V....D h264_amf             AMD AMF H.264 Encoder (codec h264)\n V....D h264_mf              H264 via MediaFoundation (codec h264)\n V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)\n V....D h264_qsv             H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (Intel Quick Sync Video acceleration) (codec h264)\n V.S... mpeg4                MPEG-4 part 2\n A....D aac                  AAC (Advanced Audio Coding)\n";
     pub const BARE: &str = "Encoders:\n V..... = Video\n ------\n V.S... mpeg4                MPEG-4 part 2\n A....D mp2                  MP2 (MPEG audio layer 2)\n";
+
+    /// Test hook: once a file `force-unknown` exists next to `binary`,
+    /// every trial encode of it is [`Trial::Unknown`] (as if it could not
+    /// be spawned). Windows needs it: std runs a `.cmd` through `cmd.exe
+    /// /c`, so a deleted `.cmd` still spawns (and exits 1 — `Fails`), and
+    /// a script cannot be an `.exe` that CreateProcess would refuse.
+    pub(crate) fn trial_forced_unknown(binary: &str) -> bool {
+        Path::new(binary)
+            .parent()
+            .is_some_and(|dir| dir.join("force-unknown").exists())
+    }
 
     /// A fake ffmpeg whose `-encoders` prints `listing` (every trial
     /// encode succeeds).
@@ -948,6 +1001,11 @@ pub(crate) mod tests {
                     "case \" $* \" in *\" -c:v {name} \"*) exit 1;; esac\n"
                 ));
             }
+            // A killed sh leaves its `sleep` child holding the stdout/stderr
+            // pipes until it ends; harmless: on a timeout
+            // `run_with_timeout_detailed` kills, reaps and returns without
+            // joining its pipe readers (they finish on their own), so the
+            // orphan cannot stretch the probe (Fix round 8 check).
             for (name, secs) in sleeping {
                 script.push_str(&format!(
                     "case \" $* \" in *\" -c:v {name} \"*) [ -e '{}' ] || sleep {secs};; esac\n",
@@ -1524,6 +1582,10 @@ pub(crate) mod tests {
         let fake = fake_ffmpeg_failing(&dir, "", &["libx264", "h264_mf", "libopenh264", "mpeg4"]);
         let enc = for_binary(&fake);
         assert!(!enc.probed() && enc.candidates_assumed() && enc.no_trial_evidence());
+        assert!(
+            !enc.gave_up_on_unknown_trial(),
+            "the mpeg4-control path: {enc:?}"
+        );
         assert_eq!(enc.video(), VideoEncoder::Mpeg4, "{enc:?}");
         let json = enc.to_json();
         assert_eq!(json["h264"], "mpeg4");
@@ -1548,9 +1610,13 @@ pub(crate) mod tests {
     }
 
     /// Fix round 7 (L2): no listing, the libx264 trial runs (and fails),
-    /// then the next trial cannot be spawned (the binary is gone — here
-    /// the fake deletes itself): `Unknown`, nothing proven — mpeg4, not
-    /// the untried libx264, with a note (a trial did run).
+    /// then the next trial cannot be spawned: `Unknown`, nothing proven —
+    /// mpeg4, not the untried libx264, with a note (a trial did run).
+    /// Unix: the fake deletes itself, so the next exec fails (ENOENT).
+    /// Windows (Fix round 8): a deleted `.cmd` would still spawn through
+    /// `cmd.exe /c` and exit 1 (`Fails`, the mpeg4-control path), so the
+    /// fake instead creates `force-unknown` ([`trial_forced_unknown`]).
+    /// `gave_up_on_unknown_trial` pins which path was taken.
     #[test]
     fn a_failed_listing_and_an_unknown_trial_assume_mpeg4() {
         let dir = std::env::temp_dir().join(format!("ft-enc-fail-unknown-{}", std::process::id()));
@@ -1561,8 +1627,9 @@ pub(crate) mod tests {
         let fake = {
             let path = dir.join("ffmpeg.cmd");
             let body = format!(
-                "@echo off\r\n>>\"{}\" echo %*\r\necho %*| findstr /c:\"-encoders\" >nul && exit /b 1\r\n(del \"%~f0\" & exit /b 1)\r\n",
-                log.display()
+                "@echo off\r\n>>\"{}\" echo %*\r\necho %*| findstr /c:\"-encoders\" >nul && exit /b 1\r\ntype nul > \"{}\"\r\nexit /b 1\r\n",
+                log.display(),
+                dir.join("force-unknown").display()
             );
             std::fs::write(&path, body).unwrap();
             path.to_string_lossy().into_owned()
@@ -1582,11 +1649,16 @@ pub(crate) mod tests {
         };
         let enc = for_binary(&fake);
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
-        // -encoders (failed) and the libx264 trial; then the binary is gone.
+        // -encoders (failed) and the libx264 trial; then nothing spawns.
         assert_eq!(calls.lines().count(), 2, "{calls}");
         assert!(calls.lines().last().unwrap().contains("-c:v libx264"));
+        #[cfg(not(windows))]
         assert!(!Path::new(&fake).exists());
+        #[cfg(windows)]
+        assert!(dir.join("force-unknown").exists());
         assert!(!enc.probed() && enc.candidates_assumed() && enc.no_trial_evidence());
+        assert!(enc.gave_up_on_unknown_trial(), "the Unknown path: {enc:?}");
+        assert!(!enc.spawn_failed(), "a trial ran: {enc:?}");
         assert_eq!(enc.video(), VideoEncoder::Mpeg4, "{enc:?}");
         assert_eq!(enc.to_json()["trial_failed"], serde_json::json!([]));
         assert_eq!(
@@ -1594,6 +1666,64 @@ pub(crate) mod tests {
             Some(
                 "ffmpeg -encoders 확인 실패 — 시험 인코딩 증거 없음, mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인"
             )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file at the ffmpeg path that exists but cannot be spawned:
+    /// Windows a 0-byte `.exe` (CreateProcess: not a valid application),
+    /// unix mode 0644 (EACCES).
+    pub fn unrunnable_ffmpeg(dir: &Path) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        #[cfg(windows)]
+        {
+            let path = dir.join("ffmpeg.exe");
+            std::fs::write(&path, b"").unwrap();
+            path.to_string_lossy().into_owned()
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("ffmpeg");
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    /// Fix round 8 (L3): an ffmpeg that exists but cannot be run (AV
+    /// block, wrong architecture, not executable): no listing, no trial
+    /// ran, nothing timed out — mpeg4 is assumed, and the note says the
+    /// ffmpeg cannot be run (it was None: doctor said ok and proxies or
+    /// exports went mpeg4 silently). A missing file keeps no note.
+    #[test]
+    fn an_existing_ffmpeg_that_cannot_run_has_a_note() {
+        let dir = std::env::temp_dir().join(format!("ft-enc-unrunnable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = unrunnable_ffmpeg(&dir);
+        let enc = for_binary(&fake);
+        assert!(!enc.probed() && enc.candidates_assumed(), "{enc:?}");
+        assert!(enc.no_trial_evidence() && enc.gave_up_on_unknown_trial());
+        assert!(enc.spawn_failed(), "{enc:?}");
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4);
+        let json = enc.to_json();
+        assert_eq!(json["h264"], "mpeg4");
+        assert_eq!(json["trial_failed"], serde_json::json!([]));
+        assert_eq!(
+            enc.build_note().as_deref(),
+            Some("ffmpeg 실행 실패 — mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인")
+        );
+        let expires = expiry_of(&fake).expect("cached").expect("with a TTL");
+        assert!(expires < Instant::now() + INCONCLUSIVE_TTL + Duration::from_secs(1));
+
+        let missing = dir.join("no-such-ffmpeg").to_string_lossy().into_owned();
+        let enc = for_binary(&missing);
+        assert!(!enc.spawn_failed() && enc.no_trial_evidence(), "{enc:?}");
+        assert_eq!(enc.video(), VideoEncoder::Mpeg4);
+        assert_eq!(
+            enc.build_note(),
+            None,
+            "a missing file is reported elsewhere"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

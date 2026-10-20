@@ -533,6 +533,25 @@ pub fn deepfake_scan(case_dir: &Path, force: bool, retry_failed: bool) -> Result
     Ok(())
 }
 
+/// The doctor line of a found ffmpeg: its encoder note, a warning when
+/// proxies/exports will not get H.264 or the file cannot be run at all
+/// (Fix round 8: an existing but unspawnable ffmpeg was "ok").
+fn ffmpeg_check(
+    found: &str,
+    feature: &str,
+    shadow: &str,
+    encoders: &crate::ffmpeg_encoders::Encoders,
+) -> DoctorCheck {
+    let name = "ffmpeg";
+    match encoders.build_note() {
+        Some(note) if !encoders.video().is_h264() || encoders.spawn_failed() => {
+            DoctorCheck::warn(name, format!("{found} — {feature} · {note}{shadow}"))
+        }
+        Some(note) => DoctorCheck::ok(name, format!("{found} — {feature} · {note}{shadow}")),
+        None => DoctorCheck::ok(name, format!("{found} — {feature}{shadow}")),
+    }
+}
+
 /// One diagnostic line for `frametrace doctor`. `level` renders as
 /// OK/WARN/FAIL — WARN means the workstation runs but a feature lane is
 /// unavailable, FAIL means a blocking defect (corrupt db, broken keyring).
@@ -599,15 +618,7 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
                 // h264_mf is listed but cannot start — Windows N/KN without
                 // the Media Feature Pack).
                 let encoders = crate::ffmpeg_encoders::for_binary(&found);
-                checks.push(match encoders.build_note() {
-                    Some(note) if !encoders.video().is_h264() => {
-                        DoctorCheck::warn(name, format!("{found} — {feature} · {note}{shadow}"))
-                    }
-                    Some(note) => {
-                        DoctorCheck::ok(name, format!("{found} — {feature} · {note}{shadow}"))
-                    }
-                    None => DoctorCheck::ok(name, format!("{found} — {feature}{shadow}")),
-                });
+                checks.push(ffmpeg_check(&found, feature, &shadow, &encoders));
             }
             Ok(found) => checks.push(DoctorCheck::ok(
                 name,
@@ -825,6 +836,34 @@ mod tests {
     use crate::audit;
     use crate::audit_key::AuditKey;
     use std::fs;
+
+    /// Fix round 8 (L3): an ffmpeg that exists but cannot be run is a
+    /// WARN naming the mpeg4 assumption, not an OK.
+    #[test]
+    fn an_unrunnable_ffmpeg_is_a_warning() {
+        let dir = std::env::temp_dir().join(format!("ft-doctor-unrunnable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let fake = crate::ffmpeg_encoders::tests::unrunnable_ffmpeg(&dir);
+        let encoders = crate::ffmpeg_encoders::for_binary(&fake);
+        let check = super::ffmpeg_check(&fake, "클립", "", &encoders);
+        assert_eq!(check.level, "WARN", "{}", check.detail);
+        assert!(
+            check.detail.ends_with(
+                "— 클립 · ffmpeg 실행 실패 — mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인"
+            ),
+            "{}",
+            check.detail
+        );
+        // A working build with libx264 stays OK without a note.
+        let full =
+            crate::ffmpeg_encoders::Encoders::from_listing(crate::ffmpeg_encoders::tests::FULL);
+        let check = super::ffmpeg_check("ffmpeg", "클립", "", &full);
+        assert_eq!(
+            (check.level, check.detail.as_str()),
+            ("OK", "ffmpeg — 클립")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// R10-I9: key introduction is decided per CASE — a lane without any
     /// HMAC in a case where another lane holds HMAC entries was stripped
