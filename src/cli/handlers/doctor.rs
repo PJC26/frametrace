@@ -544,6 +544,7 @@ fn ffmpeg_check(
 ) -> DoctorCheck {
     let name = "ffmpeg";
     match encoders.build_note() {
+        // `|| spawn_failed()` is redundant on purpose: pins the intent even if the mpeg4 fallback changes.
         Some(note) if !encoders.video().is_h264() || encoders.spawn_failed() => {
             DoctorCheck::warn(name, format!("{found} — {feature} · {note}{shadow}"))
         }
@@ -838,7 +839,7 @@ mod tests {
     use std::fs;
 
     /// Fix round 8 (L3): an ffmpeg that exists but cannot be run is a
-    /// WARN naming the mpeg4 assumption, not an OK.
+    /// WARN saying that clips, proxies and exports may fail, not an OK.
     #[test]
     fn an_unrunnable_ffmpeg_is_a_warning() {
         let dir = std::env::temp_dir().join(format!("ft-doctor-unrunnable-{}", std::process::id()));
@@ -849,7 +850,7 @@ mod tests {
         assert_eq!(check.level, "WARN", "{}", check.detail);
         assert!(
             check.detail.ends_with(
-                "— 클립 · ffmpeg 실행 실패 — mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인"
+                "— 클립 · ffmpeg 실행 실패 — 클립·프록시·내보내기가 실패할 수 있음 · 잠시 뒤 다시 확인"
             ),
             "{}",
             check.detail

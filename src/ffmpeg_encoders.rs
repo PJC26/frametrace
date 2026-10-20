@@ -167,10 +167,12 @@ pub struct Encoders {
     /// The probe gave up because a trial could not be spawned
     /// ([`Trial::Unknown`]), not because the mpeg4 control failed.
     gave_up_unknown: bool,
-    /// The file exists but nothing could be spawned from it (no listing,
-    /// no trial ran: antivirus block, wrong architecture, not executable):
-    /// mpeg4 is assumed and the note says so (Fix round 8). False for a
-    /// missing file.
+    /// The file exists, the listing failed (non-zero exit, empty listing
+    /// or spawn failure — not a timeout) and the first trial could not be
+    /// spawned (antivirus block, wrong architecture, not executable): h264
+    /// falls back to mpeg4 and the note says that ffmpeg cannot be run —
+    /// clips, proxies and exports may fail (Fix round 8; wording Fix round
+    /// 9). False for a missing file.
     spawn_failed: bool,
 }
 
@@ -418,7 +420,8 @@ impl Encoders {
     fn assumed_note(&self, video: VideoEncoder) -> Option<String> {
         if self.spawn_failed {
             return Some(
-                "ffmpeg 실행 실패 — mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인".to_string(),
+                "ffmpeg 실행 실패 — 클립·프록시·내보내기가 실패할 수 있음 · 잠시 뒤 다시 확인"
+                    .to_string(),
             );
         }
         if !self.assumed_candidates
@@ -1711,7 +1714,7 @@ pub(crate) mod tests {
         assert_eq!(json["trial_failed"], serde_json::json!([]));
         assert_eq!(
             enc.build_note().as_deref(),
-            Some("ffmpeg 실행 실패 — mpeg4(MPEG-4 Part 2) 가정 · 잠시 뒤 다시 확인")
+            Some("ffmpeg 실행 실패 — 클립·프록시·내보내기가 실패할 수 있음 · 잠시 뒤 다시 확인")
         );
         let expires = expiry_of(&fake).expect("cached").expect("with a TTL");
         assert!(expires < Instant::now() + INCONCLUSIVE_TTL + Duration::from_secs(1));
