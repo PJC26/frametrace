@@ -45,7 +45,11 @@ only the zip that run wrote (it fails when another zip in `dist/` contains
 FFmpeg). It also refuses to package while `THIRD_PARTY_NOTICES.md` still
 contains "Owner to confirm" (a paragraph the owner has not confirmed);
 `-AllowUnconfirmedNotices` overrides that for CI test packages only, never
-for a release.
+for a release: such a package is named `FrameTrace-<ver>-win64-UNCONFIRMED.zip`,
+gets `dist/SHA256SUMS.unconfirmed` instead of `dist/SHA256SUMS` (a stale
+`SHA256SUMS` is removed), and the CI artifact is `FrameTrace-win64-unconfirmed`.
+Every staged file is also scanned for FFmpeg signature strings (a renamed
+copy is refused whatever its name or extension).
 
 ## Verifying a release
 
