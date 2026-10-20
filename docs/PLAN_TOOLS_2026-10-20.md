@@ -381,3 +381,21 @@ round 8 확인 리뷰의 Low 넷(L1–L4)을 처리했다.
 ### 확인 못 한 것
 - bsdtar 읽기 경로(이 PC는 GNU tar)와 BusyBox unzip 실물은 돌리지 못했다 — BusyBox는 “`unzip -Z1` 실패 → 다음 도구”와 같은 경로라 가짜 실패 `unzip`으로 대신했다. 암호화 zip 픽스처는 만들지 않았다(Python `zipfile`은 쓰기 암호화를 못 함; 읽기 예외 → exit 1 경로는 깨진 zip으로 확인).
 - Linux/macOS에서 하네스·clippy·테스트는 돌리지 못했다.
+
+## §Fix round 10 (2026-10-20, 기준 233825f)
+
+round 9 확인 리뷰의 Medium 하나·Low 하나와 값싼 짐작 둘을 처리했다. Rust 변경 없음(cargo 안 돌림).
+
+| # | 문제 | 수정 | 확인 |
+|---|---|---|---|
+| M | `build-release.sh`의 bsdtar 읽기가 `tar -xOf zip --include='*THIRD_PARTY_NOTICES.md'` — 맞는 항목이 없으면 bsdtar가 exit 1(“Not found in archive”), 게다가 `--include`는 대소문자 구분. 이 스크립트가 만드는 zip(바이너리 + README, 고지 없음)을 bsdtar만 쓸 수 있는 호스트(Python 없음, BusyBox/실패하는 unzip: Alpine + libarchive-tools, BSD)에서는 두 번째 검사가 “every zip reader failed”로 **자기 zip을 거부**. | tar 읽기도 unzip 읽기와 같게: `tar -tf zip`으로 목록(실패 → 이 읽기 실패), 각 줄의 `\r` 제거(Windows bsdtar는 CRLF로 나열), basename을 소문자로 비교해 `third_party_notices.md`만 고르고, 항목 이름에 `[ ] * ? \`가 있으면 실패(bsdtar도 이름 인자를 패턴으로 읽음), `tar -xOf zip -- "$entry"`로 그 항목만 읽음. 고지 항목이 없으면 rc 0(깨끗함). | `FRAMETRACE_TEST_BSDTAR=C:/Windows/System32/tar.exe bash scripts/test-build-release.sh` **111 ok, 0 failed, 0 skipped**. 새 tar 경우(`FRAMETRACE_ZIP_READER=tar`): 고지 없는 zip + 스크립트 자신의 zip → exit 0·SHA256SUMS에 우리 zip; 마커 zip → exit 1·cargo 0회·마커 표시; 빌드 중 심은 마커 zip → exit 1·cargo 1회; 확인된 고지 → exit 0; 대문자 확인 고지 + 소문자 마커 고지(한 zip) → exit 1·마커 표시; `[x]` 항목 → exit 1 “cannot verify”; 깨진 zip → exit 1 “cannot verify”. 같은 하네스를 233825f의 `build-release.sh`로 돌리면 **4 실패**(106 ok): 고지 없는 zip exit 0·SHA256SUMS, 확인된 고지 exit 0, 대문자+소문자의 마커 표시. |
+| L | 하네스가 `python3`만 골라 import가 실패하면 `PY=""` — `python3`가 Store 별칭이고 `python`이 진짜인 PC에서 마커 경우가 모두 조용히 skip(나머지는 `FRAMETRACE_SKIP_NOTICES_CHECK=1`)되는데도 “all checks passed”. | `for c in python3 python`에 `-I -c 'import zipfile'` 탐침(스크립트의 `find_python`과 같음). 요약에 skip이 있으면 “`SKIPPED n (see the 'skip' lines above)`”, 마지막 줄 “`all run checks passed (n SKIPPED)`”(exit는 0 그대로). bsdtar 경우는 `tar --version`에 “bsdtar”가 있거나 `FRAMETRACE_TEST_BSDTAR=<path>`(그 경로를 exec하는 가짜 `tar`를 PATH 앞에)일 때만 돈다. | exit 9009 가짜 `python3`를 PATH 맨 앞에 두고 하네스 → 95 ok, 0 failed, 1 skipped(bsdtar만 skip; 마커 경우는 `python`으로 돌았다). |
+| 짐작 | `unzip -p`가 암호화 항목에서 tty에 암호를 물을 수 있음; `find_python` 탐침에 `-I` 없음. | `unzip -p -P '' "$zip" "$entry"`(암호화 항목은 바로 실패 → 다음 도구); `"$cand" -I -c 'import zipfile'`. | 보통 zip에서 `unzip -p -P ''` 그대로 읽힘(손으로 확인); 하네스의 unzip 경우 통과. |
+
+### 게이트 (이 PC, Windows 11, 기준 233825f + 이 라운드 커밋)
+- `bash scripts/test-build-release.sh`: **95 ok, 0 failed, 1 skipped** + “SKIPPED 1”(이 PC의 `tar`는 GNU tar → bsdtar 경우 skip); `FRAMETRACE_TEST_BSDTAR=C:/Windows/System32/tar.exe`(bsdtar 3.8.9)로 **111 ok, 0 failed, 0 skipped**.
+- `node scripts/check-ps-bom.mjs` ok · `bash -n` 두 스크립트 ok.
+- `docs/repro-build.md`: 읽기 도구가 목록을 보고 고지 항목만 읽는다는 것·고지 없는 zip은 깨끗함·하네스의 bsdtar 경우/`SKIPPED n`.
+
+### 확인 못 한 것
+- 진짜 Alpine/BSD bsdtar(Windows 동봉 bsdtar 3.8.9로 대신)·BusyBox unzip 실물. 암호화 zip 픽스처는 여전히 없음(`-P ''`는 코드 읽기와 보통 zip 회귀만).
