@@ -12,7 +12,9 @@ pub(crate) fn warm_unix_script(path: &std::path::Path) {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match std::process::Command::new(path).arg("--warm").output() {
+        let mut cmd = std::process::Command::new(path);
+        cmd.arg("--warm");
+        match crate::util::hide_console(&mut cmd).output() {
             Ok(out) if out.status.success() => break,
             Ok(out) => panic!("fake script --warm failed: {out:?}"),
             Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
