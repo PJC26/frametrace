@@ -16,7 +16,8 @@
 # run; SHA256SUMS lists only the zip written by this run.
 #
 # Signature scan (Fix round 6): case-insensitive `the FFmpeg developers`,
-# `ffmpeg version <digit|n|N->`, `libavcodec`, `Lavf<NN>.<N>` (the
+# `ffmpeg version <digit|n|N->`, `libavcodec`, `libavutil`, `libswscale`
+# (Fix round 7; absent from our exes and staged docs), `Lavf<NN>.<N>` (the
 # libavformat ident, e.g. Lavf61.7.100). They are chosen not to occur in our
 # own staged files: "FFmpeg version text" (docs/WINDOWS_USAGE.md) and
 # "lavfi" (frametrace.exe's trial encode) do not match. The manifest pins only
@@ -93,7 +94,7 @@ function Test-FfmpegVersionInfo([string]$path) {
 
 # FFmpeg signature strings (see the header): case-insensitive, ASCII.
 $script:FfmpegSignature = New-Object System.Text.RegularExpressions.Regex(
-    'the FFmpeg developers|ffmpeg version (?:n|N-)?[0-9]|libavcodec|Lavf[0-9]{2}\.[0-9]',
+    'the FFmpeg developers|ffmpeg version (?:n|N-)?[0-9]|libavcodec|libavutil|libswscale|Lavf[0-9]{2}\.[0-9]',
     ([System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant))
 # Longer than any signature: a match across a chunk boundary is not missed.
 $script:SignatureOverlap = 64

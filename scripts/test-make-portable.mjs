@@ -212,6 +212,9 @@ try {
       ['payload.bin', straddle, 'Lavf61.7'],
       ['blob', Buffer.from('\0\0\0FFMPEG VERSION 7.1-full_build-www.gyan.dev\0'), 'FFMPEG VERSION 7'],
       ['helper.dat', Buffer.from('\0ident\0libavcodec\0Lavc61.19.1\0'), 'libavcodec'],
+      // Fix round 7: libavutil / libswscale (absent from our exes and docs).
+      ['util.so', Buffer.from('\0\0LIBAVUTIL_59\0'), 'LIBAVUTIL'],
+      ['scale.part', Buffer.from('\0libswscale license: LGPL\0'), 'libswscale'],
     ]) {
       const root = fakeRepo(); roots.push(root);
       writeFileSync(join(root, 'tools/bin', name), content);
