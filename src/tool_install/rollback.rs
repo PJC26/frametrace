@@ -55,20 +55,56 @@ pub(crate) fn restore_text(
     text
 }
 
-/// Puts `tool: <name>` first in an existing `RESTORE.txt` (written by
-/// `move_all_or_nothing`, which does not know the tool). Best effort.
-pub(crate) fn name_tool_in_restore_file(path: &Path, tool: &str) {
-    if let Ok(text) = std::fs::read_to_string(path)
-        && !text.starts_with(TOOL_LINE)
-    {
-        let _ = std::fs::write(path, format!("{TOOL_LINE}{tool}\n{text}"));
-    }
+/// Puts `tool: <name>` first in `RESTORE.txt` (written by
+/// `move_all_or_nothing`, which does not know the tool). Fix round 14 L4:
+/// when that best-effort write left no file, it is created here (the
+/// `tool:` line and how to restore; the file list is then only in the
+/// error, which the install audit log keeps). `Err` when it still cannot
+/// be written — the caller says so instead of pointing at the file.
+pub(crate) fn name_tool_in_restore_file(path: &Path, tool: &str) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) if text.starts_with(TOOL_LINE) => return Ok(()),
+        Ok(text) => format!("{TOOL_LINE}{tool}\n{text}"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let folder = path.parent().unwrap_or(path);
+            format!(
+                "{}{MISSING_LIST_NOTE}",
+                restore_text(Some(tool), &[], folder)
+            )
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    std::fs::write(path, text).map_err(|err| err.to_string())
+}
+
+/// The last line of a `RESTORE.txt` created without its file list.
+pub(crate) const MISSING_LIST_NOTE: &str = "(The list of files could not be written here: the install error — also in tools/install-audit.jsonl — names each file and the name of its previous copy in this folder.)\n";
+
+/// The note added to an incomplete-rollback error when `RESTORE.txt`
+/// could not be written (Fix round 14 L4).
+pub(crate) fn restore_unwritten_note(err: &str) -> String {
+    format!("({RESTORE_FILE} could not be written: {err})")
 }
 
 fn restore_file_tool(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let tool = text.lines().next()?.strip_prefix(TOOL_LINE)?.trim();
     (!tool.is_empty()).then(|| tool.to_string())
+}
+
+/// `std::fs::write` of a `RESTORE.txt`; a test can make it fail
+/// (Fix round 14 L4).
+fn write_restore_file(path: &Path, text: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_RESTORE_WRITE.with(|fail| fail.get()) {
+        return Err(std::io::Error::other("test: RESTORE.txt write fails"));
+    }
+    std::fs::write(path, text)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_RESTORE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// One kept backup of an incomplete rollback.
@@ -126,7 +162,8 @@ pub fn rollback_backups(tools_dir: &Path) -> Vec<RollbackBackup> {
     for (name, path) in real_dirs(tools_dir) {
         let restore_file = if name.starts_with(ROLLBACK_BACKUP_PREFIX) {
             path.join(RESTORE_FILE)
-        } else if name.starts_with(".staging-") && path.join("backup").join(RESTORE_FILE).is_file()
+        } else if name.starts_with(".staging-")
+            && std::fs::symlink_metadata(path.join("backup").join(RESTORE_FILE)).is_ok()
         {
             path.join("backup").join(RESTORE_FILE)
         } else {
@@ -221,18 +258,26 @@ pub(crate) fn undo_venv(
     let where_kept = match moved {
         Ok(()) => {
             let restore = kept_dir.join(RESTORE_FILE);
-            let _ = std::fs::write(
+            let written = write_restore_file(
                 &restore,
-                restore_text(
+                &restore_text(
                     Some(tool),
                     &[(target.to_path_buf(), Some(kept.clone()))],
                     &kept_dir,
                 ),
             );
+            // Fix round 14 L4: never point at a file that is not there.
+            let how = match written {
+                Ok(()) => format!("{} says how", restore.display()),
+                Err(err) => format!(
+                    "move it back to {} {}",
+                    target.display(),
+                    restore_unwritten_note(&err.to_string())
+                ),
+            };
             format!(
-                "the previous venv is kept at {} (restore it by hand — {} says how)",
+                "the previous venv is kept at {} (restore it by hand — {how})",
                 kept.display(),
-                restore.display()
             )
         }
         Err(move_err) => {

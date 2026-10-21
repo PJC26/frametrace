@@ -726,6 +726,111 @@ fn a_rollback_blocked_by_a_held_new_file_is_retried_or_reported_loudly() {
     }
 }
 
+/// Fix round 14 L4: when `move_all_or_nothing` left no `RESTORE.txt`,
+/// `preserve_rollback_backup` creates one (tool line, how to restore, a
+/// note that the list is in the error) so the backup is attributed; when
+/// even that cannot be written (here a directory of that name) the error
+/// says so instead of pointing at the file, and the kept staging dir /
+/// backup is still never swept.
+#[test]
+fn a_missing_or_unwritable_restore_file_is_created_or_reported() {
+    let incomplete = format!("{ROLLBACK_INCOMPLETE_PREFIX}boom");
+    // Missing: created, and the backup is listed under the tool.
+    let base = scratch("restore-missing");
+    let tools = base.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let staging = StagingDir::create(&tools, ".staging-").unwrap();
+    let backup = staging.path().join("backup");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("0.bak"), b"old").unwrap();
+    let err = preserve_rollback_backup(incomplete.clone(), staging, &backup, &tools, "fake");
+    let listed = rollback_backups(&tools);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].tool.as_deref(), Some("fake"));
+    let text = std::fs::read_to_string(&listed[0].restore_file).unwrap();
+    assert!(text.starts_with("tool: fake\n"), "{text}");
+    assert!(text.contains("To restore by hand"), "{text}");
+    assert!(text.ends_with(rollback::MISSING_LIST_NOTE), "{text}");
+    assert!(
+        err.contains(&format!(
+            "{} lists each one",
+            listed[0].restore_file.display()
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("could not be written"), "{err}");
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Unwritable (a directory named RESTORE.txt): reported, not claimed.
+    let base = scratch("restore-unwritable");
+    let tools = base.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let staging = StagingDir::create(&tools, ".staging-").unwrap();
+    let backup = staging.path().join("backup");
+    std::fs::create_dir_all(backup.join(RESTORE_FILE)).unwrap();
+    std::fs::write(backup.join("0.bak"), b"old").unwrap();
+    let err = preserve_rollback_backup(incomplete.clone(), staging, &backup, &tools, "fake");
+    assert!(err.starts_with(ROLLBACK_INCOMPLETE_PREFIX), "{err}");
+    assert!(err.contains("(RESTORE.txt could not be written: "), "{err}");
+    assert!(!err.contains("RESTORE.txt lists each one"), "{err}");
+    assert!(err.contains("this message lists each one"), "{err}");
+    let listed = rollback_backups(&tools);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].tool, None, "no tool line to read");
+    assert!(listed[0].path.join("0.bak").is_file());
+    let _ = std::fs::remove_dir_all(&base);
+
+    // A staging dir kept with such a RESTORE.txt is not swept.
+    let base = scratch("restore-unwritable-staging");
+    let tools = base.join("tools");
+    let kept = tools.join(".staging-kept").join("backup");
+    std::fs::create_dir_all(kept.join(RESTORE_FILE)).unwrap();
+    std::fs::write(kept.join("0.bak"), b"old").unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    assert_eq!(clean_stale_staging(&tools, later, &[]), 0);
+    assert!(kept.join("0.bak").is_file());
+    assert_eq!(rollback_backups(&tools).len(), 1);
+    let _ = std::fs::remove_dir_all(&base);
+
+    // undo_venv: the previous venv is kept, RESTORE.txt fails to write →
+    // the error says so (and still names where the venv is and where it
+    // goes); the kept dir is attributed by its sub-folder name.
+    let base = scratch("restore-venv-unwritable");
+    let python = base.join("python");
+    let old = python.join(".lens.old-00aa");
+    std::fs::create_dir_all(old.join("Lib")).unwrap();
+    std::fs::write(old.join("Lib").join("marker.txt"), b"good").unwrap();
+    // A *file* at the target: remove_dir_all fails (not a directory).
+    let target = python.join("lens");
+    std::fs::write(&target, b"not a venv").unwrap();
+    rollback::FAIL_RESTORE_WRITE.with(|fail| fail.set(true));
+    let err = rollback::undo_venv("pip failed".into(), "lens", &target, Some(&old), &python);
+    rollback::FAIL_RESTORE_WRITE.with(|fail| fail.set(false));
+    assert!(err.starts_with(ROLLBACK_INCOMPLETE_PREFIX), "{err}");
+    assert!(
+        err.contains("(RESTORE.txt could not be written: test: RESTORE.txt write fails)"),
+        "{err}"
+    );
+    assert!(!err.contains("says how"), "{err}");
+    assert!(
+        err.contains(&format!("move it back to {}", target.display())),
+        "{err}"
+    );
+    let listed = rollback_backups(&base);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].tool.as_deref(), Some("lens"));
+    assert!(!listed[0].restore_file.exists());
+    assert!(
+        listed[0]
+            .path
+            .join("lens")
+            .join("Lib")
+            .join("marker.txt")
+            .is_file()
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Fix round 12 H-a: an ordinary failure passes `preserve_rollback_backup`
 /// unchanged and the staging dir is removed as before.
 #[test]
@@ -879,7 +984,7 @@ fn stale_staging_dirs_are_swept_but_not_live_or_foreign_entries() {
     // Created by "this" run: newer than its start, kept.
     std::fs::create_dir_all(tools.join(".staging-live")).unwrap();
     std::fs::create_dir_all(python.join(".other.old-live")).unwrap();
-    assert_eq!(clean_stale_staging(&tools, run_started), 5);
+    assert_eq!(clean_stale_staging(&tools, run_started, &[]), 5);
     assert!(!tools.join(".staging-old3.rm").exists());
     assert!(!python.join(".y.old-0a.rm").exists());
     for dir in [&tools, &python] {
@@ -900,8 +1005,8 @@ fn stale_staging_dirs_are_swept_but_not_live_or_foreign_entries() {
     assert!(tools.join(".staging-file").is_file());
     assert!(tools.join("bin").is_dir());
     // A missing tools dir is fine and is not created.
-    assert_eq!(clean_stale_staging(&base.join("nope"), run_started), 0);
-    assert_eq!(clean_stale_staging_if_unlocked(&base.join("nope")), 0);
+    assert_eq!(clean_stale_staging(&base.join("nope"), run_started, &[]), 0);
+    assert_eq!(clean_stale_staging_if_unlocked(&base.join("nope"), &[]), 0);
     assert!(!base.join("nope").exists());
     let _ = std::fs::remove_dir_all(base);
 }
@@ -914,13 +1019,13 @@ fn server_start_sweep_skips_while_another_install_holds_the_lock() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     {
         let _held = InstallLock::acquire(&tools).unwrap();
-        assert_eq!(clean_stale_staging_if_unlocked(&tools), 0);
+        assert_eq!(clean_stale_staging_if_unlocked(&tools, &[]), 0);
         assert!(
             tools.join(".staging-dead").is_dir(),
             "swept under a held lock"
         );
     }
-    assert_eq!(clean_stale_staging_if_unlocked(&tools), 1);
+    assert_eq!(clean_stale_staging_if_unlocked(&tools, &[]), 1);
     assert!(!tools.join(".staging-dead").exists());
     let _ = std::fs::remove_dir_all(base);
 }
@@ -1165,12 +1270,12 @@ fn the_sweep_keeps_an_old_venv_while_the_live_one_is_broken() {
     // No live venv at all for another tool.
     std::fs::create_dir_all(python.join(".gone.old-00bb")).unwrap();
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-    assert_eq!(clean_stale_staging(&tools, later), 0);
+    assert_eq!(clean_stale_staging(&tools, later, &[]), 0);
     assert!(old.join("Lib").join("marker.txt").is_file());
     assert!(python.join(".gone.old-00bb").is_dir());
     // Once the live venv works, the old one goes.
     write_venv_launcher(&live, "lens");
-    assert_eq!(clean_stale_staging(&tools, later), 1);
+    assert_eq!(clean_stale_staging(&tools, later, &[]), 1);
     assert!(!old.exists());
     assert!(python.join(".gone.old-00bb").is_dir());
     assert_eq!(
@@ -1178,6 +1283,45 @@ fn the_sweep_keeps_an_old_venv_while_the_live_one_is_broken() {
         Some("deepfake-lens")
     );
     assert_eq!(old_venv_base(".old-12"), None);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// Fix round 14 L5: the sweep checks a pip tool's venv for its
+/// `provides[0]` console script (what install checks), not for a script
+/// named after the tool — a tool whose name differs from `provides[0]`
+/// no longer keeps `.<tool>.old-*` forever.
+#[test]
+fn the_sweep_checks_the_provided_console_script() {
+    let base = scratch("sweep-provides");
+    let tools = base.join("tools");
+    let python = tools.join("python");
+    let mut tool = pip_tool();
+    tool.name = "lens-kit".into();
+    tool.provides = vec!["lens-cli".into()];
+    let old = python.join(".lens-kit.old-00aa");
+    std::fs::create_dir_all(&old).unwrap();
+    let live = python.join("lens-kit");
+    write_venv_launcher(&live, "lens-cli");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    // Without the tool list: looked for `lens-kit` → kept (the old bug).
+    assert_eq!(clean_stale_staging(&tools, later, &[]), 0);
+    assert!(old.is_dir());
+    // An archive tool of that name does not count.
+    let mut archive = tool.clone();
+    archive.kind = ToolKind::Archive;
+    assert_eq!(clean_stale_staging(&tools, later, &[&archive]), 0);
+    // With it: `lens-cli` is there → the old venv goes.
+    assert_eq!(venv_script_name("lens-kit", &[&tool]), "lens-cli");
+    assert_eq!(venv_script_name("other", &[&tool]), "other");
+    assert_eq!(clean_stale_staging(&tools, later, &[&tool]), 1);
+    assert!(!old.exists());
+    // A live venv with only a script named after the tool is not intact.
+    let old = python.join(".lens-kit.old-00bb");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::remove_file(pip::venv_script(&live, "lens-cli")).unwrap();
+    std::fs::write(pip::venv_script(&live, "lens-kit"), b"exe").unwrap();
+    assert_eq!(clean_stale_staging(&tools, later, &[&tool]), 0);
+    assert!(old.is_dir());
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -1212,7 +1356,11 @@ fn kept_rollback_backups_are_listed_and_never_swept() {
     let venv_kept = tools.join("python").join("rollback-backup-00dd");
     std::fs::create_dir_all(venv_kept.join("lens").join("Lib")).unwrap();
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-    assert_eq!(clean_stale_staging(&tools, later), 1, "only .staging-plain");
+    assert_eq!(
+        clean_stale_staging(&tools, later, &[]),
+        1,
+        "only .staging-plain"
+    );
     assert!(kept_staging.join("backup").join("0.bak").is_file());
     assert!(archive_kept.is_dir() && venv_kept.is_dir());
     let listed = rollback_backups(&tools);
@@ -1403,7 +1551,7 @@ fn a_pip_undo_blocked_by_a_held_file_is_retried_or_kept_safe() {
             );
             // A later sweep (server start / next install) keeps it.
             let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-            clean_stale_staging(&dirs.tools_dir, later);
+            clean_stale_staging(&dirs.tools_dir, later, &[]);
             assert!(kept.join("Lib").join("marker.txt").is_file());
             let listed = rollback_backups(&dirs.tools_dir);
             assert_eq!(listed.len(), 1, "{listed:?}");
@@ -1441,17 +1589,17 @@ fn a_leftover_rm_dir_is_retried_not_renamed_again() {
     assert_eq!(remove_dir_unless_in_use(&staging), Some(rm.clone()));
     assert_eq!(remove_dir_unless_in_use(&rm), Some(rm.clone()));
     for _ in 0..3 {
-        assert_eq!(clean_stale_staging(&tools, later), 0);
+        assert_eq!(clean_stale_staging(&tools, later, &[]), 0);
     }
     assert_eq!(names(), vec![".staging-stuck.rm".to_string()]);
     assert!(rm.join("x").join("f").is_file());
     // The same for a replaced venv's leftover.
     let old = tools.join("python").join(".lens.old-00ff.rm");
     std::fs::create_dir_all(&old).unwrap();
-    assert_eq!(clean_stale_staging(&tools, later), 0);
+    assert_eq!(clean_stale_staging(&tools, later, &[]), 0);
     assert!(old.is_dir() && !tools.join("python").join(".lens.old-00ff.rm.rm").exists());
     FAIL_DOOMED_REMOVAL.with(|fail| fail.set(false));
-    assert_eq!(clean_stale_staging(&tools, later), 2);
+    assert_eq!(clean_stale_staging(&tools, later, &[]), 2);
     assert_eq!(names(), vec!["python".to_string()]);
     assert!(!old.exists());
     let _ = std::fs::remove_dir_all(base);
@@ -2258,7 +2406,7 @@ mod windows_installs {
         drop(running);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(
-            clean_stale_staging(&fx.dirs.tools_dir, std::time::SystemTime::now()),
+            clean_stale_staging(&fx.dirs.tools_dir, std::time::SystemTime::now(), &[]),
             1
         );
         assert!(!left.exists());
@@ -2304,7 +2452,7 @@ mod windows_installs {
         let held = std::fs::File::open(&held_file).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        assert_eq!(clean_stale_staging(&tools, run_started), 0);
+        assert_eq!(clean_stale_staging(&tools, run_started, &[]), 0);
         assert!(module.is_file(), "the venv in use is left whole");
         assert!(exe.is_file());
         assert!(held_file.is_file(), "the staging dir in use is left whole");
@@ -2322,7 +2470,7 @@ mod windows_installs {
         drop(held);
         drop(running);
         std::thread::sleep(std::time::Duration::from_millis(300));
-        assert_eq!(clean_stale_staging(&tools, run_started), 2);
+        assert_eq!(clean_stale_staging(&tools, run_started, &[]), 2);
         assert!(!venv.exists() && !staging.exists());
         let left: Vec<_> = std::fs::read_dir(&tools)
             .unwrap()

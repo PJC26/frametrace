@@ -1049,7 +1049,13 @@ fn run_platform_install(
     // Anything older than this run is a stale staging dir of a killed one.
     let run_started = std::time::SystemTime::now();
     let _lock = InstallLock::acquire(&dirs.tools_dir)?;
-    clean_stale_staging(&dirs.tools_dir, run_started);
+    // Fix round 14 L5: the tool being installed first (a test fixture is
+    // not in the manifest), then every manifest tool.
+    let mut known: Vec<&ToolEntry> = vec![tool];
+    if let Ok(manifest) = manifest() {
+        known.extend(manifest.tools.iter());
+    }
+    clean_stale_staging(&dirs.tools_dir, run_started, &known);
     progress.check_cancel()?;
     match tool.kind {
         ToolKind::Archive => archive::install_archive(tool, dirs, net, progress),
@@ -1246,19 +1252,24 @@ pub fn audit_refusal(
 /// belongs to a locked install), so none of them is in use by an install;
 /// one that cannot be removed (a file in it still open) is skipped and
 /// tried again next time. Returns how many were removed.
+///
+/// Fix round 14 L5: `tools` (the manifest's, first match wins) names each
+/// pip tool's console script (`provides[0]`, which install checks) for
+/// [`venv_intact`]; a venv of a tool not listed is checked for a script
+/// named after the tool.
 pub(crate) fn clean_stale_staging(
     tools_dir: &Path,
     started_before: std::time::SystemTime,
+    tools: &[&ToolEntry],
 ) -> usize {
     // Fix round 13: a staging dir kept after an incomplete rollback (its
     // `backup/RESTORE.txt` lists the previous files) is never swept.
     let staging = |name: &str| {
+        // Fix round 14 L4: any entry of that name (even one that is not a
+        // readable file) marks a kept backup.
         name.starts_with(".staging-")
-            && !tools_dir
-                .join(name)
-                .join("backup")
-                .join(RESTORE_FILE)
-                .is_file()
+            && std::fs::symlink_metadata(tools_dir.join(name).join("backup").join(RESTORE_FILE))
+                .is_err()
     };
     // pip.rs: `.<tool>.old-<hex>` next to the tool's venv. Fix round 13
     // M: removed only once the live `<tool>/` is a working venv again —
@@ -1268,7 +1279,9 @@ pub(crate) fn clean_stale_staging(
         name.starts_with('.')
             && name.contains(".old-")
             && (name.ends_with(".rm")
-                || old_venv_base(name).is_some_and(|base| venv_intact(&python.join(base), base)))
+                || old_venv_base(name).is_some_and(|base| {
+                    venv_intact(&python.join(base), venv_script_name(base, tools))
+                }))
     };
     sweep_dir(tools_dir, &staging, started_before) + sweep_dir(&python, &old_venv, started_before)
 }
@@ -1279,9 +1292,19 @@ fn old_venv_base(name: &str) -> Option<&str> {
     (!base.is_empty()).then_some(base)
 }
 
+/// The console script of the pip tool whose venv is `tools/python/<base>`:
+/// its `provides[0]` (what [`pip::install_pip`] checks), else `base`.
+fn venv_script_name<'a>(base: &'a str, tools: &[&'a ToolEntry]) -> &'a str {
+    tools
+        .iter()
+        .find(|tool| tool.name == base && tool.kind == ToolKind::Pip)
+        .and_then(|tool| tool.provides.first())
+        .map_or(base, String::as_str)
+}
+
 /// Whether `venv` holds a working venv launcher: its interpreter and the
-/// tool's console script `<name>` (pip tools name their script after
-/// themselves).
+/// tool's console script `<name>` (`provides[0]`; see
+/// [`venv_script_name`]).
 pub(crate) fn venv_intact(venv: &Path, name: &str) -> bool {
     pip::venv_python(venv).is_file() && pip::venv_script(venv, name).is_file()
 }
@@ -1424,16 +1447,19 @@ pub fn clean_stale_staging_at_start() -> usize {
     let Ok(dirs) = InstallDirs::for_current_exe() else {
         return 0;
     };
-    clean_stale_staging_if_unlocked(&dirs.tools_dir)
+    let known: Vec<&ToolEntry> = manifest()
+        .map(|manifest| manifest.tools.iter().collect())
+        .unwrap_or_default();
+    clean_stale_staging_if_unlocked(&dirs.tools_dir, &known)
 }
 
-pub(crate) fn clean_stale_staging_if_unlocked(tools_dir: &Path) -> usize {
+pub(crate) fn clean_stale_staging_if_unlocked(tools_dir: &Path, tools: &[&ToolEntry]) -> usize {
     if !tools_dir.is_dir() {
         return 0;
     }
     let started = std::time::SystemTime::now();
     match InstallLock::acquire(tools_dir) {
-        Ok(_lock) => clean_stale_staging(tools_dir, started),
+        Ok(_lock) => clean_stale_staging(tools_dir, started, tools),
         Err(_) => 0,
     }
 }
@@ -1502,7 +1528,16 @@ pub(crate) fn preserve_rollback_backup(
     if !err.starts_with(ROLLBACK_INCOMPLETE_PREFIX) {
         return err;
     }
-    rollback::name_tool_in_restore_file(&backup_dir.join(RESTORE_FILE), tool);
+    // Fix round 14 L4: creates RESTORE.txt when the best-effort write in
+    // `move_all_or_nothing` left none; the error points at it only if it
+    // is there.
+    let unwritten = rollback::name_tool_in_restore_file(&backup_dir.join(RESTORE_FILE), tool)
+        .err()
+        .map(|err| rollback::restore_unwritten_note(&err));
+    let lists = |restore: &Path| match &unwritten {
+        None => format!("{} lists each one", restore.display()),
+        Some(note) => format!("this message lists each one {note}"),
+    };
     let kept = tools_dir.join(format!(
         "{}{}",
         rollback::ROLLBACK_BACKUP_PREFIX,
@@ -1516,19 +1551,19 @@ pub(crate) fn preserve_rollback_backup(
             );
             drop(staging);
             format!(
-                "{err} (restore the previous files from {} by hand — {} lists each one)",
+                "{err} (restore the previous files from {} by hand — {})",
                 kept.display(),
-                kept.join(RESTORE_FILE).display()
+                lists(&kept.join(RESTORE_FILE))
             )
         }
         Err(move_err) => {
             let path = staging.path().to_path_buf();
             staging.keep();
             format!(
-                "{err} (the previous files stay in {} — could not move them to {}: {move_err}; restore them by hand before installing again — {} lists each one)",
+                "{err} (the previous files stay in {} — could not move them to {}: {move_err}; restore them by hand before installing again — {})",
                 path.display(),
                 kept.display(),
-                backup_dir.join(RESTORE_FILE).display()
+                lists(&backup_dir.join(RESTORE_FILE))
             )
         }
     }
