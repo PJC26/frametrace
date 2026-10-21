@@ -138,8 +138,12 @@ from source, which Cisco's patent licence does not cover) — with `aac` audio
 (AVI clips: `libmp3lame`, else native `mp2`). The chosen encoders are written
 to each proxy/export audit line (`video_encoder`, `audio_encoder`), and
 `frametrace doctor` / `GET /api/tools` say when the build lacks libx264
-("libx264 없음 — H.264는 h264_mf 사용"). Output names and containers (`.mp4`,
-`.avi`) do not change.
+("libx264 없음 — H.264는 h264_mf 사용"). `h264_mf` cannot start on Windows N/KN
+without the Media Feature Pack, nor on Windows Server without the Media
+Foundation feature (`Server-Media-Foundation`); its trial encode then fails,
+the next encoder is used and the note says "h264_mf 사용 불가 — Windows
+N/KN(Media Feature Pack)·Windows Server(Media Foundation 기능 미설치)". Output
+names and containers (`.mp4`, `.avi`) do not change.
 
 ```powershell
 cargo build --release

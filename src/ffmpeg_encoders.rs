@@ -17,8 +17,9 @@
 //!
 //! Being listed is not enough: `h264_mf` is listed by every Windows build
 //! but fails at `MFStartup` on Windows N/KN editions without the Media
-//! Feature Pack and on Server Core — a build without libx264 would then
-//! fail every proxy and export. So each listed candidate, best first, is
+//! Feature Pack and on Windows Server without the Media Foundation feature
+//! (Server-Media-Foundation) — a build without libx264 would then fail
+//! every proxy and export. So each listed candidate, best first, is
 //! tried once with a 1-frame encode of a 64×64 black frame using the very
 //! options a proxy uses (`-f lavfi -i color=… -frames:v 1 <video args>
 //! -f null -`); one that fails is skipped and the next one tried. A trial
@@ -403,7 +404,7 @@ impl Encoders {
             note.push_str(" · h264_mf 시험 인코딩 시간 초과 — 잠시 뒤 다시 확인");
         } else if self.trial_failed(mf) {
             note.push_str(
-                " · h264_mf 사용 불가 — Media Feature Pack 필요 (Windows N/KN 에디션·Server Core)",
+                " · h264_mf 사용 불가 — Windows N/KN(Media Feature Pack)·Windows Server(Media Foundation 기능 미설치)",
             );
         }
         Some(note)
@@ -1144,9 +1145,9 @@ pub(crate) mod tests {
     }
 
     /// B-5 (Fix round 2): h264_mf is listed but cannot start (Windows N/KN
-    /// without the Media Feature Pack, Server Core) → the next listed
-    /// candidate is used, the note says why, and the result is cached
-    /// with the probe (no second trial).
+    /// without the Media Feature Pack, Windows Server without Media
+    /// Foundation) → the next listed candidate is used, the note says why,
+    /// and the result is cached with the probe (no second trial).
     #[test]
     fn a_listed_encoder_that_fails_its_trial_is_skipped() {
         let dir = std::env::temp_dir().join(format!("ft-enc-trial-{}", std::process::id()));
@@ -1158,7 +1159,12 @@ pub(crate) mod tests {
         assert_eq!(enc.video(), VideoEncoder::Libopenh264);
         let note = enc.build_note().unwrap();
         assert!(note.contains("libopenh264 사용"), "{note}");
-        assert!(note.contains("Media Feature Pack 필요"), "{note}");
+        assert!(
+            note.contains(
+                "h264_mf 사용 불가 — Windows N/KN(Media Feature Pack)·Windows Server(Media Foundation 기능 미설치)"
+            ),
+            "{note}"
+        );
         assert_eq!(
             enc.to_json()["trial_failed"],
             serde_json::json!(["h264_mf"])
