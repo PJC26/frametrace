@@ -261,6 +261,65 @@ fn the_env_cache_misses_when_tools_bin_changes() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Fix round 12 L1: a pip tool (deepfake-lens) installed from a console
+/// lands in `tools/python/<name>/Scripts` — the cache fingerprint covers
+/// that too, so `/api/env` re-probes instead of `deepfake: false`.
+#[test]
+fn the_env_cache_misses_when_a_private_venv_appears_or_changes() {
+    use super::system::{EnvCacheEntry, env_cache_hit, env_cache_store, tools_fingerprint};
+    let base = scratch("env-fp-py");
+    let bin = base.join("tools/bin");
+    let python = base.join("tools/python");
+    let scripts = if cfg!(windows) { "Scripts" } else { "bin" };
+    std::fs::create_dir_all(&bin).unwrap();
+    let cache: Mutex<Option<EnvCacheEntry>> = Mutex::new(None);
+    let empty = tools_fingerprint(&bin, &python);
+    assert_eq!(tools_fingerprint(&bin, &python), empty, "stable");
+    env_cache_store(&cache, empty.clone(), "{\"deepfake\":false}".into());
+    assert!(env_cache_hit(&cache, &empty).is_some());
+    // The venv appears (tools/bin untouched).
+    let venv = python.join("deepfake-lens");
+    std::fs::create_dir_all(venv.join(scripts)).unwrap();
+    let with_venv = tools_fingerprint(&bin, &python);
+    assert_ne!(with_venv, empty);
+    assert!(env_cache_hit(&cache, &with_venv).is_none(), "miss");
+    assert!(
+        cache.lock().unwrap().is_none(),
+        "the stale entry is dropped"
+    );
+    // pip adds the console script: the Scripts dir changes (its mtime is
+    // pushed forward explicitly — directory mtime granularity is coarse
+    // on some file systems).
+    env_cache_store(&cache, with_venv.clone(), "{}".into());
+    std::fs::write(venv.join(scripts).join("deepfake-lens.exe"), b"MZ").unwrap();
+    #[cfg(windows)]
+    let dir = {
+        // A directory handle needs FILE_FLAG_BACKUP_SEMANTICS on Windows.
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(0x0200_0000)
+            .open(venv.join(scripts))
+            .unwrap()
+    };
+    #[cfg(not(windows))]
+    let dir = std::fs::File::open(venv.join(scripts)).unwrap();
+    dir.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    drop(dir);
+    let with_script = tools_fingerprint(&bin, &python);
+    assert_ne!(
+        with_script, with_venv,
+        "the Scripts dir mtime is part of it"
+    );
+    assert!(env_cache_hit(&cache, &with_script).is_none(), "miss");
+    // Removing the venv misses as well.
+    env_cache_store(&cache, with_script.clone(), "{}".into());
+    std::fs::remove_dir_all(&venv).unwrap();
+    assert!(env_cache_hit(&cache, &tools_fingerprint(&bin, &python)).is_none());
+    let _ = std::fs::remove_dir_all(base);
+}
+
 /// Fix round 11 M1: the global `/api/cancel` ([종료] on the home screen)
 /// while a tool install holds `busy` asks the install's own latch — never
 /// the job path (`cancel_requested` + "현재 단계를 멈추는 중" in the log,

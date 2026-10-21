@@ -486,8 +486,12 @@ impl InstallDirs {
     pub fn licenses(&self) -> PathBuf {
         self.bin().join("licenses")
     }
+    /// `tools/python`: the private venvs of on-demand pip tools.
+    pub fn python_root(&self) -> PathBuf {
+        self.tools_dir.join("python")
+    }
     pub fn python_env(&self, name: &str) -> PathBuf {
-        self.tools_dir.join("python").join(name)
+        self.python_root().join(name)
     }
     pub fn audit_log(&self) -> PathBuf {
         self.tools_dir.join("install-audit.jsonl")

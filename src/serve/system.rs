@@ -38,6 +38,11 @@ pub(crate) const PROBED_TOOLS: &[(&str, &str)] = &[
 /// an install made outside this server (`frametrace tools install ffmpeg`
 /// from a console while the workstation runs) invalidates it at the next
 /// `/api/env` or `/api/tools` instead of "ffmpeg 없음" until a restart.
+///
+/// Fix round 12 L1: it also covers `<exe>/tools/python` (each venv's name
+/// and mtime plus its `Scripts`/`bin` directory mtime), where an on-demand
+/// pip tool (deepfake-lens) lands — `/api/env` reports that one through
+/// `private_venv_executable`, so a console install must miss the cache too.
 static ENV_CACHE: Mutex<Option<EnvCacheEntry>> = Mutex::new(None);
 
 pub(crate) struct EnvCacheEntry {
@@ -76,10 +81,52 @@ pub(crate) fn tools_bin_fingerprint(dir: &Path) -> String {
     rows.join("\n")
 }
 
-/// The fingerprint of this executable's `tools/bin`.
+fn mtime_nanos(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos())
+}
+
+/// The private venvs directly under `dir` (`tools/python`): each entry's
+/// name and mtime, and the mtime of its console-script directory
+/// (`Scripts` on Windows, `bin` elsewhere — a pip install adds the tool's
+/// script there), sorted; empty when `dir` is missing or unreadable.
+pub(crate) fn tools_python_fingerprint(dir: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let scripts = if cfg!(windows) { "Scripts" } else { "bin" };
+    let mut rows: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let path = entry.path();
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                entry.file_name().to_string_lossy(),
+                mtime_nanos(&path),
+                mtime_nanos(&path.join(scripts))
+            )
+        })
+        .collect();
+    rows.sort();
+    rows.join("\n")
+}
+
+/// One fingerprint over `tools/bin` and `tools/python`.
+pub(crate) fn tools_fingerprint(bin: &Path, python: &Path) -> String {
+    format!(
+        "{}\n\u{1}python\n{}",
+        tools_bin_fingerprint(bin),
+        tools_python_fingerprint(python)
+    )
+}
+
+/// The fingerprint of this executable's `tools/bin` and `tools/python`.
 fn current_tools_fingerprint() -> String {
     crate::tool_install::InstallDirs::for_current_exe()
-        .map(|dirs| tools_bin_fingerprint(&dirs.bin()))
+        .map(|dirs| tools_fingerprint(&dirs.bin(), &dirs.python_root()))
         .unwrap_or_default()
 }
 
