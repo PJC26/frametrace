@@ -129,20 +129,29 @@ $("hBtnQuit").addEventListener("click", async () => {
         try { cur = await jget("/api/status"); } catch (e) { cur = null; }
         if (cur && cur.busy) {
           $("dlgNote").textContent = "작업 중단 요청 중…";
-          const cr = await jpost("/api/cancel", {});
-          if (!cr.ok) {
+          const cr = await jpost("/api/cancel", {}) || {};
+          // Fix round 11 M1: a guided tool install (it holds busy) is stopped
+          // through its own latch — `cancelled: "tool-install"` — and cannot
+          // stop while its files move into place (`not_cancellable`): then it
+          // is left to finish and the server is stopped right after.
+          const locked = !cr.ok && cr.code === "not_cancellable";
+          const waitLabel = locked ? "파일 이동 단계라 중단할 수 없습니다 — 끝난 뒤 종료합니다"
+            : cr.cancelled === "tool-install" ? "도구 설치를 중단하는 중…"
+            : "작업이 멈추기를 기다리는 중…";
+          if (!cr.ok && !locked) {
             // "no job running" means it finished meanwhile — fine, unless still busy.
             let again = null;
             try { again = await jget("/api/status"); } catch (e) { again = null; }
             if (!again || again.busy) { $("dlgNote").textContent = "중단 요청 실패: " + (cr.error || "알 수 없는 오류"); return false; }
           }
-          let still = !!cr.ok;
+          let still = !!cr.ok || locked;
+          if (still) $("dlgNote").textContent = waitLabel;
           for (let i = 0; i < 120 && still; i++) {
             await new Promise(r => setTimeout(r, 500));
             let s2 = null;
             try { s2 = await jget("/api/status"); } catch (e) { s2 = null; }
             still = !!(s2 && s2.busy);
-            $("dlgNote").textContent = `작업이 멈추기를 기다리는 중… ${Math.round((i + 1) / 2)}초 / 최대 60초`;
+            $("dlgNote").textContent = `${waitLabel} ${Math.round((i + 1) / 2)}초 / 최대 60초`;
           }
           if (still) { $("dlgNote").textContent = "작업이 아직 멈추지 않았습니다 — 잠시 후 다시 시도하십시오."; return false; }
         }

@@ -215,6 +215,105 @@ fn running_job(state: &SharedState, id: u64) -> Arc<crate::tool_install::Progres
     progress
 }
 
+/// Fix round 11 L3: the env cache is keyed by a tools/bin fingerprint — a
+/// file added, resized or touched there (a CLI install while the
+/// workstation runs) misses the cache and drops the stale entry.
+#[test]
+fn the_env_cache_misses_when_tools_bin_changes() {
+    use super::system::{EnvCacheEntry, env_cache_hit, env_cache_store, tools_bin_fingerprint};
+    let base = scratch("env-fp");
+    let bin = base.join("tools/bin");
+    assert_eq!(tools_bin_fingerprint(&bin), "", "a missing dir");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("ffprobe.exe"), b"old").unwrap();
+    let cache: Mutex<Option<EnvCacheEntry>> = Mutex::new(None);
+    let before = tools_bin_fingerprint(&bin);
+    assert_eq!(tools_bin_fingerprint(&bin), before, "stable");
+    env_cache_store(&cache, before.clone(), "{\"ffmpeg\":false}".into());
+    assert_eq!(
+        env_cache_hit(&cache, &before).as_deref(),
+        Some("{\"ffmpeg\":false}")
+    );
+    // A new binary (the CLI install).
+    std::fs::write(bin.join("ffmpeg.exe"), b"MZ").unwrap();
+    let added = tools_bin_fingerprint(&bin);
+    assert_ne!(added, before);
+    assert!(env_cache_hit(&cache, &added).is_none(), "miss");
+    assert!(
+        cache.lock().unwrap().is_none(),
+        "the stale entry is dropped"
+    );
+    // A replaced binary of another size.
+    env_cache_store(&cache, added.clone(), "{}".into());
+    std::fs::write(bin.join("ffmpeg.exe"), b"MZ new build").unwrap();
+    assert!(env_cache_hit(&cache, &tools_bin_fingerprint(&bin)).is_none());
+    // Same size, newer mtime.
+    let same = tools_bin_fingerprint(&bin);
+    env_cache_store(&cache, same.clone(), "{}".into());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(bin.join("ffmpeg.exe"))
+        .unwrap();
+    file.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    drop(file);
+    assert!(env_cache_hit(&cache, &tools_bin_fingerprint(&bin)).is_none());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// Fix round 11 M1: the global `/api/cancel` ([종료] on the home screen)
+/// while a tool install holds `busy` asks the install's own latch — never
+/// the job path (`cancel_requested` + "현재 단계를 멈추는 중" in the log,
+/// which the install worker never reads). During the move stage it is
+/// `not_cancellable`; a worker that already ended is just acknowledged.
+#[test]
+fn the_global_cancel_stops_a_tool_install_through_its_own_latch() {
+    const JOB_LINE: &str = "현재 단계를 멈추는 중";
+    let state = new_state();
+    let _lease = try_lease_busy(&state).unwrap();
+    let progress = running_job(&state, 3);
+    let reply = parse(&api_cancel(&state));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["cancelled"], "tool-install", "{reply}");
+    assert_eq!(reply["job_kind"], "tool-install");
+    assert_eq!(reply["install"]["id"], 3);
+    assert!(progress.cancelled(), "the install's latch is set");
+    {
+        let guard = state_lock(&state);
+        assert!(!guard.cancel_requested, "the job path is untouched");
+        assert!(
+            !guard.logs.iter().any(|line| line.contains(JOB_LINE)),
+            "no false job-cancel line: {:?}",
+            guard.logs
+        );
+    }
+
+    // Moving files into place: refused with its own code, nothing set.
+    let progress = Arc::new(crate::tool_install::Progress::default());
+    progress
+        .enter_non_cancellable(crate::tool_install::Stage::Install)
+        .unwrap();
+    state_lock(&state).tool_install.as_mut().unwrap().progress = Arc::clone(&progress);
+    let logs_before = state_lock(&state).logs.len();
+    let refused = parse(&api_cancel(&state));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "not_cancellable", "{refused}");
+    assert_eq!(refused["job_kind"], "tool-install");
+    assert!(!progress.cancelled());
+    let guard = state_lock(&state);
+    assert!(!guard.cancel_requested);
+    assert_eq!(guard.logs.len(), logs_before, "nothing logged");
+    drop(guard);
+
+    // The worker already finished (still publishing): acknowledged, quiet.
+    let progress = running_job(&state, 4);
+    progress.set_stage(crate::tool_install::Stage::Done);
+    let reply = parse(&api_cancel(&state));
+    assert_eq!(reply["cancelled"], "tool-install", "{reply}");
+    assert!(!progress.cancelled());
+    assert!(!state_lock(&state).cancel_requested);
+}
+
 /// Fix round 4: a cancel naming the current job after it already ended —
 /// published (`done` / `failed`), or finished by the worker (stage done /
 /// failed) while it still writes the audit line — is `no_install`, never
@@ -534,6 +633,59 @@ mod windows {
             ))["code"],
             "no_install"
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Fix round 11 M1, end to end: [종료] → `/api/cancel` mid-download
+    /// stops the real worker (INSTALL_CANCELLED, `busy` released, so
+    /// `/api/shutdown` is accepted) and logs no false job-cancel line.
+    #[test]
+    fn the_global_cancel_ends_a_running_install_and_shutdown_proceeds() {
+        let bytes = fake::big_zip();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let source = fake::serve(HashMap::new());
+        source.route("/fake.zip", Reply::Gated(bytes.clone(), Arc::clone(&gate)));
+        let tool = crate::tool_install::tests::test_archive_entry(&source.url("/fake.zip"), &bytes);
+        let base = scratch("global-cancel");
+        let state = new_state();
+        let started = parse(&tools::start_install(
+            &state,
+            "faketool",
+            fake_env(base.join("tools"), tool),
+        ));
+        assert_eq!(started["ok"], true, "{started}");
+        wait_until("download progress", || {
+            let status = parse(&tools::api_tools_install_status(&state));
+            status["install"]["stage"] == "download"
+                && status["install"]["bytes"].as_u64().unwrap_or(0) > 0
+        });
+        assert_eq!(parse(&api_shutdown(&state))["running"], true);
+        let cancel = parse(&api_cancel(&state));
+        assert_eq!(cancel["ok"], true, "{cancel}");
+        assert_eq!(cancel["cancelled"], "tool-install", "{cancel}");
+        wait_until("install stopped", || !state_lock(&state).busy);
+        fake::open_gate(&gate);
+        let status = parse(&tools::api_tools_install_status(&state));
+        assert_eq!(status["install"]["state"], "failed", "{status}");
+        assert_eq!(
+            status["install"]["error"],
+            crate::tool_install::INSTALL_CANCELLED
+        );
+        assert_eq!(status["install"]["cancelled"], true);
+        {
+            let guard = state_lock(&state);
+            assert!(!guard.cancel_requested);
+            assert!(
+                !guard
+                    .logs
+                    .iter()
+                    .any(|line| line.contains("현재 단계를 멈추는 중")),
+                "{:?}",
+                guard.logs
+            );
+        }
+        assert!(!base.join("tools/bin/fake.exe").exists());
+        assert_eq!(parse(&api_shutdown(&state))["ok"], true);
         let _ = std::fs::remove_dir_all(base);
     }
 

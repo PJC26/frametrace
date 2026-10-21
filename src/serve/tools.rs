@@ -135,6 +135,9 @@ pub(crate) fn api_tools(request: &Request, state: &SharedState) -> String {
         Ok(manifest) => manifest,
         Err(err) => return refusal("manifest_invalid", &err, serde_json::json!({})),
     };
+    // Fix round 11 L3: an install from the CLI changed tools/bin under a
+    // cached /api/env — drop it so both endpoints agree.
+    super::system::revalidate_env_cache();
     // Resolution (filesystem) outside the state lock.
     let tools: Vec<serde_json::Value> = manifest
         .tools

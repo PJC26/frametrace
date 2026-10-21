@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 import { appBundleJs } from './app-bundle.mjs';
-import { TOOLS_FIXTURE, routeTools } from './tools-mock.mjs';
+import { TOOLS_FIXTURE, routeTools, apiCancelReply, INSTALL_CANCELLED as INSTALL_CANCELLED_U } from './tools-mock.mjs';
 
 const read = (rel) => readFileSync(new URL('../../' + rel, import.meta.url), 'utf8');
 
@@ -685,6 +685,61 @@ export async function toolsTrackU() {
     const text = small.replace(/<small[^>]*>/, '').replace(/<[^>]+>/g, '');
     assert.ok(text.includes('WindowsApps\\ffmpeg.exe') && text.includes('PATH의 다른 사본 무시됨'), 'path in the text: ' + small);
     assert.ok(/<span class="sr-only">[^<]*WindowsApps\\ffmpeg\.exe/.test(small), 'sr-only: ' + small);
+  });
+
+  // Fix round 11 M1: [종료] (assets/app/95-quit.js) while a guided install
+  // holds busy. The global /api/cancel answers from the mock's apiCancelReply
+  // (the server's shapes); /api/status is busy while the install runs.
+  const quitRun = async (stage, finishAfterPolls) => {
+    const quitSrc = read('assets/app/95-quit.js');
+    const m = { install: { ...J('downloading', 'ffmpeg', { stage, bytes: 1, total: 4 }) }, cancelRequested: false };
+    if (stage === 'install') m.install.state = 'extracting';
+    const notes = []; const posts = []; let polls = 0; let okResult = null;
+    const els = {};
+    const elOf = (id) => (els[id] ||= {
+      id, hidden: false, inert: false, innerHTML: '', disabled: false, listeners: [],
+      set textContent(v) { if (id === 'dlgNote') notes.push(v); this._t = v; }, get textContent() { return this._t || ''; },
+      addEventListener(t, f) { this.listeners.push(f); }, setAttribute() {}, removeAttribute() {},
+    });
+    const running = () => m.install.state !== 'done' && m.install.state !== 'failed';
+    const ctx = {
+      console, window: {}, $: elOf, esc: (s) => String(s),
+      setTimeout: (f) => { setImmediate(f); return 1; }, clearTimeout() {},
+      hViewer: { summary: () => ({ pending: 0 }) }, FTStore: { hasProject: () => false, state: {} },
+      jget: async (url) => {
+        if (url !== '/api/status') return { ok: true };
+        if (running()) {
+          polls += 1;
+          if (m.cancelRequested) Object.assign(m.install, { state: 'failed', stage: 'failed', error: INSTALL_CANCELLED_U, cancelled: true });
+          else if (finishAfterPolls && polls > finishAfterPolls) Object.assign(m.install, { state: 'done', stage: 'done' });
+        }
+        return { ok: true, busy: running(), phase: 'task' };
+      },
+      jpost: async (url) => { posts.push(url); if (url === '/api/cancel') return apiCancelReply(m) || { ok: false, error: '진행 중인 작업이 없습니다.' }; return { ok: true }; },
+      askDialog: async (o) => { okResult = await o.onOk(); return false; },
+      alertDialog: async () => {},
+    };
+    runInNewContext(quitSrc, ctx);
+    await elOf('hBtnQuit').listeners[0]();
+    return { okResult, notes, posts, m };
+  };
+
+  await row('Fix round 11 M1: [종료] during a download stops the install through /api/cancel (cancelled "tool-install") and then shuts the server down', async () => {
+    const r = await quitRun('download', 0);
+    assert.equal(r.okResult, true, 'onOk proceeds: ' + JSON.stringify(r.notes));
+    assert.deepEqual(r.posts, ['/api/cancel', '/api/shutdown'], JSON.stringify(r.posts));
+    assert.equal(r.m.install.cancelled, true, 'the install ended cancelled');
+    assert.ok(r.notes.some((n) => n.startsWith('도구 설치를 중단하는 중')), JSON.stringify(r.notes));
+    assert.ok(!r.notes.some((n) => /중단 요청 실패|아직 멈추지 않았습니다/.test(n)), JSON.stringify(r.notes));
+  });
+
+  await row('Fix round 11 M1: [종료] while files move into place (not_cancellable) says so, waits for the install to end, then shuts down', async () => {
+    const r = await quitRun('install', 3);
+    assert.equal(r.okResult, true, 'onOk proceeds: ' + JSON.stringify(r.notes));
+    assert.deepEqual(r.posts, ['/api/cancel', '/api/shutdown'], JSON.stringify(r.posts));
+    assert.equal(r.m.install.state, 'done', 'the install ran to its end');
+    assert.ok(r.notes.includes('파일 이동 단계라 중단할 수 없습니다 — 끝난 뒤 종료합니다'), JSON.stringify(r.notes));
+    assert.ok(!r.notes.some((n) => /중단 요청 실패/.test(n)), 'never "중단 요청 실패": ' + JSON.stringify(r.notes));
   });
 
   if (failed.length) throw new Error('Tools track U failed: ' + failed.join('; '));

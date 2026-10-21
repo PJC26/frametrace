@@ -5,6 +5,7 @@
 //   POST /api/tools/install {name}  {ok:true, install: J} | {ok:false, code, error[, manual_hint, homepage]}
 //   GET  /api/tools/install-status  {ok:true, install: J|null, now_unix}
 //   POST /api/tools/install-cancel {id?}  {ok:true, install: J} | {ok:false, code:"no_install"|"not_cancellable"|"stale_job"}
+//   POST /api/cancel (opts.routeCancel; apiCancelReply)  {ok:true, cancelled:"tool-install", install: J} | {ok:false, code:"not_cancellable"}
 // T carries notice / notice_en (option C distribution notice; null for
 // tools that cannot be installed), shadowed_by {<binary>: path|null} and,
 // for ffmpeg once installed, encoders {…, trial_failed: []}; J carries
@@ -70,6 +71,21 @@ const withAge = (i) => (i ? { ...i, age_s: i.finished_unix ? Math.max(0, nowUnix
 // GET /api/tools encoders of an installed ffmpeg without libx264 (the BtbN
 // build the installer fetches; src/ffmpeg_encoders.rs to_json).
 const LGPL_ENCODERS = { probed: true, libx264: false, h264: 'h264_mf', aac: 'aac', avi_audio: 'mp2', note: 'libx264 없음 — H.264는 h264_mf 사용', trial_failed: [], trial_timed_out: [] };
+
+// POST /api/cancel (the global cancel of [종료]) while the mock state `m`
+// has an install running — src/serve/system.rs api_cancel, Fix round 11 M1:
+// it holds `busy`, so the cancel goes to the install's own latch
+// ({ok:true, cancelled:"tool-install"}, the job ends `cancelled` on the next
+// poll) or is refused in the move / venv / pip stage
+// ({ok:false, code:"not_cancellable"}; the install then runs to its end).
+// `null` when no install runs (the caller answers for other jobs).
+export function apiCancelReply(m) {
+  const i = m.install;
+  if (!i || i.state === 'done' || i.state === 'failed') return null;
+  if (LOCKED_STAGES.includes(i.stage)) return { ok: false, code: 'not_cancellable', error: '지금 단계(파일 이동·Python 환경 구성)는 취소할 수 없습니다 — 끝날 때까지 기다리십시오.', job_kind: 'tool-install', install: withAge(i) };
+  m.cancelRequested = true;
+  return { ok: true, cancelled: 'tool-install', job_kind: 'tool-install', install: withAge(i), clips_cancelled: 0, clips_running: 0 };
+}
 
 // opts.steps: status polls per install stage (default 2); opts.fail: an
 // error string → the job ends `failed`; opts.tools: a fixture override;
@@ -142,6 +158,8 @@ export async function routeTools(page, opts = {}) {
     m.cancelRequested = true;
     return json(route, { ok: true, install: withAge(i) });
   });
+  // opts.routeCancel: also answer the global POST /api/cancel ([종료]).
+  if (opts.routeCancel) await page.route('**/api/cancel', async (route) => json(route, apiCancelReply(m) || { ok: false, error: '진행 중인 작업이 없습니다.' }));
   await page.route('**/api/tools', async (route) => json(route, { ok: true, platform: 'windows-x86_64', platform_supported: true, tools: m.tools, install: withAge(m.install), now_unix: nowUnix() }));
   return m;
 }
