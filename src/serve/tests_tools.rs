@@ -344,6 +344,7 @@ fn the_global_cancel_stops_a_tool_install_through_its_own_latch() {
     assert_eq!(reply["ok"], true, "{reply}");
     assert_eq!(reply["cancelled"], "tool-install", "{reply}");
     assert_eq!(reply["job_kind"], "tool-install");
+    assert_eq!(reply["requested"], true, "{reply}");
     assert_eq!(reply["install"]["id"], 3);
     assert!(progress.cancelled(), "the install's latch is set");
     {
@@ -378,6 +379,9 @@ fn the_global_cancel_stops_a_tool_install_through_its_own_latch() {
     progress.set_stage(crate::tool_install::Stage::Done);
     let reply = parse(&api_cancel(&state));
     assert_eq!(reply["cancelled"], "tool-install", "{reply}");
+    // Fix round 15: nothing was asked — the quit dialog must not say
+    // the install was cancelled.
+    assert_eq!(reply["requested"], false, "{reply}");
     assert!(!progress.cancelled());
     assert!(!state_lock(&state).cancel_requested);
 }

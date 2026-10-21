@@ -84,8 +84,11 @@ export function apiCancelReply(m) {
   const i = m.install;
   if (!i || i.state === 'done' || i.state === 'failed') return null;
   if (LOCKED_STAGES.includes(i.stage)) return { ok: false, code: 'not_cancellable', error: '지금 단계(파일 이동·Python 환경 구성)는 취소할 수 없습니다 — 끝날 때까지 기다리십시오.', job_kind: 'tool-install', install: withAge(i) };
+  // Fix round 15: the worker already ended (stage done / failed) but still
+  // holds `busy` while it publishes — acknowledged, nothing asked.
+  if (i.stage === 'done' || i.stage === 'failed') return { ok: true, cancelled: 'tool-install', job_kind: 'tool-install', requested: false, install: withAge(i), clips_cancelled: 0, clips_running: 0 };
   m.cancelRequested = true;
-  return { ok: true, cancelled: 'tool-install', job_kind: 'tool-install', install: withAge(i), clips_cancelled: 0, clips_running: 0 };
+  return { ok: true, cancelled: 'tool-install', job_kind: 'tool-install', requested: true, install: withAge(i), clips_cancelled: 0, clips_running: 0 };
 }
 
 // opts.steps: status polls per install stage (default 2); opts.fail: an

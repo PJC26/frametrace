@@ -723,7 +723,14 @@ export async function toolsTrackU() {
         }
         return { ok: true, busy: running(), phase: 'task' };
       },
-      jpost: async (url) => { posts.push(url); if (url === '/api/cancel') return apiCancelReply(m) || { ok: false, error: '진행 중인 작업이 없습니다.' }; return { ok: true }; },
+      jpost: async (url) => {
+        posts.push(url);
+        // Fix round 15: opts.endedAtCancel — the worker finished just before
+        // /api/cancel arrived (stage done, `busy` not yet released).
+        if (url === '/api/cancel' && opts.endedAtCancel) m.install.stage = 'done';
+        if (url === '/api/cancel') return apiCancelReply(m) || { ok: false, error: '진행 중인 작업이 없습니다.' };
+        return { ok: true };
+      },
       askDialog: async (o) => { dialog = o; ctx.dlgResolve = () => {}; okResult = await o.onOk(); return false; },
       alertDialog: async () => {},
       toast: (msg, kind) => { toasts.push([msg, kind]); },
@@ -785,6 +792,14 @@ export async function toolsTrackU() {
     const shut = await quitRun('download', 0, { cancelAfterPolls: 2 });
     assert.deepEqual(shut.posts, ['/api/cancel', '/api/shutdown'], JSON.stringify(shut.posts));
     assert.deepEqual(shut.toasts, [], JSON.stringify(shut.toasts));
+  });
+
+  await row('Fix round 15: [계속 작업] after a cancel that arrived when the install had already ended (requested:false) says it had finished, never "이미 중단됐습니다"', async () => {
+    const r = await quitRun('download', 2, { endedAtCancel: true, closeAfterPolls: 1 });
+    assert.equal(r.okResult, false, 'onOk gave up: ' + JSON.stringify(r.notes.slice(-3)));
+    assert.deepEqual(r.posts, ['/api/cancel'], 'no /api/shutdown: ' + JSON.stringify(r.posts));
+    assert.equal(r.m.cancelRequested, false, 'nothing was asked');
+    assert.deepEqual(r.toasts, [['도구 설치는 이미 끝나 있었습니다 — 도구 패널에서 결과를 확인하십시오.', 'warn']], JSON.stringify(r.toasts));
   });
 
   await row('Fix round 14 L2: [계속 작업] noticed only after a not_cancellable install ended says it finished (see the tools panel), never "계속 진행됩니다"; no quit toast while the tools panel follows that install', async () => {

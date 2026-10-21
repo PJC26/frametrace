@@ -112,6 +112,11 @@ const H_QUIT_INSTALL_WAIT_S = 600;
 // ended, so a not_cancellable install no longer "continues": it finished.
 function hQuitInstallLeftNote(cr, ended) {
   const r = cr || {};
+  // Fix round 15: `requested: false` — the install had already ended when
+  // /api/cancel arrived, so nothing was cancelled.
+  if (r.ok && r.cancelled === "tool-install" && r.requested === false) {
+    return "도구 설치는 이미 끝나 있었습니다 — 도구 패널에서 결과를 확인하십시오.";
+  }
   if (r.ok && r.cancelled === "tool-install") return "설치는 이미 중단됐습니다 — 필요하면 다시 설치하십시오.";
   if (!r.ok && r.code === "not_cancellable" && r.job_kind === "tool-install") {
     return ended ? "도구 설치가 끝났습니다 — 도구 패널에서 결과를 확인하십시오."

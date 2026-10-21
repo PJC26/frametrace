@@ -942,6 +942,10 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
                     "ok": true,
                     "cancelled": "tool-install",
                     "job_kind": "tool-install",
+                    // Fix round 15: false when the install had already
+                    // ended (Done/Failed) and nothing was asked — the quit
+                    // dialog must not then say it was cancelled.
+                    "requested": asked,
                     "install": snapshot,
                     "clips_cancelled": 0,
                     "clips_running": 0,

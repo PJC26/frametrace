@@ -529,3 +529,13 @@ f207a02에 대한 Fable 확인 리뷰의 Medium 하나(M)·Low 넷(L1–L4)·짐
 - RESTORE.txt 자체를 만들 수 없는데(디스크 가득 등) staging 백업을 밖으로 옮기지도 못한 경우: `backup/RESTORE.txt` 항목이 없으니 다음 청소가 그 staging을 지울 수 있다(오류 문구에는 남음). 디렉터리 이름 충돌 같은 경우는 이제 남긴다.
 - 중복 toast 억제는 `HT.busy`만 본다: 패널이 이미 끝을 알리고 `HT.busy`를 비운 뒤에 종료 대화 상자가 닫힘을 알아채면 두 toast가 다 날 수 있다(드묾).
 - 새 toast는 한국어 전용(종전처럼). Linux/macOS에서 새 Rust 코드는 돌리지 못했다. 이전 라운드의 남은 항목 그대로.
+
+## §Fix round 15 (2026-10-21, Opus 확인 리뷰 반영, 기준 041bf68)
+Fable 크레딧 소진으로 라운드 14 확인 리뷰는 Opus가 했다. 판정은 머지 가능(Blocker·High·Medium 없음), Low 2건.
+
+| 발견 | 변경 | 확인 |
+|---|---|---|
+| L-a: RESTORE.txt 생성이 NotFound 외 오류로 실패하고 `rollback-backup-*` 이동도 실패하면, 남은 `.staging-*`에 `backup/RESTORE.txt`가 없어 다음 서버 시작·설치의 정리가 이전 파일의 유일한 사본을 지운다. 오류 문구는 "다시 설치하기 전에"만 말했다. | 정리 규칙은 그대로 둔다. 성공한 설치도 옛 바이너리가 쓰이는 중이면 `backup/`이 든 staging을 일부러 남기고, 그것은 다음 정리에서 지워져야 하므로 "`backup/`이 비어 있지 않으면 보존"으로 바꾸면 그 폴더가 영구히 남고 되돌리기 경고가 거짓으로 뜬다. 대신 RESTORE.txt를 쓰지 못한 경우의 오류 문구를 "FrameTrace를 다시 시작하거나 다른 설치를 하기 전에(둘 다 이 폴더를 정리함)"로 바꿨다. | 코드 읽기. 디스크 가득 + 이동 실패의 겹침은 실기 재현하지 않음. |
+| L-b: 설치가 이미 Done/Failed인 순간의 `/api/cancel`은 아무것도 요청하지 않으면서 `ok:true, cancelled:"tool-install"`로 답해, 대기 중 [계속 작업]이면 "설치는 이미 중단됐습니다"가 떴다(실제로는 성공했을 수 있음). | 응답에 `requested`(실제로 중단을 요청했는지)를 추가. `95-quit.js`는 `requested === false`이면 "도구 설치는 이미 끝나 있었습니다 — 도구 패널에서 결과를 확인하십시오."를 낸다. mock(`apiCancelReply`)도 같은 규칙으로 맞췄다. | `serve::tests_tools::the_global_cancel_stops_a_tool_install_through_its_own_latch`에 `requested` true/false 단언 추가. tools-unit 새 행 "Fix round 15 …" PASS. |
+
+게이트(이 PC): `cargo fmt --check` ok · `cargo clippy --locked --all-targets -- -D warnings` ok · `cargo test --lib -- tool_install serve::tests_tools` 65 passed · `verify-review-batch --unit` 155 PASS / 0 FAIL. 전체 게이트는 깨끗한 워크트리(ft-gate)에서 따로 돈다.

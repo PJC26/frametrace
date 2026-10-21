@@ -1559,8 +1559,17 @@ pub(crate) fn preserve_rollback_backup(
         Err(move_err) => {
             let path = staging.path().to_path_buf();
             staging.keep();
+            // Fix round 15: without `backup/RESTORE.txt` the stale-staging
+            // sweep cannot tell this folder from an ordinary leftover, so
+            // the next server start or install removes it — say so instead
+            // of "before installing again" alone.
+            let when = if unwritten.is_some() {
+                "before FrameTrace is started again or another install runs (either one cleans this folder away)"
+            } else {
+                "before installing again"
+            };
             format!(
-                "{err} (the previous files stay in {} — could not move them to {}: {move_err}; restore them by hand before installing again — {})",
+                "{err} (the previous files stay in {} — could not move them to {}: {move_err}; restore them by hand {when} — {})",
                 path.display(),
                 kept.display(),
                 lists(&backup_dir.join(RESTORE_FILE))
