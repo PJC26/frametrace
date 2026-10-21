@@ -55,7 +55,8 @@ done
 # hands the zip to the next one; when every available reader failed, the
 # zip is refused. With no reader at all the run stops too, unless
 # FRAMETRACE_SKIP_NOTICES_CHECK=1 (then only a warning; names are still
-# checked).
+# checked). That is all the override does: it never affects the working
+# tree's manifest / THIRD_PARTY_NOTICES.md checks (source_problems).
 #
 # FRAMETRACE_ZIP_READER (python|unzip|tar|none) forces a single zip reader
 # (no fallback); it exists for scripts/test-build-release.sh.
@@ -172,6 +173,13 @@ notices_of_zip() {
     return 3
 }
 
+# Prints a working `node` (probed with `node -e 0`); fails if none.
+find_node() {
+    command -v node >/dev/null 2>&1 || return 1
+    node -e 0 >/dev/null 2>&1 || return 1
+    printf '%s\n' node
+}
+
 # Release guard on the working tree (§Fix round 12 M): the tools' notices in
 # tools/manifest.json are compiled into EVERY platform's binary
 # (include_str!) and `frametrace tools` prints them on Linux/macOS too, and
@@ -180,11 +188,14 @@ notices_of_zip() {
 # present, not null and not "") needs "notice_confirmed": true as a JSON
 # boolean (the string "true" does not count), and THIRD_PARTY_NOTICES.md
 # must not match Owner\s+to\s+confirm. The manifest is parsed with Python's
-# json (same probe as the zip reader); without Python the check fails
-# closed unless FRAMETRACE_SKIP_NOTICES_CHECK=1 (then only a warning).
+# json (same probe as the zip reader), else with node's JSON.parse (§Fix
+# round 13 L3: the same rule); with neither the check fails closed — there
+# is no override (FRAMETRACE_SKIP_NOTICES_CHECK=1 only concerns the zip
+# reader below, never this check). A reader's own error is printed with
+# the refusal.
 # Prints one problem per line; returns 0 (no problem) or 1.
 source_problems() {
-    local py out rc text
+    local py node out rc text err
     if [ ! -f THIRD_PARTY_NOTICES.md ]; then
         echo "THIRD_PARTY_NOTICES.md: not found"
     else
@@ -195,8 +206,11 @@ source_problems() {
     fi
     if [ ! -f tools/manifest.json ]; then
         echo "tools/manifest.json: not found — cannot check the tools' distribution notices"
-    elif py="$(find_python)"; then
-        rc=0
+        return 0
+    fi
+    err="$(mktemp 2>/dev/null || mktemp -t ft-manifest)"
+    rc=0
+    if py="$(find_python)"; then
         out="$("$py" -I -c '
 import json, sys
 try:
@@ -211,19 +225,42 @@ try:
             pending.append(str(t.get("name")))
     print(", ".join(pending))
 except BaseException as e:
-    sys.stderr.write("manifest: %r\n" % (e,))
+    sys.stderr.write("python: %r\n" % (e,))
     sys.exit(1)
-' tools/manifest.json 2>/dev/null)" || rc=$?
-        if [ "$rc" -ne 0 ]; then
-            echo "tools/manifest.json: cannot verify — not readable as a tool manifest"
-        elif [ -n "$out" ]; then
-            echo "tools/manifest.json: notice_confirmed is not true for: $out"
-        fi
-    elif [ "${FRAMETRACE_SKIP_NOTICES_CHECK:-}" = 1 ]; then
-        echo "warning: no python3/python and FRAMETRACE_SKIP_NOTICES_CHECK=1 — tools/manifest.json notice_confirmed NOT checked" >&2
+' tools/manifest.json 2>"$err")" || rc=$?
+    elif node="$(find_node)"; then
+        out="$("$node" -e '
+const fs = require("fs");
+try {
+  let text = fs.readFileSync(process.argv[1], "utf8");
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const m = JSON.parse(text);
+  if (!m || typeof m !== "object" || !Array.isArray(m.tools)) throw new Error("no \"tools\" array");
+  const pending = [];
+  for (const t of m.tools) {
+    if (!t || typeof t !== "object" || Array.isArray(t)) throw new Error("a tool entry is not an object");
+    const s = t.sha256;
+    if (s === undefined || s === null || s === "") continue; // not installable (manual only)
+    if (t.notice_confirmed !== true) pending.push(t.name === undefined || t.name === null ? "None" : String(t.name));
+  }
+  console.log(pending.join(", "));
+} catch (e) {
+  process.stderr.write("node: " + (e && e.message ? e.message : String(e)) + "\n");
+  process.exit(1);
+}
+' tools/manifest.json 2>"$err")" || rc=$?
     else
-        echo "tools/manifest.json: cannot verify — no python3/python to parse it (install one, or set FRAMETRACE_SKIP_NOTICES_CHECK=1)"
+        rm -f "$err"
+        echo "tools/manifest.json: cannot verify — no python3/python or node to parse it (install one; FRAMETRACE_SKIP_NOTICES_CHECK does not skip this check)"
+        return 0
     fi
+    out="$(printf '%s' "$out" | tr -d '\r')"
+    if [ "$rc" -ne 0 ]; then
+        echo "tools/manifest.json: cannot verify — not readable as a tool manifest ($(tr -d '\r' < "$err" | tr '\n' ' ' | sed 's/ *$//'))"
+    elif [ -n "$out" ]; then
+        echo "tools/manifest.json: notice_confirmed is not true for: $out"
+    fi
+    rm -f "$err"
 }
 
 refuse_unconfirmed() {
@@ -306,8 +343,12 @@ STAGE="dist/${ARTIFACT}"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp target/release/frametrace "$STAGE/"
-cp target/release/frametrace-app "$STAGE/" 2>/dev/null || true
+# §Fix round 13 H1: cargo wrote into $CARGO_TARGET_DIR when it is set (a
+# relative one is relative to this repo root, the cwd here) — never
+# package a stale target/release binary from an earlier build instead.
+RELEASE_DIR="${CARGO_TARGET_DIR:-target}/release"
+cp "$RELEASE_DIR/frametrace" "$STAGE/"
+cp "$RELEASE_DIR/frametrace-app" "$STAGE/" 2>/dev/null || true
 cp README.md THIRD_PARTY_NOTICES.md LICENSE "$STAGE/"
 
 rm -f "dist/${ARTIFACT}.zip"

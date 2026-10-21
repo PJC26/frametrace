@@ -13,7 +13,9 @@
 #   bash scripts/test-build-release.sh
 # Needs: shasum (the script under test), python3 or python (to make the
 # fixture zips and as the script's first zip reader; without it the marker
-# cases are skipped and the rest run with FRAMETRACE_SKIP_NOTICES_CHECK=1),
+# cases are skipped and the rest run with FRAMETRACE_SKIP_NOTICES_CHECK=1,
+# which no longer skips the manifest check — that then needs node, the
+# script's second manifest reader; node also runs its own cases),
 # unzip (optional: the unzip-reader cases are skipped without it), bsdtar
 # (optional: `tar` when it is bsdtar, or FRAMETRACE_TEST_BSDTAR=<path>, e.g.
 # C:/Windows/System32/tar.exe; the tar-reader cases are skipped without it).
@@ -44,6 +46,9 @@ for c in python3 python; do
 done
 HAVE_UNZIP=0
 command -v unzip >/dev/null 2>&1 && HAVE_UNZIP=1
+# Same probe as the script's find_node.
+NODE=""
+if command -v node >/dev/null 2>&1 && node -e 0 >/dev/null 2>&1; then NODE=node; fi
 
 # --- stubs ------------------------------------------------------------------
 STUBS="$WORK/stubs"
@@ -51,6 +56,12 @@ mkdir -p "$STUBS"
 cat > "$STUBS/cargo" <<'EOF'
 #!/usr/bin/env bash
 echo "cargo $*" >> "$FT_LOG"
+# Fix round 13 H1: like cargo, build into $CARGO_TARGET_DIR when it is set
+# (relative = to the cwd, the repo root); FT_CARGO_NOWRITE=1 writes nothing.
+if [ -n "${CARGO_TARGET_DIR:-}" ] && [ "${FT_CARGO_NOWRITE:-}" != 1 ]; then
+    mkdir -p "$CARGO_TARGET_DIR/release"
+    echo fresh-from-cargo > "$CARGO_TARGET_DIR/release/frametrace"
+fi
 case "${PLANT:-}" in
     name) : > "dist/FrameTrace-9.9.9-win64-UNCONFIRMED (1).zip" ;;
     marker) cp "$FT_MARKER_ZIP" "dist/FrameTrace-9.9.9-win64.zip" ;;
@@ -151,7 +162,7 @@ fresh_repo() {
 SKIP_DEFAULT=""
 [ -n "$PY" ] || SKIP_DEFAULT=1
 run_script() {
-    OUT="$(env PATH="${XPATH:+$XPATH:}$STUBS:$PATH" FT_LOG="$WORK/log$n" FT_MARKER_ZIP="$MARKER_ZIP" \
+    OUT="$(env -u CARGO_TARGET_DIR PATH="${XPATH:+$XPATH:}$STUBS:$PATH" FT_LOG="$WORK/log$n" FT_MARKER_ZIP="$MARKER_ZIP" \
         FT_PY="$PY" FRAMETRACE_SKIP_NOTICES_CHECK="$SKIP_DEFAULT" "$@" \
         bash "$REPO/scripts/build-release.sh" 2>&1)"
     RC=$?
@@ -424,11 +435,15 @@ else
         check "Store python3 + python: unzip found the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
         fresh_repo
         make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
-        # (no python: the manifest check needs the override; the zip check
-        # does not, unzip reads the zips)
+        # (no python: node reads the manifest — Fix round 13 L3, the
+        # override no longer skips it; unzip reads the zips)
         XPATH="$STORE_PY3:$STORE_PY" run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
-        check "Store python3 + python, confirmed: exit 0 via unzip" [ "$RC" -eq 0 ]
-        check "Store python3 + python, confirmed: warns the manifest was not checked" out_has "tools/manifest.json notice_confirmed NOT checked"
+        if [ -n "$NODE" ]; then
+            check "Store python3 + python, confirmed: exit 0 via unzip (manifest via node)" [ "$RC" -eq 0 ]
+        else
+            check "Store python3 + python, no node: exit 1 (manifest cannot be verified)" [ "$RC" -eq 1 ]
+        fi
+        check "Store python3 + python: no 'NOT checked' manifest warning any more" bash -c '! printf "%s" "$1" | grep -qF "notice_confirmed NOT checked"' _ "$OUT"
     else
         skp "Store python3 + python falling to unzip (no unzip)"
     fi
@@ -562,19 +577,70 @@ else
         check "real tools/manifest.json (unconfirmed): names ffmpeg" out_has "notice_confirmed is not true for: ffmpeg"
     fi
 
-    # no python at all: fails closed, unless FRAMETRACE_SKIP_NOTICES_CHECK=1
-    NOPY3="$(stub_dir python3 'exit 9009')"
-    NOPY="$(stub_dir python 'exit 9009')"
-    fresh_repo; XPATH="$NOPY3:$NOPY" run_script
-    refused_src "manifest, no python"
-    check "manifest, no python: says cannot verify" out_has "tools/manifest.json: cannot verify — no python3/python"
-    fresh_repo; XPATH="$NOPY3:$NOPY" run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
-    check "manifest, no python + SKIP=1: exit 0" [ "$RC" -eq 0 ]
-    check "manifest, no python + SKIP=1: warns" out_has "tools/manifest.json notice_confirmed NOT checked"
+    # Fix round 13 L3: python's own error is printed with the refusal
+    fresh_repo; echo '{"tools": [' > "$REPO/tools/manifest.json"; run_script
+    check "manifest not JSON (python): prints the cause" out_has "python: JSONDecodeError"
+    fresh_repo; printf '\357\273\277' > "$REPO/tools/manifest.json"; printf '{"tools": [{"name": "ffmpeg", "sha256": "%s", "notice_confirmed": true}]}\n' "$SHA64" >> "$REPO/tools/manifest.json"; run_script
+    check "manifest with a UTF-8 BOM (python): exit 0" [ "$RC" -eq 0 ]
     # ... and the override never skips a verdict python could give
     fresh_repo; write_manifest false; run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
     refused_src "manifest notice_confirmed false + SKIP=1"
 fi
+
+# --- the manifest without python: node, else refused with no override --------
+NOPY3="$(stub_dir python3 'exit 9009')"
+NOPY="$(stub_dir python 'exit 9009')"
+NONODE="$(stub_dir node 'exit 127')"
+if [ -n "$NODE" ]; then
+    NOPYS="$NOPY3:$NOPY"
+    fresh_repo; XPATH="$NOPYS" run_script
+    check "manifest via node (no python), confirmed: exit 0" [ "$RC" -eq 0 ]
+    check "manifest via node (no python), confirmed: cargo ran once" [ "$CARGO_CALLS" -eq 1 ]
+    check "manifest via node (no python), confirmed: no 'NOT checked' warning" bash -c '! printf "%s" "$1" | grep -qF "notice_confirmed NOT checked"' _ "$OUT"
+    fresh_repo; write_manifest false; XPATH="$NOPYS" run_script
+    refused_src "manifest via node, notice_confirmed false"
+    check "manifest via node, notice_confirmed false: names ffmpeg" out_has "tools/manifest.json: notice_confirmed is not true for: ffmpeg"
+    fresh_repo; write_manifest -; XPATH="$NOPYS" run_script
+    refused_src "manifest via node, notice_confirmed missing"
+    fresh_repo; write_manifest '"true"'; XPATH="$NOPYS" run_script
+    refused_src 'manifest via node, notice_confirmed "true" (string)'
+    fresh_repo; write_manifest 1; XPATH="$NOPYS" run_script
+    refused_src "manifest via node, notice_confirmed 1 (number)"
+    fresh_repo; write_manifest true '{"name": "other", "sha256": "bb", "notice_confirmed": false}'; XPATH="$NOPYS" run_script
+    refused_src "manifest via node, second installable tool unconfirmed"
+    check "manifest via node, second installable tool unconfirmed: names only it" out_has "notice_confirmed is not true for: other"
+    fresh_repo; write_manifest true '{"name": "manual", "sha256": ""}'; XPATH="$NOPYS" run_script
+    check 'manifest via node, sha256 "" tool without notice_confirmed: exit 0' [ "$RC" -eq 0 ]
+    fresh_repo; printf '\357\273\277' > "$REPO/tools/manifest.json"; printf '{"tools": [{"name": "ffmpeg", "sha256": "%s", "notice_confirmed": true}]}\n' "$SHA64" >> "$REPO/tools/manifest.json"; XPATH="$NOPYS" run_script
+    check "manifest via node with a UTF-8 BOM: exit 0" [ "$RC" -eq 0 ]
+    fresh_repo; echo '{"tools": [' > "$REPO/tools/manifest.json"; XPATH="$NOPYS" run_script
+    refused_src "manifest via node, not JSON"
+    check "manifest via node, not JSON: says cannot verify" out_has "tools/manifest.json: cannot verify — not readable as a tool manifest"
+    check "manifest via node, not JSON: prints node's cause" out_has "(node: "
+    fresh_repo; echo '{"schema": 1}' > "$REPO/tools/manifest.json"; XPATH="$NOPYS" run_script
+    refused_src "manifest via node, no tools array"
+    check "manifest via node, no tools array: prints the cause" out_has 'no "tools" array'
+    fresh_repo; write_manifest false; XPATH="$NOPYS" run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
+    refused_src "manifest via node, false + SKIP=1"
+    # the repository's own manifest: the same verdict as python's
+    fresh_repo; cp "$ROOT/tools/manifest.json" "$REPO/tools/manifest.json"; XPATH="$NOPYS" run_script
+    if node -e 'const m=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8").replace(/^\uFEFF/,""));process.exit(m.tools.every(t=>t.sha256==null||t.sha256===""||t.notice_confirmed===true)?0:1)' "$ROOT/tools/manifest.json"; then
+        check "real tools/manifest.json via node (confirmed): exit 0" [ "$RC" -eq 0 ]
+    else
+        refused_src "real tools/manifest.json via node (unconfirmed)"
+        check "real tools/manifest.json via node (unconfirmed): names ffmpeg" out_has "notice_confirmed is not true for: ffmpeg"
+    fi
+else
+    skp "manifest via node cases (no node)"
+fi
+# neither python nor node: fails closed, and FRAMETRACE_SKIP_NOTICES_CHECK=1
+# does not change that (Fix round 13 L3)
+fresh_repo; XPATH="$NOPY3:$NOPY:$NONODE" run_script
+refused_src "manifest, no python and no node"
+check "manifest, no python and no node: says cannot verify" out_has "tools/manifest.json: cannot verify — no python3/python or node"
+fresh_repo; XPATH="$NOPY3:$NOPY:$NONODE" run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
+refused_src "manifest, no python and no node + SKIP=1 (no override)"
+check "manifest, no python and no node + SKIP=1: no 'NOT checked' warning" bash -c '! printf "%s" "$1" | grep -qF "notice_confirmed NOT checked"' _ "$OUT"
 
 # THIRD_PARTY_NOTICES.md in the working tree (no python needed)
 fresh_repo; printf '%s' "$MARKER_TEXT" > "$REPO/THIRD_PARTY_NOTICES.md"; run_script
@@ -606,6 +672,25 @@ if [ -n "$PY" ]; then
 else
     skp "zip entry listing (no python3/python)"
 fi
+
+# --- CARGO_TARGET_DIR (Fix round 13 H1) ----------------------------------------
+# fresh_repo leaves a STALE target/release/frametrace ("bin"); with the
+# variable set, the binary cargo built there is packaged, never the stale one.
+fresh_repo; run_script CARGO_TARGET_DIR="$WORK/ctd$n"
+check "CARGO_TARGET_DIR absolute: exit 0" [ "$RC" -eq 0 ]
+check "CARGO_TARGET_DIR absolute: packages the fresh binary" grep -qx fresh-from-cargo "$REPO/dist/$OUR_ZIP_NAME/frametrace"
+fresh_repo; run_script CARGO_TARGET_DIR=out/ct
+check "CARGO_TARGET_DIR relative: exit 0" [ "$RC" -eq 0 ]
+check "CARGO_TARGET_DIR relative: cargo built under the repo root" [ -f "$REPO/out/ct/release/frametrace" ]
+check "CARGO_TARGET_DIR relative: packages the fresh binary" grep -qx fresh-from-cargo "$REPO/dist/$OUR_ZIP_NAME/frametrace"
+# cargo wrote nothing there: the stale target/release one is not taken
+fresh_repo; run_script CARGO_TARGET_DIR="$WORK/ctd-empty$n" FT_CARGO_NOWRITE=1
+check "CARGO_TARGET_DIR without a binary: fails" [ "$RC" -ne 0 ]
+check "CARGO_TARGET_DIR without a binary: no zip" [ ! -f "$REPO/dist/$OUR_ZIP_NAME.zip" ]
+check "CARGO_TARGET_DIR without a binary: no SHA256SUMS" no_sums
+# unset: target/release as before
+fresh_repo; run_script
+check "no CARGO_TARGET_DIR: packages target/release/frametrace" grep -qx bin "$REPO/dist/$OUR_ZIP_NAME/frametrace"
 
 # --- --help prints the header only -------------------------------------------
 fresh_repo

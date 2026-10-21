@@ -51,11 +51,13 @@ binary and `frametrace tools` prints them on Linux/macOS too; and
 `THIRD_PARTY_NOTICES.md` must exist and must not match `Owner\s+to\s+confirm`
 (it ships in the zip). Otherwise it exits 1 with "the working tree is not
 releasable — NOT FOR RELEASE" and names each problem. The manifest is parsed
-with Python's `json` (`python3`, else `python`, run with `-I`); without
-Python the check fails closed ("cannot verify") unless
-`FRAMETRACE_SKIP_NOTICES_CHECK=1`, which then only warns — the override
-never skips a verdict Python could give, nor the THIRD_PARTY_NOTICES.md
-check (plain bash). Unlike `make-portable.ps1` there is no switch for an
+with Python's `json` (`python3`, else `python`, run with `-I`), else with
+`node -e` (`JSON.parse`, the same rule); with neither the check fails closed
+("cannot verify") and there is **no override** — since Fix round 13,
+`FRAMETRACE_SKIP_NOTICES_CHECK=1` no longer affects the manifest or the
+working-tree THIRD_PARTY_NOTICES.md check (plain bash), only a missing zip
+reader for the `dist/*.zip` content check below. A reader that fails on the
+manifest is a refusal too, and its own error is printed with it. Unlike `make-portable.ps1` there is no switch for an
 unconfirmed test package: Unix zips are release zips only.
 
 `build-release.sh` also refuses to run (exit 1, before building and again
@@ -74,8 +76,10 @@ that exits non-zero on a zip hands it to the next one, and a zip that no
 available reader can read (broken, encrypted, unsupported compression) is
 refused as "cannot verify", never passed as clean. With no reader at all
 the run also stops (exit 1); `FRAMETRACE_SKIP_NOTICES_CHECK=1` lets it
-proceed with a warning and the name check only. It never lists such a name in
-SHA256SUMS — so `--sign` can never cosign it. Fixture test (stub
+proceed with a warning and the name check only (it affects nothing else). It never lists such a name in
+SHA256SUMS — so `--sign` can never cosign it. The binaries are packaged
+from `$CARGO_TARGET_DIR/release` when that variable is set (relative to the
+repository root), else from `target/release`. Fixture test (stub
 cargo/rustc/zip, no build): `bash scripts/test-build-release.sh`
 (the bsdtar cases run when `tar` is bsdtar or with
 `FRAMETRACE_TEST_BSDTAR=<path>`, e.g. `C:/Windows/System32/tar.exe`; the
