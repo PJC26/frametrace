@@ -4,7 +4,10 @@
 # `zip` first on PATH, and checks that a Windows UNCONFIRMED test package in
 # dist/ — by name (any case, browser/Explorer copy names) or by the
 # "Owner to confirm" marker inside its THIRD_PARTY_NOTICES.md — stops the
-# run before SHA256SUMS is written, while a clean dist/ still gets sums.
+# run before SHA256SUMS is written, while a clean dist/ still gets sums; and
+# that an unconfirmed working tree (tools/manifest.json notice_confirmed not
+# the boolean true for an installable tool, or THIRD_PARTY_NOTICES.md still
+# saying "Owner to confirm") stops it before cargo runs.
 #
 # Runs from Git Bash on Windows and from bash on Linux/macOS:
 #   bash scripts/test-build-release.sh
@@ -61,14 +64,17 @@ echo "host: x86_64-unknown-linux-gnu"
 EOF
 cat > "$STUBS/zip" <<'EOF'
 #!/usr/bin/env bash
-# zip -qr <out.zip> <dir>: a real (readable) zip with one README entry, so
-# the content check before SHA256SUMS can read it; an empty zip without
-# python.
+# zip -qr <out.zip> <dir>: a real (readable) zip of every file under <dir>,
+# so the content check before SHA256SUMS reads the staged
+# THIRD_PARTY_NOTICES.md; an empty zip without python.
 if [ -n "${FT_PY:-}" ]; then
     "$FT_PY" -I -c '
-import sys, zipfile
+import os, sys, zipfile
 with zipfile.ZipFile(sys.argv[1], "w") as z:
-    z.writestr(sys.argv[2] + "/README.md", "stub\n")
+    for root, _dirs, files in os.walk(sys.argv[2]):
+        for f in sorted(files):
+            p = os.path.join(root, f)
+            z.write(p, p.replace(os.sep, "/"))
 ' "$2" "$3"
 else
     { printf 'PK\005\006'; head -c 18 /dev/zero; } > "$2"
@@ -112,7 +118,20 @@ if [ -n "$PY" ]; then
     make_zip "$MARKER_ZIP" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$MARKER_TEXT"
 fi
 
-# fresh_repo: a new fixture repo at $REPO with an empty dist/.
+# write_manifest <ffmpeg notice_confirmed JSON value | -> [extra tool JSON]:
+# one installable tool (sha256 pinned) and one manual-only tool (sha256
+# null, no notice_confirmed); "-" leaves ffmpeg's key out.
+SHA64="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+write_manifest() {
+    local conf="" extra=""
+    [ "$1" = - ] || conf=", \"notice_confirmed\": $1"
+    [ -n "${2:-}" ] && extra=", $2"
+    mkdir -p "$REPO/tools"
+    printf '{"schema": 1, "tools": [{"name": "ffmpeg", "sha256": "%s"%s}, {"name": "libewf", "sha256": null}%s]}\n' \
+        "$SHA64" "$conf" "$extra" > "$REPO/tools/manifest.json"
+}
+# fresh_repo: a new fixture repo at $REPO with an empty dist/, a confirmed
+# tools/manifest.json, a clean THIRD_PARTY_NOTICES.md and a LICENSE.
 n=0
 fresh_repo() {
     n=$((n + 1))
@@ -121,6 +140,9 @@ fresh_repo() {
     cp "$ROOT/scripts/build-release.sh" "$REPO/scripts/"
     printf '[package]\nname = "frametrace"\nversion = "9.9.9"\n' > "$REPO/Cargo.toml"
     echo readme > "$REPO/README.md"
+    printf '%s' "$CLEAN_TEXT" > "$REPO/THIRD_PARTY_NOTICES.md"
+    echo "MIT License (fixture)" > "$REPO/LICENSE"
+    write_manifest true
     echo bin > "$REPO/target/release/frametrace"
     : > "$WORK/log$n"
 }
@@ -402,8 +424,11 @@ else
         check "Store python3 + python: unzip found the marker" out_has "THIRD_PARTY_NOTICES.md: Owner to confirm"
         fresh_repo
         make_zip "$REPO/dist/FrameTrace-9.9.9-win64.zip" "FrameTrace-9.9.9-win64/THIRD_PARTY_NOTICES.md" "$CLEAN_TEXT"
-        XPATH="$STORE_PY3:$STORE_PY" run_script
+        # (no python: the manifest check needs the override; the zip check
+        # does not, unzip reads the zips)
+        XPATH="$STORE_PY3:$STORE_PY" run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
         check "Store python3 + python, confirmed: exit 0 via unzip" [ "$RC" -eq 0 ]
+        check "Store python3 + python, confirmed: warns the manifest was not checked" out_has "tools/manifest.json notice_confirmed NOT checked"
     else
         skp "Store python3 + python falling to unzip (no unzip)"
     fi
@@ -430,15 +455,15 @@ if [ "$HAVE_TAR_READER" -eq 0 ]; then
 elif [ -z "$PY" ]; then
     skp "bsdtar reader cases (no python3/python to build fixture zips)"
 else
-    # The zips this script builds hold only binaries + README: no notices
-    # entry is clean, in the first check and the second.
+    # A zip without a notices entry is clean; the zip this script builds
+    # carries the (clean) working-tree notices, read in the second check.
     fresh_repo
     make_zip "$REPO/dist/other-1.0-aarch64.zip" "other-1.0/README.md" "readme"
     XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
-    check "tar reader, zips without notices: exit 0" [ "$RC" -eq 0 ]
-    check "tar reader, zips without notices: SHA256SUMS written" has_sums
+    check "tar reader, our zip + a zip without notices: exit 0" [ "$RC" -eq 0 ]
+    check "tar reader, our zip + a zip without notices: SHA256SUMS written" has_sums
     if has_sums; then
-        check "tar reader, zips without notices: sums list our zip" sums_has "frametrace-9.9.9-x86_64-unknown-linux-gnu.zip"
+        check "tar reader, our zip + a zip without notices: sums list our zip" sums_has "frametrace-9.9.9-x86_64-unknown-linux-gnu.zip"
     fi
 
     fresh_repo
@@ -481,6 +506,105 @@ else
     XPATH="$BSDTAR_DIR" run_script FRAMETRACE_ZIP_READER=tar
     check "tar reader, unreadable zip: exit 1" [ "$RC" -eq 1 ]
     check "tar reader, unreadable zip: says cannot verify" out_has "cannot verify — every zip reader failed on it"
+fi
+
+# --- the working tree: tools/manifest.json + THIRD_PARTY_NOTICES.md ---------
+OUR_ZIP_NAME="frametrace-9.9.9-x86_64-unknown-linux-gnu"
+# refused_src <label>: exit 1, cargo not run, no zip, no SHA256SUMS, message.
+refused_src() {
+    check "$1: exit 1" [ "$RC" -eq 1 ]
+    check "$1: cargo not run" [ "$CARGO_CALLS" -eq 0 ]
+    check "$1: no SHA256SUMS" no_sums
+    check "$1: no zip built" [ ! -f "$REPO/dist/$OUR_ZIP_NAME.zip" ]
+    check "$1: says not releasable" out_has "the working tree is not releasable — NOT FOR RELEASE"
+}
+if [ -z "$PY" ]; then
+    skp "manifest notice_confirmed cases (no python3/python)"
+else
+    fresh_repo; write_manifest false; run_script
+    refused_src "manifest notice_confirmed false"
+    check "manifest notice_confirmed false: names ffmpeg" out_has "tools/manifest.json: notice_confirmed is not true for: ffmpeg"
+
+    fresh_repo; write_manifest -; run_script
+    refused_src "manifest notice_confirmed missing"
+    check "manifest notice_confirmed missing: names ffmpeg" out_has "notice_confirmed is not true for: ffmpeg"
+
+    fresh_repo; write_manifest '"true"'; run_script
+    refused_src 'manifest notice_confirmed "true" (string)'
+    check 'manifest notice_confirmed "true" (string): names ffmpeg' out_has "notice_confirmed is not true for: ffmpeg"
+
+    fresh_repo; write_manifest 1; run_script
+    refused_src "manifest notice_confirmed 1 (number)"
+
+    # a second installable tool, unconfirmed: the rule is per tool
+    fresh_repo; write_manifest true '{"name": "other", "sha256": "bb", "notice_confirmed": false}'; run_script
+    refused_src "manifest, second installable tool unconfirmed"
+    check "manifest, second installable tool unconfirmed: names only it" out_has "notice_confirmed is not true for: other"
+
+    # sha256 "" is not installable (make-portable.ps1's rule): no notice needed
+    fresh_repo; write_manifest true '{"name": "manual", "sha256": ""}'; run_script
+    check 'manifest, sha256 "" tool without notice_confirmed: exit 0' [ "$RC" -eq 0 ]
+
+    fresh_repo; rm -f "$REPO/tools/manifest.json"; run_script
+    refused_src "manifest missing"
+    check "manifest missing: says not found" out_has "tools/manifest.json: not found"
+
+    fresh_repo; echo '{"tools": [' > "$REPO/tools/manifest.json"; run_script
+    refused_src "manifest not JSON"
+    check "manifest not JSON: says cannot verify" out_has "tools/manifest.json: cannot verify"
+
+    # the repository's own manifest
+    fresh_repo; cp "$ROOT/tools/manifest.json" "$REPO/tools/manifest.json"; run_script
+    if "$PY" -I -c 'import json,sys; m=json.load(open(sys.argv[1],encoding="utf-8-sig")); sys.exit(0 if all(t.get("notice_confirmed") is True for t in m["tools"] if t.get("sha256") not in (None, "")) else 1)' "$ROOT/tools/manifest.json"; then
+        check "real tools/manifest.json (confirmed): exit 0" [ "$RC" -eq 0 ]
+    else
+        refused_src "real tools/manifest.json (unconfirmed)"
+        check "real tools/manifest.json (unconfirmed): names ffmpeg" out_has "notice_confirmed is not true for: ffmpeg"
+    fi
+
+    # no python at all: fails closed, unless FRAMETRACE_SKIP_NOTICES_CHECK=1
+    NOPY3="$(stub_dir python3 'exit 9009')"
+    NOPY="$(stub_dir python 'exit 9009')"
+    fresh_repo; XPATH="$NOPY3:$NOPY" run_script
+    refused_src "manifest, no python"
+    check "manifest, no python: says cannot verify" out_has "tools/manifest.json: cannot verify — no python3/python"
+    fresh_repo; XPATH="$NOPY3:$NOPY" run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
+    check "manifest, no python + SKIP=1: exit 0" [ "$RC" -eq 0 ]
+    check "manifest, no python + SKIP=1: warns" out_has "tools/manifest.json notice_confirmed NOT checked"
+    # ... and the override never skips a verdict python could give
+    fresh_repo; write_manifest false; run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
+    refused_src "manifest notice_confirmed false + SKIP=1"
+fi
+
+# THIRD_PARTY_NOTICES.md in the working tree (no python needed)
+fresh_repo; printf '%s' "$MARKER_TEXT" > "$REPO/THIRD_PARTY_NOTICES.md"; run_script
+refused_src "working-tree notices marker (re-wrapped, CRLF)"
+check "working-tree notices marker: names it" out_has "THIRD_PARTY_NOTICES.md: still says 'Owner to confirm'"
+fresh_repo; printf '%s' "$MARKER_TEXT" > "$REPO/THIRD_PARTY_NOTICES.md"; run_script FRAMETRACE_SKIP_NOTICES_CHECK=1
+refused_src "working-tree notices marker + SKIP=1"
+fresh_repo; rm -f "$REPO/THIRD_PARTY_NOTICES.md"; run_script
+refused_src "working-tree notices missing"
+if [ -n "$PY" ]; then
+    fresh_repo; write_manifest false; printf '%s' "$MARKER_TEXT" > "$REPO/THIRD_PARTY_NOTICES.md"; run_script
+    refused_src "manifest + notices both unconfirmed"
+    check "manifest + notices both unconfirmed: names the manifest" out_has "notice_confirmed is not true for: ffmpeg"
+    check "manifest + notices both unconfirmed: names the notices" out_has "still says 'Owner to confirm'"
+fi
+
+# confirmed + clean: the zip carries THIRD_PARTY_NOTICES.md and LICENSE
+fresh_repo; run_script
+check "confirmed + clean notices: exit 0" [ "$RC" -eq 0 ]
+check "confirmed + clean notices: cargo ran once" [ "$CARGO_CALLS" -eq 1 ]
+check "confirmed + clean notices: SHA256SUMS written" has_sums
+check "confirmed + clean notices: staged THIRD_PARTY_NOTICES.md" [ -f "$REPO/dist/$OUR_ZIP_NAME/THIRD_PARTY_NOTICES.md" ]
+check "confirmed + clean notices: staged LICENSE" [ -f "$REPO/dist/$OUR_ZIP_NAME/LICENSE" ]
+if [ -n "$PY" ]; then
+    ENTRIES="$("$PY" -I -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$REPO/dist/$OUR_ZIP_NAME.zip" 2>&1 | tr -d '\r')"
+    for e in README.md THIRD_PARTY_NOTICES.md LICENSE frametrace; do
+        check "confirmed + clean notices: zip has $e" bash -c 'printf "%s\n" "$1" | grep -qxF -- "$2"' _ "$ENTRIES" "$OUR_ZIP_NAME/$e"
+    done
+else
+    skp "zip entry listing (no python3/python)"
 fi
 
 # --- --help prints the header only -------------------------------------------

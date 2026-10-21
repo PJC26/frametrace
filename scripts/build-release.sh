@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Builds the FrameTrace release binaries and packages them as
 #   dist/frametrace-<version>-<target-triple>.zip
-# plus a dist/SHA256SUMS manifest covering every zip in dist/ (refuses to
-# run while dist/ holds a Windows *UNCONFIRMED*.zip test package or any
-# zip whose THIRD_PARTY_NOTICES.md says "Owner to confirm" or cannot be read).
+# (binaries, README.md, THIRD_PARTY_NOTICES.md, LICENSE) plus a
+# dist/SHA256SUMS manifest covering every zip in dist/. Refuses to run while
+# the working tree's notices are unconfirmed (tools/manifest.json
+# notice_confirmed, THIRD_PARTY_NOTICES.md "Owner to confirm"), or while
+# dist/ holds a Windows *UNCONFIRMED*.zip test package or any zip whose
+# THIRD_PARTY_NOTICES.md says "Owner to confirm" or cannot be read.
 #
 # Options:
 #   --sign   also runs `cosign sign-blob` on the zip and SHA256SUMS
@@ -26,7 +29,7 @@ for arg in "$@"; do
         --sign) SIGN=1 ;;
         --sbom) SBOM=1 ;;
         -h|--help)
-            sed -n '2,17p' "$0"
+            sed -n '2,20p' "$0"
             exit 0
             ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
@@ -169,8 +172,65 @@ notices_of_zip() {
     return 3
 }
 
+# Release guard on the working tree (§Fix round 12 M): the tools' notices in
+# tools/manifest.json are compiled into EVERY platform's binary
+# (include_str!) and `frametrace tools` prints them on Linux/macOS too, and
+# this script ships THIRD_PARTY_NOTICES.md in its zips. Same rule as
+# scripts/make-portable.ps1: every installable tool (a "sha256" that is
+# present, not null and not "") needs "notice_confirmed": true as a JSON
+# boolean (the string "true" does not count), and THIRD_PARTY_NOTICES.md
+# must not match Owner\s+to\s+confirm. The manifest is parsed with Python's
+# json (same probe as the zip reader); without Python the check fails
+# closed unless FRAMETRACE_SKIP_NOTICES_CHECK=1 (then only a warning).
+# Prints one problem per line; returns 0 (no problem) or 1.
+source_problems() {
+    local py out rc text
+    if [ ! -f THIRD_PARTY_NOTICES.md ]; then
+        echo "THIRD_PARTY_NOTICES.md: not found"
+    else
+        text="$(tr '\r\n\t' '   ' < THIRD_PARTY_NOTICES.md | tr '[:upper:]' '[:lower:]')"
+        if [[ "$text" =~ owner[[:space:]]+to[[:space:]]+confirm ]]; then
+            echo "THIRD_PARTY_NOTICES.md: still says 'Owner to confirm'"
+        fi
+    fi
+    if [ ! -f tools/manifest.json ]; then
+        echo "tools/manifest.json: not found — cannot check the tools' distribution notices"
+    elif py="$(find_python)"; then
+        rc=0
+        out="$("$py" -I -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8-sig") as f:
+        m = json.load(f)
+    pending = []
+    for t in m["tools"]:
+        s = t.get("sha256")
+        if s is None or s == "":
+            continue  # not installable (manual only)
+        if t.get("notice_confirmed") is not True:
+            pending.append(str(t.get("name")))
+    print(", ".join(pending))
+except BaseException as e:
+    sys.stderr.write("manifest: %r\n" % (e,))
+    sys.exit(1)
+' tools/manifest.json 2>/dev/null)" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "tools/manifest.json: cannot verify — not readable as a tool manifest"
+        elif [ -n "$out" ]; then
+            echo "tools/manifest.json: notice_confirmed is not true for: $out"
+        fi
+    elif [ "${FRAMETRACE_SKIP_NOTICES_CHECK:-}" = 1 ]; then
+        echo "warning: no python3/python and FRAMETRACE_SKIP_NOTICES_CHECK=1 — tools/manifest.json notice_confirmed NOT checked" >&2
+    else
+        echo "tools/manifest.json: cannot verify — no python3/python to parse it (install one, or set FRAMETRACE_SKIP_NOTICES_CHECK=1)"
+    fi
+}
+
 refuse_unconfirmed() {
-    local found="" zip lower notices warned=0 noreader=0 rc
+    local found="" zip lower notices warned=0 noreader=0 rc source=""
+    if [ "${1:-}" = --source ]; then
+        source="$(source_problems)"
+    fi
     if [ -d dist ]; then
         for zip in dist/*; do
             [ -f "$zip" ] || continue
@@ -210,6 +270,14 @@ refuse_unconfirmed() {
             fi
         done
     fi
+    if [ -n "$source" ]; then
+        {
+            echo "error: the working tree is not releasable — NOT FOR RELEASE:"
+            printf '%s
+' "$source" | sed 's/^/  /'
+            echo "the owner must confirm the notices (\"notice_confirmed\": true in tools/manifest.json, the '(Owner to confirm ...)' marker removed from THIRD_PARTY_NOTICES.md); nothing was built."
+        } >&2
+    fi
     if [ -n "$found" ]; then
         {
             echo "error: dist/ holds an UNCONFIRMED (or unverifiable) test package — NOT FOR RELEASE:"
@@ -221,8 +289,11 @@ refuse_unconfirmed() {
         } >&2
         exit 1
     fi
+    if [ -n "$source" ]; then
+        exit 1
+    fi
 }
-refuse_unconfirmed
+refuse_unconfirmed --source
 
 # Pinned toolchain + locked dependencies: the two inputs that decide the
 # build (see docs/repro-build.md).
@@ -237,7 +308,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp target/release/frametrace "$STAGE/"
 cp target/release/frametrace-app "$STAGE/" 2>/dev/null || true
-cp README.md "$STAGE/"
+cp README.md THIRD_PARTY_NOTICES.md LICENSE "$STAGE/"
 
 rm -f "dist/${ARTIFACT}.zip"
 (cd dist && zip -qr "${ARTIFACT}.zip" "$ARTIFACT")

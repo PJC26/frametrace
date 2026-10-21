@@ -38,7 +38,27 @@ dist/frametrace-<version>-<target>.zip
 dist/SHA256SUMS                     # covers every zip in dist/
 ```
 
-`build-release.sh` refuses to run (exit 1, before building and again
+Each zip holds `frametrace`, `frametrace-app`, `README.md`,
+`THIRD_PARTY_NOTICES.md` and `LICENSE`.
+
+Before anything else (cargo is not run) `build-release.sh` checks the
+working tree, with the same rule as `make-portable.ps1`: every installable
+tool in `tools/manifest.json` (a `sha256` that is present, not `null` and
+not `""` — manual-only tools are exempt) must carry `"notice_confirmed": true`
+as a JSON boolean (the string `"true"`, `1` or a missing key are refused),
+because that manifest and its notices are compiled into every platform's
+binary and `frametrace tools` prints them on Linux/macOS too; and
+`THIRD_PARTY_NOTICES.md` must exist and must not match `Owner\s+to\s+confirm`
+(it ships in the zip). Otherwise it exits 1 with "the working tree is not
+releasable — NOT FOR RELEASE" and names each problem. The manifest is parsed
+with Python's `json` (`python3`, else `python`, run with `-I`); without
+Python the check fails closed ("cannot verify") unless
+`FRAMETRACE_SKIP_NOTICES_CHECK=1`, which then only warns — the override
+never skips a verdict Python could give, nor the THIRD_PARTY_NOTICES.md
+check (plain bash). Unlike `make-portable.ps1` there is no switch for an
+unconfirmed test package: Unix zips are release zips only.
+
+`build-release.sh` also refuses to run (exit 1, before building and again
 before writing SHA256SUMS) while `dist/` holds an UNCONFIRMED test package
 from `make-portable.ps1 -AllowUnconfirmedNotices`: any zip whose name
 contains `unconfirmed` in any case (so a browser/Explorer copy such as
@@ -48,7 +68,8 @@ whose `THIRD_PARTY_NOTICES.md` still matches `Owner\s+to\s+confirm`
 `import zipfile` so the Microsoft Store alias stub is skipped — else
 `unzip -Z1`/`-p`, else bsdtar `-tf`/`-xOf`; each reader lists the entries and
 reads only those named `THIRD_PARTY_NOTICES.md` in any case — a zip with
-none, like the ones this script builds, is clean). The content check fails closed: a reader
+none is clean; the zips this script builds carry the working tree's,
+already checked above, and are read again before SHA256SUMS). The content check fails closed: a reader
 that exits non-zero on a zip hands it to the next one, and a zip that no
 available reader can read (broken, encrypted, unsupported compression) is
 refused as "cannot verify", never passed as clean. With no reader at all
