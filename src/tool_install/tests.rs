@@ -562,6 +562,162 @@ fn a_briefly_locked_file_is_moved_after_a_retry_and_a_held_one_rolls_back() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Fix round 12 H-a: the rollback itself retries. A later move fails
+/// (its source held past the budget) while the file the first move just
+/// put in place is held too (an AV scan of the new ffmpeg.exe):
+/// - held briefly → the rollback's remove is retried, the old file is back;
+/// - held past the rollback's budget → `rollback_incomplete`, never silent:
+///   the error names the file left wrong and where the previous copy is,
+///   which is still there; `preserve_rollback_backup` moves it out of the
+///   staging directory, and the audit line carries the distinct code.
+#[cfg(windows)]
+#[test]
+fn a_rollback_blocked_by_a_held_new_file_is_retried_or_reported_loudly() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let hold_now = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    };
+    // Holds `dest` as soon as the first move has put the new file there
+    // (its backup exists and `dest` exists again), for `millis`.
+    let hold_new_when_moved = |dest: PathBuf, backup: PathBuf, millis: u64| {
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if backup.exists()
+                    && dest.exists()
+                    && let Ok(file) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(&dest)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(millis));
+                    drop(file);
+                    return true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    };
+    for (case, hold_new_ms) in [("brief", 2200u64), ("held", 6000u64)] {
+        let base = scratch(&format!("rollback-{case}"));
+        let bin = base.join("bin");
+        let src = base.join("src");
+        let backup_dir = base.join("staging/backup");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(bin.join("a.exe"), b"old-a").unwrap();
+        std::fs::write(src.join("a.exe"), b"new-a").unwrap();
+        std::fs::write(src.join("c.exe"), b"new-c").unwrap();
+        // c's source is held for 4 s: its move fails after ~1.6 s.
+        let c_hold = hold_now(&src.join("c.exe"));
+        let c_holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(4000));
+            drop(c_hold);
+        });
+        let a_holder =
+            hold_new_when_moved(bin.join("a.exe"), backup_dir.join("0.bak"), hold_new_ms);
+        let moves = vec![
+            (src.join("a.exe"), bin.join("a.exe")),
+            (src.join("c.exe"), bin.join("c.exe")),
+        ];
+        let err = move_all_or_nothing(&moves, &backup_dir).unwrap_err();
+        assert!(a_holder.join().unwrap(), "{case}: the new a.exe was held");
+        c_holder.join().unwrap();
+        assert!(err.contains("c.exe"), "{case}: {err}");
+        assert!(!bin.join("c.exe").exists(), "{case}");
+        if case == "brief" {
+            assert!(
+                !err.starts_with(ROLLBACK_INCOMPLETE_PREFIX),
+                "{case}: the rollback retried and completed: {err}"
+            );
+            assert_eq!(
+                std::fs::read(bin.join("a.exe")).unwrap(),
+                b"old-a",
+                "{case}"
+            );
+            assert!(!backup_dir.join("0.bak").exists(), "{case}: restored");
+        } else {
+            assert!(err.starts_with(ROLLBACK_INCOMPLETE_PREFIX), "{case}: {err}");
+            assert!(
+                err.contains(&bin.join("a.exe").display().to_string())
+                    && err.contains("NEW file")
+                    && err.contains(&backup_dir.join("0.bak").display().to_string()),
+                "{case}: names the file and the kept copy: {err}"
+            );
+            assert_eq!(
+                std::fs::read(backup_dir.join("0.bak")).unwrap(),
+                b"old-a",
+                "{case}: the previous file is kept"
+            );
+            // The installer keeps it out of the staging dir it drops.
+            let tools = base.join("tools");
+            std::fs::create_dir_all(&tools).unwrap();
+            let staging = StagingDir::create(&base, ".staging-").unwrap();
+            let staging_path = staging.path().to_path_buf();
+            let staged_backup = staging_path.join("backup");
+            std::fs::rename(&backup_dir, &staged_backup).unwrap();
+            let staged_err = err.replace(
+                &backup_dir.display().to_string(),
+                &staged_backup.display().to_string(),
+            );
+            let final_err = preserve_rollback_backup(staged_err, staging, &staged_backup, &tools);
+            assert!(!staging_path.exists(), "the staging dir is removed");
+            let kept: Vec<PathBuf> = std::fs::read_dir(&tools)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert_eq!(kept.len(), 1, "{kept:?}");
+            let kept = &kept[0];
+            assert!(
+                kept.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("rollback-backup-"),
+                "{kept:?}"
+            );
+            assert_eq!(std::fs::read(kept.join("0.bak")).unwrap(), b"old-a");
+            assert!(
+                final_err.starts_with(ROLLBACK_INCOMPLETE_PREFIX)
+                    && final_err.contains(&kept.join("0.bak").display().to_string())
+                    && !final_err.contains(&staging_path.display().to_string()),
+                "{final_err}"
+            );
+            // The audit line carries the distinct code.
+            let mut tool = base_entry();
+            tool.url = Some("https://github.com/o/r/fake.zip".into());
+            let line: serde_json::Value =
+                serde_json::from_str(&audit_line(&tool, Err(&final_err))).unwrap();
+            assert_eq!(line["result"], "failed");
+            assert_eq!(line["code"], "rollback_incomplete");
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+/// Fix round 12 H-a: an ordinary failure passes `preserve_rollback_backup`
+/// unchanged and the staging dir is removed as before.
+#[test]
+fn preserve_rollback_backup_leaves_other_errors_alone() {
+    let base = scratch("rollback-other");
+    let staging = StagingDir::create(&base, ".staging-").unwrap();
+    let path = staging.path().to_path_buf();
+    std::fs::create_dir_all(path.join("backup")).unwrap();
+    let err = preserve_rollback_backup("boom".into(), staging, &path.join("backup"), &base);
+    assert_eq!(err, "boom");
+    assert!(!path.exists());
+    let line: serde_json::Value =
+        serde_json::from_str(&audit_line(&base_entry(), Err(&err))).unwrap();
+    assert!(line.get("code").is_none(), "{line}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[test]
 fn audit_line_records_source_hash_and_result_without_signed_query() {
     let mut tool = base_entry();

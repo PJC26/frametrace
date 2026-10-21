@@ -48,8 +48,9 @@ pub(crate) fn install_archive(
     let tar = system32_tool("tar.exe")?;
     // Staging lives under tools/ so the final renames stay on one volume.
     let staging = StagingDir::create(&dirs.tools_dir, ".staging-")?;
-    // Fix round 11 L2: the paths curl/tar see must survive the ANSI code
-    // page (8.3 short form if needed), or the install is refused here.
+    // Fix round 11 L2 (narrowed in round 12 L3): the paths tar.exe sees
+    // must survive the ANSI code page (8.3 short form if needed), or the
+    // install is refused here. curl gets the same form — harmless for it.
     let work = ansi_safe_dir(staging.path())?;
     let archive = work.join("download.part");
 
@@ -100,7 +101,17 @@ pub(crate) fn install_archive(
         moves.push((out.join(&map.from), dirs.licenses().join(&map.to)));
     }
     moves.extend(own_moves);
-    move_all_or_nothing(&moves, &staging.path().join("backup"))?;
+    let backup_dir = staging.path().join("backup");
+    if let Err(err) = move_all_or_nothing(&moves, &backup_dir) {
+        // Fix round 12 H-a: an incomplete rollback keeps the previous files
+        // (they are in staging/backup, which dropping `staging` would delete).
+        return Err(preserve_rollback_backup(
+            err,
+            staging,
+            &backup_dir,
+            &dirs.tools_dir,
+        ));
+    }
     // The replaced files sit in staging/backup; a still-running old
     // ffmpeg.exe cannot be deleted, so say what was left (never "ok"
     // with a silent leftover).
@@ -366,10 +377,14 @@ pub(crate) fn check_extracted_tree(out: &Path, members: &[&str]) -> Result<(), S
     Ok(())
 }
 
-/// Fix round 11 L2: `curl.exe` and `tar.exe` (bsdtar) read their argv in
-/// the system ANSI code page, so a path character outside it (an emoji, or
-/// Hangul on an en-US PC) reaches them as `?` and the install failed with
-/// an opaque "archive listing failed".
+/// Fix round 11 L2, narrowed in round 12 L3: `tar.exe` (bsdtar 3.8.9 on
+/// Windows 11 26200) reads its argv in the system ANSI code page, so a path
+/// character outside it (an emoji, or Hangul on an en-US PC) reaches it as
+/// `?` and the install failed with an opaque "archive listing failed".
+/// `curl.exe` (8.21.0 there) takes a wide argv and wrote an emoji
+/// `--output` path intact; it is handed the same ANSI-safe form anyway
+/// (one staging path for both, and it costs curl nothing). The refusal
+/// below is about tar.
 pub(crate) const ANSI_PATH_REFUSED: &str = "FrameTrace 폴더 경로에 이 PC의 코드 페이지로 쓸 수 없는 문자가 있어 설치할 수 없습니다 — 영문 경로의 폴더로 옮긴 뒤 다시 시도하십시오";
 
 const CP_ACP: u32 = 0;
@@ -507,7 +522,7 @@ fn short_path(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_wide(&short)))
 }
 
-/// A form of the existing directory `dir` that curl/tar receive intact:
+/// A form of the existing directory `dir` that tar (and curl) receive intact:
 /// `dir` itself when it round-trips through the ANSI code page, else its
 /// 8.3 short path when that does, else the clear [`ANSI_PATH_REFUSED`]
 /// refusal (before anything is downloaded).

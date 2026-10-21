@@ -727,6 +727,12 @@ pub const INSTALL_CANCELLED: &str = "install cancelled";
 /// (the audit line then carries `"code": "busy"`).
 pub const BUSY_PREFIX: &str = "busy: ";
 
+/// Start of an install error whose all-or-nothing rollback could not put
+/// every previous file back (Fix round 12 H-a): the audit line carries
+/// `"code": "rollback_incomplete"` and the error names each file left
+/// wrong and where the previous copies were kept.
+pub const ROLLBACK_INCOMPLETE_PREFIX: &str = "rollback_incomplete: ";
+
 impl Progress {
     pub fn stage(&self) -> Stage {
         Stage::from_u8(self.stage.load(Ordering::SeqCst))
@@ -1095,6 +1101,11 @@ impl StagingDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+    /// Leaves the directory in place (it holds files that must not be
+    /// lost, e.g. the previous binaries after an incomplete rollback).
+    pub(crate) fn keep(mut self) {
+        self.closed = true;
+    }
     /// Removes the directory now (the success path) and reports it when it
     /// could not be removed — e.g. `backup/0.bak` is the previous
     /// `ffmpeg.exe`, still running: Windows lets a running image be renamed
@@ -1153,6 +1164,8 @@ fn audit_line(tool: &ToolEntry, result: Result<&InstallOutcome, &String>) -> Str
             value["error"] = err.as_str().into();
             if err.starts_with(BUSY_PREFIX) {
                 value["code"] = "busy".into();
+            } else if err.starts_with(ROLLBACK_INCOMPLETE_PREFIX) {
+                value["code"] = "rollback_incomplete".into();
             }
         }
     }
@@ -1408,10 +1421,105 @@ pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// After an incomplete rollback (error starting with
+/// [`ROLLBACK_INCOMPLETE_PREFIX`]), moves `backup_dir` — the previous
+/// files — out of `staging` to `tools/rollback-backup-<hex>`, which the
+/// stale-staging sweep never touches, and returns `err` with the paths
+/// updated. When that move fails the staging directory is kept instead
+/// (and the error says so). Any other error is returned as is and
+/// `staging` is dropped (removed) as usual.
+pub(crate) fn preserve_rollback_backup(
+    err: String,
+    staging: StagingDir,
+    backup_dir: &Path,
+    tools_dir: &Path,
+) -> String {
+    if !err.starts_with(ROLLBACK_INCOMPLETE_PREFIX) {
+        return err;
+    }
+    let kept = tools_dir.join(format!("rollback-backup-{}", random_hex()));
+    match rename_with_retry(backup_dir, &kept) {
+        Ok(()) => {
+            let err = err.replace(
+                &backup_dir.display().to_string(),
+                &kept.display().to_string(),
+            );
+            drop(staging);
+            format!(
+                "{err} (restore the previous files from {} by hand)",
+                kept.display()
+            )
+        }
+        Err(move_err) => {
+            let path = staging.path().to_path_buf();
+            staging.keep();
+            format!(
+                "{err} (the previous files stay in {} — could not move them to {}: {move_err}; restore them by hand before installing again)",
+                path.display(),
+                kept.display()
+            )
+        }
+    }
+}
+
+/// `std::fs::remove_file` with the same bounded retry as
+/// [`rename_with_retry`] (an AV scan of the file just moved into place).
+pub(crate) fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut tries = 1;
+    loop {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if tries < RENAME_TRIES && transient_rename_error(&err) => {
+                tries += 1;
+                std::thread::sleep(RENAME_PAUSE);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Undoes one completed move: removes `dest` (the new file) and renames
+/// its `backup` (the previous file) back, both with the bounded retry.
+/// `Err` describes what could not be undone.
+fn undo_move(dest: &Path, backup: Option<&Path>) -> Result<(), String> {
+    if let Err(err) = remove_file_with_retry(dest) {
+        // The previous file cannot replace a new one that is held open
+        // either; keep the backup where it is and say so.
+        return Err(match backup {
+            Some(backup) => format!(
+                "{} is the NEW file (cannot remove it: {err}); the previous one is kept at {}",
+                dest.display(),
+                backup.display()
+            ),
+            None => format!(
+                "{} is the NEW file (cannot remove it: {err})",
+                dest.display()
+            ),
+        });
+    }
+    if let Some(backup) = backup
+        && let Err(err) = rename_with_retry(backup, dest)
+    {
+        return Err(format!(
+            "{} is missing (cannot restore it: {err}); the previous one is kept at {}",
+            dest.display(),
+            backup.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Moves `(src, dest)` pairs into place, replacing existing destinations.
 /// Each existing destination is first renamed into `backup_dir`; when any
 /// move fails, every destination already moved is removed and its backup
 /// restored, so the target directory is either fully updated or unchanged.
+///
+/// Fix round 12 H-a: the rollback's removes and renames use the same
+/// bounded retry as the moves. When it still cannot undo everything the
+/// error starts with [`ROLLBACK_INCOMPLETE_PREFIX`] and names every file
+/// left wrong and where its previous copy is (inside `backup_dir` — the
+/// caller must keep that directory); it is never silent.
 pub(crate) fn move_all_or_nothing(
     moves: &[(PathBuf, PathBuf)],
     backup_dir: &Path,
@@ -1421,6 +1529,8 @@ pub(crate) fn move_all_or_nothing(
     // (dest, Some(backup)) for each completed move.
     let mut done: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     let mut failure = None;
+    // What the rollback could not undo (Fix round 12 H-a).
+    let mut undo_failed: Vec<String> = Vec::new();
     for (index, (src, dest)) in moves.iter().enumerate() {
         if let Some(parent) = dest.parent()
             && let Err(err) = std::fs::create_dir_all(parent)
@@ -1443,20 +1553,32 @@ pub(crate) fn move_all_or_nothing(
             Err(_) => None,
         };
         if let Err(err) = rename_with_retry(src, dest) {
-            if let Some(backup) = &backup {
-                let _ = std::fs::rename(backup, dest);
-            }
             failure = Some(format!("cannot move {} into place: {err}", dest.display()));
+            if let Some(backup) = backup {
+                // Nothing new is at `dest`: only the previous file to restore.
+                if let Err(restore) = rename_with_retry(&backup, dest) {
+                    undo_failed.push(format!(
+                        "{} is missing (cannot restore it: {restore}); the previous one is kept at {}",
+                        dest.display(),
+                        backup.display()
+                    ));
+                }
+            }
             break;
         }
         done.push((dest.clone(), backup));
     }
     if let Some(failure) = failure {
         for (dest, backup) in done.into_iter().rev() {
-            let _ = std::fs::remove_file(&dest);
-            if let Some(backup) = backup {
-                let _ = std::fs::rename(&backup, &dest);
+            if let Err(problem) = undo_move(&dest, backup.as_deref()) {
+                undo_failed.push(problem);
             }
+        }
+        if !undo_failed.is_empty() {
+            return Err(format!(
+                "{ROLLBACK_INCOMPLETE_PREFIX}{failure}; the rollback could NOT restore every previous file — {}",
+                undo_failed.join("; ")
+            ));
         }
         return Err(failure);
     }
