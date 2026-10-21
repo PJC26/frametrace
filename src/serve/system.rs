@@ -898,8 +898,9 @@ pub(crate) fn byte_progress_json(
 }
 
 /// `POST /api/cancel`: stops whatever holds `busy` — a guided tool install
-/// through its own latch (`cancelled: "tool-install"`, or `ok:false`
-/// `code: "not_cancellable"` while files move into place), any other job
+/// through its own latch (`cancelled: "tool-install"` with `requested` —
+/// false when the worker had already ended and nothing was asked — or
+/// `ok:false` `code: "not_cancellable"` while files move into place), any other job
 /// through `cancel_requested` (`cancelled: "job"`) — else the running clip
 /// exports / write ops.
 pub(crate) fn api_cancel(state: &SharedState) -> String {

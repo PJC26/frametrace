@@ -5,7 +5,7 @@
 //   POST /api/tools/install {name}  {ok:true, install: J} | {ok:false, code, error[, manual_hint, homepage]}
 //   GET  /api/tools/install-status  {ok:true, install: J|null, now_unix}
 //   POST /api/tools/install-cancel {id?}  {ok:true, install: J} | {ok:false, code:"no_install"|"not_cancellable"|"stale_job"}
-//   POST /api/cancel (opts.routeCancel; apiCancelReply)  {ok:true, cancelled:"tool-install", install: J} | {ok:false, code:"not_cancellable"}
+//   POST /api/cancel (opts.routeCancel; apiCancelReply)  {ok:true, cancelled:"tool-install", requested, install: J} | {ok:false, code:"not_cancellable"}
 // T carries notice / notice_en (option C distribution notice; null for
 // tools that cannot be installed), shadowed_by {<binary>: path|null},
 // rollback_incomplete / rollback_note / rollback_backups (Fix round 13 L2) and,

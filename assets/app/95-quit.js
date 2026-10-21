@@ -190,7 +190,10 @@ $("hBtnQuit").addEventListener("click", async () => {
           // minutes and cannot be stopped — wait up to 10 min for it.
           const locked = !cr.ok && cr.code === "not_cancellable";
           const isInstall = cr.job_kind === "tool-install" || cr.cancelled === "tool-install";
+          // Fix round 15: `requested: false` — the install had already ended;
+          // nothing is being stopped, `busy` is only about to be released.
           const waitLabel = locked ? "파일을 옮기는 중이라 중단할 수 없습니다 — 끝나면 종료합니다"
+            : isInstall && cr.requested === false ? "도구 설치가 끝나는 중…"
             : isInstall ? "도구 설치를 중단하는 중…"
             : "작업이 멈추기를 기다리는 중…";
           const maxS = isInstall ? H_QUIT_INSTALL_WAIT_S : H_QUIT_WAIT_S;
