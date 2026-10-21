@@ -554,6 +554,23 @@ fn ffmpeg_check(
 }
 
 /// One diagnostic line for `frametrace doctor`. `level` renders as
+/// One WARN per kept rollback backup under `tools_dir` (size and how to
+/// restore it); none when there is nothing to restore.
+fn rollback_backup_checks(tools_dir: &Path) -> Vec<DoctorCheck> {
+    crate::tool_install::rollback_backups(tools_dir)
+        .iter()
+        .map(|backup| {
+            DoctorCheck::warn(
+                &format!(
+                    "tool rollback backup ({})",
+                    backup.tool.as_deref().unwrap_or("unknown tool")
+                ),
+                crate::tool_install::rollback_hint(backup),
+            )
+        })
+        .collect()
+}
+
 /// OK/WARN/FAIL — WARN means the workstation runs but a feature lane is
 /// unavailable, FAIL means a blocking defect (corrupt db, broken keyring).
 struct DoctorCheck {
@@ -654,6 +671,12 @@ pub fn doctor(case_dir: Option<&Path>, json: bool) -> Result<(), String> {
             "미설치 — 합성 영상 스크리닝 불가 (선택 기능)".into(),
         )
     });
+
+    // Fix round 13 L1: previous tool files kept after an incomplete
+    // rollback (tools/rollback-backup-*, tools/python/rollback-backup-*).
+    if let Ok(dirs) = crate::tool_install::InstallDirs::for_current_exe() {
+        checks.extend(rollback_backup_checks(&dirs.tools_dir));
+    }
 
     // Writable probe + free space on the case (or current) volume.
     let probe_dir = case_dir
@@ -837,6 +860,54 @@ mod tests {
     use crate::audit;
     use crate::audit_key::AuditKey;
     use std::fs;
+
+    /// Fix round 13 L1: every kept rollback backup is a WARN naming its
+    /// tool, path, size and RESTORE.txt.
+    #[test]
+    fn doctor_lists_kept_rollback_backups_as_warnings() {
+        let base = std::env::temp_dir().join(format!(
+            "ft-doctor-rollback-{}-{}",
+            std::process::id(),
+            crate::tool_install::random_hex()
+        ));
+        let tools = base.join("tools");
+        assert!(super::rollback_backup_checks(&tools).is_empty());
+        let kept = tools.join("rollback-backup-00aa");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("0.bak"), vec![0u8; 2048]).unwrap();
+        std::fs::write(
+            kept.join("RESTORE.txt"),
+            "tool: ffmpeg
+how to
+C:/x/bin/ffmpeg.exe <- 0.bak
+",
+        )
+        .unwrap();
+        let venv = tools.join("python/rollback-backup-00bb/deepfake-lens/Scripts");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(venv.join("python.exe"), b"py").unwrap();
+        // Not a backup: ignored.
+        std::fs::create_dir_all(tools.join(".staging-plain/backup")).unwrap();
+        let checks = super::rollback_backup_checks(&tools);
+        assert_eq!(
+            checks.len(),
+            2,
+            "{:?}",
+            checks.iter().map(|c| &c.detail).collect::<Vec<_>>()
+        );
+        assert!(checks.iter().all(|c| c.level == "WARN"));
+        assert_eq!(checks[0].name, "tool rollback backup (ffmpeg)");
+        assert!(
+            checks[0].detail.contains(&kept.display().to_string())
+                && checks[0].detail.contains("MB")
+                && checks[0].detail.contains("RESTORE.txt")
+                && checks[0].detail.contains("복원"),
+            "{}",
+            checks[0].detail
+        );
+        assert_eq!(checks[1].name, "tool rollback backup (deepfake-lens)");
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     /// Fix round 8 (L3): an ffmpeg that exists but cannot be run is a
     /// WARN saying that clips, proxies and exports may fail, not an OK.

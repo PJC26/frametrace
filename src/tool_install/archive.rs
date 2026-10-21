@@ -110,6 +110,7 @@ pub(crate) fn install_archive(
             staging,
             &backup_dir,
             &dirs.tools_dir,
+            &tool.name,
         ));
     }
     // The replaced files sit in staging/backup; a still-running old

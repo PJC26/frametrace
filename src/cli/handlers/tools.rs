@@ -44,6 +44,10 @@ pub fn tools_list(json: bool, all: bool) -> Result<(), String> {
                 );
             }
         }
+        // Fix round 13 L2: an incomplete rollback left previous files.
+        for line in rollback_lines(&status) {
+            println!("{line}");
+        }
         if !status.installed() {
             match tool_install::not_installable_reason(tool) {
                 None => println!("  설치: frametrace tools install {}", tool.name),
@@ -57,6 +61,15 @@ pub fn tools_list(json: bool, all: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `tools list` warning lines for the tool's kept rollback backups.
+fn rollback_lines(status: &tool_install::ToolStatus) -> Vec<String> {
+    status
+        .rollback_backups
+        .iter()
+        .map(|backup| format!("  경고: {}", tool_install::rollback_hint(backup)))
+        .collect()
 }
 
 pub fn tools_install(name: &str, yes: bool) -> Result<(), String> {
@@ -222,6 +235,7 @@ mod tests {
                 ("ffprobe".to_string(), None),
             ],
             shadowed_by: Vec::new(),
+            rollback_backups: Vec::new(),
         };
         let lines = install_prompt_lines(ffmpeg, &dirs, &status);
         assert_eq!(

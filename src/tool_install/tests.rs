@@ -269,6 +269,7 @@ fn tool_json_carries_the_distribution_notice() {
     let status = ToolStatus {
         paths: Vec::new(),
         shadowed_by: Vec::new(),
+        rollback_backups: Vec::new(),
     };
     let manifest = manifest().unwrap();
     let ffmpeg = find_tool(manifest, "ffmpeg").unwrap();
@@ -667,7 +668,8 @@ fn a_rollback_blocked_by_a_held_new_file_is_retried_or_reported_loudly() {
                 &backup_dir.display().to_string(),
                 &staged_backup.display().to_string(),
             );
-            let final_err = preserve_rollback_backup(staged_err, staging, &staged_backup, &tools);
+            let final_err =
+                preserve_rollback_backup(staged_err, staging, &staged_backup, &tools, "fake");
             assert!(!staging_path.exists(), "the staging dir is removed");
             let kept: Vec<PathBuf> = std::fs::read_dir(&tools)
                 .unwrap()
@@ -683,6 +685,29 @@ fn a_rollback_blocked_by_a_held_new_file_is_retried_or_reported_loudly() {
                 "{kept:?}"
             );
             assert_eq!(std::fs::read(kept.join("0.bak")).unwrap(), b"old-a");
+            // Fix round 13 L1: RESTORE.txt maps the kept copy back to its
+            // original path and names the tool; doctor/api list it.
+            let restore = std::fs::read_to_string(kept.join(RESTORE_FILE)).unwrap();
+            assert!(
+                restore.starts_with(
+                    "tool: fake
+"
+                ),
+                "{restore}"
+            );
+            assert!(
+                restore
+                    .lines()
+                    .any(|line| line == format!("{} <- 0.bak", bin.join("a.exe").display())),
+                "{restore}"
+            );
+            assert!(restore.contains("To restore by hand"), "{restore}");
+            assert!(final_err.contains(&kept.join(RESTORE_FILE).display().to_string()));
+            let listed = rollback_backups(&tools);
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            assert_eq!(&listed[0].path, kept);
+            assert_eq!(listed[0].tool.as_deref(), Some("fake"));
+            assert!(listed[0].size_bytes >= 5);
             assert!(
                 final_err.starts_with(ROLLBACK_INCOMPLETE_PREFIX)
                     && final_err.contains(&kept.join("0.bak").display().to_string())
@@ -709,7 +734,7 @@ fn preserve_rollback_backup_leaves_other_errors_alone() {
     let staging = StagingDir::create(&base, ".staging-").unwrap();
     let path = staging.path().to_path_buf();
     std::fs::create_dir_all(path.join("backup")).unwrap();
-    let err = preserve_rollback_backup("boom".into(), staging, &path.join("backup"), &base);
+    let err = preserve_rollback_backup("boom".into(), staging, &path.join("backup"), &base, "fake");
     assert_eq!(err, "boom");
     assert!(!path.exists());
     let line: serde_json::Value =
@@ -819,6 +844,14 @@ fn cancel_is_honoured_until_a_non_cancellable_stage_then_refused() {
     assert_eq!(progress.stage(), Stage::Pip);
 }
 
+/// A venv's interpreter and the console script `name` (what
+/// `venv_intact` looks for).
+fn write_venv_launcher(venv: &Path, name: &str) {
+    std::fs::create_dir_all(pip::venv_python(venv).parent().unwrap()).unwrap();
+    std::fs::write(pip::venv_python(venv), b"py").unwrap();
+    std::fs::write(pip::venv_script(venv, name), b"exe").unwrap();
+}
+
 #[test]
 fn stale_staging_dirs_are_swept_but_not_live_or_foreign_entries() {
     let base = scratch("stale");
@@ -834,6 +867,8 @@ fn stale_staging_dirs_are_swept_but_not_live_or_foreign_entries() {
     let python = tools.join("python");
     std::fs::create_dir_all(python.join(".deepfake-lens.old-0123abcd/Scripts")).unwrap();
     std::fs::create_dir_all(python.join("deepfake-lens/Scripts")).unwrap();
+    // Fix round 13 M: only once the live venv works.
+    write_venv_launcher(&python.join("deepfake-lens"), "deepfake-lens");
     std::fs::write(python.join(".x.old-file"), b"not a dir").unwrap();
     // Fix round 4: a `<dir>.rm` whose removal failed earlier is swept too.
     std::fs::create_dir_all(tools.join(".staging-old3.rm/x")).unwrap();
@@ -1109,6 +1144,276 @@ fn pip_install_builds_private_venv_and_restores_the_old_one_on_failure() {
         .collect();
     assert!(leftovers.is_empty());
     let _ = std::fs::remove_dir_all(base);
+}
+
+/// Fix round 13 M: a replaced venv `.<tool>.old-*` is swept only once the
+/// live `<tool>/` is a working venv again — while it is broken (an
+/// incomplete undo left a partial env) the old one may be the only good
+/// copy and is kept.
+#[test]
+fn the_sweep_keeps_an_old_venv_while_the_live_one_is_broken() {
+    let base = scratch("sweep-broken-live");
+    let tools = base.join("tools");
+    let python = tools.join("python");
+    let old = python.join(".lens.old-00aa");
+    std::fs::create_dir_all(old.join("Lib")).unwrap();
+    std::fs::write(old.join("Lib").join("marker.txt"), b"good").unwrap();
+    // Partial live venv: an interpreter but no console script.
+    let live = python.join("lens");
+    std::fs::create_dir_all(pip::venv_python(&live).parent().unwrap()).unwrap();
+    std::fs::write(pip::venv_python(&live), b"py").unwrap();
+    // No live venv at all for another tool.
+    std::fs::create_dir_all(python.join(".gone.old-00bb")).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    assert_eq!(clean_stale_staging(&tools, later), 0);
+    assert!(old.join("Lib").join("marker.txt").is_file());
+    assert!(python.join(".gone.old-00bb").is_dir());
+    // Once the live venv works, the old one goes.
+    write_venv_launcher(&live, "lens");
+    assert_eq!(clean_stale_staging(&tools, later), 1);
+    assert!(!old.exists());
+    assert!(python.join(".gone.old-00bb").is_dir());
+    assert_eq!(
+        old_venv_base(".deepfake-lens.old-0123abcd"),
+        Some("deepfake-lens")
+    );
+    assert_eq!(old_venv_base(".old-12"), None);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// Fix round 13 L1: a staging dir kept because its backup could not be
+/// moved out (it holds `backup/RESTORE.txt`) is never swept, and is
+/// listed as a rollback backup; kept `rollback-backup-*` dirs are listed
+/// with their tool.
+#[test]
+fn kept_rollback_backups_are_listed_and_never_swept() {
+    let base = scratch("kept-backups");
+    let tools = base.join("tools");
+    let kept_staging = tools.join(".staging-kept");
+    std::fs::create_dir_all(kept_staging.join("backup")).unwrap();
+    std::fs::write(kept_staging.join("backup").join("0.bak"), b"old").unwrap();
+    std::fs::write(
+        kept_staging.join("backup").join(RESTORE_FILE),
+        rollback::restore_text(
+            Some("ffmpeg"),
+            &[(
+                tools.join("bin").join("ffmpeg.exe"),
+                Some(kept_staging.join("backup").join("0.bak")),
+            )],
+            &kept_staging.join("backup"),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(tools.join(".staging-plain")).unwrap();
+    let archive_kept = tools.join("rollback-backup-00cc");
+    std::fs::create_dir_all(&archive_kept).unwrap();
+    // A round-12 leftover without RESTORE.txt: listed, tool unknown.
+    std::fs::write(archive_kept.join("0.bak"), b"old").unwrap();
+    let venv_kept = tools.join("python").join("rollback-backup-00dd");
+    std::fs::create_dir_all(venv_kept.join("lens").join("Lib")).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    assert_eq!(clean_stale_staging(&tools, later), 1, "only .staging-plain");
+    assert!(kept_staging.join("backup").join("0.bak").is_file());
+    assert!(archive_kept.is_dir() && venv_kept.is_dir());
+    let listed = rollback_backups(&tools);
+    let summary: Vec<(PathBuf, Option<String>)> = listed
+        .iter()
+        .map(|b| (b.path.clone(), b.tool.clone()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (kept_staging.clone(), Some("ffmpeg".to_string())),
+            (archive_kept.clone(), None),
+            (venv_kept.clone(), Some("lens".to_string())),
+        ]
+    );
+    assert_eq!(
+        listed[0].restore_file,
+        kept_staging.join("backup").join(RESTORE_FILE)
+    );
+    let text = std::fs::read_to_string(&listed[0].restore_file).unwrap();
+    assert!(
+        text.lines().any(|line| line
+            == format!(
+                "{} <- 0.bak",
+                tools.join("bin").join("ffmpeg.exe").display()
+            )),
+        "{text}"
+    );
+    assert!(rollback_hint(&listed[0]).contains(&kept_staging.display().to_string()));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// Fix round 13 L2: a tool with a kept rollback backup carries
+/// `rollback_incomplete: true` and the note in `/api/tools` (tool_json).
+#[test]
+fn tool_json_flags_a_kept_rollback_backup() {
+    let manifest = manifest().unwrap();
+    let ffmpeg = find_tool(manifest, "ffmpeg").unwrap();
+    let clean = ToolStatus {
+        paths: Vec::new(),
+        shadowed_by: Vec::new(),
+        rollback_backups: Vec::new(),
+    };
+    let json = tool_json(ffmpeg, &clean);
+    assert_eq!(json["rollback_incomplete"], false);
+    assert!(json["rollback_note"].is_null());
+    let backup = RollbackBackup {
+        path: PathBuf::from("C:/FT/tools/rollback-backup-00ee"),
+        restore_file: PathBuf::from("C:/FT/tools/rollback-backup-00ee/RESTORE.txt"),
+        tool: Some("ffmpeg".into()),
+        size_bytes: 3 * 1024 * 1024,
+    };
+    let status = ToolStatus {
+        paths: vec![("ffmpeg".into(), Some("C:/FT/tools/bin/ffmpeg.exe".into()))],
+        shadowed_by: Vec::new(),
+        rollback_backups: vec![backup],
+    };
+    let json = tool_json(ffmpeg, &status);
+    assert_eq!(json["rollback_incomplete"], true);
+    let note = json["rollback_note"].as_str().unwrap();
+    assert!(
+        note.contains("rollback-backup-00ee") && note.contains("3.0 MB"),
+        "{note}"
+    );
+    assert_eq!(
+        json["rollback_backups"][0],
+        Path::new("C:/FT/tools/rollback-backup-00ee")
+            .display()
+            .to_string()
+    );
+}
+
+/// Fix round 13 M: pip fails and one file of the new, partial venv is
+/// held (an AV scan / the indexer: no sharing), so removing it fails:
+/// - held briefly → the remove is retried, the previous venv is back;
+/// - held past the budget → `rollback_incomplete`, never silent; the
+///   previous venv is moved whole to `python/rollback-backup-*/<tool>`
+///   with RESTORE.txt (no `.lens.old-*` left for a sweep to delete), a
+///   later sweep keeps it, and the audit line carries the code.
+#[cfg(windows)]
+#[test]
+fn a_pip_undo_blocked_by_a_held_file_is_retried_or_kept_safe() {
+    use std::os::windows::fs::OpenOptionsExt;
+    struct HoldingPython {
+        hold_ms: u64,
+        holder: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+    impl pip::PythonOps for HoldingPython {
+        fn create_venv(&self, venv: &Path) -> Result<(), String> {
+            std::fs::create_dir_all(pip::venv_python(venv).parent().unwrap()).unwrap();
+            std::fs::write(pip::venv_python(venv), b"new-py").unwrap();
+            Ok(())
+        }
+        fn pip_install(&self, venv: &Path, _requirements: &Path) -> Result<(), String> {
+            let held = venv.join("Scripts").join("held.pyd");
+            std::fs::write(&held, b"half").unwrap();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&held)
+                .unwrap();
+            let millis = self.hold_ms;
+            *self.holder.lock().unwrap() = Some(std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(millis));
+                drop(file);
+            }));
+            Err("pip install failed (exit 1): network".into())
+        }
+    }
+    for (case, hold_ms) in [("brief", 1000u64), ("held", 6000u64)] {
+        let base = scratch(&format!("pip-undo-{case}"));
+        let dirs = InstallDirs {
+            tools_dir: base.join("tools"),
+        };
+        let tool = pip_tool();
+        let req = good_requirements();
+        let ok = FakePython {
+            fail_pip: false,
+            write_script: true,
+            calls: Default::default(),
+        };
+        pip::install_pip(&tool, &req, &dirs, &ok, &Progress::default()).unwrap();
+        let target = dirs.python_env("lens");
+        let marker = target.join("Lib").join("marker.txt");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"previous").unwrap();
+        let python = HoldingPython {
+            hold_ms,
+            holder: Default::default(),
+        };
+        let err = pip::install_pip(&tool, &req, &dirs, &python, &Progress::default()).unwrap_err();
+        python
+            .holder
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(err.contains("pip install failed"), "{case}: {err}");
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        if case == "brief" {
+            assert!(
+                !err.starts_with(ROLLBACK_INCOMPLETE_PREFIX),
+                "{case}: {err}"
+            );
+            assert_eq!(std::fs::read(&marker).unwrap(), b"previous", "restored");
+            assert!(venv_intact(&target, "lens"));
+            assert_eq!(names(&dirs.python_root()), vec!["lens".to_string()]);
+        } else {
+            assert!(err.starts_with(ROLLBACK_INCOMPLETE_PREFIX), "{case}: {err}");
+            assert!(
+                err.contains("NEW, partial venv") && err.contains(&target.display().to_string()),
+                "{err}"
+            );
+            let python_dir = names(&dirs.python_root());
+            assert!(
+                !python_dir.iter().any(|n| n.contains(".old-")),
+                "no backup under a swept name: {python_dir:?}"
+            );
+            let kept_dir = python_dir
+                .iter()
+                .find(|n| n.starts_with("rollback-backup-"))
+                .map(|n| dirs.python_root().join(n))
+                .expect("kept backup dir");
+            let kept = kept_dir.join("lens");
+            assert_eq!(
+                std::fs::read(kept.join("Lib").join("marker.txt")).unwrap(),
+                b"previous"
+            );
+            assert!(venv_intact(&kept, "lens"), "the whole previous venv");
+            assert!(err.contains(&kept.display().to_string()), "{err}");
+            let restore = std::fs::read_to_string(kept_dir.join(RESTORE_FILE)).unwrap();
+            assert!(restore.starts_with("tool: lens\n"), "{restore}");
+            assert!(
+                restore
+                    .lines()
+                    .any(|line| line == format!("{} <- lens", target.display())),
+                "{restore}"
+            );
+            // A later sweep (server start / next install) keeps it.
+            let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+            clean_stale_staging(&dirs.tools_dir, later);
+            assert!(kept.join("Lib").join("marker.txt").is_file());
+            let listed = rollback_backups(&dirs.tools_dir);
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            assert_eq!(listed[0].tool.as_deref(), Some("lens"));
+            let line: serde_json::Value =
+                serde_json::from_str(&audit_line(&tool, Err(&err))).unwrap();
+            assert_eq!(line["code"], "rollback_incomplete");
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 /// Fix round 5 (L5): a renamed `<dir>.rm` whose removal keeps failing is
@@ -1972,6 +2277,8 @@ mod windows_installs {
         let base = scratch("sweep-held");
         let tools = base.join("tools");
         let venv = tools.join("python").join(".deepfake-lens.old-0123abcd");
+        // Fix round 13 M: the live venv works, so the old one may go.
+        write_venv_launcher(&tools.join("python").join("deepfake-lens"), "deepfake-lens");
         let scripts = venv.join("Scripts");
         std::fs::create_dir_all(&scripts).unwrap();
         std::fs::create_dir_all(venv.join("Lib").join("site-packages")).unwrap();

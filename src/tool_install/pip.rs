@@ -198,7 +198,8 @@ impl PythonOps for RealPython {
 
 /// Builds the private venv for `tool`. A venv is not relocatable, so it
 /// is built at its final path; an existing env is moved aside first and
-/// restored when anything fails (the new, partial env is removed).
+/// restored when anything fails (the new, partial env is removed; see
+/// `rollback::undo_venv` for when that cannot be finished).
 pub(crate) fn install_pip(
     tool: &ToolEntry,
     requirements: &str,
@@ -264,12 +265,14 @@ pub(crate) fn install_pip(
                 staging_left: old_left.or(staging_left),
             })
         }
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&target);
-            if let Some(backup) = backup {
-                let _ = std::fs::rename(&backup, &target);
-            }
-            Err(err)
-        }
+        // Fix round 13 M: retried, and never silent — a previous venv that
+        // cannot be put back is kept where no sweep removes it.
+        Err(err) => Err(super::rollback::undo_venv(
+            err,
+            &tool.name,
+            &target,
+            backup.as_deref(),
+            &parent,
+        )),
     }
 }

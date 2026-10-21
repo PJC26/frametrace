@@ -35,6 +35,10 @@
 #[cfg(windows)]
 mod archive;
 mod pip;
+mod rollback;
+pub use rollback::{
+    RESTORE_FILE, RollbackBackup, rollback_backups, rollback_backups_for_current_exe, rollback_hint,
+};
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -514,6 +518,12 @@ pub struct ToolStatus {
     /// PATH that the tools/bin one takes precedence over
     /// ([`crate::tool_policy::shadowed_by`]), else `None`.
     pub shadowed_by: Vec<(String, Option<String>)>,
+    /// Fix round 13 L2: the previous files an incomplete rollback of this
+    /// tool left in `tools/rollback-backup-*` (or a kept staging dir /
+    /// `tools/python/rollback-backup-*`). Non-empty means `installed` may
+    /// be a mix of new and old files — surfaced as a warning, never
+    /// guessed away.
+    pub rollback_backups: Vec<RollbackBackup>,
 }
 
 impl ToolStatus {
@@ -553,7 +563,15 @@ pub fn status(tool: &ToolEntry) -> ToolStatus {
         paths.push((binary.clone(), lookup.used));
         shadowed_by.push((binary.clone(), lookup.shadowed_by));
     }
-    ToolStatus { paths, shadowed_by }
+    let rollback_backups = rollback_backups_for_current_exe()
+        .into_iter()
+        .filter(|backup| backup.tool.as_deref() == Some(tool.name.as_str()))
+        .collect();
+    ToolStatus {
+        paths,
+        shadowed_by,
+        rollback_backups,
+    }
 }
 
 /// Doctor/UI hint for a missing binary: the install command when the
@@ -621,6 +639,15 @@ pub fn tool_json(tool: &ToolEntry, status: &ToolStatus) -> serde_json::Value {
             .iter()
             .map(|(binary, path)| (binary.clone(), serde_json::json!(path)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
+        // Fix round 13 L2: an incomplete rollback left previous files
+        // behind — `installed` may be new and old files mixed.
+        "rollback_incomplete": !status.rollback_backups.is_empty(),
+        "rollback_note": status.rollback_backups.first().map(rollback_hint),
+        "rollback_backups": status
+            .rollback_backups
+            .iter()
+            .map(|backup| backup.path.display().to_string())
+            .collect::<Vec<_>>(),
         "installable": reason.is_none(),
         "not_installable_reason": reason,
         "manual_hint": tool.manual_hint,
@@ -1218,11 +1245,40 @@ pub(crate) fn clean_stale_staging(
     tools_dir: &Path,
     started_before: std::time::SystemTime,
 ) -> usize {
-    let staging = |name: &str| name.starts_with(".staging-");
-    // pip.rs: `.<tool>.old-<hex>` next to the tool's venv.
-    let old_venv = |name: &str| name.starts_with('.') && name.contains(".old-");
-    sweep_dir(tools_dir, &staging, started_before)
-        + sweep_dir(&tools_dir.join("python"), &old_venv, started_before)
+    // Fix round 13: a staging dir kept after an incomplete rollback (its
+    // `backup/RESTORE.txt` lists the previous files) is never swept.
+    let staging = |name: &str| {
+        name.starts_with(".staging-")
+            && !tools_dir
+                .join(name)
+                .join("backup")
+                .join(RESTORE_FILE)
+                .is_file()
+    };
+    // pip.rs: `.<tool>.old-<hex>` next to the tool's venv. Fix round 13
+    // M: removed only once the live `<tool>/` is a working venv again —
+    // while it is not, the old one may be the only good copy left.
+    let python = tools_dir.join("python");
+    let old_venv = |name: &str| {
+        name.starts_with('.')
+            && name.contains(".old-")
+            && (name.ends_with(".rm")
+                || old_venv_base(name).is_some_and(|base| venv_intact(&python.join(base), base)))
+    };
+    sweep_dir(tools_dir, &staging, started_before) + sweep_dir(&python, &old_venv, started_before)
+}
+
+/// `<tool>` of a replaced venv's name `.<tool>.old-<hex>`.
+fn old_venv_base(name: &str) -> Option<&str> {
+    let (base, _) = name.strip_prefix('.')?.rsplit_once(".old-")?;
+    (!base.is_empty()).then_some(base)
+}
+
+/// Whether `venv` holds a working venv launcher: its interpreter and the
+/// tool's console script `<name>` (pip tools name their script after
+/// themselves).
+pub(crate) fn venv_intact(venv: &Path, name: &str) -> bool {
+    pip::venv_python(venv).is_file() && pip::venv_script(venv, name).is_file()
 }
 
 fn sweep_dir(
@@ -1423,21 +1479,30 @@ pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// After an incomplete rollback (error starting with
 /// [`ROLLBACK_INCOMPLETE_PREFIX`]), moves `backup_dir` — the previous
-/// files — out of `staging` to `tools/rollback-backup-<hex>`, which the
-/// stale-staging sweep never touches, and returns `err` with the paths
-/// updated. When that move fails the staging directory is kept instead
-/// (and the error says so). Any other error is returned as is and
-/// `staging` is dropped (removed) as usual.
+/// files and their `RESTORE.txt` — out of `staging` to
+/// `tools/rollback-backup-<hex>`, which the stale-staging sweep never
+/// touches, and returns `err` with the paths updated. When that move
+/// fails the staging directory is kept instead (the sweep skips a staging
+/// dir holding `backup/RESTORE.txt`; the error says so). Any other error
+/// is returned as is and `staging` is dropped (removed) as usual.
+/// Fix round 13 L1: `RESTORE.txt` names `tool` on its first line, so
+/// `/api/tools`, `frametrace tools list` and `doctor` can attribute it.
 pub(crate) fn preserve_rollback_backup(
     err: String,
     staging: StagingDir,
     backup_dir: &Path,
     tools_dir: &Path,
+    tool: &str,
 ) -> String {
     if !err.starts_with(ROLLBACK_INCOMPLETE_PREFIX) {
         return err;
     }
-    let kept = tools_dir.join(format!("rollback-backup-{}", random_hex()));
+    rollback::name_tool_in_restore_file(&backup_dir.join(RESTORE_FILE), tool);
+    let kept = tools_dir.join(format!(
+        "{}{}",
+        rollback::ROLLBACK_BACKUP_PREFIX,
+        random_hex()
+    ));
     match rename_with_retry(backup_dir, &kept) {
         Ok(()) => {
             let err = err.replace(
@@ -1446,17 +1511,19 @@ pub(crate) fn preserve_rollback_backup(
             );
             drop(staging);
             format!(
-                "{err} (restore the previous files from {} by hand)",
-                kept.display()
+                "{err} (restore the previous files from {} by hand — {} lists each one)",
+                kept.display(),
+                kept.join(RESTORE_FILE).display()
             )
         }
         Err(move_err) => {
             let path = staging.path().to_path_buf();
             staging.keep();
             format!(
-                "{err} (the previous files stay in {} — could not move them to {}: {move_err}; restore them by hand before installing again)",
+                "{err} (the previous files stay in {} — could not move them to {}: {move_err}; restore them by hand before installing again — {} lists each one)",
                 path.display(),
-                kept.display()
+                kept.display(),
+                backup_dir.join(RESTORE_FILE).display()
             )
         }
     }
@@ -1468,6 +1535,24 @@ pub(crate) fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
     let mut tries = 1;
     loop {
         match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if tries < RENAME_TRIES && transient_rename_error(&err) => {
+                tries += 1;
+                std::thread::sleep(RENAME_PAUSE);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// `std::fs::remove_dir_all` with the same bounded retry (Fix round 13
+/// M: one file of a partial venv held by an AV scan or the indexer).
+/// A missing directory is success.
+pub(crate) fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut tries = 1;
+    loop {
+        match std::fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) if tries < RENAME_TRIES && transient_rename_error(&err) => {
@@ -1529,8 +1614,11 @@ pub(crate) fn move_all_or_nothing(
     // (dest, Some(backup)) for each completed move.
     let mut done: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     let mut failure = None;
-    // What the rollback could not undo (Fix round 12 H-a).
+    // What the rollback could not undo (Fix round 12 H-a), and per such
+    // file its original path and kept previous copy (Fix round 13 L1:
+    // written to `backup_dir/RESTORE.txt`).
     let mut undo_failed: Vec<String> = Vec::new();
+    let mut to_restore: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     for (index, (src, dest)) in moves.iter().enumerate() {
         if let Some(parent) = dest.parent()
             && let Err(err) = std::fs::create_dir_all(parent)
@@ -1562,6 +1650,7 @@ pub(crate) fn move_all_or_nothing(
                         dest.display(),
                         backup.display()
                     ));
+                    to_restore.push((dest.clone(), Some(backup)));
                 }
             }
             break;
@@ -1572,9 +1661,15 @@ pub(crate) fn move_all_or_nothing(
         for (dest, backup) in done.into_iter().rev() {
             if let Err(problem) = undo_move(&dest, backup.as_deref()) {
                 undo_failed.push(problem);
+                to_restore.push((dest, backup));
             }
         }
         if !undo_failed.is_empty() {
+            // Best effort: the error itself names every file too.
+            let _ = std::fs::write(
+                backup_dir.join(RESTORE_FILE),
+                rollback::restore_text(None, &to_restore, backup_dir),
+            );
             return Err(format!(
                 "{ROLLBACK_INCOMPLETE_PREFIX}{failure}; the rollback could NOT restore every previous file — {}",
                 undo_failed.join("; ")
