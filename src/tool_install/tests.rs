@@ -2434,12 +2434,12 @@ fn status_walks_path_once_and_never_shadows_deepfake_lens() {
     let libewf = find_tool(manifest, "libewf").unwrap();
     assert_eq!(libewf.provides.len(), 3);
     let before = crate::tool_policy::path_walks();
-    let status = status(libewf);
+    let status = status(libewf, &[]);
     assert_eq!(crate::tool_policy::path_walks() - before, 1);
     assert_eq!(status.paths.len(), 3);
     assert_eq!(status.shadowed_by.len(), 3);
     let lens = find_tool(manifest, "deepfake-lens").unwrap();
-    let status = super::status(lens);
+    let status = super::status(lens, &[]);
     assert_eq!(
         status.shadowed_by,
         vec![("deepfake-lens".to_string(), None::<String>)]

@@ -138,12 +138,14 @@ pub(crate) fn api_tools(request: &Request, state: &SharedState) -> String {
     // Fix round 11 L3: an install from the CLI changed tools/bin under a
     // cached /api/env — drop it so both endpoints agree.
     super::system::revalidate_env_cache();
-    // Resolution (filesystem) outside the state lock.
+    // Resolution (filesystem) outside the state lock. Fix round 14 L1:
+    // the kept rollback backups are listed (and sized) once per request.
+    let backups = tool_install::rollback_backups_for_current_exe();
     let tools: Vec<serde_json::Value> = manifest
         .tools
         .iter()
         .filter(|tool| !(exclude_on_demand && tool.on_demand))
-        .map(|tool| tool_install::tool_json(tool, &tool_install::status(tool)))
+        .map(|tool| tool_install::tool_json(tool, &tool_install::status(tool, &backups)))
         .collect();
     serde_json::json!({
         "ok": true,

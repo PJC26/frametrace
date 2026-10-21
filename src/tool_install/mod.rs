@@ -547,7 +547,11 @@ impl ToolStatus {
 /// Resolution-only status (`tools/bin`, then PATH, as the pipeline would
 /// run the tool) — never spawns anything.
 /// PATH is walked once for all of the tool's binaries.
-pub fn status(tool: &ToolEntry) -> ToolStatus {
+///
+/// Fix round 14 L1: `backups` is [`rollback_backups`] of the `tools` dir
+/// in use, computed once by the caller for every tool it lists (sizing a
+/// kept venv walks all of its files); only this tool's are kept.
+pub fn status(tool: &ToolEntry, backups: &[RollbackBackup]) -> ToolStatus {
     let path = crate::tool_policy::PathDirs::from_env();
     let mut paths = Vec::new();
     let mut shadowed_by = Vec::new();
@@ -563,9 +567,10 @@ pub fn status(tool: &ToolEntry) -> ToolStatus {
         paths.push((binary.clone(), lookup.used));
         shadowed_by.push((binary.clone(), lookup.shadowed_by));
     }
-    let rollback_backups = rollback_backups_for_current_exe()
-        .into_iter()
+    let rollback_backups = backups
+        .iter()
         .filter(|backup| backup.tool.as_deref() == Some(tool.name.as_str()))
+        .cloned()
         .collect();
     ToolStatus {
         paths,

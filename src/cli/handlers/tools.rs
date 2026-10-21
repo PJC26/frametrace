@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 pub fn tools_list(json: bool, all: bool) -> Result<(), String> {
     let manifest = tool_install::manifest()?;
+    // Fix round 14 L1: listed (and sized) once, not once per tool.
+    let backups = tool_install::rollback_backups_for_current_exe();
     let tools: Vec<_> = manifest
         .tools
         .iter()
         .filter(|tool| all || !tool.on_demand)
-        .map(|tool| (tool, tool_install::status(tool)))
+        .map(|tool| (tool, tool_install::status(tool, &backups)))
         .collect();
     if json {
         let items: Vec<serde_json::Value> = tools
@@ -81,7 +83,9 @@ fn tools_install_in(name: &str, yes: bool, dirs: &InstallDirs) -> Result<(), Str
     // Unknown / not installable: refused here, before the prompt, and
     // recorded in the chained install audit log like the API's refusals.
     let tool = tool_install::preflight(manifest, name, dirs)?;
-    for line in install_prompt_lines(tool, dirs, &tool_install::status(tool)) {
+    // Fix round 14 L1: the status of the `tools` dir being installed into.
+    let backups = tool_install::rollback_backups(&dirs.tools_dir);
+    for line in install_prompt_lines(tool, dirs, &tool_install::status(tool, &backups)) {
         println!("{line}");
     }
     if !yes {
@@ -188,6 +192,9 @@ fn install_prompt_lines(
             ));
         }
     }
+    // Fix round 14 L1: a kept backup of an earlier incomplete rollback is
+    // shown before reinstalling too (the folder stays after the install).
+    lines.extend(rollback_lines(status));
     lines
 }
 
@@ -263,6 +270,46 @@ mod tests {
         plain.notice = None;
         let lines = install_prompt_lines(&plain, &dirs, &status);
         assert!(!lines.iter().any(|l| l.starts_with("고지:")), "{lines:#?}");
+    }
+
+    /// Fix round 14 L1: `status` takes the backups listed once from the
+    /// `tools` dir in use (here a fixture dir, not the test exe's) and
+    /// keeps only the tool's own; the install prompt warns about them.
+    #[test]
+    fn status_and_the_prompt_use_the_given_tools_dir_backups() {
+        let base = std::env::temp_dir().join(format!("ft-cli-backups-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs = InstallDirs {
+            tools_dir: base.join("tools"),
+        };
+        let kept = dirs.tools_dir.join("rollback-backup-00aa");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("RESTORE.txt"), "tool: ffmpeg\nhow\n").unwrap();
+        std::fs::write(kept.join("0.bak"), b"old").unwrap();
+        let other = dirs.tools_dir.join("rollback-backup-00bb");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("RESTORE.txt"), "tool: libewf\nhow\n").unwrap();
+        let backups = crate::tool_install::rollback_backups(&dirs.tools_dir);
+        assert_eq!(backups.len(), 2);
+        let manifest = crate::tool_install::manifest().unwrap();
+        let ffmpeg = crate::tool_install::find_tool(manifest, "ffmpeg").unwrap();
+        let status = crate::tool_install::status(ffmpeg, &backups);
+        assert_eq!(status.rollback_backups.len(), 1);
+        assert_eq!(status.rollback_backups[0].path, kept);
+        let lines = install_prompt_lines(ffmpeg, &dirs, &status);
+        let warnings: Vec<&String> = lines.iter().filter(|l| l.starts_with("  경고: ")).collect();
+        assert_eq!(warnings.len(), 1, "{lines:#?}");
+        assert!(
+            warnings[0].contains(&kept.display().to_string()),
+            "{}",
+            warnings[0]
+        );
+        // No backups for a tool without any: no warning line.
+        let ffmpeg_clean = crate::tool_install::status(ffmpeg, &[]);
+        assert!(ffmpeg_clean.rollback_backups.is_empty());
+        let lines = install_prompt_lines(ffmpeg, &dirs, &ffmpeg_clean);
+        assert!(!lines.iter().any(|l| l.contains("경고")), "{lines:#?}");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// `frametrace tools install` refusals before the prompt (unknown tool,
