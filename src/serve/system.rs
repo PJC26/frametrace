@@ -100,6 +100,14 @@ pub(crate) fn tools_python_fingerprint(dir: &Path) -> String {
     let scripts = if cfg!(windows) { "Scripts" } else { "bin" };
     let mut rows: Vec<String> = entries
         .filter_map(|entry| entry.ok())
+        // Fix round 13 H2: transient sweep names (`.<tool>.old-*` while a
+        // venv is rebuilt, `….rm` while one is removed) are not the
+        // resolution's business and must not cause cache misses.
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            !(name.starts_with('.') || name.ends_with(".rm"))
+        })
         .map(|entry| {
             let path = entry.path();
             format!(

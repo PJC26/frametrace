@@ -313,6 +313,15 @@ fn the_env_cache_misses_when_a_private_venv_appears_or_changes() {
         "the Scripts dir mtime is part of it"
     );
     assert!(env_cache_hit(&cache, &with_script).is_none(), "miss");
+    // Fix round 13 H2: transient sweep names do not change it.
+    std::fs::create_dir_all(python.join(".deepfake-lens.old-00ff").join(scripts)).unwrap();
+    std::fs::create_dir_all(python.join(".x.old-01.rm")).unwrap();
+    std::fs::create_dir_all(python.join("leftover.rm")).unwrap();
+    assert_eq!(
+        tools_fingerprint(&bin, &python),
+        with_script,
+        "transient names ignored"
+    );
     // Removing the venv misses as well.
     env_cache_store(&cache, with_script.clone(), "{}".into());
     std::fs::remove_dir_all(&venv).unwrap();
