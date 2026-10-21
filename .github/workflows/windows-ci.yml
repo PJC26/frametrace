@@ -229,6 +229,21 @@ jobs:
           $buildconf | Where-Object { $_ -match 'enable-(version3|gpl|nonfree|libopenh264|chromaprint|libzvbi)' } | ForEach-Object { & $log "  $_" }
           & $log '--- H.264 encoders:'
           & $ff -hide_banner -encoders | Select-String -Pattern '\(codec h264\)' | ForEach-Object { & $log "  $($_.Line.Trim())" }
+          # §Fix round 11 H2 (informational, never fails the job): evidence
+          # that zvbi's GPL-2.0-only objects are linked. packet-830.c has no
+          # string literals (its symbols are stripped), so the probe is two
+          # format strings of zvbi src/pdc.c (_vbi_pil_dump /
+          # _vbi_program_id_dump). "no" is not proof of absence (the linker
+          # may drop unused functions).
+          try {
+            $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($ff))
+            $markers = @('pcs=%s pty=%02x tape_delayed=%u', 'ch=%u cni=%04x (%s) pil=')
+            $found = @($markers | Where-Object { $text.Contains($_) })
+            $text = $null
+            & $log "zvbi packet-830/pdc linked: $(if ($found.Count -gt 0) { 'yes' } else { 'no' }) (pdc.c strings found $($found.Count)/$($markers.Count): $($found -join ' | '); packet-830.c has no strings to probe)"
+          } catch {
+            & $log "zvbi packet-830/pdc linked: unknown (probe failed: $($_.Exception.Message))"
+          }
           if ($buildconf -notcontains '--enable-version3') { throw 'buildconf lacks --enable-version3' }
           $forbidden = @($buildconf | Where-Object { $_ -eq '--enable-gpl' -or $_ -eq '--enable-nonfree' })
           if ($forbidden) { throw "buildconf has $($forbidden -join ', ') — the pinned asset's licence mix got worse" }
