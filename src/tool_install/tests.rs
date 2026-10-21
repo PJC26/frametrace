@@ -492,6 +492,76 @@ fn moves_are_all_or_nothing() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Fix round 11 H4: a just-extracted file held open for a moment (an AV
+/// scan: no sharing) is moved once it is released; one held for longer
+/// than the retry budget still fails all-or-nothing (the old file stays).
+#[cfg(windows)]
+#[test]
+fn a_briefly_locked_file_is_moved_after_a_retry_and_a_held_one_rolls_back() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let hold = |path: PathBuf, millis: u64| {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+            drop(file);
+        })
+    };
+    let base = scratch("moves-retry");
+    let bin = base.join("bin");
+    let src = base.join("src");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(bin.join("a.exe"), b"old-a").unwrap();
+    std::fs::write(src.join("a.exe"), b"new-a").unwrap();
+    std::fs::write(src.join("b.exe"), b"new-b").unwrap();
+    // Held for 500 ms: the rename is retried and succeeds.
+    let started = std::time::Instant::now();
+    let holder = hold(src.join("b.exe"), 500);
+    let moves = vec![
+        (src.join("a.exe"), bin.join("a.exe")),
+        (src.join("b.exe"), bin.join("b.exe")),
+    ];
+    move_all_or_nothing(&moves, &base.join("backup")).unwrap();
+    holder.join().unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+    assert_eq!(std::fs::read(bin.join("a.exe")).unwrap(), b"new-a");
+    assert_eq!(std::fs::read(bin.join("b.exe")).unwrap(), b"new-b");
+
+    // Held past the budget: fails, the first move is undone.
+    std::fs::write(src.join("a.exe"), b"newer-a").unwrap();
+    std::fs::write(src.join("c.exe"), b"new-c").unwrap();
+    let holder = hold(src.join("c.exe"), 4000);
+    let started = std::time::Instant::now();
+    let moves = vec![
+        (src.join("a.exe"), bin.join("a.exe")),
+        (src.join("c.exe"), bin.join("c.exe")),
+    ];
+    let err = move_all_or_nothing(&moves, &base.join("backup2")).unwrap_err();
+    let waited = started.elapsed();
+    holder.join().unwrap();
+    assert!(err.contains("c.exe"), "{err}");
+    assert!(
+        waited >= std::time::Duration::from_millis(1500)
+            && waited < std::time::Duration::from_secs(4),
+        "bounded retry: {waited:?}"
+    );
+    assert_eq!(
+        std::fs::read(bin.join("a.exe")).unwrap(),
+        b"new-a",
+        "rolled back"
+    );
+    assert!(!bin.join("c.exe").exists());
+    // Not a transient error (missing source): no retry, no wait.
+    let started = std::time::Instant::now();
+    assert!(rename_with_retry(&src.join("missing.exe"), &bin.join("m.exe")).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_millis(300));
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[test]
 fn audit_line_records_source_hash_and_result_without_signed_query() {
     let mut tool = base_entry();

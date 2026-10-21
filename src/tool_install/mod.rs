@@ -1374,6 +1374,36 @@ pub(crate) fn random_hex() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Tries of [`rename_with_retry`] and the pause after each failed one
+/// (5 tries, about 2 s in all).
+const RENAME_TRIES: u32 = 5;
+const RENAME_PAUSE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Whether a rename error is one an antivirus scan of the just-extracted
+/// file causes for a moment: `ERROR_SHARING_VIOLATION` (32) or
+/// `ERROR_ACCESS_DENIED` (5). Windows only; never elsewhere.
+fn transient_rename_error(err: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(err.raw_os_error(), Some(5) | Some(32))
+}
+
+/// `std::fs::rename` with a short bounded retry (Fix round 11 H4): a file
+/// held open by an AV scanner right after extraction must not fail the
+/// whole install and force a 170 MB re-download. Only the rename is
+/// retried; any other error, or the last try's, is returned as is.
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) if tries < RENAME_TRIES && transient_rename_error(&err) => {
+                tries += 1;
+                std::thread::sleep(RENAME_PAUSE);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Moves `(src, dest)` pairs into place, replacing existing destinations.
 /// Each existing destination is first renamed into `backup_dir`; when any
 /// move fails, every destination already moved is removed and its backup
@@ -1397,7 +1427,7 @@ pub(crate) fn move_all_or_nothing(
         let backup = match std::fs::symlink_metadata(dest) {
             Ok(_) => {
                 let backup = backup_dir.join(format!("{index}.bak"));
-                if let Err(err) = std::fs::rename(dest, &backup) {
+                if let Err(err) = rename_with_retry(dest, &backup) {
                     failure = Some(format!(
                         "cannot replace {} (is it running?): {err}",
                         dest.display()
@@ -1408,7 +1438,7 @@ pub(crate) fn move_all_or_nothing(
             }
             Err(_) => None,
         };
-        if let Err(err) = std::fs::rename(src, dest) {
+        if let Err(err) = rename_with_retry(src, dest) {
             if let Some(backup) = &backup {
                 let _ = std::fs::rename(backup, dest);
             }
