@@ -95,6 +95,11 @@ pub fn generate_proxy(
     let encoders = crate::ffmpeg_encoders::for_binary(&ffmpeg);
     let codecs = encoders.choice(encoders.video(), encoders.aac());
     let args = proxy_ffmpeg_args(&source_path, &output_path, options, &codecs);
+    // Fix round 12 L2 (as round 11 H5 for exports): the version of the
+    // binary that encodes, asked BEFORE encoding from the same resolved
+    // path — asked afterwards by bare name, a guided install finishing
+    // meanwhile would record the new build for a proxy made by the old one.
+    let ffmpeg_version = command_version(&ffmpeg, &["ffmpeg"], "-version");
     let mut command = Command::new(&ffmpeg);
     command.args(&args);
     let output = crate::util::run_with_timeout(
@@ -141,6 +146,7 @@ pub fn generate_proxy(
         &artifact,
         &args,
         Some(&codecs),
+        &ffmpeg_version,
     )?;
     Ok(artifact)
 }
@@ -178,6 +184,8 @@ pub fn generate_thumbnail(
     let args = thumbnail_ffmpeg_args(&source_path, &output_path, options);
     let ffmpeg = resolve_tool_binary("ffmpeg", &["ffmpeg"])
         .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
+    // Fix round 12 L2: asked before running, from the resolved path.
+    let ffmpeg_version = command_version(&ffmpeg, &["ffmpeg"], "-version");
     let mut command = Command::new(&ffmpeg);
     command.args(&args);
     let output = crate::util::run_with_timeout(
@@ -224,6 +232,7 @@ pub fn generate_thumbnail(
         &artifact,
         &args,
         None,
+        &ffmpeg_version,
     )?;
     Ok(artifact)
 }
@@ -426,6 +435,7 @@ fn append_artifact_log(
     artifact: &DerivedArtifact,
     command_args: &[String],
     codecs: Option<&crate::ffmpeg_encoders::CodecChoice>,
+    ffmpeg_version: &str,
 ) -> Result<(), String> {
     let path = case_dir.join(relative_log);
     let source_sha256 = audit::indexed_source_hash(
@@ -443,7 +453,7 @@ fn append_artifact_log(
         audit::optional_string(source_sha256.as_deref()),
         json_escape(&artifact.output_path.to_string_lossy()),
         json_escape(&output_sha256),
-        json_escape(&command_version("ffmpeg", &["ffmpeg"], "-version")),
+        json_escape(ffmpeg_version),
         audit::json_string_array(command_args),
         codecs
             .map(|codecs| codecs.audit_fields())
@@ -456,6 +466,41 @@ fn append_artifact_log(
 mod tests {
     use super::{ProxyOptions, ThumbnailOptions, proxy_ffmpeg_args, thumbnail_ffmpeg_args};
     use std::path::Path;
+
+    /// Fix round 12 L2: the proxy/thumbnail audit line records the version
+    /// the caller asked before encoding, never a fresh bare-name query made
+    /// after the artifact was written.
+    #[test]
+    fn artifact_log_records_the_version_asked_before_encoding() {
+        let case = std::env::temp_dir().join(format!("ft-artifact-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case);
+        let proxies = case.join("artifacts/proxies");
+        std::fs::create_dir_all(&proxies).unwrap();
+        let output = proxies.join("proxy.mp4");
+        std::fs::write(&output, b"proxy").unwrap();
+        let artifact = super::DerivedArtifact {
+            source_path: case.join("in.mp4"),
+            output_path: output,
+            kind: "proxy".to_string(),
+            created_unix: 1,
+        };
+        super::append_artifact_log(
+            &case,
+            "artifacts/proxies/proxy-log.jsonl",
+            &artifact,
+            &["-i".to_string()],
+            None,
+            "ffmpeg version OLD-BUILD-before-install",
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(proxies.join("proxy-log.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            line["ffmpeg_version"], "ffmpeg version OLD-BUILD-before-install",
+            "{line}"
+        );
+        let _ = std::fs::remove_dir_all(&case);
+    }
 
     #[test]
     fn default_proxy_is_review_sized() {
