@@ -690,11 +690,14 @@ export async function toolsTrackU() {
   // Fix round 11 M1: [종료] (assets/app/95-quit.js) while a guided install
   // holds busy. The global /api/cancel answers from the mock's apiCancelReply
   // (the server's shapes); /api/status is busy while the install runs.
-  const quitRun = async (stage, finishAfterPolls) => {
+  // Fix round 12 L5: opts.closeAfterPolls closes the dialog ([계속 작업])
+  // after that many status polls during the wait; the dialog's html and
+  // OK label are recorded.
+  const quitRun = async (stage, finishAfterPolls, opts = {}) => {
     const quitSrc = read('assets/app/95-quit.js');
     const m = { install: { ...J('downloading', 'ffmpeg', { stage, bytes: 1, total: 4 }) }, cancelRequested: false };
     if (stage === 'install') m.install.state = 'extracting';
-    const notes = []; const posts = []; let polls = 0; let okResult = null;
+    const notes = []; const posts = []; let polls = 0; let okResult = null; let dialog = null;
     const els = {};
     const elOf = (id) => (els[id] ||= {
       id, hidden: false, inert: false, innerHTML: '', disabled: false, listeners: [],
@@ -706,22 +709,25 @@ export async function toolsTrackU() {
       console, window: {}, $: elOf, esc: (s) => String(s),
       setTimeout: (f) => { setImmediate(f); return 1; }, clearTimeout() {},
       hViewer: { summary: () => ({ pending: 0 }) }, FTStore: { hasProject: () => false, state: {} },
+      dlgResolve: null,
       jget: async (url) => {
+        if (url === '/api/tools/install-status') return { ok: true, install: running() ? { ...m.install } : null };
         if (url !== '/api/status') return { ok: true };
         if (running()) {
           polls += 1;
+          if (opts.closeAfterPolls && polls > opts.closeAfterPolls) ctx.dlgResolve = null;
           if (m.cancelRequested) Object.assign(m.install, { state: 'failed', stage: 'failed', error: INSTALL_CANCELLED_U, cancelled: true });
           else if (finishAfterPolls && polls > finishAfterPolls) Object.assign(m.install, { state: 'done', stage: 'done' });
         }
         return { ok: true, busy: running(), phase: 'task' };
       },
       jpost: async (url) => { posts.push(url); if (url === '/api/cancel') return apiCancelReply(m) || { ok: false, error: '진행 중인 작업이 없습니다.' }; return { ok: true }; },
-      askDialog: async (o) => { okResult = await o.onOk(); return false; },
+      askDialog: async (o) => { dialog = o; ctx.dlgResolve = () => {}; okResult = await o.onOk(); return false; },
       alertDialog: async () => {},
     };
     runInNewContext(quitSrc, ctx);
     await elOf('hBtnQuit').listeners[0]();
-    return { okResult, notes, posts, m };
+    return { okResult, notes, posts, m, dialog, polls };
   };
 
   await row('Fix round 11 M1: [종료] during a download stops the install through /api/cancel (cancelled "tool-install") and then shuts the server down', async () => {
@@ -731,6 +737,10 @@ export async function toolsTrackU() {
     assert.equal(r.m.install.cancelled, true, 'the install ended cancelled');
     assert.ok(r.notes.some((n) => n.startsWith('도구 설치를 중단하는 중')), JSON.stringify(r.notes));
     assert.ok(!r.notes.some((n) => /중단 요청 실패|아직 멈추지 않았습니다/.test(n)), JSON.stringify(r.notes));
+    // Fix round 12 L5: the dialog speaks of the install, not of an analysis.
+    assert.ok(r.dialog.html.includes('도구 설치를 중단한 뒤 서버를 종료합니다') && r.dialog.html.includes('(ffmpeg)'), r.dialog.html);
+    assert.ok(!/체크포인트/.test(r.dialog.html), 'no checkpoint promise for an install: ' + r.dialog.html);
+    assert.equal(r.dialog.okLabel, '설치 중단 후 서버 종료');
   });
 
   await row('Fix round 11 M1: [종료] while files move into place (not_cancellable) says so, waits for the install to end, then shuts down', async () => {
@@ -738,8 +748,25 @@ export async function toolsTrackU() {
     assert.equal(r.okResult, true, 'onOk proceeds: ' + JSON.stringify(r.notes));
     assert.deepEqual(r.posts, ['/api/cancel', '/api/shutdown'], JSON.stringify(r.posts));
     assert.equal(r.m.install.state, 'done', 'the install ran to its end');
-    assert.ok(r.notes.includes('파일 이동 단계라 중단할 수 없습니다 — 끝난 뒤 종료합니다'), JSON.stringify(r.notes));
+    assert.ok(r.notes.includes('파일을 옮기는 중이라 중단할 수 없습니다 — 끝나면 종료합니다'), JSON.stringify(r.notes));
     assert.ok(!r.notes.some((n) => /중단 요청 실패/.test(n)), 'never "중단 요청 실패": ' + JSON.stringify(r.notes));
+  });
+
+  await row('Fix round 12 L5: [종료] during a venv/pip step longer than 60 s keeps waiting (up to 10 min), never says "아직 멈추지 않았습니다", then shuts down', async () => {
+    const r = await quitRun('pip', 200);
+    assert.equal(r.okResult, true, 'onOk proceeds: ' + JSON.stringify(r.notes.slice(-3)));
+    assert.deepEqual(r.posts, ['/api/cancel', '/api/shutdown'], JSON.stringify(r.posts));
+    assert.equal(r.m.install.state, 'done', 'the install ran to its end');
+    assert.ok(r.polls > 120, 'waited past the 60 s bound: ' + r.polls);
+    assert.ok(r.notes.some((n) => /^파일을 옮기는 중이라 중단할 수 없습니다 — 끝나면 종료합니다 \d+초 \/ 최대 10분$/.test(n)), JSON.stringify(r.notes.slice(0, 4)));
+    assert.ok(!r.notes.some((n) => /아직 멈추지 않았습니다|최대 60초/.test(n)), JSON.stringify(r.notes.filter((n) => /아직|60초/.test(n))));
+  });
+
+  await row('Fix round 12 L5: [계속 작업] during the wait for an install stops waiting — the server is NOT shut down afterwards', async () => {
+    const r = await quitRun('pip', 50, { closeAfterPolls: 5 });
+    assert.equal(r.okResult, false, 'onOk gave up: ' + JSON.stringify(r.notes.slice(-3)));
+    assert.deepEqual(r.posts, ['/api/cancel'], 'no /api/shutdown: ' + JSON.stringify(r.posts));
+    assert.ok(r.polls <= 7, 'stopped polling soon after the close: ' + r.polls);
   });
 
   if (failed.length) throw new Error('Tools track U failed: ' + failed.join('; '));

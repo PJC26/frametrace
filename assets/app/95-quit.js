@@ -99,6 +99,19 @@ async function hBeforeClose(timeoutMs = H_CLOSE_TIMEOUT_MS) {
   return { ok, pending, state, message, warning };
 }
 window.hBeforeClose = hBeforeClose;
+// Fix round 12 L5: the running guided tool install that holds `busy`, if
+// any (GET /api/tools/install-status), so the quit dialog speaks of the
+// install — not of an analysis resuming from a checkpoint — and waits long
+// enough for a venv / pip step that cannot be stopped.
+const H_QUIT_WAIT_S = 60;
+const H_QUIT_INSTALL_WAIT_S = 600;
+async function hQuitToolInstall() {
+  try {
+    const r = await jget("/api/tools/install-status");
+    const i = r && r.ok !== false && r.install && typeof r.install === "object" ? r.install : null;
+    return i && i.state !== "done" && i.state !== "failed" ? i : null;
+  } catch (e) { return null; }
+}
 $("hBtnQuit").addEventListener("click", async () => {
   const btn = $("hBtnQuit");
   btn.disabled = true;
@@ -114,16 +127,26 @@ $("hBtnQuit").addEventListener("click", async () => {
     const pendingHtml = pending > 0
       ? `<p><b>케이스에 아직 반영되지 않은 마크·메모 변경 ${pending}건</b>이 있습니다. 서버를 종료하면 이 브라우저의 임시 저장본에만 남습니다 — 취소하고 몇 초 기다려 자동 반영된 뒤 종료하는 것을 권장합니다.</p>`
       : "";
+    const install = st.busy ? await hQuitToolInstall() : null;
+    const installName = install ? String(install.tool || "") : "";
+    const busyHtml = !st.busy ? ""
+      : install ? `<p><b>도구 설치가 진행 중입니다</b>${installName ? ` (${esc(installName)})` : ""}. 도구 설치를 중단한 뒤 서버를 종료합니다 — 파일을 옮기는 중이면 그 단계가 끝난 뒤 종료합니다.</p>`
+      : `<p><b>작업이 진행 중입니다</b> (${esc(st.phase || "")}). 작업을 중단한 뒤 서버를 종료합니다 — 중단된 분석은 다음 실행 때 체크포인트에서 이어서 진행할 수 있습니다.</p>`;
     const go = await askDialog({
       title: "워크스테이션 서버 종료",
-      html: (st.busy ? `<p><b>작업이 진행 중입니다</b> (${esc(st.phase || "")}). 작업을 중단한 뒤 서버를 종료합니다 — 중단된 분석은 다음 실행 때 체크포인트에서 이어서 진행할 수 있습니다.</p>` : "") +
+      html: busyHtml +
         pendingHtml +
         `<p>서버를 종료하면 이 화면과 뷰어가 더 이상 동작하지 않습니다. 케이스 데이터와 감사 로그는 보존됩니다.<br>다시 시작하려면 frametrace-app을 실행하십시오.</p>`,
-      okLabel: st.busy ? "작업 중단 후 서버 종료" : "서버 종료",
+      okLabel: install ? "설치 중단 후 서버 종료" : st.busy ? "작업 중단 후 서버 종료" : "서버 종료",
       cancelLabel: "계속 작업",
       danger: true,
       focus: "dlgCancel",
       onOk: async () => {
+        // This dialog is still the open one (not closed with [계속 작업] or
+        // replaced): a long wait below must not shut the server down after
+        // the examiner chose to keep working.
+        const dlgToken = typeof dlgResolve === "undefined" ? undefined : dlgResolve;
+        const stillOpen = () => dlgToken === undefined || dlgResolve === dlgToken;
         // Status captured at dialog open may be stale: re-check before cancel.
         let cur = null;
         try { cur = await jget("/api/status"); } catch (e) { cur = null; }
@@ -134,10 +157,15 @@ $("hBtnQuit").addEventListener("click", async () => {
           // through its own latch — `cancelled: "tool-install"` — and cannot
           // stop while its files move into place (`not_cancellable`): then it
           // is left to finish and the server is stopped right after.
+          // Fix round 12 L5: an install's venv / pip step may run for
+          // minutes and cannot be stopped — wait up to 10 min for it.
           const locked = !cr.ok && cr.code === "not_cancellable";
-          const waitLabel = locked ? "파일 이동 단계라 중단할 수 없습니다 — 끝난 뒤 종료합니다"
-            : cr.cancelled === "tool-install" ? "도구 설치를 중단하는 중…"
+          const isInstall = cr.job_kind === "tool-install" || cr.cancelled === "tool-install";
+          const waitLabel = locked ? "파일을 옮기는 중이라 중단할 수 없습니다 — 끝나면 종료합니다"
+            : isInstall ? "도구 설치를 중단하는 중…"
             : "작업이 멈추기를 기다리는 중…";
+          const maxS = isInstall ? H_QUIT_INSTALL_WAIT_S : H_QUIT_WAIT_S;
+          const maxLabel = maxS >= 120 ? `${Math.round(maxS / 60)}분` : `${maxS}초`;
           if (!cr.ok && !locked) {
             // "no job running" means it finished meanwhile — fine, unless still busy.
             let again = null;
@@ -146,14 +174,21 @@ $("hBtnQuit").addEventListener("click", async () => {
           }
           let still = !!cr.ok || locked;
           if (still) $("dlgNote").textContent = waitLabel;
-          for (let i = 0; i < 120 && still; i++) {
+          for (let i = 0; i < maxS * 2 && still; i++) {
             await new Promise(r => setTimeout(r, 500));
+            if (!stillOpen()) return false;
             let s2 = null;
             try { s2 = await jget("/api/status"); } catch (e) { s2 = null; }
             still = !!(s2 && s2.busy);
-            $("dlgNote").textContent = `${waitLabel} ${Math.round((i + 1) / 2)}초 / 최대 60초`;
+            $("dlgNote").textContent = `${waitLabel} ${Math.round((i + 1) / 2)}초 / 최대 ${maxLabel}`;
           }
-          if (still) { $("dlgNote").textContent = "작업이 아직 멈추지 않았습니다 — 잠시 후 다시 시도하십시오."; return false; }
+          if (still) {
+            $("dlgNote").textContent = isInstall
+              ? "도구 설치가 아직 끝나지 않았습니다 — 끝난 뒤 다시 [서버 종료]를 누르십시오."
+              : "작업이 아직 멈추지 않았습니다 — 잠시 후 다시 시도하십시오.";
+            return false;
+          }
+          if (!stillOpen()) return false;
         }
         $("dlgNote").textContent = "서버 종료 요청 중…";
         const res = await jpost("/api/shutdown", {});
