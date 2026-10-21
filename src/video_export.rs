@@ -144,6 +144,11 @@ pub fn export_video(
     // this build really has, and log the same pick (reproducible command
     // line).
     let codecs = export_codecs(&crate::ffmpeg_encoders::for_binary(&ffmpeg), options.format);
+    // Fix round 11 H5: the version of the binary that encodes, asked
+    // BEFORE encoding from the same resolved path — asked afterwards, a
+    // guided install finishing meanwhile would record the new build's
+    // version for a clip made with the old one.
+    let ffmpeg_version = command_version(&ffmpeg, &["ffmpeg"], "-version");
     let part = crate::join::pid_part_path(&output_path, std::process::id());
     if let Err(err) = run_ffmpeg_export(
         &ffmpeg,
@@ -181,6 +186,7 @@ pub fn export_video(
         indexed_sha256.as_deref(),
         export_sha256.as_deref(),
         &codecs,
+        &ffmpeg_version,
     )?;
 
     Ok(ExportResult {
@@ -687,6 +693,7 @@ fn write_export_log(
     source_index_sha256: Option<&str>,
     source_export_sha256: Option<&str>,
     codecs: &crate::ffmpeg_encoders::CodecChoice,
+    ffmpeg_version: &str,
 ) -> Result<(), String> {
     let path = case_dir.join("artifacts/clips/export-log.jsonl");
     let exported_unix = now_unix()?;
@@ -716,7 +723,7 @@ fn write_export_log(
             .as_ref()
             .map(|spec| format!("{{\"exhibit\":\"{}\"}}", json_escape(&spec.exhibit)))
             .unwrap_or_else(|| "null".to_string()),
-        json_escape(&command_version("ffmpeg", &["ffmpeg"], "-version")),
+        json_escape(ffmpeg_version),
         audit::json_string_array(&args),
         codecs.audit_fields()
     );
@@ -836,6 +843,47 @@ mod tests {
         assert!(!args.contains(&"-n".to_string()));
         assert!(args.contains(&"libx264".to_string()));
         assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+    }
+
+    /// Fix round 11 H5: the export log records the version the caller
+    /// asked before encoding (from the binary that encoded), never a fresh
+    /// query made after the clip was written.
+    #[test]
+    fn export_log_records_the_version_asked_before_encoding() {
+        let case = std::env::temp_dir().join(format!("ft-export-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case);
+        let clips = case.join("artifacts/clips");
+        std::fs::create_dir_all(&clips).unwrap();
+        let output = clips.join("clip.mp4");
+        std::fs::write(&output, b"clip").unwrap();
+        let options = ExportOptions {
+            format: ExportFormat::Mp4,
+            start_seconds: None,
+            duration_seconds: None,
+            output_path: None,
+            timeout_secs: None,
+            burn_in: None,
+            hash_source: false,
+        };
+        super::write_export_log(
+            &case,
+            "vid-1",
+            Path::new("in.mp4"),
+            &output,
+            &options,
+            None,
+            None,
+            &crate::ffmpeg_encoders::CodecChoice::legacy_h264(),
+            "ffmpeg version OLD-BUILD-before-install",
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(clips.join("export-log.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            line["ffmpeg_version"], "ffmpeg version OLD-BUILD-before-install",
+            "{line}"
+        );
+        let _ = std::fs::remove_dir_all(&case);
     }
 
     /// LGPL-like fake ffmpeg -> h264_mf + aac; full -> libx264 unchanged;
