@@ -100,7 +100,7 @@ libpsl / nghttp2 / nghttp3 / ngtcp2 / zstd), whisper, pulseaudio, X11.
 | xz | https://github.com/tukaani-project/xz.git | `3b1efb04d17c3a9ef7f473d73af13f1531428ffe` | 0BSD (liblzma); COPYING lists GPL/LGPL files that are tools/build-system only |
 | zimg | https://github.com/sekrit-twc/zimg.git | `67e0603271c080e22c8429856dd4a8a56587e61e` | WTFPL-2.0 |
 | zlib | https://github.com/madler/zlib.git | `767c4c947852e143f582c85f14cf573411df1b35` | Zlib |
-| zvbi | https://github.com/zapping-vbi/zvbi | `d3a5ee9f2b047bf16cd1ee5ccf6ec05ee75409d0` | GPL-2.0-or-later (default for files not otherwise specified) / LGPL-2.0-or-later for src/* (library) / MIT, BSD-2-Clause for some files |
+| zvbi | https://github.com/zapping-vbi/zvbi | `d3a5ee9f2b047bf16cd1ee5ccf6ec05ee75409d0` | GPL-2.0-or-later (default for files not otherwise specified) / src/* is LGPL-2.0+, except packet-830.* and pdc.* which are GPL-2.0-only (headers checked) / MIT, BSD-2-Clause for some files |
 | gcc | https://github.com/gcc-mirror/gcc | `releases/gcc-16.2.0` | GPL-3.0-or-later WITH GCC-exception-3.1 |
 
 Toolchain runtime parts linked into the executables: mingw-w64 CRT and
