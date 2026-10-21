@@ -7,7 +7,8 @@
 //   POST /api/tools/install-cancel {id?}  {ok:true, install: J} | {ok:false, code:"no_install"|"not_cancellable"|"stale_job"}
 //   POST /api/cancel (opts.routeCancel; apiCancelReply)  {ok:true, cancelled:"tool-install", install: J} | {ok:false, code:"not_cancellable"}
 // T carries notice / notice_en (option C distribution notice; null for
-// tools that cannot be installed), shadowed_by {<binary>: path|null} and,
+// tools that cannot be installed), shadowed_by {<binary>: path|null},
+// rollback_incomplete / rollback_note / rollback_backups (Fix round 13 L2) and,
 // for ffmpeg once installed, encoders {…, trial_failed: []}; J carries
 // staging_left and age_s (seconds since it finished, by the server's clock).
 // Nothing is downloaded: the install walks downloading → verifying →
@@ -24,7 +25,7 @@ export const TOOLS_FIXTURE = () => ([
     notice: '이 파일은 BtbN FFmpeg-Builds(github.com)에서 사용자가 직접 내려받습니다. FrameTrace는 이 바이너리를 배포하지 않으며 소스 제공·특허 사용권도 제공하지 않습니다. 빌드 이름은 lgpl이지만 GPL-2.0-only(zvbi)·LGPL-3.0·Apache-2.0 코드가 섞여 있어, FrameTrace는 이 파일을 다른 사람에게 넘겨도 되는지 보증하지 않습니다. 다른 PC에는 복사하지 말고 각자 BtbN에서 받으십시오. 이 라이선스들은 내 PC에서의 사용을 제한하지 않습니다(특허는 별개).',
     notice_en: 'You download this file yourself from BtbN FFmpeg-Builds (github.com). FrameTrace does not distribute it, offers no source for it and grants no patent licence. Although the build is named lgpl, it mixes GPL-2.0-only (zvbi), LGPL-3.0 and Apache-2.0 code, so FrameTrace makes no assurance that the file may be passed on to others. Do not copy it to other PCs; let each user download it from BtbN. These licenses do not restrict use on your own PC (patents are a separate matter).',
     source_url: 'https://github.com/FFmpeg/FFmpeg/tree/29e619e767', provides: ['ffmpeg', 'ffprobe'], status: 'missing', installed: false,
-    paths: { ffmpeg: null, ffprobe: null }, shadowed_by: { ffmpeg: null, ffprobe: null }, installable: true, unavailable_reason: null, not_installable_reason: null,
+    paths: { ffmpeg: null, ffprobe: null }, shadowed_by: { ffmpeg: null, ffprobe: null }, rollback_incomplete: false, rollback_note: null, rollback_backups: [], installable: true, unavailable_reason: null, not_installable_reason: null,
     manual_hint: 'https://github.com/BtbN/FFmpeg-Builds/releases 또는 https://ffmpeg.org/download.html 에서 Windows 빌드를 받아 ffmpeg.exe·ffprobe.exe를 tools/bin에 복사하십시오.',
     source_host: 'github.com', size_bytes: 4194304, encoders: null,
     download: { file_name: FF_ZIP, url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/' + FF_ZIP, host: 'github.com', size: 4194304, sha256: '4a7642b2264c03e8a0ce8a3825b933ee5580656f45695a086fe7e294045ffc0a', checksum_source: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/checksums.sha256' },
@@ -33,7 +34,7 @@ export const TOOLS_FIXTURE = () => ([
     name: 'libewf', title: 'libewf (E01)', label: 'libewf (E01)', kind: 'archive', required: false, on_demand: false,
     version: '20260924', pinned_version: '20260924', license: 'LGPL-3.0-or-later', notice: null, notice_en: null, homepage: 'https://github.com/libyal/libewf',
     source_url: 'https://github.com/libyal/libewf/releases/tag/20260924', provides: ['ewfinfo', 'ewfverify', 'ewfexport'], status: 'missing', installed: false,
-    paths: { ewfinfo: null, ewfverify: null, ewfexport: null }, shadowed_by: { ewfinfo: null, ewfverify: null, ewfexport: null }, installable: false,
+    paths: { ewfinfo: null, ewfverify: null, ewfexport: null }, shadowed_by: { ewfinfo: null, ewfverify: null, ewfexport: null }, rollback_incomplete: false, rollback_note: null, rollback_backups: [], installable: false,
     unavailable_reason: 'The official release (https://github.com/libyal/libewf/releases/tag/20260924) publishes only a source tarball and its PGP signature, no Windows binaries.',
     not_installable_reason: 'The official release (https://github.com/libyal/libewf/releases/tag/20260924) publishes only a source tarball and its PGP signature, no Windows binaries.',
     manual_hint: 'libewf는 공식 Windows 실행 파일이 없습니다 — scripts/build-libewf-tools.ps1로 소스에서 빌드하거나 직접 설치한 뒤 ewfinfo·ewfverify·ewfexport(와 DLL)를 tools/bin에 복사하십시오: https://github.com/libyal/libewf',
@@ -43,7 +44,7 @@ export const TOOLS_FIXTURE = () => ([
     name: 'sleuthkit', title: 'The Sleuth Kit (삭제 파일 복구)', label: 'The Sleuth Kit (삭제 파일 복구)', kind: 'archive', required: false, on_demand: false,
     version: '4.15.0', pinned_version: '4.15.0', license: 'IPL-1.0 / CPL-1.0', notice: null, notice_en: null, homepage: 'https://www.sleuthkit.org/sleuthkit/',
     source_url: 'https://github.com/sleuthkit/sleuthkit/releases/tag/sleuthkit-4.15.0', provides: ['mmls', 'fls', 'icat'], status: 'missing', installed: false,
-    paths: { mmls: null, fls: null, icat: null }, shadowed_by: { mmls: null, fls: null, icat: null }, installable: false,
+    paths: { mmls: null, fls: null, icat: null }, shadowed_by: { mmls: null, fls: null, icat: null }, rollback_incomplete: false, rollback_note: null, rollback_backups: [], installable: false,
     unavailable_reason: 'The maintainers publish a PGP signature (.asc), not a checksum file, and the archive\'s file list could not be verified without downloading it.',
     not_installable_reason: 'The maintainers publish a PGP signature (.asc), not a checksum file, and the archive\'s file list could not be verified without downloading it.',
     manual_hint: 'sleuthkit-4.15.0-win32.zip을 공식 배포처에서 받아 PGP 서명(.asc)을 확인한 뒤 mmls·fls·icat과 함께 들어 있는 DLL을 tools/bin에 복사하십시오: https://www.sleuthkit.org/sleuthkit/download.php',
@@ -52,7 +53,7 @@ export const TOOLS_FIXTURE = () => ([
   {
     name: 'deepfake-lens', title: 'deepfake-lens (합성 영상 스크리닝)', label: 'deepfake-lens (합성 영상 스크리닝)', kind: 'pip', required: false, on_demand: true,
     version: null, pinned_version: null, license: null, notice: null, notice_en: null, homepage: null, source_url: null, provides: ['deepfake-lens'], status: 'missing', installed: false,
-    paths: { 'deepfake-lens': null }, shadowed_by: { 'deepfake-lens': null }, installable: false,
+    paths: { 'deepfake-lens': null }, shadowed_by: { 'deepfake-lens': null }, rollback_incomplete: false, rollback_note: null, rollback_backups: [], installable: false,
     unavailable_reason: 'deepfake-lens is not published on PyPI, so no hash-pinned requirements file can be built.',
     not_installable_reason: 'deepfake-lens is not published on PyPI, so no hash-pinned requirements file can be built.',
     manual_hint: 'deepfake-lens는 PyPI에 공개되지 않아 자동 설치할 수 없습니다 — 받은 패키지를 직접 설치(pip install <경로>)하고 FRAMETRACE_DEEPFAKE_LENS에 deepfake-lens.exe 경로를 지정하십시오.',

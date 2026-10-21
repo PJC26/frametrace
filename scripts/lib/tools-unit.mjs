@@ -697,7 +697,7 @@ export async function toolsTrackU() {
     const quitSrc = read('assets/app/95-quit.js');
     const m = { install: { ...J('downloading', 'ffmpeg', { stage, bytes: 1, total: 4 }) }, cancelRequested: false };
     if (stage === 'install') m.install.state = 'extracting';
-    const notes = []; const posts = []; let polls = 0; let okResult = null; let dialog = null;
+    const notes = []; const posts = []; const toasts = []; let polls = 0; let okResult = null; let dialog = null;
     const els = {};
     const elOf = (id) => (els[id] ||= {
       id, hidden: false, inert: false, innerHTML: '', disabled: false, listeners: [],
@@ -716,7 +716,9 @@ export async function toolsTrackU() {
         if (running()) {
           polls += 1;
           if (opts.closeAfterPolls && polls > opts.closeAfterPolls) ctx.dlgResolve = null;
-          if (m.cancelRequested) Object.assign(m.install, { state: 'failed', stage: 'failed', error: INSTALL_CANCELLED_U, cancelled: true });
+          // Fix round 13 L4: opts.cancelAfterPolls — the cancelled install
+          // takes that many polls to wind down.
+          if (m.cancelRequested && polls > (opts.cancelAfterPolls || 0)) Object.assign(m.install, { state: 'failed', stage: 'failed', error: INSTALL_CANCELLED_U, cancelled: true });
           else if (finishAfterPolls && polls > finishAfterPolls) Object.assign(m.install, { state: 'done', stage: 'done' });
         }
         return { ok: true, busy: running(), phase: 'task' };
@@ -724,10 +726,11 @@ export async function toolsTrackU() {
       jpost: async (url) => { posts.push(url); if (url === '/api/cancel') return apiCancelReply(m) || { ok: false, error: '진행 중인 작업이 없습니다.' }; return { ok: true }; },
       askDialog: async (o) => { dialog = o; ctx.dlgResolve = () => {}; okResult = await o.onOk(); return false; },
       alertDialog: async () => {},
+      toast: (msg, kind) => { toasts.push([msg, kind]); },
     };
     runInNewContext(quitSrc, ctx);
     await elOf('hBtnQuit').listeners[0]();
-    return { okResult, notes, posts, m, dialog, polls };
+    return { okResult, notes, posts, m, dialog, polls, toasts };
   };
 
   await row('Fix round 11 M1: [종료] during a download stops the install through /api/cancel (cancelled "tool-install") and then shuts the server down', async () => {
@@ -767,6 +770,40 @@ export async function toolsTrackU() {
     assert.equal(r.okResult, false, 'onOk gave up: ' + JSON.stringify(r.notes.slice(-3)));
     assert.deepEqual(r.posts, ['/api/cancel'], 'no /api/shutdown: ' + JSON.stringify(r.posts));
     assert.ok(r.polls <= 7, 'stopped polling soon after the close: ' + r.polls);
+    // Fix round 13 L4: not_cancellable — the install really goes on.
+    assert.deepEqual(r.toasts, [['도구 설치는 중단되지 않았고 계속 진행됩니다 (파일을 옮기는 중) — 서버는 종료하지 않았습니다.', 'warn']], JSON.stringify(r.toasts));
+  });
+
+  await row('Fix round 13 L4: [계속 작업] after the install was already cancelled (download stage) says "설치는 이미 중단됐습니다" — the server stays up', async () => {
+    const r = await quitRun('download', 0, { closeAfterPolls: 3, cancelAfterPolls: 10 });
+    assert.equal(r.okResult, false, 'onOk gave up: ' + JSON.stringify(r.notes.slice(-3)));
+    assert.deepEqual(r.posts, ['/api/cancel'], 'no /api/shutdown: ' + JSON.stringify(r.posts));
+    assert.deepEqual(r.toasts, [['설치는 이미 중단됐습니다 — 필요하면 다시 설치하십시오.', 'warn']], JSON.stringify(r.toasts));
+    // Not closed: no note at all, the server is shut down as before.
+    const shut = await quitRun('download', 0, { cancelAfterPolls: 2 });
+    assert.deepEqual(shut.posts, ['/api/cancel', '/api/shutdown'], JSON.stringify(shut.posts));
+    assert.deepEqual(shut.toasts, [], JSON.stringify(shut.toasts));
+  });
+
+  await row('Fix round 13 L2: a tool with rollback_incomplete shows a warning line (note in the title / sr-only), installed or not; en follows the viewer language', async () => {
+    const note = '이전 설치 되돌리기가 끝나지 않아 이전 파일이 C:/FT/tools/rollback-backup-00aa (3.0 MB)에 남아 있습니다';
+    const v = make({ replies: [reply([{ ...FF, installed: true, status: 'installed', rollback_incomplete: true, rollback_note: note, rollback_backups: ['C:/FT/tools/rollback-backup-00aa'] }, { ...OPT }])] });
+    await v.run('htLoad()');
+    assert.equal(v.els.hToolsPanel.hidden, false, 'the panel shows the warning');
+    const list = v.els.hToolsList.innerHTML;
+    const ff = (list.match(/<li[^>]*data-tool="ffmpeg"[^]*?<\/li>/) || [''])[0];
+    assert.ok(/class="h-tool h-tool-warn"/.test(ff), 'warn level: ' + ff);
+    const small = (ff.match(/<small class="h-tool-rollback"[^]*?<\/small>/) || [''])[0];
+    assert.ok(small.includes('이전 설치를 되돌리지 못했습니다') && small.includes('rollback-backup-00aa') && /title="/.test(small), 'warning line: ' + ff);
+    assert.ok(!/<button/.test(ff), 'no button on an installed row');
+    const opt = (list.match(/<li[^>]*data-tool="x-opt"[^]*?<\/li>/) || [''])[0];
+    assert.ok(!/h-tool-rollback/.test(opt), 'no flag, no warning: ' + opt);
+    const missing = v.run('htRowHtml(htRowModel(' + JSON.stringify({ ...FF, rollback_incomplete: true, rollback_note: note }) + ', null, {}))');
+    assert.ok(/h-tool-rollback/.test(missing) && /data-tool-install="ffmpeg"/.test(missing), 'missing + rollback: ' + missing);
+    v.ctx.__locale = 'en';
+    v.run('htRenderPanel()');
+    assert.ok(v.els.hToolsList.innerHTML.includes('A previous install could not be undone'), 'en: ' + v.els.hToolsList.innerHTML);
+    for (const t of TOOLS_FIXTURE()) assert.equal(t.rollback_incomplete, false, t.name + ': fixture carries rollback_incomplete:false');
   });
 
   if (failed.length) throw new Error('Tools track U failed: ' + failed.join('; '));

@@ -51,6 +51,7 @@ const HT_STR = {
     lost: "설치 상태를 알 수 없습니다 — 다시 시도하십시오",
     shadow: "PATH의 다른 사본 무시됨",
     shadowTitle: "FrameTrace는 tools/bin의 것을 씁니다. PATH의 다른 사본(사용 안 함): {paths} — 직접 둔 것이 아니면 확인하십시오.",
+    rollback: "이전 설치를 되돌리지 못했습니다 — 도구 파일이 섞였을 수 있습니다",
     "code.not_installable": "여기서 자동 설치할 수 없습니다",
     "code.unsupported_platform": "이 운영체제에서는 자동 설치를 지원하지 않습니다",
     "code.python_required": "Python이 필요합니다",
@@ -110,6 +111,7 @@ const HT_STR = {
     lost: "Install state unknown — try again",
     shadow: "Other copy on PATH ignored",
     shadowTitle: "FrameTrace uses the one in tools/bin. Other copy on PATH (not used): {paths} — check it if you did not put it there.",
+    rollback: "A previous install could not be undone — the tool's files may be mixed",
     "code.not_installable": "Cannot be installed automatically here",
     "code.unsupported_platform": "Automatic install is not supported on this OS",
     "code.python_required": "Python is required",
@@ -303,7 +305,11 @@ function htRowModel(t, install, ctx, locale) {
   const res = c.result && c.result.name === t.name ? c.result : null;
   const shadows = htShadows(t);
   const shadow = shadows.length ? { text: htT("shadow", null, locale), title: htT("shadowTitle", { paths: shadows.join(", ") }, locale) } : null;
+  // Fix round 13 L2: an incomplete rollback left previous files behind
+  // (T.rollback_note says where and how to restore; Korean, from the server).
+  const rollback = t.rollback_incomplete === true ? { text: htT("rollback", null, locale), title: String(t.rollback_note || "") } : null;
   if (t.installed) {
+    if (rollback) return { name: t.name, label, level: "warn", text: label, why: "", action: "", progress: "", busy: false, shadow, rollback };
     if (res && res.ok) return { name: t.name, label, level: "ok", text: htT("done", { label }, locale), why: "", action: "", progress: "", busy: false, shadow };
     // Installed from tools/bin, but another copy sits on PATH: one short
     // line so the examiner can check it is not planted.
@@ -311,7 +317,7 @@ function htRowModel(t, install, ctx, locale) {
     return null;
   }
   const level = t.required ? "warn" : "info";
-  const model = { name: t.name, label, level, text: htT(t.required ? "req" : "opt", { label }, locale), why: htWhy(t, locale), action: "", progress: "", busy: false, stop: false, stopBusy: false, note: "", hint: "", reason: "", homepage: "", shadow };
+  const model = { name: t.name, label, level, text: htT(t.required ? "req" : "opt", { label }, locale), why: htWhy(t, locale), action: "", progress: "", busy: false, stop: false, stopBusy: false, note: "", hint: "", reason: "", homepage: "", shadow, rollback };
   if (t.installable === true) {
     model.action = "install";
     model.busy = running || sending || !!c.busy || htActive(install);
@@ -349,6 +355,7 @@ function htRowHtml(m, locale) {
     (m.note ? `<small>${esc(m.note)}</small>` : "") + htHintSmall(m, loc) +
     // The paths are in the text too (sr-only), not only in a hover title.
     (m.shadow ? `<small class="h-tool-shadow" title="${esc(m.shadow.title)}">${esc(m.shadow.text)}<span class="sr-only"> — ${esc(m.shadow.title)}</span></small>` : "") +
+    (m.rollback ? `<small class="h-tool-rollback"${m.rollback.title ? ` title="${esc(m.rollback.title)}"` : ""}>${esc(m.rollback.text)}${m.rollback.title ? `<span class="sr-only"> — ${esc(m.rollback.title)}</span>` : ""}</small>` : "") +
     `</span>${btn}</li>`;
 }
 // Pure: the confirm dialog body — file (download.file_name), source host,

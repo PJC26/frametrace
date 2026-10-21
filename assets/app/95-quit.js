@@ -105,6 +105,19 @@ window.hBeforeClose = hBeforeClose;
 // enough for a venv / pip step that cannot be stopped.
 const H_QUIT_WAIT_S = 60;
 const H_QUIT_INSTALL_WAIT_S = 600;
+// Fix round 13 L4: the dialog was closed with [계속 작업] while waiting
+// for an install that /api/cancel already answered — say what became of
+// the install (the server stays up either way).
+function hQuitInstallLeftNote(cr) {
+  const r = cr || {};
+  if (r.ok && r.cancelled === "tool-install") return "설치는 이미 중단됐습니다 — 필요하면 다시 설치하십시오.";
+  if (!r.ok && r.code === "not_cancellable" && r.job_kind === "tool-install") return "도구 설치는 중단되지 않았고 계속 진행됩니다 (파일을 옮기는 중) — 서버는 종료하지 않았습니다.";
+  return "";
+}
+function hQuitInstallLeft(cr) {
+  const note = hQuitInstallLeftNote(cr);
+  if (note && typeof toast === "function") toast(note, "warn");
+}
 async function hQuitToolInstall() {
   try {
     const r = await jget("/api/tools/install-status");
@@ -176,7 +189,7 @@ $("hBtnQuit").addEventListener("click", async () => {
           if (still) $("dlgNote").textContent = waitLabel;
           for (let i = 0; i < maxS * 2 && still; i++) {
             await new Promise(r => setTimeout(r, 500));
-            if (!stillOpen()) return false;
+            if (!stillOpen()) { hQuitInstallLeft(cr); return false; }
             let s2 = null;
             try { s2 = await jget("/api/status"); } catch (e) { s2 = null; }
             still = !!(s2 && s2.busy);
@@ -188,7 +201,7 @@ $("hBtnQuit").addEventListener("click", async () => {
               : "작업이 아직 멈추지 않았습니다 — 잠시 후 다시 시도하십시오.";
             return false;
           }
-          if (!stillOpen()) return false;
+          if (!stillOpen()) { hQuitInstallLeft(cr); return false; }
         }
         $("dlgNote").textContent = "서버 종료 요청 중…";
         const res = await jpost("/api/shutdown", {});
