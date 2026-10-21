@@ -48,7 +48,10 @@ pub(crate) fn install_archive(
     let tar = system32_tool("tar.exe")?;
     // Staging lives under tools/ so the final renames stay on one volume.
     let staging = StagingDir::create(&dirs.tools_dir, ".staging-")?;
-    let archive = staging.path().join("download.part");
+    // Fix round 11 L2: the paths curl/tar see must survive the ANSI code
+    // page (8.3 short form if needed), or the install is refused here.
+    let work = ansi_safe_dir(staging.path())?;
+    let archive = work.join("download.part");
 
     progress.set_stage(Stage::Download);
     progress.set_bytes(0, size);
@@ -69,7 +72,7 @@ pub(crate) fn install_archive(
     let names = tar_lines(&tar, &["-tf"], &archive)?;
     let verbose = tar_lines(&tar, &["-tvf"], &archive)?;
     check_listing(&names, &verbose, &members)?;
-    let out = staging.path().join("x");
+    let out = work.join("x");
     std::fs::create_dir(&out).map_err(|err| format!("cannot create {}: {err}", out.display()))?;
     extract_members(&tar, &archive, &out, &members)?;
     check_extracted_tree(&out, &members)?;
@@ -361,4 +364,159 @@ pub(crate) fn check_extracted_tree(out: &Path, members: &[&str]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Fix round 11 L2: `curl.exe` and `tar.exe` (bsdtar) read their argv in
+/// the system ANSI code page, so a path character outside it (an emoji, or
+/// Hangul on an en-US PC) reaches them as `?` and the install failed with
+/// an opaque "archive listing failed".
+pub(crate) const ANSI_PATH_REFUSED: &str = "FrameTrace 폴더 경로에 이 PC의 코드 페이지로 쓸 수 없는 문자가 있어 설치할 수 없습니다 — 영문 경로의 폴더로 옮긴 뒤 다시 시도하십시오";
+
+const CP_ACP: u32 = 0;
+const CP_UTF8: u32 = 65001;
+const WC_NO_BEST_FIT_CHARS: u32 = 0x400;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetACP() -> u32;
+    fn WideCharToMultiByte(
+        code_page: u32,
+        flags: u32,
+        wide: *const u16,
+        wide_len: i32,
+        multi: *mut u8,
+        multi_len: i32,
+        default_char: *const u8,
+        used_default: *mut i32,
+    ) -> i32;
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        multi: *const u8,
+        multi_len: i32,
+        wide: *mut u16,
+        wide_len: i32,
+    ) -> i32;
+    fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+}
+
+/// Whether the process ANSI code page is UTF-8 (the "Beta: UTF-8" option):
+/// then every path round-trips.
+pub(crate) fn ansi_is_utf8() -> bool {
+    // SAFETY: GetACP only reads the process code page.
+    unsafe { GetACP() == CP_UTF8 }
+}
+
+/// Whether `path` survives a trip through the ANSI code page unchanged
+/// (no best-fit mapping, no default character).
+pub(crate) fn ansi_round_trips(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.iter().all(|&unit| unit < 0x80) {
+        return true;
+    }
+    let Ok(wide_len) = i32::try_from(wide.len()) else {
+        return false;
+    };
+    let utf8 = ansi_is_utf8();
+    // CP_UTF8 takes neither flags nor the used-default pointer.
+    let flags = if utf8 { 0 } else { WC_NO_BEST_FIT_CHARS };
+    let mut used_default = 0i32;
+    let used_ptr: *mut i32 = if utf8 {
+        std::ptr::null_mut()
+    } else {
+        &mut used_default
+    };
+    // SAFETY: `wide` is valid for `wide_len` units; a null output buffer
+    // with length 0 asks for the size only.
+    let needed = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            flags,
+            wide.as_ptr(),
+            wide_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            used_ptr,
+        )
+    };
+    if needed <= 0 || used_default != 0 {
+        return false;
+    }
+    let mut multi = vec![0u8; needed as usize];
+    // SAFETY: `multi` holds `needed` bytes, as the size query reported.
+    let written = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            flags,
+            wide.as_ptr(),
+            wide_len,
+            multi.as_mut_ptr(),
+            needed,
+            std::ptr::null(),
+            used_ptr,
+        )
+    };
+    if written != needed || used_default != 0 {
+        return false;
+    }
+    // SAFETY: `multi` is valid for `written` bytes; size query first.
+    let back_len =
+        unsafe { MultiByteToWideChar(CP_ACP, 0, multi.as_ptr(), written, std::ptr::null_mut(), 0) };
+    if back_len <= 0 {
+        return false;
+    }
+    let mut back = vec![0u16; back_len as usize];
+    // SAFETY: `back` holds `back_len` units, as the size query reported.
+    let got = unsafe {
+        MultiByteToWideChar(
+            CP_ACP,
+            0,
+            multi.as_ptr(),
+            written,
+            back.as_mut_ptr(),
+            back_len,
+        )
+    };
+    got == back_len && back == wide
+}
+
+/// The 8.3 short form of an existing `path` (`None` when the volume keeps
+/// no short names or the call fails).
+fn short_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let long: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `long` is NUL-terminated; a null buffer of length 0 asks for
+    // the size (including the NUL).
+    let needed = unsafe { GetShortPathNameW(long.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut short = vec![0u16; needed as usize];
+    // SAFETY: `short` holds `needed` units.
+    let written = unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), needed) };
+    if written == 0 || written >= needed {
+        return None;
+    }
+    short.truncate(written as usize);
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&short)))
+}
+
+/// A form of the existing directory `dir` that curl/tar receive intact:
+/// `dir` itself when it round-trips through the ANSI code page, else its
+/// 8.3 short path when that does, else the clear [`ANSI_PATH_REFUSED`]
+/// refusal (before anything is downloaded).
+pub(crate) fn ansi_safe_dir(dir: &Path) -> Result<PathBuf, String> {
+    if ansi_round_trips(dir) {
+        return Ok(dir.to_path_buf());
+    }
+    match short_path(dir) {
+        Some(short) if ansi_round_trips(&short) => Ok(short),
+        _ => Err(format!("{ANSI_PATH_REFUSED} ({})", dir.display())),
+    }
 }

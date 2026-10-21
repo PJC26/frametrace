@@ -1274,6 +1274,65 @@ mod windows_installs {
         }
     }
 
+    /// Fix round 11 L2: a FrameTrace folder whose path has a character
+    /// outside the ANSI code page (an emoji) either installs through the
+    /// 8.3 short path or is refused up front with the clear message —
+    /// never the opaque "archive listing failed", and never contacting the
+    /// source when refused.
+    #[test]
+    fn an_emoji_folder_installs_via_the_short_path_or_is_refused_clearly() {
+        let emoji = "ft-\u{1F600}-dir";
+        assert!(archive::ansi_round_trips(Path::new("C:/plain/ascii")));
+        assert_eq!(
+            archive::ansi_round_trips(Path::new(emoji)),
+            archive::ansi_is_utf8(),
+            "an emoji survives only a UTF-8 code page"
+        );
+        let bytes = fake::good_zip();
+        let source = fake::serve(HashMap::new());
+        source.route("/fake.zip", Reply::Body(bytes.clone()));
+        let tool = archive_entry(&source.url("/fake.zip"), &bytes);
+        let base = scratch("emoji").join(emoji);
+        let dirs = InstallDirs {
+            tools_dir: base.join("tools"),
+        };
+        let result = install_entry(
+            &tool,
+            &dirs,
+            &NetPolicy::test_loopback(&["127.0.0.1"]),
+            &Progress::default(),
+        );
+        match &result {
+            Ok(_) => {
+                assert_eq!(
+                    std::fs::read(dirs.bin().join("fake.exe")).unwrap(),
+                    b"MZ fake binary"
+                );
+            }
+            Err(err) => {
+                assert!(err.contains(archive::ANSI_PATH_REFUSED), "{err}");
+                assert!(!dirs.bin().join("fake.exe").exists());
+                assert_eq!(source.hits(), 0, "refused before any download");
+            }
+        }
+        if let Err(err) = &result {
+            assert!(!err.contains("archive listing failed"), "{err}");
+        }
+        let leftover = std::fs::read_dir(&dirs.tools_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(".staging-"));
+        assert!(!leftover, "staging left behind");
+        eprintln!(
+            "emoji folder install: {}",
+            match &result {
+                Ok(_) => "installed (short path)".to_string(),
+                Err(err) => err.clone(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
     #[test]
     fn hash_mismatch_is_refused_and_nothing_is_left() {
         let bytes = fake::good_zip();
