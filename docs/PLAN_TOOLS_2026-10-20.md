@@ -503,3 +503,29 @@ f207a02에 대한 Fable 확인 리뷰의 Medium 하나(M)·Low 넷(L1–L4)·짐
 - `95-quit.js`의 새 toast는 한국어 전용(종전처럼 en 표 없음).
 - Linux/macOS에서 `build-release.sh`(node 분기 포함)·새 Rust 코드는 돌리지 못했다.
 - 이전 라운드의 H1(4K/VFR h264_mf 실기)·H3(OneDrive)·소유자의 `notice_confirmed` 확인 그대로.
+
+## §Fix round 14 (2026-10-21, Fable 확인 리뷰 반영, 기준 90873bc)
+
+90873bc에 대한 Fable 확인 리뷰의 Low 다섯(L1–L5)과 짐작 하나(H)를 처리했다.
+
+| # | 문제 | 수정 | 확인 |
+|---|---|---|---|
+| L1 | `status(tool)`이 도구마다 `rollback_backups_for_current_exe()`를 불러 보존 백업 전부를 재귀로 크기 쟀다(보존 venv는 파일 수천 개·수백 MB) → `/api/tools` 한 번에 4번. `tools install`의 프롬프트는 받은 `dirs`가 아니라 실행 파일 옆 `tools`를 봤다. | `status(tool, backups: &[RollbackBackup])` — 호출자가 한 번 구한 목록에서 그 도구 것만 고른다. `/api/tools`·`tools list`는 요청마다 `rollback_backups_for_current_exe()` 한 번, `tools install`은 설치할 `dirs.tools_dir`의 `rollback_backups()`. 프롬프트(`install_prompt_lines`)는 그 도구의 보존 백업을 `  경고: …` 줄로 보인다(설치 뒤에도 폴더는 남으므로). | `cli::handlers::tools::tests::status_and_the_prompt_use_the_given_tools_dir_backups`(고정 tools 폴더에 ffmpeg·libewf 백업 → ffmpeg status에 1개, 프롬프트에 경고 1줄·경로; 빈 목록 → 경고 없음). 기존 `status_walks_path_once…`는 `&[]`. |
+| L2 | `95-quit.js` 기다림 루프 **뒤**의 닫힘 확인은 작업이 이미 끝난 뒤에만 닿는데, not_cancellable 설치에도 "계속 진행됩니다"라고 했다. | `hQuitInstallLeftNote(cr, ended)`: 루프 뒤(ended)에 not_cancellable 설치면 "도구 설치가 끝났습니다 — 도구 패널에서 결과를 확인하십시오.", 루프 안이면 종전 문구; "설치는 이미 중단됐습니다"는 `cr.ok && cancelled === "tool-install"`일 때만. 짐작(중복 toast): 도구 패널이 같은 설치를 따라가는 중(`HT.busy === cr.install.tool`)이면 종료 대화 상자의 toast는 내지 않는다 — 패널의 `htFinish`가 끝을 알린다. | tools-unit 새 행: install 단계·끝나는 폴링에 닫힘 → `/api/cancel`만·toast "도구 설치가 끝났습니다…"; 아직 도는 pip → "계속 진행됩니다"; 취소 수락 → "이미 중단됐습니다"; `HT.busy:'ffmpeg'` → 세 경우 모두 toast 없음, `HT.busy:'x-opt'` → 1개. |
+| L3 | `docs/ui-rebuild-contract.md` §28 T 필드 목록에 라운드 13 필드가 없었다. | T에 `rollback_incomplete`·`rollback_note`·`rollback_backups[]`, "Fix round 13"·"Fix round 14" 줄. | 문서. |
+| L4 | `RESTORE.txt` 쓰기는 best effort인데 오류 문구는 그 파일이 있다고 했다. archive 쪽 쓰기가 실패하면 `name_tool_in_restore_file`이 아무것도 안 해 백업에 도구 이름이 없고 `status()`가 붙이지 못했다(UI·CLI 경고 없음). | `name_tool_in_restore_file`은 파일이 없으면 만든다(`tool:` 줄 + 복원 안내 + "파일 목록은 설치 오류(install-audit.jsonl에도 있음)에 있다"는 줄) → `Result`. 그래도 못 쓰면 `preserve_rollback_backup`은 "… — this message lists each one (RESTORE.txt could not be written: <원인>)"(파일을 가리키지 않음). `undo_venv`도 쓰기 실패면 "move it back to <target> (RESTORE.txt could not be written: …)"(venv 백업은 하위 폴더 이름으로 도구가 붙는다). 청소·목록은 `backup/RESTORE.txt`라는 **항목이 있으면**(파일이 아니어도) 남겨 둔 staging으로 본다. | `a_missing_or_unwritable_restore_file_is_created_or_reported`: 없음 → 만들어지고 `tool: fake`·안내·끝 줄, 목록에 도구 fake, 오류가 그 경로를 가리킴; `RESTORE.txt` 디렉터리 → 오류에 "(RESTORE.txt could not be written: ", 파일을 가리키지 않음, 목록엔 도구 미상으로 나옴; 그런 staging은 청소되지 않음; `undo_venv`(target이 파일이라 지울 수 없음 + 테스트 훅 `FAIL_RESTORE_WRITE`) → 같은 문구·"move it back to"·"says how" 없음·백업은 `lens`로 목록. |
+| L5 | 청소의 `venv_intact(&python.join(base), base)`는 **도구 이름**을 콘솔 스크립트로 봤지만 설치는 `provides[0]`을 확인한다 → 이름 ≠ `provides[0]`인 pip 도구는 `.old-*`가 영원히 남는다. | `clean_stale_staging(tools_dir, started, tools: &[&ToolEntry])`: `venv_script_name(base, tools)` = 그 이름의 **pip** 도구의 `provides[0]`, 목록에 없으면 base(종전). 설치(`run_platform_install`)는 설치 중인 도구를 먼저, 그다음 매니페스트 도구; 서버 시작(`clean_stale_staging_at_start` → `clean_stale_staging_if_unlocked(…, tools)`)은 매니페스트 도구. | `the_sweep_checks_the_provided_console_script`: 이름 `lens-kit`·`provides ["lens-cli"]` 고정 도구 — 목록 없이(종전) 0개, 같은 이름의 archive 도구로도 0개, 도구를 주면 1개 삭제; live venv에 `lens-kit` 스크립트만 있으면 남김. 기존 청소 테스트는 `&[]`. |
+| H | `.gitattributes`에 `scripts/**` 규칙이 없어 autocrlf=true 체크아웃에서 `*.sh`·`*.mjs`가 CRLF. | `*.sh text eol=lf`, `scripts/**/*.mjs text eol=lf`(`assets/**`와 같은 방식). 인덱스는 48개 모두 이미 LF — `git add --renormalize .`의 변경은 `.gitattributes`뿐. | `git ls-files --eol`: 48개 `i/lf w/lf`(다시 체크아웃 뒤). |
+
+### 커밋 (detached HEAD, 기준 90873bc)
+- b9bb6d3 L1 · b4c8841 L4·L5 · b5b5474 L2 · dba1314 L3 · 78f0546 H · 이 문서.
+
+### 게이트 (이 PC, Windows 11, 기준 90873bc + 이 라운드 커밋, CARGO_TARGET_DIR=target-fix14)
+- `cargo fmt --check` ok · `cargo clippy --locked --all-targets -- -D warnings` ok · `cargo test --locked` **1266 passed / 0 failed / 30 ignored**(lib 1243 + 통합 14·5·4).
+- `node scripts/check-ps-bom.mjs` ok · `check-js` ok(54) · `check-css` ok · `verify-review-batch --unit` **154 PASS**(rc 0, 혼자 실행; 종전 153) · `node scripts/test-make-portable.mjs` all checks passed(123 ok) · `bash scripts/test-build-release.sh` **272 ok, 0 failed, 1 skipped**(bsdtar 없음).
+- `FRAMETRACE_R11_STRICT=1 node scripts/verify-i18n.mjs` 770 ko / 770 en · `FRAMETRACE_R11_STRICT=1 node scripts/verify-layout.mjs` **171/171 passed**(혼자 실행, debug `frametrace-app`는 `CARGO_TARGET_DIR`, playwright는 frametrace/node_modules로의 junction — 커밋하지 않음, `playwright install` 안 함).
+
+### 확인 못 한 것 / 남은 것
+- RESTORE.txt 자체를 만들 수 없는데(디스크 가득 등) staging 백업을 밖으로 옮기지도 못한 경우: `backup/RESTORE.txt` 항목이 없으니 다음 청소가 그 staging을 지울 수 있다(오류 문구에는 남음). 디렉터리 이름 충돌 같은 경우는 이제 남긴다.
+- 중복 toast 억제는 `HT.busy`만 본다: 패널이 이미 끝을 알리고 `HT.busy`를 비운 뒤에 종료 대화 상자가 닫힘을 알아채면 두 toast가 다 날 수 있다(드묾).
+- 새 toast는 한국어 전용(종전처럼). Linux/macOS에서 새 Rust 코드는 돌리지 못했다. 이전 라운드의 남은 항목 그대로.
