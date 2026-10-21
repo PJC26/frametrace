@@ -285,11 +285,14 @@ try {
     check('j does nothing behind the open shortcut sheet', (await page.evaluate(() => document.querySelector('.card.active')?.dataset.id)) === a0);
     const t0 = await toastCount();
     await page.keyboard.press('Escape');
-    check('1st Esc closes only the shortcut sheet', !(await modalOpen()) && (await theater()) && (await toastCount()) === t0, `toasts ${t0} -> ${await toastCount()}`);
+    // Name every part of the verdict: a Linux CI failure (041bf68, 7a0083c)
+    // printed only the toast count, which had not changed.
+    const m1 = await modalOpen(); const th1 = await theater(); const t1 = await toastCount();
+    check('1st Esc closes only the shortcut sheet', !m1 && th1 && t1 === t0, `sheet open ${m1} · theater ${th1} · toasts ${t0} -> ${t1}`);
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.press('Escape');
     const texts = () => page.evaluate(() => [...document.querySelectorAll('#toastHost .toast:not(.clip-progress)')].map((el) => el.textContent));
-    check('2nd Esc dismisses one toast (the newest), theater stays', (await toastCount()) === t0 - 1 && (await theater()) && !(await texts()).some((s) => s.includes('esc-layer-2')) && (await texts()).some((s) => s.includes('esc-layer-1')), `toasts ${t0} -> ${await toastCount()} ${JSON.stringify(await texts())}`);
+    check('2nd Esc dismisses one toast (the newest), theater stays', (await toastCount()) === t0 - 1 && (await theater()) && !(await texts()).some((s) => s.includes('esc-layer-2')) && (await texts()).some((s) => s.includes('esc-layer-1')), `sheet open ${await modalOpen()} · theater ${await theater()} · toasts ${t0} -> ${await toastCount()} ${JSON.stringify(await texts())}`);
     for (let i = 0; i < 10 && (await toastCount()) > 0; i++) await page.keyboard.press('Escape');
     check('theater survives until the toasts are gone', await theater());
     await page.keyboard.press('Escape');
