@@ -134,7 +134,17 @@ jobs:
           $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           $unconfirmed = (Get-Content -Raw -Encoding UTF8 THIRD_PARTY_NOTICES.md) -match '(?i)Owner\s+to\s+confirm'
           # §Fix round 11 M2: an installable tool whose notice is not confirmed.
-          $noticePending = @((Get-Content -Raw -Encoding UTF8 tools/manifest.json | ConvertFrom-Json).tools | Where-Object { $_.sha256 -and $_.notice_confirmed -ne $true })
+          # §Fix round 12 L4: the exact rule of scripts/make-portable.ps1 —
+          # installable = a sha256 property that is not null and not '';
+          # confirmed = notice_confirmed is the boolean true (the string
+          # "true" is not; `-ne $true` would have accepted it).
+          $noticePending = @()
+          foreach ($tool in @((Get-Content -Raw -Encoding UTF8 tools/manifest.json | ConvertFrom-Json).tools)) {
+            $pinned = $tool.PSObject.Properties['sha256']
+            if (-not $pinned -or $null -eq $pinned.Value -or "$($pinned.Value)" -eq '') { continue }
+            $confirmed = $tool.PSObject.Properties['notice_confirmed']
+            if (-not $confirmed -or $confirmed.Value -isnot [bool] -or -not $confirmed.Value) { $noticePending += "$($tool.name)" }
+          }
           if ($noticePending.Count -gt 0) { $unconfirmed = $true }
           $zips = @(Get-ChildItem -File dist -Filter "FrameTrace-$ver-win64*.zip")
           if ($zips.Count -ne 1) { throw "expected one FrameTrace-$ver-win64*.zip in dist/, found: $(@($zips | ForEach-Object Name) -join ', ')" }
