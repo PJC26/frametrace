@@ -110,9 +110,11 @@ publisher's SHA-256, compiled into the binary). The download goes **directly
 from the publisher to your machine** — for FFmpeg that is the BtbN
 FFmpeg-Builds GitHub release — and FrameTrace is not its distributor; the
 confirm step shows a notice saying so, together with the build's licence mix
-(the `win64-lgpl` variant still contains GPL-2.0-only components; see
-`THIRD_PARTY_NOTICES.md`). Downloads use Windows' own `curl.exe` (HTTPS only,
-every redirect checked against the manifest's host allowlist) and `tar.exe`; a
+(the `win64-lgpl` variant mixes GPL-2.0-only (zvbi), LGPL-3.0 and Apache-2.0
+code; see `THIRD_PARTY_NOTICES.md`). FrameTrace makes no assurance that the
+file may be passed on to others: do not copy `tools\bin\ffmpeg.exe` to other
+PCs — let each user install it from BtbN. Downloads use Windows' own
+`curl.exe` (HTTPS only, every redirect checked against the manifest's host allowlist) and `tar.exe`; a
 size or hash mismatch, or an archive entry that is absolute, climbs with `..`
 or is a link, refuses the install and leaves nothing behind. Proxies:
 `curl.exe` honours `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`; integrity never

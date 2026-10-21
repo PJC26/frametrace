@@ -30,7 +30,10 @@
 # -AllowUnconfirmedNotices is passed (CI test packages only). With the switch
 # the zip is named FrameTrace-<ver>-win64-UNCONFIRMED.zip, no SHA256SUMS is
 # written (SHA256SUMS.unconfirmed instead; a stale SHA256SUMS is removed) and
-# a warning says it is not a release.
+# a warning says it is not a release. The same applies (same switch) while
+# any installable tool in tools/manifest.json (sha256 pinned) lacks
+# "notice_confirmed": true — its distribution notice is compiled into
+# frametrace.exe and the owner has not confirmed it (§Fix round 11 M2).
 #
 # The zip is written with [IO.Compression.ZipFile]::CreateFromDirectory and
 # every entry name is checked to use forward slashes. SHA-256 is computed
@@ -143,12 +146,40 @@ Set-Location $repo
 # Release guard (docs/PLAN_TOOLS_2026-10-20.md §Fix round 5 M2, §Fix round 6
 # L-CI): any whitespace (a reflowed line break) between the words counts.
 $unconfirmed = $false
+$unconfirmedWhy = @()
 if ((Get-Content -Raw -Encoding UTF8 -LiteralPath THIRD_PARTY_NOTICES.md) -match '(?i)Owner\s+to\s+confirm') {
     if (-not $AllowUnconfirmedNotices) {
         throw "THIRD_PARTY_NOTICES.md still contains 'Owner to confirm' — the owner has not confirmed that paragraph; no release package until then (pass -AllowUnconfirmedNotices for a test package)"
     }
     $unconfirmed = $true
+    $unconfirmedWhy += "THIRD_PARTY_NOTICES.md still says 'Owner to confirm'."
     Write-Warning "THIRD_PARTY_NOTICES.md still contains 'Owner to confirm' — test package only (-AllowUnconfirmedNotices), not for release: the zip is named *-UNCONFIRMED.zip and no SHA256SUMS is written"
+}
+
+# Release guard (§Fix round 11 M2): the distribution notice of every
+# installable tool (sha256 pinned) in tools/manifest.json is compiled into
+# this package's frametrace.exe and shown before the download; it needs
+# "notice_confirmed": true from the owner. Same switch, same UNCONFIRMED
+# naming as the THIRD_PARTY_NOTICES.md guard.
+if (-not (Test-Path -LiteralPath tools/manifest.json)) {
+    throw "tools/manifest.json not found — cannot check the tools' distribution notices"
+}
+$toolManifest = Get-Content -Raw -Encoding UTF8 -LiteralPath tools/manifest.json | ConvertFrom-Json
+$noticePending = @()
+foreach ($tool in @($toolManifest.tools)) {
+    $pinned = $tool.PSObject.Properties['sha256']
+    if (-not $pinned -or $null -eq $pinned.Value -or "$($pinned.Value)" -eq '') { continue }
+    $confirmed = $tool.PSObject.Properties['notice_confirmed']
+    if (-not $confirmed -or $confirmed.Value -isnot [bool] -or -not $confirmed.Value) { $noticePending += "$($tool.name)" }
+}
+if ($noticePending.Count -gt 0) {
+    $names = $noticePending -join ', '
+    if (-not $AllowUnconfirmedNotices) {
+        throw "tools/manifest.json: the distribution notice of $names is not confirmed (notice_confirmed is not true) — the owner has not confirmed it; no release package until then (pass -AllowUnconfirmedNotices for a test package)"
+    }
+    $unconfirmed = $true
+    $unconfirmedWhy += "tools/manifest.json notice_confirmed is not true for: $names."
+    Write-Warning "tools/manifest.json: the distribution notice of $names is not confirmed — test package only (-AllowUnconfirmedNotices), not for release: the zip is named *-UNCONFIRMED.zip and no SHA256SUMS is written"
 }
 
 # A zip left in dist/ by an earlier packager (e.g. the old *-bundled.zip) must
@@ -288,7 +319,7 @@ Write-Host "sums: $(Join-Path $dist $sumsName)"
 if ($unconfirmed) {
     Write-Warning "=================================================================="
     Write-Warning " UNCONFIRMED TEST PACKAGE — NOT FOR RELEASE"
-    Write-Warning " THIRD_PARTY_NOTICES.md still says 'Owner to confirm'."
+    foreach ($why in $unconfirmedWhy) { Write-Warning " $why" }
     Write-Warning " $zipName / $sumsName (no SHA256SUMS written)"
     Write-Warning "=================================================================="
 }

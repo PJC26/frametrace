@@ -121,7 +121,9 @@ jobs:
       # "(Owner to confirm this paragraph.)" marker (owner item M2,
       # docs/PLAN_TOOLS_2026-10-20.md §Fix round 5). This CI zip is a test
       # artifact, not a release; a run without the switch fails until the
-      # owner confirms the paragraph and removes the marker. While the marker
+      # owner confirms the paragraph and removes the marker — and, since
+      # §Fix round 11 M2, sets "notice_confirmed": true on every installable
+      # tool in tools/manifest.json (same switch). While either
       # is there the zip is FrameTrace-<ver>-win64-UNCONFIRMED.zip with
       # SHA256SUMS.unconfirmed (no SHA256SUMS) and the artifact is
       # FrameTrace-win64-unconfirmed (§Fix round 6, L-CI).
@@ -131,6 +133,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "make-portable.ps1 failed ($LASTEXITCODE)" }
           $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           $unconfirmed = (Get-Content -Raw -Encoding UTF8 THIRD_PARTY_NOTICES.md) -match '(?i)Owner\s+to\s+confirm'
+          # §Fix round 11 M2: an installable tool whose notice is not confirmed.
+          $noticePending = @((Get-Content -Raw -Encoding UTF8 tools/manifest.json | ConvertFrom-Json).tools | Where-Object { $_.sha256 -and $_.notice_confirmed -ne $true })
+          if ($noticePending.Count -gt 0) { $unconfirmed = $true }
           $zips = @(Get-ChildItem -File dist -Filter "FrameTrace-$ver-win64*.zip")
           if ($zips.Count -ne 1) { throw "expected one FrameTrace-$ver-win64*.zip in dist/, found: $(@($zips | ForEach-Object Name) -join ', ')" }
           $zip = $zips[0].FullName

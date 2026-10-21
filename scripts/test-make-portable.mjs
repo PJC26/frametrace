@@ -13,6 +13,8 @@
 // that says "ffmpeg") still pass (L3b); an -AllowUnconfirmedNotices package is
 // named *-UNCONFIRMED.zip with SHA256SUMS.unconfirmed and no SHA256SUMS, and
 // the marker is found across a line break (L-CI).
+// Fix round 11 M2: tools/manifest.json's notice_confirmed guard (same switch,
+// same UNCONFIRMED naming).
 // Windows only (needs Windows PowerShell).
 //
 //   node scripts/test-make-portable.mjs
@@ -106,9 +108,22 @@ const ODD_NAMES = ['ffmpeg.exe.bak', 'FFProbe-Old.EXE', 'avcodec.dll', 'libavcod
 const TRAILING = 'ffmpeg.EXE ';
 const longPath = (p) => '\\\\?\\' + p.replace(/\//g, '\\');
 
-function fakeRepo({ toolsDir = 'tools/bin', notices = null } = {}) {
+// tools/manifest.json of a fake repo (Fix round 11 M2): one installable tool
+// (sha256 pinned) whose notice is confirmed unless `noticeConfirmed` says
+// otherwise (`'omit'` leaves the key out), and one manual tool (sha256
+// null) that never needs a confirmation.
+const fakeManifest = (noticeConfirmed = true) => JSON.stringify({
+  schema: 1,
+  tools: [
+    { name: 'ffmpeg', sha256: 'a'.repeat(64), notice: 'n', ...(noticeConfirmed === 'omit' ? {} : { notice_confirmed: noticeConfirmed }) },
+    { name: 'libewf', sha256: null, notice: null },
+  ],
+}, null, 2);
+
+function fakeRepo({ toolsDir = 'tools/bin', notices = null, manifest = fakeManifest() } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ft-portable-'));
-  for (const d of ['scripts', 'target/release', 'docs', `${toolsDir}/licenses`]) mkdirSync(join(root, d), { recursive: true });
+  for (const d of ['scripts', 'target/release', 'docs', 'tools', `${toolsDir}/licenses`]) mkdirSync(join(root, d), { recursive: true });
+  if (manifest !== null) writeFileSync(join(root, 'tools/manifest.json'), manifest);
   copyFileSync(join(repo, 'scripts/make-portable.ps1'), join(root, 'scripts/make-portable.ps1'));
   for (const f of ['frametrace.exe', 'frametrace-app.exe']) writeFileSync(join(root, 'target/release', f), 'MZ fake');
   for (const f of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) writeFileSync(join(root, f), `fake ${f}\n`);
@@ -286,6 +301,41 @@ try {
     const run = await runPortable(root, '0.0.0-test', marked ? ['-AllowUnconfirmedNotices'] : []);
     const zip = join(root, `dist/FrameTrace-0.0.0-test-win64${marked ? '-UNCONFIRMED' : ''}.zip`);
     check(run.code === 0 && existsSync(zip), `the real THIRD_PARTY_NOTICES.md passes the signature scan (${marked ? 'unconfirmed' : 'confirmed'})`, run.out);
+  }
+  // Fix round 11 M2: an installable tool whose distribution notice is not
+  // confirmed (false, missing, or a non-boolean "true") blocks a release
+  // package; a manual tool (sha256 null) never does.
+  for (const [label, confirmed] of [['false', false], ['missing', 'omit'], ['string "true"', 'true']]) {
+    const root = fakeRepo({ manifest: fakeManifest(confirmed) }); roots.push(root);
+    const blocked = await runPortable(root);
+    check(blocked.code !== 0 && /notice_confirmed/.test(blocked.out) && /ffmpeg/.test(blocked.out) && /AllowUnconfirmedNotices/.test(blocked.out),
+      `notice_confirmed ${label} blocks the package`, blocked.out);
+    check(!existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64.zip')), `no zip for notice_confirmed ${label}`);
+  }
+  {
+    const root = fakeRepo({ manifest: fakeManifest(false) }); roots.push(root);
+    mkdirSync(join(root, 'dist'), { recursive: true });
+    writeFileSync(join(root, 'dist/SHA256SUMS'), 'stale  FrameTrace-0.0.0-test-win64.zip\n');
+    const allowed = await runPortable(root, '0.0.0-test', ['-AllowUnconfirmedNotices']);
+    check(allowed.code === 0 && /notice of ffmpeg is not confirmed/.test(allowed.out) && /UNCONFIRMED TEST PACKAGE/.test(allowed.out) && /notice_confirmed is not true for: ffmpeg/.test(allowed.out),
+      'an unconfirmed tool notice with -AllowUnconfirmedNotices: a test package with the loud warning', allowed.out);
+    check(existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64-UNCONFIRMED.zip')) && !existsSync(join(root, 'dist/FrameTrace-0.0.0-test-win64.zip')),
+      'an unconfirmed tool notice: the zip is *-UNCONFIRMED.zip', allowed.out);
+    check(existsSync(join(root, 'dist/SHA256SUMS.unconfirmed')) && !existsSync(join(root, 'dist/SHA256SUMS')), 'an unconfirmed tool notice: SHA256SUMS.unconfirmed only');
+  }
+  {
+    const root = fakeRepo({ manifest: null }); roots.push(root);
+    const missing = await runPortable(root);
+    check(missing.code !== 0 && /tools\/manifest\.json not found/.test(missing.out), 'a missing tools/manifest.json fails the run', missing.out);
+  }
+  // The real tools/manifest.json: blocked while a notice is unconfirmed.
+  {
+    const real = readFileSync(join(repo, 'tools/manifest.json'), 'utf8');
+    const pending = JSON.parse(real).tools.filter((t) => t.sha256 && t.notice_confirmed !== true).map((t) => t.name);
+    const root = fakeRepo({ manifest: real }); roots.push(root);
+    const run = await runPortable(root);
+    check(pending.length ? run.code !== 0 && /notice_confirmed/.test(run.out) : run.code === 0,
+      `the real tools/manifest.json ${pending.length ? `blocks a release package (unconfirmed: ${pending.join(', ')})` : 'packages (every notice confirmed)'}`, run.out);
   }
   // A malformed -Version is refused before anything is staged.
   {

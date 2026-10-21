@@ -236,6 +236,34 @@ fn installable_tools_must_carry_a_distribution_notice() {
     validate_manifest(&manifest_with(manual)).unwrap();
 }
 
+/// Fix round 11 M2: the shipped ffmpeg notice states facts only — the
+/// licence mix (ko and en name the same three), no assurance that the
+/// file may be passed on, "do not copy" — and never a legal conclusion
+/// that it is redistributable under the GPL.
+#[test]
+fn the_ffmpeg_notice_states_facts_not_a_gpl_redistribution_conclusion() {
+    let ffmpeg = find_tool(manifest().unwrap(), "ffmpeg").unwrap();
+    let ko = ffmpeg.notice.as_deref().unwrap();
+    let en = ffmpeg.notice_en.as_deref().unwrap();
+    for licence in ["GPL-2.0-only", "LGPL-3.0", "Apache-2.0", "zvbi"] {
+        assert!(ko.contains(licence) && en.contains(licence), "{licence}");
+    }
+    assert!(
+        ko.contains("보증하지 않습니다") && ko.contains("복사하지 말고"),
+        "{ko}"
+    );
+    assert!(
+        en.contains("makes no assurance") && en.contains("Do not copy"),
+        "{en}"
+    );
+    for conclusion in ["GPL 조건을 따릅니다", "GPL 의무"] {
+        assert!(!ko.contains(conclusion), "{conclusion}: {ko}");
+    }
+    for conclusion in ["under GPL terms", "GPL obligations"] {
+        assert!(!en.contains(conclusion), "{conclusion}: {en}");
+    }
+}
+
 #[test]
 fn tool_json_carries_the_distribution_notice() {
     let status = ToolStatus {
