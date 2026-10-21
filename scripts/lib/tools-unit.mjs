@@ -728,6 +728,8 @@ export async function toolsTrackU() {
       alertDialog: async () => {},
       toast: (msg, kind) => { toasts.push([msg, kind]); },
     };
+    // Fix round 14 L2: opts.ht — the tools panel's state (56-tools.js HT).
+    if (opts.ht) ctx.HT = opts.ht;
     runInNewContext(quitSrc, ctx);
     await elOf('hBtnQuit').listeners[0]();
     return { okResult, notes, posts, m, dialog, polls, toasts };
@@ -783,6 +785,31 @@ export async function toolsTrackU() {
     const shut = await quitRun('download', 0, { cancelAfterPolls: 2 });
     assert.deepEqual(shut.posts, ['/api/cancel', '/api/shutdown'], JSON.stringify(shut.posts));
     assert.deepEqual(shut.toasts, [], JSON.stringify(shut.toasts));
+  });
+
+  await row('Fix round 14 L2: [계속 작업] noticed only after a not_cancellable install ended says it finished (see the tools panel), never "계속 진행됩니다"; no quit toast while the tools panel follows that install', async () => {
+    // Closed at the poll on which the install ends: the wait loop ends first.
+    const r = await quitRun('install', 3, { closeAfterPolls: 3 });
+    assert.equal(r.okResult, false, 'onOk gave up: ' + JSON.stringify(r.notes.slice(-3)));
+    assert.deepEqual(r.posts, ['/api/cancel'], 'no /api/shutdown: ' + JSON.stringify(r.posts));
+    assert.equal(r.m.install.state, 'done');
+    assert.deepEqual(r.toasts, [['도구 설치가 끝났습니다 — 도구 패널에서 결과를 확인하십시오.', 'warn']], JSON.stringify(r.toasts));
+    // Still running when closed: it does continue.
+    const cont = await quitRun('pip', 50, { closeAfterPolls: 5 });
+    assert.deepEqual(cont.toasts, [['도구 설치는 중단되지 않았고 계속 진행됩니다 (파일을 옮기는 중) — 서버는 종료하지 않았습니다.', 'warn']], JSON.stringify(cont.toasts));
+    // A cancelled install keeps "이미 중단됐습니다" either way.
+    const cancelled = await quitRun('download', 0, { closeAfterPolls: 3, cancelAfterPolls: 3 });
+    assert.deepEqual(cancelled.posts, ['/api/cancel'], JSON.stringify(cancelled.posts));
+    assert.deepEqual(cancelled.toasts, [['설치는 이미 중단됐습니다 — 필요하면 다시 설치하십시오.', 'warn']], JSON.stringify(cancelled.toasts));
+    // The tools panel follows the same install: it announces the end.
+    for (const [stage, finish, o] of [['install', 3, { closeAfterPolls: 3 }], ['pip', 50, { closeAfterPolls: 5 }], ['download', 0, { closeAfterPolls: 3, cancelAfterPolls: 10 }]]) {
+      const followed = await quitRun(stage, finish, { ...o, ht: { busy: 'ffmpeg' } });
+      assert.deepEqual(followed.posts, ['/api/cancel'], stage + ': ' + JSON.stringify(followed.posts));
+      assert.deepEqual(followed.toasts, [], stage + ': ' + JSON.stringify(followed.toasts));
+      // Following another tool's install: the quit toast stays.
+      const other = await quitRun(stage, finish, { ...o, ht: { busy: 'x-opt' } });
+      assert.equal(other.toasts.length, 1, stage + ': ' + JSON.stringify(other.toasts));
+    }
   });
 
   await row('Fix round 13 L2: a tool with rollback_incomplete shows a warning line (note in the title / sr-only), installed or not; en follows the viewer language', async () => {

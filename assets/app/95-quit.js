@@ -108,15 +108,26 @@ const H_QUIT_INSTALL_WAIT_S = 600;
 // Fix round 13 L4: the dialog was closed with [계속 작업] while waiting
 // for an install that /api/cancel already answered — say what became of
 // the install (the server stays up either way).
-function hQuitInstallLeftNote(cr) {
+// Fix round 14 L2: `ended` — the close was noticed only after the job had
+// ended, so a not_cancellable install no longer "continues": it finished.
+function hQuitInstallLeftNote(cr, ended) {
   const r = cr || {};
   if (r.ok && r.cancelled === "tool-install") return "설치는 이미 중단됐습니다 — 필요하면 다시 설치하십시오.";
-  if (!r.ok && r.code === "not_cancellable" && r.job_kind === "tool-install") return "도구 설치는 중단되지 않았고 계속 진행됩니다 (파일을 옮기는 중) — 서버는 종료하지 않았습니다.";
+  if (!r.ok && r.code === "not_cancellable" && r.job_kind === "tool-install") {
+    return ended ? "도구 설치가 끝났습니다 — 도구 패널에서 결과를 확인하십시오."
+      : "도구 설치는 중단되지 않았고 계속 진행됩니다 (파일을 옮기는 중) — 서버는 종료하지 않았습니다.";
+  }
   return "";
 }
-function hQuitInstallLeft(cr) {
-  const note = hQuitInstallLeftNote(cr);
-  if (note && typeof toast === "function") toast(note, "warn");
+// Fix round 14 L2: the tools panel following that same install
+// (56-tools.js `HT.busy`) announces its end itself — no second toast.
+function hQuitPanelFollows(cr) {
+  const tool = cr && cr.install && typeof cr.install.tool === "string" ? cr.install.tool : "";
+  return !!tool && typeof HT === "object" && HT !== null && HT.busy === tool;
+}
+function hQuitInstallLeft(cr, ended) {
+  const note = hQuitInstallLeftNote(cr, ended);
+  if (note && !hQuitPanelFollows(cr) && typeof toast === "function") toast(note, "warn");
 }
 async function hQuitToolInstall() {
   try {
@@ -201,7 +212,7 @@ $("hBtnQuit").addEventListener("click", async () => {
               : "작업이 아직 멈추지 않았습니다 — 잠시 후 다시 시도하십시오.";
             return false;
           }
-          if (!stillOpen()) { hQuitInstallLeft(cr); return false; }
+          if (!stillOpen()) { hQuitInstallLeft(cr, true); return false; }
         }
         $("dlgNote").textContent = "서버 종료 요청 중…";
         const res = await jpost("/api/shutdown", {});
