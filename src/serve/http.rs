@@ -923,6 +923,7 @@ pub(crate) fn path_fields_for(method: &str, path: &str) -> &'static [(bool, &'st
         ("GET", "/api/case-info") => &[(true, "case_dir")],
         ("POST", "/api/open-case") => &[(false, "case_dir")],
         ("POST", "/api/open-folder") => &[(false, "path")],
+        ("POST", "/api/mkdir") => &[(false, "parent")],
         ("POST", "/api/preflight" | "/api/start") => &[(false, "source_path"), (false, "case_dir")],
         ("POST", "/api/export-clip" | "/api/telemetry" | "/api/proxy") => &[(false, "path")],
         ("POST", "/api/advanced") => &[(false, "extra")],

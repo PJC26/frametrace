@@ -1,6 +1,6 @@
-async function loadEnv() {
+async function loadEnv(refresh) {
   try {
-    const env = await jget("/api/env");
+    const env = await jget(refresh ? "/api/env?refresh=1" : "/api/env");
     const t = env.tools || {};
     const wf = env.workflows || {};
     const hints = env.hints || {};

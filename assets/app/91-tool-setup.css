@@ -1,0 +1,9 @@
+/* ---- '도구' popover: one-click installer rows (91-tool-setup.js) ---- */
+.h-tool-setup { display: grid; gap: 4px; padding: 4px 4px 0; }
+.h-ts-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 32px; padding: 4px 6px 4px 10px; border-radius: var(--radius); background: var(--surface-2); font-size: var(--fs-xs); }
+.h-ts-name { display: grid; gap: 1px; color: var(--text); font-weight: 600; }
+.h-ts-name small { color: var(--muted); font-weight: 400; }
+.h-ts-btn { flex: none; }
+.h-ts-status { margin: 2px 6px; color: var(--muted); font-size: var(--fs-xs); line-height: 1.45; overflow-wrap: anywhere; }
+.h-ts-status.ok { color: var(--verified-fg); }
+.h-ts-status.bad { color: var(--failed-fg); }

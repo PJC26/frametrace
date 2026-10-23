@@ -268,37 +268,52 @@ fn resolve_bare_tool_path(name: &str, allowed_names: &[&str]) -> Option<String> 
 }
 
 /// Whether an optional forensic tool has been dropped into the portable
-/// `tools/bin` directory next to the executable.
+/// `tools/bin` directory (or an installer package dir) next to the executable.
 pub fn tools_bin_tool_exists(name: &str) -> bool {
-    let Some(dir) = tools_bin_dir() else {
-        return false;
-    };
-    [name.to_string(), format!("{name}.exe")]
-        .iter()
-        .any(|candidate| dir.join(candidate).is_file())
+    tools_search_dirs().iter().any(|dir| {
+        [name.to_string(), format!("{name}.exe")]
+            .iter()
+            .any(|candidate| dir.join(candidate).is_file())
+    })
 }
 
-fn tools_bin_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join("tools").join("bin"))
+/// `<exe dir>/tools/bin` (hand-copied portable layout) first, then the
+/// per-package dirs the in-app installer writes (`tools/ffmpeg`, ...). The
+/// package list is fixed by the catalog — never a directory glob — so only
+/// install-tree paths the workstation itself owns are trusted.
+fn tools_search_dirs() -> Vec<PathBuf> {
+    let Some(tools) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("tools")))
+    else {
+        return Vec::new();
+    };
+    std::iter::once(tools.join("bin"))
+        .chain(
+            crate::tool_install::ALL_PACKAGES
+                .iter()
+                .map(|package| tools.join(package.dir_name())),
+        )
+        .collect()
 }
 
 fn find_in_tools_bin(name: &str, allowed_names: &[&str]) -> Option<String> {
-    let dir = tools_bin_dir()?;
-    for candidate_name in [name.to_string(), format!("{name}.exe")] {
-        let candidate = dir.join(&candidate_name);
-        let Ok(metadata) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let Ok(canonical) = crate::util::canonicalize_display(&candidate) else {
-            continue;
-        };
-        let file_name = canonical.file_name().and_then(|n| n.to_str());
-        if file_name.map(|n| is_allowed_tool_name(n, allowed_names)) == Some(true) {
-            return Some(canonical.to_string_lossy().to_string());
+    for dir in tools_search_dirs() {
+        for candidate_name in [name.to_string(), format!("{name}.exe")] {
+            let candidate = dir.join(&candidate_name);
+            let Ok(metadata) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let Ok(canonical) = crate::util::canonicalize_display(&candidate) else {
+                continue;
+            };
+            let file_name = canonical.file_name().and_then(|n| n.to_str());
+            if file_name.map(|n| is_allowed_tool_name(n, allowed_names)) == Some(true) {
+                return Some(canonical.to_string_lossy().to_string());
+            }
         }
     }
     None
@@ -397,6 +412,23 @@ mod tests {
             "unexpected resolution: {resolved}"
         );
         let _ = std::fs::remove_file(&probe);
+    }
+
+    #[test]
+    fn resolves_tools_installed_into_package_dirs() {
+        // Given: a binary the in-app installer placed under tools/sleuthkit/
+        let exe = std::env::current_exe().unwrap();
+        let package_dir = exe.parent().unwrap().join("tools").join("sleuthkit");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        let probe = package_dir.join("frametrace-probe-mmls.exe");
+        std::fs::write(&probe, b"stub").unwrap();
+        // When: the bare name is resolved
+        let resolved =
+            super::resolve_bare_tool_path("frametrace-probe-mmls", &["frametrace-probe-mmls"]);
+        let _ = std::fs::remove_file(&probe);
+        // Then: the package-dir copy is found
+        let resolved = resolved.expect("tool in tools/<package> must resolve");
+        assert!(resolved.ends_with("frametrace-probe-mmls.exe"), "{resolved}");
     }
 
     #[test]

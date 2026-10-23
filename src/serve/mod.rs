@@ -27,6 +27,8 @@ mod recent;
 mod records;
 mod state;
 mod system;
+mod tool_setup;
+mod fs_tools;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -1603,6 +1605,10 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/audio-measure") => json(api_audio_measure(request, state)),
         ("GET", "/api/recent-cases") => json(api_recent_cases()),
         ("POST", "/api/recent-cases/forget") => json(api_recent_cases_forget(request)),
+        ("POST", "/api/tools/install") => json(tool_setup::api_tools_install(request)),
+        ("GET", "/api/tools/install-status") => json(tool_setup::api_tools_install_status()),
+        ("POST", "/api/mkdir") => json(fs_tools::api_mkdir(request)),
+        ("GET", "/api/places") => json(fs_tools::api_places()),
         _ => plain(404, b"not found".to_vec()),
     }
 }

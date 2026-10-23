@@ -98,11 +98,11 @@ async function verifyAudit() {
 function errorHint(msg) {
   const m = msg.toLowerCase();
   if (/ewfinfo|ewfverify|ewfexport|libewf/.test(m))
-    return "E01 처리에는 libewf 도구가 필요합니다 — tools/bin에 ewf*.exe를 넣거나 PATH에 설치하십시오.";
+    return "E01 처리에는 libewf 도구가 필요합니다 — 상단 ‘도구’에서 libewf [설치]를 누르십시오.";
   if (/mmls|fls|icat|sleuth/.test(m))
-    return "파일시스템 조사에는 Sleuth Kit이 필요합니다 — tools/bin에 mmls/fls/icat.exe를 넣거나 PATH에 설치하십시오.";
+    return "파일시스템 조사에는 Sleuth Kit이 필요합니다 — 상단 ‘도구’에서 Sleuth Kit [설치]를 누르십시오.";
   if (/ffmpeg|ffprobe/.test(m))
-    return "ffmpeg/ffprobe가 필요합니다 — tools/bin에 복사하거나 PATH에 설치하십시오.";
+    return "ffmpeg/ffprobe가 필요합니다 — 상단 ‘도구’에서 FFmpeg [설치]를 누르십시오.";
   if (/tool not found|not found|cannot find|실행 파일/.test(m))
     return "필요한 외부 도구를 찾지 못했습니다 — 상단 도구 배지에서 누락 항목을 확인하십시오.";
   if (/space|disk|공간|저장소/.test(m))

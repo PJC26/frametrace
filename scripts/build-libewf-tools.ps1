@@ -20,7 +20,11 @@ param(
     [string]$LibewfSha256 = "",
     # Dated MSYS2 base image (NOT the moving "latest" URL) so the hash is stable.
     [string]$Msys2Release = "20260927",
-    [string]$Msys2Sha256 = ""
+    [string]$Msys2Sha256 = "",
+    # Install folder for the built tools. Empty keeps the developer layout
+    # (target/release/tools/bin + target/debug/deps/tools/bin); the
+    # workstation's in-app installer passes its own staging folder.
+    [string]$Destination = ""
 )
 $ErrorActionPreference = "Stop"
 
@@ -95,6 +99,9 @@ $null = Invoke-Native { & $bash -lc "pacman-key --init && pacman-key --populate 
 
 # 3. mingw64 toolchain
 $null = Invoke-Native { & $bash -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc make" } "pacman toolchain install"
+# pacman-key/pacman start a gpg-agent daemon that outlives this script and
+# keeps the caller's stdout/stderr handles open; stop it (best effort).
+$null = Invoke-Native { & $bash -lc "gpgconf --kill all || true" } "gpg-agent shutdown" -Quiet
 
 # 4. libewf source (pinned SHA256)
 $srcRoot = "$Msys2Dir/build"
@@ -173,14 +180,20 @@ if (Test-Path $objdump) {
     }
 }
 
-# 7. deploy to tools/bin layout
-$dest = Join-Path $repoRoot "target/release/tools/bin"
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
-foreach ($f in $files) { Copy-Item -LiteralPath $f -Destination $dest -Force }
-# integration tests discover tools/bin next to the test binary too
-$depsDest = Join-Path $repoRoot "target/debug/deps/tools/bin"
-New-Item -ItemType Directory -Force -Path $depsDest | Out-Null
-Copy-Item "$dest/*" $depsDest -Force
+# 7. deploy to tools/bin layout (or the caller-chosen -Destination)
+if ($Destination) {
+    $dest = $Destination
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    foreach ($f in $files) { Copy-Item -LiteralPath $f -Destination $dest -Force }
+} else {
+    $dest = Join-Path $repoRoot "target/release/tools/bin"
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    foreach ($f in $files) { Copy-Item -LiteralPath $f -Destination $dest -Force }
+    # integration tests discover tools/bin next to the test binary too
+    $depsDest = Join-Path $repoRoot "target/debug/deps/tools/bin"
+    New-Item -ItemType Directory -Force -Path $depsDest | Out-Null
+    Copy-Item "$dest/*" $depsDest -Force
+}
 Write-Host ("bundled: " + (($files | ForEach-Object { Split-Path $_ -Leaf }) -join ", "))
 Write-Host "libewf tools installed: $dest"
 Write-Host "verify: $dest/ewfinfo.exe -V"

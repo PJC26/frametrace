@@ -55,6 +55,7 @@ function renderRecent() {
   fill("recentSources", prefs.recentSources);
   fill("recentCases", prefs.recentCases);
   renderRecentCases();
+  renderEvRecent();
 }
 
 function setStatus(el, cls, msg) {
@@ -176,8 +177,9 @@ function openPicker(targetId, mode, onChoose) {
   $("pickerSelect").textContent = m.select || "선택";
   $("pickerSelect").style.display = m.select ? "" : "none";
   $("pickerBackdrop").hidden = false;
+  pickerPlusOpen(mode);
   // Focus lands in the list (first entry) once it loads, not the path box.
-  browseTo($(targetId).value.trim(), true);
+  browseTo(pickerSeed(targetId, mode), true);
 }
 function closePicker() {
   $("pickerBackdrop").hidden = true;
@@ -188,6 +190,7 @@ function closePicker() {
 function choose(path) {
   const input = $(pickerTarget);
   const after = pickerOnChoose;
+  pickerRemember(pickerMode, path);
   input.value = path;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   closePicker();
@@ -197,7 +200,7 @@ function choose(path) {
 // for the list, Up/Down/Home/End move, Enter/Space activate (open a
 // folder or choose an image), Backspace goes up.
 function pickerOptions() {
-  return [...$("pickerList").querySelectorAll('[role="option"]')];
+  return [...$("pickerList").querySelectorAll('[role="option"]')].filter(o => !o.hidden);
 }
 function pickerFocus(el, focus) {
   pickerOptions().forEach(o => { o.tabIndex = -1; o.setAttribute("aria-selected", "false"); });
@@ -275,6 +278,10 @@ async function browseTo(path, focusList) {
   $("pickerPath").value = pickerCurrent;
   $("pickerSelect").disabled = !pickerCurrent;
   list.innerHTML = "";
+  // A typed or remembered folder that no longer exists opens its nearest
+  // existing ancestor instead of a dead end.
+  const up = res.ok && res.exists === false ? parentPath(path) : "";
+  if (up && up !== path) { browseTo(up, focusList); return; }
   if (!res.ok || res.exists === false) {
     const li = document.createElement("li");
     li.className = "picker-item errrow";
@@ -293,15 +300,14 @@ async function browseTo(path, focusList) {
     if (keepFocus) retry.focus();
     return;
   }
-  list.appendChild(pickerRow(`<span class="dir">.. (상위 / 드라이브 목록)</span>`, () => browseTo(pickerParent, true)));
+  list.appendChild(pickerRow(`<svg class="ic pk-ic" aria-hidden="true"><use href="#i-chevron-up"/></svg><span class="pk-name dir">.. (상위 / 드라이브 목록)</span>`, () => browseTo(pickerParent, true)));
   for (const e of res.entries || []) {
     // In "case" mode a case folder is the answer itself (one Enter opens it).
     const pickCase = pickerMode === "case" && e.is_case;
-    const html = `<span class="${e.dir ? "dir" : ""}">${esc(e.name)}${e.dir ? "/" : ""}</span>` +
-      (e.is_case ? `<span class="pk-tag"> · 케이스</span>` : "") +
-      (!e.dir ? `<span class="pk-tag"> · E01 이미지</span>` : "");
-    list.appendChild(pickerRow(html, () => { if (e.dir && !pickCase) browseTo(e.path, true); else choose(e.path); },
-      pickCase ? "Enter: 이 케이스 열기" : e.dir ? "Enter: 폴더 열기" : "Enter: 이 이미지 선택"));
+    const row = pickerRow(pickerEntryHtml(e), () => { if (e.dir && !pickCase) browseTo(e.path, true); else choose(e.path); },
+      pickCase ? "Enter: 이 케이스 열기" : e.dir ? "Enter: 폴더 열기" : "Enter: 이 이미지 선택");
+    row.dataset.name = String(e.name || "").toLowerCase();
+    list.appendChild(row);
   }
   if (!(res.entries || []).length) {
     const li = document.createElement("li");
@@ -316,6 +322,7 @@ async function browseTo(path, focusList) {
   $("pickerStatus").textContent = res.truncated
     ? "항목이 많아 일부만 표시합니다 (500개 제한) — 경로를 직접 입력해도 됩니다"
     : `${pickerCurrent || "드라이브 목록"} — ${count}개 항목`;
+  pickerPlusRendered(res);
 }
 
 $("btnBrowseSource").addEventListener("click", () => openPicker("sourcePath", "source"));
@@ -327,7 +334,7 @@ document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("picker
 $("pickerBackdrop").addEventListener("keydown", e => {
   if (e.key !== "Tab") return;
   const focusables = [...$("pickerBackdrop").querySelectorAll("button, input, .picker-item[tabindex='0']")]
-    .filter(el => !el.disabled && el.style.display !== "none");
+    .filter(el => !el.disabled && el.style.display !== "none" && el.offsetParent !== null);
   if (!focusables.length) return;
   const first = focusables[0], last = focusables[focusables.length - 1];
   if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }

@@ -63,7 +63,8 @@
     <div class="h-pop" id="hToolsPop" role="group" aria-label="외부 도구 · 감사 로그" data-keys="off" hidden>
       <div class="h-pop-title">외부 도구 · 감사 로그</div>
       <div class="h-env" id="hEnv"></div>
-      <p class="h-pop-note">없는 도구가 있어도 폴더 분석은 동작합니다. E01에는 libewf, 삭제 파일 조사에는 Sleuth Kit이 필요합니다.</p>
+      <div class="h-tool-setup" id="hToolSetup" hidden></div>
+      <p class="h-pop-note">없는 도구가 있어도 폴더 분석은 동작합니다. E01에는 libewf, 삭제 파일 조사에는 Sleuth Kit이 필요합니다. [설치]를 누르면 자동으로 받아 설치합니다.</p>
     </div>
   </div>
   <div class="h-popwrap">
@@ -100,8 +101,8 @@
         </div>
         <label class="sr-only" for="sourcePath" id="sourceLabel">증거 경로 — E01 이미지 파일 또는 폴더·드라이브</label>
         <div class="pathrow">
-          <input type="text" id="sourcePath" list="recentSources" autocomplete="off" spellcheck="false" placeholder="E:\BLACKBOX 또는 D:\증거\disk.E01" aria-describedby="blkEvidenceDesc sourceStatus" autofocus>
-          <button type="button" id="btnBrowseSource" title="폴더 또는 E01 이미지 파일을 고릅니다"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>찾아보기…</button>
+          <input type="text" id="sourcePath" list="recentSources" autocomplete="off" spellcheck="false" placeholder="E:\BLACKBOX 또는 D:\증거\disk.E01" aria-describedby="blkEvidenceDesc sourceStatus evTips" autofocus>
+          <button type="button" id="btnBrowseSource" title="폴더 또는 E01 이미지 파일을 목록에서 고릅니다"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>파일·폴더 찾아보기…</button>
           <button type="button" class="primary lg" id="btnStart">분석 시작</button>
         </div>
         <datalist id="recentSources"></datalist>
@@ -110,7 +111,13 @@
           <span class="pathstatus" id="sourceStatus" aria-live="polite"></span>
           <span class="muted starthint" id="startHint" aria-live="polite"></span>
         </div>
-        <small class="need" id="e01Need" hidden>libewf 미설치 — E01을 분석하려면 tools/bin 또는 PATH에 ewf* 도구가 필요합니다 (상단 ‘도구’ 참고)</small>
+        <p class="ev-tips" id="evTips">경로를 붙여넣거나 파일을 이 카드에 끌어다 놓으십시오. 탐색기에서 파일을 <kbd>Shift</kbd>+우클릭 → ‘경로로 복사’ 후 <kbd>Ctrl</kbd>+<kbd>V</kbd> 하면 가장 빠릅니다 (따옴표는 자동으로 지웁니다).</p>
+        <div class="ev-recent" id="evRecent" hidden>
+          <span class="ev-recent-k" id="evRecentTitle">최근 증거</span>
+          <ul class="ev-recent-list" id="evRecentList" aria-labelledby="evRecentTitle"></ul>
+        </div>
+        <div class="ev-dropveil" id="evDropVeil" aria-hidden="true"><svg class="ic" aria-hidden="true"><use href="#i-file-image"/></svg>여기에 놓으십시오</div>
+        <small class="need" id="e01Need" hidden>libewf 미설치 — 상단 ‘도구’에서 libewf [설치]를 누르면 자동으로 설치합니다</small>
         <div class="preflight" id="preflight" aria-live="polite" hidden></div>
         <div class="resumebox" id="resumeBox" hidden>
           <span id="resumeText"></span>
@@ -129,9 +136,11 @@
             </div>
             <div class="field">
               <label class="fieldlabel" for="caseDir"><span>케이스 폴더 <span class="opt">(비우면 자동 생성)</span></span></label>
+              <p class="case-hint" id="caseHint">분석 결과·로그가 저장될 폴더입니다. 증거와 <b>다른 드라이브</b>를 권장합니다.</p>
               <div class="pathrow">
-                <input type="text" id="caseDir" list="recentCases" autocomplete="off" spellcheck="false" placeholder="자동 — 예: C:\Cases\case-001">
-                <button type="button" id="btnBrowseCase">찾아보기…</button>
+                <input type="text" id="caseDir" list="recentCases" autocomplete="off" spellcheck="false" placeholder="자동 — 예: C:\Cases\case-001" aria-describedby="caseHint caseStatus">
+                <button type="button" id="btnBrowseCase" title="저장할 폴더를 고르거나 그 자리에서 새 폴더를 만듭니다"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>폴더 선택…</button>
+                <button type="button" id="btnNewCase" title="위치를 고른 뒤 새 케이스 폴더를 만듭니다"><svg class="ic" aria-hidden="true"><use href="#i-folder-plus"/></svg>새 폴더…</button>
                 <button type="button" class="quiet" id="btnSuggestCase" title="소스 이름과 오늘 날짜로 케이스 폴더 경로를 채웁니다">자동 제안</button>
               </div>
               <datalist id="recentCases"></datalist>
@@ -215,16 +224,33 @@
   </div>
 </div>
 <div class="h-modal-backdrop" id="pickerBackdrop" data-keys="off" data-region="h-modal" hidden>
-  <div class="h-modal" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
+  <div class="h-modal pk-modal" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
     <div class="h-modal-head">
       <h3 id="pickerTitle">폴더 선택</h3>
       <button type="button" class="quiet icon" id="pickerClose" aria-label="선택 창 닫기" title="닫기 (Esc)"><svg class="ic" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
-    <div class="picker-pathrow">
-      <input type="text" id="pickerPath" aria-label="현재 경로 — 직접 입력 후 Enter로 이동" spellcheck="false">
-      <button type="button" id="pickerUp">상위</button>
+    <div class="pk-toolbar">
+      <button type="button" id="pickerUp" title="상위 폴더 (Backspace)"><svg class="ic" aria-hidden="true"><use href="#i-chevron-up"/></svg>상위</button>
+      <nav class="pk-crumbs" id="pickerCrumbs" aria-label="현재 위치"></nav>
+      <button type="button" id="pickerNewFolder" hidden><svg class="ic" aria-hidden="true"><use href="#i-folder-plus"/></svg>새 폴더</button>
     </div>
-    <ul class="picker-list" id="pickerList" role="listbox" aria-label="폴더 목록 — 위/아래 화살표로 이동, Enter 또는 Space로 열기"></ul>
+    <div class="pk-body">
+      <nav class="pk-places" id="pickerPlaces" aria-label="바로 가기"></nav>
+      <div class="pk-main">
+        <div class="picker-pathrow">
+          <input type="text" id="pickerPath" aria-label="현재 경로 — 직접 입력 후 Enter로 이동" spellcheck="false">
+          <input type="text" id="pickerFilter" class="pk-filter" aria-label="이 폴더에서 이름으로 찾기" placeholder="이 폴더에서 찾기" spellcheck="false" autocomplete="off">
+        </div>
+        <form class="pk-newrow" id="pickerNewRow" hidden>
+          <svg class="ic" aria-hidden="true"><use href="#i-folder-plus"/></svg>
+          <input type="text" id="pickerNewName" aria-label="새 폴더 이름" spellcheck="false" autocomplete="off">
+          <button type="submit" class="primary" id="pickerNewOk">만들기</button>
+          <button type="button" class="quiet" id="pickerNewCancel">취소</button>
+          <span class="pk-newerr" id="pickerNewErr" role="alert"></span>
+        </form>
+        <ul class="picker-list" id="pickerList" role="listbox" aria-label="폴더 목록 — 위/아래 화살표로 이동, Enter 또는 Space로 열기"></ul>
+      </div>
+    </div>
     <div class="h-modal-foot">
       <span class="muted" id="pickerStatus" role="status" aria-live="polite"></span>
       <button type="button" id="pickerCancel">취소</button>
