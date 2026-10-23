@@ -217,7 +217,7 @@ fn latest_entries_jsonl(case_dir: &Path) -> Option<PathBuf> {
 /// the auto-target list for `recover-batch --deleted-videos`. The
 /// entries' inode becomes the selector; the filesystem path is kept as a
 /// note so the audit record shows what each inode was.
-fn deleted_video_selectors(
+pub(crate) fn deleted_video_selectors(
     entries_jsonl: &Path,
 ) -> Result<Vec<crate::selection::SelectionItem>, String> {
     let text = fs::read_to_string(entries_jsonl)
@@ -246,6 +246,49 @@ fn deleted_video_selectors(
                 selector: inode.to_string(),
                 kind: Some("filesystem".to_string()),
                 action: Some("recover".to_string()),
+                format: None,
+                time_seconds: None,
+                notes: value
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            });
+        }
+    }
+    Ok(items)
+}
+
+/// Allocated (live) video-candidate selectors from an inspect-image entries file —
+/// the auto-target list for extracting active videos while preserving directory hierarchy.
+pub(crate) fn allocated_video_selectors(
+    entries_jsonl: &Path,
+) -> Result<Vec<crate::selection::SelectionItem>, String> {
+    let text = fs::read_to_string(entries_jsonl)
+        .map_err(|err| format!("failed to read {}: {err}", entries_jsonl.display()))?;
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+            format!(
+                "invalid entries line {}:{}: {err}",
+                entries_jsonl.display(),
+                line_no + 1
+            )
+        })?;
+        let deleted = value.get("deleted").and_then(|v| v.as_bool()) == Some(true);
+        let video = value.get("video_candidate").and_then(|v| v.as_bool()) == Some(true);
+        let Some(inode) = value.get("inode").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !deleted && video && !inode.is_empty() && seen.insert(inode.to_string()) {
+            items.push(crate::selection::SelectionItem {
+                selector: inode.to_string(),
+                kind: Some("filesystem".to_string()),
+                action: Some("extract".to_string()),
                 format: None,
                 time_seconds: None,
                 notes: value

@@ -269,9 +269,80 @@ function renderDetails() {
 // Facet counts come from facetCounts() (40-grid.js): each dimension is
 // counted with its own filter excluded, computed once per render.
 function renderTree(facets) {
-  const { typeCounts, kindCounts, dayCounts, audioCounts } = facets || facetCounts();
+  const { typeCounts, kindCounts, dayCounts, audioCounts, dirCounts } = facets || facetCounts();
   const kindLabels = { video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate"), joined: t("filter.kind.joined") };
   const items = [];
+
+  // 1. Folder structure tree
+  items.push({ header: t("tree.folders") });
+  items.push({
+    sec: "folder",
+    label: t("tree.all"),
+    count: null,
+    key: "",
+    depth: 0,
+    icon: "📂",
+    pick: () => {
+      state.dirFilter = "";
+      state.currentPage = 1;
+      requestRender();
+    },
+    active: !state.dirFilter
+  });
+
+  if (dirCounts && dirCounts.size > 0) {
+    const folderPaths = new Set();
+    dirCounts.forEach((_, path) => {
+      if (!path) return;
+      const parts = path.split("/");
+      for (let i = 1; i <= parts.length; i++) {
+        folderPaths.add(parts.slice(0, i).join("/"));
+      }
+    });
+
+    const getSubtreeCount = (prefix) => {
+      let total = 0;
+      dirCounts.forEach((cnt, p) => {
+        if (prefix === "Root" ? p === "Root" : (p === prefix || p.startsWith(prefix + "/"))) {
+          total += cnt;
+        }
+      });
+      return total;
+    };
+
+    const sortedFolders = Array.from(folderPaths).sort((a, b) => {
+      if (a === "Root") return -1;
+      if (b === "Root") return 1;
+      const aRec = a.startsWith("Recovery");
+      const bRec = b.startsWith("Recovery");
+      if (aRec !== bRec) return aRec ? 1 : -1;
+      return a.localeCompare(b);
+    });
+
+    sortedFolders.forEach(folder => {
+      const depth = folder === "Root" ? 0 : folder.split("/").length - 1;
+      let name = folder === "Root" ? t("tree.root") : (folder.split("/").pop());
+      if (folder === "Recovery") name = t("tree.recovery");
+      const count = getSubtreeCount(folder);
+      if (count === 0) return;
+      const isRecoveryNode = folder.startsWith("Recovery");
+      items.push({
+        sec: "folder",
+        label: name,
+        count,
+        key: folder,
+        depth,
+        icon: isRecoveryNode ? "🛡️" : "📁",
+        pick: () => {
+          state.dirFilter = (state.dirFilter === folder ? "" : folder);
+          state.currentPage = 1;
+          requestRender();
+        },
+        active: state.dirFilter === folder
+      });
+    });
+  }
+
   // `sec` + label identify an item across re-renders (focus restore).
   const addItems = (sec, title, entries, activeKey, onPick) => {
     items.push({ header: title });
@@ -316,7 +387,7 @@ function renderTree(facets) {
   });
   els.facetTree.innerHTML = items.map(item => item.header !== undefined
     ? `<div class="tree-sec">${escapeHtml(item.header)}</div>`
-    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}" data-sec="${item.sec}"${item.facet ? ` data-facet="${item.facet}" data-key="${escapeHtml(item.key)}"` : ""} tabindex="0" role="button" aria-pressed="${!!item.active}"><span>${escapeHtml(item.label)}</span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
+    : `<div class="tree-item${item.active ? " active" : ""}" data-pick="${escapeHtml(item.label)}" data-sec="${item.sec || "folder"}"${item.depth ? ` data-depth="${item.depth}"` : ""}${item.facet ? ` data-facet="${item.facet}"` : ""}${item.key ? ` data-key="${escapeHtml(item.key)}"` : ""} style="${item.depth ? `padding-left: ${8 + item.depth * 14}px;` : ""}" tabindex="0" role="button" aria-pressed="${!!item.active}"><span>${item.icon ? `<span style="margin-right:5px;font-size:12px;">${item.icon}</span>` : ""}<span>${escapeHtml(item.label)}</span></span>${item.count != null ? `<span class="muted">${item.count}</span>` : ""}</div>`
   ).join("");
   // Memo probe for harnesses: bumps only when the counts were recomputed.
   els.facetTree.dataset.facetGen = String(facetMemo.gen);

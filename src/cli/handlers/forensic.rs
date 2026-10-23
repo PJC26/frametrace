@@ -387,16 +387,53 @@ pub(crate) fn next_scan_folder_hint(case_dir: &Path, folder: &Path) -> String {
     ])
 }
 
+fn clean_relative_path(raw: &str) -> std::path::PathBuf {
+    let raw = raw.trim().trim_end_matches("(deleted)").trim();
+    let norm = raw.replace('\\', "/");
+    let trimmed = norm.trim_start_matches('/');
+    let mut path = std::path::PathBuf::new();
+    for part in trimmed.split('/') {
+        let clean = crate::util::sanitize_filename(part);
+        if !clean.is_empty() && clean != "." && clean != ".." {
+            path.push(clean);
+        }
+    }
+    if path.as_os_str().is_empty() {
+        std::path::PathBuf::from("unnamed.bin")
+    } else {
+        path
+    }
+}
+
 pub fn recover_batch(
     case_dir: &Path,
     image_file: &Path,
     selection_path: Option<&Path>,
     partition_offset: u64,
     deleted_videos: bool,
+    allocated_videos: bool,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
     ensure_case(case_dir)?;
-    let (selection, selection_label) = if deleted_videos {
+    let (selection, selection_label) = if allocated_videos {
+        let entries_jsonl = latest_entries_jsonl(case_dir).ok_or_else(|| {
+            "no filesystem inspection entries found; run inspect-image or inspect-e01 --filesystem first"
+                .to_string()
+        })?;
+        let items = allocated_video_selectors(&entries_jsonl)?;
+        if items.is_empty() {
+            println!("latest inspection {} lists no allocated video candidates", entries_jsonl.display());
+            return Ok(());
+        }
+        println!("auto-selection (allocated): {}", entries_jsonl.display());
+        (
+            crate::selection::SelectionFile {
+                case_id: None,
+                items,
+            },
+            entries_jsonl.display().to_string(),
+        )
+    } else if deleted_videos {
         let entries_jsonl = latest_entries_jsonl(case_dir).ok_or_else(|| {
             "no filesystem inspection entries found; run inspect-image or inspect-e01 --filesystem first"
                 .to_string()
@@ -418,7 +455,7 @@ pub fn recover_batch(
         )
     } else {
         let selection_path = selection_path.ok_or_else(|| {
-            "recover-batch needs a selection file or --deleted-videos".to_string()
+            "recover-batch needs a selection file or --deleted-videos / --allocated-videos".to_string()
         })?;
         let parsed = crate::selection::parse_selection_file(selection_path)?;
         crate::selection::enforce_case_binding(
@@ -435,11 +472,12 @@ pub fn recover_batch(
         image_file,
         Some(selection.items.len() as u64),
         &format!(
-            "{{\"items\":{},\"deleted_videos\":{deleted_videos}}}",
+            "{{\"items\":{},\"deleted_videos\":{deleted_videos},\"allocated_videos\":{allocated_videos}}}",
             selection.items.len()
         ),
     )?;
 
+    let is_extract = allocated_videos;
     let mut outcomes = Vec::new();
     for item in &selection.items {
         let inode = item
@@ -448,11 +486,47 @@ pub fn recover_batch(
             .strip_prefix("fls:")
             .unwrap_or(item.selector.trim())
             .to_string();
+
+        let item_is_extract = is_extract || item.action.as_deref() == Some("extract");
+        let (output_path, recover_deleted, detail_folder) = if item_is_extract {
+            let note = item.notes.as_deref().unwrap_or(&inode);
+            let clean_rel = clean_relative_path(note);
+            let target = case_dir.join("artifacts/extracted").join(clean_rel);
+            (target, false, "artifacts/extracted")
+        } else {
+            let filename = item
+                .notes
+                .as_deref()
+                .and_then(|p| Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let clean_name = filename.trim_end_matches("(deleted)").trim();
+            let leaf = if clean_name.is_empty() {
+                format!("inode_{}.bin", crate::util::sanitize_filename(&inode))
+            } else {
+                format!("{}_{}", crate::util::sanitize_filename(&inode), crate::util::sanitize_filename(clean_name))
+            };
+            let target = case_dir.join("artifacts/Recovery/Filesystem").join(leaf);
+            (target, true, "artifacts/Recovery/Filesystem")
+        };
+
+        if output_path.is_file()
+            && std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0) > 0
+        {
+            outcomes.push(BatchOutcome {
+                selector: item.selector.clone(),
+                action: if item_is_extract { "extract" } else { "recover" },
+                status: "ok",
+                detail: format!("already exists at {}", output_path.display()),
+            });
+            continue;
+        }
+
         let options = TskRecoverOptions {
             partition_offset,
             inode,
-            output_path: None,
-            recover_deleted: true,
+            output_path: Some(output_path),
+            recover_deleted,
             include_slack: false,
             skip_sparse_holes: true,
             icat_bin: "icat".to_string(),
@@ -462,13 +536,13 @@ pub fn recover_batch(
         outcomes.push(match outcome {
             Ok(()) => BatchOutcome {
                 selector: item.selector.clone(),
-                action: "recover",
+                action: if item_is_extract { "extract" } else { "recover" },
                 status: "ok",
-                detail: "recovered into artifacts/recovered/filesystem".to_string(),
+                detail: format!("saved into {detail_folder}"),
             },
             Err(error) => BatchOutcome {
                 selector: item.selector.clone(),
-                action: "recover",
+                action: if item_is_extract { "extract" } else { "recover" },
                 status: "failed",
                 detail: error,
             },

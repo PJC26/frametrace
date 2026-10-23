@@ -376,6 +376,10 @@ pub enum Commands {
         /// filesystem inspection instead of a selection file
         #[arg(long)]
         deleted_videos: bool,
+        /// Extract every allocated (normal) video found by the latest filesystem inspection
+        /// keeping original directory structure
+        #[arg(long)]
+        allocated_videos: bool,
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -992,6 +996,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             selection,
             partition_offset,
             deleted_videos,
+            allocated_videos,
             timeout,
         } => recover_batch(
             &case_dir,
@@ -999,6 +1004,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             selection.as_deref(),
             partition_offset,
             deleted_videos,
+            allocated_videos,
             timeout,
         ),
         Commands::ValidateArtifact {

@@ -92,7 +92,7 @@ var filterComputeCount = 0;
 function filterStateKey(withGen = true) {
   const chip = state.chip || "";
   const annotated = chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:");
-  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.audio, annotated && withGen ? "a" + annotationGen : ""].join("\u0001");
+  return [state.kind, state.recType, state.status, state.dirFilter || "", chip, state.dateFrom, state.dateTo, state.query, state.audio, annotated && withGen ? "a" + annotationGen : ""].join("\u0001");
 }
 function filterMemoKey(withGen = true) {
   const base = filterStateKey(withGen);
@@ -114,7 +114,7 @@ function noteFilterTouched(id) {
   else if (!filterTouchedAll) filterTouched.add(id);
 }
 function recordPassesFilter(record, chip, query) {
-  return passesKind(record) && passesRecType(record) && passesDate(record) && passesAudio(record) && passesRest(record, chip, query);
+  return passesKind(record) && passesRecType(record) && passesDate(record) && passesDir(record) && passesAudio(record) && passesRest(record, chip, query);
 }
 // The new list from `old` when only the touched ids changed, or null (run
 // the full filter). Returns `old` itself when no touched id left or joined.
@@ -224,6 +224,14 @@ function passesDate(record) {
   if (state.dateTo && record.recDay > state.dateTo) return false;
   return true;
 }
+function passesDir(record) {
+  if (!state.dirFilter) return true;
+  const rDir = record.dirPath || "Root";
+  if (state.dirFilter === "Root") {
+    return rDir === "Root";
+  }
+  return rDir === state.dirFilter || rDir.startsWith(state.dirFilter + "/");
+}
 function passesRest(record, chip, query) {
   if (state.status && record.status !== state.status) return false;
   if (chip === "anomaly" && !record.hasAnomaly) return false;
@@ -255,16 +263,20 @@ function facetCounts() {
   if (key !== null && facetMemo.key === key) return facetMemo.value;
   const chip = state.chip || "";
   const query = state.query || "";
-  const typeCounts = new Map(), kindCounts = new Map(), dayCounts = new Map(), audioCounts = new Map();
+  const typeCounts = new Map(), kindCounts = new Map(), dayCounts = new Map(), audioCounts = new Map(), dirCounts = new Map();
   records.forEach(record => {
     if (!passesRest(record, chip, query)) return;
-    const k = passesKind(record), ty = passesRecType(record), d = passesDate(record), a = passesAudio(record);
-    if (k && d && a) { const tk = record.recType || "unclassified"; typeCounts.set(tk, (typeCounts.get(tk) || 0) + 1); }
-    if (ty && d && a) kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
-    if (k && ty && a && record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
-    if (k && ty && d) audioCounts.set(record.audioFacet, (audioCounts.get(record.audioFacet) || 0) + 1);
+    const k = passesKind(record), ty = passesRecType(record), d = passesDate(record), a = passesAudio(record), dir = passesDir(record);
+    if (k && d && a && dir) { const tk = record.recType || "unclassified"; typeCounts.set(tk, (typeCounts.get(tk) || 0) + 1); }
+    if (ty && d && a && dir) kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
+    if (k && ty && a && dir && record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
+    if (k && ty && d && dir) audioCounts.set(record.audioFacet, (audioCounts.get(record.audioFacet) || 0) + 1);
+    if (k && ty && d && a) {
+      const rDir = record.dirPath || "Root";
+      dirCounts.set(rDir, (dirCounts.get(rDir) || 0) + 1);
+    }
   });
-  const value = { typeCounts, kindCounts, dayCounts, audioCounts };
+  const value = { typeCounts, kindCounts, dayCounts, audioCounts, dirCounts };
   facetMemo = { key, value, gen: facetMemo.gen + 1 };
   return value;
 }
@@ -273,7 +285,7 @@ function computeFilteredRecords() {
   const chip = state.chip || "";
   const query = state.query || "";
   const list = records.filter(record =>
-    passesKind(record) && passesRecType(record) && passesDate(record) && passesAudio(record) && passesRest(record, chip, query));
+    passesKind(record) && passesRecType(record) && passesDate(record) && passesDir(record) && passesAudio(record) && passesRest(record, chip, query));
   const byId = (a, b) => idCollator.compare(String(a.id), String(b.id));
   switch (state.sortBy) {
     case "time-desc":

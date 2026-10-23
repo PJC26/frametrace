@@ -1260,8 +1260,26 @@ const records = [
   })
 ];
 
+function dirPathOfRecord(record) {
+  if (record.kind === "carved") return "Recovery/Carved";
+  if (record.kind === "filesystem") return "Recovery/Filesystem";
+  if (record.kind === "candidate") return "Recovery/Candidates";
+  let raw = record.name || record.originalPath || "";
+  raw = String(raw).replace(/\\/g, "/").replace(/^\/+/, "");
+  if (raw.startsWith("artifacts/extracted/")) {
+    raw = raw.slice("artifacts/extracted/".length);
+  }
+  const parts = raw.split("/").filter(Boolean);
+  if (parts.length > 1) {
+    parts.pop();
+    return parts.join("/");
+  }
+  return "Root";
+}
+
 records.forEach(record => {
   record.originalPath = record.originalPath || originalPathFor(record);
+  record.dirPath = dirPathOfRecord(record);
   const rec = recordingTimeFor(record);
   record.recTime = rec ? rec.ts : null;
   record.recDay = rec ? rec.date : null;
