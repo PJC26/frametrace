@@ -32,6 +32,10 @@
 .h-check-warn .ic { color: var(--warn); }
 .h-check-ok .ic { color: var(--ok); }
 .h-check-info .ic { color: var(--info); }
+/* R13: the rows behind a count (a newer run's mismatches). */
+.h-check-items { list-style: none; margin: var(--sp-1) 0 0; padding: 0; display: grid; gap: 2px; font-size: var(--fs-xs); font-weight: 400; }
+.h-check-items li { overflow-wrap: anywhere; }
+.h-check-items code { font-family: var(--font-mono); }
 
 .h-fin-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
 .h-fin-actions [hidden] { display: none; }
@@ -41,6 +45,8 @@
 .h-fin-links li { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); align-items: center; overflow-wrap: anywhere; }
 .h-fin-links a { color: var(--accent-ink); text-underline-offset: 2px; }
 .h-fin-links code { font-family: var(--font-mono); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+/* R10 U4: a package whose finalize did not complete. */
+.h-fin-incomplete { display: inline-flex; align-items: center; min-height: 20px; padding: 0 var(--sp-2); border-radius: var(--radius); background: var(--warn-bg); color: var(--warn-fg); font-size: var(--fs-xs); font-weight: 600; }
 
 .h-fin-adv { border: 1px solid var(--border); border-radius: var(--radius); }
 .h-fin-adv > summary { cursor: pointer; padding: var(--sp-2) var(--sp-3); min-height: 28px; box-sizing: border-box; display: flex; align-items: center; font-weight: 600; }
@@ -51,3 +57,9 @@
 .h-fin-adv-body input[type="text"] { width: 100%; box-sizing: border-box; }
 .h-fin-out { margin: 0; padding: var(--sp-2); background: var(--surface-2); border-radius: var(--radius); font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow: auto; }
 .h-fin-adv-body a { color: var(--accent-ink); }
+/* R13 U1: startup recovery in progress — information, not a fault. */
+.h-fin-info { display: inline-flex; align-items: center; min-height: 20px; padding: 0 var(--sp-2); border-radius: var(--radius); background: var(--info-bg); color: var(--info-fg); font-size: var(--fs-xs); font-weight: 600; }
+/* R13 U3: the CLI command that sets an unreadable journal aside. */
+.h-fin-cmd code { user-select: all; }
+/* R12 U2: the server's short detail under a 최종화 미완료 row. */
+.h-fin-detail { flex-basis: 100%; font-size: var(--fs-xs); overflow-wrap: anywhere; }

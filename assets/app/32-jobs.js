@@ -43,6 +43,20 @@ const CASE_JOBS = {
       okLabel: "카빙 실행",
     },
   },
+  // Measured sound for the items not measured yet (docs/PLAN_PHASE2_JOIN_
+  // AUDIO_2026-10-13.md §2.2): started from the deliverables sheet's
+  // Advanced section (41-finalize.js); same case-job contract as recover.
+  audio: {
+    serverKind: "audio-measure",
+    title: "소리 측정",
+    url: () => "/api/audio-measure",
+    confirm: {
+      title: "소리 측정",
+      html: "<p>오디오 트랙이 있는데 아직 소리를 재지 않은 영상을 <b>처음부터 끝까지 디코드</b>해 최대·평균 신호 레벨을 잽니다.</p>" +
+        "<p>영상 수와 길이에 따라 오래 걸릴 수 있습니다 — 그동안 다른 작업(복구·카빙·보고서 생성)은 기다리며, 진행 상황은 작업 시트에 표시되고 언제든 중단할 수 있습니다. 계속하시겠습니까?</p>",
+      okLabel: "소리 측정 실행",
+    },
+  },
 };
 // A server that went async but whose first status still reads idle gets
 // this long before "not busy" is taken as "finished".
@@ -124,7 +138,12 @@ const CASE_JOB_TITLES = {
   btnRecoverDeleted: "조사된 이미지에서 삭제된 영상 후보를 복구한 뒤 뷰어를 갱신합니다",
   btnCarve: "export된 raw 이미지에서 영상 시그니처를 카빙합니다 (E01 전체 export 분석 필요)",
 };
+// Whether a case job (or anything the server refuses one beside) runs:
+// read by the deliverables sheet's 소리 측정 button (41-finalize.js), which
+// also depends on ffmpeg/ffprobe being present.
+let caseJobsBusy = false;
 function setCaseJobButtons(busy) {
+  caseJobsBusy = !!busy;
   for (const id of ["btnRecoverDeleted", "btnCarve"]) {
     const el = $(id);
     if (!el) continue;
@@ -132,6 +151,7 @@ function setCaseJobButtons(busy) {
     // A disabled control says why.
     el.title = busy ? "다른 작업이 진행 중입니다 — 위 칩이나 이 시트에서 진행 상황을 보고 중단할 수 있습니다" : CASE_JOB_TITLES[id];
   }
+  try { if (typeof finApplyAudioEnv === "function") finApplyAudioEnv(); } catch (e) { /* sheet not built yet */ }
 }
 setCaseToolsVisible(false);
 
@@ -354,6 +374,16 @@ async function finishCaseJob(job, outcome, error) {
   } else {
     job.message = how === "none" ? "완료 — 검토 화면을 열면 결과가 표시됩니다." : "완료 — 뷰어에 결과를 반영했습니다.";
   }
+  // Sound measurement may finish with per-file errors (server log line
+  // "소리 측정 완료(오류 N건)"): never reported as a clean success.
+  if (job.kind === "audio") {
+    const logs = typeof lastStatus !== "undefined" && lastStatus && Array.isArray(lastStatus.logs) ? lastStatus.logs : [];
+    const hit = logs.map(String).reverse().map(l => /소리 측정 완료\s*\(\s*오류\s*(\d+)\s*건\s*\)/.exec(l)).find(Boolean);
+    if (hit && Number(hit[1]) > 0) {
+      job.message = `완료 — 오류 ${hit[1]}건: 그 영상은 '측정 실패'(미확인)로 표시됩니다. 로그를 확인하십시오. ` + job.message.replace(/^완료 — /, "");
+      toast(`${title} 완료 — 오류 ${hit[1]}건 (로그 확인)`, "warn");
+    }
+  }
   setJobsNote(`${title} ${job.message}`);
   renderCaseJob();
 }
@@ -363,7 +393,19 @@ let pipelineCancelAsked = false;
 let clipCancelAsked = false;
 async function cancelPipelineOrClips(kind) {
   const clips = kind === "clips";
-  const go = await askDialog(clips ? {
+  const S0 = storeState();
+  const running = clips && !!S0 ? clipView(S0).running : [];
+  const joinsOnly = clips && clipJobsTitle(running) === "영상 이어붙이기";
+  const joinsAmong = clips && !joinsOnly && running.some(isJoinJob);
+  const go = await askDialog(joinsOnly ? {
+    title: "이어붙이기 중단",
+    html: "<p>진행 중인 영상 이어붙이기를 중단하시겠습니까?</p><p>이어붙이던 파일은 지웁니다. 원본은 그대로이고, 언제든 다시 실행할 수 있습니다.</p>",
+    okLabel: "이어붙이기 중단", cancelLabel: "계속", danger: true, focus: "dlgCancel",
+  } : joinsAmong ? {
+    title: "내보내기·이어붙이기 중단",
+    html: "<p>진행 중인 클립 내보내기와 영상 이어붙이기를 모두 중단하시겠습니까?</p><p>이미 만들어진 클립은 케이스 폴더에 남고, 이어붙이던 파일은 지웁니다. 원본은 그대로입니다.</p>",
+    okLabel: "모두 중단", cancelLabel: "계속", danger: true, focus: "dlgCancel",
+  } : clips ? {
     title: "클립 내보내기 중단",
     html: "<p>진행 중인 클립 내보내기를 중단하시겠습니까?</p><p>이미 만들어진 파일은 케이스 폴더에 남습니다.</p>",
     okLabel: "내보내기 중단", cancelLabel: "계속", danger: true, focus: "dlgCancel",
@@ -447,7 +489,7 @@ $("btnNew").addEventListener("click", async () => {
   if (go && typeof go.click === "function") { go.click(); return; }
   const ss = typeof FTViewer === "object" && FTViewer && typeof FTViewer.saveState === "function" ? FTViewer.saveState() : null;
   if (hViewerStateUnsaved(ss, () => { try { return Number((FTViewer.summary() || {}).pending) || 0; } catch (e) { return 1; } })) {
-    if (typeof FTViewer.save === "function") { try { FTViewer.save(); } catch (e) { /* surfaced by the viewer */ } }
+    if (typeof FTViewer.save === "function") { try { FTViewer.save({ patient: true }); } catch (e) { /* surfaced by the viewer */ } }
     toast("아직 저장되지 않은 마크·메모가 있습니다 — 저장 상태가 '저장됨'이 된 뒤 다시 누르십시오.", "warn");
     return;
   }
@@ -541,10 +583,18 @@ function renderTrack(steps, names, progress, warnings) {
   const labels = (names && names.length === 5) ? names : STEP_NAMES;
   el.innerHTML = labels.map((name, i) => {
     const s = steps[i] || "pending";
-    const cls = s === "done" ? "done" : s === "running" ? "running" : s === "failed" ? "failed" : "";
+    // R4 B16: "partial" = the step finished with a partial result (child
+    // exit code 5) — a warning state, neither done nor failed.
+    const partial = s === "partial";
+    const cls = s === "done" || partial ? "done" : s === "running" ? "running" : s === "failed" ? "failed" : "";
     let extra = "";
     const ws = (warnings || []).filter(w => w && w.step === i && w.message);
-    if (s === "running" && progress && progress.total > 0) {
+    if (s === "running" && progress && progress.job_type === "raw-rehash") {
+      // R6 (S4): raw re-verification — bytes, not files.
+      const total = Number(progress.total) || 0;
+      const pct = total > 0 ? Math.min(100, Math.floor((Number(progress.done) || 0) * 100 / total)) : 0;
+      extra = `<span class="h-prog"><span class="h-bar${total > 0 ? "" : " indet"}" role="progressbar" aria-valuemin="0" aria-valuemax="100"${total > 0 ? ` aria-valuenow="${pct}"` : ""} aria-label="원본 재검증 진행률"><i${total > 0 ? ` style="width:${pct}%"` : ""}></i></span><span class="h-ptext mono num">${esc(rawRehashText(progress))}</span></span>`;
+    } else if (s === "running" && progress && progress.total > 0) {
       const pct = Math.min(100, Math.round(progress.done * 100 / progress.total));
       const eta = progress.eta_secs > 0 ? ` · 남은 시간 ${fmtEta(progress.eta_secs)}` : ` · 계산 중`;
       extra = `<span class="h-prog"><span class="h-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-label="${esc(name)} 진행률"><i style="width:${pct}%"></i></span><span class="h-ptext mono num">${progress.done.toLocaleString()}/${progress.total.toLocaleString()} (${pct}%)${eta}</span></span>`;
@@ -552,33 +602,57 @@ function renderTrack(steps, names, progress, warnings) {
       const bytes = progress.done > 0 ? `${fmtBytes(progress.done)} 기록됨 · ` : "";
       extra = `<span class="h-prog"><span class="h-bar indet" role="progressbar" aria-label="${esc(name)} 진행 중"><i></i></span><span class="h-ptext mono num">${bytes}${esc(progress.job_type)} · ${fmtClock(progress.elapsed_secs || 0)}</span></span>`;
     }
-    if (s === "done" && ws.length) {
+    if (partial) {
+      extra = `<span class="h-trk-warn">부분 결과로 끝났습니다 — 일부만 조사되었습니다</span>` +
+        (ws.length ? `<span class="h-wlist">${ws.map(w => `<span>• ${esc(w.message)}</span>`).join("")}</span>` : "");
+    } else if (s === "done" && ws.length) {
       extra = `<span class="h-trk-warn">경고 ${ws.length}건과 함께 완료</span>` +
         `<span class="h-wlist">${ws.map(w => `<span>• ${esc(w.message)}</span>`).join("")}</span>`;
     }
-    const state = s === "done" ? (ws.length ? "완료(경고)" : "완료") : s === "running" ? "진행 중" : s === "failed" ? "실패" : "대기";
-    return `<li class="${cls}${s === "done" && ws.length ? " warned" : ""}"><span class="h-trk-dot" aria-hidden="true"></span><span class="h-trk-lbl">${esc(name)}</span><span class="sr-only">${state}</span>${extra}</li>`;
+    const state = partial ? "부분 결과(경고)" : s === "done" ? (ws.length ? "완료(경고)" : "완료") : s === "running" ? "진행 중" : s === "failed" ? "실패" : "대기";
+    return `<li class="${cls}${(s === "done" && ws.length) || partial ? " warned" : ""}"${partial ? ' data-step="partial"' : ""}><span class="h-trk-dot" aria-hidden="true"></span><span class="h-trk-lbl">${esc(name)}</span><span class="sr-only">${state}</span>${extra}</li>`;
   }).join("");
 }
 
 // ---- sheet render (store -> DOM) ----
+// The output file name once known; before that "이어붙이기 #3" / "클립 #2"
+// (server ids are "join-3" / "clip-2" — the prefix is not shown twice).
 function clipName(job) {
   const p = String(job && job.path || "").split(/[\\/]/).filter(Boolean).pop();
-  return p || `클립 #${job && job.id != null ? job.id : ""}`;
+  if (p) return p;
+  const id = String(job && job.id != null ? job.id : "").replace(/^(join|clip)-/, "");
+  return `${isJoinJob(job) ? "이어붙이기" : "클립"} #${id}`;
 }
+// State words per job kind (clip_jobs also carries lossless joins).
 const CLIP_STATE = { running: "내보내는 중", done: "완료", failed: "실패", cancelled: "중단됨" };
+const JOIN_STATE = { running: "이어붙이는 중", done: "완료", failed: "실패", cancelled: "중단됨" };
+// Running join: hash i/N → concat (.part bytes / sources total) → verify.
+function joinStageText(c) {
+  const raw = c.stage && typeof c.stage === "object" ? c.stage : { stage: c.stage, done: c.stage_done ?? c.done, total: c.stage_total ?? c.total };
+  const stage = String(raw.stage || "");
+  const clock = fmtClock(c.elapsed_secs);
+  if (stage === "hash" && Number(raw.total) > 0) return `해시 ${Number(raw.done) || 0}/${Number(raw.total)} · ${clock}`;
+  if (stage === "concat" && Number(c.expected_bytes) > 0) return `${Math.min(100, Math.floor((Number(c.bytes_written) || 0) * 100 / Number(c.expected_bytes)))}% · ${clock}`;
+  if (stage === "verify") return `결과 확인 · ${clock}`;
+  return clock;
+}
 function renderClips(S) {
   const sec = $("jobsClips"), list = $("jobsClipList");
   if (!sec || !list) return;
   const clips = (S.jobs.clipJobs || []).slice(0, 8);
   sec.hidden = clips.length === 0;
+  const head = typeof sec.querySelector === "function" ? sec.querySelector("h3") : null;
+  const title = clipJobsTitle(clips);
+  if (head && head.textContent !== title) head.textContent = title;
+  if (typeof sec.setAttribute === "function") sec.setAttribute("aria-label", title);
   list.innerHTML = clips.map(c => {
     const st = String(c.state || "");
-    const tail = st === "running" ? `${fmtBytes(Number(c.bytes_written) || 0)} 기록됨 · ${fmtClock(c.elapsed_secs)}`
+    const join = isJoinJob(c);
+    const tail = st === "running" ? (join ? joinStageText(c) : `${fmtBytes(Number(c.bytes_written) || 0)} 기록됨 · ${fmtClock(c.elapsed_secs)}`)
       : st === "done" ? `${fmtBytes(Number(c.size_bytes) || 0)} · ${fmtClock(c.elapsed_secs)}`
       : st === "failed" || st === "cancelled" ? esc(String(c.error || "").split(/\r?\n/)[0].slice(0, 160)) : "";
     return `<li class="${esc(st)}"><span class="h-clip-name" title="${esc(c.path || "")}">${esc(clipName(c))}</span>` +
-      `<span class="h-clip-state">${esc(CLIP_STATE[st] || st)}</span>` +
+      `<span class="h-clip-state">${esc((join ? JOIN_STATE : CLIP_STATE)[st] || st)}</span>` +
       (tail ? `<span class="h-clip-tail mono num">${tail}</span>` : "") + `</li>`;
   }).join("");
 }
@@ -592,8 +666,22 @@ function jobsNoteText(S, pv) {
   if (cj && cj.outcome === "failed") return `${cj.title} 실패 — 원인을 확인한 뒤 다시 시도할 수 있습니다.`;
   if (cj && cj.outcome === "cancelled") return `${cj.title}이(가) 중단되었습니다.`;
   if (cj && (cj.outcome === "ok" || cj.outcome === "deferred")) return `${cj.title} ${cj.message}`;
-  if (Number(S.jobs.clipsRunning) > 0) return "클립 내보내기 진행 중…";
+  if (Number(S.jobs.clipsRunning) > 0) return `${clipJobsTitle(clipView(S).running)} 진행 중…`;
+  if (joinReloadPending()) return "이어붙이기 완료 — '새 데이터 반영'을 누르면 목록에 표시됩니다.";
   return "";
+}
+// A10: the failure box is rewritten only when its markup string changes —
+// compared with what was last WRITTEN, never with innerHTML (the browser
+// re-serializes it: an escaped quote reads back as a plain one, so the
+// read-back never matched and every poll rebuilt the box, folding the
+// examiner's opened "자세한 오류 내용"). Same rule as 40-status.js.
+let jobsErrWritten = null;
+function jobsErrWrite(el, html) {
+  if (!el) return false;
+  if (jobsErrWritten === html && (el.innerHTML !== "" || html === "")) return false;
+  jobsErrWritten = html;
+  el.innerHTML = html;
+  return true;
 }
 function renderJobsSheet() {
   const S = storeState();
@@ -621,8 +709,8 @@ function renderJobsSheet() {
   if (err) {
     let html = "";
     if (pv.state === "failed" || (pv.state === "stopped" && p.error)) html = errorHtml(p.error);
-    else if (cj && cj.outcome === "failed") html = `<div>오류: ${esc(cj.message)}</div>`;
-    if (err.innerHTML !== html) err.innerHTML = html;
+    else if (cj && cj.outcome === "failed") html = rawMismatchError(cj.message) ? errorHtml(cj.message) : `<div>오류: ${esc(cj.message)}</div>`;
+    jobsErrWrite(err, html);
     err.hidden = !html;
   }
 
@@ -638,7 +726,9 @@ function renderJobsSheet() {
     const asked = pv.active ? pipelineCancelAsked : clipCancelAsked;
     cancelPipe.disabled = !!asked;
     if (asked) cancelPipe.setAttribute("aria-busy", "true"); else cancelPipe.removeAttribute("aria-busy");
-    cancelPipe.textContent = asked ? "중단 요청 중…" : pv.active ? (pv.state === "enriching" ? "보강 중단" : "분석 중단") : "내보내기 중단";
+    const clipTitle = clipJobsTitle(clipView(S).running);
+    const clipWord = clipTitle === "영상 이어붙이기" ? "이어붙이기 중단" : clipTitle === "내보내기·이어붙이기" ? "내보내기·이어붙이기 중단" : "내보내기 중단";
+    cancelPipe.textContent = asked ? "중단 요청 중…" : pv.active ? (pv.state === "enriching" ? "보강 중단" : "분석 중단") : clipWord;
     if (!pv.active && !clipsRunning) clipCancelAsked = false;
   }
   if (!pv.active) pipelineCancelAsked = false;
@@ -660,7 +750,7 @@ function renderJobsSheet() {
   }
   const closeBtn = $("btnJobClose");
   if (closeBtn) {
-    closeBtn.hidden = !((cj && cj.outcome && cj.outcome !== "deferred") || pv.dismissible);
+    closeBtn.hidden = !((cj && cj.outcome && cj.outcome !== "deferred") || pv.dismissible || joinReloadPending());
   }
   const newBtn = $("btnNew");
   if (newBtn) newBtn.hidden = !(S.project && S.project.caseDir) || pv.active || caseRunning;

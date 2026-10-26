@@ -165,11 +165,60 @@ pub enum Commands {
         case_dir: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Package even while review marks are still queued
+        /// (marks-pending/) or save conflicts are unresolved; the state is
+        /// printed as a warning (default: refuse)
+        #[arg(long)]
+        allow_pending: bool,
+        /// Publish under exactly reports/<NAME> (package_…); fail instead
+        /// of picking another name when it is taken. The workstation's
+        /// finalize passes the name it recorded in the sign-off lane.
+        #[arg(long, conflicts_with = "output")]
+        package_name: Option<String>,
+    },
+    /// Show the finalize journal of a case (review/finalize.inprogress.json:
+    /// an interrupted finalize, or one another PC is running) and what the
+    /// sign-off lane says about it; --dismiss moves it aside (never deletes)
+    /// so the next finalize is no longer blocked
+    FinalizeJournal {
+        case_dir: PathBuf,
+        /// Move the journal to review/finalize.dismissed-<unix>.json and
+        /// record that in the sign-off lane. An interrupted finalize this PC
+        /// can clean up is cleaned up first (as opening the case would);
+        /// otherwise nothing is changed: check review/signoff.json and the
+        /// reports folder yourself, then finalize again
+        #[arg(long)]
+        dismiss: bool,
+        /// With --dismiss: also move a journal whose writer process still
+        /// seems to run, or one whose cleanup left something to check
+        #[arg(long, requires = "dismiss")]
+        force: bool,
+        /// You confirmed that the process the journal names as its writer
+        /// is not a finalize still running (another FrameTrace install,
+        /// another account): run the normal recovery as if it were gone —
+        /// an interrupted finalize is cleaned up (sign-off taken back,
+        /// package marked), unlike --dismiss --force, which only moves the
+        /// journal. Refused while the writer is verified as this program
+        #[arg(long, conflicts_with_all = ["dismiss", "force"])]
+        writer_gone: bool,
+        /// With --writer-gone: required while a live process still matches
+        /// the writer's pid and start time — you confirmed it is not a
+        /// FrameTrace finalize of this case
+        #[arg(long = "i-am-sure", requires = "writer_gone")]
+        i_am_sure: bool,
     },
     /// Verify a package written by package-case: manifest.sha256 entries vs
     /// files, package-manifest.json, audit chains, database snapshot and
     /// sign-off consistency; reports what is verified vs not verified
-    VerifyPackage { package_dir: PathBuf },
+    VerifyPackage {
+        package_dir: PathBuf,
+        /// Exit with code 3 (not 0) when every file checks out but the
+        /// package is from a finalize that did not complete, or its
+        /// sign-off (record or audit-lane entry) is NOT VERIFIED or matched
+        /// only structurally (no audit-key HMAC checked)
+        #[arg(long)]
+        strict: bool,
+    },
     /// Export an indexed video or selected range as a client-deliverable MP4/AVI
     ExportVideo {
         case_dir: PathBuf,
@@ -339,18 +388,35 @@ pub enum Commands {
     },
     /// Verify a chained JSONL audit log and report tamper status
     VerifyAudit { log_path: PathBuf },
+    /// Repair an audit lane whose chain does not verify (e.g. a torn final
+    /// line): cut it back to its verifying prefix, keep the cut bytes
+    /// beside the lane (`<lane>.repair-<unix>.removed`), and append a
+    /// `lane-repair` marker recording their SHA-256. The lane then shows as
+    /// 수리됨 (repaired)
+    RepairLane {
+        log_path: PathBuf,
+        /// Only report what would be cut; change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Rotate the audit-chain HMAC key: generate a new key, register it as
     /// the keyring's active key, and retire the previous key so older keyed
     /// entries stay verifiable
     RotateAuditKey {
         /// Key id stamped as entry_hmac_key_id on new entries
-        /// (default: key-<key fingerprint prefix>)
+        /// (default: kid-<sha8 of the key>, matched by fingerprint)
         #[arg(long)]
         key_id: Option<String>,
-        /// Append a signed audit-key-rotate marker entry to this audit log
+        /// Append a signed audit-key-rotate marker entry to this audit log,
+        /// or to every verifying lane of a case when given a case folder
         /// (repeatable; the marker is keyed under the NEW key)
         #[arg(long)]
         log: Vec<PathBuf>,
+        /// Create a NEW keyring at the path FRAMETRACE_AUDIT_KEYRING_FILE
+        /// names when nothing is there yet (without it, a missing explicit
+        /// keyring is an error — the drive may just be disconnected)
+        #[arg(long)]
+        init: bool,
     },
     /// Batch-process a viewer selection file (export/proxy/thumbnail per item)
     ExportBatch {
@@ -368,6 +434,45 @@ pub enum Commands {
         #[arg(long, overrides_with = "no_resume")]
         resume: bool,
         /// Discard any interrupted-run checkpoint and revalidate every item
+        #[arg(long, overrides_with = "resume")]
+        no_resume: bool,
+    },
+    /// Join consecutive indexed videos losslessly (ffmpeg concat, stream
+    /// copy only) into artifacts/joined with a sidecar manifest and a
+    /// chained join-log entry. Exit code 3 when --plan-id no longer matches
+    JoinVideo {
+        case_dir: PathBuf,
+        /// Indexed video ids (vid_*), comma-separated or repeated
+        #[arg(long, required = true, num_args = 1..)]
+        ids: Vec<String>,
+        /// Junction tolerance in seconds (0.5-5.0)
+        #[arg(long, default_value_t = crate::join::DEFAULT_TOLERANCE_SECONDS)]
+        tolerance: f64,
+        /// plan_id from a prior check; refuses (exit 3) when files changed
+        #[arg(long)]
+        plan_id: Option<String>,
+        /// Temp-file tag ([A-Za-z0-9_-], ≤64); default cli-<unix>-<pid>
+        #[arg(long)]
+        job_tag: Option<String>,
+        /// Print the plan JSON (the /api/join-check shape) and stop
+        #[arg(long)]
+        check: bool,
+    },
+    /// Measure the real sound level (peak/RMS dBFS via ffmpeg volumedetect)
+    /// of indexed videos that have an audio track; results go to
+    /// evidence/logs/audio-level-log.jsonl. Already-valid measurements are
+    /// skipped unless --all
+    MeasureAudio {
+        case_dir: PathBuf,
+        /// Optional viewer selection file limiting the targets
+        selection: Option<PathBuf>,
+        /// Re-measure files that already have a valid measurement
+        #[arg(long)]
+        all: bool,
+        /// Resume from an interrupted run's checkpoint (default: auto)
+        #[arg(long, overrides_with = "no_resume")]
+        resume: bool,
+        /// Discard any interrupted-run checkpoint
         #[arg(long, overrides_with = "resume")]
         no_resume: bool,
     },
@@ -519,6 +624,21 @@ pub enum QaCommands {
     Anomalies { case_dir: PathBuf },
 }
 
+/// R11-S8: a non-zero exit code a command that SUCCEEDED asks for
+/// (`verify-package --strict` on an incomplete finalize: 3); `main` exits
+/// with it after `run` returns `Ok`.
+static REQUESTED_EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn request_exit_code(code: i32) {
+    REQUESTED_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// R11-S8: the exit code for a successful [`run`] (0 unless a command
+/// asked for another).
+pub fn requested_exit_code() -> i32 {
+    REQUESTED_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub fn run(args: Vec<String>) -> Result<(), String> {
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
@@ -536,6 +656,17 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
 
     if let Some(spec) = &cli.key_source {
         crate::audit_key::install_source_override(spec)?;
+    }
+    // R4-B15: a child started by the workstation checks that it signs with
+    // the same audit key source as its parent and says so when it does not.
+    // R5-S9: with the machine-readable prefix the workstation promotes the
+    // line to a job warning (an examiner never sees a child's stderr).
+    if let Some(warning) = crate::serve::key_source_mismatch_warning() {
+        // R8-S7: bound to the step's token (forged lines do not count).
+        eprintln!(
+            "{}",
+            crate::util::step_marker_line(crate::serve::KEY_MISMATCH_MARKER, &warning)
+        );
     }
 
     match cli.command {
@@ -679,11 +810,40 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             signoff,
         } => make_report(&case_dir, rehash, redact_paths, signoff.as_deref()),
         Commands::MakeCustody { case_dir } => make_custody(&case_dir),
-        Commands::PackageCase { case_dir, output } => {
+        Commands::PackageCase {
+            case_dir,
+            output,
+            allow_pending,
+            package_name,
+        } => {
             let options = PackageOptions { output_dir: output };
-            package_case(&case_dir, options)
+            package_case_with_pending(&case_dir, options, allow_pending, package_name.as_deref())
         }
-        Commands::VerifyPackage { package_dir } => verify_package(&package_dir),
+        Commands::FinalizeJournal {
+            case_dir,
+            dismiss,
+            force,
+            writer_gone,
+            i_am_sure,
+        } => {
+            let text = crate::serve::finalize_journal_command(
+                &case_dir,
+                dismiss,
+                force,
+                writer_gone,
+                i_am_sure,
+            )?;
+            print!("{text}");
+            Ok(())
+        }
+        Commands::VerifyPackage {
+            package_dir,
+            strict,
+        } => {
+            let code = crate::cli::handlers::verify_package_with(&package_dir, strict)?;
+            request_exit_code(code);
+            Ok(())
+        }
         Commands::ExportVideo {
             case_dir,
             selector,
@@ -795,7 +955,9 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                 // probe default would kill them mid-walk.
                 timeout_secs: match timeout {
                     Some(0) => None,
-                    other => Some(other.unwrap_or(crate::tsk::TSK_PROBE_TIMEOUT_SECS)),
+                    Some(t) => Some(t),
+                    // R4-C7: default scales with the image (1 h per started TB).
+                    None => Some(crate::tsk::scaled_inspect_timeout_secs(&image_file)),
                 },
             };
             inspect_image(&case_dir, &image_file, options)
@@ -850,7 +1012,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             validate_artifact(&case_dir, &selector, options)
         }
         Commands::VerifyAudit { log_path } => verify_audit(&log_path),
-        Commands::RotateAuditKey { key_id, log } => rotate_audit_key(key_id.as_deref(), &log),
+        Commands::RepairLane { log_path, dry_run } => repair_lane(&log_path, dry_run),
+        Commands::RotateAuditKey { key_id, log, init } => {
+            rotate_audit_key(key_id.as_deref(), &log, init)
+        }
         Commands::ExportBatch {
             case_dir,
             selection,
@@ -864,6 +1029,35 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         } => validate_batch(
             &case_dir,
             &selection,
+            crate::checkpoint::ResumeMode::from_flags(resume, no_resume),
+        ),
+        Commands::JoinVideo {
+            case_dir,
+            ids,
+            tolerance,
+            plan_id,
+            job_tag,
+            check,
+        } => join_video(
+            &case_dir,
+            &JoinVideoArgs {
+                ids: split_ids(&ids),
+                tolerance,
+                plan_id,
+                job_tag,
+                check,
+            },
+        ),
+        Commands::MeasureAudio {
+            case_dir,
+            selection,
+            all,
+            resume,
+            no_resume,
+        } => measure_audio(
+            &case_dir,
+            selection.as_deref(),
+            all,
             crate::checkpoint::ResumeMode::from_flags(resume, no_resume),
         ),
         Commands::KnownHashFilter {
@@ -973,6 +1167,10 @@ fn run_qa(command: QaCommands) -> Result<(), String> {
         }
         QaCommands::Anomalies { case_dir } => {
             let result = crate::anomaly::scan_case(&case_dir, true)?;
+            // R12-I4: first line, before any finding text.
+            if let Some(run_id) = &result.hash_verify_run_id {
+                println!("{}{run_id}", crate::anomaly::HASH_VERIFY_RUN_ID_PREFIX);
+            }
             println!(
                 "anomaly scan complete: {} candidate finding(s)",
                 result.findings.len()

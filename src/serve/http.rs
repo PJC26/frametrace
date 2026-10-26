@@ -1,6 +1,11 @@
 //! HTTP request parsing, loopback/token auth gating, and response/static/media serving.
 
 use super::*;
+#[cfg(test)]
+pub(crate) use crate::util::is_reserved_device_name;
+use crate::util::{
+    is_remote_or_device_path, is_verbatim_local_drive, reserved_device_refused, unc_share_form,
+};
 
 // Bounded so a malformed client cannot exhaust memory; export payloads
 // carry one small JSON record per selected item.
@@ -21,7 +26,69 @@ pub(crate) fn http_body_limit_for(path: &str) -> usize {
     }
 }
 
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// R4-B12: the whole header block must arrive within this (was 30 s): a
+/// slowloris client dripping one byte at a time holds a connection thread
+/// for at most this long.
+pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// R5-S7: connections that may sit in the unauthenticated header phase at
+/// once, server-wide. R4-B12 counted them per peer ADDRESS, but every
+/// local process — the examiner's own page included — is 127.0.0.1, so
+/// the per-peer cap of 16 was in effect a global cap that a burst of the
+/// viewer's own parallel requests (thumbnails, records pages) could hit
+/// and get 503 for. The header phase is short for a real client; only a
+/// slow-drip client stays in it, for at most [`HEADER_READ_TIMEOUT`].
+pub(crate) const MAX_PREAUTH: usize = 48;
+
+/// R5-S7: authenticated requests in flight at once — a separate pool, so
+/// unauthenticated connections (up to [`MAX_PREAUTH`]) can never use up
+/// the slots of requests that already proved the token / nonce.
+pub(crate) const MAX_AUTHED: usize = 64;
+
+/// R5-S7: the two connection pools (lock-free counters).
+#[derive(Default, Debug)]
+pub(crate) struct ConnLimits {
+    pub(crate) preauth: std::sync::atomic::AtomicUsize,
+    pub(crate) authed: std::sync::atomic::AtomicUsize,
+}
+
+/// One taken slot of a [`ConnLimits`] pool; released on drop (also while
+/// a panicking handler unwinds).
+pub(crate) struct ConnSlot {
+    limits: Arc<ConnLimits>,
+    authed: bool,
+}
+
+impl ConnLimits {
+    fn pool(&self, authed: bool) -> &std::sync::atomic::AtomicUsize {
+        if authed { &self.authed } else { &self.preauth }
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.limits
+            .pool(self.authed)
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Takes a slot of the pre-auth (`authed == false`) or authenticated
+/// pool, or `None` when that pool is full.
+pub(crate) fn take_conn_slot(limits: &Arc<ConnLimits>, authed: bool) -> Option<ConnSlot> {
+    use std::sync::atomic::Ordering;
+    let cap = if authed { MAX_AUTHED } else { MAX_PREAUTH };
+    limits
+        .pool(authed)
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < cap).then_some(count + 1)
+        })
+        .ok()
+        .map(|_| ConnSlot {
+            limits: Arc::clone(limits),
+            authed,
+        })
+}
 
 /// Windows review item 11: the workstation URL carries `?token=` on first
 /// load, so no response may leak it (or any evidence path in a query) to a
@@ -112,23 +179,37 @@ pub(crate) fn http_auth_class(method: &str, token_configured: bool) -> HttpAuthC
 /// the ft_nonce cookie a GET / plants or from the user-private instance
 /// file and send X-FrameTrace-Nonce (/api/status's "instance" is only a
 /// fingerprint, not the nonce).
+#[cfg(test)]
 pub(crate) fn authorize(
     request: &Request,
     token: Option<&str>,
     instance: &str,
+) -> Result<bool, u16> {
+    authorize_on(request, token, instance, None)
+}
+
+/// [`authorize`] for a server listening on `port` (C2: the auth cookies
+/// are named per port; `None` = only the legacy names, tests).
+pub(crate) fn authorize_on(
+    request: &Request,
+    token: Option<&str>,
+    instance: &str,
+    port: Option<u16>,
 ) -> Result<bool, u16> {
     if !request_is_localhost_trusted(request) {
         return Err(403);
     }
     match http_auth_class(&request.method, token.is_some()) {
         HttpAuthClass::Public => Ok(false),
-        HttpAuthClass::Token => match request_authorized(request, token.unwrap_or_default()) {
-            AuthProof::Denied => Err(401),
-            AuthProof::Query => Ok(true),
-            AuthProof::Header | AuthProof::Cookie => Ok(false),
-        },
+        HttpAuthClass::Token => {
+            match request_authorized_on(request, token.unwrap_or_default(), port) {
+                AuthProof::Denied => Err(401),
+                AuthProof::Query => Ok(true),
+                AuthProof::Header | AuthProof::Cookie => Ok(false),
+            }
+        }
         HttpAuthClass::Nonce => {
-            if request_nonce_authorized(request, instance) {
+            if request_nonce_authorized(request, instance, port) {
                 Ok(false)
             } else {
                 Err(401)
@@ -166,14 +247,34 @@ pub(crate) fn drain_unread(stream: &mut TcpStream) {
     }
 }
 
-pub(crate) fn handle_connection(stream: TcpStream, state: SharedState) -> Result<(), String> {
-    handle_connection_timed(stream, state, HEADER_READ_TIMEOUT)
+#[cfg(test)]
+pub(crate) fn handle_connection_timed(
+    stream: TcpStream,
+    state: SharedState,
+    read_timeout: Duration,
+) -> Result<(), String> {
+    let limits = Arc::clone(&state_lock(&state).conn_limits);
+    handle_connection_with(stream, state, read_timeout, &limits, None)
 }
 
-pub(crate) fn handle_connection_timed(
+/// The 503 a full connection pool answers with (no thread, no state lock).
+pub(crate) fn refuse_busy(stream: &mut TcpStream, message: &[u8]) {
+    let _ = finish(stream, &plain(503, message.to_vec()));
+    // Bounded discard so the close does not RST away the 503.
+    drain_unread(stream);
+}
+
+/// [`handle_connection_timed`] with the connection pools handed in: the
+/// accept loop clones them once, so serving a connection that is refused
+/// before the auth gate (400/408/503) never waits for the state lock.
+/// `preauth` is the header-phase slot the accept loop already took
+/// (`None`: take one here).
+pub(crate) fn handle_connection_with(
     mut stream: TcpStream,
     state: SharedState,
     read_timeout: Duration,
+    limits: &Arc<ConnLimits>,
+    preauth: Option<ConnSlot>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(read_timeout))
@@ -183,21 +284,36 @@ pub(crate) fn handle_connection_timed(
         .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|err| format!("write timeout: {err}"))?;
     HEAD_ONLY.with(|flag| flag.set(false));
-    let (mut request, extras) = match read_request_ext(&mut stream, read_timeout) {
-        Ok(read) => read,
-        Err(err) => {
-            if err.status != 0 {
-                let _ = finish(
-                    &mut stream,
-                    &plain(err.status, err.message.clone().into_bytes()),
-                );
-                if matches!(err.status, 400 | 411 | 413 | 431) {
-                    drain_unread(&mut stream);
-                }
-            }
-            return Err(err.message);
+    // R5-S7: bounded unauthenticated connections server-wide; the slot is
+    // held through the header phase and the auth gate only.
+    let preauth = match preauth.or_else(|| take_conn_slot(limits, false)) {
+        Some(slot) => slot,
+        None => {
+            refuse_busy(
+                &mut stream,
+                b"too many unauthenticated connections - retry shortly",
+            );
+            return Err("pre-auth connection cap reached".into());
         }
     };
+    let refuse_read = |stream: &mut TcpStream, err: HttpReadError| {
+        if err.status != 0 {
+            let _ = finish(stream, &plain(err.status, err.message.clone().into_bytes()));
+            if matches!(err.status, 400 | 411 | 413 | 431) {
+                drain_unread(stream);
+            }
+        }
+        Err(err.message)
+    };
+    let (head, pending_body) = match read_request_head(&mut stream, read_timeout) {
+        Ok(read) => read,
+        Err(err) => return refuse_read(&mut stream, err),
+    };
+    let ParsedHead {
+        mut request,
+        extras,
+        ..
+    } = head;
     // HEAD is answered exactly like GET minus the body.
     let is_head = request.method == "HEAD";
     if is_head {
@@ -208,15 +324,65 @@ pub(crate) fn handle_connection_timed(
         let guard = state_lock(&state);
         (guard.token.clone(), guard.instance.clone())
     };
-    let plant_cookie = match authorize(&request, token.as_deref(), &instance) {
-        Ok(plant) => plant,
-        Err(403) => {
-            return finish(
-                &mut stream,
-                &plain(403, b"cross-origin request rejected".to_vec()),
-            );
+    // C2: cookies are scoped by host, not by port, so the auth cookies are
+    // named after the port this server listens on.
+    let port = stream.local_addr().ok().map(|addr| addr.port());
+    // R4-B2: `GET /?launch=<code>` is its own gate — a valid one-time code
+    // plants the auth cookie and redirects to `/`.
+    if request.method == "GET"
+        && request.path == "/"
+        && let Some(code) = query_value(&request.query, "launch")
+    {
+        drop(preauth);
+        let mut response = launch_response(&request, &state, &code, port);
+        if is_head && let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            response.truncate(end + 4);
         }
-        Err(code) => return finish(&mut stream, &plain(code, b"unauthorized".to_vec())),
+        let result = finish(&mut stream, &response);
+        if pending_body.has_unread() {
+            drain_unread(&mut stream);
+        }
+        return result;
+    }
+    // S3: Origin/Host, token and nonce live in the header block, so the
+    // gate runs before a single body byte is read — an unauthenticated
+    // client can no longer make the server buffer a 16 MiB body first.
+    let authorized = authorize_on(&request, token.as_deref(), &instance, port);
+    // R5-S7: an authorized request moves to its own pool BEFORE leaving
+    // the header-phase one, so a connection is always counted somewhere.
+    let _authed = if authorized.is_ok() {
+        match take_conn_slot(limits, true) {
+            Some(slot) => Some(slot),
+            None => {
+                drop(preauth);
+                refuse_busy(&mut stream, b"server busy - too many requests in flight");
+                return Err("authenticated connection cap reached".into());
+            }
+        }
+    } else {
+        None
+    };
+    drop(preauth);
+    let plant_cookie = match authorized {
+        Ok(plant) => plant,
+        Err(code) => {
+            let message: &[u8] = if code == 403 {
+                b"cross-origin request rejected"
+            } else {
+                b"unauthorized"
+            };
+            let result = finish(&mut stream, &plain(code, message.to_vec()));
+            if pending_body.has_unread() {
+                // Discard (never buffer) what the client keeps sending, so
+                // closing does not RST away the refusal it has not read.
+                drain_unread(&mut stream);
+            }
+            return result;
+        }
+    };
+    request.body = match read_request_body(&mut stream, pending_body) {
+        Ok(body) => body,
+        Err(err) => return refuse_read(&mut stream, err),
     };
     // Item 8: UNC/device paths are refused before any handler (and thus
     // any filesystem call) sees them.
@@ -246,12 +412,12 @@ pub(crate) fn handle_connection_timed(
     }
     let mut response = route(&request, &state);
     if plant_cookie && let Some(token) = token.as_deref() {
-        set_token_cookie(&mut response, token);
+        set_token_cookie(&mut response, token, port);
     }
     // GETs under the no-token model also plant the instance nonce so the
     // just-served page can satisfy the mutating-request gate.
     if token.is_none() && request.method == "GET" && !instance.is_empty() {
-        set_nonce_cookie(&mut response, &instance);
+        set_nonce_cookie(&mut response, &instance, port);
     }
     if is_head && let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
         response.truncate(end + 4);
@@ -349,14 +515,31 @@ pub(crate) fn parse_request_head(head: &str) -> Result<ParsedHead, HttpReadError
     })
 }
 
-/// Reads one request. `header_deadline` bounds the whole header phase (a
-/// slowloris client dripping a byte at a time resets the per-read socket
-/// timeout forever, so a wall-clock deadline is also enforced); the body
-/// gets 4x that budget.
-pub(crate) fn read_request_ext(
+/// The not-yet-read part of a request body after [`read_request_head`]:
+/// bytes that arrived with the header plus how many are still expected.
+pub(crate) struct PendingBody {
+    leftover: Vec<u8>,
+    content_length: usize,
+    started: std::time::Instant,
+    body_deadline: Duration,
+}
+
+impl PendingBody {
+    /// Whether body bytes are still in flight on the socket.
+    pub(crate) fn has_unread(&self) -> bool {
+        self.leftover.len() < self.content_length
+    }
+}
+
+/// Reads one request's header block. `header_deadline` bounds the whole
+/// header phase (a slowloris client dripping a byte at a time resets the
+/// per-read socket timeout forever, so a wall-clock deadline is also
+/// enforced); the body ([`read_request_body`]) gets 4x that budget. S3:
+/// the auth gate runs between the two, on the header alone.
+pub(crate) fn read_request_head(
     stream: &mut TcpStream,
     header_deadline: Duration,
-) -> Result<(Request, RequestExtras), HttpReadError> {
+) -> Result<(ParsedHead, PendingBody), HttpReadError> {
     let started = std::time::Instant::now();
     let mut buffer: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = [0u8; 2048];
@@ -382,9 +565,29 @@ pub(crate) fn read_request_ext(
     let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
     let parsed = parse_request_head(&head)?;
     let content_length = parsed.content_length;
-    let mut body = buffer[header_end + 4..].to_vec();
-    let body_deadline = header_deadline * 4;
-    while body.len() < content_length {
+    let pending = PendingBody {
+        leftover: buffer[header_end + 4..].to_vec(),
+        content_length,
+        started,
+        body_deadline: header_deadline * 4,
+    };
+    Ok((parsed, pending))
+}
+
+/// Body phase after [`read_request_head`]: reads up to Content-Length within
+/// the body budget (4x the header deadline, measured from the first byte).
+pub(crate) fn read_request_body(
+    stream: &mut TcpStream,
+    pending: PendingBody,
+) -> Result<String, HttpReadError> {
+    let PendingBody {
+        mut leftover,
+        content_length,
+        started,
+        body_deadline,
+    } = pending;
+    let mut chunk = [0u8; 2048];
+    while leftover.len() < content_length {
         if started.elapsed() > body_deadline {
             return Err(read_error(408, "request body timed out"));
         }
@@ -392,12 +595,10 @@ pub(crate) fn read_request_ext(
         if read == 0 {
             break;
         }
-        body.extend_from_slice(&chunk[..read]);
+        leftover.extend_from_slice(&chunk[..read]);
     }
-    body.truncate(content_length);
-    let mut request = parsed.request;
-    request.body = String::from_utf8_lossy(&body).to_string();
-    Ok((request, parsed.extras))
+    leftover.truncate(content_length);
+    Ok(String::from_utf8_lossy(&leftover).to_string())
 }
 
 /// Percent-decodes a URL component. `plus_as_space` selects query-string
@@ -605,12 +806,34 @@ pub(crate) const REMOTE_PATH_ERROR: &str = "네트워크(UNC)·장치 경로는 
 /// (`/api/preflight`, `/api/start`, see [`route_admits_typed_unc`]) are
 /// gated by the Origin port check and the instance nonce, so a typed UNC
 /// share is honoured there; device-namespace paths stay refused.
+///
+/// S8: only Windows gives two leading separators the UNC meaning; on
+/// Linux/macOS `//mnt/x` is an ordinary local path, so a path that starts
+/// with `/` is never remote there.
+///
+/// S2: on Windows a component that names a reserved DOS device (`CON`,
+/// `NUL`, `COM1`, `LPT1`, … — also with an extension, `nul.txt`) is
+/// refused too: `C:\x\COM1` opens the serial port, and a `metadata` /
+/// `read` on it can block a handler thread for good.
 pub(crate) fn reject_remote_path(
     raw: &str,
     approved_roots: &[PathBuf],
 ) -> Result<(), &'static str> {
+    reject_remote_path_on(raw, approved_roots, cfg!(windows))
+}
+
+/// [`reject_remote_path`] with the platform made explicit (`windows`
+/// selects Windows path semantics) so both are tested on every host.
+pub(crate) fn reject_remote_path_on(
+    raw: &str,
+    approved_roots: &[PathBuf],
+    windows: bool,
+) -> Result<(), &'static str> {
     let text = raw.trim();
-    if !is_remote_or_device_path(text) {
+    if windows && reserved_device_refused(text) {
+        return Err(RESERVED_DEVICE_ERROR);
+    }
+    if !is_remote_or_device_path(text, windows) {
         return Ok(());
     }
     if is_verbatim_local_drive(text) {
@@ -639,8 +862,16 @@ pub(crate) fn reject_remote_path(
 /// `\\?\UNC\server\share\…`, no `.`/`..` components) is admitted;
 /// device-namespace and malformed remote paths are still refused.
 pub(crate) fn reject_device_path(raw: &str) -> Result<(), &'static str> {
+    reject_device_path_on(raw, cfg!(windows))
+}
+
+/// [`reject_device_path`] with explicit platform semantics (tests).
+pub(crate) fn reject_device_path_on(raw: &str, windows: bool) -> Result<(), &'static str> {
     let text = raw.trim();
-    if is_remote_or_device_path(text)
+    if windows && reserved_device_refused(text) {
+        return Err(RESERVED_DEVICE_ERROR);
+    }
+    if is_remote_or_device_path(text, windows)
         && let Some(unc) = unc_share_form(text)
     {
         if unc.split('\\').any(|part| part == ".." || part == ".") {
@@ -648,8 +879,11 @@ pub(crate) fn reject_device_path(raw: &str) -> Result<(), &'static str> {
         }
         return Ok(());
     }
-    reject_remote_path(text, &[])
+    reject_remote_path_on(text, &[], windows)
 }
+
+/// Refusal text for a path naming a reserved Windows device (S2).
+pub(crate) const RESERVED_DEVICE_ERROR: &str = "Windows 예약 장치 이름(CON·PRN·AUX·NUL·COM0–9·LPT0–9 등)이 들어간 경로는 허용되지 않습니다. / Paths naming a reserved Windows device are refused.";
 
 /// Routes whose path fields may name a UNC share the examiner typed (see
 /// the policy on [`reject_remote_path`]). Only same-origin, nonce-gated
@@ -659,61 +893,6 @@ pub(crate) fn route_admits_typed_unc(method: &str, path: &str) -> bool {
         (method, path),
         ("POST", "/api/preflight") | ("POST", "/api/start")
     )
-}
-
-fn is_separator(byte: u8) -> bool {
-    byte == b'\\' || byte == b'/'
-}
-
-/// Two leading separators (any mix of `\` and `/`) or the NT object prefix.
-fn is_remote_or_device_path(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    (bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]))
-        || (bytes.len() >= 4
-            && is_separator(bytes[0])
-            && bytes[1] == b'?'
-            && bytes[2] == b'?'
-            && is_separator(bytes[3]))
-}
-
-/// `\\?\C:` / `\\?\C:\…` — the verbatim spelling of a local drive path.
-fn is_verbatim_local_drive(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() >= 6
-        && bytes[0] == b'\\'
-        && bytes[1] == b'\\'
-        && bytes[2] == b'?'
-        && bytes[3] == b'\\'
-        && bytes[4].is_ascii_alphabetic()
-        && bytes[5] == b':'
-        && (bytes.len() == 6 || bytes[6] == b'\\')
-}
-
-/// Lowercased `\\server\share[\rest]` form of a UNC path (separators
-/// normalized to `\`, `\\?\UNC\` unwrapped, trailing separators dropped);
-/// `None` for anything else — device paths, local paths, or a UNC path
-/// without both a server and a share component.
-fn unc_share_form(text: &str) -> Option<String> {
-    let normalized = text.trim().replace('/', "\\");
-    let lower = normalized.to_ascii_lowercase();
-    let rest = if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
-        rest.to_string()
-    } else if lower.starts_with(r"\\?\") || lower.starts_with(r"\\.\") || lower.starts_with(r"\??\")
-    {
-        return None;
-    } else if let Some(rest) = lower.strip_prefix(r"\\") {
-        rest.to_string()
-    } else {
-        return None;
-    };
-    let rest = rest.trim_end_matches('\\');
-    let mut parts = rest.split('\\');
-    let server = parts.next().unwrap_or_default();
-    let share = parts.next().unwrap_or_default();
-    if server.is_empty() || share.is_empty() || matches!(server, "?" | ".") {
-        return None;
-    }
-    Some(format!(r"\\{rest}"))
 }
 
 /// Roots that may admit a UNC path: the bound case, the last package and
@@ -747,6 +926,9 @@ pub(crate) fn path_fields_for(method: &str, path: &str) -> &'static [(bool, &'st
         ("POST", "/api/preflight" | "/api/start") => &[(false, "source_path"), (false, "case_dir")],
         ("POST", "/api/export-clip" | "/api/telemetry" | "/api/proxy") => &[(false, "path")],
         ("POST", "/api/advanced") => &[(false, "extra")],
+        // Join and sound measurement take indexed ids only — never a path
+        // (the CLI resolves sources from the case index).
+        ("POST", "/api/join-check" | "/api/join" | "/api/audio-measure") => &[],
         _ => &[],
     }
 }
@@ -806,11 +988,56 @@ pub(crate) enum AuthProof {
     Denied,
 }
 
+/// C2: name of an auth cookie (`ft_token` / `ft_nonce`) for the server on
+/// `port`. Browsers scope cookies by host only — a `Path=/` cookie set by
+/// 127.0.0.1:8478 replaces the one 127.0.0.1:8477 planted — so two
+/// workstation instances side by side overwrote each other's proof and
+/// answered each other's pages with intermittent 401s. Each server plants
+/// `ft_token_<port>` / `ft_nonce_<port>`. `None` (no listening port known,
+/// tests) yields the legacy name.
+pub(crate) fn auth_cookie_name(base: &str, port: Option<u16>) -> String {
+    match port {
+        Some(port) => format!("{base}_{port}"),
+        None => base.to_string(),
+    }
+}
+
+/// Whether the Cookie header carries `base` for `port` with a value equal
+/// to `secret`. The per-port name is checked; the legacy unsuffixed name
+/// (planted by builds before C2) is accepted for one release as a
+/// fallback — only when its value validates, so another instance's stale
+/// legacy cookie can never stand in for this one's.
+pub(crate) fn auth_cookie_matches(
+    cookie_header: Option<&str>,
+    base: &str,
+    port: Option<u16>,
+    secret: &str,
+) -> bool {
+    let scoped = auth_cookie_name(base, port);
+    cookie_header.is_some_and(|header| {
+        header.split(';').any(|pair| {
+            let mut parts = pair.trim().splitn(2, '=');
+            let name = parts.next().map(str::trim).unwrap_or_default();
+            (name == scoped || name == base) && parts.next().is_some_and(|v| secret_eq(v, secret))
+        })
+    })
+}
+
 /// Checks the optional shared-secret gate. A valid `?token=` query value
-/// authenticates *and* asks the caller to plant the `ft_token` cookie —
-/// page-initiated fetches (video elements, fetch() without headers) can
-/// only carry cookies, not custom headers.
+/// authenticates *and* asks the caller to plant the `ft_token_<port>`
+/// cookie — page-initiated fetches (video elements, fetch() without
+/// headers) can only carry cookies, not custom headers.
+#[cfg(test)]
 pub(crate) fn request_authorized(request: &Request, token: &str) -> AuthProof {
+    request_authorized_on(request, token, None)
+}
+
+/// [`request_authorized`] for the server on `port` (C2 cookie names).
+pub(crate) fn request_authorized_on(
+    request: &Request,
+    token: &str,
+    port: Option<u16>,
+) -> AuthProof {
     if request
         .token_header
         .as_deref()
@@ -821,33 +1048,124 @@ pub(crate) fn request_authorized(request: &Request, token: &str) -> AuthProof {
     if query_value(&request.query, "token").is_some_and(|value| secret_eq(&value, token)) {
         return AuthProof::Query;
     }
-    let cookie_match = request.cookie.as_deref().is_some_and(|header| {
-        header.split(';').any(|pair| {
-            let mut parts = pair.trim().splitn(2, '=');
-            parts.next().map(str::trim) == Some("ft_token")
-                && parts.next().is_some_and(|value| secret_eq(value, token))
-        })
-    });
-    if cookie_match {
+    if auth_cookie_matches(request.cookie.as_deref(), "ft_token", port, token) {
         AuthProof::Cookie
     } else {
         AuthProof::Denied
     }
 }
 
-/// Inserts the `ft_token` cookie into an already-rendered response, right
-/// after the status line.
-pub(crate) fn set_token_cookie(response: &mut Vec<u8>, token: &str) {
-    let header = format!("Set-Cookie: ft_token={token}; HttpOnly; SameSite=Strict; Path=/\r\n");
+/// Inserts the `ft_token_<port>` cookie into an already-rendered response,
+/// right after the status line.
+pub(crate) fn set_token_cookie(response: &mut Vec<u8>, token: &str, port: Option<u16>) {
+    let name = auth_cookie_name("ft_token", port);
+    let header = format!("Set-Cookie: {name}={token}; HttpOnly; SameSite=Strict; Path=/\r\n");
     if let Some(pos) = response.windows(2).position(|w| w == b"\r\n") {
         response.splice(pos + 2..pos + 2, header.into_bytes());
     }
 }
 
+/// The `/` redirect target of a launch request: the query without its
+/// `launch` and `token` parameters (raw, still percent-encoded, order
+/// kept). A parameter holding a control character or a space is dropped
+/// rather than echoed into a header.
+pub(crate) fn launch_redirect_target(query: &str) -> String {
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            name != "launch" && name != "token"
+        })
+        .filter(|pair| !pair.chars().any(|c| c.is_control() || c == ' '))
+        .collect();
+    if kept.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{}", kept.join("&"))
+    }
+}
+
+/// R6-S3: the `200` page a launch request answers with: it replaces itself
+/// (`location.replace`, keeping the address-bar hash) with `target` — a
+/// same-origin path from [`launch_redirect_target`]. `<noscript>` falls
+/// back to a meta refresh, plus a plain link. `no-store`, no referrer.
+pub(crate) fn launch_step_page(target: &str) -> Vec<u8> {
+    let script_target =
+        crate::util::script_json_value(&serde_json::Value::String(target.to_string()));
+    let safe = crate::util::html_escape(target);
+    let body = format!(
+        "<!doctype html>\n<html lang=\"ko\"><head><meta charset=\"utf-8\">\n<meta name=\"referrer\" content=\"no-referrer\">\n<title>FrameTrace</title>\n<noscript><meta http-equiv=\"refresh\" content=\"0;url={safe}\"></noscript>\n</head><body><p>FrameTrace 워크스테이션을 여는 중… / Opening the FrameTrace workstation…</p>\n<p><a href=\"{safe}\">열리지 않으면 여기를 누르십시오 / click here if nothing happens</a></p>\n<script>location.replace({script_target} + location.hash);</script>\n</body></html>\n"
+    );
+    respond(
+        200,
+        "text/html; charset=utf-8",
+        body.into_bytes(),
+        "no-store",
+        None,
+    )
+}
+
+/// R4-B2: answer to `GET /?launch=<code>`.
+/// - valid, unexpired, unused code → a same-origin step page
+///   ([`launch_step_page`], R6-S3) to `/` with the `ft_token_<port>`
+///   cookie (the code is consumed: single use);
+/// - otherwise, a request that already proves the token (cookie/header)
+///   is simply sent on to `/`;
+/// - otherwise `401` with an explanation (expired or reused link).
+///
+/// Without a configured token there is nothing to plant: redirect.
+pub(crate) fn launch_response(
+    request: &Request,
+    state: &SharedState,
+    code: &str,
+    port: Option<u16>,
+) -> Vec<u8> {
+    if !request_is_localhost_trusted(request) {
+        return plain(403, b"cross-origin request rejected".to_vec());
+    }
+    // R5 (contract with U14): the redirect drops `launch` (and any
+    // `token`) but keeps every other query parameter, so a launch URL such
+    // as `/?launch=…&case=…` still lands where it pointed.
+    let target = launch_redirect_target(&request.query);
+    // R6-S3: a same-origin HTML step instead of `303`. A launch URL opened
+    // from a `file://` launch page (Linux/macOS) or another site is a
+    // cross-site navigation, and a redirect keeps that chain cross-site:
+    // the browser stored the `SameSite=Strict` token cookie but did not
+    // send it with the redirected `GET /` → 401. A navigation the
+    // workstation's own page starts is same-site, so the cookie goes.
+    let redirect = || launch_step_page(&target);
+    let (token, valid) = {
+        let mut guard = state_lock(state);
+        let valid = super::consume_launch_code(&mut guard, code.trim(), std::time::Instant::now());
+        (guard.token.clone(), valid)
+    };
+    let Some(token) = token else {
+        return redirect();
+    };
+    if valid {
+        let mut response = redirect();
+        set_token_cookie(&mut response, &token, port);
+        return response;
+    }
+    if request_authorized_on(request, &token, port) != AuthProof::Denied {
+        return redirect();
+    }
+    respond(
+        401,
+        "text/html; charset=utf-8",
+        "<!doctype html><meta charset=\"utf-8\"><title>FrameTrace</title><p>실행 링크가 만료되었거나 이미 사용되었습니다. FrameTrace를 다시 실행하면 새 링크로 열립니다.</p><p>This launch link expired or was already used; start FrameTrace again.</p>"
+            .as_bytes()
+            .to_vec(),
+        "no-store",
+        None,
+    )
+}
+
 /// Checks the instance-nonce proof for mutating requests in the no-token
 /// model. An empty configured nonce can never authenticate (entropy
 /// failure is fail-closed, matching the instance-file check).
-pub(crate) fn request_nonce_authorized(request: &Request, nonce: &str) -> bool {
+pub(crate) fn request_nonce_authorized(request: &Request, nonce: &str, port: Option<u16>) -> bool {
     if nonce.is_empty() {
         return false;
     }
@@ -861,13 +1179,7 @@ pub(crate) fn request_nonce_authorized(request: &Request, nonce: &str) -> bool {
     if query_value(&request.query, "nonce").is_some_and(|value| secret_eq(&value, nonce)) {
         return true;
     }
-    request.cookie.as_deref().is_some_and(|cookie| {
-        cookie.split(';').any(|part| {
-            let mut parts = part.trim().splitn(2, '=');
-            parts.next().map(str::trim) == Some("ft_nonce")
-                && parts.next().is_some_and(|value| secret_eq(value, nonce))
-        })
-    })
+    auth_cookie_matches(request.cookie.as_deref(), "ft_nonce", port, nonce)
 }
 
 /// Public, non-secret fingerprint of the instance nonce. `/api/status`
@@ -884,11 +1196,12 @@ pub(crate) fn instance_fingerprint(instance: &str) -> String {
     digest[..12].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Inserts the `ft_nonce` cookie so the served page's same-origin fetches
-/// carry the instance proof automatically. SameSite=Strict keeps it off
-/// cross-site form POSTs — the request then fails the nonce gate.
-pub(crate) fn set_nonce_cookie(response: &mut Vec<u8>, nonce: &str) {
-    let header = format!("Set-Cookie: ft_nonce={nonce}; HttpOnly; SameSite=Strict; Path=/\r\n");
+/// Inserts the `ft_nonce_<port>` cookie so the served page's same-origin
+/// fetches carry the instance proof automatically. SameSite=Strict keeps
+/// it off cross-site form POSTs — the request then fails the nonce gate.
+pub(crate) fn set_nonce_cookie(response: &mut Vec<u8>, nonce: &str, port: Option<u16>) {
+    let name = auth_cookie_name("ft_nonce", port);
+    let header = format!("Set-Cookie: {name}={nonce}; HttpOnly; SameSite=Strict; Path=/\r\n");
     if let Some(pos) = response.windows(2).position(|w| w == b"\r\n") {
         response.splice(pos + 2..pos + 2, header.into_bytes());
     }
@@ -1022,13 +1335,61 @@ pub(crate) fn serve_case_file_with(
         Ok(meta) if meta.is_file() => meta,
         _ => return write_simple(stream, 404, b"file not found"),
     };
-    let total = meta.len();
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(_) => return write_simple(stream, 404, b"file not found"),
+    let mut total = meta.len();
+    // R5-S2: a script under the case folder runs in the workstation origin
+    // when a trusted page loads it (`review/data-bundle.js`), so its bytes
+    // must be pinned in the same HMAC'd manifest as the pages — an edited
+    // or planted script is refused outright (a page's hash says nothing
+    // about the sibling file it loads). R4-B5: a page at a generated
+    // location is trusted only when the manifest lists its exact bytes;
+    // an unlisted one renders sandboxed (no script).
+    // R6-S7 / R7-S2: what is served under the trusted answer is exactly
+    // what was verified — see [`verify_for_serving`].
+    let is_script = is_script_path(&path);
+    let is_page = !is_script && is_generated_page(&case_dir, &path);
+    let head_only = HEAD_ONLY.with(std::cell::Cell::get);
+    let mut verified_stream: Option<VerifiedStream> = None;
+    let mut memory_body: Option<Vec<u8>> = None;
+    let mut safety = content_safety_headers(&path, false, false);
+    if is_script || is_page {
+        match verify_for_serving(&case_dir, &path, total, is_page, head_only) {
+            ServeVerdict::Trusted { script_src, body } => {
+                if is_page {
+                    safety = trusted_page_headers(script_src.as_deref());
+                }
+                match body {
+                    VerifiedBody::Memory(bytes) => {
+                        total = bytes.len() as u64;
+                        memory_body = Some(bytes);
+                    }
+                    VerifiedBody::Stream(verified) => verified_stream = Some(verified),
+                    VerifiedBody::HeadOnly => {}
+                }
+            }
+            ServeVerdict::Untrusted | ServeVerdict::Unknown if is_script => {
+                return write_simple(
+                    stream,
+                    403,
+                    b"script not verified - regenerate the review pages on this computer",
+                );
+            }
+            ServeVerdict::Untrusted | ServeVerdict::Unknown => {
+                safety = UNVERIFIED_PAGE_HEADERS.to_string();
+            }
+        }
+    }
+    let mut file: Box<dyn Read> = match (memory_body, verified_stream.is_some()) {
+        (Some(bytes), _) => Box::new(std::io::Cursor::new(bytes)),
+        (None, true) => Box::new(std::io::empty()),
+        (None, false) => match std::fs::File::open(&path) {
+            Ok(file) => Box::new(file),
+            Err(_) => return write_simple(stream, 404, b"file not found"),
+        },
     };
-    let trusted = is_generated_page(&case_dir, &path);
-    let safety = content_safety_headers(&path, trusted, false);
+    if mime_for(&path).starts_with("text/html") {
+        let frame = html_frame_headers(&safety);
+        safety.push_str(&frame);
+    }
     let (cache, etag_header) = if is_thumbnail_path(&case_dir, &path) {
         let etag = thumb_etag(&meta);
         let immutable = query_value(&request.query, "v").is_some_and(|v| !v.is_empty());
@@ -1060,7 +1421,580 @@ pub(crate) fn serve_case_file_with(
     stream
         .write_all(head.as_bytes())
         .map_err(|err| format!("write failed: {err}"))?;
-    stream_body(stream, &mut file, total)
+    match verified_stream {
+        Some(verified) => stream_verified(stream, &path, verified),
+        None => stream_body(stream, &mut file, total),
+    }
+}
+
+/// R7-S2: files up to this size are verified by reading them into memory
+/// and served from those bytes (the R6-S7 rule); larger ones are hashed
+/// in a streaming pass and streamed (see [`verify_for_serving`]), so a
+/// request never holds more than this much of a file in memory.
+pub(crate) const IN_MEMORY_VERIFY_MAX: u64 = 4 * 1024 * 1024;
+
+/// R7-S2: what [`verify_for_serving`] decided.
+pub(crate) enum ServeVerdict {
+    /// The manifest lists the bytes; `script_src` for a page's CSP.
+    Trusted {
+        script_src: Option<String>,
+        body: VerifiedBody,
+    },
+    /// Not listed, unreadable, too large, or changed while hashed.
+    Untrusted,
+    /// HEAD without a cached verdict: nothing was read.
+    Unknown,
+}
+
+/// R7-S2: how the verified bytes are delivered.
+pub(crate) enum VerifiedBody {
+    /// Read once into memory and served as read (small files).
+    Memory(Vec<u8>),
+    /// Streamed from the verified handle by [`stream_verified`]: each
+    /// [`VERIFY_CHUNK`] is re-read and compared with the hashing pass's
+    /// hash of that chunk BEFORE it is sent (R9-S1; no whole-file re-hash
+    /// at the end any more), the last chunk is held back until length,
+    /// end of file and identity still match, and the whole transfer has a
+    /// deadline (R10-S9).
+    Stream(VerifiedStream),
+    /// HEAD: no body.
+    HeadOnly,
+}
+
+/// R7-S2: an open, verified file to stream with [`stream_verified`].
+pub(crate) struct VerifiedStream {
+    file: std::fs::File,
+    len: u64,
+    /// R9-S1: SHA-256 of every [`VERIFY_CHUNK`]-byte chunk the hashing
+    /// pass read (the last one may be shorter), in file order. At most
+    /// [`MAX_VERIFY_CHUNKS`] entries (32 bytes each: 256 KiB for a
+    /// 512 MiB file).
+    chunks: Vec<[u8; 32]>,
+    identity: FileIdentity,
+}
+
+/// R9-S1: the unit both passes read, hash and compare.
+pub(crate) const VERIFY_CHUNK: usize = 64 * 1024;
+
+/// R9-S1: most chunks a verified file can have
+/// (`VERIFIED_SERVE_MAX_BYTES / VERIFY_CHUNK` = 8192).
+pub(crate) const MAX_VERIFY_CHUNKS: usize =
+    (VERIFIED_SERVE_MAX_BYTES as usize).div_ceil(VERIFY_CHUNK);
+
+/// R9-S1: fills `buf` from `file` until it is full or the file ends
+/// (`Interrupted` retried) - both passes cut the file at the same
+/// [`VERIFY_CHUNK`] boundaries whatever sizes the OS reads return.
+fn read_chunk(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// R7-S2: a file's identity as far as the platform tells it — size,
+/// modification time, file id (volume + index / device + inode) and
+/// change time (ctime / NTFS `ChangeTime`, updated by every write).
+///
+/// R8-S2: NOT proof that the bytes are unchanged — NTFS `ChangeTime` is
+/// settable with `SetFileInformationByHandle(FileBasicInfo)`, so a
+/// same-size rewrite can restore the whole identity. It only detects a
+/// change DURING one verification or transfer, and answers HEAD (no body)
+/// from the last GET's verdict; content is hashed before every GET.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    len: u64,
+    modified_nanos: Option<u128>,
+    file_id: Option<(u64, u64)>,
+    changed: Option<i128>,
+}
+
+/// R7-S2: [`FileIdentity`] of an open file (`None` when its metadata
+/// cannot be read).
+pub(crate) fn file_identity(file: &std::fs::File) -> Option<FileIdentity> {
+    let meta = file.metadata().ok()?;
+    let modified_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    #[cfg(unix)]
+    let (file_id, changed) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            Some((meta.dev(), meta.ino())),
+            Some(i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())),
+        )
+    };
+    #[cfg(windows)]
+    let (file_id, changed) = windows_file_identity(file);
+    #[cfg(not(any(unix, windows)))]
+    let (file_id, changed) = (None, None);
+    Some(FileIdentity {
+        len: meta.len(),
+        modified_nanos,
+        file_id,
+        changed,
+    })
+}
+
+/// Volume serial + file index and the NTFS change time of an open file.
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> (Option<(u64, u64)>, Option<i128>) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is the open file's handle (borrowed for the call);
+    // `info` is a properly sized out-structure.
+    let id = unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .ok()
+        .map(|()| {
+            (
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            )
+        });
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: as above; the buffer size is the structure's size.
+    let changed = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .ok()
+    .map(|()| i128::from(basic.ChangeTime));
+    (id, changed)
+}
+
+/// R7-S2: a verification result for one file identity.
+#[derive(Clone)]
+struct CachedVerdict {
+    identity: FileIdentity,
+    sha: String,
+    script_src: Option<String>,
+}
+
+/// Most cached verdicts kept (the map is cleared when it is full).
+const VERIFY_CACHE_MAX: usize = 512;
+
+/// R7-S2: verdicts by canonical path. Its own lock — never `state_lock`
+/// — and held only for the map operation, never during disk work.
+fn verify_cache() -> &'static Mutex<std::collections::HashMap<PathBuf, CachedVerdict>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, CachedVerdict>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cache_lookup(path: &Path, identity: &FileIdentity) -> Option<CachedVerdict> {
+    let cache = verify_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .get(path)
+        .filter(|entry| entry.identity == *identity)
+        .cloned()
+}
+
+fn cache_store(path: &Path, entry: CachedVerdict) {
+    let mut cache = verify_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= VERIFY_CACHE_MAX && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), entry);
+}
+
+fn cache_forget(path: &Path) {
+    verify_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
+}
+
+/// R7-S2 test hook: content bytes read for verification per path (hash
+/// passes and in-memory reads; not the serving pass).
+#[cfg(test)]
+pub(crate) fn verify_read_bytes(path: &Path) -> u64 {
+    verify_reads()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn verify_reads() -> &'static Mutex<std::collections::HashMap<PathBuf, u64>> {
+    static READS: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, u64>>> =
+        std::sync::OnceLock::new();
+    READS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_verify_read(_path: &Path, _bytes: usize) {
+    #[cfg(test)]
+    {
+        *verify_reads()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(_path.to_path_buf())
+            .or_default() += _bytes as u64;
+    }
+}
+
+/// R7-S2: decides whether a script or generated page (`page`) of `len`
+/// bytes (the size from its metadata) may be served under the trusted
+/// answer, and how.
+///
+/// R6-S7 read every such file whole (up to 512 MiB) into memory and hashed
+/// it on EVERY request, HEAD included. Now:
+/// - `len` above [`VERIFIED_SERVE_MAX_BYTES`] is refused before anything
+///   is read;
+/// - files up to [`IN_MEMORY_VERIFY_MAX`] are read once, hashed and served
+///   from those bytes (unchanged rule);
+/// - larger files are hashed in a streaming pass on EVERY GET (R8-S2: R7
+///   skipped the pass when the cached [`FileIdentity`] matched, and that
+///   identity can be restored after a rewrite); the result is cached for
+///   HEAD only. The pass also keeps the SHA-256 of each 64 KiB chunk
+///   (R9-S1). The body is then streamed from the same handle, every chunk
+///   compared with its first-pass hash BEFORE it is sent (the connection
+///   is cut at the first changed chunk, so no changed byte goes out), and
+///   the last chunk is sent only after the length and identity still
+///   match ([`stream_verified`]), else the connection is cut (the client
+///   never gets a complete response). Streamed pages always get a
+///   hash-list `script-src`
+///   ([`crate::util::generated_pages::InlineScriptScan`]);
+/// - HEAD reads no content: a cached verdict answers, otherwise
+///   [`ServeVerdict::Unknown`] (scripts 403, pages sandboxed).
+pub(crate) fn verify_for_serving(
+    case_dir: &Path,
+    path: &Path,
+    len: u64,
+    page: bool,
+    head_only: bool,
+) -> ServeVerdict {
+    if len > VERIFIED_SERVE_MAX_BYTES {
+        return ServeVerdict::Untrusted;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return ServeVerdict::Untrusted;
+    };
+    let Some(identity) = file_identity(&file).filter(|identity| identity.len == len) else {
+        return ServeVerdict::Untrusted;
+    };
+    if head_only {
+        // Headers only: no content byte leaves, so the cached verdict of
+        // the last GET may answer without reading the file.
+        return match cache_lookup(path, &identity) {
+            Some(entry) if trusted_sha(case_dir, &entry.sha) => ServeVerdict::Trusted {
+                script_src: entry.script_src,
+                body: VerifiedBody::HeadOnly,
+            },
+            Some(_) => ServeVerdict::Untrusted,
+            None => ServeVerdict::Unknown,
+        };
+    }
+    if len <= IN_MEMORY_VERIFY_MAX {
+        let mut bytes = Vec::with_capacity(len as usize);
+        if (&file)
+            .take(IN_MEMORY_VERIFY_MAX + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > IN_MEMORY_VERIFY_MAX
+        {
+            return ServeVerdict::Untrusted;
+        }
+        note_verify_read(path, bytes.len());
+        let sha = sha256_hex(&bytes);
+        if !trusted_sha(case_dir, &sha) {
+            return ServeVerdict::Untrusted;
+        }
+        let script_src = if page {
+            crate::util::generated_pages::inline_script_sources(&String::from_utf8_lossy(&bytes))
+        } else {
+            None
+        };
+        if bytes.len() as u64 == len && file_identity(&file).as_ref() == Some(&identity) {
+            cache_store(
+                path,
+                CachedVerdict {
+                    identity,
+                    sha,
+                    script_src: script_src.clone(),
+                },
+            );
+        }
+        return ServeVerdict::Trusted {
+            script_src,
+            body: VerifiedBody::Memory(bytes),
+        };
+    }
+    // R8-S2: a GET always hashes the file before its first byte is sent —
+    // the cached verdict is never a shortcut for content. Its identity
+    // (size, mtime, file id, change time) can be forged: NTFS `ChangeTime`
+    // is settable through `SetFileInformationByHandle`, so a same-size
+    // rewrite with every timestamp restored matched the cache, and the
+    // changed bytes went out (and rendered) before the re-hash at the end
+    // of the transfer noticed.
+    let Some(HashedFile {
+        sha,
+        script_src,
+        read,
+        chunks,
+    }) = hash_file_streaming(path, &mut file, page)
+    else {
+        return ServeVerdict::Untrusted;
+    };
+    if read != len || file_identity(&file).as_ref() != Some(&identity) {
+        // Changed while it was hashed: nothing to vouch for.
+        cache_forget(path);
+        return ServeVerdict::Untrusted;
+    }
+    cache_store(
+        path,
+        CachedVerdict {
+            identity: identity.clone(),
+            sha: sha.clone(),
+            script_src: script_src.clone(),
+        },
+    );
+    if !trusted_sha(case_dir, &sha) {
+        return ServeVerdict::Untrusted;
+    }
+    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return ServeVerdict::Untrusted;
+    }
+    ServeVerdict::Trusted {
+        // A streamed page always gets a hash list (never "no script-src").
+        script_src: if page {
+            script_src.or_else(|| Some("'self'".to_string()))
+        } else {
+            script_src
+        },
+        body: VerifiedBody::Stream(VerifiedStream {
+            file,
+            len,
+            chunks,
+            identity,
+        }),
+    }
+}
+
+/// Whether the case's verified manifest lists `sha`.
+fn trusted_sha(case_dir: &Path, sha: &str) -> bool {
+    crate::util::generated_pages::trusted_hashes(case_dir)
+        .iter()
+        .any(|known| known == sha)
+}
+
+/// R7-S2 / R9-S1: what the hashing pass of [`verify_for_serving`] saw.
+struct HashedFile {
+    /// SHA-256 (hex) of the whole file, as the manifest lists it.
+    sha: String,
+    /// The streamed page's `script-src` (pages only).
+    script_src: Option<String>,
+    /// Bytes read.
+    read: u64,
+    /// R9-S1: SHA-256 of each [`VERIFY_CHUNK`]-byte chunk, in order.
+    chunks: Vec<[u8; 32]>,
+}
+
+/// R7-S2: SHA-256 (hex) of `file` read to its end in [`VERIFY_CHUNK`]
+/// chunks (at most [`VERIFIED_SERVE_MAX_BYTES`] + 1 bytes), the streamed
+/// page's `script-src` when `page`, and the byte count read. R9-S1: also
+/// the SHA-256 of each chunk, so the serving pass can compare every chunk
+/// BEFORE sending it ([`stream_verified`]); bounded by
+/// [`MAX_VERIFY_CHUNKS`] (a longer file is refused). `path` names the file
+/// for the test hook only.
+fn hash_file_streaming(path: &Path, file: &mut std::fs::File, page: bool) -> Option<HashedFile> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut scan = page.then(crate::util::generated_pages::InlineScriptScan::new);
+    let mut chunk = vec![0u8; VERIFY_CHUNK];
+    let mut chunks: Vec<[u8; 32]> = Vec::new();
+    let mut read_total = 0u64;
+    loop {
+        let read = read_chunk(file, &mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        note_verify_read(path, read);
+        read_total += read as u64;
+        if read_total > VERIFIED_SERVE_MAX_BYTES || chunks.len() >= MAX_VERIFY_CHUNKS {
+            return None;
+        }
+        hasher.update(&chunk[..read]);
+        chunks.push(sha256_bytes(&chunk[..read]));
+        if let Some(scan) = scan.as_mut() {
+            scan.feed(&chunk[..read]);
+        }
+        if read < chunk.len() {
+            break;
+        }
+    }
+    let sha = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some(HashedFile {
+        sha,
+        script_src: scan.map(|scan| scan.finish()),
+        read: read_total,
+        chunks,
+    })
+}
+
+/// R7-S2: streams a verified file. R9-S1: every [`VERIFY_CHUNK`]-byte
+/// chunk is read, hashed and compared with the hashing pass's hash of the
+/// same chunk BEFORE any of its bytes is sent; at the first mismatch the
+/// connection is cut, so not one changed byte reaches the client (R8 sent
+/// every chunk but the last and compared only the whole-file hash at the
+/// end, so a page rewritten between or during the passes had its changed
+/// middle delivered - rendered, if not scripted). One chunk is still held
+/// back; it goes out only once every byte has been read and the length,
+/// the end of file and the file's identity still match. Otherwise the
+/// cached verdict is dropped and the connection is cut short of its
+/// `Content-Length` - the client never receives a complete response of
+/// bytes that were not verified (and a script that did not arrive whole
+/// does not run).
+pub(crate) fn stream_verified(
+    stream: &mut TcpStream,
+    path: &Path,
+    mut verified: VerifiedStream,
+) -> Result<(), String> {
+    if HEAD_ONLY.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    let cut = |stream: &mut TcpStream, why: &str| -> Result<(), String> {
+        cache_forget(path);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        Err(format!(
+            "{} changed while it was served ({why}) - transfer cut before the changed bytes",
+            path.display()
+        ))
+    };
+    // R10-S9: the open handle pins the file (on Windows nothing can
+    // rename or replace it meanwhile — a regenerated review bundle, an
+    // `_INCOMPLETE` package rename). A client that keeps reading just
+    // enough to beat the 60 s per-write timeout held it for hours; the
+    // whole transfer now has a deadline from its size, and each write may
+    // block only until then.
+    let deadline = std::time::Instant::now() + stream_budget(verified.len);
+    let send = |stream: &mut TcpStream, bytes: &[u8]| -> Result<(), String> {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "{} was not taken by the client in time - transfer cut (slow or stalled client)",
+                path.display()
+            ));
+        }
+        let _ = stream.set_write_timeout(Some(left.min(STREAM_WRITE_STALL)));
+        stream
+            .write_all(bytes)
+            .map_err(|err| format!("file write failed: {err}"))
+    };
+    let mut held: Vec<u8> = Vec::with_capacity(VERIFY_CHUNK);
+    let mut chunk = vec![0u8; VERIFY_CHUNK];
+    let mut read_total = 0u64;
+    let mut index = 0usize;
+    while read_total < verified.len {
+        let want = (verified.len - read_total).min(VERIFY_CHUNK as u64) as usize;
+        let read = read_chunk(&mut verified.file, &mut chunk[..want])
+            .map_err(|err| format!("file read failed: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        // R9-S1: compared before a byte of it leaves.
+        if verified.chunks.get(index) != Some(&sha256_bytes(&chunk[..read])) {
+            return cut(stream, &format!("chunk {index} differs"));
+        }
+        index += 1;
+        if !held.is_empty() {
+            send(stream, &held)?;
+        }
+        held.clear();
+        held.extend_from_slice(&chunk[..read]);
+        read_total += read as u64;
+        #[cfg(test)]
+        STREAM_CHUNK_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(index);
+            }
+        });
+    }
+    let mut probe = [0u8; 1];
+    let at_end = matches!(verified.file.read(&mut probe), Ok(0));
+    if read_total != verified.len
+        || index != verified.chunks.len()
+        || !at_end
+        || file_identity(&verified.file).as_ref() != Some(&verified.identity)
+    {
+        return cut(stream, "length or identity");
+    }
+    send(stream, &held)?;
+    stream
+        .flush()
+        .map_err(|err| format!("file write failed: {err}"))
+}
+
+/// R10-S9: longest one write of a verified stream may block (a stalled
+/// client), within the transfer deadline.
+const STREAM_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// R10-S9: the slowest average rate a verified transfer may take before
+/// it is cut: 256 KiB/s (a loopback viewer reads tens of MB/s; a 512 MiB
+/// verified file then has about 35 minutes), plus [`STREAM_BASE_BUDGET`].
+const STREAM_MIN_RATE: u64 = 256 * 1024;
+
+/// R10-S9: the deadline every verified transfer gets regardless of size.
+const STREAM_BASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(test)]
+thread_local! {
+    /// R10-S9 test hook: a fixed transfer deadline on this thread.
+    pub(crate) static STREAM_BUDGET_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// R10-S9: how long a verified transfer of `len` bytes may take.
+fn stream_budget(len: u64) -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = STREAM_BUDGET_OVERRIDE.with(|cell| cell.get()) {
+        return budget;
+    }
+    STREAM_BASE_BUDGET + std::time::Duration::from_secs(len / STREAM_MIN_RATE)
+}
+
+/// R9-S1 test hook type (see [`STREAM_CHUNK_HOOK`]).
+#[cfg(test)]
+pub(crate) type ChunkHook = Box<dyn FnMut(usize)>;
+
+#[cfg(test)]
+thread_local! {
+    /// R9-S1 test hook: called on the serving thread after each chunk of
+    /// [`stream_verified`] passed its comparison (argument: chunks
+    /// compared so far) - lets a test rewrite the file mid-transfer.
+    pub(crate) static STREAM_CHUNK_HOOK: std::cell::RefCell<Option<ChunkHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// True for the two spellings of the embedded viewer page itself.
@@ -1202,6 +2136,48 @@ pub(crate) fn is_generated_page(case_dir: &Path, canonical: &Path) -> bool {
     }
 }
 
+/// R4-B5: headers for a page at a generated location whose bytes the
+/// manifest does not vouch for — rendered inline but sandboxed (opaque
+/// origin, no script), so it can neither run code nor reach the APIs.
+pub(crate) const UNVERIFIED_PAGE_HEADERS: &str = "Content-Security-Policy: sandbox; default-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'unsafe-inline'; frame-ancestors 'self'\r\n";
+
+/// R4-B5: headers for a verified generated page; `script_src` (inline
+/// script hashes + `'self'`) is added when the page allows it.
+pub(crate) fn trusted_page_headers(script_src: Option<&str>) -> String {
+    match script_src {
+        Some(sources) => format!(
+            "Content-Security-Policy: frame-ancestors 'self'; object-src 'none'; base-uri 'self'; script-src {sources}\r\n"
+        ),
+        None => content_safety_headers(Path::new("index.html"), true, false),
+    }
+}
+
+/// R6-S7: generated pages and case scripts up to this size can be trusted
+/// (R7-S2: checked against the metadata size before anything is read). A
+/// larger generated page is served sandboxed (never trusted); a larger
+/// script is refused.
+pub(crate) const VERIFIED_SERVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// SHA-256 (hex) of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// R5-S2: extensions a browser executes as a classic or module script.
+pub(crate) fn is_script_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("js" | "mjs" | "cjs")
+    )
+}
+
 /// Security headers for streamed case/media files (SEC-02).
 /// - Generated pages: may only be framed by the workstation itself.
 /// - Everything else: CSP `sandbox` (no script, opaque origin, so the
@@ -1299,17 +2275,28 @@ pub(crate) fn serve_media(
     if file.seek(SeekFrom::Start(start)).is_err() {
         return write_simple(stream, 500, b"seek failed");
     }
-    let mut head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: {}\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n",
-        if code == 206 { "Partial Content" } else { "OK" },
+    // R5-S2: evidence is never served with a script MIME type — with
+    // `nosniff`, `<script src="/media?path=…evil.js">` is then refused by
+    // the browser instead of running in the workstation origin.
+    let media_type = if is_script_path(&canonical) {
+        "application/octet-stream"
+    } else {
         mime_for(&canonical)
+    };
+    let mut head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: {media_type}\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{REFERRER_POLICY}Connection: close\r\n",
+        if code == 206 { "Partial Content" } else { "OK" },
     );
     // `?download=1` forces a browser save-as with the evidence filename
     // instead of inline playback. Same approved-roots containment applies.
     // Evidence is never trusted content: script-capable documents (html,
     // svg, xml) are always forced to download and sandboxed (SEC-02).
     let wants_download = query_value(&request.query, "download").is_some();
-    head.push_str(&content_safety_headers(&canonical, false, wants_download));
+    let safety = content_safety_headers(&canonical, false, wants_download);
+    if mime_for(&canonical).starts_with("text/html") {
+        head.push_str(&html_frame_headers(&safety));
+    }
+    head.push_str(&safety);
     if code == 206 {
         head.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
     }
@@ -1379,6 +2366,7 @@ pub(crate) fn respond(
     let status_text = match code {
         200 => "OK",
         206 => "Partial Content",
+        303 => "See Other",
         304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -1399,10 +2387,29 @@ pub(crate) fn respond(
     if let Some(extra) = extra {
         head.push_str(extra);
     }
+    if content_type.starts_with("text/html") {
+        head.push_str(&html_frame_headers(extra.unwrap_or_default()));
+    }
     head.push_str("\r\n");
     let mut bytes = head.into_bytes();
     bytes.extend_from_slice(&body);
     bytes
+}
+
+/// R4-B13: anti-framing headers every HTML response carries — a CSP
+/// `frame-ancestors 'self'` (unless `existing` headers already set one)
+/// and the legacy `X-Frame-Options: SAMEORIGIN` for older engines — so no
+/// other site can frame a workstation page (clickjacking the finalize or
+/// delete buttons).
+pub(crate) fn html_frame_headers(existing: &str) -> String {
+    let mut headers = String::new();
+    if !existing.contains("frame-ancestors") {
+        headers.push_str("Content-Security-Policy: frame-ancestors 'self'\r\n");
+    }
+    if !existing.contains("X-Frame-Options") {
+        headers.push_str("X-Frame-Options: SAMEORIGIN\r\n");
+    }
+    headers
 }
 
 /// Percent-encodes a value for RFC 5986/5987 ext-value (`filename*=`).
@@ -1550,7 +2557,7 @@ mod tests_origin_and_paths {
             r"\\evil",
         ] {
             assert_eq!(
-                reject_remote_path(raw, &[]),
+                reject_remote_path_on(raw, &[], true),
                 Err(REMOTE_PATH_ERROR),
                 "{raw} must be refused"
             );
@@ -1561,10 +2568,16 @@ mod tests_origin_and_paths {
             r"\cases\a.mp4",
             "relative/a.mp4",
             r"\\?\C:\cases\a.mp4",
-            r"\\?\d:",
+            // R21-S1: the root separator makes it the drive, not the
+            // volume device (`\\?\d:` is refused — tests_r21_server).
+            r"\\?\d:\",
             "",
         ] {
-            assert_eq!(reject_remote_path(raw, &[]), Ok(()), "{raw} is local");
+            assert_eq!(
+                reject_remote_path_on(raw, &[], true),
+                Ok(()),
+                "{raw} is local"
+            );
         }
     }
 
@@ -1581,7 +2594,7 @@ mod tests_origin_and_paths {
             r"\\?\C:\cases",
             "",
         ] {
-            assert_eq!(reject_device_path(raw), Ok(()), "{raw}");
+            assert_eq!(reject_device_path_on(raw, true), Ok(()), "{raw}");
         }
         for raw in [
             r"\\.\PhysicalDrive0",
@@ -1593,7 +2606,11 @@ mod tests_origin_and_paths {
             r"\\evil",
             r"\\nas\evidence\..\..\x",
         ] {
-            assert_eq!(reject_device_path(raw), Err(REMOTE_PATH_ERROR), "{raw}");
+            assert_eq!(
+                reject_device_path_on(raw, true),
+                Err(REMOTE_PATH_ERROR),
+                "{raw}"
+            );
         }
         assert!(route_admits_typed_unc("POST", "/api/preflight"));
         assert!(route_admits_typed_unc("POST", "/api/start"));
@@ -1621,7 +2638,7 @@ mod tests_origin_and_paths {
             "//nas/evidence/case7/sub/a.mp4",
             r"\\?\UNC\nas\evidence\case7\a.mp4",
         ] {
-            assert_eq!(reject_remote_path(raw, &roots), Ok(()), "{raw}");
+            assert_eq!(reject_remote_path_on(raw, &roots, true), Ok(()), "{raw}");
         }
         for raw in [
             r"\\nas\evidence\case70\a.mp4",
@@ -1632,7 +2649,7 @@ mod tests_origin_and_paths {
             r"\\.\nas\evidence\case7",
         ] {
             assert_eq!(
-                reject_remote_path(raw, &roots),
+                reject_remote_path_on(raw, &roots, true),
                 Err(REMOTE_PATH_ERROR),
                 "{raw}"
             );

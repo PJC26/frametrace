@@ -1,14 +1,26 @@
 const STEP_NAMES = ["케이스 준비", "소스 등록", "스캔 · 색인", "재생성 검증", "리뷰 생성"];
 
+// U8: a 401 means the server is up but refused this page's proof (the
+// HttpOnly ft_token / ft_nonce cookie is missing or belongs to another
+// FrameTrace instance on this computer) — never "server down", and not
+// "expired" either: the likely cause is a second window/instance.
+const AUTH_EXPIRED_MSG = "요청이 인증 오류로 거부되었습니다 — 같은 컴퓨터에서 다른 FrameTrace 창이 열려 있으면 닫고 이 창을 새로 고치십시오";
 // Reads a fetch Response as JSON without ever throwing: HTTP errors,
 // non-JSON bodies (a proxy error page, a truncated reply) and network
 // failures all collapse to { ok:false, error } so callers have exactly one
-// failure shape to render.
-async function readJson(r) {
+// failure shape to render. `kind` ("read" = GET, "write" = POST) feeds the
+// auth banner (40-status.js): a 401 raises it for that kind, a success of
+// the same kind clears it — a public GET (no-token mode: /api/status needs
+// no proof) never clears a refused write.
+async function readJson(r, kind) {
   let data = null;
   try { data = await r.json(); } catch (e) { data = null; }
   if (!r || !r.ok) {
     const status = r && r.status ? `HTTP ${r.status}` : "응답 없음";
+    if (r && r.status === 401) {
+      if (typeof noteAuthExpired === "function") noteAuthExpired(kind || "read");
+      return Object.assign({}, data && typeof data === "object" ? data : {}, { ok: false, status: 401, auth: true, error: AUTH_EXPIRED_MSG });
+    }
     return Object.assign({}, data && typeof data === "object" ? data : {}, {
       ok: false,
       // HTTP status kept so callers can tell "endpoint not in this server
@@ -17,6 +29,7 @@ async function readJson(r) {
       error: (data && data.error) || `서버 오류 (${status})`,
     });
   }
+  if (typeof noteAuthOk === "function") noteAuthOk(kind || "read");
   if (!data || typeof data !== "object") return { ok: false, malformed: true, error: "서버 응답을 해석할 수 없습니다 (JSON 아님)" };
   return data;
 }
@@ -27,15 +40,19 @@ function netError(err) {
 // "unknown"); jpost never throws — it always resolves to { ok, error }.
 async function jget(url) {
   const r = await fetch(url, { cache: "no-store" });
-  const data = await readJson(r);
-  if (!(r && r.ok) || data.malformed) throw new Error(data.error);
+  const data = await readJson(r, "read");
+  if (!(r && r.ok) || data.malformed) {
+    const err = new Error(data.error);
+    err.status = data.status || 0;
+    throw err;
+  }
   return data;
 }
 // Like jpost for GET: never throws, keeps the HTTP status on failure.
 async function jgetSoft(url) {
   try {
     const r = await fetch(url, { cache: "no-store" });
-    return await readJson(r);
+    return await readJson(r, "read");
   } catch (err) {
     return netError(err);
   }
@@ -48,7 +65,7 @@ function endpointMissing(res) {
 async function jpost(url, body) {
   try {
     const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
-    return await readJson(r);
+    return await readJson(r, "write");
   } catch (err) {
     return netError(err);
   }
@@ -130,6 +147,27 @@ function dismissToast(rec) {
   rec.timer = 0;
   toasts = toasts.filter(t => t !== rec);
   try { rec.el.remove(); } catch (e) {}
+}
+// Esc with focus inside a toast (97-shell.js): that toast goes, and focus
+// lands somewhere useful instead of on <body> — the newest remaining
+// toast's close button, else the open deliverables sheet, else the hosted
+// viewer (its active card), else #main.
+function dismissToastEl(el) {
+  const rec = toasts.find(t => t.el === el);
+  if (!rec) return false;
+  dismissToast(rec);
+  const next = toasts[toasts.length - 1];
+  const nextBtn = next && next.el && typeof next.el.querySelector === "function" ? next.el.querySelector("button") : null;
+  if (nextBtn) { nextBtn.focus(); return true; }
+  const sheetOpen = typeof FTStore === "object" && FTStore && FTStore.state && FTStore.state.panels && FTStore.state.panels.finalize;
+  if (sheetOpen && typeof hFocusables === "function") {
+    const f = hFocusables($("hFinalizeSheet"));
+    if (f.length) { f[0].focus(); return true; }
+  }
+  if (window.FTViewer && typeof window.FTViewer.focus === "function" && window.FTViewer.focus()) return true;
+  const main = $("main");
+  if (main && typeof main.focus === "function") main.focus();
+  return true;
 }
 function dismissNewestToast() {
   const rec = toasts[toasts.length - 1];

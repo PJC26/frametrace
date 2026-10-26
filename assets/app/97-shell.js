@@ -128,7 +128,7 @@ function hExaminerSave() {
 }
 $("hBtnExaminerSave").addEventListener("click", () => { hExaminerSave(); });
 $("hExaminerInput").addEventListener("keydown", e => {
-  if (e.key === "Enter") { e.preventDefault(); hExaminerSave(); }
+  if (e.key === "Enter") { e.preventDefault(); if (!hImeComposing(e)) hExaminerSave(); }
 });
 
 // ---- sheets (§6.3) ----
@@ -328,7 +328,13 @@ function isTextField(el) {
   const type = (el.type || "text").toLowerCase();
   return !["checkbox", "radio", "button", "submit", "reset", "range", "color", "file"].includes(type);
 }
-function hDialogOpen() { return !$("dlgBackdrop").hidden || !$("pickerBackdrop").hidden; }
+// A modal of the hosted viewer (shortcut sheet, in-page dialog, command
+// palette — .modal-backdrop inside the hosted fragment) counts too (U12): Alt+P/J/R
+// must not open a sheet or popover behind it, and Esc is the viewer's.
+function hViewerModalOpen() {
+  return typeof document.querySelector === "function" && !!document.querySelector("#hViewerHost .modal-backdrop:not([hidden])");
+}
+function hDialogOpen() { return !$("dlgBackdrop").hidden || !$("pickerBackdrop").hidden || hViewerModalOpen(); }
 function hShellShortcut(e, activeEl) {
   if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return false;
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
@@ -366,6 +372,16 @@ document.addEventListener("keydown", e => {
   // inside), popover, newest toast. Dialogs and the viewer handle theirs
   // first and mark the event handled.
   if (e.key !== "Escape" || e.defaultPrevented || hDialogOpen()) return;
+  const target = e.target && e.target.nodeType === 1 ? e.target : document.activeElement;
+  const inViewer = !!(target && typeof target.closest === "function" && target.closest("#hViewerHost"));
+  // A text field (or select) of the hosted viewer: its Esc blurs the field
+  // first (viewer handler) — the shell must not close or dismiss anything.
+  if (inViewer && isTextField(target)) return;
+  // Focus inside a toast: Esc dismisses THAT toast (the topmost layer the
+  // examiner is on). A viewer toast is the viewer's own (80-review.js).
+  if (inViewer && target.closest(".toast")) return;
+  const shellToast = target && typeof target.closest === "function" ? target.closest(".h-toast") : null;
+  if (shellToast && dismissToastEl(shellToast)) { e.preventDefault(); return; }
   if (FTStore.state.panels.finalize) {
     const sheet = $("hFinalizeSheet");
     if (sheet.querySelector && sheet.querySelector("[aria-busy='true']")) return;

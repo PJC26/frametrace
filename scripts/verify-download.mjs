@@ -1,10 +1,14 @@
 // Verify single + multi file download from the viewer.
+// MANUAL harness - not in scripts/ci-harnesses.sh (T13): needs headless Edge on
+// :9222, a workstation (FT_BASE, default :8477 - refused without --i-know, R4 F7)
+// with a case open, and writes to C:/Temp.
 // Note: headless Edge cancels every download (even blob:) at the download
 // manager, so we assert on Page.downloadWillBegin — the browser observed
 // the request, resolved the filename, and started a download. Byte-level
 // correctness of /media?download=1 is verified separately with curl.
 const CDP = 'http://127.0.0.1:9222';
-const BASE = 'http://127.0.0.1:8477';
+import { guardBase } from './lib/real-server-guard.mjs';
+const BASE = guardBase('verify-download', process.env.FT_BASE || 'http://127.0.0.1:8477'); // R4 F7: refuses the real :8477 without --i-know
 const fs = await import('fs');
 const DL = 'C:/Temp/ft-dl-test';
 fs.mkdirSync(DL, { recursive: true });

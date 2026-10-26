@@ -12,12 +12,13 @@ pub(crate) use std::io::{Read, Seek, SeekFrom, Write};
 pub(crate) use std::net::{TcpListener, TcpStream};
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::process::{Command, Stdio};
-pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod discovery;
+mod finalize_journal;
 mod http;
 mod jobs;
 mod media;
@@ -35,9 +36,49 @@ mod tests_http;
 #[cfg(test)]
 mod tests_jobs;
 #[cfg(test)]
+mod tests_join;
+#[cfg(test)]
 mod tests_live;
 #[cfg(test)]
 mod tests_marks_live;
+#[cfg(test)]
+mod tests_phase3;
+#[cfg(test)]
+mod tests_post_review;
+#[cfg(test)]
+mod tests_r12_server;
+#[cfg(test)]
+mod tests_r13_server;
+#[cfg(test)]
+mod tests_r14_server;
+#[cfg(test)]
+mod tests_r16_server;
+#[cfg(test)]
+mod tests_r17_server;
+#[cfg(test)]
+mod tests_r18_server;
+#[cfg(test)]
+mod tests_r19_server;
+#[cfg(test)]
+mod tests_r20_server;
+#[cfg(test)]
+mod tests_r21_server;
+#[cfg(test)]
+mod tests_r4_integration;
+#[cfg(test)]
+mod tests_r4_jobs;
+#[cfg(test)]
+mod tests_r4_server;
+#[cfg(test)]
+mod tests_r5_server;
+#[cfg(test)]
+mod tests_r6_server;
+#[cfg(test)]
+mod tests_r7_server;
+#[cfg(test)]
+mod tests_r8_server;
+#[cfg(test)]
+mod tests_r9_server;
 #[cfg(test)]
 mod tests_recent;
 #[cfg(test)]
@@ -47,32 +88,41 @@ pub(crate) use discovery::{
     find_running_server, publish_local_server, token_for_port, write_instance_file,
 };
 pub(crate) use http::{
-    MAX_CAPTURE_FRAME_BODY, Request, body_value, handle_connection, instance_fingerprint,
-    is_viewer_page_path, json, json_string, page, path_is_under, plain, query_value,
-    request_is_localhost_trusted, valid_token, viewer_page, write_simple,
+    MAX_CAPTURE_FRAME_BODY, Request, body_value, instance_fingerprint, is_viewer_page_path, json,
+    json_string, page, path_is_under, plain, query_value, request_is_localhost_trusted,
+    valid_token, viewer_page, write_simple,
 };
+#[cfg(test)]
+pub(crate) use jobs::api_mark_conflicts;
 pub(crate) use jobs::{
-    api_carve, api_finalize, api_import_marks, api_recover_deleted, api_start, api_verify_sources,
-    case_job_json, default_case_dir, pending_marks_count, run_step, run_step_cancellable,
+    api_audio_measure, api_carve, api_finalize, api_import_marks, api_marks_pending,
+    api_recover_deleted, api_start, api_verify_sources, case_job_json, default_case_dir_checked,
+    pending_marks_count, run_step, run_step_cancellable,
 };
+#[cfg(test)]
+pub(crate) use media::newest_package_dir;
 pub(crate) use media::{
     api_advanced, api_capture_frame, api_export_clip, api_export_clip_cancel,
-    api_export_clip_status, api_export_selected, api_proxy, api_telemetry, api_transcode_queue,
-    cancel_all_clip_jobs, clip_job_json, newest_package_dir, opt_path, running_clip_job_count,
+    api_export_clip_status, api_export_selected, api_join, api_join_check, api_proxy,
+    api_telemetry, api_transcode_queue, cancel_all_clip_jobs, clip_job_json,
+    running_clip_job_count,
 };
 pub(crate) use recent::{api_recent_cases, api_recent_cases_forget, record_recent_case};
 pub(crate) use records::{
     api_records, api_records_meta, cached_index, index_generation, newest_tsk_inspection,
     scan_progress_path,
 };
+#[cfg(test)]
+pub(crate) use state::try_lease_busy;
 pub(crate) use state::{
     BusyLease, CaseJob, ClipJob, Enrichment, IndexCache, IndexFingerprint, InputKind, JobState,
-    LiveCache, PipelineJob, SharedState, StepStatus, api_err, restore_session, save_session,
-    state_lock, try_acquire_busy, try_lease_busy,
+    JoinJobInfo, LiveCache, PipelineJob, SharedState, StepStatus, api_err, cancel_write_ops,
+    lease_busy_locked, restore_session, save_session, shutdown_refusal, side_work_refusal,
+    state_lock, try_acquire_busy, try_begin_seal, try_begin_write_op,
 };
 pub(crate) use system::{
     api_browse, api_cancel, api_case_info, api_env, api_open_case, api_preflight, api_shutdown,
-    api_status, api_verify_audit, tool_available,
+    api_status, api_verify_audit,
 };
 
 // ---- test-only re-exports (names only the unit tests reach through `super::*`)
@@ -97,16 +147,23 @@ pub(crate) use jobs::{
     run_folder_enrichment, source_is_volume_root, start_media_roots, warn_step,
 };
 #[cfg(test)]
-pub(crate) use media::{copy_unique, export_clip_with_exe, export_safe_name};
-// Only the fake-CLI tests (unix-only) use these.
-#[cfg(all(test, unix))]
+pub(crate) use jobs::{audio_measure_with_exe, enrichment_plan};
+#[cfg(test)]
+pub(crate) use media::{
+    copy_unique, export_clip_with_exe, export_safe_name, join_check_with_tools, join_with_exe,
+};
+// The fake-CLI tests use these (unix scripts and Windows `.cmd` fakes).
+#[cfg(test)]
 pub(crate) use jobs::SIGNOFF_PENDING_REL_PATH;
-#[cfg(all(test, unix))]
+// Unused by the current Windows test set; kept for the fake-CLI tests.
+#[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use media::exhibit_arg;
 #[cfg(test)]
 pub(crate) use recent::{
-    RECENT_CAP, RecentCase, canonical_case_dir, forget_recent_in, load_recent, recent_case_json,
-    recent_cases_file, recent_cases_json_from, record_recent_in, upsert_recent,
+    RECENT_CAP, RecentCase, canonical_case_dir, forget_recent_in, load_recent,
+    override_recent_cases_file, recent_case_json, recent_cases_file, recent_cases_json_from,
+    record_recent_in, upsert_recent,
 };
 #[cfg(test)]
 pub(crate) use records::{
@@ -149,8 +206,14 @@ fn examiner_page(legacy: bool) -> &'static str {
 /// In-flight connection bound: the accept loop spawns one thread per
 /// connection, so an unbounded accept would let any local process exhaust
 /// memory/handles by opening thousands of idle sockets. Overflow
-/// connections get an immediate 503 instead of a thread.
-pub(crate) const MAX_CONNECTIONS: usize = 64;
+/// connections get an immediate 503 instead of a thread. R5-S7: the
+/// budget is the header-phase pool plus the authenticated pool, each
+/// capped on its own (`http::MAX_PREAUTH`, `http::MAX_AUTHED`).
+pub(crate) const MAX_CONNECTIONS: usize = http::MAX_PREAUTH + http::MAX_AUTHED;
+
+/// How long the nonblocking accept loop sleeps when no connection is
+/// pending (also bounds how fast /api/shutdown ends the loop).
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
 pub struct ServeOptions {
     pub case_dir: Option<PathBuf>,
@@ -162,24 +225,55 @@ pub struct ServeOptions {
 }
 
 pub fn run(options: ServeOptions) -> Result<(), String> {
+    run_on(options, None)
+}
+
+/// [`run`] on a listener the caller already bound (R5: the WebView2 shell
+/// binds its port itself and hands the very socket over, so no other
+/// process can claim the port between "probe says free" and the bind).
+/// The "reuse an already-running workstation" step is skipped — the
+/// caller decided to own this server.
+pub fn run_with_listener(options: ServeOptions, listener: TcpListener) -> Result<(), String> {
+    run_on(options, Some(listener))
+}
+
+/// R20-S3: the [`ServeOptions::case_dir`] folder as bound —
+/// [`state::bind_path`] under the `/api/start` policy (a typed UNC share
+/// admitted; device, reserved and verbatim-reassembled paths refused with
+/// an error, never silently). R21-S4: no production entry point sets it
+/// (`main.rs`, `app.rs` and `shell.rs` pass `None`; there is no
+/// `serve --case` flag) — tests and library callers only.
+pub(crate) fn bind_cli_case(typed: &Path) -> Result<PathBuf, String> {
+    state::bind_path(typed, http::reject_device_path)
+        .map_err(|reason| format!("--case {}: {reason}", typed.display()))
+}
+
+fn run_on(options: ServeOptions, bound: Option<TcpListener>) -> Result<(), String> {
     proc::install_process_guard();
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
-    if let Some(case_dir) = &options.case_dir {
-        let mut guard = state_lock(&state);
-        guard.case_dir = Some(case_dir.clone());
+    if let Some(typed) = &options.case_dir {
+        // R20-S3 (P34): `case_dir` is bound like a typed `/api/start` case
+        // folder — normalized and checked again on the normalized path —
+        // so it compares equal to the same folder bound any other way.
+        let case_dir = bind_cli_case(typed)?;
         // An explicit --case binding still honors extra media roots the
         // session recorded for that case (linked carving workspaces).
-        guard.media_roots = restore_session()
-            .and_then(|(dir, roots)| (dir == *case_dir).then_some(roots))
+        // Read before the state lock.
+        let roots = restore_session()
+            .and_then(|(dir, roots)| (dir == case_dir).then_some(roots))
             .unwrap_or_else(|| vec![case_dir.clone()]);
+        let mut guard = state_lock(&state);
+        guard.case_dir = Some(case_dir);
+        guard.media_roots = roots;
     } else if let Some((case_dir, roots)) = restore_session() {
         // Upgrading from a build without the recent list: the restored
         // case is at least the first entry.
         record_recent_case(&case_dir, None);
+        let has_review = case_dir.join("review/index.html").is_file();
         let mut guard = state_lock(&state);
         guard.case_dir = Some(case_dir.clone());
         guard.media_roots = roots;
-        if case_dir.join("review/index.html").is_file() {
+        if has_review {
             guard.phase = "review-ready";
             guard.steps = [StepStatus::Done; 5];
             guard.restored = true;
@@ -194,7 +288,7 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
     // that guessed the port) can otherwise read evidence over GET.
     // FRAMETRACE_TOKEN pins a specific token; FRAMETRACE_NO_TOKEN=1 opts
     // out (E2E harnesses). The token must be cookie-safe because a
-    // successful ?token= request plants it as the ft_token cookie.
+    // successful ?token= request plants it as the ft_token_<port> cookie.
     let token = resolve_token(
         std::env::var("FRAMETRACE_TOKEN").ok().as_deref(),
         std::env::var("FRAMETRACE_NO_TOKEN").ok().as_deref(),
@@ -202,55 +296,105 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
     if let Some(token) = &token {
         state_lock(&state).token = Some(token.clone());
     }
+    // R4-B15: the audit key source this workstation runs with is handed to
+    // every CLI child, and installed here too for the in-process appends.
+    let key_source = workstation_key_source();
+    if let Some(spec) = &key_source
+        && let Err(err) = crate::audit_key::install_source_override(spec)
+        && !err.contains("already installed")
+    {
+        return Err(err);
+    }
+    let key_tag = audit_key_tag(crate::audit_key::configured());
+    {
+        let mut guard = state_lock(&state);
+        guard.key_source = key_source;
+        guard.audit_key_tag = Some(key_tag);
+    }
     // Relaunching the app (e.g. after closing the browser tab) must reuse
     // the already-running workstation instead of stacking zombie servers on
     // successive ports. Skipped when a port or case is explicitly given —
     // that is the E2E harness / CLI asking for a fresh dedicated instance.
-    if options.port.is_none()
+    // R4-B1: only a server whose identity the user-private instance file
+    // proves is reused — never one that merely answers like a workstation.
+    if bound.is_none()
+        && options.port.is_none()
         && options.case_dir.is_none()
         && let Some(existing_port) = find_running_server()
     {
-        // The running instance's token lives in the user-private instance
-        // file (or FRAMETRACE_TOKEN pinned it for both processes).
-        let url = match token_for_port(existing_port).or_else(|| token.clone()) {
-            Some(token) => format!("http://127.0.0.1:{existing_port}/?token={token}"),
-            None => format!("http://127.0.0.1:{existing_port}/"),
-        };
+        // R4-B2: the running instance mints a one-time launch code; the
+        // token (instance file or FRAMETRACE_TOKEN) is only sent to it in
+        // a header, never put on a command line or printed.
+        let code = token_for_port(existing_port)
+            .or_else(|| token.clone())
+            .and_then(|token| discovery::request_launch_code(existing_port, &token));
+        let url = launch_url(existing_port, code.as_deref());
         println!("FrameTrace workstation is already running — reusing it.");
         println!("  {url}");
+        if code.is_some() {
+            println!("{LAUNCH_URL_NOTE}");
+        }
         let _ = std::io::stdout().flush();
-        if should_open_browser(&options) {
-            open_in_browser(&url);
+        if should_open_browser(&options)
+            && let Err(err) = try_open_in_browser(&url)
+        {
+            eprintln!("frametrace: {err}");
         }
         return Ok(());
     }
-    let listener = match options.port {
-        Some(port) => {
+    let listener = match (bound, options.port) {
+        (Some(listener), _) => listener,
+        (None, Some(port)) => {
             bind_loopback(port).map_err(|err| format!("failed to bind 127.0.0.1:{port}: {err}"))?
         }
         // The probe listener is passed straight through instead of being
         // dropped and re-bound: between "probe says free" and "bind for
         // real" another process could claim the port (classic TOCTOU).
-        None => first_free_port().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?,
+        (None, None) => {
+            let (listener, occupied) =
+                first_free_port_noting().ok_or("사용 가능한 로컬 포트를 찾지 못했습니다")?;
+            // R4-B1: a preferred port held by something we could not
+            // identify as our workstation is skipped — say so.
+            if let Some(warning) = occupied_ports_warning(&occupied) {
+                eprintln!("{warning}");
+            }
+            listener
+        }
     };
     let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
     // In-process publish first: the shell must never depend on the file.
     publish_local_server(port, token.as_deref());
     write_instance_file(port, &state_lock(&state).instance, token.as_deref());
-    let url = match &token {
-        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
-        None => format!("http://127.0.0.1:{port}/"),
-    };
+    // R4-B2: printed and opened with a one-time launch code, not the token.
+    // R5-S8: only when a browser (or the examiner) is meant to open it —
+    // the WebView2 shell (`open_browser: false`) hosts the UI itself and
+    // authenticates through the instance file, so a code minted for it
+    // would only sit there, valid, for its whole life.
+    let code = launch_code_wanted(&options, token.is_some())
+        .then(|| mint_launch_code(&state))
+        .flatten();
+    let url = launch_url(port, code.as_deref());
     println!("FrameTrace examiner workstation is running.");
     println!("  {url}");
+    if code.is_some() {
+        println!("{LAUNCH_URL_NOTE}");
+    }
     println!("Close this window to stop the workstation.");
     let _ = std::io::stdout().flush();
     // Test harnesses set FRAMETRACE_NO_BROWSER=1 so spawning the server
     // never steals focus with a real browser window; the WebView2 shell
     // suppresses it via `open_browser: false` because it hosts the UI.
-    if should_open_browser(&options) {
-        open_in_browser(&url);
+    if should_open_browser(&options)
+        && let Err(err) = try_open_in_browser(&url)
+    {
+        eprintln!("frametrace: {err}");
     }
+    // R12-S2 (P13) / R13-S7 (P17): a finalize the last run left unfinished
+    // (crash, kill, power loss) is cleaned up in the background once the
+    // listener is bound and the URL handed out — holding `busy`, status
+    // "recovering" — so a file another program holds can no longer keep
+    // the app from starting. The audit key is installed by now.
+    let _recovery = finalize_journal::spawn_bound_case_recovery(&state);
     serve_on(listener, state);
     // Drop the instance file while it still names this process, so later
     // launches never send a token to whatever reuses the port.
@@ -269,6 +413,38 @@ pub fn run(options: ServeOptions) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub(crate) fn kill_all_tracked() {
     proc::kill_all_tracked();
+}
+
+/// R13-S6: `frametrace finalize-journal <case> [--dismiss]` (the CLI's
+/// view of a case's finalize journal; `--dismiss` moves it aside). R17-S2:
+/// `--writer-gone` runs the normal recovery as if the writer were gone.
+/// R18-S7: `i_am_sure` confirms that while a live process still matches
+/// the writer's pid and start time.
+pub fn finalize_journal_command(
+    case_dir: &Path,
+    dismiss: bool,
+    force: bool,
+    writer_gone: bool,
+    i_am_sure: bool,
+) -> Result<String, String> {
+    if writer_gone {
+        return finalize_journal::cli_writer_gone(case_dir, i_am_sure);
+    }
+    finalize_journal::cli_command(case_dir, dismiss, force)
+}
+
+/// C4: stamps every selection export this process is still writing as
+/// "중단됨" (the shell's forced-exit path, after its bounded wait).
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn mark_abandoned_exports() -> usize {
+    media::mark_abandoned_exports()
+}
+
+/// C8: a step child started by the workstation server watches the server
+/// and takes its process group down when the server dies (unix; no-op
+/// elsewhere). Called first thing by every binary's `main`.
+pub fn watch_parent_from_env() {
+    proc::watch_parent_from_env();
 }
 
 /// Binds a loopback listener. On Windows the socket is created through
@@ -293,9 +469,8 @@ mod winsock {
     use std::os::windows::io::FromRawSocket;
     use windows::Win32::Networking::WinSock::{
         AF_INET, INVALID_SOCKET, IPPROTO_TCP, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR,
-        SOCKADDR_IN, SOCKET, SOL_SOCKET, SOMAXCONN, WSA_FLAG_NO_HANDLE_INHERIT,
-        WSA_FLAG_OVERLAPPED, WSADATA, WSAGetLastError, WSASocketW, WSAStartup, bind, closesocket,
-        listen, setsockopt,
+        SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSADATA,
+        WSAGetLastError, WSASocketW, WSAStartup, bind, closesocket, listen, setsockopt,
     };
 
     fn last_error() -> std::io::Error {
@@ -371,12 +546,21 @@ mod winsock {
         }
     }
 
+    /// Listen backlog: WinSock 2's `SOMAXCONN` (0x7fffffff = "reasonable
+    /// system maximum"). NOT the `windows` crate's `SOMAXCONN`, which is the
+    /// WinSock 1.1 value 5 from winsock.h: with a backlog of 5, a burst of
+    /// connects arriving between two polls of the nonblocking accept loop
+    /// (the viewer reloading records + thumbnails while the UI polls
+    /// /api/status) overflowed the queue and Windows answered the excess
+    /// with RST, i.e. ECONNREFUSED on a live server.
+    pub(super) const LISTEN_BACKLOG: i32 = 0x7fff_ffff;
+
     pub(super) fn bind_loopback_exclusive(port: u16) -> std::io::Result<TcpListener> {
         let sock = bind_with_option(port, SO_EXCLUSIVEADDRUSE)?;
         // SAFETY: `sock` is a bound socket we own; ownership moves into the
         // TcpListener on success.
         unsafe {
-            if listen(sock, SOMAXCONN as i32) != 0 {
+            if listen(sock, LISTEN_BACKLOG) != 0 {
                 let err = last_error();
                 let _ = closesocket(sock);
                 return Err(err);
@@ -404,6 +588,30 @@ mod winsock {
 #[cfg(all(test, windows))]
 mod bind_tests {
     use super::{bind_loopback, winsock};
+
+    /// The listen backlog must absorb a burst of connects that arrive
+    /// before the accept loop gets to them. With the `windows` crate's
+    /// `SOMAXCONN` (WinSock 1.1 value 5) every connect past the fifth was
+    /// answered with RST — ECONNREFUSED against a live server.
+    #[test]
+    fn listener_backlog_absorbs_a_burst_of_pending_connects() {
+        use std::net::TcpStream;
+        use std::time::Duration;
+        let listener = bind_loopback(0).expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let burst = 48;
+        let clients: Vec<TcpStream> = (0..burst)
+            .map(|i| {
+                TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap_or_else(|err| {
+                    panic!("connect {i} refused while nothing was accepted yet: {err}")
+                })
+            })
+            .collect();
+        for _ in 0..burst {
+            listener.accept().expect("accept a queued connection");
+        }
+        drop(clients);
+    }
 
     /// Without SO_EXCLUSIVEADDRUSE a second socket with SO_REUSEADDR can
     /// bind on top of a listening port and steal new connections; with it
@@ -495,15 +703,180 @@ pub(crate) fn resolve_token(
     Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
+// ---- R4-B2: one-time launch codes ----
+
+/// How long a launch code stays valid.
+pub(crate) const LAUNCH_CODE_TTL: Duration = Duration::from_secs(30);
+/// Outstanding codes kept at most (oldest dropped first).
+const LAUNCH_CODES_CAP: usize = 16;
+
+/// Printed under a launch URL.
+pub(crate) const LAUNCH_URL_NOTE: &str = "  (이 주소는 30초 동안 한 번만 열 수 있습니다 — 다시 열려면 프로그램을 다시 실행하십시오. / one-time link, valid for 30 s)";
+
+/// The URL printed / handed to the browser: `/?launch=<code>` when a code
+/// was minted, else the bare page (no-token mode, or the code could not be
+/// obtained). Never carries the token.
+pub(crate) fn launch_url(port: u16, code: Option<&str>) -> String {
+    match code {
+        Some(code) => format!("http://127.0.0.1:{port}/?launch={code}"),
+        None => format!("http://127.0.0.1:{port}/"),
+    }
+}
+
+/// R5-S8 (pure): whether startup mints a launch code — only with a token
+/// and when the URL is for a browser (not the shell, which never uses it).
+pub(crate) fn launch_code_wanted(options: &ServeOptions, has_token: bool) -> bool {
+    has_token && options.open_browser
+}
+
+/// Mints a one-time launch code (only meaningful while a token is
+/// configured; `None` otherwise or when entropy fails).
+pub(crate) fn mint_launch_code(state: &SharedState) -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let code: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let now = std::time::Instant::now();
+    let mut guard = state_lock(state);
+    guard.token.as_ref()?;
+    guard.launch_codes.retain(|(_, expires)| *expires > now);
+    if guard.launch_codes.len() >= LAUNCH_CODES_CAP {
+        guard.launch_codes.remove(0);
+    }
+    guard
+        .launch_codes
+        .push((code.clone(), now + LAUNCH_CODE_TTL));
+    Some(code)
+}
+
+/// Consumes `code` if it is outstanding and unexpired at `now` (single
+/// use: a consumed or expired code never validates again).
+pub(crate) fn consume_launch_code(
+    guard: &mut JobState,
+    code: &str,
+    now: std::time::Instant,
+) -> bool {
+    guard.launch_codes.retain(|(_, expires)| *expires > now);
+    match guard
+        .launch_codes
+        .iter()
+        .position(|(known, _)| http::secret_eq(code, known))
+    {
+        Some(position) => {
+            guard.launch_codes.remove(position);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `POST /api/launch-code` (token-authenticated): a fresh one-time code,
+/// for a relaunch that reuses this running workstation.
+pub(crate) fn api_launch_code(state: &SharedState) -> String {
+    match mint_launch_code(state) {
+        Some(code) => serde_json::json!({
+            "ok": true,
+            "code": code,
+            "url": format!("/?launch={code}"),
+            "expires_in_secs": LAUNCH_CODE_TTL.as_secs(),
+        })
+        .to_string(),
+        None => api_err("이 워크스테이션은 접근 토큰 없이 실행 중이라 실행 코드가 필요 없습니다."),
+    }
+}
+
+// ---- R4-B15: audit key source handed to CLI children ----
+
+/// The key source spec this workstation process runs with.
+///
+/// R5-S9: the workstation takes its audit key source from the
+/// `FRAMETRACE_KEY_SOURCE` environment variable only (same spec syntax as
+/// the CLI's global `--key-source`). The never-called
+/// `serve::set_key_source` hook is gone: neither launcher (`frametrace`
+/// without arguments, `frametrace-app`) parses CLI flags, so the variable
+/// is the one documented way. The spec is then handed to every CLI child
+/// as `--key-source`, and a child that still resolves another key says so
+/// on stderr ([`KEY_MISMATCH_MARKER`]) — the server turns that into a job
+/// warning.
+fn workstation_key_source() -> Option<String> {
+    std::env::var("FRAMETRACE_KEY_SOURCE")
+        .ok()
+        .map(|spec| spec.trim().to_string())
+        .filter(|spec| !spec.is_empty())
+}
+
+/// R5-S9: stderr line prefix of a child's audit-key mismatch warning
+/// (machine-readable; the server promotes such lines to job warnings).
+pub const KEY_MISMATCH_MARKER: &str = "FRAMETRACE-KEY-MISMATCH: ";
+
+/// `<key id>:<12-hex fingerprint>` of a resolved audit key, `none` without
+/// one, `error` when the configured source is unusable. The fingerprint
+/// is a domain-separated hash prefix — it identifies, never reveals, the
+/// key.
+pub(crate) fn audit_key_tag(key: Result<Option<crate::audit_key::AuditKey>, String>) -> String {
+    use sha2::{Digest, Sha256};
+    match key {
+        Ok(Some(key)) => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"frametrace-key-tag:");
+            hasher.update(&key.bytes);
+            let digest = hasher.finalize();
+            let fp: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+            format!("{}:{fp}", key.id)
+        }
+        Ok(None) => "none".to_string(),
+        Err(_) => "error".to_string(),
+    }
+}
+
+/// Pure comparison behind [`key_source_mismatch_warning`].
+pub(crate) fn key_tag_mismatch(expected: &str, actual: &str) -> Option<String> {
+    (expected.trim() != actual.trim()).then(|| {
+        format!(
+            "경고: 이 단계의 감사 키({actual})가 워크스테이션의 감사 키({expected})와 다릅니다 — 감사 기록의 키가 섞일 수 있습니다. --key-source 설정을 확인하십시오. / audit key differs from the workstation's"
+        )
+    })
+}
+
+/// R4-B15, child side: a CLI process started by the workstation compares
+/// its own resolved audit key with the one the workstation announced
+/// (`FRAMETRACE_EXPECTED_AUDIT_KEY`) and returns a warning on mismatch.
+/// `None` outside the workstation or when they agree.
+///
+/// `cli::run` calls this right after installing `--key-source` and prints
+/// the warning to stderr.
+pub fn key_source_mismatch_warning() -> Option<String> {
+    let expected = std::env::var(jobs::EXPECTED_AUDIT_KEY_ENV).ok()?;
+    key_tag_mismatch(&expected, &audit_key_tag(crate::audit_key::configured()))
+}
+
+/// One counted in-flight connection (P11): decrements on drop, including
+/// while a panicking handler thread unwinds.
+pub(crate) struct InFlightSlot(pub(crate) Arc<AtomicUsize>);
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Accept loop shared by `run` and the integration tests (no browser side
 /// effects here). Nonblocking so the /api/shutdown flag can end the loop
 /// without a wake-up connection. The server only exits on an explicit
 /// shutdown request — never on idle timeout.
+///
+/// The loop never takes the state lock: the shutdown flag is an atomic
+/// cloned once up front, so a handler holding `JobState` cannot stall
+/// accepting (a stalled accept loop fills the listen backlog and Windows
+/// then refuses new connections outright).
 pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let (shutdown, limits) = {
+        let guard = state_lock(&state);
+        (Arc::clone(&guard.shutdown), Arc::clone(&guard.conn_limits))
+    };
     let _ = listener.set_nonblocking(true);
     loop {
-        if state_lock(&state).shutdown_requested {
+        if shutdown.load(Ordering::SeqCst) {
             break;
         }
         match listener.accept() {
@@ -521,21 +894,40 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
-                let worker_count = Arc::clone(&in_flight);
-                let spawned = thread::Builder::new()
+                // R5-S7: the header-phase slot is taken here, before a
+                // thread exists; a full pre-auth pool costs no thread.
+                let Some(preauth) = http::take_conn_slot(&limits, false) else {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let _ = write_simple(
+                        &mut stream,
+                        503,
+                        b"too many unauthenticated connections - retry shortly",
+                    );
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                };
+                // P11: the slot is released by a drop guard, so a handler
+                // that panics still frees it (a leak would eventually turn
+                // every connection into a 503 and stall shutdown's drain).
+                // A failed spawn drops the closure, and with it the guard.
+                let slot = InFlightSlot(Arc::clone(&in_flight));
+                let limits = Arc::clone(&limits);
+                let _ = thread::Builder::new()
                     .name("ft-http".into())
                     .spawn(move || {
-                        let _ = handle_connection(stream, state);
-                        worker_count.fetch_sub(1, Ordering::SeqCst);
+                        let _slot = slot;
+                        let _ = http::handle_connection_with(
+                            stream,
+                            state,
+                            http::HEADER_READ_TIMEOUT,
+                            &limits,
+                            Some(preauth),
+                        );
                     });
-                if spawned.is_err() {
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => thread::sleep(Duration::from_millis(50)),
+            // Only an empty queue sleeps; every pending connection is
+            // accepted back to back first.
+            Err(_) => thread::sleep(ACCEPT_POLL),
         }
     }
     // Drain in-flight handlers so a shutdown response (and any in-progress
@@ -548,20 +940,116 @@ pub(crate) fn serve_on(listener: TcpListener, state: SharedState) {
     }
 }
 
+/// The well-known workstation ports, tried in order before a random one
+/// (the viewer keeps unsaved drafts per origin, so a stable port keeps a
+/// crashed session's drafts reachable).
+pub(crate) const PREFERRED_PORTS: std::ops::RangeInclusive<u16> = 8477..=8486;
+
+// Only the Windows WebView2 shell claims a preferred port this way.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn first_free_port() -> Option<TcpListener> {
-    for port in 8477..=8486 {
-        if let Ok(listener) = bind_loopback(port) {
-            return Some(listener);
+    first_free_port_noting().map(|(listener, _)| listener)
+}
+
+/// [`first_free_port`] plus the preferred ports it had to skip because
+/// something else holds them (R4-B1 warning).
+pub(crate) fn first_free_port_noting() -> Option<(TcpListener, Vec<u16>)> {
+    let mut occupied = Vec::new();
+    for port in PREFERRED_PORTS {
+        match bind_loopback(port) {
+            Ok(listener) => return Some((listener, occupied)),
+            Err(_) => occupied.push(port),
         }
     }
-    bind_loopback(0).ok()
+    bind_loopback(0).ok().map(|listener| (listener, occupied))
+}
+
+/// R4-B1: warning for preferred ports held by processes that are not a
+/// workstation this user's instance file vouches for (they are never
+/// reused, whatever they answer).
+pub(crate) fn occupied_ports_warning(occupied: &[u16]) -> Option<String> {
+    (!occupied.is_empty()).then(|| {
+        let list = occupied
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "경고: 포트 {list}을(를) 신원이 확인되지 않은 다른 프로세스가 쓰고 있어 건너뜁니다 — 이 워크스테이션은 다른 포트에서 시작합니다. / ports in use by an unverified process were skipped"
+        )
+    })
 }
 
 pub(crate) fn should_open_browser(options: &ServeOptions) -> bool {
     options.open_browser && std::env::var("FRAMETRACE_NO_BROWSER").as_deref() != Ok("1")
 }
 
+/// R4-B14: the system "open this" program off Windows — `open` on macOS
+/// (there is no xdg-open there), `xdg-open` elsewhere.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn system_opener(target_os: &str) -> &'static str {
+    if target_os == "macos" {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+/// How long the opener may take before the open counts as failed (it
+/// normally hands off to the desktop and exits within a second).
+#[cfg_attr(windows, allow(dead_code))]
+const OPENER_TIMEOUT_SECS: u64 = 15;
+
+/// R4-B14: runs `program target`, waits for it (no zombie), and reports a
+/// spawn failure, a timeout or a non-zero exit as an error — the old code
+/// spawned and forgot, so "no browser opened" looked like success.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn run_opener(program: &str, target: &std::ffi::OsStr) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.arg(target);
+    match crate::util::run_with_timeout_detailed(&mut command, Some(OPENER_TIMEOUT_SECS)) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "{program} 실패 (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(err) => Err(format!("{program} 실행 실패: {}", err.message())),
+    }
+}
+
+/// [`try_open_in_browser`] for callers without an error channel (the
+/// WebView2 shell's fallback): a failure is printed, never swallowed.
+/// R4-B2: a tokenized workstation URL is exchanged for a one-time launch
+/// URL first — the token never reaches a browser command line.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn open_in_browser(url: &str) {
+    let url = browser_safe_url(url, &discovery::request_launch_code);
+    if let Err(err) = try_open_in_browser(&url) {
+        eprintln!("frametrace: {err}");
+    }
+}
+
+/// `http://127.0.0.1:<port>/?token=<t>` → `/?launch=<code>` (code minted
+/// by that server through `mint`), or the bare page when no code could be
+/// obtained. Any other URL is returned unchanged.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn browser_safe_url(url: &str, mint: &dyn Fn(u16, &str) -> Option<String>) -> String {
+    let Some(rest) = url.strip_prefix("http://127.0.0.1:") else {
+        return url.to_string();
+    };
+    let Some((port, query)) = rest.split_once("/?") else {
+        return url.to_string();
+    };
+    let (Ok(port), Some(token)) = (port.parse::<u16>(), query_value(query, "token")) else {
+        return url.to_string();
+    };
+    launch_url(port, mint(port, &token).as_deref())
+}
+
+/// Opens the workstation URL in a browser. `Err` when no launch strategy
+/// worked (R4-B14) — the caller tells the examiner to open it by hand.
+pub(crate) fn try_open_in_browser(url: &str) -> Result<(), String> {
     // Windows-first: prefer Edge app mode so the workstation opens as a
     // dedicated chromeless window instead of a tab inside the examiner's
     // browsing session. Edge and Explorer are resolved to ABSOLUTE paths
@@ -577,43 +1065,180 @@ pub(crate) fn open_in_browser(url: &str) {
         if let Some(edge) = launch::resolve_edge_path(&env, &|p| p.is_file(), &launch::app_path)
             && launch::spawn_detached(&edge, &[std::ffi::OsString::from(format!("--app={url}"))])
         {
-            return;
+            return Ok(());
         }
         if let Some(explorer) = launch::resolve_explorer_path(&env)
             && launch::spawn_detached(&explorer, &[std::ffi::OsString::from(url)])
         {
-            return;
+            return Ok(());
         }
-        if !launch::shell_open(url) {
-            eprintln!("frametrace: could not open a browser for {url}; open it manually");
+        if launch::shell_open(url) {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not open a browser for {url}; open it manually"
+            ))
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = crate::util::hide_console(&mut Command::new("xdg-open"))
-            .arg(url)
-            .spawn();
+        // R5-S8: a one-time launch URL never goes on the opener's command
+        // line (`/proc/<pid>/cmdline` and `ps` show it to every local
+        // user for as long as xdg-open / open runs, well inside the code's
+        // 30 s life). The opener gets the path of a user-private (0600, in
+        // a 0700 folder) redirect page instead; the page is deleted once
+        // the code has expired.
+        let target = if url.contains("?launch=") {
+            // R6-S3: without a home folder there is no user-private place
+            // a sandboxed browser can read (the temp folder is shared):
+            // no launch page — the examiner opens the printed URL.
+            let Some(dir) = launcher_dir() else {
+                return Err(format!(
+                    "no home folder (HOME) for a private launch page; open {url} manually"
+                ));
+            };
+            match write_launcher_file(&dir, url) {
+                Ok(path) => {
+                    schedule_launcher_removal(path.clone());
+                    path.into_os_string()
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "could not prepare a private launch page ({err}); open {url} manually"
+                    ));
+                }
+            }
+        } else {
+            std::ffi::OsString::from(url)
+        };
+        run_opener(system_opener(std::env::consts::OS), &target)
+            .map_err(|err| format!("could not open a browser for {url} ({err}); open it manually"))
     }
 }
 
-pub(crate) fn open_in_explorer(path: &Path) {
+/// R5-S8: the redirect page handed to the system opener instead of a
+/// launch URL (pure). `url` is our own `http://127.0.0.1:<port>/?launch=`
+/// URL (hex code); it is HTML-escaped anyway.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn launcher_page_html(url: &str) -> String {
+    let safe = crate::util::html_escape(url);
+    let script_url = serde_json::to_string(url).unwrap_or_else(|_| "\"/\"".to_string());
+    format!(
+        "<!doctype html>\n<html lang=\"ko\"><head><meta charset=\"utf-8\">\n<meta name=\"referrer\" content=\"no-referrer\">\n<meta http-equiv=\"refresh\" content=\"0;url={safe}\">\n<title>FrameTrace</title></head>\n<body><p>FrameTrace 워크스테이션을 여는 중… / Opening the FrameTrace workstation…</p>\n<p><a href=\"{safe}\">열리지 않으면 여기를 누르십시오 / click here if nothing happens</a></p>\n<script>location.replace({script_url});</script>\n</body></html>\n"
+    )
+}
+
+/// R5-S8: where launch pages go — `<Documents or home>/FrameTrace/launch`
+/// (a NON-hidden folder in the examiner's home: sandboxed browsers such
+/// as snap/flatpak Firefox can read it, and neither `/tmp` nor a dot
+/// folder is reliably readable to them). R6-S3: `None` without a home
+/// folder (the fallback would be the shared temp folder).
+#[cfg(not(target_os = "windows"))]
+fn launcher_dir() -> Option<PathBuf> {
+    launcher_dir_from(&|name| std::env::var_os(name), &|path| path.is_dir())
+}
+
+/// [`launcher_dir`] with the environment injected (pure, tests).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn launcher_dir_from(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let (root, temp_fallback) = jobs::default_case_root(false, env, is_dir, Path::new(""));
+    (!temp_fallback).then(|| root.join("FrameTrace").join("launch"))
+}
+
+/// Launch pages older than this are removed by the next launch (a
+/// process that exited before its own removal timer ran).
+#[cfg_attr(windows, allow(dead_code))]
+const LAUNCHER_PAGE_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// R5-S8: writes a fresh user-private launch page into `dir` (created
+/// 0700; the file is created 0600 with `create_new`, so it never follows
+/// or reuses an existing name) and sweeps old ones. Returns its path.
+/// R6-S3: only `dir` itself is made 0700 — its parents (the examiner's
+/// `~/Documents/FrameTrace`, which also holds cases) are created with the
+/// default mode and never re-permissioned.
+#[cfg(unix)]
+pub(crate) fn write_launcher_file(dir: &Path, url: &str) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(format!("{}: {err}", dir.display())),
+    }
+    // An existing launch folder keeps whatever mode it had; tighten it.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("{}: {err}", dir.display()))?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| now.duration_since(time).ok())
+                .is_some_and(|age| age >= LAUNCHER_PAGE_MAX_AGE);
+            if name.starts_with("open-") && name.ends_with(".html") && old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).map_err(|err| format!("entropy: {err}"))?;
+    let name: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("open-{name}.html"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    file.write_all(launcher_page_html(url).as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(path)
+}
+
+/// R5-S8: removes the launch page once its code can no longer be used
+/// (the code lives [`LAUNCH_CODE_TTL`] and opens once). Runs on its own
+/// thread; if this process exits first, the next launch sweeps the page.
+#[cfg(not(target_os = "windows"))]
+fn schedule_launcher_removal(path: PathBuf) {
+    let _ = thread::Builder::new()
+        .name("ft-launch-page".into())
+        .spawn(move || {
+            thread::sleep(LAUNCH_CODE_TTL + Duration::from_secs(5));
+            let _ = std::fs::remove_file(&path);
+        });
+}
+
+/// Opens a folder in the system file manager; `Err` when it could not be
+/// opened (R4-B14 — reported to the UI instead of a silent success).
+pub(crate) fn open_in_explorer(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let env = |name: &str| std::env::var_os(name);
         if let Some(explorer) = launch::resolve_explorer_path(&env)
             && launch::spawn_detached(&explorer, &[path.as_os_str().to_owned()])
         {
-            return;
+            return Ok(());
         }
-        if !launch::shell_open(&path.to_string_lossy()) {
-            eprintln!("frametrace: could not open {} in Explorer", path.display());
+        if launch::shell_open(&path.to_string_lossy()) {
+            Ok(())
+        } else {
+            Err(format!("탐색기에서 열지 못했습니다: {}", path.display()))
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = crate::util::hide_console(&mut Command::new("xdg-open"))
-            .arg(path)
-            .spawn();
+        run_opener(system_opener(std::env::consts::OS), path.as_os_str())
+            .map_err(|err| format!("폴더를 열지 못했습니다 ({}): {err}", path.display()))
     }
 }
 
@@ -917,11 +1542,8 @@ pub(crate) fn shell_path(path: PathBuf) -> PathBuf {
 
 pub(crate) fn api_open_folder(request: &Request, state: &SharedState) -> String {
     let raw = body_value(&request.body, "path").unwrap_or_default();
-    match resolve_open_folder(state, &raw) {
-        Ok(path) => {
-            open_in_explorer(&path);
-            "{\"ok\":true}".to_string()
-        }
+    match resolve_open_folder(state, &raw).and_then(|path| open_in_explorer(&path)) {
+        Ok(()) => "{\"ok\":true}".to_string(),
         Err(err) => api_err(&err),
     }
 }
@@ -933,6 +1555,15 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
     if !request_is_localhost_trusted(request) {
         return plain(403, b"cross-origin request rejected".to_vec());
     }
+    // R4-B19: the UNC/device gate also guards every direct `route` caller
+    // (handle_connection runs it first too) — path fields such as
+    // `/api/advanced`'s `extra` never reach a handler unchecked.
+    if !http::path_fields_for(&request.method, &request.path).is_empty()
+        && let Some(reason) =
+            http::remote_path_violation(request, &http::approved_path_roots(state))
+    {
+        return http::remote_path_refusal(reason);
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => page(examiner_page(legacy_ui()).as_bytes().to_vec()),
         ("GET", "/api/env") => json(api_env(request)),
@@ -940,7 +1571,11 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("GET", "/api/records") => json(api_records(request, state)),
         ("GET", "/api/records-meta") => json(api_records_meta(state)),
         ("GET", "/api/status") => json(api_status(state)),
+        ("GET", "/api/mark-conflicts") => json(jobs::api_mark_conflicts_page(request, state)),
+        ("GET", "/api/marks-pending") => json(api_marks_pending(request, state)),
+        ("POST", "/api/launch-code") => json(api_launch_code(state)),
         ("POST", "/api/start") => json(api_start(request, state)),
+        ("POST", "/api/reimport-raw") => json(jobs::api_reimport_raw(request, state)),
         ("POST", "/api/finalize") => json(api_finalize(request, state)),
         ("POST", "/api/recover-deleted") => json(api_recover_deleted(state)),
         ("POST", "/api/export-selected") => json(api_export_selected(request, state)),
@@ -963,6 +1598,9 @@ pub(crate) fn route(request: &Request, state: &SharedState) -> Vec<u8> {
         ("POST", "/api/preflight") => json(api_preflight(request)),
         ("GET", "/api/export-clip-status") => json(api_export_clip_status(request, state)),
         ("POST", "/api/export-clip-cancel") => json(api_export_clip_cancel(request, state)),
+        ("POST", "/api/join-check") => json(api_join_check(request, state)),
+        ("POST", "/api/join") => json(api_join(request, state)),
+        ("POST", "/api/audio-measure") => json(api_audio_measure(request, state)),
         ("GET", "/api/recent-cases") => json(api_recent_cases()),
         ("POST", "/api/recent-cases/forget") => json(api_recent_cases_forget(request)),
         _ => plain(404, b"not found".to_vec()),

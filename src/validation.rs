@@ -2,7 +2,7 @@ use crate::audit;
 use crate::ffprobe;
 use crate::model::ProbeSummary;
 use crate::tool_policy::command_version;
-use crate::util::{canonicalize_display, json_escape, now_unix, read_to_string};
+use crate::util::{canonicalize_display, json_escape, now_unix};
 use crate::video_export::resolve_video_source;
 use std::path::{Path, PathBuf};
 
@@ -76,6 +76,15 @@ pub fn compute_validation(
     })
 }
 
+/// Logs whose entries map an artifact id / selector to an output file.
+const ARTIFACT_LOGS: [&str; 5] = [
+    "artifacts/carved/carve-log.jsonl",
+    "artifacts/clips/export-log.jsonl",
+    "artifacts/proxies/proxy-log.jsonl",
+    "artifacts/thumbnails/thumbnail-log.jsonl",
+    "evidence/logs/tsk-audit.jsonl",
+];
+
 /// Resolves an indexed video id, artifact id, inode recovery id, or direct
 /// path to an existing file. Shared by validate-artifact and the batch
 /// commands so carved/recovered selectors work everywhere.
@@ -90,19 +99,32 @@ pub fn resolve_artifact_path(case_dir: &Path, selector: &str) -> Result<PathBuf,
         return Ok(path);
     }
 
-    for rel_log in [
-        "artifacts/carved/carve-log.jsonl",
-        "artifacts/clips/export-log.jsonl",
-        "artifacts/proxies/proxy-log.jsonl",
-        "artifacts/thumbnails/thumbnail-log.jsonl",
-        "evidence/logs/tsk-audit.jsonl",
-    ] {
-        let Some(path) = resolve_from_log(&case_dir.join(rel_log), selector) else {
-            continue;
-        };
-        if path.is_file() {
-            return canonicalize_display(&path)
-                .map_err(|err| format!("failed to canonicalize validation target: {err}"));
+    for rel_log in ARTIFACT_LOGS {
+        let log_path = case_dir.join(rel_log);
+        let existing: Vec<PathBuf> = resolve_all_from_log(&log_path, selector)
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect();
+        match existing.as_slice() {
+            [] => continue,
+            [path] => {
+                return canonicalize_display(path)
+                    .map_err(|err| format!("failed to canonicalize validation target: {err}"));
+            }
+            many => {
+                // E4: carve ids before run-unique ids (`carve_000001`) were
+                // reused by every carve run. Picking the first logged match
+                // validated whichever run's file came first — refuse and
+                // make the examiner choose the (id, output path) pair.
+                return Err(format!(
+                    "ambiguous selector {selector}: {rel_log} maps it to {} different existing files ({}) — an id reused by several carve runs; pass the output path itself to choose one",
+                    many.len(),
+                    many.iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
     }
 
@@ -111,31 +133,78 @@ pub fn resolve_artifact_path(case_dir: &Path, selector: &str) -> Result<PathBuf,
     ))
 }
 
-fn resolve_from_log(log_path: &Path, selector: &str) -> Option<PathBuf> {
-    let text = read_to_string(log_path).ok()?;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+/// Resolves an artifact by its (id, output path) PAIR (E4): the logged
+/// entry must carry both, so a reused legacy id can never select another
+/// run's file. Returns the canonical output path when it still exists.
+pub fn resolve_artifact_pair(
+    case_dir: &Path,
+    id: &str,
+    output_path: &Path,
+) -> Result<PathBuf, String> {
+    let wanted = output_path.to_string_lossy();
+    for rel_log in ARTIFACT_LOGS {
+        // R9 P3: only entries usable here resolve a target to validate.
+        let Ok(lane) = audit::read_lane_rows(&case_dir.join(rel_log)) else {
             continue;
         };
-        let field = |key: &str| {
-            value
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        };
-        let id = field("id");
-        let inode = field("inode");
-        let output_path = field("output_path");
-        let selector_field = field("selector");
-        let matches = id.as_deref() == Some(selector)
-            || inode.as_deref() == Some(selector)
-            || selector_field.as_deref() == Some(selector)
-            || output_path.as_deref() == Some(selector);
-        if matches {
-            return output_path.map(PathBuf::from);
+        for row in lane.usable() {
+            let value = &row.value;
+            let field = |key: &str| value.get(key).and_then(serde_json::Value::as_str);
+            let id_matches = field("id") == Some(id)
+                || field("inode") == Some(id)
+                || field("selector") == Some(id);
+            if id_matches && field("output_path") == Some(wanted.as_ref()) {
+                let path = PathBuf::from(wanted.as_ref());
+                if path.is_file() {
+                    return canonicalize_display(&path)
+                        .map_err(|err| format!("failed to canonicalize validation target: {err}"));
+                }
+                return Err(format!(
+                    "artifact {id} at {wanted} is logged but the file no longer exists"
+                ));
+            }
         }
     }
-    None
+    Err(format!(
+        "no logged artifact pairs id {id} with output path {wanted}"
+    ))
+}
+
+/// Every distinct output path a log maps `selector` to, in log order.
+fn resolve_all_from_log(log_path: &Path, selector: &str) -> Vec<PathBuf> {
+    // R9 P3: through the one lane reader; an entry this PC cannot
+    // authenticate (keys held) never names a validation target.
+    let Ok(lane) = audit::read_lane_rows(log_path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for row in lane.usable() {
+        let Some(path) = match_line(&row.raw, selector) else {
+            continue;
+        };
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn resolve_from_log(log_path: &Path, selector: &str) -> Option<PathBuf> {
+    resolve_all_from_log(log_path, selector).into_iter().next()
+}
+
+/// The output path of one log line when its id / inode / selector /
+/// output path equals `selector`.
+fn match_line(line: &str, selector: &str) -> Option<PathBuf> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let field = |key: &str| value.get(key).and_then(serde_json::Value::as_str);
+    let output_path = field("output_path");
+    let matches = field("id") == Some(selector)
+        || field("inode") == Some(selector)
+        || field("selector") == Some(selector)
+        || output_path == Some(selector);
+    matches.then(|| output_path.map(PathBuf::from)).flatten()
 }
 
 fn validation_status(probe: &ProbeSummary) -> (&'static str, &'static str) {
@@ -347,7 +416,9 @@ fn optional_u32(value: Option<u32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_from_log, validation_status};
+    use super::{
+        resolve_artifact_pair, resolve_artifact_path, resolve_from_log, validation_status,
+    };
     use crate::model::ProbeSummary;
     use std::fs;
 
@@ -418,17 +489,52 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("log.jsonl");
-        fs::write(
+        crate::audit::test_write_lane(
             &log,
             r#"{"id":"carve_000001","output_path":"/tmp/out.mp4"}"#,
-        )
-        .unwrap();
+        );
         assert_eq!(
             resolve_from_log(&log, "carve_000001")
                 .unwrap()
                 .to_string_lossy(),
             "/tmp/out.mp4"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// E4: two legacy carve runs both logged `carve_000001`. The old
+    /// resolver silently returned the first run's file; now a bare id that
+    /// names two existing files is refused, and the (id, output path) pair
+    /// selects exactly one.
+    #[test]
+    fn reused_legacy_id_is_ambiguous_but_the_pair_resolves() {
+        let dir = crate::util::unique_dir(
+            &std::env::temp_dir()
+                .join(format!("frametrace-validation-pair-{}", std::process::id())),
+        );
+        let carved = dir.join("artifacts/carved");
+        fs::create_dir_all(&carved).unwrap();
+        let run1 = carved.join("carve_000001_run1.mp4");
+        let run2 = carved.join("carve_000001_run2.mp4");
+        fs::write(&run1, b"one").unwrap();
+        fs::write(&run2, b"two").unwrap();
+        let line = |path: &std::path::Path| {
+            serde_json::json!({"event": "carve-file", "id": "carve_000001", "output_path": path.to_string_lossy()})
+                .to_string()
+        };
+        crate::audit::test_write_lane(
+            &carved.join("carve-log.jsonl"),
+            &format!("{}\n{}\n{}\n", line(&run1), line(&run2), line(&run2)),
+        );
+        let err = resolve_artifact_path(&dir, "carve_000001").unwrap_err();
+        assert!(err.contains("ambiguous selector"), "{err}");
+        let chosen = resolve_artifact_pair(&dir, "carve_000001", &run2).unwrap();
+        assert_eq!(fs::read(chosen).unwrap(), b"two");
+        assert!(resolve_artifact_pair(&dir, "carve_000002", &run2).is_err());
+        // Once only one of the files exists the id is unambiguous again.
+        fs::remove_file(&run1).unwrap();
+        let only = resolve_artifact_path(&dir, "carve_000001").unwrap();
+        assert_eq!(fs::read(only).unwrap(), b"two");
         let _ = fs::remove_dir_all(dir);
     }
 }

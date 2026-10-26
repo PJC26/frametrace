@@ -235,8 +235,15 @@ pub fn render_review_html(manifest_json: &str, index_json: &str) -> String {
     </section>
   </main>
   <script>
-    const manifest = {manifest};
-    const scan = {index};
+    // R7-S6: an input that was not one JSON value is embedded as null —
+    // say so instead of failing on `null.title` (a blank page).
+    const manifestInput = {manifest};
+    const scanInput = {index};
+    const manifest = manifestInput && typeof manifestInput === "object" ? manifestInput : {{}};
+    const scan = scanInput && typeof scanInput === "object" ? scanInput : {{}};
+    const inputProblems = [];
+    if (manifest !== manifestInput) inputProblems.push("케이스 파일(case.json)을 읽지 못했습니다 — 올바른 JSON이 아닙니다. / The case file could not be read.");
+    if (scan !== scanInput) inputProblems.push("색인 파일(db/video_index.json)을 읽지 못했습니다 — 올바른 JSON이 아닙니다. / The case index could not be read.");
     const videos = Array.isArray(scan.videos) ? scan.videos : [];
     const warnings = Array.isArray(scan.warnings) ? scan.warnings : [];
 
@@ -303,6 +310,12 @@ pub fn render_review_html(manifest_json: &str, index_json: &str) -> String {
     document.getElementById("warnings").innerHTML = warnings.length
       ? `<div class="warnings"><strong>Scan warnings</strong><table><thead><tr><th>Severity</th><th>Message</th><th>Status</th></tr></thead><tbody>${{warnings.map(warning => `<tr><td>${{warningSeverity(warning)}}</td><td>${{escapeHtml(warning)}}</td><td>Review required</td></tr>`).join("")}}</tbody></table></div>`
       : "";
+    if (inputProblems.length) {{
+      document.getElementById("warnings").insertAdjacentHTML(
+        "afterbegin",
+        `<div class="warnings" role="alert" id="input-problems"><strong>케이스 파일을 읽지 못했습니다</strong>${{inputProblems.map(problem => `<p>${{escapeHtml(problem)}}</p>`).join("")}}</div>`
+      );
+    }}
 
     let currentPage = 1;
     const pageSize = 100;
@@ -402,6 +415,9 @@ fn evidence_viewer_data(
     deepfake_json: &str,
     telemetry_json: &str,
     proxies_json: &str,
+    join_log_jsonl: &str,
+    audio_levels_json: &str,
+    log_chains_json: &str,
     case_dir: &std::path::Path,
 ) -> String {
     // Carve/recovery logs may carry relative artifact paths; the viewer
@@ -409,7 +425,7 @@ fn evidence_viewer_data(
     let case_dir_json =
         serde_json::to_string(&crate::audit::path_string(case_dir)).unwrap_or_default();
     format!(
-        "window.__FRAMETRACE_DATA__ = {{manifest:{manifest},caseDir:{case_dir},scan:{index},carveLog:{carve_lines},filesystemLog:{filesystem_lines},validationLog:{validation_lines},anomalyLog:{anomaly_lines},flsEntries:{fls_lines},thumbs:{thumbs_lines},annotations:{annotations_lines},deepfake:{deepfake_map},telemetry:{telemetry_map},proxies:{proxies_map}}};",
+        "window.__FRAMETRACE_DATA__ = {{manifest:{manifest},caseDir:{case_dir},scan:{index},carveLog:{carve_lines},filesystemLog:{filesystem_lines},validationLog:{validation_lines},anomalyLog:{anomaly_lines},flsEntries:{fls_lines},thumbs:{thumbs_lines},annotations:{annotations_lines},deepfake:{deepfake_map},telemetry:{telemetry_map},proxies:{proxies_map},joinLog:{join_lines},audioLevels:{audio_levels}{log_chains}}};",
         case_dir = json_for_script(&case_dir_json),
         manifest = json_for_script(manifest_json),
         index = json_for_script(index_json),
@@ -426,7 +442,24 @@ fn evidence_viewer_data(
         deepfake_map = json_for_script(deepfake_json),
         telemetry_map = json_for_script(telemetry_json),
         proxies_map = json_for_script(proxies_json),
+        join_lines = json_for_script(&jsonl_to_array(join_log_jsonl)),
+        audio_levels = json_for_script(&crate::report::audio_levels_object(audio_levels_json)),
+        // R17 I6: `logChains` (only the anomaly head, `{anomaly:{head}}` —
+        // the records-meta / report object) when the caller has one; an
+        // empty or non-object value leaves the key out (older bundles).
+        log_chains = log_chains_field(log_chains_json),
     )
+}
+
+/// R17 I6: `,logChains:<object>` for the data block, or "" when `chains`
+/// is empty or not one JSON object.
+fn log_chains_field(chains: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(chains.trim()) {
+        Ok(value) if value.is_object() => {
+            format!(",logChains:{}", json_for_script(&value.to_string()))
+        }
+        _ => String::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -443,6 +476,8 @@ pub fn render_evidence_viewer_html(
     deepfake_json: &str,
     telemetry_json: &str,
     proxies_json: &str,
+    join_log_jsonl: &str,
+    audio_levels_json: &str,
     case_dir: &std::path::Path,
 ) -> String {
     // The layout/markup lives in assets/evidence_viewer.* and is embedded at
@@ -460,6 +495,9 @@ pub fn render_evidence_viewer_html(
         deepfake_json,
         telemetry_json,
         proxies_json,
+        join_log_jsonl,
+        audio_levels_json,
+        "",
         case_dir,
     );
     fill_viewer_template(&data)
@@ -523,6 +561,9 @@ pub fn render_data_bundle_js(
     deepfake_json: &str,
     telemetry_json: &str,
     proxies_json: &str,
+    join_log_jsonl: &str,
+    audio_levels_json: &str,
+    log_chains_json: &str,
     case_dir: &std::path::Path,
 ) -> String {
     evidence_viewer_data(
@@ -538,6 +579,9 @@ pub fn render_data_bundle_js(
         deepfake_json,
         telemetry_json,
         proxies_json,
+        join_log_jsonl,
+        audio_levels_json,
+        log_chains_json,
         case_dir,
     )
 }
@@ -652,6 +696,8 @@ pub fn render_carve_report_html(
     .kv {{ font-size: 12px; margin: 3px 0; word-break: break-all; }}
     .kv b {{ display: inline-block; min-width: 110px; color: #667085; }}
     .muted {{ color: #98a2b3; }}
+    .unaudited {{ color: #b54708; font-weight: 600; }}
+    html[data-theme="dark"] .unaudited {{ color: #f0b429; }}
     a {{ color: #1f6feb; }}
   </style>
 </head>
@@ -667,16 +713,18 @@ pub fn render_carve_report_html(
   <div class="subtle" id="countLine"></div>
   <table>
     <thead><tr>
-      <th data-k="id">ID</th><th data-k="extension">확장자</th><th data-k="size_bytes">크기</th>
+      <th data-k="run_order">실행</th><th data-k="id">ID</th><th data-k="extension">확장자</th><th data-k="size_bytes">크기</th>
       <th data-k="offset">오프셋</th><th>라이브FS</th><th data-k="validation_status">검증 상태</th>
-      <th>SHA-256</th><th>비고</th><th></th>
+      <th data-k="trust_ok">신뢰</th><th>SHA-256</th><th>비고</th><th></th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
   <div class="detail" id="detail" hidden></div>
 </main>
 <script>
-const MANIFEST = {manifest};
+// R7-S6: null when case.json was not one JSON value (shown in the title).
+const MANIFEST_INPUT = {manifest};
+const MANIFEST = MANIFEST_INPUT && typeof MANIFEST_INPUT === "object" ? MANIFEST_INPUT : {{}};
 const ARTIFACTS = {artifacts};
 const RESULTS = {results};
 const PROXIES = {proxies};
@@ -733,7 +781,10 @@ function proxyFor(a) {{
   const keys = [a.id, a.output_path, base].filter(Boolean).map(sanitizeSelector);
   return PROXIES.find(p => {{
     const name = String(p).split(/[\\/]/).pop() || "";
+    // D5: path-free names are proxy_<sanitized record id>_<8 hex>[_NNN].mp4;
+    // names written before D5 embed the sanitized selector.
     return name.endsWith(".mp4") && keys.some(k =>
+      new RegExp("^proxy_" + k.replace(/[-]/g, "\\-") + "_[0-9a-f]{{8}}(_[0-9]{{3}})?\\.mp4$").test(name) ||
       name.startsWith(k + "_proxy_") || name.includes(k + "_proxy_"));
   }}) || "";
 }}
@@ -753,22 +804,49 @@ document.getElementById("btnTheme").addEventListener("click", () => {{
   document.documentElement.dataset.theme = next;
   try {{ localStorage.setItem("ft-theme", next); }} catch (e) {{}}
 }});
-document.getElementById("caseTitle").textContent = MANIFEST.case_id ? "— " + MANIFEST.case_id : "";
+document.getElementById("caseTitle").textContent = MANIFEST !== MANIFEST_INPUT
+  ? "— 케이스 파일(case.json)을 읽지 못했습니다"
+  : (MANIFEST.case_id ? "— " + MANIFEST.case_id : "");
 const R = RESULTS || {{}};
+// I6: carve time in UTC (the custody statement's basis) plus the viewing
+// PC's local time with its UTC offset, never a bare browser-local string.
+const fmtCarveTime = unix => {{
+  const d = new Date(unix * 1000);
+  if (!Number.isFinite(unix) || Number.isNaN(d.getTime())) return "";
+  const p = n => String(n).padStart(2, "0");
+  const off = -d.getTimezoneOffset();
+  const utc = `${{d.getUTCFullYear()}}-${{p(d.getUTCMonth() + 1)}}-${{p(d.getUTCDate())}} ${{p(d.getUTCHours())}}:${{p(d.getUTCMinutes())}}:${{p(d.getUTCSeconds())}} UTC`;
+  const local = `${{d.getFullYear()}}-${{p(d.getMonth() + 1)}}-${{p(d.getDate())}} ${{p(d.getHours())}}:${{p(d.getMinutes())}}:${{p(d.getSeconds())}}`;
+  return `${{utc}} (현지 ${{local}} UTC${{off < 0 ? "-" : "+"}}${{p(Math.floor(Math.abs(off) / 60))}}:${{p(Math.abs(off) % 60)}})`;
+}};
 document.getElementById("sourceInfo").textContent =
-  (R.source_path || "") + (R.carved_unix ? "  ·  " + new Date(R.carved_unix*1000).toLocaleString() : "");
+  (R.source_path || "") + (R.carved_unix ? "  ·  " + fmtCarveTime(R.carved_unix) : "") +
+  (R.source_path || R.carved_unix ? "  ·  실행 요약 감사 안 됨 (db/carve_results.json)" : "");
 const exts = [...new Set(ARTIFACTS.map(a => a.extension || "?"))].sort();
 const warnN = (R.warnings || []).length;
-const dupN = ARTIFACTS.filter(a => INDEXED_SHAS.has(a.sha256)).length;
-const newN = ARTIFACTS.length - dupN;
+// R10-I1: only entries usable here (trust_ok) are carve results; the rest
+// are listed with "인증 안 됨" in the 신뢰 column and never counted.
+const trusted = a => a.trust_ok !== false;
+const RESULT_ARTIFACTS = ARTIFACTS.filter(trusted);
+const unauthN = ARTIFACTS.length - RESULT_ARTIFACTS.length;
+const dupN = RESULT_ARTIFACTS.filter(a => INDEXED_SHAS.has(a.sha256)).length;
+const newN = RESULT_ARTIFACTS.length - dupN;
+// R11-I5: the run summary (scan complete, candidate limit, source size,
+// warnings) comes from db/carve_results.json, which is NOT an audit lane:
+// nothing authenticates it, so those metrics carry "감사 안 됨" and are
+// never shown in the ok colour (a bad value still warns — the safe
+// direction).
+const UNAUDITED_LABEL = "감사 안 됨";
+const unaudited = k => `${{k}} <span class="unaudited" title="db/carve_results.json — 감사 체인 밖 (인증되지 않음)">· ${{UNAUDITED_LABEL}}</span>`;
 document.getElementById("metrics").innerHTML = [
-  ["아티팩트", ARTIFACTS.length, ""],
+  ["아티팩트", RESULT_ARTIFACTS.length, ""],
+  ...(unauthN ? [["인증 안 됨(결과 아님)", unauthN, "fail"]] : []),
   ["라이브FS 미존재", newN, newN ? "warn" : ""],
   ["인덱스 동일", dupN, ""],
-  ["스캔 완료", R.scan_complete ? "전체 완료" : "부분 스캔", R.scan_complete ? "ok" : "fail"],
-  ["상한 도달", R.candidate_limit_reached ? "예" : "아니오", R.candidate_limit_reached ? "fail" : ""],
-  ["원본 크기", fmtSize(R.source_size_bytes), ""],
-  ["경고", warnN, warnN ? "warn" : ""],
+  [unaudited("스캔 완료"), R.scan_complete ? "전체 완료" : "부분 스캔", R.scan_complete ? "" : "fail"],
+  [unaudited("상한 도달"), R.candidate_limit_reached ? "예" : "아니오", R.candidate_limit_reached ? "fail" : ""],
+  [unaudited("원본 크기"), fmtSize(R.source_size_bytes), ""],
+  [unaudited("경고"), warnN, warnN ? "warn" : ""],
 ].map(([k,v,c]) => `<div class="metric ${{c}}"><b>${{v}}</b>${{k}}</div>`).join("");
 
 // filters
@@ -809,7 +887,10 @@ function rows() {{
     (!state.big || (a.size_bytes || 0) > 50_000_000) &&
     (!state.newOnly || !INDEXED_SHAS.has(a.sha256)) &&
     (!state.q || [a.id, a.output_path, a.validation_note].join(" ").toLowerCase().includes(state.q)));
+  // Runs stay grouped (latest run first); the chosen column sorts within a run.
   list.sort((a, b) => {{
+    const run = (a.run_order ?? 0) - (b.run_order ?? 0);
+    if (state.sort !== "run_order" && run) return run;
     const x = a[state.sort], y = b[state.sort];
     const c = typeof x === "number" && typeof y === "number" ? x - y : String(x ?? "").localeCompare(String(y ?? ""));
     return state.asc ? c : -c;
@@ -820,16 +901,19 @@ function render() {{
   const list = rows();
   document.getElementById("countLine").textContent = `${{list.length}} / ${{ARTIFACTS.length}} 표시`;
   tbody.innerHTML = list.map(a => `<tr data-id="${{esc(a.id)}}">
-    <td>${{esc(a.id)}}</td><td>${{esc(a.extension || "-")}}</td><td>${{fmtSize(a.size_bytes)}}</td>
+    <td class="muted">${{esc(a.run_label || "-")}}</td><td>${{esc(a.id)}}</td><td>${{esc(a.extension || "-")}}</td><td>${{fmtSize(a.size_bytes)}}</td>
     <td title="${{a.offset}}">${{hex(a.offset)}}</td>
-    <td>${{INDEXED_SHAS.has(a.sha256) ? '<span class="badge">중복</span>' : '<span class="badge ok">신규</span>'}}</td>
-    <td><span class="badge ${{(a.validation_status||"").includes("failed") ? "failed" : (a.validation_status||"").includes("confirmed") ? "ok" : ""}}">${{esc(a.validation_status || "-")}}</span></td>
+    <td>${{!trusted(a) ? '<span class="badge">-</span>' : INDEXED_SHAS.has(a.sha256) ? '<span class="badge">중복</span>' : '<span class="badge ok">신규</span>'}}</td>
+    <td><span class="badge ${{!trusted(a) ? "" : (a.validation_status||"").includes("failed") ? "failed" : (a.validation_status||"").includes("confirmed") ? "ok" : ""}}">${{esc(a.validation_status || "-")}}</span></td>
+    <td>${{trusted(a) ? `<span class="badge ok" title="${{esc(a.trust_label)}}">${{esc(a.trust === "sc" ? "자기 일관성만" : "확인됨")}}</span>` : `<span class="badge failed" title="${{esc(a.trust_label)}}">인증 안 됨</span>`}}</td>
     <td class="muted">${{esc((a.sha256 || "").slice(0, 12))}}</td>
     <td class="muted" title="${{esc(a.validation_note)}}">${{esc((a.validation_note || "").slice(0, 60))}}</td>
-    <td><a href="${{esc(downloadHref(a.output_path))}}" onclick="event.stopPropagation()">저장</a></td>
+    <td><a href="${{esc(downloadHref(a.output_path))}}">저장</a></td>
   </tr>`).join("");
 }}
 tbody.addEventListener("click", e => {{
+  // The 저장 link downloads; it does not select the row.
+  if (e.target.closest("a")) return;
   const tr = e.target.closest("tr[data-id]"); if (!tr) return;
   tbody.querySelectorAll("tr.sel").forEach(x => x.classList.remove("sel"));
   tr.classList.add("sel");
@@ -847,6 +931,7 @@ function showDetail(a) {{
     <div class="kv"><b>오프셋 / 크기</b>${{hex(a.offset)}} (${{a.offset}}) / ${{fmtSize(a.size_bytes)}}</div>
     <div class="kv"><b>SHA-256</b>${{esc(a.sha256)}}</div>
     <div class="kv"><b>검증 상태</b>${{esc(a.validation_status)}}</div>
+    <div class="kv"><b>신뢰</b>${{esc(a.trust_label)}}${{trusted(a) ? "" : " — 이 항목은 카빙 결과로 보지 마십시오"}}</div>
     <div class="kv"><b>검증 비고</b>${{esc(a.validation_note)}}</div>
     ${{proxy ? `<div class="kv"><b>프록시</b>${{esc(proxy)}}</div>` : ""}}
     ${{src
@@ -880,21 +965,29 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
         .filter(|line| !line.is_empty())
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .collect();
-    // The audit log is append-only across runs: a recarve re-emits the
-    // same id space (carve_000001…), so every earlier entry for an id
-    // is superseded by the latest run's record for that id. Keep the
-    // last occurrence — the report must show one current artifact set,
-    // not the union of every run that ever wrote to the log. Lines
-    // without an id are run-level events (e.g. carve-resume), not
-    // artifacts, and are dropped.
+    // Carve ids are run-unique since E4 (`carve_<runid>_<n>`, entries carry
+    // `run_id` / `carved_unix`), so every run is shown, grouped by run with
+    // the latest run first. Within one run a repeated id (a resumed run
+    // re-logging an artifact) keeps its last entry. Entries logged before
+    // run ids existed share one "earlier runs" group where the old id space
+    // repeated across runs, so there the last entry per id still wins.
+    // Lines without an id are run-level events (e.g. carve-resume).
     {
         use std::collections::HashMap;
-        let mut last: HashMap<String, usize> = HashMap::new();
+        let run_of = |item: &serde_json::Value| {
+            item.get("run_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let mut last: HashMap<(Option<String>, String), usize> = HashMap::new();
         for (i, item) in items.iter().enumerate() {
             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                last.insert(id.to_string(), i);
+                last.insert((run_of(item), id.to_string()), i);
             }
         }
+        // R10 P7: the LAST entry per (run, id) decides — whatever its
+        // trust, so an unauthenticated newest entry is never rolled back
+        // to an older authenticated one (it is shown as "인증 안 됨").
         let keep: std::collections::HashSet<usize> = last.into_values().collect();
         let mut i = 0usize;
         items.retain(|item| {
@@ -902,6 +995,52 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
             i += 1;
             keep_it
         });
+        // R10-I1: every entry carries whether it may be shown as a result
+        // (`trust_ok`, from the reader's per-entry `trust`) and the
+        // "신뢰" column text; the page counts and lists results from
+        // `trust_ok` entries only.
+        for item in &mut items {
+            let (ok, label) = carve_entry_trust(item);
+            item["trust_ok"] = serde_json::Value::Bool(ok);
+            item["trust_label"] = serde_json::Value::String(label);
+        }
+        // Run order: newest carved_unix first (then latest in the log);
+        // the legacy group (no run id) last.
+        let mut runs: Vec<(Option<String>, u64, usize)> = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let run = run_of(item);
+            let at = item
+                .get("carved_unix")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            match runs.iter_mut().find(|(known, _, _)| *known == run) {
+                Some(entry) => {
+                    entry.1 = entry.1.max(at);
+                    entry.2 = index;
+                }
+                None => runs.push((run, at, index)),
+            }
+        }
+        runs.sort_by(|a, b| {
+            a.0.is_none()
+                .cmp(&b.0.is_none())
+                .then(b.1.cmp(&a.1))
+                .then(b.2.cmp(&a.2))
+        });
+        for item in &mut items {
+            let run = run_of(item);
+            let order = runs
+                .iter()
+                .position(|(known, _, _)| *known == run)
+                .unwrap_or(0);
+            let label = match &run {
+                Some(run_id) => run_id.clone(),
+                None => "이전 실행(실행 id 없음)".to_string(),
+            };
+            item["run_order"] = serde_json::json!(order);
+            item["run_label"] = serde_json::Value::String(label);
+        }
+        items.sort_by_key(|item| item["run_order"].as_u64().unwrap_or(0));
     }
     for item in &mut items {
         let Some(raw) = item.get("output_path").and_then(|v| v.as_str()) else {
@@ -914,6 +1053,38 @@ fn carve_artifacts_json(case_dir: &std::path::Path, jsonl: &str) -> String {
         item["output_path"] = serde_json::Value::String(crate::audit::path_string(&resolved));
     }
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// R10-I1: whether a carve-log entry (as `audit::LaneRows::
+/// jsonl_with_trust` hands it over, field `trust`) may be shown as a
+/// carve RESULT, and its "신뢰" text. `auth` / `sc` are results (`sc` says
+/// "자기 일관성만"); `unauth` and `pc:<id>` are listed as "인증 안 됨"
+/// (another PC's key named); an entry without `trust` comes from a caller
+/// that did not classify it and is shown as before.
+fn carve_entry_trust(item: &serde_json::Value) -> (bool, String) {
+    let note = item
+        .get("trust_note")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match item.get("trust").and_then(serde_json::Value::as_str) {
+        None | Some("auth") => (true, "확인됨".to_string()),
+        Some("sc") => (true, crate::audit::SELF_CONSISTENT_NOTE.to_string()),
+        Some(code) => {
+            let base = match code.strip_prefix("pc:") {
+                // R19 I3: quoted only when quotable (`pc:unknown` otherwise).
+                Some(key_id) => format!(
+                    "인증 안 됨 — 이 PC에서 인증 불가, {} 보유 PC에서 확인 (변조 판정 아님)",
+                    crate::audit::key_id_phrase(key_id)
+                ),
+                None => "인증 안 됨".to_string(),
+            };
+            if note.is_empty() || code.starts_with("pc:") {
+                (false, base)
+            } else {
+                (false, format!("{base} — {note}"))
+            }
+        }
+    }
 }
 
 fn jsonl_to_array(jsonl: &str) -> String {
@@ -1036,6 +1207,8 @@ mod tests {
             "{}",
             "{}",
             "[]",
+            "",
+            "{}",
             Path::new("C:\\case"),
         );
         assert!(html.contains("recoveredFilesystemLog"));
@@ -1066,6 +1239,8 @@ mod tests {
             deepfake,
             "{}",
             "[]",
+            "",
+            "{}",
             Path::new("C:\\case"),
         );
         assert!(html.contains("deepfake:{\"vid_1\""));
@@ -1073,6 +1248,119 @@ mod tests {
         assert!(!html.contains("</script><script>alert(1)"));
         assert!(html.contains("\\u003c/script\\u003e"));
         assert_script_blocks_parse_with_node("evidence-viewer-dfl", &html);
+    }
+
+    /// Plan §1.9/§2.4: the court viewer data carries `joinLog` (array) and the
+    /// compact `audioLevels` map; script-close sequences stay escaped.
+    #[test]
+    fn evidence_viewer_embeds_join_log_and_audio_levels() {
+        let join = r#"{"schema_version":1,"event":"join-video","output_path":"</script>x.mp4","segment_count":2,"entry_sha256":"e"}"#;
+        let levels = r#"{"vid_1":{"r":"silent","max":-91.0,"mean":-91.0,"sec":60.0,"t":5}}"#;
+        let html = render_evidence_viewer_html(
+            r#"{"case_id":"FT-J","title":"j"}"#,
+            r#"{"videos":[]}"#,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "{}",
+            "{}",
+            "{}",
+            "{}",
+            "[]",
+            join,
+            levels,
+            Path::new("C:\\case"),
+        );
+        assert!(html.contains("joinLog:[{\"schema_version\":1,\"event\":\"join-video\""));
+        assert!(html.contains("audioLevels:{\"vid_1\":{\"r\":\"silent\""));
+        assert!(!html.contains("</script>x.mp4"));
+        assert_script_blocks_parse_with_node("evidence-viewer-join", &html);
+        // Defaults keep a stable shape: empty array / object, never missing.
+        let plain = full_viewer_page();
+        assert!(plain.contains("joinLog:[],audioLevels:{}"));
+        // The slim data bundle uses the same data builder.
+        let bundle = super::render_data_bundle_js(
+            "{}",
+            "{}",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "{}",
+            "{}",
+            "{}",
+            "{}",
+            "[]",
+            join,
+            levels,
+            r#"{"anomaly":{"head":{"status":"truncated"}}}"#,
+            Path::new("C:\\case"),
+        );
+        assert!(bundle.contains("joinLog:[{") && bundle.contains("audioLevels:{\"vid_1\""));
+        // R17 I6: the anomaly head rides along as `logChains`; the inline
+        // page (no chains given) has none.
+        assert!(
+            bundle.contains(r#"logChains:{"anomaly":{"head":{"status":"truncated"}}}"#),
+            "{bundle}"
+        );
+        assert!(!plain.contains(",logChains:"));
+    }
+
+    /// R7-S6: a `case.json` / index that is not one JSON value is
+    /// embedded as `null` (R6-S1); the review page then threw on
+    /// `manifest.title` and stayed blank. It now runs and says which file
+    /// could not be read. (Runs the page script under node with a stub
+    /// DOM; skipped without node, like the syntax checks.)
+    #[test]
+    fn review_page_says_when_its_inputs_were_unreadable() {
+        let html = crate::html_report::render_review_html("{} x", "not json");
+        assert!(html.contains("const manifestInput = null;"));
+        assert!(html.contains("const scanInput = null;"));
+        let Ok(node) = Command::new("node").arg("--version").output() else {
+            return;
+        };
+        if !node.status.success() {
+            return;
+        }
+        let blocks = extract_script_blocks(&html);
+        let main = blocks
+            .iter()
+            .find(|block| block.contains("manifestInput"))
+            .expect("main script");
+        let stub = r#"
+const shown = [];
+const el = () => new Proxy(function () {}, {
+  get: (_, key) => {
+    if (key === "insertAdjacentHTML") return (_where, html) => shown.push(String(html));
+    if (key === "value") return "";
+    if (key === Symbol.toPrimitive) return () => "";
+    if (key === Symbol.iterator) return [][Symbol.iterator];
+    return el();
+  },
+  set: () => true,
+  apply: () => el(),
+});
+globalThis.document = el();
+globalThis.localStorage = el();
+globalThis.matchMedia = () => ({ matches: false });
+process.on("exit", code => { if (code === 0) console.log("SHOWN:" + JSON.stringify(shown)); });
+"#;
+        let path =
+            std::env::temp_dir().join(format!("frametrace-r7-s6-review-{}.js", std::process::id()));
+        std::fs::write(&path, format!("{stub}\n{main}")).unwrap();
+        let output = Command::new("node").arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "review page script failed on null inputs:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("case.json"), "{stdout}");
+        assert!(stdout.contains("video_index.json"), "{stdout}");
     }
 
     fn extract_script_blocks(html: &str) -> Vec<String> {
@@ -1145,6 +1433,8 @@ mod tests {
                 "{}",
                 "{}",
                 "[]",
+                "",
+                "{}",
                 Path::new("C:\\case"),
             ),
         );
@@ -1161,9 +1451,14 @@ mod tests {
                 validation_log_jsonl: validation,
                 anomaly_log_jsonl: "",
                 batch_log_jsonl: "",
+                join_log_jsonl: "",
+                audio_levels_json: "{}",
                 scan_runs_json: "[]",
                 marks_json: "[]",
                 redaction_applied: false,
+                review_warnings_json: "",
+                read_errors_json: "",
+                telemetry_json: "",
             }),
         );
     }
@@ -1189,6 +1484,8 @@ mod tests {
             "{}",
             "{}",
             "[]",
+            "",
+            "{}",
             Path::new("/case"),
         )
     }
@@ -1322,5 +1619,70 @@ mod tests {
         ] {
             assert!(page.contains(needle), "{needle}");
         }
+    }
+
+    /// I6: the carve report's run time names its basis (UTC plus the local
+    /// offset) instead of a bare browser-local string.
+    #[test]
+    fn carve_report_time_label_is_utc_with_offset() {
+        let html = render_carve_report_html(
+            r#"{"case_id":"FT-T"}"#,
+            "",
+            r#"{"carved_unix":1700000000}"#,
+            "[]",
+            Path::new("case"),
+            "{}",
+        );
+        assert!(!html.contains("toLocaleString"), "bare local time label");
+        let script = html.rsplit_once("<script>").unwrap().1;
+        let start = script.find("const fmtCarveTime").unwrap();
+        let end = script[start..].find("};").unwrap() + start + 2;
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(format!(
+                "{}\nprocess.stdout.write(fmtCarveTime(1700000000));",
+                &script[start..end]
+            ))
+            .output()
+            .expect("node is required for report rendering tests");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with("2023-11-14 22:13:20 UTC (현지 "), "{text}");
+        assert!(text.contains(" UTC+") || text.contains(" UTC-"), "{text}");
+    }
+
+    /// E4 follow-up: carve ids are run-unique, so every run is shown,
+    /// grouped by run with the latest run first; only legacy entries
+    /// (no run id, repeating id space) keep the last entry per id.
+    #[test]
+    fn carve_page_shows_every_run_grouped_latest_first() {
+        let log = [
+            r#"{"id":"carve_000001","output_path":"/c/a.mp4"}"#,
+            r#"{"id":"carve_000001","output_path":"/c/a2.mp4"}"#,
+            r#"{"id":"carve_r1_1","run_id":"r1","carved_unix":100,"output_path":"/c/r1.mp4"}"#,
+            r#"{"event":"carve-resume","run_id":"r1"}"#,
+            r#"{"id":"carve_r2_1","run_id":"r2","carved_unix":200,"output_path":"/c/r2a.mp4"}"#,
+            r#"{"id":"carve_r2_2","run_id":"r2","carved_unix":200,"output_path":"/c/r2b.mp4"}"#,
+        ]
+        .join("\n");
+        let items: Vec<serde_json::Value> = serde_json::from_str(&super::carve_artifacts_json(
+            std::path::Path::new("/c"),
+            &log,
+        ))
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["carve_r2_1", "carve_r2_2", "carve_r1_1", "carve_000001"]
+        );
+        assert_eq!(items[0]["run_label"], "r2");
+        assert_eq!(items[2]["run_order"], 1);
+        assert!(
+            items[3]["output_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("a2.mp4"),
+            "legacy: last entry per id"
+        );
+        assert_eq!(items[3]["run_label"], "이전 실행(실행 id 없음)");
     }
 }

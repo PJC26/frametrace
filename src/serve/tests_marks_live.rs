@@ -69,6 +69,7 @@ fn job_for(case_dir: &Path) -> PipelineJob {
         with_hash: true,
         with_ffprobe: false,
         with_deepfake: false,
+        with_audio: false,
         skip_e01_verify: false,
         e01_direct: false,
     }
@@ -80,7 +81,10 @@ fn marks_apply_immediately_during_short_enrichment_steps() {
     let state = partial_state(&case_dir, Some("anomalies"));
     let response = import(&state, "vid_000001");
     assert_eq!(response["ok"], true, "{response}");
-    assert_eq!(response["applied"], true);
+    // Save protocol v2: `applied` is the {id: revision} map (truthy to
+    // the harnesses that only check it is set).
+    assert_eq!(response["applied"]["vid_000001"], 1, "{response}");
+    assert_eq!(response["deferred"], false);
     assert_eq!(stored_ids(&case_dir), ["vid_000001"]);
     assert_eq!(state_lock(&state).phase, "review-partial");
     let _ = std::fs::remove_dir_all(&case_dir);
@@ -128,7 +132,8 @@ fn marks_saved_during_every_phase_two_step_reach_review_ready() {
             // During the anomaly pass: applied at once.
             "qa" => {
                 let r = import(&state, "vid_000002");
-                assert_eq!(r["applied"], true, "{r}");
+                assert_eq!(r["applied"]["vid_000002"], 1, "{r}");
+                assert_eq!(r["deferred"], false, "{r}");
             }
             "make-review" => {
                 make_review_runs += 1;
@@ -159,7 +164,13 @@ fn marks_saved_during_every_phase_two_step_reach_review_ready() {
     assert_eq!(status["busy"], false);
     // After review-ready the normal path no longer takes the enrichment route.
     let late = import(&state, "vid_000004");
-    assert!(late.get("deferred").is_none(), "{late}");
+    // The v2 response always carries `deferred`; off the enrichment route
+    // it is false and the report was refreshed.
+    assert_eq!(late["deferred"], false, "{late}");
+    assert_eq!(
+        late["report_url"], "case/reports/case-report.html",
+        "{late}"
+    );
     let _ = std::fs::remove_dir_all(&case_dir);
 }
 

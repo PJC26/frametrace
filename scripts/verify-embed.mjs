@@ -113,7 +113,11 @@ const die = async (msg) => { console.error('FAIL:', msg); await cleanup(); proce
 const src = join(work, 'src');
 const demo = spawnSync(process.execPath, [join(root, 'scripts/make-demo-case.mjs'), src], { encoding: 'utf8' });
 if (demo.status !== 0) await die('demo source: ' + (demo.stderr || demo.stdout));
-try { server = await startIsolatedServer({ root, work: join(work, 'srv') }); } catch (e) { await die(e.message); }
+// R4 B5: generated pages are trusted by an HMAC with a per-user key; both
+// servers (main + legacy, separate config dirs) must share one key file or
+// the legacy one sandboxes the review page the main one generated.
+const pagesKey = { FRAMETRACE_PAGES_KEY_FILE: join(work, 'generated-pages.key') };
+try { server = await startIsolatedServer({ root, work: join(work, 'srv'), env: pagesKey }); } catch (e) { await die(e.message); }
 const caseDir = join(work, 'case');
 const started = await server.postJson('/api/start', { input_kind: 'folder', source_path: src, case_dir: caseDir, with_hash: true, with_ffprobe: true });
 if (!started.ok) await die('start: ' + started.error);
@@ -281,7 +285,7 @@ await host.waitForTimeout(3000); // past the old mount's autosave delay
 await host.evaluate(() => FTViewer.init({ embed: true, host: document.getElementById('hViewerHost') }));
 await host.waitForSelector('#recordGrid .card', { timeout: 30000 });
 check('7 re-init: unsaved mark restored from drafts', /needs_verification/.test(await markOf(host, third)) && await host.evaluate(() => FTViewer.summary().pending > 0), await host.evaluate(() => JSON.stringify(FTViewer.summary())));
-check('7 save() resolves true and the indicator turns saved', await host.evaluate(() => FTViewer.save()) === true && await host.evaluate(() => FTViewer.saveState()) === 'saved');
+check('7 save() resolves true and the indicator turns saved', await host.evaluate(() => FTViewer.save({ patient: true })) === true && await host.evaluate(() => FTViewer.saveState()) === 'saved');
 const meta = await server.getJson('/api/records-meta');
 const dbMarks = (meta.annotations && meta.annotations.marks) || [];
 const byId = (id) => dbMarks.find((m) => (m.record_id || m.id) === id);
@@ -414,7 +418,7 @@ check('no page errors (hosted + standalone)', errors.length === 0, errors.join('
 // ---------------------------------------------------------------- legacy
 server.stop();
 server = null;
-try { legacy = await startIsolatedServer({ root, work: join(work, 'legacy'), env: { FRAMETRACE_UI: 'legacy' } }); } catch (e) { await die('legacy server: ' + e.message); }
+try { legacy = await startIsolatedServer({ root, work: join(work, 'legacy'), env: { FRAMETRACE_UI: 'legacy', ...pagesKey } }); } catch (e) { await die('legacy server: ' + e.message); }
 const legacyHtml = await (await fetch(legacy.base + '/', { headers: legacy.headers })).text();
 check('8 FRAMETRACE_UI=legacy: GET / has #stageNav and the review iframe', legacyHtml.includes('id="stageNav"') && legacyHtml.includes('<iframe id="reviewFrame"'));
 check('8 legacy page carries no fragment of its own', !legacyHtml.includes('id="ftViewer"'));

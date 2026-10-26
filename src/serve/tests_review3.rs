@@ -5,6 +5,12 @@
 
 use super::*;
 
+// Included per test file (no mod.rs line needed); see the helper's header.
+#[allow(clippy::duplicate_mod)]
+#[path = "tests_fake_tools.rs"]
+mod fake_tools;
+use fake_tools::{CMD_FIND_OUTPUT, CMD_SPIN, cmd_sleep, write_fake};
+
 fn scratch(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft-rev3-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -162,7 +168,7 @@ fn signoff_detects_range_and_tag_changes() {
         crate::package::CheckStatus::Fail
     );
     let signoff = std::fs::read_to_string(case.join(crate::report::SIGNOFF_REL_PATH)).unwrap();
-    assert!(signoff.contains("\"schema_version\":3"), "{signoff}");
+    assert!(signoff.contains("\"schema_version\":4"), "{signoff}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -198,9 +204,83 @@ fn legacy_signoff_reads_as_binding_unknown() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Digest pin (save protocol v2): the sign-off content must not include
+/// the v7 revision table, so an existing sign-off still reads as
+/// "unchanged" after the migration and after revision bumps that change
+/// no content. Both the JSON string and its SHA-256 are pinned.
+#[test]
+fn signoff_content_json_unchanged_by_revision_table() {
+    let rows = vec![
+        crate::case_db::ReviewMarkRow {
+            record_id: "vid_000002".into(),
+            status: "reviewed".into(),
+            marked_unix: 200,
+            ..Default::default()
+        },
+        crate::case_db::ReviewMarkRow {
+            record_id: "vid_000001".into(),
+            status: "important".into(),
+            marked_unix: 100,
+            record_path: Some("/e/a.mp4".into()),
+            examiner: Some("kim".into()),
+            note: Some("메모 \"q\"".into()),
+            range: Some(crate::case_db::RangeSpan {
+                start: Some(1.5),
+                end: Some(4.0),
+            }),
+        },
+    ];
+    let tags = vec![
+        crate::selection::TagEntry {
+            id: "vid_000009".into(),
+            tags: vec!["tag-only".into()],
+        },
+        crate::selection::TagEntry {
+            id: "vid_000001".into(),
+            tags: vec!["사고".into(), "보류".into(), "사고".into()],
+        },
+    ];
+    let expected = concat!(
+        r#"{"schema":3,"marks":[{"id":"vid_000001","status":"important","marked_unix":100,"examiner":"kim","note":"메모 \"q\"","range_in":1.5,"range_out":4.0},"#,
+        r#"{"id":"vid_000002","status":"reviewed","marked_unix":200,"examiner":null,"note":null,"range_in":null,"range_out":null}],"#,
+        r#""tags":{"vid_000001":["보류","사고"],"vid_000009":["tag-only"]}}"#
+    );
+    let content = crate::cli::handlers::signoff_content_json_from(&rows, &tags);
+    assert_eq!(content, expected);
+    assert_eq!(
+        crate::report::signoff_content_sha256(&content),
+        "e16c86c1dc661a526d17237a1b349a0db2eff7a1b265712262dc3e90c96aba50"
+    );
+    // Through a real v7 case: revisions move, the digest does not.
+    let case = scratch("signoff-rev-pin");
+    std::fs::create_dir_all(case.join("db")).unwrap();
+    std::fs::write(case.join("case.json"), br#"{"case_id":"FT-pin"}"#).unwrap();
+    let base = std::collections::BTreeMap::new();
+    let patch = crate::case_db::AnnotationPatch {
+        marks: &rows,
+        tags: &tags,
+        deleted_ids: &[],
+        base_revisions: Some(&base),
+    };
+    crate::case_db::patch_review_annotations_v2(&case, &patch, Some("kim"), Some("w-1")).unwrap();
+    let stored = crate::cli::handlers::signoff_content_json(&case).unwrap();
+    assert_eq!(stored, expected);
+    assert!(!stored.contains("revision"));
+    // Legacy digest helper is byte-stable too (older sign-offs compare to it).
+    let loaded = crate::case_db::load_review_marks(&case).unwrap();
+    assert_eq!(
+        crate::cli::handlers::review_marks_json_from_rows(&loaded),
+        r#"[{"id":"vid_000001","status":"important","marked_unix":100,"examiner":"kim","note":"메모 \"q\""},{"id":"vid_000002","status":"reviewed","marked_unix":200}]"#
+    );
+    assert_eq!(
+        crate::case_db::load_review_revisions(&case).unwrap().len(),
+        3
+    );
+    let _ = std::fs::remove_dir_all(case);
+}
+
 /// Finding 8: a review-mark read failure must refuse the sign-off rather
 /// than bind it to an empty mark list.
-#[cfg(unix)]
 #[test]
 fn signoff_refused_when_marks_cannot_be_read() {
     let root = scratch("signoff-dberr");
@@ -223,6 +303,7 @@ fn signoff_refused_when_marks_cannot_be_read() {
 fn running_clip(id: &str, key: &str, output: PathBuf) -> ClipJob {
     ClipJob {
         id: id.into(),
+        kind: "export-clip",
         key: key.into(),
         record_id: "vid_0001".into(),
         rel_path: output.to_string_lossy().to_string(),
@@ -234,6 +315,9 @@ fn running_clip(id: &str, key: &str, output: PathBuf) -> ClipJob {
         size_bytes: None,
         error: None,
         cancel_requested: false,
+        progress_path: None,
+        expected_bytes: None,
+        join: None,
     }
 }
 
@@ -270,17 +354,11 @@ fn cancel_targets_the_busy_job_not_clip_exports() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Writes an executable `/bin/sh` script standing in for the CLI.
-#[cfg(unix)]
-fn fake_cli(dir: &Path, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("fake-frametrace.sh");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+/// Writes a fake CLI (`/bin/sh` on unix, `.cmd` on Windows).
+fn fake_cli(dir: &Path, unix_body: &str, cmd_body: &str) -> PathBuf {
+    write_fake(dir, unix_body, cmd_body)
 }
 
-#[cfg(unix)]
 const SLOW_EXPORT: &str = r#"out=""; prev=""
 for a in "$@"; do
   if [ "$prev" = "--output" ]; then out="$a"; fi
@@ -291,7 +369,13 @@ case "$1" in
   *) exit 0 ;;
 esac"#;
 
-#[cfg(unix)]
+fn slow_export_cmd() -> String {
+    format!(
+        "set first=%1\n{CMD_FIND_OUTPUT}\nif \"%first%\"==\"export-video\" (\n{}\necho clip> \"%out%\"\necho exported\nexit /b 0\n)\nexit /b 0",
+        cmd_sleep(3)
+    )
+}
+
 fn temp_case(label: &str) -> PathBuf {
     let dir = scratch(label);
     std::fs::create_dir_all(dir.join("db")).unwrap();
@@ -299,7 +383,6 @@ fn temp_case(label: &str) -> PathBuf {
     dir
 }
 
-#[cfg(unix)]
 fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !check() {
@@ -310,13 +393,12 @@ fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
 
 /// Finding 3: an identical export request must not join a job whose
 /// cancel is already pending (it would end "cancelled" under the caller).
-#[cfg(unix)]
 #[test]
 fn export_dedupe_skips_cancel_pending_jobs() {
     let case = temp_case("clip-cancel-dedupe");
-    let exe = fake_cli(&case, SLOW_EXPORT);
+    let exe = fake_cli(&case, SLOW_EXPORT, &slow_export_cmd());
     let state = bound(&case, "review-ready");
-    let body = r#"{"id":"vid_0001","start":"1","duration":"2"}"#;
+    let body = r#"{"id":"vid_000001","start":"1","duration":"2"}"#;
     let req = request("POST", "/api/export-clip", "", body);
     let first = parse(&export_clip_with_exe(&req, &state, &exe));
     let first_id = first["job"]["id"].as_str().unwrap().to_string();
@@ -351,7 +433,6 @@ fn export_dedupe_skips_cancel_pending_jobs() {
 /// queue during it, so a shell reloaded mid-job must be able to open the
 /// review stage); the job itself is reported via job/job_kind, and
 /// finalize is still refused while it holds busy.
-#[cfg(unix)]
 #[test]
 fn case_job_keeps_review_phase_and_still_blocks_finalize() {
     let case = temp_case("job-phase");
@@ -368,6 +449,10 @@ fn case_job_keeps_review_phase_and_still_blocks_finalize() {
   recover-batch) sleep 2; echo ok ;;
   *) echo ok ;;
 esac"#,
+        &format!(
+            "if \"%1\"==\"recover-batch\" (\n{}\n)\necho ok",
+            cmd_sleep(2)
+        ),
     );
     let state = bound(&case, "review-ready");
     let started = parse(&recover_deleted_with_exe(&state, &exe));
@@ -412,7 +497,7 @@ fn open_case_refused_while_clip_exports_run() {
         response["error"]
             .as_str()
             .unwrap()
-            .contains("클립 내보내기"),
+            .contains("내보내기·이어붙이기"),
         "{response}"
     );
     assert_eq!(state_lock(&state).case_dir.as_deref(), Some(old.as_path()));
@@ -422,11 +507,10 @@ fn open_case_refused_while_clip_exports_run() {
 
 /// NICE: finalize_with_exe must not release `busy` while the caller's
 /// BusyGuard is still alive (another job could start in that window).
-#[cfg(unix)]
 #[test]
 fn finalize_leaves_busy_to_the_callers_guard() {
     let case = temp_case("finalize-busy");
-    let exe = fake_cli(&case, "exit 1");
+    let exe = fake_cli(&case, "exit 1", "exit /b 1");
     let state = bound(&case, "review-ready");
     let guard = try_acquire_busy(&state).unwrap();
     let response = finalize_with_exe(&exe, &case, "홍길동", &state);
@@ -442,7 +526,6 @@ fn finalize_leaves_busy_to_the_callers_guard() {
 
 /// NICE: a cancel between `qa anomalies` and `make-custody` is reported as
 /// cancelled, not as a completed verification.
-#[cfg(unix)]
 #[test]
 fn verify_sources_cancelled_before_custody_is_not_ok() {
     let (root, case) = case_fixture("verify-cancel");
@@ -458,6 +541,11 @@ fn verify_sources_cancelled_before_custody_is_not_ok() {
   *) exit 0 ;;
 esac"#,
             marker.display()
+        ),
+        &format!(
+            "if \"%1\"==\"make-custody\" (\necho x> \"{}\"\ngoto spin\n)\nexit /b 0\n{}",
+            marker.display(),
+            CMD_SPIN
         ),
     );
     let state = bound(&case, "review-ready");

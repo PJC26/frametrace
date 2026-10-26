@@ -40,14 +40,14 @@ cargo test --locked --test perf_budgets -- --ignored --nocapture
 
 | Measurement | What it covers | Reference budget |
 | --- | --- | --- |
-| `index_write_read_10k_rows` | `case_db::benchmark_case_db` single-transaction writes + `load_video_ids` / `summarize_case_db` reads | 10k-row write ≈ 591 ms release (ROADMAP-v2 §1); sanity ceiling 30 s write / 10 s read in debug |
+| `index_write_read_10k_rows` | `case_db::benchmark_case_db` single-transaction writes + `load_video_ids` / `summarize_case_db` reads | 10k-row write ≈ 591 ms release (`docs/archive/ROADMAP-v2.md` §1); sanity ceiling 30 s write / 10 s read in debug |
 | `audit_append_verify_1k_entries` | `audit::append_chained_jsonl` lock+chain+fsync per entry, then `verify_chained_jsonl` | sanity ceiling 60 s append / 10 s verify |
 | `scan_synthetic_tree_1k_files` | `scan_folder` walk + SQLite/JSON/JSONL/TSV index outputs, `--no-ffprobe`, no hashing | sanity ceiling 30 s |
 
 The in-test ceilings are regression tripwires for debug builds, not the field
 budgets — the product-level budgets (10k viewer load ≤1.5 s, 1k thumbnails
 ≤180 s, 1k validations ≤240 s, inspect-image 10k entries ≤120 s) live in
-`docs/ROADMAP-v2.md` §3 and are exercised against real media. CI also runs a
+`docs/archive/ROADMAP-v2.md` §3 (performance budgets) and are exercised against real media. CI runs this harness weekly and on manual dispatch (`.github/workflows/perf.yml`, release-less debug build, `--ignored`). CI also runs a
 smaller `qa performance --rows 1000` gate (≥50k rows/minute) on both the
 Windows and macOS lanes.
 

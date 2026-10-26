@@ -51,6 +51,8 @@ const PRESET_CHIPS = [
   ["mark:none", "chip.markNone"],
   ["marked:any", "chip.marked", true],
   ["anomaly", "chip.anomaly", true],
+  ["anomaly:unauth", "chip.anomalyUnauth", true],
+  ["anomaly:pc", "chip.anomalyPc", true],
   ["warning", "chip.warning", true],
   ["status:validation-failed", "chip.failed", true],
   ["status:duplicate-candidate", "chip.duplicate", true],
@@ -75,21 +77,137 @@ function searchHaystack(record) {
 // Filter+sort memo. Every input of a non-annotation filter is either an
 // immutable record field or one of the state fields in the key, so the
 // result can be reused until one of them changes. Chips that read marks,
-// notes or tags ("marked:any", "mark:*", "tag:*") depend on annotation
-// state that several modules mutate directly, so those are recomputed on
-// every call rather than risk serving a stale list.
+// notes or tags ("marked:any", "mark:*", "tag:*") also key on
+// annotationGen (30-records.js), which every write of state.marks / notes /
+// tags bumps (touchAnnotation, draft replay, hydration, server values), so
+// j/k under a mark or tag filter reuses the list instead of filtering and
+// sorting every record on each key press (U7).
 let filteredMemo = { key: null, list: null };
-function filterMemoKey() {
+// How many times the full filter + sort actually ran (memo misses): read by
+// harnesses through FTViewer._debugStats() (U7 — j/k must not recompute).
+var filterComputeCount = 0;
+// Every FILTER input (no sort): the facet memo keys on this alone, so a
+// new filter dimension added here invalidates both memos and a sort change
+// never recomputes the facet counts (no positional slicing of the key).
+function filterStateKey(withGen = true) {
   const chip = state.chip || "";
-  if (chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:")) return null;
-  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.sortBy].join("\u0001");
+  const annotated = chip === "marked:any" || chip.startsWith("mark:") || chip.startsWith("tag:");
+  return [state.kind, state.recType, state.status, chip, state.dateFrom, state.dateTo, state.query, state.audio, annotated && withGen ? "a" + annotationGen : ""].join("\u0001");
+}
+function filterMemoKey(withGen = true) {
+  const base = filterStateKey(withGen);
+  return base === null ? null : base + "\u0001" + state.sortBy;
+}
+// R7 U4: the ids whose annotations changed since the memoised list was
+// made (30-records.js bumpAnnotations). Under a mark / tag chip a mark
+// used to re-filter and re-sort every record and rebuild the id → index
+// map; now only these ids are re-tested against the filter: a record that
+// left is cut out of the old list (same order — the sort never reads
+// annotations) and the old position map is reused with that shift. A
+// record that JOINS the list (its sorted place unknown) or a change of
+// everything (hydration, > 256 ids) still runs the full filter + sort.
+var filterTouched = new Set();
+var filterTouchedAll = true;
+function noteFilterTouched(id) {
+  if (!filterTouched) return; // boot hydration runs before this file: the first list is a full compute anyway
+  if (id == null || filterTouched.size >= 256) { filterTouchedAll = true; filterTouched.clear(); }
+  else if (!filterTouchedAll) filterTouched.add(id);
+}
+function recordPassesFilter(record, chip, query) {
+  return passesKind(record) && passesRecType(record) && passesDate(record) && passesAudio(record) && passesRest(record, chip, query);
+}
+// The new list from `old` when only the touched ids changed, or null (run
+// the full filter). Returns `old` itself when no touched id left or joined.
+function deriveFilteredList(old) {
+  if (filterTouchedAll || !Array.isArray(old)) return null;
+  const chip = state.chip || "";
+  const query = state.query || "";
+  const cut = [];
+  for (const id of filterTouched) {
+    const record = recordById.get(id);
+    const at = indexInList(old, id);
+    const passes = !!record && recordPassesFilter(record, chip, query);
+    if (at >= 0 && !passes) cut.push(at);
+    else if (at < 0 && passes) return null;
+  }
+  if (!cut.length) return old;
+  cut.sort((a, b) => a - b);
+  const list = old.slice();
+  for (let i = cut.length - 1; i >= 0; i--) list.splice(cut[i], 1);
+  indexInListDerive(list, old, cut);
+  return list;
 }
 
+// R5 U17: position of a record id in a list (the memoised filteredRecords()
+// array, the virtual grid's copy). j/k, a click, a mark and every
+// gridEnsureActiveVisible used to findIndex() through all 50k records —
+// O(n) per key. One id → index map per list (built once, checked against
+// the list's length and the entry it points at, so a list changed in place
+// is re-indexed rather than misread).
+// R7 U4: an entry may be DERIVED from an older list's map (`cut`: sorted
+// positions, in that map's numbering, cut out since) — a position is the
+// mapped one minus the cuts before it, checked against the entry it points
+// at like any other.
+function indexInList(list, id) {
+  if (!Array.isArray(list) || id == null) return -1;
+  const listIndexCache = indexInList.cache || (indexInList.cache = new WeakMap()); // self-contained (VM harness)
+  let entry = listIndexCache.get(list);
+  if (!entry || entry.len !== list.length) {
+    const map = new Map();
+    for (let i = 0; i < list.length; i++) if (list[i] && !map.has(list[i].id)) map.set(list[i].id, i);
+    entry = { len: list.length, map, cut: null };
+    listIndexCache.set(list, entry);
+  }
+  let at = entry.map.get(id);
+  if (at === undefined) return -1;
+  if (entry.cut) {
+    const cut = entry.cut;
+    let lo = 0, hi = cut.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cut[mid] < at) lo = mid + 1; else hi = mid; }
+    if (lo < cut.length && cut[lo] === at) return -1; // cut out of this list
+    at -= lo;
+  }
+  if (list[at] && list[at].id === id) return at;
+  listIndexCache.delete(list);
+  return list.findIndex(record => record && record.id === id);
+}
+// R7 U4: `list` = `old` minus the records at positions `cutNow` (old's
+// numbering, sorted) — it reuses old's map instead of building its own.
+// Past 512 accumulated cuts the next lookup rebuilds the map once instead.
+function indexInListDerive(list, old, cutNow) {
+  const listIndexCache = indexInList.cache || (indexInList.cache = new WeakMap());
+  const base = listIndexCache.get(old);
+  if (!base || base.len !== old.length) return;
+  let cut = cutNow;
+  if (base.cut) {
+    // old's position → the base map's position (the pos-th kept one).
+    const toBase = (pos) => {
+      let q = pos, k = 0;
+      for (;;) {
+        while (k < base.cut.length && base.cut[k] <= q) k++;
+        if (pos + k === q) return q;
+        q = pos + k;
+      }
+    };
+    cut = base.cut.concat(cutNow.map(toBase)).sort((a, b) => a - b);
+  }
+  if (cut.length > 512) return;
+  listIndexCache.set(list, { len: list.length, map: base.map, cut });
+}
 function filteredRecords() {
   const key = filterMemoKey();
-  if (key !== null && filteredMemo.key === key) return filteredMemo.list;
-  const list = computeFilteredRecords();
-  filteredMemo = { key, list };
+  if (key !== null && filteredMemo.key === key) {
+    filterTouched.clear();
+    filterTouchedAll = false;
+    return filteredMemo.list;
+  }
+  filterComputeCount += 1;
+  const base = filterMemoKey(false);
+  const sameFilter = key !== null && Array.isArray(filteredMemo.list) && filteredMemo.base === base;
+  const list = (sameFilter && deriveFilteredList(filteredMemo.list)) || computeFilteredRecords();
+  filterTouched.clear();
+  filterTouchedAll = false;
+  filteredMemo = { key, base, list };
   return list;
 }
 
@@ -98,6 +216,7 @@ function filteredRecords() {
 // day does not collapse the calendar to that one day (UX-22).
 function passesKind(record) { return !state.kind || record.kind === state.kind; }
 function passesRecType(record) { return !state.recType || (record.recType || "unclassified") === state.recType; }
+function passesAudio(record) { return !state.audio || record.audioFacet === state.audio; }
 function passesDate(record) {
   if (!state.dateFrom && !state.dateTo) return true;
   if (!record.recDay) return false;
@@ -108,6 +227,8 @@ function passesDate(record) {
 function passesRest(record, chip, query) {
   if (state.status && record.status !== state.status) return false;
   if (chip === "anomaly" && !record.hasAnomaly) return false;
+  if (chip === "anomaly:unauth" && !record.hasUnauthAnomaly) return false;
+  if (chip === "anomaly:pc" && !record.hasPcAnomaly) return false;
   if (chip === "warning" && !(record.warnings || []).length) return false;
   if (chip === "kind:recovery" && record.kind !== "candidate" && record.kind !== "filesystem") return false;
   if (chip === "marked:any" && !state.marks[record.id] && !(state.tags[record.id] || []).length && !(state.notes[record.id] || "").trim()) return false;
@@ -127,23 +248,24 @@ function passesRest(record, chip, query) {
 // Counts for the calendar and the facet tree, each excluding its own
 // dimension's filter. One pass; memoised on the filter key minus sort,
 // and fetched once per render() and passed to both renderers.
-let facetMemo = { key: null, value: null };
+let facetMemo = { key: null, value: null, gen: 0 };
 function facetCounts() {
-  const base = filterMemoKey();
-  const key = base === null ? null : base.split("\u0001").slice(0, 7).join("\u0001") + "\u0001" + records.length;
+  const base = filterStateKey();
+  const key = base === null ? null : base + "\u0001" + records.length;
   if (key !== null && facetMemo.key === key) return facetMemo.value;
   const chip = state.chip || "";
   const query = state.query || "";
-  const typeCounts = new Map(), kindCounts = new Map(), dayCounts = new Map();
+  const typeCounts = new Map(), kindCounts = new Map(), dayCounts = new Map(), audioCounts = new Map();
   records.forEach(record => {
     if (!passesRest(record, chip, query)) return;
-    const k = passesKind(record), ty = passesRecType(record), d = passesDate(record);
-    if (k && d) { const tk = record.recType || "unclassified"; typeCounts.set(tk, (typeCounts.get(tk) || 0) + 1); }
-    if (ty && d) kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
-    if (k && ty && record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
+    const k = passesKind(record), ty = passesRecType(record), d = passesDate(record), a = passesAudio(record);
+    if (k && d && a) { const tk = record.recType || "unclassified"; typeCounts.set(tk, (typeCounts.get(tk) || 0) + 1); }
+    if (ty && d && a) kindCounts.set(record.kind, (kindCounts.get(record.kind) || 0) + 1);
+    if (k && ty && a && record.recDay) dayCounts.set(record.recDay, (dayCounts.get(record.recDay) || 0) + 1);
+    if (k && ty && d) audioCounts.set(record.audioFacet, (audioCounts.get(record.audioFacet) || 0) + 1);
   });
-  const value = { typeCounts, kindCounts, dayCounts };
-  facetMemo = { key, value };
+  const value = { typeCounts, kindCounts, dayCounts, audioCounts };
+  facetMemo = { key, value, gen: facetMemo.gen + 1 };
   return value;
 }
 
@@ -151,7 +273,7 @@ function computeFilteredRecords() {
   const chip = state.chip || "";
   const query = state.query || "";
   const list = records.filter(record =>
-    passesKind(record) && passesRecType(record) && passesDate(record) && passesRest(record, chip, query));
+    passesKind(record) && passesRecType(record) && passesDate(record) && passesAudio(record) && passesRest(record, chip, query));
   const byId = (a, b) => idCollator.compare(String(a.id), String(b.id));
   switch (state.sortBy) {
     case "time-desc":
@@ -175,7 +297,7 @@ function computeFilteredRecords() {
 function groupKeyFor(record) {
   switch (state.groupBy) {
     case "day": return record.recDay || t("group.noTime");
-    case "kind": return ({ video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate") })[record.kind] || record.kind;
+    case "kind": return ({ video: t("filter.kind.video"), carved: t("filter.kind.carved"), filesystem: t("filter.kind.filesystem"), candidate: t("filter.kind.candidate"), joined: t("filter.kind.joined") })[record.kind] || record.kind;
     case "recType": return recTypeLabel(record.recType);
     case "status": return statusLabel(record.status);
     case "mark": return markOf(record) ? markLabel(markOf(record).status) : t("group.noMark");
@@ -289,7 +411,7 @@ function setupColumnSplitter() {
     else if (event.key === "ArrowRight") next = now + step;
     else if (event.key === "Home") next = COL_MIN;
     else if (event.key === "End") next = COL_MAX;
-    else if (event.key === "Enter") { event.preventDefault(); state.layout.colSplit = 0; saveLayout(); applyLayout(); return; }
+    else if (event.key === "Enter" && !imeComposing(event)) { event.preventDefault(); state.layout.colSplit = 0; saveLayout(); applyLayout(); return; }
     if (next === null) return;
     event.preventDefault();
     event.stopPropagation();
@@ -336,7 +458,7 @@ function setupHeightSplitter() {
     let next = null;
     if (event.key === "ArrowUp") next = cur - step;
     else if (event.key === "ArrowDown") next = cur + step;
-    else if (event.key === "Enter") { event.preventDefault(); state.layout.stageH = 0; saveLayout(); applyLayout(); return; }
+    else if (event.key === "Enter" && !imeComposing(event)) { event.preventDefault(); state.layout.stageH = 0; saveLayout(); applyLayout(); return; }
     if (next === null) return;
     event.preventDefault();
     event.stopPropagation();
@@ -483,13 +605,17 @@ function groupedModel(filtered, cols, rowH) {
   };
 }
 
-function vgRowElement(row) {
+// `index` is the row's 0-based position in the model: aria-rowindex lets a
+// screen reader report "row 412 of 2000" although only a window of rows is
+// in the DOM (U14; the grid carries aria-rowcount).
+function vgRowElement(row, index) {
   if (row.type === "h") {
     const holder = document.createElement("div");
     holder.innerHTML = groupHeaderHtml(row.key, row.kind, row.count, row.collapsed);
     const el = holder.firstElementChild;
     el.style.top = row.top + "px";
     el.style.height = row.h + "px";
+    el.setAttribute("aria-rowindex", String(index + 1));
     return el;
   }
   const html = [];
@@ -497,6 +623,7 @@ function vgRowElement(row) {
   const el = document.createElement("div");
   el.className = "vrow";
   el.setAttribute("role", "row");
+  el.setAttribute("aria-rowindex", String(index + 1));
   el.style.top = row.top + "px";
   el.style.height = row.h + "px";
   el.innerHTML = html.join("");
@@ -526,7 +653,7 @@ function paintVirtual(full) {
   for (let i = first; i <= last; i++) {
     let el = vg.painted.get(i);
     if (!el) {
-      el = vgRowElement(vg.model.get(i));
+      el = vgRowElement(vg.model.get(i), i);
       vg.painted.set(i, el);
     }
     const expectedNext = prev ? prev.nextSibling : vg.spacer.firstChild;
@@ -562,7 +689,7 @@ function groupHeaderHtml(key, kind, count, collapsed) {
 // Scroll the active record's row into view (nearest edge), then paint it.
 function gridEnsureActiveVisible() {
   if (!vg || state.activeId == null) return;
-  const idx = vg.filtered.findIndex(record => record.id === state.activeId);
+  const idx = indexInList(vg.filtered, state.activeId);
   if (idx < 0) return;
   const rowIndex = vg.model.rowOfIndex(idx);
   if (rowIndex < 0) return;
@@ -602,7 +729,7 @@ if (typeof ResizeObserver === "function") {
   const moveActiveByPage = moveActive;
   moveActive = function moveActiveVirtual(step) {
     if (vg && vg.filtered.length) {
-      const index = vg.filtered.findIndex(record => record.id === state.activeId);
+      const index = indexInList(vg.filtered, state.activeId);
       const next = Math.max(0, Math.min(vg.filtered.length - 1, index < 0 ? 0 : index + step));
       state.currentPage = Math.floor(next / state.pageSize) + 1;
     }
@@ -621,9 +748,13 @@ function renderVirtualGrid(filtered) {
     grid.textContent = "";
     spacer = document.createElement("div");
     spacer.className = "vspacer";
+    // grid > rowgroup > row > gridcell: the spacer is a structural element
+    // of the ARIA grid, not a generic wrapper (axe aria-required-children).
+    spacer.setAttribute("role", "rowgroup");
     grid.appendChild(spacer);
   }
   grid.classList.add("virtual");
+  grid.setAttribute("aria-rowcount", String(model.rowCount));
   grid.style.setProperty("--vcols", String(cols));
   spacer.style.height = model.total + "px";
   vg = { filtered, model, cols, spacer, painted: new Map(), first: 0, last: -1 };
@@ -634,8 +765,39 @@ function renderVirtualGrid(filtered) {
   if (activeChanged) gridEnsureActiveVisible();
 }
 
+// A grid rebuild replaces the card nodes: keyboard focus on a card, a
+// group header or the grid itself must not fall to <body> (an autosave
+// retry or a resize re-render lands at any time — PR #4 Windows CI).
+function gridFocusSnapshot() {
+  const el = document.activeElement;
+  if (!el || !els.recordGrid || !els.recordGrid.contains(el)) return null;
+  const card = el.closest(".card");
+  const header = card ? null : el.closest(".group-header");
+  return { id: card ? card.dataset.id : null, group: header ? header.dataset.group : null };
+}
+function gridFocusRestore(snap) {
+  if (!snap) return;
+  const now = document.activeElement;
+  if (now && now !== document.body && now.isConnected) return;
+  const grid = els.recordGrid;
+  let el = null;
+  if (snap.id != null) el = grid.querySelector(`.card[data-id="${CSS.escape(snap.id)}"]`);
+  else if (snap.group != null) el = grid.querySelector(`.group-header[data-group="${CSS.escape(snap.group)}"] .gh-cell`);
+  if (!el) {
+    el = grid;
+    if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+  }
+  try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+}
+function renderGridKeepFocus(filtered) {
+  const snap = gridFocusSnapshot();
+  renderGrid(filtered);
+  gridFocusRestore(snap);
+}
+
 function renderGrid(filtered) {
-  if (!filtered.some(record => record.id === state.activeId)) {
+  // R6 U8: the id → index map, not a scan of the whole list per render.
+  if (indexInList(filtered, state.activeId) < 0) {
     state.activeId = filtered[0]?.id || null;
   }
   gridRenderedOnce = true;
@@ -650,15 +812,10 @@ function renderGrid(filtered) {
   const rangeEnd = Math.min(filtered.length, start + pageRows.length);
   const rangeStart = filtered.length ? start + 1 : 0;
   els.pageStatus.textContent = `${rangeStart}–${rangeEnd} / ${filtered.length} · ${state.currentPage}/${pageCount}`;
-  // Marks are sparse: walk the mark map, not every record (PERF-03).
-  let reviewed = 0, important = 0, pending = 0;
-  for (const [id, mark] of Object.entries(state.marks)) {
-    if (!recordById.has(id)) continue;
-    const status = mark?.status;
-    if (status === "reviewed") reviewed += 1;
-    else if (status === "important") important += 1;
-    else if (status === "needs_verification") pending += 1;
-  }
+  // R7 U4: the incremental mark tally (30-records.js markTallyNow) — no
+  // walk of the mark map on every render (j/k re-render, a click).
+  const tally = markTallyNow().byStatus;
+  const reviewed = tally.reviewed || 0, important = tally.important || 0, pending = tally.needs_verification || 0;
   // Status texts are plain (non-live) — one polite region (#gridLive)
   // announces the result count, and only when the filter result changes,
   // never on j/k or a mark.
@@ -685,6 +842,7 @@ function renderGrid(filtered) {
   }
   vg = null;
   els.recordGrid.classList.remove("virtual");
+  els.recordGrid.removeAttribute("aria-rowcount");
 
   const groupCounts = new Map();
   if (state.groupBy !== "none") {
@@ -737,18 +895,18 @@ function announceResultCount(n) {
   announceTimer = setTimeout(() => { live.textContent = tf("layout.live", { n }); }, 600);
 }
 
-// Tri-state audio flag: probed codec present → speaker, probed with no
-// audio stream → muted, unprobed (carved/candidate) → nothing so we never
-// claim audio state we haven't verified.
+// Sound flag (§2.5): the shape tells the state — measured sound (waves),
+// measured silent track (flat line), no audio stream (crossed), stream
+// present but not measured (bare speaker), never probed (nothing) — so the
+// grid never claims a sound that was not measured. Icon + label, never
+// colour alone.
+const AUDIO_FLAG_ICON = { sound: "audio", silent: "audio-silent", none: "mute", track: "audio-track" };
 function audioFlag(record) {
-  const codec = String(record.audioCodec || "").toLowerCase();
-  if (codec && codec !== "none" && codec !== "-") {
-    return `<span class="audio-flag has" title="${escapeHtml(record.audioCodec)}">${ftIcon("audio")}</span>`;
-  }
-  if (record.probeOk === true) {
-    return `<span class="audio-flag none" title="${escapeHtml(t("audio.absent"))}">${ftIcon("mute")}</span>`;
-  }
-  return "";
+  // R9 U3: an unknown state signed by another PC's key still says so.
+  const icon = AUDIO_FLAG_ICON[record.audioState] || (record.audioPcKey ? "lock" : "");
+  if (!icon) return "";
+  const tip = escapeHtml(audioTipFor(record));
+  return `<span class="audio-flag ${escapeHtml(record.audioState)}" role="img" aria-label="${tip}" title="${tip}">${ftIcon(icon)}</span>`;
 }
 
 // Thumbnail URLs that already failed (see the capture-phase error handler
@@ -756,15 +914,49 @@ function audioFlag(record) {
 const thumbRetried = new Set();
 const thumbDead = new Set();
 
+// R9 U1: the trust of one log entry shown next to it (details lists):
+// nothing for authenticated / legacy entries.
+function logTrustTagHtml(item) {
+  const trust = logTrustOf(item);
+  // R20 U1: a validation flag row that is not current says so, whatever its trust.
+  if (item && item.superseded === true) return ` <span class="badge candidate" title="${escapeHtml(t("anomaly.tip.superseded"))}">${ftIcon("lock")}${escapeHtml(t("anomaly.superseded"))}</span>`;
+  // R21 U1: a newer line of the path is not authenticated — never "대체됨".
+  if (item && item.newerUnauth === true) {
+    const npc = logTrustPcKey(trust);
+    const ntip = t("status.tip.newer") + (npc ? " · " + trustOtherPcText(npc) : "");
+    return ` <span class="badge candidate" title="${escapeHtml(ntip)}">${ftIcon("lock")}${escapeHtml(npc ? t("status.otherPc") : t("trust.unauth"))}</span>`;
+  }
+  if (item && item.repairedAfter === true) return ` <span class="badge candidate" title="${escapeHtml(t("status.tip.repairedAfter"))}">${ftIcon("lock")}${escapeHtml(t("status.repairedAfter"))}</span>`;
+  // R11 U2: a usable entry's own note (legacy: `auth` + "레거시") as a tooltip.
+  const own = logTrustUsable(trust) ? logTrustNote(item, true) : "";
+  if (trust === "sc") return ` <span class="badge candidate"${own ? ` title="${escapeHtml(own)}"` : ""}>${escapeHtml(t("trust.sc"))}</span>`;
+  if (own) return ` <span class="trust-info" role="img" title="${escapeHtml(own)}" aria-label="${escapeHtml(own)}">${ftIcon("info")}</span>`;
+  if (logTrustUsable(trust)) return "";
+  const pc = logTrustPcKey(trust);
+  // R10 U3: the server's own reason (trust_note) in the tooltip.
+  const note = logTrustNote(item);
+  const tip = (pc ? trustOtherPcText(pc) : t("status.tip.unauth")) + (note ? "\n" + note : "");
+  return ` <span class="badge candidate" title="${escapeHtml(tip)}">${ftIcon("lock")}${escapeHtml(pc ? t("status.otherPc") : t("trust.unauth"))}</span>`;
+}
+// R10 U3: the trust_note of an entry this PC could not use, as a detail
+// line under it ("" otherwise).
+function logTrustNoteHtml(item) {
+  const note = logTrustNote(item);
+  return note ? `<div class="muted trust-note">${escapeHtml(note)}</div>` : "";
+}
+
 // Status is never colour alone: every status badge carries an icon + text.
 function statusIcon(status) {
+  if (status === "unauthenticated" || status === "auth-other-pc") return "lock";
   if (status === "ffprobe-video-stream-confirmed" || status === "ffprobe-confirmed") return "check";
   if (status === "validation-failed") return "x";
   if (status === "duplicate-candidate") return "copy";
+  if (status === "derived") return "clip";
   return "question";
 }
-function statusBadgeHtml(status) {
-  return `<span class="badge ${statusClass(status)}" title="${escapeHtml(status)}">${ftIcon(statusIcon(status))}${escapeHtml(statusLabel(status))}</span>`;
+// R9 U1: `record` (optional) adds what the status rests on to the tooltip.
+function statusBadgeHtml(status, record) {
+  return `<span class="badge ${statusClass(status)}" title="${escapeHtml(record ? statusTitle(record) : status)}">${ftIcon(statusIcon(status))}${escapeHtml(statusLabel(status))}</span>`;
 }
 
 // While the workstation is still scanning/enriching (live index), a record
@@ -805,14 +997,15 @@ function renderCard(record) {
   const recTime = record.recTime
     ? record.recSource === "name-date"
       ? record.recDay
-      : cardTimeFormat.format(new Date(record.recTime * 1000))
+      // A device-clock wall time reads as written (no local-Date DST shift).
+      : record.recSource === "name" && record.recWall
+        ? record.recWall.slice(0, 16).replace("T", " ")
+        : cardTimeFormat.format(new Date(record.recTime * 1000))
     : "";
   const tagsHtml = tagListFor(record).length
     ? `<div class="tag-row">${tagListFor(record).map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("")}</div>`
     : "";
-  const anomalyChip = record.hasAnomaly
-    ? `<span class="badge anomaly" title="${escapeHtml(record.anomalies.map(item => item.kind).join(", "))}">${ftIcon("warning")}${escapeHtml(t("header.anomaly"))}</span>`
-    : "";
+  const anomalyChip = anomalyBadgeHtml(record, true);
   const kindChip = `<span class="kind-badge kind-${escapeHtml(record.kind || "video")}" title="${t("tree.kind")}">${escapeHtml(KIND_SHORT[record.kind] || record.kind || "?")}</span>`;
   const warnChip = (record.warnings || []).length
     ? `<span class="badge warn" title="${escapeHtml(record.warnings.join("\n"))}">${ftIcon("info")}${tf("warn.count", { n: record.warnings.length })}</span>`
@@ -830,7 +1023,7 @@ function renderCard(record) {
     <div class="meta">
       <div class="name-row"><span class="name" title="${escapeHtml(displayName)}">${highlightEscape(displayName, state.query)}</span>${record.channel ? `<span class="channel-badge">${escapeHtml(record.channel)}</span>` : ""}</div>
       <div class="time-row"><span class="time-text">${recTime ? escapeHtml(recTime) : t("time.unknown")}</span><span class="sub">${fmtBytes(record.size)}${audioFlag(record)}${staleTag}</span></div>
-      <div class="badge-row">${statusBadgeHtml(record.status)}${markChip}${anomalyChip}${warnChip}${dflChip}</div>
+      <div class="badge-row">${statusBadgeHtml(record.status, record)}${markChip}${anomalyChip}${warnChip}${dflChip}</div>
       ${tagsHtml}
     </div>
   </div>`;
@@ -988,7 +1181,10 @@ function setupLayoutChrome() {
   document.getElementById("btnRail")?.addEventListener("click", toggleRail);
   document.addEventListener("keydown", event => {
     if (event.defaultPrevented || event.altKey || event.shiftKey) return;
-    if (!(event.ctrlKey || event.metaKey) || String(event.key).toLowerCase() !== "b") return;
+    // shortcutKey (80-review): a Russian / Korean layout's Ctrl+"и" is Ctrl+B.
+    if (!(event.ctrlKey || event.metaKey) || shortcutKey(event).toLowerCase() !== "b") return;
+    // Nothing behind an open viewer modal changes (U12).
+    if (viewerModalOpen()) return;
     const el = document.activeElement;
     if (el && (el.tagName === "TEXTAREA" || el.isContentEditable)) return;
     if (el && el.closest && el.closest('[data-keys="off"]')) return;

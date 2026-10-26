@@ -36,18 +36,40 @@ pub struct TelemetryPoint {
     pub alt_m: Option<f64>,
 }
 
+/// Bounded point collector (E9): keeps at most `MAX_POINTS` points in
+/// memory but counts every decoded point, so a capped report can say how
+/// many it dropped instead of truncating silently.
+#[derive(Debug, Default)]
+struct PointSink {
+    points: Vec<TelemetryPoint>,
+    total: usize,
+}
+
+impl PointSink {
+    fn push(&mut self, point: TelemetryPoint) {
+        self.total += 1;
+        if self.points.len() < MAX_POINTS {
+            self.points.push(point);
+        }
+    }
+
+    fn truncated(&self) -> bool {
+        self.total > self.points.len()
+    }
+}
+
 /// Per-case counts from a camm (Camera Motion Metadata) stream — kept
 /// alongside the decoded points so the examiner sees how much of the
 /// stream the spec-based parser covered versus skipped.
 #[derive(Debug, Serialize)]
 pub struct CammStats {
     pub packets: usize,
-    /// case 5 lat/lon + case 7 GPS packets that yielded a point.
+    /// case 5 (lat/lon/alt) + case 6 (full GPS) packets that yielded a point.
     pub gps_points: usize,
-    /// case 7 packets skipped because gps_fix_type was 0 (no fix).
+    /// case 6 packets skipped because gps_fix_type was 0 (no fix).
     pub gps_no_fix: usize,
-    /// cases 0/2/3/6 (angle-axis/gyro/acceleration/orientation) counted
-    /// but not surfaced as track points.
+    /// cases 0/1/2/3/4/7 (angle-axis, exposure, gyro, acceleration,
+    /// position, magnetic field) counted but not surfaced as track points.
     pub imu_packets: usize,
     pub unknown_packets: usize,
 }
@@ -71,7 +93,14 @@ pub struct TelemetryReport {
     /// here, so points carry the caveat in `note`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camm: Option<CammStats>,
+    /// Points kept in `points` (at most 20,000).
     pub point_count: usize,
+    /// Every point decoded, including those beyond the cap (E9).
+    pub total_points: usize,
+    /// `true` when `points` holds fewer than `total_points`: the track was
+    /// cut at the cap and `first/last_ts_unix`/`max_speed_kmh` describe the
+    /// kept points only.
+    pub truncated: bool,
     pub first_ts_unix: Option<f64>,
     pub last_ts_unix: Option<f64>,
     pub max_speed_kmh: Option<f64>,
@@ -175,12 +204,9 @@ fn rmc_unix(time: &str, date: &str) -> Option<f64> {
 /// located anywhere in the byte stream — dashcams often embed them
 /// mid-record between binary fields, so no line-start alignment is
 /// assumed; each candidate is bounded by the next CR/LF or 200 bytes.
-fn scan_nmea_bytes(bytes: &[u8], points: &mut Vec<TelemetryPoint>) {
+fn scan_nmea_bytes(bytes: &[u8], points: &mut PointSink) {
     let mut pos = 0usize;
     while pos + 1 < bytes.len() {
-        if points.len() >= MAX_POINTS {
-            return;
-        }
         let Some(off) = bytes[pos..].windows(2).position(|w| w == b"$G") else {
             return;
         };
@@ -264,7 +290,7 @@ fn telemetry_streams(path: &Path) -> (Vec<u32>, Vec<u32>) {
 }
 
 /// Seconds between the GPS epoch (1980-01-06T00:00:00Z) and the Unix
-/// epoch. camm case-7 `time_gps_epoch` counts GPS seconds; the ~18s of
+/// epoch. camm case-6 `time_gps_epoch` counts GPS seconds; the ~18s of
 /// accumulated leap seconds are not corrected here — flagged in `note`.
 const GPS_EPOCH_OFFSET: f64 = 315_964_800.0;
 
@@ -289,60 +315,103 @@ fn le_i32(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// Packet sizes (4-byte header included) per the public Camera Motion
+/// Metadata Spec, Google Street View Publish API —
+/// <https://developers.google.com/streetview/publish/camm-spec>
+/// (page "Last updated 2025-08-28 UTC", fetched 2026-10-14). The spec
+/// declares a header of `uint16 reserved; uint16 type;` followed by:
+///
+/// ```text
+/// case 0: float angle_axis[3]                                 (12 B)
+/// case 1: int32 pixel_exposure_time; int32 rolling_shutter_skew_time (8 B)
+/// case 2: float gyro[3]                                       (12 B)
+/// case 3: float acceleration[3]                               (12 B)
+/// case 4: float position[3]                                   (12 B)
+/// case 5: double latitude; double longitude; double altitude  (24 B)
+/// case 6: double time_gps_epoch; int gps_fix_type;
+///         double latitude; double longitude; float altitude;
+///         float horizontal_accuracy; float vertical_accuracy;
+///         float velocity_east; float velocity_north; float velocity_up;
+///         float speed_accuracy                                (56 B)
+/// case 7: float magnetic_field[3]                             (12 B)
+/// ```
+///
+/// "All fields are little-endian ... and the 32-bit floating points are
+/// of IEEE 754-1985 format"; the spec states no padding, so fields are
+/// packed in declaration order. E6 corrected this parser: it previously
+/// read the full GPS record as case 7 (which is the magnetometer) with a
+/// 4-byte float `time_gps_epoch`, and dropped case 5's altitude.
+const CAMM_CASE5_LEN: usize = 4 + 24;
+const CAMM_CASE6_LEN: usize = 4 + 56;
+
+/// R5-P11: a camm position worth a track point — finite, in range, and
+/// not the (0, 0) "null island" a recorder writes before it has a fix.
+fn plausible_fix(lat: f64, lon: f64) -> bool {
+    lat.is_finite()
+        && lon.is_finite()
+        && lat.abs() <= 90.0
+        && lon.abs() <= 180.0
+        && !(lat == 0.0 && lon == 0.0)
+}
+
 /// Parses one camm sample (4-byte header + type-specific payload).
-/// Cases 5 and 7 produce track points; IMU cases only bump counters —
-/// a packet shorter than the spec minimum is counted unknown rather
-/// than mis-parsed.
-fn parse_camm_packet(packet: &[u8], points: &mut Vec<TelemetryPoint>, stats: &mut CammStats) {
+/// Cases 5 and 6 produce track points; the other spec cases only bump
+/// counters — a packet shorter than the spec size is counted unknown
+/// rather than mis-parsed.
+fn parse_camm_packet(packet: &[u8], points: &mut PointSink, stats: &mut CammStats) {
     if packet.len() < 4 {
         stats.unknown_packets += 1;
         return;
     }
-    let ty = packet[2];
+    // `uint16 type`, little-endian, at bytes 2..4.
+    let ty = u16::from_le_bytes([packet[2], packet[3]]);
     match ty {
-        5 if packet.len() >= 20 => {
-            let (lat, lon) = (le_f64(packet, 4), le_f64(packet, 12));
-            if lat.abs() <= 90.0 && lon.abs() <= 180.0 {
+        5 if packet.len() >= CAMM_CASE5_LEN => {
+            let (lat, lon, alt) = (le_f64(packet, 4), le_f64(packet, 12), le_f64(packet, 20));
+            if plausible_fix(lat, lon) {
                 points.push(TelemetryPoint {
                     lat,
                     lon,
                     ts_unix: None,
                     speed_kmh: None,
-                    alt_m: None,
+                    alt_m: alt.is_finite().then_some(alt),
                 });
                 stats.gps_points += 1;
             } else {
                 stats.unknown_packets += 1;
             }
         }
-        7 if packet.len() >= 56 => {
-            let fix = le_i32(packet, 8);
+        6 if packet.len() >= CAMM_CASE6_LEN => {
+            // Offsets (header included): 4 time_gps_epoch(f64) ·
+            // 12 gps_fix_type(i32) · 16 lat(f64) · 24 lon(f64) ·
+            // 32 alt(f32) · 36 h_acc · 40 v_acc · 44 vel_e · 48 vel_n ·
+            // 52 vel_up · 56 speed_acc.
+            let fix = le_i32(packet, 12);
             if fix == 0 {
                 stats.gps_no_fix += 1;
                 return;
             }
-            let (lat, lon) = (le_f64(packet, 12), le_f64(packet, 20));
-            if lat.abs() > 90.0 || lon.abs() > 180.0 {
+            let (lat, lon) = (le_f64(packet, 16), le_f64(packet, 24));
+            if !plausible_fix(lat, lon) {
                 stats.unknown_packets += 1;
                 return;
             }
-            // Layout: 4 time_gps_epoch(f32) · 8 fix(i32) · 12 lat(f64) ·
-            // 20 lon(f64) · 28 alt(f32) · 32 h_acc · 36 v_acc · 40 vel_e
-            // · 44 vel_n · 48 vel_up · 52 speed_acc — all little-endian.
-            let speed_ms = (le_f32(packet, 40).powi(2)
-                + le_f32(packet, 44).powi(2)
-                + le_f32(packet, 48).powi(2))
-            .sqrt();
+            // R5-P11: ground speed is the HORIZONTAL velocity (east, north);
+            // velocity_up (offset 52) is climb rate, not road speed.
+            let speed_ms = (le_f32(packet, 44).powi(2) + le_f32(packet, 48).powi(2)).sqrt();
+            let gps_seconds = le_f64(packet, 4);
             points.push(TelemetryPoint {
                 lat,
                 lon,
-                ts_unix: Some(le_f32(packet, 4) + GPS_EPOCH_OFFSET),
-                speed_kmh: Some(speed_ms * 3.6),
-                alt_m: Some(le_f32(packet, 28)),
+                ts_unix: gps_seconds
+                    .is_finite()
+                    .then_some(gps_seconds + GPS_EPOCH_OFFSET),
+                speed_kmh: speed_ms.is_finite().then_some(speed_ms * 3.6),
+                alt_m: Some(le_f32(packet, 32)).filter(|alt| alt.is_finite()),
             });
             stats.gps_points += 1;
         }
-        0..=4 | 6 => {
+        0..=4 | 7 => {
             stats.imu_packets += 1;
         }
         _ => {
@@ -386,7 +455,7 @@ fn packet_sizes(path: &Path, stream_index: u32) -> Result<Vec<usize>, String> {
 fn extract_camm_stream(
     path: &Path,
     stream_index: u32,
-    points: &mut Vec<TelemetryPoint>,
+    points: &mut PointSink,
 ) -> Result<CammStats, String> {
     let sizes = packet_sizes(path, stream_index)?;
     if sizes.is_empty() {
@@ -426,12 +495,7 @@ fn extract_camm_stream(
 /// no length prefix. A dump shorter than the declared sizes marks the
 /// remainder unknown and stops; a trailing tail beyond the last
 /// declared packet is ignored (muxer padding).
-fn parse_camm_dump(
-    dump: &[u8],
-    sizes: &[usize],
-    points: &mut Vec<TelemetryPoint>,
-    stats: &mut CammStats,
-) {
+fn parse_camm_dump(dump: &[u8], sizes: &[usize], points: &mut PointSink, stats: &mut CammStats) {
     let mut cursor = 0usize;
     for size in sizes {
         if cursor + size > dump.len() {
@@ -439,11 +503,10 @@ fn parse_camm_dump(
             return;
         }
         stats.packets += 1;
+        // Walks every packet even past the point cap: the sink keeps the
+        // first MAX_POINTS and counts the rest (E9).
         parse_camm_packet(&dump[cursor..cursor + size], points, stats);
         cursor += size;
-        if points.len() >= MAX_POINTS {
-            return;
-        }
     }
 }
 
@@ -451,7 +514,7 @@ fn parse_camm_dump(
 pub fn extract_file(path: &Path) -> Result<TelemetryReport, String> {
     let (stream_indexes, camm_indexes) = telemetry_streams(path);
     let mut unparsed = Vec::new();
-    let mut points = Vec::new();
+    let mut points = PointSink::default();
     let mut sources: Vec<&str> = Vec::new();
     let mut camm_stats: Option<CammStats> = None;
 
@@ -475,9 +538,9 @@ pub fn extract_file(path: &Path) -> Result<TelemetryReport, String> {
             ],
         ) {
             Ok(bytes) => {
-                let before = points.len();
+                let before = points.total;
                 scan_nmea_bytes(&bytes, &mut points);
-                if points.len() > before && !sources.contains(&"nmea-data-stream") {
+                if points.total > before && !sources.contains(&"nmea-data-stream") {
                     sources.push("nmea-data-stream");
                 }
             }
@@ -513,13 +576,13 @@ pub fn extract_file(path: &Path) -> Result<TelemetryReport, String> {
     // embed sentences without declaring a data stream at all. Only the
     // head and tail are read: a multi-GB evidence file never enters
     // memory whole.
-    if points.is_empty() {
+    if points.total == 0 {
         use std::io::{Read, Seek, SeekFrom};
         if let Ok(mut f) = fs::File::open(path) {
             let mut head = vec![0u8; EDGE_SCAN_BYTES];
             let n = f.read(&mut head).unwrap_or(0);
             scan_nmea_bytes(&head[..n], &mut points);
-            if points.is_empty() {
+            if points.total == 0 {
                 let mut tail = vec![0u8; EDGE_SCAN_BYTES];
                 if f.seek(SeekFrom::End(-(EDGE_SCAN_BYTES as i64))).is_ok()
                     && f.read_exact(&mut tail).is_ok()
@@ -528,10 +591,13 @@ pub fn extract_file(path: &Path) -> Result<TelemetryReport, String> {
                 }
             }
         }
-        if !points.is_empty() {
+        if points.total > 0 {
             sources.push("nmea-file-scan");
         }
     }
+    let total_points = points.total;
+    let truncated = points.truncated();
+    let mut points = points.points;
     let source = if sources.is_empty() {
         "none".to_string()
     } else {
@@ -566,18 +632,25 @@ pub fn extract_file(path: &Path) -> Result<TelemetryReport, String> {
             .unwrap_or_else(|_| path.to_string_lossy().to_string()),
         source: source.clone(),
         point_count: points.len(),
+        total_points,
+        truncated,
         first_ts_unix: tss.first().copied(),
         last_ts_unix: tss.last().copied(),
         max_speed_kmh: max_speed,
         points,
         unparsed_streams: unparsed,
         camm: camm_stats,
-        note: build_note(&source, has_camm),
+        note: build_note(&source, has_camm, truncated.then_some(total_points)),
     })
 }
 
-fn build_note(source: &str, has_camm: bool) -> String {
+fn build_note(source: &str, has_camm: bool, truncated_total: Option<usize>) -> String {
     let mut parts = Vec::new();
+    if let Some(total) = truncated_total {
+        parts.push(format!(
+            "TRUNCATED: {total} points were decoded but only the first {MAX_POINTS} are kept; the track, first/last timestamps and maximum speed cover the kept points only."
+        ));
+    }
     if source == "none" {
         parts.push(
             "No NMEA/camm telemetry found. Dashcams that record GPS only in proprietary tracks report them as unparsed streams — absence here does not prove absence in the original."
@@ -698,17 +771,20 @@ mod tests {
             b"$GNRMC,120000.00,A,3723.2000,N,12658.0000,E,30.0,0.0,010124,0,E*00\r\n",
         );
         bytes.extend_from_slice(&[0xAB; 32]);
-        let mut points = Vec::new();
+        let mut points = PointSink::default();
         scan_nmea_bytes(&bytes, &mut points);
-        assert_eq!(points.len(), 1);
-        assert!((points[0].lat - 37.386666).abs() < 0.001);
+        assert_eq!(points.points.len(), 1);
+        assert!((points.points[0].lat - 37.386666).abs() < 0.001);
     }
 
-    /// Builds a synthetic camm case-7 GPS packet per the public spec:
-    /// 2-byte reserved, type byte, reserved, then LE fields.
+    /// Builds a camm case-6 GPS packet exactly as the public Camera Motion
+    /// Metadata Spec lays it out (uint16 reserved, uint16 type = 6, then
+    /// packed little-endian fields: f64 time_gps_epoch, i32 fix, f64 lat,
+    /// f64 lon, f32 alt, f32 h_acc, f32 v_acc, f32 vel_e, f32 vel_n,
+    /// f32 vel_up, f32 speed_acc) — 60 bytes.
     #[allow(clippy::too_many_arguments)]
-    fn camm_case7(
-        gps_epoch: f32,
+    fn camm_case6(
+        gps_epoch: f64,
         fix: i32,
         lat: f64,
         lon: f64,
@@ -717,7 +793,7 @@ mod tests {
         vn: f32,
         vup: f32,
     ) -> Vec<u8> {
-        let mut p = vec![0u8, 0, 7, 0];
+        let mut p = vec![0u8, 0, 6, 0];
         p.extend_from_slice(&gps_epoch.to_le_bytes());
         p.extend_from_slice(&fix.to_le_bytes());
         p.extend_from_slice(&lat.to_le_bytes());
@@ -733,8 +809,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_camm_case7_gps_fix() {
-        let mut points = Vec::new();
+    fn parses_camm_case6_gps_fix() {
+        let mut points = PointSink::default();
         let mut stats = CammStats {
             packets: 0,
             gps_points: 0,
@@ -743,11 +819,11 @@ mod tests {
             unknown_packets: 0,
         };
         // gps_epoch 1400000000 → unix ≈ 1715964800; 3-4-5 velocity = 5 m/s.
-        let packet = camm_case7(1_400_000_000.0, 3, 37.5, 127.0, 25.0, 3.0, 4.0, 0.0);
-        assert_eq!(packet.len(), 56);
+        let packet = camm_case6(1_400_000_000.0, 3, 37.5, 127.0, 25.0, 3.0, 4.0, 0.0);
+        assert_eq!(packet.len(), 60);
         parse_camm_packet(&packet, &mut points, &mut stats);
         assert_eq!(stats.gps_points, 1);
-        let p = &points[0];
+        let p = &points.points[0];
         assert!((p.lat - 37.5).abs() < 1e-9);
         assert!((p.lon - 127.0).abs() < 1e-9);
         assert_eq!(p.alt_m, Some(25.0));
@@ -755,9 +831,11 @@ mod tests {
         assert!((p.ts_unix.unwrap() - (1_400_000_000.0 + 315_964_800.0)).abs() < 1.0);
     }
 
+    /// R5-P11: speed is horizontal (a 3 m/s climb adds nothing), and a
+    /// (0, 0) or non-finite position is no track point.
     #[test]
-    fn skips_camm_case7_without_fix() {
-        let mut points = Vec::new();
+    fn camm_speed_is_horizontal_and_null_island_is_dropped() {
+        let mut points = PointSink::default();
         let mut stats = CammStats {
             packets: 0,
             gps_points: 0,
@@ -765,15 +843,50 @@ mod tests {
             imu_packets: 0,
             unknown_packets: 0,
         };
-        let packet = camm_case7(1_400_000_000.0, 0, 37.5, 127.0, 25.0, 0.0, 0.0, 0.0);
+        let climbing = camm_case6(1_400_000_000.0, 3, 37.5, 127.0, 25.0, 3.0, 4.0, 12.0);
+        parse_camm_packet(&climbing, &mut points, &mut stats);
+        assert_eq!(points.points.len(), 1);
+        assert!(
+            (points.points[0].speed_kmh.unwrap() - 18.0).abs() < 0.01,
+            "{:?}",
+            points.points[0].speed_kmh
+        );
+        for (lat, lon) in [(0.0, 0.0), (f64::NAN, 127.0), (37.5, f64::INFINITY)] {
+            parse_camm_packet(
+                &camm_case6(1_400_000_000.0, 3, lat, lon, 0.0, 1.0, 1.0, 0.0),
+                &mut points,
+                &mut stats,
+            );
+        }
+        let mut case5 = vec![0u8, 0, 5, 0];
+        case5.extend_from_slice(&0.0f64.to_le_bytes());
+        case5.extend_from_slice(&0.0f64.to_le_bytes());
+        case5.extend_from_slice(&10.0f64.to_le_bytes());
+        parse_camm_packet(&case5, &mut points, &mut stats);
+        assert_eq!(points.points.len(), 1, "no (0,0)/non-finite points");
+        assert_eq!(stats.unknown_packets, 4);
+        assert_eq!(stats.gps_points, 1);
+    }
+
+    #[test]
+    fn skips_camm_case6_without_fix() {
+        let mut points = PointSink::default();
+        let mut stats = CammStats {
+            packets: 0,
+            gps_points: 0,
+            gps_no_fix: 0,
+            imu_packets: 0,
+            unknown_packets: 0,
+        };
+        let packet = camm_case6(1_400_000_000.0, 0, 37.5, 127.0, 25.0, 0.0, 0.0, 0.0);
         parse_camm_packet(&packet, &mut points, &mut stats);
-        assert!(points.is_empty());
+        assert!(points.points.is_empty());
         assert_eq!(stats.gps_no_fix, 1);
     }
 
     #[test]
     fn parses_camm_case5_and_counts_imu() {
-        let mut points = Vec::new();
+        let mut points = PointSink::default();
         let mut stats = CammStats {
             packets: 0,
             gps_points: 0,
@@ -784,20 +897,22 @@ mod tests {
         let mut case5 = vec![0u8, 0, 5, 0];
         case5.extend_from_slice(&37.123f64.to_le_bytes());
         case5.extend_from_slice(&127.456f64.to_le_bytes());
+        case5.extend_from_slice(&88.5f64.to_le_bytes());
         parse_camm_packet(&case5, &mut points, &mut stats);
-        assert_eq!(points.len(), 1);
-        assert!((points[0].lat - 37.123).abs() < 1e-9);
+        assert_eq!(points.points.len(), 1);
+        assert!((points.points[0].lat - 37.123).abs() < 1e-9);
+        assert_eq!(points.points[0].alt_m, Some(88.5));
         // IMU case (gyro) counts but yields no point.
         let mut gyro = vec![0u8, 0, 2, 0];
         gyro.extend_from_slice(&[0u8; 12]);
         parse_camm_packet(&gyro, &mut points, &mut stats);
-        assert_eq!(points.len(), 1);
+        assert_eq!(points.points.len(), 1);
         assert_eq!(stats.imu_packets, 1);
     }
 
     #[test]
     fn camm_malformed_and_unknown_types_are_counted_not_parsed() {
-        let mut points = Vec::new();
+        let mut points = PointSink::default();
         let mut stats = CammStats {
             packets: 0,
             gps_points: 0,
@@ -807,12 +922,12 @@ mod tests {
         };
         parse_camm_packet(&[0u8, 0], &mut points, &mut stats); // too short
         parse_camm_packet(&[0u8, 0, 99, 0, 0, 0, 0, 0], &mut points, &mut stats); // unknown type
-        let short7 = vec![0u8, 0, 7, 0, 0, 0]; // truncated case 7
-        parse_camm_packet(&short7, &mut points, &mut stats);
-        // out-of-range coords in a well-formed case 7 → unknown, no point
-        let bad = camm_case7(1.0, 3, 95.0, 200.0, 0.0, 0.0, 0.0, 0.0);
+        let short6 = vec![0u8, 0, 6, 0, 0, 0]; // truncated case 6
+        parse_camm_packet(&short6, &mut points, &mut stats);
+        // out-of-range coords in a well-formed case 6 → unknown, no point
+        let bad = camm_case6(1.0, 3, 95.0, 200.0, 0.0, 0.0, 0.0, 0.0);
         parse_camm_packet(&bad, &mut points, &mut stats);
-        assert!(points.is_empty());
+        assert!(points.points.is_empty());
         assert_eq!(stats.unknown_packets, 4);
     }
 
@@ -821,16 +936,16 @@ mod tests {
         // Simulates `ffmpeg -f data` output: three packets concatenated
         // (GPS fix, gyro, no-fix) — the same shape a real camm stream
         // yields once ffprobe packet sizes are applied.
-        let p1 = camm_case7(1_400_000_000.0, 3, 37.5, 127.0, 25.0, 3.0, 4.0, 0.0);
+        let p1 = camm_case6(1_400_000_000.0, 3, 37.5, 127.0, 25.0, 3.0, 4.0, 0.0);
         let mut p2 = vec![0u8, 0, 2, 0];
         p2.extend_from_slice(&[0u8; 12]);
-        let p3 = camm_case7(1_400_000_001.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let p3 = camm_case6(1_400_000_001.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let mut dump = p1.clone();
         dump.extend_from_slice(&p2);
         dump.extend_from_slice(&p3);
         let sizes = [p1.len(), p2.len(), p3.len()];
 
-        let mut points = Vec::new();
+        let mut points = PointSink::default();
         let mut stats = CammStats {
             packets: 0,
             gps_points: 0,
@@ -843,11 +958,11 @@ mod tests {
         assert_eq!(stats.gps_points, 1);
         assert_eq!(stats.imu_packets, 1);
         assert_eq!(stats.gps_no_fix, 1);
-        assert_eq!(points.len(), 1);
-        assert!((points[0].lat - 37.5).abs() < 1e-9);
+        assert_eq!(points.points.len(), 1);
+        assert!((points.points[0].lat - 37.5).abs() < 1e-9);
 
         // A truncated dump marks the missing packet unknown and stops.
-        let mut points2 = Vec::new();
+        let mut points2 = PointSink::default();
         let mut stats2 = CammStats {
             packets: 0,
             gps_points: 0,
@@ -860,6 +975,80 @@ mod tests {
         assert_eq!(stats2.unknown_packets, 1);
     }
 
+    /// E6: spec case 7 is the magnetometer (`float magnetic_field[3]`) —
+    /// never a GPS fix — and case 6 carries `time_gps_epoch` as a double.
+    /// The old parser read a 56+-byte case 7 as GPS and decoded a float
+    /// epoch, so a spec-conformant case-6 packet produced no point at all.
+    #[test]
+    fn camm_follows_spec_case_numbers_and_field_widths() {
+        let mut points = PointSink::default();
+        let mut stats = CammStats {
+            packets: 0,
+            gps_points: 0,
+            gps_no_fix: 0,
+            imu_packets: 0,
+            unknown_packets: 0,
+        };
+        // Spec case 6 with a double epoch that a float would round away.
+        let epoch = 1_400_000_000.25f64;
+        let gps = camm_case6(epoch, 3, 37.5, 127.0, 25.0, 3.0, 4.0, 0.0);
+        parse_camm_packet(&gps, &mut points, &mut stats);
+        assert_eq!(stats.gps_points, 1);
+        let ts = points.points[0].ts_unix.unwrap();
+        assert!((ts - (epoch + GPS_EPOCH_OFFSET)).abs() < 1e-6, "{ts}");
+        // A case-7 magnetometer sample padded to GPS size is still IMU data.
+        let mut magnet = vec![0u8, 0, 7, 0];
+        magnet.extend_from_slice(&[0x41u8; 56]);
+        parse_camm_packet(&magnet, &mut points, &mut stats);
+        assert_eq!(points.points.len(), 1, "magnetometer is not a GPS point");
+        assert_eq!(stats.imu_packets, 1);
+        // The type is a little-endian uint16: 0x0105 is not case 5.
+        let mut wide = vec![0u8, 0, 5, 1];
+        wide.extend_from_slice(&[0u8; 24]);
+        parse_camm_packet(&wide, &mut points, &mut stats);
+        assert_eq!(stats.unknown_packets, 1);
+    }
+
+    /// E9: the 20,000-point cap used to cut the track silently. The kept
+    /// points stay capped, but every decoded point is counted.
+    #[test]
+    fn point_cap_is_reported_not_silent() {
+        let sentence = b"$GNRMC,120000.00,A,3723.2000,N,12658.0000,E,30.0,0.0,010124,0,E*00\r\n";
+        let mut bytes = Vec::with_capacity(sentence.len() * (MAX_POINTS + 5));
+        for _ in 0..MAX_POINTS + 5 {
+            bytes.extend_from_slice(sentence);
+        }
+        let mut points = PointSink::default();
+        scan_nmea_bytes(&bytes, &mut points);
+        assert_eq!(points.points.len(), MAX_POINTS);
+        assert_eq!(points.total, MAX_POINTS + 5);
+        assert!(points.truncated());
+        let note = build_note("nmea-data-stream", false, Some(points.total));
+        assert!(note.starts_with("TRUNCATED: 20005 points"), "{note}");
+        // The report serializes both fields.
+        let report = TelemetryReport {
+            schema_version: 2,
+            event: "telemetry-extract",
+            extracted_unix: 0,
+            selector: String::new(),
+            source_path: String::new(),
+            source: "nmea-data-stream".to_string(),
+            point_count: points.points.len(),
+            total_points: points.total,
+            truncated: points.truncated(),
+            points: Vec::new(),
+            unparsed_streams: Vec::new(),
+            camm: None,
+            first_ts_unix: None,
+            last_ts_unix: None,
+            max_speed_kmh: None,
+            note,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["total_points"], 20005);
+    }
+
     #[test]
     fn does_not_panic_on_binary_after_marker() {
         // Regression: a real dashcam MP4 put invalid-UTF-8 bytes right
@@ -868,9 +1057,9 @@ mod tests {
         let mut bytes = b"$G".to_vec();
         bytes.extend_from_slice(&[0xF0, 0x9F, 0x98]); // truncated 4-byte seq
         bytes.extend(std::iter::repeat_n(0x80, 210));
-        let mut points = Vec::new();
+        let mut points = PointSink::default();
         scan_nmea_bytes(&bytes, &mut points);
-        assert!(points.is_empty());
+        assert!(points.points.is_empty());
     }
 
     /// Minimal MP4 box (`size`,`type`,payload).
@@ -1038,11 +1227,13 @@ mod tests {
         let mut p5 = vec![0u8, 0, 5, 0];
         p5.extend_from_slice(&37.2636f64.to_le_bytes());
         p5.extend_from_slice(&127.0286f64.to_le_bytes());
-        let p7 = camm_case7(1_400_000_000.0, 3, 37.2637, 127.0287, 42.0, 13.8, 0.0, 0.0);
+        p5.extend_from_slice(&10.0f64.to_le_bytes());
+        let p6 = camm_case6(1_400_000_000.0, 3, 37.2637, 127.0287, 42.0, 13.8, 0.0, 0.0);
         let mut p5b = vec![0u8, 0, 5, 0];
         p5b.extend_from_slice(&37.2638f64.to_le_bytes());
         p5b.extend_from_slice(&127.0288f64.to_le_bytes());
-        let mp4 = synthetic_camm_mp4(&[p5, p7, p5b]);
+        p5b.extend_from_slice(&11.0f64.to_le_bytes());
+        let mp4 = synthetic_camm_mp4(&[p5, p6, p5b]);
 
         let dir = std::env::temp_dir().join(format!("frametrace-camm-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -1057,7 +1248,7 @@ mod tests {
         assert_eq!(camm.packets, 3);
         assert_eq!(camm.gps_points, 3);
         assert_eq!(report.point_count, 3);
-        // The case-7 point carries timestamp, altitude, and km/h speed.
+        // The case-6 point carries timestamp, altitude, and km/h speed.
         let fixed = report
             .points
             .iter()

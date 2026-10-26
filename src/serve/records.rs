@@ -147,6 +147,81 @@ pub(crate) fn cached_fts_search(
     hit
 }
 
+/// B9: the serialized `audioLevels` map for one case, valid while the
+/// audio lane, the index generation and `db/videos.jsonl` are unchanged.
+struct AudioLevelsCacheEntry {
+    case_dir: PathBuf,
+    key: (String, u64, FileStamp),
+    json: Arc<String>,
+}
+
+/// A few cases (a reopened previous case stays warm); each entry is one
+/// serialized map.
+const AUDIO_LEVELS_CACHE_CAPACITY: usize = 4;
+static AUDIO_LEVELS_CACHE: Mutex<VecDeque<AudioLevelsCacheEntry>> = Mutex::new(VecDeque::new());
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread computed the map (cache misses).
+    pub(crate) static AUDIO_LEVELS_COMPUTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The compact `audioLevels` JSON (plan §2.4) bound to the current index,
+/// as text. Rows come from the shared parsed index (no re-read of
+/// `videos.jsonl`, no re-parse of nested ffprobe JSON) — the jsonl is read
+/// only while no `video_index.json` exists yet. Cached by (audio lane
+/// stamp, index generation, jsonl stamp); errors are never cached.
+pub(crate) fn cached_audio_levels_json(
+    state: &SharedState,
+    case_dir: &Path,
+) -> Result<Arc<String>, String> {
+    // R5 (P8): every sound lane (a damaged lane continues in a new file)
+    // and the keyring fingerprint are part of the key, so a new lane or a
+    // key change refreshes the map.
+    let key = (
+        crate::audio_level::levels_cache_key(case_dir),
+        index_generation(state, case_dir),
+        file_stamp(&case_dir.join("db/videos.jsonl")),
+    );
+    if let Some(entry) = AUDIO_LEVELS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|entry| entry.case_dir == case_dir && entry.key == key)
+    {
+        return Ok(Arc::clone(&entry.json));
+    }
+    #[cfg(test)]
+    AUDIO_LEVELS_COMPUTED.with(|count| count.set(count.get() + 1));
+    let rows: Vec<crate::audio_level::IndexRow> = match cached_index(state, case_dir) {
+        Ok(index) => match index.get("videos").and_then(|v| v.as_array()) {
+            Some(videos) => videos
+                .iter()
+                .filter_map(crate::audio_level::IndexRow::from_json)
+                .collect(),
+            None => crate::audio_level::read_index(case_dir)?,
+        },
+        Err(_) => crate::audio_level::read_index(case_dir)?,
+    };
+    let logged = crate::audio_level::latest_logged_results(case_dir)?;
+    let levels = crate::audio_level::apply_levels(&rows, &logged);
+    let json = Arc::new(crate::audio_level::audio_levels_json(&levels).to_string());
+    let mut cache = AUDIO_LEVELS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|entry| entry.case_dir != case_dir);
+    cache.push_back(AudioLevelsCacheEntry {
+        case_dir: case_dir.to_path_buf(),
+        key,
+        json: Arc::clone(&json),
+    });
+    while cache.len() > AUDIO_LEVELS_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    Ok(json)
+}
+
 struct ThumbListing {
     case_dir: PathBuf,
     dir_mtime: SystemTime,
@@ -535,7 +610,10 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
     // The scan object minus the (paged) videos array — built from the
     // shared index cache so the (large) videos array is neither re-parsed
     // nor cloned here.
-    let scan = match cached_index(state, &case_dir).as_deref() {
+    let index = cached_index(state, &case_dir);
+    // R5-S15: per-record proxy paths (the viewer uses only these).
+    let proxy_paths = record_proxy_paths(&case_dir, index.as_deref().ok());
+    let scan = match index.as_deref() {
         Ok(serde_json::Value::Object(map)) => {
             let mut scan: serde_json::Map<String, serde_json::Value> = map
                 .iter()
@@ -586,10 +664,113 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         }
     }
     proxies.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
-    let annotations = serde_json::json!({
-        "marks": crate::case_db::load_review_marks(&case_dir).unwrap_or_default(),
-        "tags": crate::case_db::load_review_tags(&case_dir).unwrap_or_default(),
-    });
+    // `{marks, tags, revisions, writers}` — the object make-review embeds
+    // plus `writers` (which window wrote each current revision, §10.2). A
+    // read failure is reported inside the object (empty lists plus
+    // `error`) rather than silently presented as "no annotations".
+    let annotations = crate::case_db::review_annotations_value_with_writers(&case_dir)
+        .unwrap_or_else(|err| {
+            serde_json::json!({
+                "marks": [],
+                "tags": [],
+                "revisions": {},
+                "writers": {},
+                "error": err,
+            })
+        });
+    // Plan §2.4: the measured-sound map, already bound to the current index
+    // bytes (a measurement of other bytes is `stale`). A read failure is
+    // reported beside an empty map, never presented as "nothing measured".
+    let (audio_levels, audio_levels_error) = match cached_audio_levels_json(state, &case_dir) {
+        Ok(json) => (json, None),
+        Err(err) => (Arc::new("{}".to_string()), Some(err)),
+    };
+    // U2: every joinLog entry carries the derived record's `record_id`
+    // (`join:<first 16 hex of output_sha256>`), also for entries logged
+    // before the field existed.
+    // R9 P3 (contract with the viewer, track U): every log array entry is
+    // read through `audit::read_lane_rows` and carries `trust` — "auth"
+    // (authenticated here), "sc" (self-consistency only), "unauth" (keys
+    // held here and not authenticated, or past a chain break; with a
+    // `trust_note`), "pc:<key id>" (another PC's key — check it there).
+    // Only "auth"/"sc" entries may be shown as confirmed / derived
+    // results. `logChains` carries each lane's status for the same arrays.
+    let mut log_chains = serde_json::Map::new();
+    // R19 I2: the anomaly lane's `withheld` verdict from the very read its
+    // rows come from (never a second read: a scan in between made the two
+    // disagree; an unreadable lane is `unreadable`, not re-read).
+    let mut anomaly_withheld = serde_json::Value::Null;
+    // R20 I1: and the head, from that same read.
+    let mut anomaly_head = serde_json::Value::Null;
+    let mut lane_values = |name: &str, path: PathBuf| -> Vec<serde_json::Value> {
+        let rel = path
+            .strip_prefix(&case_dir)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let lane = crate::audit::read_lane_rows(&path);
+        if name == "anomalyLog" {
+            anomaly_withheld = crate::report::anomaly_lane_read_withheld_json(&lane);
+            anomaly_head = crate::report::anomaly_head_check(&case_dir, &lane)
+                .to_json_in(crate::report::HeadLane::Anomaly);
+        }
+        match lane {
+            Ok(lane) => {
+                log_chains.insert(name.to_string(), lane.chain_json(&rel));
+                lane.values_with_trust()
+            }
+            Err(err) => {
+                log_chains.insert(
+                    name.to_string(),
+                    serde_json::json!({"path": rel, "status": "unreadable", "detail": err}),
+                );
+                Vec::new()
+            }
+        }
+    };
+    let join_log: Vec<serde_json::Value> = lane_values(
+        "joinLog",
+        case_dir
+            .join(crate::join::JOINED_DIR)
+            .join(crate::join::LOG_FILE),
+    )
+    .into_iter()
+    .map(crate::join::with_record_id)
+    .collect();
+    let carve_log = lane_values(
+        "carveLog",
+        case_dir.join("artifacts/carved/carve-log.jsonl"),
+    );
+    let filesystem_log = lane_values(
+        "filesystemLog",
+        case_dir.join("evidence/logs/tsk-audit.jsonl"),
+    );
+    let validation_log = lane_values(
+        "validationLog",
+        case_dir.join("evidence/logs/validation-log.jsonl"),
+    );
+    let anomaly_log = lane_values(
+        "anomalyLog",
+        case_dir.join("evidence/logs/anomaly-log.jsonl"),
+    );
+    // R16 I2 (track U): the sign-off lane's head against the anomaly lane
+    // — the same check the report's anomaly "현재 결과" uses
+    // (`{status, reason_code, withhold_reason, detail}`); the viewer's
+    // anomaly badge withholds / warns on it.
+    // R18 I2 (P9, track U): `withheld` — the report's lane rules (an entry
+    // this PC cannot use after the newest usable marker or inside its run,
+    // a repair after it, an unmarked newer run), computed by the one shared
+    // function from the very `anomalyLog` rows sent here: `null`, or
+    // `{reason_code, codes, reason}`. A P7-superseded finding is then never
+    // silently missing from a "current" count. R19 I2: computed in
+    // `lane_values` from the same read as `anomalyLog`.
+    let withheld = anomaly_withheld;
+    log_chains.insert(
+        "anomaly".to_string(),
+        serde_json::json!({
+            "head": anomaly_head,
+            "withheld": withheld,
+        }),
+    );
     let body = serde_json::json!({
         "ok": true,
         "manifest": read_json(case_dir.join("case.json")),
@@ -597,18 +778,209 @@ pub(crate) fn api_records_meta(state: &SharedState) -> String {
         // against this — same field name as the standalone data bundle.
         "caseDir": crate::audit::path_string(&case_dir),
         "scan": scan,
-        "carveLog": read_jsonl(case_dir.join("artifacts/carved/carve-log.jsonl")),
-        "filesystemLog": read_jsonl(case_dir.join("evidence/logs/tsk-audit.jsonl")),
-        "validationLog": read_jsonl(case_dir.join("evidence/logs/validation-log.jsonl")),
-        "anomalyLog": read_jsonl(case_dir.join("evidence/logs/anomaly-log.jsonl")),
+        "carveLog": carve_log,
+        "filesystemLog": filesystem_log,
+        "validationLog": validation_log,
+        "anomalyLog": anomaly_log,
+        "logChains": log_chains,
         "flsEntries": fls_entries,
         "thumbs": thumbs,
         "annotations": annotations,
         "deepfake": crate::deepfake::collect_reports(&case_dir),
         "telemetry": crate::telemetry::collect_reports(&case_dir),
         "proxies": proxies,
+        // R5-S15 (contract with the viewer, U16): `{record id: proxy path}`.
+        "proxy_paths": proxy_paths,
+        // Plan §1.8: one entry per completed lossless join (derived records).
+        "joinLog": join_log,
+        "audioLevelsError": audio_levels_error,
     });
-    serde_json::to_string(&body).unwrap_or_else(|_| "{\"ok\":false}".to_string())
+    // `audioLevels` (up to ~6 MB for 100k records) is spliced in as the
+    // cached text instead of being cloned into the body value.
+    let mut text = serde_json::to_string(&body).unwrap_or_else(|_| "{\"ok\":false}".to_string());
+    if text.ends_with('}') {
+        text.pop();
+        text.push_str(",\"audioLevels\":");
+        text.push_str(&audio_levels);
+        text.push('}');
+    }
+    text
+}
+
+/// R5-S15: the cached proxy of every viewer record that has one,
+/// `{record id: absolute proxy path}`, decided here so the viewer never
+/// guesses from file names (P9: a name-prefix guess gave a legacy carve id
+/// — reused across carve runs — another run's proxy). Record ids are the
+/// viewer's own: indexed `vid_*`, carved `id` (else the logged
+/// `output_path`), `inode:<partition offset>:<inode or output_path>` for
+/// recovered files, and the join log's `record_id`.
+///
+/// A path-free `proxy_<sanitized id>_<hash8>[_NNN].mp4` (D5) counts only
+/// when `hash8` is that record's source path hash (the canonical spelling
+/// the proxy generator hashed, or the spelling as logged); a pre-D5
+/// `<sanitized id or path>_proxy_*.mp4` has no hash and matches by name
+/// as before. First match in name order wins. Runs outside the state lock.
+pub(crate) fn record_proxy_paths(
+    case_dir: &Path,
+    index: Option<&serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let dir = case_dir.join("artifacts/proxies");
+    let mut names: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".mp4"))
+            .collect(),
+        Err(_) => return out,
+    };
+    if names.is_empty() {
+        return out;
+    }
+    names.sort();
+    // stem (sanitized id) → [(hash8, name)] for D5 names; legacy prefix →
+    // first name.
+    let mut fresh: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut legacy: HashMap<String, String> = HashMap::new();
+    for name in &names {
+        if let Some(body) = name
+            .strip_prefix("proxy_")
+            .and_then(|rest| rest.strip_suffix(".mp4"))
+        {
+            // Optional `_NNN` collision suffix, then `_<hash8>`.
+            let body = match body.rsplit_once('_') {
+                Some((head, tail))
+                    if tail.len() == 3 && tail.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    head
+                }
+                _ => body,
+            };
+            if let Some((stem, hash)) = body.rsplit_once('_')
+                && hash.len() == 8
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && !stem.is_empty()
+            {
+                fresh
+                    .entry(stem.to_string())
+                    .or_default()
+                    .push((hash.to_ascii_lowercase(), name.clone()));
+            }
+        }
+        let mut from = 0;
+        while let Some(found) = name[from..].find("_proxy_") {
+            let at = from + found;
+            legacy
+                .entry(name[..at].to_string())
+                .or_insert_with(|| name.clone());
+            from = at + 1;
+        }
+    }
+    let path_of =
+        |name: &str| serde_json::Value::String(crate::audit::path_string(&dir.join(name)));
+    let mut consider = |id: &str, source: Option<PathBuf>, logged_path: Option<&str>| {
+        if id.is_empty() || out.contains_key(id) {
+            return;
+        }
+        let key = crate::video_export::sanitize_filename(id);
+        if let Some(candidates) = fresh.get(&key)
+            && let Some(source) = &source
+        {
+            let mut hashes = vec![crate::artifacts::source_hash8(source)];
+            if let Ok(canonical) = crate::util::canonicalize_display(source) {
+                hashes.push(crate::artifacts::source_hash8(&canonical));
+            }
+            if let Some((_, name)) = candidates.iter().find(|(hash, _)| hashes.contains(hash)) {
+                out.insert(id.to_string(), path_of(name));
+                return;
+            }
+        }
+        let mut keys = vec![key];
+        if let Some(logged) = logged_path {
+            keys.push(crate::video_export::sanitize_filename(logged));
+        }
+        if let Some(name) = keys.iter().find_map(|key| legacy.get(key)) {
+            out.insert(id.to_string(), path_of(name));
+        }
+    };
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    // R9 P3: only entries usable here map a record to a proxy.
+    let read_lines = |rel: &str| -> Vec<serde_json::Value> {
+        crate::audit::read_lane_rows(&case_dir.join(rel))
+            .map(|lane| lane.usable_values())
+            .unwrap_or_default()
+    };
+    if let Some(videos) = index
+        .and_then(|index| index.get("videos"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for video in videos {
+            if let Some(id) = text(video, "id") {
+                let source = text(video, "source_path").map(PathBuf::from);
+                consider(&id, source, None);
+            }
+        }
+    }
+    for item in read_lines("artifacts/carved/carve-log.jsonl") {
+        let output = text(&item, "output_path");
+        let Some(id) = text(&item, "id")
+            .filter(|id| !id.is_empty())
+            .or_else(|| output.clone())
+        else {
+            continue;
+        };
+        let source = output
+            .as_deref()
+            .map(|path| crate::util::resolve_case_artifact_path(case_dir, path));
+        consider(&id, source, output.as_deref());
+    }
+    for item in read_lines("evidence/logs/tsk-audit.jsonl") {
+        if text(&item, "event").as_deref() != Some("recover-inode") {
+            continue;
+        }
+        let Some(output) = text(&item, "output_path").filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        let offset = item
+            .get("partition_offset")
+            .filter(|value| !value.is_null())
+            .map(|value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "0".to_string());
+        let inode = item
+            .get("inode")
+            .filter(|value| !value.is_null() && value.as_str() != Some(""))
+            .map(|value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| output.clone());
+        let id = format!("inode:{offset}:{inode}");
+        let source = crate::util::resolve_case_artifact_path(case_dir, &output);
+        consider(&id, Some(source), Some(&output));
+    }
+    for item in read_lines(&format!(
+        "{}/{}",
+        crate::join::JOINED_DIR,
+        crate::join::LOG_FILE
+    )) {
+        let item = crate::join::with_record_id(item);
+        let (Some(id), Some(output)) = (text(&item, "record_id"), text(&item, "output_path"))
+        else {
+            continue;
+        };
+        let source = crate::util::resolve_case_artifact_path(case_dir, &output);
+        consider(&id, Some(source), Some(&output));
+    }
+    out
 }
 
 /// Newest `db/filesystem/tsk-inspection-*.json` summary — carries the
@@ -630,3 +1002,11 @@ pub(crate) fn newest_tsk_inspection(case_dir: &Path) -> Option<(PathBuf, u64)> {
     let offset = value.get("partition_offset")?.as_u64()?;
     Some((PathBuf::from(image), offset))
 }
+
+#[cfg(test)]
+#[path = "tests_r18_records.rs"]
+mod tests_r18_records;
+
+#[cfg(test)]
+#[path = "tests_r19_records.rs"]
+mod tests_r19_records;

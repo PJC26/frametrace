@@ -1025,6 +1025,70 @@ fn lighter_rescan_keeps_recorded_hashes() {
     let _ = fs::remove_dir_all(case_dir.parent().unwrap());
 }
 
+/// I11: a lighter rescan keeps a recorded hash FAILURE (`error`,
+/// `changed-during-hash`) of an unchanged file instead of rewriting it to
+/// `skipped`; a later `--hash` pass retries and records the digest.
+#[test]
+fn lighter_rescan_keeps_recorded_hash_failures() {
+    for failure in ["error", "changed-during-hash"] {
+        let (case_dir, source_dir) = incremental_fixture(&format!("keepfail-{failure}"));
+        fs::write(source_dir.join("a.mp4"), b"\0\0\0\x18ftypmp42one").unwrap();
+        fs::write(source_dir.join("b.mp4"), b"\0\0\0\x18ftypmp42two").unwrap();
+        let hashed = ScanOptions {
+            hash_files: true,
+            use_ffprobe: false,
+            ..ScanOptions::default()
+        };
+        super::scan_folder(&case_dir, &source_dir, &hashed, ResumeMode::Auto, None).unwrap();
+        // Record a failed hash attempt for a.mp4 (what hash_with_restat
+        // writes when the read fails or the file moves mid-hash).
+        let jsonl = case_dir.join("db/videos.jsonl");
+        let text = fs::read_to_string(&jsonl).unwrap();
+        let rewritten = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if value["relative_path"] == "a.mp4" {
+                    value["sha256"] = serde_json::Value::Null;
+                    value["hash_status"] = serde_json::json!(failure);
+                }
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&jsonl, format!("{rewritten}\n")).unwrap();
+
+        for incremental in [false, true] {
+            super::scan_folder(
+                &case_dir,
+                &source_dir,
+                &ScanOptions {
+                    hash_files: false,
+                    use_ffprobe: false,
+                    incremental,
+                    ..ScanOptions::default()
+                },
+                ResumeMode::Auto,
+                None,
+            )
+            .unwrap();
+            let after = jsonl_hashes(&case_dir);
+            assert_eq!(
+                after["a.mp4"],
+                (None, failure.to_string()),
+                "incremental={incremental}: lighter pass erased the {failure} record"
+            );
+            assert_eq!(after["b.mp4"].1, "complete");
+        }
+        // A real --hash pass retries the failed file.
+        super::scan_folder(&case_dir, &source_dir, &hashed, ResumeMode::Auto, None).unwrap();
+        let retried = jsonl_hashes(&case_dir);
+        assert!(retried["a.mp4"].0.is_some(), "{retried:?}");
+        assert_eq!(retried["a.mp4"].1, "complete");
+        let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+    }
+}
+
 /// Blocker 2: cancel the phase-2 `--incremental --hash` pass mid-way,
 /// re-run the analysis (phase 1 = `--incremental --no-ffprobe`, a
 /// different checkpoint fingerprint), then phase 2 again. The files the
@@ -1084,5 +1148,187 @@ fn rerun_after_cancelled_hash_pass_reuses_computed_hashes() {
     assert_eq!(done["b.mp4"].0.as_deref(), Some(sentinel.as_str()));
     let c_sha = done["c.mp4"].0.clone().expect("c.mp4 hashed");
     assert_ne!(c_sha, sentinel);
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}
+
+/// A file name that is not valid Unicode and renders as `\u{FFFD}.mp4`
+/// through `to_string_lossy` — raw byte `tag` on unix, an unpaired
+/// surrogate on Windows/NTFS.
+fn non_unicode_name(tag: u8) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![tag, b'.', b'm', b'p', b'4'])
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[
+            0xD800 + u16::from(tag),
+            u16::from(b'.'),
+            u16::from(b'm'),
+            u16::from(b'p'),
+            u16::from(b'4'),
+        ])
+    }
+}
+
+/// E1: two non-Unicode names that both render as `\u{FFFD}.mp4` used to
+/// share one id and one record (the second file's facts silently replaced
+/// the first's) and the stored path did not exist, so the next rescan
+/// marked it stale. Each now gets its own id, row, and lossless
+/// `source_path_raw_hex`; ids stay stable across rescans; UTF-8 records
+/// are unchanged.
+#[test]
+fn non_unicode_names_keep_distinct_ids_and_records() {
+    let (case_dir, source_dir) = incremental_fixture("nonunicode");
+    let first_name = source_dir.join(non_unicode_name(0xff));
+    let second_name = source_dir.join(non_unicode_name(0xfe));
+    if fs::write(&first_name, b"\0\0\0\x18ftypmp42one").is_err()
+        || fs::write(&second_name, b"\0\0\0\x18ftypmp42two!").is_err()
+    {
+        // e.g. macOS APFS refuses non-UTF-8 names outright.
+        eprintln!("skipping: filesystem refuses non-Unicode file names");
+        let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+        return;
+    }
+    fs::write(source_dir.join("plain.mp4"), b"\0\0\0\x18ftypmp42plain").unwrap();
+    let options = ScanOptions {
+        hash_files: true,
+        use_ffprobe: false,
+        ..ScanOptions::default()
+    };
+    let first =
+        super::scan_folder(&case_dir, &source_dir, &options, ResumeMode::Auto, None).unwrap();
+    assert_eq!(first.video_count, 3);
+    assert!(
+        first
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("non-unicode-name-collision")),
+        "{:?}",
+        first.warnings
+    );
+
+    let rows = |case_dir: &Path| -> Vec<serde_json::Value> {
+        fs::read_to_string(case_dir.join("db/videos.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let before = rows(&case_dir);
+    assert_eq!(before.len(), 3, "one row per file: {before:?}");
+    let ids: std::collections::HashSet<&str> = before
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3, "distinct ids: {before:?}");
+    let raw: Vec<&serde_json::Value> = before
+        .iter()
+        .filter(|row| row.get("source_path_raw_hex").is_some())
+        .collect();
+    assert_eq!(raw.len(), 2, "{before:?}");
+    // Distinct contents → distinct hashes: neither record was overwritten.
+    assert_ne!(raw[0]["sha256"], raw[1]["sha256"]);
+    let plain = before
+        .iter()
+        .find(|row| row["relative_path"] == "plain.mp4")
+        .unwrap();
+    assert!(plain.get("source_path_raw_hex").is_none());
+
+    // The stored raw path round-trips to the real OS path.
+    for row in &raw {
+        let record: VideoRecord = serde_json::from_value((*row).clone()).unwrap();
+        assert!(record.source_path.is_file(), "{:?}", record.source_path);
+    }
+
+    // Full and incremental rescans: same ids, nothing marked stale.
+    super::scan_folder(&case_dir, &source_dir, &options, ResumeMode::Auto, None).unwrap();
+    let again = rows(&case_dir);
+    let id_of = |rows: &[serde_json::Value], raw_hex: &serde_json::Value| -> String {
+        rows.iter()
+            .find(|row| row.get("source_path_raw_hex") == Some(raw_hex))
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    for row in &raw {
+        let hex = &row["source_path_raw_hex"];
+        assert_eq!(id_of(&again, hex), row["id"].as_str().unwrap());
+    }
+    assert!(
+        again.iter().all(|row| row.get("index_status").is_none()),
+        "{again:?}"
+    );
+    let incremental = super::scan_folder(
+        &case_dir,
+        &source_dir,
+        &ScanOptions {
+            incremental: true,
+            ..options.clone()
+        },
+        ResumeMode::Auto,
+        None,
+    )
+    .unwrap();
+    assert_eq!(incremental.unchanged_files, 3);
+    assert_eq!(rows(&case_dir).len(), 3);
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}
+
+/// E2: a record marked stale while its drive was disconnected keeps its
+/// recorded SHA-256 when the unchanged file comes back and a lighter
+/// (no `--hash`) rescan runs — the old code skipped flagged records as
+/// fact donors and rewrote the hash to `skipped`.
+#[test]
+fn stale_record_donates_hash_when_file_returns_unchanged() {
+    let (case_dir, source_dir) = incremental_fixture("stalereturn");
+    let file = source_dir.join("a.mp4");
+    fs::write(&file, b"\0\0\0\x18ftypmp42one").unwrap();
+    fs::write(source_dir.join("b.mp4"), b"\0\0\0\x18ftypmp42two").unwrap();
+    let hashed = ScanOptions {
+        hash_files: true,
+        use_ffprobe: false,
+        ..ScanOptions::default()
+    };
+    super::scan_folder(&case_dir, &source_dir, &hashed, ResumeMode::Auto, None).unwrap();
+    let recorded = jsonl_hashes(&case_dir)["a.mp4"].clone();
+    assert!(recorded.0.is_some());
+
+    // "Unplug": the file is gone during a rescan → marked stale.
+    let parked = case_dir.parent().unwrap().join("parked.mp4");
+    fs::rename(&file, &parked).unwrap();
+    let lighter = ScanOptions {
+        hash_files: false,
+        use_ffprobe: false,
+        ..ScanOptions::default()
+    };
+    super::scan_folder(&case_dir, &source_dir, &lighter, ResumeMode::Auto, None).unwrap();
+    let text = fs::read_to_string(case_dir.join("db/videos.jsonl")).unwrap();
+    assert!(text.contains("\"index_status\":\"stale\""), "{text}");
+
+    // "Replug": same bytes, same mtime (rename keeps it).
+    fs::rename(&parked, &file).unwrap();
+    for incremental in [false, true] {
+        super::scan_folder(
+            &case_dir,
+            &source_dir,
+            &ScanOptions {
+                incremental,
+                ..lighter.clone()
+            },
+            ResumeMode::Auto,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            jsonl_hashes(&case_dir)["a.mp4"],
+            recorded,
+            "incremental={incremental}: stale record's hash was dropped"
+        );
+    }
+    let text = fs::read_to_string(case_dir.join("db/videos.jsonl")).unwrap();
+    assert!(!text.contains("\"index_status\""), "marker cleared: {text}");
     let _ = fs::remove_dir_all(case_dir.parent().unwrap());
 }

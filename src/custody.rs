@@ -33,6 +33,20 @@ const AUDIT_LOG_DIRS: &[&str] = &["artifacts", "evidence/logs"];
 /// Generates (or refreshes) `reports/custody-statement.html`.
 /// Returns the written path.
 pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
+    let html = render_statement(case_dir, false)?;
+    let out = case_dir.join(CUSTODY_REL_PATH);
+    write_text_atomic(&out, &html)
+        .map_err(|err| format!("failed to write custody statement {}: {err}", out.display()))?;
+    Ok(out)
+}
+
+/// Renders the statement without writing it. With `redact_paths` (I4, a
+/// path-redacted package) every path-bearing value — the case directory,
+/// source paths, job subjects, error texts — goes through
+/// [`crate::redact::Redactor`], and the page carries the redaction marker
+/// and note. The live checks (re-stat, chain verification) still run on the
+/// real paths; only what is printed is rewritten.
+pub fn render_statement(case_dir: &Path, redact_paths: bool) -> Result<String, String> {
     if !case_dir.join("case.json").is_file() {
         return Err(format!(
             "not a FrameTrace case directory: {}",
@@ -44,12 +58,13 @@ pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .unwrap_or(serde_json::Value::Null);
+    let redactor = redact_paths.then(|| crate::redact::Redactor::new(case_dir));
     let sources = load_evidence_sources(case_dir);
     let jobs = load_jobs(case_dir);
     let coverage = load_hash_coverage(case_dir);
     let logs = verify_audit_logs(case_dir);
-    let hash_verify_html = render_hash_verify(case_dir);
-    let html = render(
+    let hash_verify_html = render_hash_verify(case_dir, redactor.as_ref());
+    Ok(render(
         case_dir,
         &manifest,
         &sources,
@@ -58,12 +73,23 @@ pub fn generate(case_dir: &Path) -> Result<PathBuf, String> {
         &logs,
         &hash_verify_html,
         generated_unix as i64,
-    );
+        redactor.as_ref(),
+    ))
+}
 
-    let out = case_dir.join(CUSTODY_REL_PATH);
-    write_text_atomic(&out, &html)
-        .map_err(|err| format!("failed to write custody statement {}: {err}", out.display()))?;
-    Ok(out)
+/// HTML-escapes `text`, path-redacting it first when a redactor is given.
+fn esc_with(redactor: Option<&crate::redact::Redactor>, text: &str) -> String {
+    match redactor {
+        Some(redactor) => esc(&redactor.text(text)),
+        None => esc(text),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` in UTC (the statement's time basis), `—` for an
+/// unset time. Shared with the case report so both documents print the
+/// same instant the same way (I6).
+pub fn utc_timestamp(unix: i64) -> String {
+    ts(unix).trim_end_matches('Z').to_string()
 }
 
 struct SourceRow {
@@ -271,18 +297,147 @@ fn verify_audit_logs(case_dir: &Path) -> Vec<LogRow> {
 /// workstation's 원본 재검증 button runs). The statement itself never
 /// hashes anything; when no run exists it says so instead of implying the
 /// sources were verified.
-fn render_hash_verify(case_dir: &Path) -> String {
-    let path = case_dir.join(crate::anomaly::HASH_VERIFY_REL_PATH);
-    let Some((latest, entries)) = crate::anomaly::latest_hash_verify_run(case_dir) else {
-        return "<p class=\"note warn\">No completed live source re-hash has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>".to_string();
+///
+/// R11 P9: the decision is [`crate::anomaly::hash_verify_assessment`]'s —
+/// a missing (unusable) row is not good news: no green banner for a run
+/// that is not `verified`, and no older run as "latest" when a newer one
+/// cannot be authenticated (banner states: see `hash_verify_banner`).
+fn render_hash_verify(case_dir: &Path, redactor: Option<&crate::redact::Redactor>) -> String {
+    let esc = |text: &str| esc_with(redactor, text);
+    // D11: an unreadable log is an error, never "no run recorded".
+    let assessment = match crate::anomaly::hash_verify_assessment(case_dir) {
+        Ok(assessment) => assessment,
+        Err(err) => {
+            return format!(
+                "<p class=\"note bad\">The live source re-hash log could not be read — re-verification status unknown: {}</p>",
+                esc(&err)
+            );
+        }
     };
-    let chain = match audit::verify_chained_jsonl(&path) {
-        Ok(v) => format!("log chain: {} ({} entries)", v.integrity.label(), v.entries),
-        Err(err) => format!("log chain verification FAILED: {err}"),
+    let lane = &assessment.lane;
+    // D4: runs are grouped by run id; only the newest COMPLETED run is the
+    // result, and a newer run without its completion marker is disclosed
+    // as interrupted instead of being mixed into (or shown as) the result.
+    // R13 P16: such a run WITHHOLDS the result (its marker may have been
+    // deleted — no key is needed for that), and its usable MISMATCH rows
+    // are listed here, never hidden.
+    let mut interrupted_html = assessment
+        .newer_runs()
+        .map(|run| {
+            let mismatched = run.mismatches().count();
+            format!(
+                "<p class=\"note {}\">Run {} started {} has no completion marker ({} record(s) logged{}; 표식 없는 더 새 실행): its marker may have been deleted or the run was cut short — it is not a result, and it means NO earlier run is the current result.</p>\n",
+                if mismatched > 0 { "bad" } else { "warn" },
+                esc(&run.run_id),
+                ts(run.run_unix),
+                run.entries.len(),
+                if mismatched > 0 {
+                    format!(", {mismatched} MISMATCH")
+                } else {
+                    String::new()
+                }
+            )
+        })
+        .collect::<String>();
+    let newer_mismatches = assessment.newer_mismatches();
+    if !newer_mismatches.is_empty() {
+        let rows = newer_mismatches
+            .iter()
+            .map(|row| {
+                let dash = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .map(esc)
+                        .unwrap_or_else(|| "—".to_string())
+                };
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td class=path>{}</td><td class=hash>{}</td><td class=hash>{}</td><td class=bad>MISMATCH</td></tr>\n",
+                    esc(&row.run_id),
+                    esc(&row.id),
+                    esc(&row.source_path),
+                    dash(&row.recorded_sha256),
+                    dash(&row.observed_sha256),
+                )
+            })
+            .collect::<String>();
+        interrupted_html.push_str(&format!(
+            "<p class=\"banner bad\">{} MISMATCH row(s) recorded by a re-hash run without a completion marker — shown here because no completed run may stand in for it.</p>\n<table><tr><th>Run</th><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>\n",
+            newer_mismatches.len()
+        ));
+    }
+    let unauthenticated = assessment.unauthenticated;
+    let unauth_html = if unauthenticated > 0 {
+        format!(
+            "<p class=\"note warn\">{unauthenticated} re-hash log entr{} cannot be authenticated on this PC (not HMAC-authenticated here while this PC holds audit keys, signed under another PC's key, superseded by a newer entry this PC cannot authenticate, or in a log whose chain does not verify) — NOT used as re-verification results anywhere below, and a record missing for that reason is NOT counted as a match (unauthenticated; not a tampering verdict for another PC's key: check it on the PC holding that key).</p>\n",
+            if unauthenticated == 1 { "y" } else { "ies" }
+        )
+    } else {
+        String::new()
     };
+    // A chain that does not verify: say so (nothing from it is used).
+    let broken_html = if lane.failure.is_some() {
+        "<p class=\"banner bad\">The live re-hash log (hash-verify.jsonl) does not verify as a chain — no re-verification result from it is relied on.</p>\n".to_string()
+    } else {
+        String::new()
+    };
+    // R14 I3: the sign-off lane's `hash-verify-head` against this lane —
+    // a tail cut (even two lines, no key) is said here, never hidden.
+    let head = &assessment.head;
+    let head_html = match head {
+        crate::report::HashVerifyHeadCheck::Truncated { .. }
+        | crate::report::HashVerifyHeadCheck::Rewritten { .. } => format!(
+            "<p class=\"banner bad\">Re-verification lane anchor: {}.</p>\n",
+            esc(&head.describe())
+        ),
+        crate::report::HashVerifyHeadCheck::Unknown { .. }
+        | crate::report::HashVerifyHeadCheck::NotAuthenticated(_) => format!(
+            "<p class=\"note warn\">Re-verification lane anchor: {}.</p>\n",
+            esc(&head.describe())
+        ),
+        crate::report::HashVerifyHeadCheck::Intact { .. }
+        | crate::report::HashVerifyHeadCheck::Absent => format!(
+            "<p class=note>Re-verification lane anchor: {}.</p>\n",
+            esc(&head.describe())
+        ),
+    };
+    let Some(latest_run) = assessment.result_run() else {
+        // R11 I2: a newer run this PC cannot authenticate (e.g. its
+        // completion marker's HMAC stripped) — the previous completed run
+        // is NOT the current result.
+        let withheld_html = match &assessment.withheld {
+            Some(reason) if lane.failure.is_none() => format!(
+                "<p class=\"banner warn\">No current re-verification result: the newest re-hash run recorded in hash-verify.jsonl has no outcome this PC can rely on (an entry it cannot authenticate, a run without a completion marker, or a lane repair after the last completed run) — an earlier completed run is NOT presented as the latest result (결과 아님: {}).</p>\n",
+                esc(reason)
+            ),
+            _ => String::new(),
+        };
+        return format!(
+            "{broken_html}{head_html}{withheld_html}{interrupted_html}{unauth_html}<p class=\"note warn\">No completed live source re-hash usable on this PC has been recorded for this case (run 원본 재검증 / <code>frametrace qa anomalies</code>). Hashes in section 2 are as-scanned, not re-verified.</p>"
+        );
+    };
+    let (latest, entries) = (latest_run.run_unix, &latest_run.entries);
+    // R8-I10 (P0/P1): the re-hash results are only as good as the log
+    // they are read from. R9 P3: the run's records are only the entries
+    // usable here; entries this PC cannot authenticate are counted, never
+    // results.
+    let chain = format!(
+        "log chain: {} ({} entries){}",
+        lane.lane.label(),
+        lane.rows.len(),
+        Some(lane.lane.reason())
+            .filter(|reason| !reason.is_empty())
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default()
+    );
+    let self_consistent_rows = entries
+        .iter()
+        .any(|entry| entry.get("trust").and_then(|t| t.as_str()) != Some("auth"));
+    // Error text quotes the log's absolute path: escaped (and redacted).
+    let chain = esc(&chain);
     let mut rows = String::new();
     let (mut matched, mut mismatched, mut other) = (0usize, 0usize, 0usize);
-    for entry in &entries {
+    for entry in entries {
         let get = |key: &str| entry.get(key).and_then(|v| v.as_str()).unwrap_or("");
         let status = get("status");
         let (class, label) = match status {
@@ -321,10 +476,44 @@ fn render_hash_verify(case_dir: &Path) -> String {
             dash(get("observed_sha256")),
         ));
     }
-    let banner = hash_verify_banner(matched, mismatched, other);
+    let banner = if !assessment.not_verified.is_empty() && mismatched == 0 {
+        // R11 P9: never green (nor "re-hashed and equal") for a run that
+        // is not verified here — rows may be missing from it.
+        format!(
+            "<p class=\"banner warn\">This re-hash run is NOT VERIFIED on this PC — {matched} file(s) shown as matching, but the run cannot be relied on as a complete re-verification (missing or unauthenticated rows are not good news): {}. It does not confirm that the sources are unchanged.</p>",
+            esc(&assessment.not_verified.join("; "))
+        )
+    } else if !assessment.not_verified.is_empty() {
+        hash_verify_banner(matched, mismatched, other).replacen(
+            "</p>",
+            &format!(
+                " This run is also NOT VERIFIED on this PC: {}.</p>",
+                esc(&assessment.not_verified.join("; "))
+            ),
+            1,
+        )
+    } else if let audit::LaneTrust::SelfConsistentOnly(_) = &lane.lane {
+        hash_verify_banner(matched, mismatched, other).replacen(
+            "</p>",
+            " (Self-consistency only, not authentication: the re-hash log is not HMAC-authenticated on this PC.)</p>",
+            1,
+        )
+    } else if self_consistent_rows {
+        // R9 P3: the run shown is built from usable entries only; when
+        // some of them are only self-consistent (the pre-key prefix) the
+        // banner says so.
+        hash_verify_banner(matched, mismatched, other).replacen(
+            "</p>",
+            " (Self-consistency only for entries written before audit keying was introduced — not authentication.)</p>",
+            1,
+        )
+    } else {
+        hash_verify_banner(matched, mismatched, other)
+    };
     format!(
-        "<p class=note>Live re-hash run at {} (newest run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
+        "{broken_html}{head_html}{interrupted_html}{unauth_html}<p class=note>Latest completed live re-hash run at {} (run {}, newest completed run in {}); {chain}.</p>\n{banner}\n<table><tr><th>Record</th><th>Path</th><th>Recorded SHA-256</th><th>Observed SHA-256 (live)</th><th>Result</th></tr>\n{rows}</table>",
         ts(latest),
+        esc(&latest_run.run_id),
         crate::anomaly::HASH_VERIFY_REL_PATH,
     )
 }
@@ -332,7 +521,8 @@ fn render_hash_verify(case_dir: &Path) -> String {
 /// Section-5 banner. Green ("ok") only when at least one file was actually
 /// compared and every file was comparable (SHOULD-FIX 4): a run where
 /// nothing matched — or some files could not be compared — must never read
-/// as a clean re-verification.
+/// as a clean re-verification. R11 P9: the caller never uses it unchanged
+/// for a run that is not verified here.
 fn hash_verify_banner(matched: usize, mismatched: usize, other: usize) -> String {
     if mismatched > 0 {
         format!(
@@ -382,8 +572,27 @@ fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
     }
 }
 
-fn opt(value: &Option<String>) -> String {
-    value.as_deref().map(esc).unwrap_or_else(|| "—".to_string())
+/// An optional field, escaped — and path-redacted when a redactor is
+/// given (D8: write-protect / acquisition-tool notes can quote paths).
+fn opt(redactor: Option<&crate::redact::Redactor>, value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .map(|text| esc_with(redactor, text))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// D8: the host name in a redacted statement — a stable hash token (the
+/// machine name can identify a person or organisation); the operator is
+/// printed as recorded and the redaction banner says so.
+fn host_cell(redactor: Option<&crate::redact::Redactor>, host: Option<&str>) -> String {
+    match (redactor, host.filter(|h| !h.is_empty())) {
+        (_, None) => "—".to_string(),
+        (Some(_), Some(host)) => esc(&format!(
+            "<redacted-host:{}>",
+            &crate::sha256::digest_bytes(host.as_bytes())[..16]
+        )),
+        (None, Some(host)) => esc(host),
+    }
 }
 
 fn ts(unix: i64) -> String {
@@ -421,7 +630,19 @@ fn render(
     logs: &[LogRow],
     hash_verify_html: &str,
     generated_unix: i64,
+    redactor: Option<&crate::redact::Redactor>,
 ) -> String {
+    // Every printed value goes through the (optional) path redactor.
+    let esc = |text: &str| esc_with(redactor, text);
+    let redaction_banner = if redactor.is_some() {
+        format!(
+            "{}\n<p class=\"banner warn\">{} The host name is replaced by a hash token; the operator name is shown as recorded at case creation.</p>",
+            crate::redact::REDACTION_MARKER,
+            crate::util::html_escape(crate::redact::REDACTION_NOTE)
+        )
+    } else {
+        String::new()
+    };
     let field = |key: &str| -> String {
         manifest
             .get(key)
@@ -443,8 +664,8 @@ fn render(
                     esc(&s.kind),
                     esc(&s.path),
                     ts(s.registered_unix),
-                    opt(&s.write_protect),
-                    opt(&s.acquisition_tool),
+                    opt(redactor, &s.write_protect),
+                    opt(redactor, &s.acquisition_tool),
                     evidence_hash_cell(s),
                     esc(&s.observed),
                 ));
@@ -532,21 +753,38 @@ fn render(
     let mut log_rows = String::new();
     let mut verified = 0usize;
     let mut structural_only = 0usize;
+    let mut not_verified = 0usize;
     let mut broken = 0usize;
     for l in logs {
         match &l.result {
             Ok(v) => {
-                verified += 1;
-                let keyed = v.integrity == audit::AuditIntegrity::Keyed;
-                if !keyed {
-                    structural_only += 1;
+                // R8 P0/P1/P2: the lane's trust under THIS PC's policy.
+                // Keys held + any line not authenticated here = NOT
+                // VERIFIED (never "verified", never "failed"); no keys =
+                // structural, self-consistency only.
+                let trust = v.lane_trust();
+                let keyed = trust == audit::LaneTrust::Authenticated;
+                match &trust {
+                    audit::LaneTrust::Authenticated => verified += 1,
+                    audit::LaneTrust::SelfConsistentOnly(_) => {
+                        verified += 1;
+                        structural_only += 1;
+                    }
+                    audit::LaneTrust::NotVerified { .. } => not_verified += 1,
                 }
                 let mut notes = v.warnings.clone();
-                if !keyed {
-                    notes.push(
-                        "structural only: detects partial edits, not a full rewrite by someone with file access"
-                            .to_string(),
-                    );
+                match &trust {
+                    audit::LaneTrust::NotVerified { reason, .. } => {
+                        notes.insert(0, format!("not verified on this PC: {reason}"));
+                    }
+                    audit::LaneTrust::SelfConsistentOnly(reason) => {
+                        notes.insert(0, reason.clone());
+                        notes.push(
+                            "structural only: detects partial edits, not a full rewrite by someone with file access"
+                                .to_string(),
+                        );
+                    }
+                    audit::LaneTrust::Authenticated => {}
                 }
                 let caveat = if notes.is_empty() {
                     String::new()
@@ -558,10 +796,20 @@ fn render(
                     esc(&l.rel_path),
                     v.entries,
                     if keyed { "ok" } else { "warn" },
-                    v.integrity.label(),
+                    trust.label(),
                     esc(&v.last_entry_sha256[..v.last_entry_sha256.len().min(16)]),
                     v.keyed_entries,
                     caveat,
+                ));
+            }
+            // R9 P5/I9: an unreadable audit key configuration is NOT
+            // VERIFIED (fail closed) — never "verification failed".
+            Err(err) if audit::is_key_config_error(err) => {
+                not_verified += 1;
+                log_rows.push_str(&format!(
+                    "<tr><td class=path>{}</td><td colspan=4 class=warn>NOT VERIFIED on this PC (not a tampering verdict): {}</td></tr>\n",
+                    esc(&l.rel_path),
+                    esc(err),
                 ));
             }
             Err(err) => {
@@ -580,6 +828,10 @@ fn render(
 
     let mut integrity_banner = if broken > 0 {
         "<p class=\"banner bad\">WARNING: one or more audit lanes failed verification — inspect the ledger below before relying on this package.</p>".to_string()
+    } else if not_verified > 0 {
+        format!(
+            "<p class=\"banner warn\">Audit lanes re-checked at statement generation time: {not_verified} lane(s) NOT VERIFIED on this PC — this PC holds audit keys and those lanes contain entries it cannot authenticate (entries signed under another PC's key: check them on the PC holding that key); {verified} other lane(s) passed.</p>"
+        )
     } else if verified > 0 && structural_only > 0 {
         format!(
             "<p class=\"banner warn\">Audit lanes re-checked at statement generation time: {verified} observed internally consistent; {structural_only} of them are structural-only (unsigned) and are not tamper-proof against a complete rewrite.</p>"
@@ -627,6 +879,7 @@ p.banner:not(.ok):not(.bad):not(.warn) {{ background: #f1f3f4; color: #444; }}
 @media print {{ body {{ margin: 0; }} }}
 </style></head><body>
 <h1>Chain of Custody Statement</h1>
+{redaction_banner}
 <p class=note>Generated {generated} by FrameTrace. At generation time the audit lanes in section 4 were re-verified and the evidence source paths in section 2 were re-stat'ed (presence/size only); original evidence was not re-hashed by this statement (section 5 shows the result of a separate live re-hash run, if one was recorded). Print to PDF for submission if required.</p>
 {integrity_banner}
 <h2>1. Case Identity</h2>
@@ -664,12 +917,15 @@ authenticated originals. Hash verification of any packaged file can be performed
 <p class=note>Integrity labels: <code>integrity-keyed</code> = every entry HMAC-verified against a
 configured key; <code>integrity-structural-only</code> = hash-chain structure observed consistent but
 entries are unsigned or unauthenticated, so a complete rewrite of the log by someone with file
-access would not be detected. A failed lane is disclosed in section 4 rather than omitted.</p>
+access would not be detected (self-consistency only, not authentication);
+<code>integrity-not-verified</code> = this PC holds audit keys and the lane contains entries it cannot
+authenticate (no HMAC, or signed under another PC's key — check those on the PC holding that key), so
+the lane is not relied on here. A failed lane is disclosed in section 4 rather than omitted.</p>
 </body></html>"#,
         case_id = field("case_id"),
         title = field("title"),
         operator = field("operator"),
-        host = field("host"),
+        host = host_cell(redactor, manifest.get("host").and_then(|v| v.as_str())),
         created = manifest
             .get("created_unix")
             .and_then(|v| v.as_i64())
@@ -735,15 +991,32 @@ mod tests {
     }
 
     fn ok_lane(integrity: audit::AuditIntegrity) -> LogRow {
+        let keyed = integrity == audit::AuditIntegrity::Keyed;
         LogRow {
             rel_path: "evidence/logs/anomaly-log.jsonl".to_string(),
             result: Ok(audit::AuditChainVerification {
                 entries: 2,
                 last_entry_sha256: "ab".repeat(32),
-                keyed_entries: 0,
+                keyed_entries: if keyed { 2 } else { 0 },
                 unauthenticated_keyed_entries: 0,
+                entry_auth: if keyed {
+                    vec![audit::EntryAuth::Authenticated; 2]
+                } else {
+                    vec![audit::EntryAuth::Unkeyed; 2]
+                },
+                rewrite_not_excluded: None,
                 integrity,
                 warnings: Vec::new(),
+                requirement: if keyed {
+                    audit::AuthRequirement::Required
+                } else {
+                    audit::AuthRequirement::SelfConsistentOnly
+                },
+                entry_key_ids: vec![keyed.then(|| "k".to_string()); 2],
+                pre_key_entries: 0,
+                pre_key_other_pc: None,
+                rewrite_suspect_lines: Vec::new(),
+                location_unverified: None,
             }),
         }
     }
@@ -763,6 +1036,7 @@ mod tests {
             &[ok_lane(audit::AuditIntegrity::StructuralOnly)],
             "",
             1_704_110_400,
+            None,
         );
         assert!(!html.contains("were not modified"));
         assert!(!html.contains("verified live"));
@@ -801,6 +1075,7 @@ mod tests {
             &[],
             "",
             1_704_110_400,
+            None,
         );
         assert!(
             html.contains("<span class=ok>computed by FrameTrace</span>"),
@@ -861,6 +1136,7 @@ mod tests {
             &[ok_lane(audit::AuditIntegrity::Keyed)],
             "",
             1_704_110_400,
+            None,
         );
         assert!(!html.contains("No evidence sources registered."));
         assert!(!html.contains("No jobs recorded."));
@@ -940,9 +1216,284 @@ mod tests {
         assert!(hash_verify_banner(3, 1, 0).contains("banner bad"));
     }
 
+    /// Writes `evidence/logs/hash-verify.jsonl` lines (unchained is fine
+    /// for the reader) under a fresh case dir.
+    fn hash_verify_case(name: &str, lines: &[serde_json::Value]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-custody-hv-{name}-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        std::fs::create_dir_all(dir.join("evidence/logs")).unwrap();
+        // R8-I10: the real log is chained; a log that does not verify no
+        // longer gets a green re-verification banner.
+        for line in lines {
+            crate::audit::append_chained_jsonl_keyed(
+                &dir.join(crate::anomaly::HASH_VERIFY_REL_PATH),
+                &line.to_string(),
+                None,
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn hv(run: i64, run_id: Option<&str>, id: &str, status: &str) -> serde_json::Value {
+        let mut value = serde_json::json!({"event": "hash-verify", "run_unix": run, "id": id,
+            "source_path": format!("/e/{id}.mp4"), "status": status});
+        if let Some(run_id) = run_id {
+            value["run_id"] = run_id.into();
+        }
+        value
+    }
+
+    fn hv_done(run: i64, run_id: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({"event": "hash-verify-run", "run_unix": run});
+        if let Some(run_id) = run_id {
+            value["run_id"] = run_id.into();
+        }
+        value
+    }
+
+    /// D4: an interrupted run's records are never mixed into the next
+    /// completed run — only the newest COMPLETED run is the result. R13
+    /// P16: an interrupted run AFTER it withholds the result (its marker
+    /// may have been deleted) and its mismatch rows are shown.
+    #[test]
+    fn hash_verify_groups_by_run_and_shows_interrupted_runs_separately() {
+        let lines = [
+            hv(100, Some("100-aaaa"), "vid_old", "match"),
+            hv_done(100, Some("100-aaaa")),
+            // Interrupted (no marker) — must not join run 300.
+            hv(200, Some("200-bbbb"), "vid_cut", "mismatch"),
+            hv(300, Some("300-cccc"), "vid_new", "match"),
+            hv_done(300, Some("300-cccc")),
+        ];
+        let dir = hash_verify_case("mixed", &lines);
+        let (latest, entries) = crate::anomaly::latest_hash_verify_run(&dir).unwrap();
+        assert_eq!(latest, 300);
+        let ids: Vec<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["vid_new"], "only the completed run's own records");
+        let html = render_hash_verify(&dir, None);
+        assert!(html.contains("Latest completed live re-hash run"), "{html}");
+        assert!(html.contains("vid_new"), "{html}");
+        assert!(!html.contains("vid_cut"), "{html}");
+        assert!(html.contains("banner ok"), "{html}");
+
+        // A newer run without a completion marker: no current result, and
+        // its mismatch is listed.
+        crate::audit::append_chained_jsonl_keyed(
+            &dir.join(crate::anomaly::HASH_VERIFY_REL_PATH),
+            &hv(400, Some("400-dddd"), "vid_late", "mismatch").to_string(),
+            None,
+        )
+        .unwrap();
+        assert!(crate::anomaly::latest_hash_verify_run(&dir).is_none());
+        let html = render_hash_verify(&dir, None);
+        assert!(html.contains("No current re-verification result"), "{html}");
+        assert!(html.contains("표식 없는 더 새 실행"), "{html}");
+        assert!(
+            html.contains("vid_late") && html.contains("MISMATCH"),
+            "{html}"
+        );
+        assert!(!html.contains("banner ok"), "{html}");
+        assert!(!html.contains("vid_cut"), "{html}");
+
+        // Logs written before run ids existed group by run_unix the same way.
+        let legacy = hash_verify_case(
+            "legacy",
+            &[
+                hv(200, None, "vid_cut", "mismatch"),
+                hv(300, None, "vid_new", "match"),
+                hv_done(300, None),
+            ],
+        );
+        let (_, entries) = crate::anomaly::latest_hash_verify_run(&legacy).unwrap();
+        assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&legacy);
+    }
+
+    /// D11: a re-hash log that exists but cannot be read is an error in the
+    /// statement, never "no re-hash recorded".
+    #[test]
+    fn unreadable_hash_verify_log_is_an_error_not_absence() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-custody-hv-unreadable-{}-{}",
+            std::process::id(),
+            now_unix().unwrap()
+        ));
+        // A directory where the log should be: exists, cannot be read.
+        std::fs::create_dir_all(dir.join(crate::anomaly::HASH_VERIFY_REL_PATH)).unwrap();
+        let html = render_hash_verify(&dir, None);
+        assert!(html.contains("could not be read"), "{html}");
+        assert!(!html.contains("No completed live source re-hash"), "{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn renders_utc_timestamp() {
         assert_eq!(ts(1704110400), "2024-01-01 12:00:00Z");
         assert_eq!(ts(0), "—");
+        assert_eq!(utc_timestamp(1704110400), "2024-01-01 12:00:00");
+    }
+
+    /// I4: a statement rendered for a path-redacted package prints no
+    /// absolute path — case directory, sources, job subjects and errors —
+    /// and says so.
+    #[test]
+    fn redacted_statement_hides_every_absolute_path() {
+        let source = SourceRow {
+            source_id: "SRC-1".into(),
+            kind: "e01".into(),
+            path: "/evidence/secret/disk.E01".into(),
+            registered_unix: 1_704_110_400,
+            // D8: free-text custody fields quoting paths are redacted too.
+            write_protect: Some("blocker log at /evidence/secret/blocker.txt".into()),
+            acquisition_tool: Some(r"ewfacquire from C:\Users\secret\tools".into()),
+            evidence_hash: None,
+            hash_algorithm: None,
+            hash_origin: None,
+            observed: "present".into(),
+        };
+        let job = JobRow {
+            job_id: "job-1".into(),
+            job_type: "scan".into(),
+            status: "failed".into(),
+            subject_path: "/evidence/secret".into(),
+            started_unix: 1_704_110_400,
+            completed_unix: None,
+            total_units: None,
+            completed_units: 0,
+            error: Some("failed to read /evidence/secret/x.mp4: denied".into()),
+        };
+        let case_dir = Path::new("/cases/secret-case");
+        let redactor = crate::redact::Redactor::new(case_dir);
+        let html = render(
+            case_dir,
+            &serde_json::json!({"case_id": "FT-1", "host": "SECRET-LAPTOP", "operator": "Examiner Lee"}),
+            &Ok(vec![source]),
+            &Ok(vec![job]),
+            &Err("cannot open /cases/secret-case/db/case.db".to_string()),
+            &[],
+            "",
+            1_704_110_400,
+            Some(&redactor),
+        );
+        assert!(!html.to_ascii_lowercase().contains("secret"), "{html}");
+        assert!(html.contains("&lt;redacted-host:"), "{html}");
+        assert!(html.contains("Examiner Lee"), "operator shown as recorded");
+        assert!(
+            html.contains("operator name is shown as recorded"),
+            "{html}"
+        );
+        assert!(crate::redact::html_is_redacted(&html));
+        assert!(html.contains("&lt;redacted:"), "{html}");
+        assert!(html.contains("&lt;case&gt;/db/case.db"), "{html}");
+        assert!(html.contains(": denied"), "{html}");
+        let plain = render(
+            case_dir,
+            &serde_json::Value::Null,
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &Err("n/a".into()),
+            &[],
+            "",
+            1,
+            None,
+        );
+        assert!(!crate::redact::html_is_redacted(&plain));
+        assert!(plain.contains("secret-case"));
+    }
+
+    fn r8_render_lane(lane: &std::path::Path, keys: &[crate::audit_key::AuditKey]) -> String {
+        render(
+            Path::new("/case"),
+            &serde_json::json!({"case_id": "FT-R8"}),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &Err("n/a".to_string()),
+            &[LogRow {
+                rel_path: "evidence/logs/scan-log.jsonl".to_string(),
+                result: audit::verify_chained_jsonl_keyed(lane, keys),
+            }],
+            "",
+            1_704_110_400,
+            None,
+        )
+    }
+
+    /// R8 P0/P2 for the custody statement: a lane stripped of its HMACs was
+    /// counted "observed internally consistent" (structural) on a PC
+    /// holding the key; now it is NOT VERIFIED there. A lane continued on
+    /// another PC names that PC's key and is not "failed".
+    #[test]
+    fn r8_custody_lane_trust_comes_from_keys_held() {
+        let dir = std::env::temp_dir().join(format!("ft-custody-r8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xc1; 32]);
+        let other = crate::audit_key::AuditKey::new("pc-b", &[0xc2; 32]);
+        let stripped = dir.join("stripped.jsonl");
+        audit::append_chained_jsonl_keyed(&stripped, r#"{"n":1}"#, None).unwrap();
+        let html = r8_render_lane(&stripped, std::slice::from_ref(&mine));
+        assert!(html.contains("class=warn>integrity-not-verified"), "{html}");
+        assert!(html.contains("NOT VERIFIED on this PC"), "{html}");
+        assert!(!html.contains("banner ok"), "{html}");
+        let multi = dir.join("multi.jsonl");
+        audit::append_chained_jsonl_keyed(&multi, r#"{"n":1}"#, Some(&mine)).unwrap();
+        audit::append_chained_jsonl_keyed(&multi, r#"{"n":2}"#, Some(&other)).unwrap();
+        let html = r8_render_lane(&multi, std::slice::from_ref(&mine));
+        assert!(html.contains("&quot;pc-b&quot; 보유 PC에서 확인"), "{html}");
+        assert!(
+            !html.contains("failed verification") && html.contains("NOT VERIFIED on this PC"),
+            "never failed: {html}"
+        );
+        // P1: without keys, structural — self-consistency only.
+        let html = r8_render_lane(&stripped, &[]);
+        assert!(
+            html.contains("class=warn>integrity-structural-only"),
+            "{html}"
+        );
+        assert!(html.contains("자기 일관성만 확인(인증 아님)"), "{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R8-I10: section 5 no longer prints a green "all re-hashed and equal"
+    /// banner over a re-hash log whose chain FAILED, or (keys held) over
+    /// entries this PC cannot authenticate.
+    #[test]
+    fn r8_rehash_clause_follows_the_log_trust() {
+        let lines = [
+            hv(300, Some("300-a"), "vid_a", "match"),
+            hv_done(300, Some("300-a")),
+        ];
+        let dir = hash_verify_case("r8-trust", &lines);
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xc3; 32]);
+        crate::audit_key::with_test_keys(&[], || {
+            let html = render_hash_verify(&dir, None);
+            assert!(html.contains("banner ok"), "{html}");
+            assert!(html.contains("Self-consistency only"), "{html}");
+        });
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let html = render_hash_verify(&dir, None);
+            assert!(!html.contains("banner ok"), "{html}");
+            // R9 P3: the unauthenticated entries are not a result at all.
+            assert!(
+                html.contains("cannot be authenticated on this PC"),
+                "{html}"
+            );
+            assert!(html.contains("No completed live source re-hash"), "{html}");
+        });
+        // A forged result line (chain not recomputed): never green.
+        let path = dir.join(crate::anomaly::HASH_VERIFY_REL_PATH);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"match\"", "\"match\" ")).unwrap();
+        crate::audit_key::with_test_keys(&[], || {
+            let html = render_hash_verify(&dir, None);
+            assert!(!html.contains("banner ok"), "{html}");
+            assert!(html.contains("banner bad"), "{html}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

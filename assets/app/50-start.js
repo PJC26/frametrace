@@ -51,6 +51,7 @@ $("btnStart").addEventListener("click", async () => {
       with_hash: $("withHash").checked,
       with_ffprobe: $("withFfprobe").checked,
       with_deepfake: $("withDeepfake").checked,
+      with_audio: $("withAudio").checked && !$("withAudio").disabled,
       skip_e01_verify: $("skipE01Verify").checked,
       e01_direct: inputKind() === "e01" && $("directE01").checked
     });
@@ -167,3 +168,27 @@ $("directE01").addEventListener("change", syncDirectE01);
 document.querySelectorAll("input[name='scanMode']").forEach(r => r.addEventListener("change", () => applyScanMode(r.value)));
 $("withHash").addEventListener("change", syncScanMode);
 $("withFfprobe").addEventListener("change", syncScanMode);
+
+// Sound measurement (docs/PLAN_PHASE2_JOIN_AUDIO_2026-10-13.md §2.2): off by
+// default; it picks its targets from ffprobe, so it is disabled — with the
+// reason in the tooltip — while ffprobe is off or missing. Re-synced
+// whenever the options open or ffprobe / the scan mode change.
+const WITH_AUDIO_TIP = "오디오 트랙을 끝까지 디코드해 최대·평균 신호 레벨(dBFS)로 무음 여부를 잽니다 — 말소리 여부는 판단하지 않습니다";
+function syncAudioOpt() {
+  const box = $("withAudio");
+  if (!box) return;
+  const ffmpegMissing = typeof envState !== "undefined" && !!envState && envState.ffmpeg === false;
+  const ff = $("withFfprobe").checked && !ffprobeMissing && !ffmpegMissing;
+  box.disabled = !ff;
+  if (!ff) box.checked = false;
+  const tip = ff ? WITH_AUDIO_TIP
+    : ffmpegMissing ? "ffmpeg가 없어 사용할 수 없습니다 — 소리 측정은 ffmpeg로 오디오를 디코드합니다"
+    : ffprobeMissing ? "ffprobe가 없어 사용할 수 없습니다 — 소리 측정은 ffprobe가 찾은 오디오 트랙만 잽니다"
+      : "ffprobe 재생성 검증을 켜야 사용할 수 있습니다 — 소리 측정은 ffprobe가 찾은 오디오 트랙만 잽니다";
+  const wrap = $("withAudioWrap");
+  if (wrap) wrap.title = tip;
+}
+$("withFfprobe").addEventListener("change", syncAudioOpt);
+document.querySelectorAll("input[name='scanMode']").forEach(r => r.addEventListener("change", syncAudioOpt));
+$("startOptions").addEventListener("toggle", syncAudioOpt);
+syncAudioOpt();

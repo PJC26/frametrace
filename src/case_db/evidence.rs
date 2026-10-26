@@ -46,6 +46,68 @@ pub fn patch_review_annotations(
     super::marks::patch_review_annotations_by(case_dir, marks, tags, deleted_ids, None)
 }
 
+/// The viewer's `annotations` object — marks, tags and the per-record
+/// revision map (save protocol v2) — as served by `/api/records-meta` and
+/// embedded by make-review. Reading errors are reported, never swallowed
+/// into an empty annotation set.
+///
+/// Shape: `{"marks":[ReviewMarkRow…],"tags":[{"id","tags"}…],"revisions":{id:n}}`.
+pub fn review_annotations_value(case_dir: &Path) -> Result<serde_json::Value, String> {
+    annotations_snapshot(case_dir, false)
+}
+
+/// [`review_annotations_value`] plus `writers: {id: client_id|null}` — the
+/// window that wrote each record's current revision (`null` = legacy, CLI
+/// or merge writer). Served by `/api/records-meta` only (contract §10.2);
+/// the packaged data bundle does not carry writer tokens.
+pub fn review_annotations_value_with_writers(case_dir: &Path) -> Result<serde_json::Value, String> {
+    annotations_snapshot(case_dir, true)
+}
+
+/// Marks, tags and revision rows read inside ONE read transaction, so the
+/// revision map always describes exactly the values served beside it.
+fn annotations_snapshot(case_dir: &Path, with_writers: bool) -> Result<serde_json::Value, String> {
+    let path = case_db_path(case_dir);
+    let (marks, tags, rows) = if path.is_file() {
+        let conn = open_readonly_case_db(&path)?;
+        conn.execute_batch("BEGIN")
+            .map_err(|err| format!("failed to start annotation read: {err}"))?;
+        let marks = load_review_marks_from(&conn)
+            .map_err(|err| format!("failed to read review marks: {err}"))?;
+        let tags = load_review_tags_from(&conn)
+            .map_err(|err| format!("failed to read review tags: {err}"))?;
+        let rows = super::marks::load_review_revision_rows_from(&conn)
+            .map_err(|err| format!("failed to read annotation revisions: {err}"))?;
+        let _ = conn.execute_batch("COMMIT");
+        (marks, tags, rows)
+    } else {
+        Default::default()
+    };
+    let revisions: std::collections::BTreeMap<&str, u64> = rows
+        .iter()
+        .map(|(id, (revision, _))| (id.as_str(), *revision))
+        .collect();
+    let mut value = serde_json::json!({
+        "marks": marks,
+        "tags": tags,
+        "revisions": revisions,
+    });
+    if with_writers {
+        let writers: std::collections::BTreeMap<&str, Option<&str>> = rows
+            .iter()
+            .map(|(id, (_, writer))| (id.as_str(), writer.as_deref()))
+            .collect();
+        value["writers"] = serde_json::json!(writers);
+    }
+    Ok(value)
+}
+
+/// [`review_annotations_value`] serialized for the review data bundle.
+pub fn review_annotations_json(case_dir: &Path) -> Result<String, String> {
+    serde_json::to_string(&review_annotations_value(case_dir)?)
+        .map_err(|err| format!("failed to serialize review annotations: {err}"))
+}
+
 pub fn load_review_tags(case_dir: &Path) -> Result<Vec<crate::selection::TagEntry>, String> {
     let path = case_db_path(case_dir);
     if !path.is_file() {

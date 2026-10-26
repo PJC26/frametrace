@@ -1,6 +1,13 @@
 {
   "upstream": "lazy-contracts",
   "upstream_commit": "f4684a7",
+  "upstream_commit_full": "f4684a73661b0d3dd60038c404395826e29c4597",
+  "upstream_repo": "https://github.com/daeryundf2-prog/lazy-contracts",
+  "upstream_paths": {
+    "lazy-evidence-case-v1.json": "schemas/lazy-evidence-case-v1.json",
+    "trust-levels.md": "trust-levels.md"
+  },
+  "provenance": "Vendored byte-for-byte. Re-verified 2026-10-13 against the upstream repo at upstream_commit_full: both sha256 values below equal the raw file contents at that commit (fetch each upstream path at that commit and run sha256sum). To re-vendor, copy the upstream file, update upstream_commit(_full) and the hashes here, and run `node scripts/verify-contract-pin.mjs`.",
   "sha256": {
     "lazy-evidence-case-v1.json": "fff669b9b9b1707e0b1357e3c7c547eedb8cdc0c2bbd9ebed0b8b1e48a6f62db",
     "trust-levels.md": "e42ca36ccc20f7ff1c0701199b5701f99078233488c891c5d3f07ddc436360a9"

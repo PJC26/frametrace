@@ -16,7 +16,11 @@ pub(super) fn scan_fingerprint(
         format!("max_depth={:?}", options.max_depth),
         format!("incremental={}", options.incremental),
     ];
-    parts.extend(files.iter().map(|path| path.to_string_lossy().to_string()));
+    // Lossless per-file spelling: two non-Unicode names must not
+    // fingerprint as one candidate list (UTF-8 names are unchanged).
+    parts.extend(files.iter().map(|path| {
+        crate::model::path_raw_hex(path).unwrap_or_else(|| path.to_string_lossy().to_string())
+    }));
     checkpoint::fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
@@ -34,10 +38,7 @@ pub(super) fn load_checkpoint_records(
                 checkpoint.path().display()
             )
         })?;
-        records.insert(
-            normalize_source_key(&record.source_path.to_string_lossy()),
-            record,
-        );
+        records.insert(source_key(&record.source_path), record);
     }
     Ok(records)
 }
@@ -282,12 +283,7 @@ pub(super) fn salvage_checkpoint_records(
         .stale_data_lines()
         .iter()
         .filter_map(|line| serde_json::from_str::<VideoRecord>(line).ok())
-        .map(|record| {
-            (
-                normalize_source_key(&record.source_path.to_string_lossy()),
-                record,
-            )
-        })
+        .map(|record| (source_key(&record.source_path), record))
         .collect()
 }
 
@@ -303,6 +299,13 @@ pub(super) fn same_file_state(
 
 fn has_hash(record: &VideoRecord) -> bool {
     record.sha256.is_some()
+}
+
+/// A recorded hash attempt that failed (I11) — kept by passes that do not
+/// hash, so the failure stays visible.
+fn has_hash_failure(record: &VideoRecord) -> bool {
+    record.sha256.is_none()
+        && matches!(record.hash_status.as_str(), "error" | "changed-during-hash")
 }
 
 fn has_probe(record: &VideoRecord) -> bool {
@@ -338,10 +341,14 @@ pub(super) fn carried_facts<'a>(
     indexed: Option<&'a VideoRecord>,
     options: &ScanOptions,
 ) -> CarriedFacts<'a> {
+    // I11: a pass that does not hash also keeps a recorded hash FAILURE
+    // (`error` / `changed-during-hash`) for the unchanged file — that is a
+    // fact about these bytes too, and a lighter rescan must not turn it into
+    // `skipped`. A `--hash` pass retries the file instead.
     let hash = salvaged.filter(|r| has_hash(r)).or_else(|| {
         indexed
             .filter(|_| options.incremental || !options.hash_files)
-            .filter(|r| has_hash(r))
+            .filter(|r| has_hash(r) || (!options.hash_files && has_hash_failure(r)))
     });
     let probe = salvaged.filter(|r| has_probe(r)).or_else(|| {
         indexed

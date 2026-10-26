@@ -25,22 +25,76 @@ pub(crate) const PROBED_TOOLS: &[(&str, &str)] = &[
 /// does not change during a workstation session, so the result is cached
 /// after the first probe; `?refresh=1` forces a re-probe after the
 /// examiner installs a missing tool.
+///
+/// R6: the probes run in parallel threads (one slow tool no longer adds
+/// its whole bound to every other), outside the cache lock and never
+/// under `state_lock`. Concurrent cold callers share one probe (the
+/// single-flight lock), and a result with a timed-out probe is not cached
+/// — the next call re-probes instead of pinning "timed out" for the
+/// session.
 pub(crate) fn api_env(request: &Request) -> String {
     static ENV_CACHE: Mutex<Option<String>> = Mutex::new(None);
+    static PROBING: Mutex<()> = Mutex::new(());
     let refresh = query_value(&request.query, "refresh").as_deref() == Some("1");
-    let mut guard = ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if refresh || guard.is_none() {
-        *guard = Some(probe_env());
+    let cached = || ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !refresh && let Some(hit) = cached() {
+        return hit;
     }
-    guard
-        .clone()
-        .unwrap_or_else(|| "{\"ok\":false}".to_string())
+    let _single_flight = PROBING.lock().unwrap_or_else(|e| e.into_inner());
+    // Another caller may have finished the probe while this one waited.
+    if !refresh && let Some(hit) = cached() {
+        return hit;
+    }
+    let (body, cacheable) = probe_env_outcome();
+    if cacheable {
+        *ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(body.clone());
+    }
+    body
 }
 
-pub(crate) fn probe_env() -> String {
-    let tools: Vec<(&str, bool)> = PROBED_TOOLS
+/// Outcome of one tool presence probe (R6). A timeout is its own fact:
+/// the binary resolved and started but did not answer within the bound —
+/// not proof that it is missing or broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolProbe {
+    Present,
+    Missing,
+    Failed,
+    TimedOut,
+}
+
+impl ToolProbe {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ToolProbe::Present => "present",
+            ToolProbe::Missing => "missing",
+            ToolProbe::Failed => "failed",
+            ToolProbe::TimedOut => "timed-out",
+        }
+    }
+}
+
+/// Probes every tool in parallel; returns the env JSON and whether it may
+/// be cached (no probe timed out).
+pub(crate) fn probe_env_outcome() -> (String, bool) {
+    let probes: Vec<(&str, ToolProbe)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = PROBED_TOOLS
+            .iter()
+            .map(|(name, arg)| (*name, scope.spawn(move || tool_probe(name, arg))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(name, handle)| (name, handle.join().unwrap_or(ToolProbe::Failed)))
+            .collect()
+    });
+    let timed_out: Vec<&str> = probes
         .iter()
-        .map(|(name, arg)| (*name, tool_available(name, arg)))
+        .filter(|(_, probe)| *probe == ToolProbe::TimedOut)
+        .map(|(name, _)| *name)
+        .collect();
+    let tools: Vec<(&str, bool)> = probes
+        .iter()
+        .map(|(name, probe)| (*name, *probe == ToolProbe::Present))
         .collect();
     let has = |name: &str| tools.iter().any(|(n, ok)| *n == name && *ok);
     // Workflows require every binary in their set.
@@ -61,44 +115,69 @@ pub(crate) fn probe_env() -> String {
         .iter()
         .map(|(name, ok)| (name.to_string(), serde_json::Value::Bool(*ok)))
         .collect();
-    serde_json::json!({
+    let body = serde_json::json!({
         "ok": true,
         "ffmpeg": has("ffmpeg"),
         "ffprobe": has("ffprobe"),
         "ewf": ewf,
         "deepfake": deepfake,
         "tools": tools_map,
+        // R6: per-tool probe outcome — `timed-out` is distinct from
+        // `missing`/`failed` (the tool may well work; it was just slow).
+        "tool_probe": probes
+            .iter()
+            .map(|(name, probe)| (name.to_string(), serde_json::Value::from(probe.as_str())))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "probe_timed_out": timed_out,
+        "probe_timeout_secs": crate::util::version_probe_timeout_secs(),
         "workflows": {"media": media, "e01": ewf, "filesystem": tsk},
         "hints": {
             "media": "FFmpeg 설치 후 ffmpeg/ffprobe가 PATH에 있어야 합니다. portable 배포본은 tools/bin에 복사하면 자동 인식됩니다.",
             "e01": "libewf(ewfinfo/ewfverify/ewfexport) 설치 후 PATH 등록 또는 tools/bin에 복사하십시오.",
             "filesystem": "Sleuth Kit(mmls/fls/icat) 설치 후 PATH 등록 또는 tools/bin에 복사하십시오.",
+            "probe_timeout": "버전 확인이 시간 안에 끝나지 않은 도구는 '없음'이 아니라 '확인 시간 초과'입니다 — 백신 검사 등으로 첫 실행이 느릴 수 있습니다. 잠시 후 다시 확인하거나 FRAMETRACE_TOOL_PROBE_TIMEOUT(초)을 늘리십시오.",
         }
     })
-    .to_string()
+    .to_string();
+    (body, timed_out.is_empty())
 }
 
 pub(crate) fn tool_available(name: &str, version_arg: &str) -> bool {
+    tool_probe(name, version_arg) == ToolProbe::Present
+}
+
+/// One presence probe (R6 outcome, see [`ToolProbe`]).
+pub(crate) fn tool_probe(name: &str, version_arg: &str) -> ToolProbe {
     // resolve_tool_binary covers PATH plus the portable tools/bin layout, so
     // a bare binary dropped next to frametrace-app.exe is detected.
     let Ok(resolved) = crate::tool_policy::resolve_tool_binary(name, &[name]) else {
-        return false;
+        return ToolProbe::Missing;
     };
     // An empty version_arg means "resolution is enough" — TSK tools have no
     // -V flag and print usage to stderr, so executing them tells us nothing.
     if version_arg.is_empty() {
-        return true;
+        return ToolProbe::Present;
     }
+    // P7: bounded — this runs inside HTTP handlers (/api/env, /api/start),
+    // and a tool wedged on start (or held by a loader dialog) must not pin
+    // the handler thread.
     let mut command = Command::new(&resolved);
-    crate::util::hide_console(&mut command);
     command.arg(version_arg);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    classify_tool_probe(crate::util::run_with_timeout_detailed(
+        &mut command,
+        Some(crate::util::version_probe_timeout_secs()),
+    ))
+}
+
+/// Pure classification of a version run (R6).
+pub(crate) fn classify_tool_probe(
+    result: Result<std::process::Output, crate::util::RunError>,
+) -> ToolProbe {
+    match result {
+        Ok(output) if output.status.success() => ToolProbe::Present,
+        Ok(_) | Err(crate::util::RunError::Failed(_)) => ToolProbe::Failed,
+        Err(crate::util::RunError::TimedOut(_)) => ToolProbe::TimedOut,
+    }
 }
 
 /// Directory listing for the in-app path picker. An empty `path` returns
@@ -268,13 +347,27 @@ pub(crate) fn has_ewf_signature(head: &[u8]) -> bool {
     head.len() >= 8 && SIGS.iter().any(|sig| &head[..8] == sig.as_slice())
 }
 
-/// Reads at most the first 8 bytes of `path` (read-only).
-fn has_ewf_signature_file(path: &Path) -> bool {
+/// Reads at most the first 8 bytes of `path` (read-only). S2: only a
+/// regular file of at least 8 bytes is opened — a device, FIFO or other
+/// special file can block `read_exact` forever (and pin the handler).
+pub(crate) fn has_ewf_signature_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !signature_probe_allowed(&meta) {
+        return false;
+    }
     let mut head = [0u8; 8];
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut head))
         .map(|_| has_ewf_signature(&head))
         .unwrap_or(false)
+}
+
+/// Whether the EWF signature probe may open a file with this metadata: a
+/// regular file large enough to hold the 8-byte signature.
+pub(crate) fn signature_probe_allowed(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_file() && meta.len() >= 8
 }
 
 /// `true` for the first segment of a split forensic image family. The
@@ -312,9 +405,132 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         .as_deref()
         .map(|dir| index_generation(state, dir))
         .unwrap_or(0);
-    let guard = state_lock(state);
-    let case_dir = guard.case_dir.clone();
-    let byte_progress = guard.byte_progress.clone();
+    // Everything that touches the disk — the case DB (SQLite: reaping,
+    // schema check and a query, each of which can wait out the busy
+    // timeout while a running job writes) and the marks queue directory —
+    // runs AFTER the state lock is released. Holding the global lock across
+    // those reads stalled every other endpoint for seconds while a carve
+    // job was writing (measured: up to 4 s per /api/status poll).
+    let (
+        mut body,
+        case_dir,
+        byte_progress,
+        rehash_progress,
+        enrichment_step,
+        recent_clips,
+        recovering_case,
+    ) = {
+        let guard = state_lock(state);
+        (
+            status_snapshot(&guard),
+            guard.case_dir.clone(),
+            guard.byte_progress.clone(),
+            guard.rehash_progress,
+            guard.enrichment,
+            // Cloned here, rendered below: a job's JSON stats its growing
+            // output / `.part` and reads the join progress file.
+            guard
+                .clip_jobs
+                .iter()
+                .rev()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>(),
+            guard.finalize_recovering.clone(),
+        )
+    };
+    // UX-09: clip exports and joins run beside `busy`; running + recent ones.
+    body["clip_jobs"] = recent_clips
+        .iter()
+        .map(clip_job_json)
+        .collect::<Vec<_>>()
+        .into();
+    let progress = match rehash_progress {
+        // R6-S4: an existing raw image is being re-hashed in-process.
+        Some((done, total)) => serde_json::json!({
+            "job_type": "raw-rehash",
+            "done": done,
+            "total": total,
+            "elapsed_secs": 0,
+            "eta_secs": 0,
+        }),
+        None => progress_json(case_dir.as_deref(), byte_progress.as_ref()),
+    };
+    // UX-02: which phase-2 step is enriching the partial index. `done` /
+    // `total` are the running job's unit progress when the step reports
+    // one (files hashed), else the step position within the plan.
+    let enrichment = enrichment_step.map(|step| {
+        let (done, total, unit) = match (
+            progress.get("done").and_then(|v| v.as_u64()),
+            progress.get("total").and_then(|v| v.as_u64()),
+        ) {
+            (Some(done), Some(total)) if total > 0 => (done, total, "units"),
+            _ => (
+                step.stage.saturating_sub(1) as u64,
+                step.stages as u64,
+                "steps",
+            ),
+        };
+        serde_json::json!({
+            "step": step.step,
+            "label": step.label,
+            "stage": step.stage,
+            "stages": step.stages,
+            "done": done,
+            "total": total,
+            "unit": unit,
+        })
+    });
+    body["progress"] = progress;
+    body["enrichment"] = enrichment.unwrap_or(serde_json::Value::Null);
+    body["index_generation"] = index_generation.into();
+    // Marks accepted while a hash/make-review step held the case DB;
+    // applied automatically right after that step.
+    body["pending_marks"] = case_dir
+        .as_deref()
+        .map(pending_marks_count)
+        .unwrap_or(0)
+        .into();
+    // Save protocol v2: ids a queued import could not apply because the
+    // case had moved on (journaled in marks-pending/conflicts.jsonl, never
+    // dropped). `{count, ids}` with at most 50 ids; the viewer resolves
+    // them by saving the id again with a current base.
+    body["mark_conflicts"] = case_dir
+        .as_deref()
+        .map(super::jobs::pending_mark_conflicts)
+        .unwrap_or_else(|| serde_json::json!({"count": 0, "ids": []}));
+    // R10-S2: package folders an incomplete finalize left in reports/
+    // (`…_INCOMPLETE` or marked beside) — "최종화 미완료", never final.
+    body["incomplete_packages"] = case_dir
+        .as_deref()
+        .map(super::media::incomplete_package_dirs)
+        .unwrap_or_default()
+        .iter()
+        .map(|dir| dir.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .into();
+    // R10-S2: whether `package_dir` is such a package (an incomplete
+    // finalize sets it to the renamed folder).
+    let package_incomplete = body["package_dir"]
+        .as_str()
+        .is_some_and(|dir| crate::package::finalize_incomplete_reason(Path::new(dir)).is_some());
+    body["package_incomplete"] = package_incomplete.into();
+    // R12-S2: a finalize journal on disk (an interrupted finalize not yet
+    // fully recovered, or — `active` — the finalize running now).
+    // R13-S7: `recovering` while the background start-up recovery runs.
+    let active = body["phase"].as_str() == Some("finalizing");
+    body["finalize_journal"] = case_dir
+        .as_deref()
+        .map(|dir| {
+            let recovering = recovering_case.as_deref() == Some(dir);
+            super::finalize_journal::status_value(dir, active, recovering)
+        })
+        .unwrap_or(serde_json::Value::Null);
+    body.to_string()
+}
+
+/// The in-memory part of /api/status, built under the state lock (no I/O).
+fn status_snapshot(guard: &JobState) -> serde_json::Value {
     let steps: Vec<&str> = guard.steps.iter().map(|step| step.as_str()).collect();
     let current = guard
         .steps
@@ -339,32 +555,6 @@ pub(crate) fn api_status(state: &SharedState) -> String {
             .as_ref()
             .map(|path| path.to_string_lossy().to_string())
     };
-    let progress = progress_json(case_dir.as_deref(), byte_progress.as_ref());
-    // UX-02: which phase-2 step is enriching the partial index. `done` /
-    // `total` are the running job's unit progress when the step reports
-    // one (files hashed), else the step position within the plan.
-    let enrichment = guard.enrichment.map(|step| {
-        let (done, total, unit) = match (
-            progress.get("done").and_then(|v| v.as_u64()),
-            progress.get("total").and_then(|v| v.as_u64()),
-        ) {
-            (Some(done), Some(total)) if total > 0 => (done, total, "units"),
-            _ => (
-                step.stage.saturating_sub(1) as u64,
-                step.stages as u64,
-                "steps",
-            ),
-        };
-        serde_json::json!({
-            "step": step.step,
-            "label": step.label,
-            "stage": step.stage,
-            "stages": step.stages,
-            "done": done,
-            "total": total,
-            "unit": unit,
-        })
-    });
     serde_json::json!({
         "ok": true,
         "app": "frametrace",
@@ -384,21 +574,35 @@ pub(crate) fn api_status(state: &SharedState) -> String {
         "case_dir": opt(&guard.case_dir),
         "package_dir": opt(&guard.package_dir),
         "error": guard.error,
-        "progress": progress,
-        "enrichment": enrichment,
-        "index_generation": index_generation,
-        // Marks accepted while a hash/make-review step held the case DB;
-        // applied automatically right after that step.
-        "pending_marks": case_dir.as_deref().map(pending_marks_count).unwrap_or(0),
+        // R11-S5: the case report could not be re-rendered after a failed
+        // finalize (it still names that finalize's unfinished sign-off).
+        "report_stale": guard.report_stale,
+        // R11-S6: the last failed finalize left something that must not
+        // be read as final (sign-off not restored, report stale, abandon
+        // record missing); `finalize_incomplete_detail` says what.
+        "finalize_incomplete": guard.finalize_incomplete.is_some(),
+        "finalize_incomplete_detail": guard.finalize_incomplete,
+        // R12-S2: an interrupted finalize (journal found at server start,
+        // open-case or the next finalize) was recovered; the detail says
+        // what was done and what still needs a look ("확인 필요").
+        "finalize_recovered": guard.finalize_recovered.is_some(),
+        "finalize_recovered_detail": guard.finalize_recovered,
         // UX-06: which kind of job holds `busy` (null when idle), and the
         // current/last background case job with its stage and outcome.
-        "job_kind": status_job_kind(&guard),
+        "job_kind": status_job_kind(guard),
         "job": guard.case_job.as_ref().map(case_job_json),
-        // UX-09: clip exports run beside `busy`; running + recent ones.
-        "clip_jobs": guard.clip_jobs.iter().rev().take(8).map(clip_job_json).collect::<Vec<_>>(),
+        // `clip_jobs` is filled in by api_status outside the lock.
         "clips_running": guard.clip_jobs.iter().filter(|job| job.state == "running").count(),
+        // S1: export-selected / capture-frame writes in flight.
+        "writes_running": guard.write_ops,
+        // R5-S6: the last E01 run stopped on a raw image it could not
+        // confirm; `POST /api/reimport-raw` discards it and re-runs.
+        "raw_reimport": guard.raw_reimport.as_ref().map(|pending| serde_json::json!({
+            "raw_path": pending.raw_path.to_string_lossy(),
+            "reason": pending.reason,
+            "endpoint": "/api/reimport-raw",
+        })),
     })
-    .to_string()
 }
 
 /// `job_kind` for /api/status: the background case job when one runs,
@@ -432,13 +636,36 @@ pub(crate) fn progress_json(
     if !case_dir.join("case.json").is_file() || !crate::case_db::case_db_path(case_dir).is_file() {
         return byte_progress_json(byte_progress);
     }
-    let job = crate::case_db::latest_running_job(case_dir).ok().flatten();
+    // R10: read-only, write-free, bounded wait. A writer holding the DB
+    // past STATUS_DB_BUSY no longer stalls the poll (it used to wait out
+    // the 5 s busy timeout, beyond the shell's 1 s status timeout): the
+    // last progress seen for this case is reported, marked `stale`.
+    STATUS_PROGRESS_READS.with(|reads| reads.set(reads.get() + 1));
+    let job = match crate::case_db::latest_running_job_quick(case_dir, STATUS_DB_BUSY) {
+        Ok(job) => {
+            remember_progress(case_dir, job.as_ref());
+            job
+        }
+        Err(_) => {
+            STATUS_PROGRESS_BUSY_FALLBACKS.with(|count| count.set(count.get() + 1));
+            if let Some(mut last) = remembered_progress(case_dir) {
+                last["stale"] = true.into();
+                return last;
+            }
+            None
+        }
+    };
     let Some(job) = job else {
         // Fallback: external-tool steps (e.g. ewfexport) don't touch the
         // jobs table — report output bytes seen so far as an indeterminate
         // progress signal.
         return byte_progress_json(byte_progress);
     };
+    job_progress_json(&job)
+}
+
+/// Progress JSON for one running job row.
+fn job_progress_json(job: &crate::case_db::JobProgress) -> serde_json::Value {
     let now = crate::util::now_unix().unwrap_or(job.updated_unix);
     let elapsed = now.saturating_sub(job.started_unix).max(1);
     let total = job.total_units.unwrap_or(0);
@@ -462,6 +689,47 @@ pub(crate) fn progress_json(
         "elapsed_secs": elapsed,
         "eta_secs": eta,
     })
+}
+
+thread_local! {
+    /// R4-B20: bounded (`latest_running_job_quick`) progress reads made by
+    /// `/api/status` on this thread — the only case-DB access it makes.
+    pub(crate) static STATUS_PROGRESS_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// R4-B20: of those, reads that found the DB locked and fell back to
+    /// the remembered (stale) progress instead of waiting.
+    pub(crate) static STATUS_PROGRESS_BUSY_FALLBACKS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// R10: how long one `/api/status` progress read may wait for a case-DB
+/// lock (the whole poll targets < 200 ms under a carve writer).
+pub(crate) const STATUS_DB_BUSY: Duration = Duration::from_millis(100);
+
+/// Last progress JSON read per case (R10 fallback when the DB is busy).
+/// Keyed by case so polls of different cases (tests, a case switch) never
+/// clear each other's entry; bounded so it cannot grow without limit.
+static LAST_PROGRESS: Mutex<Vec<(PathBuf, serde_json::Value)>> = Mutex::new(Vec::new());
+const LAST_PROGRESS_CAP: usize = 16;
+
+fn remember_progress(case_dir: &Path, job: Option<&crate::case_db::JobProgress>) {
+    let mut last = LAST_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    last.retain(|(dir, _)| dir != case_dir);
+    if let Some(job) = job {
+        if last.len() >= LAST_PROGRESS_CAP {
+            last.remove(0);
+        }
+        last.push((case_dir.to_path_buf(), job_progress_json(job)));
+    }
+}
+
+fn remembered_progress(case_dir: &Path) -> Option<serde_json::Value> {
+    LAST_PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(dir, _)| dir == case_dir)
+        .map(|(_, value)| value.clone())
 }
 
 /// Byte-level fallback for steps whose work happens inside an external
@@ -520,18 +788,30 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
         .to_string();
     }
     // Nothing holds `busy`: the global cancel stops running clip exports
-    // (UX-09) so "중단 후 종료" never leaves an ffmpeg behind.
+    // (UX-09) so "중단 후 종료" never leaves an ffmpeg behind, and (R3)
+    // asks every write op to stop — export-selected checks its flag
+    // between items and still writes a manifest marked cancelled.
     let clips = cancel_all_clip_jobs(&mut guard);
-    if clips > 0 {
-        guard
-            .logs
-            .push(format!("클립 내보내기 {clips}건 중단 요청을 받았습니다."));
+    let writes = cancel_write_ops(&mut guard);
+    if clips > 0 || writes > 0 {
+        if clips > 0 {
+            guard.logs.push(format!(
+                "내보내기·이어붙이기 {clips}건 중단 요청을 받았습니다."
+            ));
+        }
+        if writes > 0 {
+            guard.logs.push(format!(
+                "선택 내보내기·프레임 캡처 {writes}건 중단 요청을 받았습니다 — 진행 중인 항목을 마치고 멈춥니다."
+            ));
+        }
         return serde_json::json!({
             "ok": true,
-            "cancelled": "clips",
+            "cancelled": if clips > 0 { "clips" } else { "writes" },
             "job_kind": null,
             "clips_cancelled": clips,
             "clips_running": clips,
+            "writes_cancelled": writes,
+            "writes_running": guard.write_ops,
         })
         .to_string();
     }
@@ -543,13 +823,15 @@ pub(crate) fn api_cancel(state: &SharedState) -> String {
 /// a mid-pipeline exit cannot truncate audit/carve output; the UI offers a
 /// cancel-then-shutdown flow for that case.
 pub(crate) fn api_shutdown(state: &SharedState) -> String {
-    let mut guard = state_lock(state);
+    let guard = state_lock(state);
     let clips_running = guard.clip_jobs.iter().any(|job| job.state == "running");
-    if guard.busy || clips_running {
+    // S1: an export-selected / capture-frame still writing into the case
+    // counts as running work too (it is short; the UI retries).
+    if guard.busy || clips_running || guard.write_ops > 0 {
         return "{\"ok\":false,\"running\":true,\"error\":\"작업이 진행 중입니다 — 중단 후 종료하십시오.\"}"
             .to_string();
     }
-    guard.shutdown_requested = true;
+    guard.request_shutdown();
     "{\"ok\":true}".to_string()
 }
 
@@ -558,12 +840,22 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     if dir_text.trim().is_empty() {
         return "{\"ok\":false,\"error\":\"케이스 폴더 경로를 입력하십시오.\"}".to_string();
     }
-    if let Err(reason) =
-        super::http::reject_remote_path(&dir_text, &super::http::approved_path_roots(state))
-    {
-        return api_err(reason);
-    }
-    let case_dir = PathBuf::from(dir_text.trim());
+    // R19-S1 (P32): the bound case folder is normalized — absolute, no
+    // trailing separator, a drive root `X:\.` — so every path the status
+    // shows and every command built from it is the same, argv-safe text
+    // (`E:\` or `C:\cases\c 1\` typed with a trailing backslash made the
+    // pasted command's closing quote literal). Lexical only (no disk).
+    // R20-S1 (P34): the UNC/device/reserved check runs on the typed text
+    // AND on the normalized path, before any filesystem call — the R19
+    // check on the text alone let `\\?\C:\x\//srv/sh` normalize to the
+    // UNC `//srv/sh` and the `case.json` probe below open an SMB session.
+    let roots = super::http::approved_path_roots(state);
+    let case_dir = match super::state::bind_path(Path::new(dir_text.trim()), |text| {
+        super::http::reject_remote_path(text, &roots)
+    }) {
+        Ok(case_dir) => case_dir,
+        Err(reason) => return api_err(reason),
+    };
     if !case_dir.join("case.json").is_file() {
         return "{\"ok\":false,\"error\":\"해당 폴더에 case.json이 없습니다 — 기존 케이스 폴더가 아닙니다.\"}"
             .to_string();
@@ -572,36 +864,71 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     // A case whose enrichment pass was cancelled (or failed) before
     // make-review still has a reviewable index (UX-02).
     let has_index = case_dir.join("db/video_index.json").is_file();
-    let mut guard = state_lock(state);
-    if guard.busy {
-        return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
+    // R4-B5: pages this user's FrameTrace did not generate open without
+    // script — say so instead of leaving a blank dashboard unexplained.
+    let unverified_pages = has_review
+        && !crate::util::generated_pages::page_is_trusted(&case_dir, "review/index.html");
+    // R13-S10: the refusals are checked BEFORE a recovery changes the
+    // case (R12 recovered first and then could refuse the open, so what
+    // the recovery did was only in the job log).
+    {
+        let guard = state_lock(state);
+        if guard.busy {
+            return "{\"ok\":false,\"error\":\"분석이 진행 중입니다.\"}".to_string();
+        }
+        if let Some(refusal) = side_work_refusal(&guard, "케이스를 여십시오") {
+            return api_err(&refusal);
+        }
     }
-    // Clip exports write into the bound case and block its finalize; a
-    // switch while one runs would leave the new case's finalize refused for
-    // the old case's export (and the export landing under a case no longer
-    // shown).
-    let clips_running = guard
-        .clip_jobs
-        .iter()
-        .filter(|job| job.state == "running")
-        .count();
-    if clips_running > 0 {
-        return api_err(&format!(
-            "클립 내보내기 {clips_running}건이 진행 중입니다 — 끝나거나 중단한 뒤 케이스를 여십시오."
-        ));
+    // R12-S2 (P13): an interrupted finalize of this case is cleaned up
+    // before the case is bound — holding `busy` (so no finalize of this
+    // workstation is running) and outside the state lock. R13: only one
+    // its lane entry pairs with (see finalize_journal).
+    let recovery = if super::finalize_journal::journal_path(&case_dir).exists() {
+        let _busy = match try_acquire_busy(state) {
+            Ok(guard) => guard,
+            Err(err) => return api_err(&err),
+        };
+        super::finalize_journal::recover(&case_dir, state, crate::package::rename_retry_budget())
+    } else {
+        None
+    };
+    // Reopening the same case must keep extra media roots the earlier
+    // session recorded (e.g. a carving workspace linked into the case) —
+    // resetting to just the case dir would 403 artifacts that resolve
+    // through that root. Read (file + probes) before the state lock.
+    let prior_roots = restore_session()
+        .and_then(|(dir, roots)| (dir == case_dir).then_some(roots))
+        .unwrap_or_else(|| vec![case_dir.clone()]);
+    let mut guard = state_lock(state);
+    // R13-S10: a refusal that still comes now (a job or a clip export
+    // started meanwhile) carries what the recovery did.
+    let recovered_note = recovery
+        .as_ref()
+        .map(|recovery| format!(" (참고: {})", recovery.detail))
+        .unwrap_or_default();
+    if guard.busy {
+        return api_err(&format!("분석이 진행 중입니다.{recovered_note}"));
+    }
+    // Clip exports (and S1 write ops) write into the bound case and block
+    // its finalize; a switch while one runs would leave the new case's
+    // finalize refused for the old case's export (and the export landing
+    // under a case no longer shown).
+    if let Some(refusal) = side_work_refusal(&guard, "케이스를 여십시오") {
+        return api_err(&format!("{refusal}{recovered_note}"));
     }
     if guard.case_dir.as_deref() != Some(case_dir.as_path()) {
         // Finished clip jobs belong to the previous binding.
         guard.clip_jobs.clear();
+        // R11-S5/S6: so did the last finalize's leftovers.
+        guard.report_stale = false;
+        guard.finalize_incomplete = None;
+        guard.finalize_recovered = None;
+    }
+    if let Some(recovery) = recovery {
+        super::jobs::apply_recovery_locked(&mut guard, recovery);
     }
     guard.case_dir = Some(case_dir.clone());
-    // Reopening the same case must keep extra media roots the earlier
-    // session recorded (e.g. a carving workspace linked into the case) —
-    // resetting to just the case dir would 403 artifacts that resolve
-    // through that root.
-    let prior_roots = restore_session()
-        .and_then(|(dir, roots)| (dir == case_dir).then_some(roots))
-        .unwrap_or_else(|| vec![case_dir.clone()]);
     let extra_root = prior_roots.iter().find(|root| **root != case_dir).cloned();
     guard.media_roots = prior_roots;
     // An explicit open is a deliberate choice — the restored-session
@@ -611,6 +938,12 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
     guard.enrichment = None;
     // The last recover/carve outcome belonged to the previous binding.
     guard.case_job = None;
+    // R4-B8: so did the last package (the review-ready branch used to keep
+    // it, so "open package folder" offered the previous case's package and
+    // /api/open-folder admitted it as an approved root).
+    guard.package_dir = None;
+    guard.raw_reimport = None;
+    guard.error = None;
     if has_review {
         guard.phase = "review-ready";
         guard.steps = [StepStatus::Done; 5];
@@ -627,6 +960,7 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
             StepStatus::Pending,
         ];
         guard.package_dir = None;
+        guard.raw_reimport = None;
         guard.logs.push(format!(
             "케이스를 열었습니다 (색인만 있음 — 보강·리뷰 생성 전): {}",
             case_dir.display()
@@ -638,10 +972,16 @@ pub(crate) fn api_open_case(request: &Request, state: &SharedState) -> String {
         guard.phase = "idle";
         guard.steps = [StepStatus::Pending; 5];
         guard.package_dir = None;
+        guard.raw_reimport = None;
         guard.logs.push(format!(
             "케이스를 열었습니다 (검토 결과 없음): {}",
             case_dir.display()
         ));
+    }
+    if unverified_pages {
+        let message = "이 케이스의 대시보드·보고서 페이지는 이 컴퓨터의 FrameTrace가 만든 것으로 확인되지 않아 스크립트 없이(보기 전용) 열립니다 — 최종화하거나 다시 분석하면 새로 생성됩니다. 검토 화면(뷰어)은 영향을 받지 않습니다.".to_string();
+        guard.logs.push(format!("경고: {message}"));
+        guard.warnings.push((4, message));
     }
     drop(guard);
     save_session(&case_dir, extra_root.as_deref());
@@ -658,26 +998,24 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
         return "{\"ok\":false,\"error\":\"먼저 INPUT 분석을 실행하십시오.\"}".to_string();
     };
     let logs_dir = case_dir.join("evidence/logs");
-    let mut log_paths: Vec<PathBuf> = match std::fs::read_dir(&logs_dir) {
-        Ok(read_dir) => read_dir
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-            .collect(),
-        Err(err) => {
-            return serde_json::json!({
-                "ok": false,
-                "error": format!("감사 로그 디렉터리를 읽지 못했습니다: {err}"),
-            })
-            .to_string();
-        }
-    };
-    log_paths.sort();
+    if let Err(err) = std::fs::read_dir(&logs_dir) {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("감사 로그 디렉터리를 읽지 못했습니다: {err}"),
+        })
+        .to_string();
+    }
+    // R9 P4: the WHOLE case — every chained lane under artifacts/** as well
+    // as evidence/logs (R8 checked evidence/logs only, so a tampered
+    // artifacts lane never reached the workstation badge).
+    let log_paths: Vec<PathBuf> = audit::case_lane_paths(&case_dir);
     if log_paths.is_empty() {
         return "{\"ok\":false,\"error\":\"검증할 감사 로그가 없습니다.\"}".to_string();
     }
     let mut logs_json = Vec::new();
     let mut failed = 0usize;
     let mut any_structural_only = false;
+    let mut any_not_verified = false;
     let mut total_entries = 0usize;
     for path in &log_paths {
         let name = path
@@ -685,25 +1023,78 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
+        let rel = path
+            .strip_prefix(&case_dir)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| name.clone());
         match audit::verify_chained_jsonl(path) {
             Ok(result) => {
                 total_entries += result.entries;
-                if result.integrity == audit::AuditIntegrity::StructuralOnly {
-                    any_structural_only = true;
+                let (unauthenticated_lines, other_pc_lines) = result.trust_counts();
+                // R8 P0/P1/P2: one mapping for every lane consumer — keys
+                // held here + any line not authenticated here = NOT
+                // VERIFIED (naming other PCs' keys); no keys = structural
+                // (self-consistency only).
+                let trust = result.lane_trust();
+                match &trust {
+                    audit::LaneTrust::Authenticated => {}
+                    audit::LaneTrust::SelfConsistentOnly(_) => any_structural_only = true,
+                    audit::LaneTrust::NotVerified { .. } => any_not_verified = true,
                 }
+                let other_pc_key_ids = match &trust {
+                    audit::LaneTrust::NotVerified {
+                        other_pc_key_ids, ..
+                    } => other_pc_key_ids.clone(),
+                    _ => Vec::new(),
+                };
                 logs_json.push(serde_json::json!({
                     "name": name,
+                    // R9 P4: case-relative path (artifacts lanes share file
+                    // names with evidence/logs lanes, e.g. export-log.jsonl).
+                    "path": rel,
+                    // R9 (contract with track U): numeric counts so the
+                    // badge never parses the reason text.
+                    "unauthenticated_lines": unauthenticated_lines,
+                    "other_pc_lines": other_pc_lines,
                     "entries": result.entries,
-                    "integrity": result.integrity.label(),
+                    "integrity": if trust.passes() {
+                        trust.label()
+                    } else {
+                        "not-verified"
+                    },
+                    "trust": trust.reason(),
+                    "keys_held": result.requirement.keys_held(),
+                    "other_pc_key_ids": other_pc_key_ids,
+                    "rewrite_not_excluded": result.rewrite_not_excluded,
                     "keyed_entries": result.keyed_entries,
                     "unauthenticated_keyed_entries": result.unauthenticated_keyed_entries,
                     "warnings": result.warnings,
+                }));
+            }
+            // R9 P5/I9: an audit key configuration that exists but cannot
+            // be read is NOT VERIFIED (fail closed) — never "failed"
+            // (a tamper verdict).
+            Err(err) if audit::is_key_config_error(&err) => {
+                any_not_verified = true;
+                logs_json.push(serde_json::json!({
+                    "name": name,
+                    "path": rel,
+                    "entries": 0,
+                    "integrity": "not-verified",
+                    "trust": err,
+                    "keys_held": true,
+                    "key_config_error": true,
+                    "other_pc_key_ids": Vec::<String>::new(),
+                    "unauthenticated_lines": 0,
+                    "other_pc_lines": 0,
+                    "warnings": Vec::<String>::new(),
                 }));
             }
             Err(err) => {
                 failed += 1;
                 logs_json.push(serde_json::json!({
                     "name": name,
+                    "path": rel,
                     "entries": 0,
                     "integrity": "failed",
                     "error": err,
@@ -714,6 +1105,8 @@ pub(crate) fn api_verify_audit(state: &SharedState) -> String {
     }
     let overall = if failed > 0 {
         "integrity-failed"
+    } else if any_not_verified {
+        "integrity-not-verified"
     } else if any_structural_only {
         "integrity-structural-only"
     } else {
@@ -758,7 +1151,12 @@ pub(crate) fn api_case_info(request: &Request, state: &SharedState) -> String {
     if !case_dir.join("case.json").is_file() {
         return api_err("해당 폴더에 case.json이 없습니다 — 케이스 폴더가 아닙니다.");
     }
-    let is_bound = bound.as_deref() == Some(case_dir.as_path());
+    // R21-S3: the bound folder is in normalized (plain) form; the typed
+    // text is compared in that form too (lexical — no disk).
+    let is_bound = bound.as_deref().is_some_and(|bound| {
+        bound == case_dir
+            || crate::paste_path::normalize_checked(&case_dir).as_deref() == Some(bound)
+    });
     let video_count = if is_bound {
         cached_index(state, &case_dir)
             .ok()
@@ -769,7 +1167,11 @@ pub(crate) fn api_case_info(request: &Request, state: &SharedState) -> String {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
             .and_then(|index| index_video_count(&index))
     };
-    let mut info = case_info_json(&case_dir, video_count);
+    let mut info = case_info_json(
+        &case_dir,
+        video_count,
+        &super::http::approved_path_roots(state),
+    );
     if let Some(map) = info.as_object_mut() {
         map.insert("ok".into(), serde_json::Value::Bool(true));
         map.insert(
@@ -799,12 +1201,16 @@ fn index_video_count(index: &serde_json::Value) -> Option<u64> {
 /// the checkpoint itself never records a total), `fingerprint_matches` =
 /// records whose file still has the recorded size+mtime (the oracle a
 /// rerun uses to reuse them instead of re-hashing).
-pub(crate) fn case_info_json(case_dir: &Path, video_count: Option<u64>) -> serde_json::Value {
+pub(crate) fn case_info_json(
+    case_dir: &Path,
+    video_count: Option<u64>,
+    approved_roots: &[PathBuf],
+) -> serde_json::Value {
     let has_index = case_dir.join("db/video_index.json").is_file();
     let has_review = case_dir.join("review/index.html").is_file();
     let checkpoint = crate::util::read_to_string(&scan_progress_path(case_dir))
         .ok()
-        .map(|text| checkpoint_summary_json(&text, video_count));
+        .map(|text| checkpoint_summary_json(&text, video_count, approved_roots));
     let phase = if has_review {
         "review-ready"
     } else if has_index {
@@ -821,13 +1227,18 @@ pub(crate) fn case_info_json(case_dir: &Path, video_count: Option<u64>) -> serde
     })
 }
 
-fn checkpoint_summary_json(text: &str, video_count: Option<u64>) -> serde_json::Value {
+pub(crate) fn checkpoint_summary_json(
+    text: &str,
+    video_count: Option<u64>,
+    approved_roots: &[PathBuf],
+) -> serde_json::Value {
     let mut kind = serde_json::Value::Null;
     let mut run_id = serde_json::Value::Null;
     let mut done = 0u64;
     let mut unreadable = 0u64;
     let mut matches = 0u64;
     let mut checked = 0usize;
+    let mut skipped = 0u64;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             unreadable += 1;
@@ -850,6 +1261,16 @@ fn checkpoint_summary_json(text: &str, video_count: Option<u64>) -> serde_json::
         let path = value.get("source_path").and_then(|v| v.as_str());
         let size = value.get("size_bytes").and_then(|v| v.as_u64());
         let mtime = value.get("modified_unix").and_then(|v| v.as_u64());
+        // S6: the checkpoint may come from another (external) case: a UNC
+        // or device source path is never stat'ed (an SMB session would
+        // hand out the examiner's NTLM credentials) unless it lies under
+        // an approved root — it is counted as skipped, not as a match.
+        if let Some(path) = path
+            && super::http::reject_remote_path(path, approved_roots).is_err()
+        {
+            skipped += 1;
+            continue;
+        }
         if let (Some(path), Some(size)) = (path, size)
             && let Ok(meta) = std::fs::metadata(path)
         {
@@ -870,6 +1291,7 @@ fn checkpoint_summary_json(text: &str, video_count: Option<u64>) -> serde_json::
         "total": video_count,
         "fingerprint_matches": matches,
         "fingerprint_checked": checked,
+        "fingerprint_skipped_remote": skipped,
         "unreadable_lines": unreadable,
     })
 }
@@ -908,29 +1330,47 @@ pub(crate) fn api_preflight(request: &Request) -> String {
             return api_err(reason);
         }
     }
-    let case_dir = case_text
-        .map(PathBuf::from)
-        .unwrap_or_else(default_case_dir);
-    preflight_json(
+    let (case_dir, case_dir_warning) = match case_text {
+        Some(text) => (PathBuf::from(text), None),
+        None => default_case_dir_checked(),
+    };
+    let mut body = preflight_json(
         Path::new(&source),
         &case_dir,
         PREFLIGHT_MAX_ENTRIES,
         Duration::from_millis(PREFLIGHT_MAX_MILLIS),
-    )
-    .to_string()
+    );
+    // P1: a temp-dir default case folder is announced before the start.
+    if let Some(warning) = case_dir_warning
+        && let Some(list) = body.get_mut("warnings").and_then(|w| w.as_array_mut())
+    {
+        list.push(serde_json::Value::String(warning));
+    }
+    body.to_string()
 }
 
 /// `path` resolved through its nearest existing ancestor, so a case folder
 /// that does not exist yet still compares against the canonical source.
-fn canonical_via_ancestor(path: &Path) -> PathBuf {
+/// R21-S5: the missing tail is joined as TEXT (one separator per name) —
+/// `PathBuf::push` replaced the canonical buffer for a typed name that
+/// parses as a prefix or root (`…\missing\D:` became `D:`).
+pub(crate) fn canonical_via_ancestor(path: &Path) -> PathBuf {
     let mut missing = Vec::new();
     let mut cursor = path.to_path_buf();
     loop {
         if let Ok(canonical) = cursor.canonicalize() {
-            return missing
-                .iter()
-                .rev()
-                .fold(canonical, |acc: PathBuf, part| acc.join(part));
+            let mut joined = canonical.into_os_string();
+            for part in missing.iter().rev() {
+                let ends_with_separator = joined
+                    .as_encoded_bytes()
+                    .last()
+                    .is_some_and(|&byte| std::path::is_separator(char::from(byte)));
+                if !ends_with_separator {
+                    joined.push(std::path::MAIN_SEPARATOR_STR);
+                }
+                joined.push(part);
+            }
+            return PathBuf::from(joined);
         }
         match (
             cursor.file_name().map(|n| n.to_os_string()),
@@ -1156,4 +1596,78 @@ fn sample_source_tree(
     }
     sample.pending_dirs = pending.len() as u64;
     sample
+}
+
+#[cfg(test)]
+mod tests_r8_audit_api {
+    use super::*;
+
+    fn audit_case(
+        tag: &str,
+        bodies: &[(&str, Option<&crate::audit_key::AuditKey>)],
+    ) -> SharedState {
+        let case = std::env::temp_dir().join(format!("ft-r8-api-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case);
+        let lane = case.join("evidence/logs/scan-log.jsonl");
+        std::fs::create_dir_all(lane.parent().unwrap()).unwrap();
+        for (body, key) in bodies {
+            crate::audit::append_chained_jsonl_keyed(&lane, body, *key).unwrap();
+        }
+        let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+        state_lock(&state).case_dir = Some(case);
+        state
+    }
+
+    /// R8 P0/P1/P2 for the workstation audit API: a lane stripped of its
+    /// HMACs read "integrity-structural-only" (a pass) on a PC holding the
+    /// key in R7; now it is "integrity-not-verified" there. A lane
+    /// continued on another PC names that PC's key and is not "failed".
+    #[test]
+    fn r8_audit_api_trust_comes_from_keys_held() {
+        let mine = crate::audit_key::AuditKey::new("pc-a", &[0xd1; 32]);
+        let other = crate::audit_key::AuditKey::new("pc-b", &[0xd2; 32]);
+        let stripped = audit_case("strip", &[(r#"{"n":1}"#, None)]);
+        let multi = audit_case(
+            "multi",
+            &[(r#"{"n":1}"#, Some(&mine)), (r#"{"n":2}"#, Some(&other))],
+        );
+        let parse = |state: &SharedState| -> serde_json::Value {
+            serde_json::from_str(&api_verify_audit(state)).unwrap()
+        };
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let body = parse(&stripped);
+            assert_eq!(body["integrity"], "integrity-not-verified", "{body}");
+            assert_eq!(body["logs"][0]["keys_held"], true, "{body}");
+            let body = parse(&multi);
+            assert_eq!(body["ok"], true, "not failed: {body}");
+            assert_eq!(body["integrity"], "integrity-not-verified", "{body}");
+            // R10-I6: pc-b's line follows a line this PC authenticated —
+            // "재작성 배제 불가", counted as unauthenticated, not other-PC.
+            assert_eq!(body["logs"][0]["unauthenticated_lines"], 1, "{body}");
+            assert!(
+                body["logs"][0]["trust"]
+                    .as_str()
+                    .unwrap()
+                    .contains("재작성 배제 불가"),
+                "{body}"
+            );
+        });
+        crate::audit_key::with_test_keys(&[], || {
+            let body = parse(&stripped);
+            assert_eq!(body["integrity"], "integrity-structural-only", "{body}");
+            assert!(
+                body["logs"][0]["trust"]
+                    .as_str()
+                    .unwrap()
+                    .contains("자기 일관성만 확인(인증 아님)"),
+                "{body}"
+            );
+        });
+        for state in [stripped, multi] {
+            let case = state_lock(&state).case_dir.clone();
+            if let Some(case) = case {
+                let _ = std::fs::remove_dir_all(case);
+            }
+        }
+    }
 }

@@ -17,13 +17,27 @@ on:
 jobs:
   harnesses:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # R6 U11 — why 60 minutes. Measured on ubuntu-latest (gh run view):
+    #   job total   11m19s (run 38254351126, 2026-10-12) → 12m14s → 13m21s
+    #               → 15m03s → 16m37s (run 38668482519, 2026-10-15)
+    #   that last run: setup + ffmpeg + Playwright 3m03s, build 0m42s,
+    #   "Run harnesses" 14m26s, of it check-a11y 207s, verify-virtual-grid
+    #   160s, verify-join --live 72s, verify-join / verify-layout 54s,
+    #   verify-jobs-e2e 49s, verify-embed 47s, verify-buttons / -marks-sync
+    #   45s, verify-live-index 43s, the other 18 together < 2 min.
+    # The total grew ~1 min per review round (each adds checks); 60 min is
+    # ~3.6× the latest total — room for a slow runner (the same harnesses
+    # take ~3× longer on a laptop: verify-virtual-grid 12 min on Windows)
+    # without letting a hung browser burn the 6 h default. A total above
+    # ~30 min means a harness hangs or the budget needs a new measurement:
+    # ci-harnesses.sh prints the per-harness durations at the end.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; toolchain pinned via input
         with:
           toolchain: 1.94.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Install ffmpeg
@@ -37,4 +51,7 @@ jobs:
       - name: Run harnesses
         env:
           FRAMETRACE_BIN: ${{ github.workspace }}/target/debug/frametrace-app
+          # T7: harnesses that can degrade to an HTTP-only run when Playwright
+          # does not resolve must fail here instead of skipping.
+          FRAMETRACE_REQUIRE_BROWSER: "1"
         run: bash scripts/ci-harnesses.sh

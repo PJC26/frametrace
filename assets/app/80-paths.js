@@ -25,7 +25,7 @@ $("caseDir").addEventListener("input", scheduleValidate);
 // Enter in a path field starts analysis, matching the single-action form.
 for (const id of ["sourcePath", "caseDir"]) {
   $(id).addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.isComposing && !$("btnStart").disabled) $("btnStart").click();
+    if (e.key === "Enter" && !hImeComposing(e) && !$("btnStart").disabled) $("btnStart").click();
   });
 }
 
@@ -227,7 +227,7 @@ $("pickerList").addEventListener("keydown", e => {
   else if (e.key === "ArrowUp") next = opts[Math.max(0, idx - 1)];
   else if (e.key === "Home") next = opts[0];
   else if (e.key === "End") next = opts[opts.length - 1];
-  else if ((e.key === "Enter" || e.key === " ") && idx >= 0 && !e.isComposing) {
+  else if ((e.key === "Enter" || e.key === " ") && idx >= 0 && !hImeComposing(e)) {
     e.preventDefault();
     if (opts[idx]._act) opts[idx]._act();
     return;
@@ -335,7 +335,7 @@ $("pickerBackdrop").addEventListener("keydown", e => {
 });
 $("pickerSelect").addEventListener("click", () => { if (pickerCurrent) choose(pickerCurrent); });
 $("pickerUp").addEventListener("click", () => browseTo(pickerParent, false));
-$("pickerPath").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) browseTo($("pickerPath").value.trim(), true); });
+$("pickerPath").addEventListener("keydown", e => { if (e.key === "Enter" && !hImeComposing(e)) browseTo($("pickerPath").value.trim(), true); });
 
 $("btnSuggestCase").addEventListener("click", () => {
   const src = $("sourcePath").value.trim().replace(/[\\/]+$/, "");

@@ -232,11 +232,11 @@ fn shutdown_refuses_while_busy_then_accepts() {
     let refused = parse(&api_shutdown(&state));
     assert_eq!(refused["ok"].as_bool(), Some(false));
     assert_eq!(refused["running"].as_bool(), Some(true));
-    assert!(!state_lock(&state).shutdown_requested);
+    assert!(!state_lock(&state).shutdown_requested());
     state_lock(&state).busy = false;
     let granted = parse(&api_shutdown(&state));
     assert_eq!(granted["ok"].as_bool(), Some(true));
-    assert!(state_lock(&state).shutdown_requested);
+    assert!(state_lock(&state).shutdown_requested());
 }
 
 #[test]
@@ -729,9 +729,10 @@ fn server_answers_status_env_and_guards() {
     assert!(cookie.contains("\"ok\":false"), "{cookie}");
     // GETs plant the ft_nonce cookie so the served page's same-origin
     // fetches carry the proof automatically.
+    // C2: named after this server's port.
     assert!(
-        status.contains("Set-Cookie: ft_nonce="),
-        "GET responses must plant the nonce cookie: {status}"
+        status.contains(&format!("Set-Cookie: ft_nonce_{}=", addr.port())),
+        "GET responses must plant the per-port nonce cookie: {status}"
     );
 }
 
@@ -809,12 +810,28 @@ fn token_gate_over_socket_plants_cookie() {
     // Query token authenticates and plants the ft_token cookie.
     let query = response("GET /api/status?token=testtoken-1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
     assert!(query.contains("200"), "{query}");
+    // C2: the cookie is named after the server's port.
     assert!(
-        query.contains("Set-Cookie: ft_token=testtoken-1; HttpOnly; SameSite=Strict"),
+        query.contains(&format!(
+            "Set-Cookie: ft_token_{}=testtoken-1; HttpOnly; SameSite=Strict",
+            addr.port()
+        )),
         "{query}"
     );
-    // The planted cookie then authorizes header-less follow-ups,
-    // including media requests (video elements cannot set headers).
+    let scoped = response(&format!(
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ft_token_{}=testtoken-1\r\n\r\n",
+        addr.port()
+    ));
+    assert!(scoped.contains("200"), "{scoped}");
+    // Another port's cookie is not this server's proof.
+    let foreign = response(&format!(
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ft_token_{}=testtoken-1\r\n\r\n",
+        addr.port().wrapping_add(1)
+    ));
+    assert!(foreign.contains("401"), "{foreign}");
+    // The legacy (pre-C2) cookie name still authorizes for one release
+    // when its value validates — header-less follow-ups included (video
+    // elements cannot set headers).
     let cookie =
         response("GET /media HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ft_token=testtoken-1\r\n\r\n");
     assert!(cookie.contains("400"), "{cookie}");
@@ -1156,6 +1173,9 @@ fn untrusted_case_documents_are_sandboxed_and_downloaded() {
         "reports/package_1/review/index.html",
     ] {
         assert!(is_generated_page(&case_dir, &canon(trusted)), "{trusted}");
+        // R4-B5: location alone no longer trusts a page — FrameTrace's
+        // generators record what they wrote.
+        crate::util::generated_pages::record_generated_pages(&case_dir, &[trusted]).unwrap();
     }
     for untrusted in [
         "reports/package_1/artifacts/carved/x.html",
@@ -1384,5 +1404,44 @@ fn records_share_cached_index_and_meta_omits_videos() {
     let third = cached_index(&state, &case_dir).unwrap();
     assert!(!Arc::ptr_eq(&first, &third));
     assert_eq!(third["schema"], "y");
+    let _ = std::fs::remove_dir_all(&case_dir);
+}
+
+/// R16 I2 (track U contract): records-meta carries the anomaly lane's
+/// head check as `logChains.anomaly.head` — `{status, reason_code,
+/// withhold_reason, detail}`, the same object as the report's
+/// `auditChains.anomaly.head`.
+#[test]
+fn records_meta_carries_the_anomaly_head() {
+    let case_dir = scratch_dir("records-meta-anomaly-head");
+    std::fs::create_dir_all(case_dir.join("db")).unwrap();
+    std::fs::write(case_dir.join("db/videos.jsonl"), b"").unwrap();
+    let state: SharedState = Arc::new(Mutex::new(JobState::new()));
+    state_lock(&state).case_dir = Some(case_dir.clone());
+    crate::audit_key::with_test_keys(&[], || {
+        let meta =
+            || -> serde_json::Value { serde_json::from_str(&api_records_meta(&state)).unwrap() };
+        let head = meta()["logChains"]["anomaly"]["head"].clone();
+        assert_eq!(head["status"], "absent", "{head}");
+        crate::anomaly::scan_case(&case_dir, false).unwrap();
+        let head = meta()["logChains"]["anomaly"]["head"].clone();
+        assert_eq!(head["status"], "intact", "{head}");
+        assert!(head["reason_code"].is_null() && head["withhold_reason"].is_null());
+        // The scan's anomaly rows cut (no key): the lane is shorter than
+        // its head.
+        let lane = case_dir.join(crate::report::ANOMALY_LOG_REL_PATH);
+        let text = std::fs::read_to_string(&lane).unwrap();
+        let first_line = text.find('\n').unwrap() + 1;
+        std::fs::write(&lane, &text[..first_line]).unwrap();
+        let head = meta()["logChains"]["anomaly"]["head"].clone();
+        assert_eq!(head["status"], "truncated", "{head}");
+        assert!(
+            head["withhold_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains(crate::report::HASH_VERIFY_HEAD_TRUNCATED)),
+            "{head}"
+        );
+        assert!(head["detail"].is_string(), "{head}");
+    });
     let _ = std::fs::remove_dir_all(&case_dir);
 }

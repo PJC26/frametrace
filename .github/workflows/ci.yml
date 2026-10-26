@@ -8,13 +8,14 @@ on:
 jobs:
   ubuntu:
     runs-on: ubuntu-latest
+    timeout-minutes: 90 # R5 U13: bounded, never the 6 h default
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; toolchain pinned via input
         with:
           toolchain: 1.94.0
           components: clippy, rustfmt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Format
@@ -34,18 +35,25 @@ jobs:
         env:
           FRAMETRACE_IT: "1"
         run: cargo test --locked --test workstation_e2e -- --ignored
+      # R4 F1: real-ffmpeg join-video / measure-audio (ffmpeg installed above;
+      # with FRAMETRACE_IT=1 a missing tool fails instead of skipping).
+      - name: Join and audio integration tests (real ffmpeg)
+        env:
+          FRAMETRACE_IT: "1"
+        run: cargo test --locked --test join_audio_it -- --ignored
 
   screenshots:
     # Drives the real workstation UI with Playwright against a synthetic
     # dashcam case and uploads the PNGs so UI changes can be eyeballed.
     runs-on: ubuntu-latest
+    timeout-minutes: 45 # R5 U13: bounded, never the 6 h default
     needs: ubuntu
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; toolchain pinned via input
         with:
           toolchain: 1.94.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Install ffmpeg
@@ -56,7 +64,7 @@ jobs:
           npx playwright install --with-deps chromium
       - name: Capture screens
         run: node scripts/capture-screens.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ui-screens
           path: docs/screens/current/

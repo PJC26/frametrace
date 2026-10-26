@@ -9,7 +9,8 @@ fn finds_mp4_ftyp_start_offset() {
         CarveHit {
             offset: 100,
             signature: "mp4-ftyp".to_string(),
-            extension: "mp4".to_string()
+            extension: "mp4".to_string(),
+            nested_in: None,
         }
     );
 }
@@ -333,6 +334,7 @@ fn stale_completed_artifact_is_rejected_without_overwrite() {
             offset: a.offset,
             signature: a.signature.clone(),
             extension: a.extension.clone(),
+            nested_in: None,
         })
         .collect::<Vec<_>>();
     checkpoint
@@ -435,11 +437,13 @@ fn resume_replays_scan_and_completed_artifacts() {
                 offset: 0,
                 signature: "mp4-ftyp".to_string(),
                 extension: "mp4".to_string(),
+                nested_in: None,
             },
             super::CarveHit {
                 offset: 128,
                 signature: "mp4-ftyp".to_string(),
                 extension: "mp4".to_string(),
+                nested_in: None,
             },
         ];
         checkpoint
@@ -552,6 +556,8 @@ fn fake_artifact(
         validation_status: "candidate-unvalidated".into(),
         validation_note: String::new(),
         duplicate_of: None,
+        run_id: None,
+        carved_unix: None,
     }
 }
 
@@ -612,6 +618,16 @@ fn reassemble_ts_cc_joins_interlocked_fragments() {
         "{}",
         join.validation_note
     );
+    // E7: a 4-bit counter agrees by chance 1 in 16 per boundary PID — the
+    // note grades the join weak and never calls it join evidence.
+    assert!(
+        join.validation_note.contains("evidence grade: weak")
+            && join.validation_note.contains("1 in 16")
+            && !join.validation_note.contains("Structural join evidence"),
+        "{}",
+        join.validation_note
+    );
+    assert!(warnings.iter().any(|w| w.contains("weak join hypothesis")));
     assert_eq!(
         fs::metadata(&join.output_path).unwrap().len(),
         a_len + b_len
@@ -1093,6 +1109,7 @@ fn resume_twice_does_not_duplicate_artifact_log_lines() {
                 offset,
                 signature: "mp4-ftyp".to_string(),
                 extension: "mp4".to_string(),
+                nested_in: None,
             })
             .collect();
         checkpoint
@@ -1120,7 +1137,17 @@ fn resume_twice_does_not_duplicate_artifact_log_lines() {
     let second = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
     assert_eq!(second.resumed_artifacts, 2);
     let (ids, resumes) = carve_log_ids(&case_dir);
-    assert_eq!(ids, ["carve_000001", "carve_000002"]);
+    let expected: Vec<String> = second.artifacts.iter().map(|a| a.id.clone()).collect();
+    assert_eq!(ids, expected);
+    assert_eq!(
+        ids[0], first.artifacts[0].id,
+        "replayed artifact keeps its id"
+    );
+    assert!(
+        ids[1].starts_with("carve_") && ids[1].ends_with("_000002"),
+        "{ids:?}"
+    );
+    assert_ne!(ids[0], ids[1]);
     assert_eq!(resumes, 1);
 
     // (B) Crash between the log append and checkpoint removal.
@@ -1129,12 +1156,180 @@ fn resume_twice_does_not_duplicate_artifact_log_lines() {
     assert_eq!(third.resumed_artifacts, 2);
     assert_eq!(third.artifacts.len(), 2);
     let (ids, resumes) = carve_log_ids(&case_dir);
-    assert_eq!(
-        ids,
-        ["carve_000001", "carve_000002"],
-        "replayed artifacts were logged twice"
-    );
+    assert_eq!(ids, expected, "replayed artifacts were logged twice");
     assert_eq!(resumes, 2);
     crate::audit::verify_chained_jsonl(&log_path).unwrap();
     let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}
+
+/// E3: inside a RIFF-declared span, container signatures with a real file
+/// header are still candidates (tagged `nested_in`), while fragment-prone
+/// signatures stay suppressed. The old scan dropped every signature in the
+/// span, so a false/oversized RIFF size blinded it to unrelated files.
+#[test]
+fn container_signatures_inside_riff_span_are_nested_candidates() {
+    let mut buf = vec![0u8; 8192];
+    buf[0..4].copy_from_slice(b"RIFF");
+    buf[4..8].copy_from_slice(&(4096u32).to_le_bytes());
+    buf[8..12].copy_from_slice(b"AVI ");
+    buf[1000..1008].copy_from_slice(b"\0\0\0\x18ftyp");
+    buf[2000..2004].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+    // JPEG SOI inside the span: still payload, still suppressed.
+    buf[3000..3003].copy_from_slice(&[0xff, 0xd8, 0xff]);
+    let mut hits = Vec::new();
+    scan_buffer(&buf, 0, 0, &mut hits);
+    let mp4 = hits.iter().find(|h| h.signature == "mp4-ftyp").unwrap();
+    assert_eq!(mp4.offset, 1000);
+    assert_eq!(mp4.nested_in, Some(0));
+    let mkv = hits.iter().find(|h| h.signature == "ebml-mkv").unwrap();
+    assert_eq!(mkv.nested_in, Some(0));
+    assert!(hits.iter().all(|h| h.signature != "jpeg"), "{hits:?}");
+    let riff = hits.iter().find(|h| h.signature == "riff-avi").unwrap();
+    assert_eq!(riff.nested_in, None);
+}
+
+fn riff_span_fixture(name: &str) -> (PathBuf, PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "frametrace-carve-riffspan-{name}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let case_dir = root.join("case");
+    fs::create_dir_all(&case_dir).unwrap();
+    let source = root.join("image.raw");
+    // RIFF AVI at 0 declaring 4096 payload bytes (span [0, 4104)), an MP4
+    // ftyp nested at 1000, then 4 KiB of trailing bytes.
+    let mut content = vec![0u8; 8192];
+    content[0..4].copy_from_slice(b"RIFF");
+    content[4..8].copy_from_slice(&(4096u32).to_le_bytes());
+    content[8..12].copy_from_slice(b"AVI ");
+    content[1000..1008].copy_from_slice(b"\0\0\0\x18ftyp");
+    fs::write(&source, &content).unwrap();
+    (case_dir, source)
+}
+
+/// E3 at carve level: the nested MP4 is carved (with a nesting note)
+/// without cutting the AVI short, suppressed spans are reported, and a
+/// span the carved artifacts do not cover (the AVI truncated by
+/// --max-bytes) makes `scan_complete` false — the old carve claimed
+/// completeness over bytes it never offered as fragment candidates.
+#[test]
+fn suppressed_riff_span_is_reported_and_uncovered_bytes_block_completeness() {
+    let (case_dir, source) = riff_span_fixture("full");
+    let result = carve_file(
+        &case_dir,
+        &source,
+        &super::CarveOptions::default(),
+        ResumeMode::Auto,
+        None,
+    )
+    .unwrap();
+    let avi = result
+        .artifacts
+        .iter()
+        .find(|a| a.signature == "riff-avi")
+        .unwrap();
+    assert_eq!(avi.size_bytes, 4104, "nested hit must not truncate the AVI");
+    let mp4 = result
+        .artifacts
+        .iter()
+        .find(|a| a.signature == "mp4-ftyp")
+        .unwrap();
+    assert_eq!(mp4.offset, 1000);
+    assert!(mp4.validation_note.contains("inside the RIFF AVI span"));
+    assert_eq!(result.suppressed_spans, vec![(0, 4104)]);
+    assert!(result.unexamined_spans.is_empty());
+    assert!(result.scan_complete);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("fragment-signature suppression"))
+    );
+    let json: serde_json::Value = serde_json::from_str(&result.to_json()).unwrap();
+    assert_eq!(json["suppressed_spans"], serde_json::json!([[0, 4104]]));
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+
+    let (case_dir, source) = riff_span_fixture("truncated");
+    let options = super::CarveOptions {
+        max_bytes: 1024,
+        ..Default::default()
+    };
+    let result = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
+    // The AVI is cut to [0,1024); whatever the nested MP4 covers, the
+    // tail of the declared span up to 4104 was never examined.
+    let last = *result.unexamined_spans.last().expect("unexamined span");
+    assert_eq!(last.1, 4104, "{:?}", result.unexamined_spans);
+    assert!(last.0 >= 1024, "{:?}", result.unexamined_spans);
+    assert!(!result.scan_complete);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("unexamined bytes"))
+    );
+    let json: serde_json::Value = serde_json::from_str(&result.to_json()).unwrap();
+    assert_eq!(json["scan_complete"], false);
+    assert_eq!(
+        json["unexamined_spans"].as_array().unwrap().len(),
+        result.unexamined_spans.len()
+    );
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}
+
+/// E4: ids are run-unique (`carve_<run>_<n>`). The old `carve_000001`
+/// repeated on every run, so validation/deepfake/report lookups by id hit
+/// whichever run's artifact came first.
+#[test]
+fn two_carve_runs_never_share_an_artifact_id() {
+    let (case_dir, source, _) = resume_fixture("runids");
+    let options = super::CarveOptions::default();
+    let first = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
+    let second = carve_file(&case_dir, &source, &options, ResumeMode::Auto, None).unwrap();
+    assert_ne!(first.run_id, second.run_id);
+    let ids_first: Vec<&str> = first.artifacts.iter().map(|a| a.id.as_str()).collect();
+    for artifact in &second.artifacts {
+        assert!(
+            !ids_first.contains(&artifact.id.as_str()),
+            "{} reused",
+            artifact.id
+        );
+    }
+    for artifact in first.artifacts.iter().chain(&second.artifacts) {
+        let rest = artifact.id.strip_prefix("carve_").unwrap();
+        let (run, number) = rest.rsplit_once('_').unwrap();
+        assert_eq!(number.len(), 6);
+        assert!(run.contains('-'), "{}", artifact.id);
+        assert_eq!(artifact.run_id.as_deref(), Some(run));
+        assert!(artifact.carved_unix.is_some());
+    }
+    // The log holds both runs, each line carrying its run and time.
+    let (ids, _) = carve_log_ids(&case_dir);
+    assert_eq!(ids.len(), 4);
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), 4);
+    let _ = fs::remove_dir_all(case_dir.parent().unwrap());
+}
+
+#[test]
+fn carve_run_tag_is_stable_per_run_and_distinct_across_runs() {
+    let a = super::carve_run_tag("carve-file-1760400000-000000001");
+    let b = super::carve_run_tag("carve-file-1760400000-000000002");
+    assert_eq!(a, super::carve_run_tag("carve-file-1760400000-000000001"));
+    assert_ne!(a, b);
+    assert!(a.starts_with("1760400000-") && a.len() == "1760400000-".len() + 4);
+}
+
+#[test]
+fn uncovered_parts_subtracts_artifact_extents() {
+    let source = Path::new("unused");
+    let artifacts = vec![
+        fake_artifact("a", 0, 100, "riff-avi", "avi", source),
+        fake_artifact("b", 150, 50, "mp4-ftyp", "mp4", source),
+    ];
+    assert_eq!(
+        super::uncovered_parts(&[(0, 300)], &artifacts),
+        vec![(100, 150), (200, 300)]
+    );
+    assert!(super::uncovered_parts(&[(10, 90)], &artifacts).is_empty());
 }

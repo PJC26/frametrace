@@ -19,10 +19,11 @@
 //   glyph      ENFORCED  no Unicode icon glyph in a button label (icons come
 //                        from the sprite); the pre-rebuild viewer (no
 //                        data-ft-viewer="2" root) is reported as a warning
-//   target     warning   interactive targets >= 24x24 CSS px or spaced (WCAG 2.5.8)
-//   focus      warning   a focus-visible ring is present when Tabbing
-//   axe        warning   serious/critical axe-core violations (only when
-//                        axe-core resolves: `npm i --no-save axe-core`)
+//   target     ENFORCED  interactive targets >= 24x24 CSS px or spaced (WCAG 2.5.8)
+//   focus      ENFORCED  a focus-visible ring is present when Tabbing
+//   axe        ENFORCED  serious/critical axe-core violations; without axe-core
+//                        the run says "axe off" — and FAILS when
+//                        FRAMETRACE_REQUIRE_BROWSER=1 (`npm i --no-save axe-core`)
 //
 // Writes a JSON report and a human summary. Exit status is nonzero only for
 // violations of ENFORCED rules.
@@ -48,7 +49,13 @@ try { ({ chromium } = require('playwright')); } catch {
   process.exit(2);
 }
 let axeSource = '';
-try { axeSource = readFileSync(require.resolve('axe-core/axe.min.js'), 'utf8'); } catch { /* axe optional */ }
+try { axeSource = readFileSync(require.resolve('axe-core/axe.min.js'), 'utf8'); } catch { /* checked below */ }
+// F13: a required browser run (CI, FRAMETRACE_REQUIRE_BROWSER=1) must not
+// pass without axe-core — an unloaded axe is not "no violations".
+if (!axeSource && process.env.FRAMETRACE_REQUIRE_BROWSER === '1') {
+  console.error('axe-core not resolvable but FRAMETRACE_REQUIRE_BROWSER=1 — install it beside playwright (npm i --no-save axe-core@4.10.2)');
+  process.exit(1);
+}
 
 // All rules reached zero after the UX overhaul; enforce them so regressions fail.
 const ENFORCED = { contrast: true, name: true, 'name-baseline': true, 'name-custom': true, 'min-font': true, glyph: true, 'glyph-legacy': false, target: true, focus: true, axe: true };

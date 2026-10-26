@@ -25,11 +25,11 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, openSync, writeSync, closeSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createHash, randomFillSync } from 'node:crypto';
-import { startIsolatedServer } from './lib/isolated-server.mjs';
+import { startIsolatedServer, isolatedEnv } from './lib/isolated-server.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -90,6 +90,13 @@ function writeRaw(path, mib) {
     writeSync(fd, i % 3 === 0 ? noise : zero);
   }
   closeSync(fd);
+  // R4 C1: a raw image is carved only with its completion marker (size +
+  // modification time in ns — written as the exact BigInt digits, > 2^53).
+  const st = statSync(path, { bigint: true });
+  writeFileSync(path + '.done.json', JSON.stringify({
+    schema_version: 1, kind: 'frametrace-e01-raw-complete', raw_path: path, size_bytes: Number(st.size),
+    modified_nanos: '@NANOS@', sha256: '0'.repeat(64), e01_path: join(dirname(path), 'synthetic.E01'), imported_unix: 1,
+  }).replace('"@NANOS@"', st.mtimeNs.toString()));
 }
 
 const server = await startIsolatedServer({ root, work });
@@ -238,6 +245,45 @@ try {
   check('mark still shown after the viewer reload; save state clean', shown && shown.marked >= 1 && shown.save === 'saved', JSON.stringify(shown));
   if (shots) await page.screenshot({ path: join(shots, 'jobs-carve-done.png') });
 
+  // ---- 3b. R11 U5 (track I5): carve page metrics are not taken from the
+  // unaudited db/carve_results.json. Forge it (a fake source size, warnings
+  // dropped, scan "complete"), re-render the review pages, and the page must
+  // either show the audited values or mark the metrics "감사 안 됨" without
+  // an ok (green) colour — never the forged size as fact.
+  {
+    const caseRoot = st3.case_dir || caseDir;
+    const resultsPath = join(caseRoot, 'db/carve_results.json');
+    const pagePath = join(caseRoot, 'review/carve-report.html');
+    if (!existsSync(resultsPath) || !existsSync(pagePath)) {
+      check('R11 U5: carve results + carve page exist after the carve job', false, `${existsSync(resultsPath)} ${existsSync(pagePath)}`);
+    } else {
+      const forged = JSON.parse(readFileSync(resultsPath, 'utf8'));
+      const FORGED_SIZE = 7777777777777;
+      Object.assign(forged, { source_size_bytes: FORGED_SIZE, scan_complete: true, candidate_limit_reached: false, warnings: [] });
+      writeFileSync(resultsPath, JSON.stringify(forged));
+      const mr = spawnSync(server.exe, ['make-review', caseRoot], { env: isolatedEnv(work), encoding: 'utf8' });
+      check('R11 U5: make-review re-renders the carve page', mr.status === 0, (mr.stderr || '').slice(-400));
+      const cp = await browser.newPage();
+      await cp.goto(pathToFileURL(pagePath).href);
+      const m = await cp.evaluate(() => [...document.querySelectorAll('#metrics .metric')].map((el) => ({ text: el.textContent, cls: el.className, marked: !!el.querySelector('.unaudited') })));
+      await cp.close();
+      const all = m.map((x) => x.text).join(' | ');
+      const unaudited = /감사 안 됨/.test(all);
+      const sizeText = m.find((x) => /원본 크기/.test(x.text))?.text || '';
+      // The page's fmtSize renders the forged 7777777777777 B as "7777.78 GB".
+      const forgedShown = /7777\.78\s*GB/.test(sizeText);
+      const okColour = m.some((x) => /\bok\b/.test(x.cls));
+      // dfa2f8a: the four db/carve_results.json metrics each carry <span class="unaudited">· 감사 안 됨</span>.
+      const fromResults = m.filter((x) => /스캔 완료|상한 도달|원본 크기|경고/.test(x.text));
+      const verdict = unaudited ? !okColour && fromResults.length === 4 && fromResults.every((x) => x.marked) : !forgedShown;
+      if (!verdict && !unaudited && !process.env.FRAMETRACE_R11_STRICT) {
+        console.log(`PEND  R11 U5: carve page still reads db/carve_results.json (track I5 not in this binary) — ${all}`);
+      } else {
+        check('R11 U5: forged carve_results.json → metrics marked "감사 안 됨" (no green) or audited values', verdict, all);
+      }
+    }
+  }
+
   // ---- 4. clip export from the viewer ---------------------------------------
   const v = page; // hosted viewer: same document
   const clipId = await v.evaluate(() => {
@@ -258,6 +304,17 @@ try {
       document.getElementById(btn).click();
     }, [t, btn]);
   }
+  // Toasts vanish after ~3 s; keep every one shown from here on so a
+  // missing summary can be explained (e.g. "server unreachable", failure).
+  await v.evaluate(() => {
+    window.__e2eToasts = [];
+    const host = document.getElementById('toastHost');
+    if (host) {
+      new MutationObserver((muts) => {
+        for (const m of muts) for (const n of m.addedNodes) window.__e2eToasts.push(`${new Date().toISOString().slice(11, 23)} ${n.textContent}`);
+      }).observe(host, { childList: true });
+    }
+  });
   await v.evaluate(() => document.getElementById('btnExportClip').click());
   await v.waitForSelector('.modal.dlg input', { timeout: 5000 });
   await v.evaluate(() => document.querySelector('.modal.dlg button.primary').click());
@@ -266,6 +323,27 @@ try {
     return el ? el.innerText() : null;
   }, 120000, 300);
   console.log('exhibit summary:\n' + summary);
+  if (!summary) {
+    // Explain a missing summary instead of only failing on it: what the
+    // page shows, what the viewer thinks, and what the server reports.
+    const ui = await v.evaluate(() => {
+      const visible = (el) => !!el && !el.hidden && el.offsetParent !== null;
+      return {
+        dialogs: [...document.querySelectorAll('.modal, [role="dialog"], #dlgBackdrop')].filter(visible).map((el) => (el.id ? '#' + el.id + ': ' : '') + el.innerText.slice(0, 300)),
+        toasts: window.__e2eToasts || [],
+        toastsNow: [...document.querySelectorAll('#toastHost .toast')].map((el) => el.textContent),
+        saveState: window.FTViewer ? window.FTViewer.saveState() : 'no FTViewer',
+        exportBtn: (() => { const b = document.getElementById('btnExportClip'); return b ? { disabled: b.disabled, busy: b.getAttribute('aria-busy'), cls: b.className } : null; })(),
+      };
+    }).catch((e) => ({ evaluateError: String(e) }));
+    console.log('no-summary diagnostics (page):', JSON.stringify(ui, null, 1));
+    const st = await getJson('/api/status').catch((e) => ({ fetchError: String(e && e.cause ? e.cause.code || e.cause.message : e) }));
+    console.log('no-summary diagnostics (/api/status):', JSON.stringify({
+      busy: st.busy, phase: st.phase, job: st.job, job_kind: st.job_kind, clip_jobs: st.clip_jobs, clips_running: st.clips_running,
+      pending_marks: st.pending_marks, mark_conflicts: st.mark_conflicts, fetchError: st.fetchError,
+    }));
+    console.log('server log tail:\n' + server.log().split('\n').slice(-20).join('\n'));
+  }
   const shaMatch = summary && summary.match(/SHA-256:\s*([0-9a-f]{64})/);
   const pathMatch = summary && summary.match(/(?:클립 파일|Clip file):\s*(.+)/);
   check('exhibit summary shows a SHA-256', shaMatch);
@@ -287,6 +365,28 @@ try {
   if (cap.ok) {
     const saved = join(caseDir, cap.path);
     check('captured frame stored with the decoded size and its hash', existsSync(saved) && statSync(saved).size === 3 + 3 * groups && sha256File(saved) === cap.sha256);
+  }
+
+  // ---- 6. finalize packages the viewer together with its data bundle ----------
+  // Finalize refuses (correctly) while any job holds `busy` — including a
+  // viewer mark save, which takes busy and refreshes the report. Wait for
+  // an idle server and a settled viewer instead of racing them; a refusal
+  // that still hits a just-started save is retried until the deadline.
+  const finStart = Date.now();
+  const fin = await until(async () => {
+    const idle = await getJson('/api/status');
+    const saved = await page.evaluate(() => { const s = window.FTViewer.saveState(); return !s || s === 'saved'; });
+    if (idle.busy || idle.clips_running || !saved) return null;
+    const res = await postJson('/api/finalize', { examiner: 'e2e' });
+    return res && res.ok === false && /진행 중/.test(res.error || '') ? null : res;
+  }, 60000, 250) || await postJson('/api/finalize', { examiner: 'e2e' });
+  const marksDuring = importMarks.filter((r) => r.at >= finStart).length;
+  if (marksDuring) console.log(`finalize waited for ${marksDuring} viewer mark save(s)`);
+  check('finalize succeeds', fin && fin.ok === true, JSON.stringify(fin).slice(0, 300));
+  if (fin && fin.ok) {
+    const pkgDir = fin.package_dir || join(caseDir, fin.package_url || '');
+    check('package folder contains review/data-bundle.js next to the viewer',
+      existsSync(join(pkgDir, 'review', 'evidence-viewer.html')) && existsSync(join(pkgDir, 'review', 'data-bundle.js')), pkgDir);
   }
 
   check('no page errors in shell or viewer', pageErrors.length === 0, pageErrors.join(' | '));

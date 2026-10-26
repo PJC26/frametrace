@@ -82,6 +82,43 @@ pub struct TagEntry {
     pub tags: Vec<String>,
 }
 
+/// Which save protocol a marks body declared (`protocol` key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarksProtocol {
+    /// No `protocol` key: a plain marks export (full upsert, no deletes).
+    Legacy,
+    /// `patch-v1`: full marks + tags + `deleted_ids`, last write wins.
+    PatchV1,
+    /// `patch-v2`: dirty ids only, per-record `base_revisions`.
+    PatchV2,
+}
+
+impl MarksProtocol {
+    /// Wire name (`null` for a body without `protocol`).
+    pub fn wire_name(self) -> Option<&'static str> {
+        match self {
+            MarksProtocol::Legacy => None,
+            MarksProtocol::PatchV1 => Some("patch-v1"),
+            MarksProtocol::PatchV2 => Some("patch-v2"),
+        }
+    }
+}
+
+/// `batch` of a patch-v2 body: chunk `index` of `total` (0-based) sharing
+/// one `id`, so the server can run make-report once per batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarksBatch {
+    pub id: String,
+    pub index: u64,
+    pub total: u64,
+}
+
+impl MarksBatch {
+    pub fn is_last(&self) -> bool {
+        self.index + 1 == self.total
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarksFile {
     pub case_id: Option<String>,
@@ -89,6 +126,13 @@ pub struct MarksFile {
     pub marks: Vec<MarkEntry>,
     pub tags: Vec<TagEntry>,
     pub deleted_ids: Vec<String>,
+    pub protocol: MarksProtocol,
+    /// `Some` only for patch-v2 (an omitted map is `Some(empty)`: every id
+    /// then has base 0 and conflicts with any server revision > 0).
+    pub base_revisions: Option<std::collections::BTreeMap<String, u64>>,
+    /// patch-v2 writer token (which window wrote; audited in history).
+    pub client_id: Option<String>,
+    pub batch: Option<MarksBatch>,
 }
 
 /// Minimal JSON field/array accessors reused by other modules (e.g. reading
@@ -367,28 +411,60 @@ pub(crate) fn parse_marks_text(text: &str, path: &Path) -> Result<MarksFile, Str
                 .map(str::to_string),
         });
     }
-    let tags: Vec<TagEntry> = value
+    let protocol = match value.get("protocol") {
+        None => MarksProtocol::Legacy,
+        Some(raw) => match raw.as_str() {
+            Some("patch-v1") => MarksProtocol::PatchV1,
+            Some("patch-v2") => MarksProtocol::PatchV2,
+            _ => return Err("unsupported marks protocol".into()),
+        },
+    };
+    let mut tags: Vec<TagEntry> = value
         .get("tags")
         .map(|raw| serde_json::from_value(raw.clone()))
         .transpose()
         .map_err(|err| format!("invalid tags: {err}"))?
         .unwrap_or_default();
+    // v2 only: a mark entry may carry its own `tags`; they are folded into
+    // the tag list so every id has at most one tag entry. Legacy bodies
+    // never read a mark's `tags` key (as before).
+    if protocol == MarksProtocol::PatchV2 {
+        for (index, item) in marks_value.iter().enumerate() {
+            let Some(raw) = item.get("tags") else {
+                continue;
+            };
+            let id = marks[index].id.clone();
+            let inline: Vec<String> = serde_json::from_value(raw.clone()).map_err(|err| {
+                format!(
+                    "marks entry {} in {} has invalid tags: {err}",
+                    index + 1,
+                    path.display()
+                )
+            })?;
+            if tags.iter().any(|entry| entry.id == id) {
+                return Err(format!(
+                    "marks entry {} in {} has tags both inline and in the tags list",
+                    index + 1,
+                    path.display()
+                ));
+            }
+            tags.push(TagEntry { id, tags: inline });
+        }
+    }
     let deleted_ids: Vec<String> = value
         .get("deleted_ids")
         .map(|raw| serde_json::from_value(raw.clone()))
         .transpose()
         .map_err(|err| format!("invalid deleted_ids: {err}"))?
         .unwrap_or_default();
-    if let Some(protocol) = value.get("protocol")
-        && protocol.as_str() != Some("patch-v1")
-    {
-        return Err("unsupported marks protocol".into());
-    }
-    if !deleted_ids.is_empty()
-        && value.get("protocol").and_then(serde_json::Value::as_str) != Some("patch-v1")
-    {
+    if !deleted_ids.is_empty() && protocol == MarksProtocol::Legacy {
         return Err("deleted_ids requires patch-v1 protocol".into());
     }
+    let (base_revisions, client_id, batch) = if protocol == MarksProtocol::PatchV2 {
+        parse_patch_v2_fields(&value, path)?
+    } else {
+        (None, None, None)
+    };
     let mut ids = std::collections::HashSet::new();
     for id in marks.iter().map(|mark| &mark.id).chain(deleted_ids.iter()) {
         if id.trim().is_empty() || !ids.insert(id) {
@@ -413,7 +489,84 @@ pub(crate) fn parse_marks_text(text: &str, path: &Path) -> Result<MarksFile, Str
         marks,
         tags,
         deleted_ids,
+        protocol,
+        base_revisions,
+        client_id,
+        batch,
     })
+}
+
+type PatchV2Fields = (
+    Option<std::collections::BTreeMap<String, u64>>,
+    Option<String>,
+    Option<MarksBatch>,
+);
+
+/// patch-v2 envelope: `base_revisions` (object of non-negative integers,
+/// or -1 for an unsafe base; absent/null = empty), `client_id` (non-empty string when present) and
+/// `batch` (`{id, index, total}` with `index < total`).
+fn parse_patch_v2_fields(value: &serde_json::Value, path: &Path) -> Result<PatchV2Fields, String> {
+    let bad = |what: String| format!("marks file {} (patch-v2): {what}", path.display());
+    let mut base = std::collections::BTreeMap::new();
+    match value.get("base_revisions") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(map)) => {
+            for (id, rev) in map {
+                // R5 (U1 ↔ P): -1 marks a draft made while the viewer could
+                // not trust its view; it always conflicts (see
+                // `case_db::UNSAFE_BASE_REVISION`). Any other negative or
+                // non-integer value is still refused.
+                let rev = match rev.as_u64() {
+                    Some(rev) => rev,
+                    None if rev.as_i64() == Some(-1) => crate::case_db::UNSAFE_BASE_REVISION,
+                    None => {
+                        return Err(bad(format!(
+                            "base_revisions[{id:?}] must be a non-negative integer or -1"
+                        )));
+                    }
+                };
+                if id.trim().is_empty() {
+                    return Err(bad("base_revisions has an empty id".into()));
+                }
+                base.insert(id.clone(), rev);
+            }
+        }
+        Some(_) => return Err(bad("base_revisions must be an object".into())),
+    }
+    let client_id = match value.get("client_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) if !text.trim().is_empty() => Some(text.clone()),
+        Some(_) => return Err(bad("client_id must be a non-empty string".into())),
+    };
+    let batch = match value.get("batch") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(map)) => {
+            let id = map
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| bad("batch.id must be a non-empty string".into()))?;
+            let index = map
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| bad("batch.index must be a non-negative integer".into()))?;
+            let total = map
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|total| *total > 0)
+                .ok_or_else(|| bad("batch.total must be a positive integer".into()))?;
+            if index >= total {
+                return Err(bad(format!("batch.index {index} must be < total {total}")));
+            }
+            Some(MarksBatch {
+                id: id.to_string(),
+                index,
+                total,
+            })
+        }
+        Some(_) => return Err(bad("batch must be an object".into())),
+    };
+    Ok((Some(base), client_id, batch))
 }
 
 /// Effective action for a selection item when the file omits it.
@@ -468,6 +621,110 @@ mod tests {
             let err = parse_marks_text(&text, std::path::Path::new("m.json")).unwrap_err();
             assert!(err.contains("invalid range"), "{range}: {err}");
         }
+    }
+
+    #[test]
+    fn parse_patch_v2_fields_and_rejects_bad_batch_or_base_revisions() {
+        use super::{MarksBatch, MarksProtocol};
+        let p = std::path::Path::new("m.json");
+        let full = r#"{"schema_version":2,"protocol":"patch-v2","case_id":"FT-1","examiner":"kim",
+            "client_id":"w-7f3a","exported_unix":1,
+            "batch":{"id":"b-01","index":0,"total":3},
+            "base_revisions":{"vid_000001":4,"vid_000009":0},
+            "marks":[{"id":"vid_000001","status":"important","marked_unix":5,"note":"n","examiner":"kim",
+                      "range":{"in":1.5,"out":4.0},"tags":["사고"]}],
+            "tags":[{"id":"vid_000009","tags":[]}],
+            "deleted_ids":["vid_000009"]}"#;
+        let file = parse_marks_text(full, p).unwrap();
+        assert_eq!(file.protocol, MarksProtocol::PatchV2);
+        assert_eq!(file.client_id.as_deref(), Some("w-7f3a"));
+        assert_eq!(
+            file.batch,
+            Some(MarksBatch {
+                id: "b-01".into(),
+                index: 0,
+                total: 3
+            })
+        );
+        assert!(!file.batch.as_ref().unwrap().is_last());
+        let base = file.base_revisions.as_ref().unwrap();
+        assert_eq!(base.get("vid_000001"), Some(&4));
+        assert_eq!(base.get("vid_000009"), Some(&0));
+        // Inline mark tags are folded into one tag entry per id.
+        let mut tag_ids: Vec<(&str, usize)> = file
+            .tags
+            .iter()
+            .map(|t| (t.id.as_str(), t.tags.len()))
+            .collect();
+        tag_ids.sort();
+        assert_eq!(tag_ids, [("vid_000001", 1), ("vid_000009", 0)]);
+        assert_eq!(file.deleted_ids, ["vid_000009"]);
+
+        // Minimal v2: no base map at all is Some(empty) — every id base 0.
+        let minimal = r#"{"protocol":"patch-v2","marks":[{"id":"a","status":"noted"}]}"#;
+        let file = parse_marks_text(minimal, p).unwrap();
+        assert_eq!(file.base_revisions, Some(Default::default()));
+        assert!(file.client_id.is_none() && file.batch.is_none());
+        let single = r#"{"protocol":"patch-v2","batch":{"id":"b","index":0,"total":1},"marks":[{"id":"a","status":"noted"}]}"#;
+        assert!(
+            parse_marks_text(single, p)
+                .unwrap()
+                .batch
+                .unwrap()
+                .is_last()
+        );
+
+        // Legacy bodies are untouched: v2 envelope fields are ignored and a
+        // mark's inline tags are NOT read.
+        let legacy = r#"{"schema_version":2,"protocol":"patch-v1","client_id":"","batch":5,"base_revisions":"x",
+            "marks":[{"id":"a","status":"noted","tags":["ignored"]}],"deleted_ids":["b"]}"#;
+        let file = parse_marks_text(legacy, p).unwrap();
+        assert_eq!(file.protocol, MarksProtocol::PatchV1);
+        assert!(file.base_revisions.is_none() && file.client_id.is_none() && file.batch.is_none());
+        assert!(file.tags.is_empty());
+        let plain = r#"{"marks":[{"id":"a","status":"noted"}]}"#;
+        assert_eq!(
+            parse_marks_text(plain, p).unwrap().protocol,
+            MarksProtocol::Legacy
+        );
+
+        let body = |extra: &str| {
+            format!(r#"{{"protocol":"patch-v2",{extra}"marks":[{{"id":"a","status":"noted"}}]}}"#)
+        };
+        for (extra, what) in [
+            (r#""batch":{"id":"b","index":3,"total":3},"#, "batch.index"),
+            (r#""batch":{"id":"b","index":0,"total":0},"#, "batch.total"),
+            (r#""batch":{"id":"","index":0,"total":1},"#, "batch.id"),
+            (r#""batch":[],"#, "batch must be an object"),
+            (r#""base_revisions":{"a":-2},"#, "base_revisions"),
+            (r#""base_revisions":{"a":-1.0},"#, "base_revisions"),
+            (r#""base_revisions":{"a":1.5},"#, "base_revisions"),
+            (r#""base_revisions":{"a":"1"},"#, "base_revisions"),
+            (
+                r#""base_revisions":[],"#,
+                "base_revisions must be an object",
+            ),
+            (r#""client_id":"","#, "client_id"),
+            (r#""client_id":7,"#, "client_id"),
+        ] {
+            let err = parse_marks_text(&body(extra), p).unwrap_err();
+            assert!(err.contains(what), "{extra}: {err}");
+        }
+        // R5: -1 is the unsafe-base marker (always a conflict server-side).
+        let unsafe_body = body(r#""base_revisions":{"a":-1},"#);
+        let file = parse_marks_text(&unsafe_body, p).unwrap();
+        assert_eq!(
+            file.base_revisions.unwrap().get("a"),
+            Some(&crate::case_db::UNSAFE_BASE_REVISION)
+        );
+        // Same id tagged inline and in the list is ambiguous.
+        let twice = r#"{"protocol":"patch-v2","marks":[{"id":"a","status":"noted","tags":["x"]}],"tags":[{"id":"a","tags":["y"]}]}"#;
+        assert!(
+            parse_marks_text(twice, p)
+                .unwrap_err()
+                .contains("both inline")
+        );
+        assert!(parse_marks_text(r#"{"protocol":"patch-v3","marks":[]}"#, p).is_err());
     }
 
     #[test]

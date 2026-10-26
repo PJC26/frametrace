@@ -16,12 +16,14 @@ use std::time::UNIX_EPOCH;
 
 mod candidates;
 mod index_merge;
+mod index_rows;
 mod json_line;
 #[cfg(test)]
 mod tests;
 
 use candidates::*;
 use index_merge::*;
+pub use index_rows::{IndexRow, IndexRows, read_index_rows};
 pub(crate) use json_line::tsv_escape;
 use json_line::*;
 pub use json_line::{json_record_lines, set_json_field, try_set_json_field};
@@ -63,8 +65,9 @@ pub fn scan_folder(
     // The interrupted run already consumed these ids — re-registering them
     // keeps replayed records stable and stops fresh files from colliding.
     for record in resumed_records.values() {
-        let key = normalize_source_key(&record.source_path.to_string_lossy());
-        id_registry.ids_by_source.insert(key, record.id.clone());
+        id_registry
+            .ids_by_source
+            .insert(source_key(&record.source_path), record.id.clone());
         if let Some(number) = record.id.strip_prefix("vid_").and_then(parse_usize) {
             id_registry.next_number = id_registry.next_number.max(number + 1);
         }
@@ -82,7 +85,7 @@ pub fn scan_folder(
     // `carried_facts`).
     let existing_index: HashMap<String, IndexedRecordLine> = load_existing_record_lines(case_dir)?
         .into_iter()
-        .map(|line| (normalize_source_key(&line.source_path), line))
+        .map(|line| (line.key(), line))
         .collect();
     // A prior checkpoint discarded for different inputs (e.g. a cancelled
     // `--incremental --hash` enrichment followed by a lighter phase-1 scan)
@@ -96,6 +99,7 @@ pub fn scan_folder(
     let mut processed_files = 0u64;
     let mut total_bytes = 0u64;
     let mut warnings = collection.warnings;
+    let mut lossy_display_owner: HashMap<String, String> = HashMap::new();
     if checkpoint.reset_stale() {
         warnings.push(
             "previous scan checkpoint was recorded for different inputs; started fresh".to_string(),
@@ -120,7 +124,7 @@ pub fn scan_folder(
                 // An already-indexed file whose metadata cannot be read is
                 // still present: merge_existing_with_scan carries its record
                 // forward unchanged rather than marking it stale.
-                let key = normalize_source_key(&path.to_string_lossy());
+                let key = source_key(&path);
                 if id_registry.ids_by_source.contains_key(&key) {
                     warnings.push(format!(
                         "metadata-error: {} ({err}); existing index record carried forward unchanged",
@@ -137,7 +141,22 @@ pub fn scan_folder(
         };
         total_bytes = total_bytes.saturating_add(metadata.len());
         let modified_unix = modified_unix(&metadata);
-        let source_key = normalize_source_key(&path.to_string_lossy());
+        let source_key = source_key(&path);
+        // E1: distinct non-Unicode names that render identically keep
+        // distinct ids and records, but the examiner is told their
+        // displayed paths are ambiguous.
+        if path.to_str().is_none() {
+            let display = path.to_string_lossy().to_string();
+            match lossy_display_owner.get(&display) {
+                Some(first) if first != &source_key => warnings.push(format!(
+                    "non-unicode-name-collision: {display} names more than one file (raw names differ); each keeps its own id, and source_path_raw_hex in db/videos.jsonl records the exact name"
+                )),
+                Some(_) => {}
+                None => {
+                    lossy_display_owner.insert(display, source_key.clone());
+                }
+            }
+        }
         // Replay the interrupted run's record verbatim — but only while the
         // file's size+mtime still match it, so a file changed between the
         // crash and the resume is reprocessed rather than trusted stale.
@@ -152,9 +171,15 @@ pub fn scan_folder(
         let salvaged = salvaged_records
             .get(&source_key)
             .filter(|record| same_file_state(record, metadata.len(), modified_unix));
+        // E2: a record marked stale (e.g. its drive was unplugged during an
+        // earlier rescan) still donates its facts once the file is back
+        // with the same size+mtime — the stale marker says "was absent",
+        // not "these bytes are different". Dropping the filter that
+        // excluded flagged lines keeps a lighter rescan from turning the
+        // recorded SHA-256 into `hash_status=skipped`. (record_is_unchanged
+        // still refuses to skip a flagged record, so the marker clears.)
         let indexed = existing_index
             .get(&source_key)
-            .filter(|line| !line.json_line.contains("\"index_status\""))
             .map(|line| &line.record)
             .filter(|record| same_file_state(record, metadata.len(), modified_unix));
         if options.incremental

@@ -17,21 +17,24 @@ function removeTagPreset(tag) {
   saveTagPresets();
 }
 
+// A14: tag lists are replaced, never edited in place — a list may still be
+// shared with a snapshot (a draft, a conflict's server value, the loaded
+// case data) that must keep its own value.
 function addTag(id, tag) {
-  const list = state.tags[id] || [];
+  if (refuseLockedEdit()) return; // R5 U1
+  const list = [...(state.tags[id] || [])];
   if (!list.includes(tag)) list.push(tag);
   state.tags[id] = list;
   touchAnnotation(id);
-  storageSet(TAGS_KEY, state.tags);
 }
 
 function removeTag(id, tag) {
-  const list = state.tags[id] || [];
+  if (refuseLockedEdit()) return; // R5 U1
+  const list = [...(state.tags[id] || [])];
   const idx = list.indexOf(tag);
   if (idx >= 0) list.splice(idx, 1);
   state.tags[id] = list;
   touchAnnotation(id);
-  storageSet(TAGS_KEY, state.tags);
 }
 
 function toggleTag(id, tag) {
@@ -55,13 +58,13 @@ function markLabel(status) {
 }
 
 function indexOfFiltered(id) {
-  return filteredRecords().findIndex(record => record.id === id);
+  return indexInList(filteredRecords(), id);
 }
 
 function selectRange(fromId, toId, checked) {
   const filtered = filteredRecords();
-  const from = filtered.findIndex(record => record.id === fromId);
-  const to = filtered.findIndex(record => record.id === toId);
+  const from = indexInList(filtered, fromId);
+  const to = indexInList(filtered, toId);
   if (from < 0 || to < 0) return;
   const [low, high] = from <= to ? [from, to] : [to, from];
   for (let index = low; index <= high; index += 1) {
@@ -87,6 +90,7 @@ function targetIds() {
 }
 
 function applyMark(status) {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   const stamped = Math.floor(Date.now() / 1000);
@@ -97,7 +101,6 @@ function applyMark(status) {
     // resulting state into the draft that hydration replays on reload.
     touchAnnotation(id);
   });
-  storageSet(MARKS_KEY, state.marks);
   requestRender();
   toast(tf("toast.markApplied", { n: ids.length, status: status === null ? t("mark.cleared") : markLabel(status) }));
 }

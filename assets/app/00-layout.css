@@ -109,6 +109,8 @@ a.h-mi:focus-visible, button.h-mi:focus-visible { outline-offset: -2px; }
 #hEnv .badge { display: flex; align-items: center; gap: 6px; min-height: 28px; padding: 4px 10px; border-radius: var(--radius); background: var(--surface-2); color: var(--muted); font-size: var(--fs-xs); font-weight: 500; white-space: normal; }
 #hEnv .badge.ok { background: var(--verified-bg); color: var(--verified-fg); }
 #hEnv .badge.bad { background: var(--failed-bg); color: var(--failed-fg); }
+/* R8: audit lanes not authenticated here (keyless PC / other PCs' keys) — amber, never green. */
+#hEnv .badge.warn { background: var(--warn-bg); color: var(--text); }
 
 /* ---- server-lost banner (§6.2): under the strip, 36px ---- */
 .h-srvbanner { position: sticky; top: var(--h-top); z-index: 39; flex: none; display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 16px; background: var(--failed-bg); color: var(--failed-fg); border-bottom: 1px solid var(--danger); font-size: var(--fs-sm); }
@@ -159,6 +161,8 @@ a.h-mi:focus-visible, button.h-mi:focus-visible { outline-offset: -2px; }
 #inputCard .err { display: none; margin-top: 10px; padding: 8px 12px; border-radius: var(--radius); background: var(--failed-bg); color: var(--failed-fg); font-size: var(--fs-sm); }
 #inputCard .err.show { display: block; }
 #inputCard .err .hintline { margin-top: 4px; font-size: var(--fs-xs); }
+/* R5: the one action an error box may carry ("원본 다시 가져오기", /api/reimport-raw). */
+.err-acts { margin-top: 8px; }
 #inputCard .err details { margin-top: 6px; font-size: var(--fs-xs); }
 #inputCard .err details pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-all; font-family: var(--font-mono); font-size: var(--fs-xs); }
 details.opts { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--border); }

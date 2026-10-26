@@ -36,6 +36,22 @@ fn export_dav_inner(
     output: Option<PathBuf>,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
+    export_dav_with(case_dir, dav_file, output, &|dav, mp4| {
+        crate::dav::remux_dav_to_mp4(dav, mp4, timeout_secs)
+    })
+}
+
+/// The DAV remux step `export_dav_with` runs (ffmpeg in production,
+/// injected by tests).
+type DavRemux<'a> = &'a dyn Fn(&Path, &Path) -> Result<&'static str, String>;
+
+/// [`export_dav_inner`] with the remux step made explicit.
+fn export_dav_with(
+    case_dir: &Path,
+    dav_file: &Path,
+    output: Option<PathBuf>,
+    remux: DavRemux<'_>,
+) -> Result<(), String> {
     // Type gate: ffmpeg can remux an ordinary MP4 with `-c copy`, so success
     // alone never proved DAV input. Require DAV/DAHUA magic up front so
     // non-DAV files are rejected as "not a DAV container" instead of being
@@ -71,21 +87,22 @@ fn export_dav_inner(
         ));
     }
 
-    let walk = crate::dav::walk_frames(dav_file);
-    let (frames, channel) = match &walk {
-        Ok(list) => {
-            let video: Vec<_> = list
-                .iter()
-                .filter(|frame| matches!(frame.stream_type, 0xFC | 0xFD))
-                .collect();
-            (video.len(), video.first().map(|frame| frame.channel))
+    // E10/R5-P4: the frame count is a side measurement. A frame walk that
+    // fails is recorded as a warning with null counts (never as 0) — it
+    // must not stop ffmpeg's own demuxer from exporting the recording.
+    let (summary, frame_count_error) = match crate::dav::summarize_frames(dav_file) {
+        Ok(summary) => (Some(summary), None),
+        Err(err) => {
+            eprintln!(
+                "warning: DAV frame count could not be verified ({err}); the export continues and the log records the counts as unknown"
+            );
+            (None, Some(err))
         }
-        Err(_) => (0, None),
     };
-    let method =
-        crate::dav::remux_dav_to_mp4(dav_file, &requested_raw, timeout_secs).inspect_err(|_| {
-            let _ = std::fs::remove_file(&requested_raw);
-        })?;
+    let channel = summary.as_ref().and_then(|s| s.first_video_channel);
+    let method = remux(dav_file, &requested_raw).inspect_err(|_| {
+        let _ = std::fs::remove_file(&requested_raw);
+    })?;
     let output_sha256 = audit::digest_file(&requested_raw)?;
     let validation = if method == "ffmpeg-dhav-demux" {
         "ffmpeg-native-demux"
@@ -93,24 +110,60 @@ fn export_dav_inner(
         "es-extract-remux-candidate"
     };
 
+    // The ES fallback carries only the first video channel; ffmpeg's demuxer
+    // decides itself, so its exported frame count is not known here.
+    let (exported_video_frames, exported_note) = match (&summary, method) {
+        (_, "ffmpeg-dhav-demux") => (
+            "null".to_string(),
+            "ffmpeg dhav demuxer chose the exported stream; per-channel count not verified",
+        ),
+        (Some(summary), _) => (
+            summary.pinned_channel_frames().to_string(),
+            "es-extract-remux exports only the first video channel",
+        ),
+        (None, _) => (
+            "null".to_string(),
+            "es-extract-remux exports only the first video channel; frame count not verified",
+        ),
+    };
+    let null = || "null".to_string();
+    let frame_count_error = frame_count_error
+        .map(|err| format!("\"{}\"", json_escape(&err)))
+        .unwrap_or_else(null);
     let line = format!(
-        "{{\"schema_version\":1,\"event\":\"export-dav\",\"selector\":\"{}\",\"source_path\":\"{}\",\"format\":\"mp4\",\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"remux_method\":\"{}\",\"video_frames\":{},\"channel\":{},\"container_validation\":\"{}\"}}",
+        "{{\"schema_version\":1,\"event\":\"export-dav\",\"selector\":\"{}\",\"source_path\":\"{}\",\"format\":\"mp4\",\"output_path\":\"{}\",\"output_sha256\":\"{}\",\"remux_method\":\"{}\",\"video_frames\":{},\"video_frames_by_channel\":{},\"audio_frames\":{},\"channel\":{},\"exported_video_frames\":{},\"exported_frames_note\":\"{}\",\"frame_count_error\":{},\"container_validation\":\"{}\"}}",
         json_escape(stem),
         json_escape(&dav_file.to_string_lossy()),
         json_escape(&requested_raw.to_string_lossy()),
         json_escape(&output_sha256),
         json_escape(method),
-        frames,
-        channel
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "null".to_string()),
+        summary
+            .as_ref()
+            .map(|s| s.video_frames().to_string())
+            .unwrap_or_else(null),
+        summary
+            .as_ref()
+            .map(|s| s.channels_json())
+            .unwrap_or_else(null),
+        summary
+            .as_ref()
+            .map(|s| s.audio_frames.to_string())
+            .unwrap_or_else(null),
+        channel.map(|value| value.to_string()).unwrap_or_else(null),
+        exported_video_frames,
+        json_escape(exported_note),
+        frame_count_error,
         json_escape(validation),
     );
     audit::append_chained_jsonl(&case_dir.join("artifacts/clips/export-log.jsonl"), &line)?;
 
     println!("dav remux complete");
     println!(
-        "method: {method} · video frames: {frames} · channel: {}",
+        "method: {method} · video frames: {} · channel: {}",
+        summary
+            .as_ref()
+            .map(|s| s.video_frames().to_string())
+            .unwrap_or_else(|| "확인 불가".to_string()),
         channel
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string())
@@ -298,4 +351,48 @@ pub fn validate_artifact(
         println!("duration seconds: {duration:.3}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_dav_with;
+    use std::path::Path;
+
+    /// R5-P4: a DAV whose frames cannot all be walked is still exported by
+    /// ffmpeg's demuxer; the counts are logged as unknown (null) with the
+    /// reason — never as 0, and never as a refused export.
+    #[test]
+    fn dav_export_continues_when_the_frame_count_fails() {
+        let case = std::env::temp_dir().join(format!("ft-r5-p4-dav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case);
+        std::fs::create_dir_all(case.join("artifacts/clips")).unwrap();
+        let dav = case.join("broken.dav");
+        let mut bytes = b"DHAV\xFD".to_vec();
+        bytes.extend_from_slice(&[0u8; 40]);
+        std::fs::write(&dav, &bytes).unwrap();
+        assert!(
+            crate::dav::summarize_frames(&dav).is_err(),
+            "fixture must break the walk"
+        );
+        let remux = |_: &Path, mp4: &Path| -> Result<&'static str, String> {
+            std::fs::write(mp4, b"mp4 bytes").map_err(|e| e.to_string())?;
+            Ok("ffmpeg-dhav-demux")
+        };
+        let out = case.join("artifacts/clips/broken.mp4");
+        export_dav_with(&case, &dav, Some(out.clone()), &remux).expect("export proceeds");
+        assert_eq!(std::fs::read(&out).unwrap(), b"mp4 bytes");
+        let log = std::fs::read_to_string(case.join("artifacts/clips/export-log.jsonl")).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(entry["event"], "export-dav");
+        assert!(entry["video_frames"].is_null(), "{entry}");
+        assert!(entry["audio_frames"].is_null(), "{entry}");
+        assert!(entry["video_frames_by_channel"].is_null(), "{entry}");
+        assert!(
+            entry["frame_count_error"]
+                .as_str()
+                .is_some_and(|e| !e.is_empty()),
+            "{entry}"
+        );
+        let _ = std::fs::remove_dir_all(&case);
+    }
 }

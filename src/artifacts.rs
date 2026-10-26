@@ -75,10 +75,14 @@ pub fn generate_proxy(
         }
         output_path.clone()
     } else {
-        unique_path(&case_dir.join("artifacts/proxies").join(format!(
-            "{}_proxy_{}.mp4",
-            sanitize_filename(selector),
-            created_unix
+        // D5: path-free name — `proxy_<record id>_<hash8>.mp4`, never the
+        // (often absolute) selector itself.
+        let record_id = artifact_record_id(case_dir, selector, &source_path);
+        unique_path(&case_dir.join("artifacts/proxies").join(artifact_file_name(
+            "proxy",
+            &record_id,
+            &source_path,
+            "mp4",
         )))
     };
     ensure_parent(&output_path)?;
@@ -155,11 +159,13 @@ pub fn generate_thumbnail(
         }
         output_path.clone()
     } else {
-        unique_path(&case_dir.join("artifacts/thumbnails").join(format!(
-            "{}_thumb_{}.jpg",
-            sanitize_filename(selector),
-            created_unix
-        )))
+        // D5: path-free name — `thumb_<record id>_<hash8>.jpg`.
+        let record_id = artifact_record_id(case_dir, selector, &source_path);
+        unique_path(
+            &case_dir
+                .join("artifacts/thumbnails")
+                .join(artifact_file_name("thumb", &record_id, &source_path, "jpg")),
+        )
     };
     ensure_parent(&output_path)?;
 
@@ -213,6 +219,136 @@ pub fn generate_thumbnail(
         &args,
     )?;
     Ok(artifact)
+}
+
+/// D5: the path-free file name of a derived artifact:
+/// `<kind>_<record id>_<hash8>.<ext>` (contract §8: `proxy_<record_id>_
+/// <hash8>.mp4`, `thumb_<record_id>_<hash8>.jpg`). The record id is
+/// sanitized for the file system; `hash8` is the first 8 hex digits of the
+/// SHA-256 of the source path, so two sources behind one id (a re-scanned
+/// case) never share a name, while the name reveals nothing of the path.
+pub fn artifact_file_name(kind: &str, record_id: &str, source_path: &Path, ext: &str) -> String {
+    format!(
+        "{kind}_{}_{}.{ext}",
+        sanitize_filename(record_id),
+        source_hash8(source_path)
+    )
+}
+
+/// First 8 hex digits of the SHA-256 of the source path as a string.
+pub fn source_hash8(source_path: &Path) -> String {
+    crate::sha256::digest_bytes(audit::path_string(source_path).as_bytes())[..8].to_string()
+}
+
+/// The record id a derived artifact of `selector` is filed under (D5): the
+/// indexed video id, the carve id, `inode:<offset>:<inode>` for a
+/// recovered file, the joined record id — or `file` for a source FrameTrace
+/// has no record of. Never a path.
+pub fn artifact_record_id(case_dir: &Path, selector: &str, source_path: &Path) -> String {
+    let source = audit::path_string(source_path);
+    // Only an existing case database is consulted (a lookup never creates one).
+    if crate::case_db::case_db_path(case_dir).is_file()
+        && let Ok(rows) = crate::case_db::load_video_ids(case_dir)
+        && let Some(row) = rows.iter().find(|row| row.id == selector).or_else(|| {
+            rows.iter()
+                .find(|row| row.source_path == selector || row.source_path == source)
+        })
+    {
+        return row.id.clone();
+    }
+    let same_file = |logged: &str| {
+        let resolved = crate::util::resolve_case_artifact_path(case_dir, logged);
+        resolved == source_path
+            || audit::canonical_or_original(&resolved) == audit::canonical_or_original(source_path)
+    };
+    // R9 P3: only entries usable here name an artifact's record.
+    let log_entries = |rel: &str| -> Vec<serde_json::Value> {
+        audit::read_lane_rows(&case_dir.join(rel))
+            .map(|lane| lane.usable_values())
+            .unwrap_or_default()
+    };
+    let text = |value: &serde_json::Value, key: &str| {
+        value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    for entry in log_entries("artifacts/carved/carve-log.jsonl").iter().rev() {
+        if let (Some(id), Some(output)) = (text(entry, "id"), text(entry, "output_path"))
+            && (id == selector || same_file(&output))
+        {
+            return id;
+        }
+    }
+    for entry in log_entries("evidence/logs/tsk-audit.jsonl").iter().rev() {
+        if text(entry, "event").as_deref() != Some("recover-inode") {
+            continue;
+        }
+        if let Some(output) = text(entry, "output_path")
+            && same_file(&output)
+        {
+            let offset = entry
+                .get("partition_offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let inode = entry
+                .get("inode")
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .unwrap_or_default();
+            return format!("inode:{offset}:{inode}");
+        }
+    }
+    for entry in log_entries("artifacts/joined/join-log.jsonl").iter().rev() {
+        let entry = crate::join::with_record_id(entry.clone());
+        if let (Some(id), Some(output)) = (text(&entry, "record_id"), text(&entry, "output_path"))
+            && (id == selector || same_file(&output))
+        {
+            return id;
+        }
+    }
+    "file".to_string()
+}
+
+/// D5: the cached proxy of `selector`, if one exists: a path-free
+/// `proxy_<record id>_<hash8>[_NNN].mp4`, or — backward compatible — a
+/// proxy written before D5 under `<sanitize(selector)>_proxy_*.mp4`. The
+/// first match in name order wins, so the lookup is deterministic.
+pub fn find_existing_proxy(case_dir: &Path, selector: &str) -> Option<PathBuf> {
+    let dir = case_dir.join("artifacts/proxies");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".mp4"))
+        .collect();
+    names.sort();
+    if let Ok(source_path) = resolve_video_source(case_dir, selector) {
+        let record_id = artifact_record_id(case_dir, selector, &source_path);
+        let stem = format!(
+            "proxy_{}_{}",
+            sanitize_filename(&record_id),
+            source_hash8(&source_path)
+        );
+        if let Some(name) = names.iter().find(|name| {
+            name.strip_prefix(&stem)
+                .and_then(|rest| rest.strip_suffix(".mp4"))
+                .is_some_and(|rest| {
+                    rest.is_empty()
+                        || rest
+                            .strip_prefix('_')
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+        }) {
+            return Some(dir.join(name));
+        }
+    }
+    let legacy = format!("{}_proxy_", sanitize_filename(selector));
+    names
+        .iter()
+        .find(|name| name.starts_with(&legacy))
+        .map(|name| dir.join(name))
 }
 
 fn proxy_ffmpeg_args(
@@ -321,6 +457,81 @@ mod tests {
     #[test]
     fn default_thumbnail_starts_at_zero() {
         assert_eq!(ThumbnailOptions::default().time_seconds, 0.0);
+    }
+
+    /// D5: derived-artifact names carry the record id and a short hash of
+    /// the source path — never the path itself.
+    #[test]
+    fn artifact_names_are_path_free() {
+        let source = Path::new(r"C:\Users\kim\Videos\cam1.mp4");
+        let name = super::artifact_file_name("proxy", "vid_000001", source, "mp4");
+        let hash8 = super::source_hash8(source);
+        assert_eq!(name, format!("proxy_vid_000001_{hash8}.mp4"));
+        assert_eq!(hash8.len(), 8);
+        assert!(hash8.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!name.contains("kim") && !name.contains("Users"), "{name}");
+        assert_eq!(
+            super::artifact_file_name("thumb", "join:abcdef0123456789", source, "jpg"),
+            format!("thumb_join_abcdef0123456789_{hash8}.jpg")
+        );
+        // Another source behind the same id gets another name.
+        assert_ne!(
+            super::artifact_file_name("proxy", "vid_000001", Path::new("/e/other.mp4"), "mp4"),
+            name
+        );
+    }
+
+    /// D5: the cache lookup finds a path-free proxy, and still finds a proxy
+    /// written before D5 under `<sanitize(selector)>_proxy_*`.
+    #[test]
+    fn find_existing_proxy_reads_new_and_legacy_names() {
+        let case_dir =
+            std::env::temp_dir().join(format!("frametrace-artifact-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case_dir);
+        std::fs::create_dir_all(case_dir.join("db")).unwrap();
+        std::fs::create_dir_all(case_dir.join("artifacts/proxies")).unwrap();
+        let source = case_dir.join("src.mp4");
+        std::fs::write(&source, b"x").unwrap();
+        let source = crate::util::canonicalize_display(&source).unwrap();
+        let selector = source.to_string_lossy().to_string();
+        assert_eq!(super::find_existing_proxy(&case_dir, &selector), None);
+
+        let legacy = format!(
+            "{}_proxy_1700000000.mp4",
+            crate::video_export::sanitize_filename(&selector)
+        );
+        std::fs::write(case_dir.join("artifacts/proxies").join(&legacy), b"p").unwrap();
+        assert_eq!(
+            super::find_existing_proxy(&case_dir, &selector),
+            Some(case_dir.join("artifacts/proxies").join(&legacy))
+        );
+
+        // A source FrameTrace has no record of is filed under `file`.
+        let record_id = super::artifact_record_id(&case_dir, &selector, &source);
+        assert_eq!(record_id, "file");
+        let fresh = super::artifact_file_name("proxy", &record_id, &source, "mp4");
+        let numbered = fresh.replace(".mp4", "_001.mp4");
+        std::fs::write(case_dir.join("artifacts/proxies").join(&numbered), b"p").unwrap();
+        assert_eq!(
+            super::find_existing_proxy(&case_dir, &selector),
+            Some(case_dir.join("artifacts/proxies").join(&numbered)),
+            "a path-free name wins over a legacy one"
+        );
+        // A carved output is filed under its carve id.
+        std::fs::create_dir_all(case_dir.join("artifacts/carved")).unwrap();
+        // R9 P3: a real (chained) lane — lane rows come through
+        // `audit::read_lane_rows`, which trusts nothing past a chain break.
+        crate::audit::append_chained_jsonl_keyed(
+            &case_dir.join("artifacts/carved/carve-log.jsonl"),
+            &serde_json::json!({"id": "carve_7", "output_path": selector}).to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            super::artifact_record_id(&case_dir, &selector, &source),
+            "carve_7"
+        );
+        let _ = std::fs::remove_dir_all(&case_dir);
     }
 
     #[test]

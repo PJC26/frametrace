@@ -79,21 +79,18 @@ fn logged_carve_files(log_path: &Path) -> Result<Vec<(String, String, String)>, 
     // Through the audit module's lock-aware reader: on Windows the
     // appender's byte-range lock is mandatory, so a plain second-handle
     // read during an append would fail with ERROR_LOCK_VIOLATION.
-    let text = match audit::read_log_locked(log_path) {
-        Ok(Some(text)) => text,
-        Ok(None) => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(format!(
-                "failed to read carve log {} to de-duplicate resumed artifacts: {err}",
-                log_path.display()
-            ));
-        }
-    };
+    // R9 P3: through the one lane reader (lock-aware); only entries usable
+    // here count as "already logged" — an unauthenticated entry never
+    // stops a resumed artifact from getting its own authenticated record.
+    let lane = audit::read_lane_rows(log_path).map_err(|err| {
+        format!(
+            "failed to read carve log {} to de-duplicate resumed artifacts: {err}",
+            log_path.display()
+        )
+    })?;
     let mut out = Vec::new();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue; // a torn/foreign line is verify-audit's concern
-        };
+    for row in lane.usable() {
+        let value = &row.value;
         if value.get("event").and_then(|v| v.as_str()) != Some("carve-file") {
             continue;
         }

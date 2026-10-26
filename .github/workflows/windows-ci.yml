@@ -8,9 +8,11 @@ on:
 jobs:
   windows-msvc:
     runs-on: windows-latest
+    # R5 U13: a hung step must fail the job in bounded time (the default is 6 h).
+    timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; toolchain pinned via input
         with:
           toolchain: 1.94.0
           components: clippy, rustfmt
@@ -20,7 +22,7 @@ jobs:
         run: cargo check --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Frontend asset checks
@@ -36,16 +38,63 @@ jobs:
         shell: pwsh
       - name: Test
         run: cargo test --locked
-      - name: Integration tests with real ffmpeg
+      # libewf is NOT installed on this runner, so the E01 round-trip test is
+      # excluded explicitly (with FRAMETRACE_IT=1 it fails when the tools are
+      # missing instead of skipping). It runs on the macOS lane, which
+      # installs libewf. TSK-based paths are likewise not covered here.
+      - name: Integration tests with real ffmpeg (E01/libewf test excluded - not installed)
         env:
           FRAMETRACE_IT: "1"
-        run: cargo test --locked --test integration_tools -- --ignored
+        run: cargo test --locked --test integration_tools -- --ignored --skip e01_import_roundtrip_with_real_libewf
+      # R4 F1: real-ffmpeg join-video / measure-audio (ffmpeg from choco above).
+      - name: Join and audio integration tests (real ffmpeg)
+        env:
+          FRAMETRACE_IT: "1"
+        run: cargo test --locked --test join_audio_it -- --ignored
       - name: Workstation end-to-end test
         env:
           FRAMETRACE_IT: "1"
         run: cargo test --locked --test workstation_e2e -- --ignored
       - name: Build debug binaries for harnesses
         run: cargo build --locked
+      # R4 F2: the real WebView2 shell (frametrace-app.exe, no arguments).
+      # FRAMETRACE_SHELL_SMOKE=1 (provided by the shell, track C) makes it
+      # close itself with exit code 0 once the page has loaded. R5 U13: the
+      # shell fails itself (with a reason on stderr) after its own 120 s
+      # SMOKE_DEADLINE (src/shell.rs), so this step waits LONGER than that
+      # (180 s) — killing it first threw the shell's diagnosis away — and
+      # prints the shell's stdout/stderr whenever the smoke fails. Config
+      # dirs are isolated.
+      - name: WebView2 shell smoke (FRAMETRACE_SHELL_SMOKE=1)
+        shell: pwsh
+        timeout-minutes: 6
+        env:
+          FRAMETRACE_SHELL_SMOKE: "1"
+        run: |
+          $smoke = Join-Path $env:RUNNER_TEMP 'ft-shell-smoke'
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          $env:APPDATA = Join-Path $smoke 'appdata'
+          $env:LOCALAPPDATA = Join-Path $smoke 'localappdata'
+          $env:FRAMETRACE_INSTANCE_FILE = Join-Path $smoke 'server.json'
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target/debug/frametrace-app.exe'
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $out = Join-Path $smoke 'stdout.log'
+          $err = Join-Path $smoke 'stderr.log'
+          $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          $failure = $null
+          if (-not $proc.WaitForExit(180000)) {
+            Stop-Process -Id $proc.Id -Force
+            $failure = 'shell smoke: frametrace-app.exe did not exit within 180 s (its own deadline is 120 s)'
+          } elseif ($proc.ExitCode -ne 0) {
+            $failure = "shell smoke: exit code $($proc.ExitCode)"
+          }
+          if ($failure) {
+            foreach ($log in @($err, $out)) {
+              Write-Host "---- $(Split-Path $log -Leaf) ----"
+              if (Test-Path $log) { Get-Content $log } else { Write-Host '(none)' }
+            }
+            throw $failure
+          }
       - name: Install Playwright and harness dependencies
         run: |
           npm install --no-save --no-package-lock playwright@1.56.1 axe-core@4.10.2 pngjs pixelmatch
@@ -54,6 +103,7 @@ jobs:
       - name: Viewer and workstation harnesses
         run: |
           export FRAMETRACE_BIN="$(cygpath -m "$GITHUB_WORKSPACE")/target/debug/frametrace-app.exe"
+          export FRAMETRACE_REQUIRE_BROWSER=1
           test -f "$FRAMETRACE_BIN"
           bash scripts/ci-harnesses.sh
         shell: bash

@@ -12,7 +12,6 @@
 use crate::artifacts::{ProxyOptions, generate_proxy};
 use crate::audit;
 use crate::util::{json_escape, now_unix, read_to_string};
-use crate::video_export::sanitize_filename;
 use std::path::{Path, PathBuf};
 
 const QUEUE_LOG: &str = "artifacts/logs/transcode-queue-log.jsonl";
@@ -90,20 +89,10 @@ pub fn unplayable_reason(
     None
 }
 
+/// D5: the shared cache lookup — path-free `proxy_<id>_<hash8>.mp4`
+/// names first, then pre-D5 `<sanitize(selector)>_proxy_*` names.
 fn existing_proxy(case_dir: &Path, selector: &str) -> Option<PathBuf> {
-    let prefix = format!("{}_proxy_", sanitize_filename(selector));
-    std::fs::read_dir(case_dir.join("artifacts/proxies"))
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .map(|n| {
-                    let n = n.to_string_lossy();
-                    n.starts_with(&prefix) && n.ends_with(".mp4")
-                })
-                .unwrap_or(false)
-        })
+    crate::artifacts::find_existing_proxy(case_dir, selector)
 }
 
 /// Runs the queue: for each candidate, generate_proxy sequentially.
@@ -208,11 +197,20 @@ pub fn run_queue(
 }
 
 /// Latest queue summary for status display.
+/// R9 P3: the newest entry usable here (read through
+/// `audit::read_lane_rows`), with its `trust` code.
+///
+/// R14 I5: the NEWEST line of the lane, whatever it is — an unusable line
+/// after the last usable summary may itself be a newer summary (P12: its
+/// content is never read), and a summary before a `lane-repair` marker is
+/// not known to be the latest. Either way: `None` (no summary claimed).
 pub fn latest_summary(case_dir: &Path) -> Option<serde_json::Value> {
-    let text = read_to_string(&case_dir.join(QUEUE_LOG)).ok()?;
-    text.lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    let lane = crate::audit::read_lane_rows(&case_dir.join(QUEUE_LOG)).ok()?;
+    let row = lane.rows.last()?;
+    if !row.usable() || lane.repaired_after(row.index) {
+        return None;
+    }
+    Some(row.value_with_trust())
         .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("transcode-queue"))
 }
 
@@ -268,5 +266,64 @@ mod tests {
             ]))
             .is_none()
         );
+    }
+
+    /// Integration (D5 × queue): a proxy the queue generated under the
+    /// path-free `proxy_<id>_<hash8>.mp4` name is found by the next run
+    /// (before: the lookup only knew `<selector>_proxy_*`, so every run
+    /// re-transcoded), and a pre-D5 `_proxy_` file still counts.
+    /// Uses the real ffmpeg; skipped when it is not on PATH.
+    #[test]
+    fn queue_finds_path_free_and_legacy_proxies() {
+        if crate::tool_policy::resolve_tool_binary("ffmpeg", &["ffmpeg"]).is_err() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let case_dir =
+            std::env::temp_dir().join(format!("frametrace-transcode-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&case_dir);
+        std::fs::create_dir_all(case_dir.join("db")).unwrap();
+        let source = case_dir.join("clip.dav");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc=size=160x120:rate=5:duration=1"])
+            .args(["-c:v", "mpeg4", "-f", "mp4"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let source_text = source.to_string_lossy().to_string();
+        std::fs::write(
+            case_dir.join("db/video_paths.tsv"),
+            format!("id\tsource_path\trelative_path\nvid_000001\t{source_text}\tclip.dav\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            case_dir.join("db/video_index.json"),
+            serde_json::json!({"videos": [{"id": "vid_000001", "extension": "dav", "source_path": source_text}]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let first = run_queue(&case_dir, None, false).unwrap();
+        assert_eq!((first.proxied, first.failed), (1, 0), "{first:?}");
+        let made = existing_proxy(&case_dir, "vid_000001").expect("generated proxy is found");
+        let name = made.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("proxy_"), "{name}");
+        let second = run_queue(&case_dir, None, false).unwrap();
+        assert_eq!(
+            (second.proxied, second.skipped_existing),
+            (0, 1),
+            "the path-free proxy is reused: {second:?}"
+        );
+
+        // A proxy written before D5 is still reused.
+        std::fs::remove_file(&made).unwrap();
+        let legacy = case_dir.join("artifacts/proxies/vid_000001_proxy_1700000000.mp4");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(existing_proxy(&case_dir, "vid_000001"), Some(legacy));
+        let third = run_queue(&case_dir, None, false).unwrap();
+        assert_eq!((third.proxied, third.skipped_existing), (0, 1), "{third:?}");
+        let _ = std::fs::remove_dir_all(&case_dir);
     }
 }

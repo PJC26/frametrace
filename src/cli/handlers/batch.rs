@@ -545,17 +545,37 @@ pub fn validate_batch(
 }
 
 pub fn import_marks(case_dir: &Path, marks_path: &Path) -> Result<(), String> {
-    let stored = import_marks_quiet(case_dir, marks_path)?;
+    let outcome = import_marks_quiet(case_dir, marks_path)?;
     println!("marks imported");
     println!("source: {}", marks_path.display());
-    println!("marks stored: {stored}");
+    println!("marks stored: {}", outcome.stored);
+    println!("records applied: {}", outcome.applied.len());
+    println!("conflicts: {}", outcome.conflicts.len());
+    for conflict in &outcome.conflicts {
+        println!(
+            "  [conflict] {} server_revision={} server={}",
+            conflict.id,
+            conflict.server_revision,
+            serde_json::to_string(&conflict.server).unwrap_or_else(|_| "null".into())
+        );
+    }
     println!("sqlite: {}", case_db::case_db_path(case_dir).display());
+    if !outcome.conflicts.is_empty() {
+        return Err(format!(
+            "{} record(s) not applied: the file's base_revisions are older than the case (see conflicts above)",
+            outcome.conflicts.len()
+        ));
+    }
     Ok(())
 }
 
 /// [`import_marks`] without the stdout report, so the workstation server
-/// can apply marks in-process (phase-2 enrichment) and return the count.
-pub fn import_marks_quiet(case_dir: &Path, marks_path: &Path) -> Result<usize, String> {
+/// can apply marks in-process and return what was applied and what
+/// conflicted (save protocol v2; legacy bodies never conflict).
+pub fn import_marks_quiet(
+    case_dir: &Path,
+    marks_path: &Path,
+) -> Result<case_db::PatchOutcome, String> {
     ensure_case(case_dir)?;
     let marks_file = crate::selection::parse_marks_file(marks_path)?;
     crate::selection::enforce_case_binding(
@@ -590,14 +610,18 @@ pub fn import_marks_quiet(case_dir: &Path, marks_path: &Path) -> Result<usize, S
         .collect::<Result<Vec<_>, String>>()?;
     // The file-level examiner is the only "who" deletions and tag edits
     // carry into review_mark_history (FOR-07).
-    let stored = case_db::patch_review_annotations_by(
+    let patch = case_db::AnnotationPatch {
+        marks: &rows,
+        tags: &marks_file.tags,
+        deleted_ids: &marks_file.deleted_ids,
+        base_revisions: marks_file.base_revisions.as_ref(),
+    };
+    case_db::patch_review_annotations_v2(
         case_dir,
-        &rows,
-        &marks_file.tags,
-        &marks_file.deleted_ids,
+        &patch,
         marks_file.examiner.as_deref(),
-    )?;
-    Ok(stored)
+        marks_file.client_id.as_deref(),
+    )
 }
 
 pub fn export_marks(case_dir: &Path, output: Option<&Path>) -> Result<(), String> {

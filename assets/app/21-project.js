@@ -11,8 +11,10 @@ function hProjectPopRender() {
   const s = FTStore.state;
   const cur = $("hProjectCur");
   if (cur) {
-    const label = H_PHASE_LABEL[s.phase] || "";
-    const cls = s.phase === "finalized" ? " ok" : s.phase === "review-partial" ? " warn" : "";
+    // R10 U4: the open project's last package did not finish finalizing.
+    const incomplete = !!s.project.packageIncomplete;
+    const label = incomplete ? H_PKG_INCOMPLETE : H_PHASE_LABEL[s.phase] || "";
+    const cls = incomplete ? " warn" : s.phase === "finalized" ? " ok" : s.phase === "review-partial" ? " warn" : "";
     cur.innerHTML = s.project.caseDir
       ? `<b title="${esc(s.project.caseDir)}">${esc(s.project.name || s.project.caseDir)}</b>` +
         `<span class="mono">${esc(s.project.caseDir)}</span>` +
@@ -36,7 +38,7 @@ function hProjectPopRender() {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "quiet h-mi";
-    const name = it.name || hBaseName(it.case_dir) || it.case_dir;
+    const name = hCaseName(it.name, it.case_dir);
     const st = recentState(it, lastStatus);
     btn.innerHTML = `<span title="${esc(it.case_dir)}">${esc(name)}</span><small>${esc([fmtWhen(it.last_opened_unix), st.state].filter(Boolean).join(" · "))}</small>`;
     if (it.exists === false) { btn.disabled = true; btn.title = "폴더를 찾을 수 없습니다"; }
@@ -111,7 +113,9 @@ async function hSwitchProject(dir) {
     hSwitching = false;
   }
   if (!switched) {
-    toast("저장되지 않은 판독 내용이 있어 프로젝트를 바꾸지 않았습니다 — 뷰어의 저장 상태를 확인하십시오.", "warn");
+    toast(hostViewer.stillSaving
+      ? "판독 내용을 아직 저장 중이라 프로젝트를 바꾸지 않았습니다 — 저장이 끝난 뒤 다시 시도하십시오."
+      : "저장되지 않은 판독 내용이 있어 프로젝트를 바꾸지 않았습니다 — 뷰어의 저장 상태를 확인하십시오.", "warn");
     return false;
   }
   if (!opened) toast(($("startErr").textContent || "케이스를 열지 못했습니다."), "err");

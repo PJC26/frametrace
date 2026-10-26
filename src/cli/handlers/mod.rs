@@ -144,7 +144,8 @@ fn default_host() -> Option<String> {
 mod batch;
 mod case;
 mod doctor;
-mod forensic;
+pub(crate) mod forensic;
+mod join_audio;
 mod media;
 mod merge;
 
@@ -265,16 +266,19 @@ pub(crate) use batch::{
 };
 pub(crate) use case::{
     InitCaseOptions, PackageOptions, RegisterSourceOptions, init_case, inspect, make_custody,
-    make_report, make_review, package_case, register_source, review_marks_json_from_rows,
-    scan_folder, signoff_content_json, signoff_content_json_from, verify_package,
+    make_report, make_review, package_case_with_pending, register_source,
+    review_marks_json_from_rows, scan_folder, signoff_content_json_from, verify_package_with,
 };
+#[cfg(test)]
+pub(crate) use case::{report_audit_chains_json, signoff_content_json};
 pub(crate) use doctor::{
-    BenchmarkOptions, benchmark_db, deepfake_scan, deepfake_screen, doctor, rotate_audit_key,
-    verify_audit,
+    BenchmarkOptions, benchmark_db, deepfake_scan, deepfake_screen, doctor, repair_lane,
+    rotate_audit_key, verify_audit,
 };
 pub(crate) use forensic::{
     carve_file, import_e01, inspect_e01, inspect_image, recover_batch, recover_inode,
 };
+pub(crate) use join_audio::{JoinVideoArgs, join_video, measure_audio, split_ids};
 pub(crate) use media::{
     export_dav, export_hik, export_video, extract_telemetry, make_proxy, make_thumbnail,
     transcode_queue, validate_artifact,

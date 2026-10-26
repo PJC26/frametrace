@@ -50,9 +50,24 @@ pub fn inspect_e01(
             timeout_secs: None,
             ..Default::default()
         };
-        inspect_image(case_dir, e01_file, tsk_options)?;
+        // C7 / B16: a partial listing (direct triage) exits 5 — completed,
+        // but the server must report it as partial, never as a clean pass.
+        if let Some(reason) = inspect_image_run(case_dir, e01_file, tsk_options)? {
+            exit_partial(&reason);
+        }
     }
     Ok(())
+}
+
+/// C7 / B16 contract: the step completed and recorded everything, but its
+/// result is PARTIAL. The last stderr line starts with
+/// [`crate::tsk::PARTIAL_LINE_PREFIX`].
+fn exit_partial(reason: &str) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprintln!("{}{reason}", crate::tsk::PARTIAL_LINE_PREFIX);
+    let _ = std::io::stderr().flush();
+    std::process::exit(crate::tsk::EXIT_PARTIAL);
 }
 
 pub fn import_e01(case_dir: &Path, e01_file: &Path, options: E01Options) -> Result<(), String> {
@@ -119,10 +134,10 @@ pub fn import_e01(case_dir: &Path, e01_file: &Path, options: E01Options) -> Resu
         println!("verify log: {}", path.display());
     }
     println!("export log: {}", result.ewfexport_log_path.display());
+    // R19-S2 (P29/P32): the paths are quoted, or named by a placeholder.
     println!(
-        "next: carve-file {} {}",
-        case_dir.display(),
-        result.raw_output_path.display()
+        "{}",
+        next_carve_file_hint(case_dir, &result.raw_output_path)
     );
     Ok(())
 }
@@ -134,6 +149,9 @@ pub fn carve_file(
     resume: ResumeMode,
 ) -> Result<(), String> {
     ensure_case(case_dir)?;
+    // C1: an imported raw image is carved only when its completion marker
+    // proves the export finished (a killed import's torn image is refused).
+    e01::require_complete_case_raw(case_dir, source_file)?;
     let source = case_db::register_evidence_source(
         case_dir,
         &case_db::EvidenceSourceInput {
@@ -194,6 +212,20 @@ pub fn inspect_image(
     image_file: &Path,
     options: TskInspectOptions,
 ) -> Result<(), String> {
+    // C7 / B16: exit code 5 when the listing is partial.
+    if let Some(reason) = inspect_image_run(case_dir, image_file, options)? {
+        exit_partial(&reason);
+    }
+    Ok(())
+}
+
+/// Runs the inspection; `Ok(Some(reason))` when the result is partial
+/// (fls timed out, or the listing was truncated to `--max-entries`).
+fn inspect_image_run(
+    case_dir: &Path,
+    image_file: &Path,
+    options: TskInspectOptions,
+) -> Result<Option<String>, String> {
     ensure_case(case_dir)?;
     let source = case_db::register_evidence_source(
         case_dir,
@@ -265,8 +297,11 @@ pub fn inspect_image(
     println!("fls log: {}", result.fls_log_path.display());
     if !result.warnings.is_empty() {
         println!("warnings: {}", result.warnings.len());
+        for warning in &result.warnings {
+            println!("warning: {warning}");
+        }
     }
-    Ok(())
+    Ok(crate::tsk::partial_reason(&result))
 }
 
 pub fn recover_inode(
@@ -317,15 +352,39 @@ pub fn recover_inode(
         println!("warning: {warning}");
     }
     println!(
-        "next: scan-folder {} {} --no-ffprobe",
-        case_dir.display(),
-        result
-            .output_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .display()
+        "{}",
+        next_scan_folder_hint(
+            case_dir,
+            result
+                .output_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+        )
     );
     Ok(())
+}
+
+/// R19-S2: `next: carve-file "<case>" "<raw>"` — each path quoted when
+/// paste-safe, else `<케이스 폴더>` / `<파일>` and the reason
+/// ([`crate::paste_path::hint_command`]).
+pub(crate) fn next_carve_file_hint(case_dir: &Path, raw: &Path) -> String {
+    use crate::paste_path::{Arg, hint_command};
+    hint_command(&[
+        Arg::Word("next: carve-file"),
+        Arg::Path(case_dir, "<케이스 폴더>"),
+        Arg::Path(raw, "<파일>"),
+    ])
+}
+
+/// R19-S2: `next: scan-folder "<case>" "<folder>" --no-ffprobe`.
+pub(crate) fn next_scan_folder_hint(case_dir: &Path, folder: &Path) -> String {
+    use crate::paste_path::{Arg, hint_command};
+    hint_command(&[
+        Arg::Word("next: scan-folder"),
+        Arg::Path(case_dir, "<케이스 폴더>"),
+        Arg::Path(folder, "<폴더>"),
+        Arg::Word("--no-ffprobe"),
+    ])
 }
 
 pub fn recover_batch(

@@ -39,17 +39,53 @@ struct RecentFile {
     cases: Vec<RecentCase>,
 }
 
-/// `<config>/frametrace/recent-cases.json`. Unit tests get a per-process
-/// temp file so in-process open-case/start calls never touch the
-/// examiner's real list (same isolation as `session_file`).
-pub(crate) fn recent_cases_file() -> Option<PathBuf> {
-    if cfg!(test) {
-        return Some(std::env::temp_dir().join(format!(
-            "frametrace-test-recent-{}.json",
-            std::process::id()
-        )));
+#[cfg(test)]
+thread_local! {
+    /// Test override: this thread's recent-cases file. Tests that read or
+    /// write the list set their own file, so parallel tests in one process
+    /// never share (and on Windows lock — error 32) one file.
+    static RECENT_FILE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test helper: points [`recent_cases_file`] at `file` on this thread
+/// until the returned guard is dropped.
+#[cfg(test)]
+pub(crate) fn override_recent_cases_file(file: PathBuf) -> RecentFileOverride {
+    RECENT_FILE_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(file));
+    RecentFileOverride
+}
+
+/// Clears the thread's override ([`override_recent_cases_file`]) on drop.
+#[cfg(test)]
+pub(crate) struct RecentFileOverride;
+
+#[cfg(test)]
+impl Drop for RecentFileOverride {
+    fn drop(&mut self) {
+        RECENT_FILE_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
     }
+}
+
+/// `<config>/frametrace/recent-cases.json`. Unit tests never touch the
+/// examiner's real list (same isolation as `session_file`): a thread's
+/// override when set, else a per-process temp file (best-effort writes of
+/// in-process open-case/start calls in other tests land there).
+#[cfg(not(test))]
+pub(crate) fn recent_cases_file() -> Option<PathBuf> {
     crate::audit_key::config_dir().map(|dir| dir.join("recent-cases.json"))
+}
+
+/// Test build of [`recent_cases_file`]: never the real config.
+#[cfg(test)]
+pub(crate) fn recent_cases_file() -> Option<PathBuf> {
+    if let Some(file) = RECENT_FILE_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Some(file);
+    }
+    Some(std::env::temp_dir().join(format!(
+        "frametrace-test-recent-{}.json",
+        std::process::id()
+    )))
 }
 
 fn now_unix() -> u64 {
@@ -63,7 +99,24 @@ fn now_unix() -> u64 {
 /// folder exists (without Windows' `\\?\` prefix), otherwise the path as
 /// given minus trailing separators.
 pub(crate) fn canonical_case_dir(path: &Path) -> String {
-    match path.canonicalize() {
+    canonical_case_dir_with(path, &|path| path.canonicalize())
+}
+
+/// [`canonical_case_dir`] with the resolver injected (tests). S5: a UNC or
+/// device path is never resolved — `canonicalize` would open an SMB
+/// session (handing the examiner's NTLM credentials to the named host),
+/// and `/api/recent-cases/forget` takes that text from any request body —
+/// it keeps its textual form instead.
+pub(crate) fn canonical_case_dir_with(
+    path: &Path,
+    resolve: &dyn Fn(&Path) -> std::io::Result<PathBuf>,
+) -> String {
+    let resolved = if super::http::reject_remote_path(&path.to_string_lossy(), &[]).is_ok() {
+        resolve(path)
+    } else {
+        Err(std::io::Error::other("remote path: not resolved"))
+    };
+    match resolved {
         Ok(resolved) => shell_path(resolved).display().to_string(),
         Err(_) => {
             let text = path.display().to_string();

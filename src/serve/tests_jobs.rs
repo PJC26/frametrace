@@ -4,6 +4,18 @@
 
 use super::*;
 
+// Included per test file (no mod.rs line needed); see the helper's header.
+#[allow(clippy::duplicate_mod)]
+#[path = "tests_fake_tools.rs"]
+mod fake_tools;
+// mod.rs re-exports this only for unix (B-owned gate): reach it by path elsewhere.
+#[cfg(not(unix))]
+use super::media::exhibit_arg;
+use fake_tools::{
+    CMD_FIND_OUTPUT, CMD_SPIN, cmd_grandchild_sleeper, cmd_sleep, cmd_wait_for_file, pid_alive,
+    write_fake,
+};
+
 fn temp_case(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft-jobs-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -39,12 +51,10 @@ fn parse(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid JSON {err}: {text}"))
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn status(state: &SharedState) -> serde_json::Value {
     parse(&api_status(state))
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + timeout;
     while !check() {
@@ -53,18 +63,12 @@ fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     }
 }
 
-/// Writes an executable `/bin/sh` script standing in for the frametrace
-/// CLI; `$1` is the subcommand.
-#[cfg(unix)]
-fn fake_cli(dir: &Path, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("fake-frametrace.sh");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+/// Writes a fake CLI (`/bin/sh` on unix, `.cmd` on Windows); `$1` / `%1` is
+/// the subcommand.
+fn fake_cli(dir: &Path, unix_body: &str, cmd_body: &str) -> PathBuf {
+    write_fake(dir, unix_body, cmd_body)
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn write_inspection(case_dir: &Path) {
     let dir = case_dir.join("db/filesystem");
     std::fs::create_dir_all(&dir).unwrap();
@@ -75,7 +79,6 @@ fn write_inspection(case_dir: &Path) {
     .unwrap();
 }
 
-#[cfg(unix)] // only the fake-CLI (unix) tests use it
 fn marks_request(id: &str) -> Request {
     let marks = serde_json::json!({
         "schema_version": 1,
@@ -90,16 +93,569 @@ fn marks_request(id: &str) -> Request {
     )
 }
 
-#[cfg(unix)]
-fn pid_alive(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+/// A patch-v2 request body for one record (dirty id only), optionally
+/// chunked as `batch {id, index, total}`.
+fn v2_request(
+    id: &str,
+    note: &str,
+    base: u64,
+    client: &str,
+    batch: Option<(&str, u64, u64)>,
+) -> Request {
+    let mut marks = serde_json::json!({
+        "schema_version": 2,
+        "protocol": "patch-v2",
+        "case_id": "FT-jobs",
+        "examiner": "kim",
+        "client_id": client,
+        "exported_unix": 1,
+        "base_revisions": { id: base },
+        "marks": [{"id": id, "status": "important", "marked_unix": 100, "note": note,
+                   "examiner": "kim", "range": {"in": 1.0, "out": 2.0}, "tags": ["사고"]}],
+        "tags": [],
+        "deleted_ids": [],
+    });
+    if let Some((batch_id, index, total)) = batch {
+        marks["batch"] = serde_json::json!({"id": batch_id, "index": index, "total": total});
+    }
+    request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": marks.to_string()}).to_string(),
+    )
 }
 
-#[cfg(unix)]
+/// `make-report` is rebuilt once per batch: never for a middle chunk,
+/// once on the last chunk, and every time for a request without `batch`
+/// (legacy clients keep their current behaviour).
+#[test]
+fn import_marks_batch_runs_make_report_once_on_last_chunk() {
+    let case_dir = temp_case("batch-report");
+    let state = bound_state(&case_dir, "review-ready");
+    let reports = std::cell::Cell::new(0usize);
+    let runner = |args: &[String]| {
+        assert_eq!(args[0], "make-report", "{args:?}");
+        assert_eq!(args[1], case_dir.to_string_lossy());
+        reports.set(reports.get() + 1);
+        Ok(String::new())
+    };
+    let send = |req: Request| {
+        parse(&super::jobs::api_import_marks_with_runner(
+            &req, &state, &runner,
+        ))
+    };
+
+    let first = send(v2_request("vid_1", "a", 0, "w-a", Some(("b-1", 0, 3))));
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["batch_done"], false, "{first}");
+    assert!(first["report_url"].is_null(), "{first}");
+    assert_eq!(reports.get(), 0);
+    let middle = send(v2_request("vid_2", "b", 0, "w-a", Some(("b-1", 1, 3))));
+    assert_eq!(middle["batch_done"], false, "{middle}");
+    assert_eq!(reports.get(), 0);
+    let last = send(v2_request("vid_3", "c", 0, "w-a", Some(("b-1", 2, 3))));
+    assert_eq!(last["ok"], true, "{last}");
+    assert_eq!(last["batch_done"], true, "{last}");
+    assert_eq!(last["report_url"], "case/reports/case-report.html");
+    assert_eq!(reports.get(), 1, "exactly one make-report per batch");
+    // Every chunk was applied as its own transaction.
+    let mut ids: Vec<String> = crate::case_db::load_review_marks(&case_dir)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.record_id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["vid_1", "vid_2", "vid_3"]);
+    // No batch (single request) and a legacy body: report every time.
+    let single = send(v2_request("vid_4", "d", 0, "w-a", None));
+    assert_eq!(single["batch_done"], true, "{single}");
+    assert_eq!(reports.get(), 2);
+    let legacy = send(request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": serde_json::json!({
+            "schema_version": 2, "protocol": "patch-v1", "case_id": "FT-jobs",
+            "marks": [{"id": "vid_1", "status": "noted", "note": "legacy"}], "tags": [], "deleted_ids": []
+        }).to_string()}).to_string(),
+    ));
+    assert_eq!(legacy["ok"], true, "{legacy}");
+    assert_eq!(legacy["protocol"], "patch-v1");
+    assert_eq!(
+        legacy["applied"]["vid_1"], 2,
+        "legacy writes still bump the revision"
+    );
+    assert_eq!(reports.get(), 3);
+    // The busy lease is released after each request.
+    assert!(!state_lock(&state).busy);
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// §1.4 response contract: a stale id is reported with the server value
+/// and not applied, the other ids in the same body are applied, and a
+/// resend with the returned revision goes through.
+#[test]
+fn import_marks_conflict_response_shape() {
+    let case_dir = temp_case("conflict-shape");
+    let state = bound_state(&case_dir, "review-ready");
+    let runner = |_: &[String]| Ok(String::new());
+    let send = |req: Request| {
+        parse(&super::jobs::api_import_marks_with_runner(
+            &req, &state, &runner,
+        ))
+    };
+    // Window B saves vid_1 first (revision 1).
+    let b = send(v2_request("vid_1", "from B", 0, "w-b", None));
+    assert_eq!(b["applied"], serde_json::json!({"vid_1": 1}), "{b}");
+    assert_eq!(b["conflicts"], serde_json::json!([]), "{b}");
+    // Window A, still at base 0 for vid_1, also saves a fresh vid_2.
+    let mut marks = serde_json::json!({
+        "schema_version": 2, "protocol": "patch-v2", "case_id": "FT-jobs", "examiner": "lee",
+        "client_id": "w-a", "base_revisions": {"vid_1": 0, "vid_2": 0},
+        "marks": [
+            {"id": "vid_1", "status": "noted", "marked_unix": 7, "note": "from A", "examiner": "lee", "tags": []},
+            {"id": "vid_2", "status": "reviewed", "marked_unix": 8, "note": "", "examiner": "lee", "tags": ["x"]}
+        ],
+        "tags": [], "deleted_ids": []
+    });
+    let a = send(request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": marks.to_string()}).to_string(),
+    ));
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["protocol"], "patch-v2");
+    assert_eq!(a["stored"], 1);
+    assert_eq!(a["applied"], serde_json::json!({"vid_2": 1}), "{a}");
+    assert_eq!(a["batch_done"], true);
+    assert_eq!(a["deferred"], false);
+    assert_eq!(a["report_url"], "case/reports/case-report.html");
+    let conflicts = a["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "{a}");
+    assert_eq!(
+        conflicts[0],
+        serde_json::json!({
+            "id": "vid_1",
+            "server_revision": 1,
+            "server": {
+                "status": "important", "marked_unix": 100, "examiner": "kim", "note": "from B",
+                "range": {"in": 1.0, "out": 2.0}, "tags": ["사고"]
+            }
+        }),
+        "{a}"
+    );
+    let stored = crate::case_db::load_review_marks(&case_dir).unwrap();
+    let vid_1 = stored.iter().find(|m| m.record_id == "vid_1").unwrap();
+    assert_eq!(
+        vid_1.note.as_deref(),
+        Some("from B"),
+        "stale save must not apply"
+    );
+    // "내 값으로 덮어쓰기": resend with the server revision as base.
+    marks["base_revisions"] = serde_json::json!({"vid_1": 1});
+    marks["marks"].as_array_mut().unwrap().truncate(1);
+    let retry = send(request(
+        "POST",
+        "/api/import-marks",
+        "",
+        &serde_json::json!({"marks_json": marks.to_string()}).to_string(),
+    ));
+    assert_eq!(retry["applied"], serde_json::json!({"vid_1": 2}), "{retry}");
+    assert_eq!(retry["conflicts"], serde_json::json!([]));
+    let stored = crate::case_db::load_review_marks(&case_dir).unwrap();
+    let vid_1 = stored.iter().find(|m| m.record_id == "vid_1").unwrap();
+    assert_eq!(vid_1.note.as_deref(), Some("from A"));
+    assert!(
+        crate::case_db::load_review_tags(&case_dir)
+            .unwrap()
+            .iter()
+            .all(|t| t.id != "vid_1"),
+        "explicit empty tags cleared the server tags"
+    );
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// A body over the 4 MiB cap is refused with HTTP 413 before anything is
+/// read or applied (the client halves its chunk size on this status).
+/// The 413 body is plain text, not JSON — clients branch on the status.
+#[test]
+fn import_marks_oversize_body_is_413() {
+    let case_dir = temp_case("oversize");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = bound_state(&case_dir, "review-ready");
+    let server_state = Arc::clone(&state);
+    thread::spawn(move || serve_on(listener, server_state));
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let five_mib = 5 * 1024 * 1024;
+    write!(
+        stream,
+        "POST /api/import-marks HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {five_mib}\r\n\r\n"
+    )
+    .unwrap();
+    let _ = stream.write_all(&vec![b'x'; 64 * 1024]);
+    let mut buffer = Vec::new();
+    let _ = stream.read_to_end(&mut buffer);
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    assert!(
+        crate::case_db::load_review_marks(&case_dir)
+            .unwrap()
+            .is_empty()
+    );
+    state_lock(&state).request_shutdown();
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// A v2 body queued during a long step whose ids moved on before the
+/// drain: the conflict is journaled with the client's original entry
+/// (never dropped), `/api/status.mark_conflicts` reports it — also from a
+/// fresh server state (restart) — and a later save of that id with a
+/// current base resolves it while the journal keeps the original line.
+#[test]
+fn deferred_drain_records_conflicts_file_and_status_count() {
+    let case_dir = temp_case("drain-conflict");
+    let state = {
+        let mut job_state = JobState::new();
+        job_state.case_dir = Some(case_dir.clone());
+        job_state.phase = "review-partial";
+        job_state.busy = true;
+        job_state.enrichment = Some(Enrichment {
+            step: "hash",
+            label: "test",
+            stage: 1,
+            stages: 4,
+        });
+        Arc::new(Mutex::new(job_state))
+    };
+    let queued = parse(&api_import_marks(
+        &v2_request("vid_1", "mine", 0, "w-a", None),
+        &state,
+    ));
+    assert_eq!(queued["ok"], true, "{queued}");
+    assert_eq!(queued["deferred"], true);
+    assert_eq!(queued["pending"], 1);
+    assert_eq!(queued["applied"], serde_json::json!({}));
+    assert_eq!(queued["conflicts"], serde_json::json!([]));
+    // Meanwhile another window's save lands (revision 1 for vid_1).
+    let server_mark = crate::case_db::ReviewMarkRow {
+        record_id: "vid_1".into(),
+        status: "reviewed".into(),
+        marked_unix: 50,
+        examiner: Some("lee".into()),
+        note: Some("server".into()),
+        ..Default::default()
+    };
+    crate::case_db::patch_review_annotations_by(&case_dir, &[server_mark], &[], &[], Some("lee"))
+        .unwrap();
+    // The drain at the next short step applies the queue.
+    let job = PipelineJob {
+        kind: InputKind::Folder,
+        case_dir: case_dir.clone(),
+        source_path: PathBuf::from("/ev"),
+        with_hash: true,
+        with_ffprobe: false,
+        with_deepfake: false,
+        with_audio: false,
+        skip_e01_verify: false,
+        e01_direct: false,
+    };
+    run_folder_enrichment(&state, &job, |_| Ok("ok".into()));
+    assert_eq!(pending_marks_count(&case_dir), 0);
+    assert_eq!(state_lock(&state).phase, "review-ready");
+    let stored = crate::case_db::load_review_marks(&case_dir).unwrap();
+    assert_eq!(
+        stored[0].note.as_deref(),
+        Some("server"),
+        "stale queued save not applied"
+    );
+    let journal_path = case_dir.join(super::jobs::PENDING_MARK_CONFLICTS_FILE);
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    let lines: Vec<serde_json::Value> = journal.lines().map(parse).collect();
+    assert_eq!(lines.len(), 1, "{journal}");
+    assert_eq!(lines[0]["id"], "vid_1");
+    assert_eq!(lines[0]["server_revision"], 1);
+    assert_eq!(lines[0]["server"]["note"], "server");
+    assert_eq!(
+        lines[0]["mine"]["mark"]["note"], "mine",
+        "original entry kept verbatim"
+    );
+    assert_eq!(
+        lines[0]["mine"]["mark"]["tags"],
+        serde_json::json!(["사고"])
+    );
+    assert_eq!(lines[0]["mine"]["base_revision"], 0);
+    assert_eq!(lines[0]["mine"]["deleted"], false);
+    assert_eq!(lines[0]["client_id"], "w-a");
+    assert!(lines[0]["recorded_unix"].as_u64().unwrap() > 0);
+    let logs = state_lock(&state).logs.join("\n");
+    assert!(logs.contains("충돌 1건"), "{logs}");
+    let status = parse(&api_status(&state));
+    assert_eq!(
+        status["mark_conflicts"],
+        serde_json::json!({"count": 1, "ids": ["vid_1"]}),
+        "{status}"
+    );
+    // Survives a server restart: a fresh state reads the same journal.
+    let restarted = bound_state(&case_dir, "review-ready");
+    assert_eq!(parse(&api_status(&restarted))["mark_conflicts"]["count"], 1);
+    // The examiner decides ("내 값") and saves with the current base.
+    let runner = |_: &[String]| Ok(String::new());
+    let resolved = parse(&super::jobs::api_import_marks_with_runner(
+        &v2_request("vid_1", "mine again", 1, "w-a", None),
+        &state,
+        &runner,
+    ));
+    assert_eq!(
+        resolved["applied"],
+        serde_json::json!({"vid_1": 2}),
+        "{resolved}"
+    );
+    let status = parse(&api_status(&state));
+    assert_eq!(
+        status["mark_conflicts"],
+        serde_json::json!({"count": 0, "ids": []}),
+        "{status}"
+    );
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    let lines: Vec<serde_json::Value> = journal.lines().map(parse).collect();
+    assert_eq!(lines.len(), 2, "journal is append-only: {journal}");
+    assert_eq!(lines[0]["mine"]["mark"]["note"], "mine");
+    assert_eq!(lines[1]["resolved"], "vid_1");
+    assert_eq!(lines[1]["revision"], 2);
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+fn import_body(state: &SharedState, body: serde_json::Value) -> serde_json::Value {
+    let runner = |_: &[String]| Ok(String::new());
+    parse(&super::jobs::api_import_marks_with_runner(
+        &request(
+            "POST",
+            "/api/import-marks",
+            "",
+            &serde_json::json!({"marks_json": body.to_string()}).to_string(),
+        ),
+        state,
+        &runner,
+    ))
+}
+
+/// Queues one v2 body during a long step, lets another (legacy) writer
+/// land revision 1 for the same id, and drains — leaving one open queue
+/// conflict for `vid_1` at server revision 1.
+fn open_queue_conflict(tag: &str) -> (PathBuf, SharedState) {
+    let case_dir = temp_case(tag);
+    let state = {
+        let mut job_state = JobState::new();
+        job_state.case_dir = Some(case_dir.clone());
+        job_state.phase = "review-partial";
+        job_state.busy = true;
+        job_state.enrichment = Some(Enrichment {
+            step: "hash",
+            label: "test",
+            stage: 1,
+            stages: 4,
+        });
+        Arc::new(Mutex::new(job_state))
+    };
+    let queued = parse(&api_import_marks(
+        &v2_request("vid_1", "mine", 0, "w-a", None),
+        &state,
+    ));
+    assert_eq!(queued["deferred"], true, "{queued}");
+    let server_mark = crate::case_db::ReviewMarkRow {
+        record_id: "vid_1".into(),
+        status: "reviewed".into(),
+        marked_unix: 50,
+        examiner: Some("lee".into()),
+        note: Some("server".into()),
+        ..Default::default()
+    };
+    crate::case_db::patch_review_annotations_by(&case_dir, &[server_mark], &[], &[], Some("lee"))
+        .unwrap();
+    let job = PipelineJob {
+        kind: InputKind::Folder,
+        case_dir: case_dir.clone(),
+        source_path: PathBuf::from("/ev"),
+        with_hash: true,
+        with_ffprobe: false,
+        with_deepfake: false,
+        with_audio: false,
+        skip_e01_verify: false,
+        e01_direct: false,
+    };
+    run_folder_enrichment(&state, &job, |_| Ok("ok".into()));
+    assert_eq!(state_lock(&state).phase, "review-ready");
+    (case_dir, state)
+}
+
+/// §10.2: `GET /api/mark-conflicts` lists every open queue conflict with
+/// the server value and the entry as originally queued; finalize refuses
+/// while one is open; only a patch-v2 save that applies the id with a base
+/// at least the journaled server revision resolves it — not a legacy/v1
+/// body, not an unchanged-content save carrying an older base.
+#[test]
+fn mark_conflicts_endpoint_resolution_rule_and_finalize_block() {
+    let (case_dir, state) = open_queue_conflict("conflict-endpoint");
+    let listed = parse(&api_mark_conflicts(&state));
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["count"], 1);
+    let entry = &listed["conflicts"][0];
+    assert_eq!(entry["id"], "vid_1");
+    assert_eq!(entry["server_revision"], 1);
+    assert_eq!(entry["server"]["note"], "server");
+    assert_eq!(entry["server"]["status"], "reviewed");
+    assert_eq!(entry["queued"]["mark"]["note"], "mine", "{entry}");
+    assert_eq!(entry["queued"]["mark"]["tags"], serde_json::json!(["사고"]));
+    assert_eq!(entry["queued"]["base_revision"], 0);
+    assert_eq!(entry["queued"]["deleted"], false);
+    assert_eq!(entry["client_id"], "w-a");
+    assert!(entry["recorded_unix"].as_u64().unwrap() > 0);
+    assert_eq!(entry["entries"], 1);
+    // Routed as a plain API GET.
+    let routed = route(&request("GET", "/api/mark-conflicts", "", ""), &state);
+    let routed = String::from_utf8_lossy(&routed);
+    let body = routed.split("\r\n\r\n").nth(1).unwrap_or_default();
+    assert_eq!(parse(body)["count"], 1, "{routed}");
+
+    // Finalize is refused before anything is written.
+    let refused = parse(&finalize_with_exe(
+        Path::new("/nonexistent/frametrace"),
+        &case_dir,
+        "kim",
+        &state,
+    ));
+    assert_eq!(refused["ok"], false);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("저장 충돌 1건을 먼저 해결하십시오"),
+        "{refused}"
+    );
+    assert!(
+        !case_dir
+            .join(super::jobs::SIGNOFF_PENDING_REL_PATH)
+            .exists()
+    );
+    assert!(!case_dir.join(crate::report::SIGNOFF_REL_PATH).exists());
+
+    // Identical content from another window with an old base: applied as
+    // a no-op at revision 1, but it is not a decision — still open.
+    let same = import_body(
+        &state,
+        serde_json::json!({
+            "schema_version": 2, "protocol": "patch-v2", "case_id": "FT-jobs",
+            "client_id": "w-c", "base_revisions": {"vid_1": 0},
+            "marks": [{"id": "vid_1", "status": "reviewed", "marked_unix": 50,
+                       "examiner": "lee", "note": "server"}],
+        }),
+    );
+    assert_eq!(same["applied"], serde_json::json!({"vid_1": 1}), "{same}");
+    assert_eq!(parse(&api_mark_conflicts(&state))["count"], 1);
+    // A patch-v1 (last write wins) body never resolves.
+    let v1 = import_body(
+        &state,
+        serde_json::json!({
+            "schema_version": 2, "protocol": "patch-v1", "case_id": "FT-jobs",
+            "marks": [{"id": "vid_1", "status": "reviewed", "marked_unix": 50, "note": "legacy"}],
+            "tags": [], "deleted_ids": [],
+        }),
+    );
+    assert_eq!(v1["applied"], serde_json::json!({"vid_1": 2}), "{v1}");
+    assert_eq!(parse(&api_status(&state))["mark_conflicts"]["count"], 1);
+    // The window decides with the current base (2 >= journaled 1).
+    let decided = parse(&super::jobs::api_import_marks_with_runner(
+        &v2_request("vid_1", "decided", 2, "w-a", None),
+        &state,
+        &|_: &[String]| Ok(String::new()),
+    ));
+    assert_eq!(
+        decided["applied"],
+        serde_json::json!({"vid_1": 3}),
+        "{decided}"
+    );
+    let listed = parse(&api_mark_conflicts(&state));
+    assert_eq!(
+        listed,
+        serde_json::json!({"ok": true, "count": 0, "conflicts": []})
+    );
+    assert_eq!(
+        parse(&api_status(&state))["mark_conflicts"],
+        serde_json::json!({"count": 0, "ids": []})
+    );
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
+/// `/api/records-meta` annotations carry the per-record revision map the
+/// v2 client seeds `state.revisions` from (empty before any save).
+#[test]
+fn records_meta_annotations_include_revisions() {
+    let case_dir = temp_case("meta-revisions");
+    let state = bound_state(&case_dir, "review-ready");
+    let empty = parse(&api_records_meta(&state));
+    assert_eq!(empty["ok"], true, "{empty}");
+    assert_eq!(empty["annotations"]["marks"], serde_json::json!([]));
+    assert_eq!(empty["annotations"]["revisions"], serde_json::json!({}));
+    let runner = |_: &[String]| Ok(String::new());
+    let saved = parse(&super::jobs::api_import_marks_with_runner(
+        &v2_request("vid_1", "n", 0, "w-a", None),
+        &state,
+        &runner,
+    ));
+    assert_eq!(saved["ok"], true, "{saved}");
+    crate::case_db::patch_review_annotations_by(
+        &case_dir,
+        &[],
+        &[crate::selection::TagEntry {
+            id: "vid_9".into(),
+            tags: vec!["t".into()],
+        }],
+        &[],
+        None,
+    )
+    .unwrap();
+    let meta = parse(&api_records_meta(&state));
+    let annotations = &meta["annotations"];
+    assert_eq!(
+        annotations["marks"][0]["record_id"], "vid_1",
+        "{annotations}"
+    );
+    assert_eq!(
+        annotations["marks"][0]["range"],
+        serde_json::json!({"in": 1.0, "out": 2.0})
+    );
+    assert_eq!(
+        annotations["tags"],
+        serde_json::json!([{"id": "vid_1", "tags": ["사고"]}, {"id": "vid_9", "tags": ["t"]}])
+    );
+    assert_eq!(
+        annotations["revisions"],
+        serde_json::json!({"vid_1": 1, "vid_9": 1}),
+        "{annotations}"
+    );
+    // §10.2: the window that wrote each current revision (null = legacy).
+    assert_eq!(
+        annotations["writers"],
+        serde_json::json!({"vid_1": "w-a", "vid_9": null}),
+        "{annotations}"
+    );
+    // Same object make-review embeds in the data bundle, minus `writers`
+    // (writer tokens stay out of the packaged bundle).
+    let bundle: serde_json::Value =
+        serde_json::from_str(&crate::case_db::review_annotations_json(&case_dir).unwrap()).unwrap();
+    assert!(bundle.get("writers").is_none(), "{bundle}");
+    let mut served = annotations.clone();
+    served.as_object_mut().unwrap().remove("writers");
+    assert_eq!(bundle, served);
+    let _ = std::fs::remove_dir_all(case_dir);
+}
+
 #[test]
 fn recover_returns_immediately_and_status_reaches_done() {
     let case_dir = temp_case("recover-done");
@@ -111,6 +667,10 @@ fn recover_returns_immediately_and_status_reaches_done() {
   make-review) echo "review rebuilt" ;;
   *) exit 9 ;;
 esac"#,
+        &format!(
+            "if \"%1\"==\"recover-batch\" (\n{}\necho recovered 3 candidates\nexit /b 0\n)\nif \"%1\"==\"make-review\" (\necho review rebuilt\nexit /b 0\n)\nexit /b 9",
+            cmd_sleep(1)
+        ),
     );
     let state = bound_state(&case_dir, "review-ready");
     let started = std::time::Instant::now();
@@ -145,7 +705,6 @@ esac"#,
     assert!(logs.contains("review rebuilt"), "{logs}");
 }
 
-#[cfg(unix)]
 #[test]
 fn cancel_kills_the_recover_step_tree() {
     let case_dir = temp_case("recover-cancel");
@@ -159,6 +718,10 @@ fn cancel_kills_the_recover_step_tree() {
   *) echo ok ;;
 esac"#,
             pid_file.display()
+        ),
+        &format!(
+            "if \"%1\"==\"recover-batch\" (\n{}\nexit /b 0\n)\necho ok",
+            cmd_grandchild_sleeper(&pid_file)
         ),
     );
     let state = bound_state(&case_dir, "review-partial");
@@ -203,12 +766,15 @@ fn recover_and_carve_reject_missing_inputs_without_taking_busy() {
     assert!(state_lock(&state).case_job.is_none());
 }
 
-#[cfg(unix)]
 #[test]
 fn a_failed_recover_step_is_reported_not_swallowed() {
     let case_dir = temp_case("recover-fail");
     write_inspection(&case_dir);
-    let exe = fake_cli(&case_dir, r#"echo "image unreadable" >&2; exit 3"#);
+    let exe = fake_cli(
+        &case_dir,
+        r#"echo "image unreadable" >&2; exit 3"#,
+        "echo image unreadable 1>&2\nexit /b 3",
+    );
     let state = bound_state(&case_dir, "review-ready");
     assert_eq!(parse(&recover_deleted_with_exe(&state, &exe))["ok"], true);
     wait_for("job failed", Duration::from_secs(10), || {
@@ -227,7 +793,6 @@ fn a_failed_recover_step_is_reported_not_swallowed() {
 
 /// Marks saved while a recover job runs are queued durably and applied
 /// before the job releases `busy` (make-review re-runs to include them).
-#[cfg(unix)]
 #[test]
 fn marks_saved_during_recover_are_queued_and_applied() {
     let case_dir = temp_case("recover-marks");
@@ -241,6 +806,10 @@ fn marks_saved_during_recover_are_queued_and_applied() {
   make-review) echo review ;;
 esac"#,
             gate.display()
+        ),
+        &format!(
+            "if \"%1\"==\"recover-batch\" (\n{}\necho recovered\nexit /b 0\n)\nif \"%1\"==\"make-review\" echo review\nexit /b 0",
+            cmd_wait_for_file(&gate)
         ),
     );
     let state = bound_state(&case_dir, "review-ready");
@@ -262,7 +831,6 @@ esac"#,
     assert_eq!(stored, vec!["vid_0042".to_string()]);
 }
 
-#[cfg(unix)]
 const FAKE_EXPORT: &str = r#"out=""; prev=""
 for a in "$@"; do
   printf '%s\n' "$a" >> "$(dirname "$0")/argv.txt"
@@ -274,15 +842,23 @@ case "$1" in
   *) exit 0 ;;
 esac"#;
 
-fn clip_body(extra: &str) -> String {
-    format!(r#"{{"id":"vid_0001","start":"1.500","duration":"4.000"{extra}}}"#)
+/// Batch twin of [`FAKE_EXPORT`]: the raw argument line goes to argv.txt
+/// (cmd splits `--exhibit=<v>` on `=`, so per-arg lines are not possible).
+fn fake_export_cmd() -> String {
+    format!(
+        "echo %* >> \"%~dp0argv.txt\"\nset first=%1\n{CMD_FIND_OUTPUT}\nif \"%first%\"==\"export-video\" (\n{}\necho clip-bytes-%out% > \"%out%\"\necho exported\nexit /b 0\n)\nexit /b 0",
+        cmd_sleep(1)
+    )
 }
 
-#[cfg(unix)]
+fn clip_body(extra: &str) -> String {
+    format!(r#"{{"id":"vid_000001","start":"1.500","duration":"4.000"{extra}}}"#)
+}
+
 #[test]
 fn double_export_returns_the_same_job_and_clip_sha256() {
     let case_dir = temp_case("clip-dedupe");
-    let exe = fake_cli(&case_dir, FAKE_EXPORT);
+    let exe = fake_cli(&case_dir, FAKE_EXPORT, &fake_export_cmd());
     let state = bound_state(&case_dir, "review-ready");
     let req = request("POST", "/api/export-clip", "", &clip_body(""));
     let first = parse(&export_clip_with_exe(&req, &state, &exe));
@@ -310,7 +886,10 @@ fn double_export_returns_the_same_job_and_clip_sha256() {
         &state,
     ));
     let rel = done["path"].as_str().unwrap();
-    assert!(rel.starts_with("artifacts/clips/vid_0001__1s+4s"), "{rel}");
+    assert!(
+        rel.starts_with("artifacts/clips/vid_000001__1s+4s"),
+        "{rel}"
+    );
     let digest = crate::audit::digest_file(&case_dir.join(rel)).unwrap();
     assert_eq!(done["sha256"], digest);
     assert_eq!(done["job"]["sha256"], digest);
@@ -327,7 +906,7 @@ fn double_export_returns_the_same_job_and_clip_sha256() {
             "POST",
             "/api/export-clip",
             "",
-            r#"{"id":"vid_0001","start":"9","duration":"1"}"#,
+            r#"{"id":"vid_000001","start":"9","duration":"1"}"#,
         ),
         &state,
         &exe,
@@ -337,11 +916,10 @@ fn double_export_returns_the_same_job_and_clip_sha256() {
 
 /// SEC-06: the exhibit label is one `--exhibit=<value>` argv token, so a
 /// value starting with `-` cannot become a separate flag.
-#[cfg(unix)]
 #[test]
 fn exhibit_label_travels_as_a_single_argv_token() {
     let case_dir = temp_case("clip-exhibit");
-    let exe = fake_cli(&case_dir, FAKE_EXPORT);
+    let exe = fake_cli(&case_dir, FAKE_EXPORT, &fake_export_cmd());
     let state = bound_state(&case_dir, "review-ready");
     let req = request(
         "POST",
@@ -359,7 +937,11 @@ fn exhibit_label_travels_as_a_single_argv_token() {
             .any(|job| job.id == id && job.state != "running")
     });
     let argv = std::fs::read_to_string(case_dir.join("argv.txt")).unwrap();
-    let lines: Vec<&str> = argv.lines().collect();
+    // Unix logs one argv per line, the batch twin the raw line: compare tokens.
+    let lines: Vec<&str> = argv
+        .split_whitespace()
+        .map(|token| token.trim_matches('"'))
+        .collect();
     assert!(lines.contains(&"--exhibit=--hash-source"), "{argv}");
     assert!(!lines.contains(&"--hash-source"), "{argv}");
     assert!(!lines.contains(&"--exhibit"), "{argv}");
@@ -368,7 +950,6 @@ fn exhibit_label_travels_as_a_single_argv_token() {
 
 /// UX-09: marks saving keeps working while an export runs, and finalize
 /// waits for the export instead of sealing a torn clip.
-#[cfg(unix)]
 #[test]
 fn marks_import_succeeds_while_an_export_runs() {
     let case_dir = temp_case("clip-marks");
@@ -381,6 +962,10 @@ for a in "$@"; do if [ "$prev" = "--output" ]; then out="$a"; fi; prev="$a"; don
 while [ ! -f "{}" ]; do sleep 0.05; done
 printf clip > "$out""#,
             gate.display()
+        ),
+        &format!(
+            "{CMD_FIND_OUTPUT}\n{}\necho clip> \"%out%\"",
+            cmd_wait_for_file(&gate)
         ),
     );
     let state = bound_state(&case_dir, "review-ready");
@@ -403,7 +988,10 @@ printf clip > "$out""#,
     ));
     assert_eq!(finalize["ok"], false);
     assert!(
-        finalize["error"].as_str().unwrap().contains("클립"),
+        finalize["error"]
+            .as_str()
+            .unwrap()
+            .contains("내보내기·이어붙이기"),
         "{finalize}"
     );
     // Shutdown refuses while the export runs; the global cancel stops it.
@@ -418,11 +1006,10 @@ printf clip > "$out""#,
     std::fs::write(&gate, b"go").unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn clip_cancel_endpoint_kills_only_that_export() {
     let case_dir = temp_case("clip-cancel");
-    let exe = fake_cli(&case_dir, "sleep 300");
+    let exe = fake_cli(&case_dir, "sleep 300", CMD_SPIN);
     let state = bound_state(&case_dir, "review-ready");
     let started = parse(&export_clip_with_exe(
         &request("POST", "/api/export-clip", "", &clip_body("")),
@@ -683,5 +1270,38 @@ fn media_is_confined_to_the_registered_source() {
         let link = get(&source.join("link.mp4"));
         assert!(link.starts_with("HTTP/1.1 403"), "{link}");
     }
-    state_lock(&state).shutdown_requested = true;
+    state_lock(&state).request_shutdown();
+}
+
+/// R4 F11 (P12): `marks-imported.json` is replaced wholesale through the
+/// atomic temp+rename writer: a stale earlier import never survives and no
+/// `.tmp-` sibling is left behind. (Failure-path cleanup needs a writer seam
+/// from track B; see the F11 integration TODO.)
+#[test]
+fn marks_imported_json_is_rewritten_atomically_without_temp_leftovers() {
+    let case_dir = temp_case("marks-atomic");
+    let marks_path = case_dir.join("marks-imported.json");
+    std::fs::write(&marks_path, b"stale half-written import").unwrap();
+    let state = bound_state(&case_dir, "review-ready");
+    let saved = parse(&super::jobs::api_import_marks_with_runner(
+        &marks_request("vid_0007"),
+        &state,
+        &|_| Ok(String::new()),
+    ));
+    assert_eq!(saved["ok"], true, "{saved}");
+    let written = std::fs::read_to_string(&marks_path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&written)
+        .unwrap_or_else(|err| panic!("marks-imported.json is not whole JSON ({err}): {written}"));
+    assert_eq!(json["marks"][0]["id"], "vid_0007");
+    let leftovers: Vec<String> = std::fs::read_dir(&case_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(case_dir);
 }

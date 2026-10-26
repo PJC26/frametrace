@@ -23,6 +23,10 @@ async function loadEnv() {
     syncToolsBtn();
     ffprobeMissing = !t.ffprobe;
     if (!t.ffprobe) { $("withFfprobe").checked = false; syncScanMode(); }
+    // The sound option depends on ffprobe (and ffmpeg to decode): re-sync it
+    // now that the tools are known — it may have been enabled before /api/env
+    // answered, and unchecking ffprobe programmatically fires no change event.
+    if (typeof syncAudioOpt === "function") syncAudioOpt();
     // E01 is auto-detected from the path; a missing libewf is explained
     // next to the detected-kind chip instead of greying a radio.
     syncE01Need();
@@ -102,8 +106,9 @@ function looksLargeSource(src) {
   return /^[A-Za-z]:[\\/]?$/.test(v) || /^\\\\[?.]\\/.test(v) || v === "/" ||
     /^\/(dev|media|mnt|Volumes|run\/media\/[^/]+)\/[^/]+\/?$/.test(v);
 }
+// R19 (track S1): the server writes a drive root as `E:\.` — read as `E:`.
 function normPath(p) {
-  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return String(p || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([a-z]:)\/\.$/i, "$1").toLowerCase();
 }
 // True when `child` is `parent` or lies beneath it (case-insensitive,
 // separator-agnostic — the workstation is primarily Windows).

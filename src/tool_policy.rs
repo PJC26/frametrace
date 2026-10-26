@@ -25,8 +25,10 @@ pub fn resolve_tool_binary(input: &str, allowed_names: &[&str]) -> Result<String
         ));
     }
 
-    let canonical = Path::new(trimmed)
-        .canonicalize()
+    // Checks run on the display form so argv[0], error strings and audit
+    // text never carry the Windows `\\?\` verbatim prefix. The allowlist
+    // check is by file name, which the prefix strip never changes.
+    let canonical = crate::util::canonicalize_display(Path::new(trimmed))
         .map_err(|err| format!("failed to canonicalize tool binary '{trimmed}': {err}"))?;
     if !canonical.is_file() {
         return Err(format!(
@@ -59,7 +61,27 @@ pub fn command_version(input: &str, allowed_names: &[&str], version_arg: &str) -
         Ok(binary) => binary,
         Err(err) => return format!("unavailable: {err}"),
     };
-    match crate::util::hide_console(Command::new(&binary).arg(version_arg)).output() {
+    // P7: a version probe is bounded — a wedged tool must not hang the
+    // command (or the HTTP handler) that asked for its version.
+    let secs = crate::util::version_probe_timeout_secs();
+    let result =
+        crate::util::run_with_timeout_detailed(Command::new(&binary).arg(version_arg), Some(secs));
+    describe_version_probe(&binary, secs, result)
+}
+
+/// Provenance text for one version probe. R6: a probe that ran out of
+/// time says exactly that — the tool resolved and started, its version is
+/// simply not known — and is never recorded as "unavailable", which would
+/// claim as fact that the tool was missing or broken.
+pub fn describe_version_probe(
+    binary: &str,
+    secs: u64,
+    result: Result<std::process::Output, crate::util::RunError>,
+) -> String {
+    match result {
+        Err(crate::util::RunError::TimedOut(_)) => format!(
+            "version probe timed out after {secs}s ({binary} started but did not report its version; version not recorded)"
+        ),
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -75,7 +97,7 @@ pub fn command_version(input: &str, allowed_names: &[&str], version_arg: &str) -
             "unavailable: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ),
-        Err(err) => format!("unavailable: {err}"),
+        Err(err) => format!("unavailable: {}", err.message()),
     }
 }
 
@@ -100,8 +122,8 @@ pub fn require_case_output_path(
     if !canonical_parent.starts_with(&case_root) {
         return Err(format!(
             "{label} output must be inside the case directory {}; parent resolves to {}",
-            case_root.display(),
-            canonical_parent.display()
+            crate::util::strip_windows_extended_prefix(&case_root).display(),
+            crate::util::strip_windows_extended_prefix(&canonical_parent).display()
         ));
     }
 
@@ -123,8 +145,8 @@ pub fn require_case_output_path(
             if !canonical_leaf.starts_with(&case_root) {
                 return Err(format!(
                     "{label} output must be inside the case directory {}; resolves to {}",
-                    case_root.display(),
-                    canonical_leaf.display()
+                    crate::util::strip_windows_extended_prefix(&case_root).display(),
+                    crate::util::strip_windows_extended_prefix(&canonical_leaf).display()
                 ));
             }
         }
@@ -271,7 +293,7 @@ fn find_in_tools_bin(name: &str, allowed_names: &[&str]) -> Option<String> {
         if !metadata.is_file() {
             continue;
         }
-        let Ok(canonical) = candidate.canonicalize() else {
+        let Ok(canonical) = crate::util::canonicalize_display(&candidate) else {
             continue;
         };
         let file_name = canonical.file_name().and_then(|n| n.to_str());
@@ -299,7 +321,7 @@ fn find_in_path_dirs(name: &str, allowed_names: &[&str], path_var: &str) -> Opti
             if !metadata.is_file() {
                 continue;
             }
-            let Ok(canonical) = candidate.canonicalize() else {
+            let Ok(canonical) = crate::util::canonicalize_display(&candidate) else {
                 continue;
             };
             if let Some(file_name) = canonical.file_name().and_then(|file| file.to_str())
@@ -442,6 +464,60 @@ mod tests {
         let impostor_path = impostor_dir.display().to_string();
         assert!(find_in_path_dirs("ffprobe", &["ffprobe"], &impostor_path).is_none());
 
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resolved_tool_paths_never_carry_the_verbatim_prefix() {
+        let base = std::env::temp_dir().join(format!(
+            "frametrace-tool-display-test-{}",
+            std::process::id()
+        ));
+        let tool_dir = base.join("bin");
+        fs::create_dir_all(&tool_dir).unwrap();
+        let tool = tool_dir.join("frametrace-probe-disp.exe");
+        fs::write(&tool, b"stub").unwrap();
+
+        let explicit =
+            resolve_tool_binary(&tool.display().to_string(), &["frametrace-probe-disp"]).unwrap();
+        let via_path = find_in_path_dirs(
+            "frametrace-probe-disp",
+            &["frametrace-probe-disp"],
+            &tool_dir.display().to_string(),
+        )
+        .unwrap();
+        for resolved in [explicit.clone(), via_path.display().to_string()] {
+            assert!(
+                !resolved.starts_with(r"\\?\"),
+                "verbatim prefix: {resolved}"
+            );
+            assert!(Path::new(&resolved).is_absolute(), "{resolved}");
+            // Still the same file as the input once both are canonicalized.
+            assert_eq!(
+                Path::new(&resolved).canonicalize().unwrap(),
+                tool.canonicalize().unwrap()
+            );
+        }
+
+        // Allowlist enforcement is unchanged for explicit paths.
+        let err = resolve_tool_binary(&tool.display().to_string(), &["ffprobe"]).unwrap_err();
+        assert!(err.contains("unsupported tool binary"), "{err}");
+        assert!(!err.contains(r"\\?\"), "{err}");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn containment_errors_show_plain_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "frametrace-output-policy-display-test-{}",
+            std::process::id()
+        ));
+        let case_dir = base.join("case");
+        fs::create_dir_all(&case_dir).unwrap();
+        let err = require_case_output_path(&case_dir, &base.join("out.mp4"), "test").unwrap_err();
+        assert!(err.contains("inside the case directory"), "{err}");
+        assert!(!err.contains(r"\\?\"), "{err}");
         let _ = fs::remove_dir_all(base);
     }
 

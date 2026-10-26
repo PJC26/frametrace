@@ -1,7 +1,7 @@
 function moveActive(step) {
   const filtered = filteredRecords();
   if (!filtered.length) return;
-  const index = filtered.findIndex(record => record.id === state.activeId);
+  const index = indexInList(filtered, state.activeId);
   const next = Math.max(0, Math.min(filtered.length - 1, (index < 0 ? 0 : index + step)));
   const nextId = filtered[next].id;
   const nextPage = Math.floor(next / state.pageSize) + 1;
@@ -54,7 +54,17 @@ document.getElementById("shortcutsModal").addEventListener("keydown", e => {
 // so a stray key or a bulk action over a large selection is reversible
 // with Ctrl+Z / Ctrl+Y (or the Undo button on the toast).
 const JOURNAL_LIMIT = 200;
+// A8: the journal is bounded by record ids too, not just by entries: 200
+// bulk actions over 100 000 records each would hold 20 M snapshots. Past
+// this many ids (both stacks together) the OLDEST undo entries go first;
+// the newest action always stays undoable.
+const JOURNAL_ID_CAP = 200000;
 const BULK_CONFIRM_MIN = 5;
+// Entries are stored packed (journalPack): { label, activeBefore, n,
+// groups: [{ ids, fields, before, after }] } — the ids whose changed fields
+// went from the same `before` values to the same `after` values share one
+// group, and only the changed fields are kept (a note's text only when the
+// note changed). A bulk mark over 100 000 unmarked records is ONE group.
 const undoStack = [];
 const redoStack = [];
 
@@ -86,14 +96,27 @@ function journalDiff(before, after) {
   return changes;
 }
 
+// Applies one side of a journal entry. A field whose current value is no
+// longer what the entry left behind (undo expects `after`, redo `before`)
+// was changed elsewhere — another window, the server, a resolved conflict —
+// and is NOT overwritten: it is left as is and leaves the entry, so a later
+// redo/undo cannot replay it either. Returns { applied, skipped } where
+// `applied` is the changes (fields) that were restored.
 function applyJournalSide(changes, side) {
+  const expect = side === "before" ? "after" : "before";
   const current = new Map(snapshotIds(changes.map(change => change.id)).map(item => [item.id, item]));
+  const applied = [];
+  let skipped = 0;
   for (const change of changes) {
     const id = change.id;
     const item = change[side];
     const now = current.get(id);
     let annotationChanged = false;
-    for (const field of change.fields) {
+    const fields = change.fields.filter(field =>
+      !change[expect] || journalFieldValue(field, now[field]) === journalFieldValue(field, change[expect][field]));
+    skipped += change.fields.length - fields.length;
+    if (fields.length) applied.push(fields.length === change.fields.length ? change : { ...change, fields });
+    for (const field of fields) {
       if (field === "mark") {
         if (item.mark) state.marks[id] = { ...item.mark }; else delete state.marks[id];
         if (JSON.stringify(now.mark) !== JSON.stringify(item.mark)) annotationChanged = true;
@@ -109,12 +132,144 @@ function applyJournalSide(changes, side) {
         if (JSON.stringify(now.range) !== JSON.stringify(item.range)) annotationChanged = true;
       }
     }
+    // touchAnnotation snapshots the restored annotation (incl. range) into
+    // the draft; hydration replays drafts, so no per-map storage write.
     if (annotationChanged) touchAnnotation(id);
   }
-  storageSet(MARKS_KEY, state.marks);
-  storageSet(NOTES_KEY, state.notes);
-  storageSet(TAGS_KEY, state.tags);
-  storageSet(RANGES_KEY, state.ranges);
+  return { applied, skipped };
+}
+
+// A resolved save conflict (90-sync resolveConflicts) is the examiner's
+// decision for those ids: undo/redo must not replay an older value of
+// theirs over it, so their journal changes go (an entry left with no
+// change goes too).
+function dropJournalIds(ids) {
+  const drop = new Set(ids);
+  for (const stack of [undoStack, redoStack]) {
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const entry = stack[i];
+      entry.groups = (entry.groups || []).map(g => ({ ...g, ids: g.ids.filter(id => !drop.has(id)) })).filter(g => g.ids.length);
+      entry.n = entry.groups.reduce((sum, g) => sum + g.ids.length, 0);
+      if (!entry.groups.length) stack.splice(i, 1);
+    }
+  }
+}
+
+// --- packed journal entries (A8) ----------------------------------------
+// changes [{ id, fields, before: snapshot, after: snapshot }] → groups.
+function journalPack(changes) {
+  const byKey = new Map();
+  for (const change of changes || []) {
+    if (!change || change.id == null || !Array.isArray(change.fields) || !change.fields.length) continue;
+    const fields = change.fields.filter(field => JOURNAL_FIELDS.includes(field));
+    if (!fields.length) continue;
+    const pick = side => {
+      const out = {};
+      for (const field of fields) out[field] = side && side[field] !== undefined ? side[field] : null;
+      return out;
+    };
+    const before = pick(change.before);
+    const after = pick(change.after);
+    const key = JSON.stringify([fields, before, after]);
+    const group = byKey.get(key);
+    if (group) group.ids.push(change.id);
+    else byKey.set(key, { ids: [change.id], fields, before, after });
+  }
+  return [...byKey.values()];
+}
+function journalEntry(label, activeBefore, changes) {
+  const groups = journalPack(changes);
+  return { label, activeBefore, groups, n: groups.reduce((sum, g) => sum + g.ids.length, 0) };
+}
+// groups → changes (transient: only for the entry being undone / redone).
+function journalUnpack(entry) {
+  const out = [];
+  for (const g of (entry && entry.groups) || []) {
+    for (const id of g.ids) out.push({ id, fields: g.fields, before: g.before, after: g.after });
+  }
+  return out;
+}
+function journalIdCount() {
+  let n = 0;
+  for (const stack of [undoStack, redoStack]) for (const entry of stack) n += entry.n || 0;
+  return n;
+}
+// Oldest undo entries go first (then the oldest redo ones); the newest
+// undo entry always stays.
+function trimJournal() {
+  while (undoStack.length > JOURNAL_LIMIT) undoStack.shift();
+  let n = journalIdCount();
+  while (n > JOURNAL_ID_CAP && undoStack.length > 1) n -= undoStack.shift().n || 0;
+  while (n > JOURNAL_ID_CAP && redoStack.length) n -= redoStack.shift().n || 0;
+}
+// Harness view (verify-review-batch --unit, A8): entries, ids, JSON size.
+function journalStats() {
+  return { entries: undoStack.length + redoStack.length, ids: journalIdCount(), bytes: JSON.stringify({ undoStack, redoStack }).length };
+}
+
+// --- journal across a reload (U4) ---------------------------------------
+// FTViewer.reload() rebuilds the record model; the journal goes with the
+// rest of the view state (95-init viewerViewState) and comes back filtered:
+// a change survives only when its record still exists AND the record still
+// holds the value the entry would leave (undo: `after`, redo: `before`) —
+// anything that moved meanwhile (another window, the server) is dropped
+// rather than overwritten by a stale Ctrl+Z. Undo/redo then go through the
+// normal draft + save path (touchAnnotation), so the save protocol's
+// dirty/draft/conflict state is never touched here.
+function journalFieldValue(field, v) {
+  if (field === "note") return String(v || "");
+  if (field === "tags") return JSON.stringify(Array.isArray(v) ? v : []);
+  if (field === "mark") return v && v.status ? String(v.status) : "";
+  if (field === "range") return v && (Number.isFinite(v.in) || Number.isFinite(v.out)) ? `${Number.isFinite(v.in) ? v.in : ""}|${Number.isFinite(v.out) ? v.out : ""}` : "";
+  return JSON.stringify(v ?? null);
+}
+function journalExport() {
+  const plain = stack => stack.map(entry => ({ label: entry.label, activeBefore: entry.activeBefore, groups: entry.groups }));
+  return { undo: plain(undoStack), redo: plain(redoStack) };
+}
+function journalImport(saved) {
+  if (!saved || typeof saved !== "object") return 0;
+  // Walks a stack from its top (the next Ctrl+Z / Ctrl+Y) down, replaying
+  // each kept change on a virtual copy of the current values, so a deeper
+  // entry is checked against what the record will hold by the time it is
+  // reached. A dropped change blocks every deeper change of that id+field.
+  const take = (list, side) => {
+    const other = side === "after" ? "before" : "after";
+    const virtual = new Map();
+    const blocked = new Set();
+    const valueOf = (id, field) => {
+      const k = id + "\u0001" + field;
+      if (!virtual.has(k)) virtual.set(k, journalFieldValue(field, snapshotIds([id])[0][field]));
+      return virtual.get(k);
+    };
+    const kept = [];
+    const entries = Array.isArray(list) ? list : [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      // Packed entries (A8) or the older per-change form.
+      const list = entry && Array.isArray(entry.groups) ? journalUnpack(entry) : entry && Array.isArray(entry.changes) ? entry.changes : null;
+      if (!list) continue;
+      const changes = list.filter(change => {
+        if (!change || change.id == null || !Array.isArray(change.fields) || !change[side] || !change[other]) return false;
+        const fields = change.fields;
+        const ok = recordById.has(change.id) && fields.length > 0 &&
+          fields.every(field => JOURNAL_FIELDS.includes(field) && !blocked.has(change.id + "\u0001" + field) &&
+            valueOf(change.id, field) === journalFieldValue(field, change[side][field]));
+        for (const field of fields) {
+          const k = change.id + "\u0001" + field;
+          if (ok) virtual.set(k, journalFieldValue(field, change[other][field]));
+          else blocked.add(k);
+        }
+        return ok;
+      });
+      if (changes.length) kept.unshift(journalEntry(String(entry.label || ""), recordById.has(entry.activeBefore) ? entry.activeBefore : null, changes));
+    }
+    return kept.slice(-JOURNAL_LIMIT);
+  };
+  undoStack.splice(0, undoStack.length, ...take(saved.undo, "after"));
+  redoStack.splice(0, redoStack.length, ...take(saved.redo, "before"));
+  trimJournal();
+  return undoStack.length + redoStack.length;
 }
 
 // --- toasts ------------------------------------------------------------
@@ -167,13 +322,15 @@ function toast(message, opts) {
   const host = document.getElementById("toastHost");
   const text = String(message == null ? "" : message);
   const error = opts && opts.error != null ? !!opts.error : TOAST_ERROR_RE.test(text);
+  // R7 U8: a warning (amber) is neither an error nor plain information.
+  const warn = !error && !!(opts && opts.warn);
   // Host notification; a host that renders the message itself cancels it
   // (contract section 6.5: one toast host at a time, by default the viewer's).
-  if (FTViewer._emit("toast", { message: text, kind: error ? "error" : "info" }, true).defaultPrevented) return null;
+  if (FTViewer._emit("toast", { message: text, kind: error ? "error" : warn ? "warn" : "info" }, true).defaultPrevented) return null;
   ftAnnounce(text);
   if (!host) return null;
   const item = document.createElement("div");
-  item.className = error ? "toast toast-error" : "toast";
+  item.className = error ? "toast toast-error" : warn ? "toast toast-warn" : "toast";
   const body = document.createElement("span");
   body.className = "toast-text";
   body.textContent = text;
@@ -230,9 +387,9 @@ function journaled(label, ids, mutate, message) {
   const after = snapshotIds(unique);
   const changes = journalDiff(before, after);
   if (!changes.length) return result;
-  undoStack.push({ label, changes, activeBefore });
-  if (undoStack.length > JOURNAL_LIMIT) undoStack.shift();
+  undoStack.push(journalEntry(label, activeBefore, changes));
   redoStack.length = 0;
+  trimJournal();
   const raised = host && host.lastElementChild !== lastToastBefore ? host.lastElementChild : null;
   if (message == null && raised && raised.classList.contains("toast")) {
     host.querySelectorAll(".toast-undo").forEach(el => dismissToast(el));
@@ -246,31 +403,35 @@ function journaled(label, ids, mutate, message) {
 function focusRecordId(id) {
   if (!id || !records.some(record => record.id === id)) return;
   state.activeId = id;
-  const index = filteredRecords().findIndex(record => record.id === id);
+  const index = indexInList(filteredRecords(), id);
   if (index >= 0) state.currentPage = Math.floor(index / state.pageSize) + 1;
 }
 
 function undoJournal() {
+  if (refuseLockedEdit()) return false; // R5 U1
   const entry = undoStack.pop();
   if (!entry) { toast(t("toast.nothingUndo")); return false; }
-  applyJournalSide(entry.changes, "before");
-  redoStack.push(entry);
+  const res = applyJournalSide(journalUnpack(entry), "before");
+  if (res.applied.length) { redoStack.push(journalEntry(entry.label, entry.activeBefore, res.applied)); trimJournal(); }
   focusRecordId(entry.activeBefore);
   render();
   updateRangeLabel();
-  toast(tf("toast.undone", { what: entry.label }));
+  if (res.applied.length) toast(tf("toast.undone", { what: entry.label }));
+  if (res.skipped) toast(t("journal.skippedUndo"));
   return true;
 }
 
 function redoJournal() {
+  if (refuseLockedEdit()) return false; // R5 U1
   const entry = redoStack.pop();
   if (!entry) { toast(t("toast.nothingRedo")); return false; }
-  applyJournalSide(entry.changes, "after");
-  undoStack.push(entry);
+  const res = applyJournalSide(journalUnpack(entry), "after");
+  if (res.applied.length) { undoStack.push(journalEntry(entry.label, entry.activeBefore, res.applied)); trimJournal(); }
   focusRecordId(entry.activeBefore);
   render();
   updateRangeLabel();
-  toast(tf("toast.redone", { what: entry.label }));
+  if (res.applied.length) toast(tf("toast.redone", { what: entry.label }));
+  if (res.skipped) toast(t("journal.skippedRedo"));
   return true;
 }
 
@@ -291,6 +452,7 @@ function markStatusLabel(status) {
 // Selection-bar mark buttons. Clearing a mark keeps the examiner's note —
 // notes are only ever edited in the note field.
 function applyMarkJournaled(status) {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { toast(t("toast.selectTarget")); return; }
   const label = markStatusLabel(status);
@@ -302,19 +464,20 @@ function applyMarkJournaled(status) {
         else state.marks[id] = { status, marked_unix: stamped };
         touchAnnotation(id);
       });
-      storageSet(MARKS_KEY, state.marks);
     }, tf("toast.markApplied", { n: ids.length, status: label }));
     render();
   });
 }
 
 function applyTagJournaled(tag) {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag)); return; }
   confirmThen(ids, tf("journal.tag", { tag }), () => journaled(tf("journal.tag", { tag }), ids, () => applyTag(tag)));
 }
 
 function clearTagsJournaled() {
+  if (refuseLockedEdit()) return; // R5 U1
   const ids = targetIds();
   if (!ids.length) { journaled(t("journal.tagClear"), ids, () => clearTags()); return; }
   confirmThen(ids, t("journal.tagClear"), () => journaled(t("journal.tagClear"), ids, () => clearTags()));
@@ -324,8 +487,9 @@ function clearTagsJournaled() {
 // can clear a review queue without touching the mouse. Key 0 removes the
 // mark only — the note survives — and every mark is undoable.
 function markActive(status) {
+  if (refuseLockedEdit()) return; // R5 U1: read-only — no mark, no advance
   const before = filteredRecords();
-  const index = before.findIndex(record => record.id === state.activeId);
+  const index = indexInList(before, state.activeId);
   if (index < 0) return;
   const id = state.activeId;
   const label = markStatusLabel(status);
@@ -333,12 +497,16 @@ function markActive(status) {
     if (status === null) delete state.marks[id];
     else state.marks[id] = { status, marked_unix: Math.floor(Date.now() / 1000) };
     touchAnnotation(id);
-    storageSet(MARKS_KEY, state.marks);
   }, tf("toast.markApplied", { n: 1, status: label }));
   const after = filteredRecords();
-  const next = before.slice(index + 1).find(record => after.some(item => item.id === record.id));
+  // R6 U8: the next record of the old list that the new one still holds —
+  // by index map (the same memoised list in the common case: the very next).
+  let next = null;
+  for (let i = index + 1; i < before.length; i++) {
+    if (indexInList(after, before[i].id) >= 0) { next = before[i]; break; }
+  }
   state.activeId = next?.id || after[Math.min(index, after.length - 1)]?.id || null;
-  state.currentPage = Math.max(1, Math.floor(after.findIndex(record => record.id === state.activeId) / state.pageSize) + 1);
+  state.currentPage = Math.max(1, Math.floor(indexInList(after, state.activeId) / state.pageSize) + 1);
   render();
 }
 
@@ -350,7 +518,7 @@ function isReviewed(record) { return !!state.marks[record.id]; }
 function moveToUnreviewed(step) {
   const filtered = filteredRecords();
   if (!filtered.length) return;
-  const start = filtered.findIndex(record => record.id === state.activeId);
+  const start = indexInList(filtered, state.activeId);
   const base = start < 0 ? (step > 0 ? -1 : 0) : start;
   const total = filtered.length;
   for (let offset = 1; offset <= total; offset += 1) {
@@ -399,7 +567,9 @@ function setI18nTitle(el, key) {
 function updateReviewMeta() {
   if (!reviewMeta) return;
   const total = records.length;
-  const reviewed = records.reduce((n, record) => n + (isReviewed(record) ? 1 : 0), 0);
+  // R7 U4: kept incrementally (30-records.js markTallyNow: by changed id) —
+  // a mark no longer walks the whole mark map (R6 recounted it per mark).
+  const reviewed = markTallyNow().n;
   reviewMeta.progressText.textContent = tf("progress.label", { n: reviewed, m: total });
   reviewMeta.meter.max = Math.max(1, total);
   reviewMeta.meter.value = reviewed;
@@ -474,7 +644,73 @@ function isTypingTarget(el) {
   return el.tagName === "INPUT" && TEXT_INPUT_TYPES.has(String(el.getAttribute("type") || "").toLowerCase());
 }
 
+// U6: the key a shortcut means. A Korean (or other non-Latin-script) layout
+// or IME reports event.key as the composed jamo ("ㅓ" for J), a Cyrillic /
+// Greek / … letter ("о" for J on a Russian layout) or "Process" — the
+// physical key (event.code) then decides, so j/k/n/x/i/o/1/2/3/0/,/./[/]/?
+// and Ctrl+Z/Y/A/D/B/K keep working without switching the input language.
+// Anything else keeps event.key as is: AZERTY "&" on Digit1, "é" on Digit2,
+// Czech "ě"/"š", Turkish "ı", Nordic "å" … are that layout's own
+// characters and trigger nothing (they are not "2" or "1"). Letters follow
+// Shift alone, so CapsLock never turns j into the J shuttle (or Shift+j
+// into j). `var`: 40-grid's Ctrl+B listener calls this too.
+var SHORTCUT_CODE_KEYS = { Comma: ",", Period: ".", BracketLeft: "[", BracketRight: "]", Space: " " };
+var NON_LATIN_SCRIPT_RE = /^[\p{Script=Hangul}\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Armenian}\p{Script=Georgian}\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Thai}\p{Script=Devanagari}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Bopomofo}]$/u;
+function shortcutKey(event) {
+  let key = String(event.key || "");
+  if (key === "Process" || key === "Unidentified" || NON_LATIN_SCRIPT_RE.test(key)) {
+    const code = String(event.code || "");
+    let m = /^Key([A-Z])$/.exec(code);
+    if (m) key = m[1].toLowerCase();
+    else if ((m = /^(?:Digit|Numpad)([0-9])$/.exec(code)) && !event.shiftKey) key = m[1];
+    else if (code === "Slash" && event.shiftKey) key = "?";
+    else if (SHORTCUT_CODE_KEYS[code] && !event.shiftKey) key = SHORTCUT_CODE_KEYS[code];
+    else return key;
+  }
+  if (/^[a-z]$/i.test(key)) key = event.shiftKey ? key.toUpperCase() : key.toLowerCase();
+  return key;
+}
+// A viewer modal (shortcut sheet, in-page dialog, command palette) is open.
+function viewerModalOpen() {
+  return !!ftRoot.querySelector(".modal-backdrop:not([hidden])");
+}
+// A12: a modal OUTSIDE the viewer (the hosting shell's dialog, path picker,
+// deliverables sheet) is open and shown — nothing of the viewer may open
+// over it (the command palette).
+function hostModalOpen() {
+  for (const el of document.querySelectorAll('[aria-modal="true"]')) {
+    if (ftRoot.contains(el) || el.closest("[hidden]") || !el.getClientRects().length) continue;
+    return true;
+  }
+  return false;
+}
+// Focus inside a toast (its Undo / close button): Esc dismisses THAT toast,
+// then focus moves to the newest remaining toast's button, else back to
+// the active card (viewerFocus), never left on a removed node.
+function dismissFocusedViewerToast(el) {
+  const item = el && el.closest ? el.closest("#toastHost .toast") : null;
+  if (!item) return false;
+  dismissToast(item);
+  const host = document.getElementById("toastHost");
+  const rest = host ? [...host.querySelectorAll(".toast:not(.clip-progress)")] : [];
+  const next = rest.length ? rest[rest.length - 1].querySelector("button") : null;
+  if (next) next.focus();
+  else if (typeof viewerFocus === "function") viewerFocus();
+  return true;
+}
+// Esc closes ONE layer per press (U13): newest toast first, then theater.
+function dismissNewestViewerToast() {
+  const host = document.getElementById("toastHost");
+  const items = host ? [...host.querySelectorAll(".toast:not(.clip-progress)")] : [];
+  if (!items.length) return false;
+  dismissToast(items[items.length - 1]);
+  return true;
+}
+
 document.addEventListener("keydown", event => {
+  // No IME guard here: outside a text field nothing composes, and a
+  // Korean-layout shortcut arrives as key "Process" / keyCode 229 that
+  // shortcutKey() maps by event.code (U6). Text fields return below.
   if (event.defaultPrevented) return;
   const el = document.activeElement;
   const tag = el?.tagName;
@@ -494,8 +730,12 @@ document.addEventListener("keydown", event => {
   const altGraph = typeof event.getModifierState === "function" && event.getModifierState("AltGraph");
   const mod = !altGraph && (event.ctrlKey || event.metaKey);
   if (!altGraph && event.altKey) return; // Alt+Left etc. belong to the browser
+  const skey = shortcutKey(event);
+  // Under an open viewer modal only Esc reaches here (its own handler
+  // usually takes it first): nothing behind it may change.
+  if (viewerModalOpen() && skey !== "Escape") return;
   if (mod) {
-    const key = String(event.key).toLowerCase();
+    const key = skey.toLowerCase();
     if (key === "z" && !event.shiftKey) { event.preventDefault(); undoJournal(); }
     else if (key === "y" || (key === "z" && event.shiftKey)) { event.preventDefault(); redoJournal(); }
     else if (event.ctrlKey && !event.metaKey && !event.shiftKey && key === "a") { event.preventDefault(); selectAllFiltered(); }
@@ -503,7 +743,7 @@ document.addEventListener("keydown", event => {
     return; // every other Ctrl/Cmd combo (zoom, find, print…) stays the browser's
   }
   let handled = true;
-  switch (event.key) {
+  switch (skey) {
     case "j": moveActive(1); break;
     case "k": moveActive(-1); break;
     case "n": moveToUnreviewed(1); break;
@@ -533,10 +773,15 @@ document.addEventListener("keydown", event => {
     case "p": togglePip(); break;
     case "?": toggleShortcuts(true); break;
     case "Escape":
+      // One layer per press, topmost first (U13): a focused filter
+      // control, the shortcut sheet, the newest toast, theater mode.
       if (tag === "SELECT" || tag === "INPUT") el.blur();
-      toggleShortcuts(false);
-      dismissToasts();
-      if (state.layout.theater) toggleTheater();
+      else if (!document.getElementById("shortcutsModal").hidden) toggleShortcuts(false);
+      else if (dismissFocusedViewerToast(el)) { /* the toast focus was on */ }
+      else if (dismissNewestViewerToast()) { /* one toast */ }
+      else if (state.layout.theater) toggleTheater();
+      else handled = false;
+      if (handled) event.preventDefault();
       break;
     default: handled = false; break;
   }
@@ -631,12 +876,7 @@ document.getElementById("btnTelemetry").addEventListener("click", async (ev) => 
   const record = selectedRecord();
   if (!record) return;
   await withBusy(ev.currentTarget, async () => {
-    const res = await fetch("/api/telemetry", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ id: record.id, path: record.path || "" })
-    });
-    const data = await res.json();
+    const data = await viewerPost("/api/telemetry", { id: record.id, path: record.path || "" });
     if (data.ok && data.report) {
       record.telemetry = data.report;
       if (DATA.telemetry) DATA.telemetry[String(record.id).replace(/[:\\\/]/g, "_")] = data.report;
@@ -659,12 +899,7 @@ async function captureCurrentFrame(videoEl, recordId, btn) {
   const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
   const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
   await withBusy(btn, async () => {
-    const res = await fetch("/api/capture-frame", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ id: recordId, image: b64, time: videoEl.currentTime.toFixed(2) })
-    });
-    const data = await res.json();
+    const data = await viewerPost("/api/capture-frame", { id: recordId, image: b64, time: videoEl.currentTime.toFixed(2) });
     if (!data.ok) throw new Error(data.error || "");
     toast(tf("toast.captureSaved", { path: data.path }));
   }, { fail: err => (err instanceof TypeError || err instanceof SyntaxError) ? t("toast.captureOffline") : tf("toast.captureFail", { err: err?.message || "" }) });
@@ -674,7 +909,7 @@ document.getElementById("btnCaptureFrame").addEventListener("click", ev => {
   captureCurrentFrame(currentVideo(), record ? record.id : "unknown", ev.currentTarget);
 });
 
-// --- 구간(인/아웃) 마킹 + 클립보내기: 기록별로 localStorage에 유지됨 ---
+// --- 구간(인/아웃) 마킹 + 클립보내기: 케이스 주석(저장 프로토콜 v2, 드래프트 경유) ---
 function rangeOf(record) { return record ? state.ranges[record.id] : null; }
 function updateRangeLabel() {
   const el = document.getElementById("rangeLabel");
@@ -691,6 +926,7 @@ function updateRangeLabel() {
 // put every toast in this function into its TDZ (UX-01). A point that
 // would make OUT <= IN is rejected and the existing range kept intact.
 function setRangePoint(which) {
+  if (refuseLockedEdit()) return; // R5 U1
   const video = currentVideo();
   const record = selectedRecord();
   const now = video ? Number(video.currentTime) : NaN;
@@ -704,8 +940,8 @@ function setRangePoint(which) {
   }
   journaled(t("journal.range"), [record.id], () => {
     state.ranges[record.id] = range;
-    storageSet(RANGES_KEY, state.ranges);
-    // Ranges persist server-side (FOR-01): queue the case-DB sync.
+    // Ranges persist server-side (FOR-01, R4 A1): the draft carries the
+    // range and the next save sends it explicitly.
     touchAnnotation(record.id);
   }, tf("range.label", {
     in: Number.isFinite(range.in) ? `${range.in.toFixed(1)}s` : "—",
@@ -719,12 +955,7 @@ document.getElementById("btnSetOut").addEventListener("click", () => setRangePoi
 // fallback when the selected record's container can't decode in-browser.
 // Returns the proxy path on success; throws with the server error text.
 async function requestReviewProxy(record) {
-  const res = await fetch("/api/proxy", {
-    method: "POST",
-    headers: { "Content-Type": "text/plain" },
-    body: JSON.stringify({ id: record.id, path: record.path || "" })
-  });
-  const data = await res.json();
+  const data = await viewerPost("/api/proxy", { id: record.id, path: record.path || "" });
   if (!data.ok) throw new Error(data.error || "proxy failed");
   state.proxies[record.id] = data.path;
   storageSet(PROXIES_KEY, state.proxies);
@@ -789,11 +1020,28 @@ function fmtClipBytes(n) {
   if (v >= 1024) return Math.round(v / 1024) + " KB";
   return v + " B";
 }
+// One progress line per job kind. A join job (§1.6/§1.7) reports `stage`
+// (hash i/N → concat → verify) from its progress file; concat progress is
+// the .part size against the sources total (expected_bytes). The stage may
+// arrive as a string with stage_done/stage_total, or as the progress object.
+function jobProgressText(job, kind) {
+  const sec = Number(job.elapsed_secs) || 0;
+  if (kind !== "join") return tf("clip.progress", { sec, size: fmtClipBytes(job.bytes_written) });
+  const raw = job.stage && typeof job.stage === "object" ? job.stage : { stage: job.stage, done: job.stage_done ?? job.done, total: job.stage_total ?? job.total };
+  const stage = String(raw.stage || "");
+  if (stage === "hash" && Number(raw.total) > 0) return tf("join.prog.hash", { done: Number(raw.done) || 0, total: Number(raw.total) });
+  if (stage === "concat") {
+    const expected = Number(job.expected_bytes) || 0;
+    if (expected > 0) return tf("join.prog.concat", { pct: Math.min(100, Math.floor((Number(job.bytes_written) || 0) * 100 / expected)), sec });
+  }
+  if (stage === "verify") return tf("join.prog.verify", { sec });
+  return tf("join.prog", { sec });
+}
 // Persistent progress row (in the toast host) with a cancel button.
-function clipProgressUi(onCancel) {
+function clipProgressUi(onCancel, kind) {
   const host = document.getElementById("toastHost");
   const item = document.createElement("div");
-  item.className = "toast clip-progress";
+  item.className = "toast clip-progress" + (kind ? " job-" + kind : "");
   const text = document.createElement("span");
   text.className = "toast-text";
   const cancel = document.createElement("button");
@@ -809,22 +1057,24 @@ function clipProgressUi(onCancel) {
   if (host) host.appendChild(item);
   return {
     set(job) {
-      text.textContent = tf("clip.progress", { sec: Number(job.elapsed_secs) || 0, size: fmtClipBytes(job.bytes_written) });
+      text.textContent = jobProgressText(job, kind || job.kind || "");
     },
     remove() { item.remove(); }
   };
 }
-// Polls one export job until it leaves "running"; resolves with the final
-// job record (state done|failed|cancelled). Network blips are retried.
+// Polls one export job (clip or join — same status route, looked up by id)
+// until it leaves "running"; resolves with the final job record (state
+// done|failed|cancelled). Network blips are retried. `btn` is optional: a
+// menu item has no room for the elapsed counter (the progress row has it).
 async function pollExportJob(job, btn, ui) {
   const id = job.id;
-  const base = btn.dataset.label || btn.textContent;
-  btn.dataset.label = base;
+  const base = btn ? (btn.dataset.label || btn.textContent) : "";
+  if (btn) btn.dataset.label = base;
   let current = job;
   let misses = 0;
   while (current.state === "running") {
     ui.set(current);
-    btn.textContent = `${base} ${Number(current.elapsed_secs) || 0}s`;
+    if (btn) btn.textContent = `${base} ${Number(current.elapsed_secs) || 0}s`;
     await new Promise(r => setTimeout(r, 1000));
     let data = null;
     try {
@@ -839,8 +1089,33 @@ async function pollExportJob(job, btn, ui) {
     if (!data || !data.ok || !data.job) throw new Error((data && data.error) || "export-clip-status");
     current = data.job;
   }
-  btn.textContent = base;
+  if (btn) btn.textContent = base;
   return current;
+}
+
+// A server path relative to the case folder, shown absolute (the examiner
+// copies it into the exhibit list).
+function caseAbsPath(path) {
+  const caseDir = String(DATA.caseDir || "");
+  const sep = caseDir.includes("\\") && !caseDir.includes("/") ? "\\" : "/";
+  return path && caseDir && !/^([a-zA-Z]:|[\\/])/.test(path)
+    ? caseDir.replace(/[\\/]+$/, "") + sep + path.split("/").join(sep) : path;
+}
+// Cancel button of a clip/join progress row (POST /api/export-clip-cancel).
+// A cancel that lost the race to completion is not a failure: the server
+// answers "already finished" and the poll then shows the result (the
+// success dialog) — no failure toast beside it.
+function cancelLostRace(d) {
+  if (!d) return false;
+  const st = String(d.state || (d.job && d.job.state) || "");
+  if (st === "done" || st === "failed" || st === "cancelled") return true;
+  return /이미\s*끝난|already\s+(finished|done|ended)/i.test(String(d.error || ""));
+}
+async function cancelExportJob(job, failKey) {
+  try {
+    const d = await viewerPost("/api/export-clip-cancel", { job: job.id });
+    if (!d.ok && !cancelLostRace(d)) toast(tf(failKey, { err: d.error || "" }));
+  } catch (err) { toast(err && err.ftAuth ? err.message : t("toast.clipOffline")); }
 }
 
 async function exportClip(btn, burn) {
@@ -862,34 +1137,25 @@ async function exportClip(btn, burn) {
   const body = { id: record.id, path: record.path || "", start: tin.toFixed(3), duration: (tout - tin).toFixed(3) };
   if (burn) { body.burn_in = "true"; body.exhibit = (ans.exhibit || "").trim(); }
   await withBusy(btn, async () => {
-    let res;
+    let data;
     try {
-      res = await fetch("/api/export-clip", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(body) });
-    } catch {
+      data = await viewerPost("/api/export-clip", body);
+    } catch (err) {
+      if (err && err.ftAuth) throw err;
       throw new Error(t("toast.clipOffline"));
     }
-    const data = await res.json();
     if (!data.ok) throw new Error(data.error || "");
     let job = data.job || null;
     if (job && job.state === "running") {
       if (data.deduped) toast(t("clip.joined"));
-      const ui = clipProgressUi(async () => {
-        try {
-          const r = await fetch("/api/export-clip-cancel", { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ job: job.id }) });
-          const d = await r.json();
-          if (!d.ok) toast(tf("toast.clipFail", { err: d.error || "" }));
-        } catch { toast(t("toast.clipOffline")); }
-      });
+      const ui = clipProgressUi(() => cancelExportJob(job, "toast.clipFail"));
       try { job = await pollExportJob(job, btn, ui); } finally { ui.remove(); }
     }
     if (job && job.state === "cancelled") { toast(t("toast.clipCancelled")); return; }
     if (job && job.state === "failed") throw new Error(job.error || "export failed");
     const path = (job && job.path) || data.path || "";
     const sha = (job && job.sha256) || data.sha256 || "";
-    const caseDir = String(DATA.caseDir || "");
-    const sep = caseDir.includes("\\") && !caseDir.includes("/") ? "\\" : "/";
-    const full = path && caseDir && !/^([a-zA-Z]:|[\\/])/.test(path)
-      ? caseDir.replace(/[\\/]+$/, "") + sep + path.split("/").join(sep) : path;
+    const full = caseAbsPath(path);
     toast(path ? tf("toast.clipDone", { path }) : t("clip.doneNoPath"));
     // Exhibit summary: what was cut, from what, where it is, and its hash.
     await askDialog({
@@ -908,6 +1174,228 @@ async function exportClip(btn, burn) {
 }
 document.getElementById("btnExportClip").addEventListener("click", ev => exportClip(ev.currentTarget, false));
 document.getElementById("btnExportClipBurn").addEventListener("click", ev => exportClip(ev.currentTarget, true));
+
+// --- Lossless join (docs/PLAN_PHASE2_JOIN_AUDIO_2026-10-13.md §1.6-§1.8) ---
+// "보내기·복사 › 선택 영상 이어붙이기…": POST /api/join-check (synchronous
+// probe → plan) → dialog (summary, notes, blocking reasons, segment table)
+// → POST /api/join {ids, plan_id, tolerance} → a clip-style job (kind
+// "join") polled through /api/export-clip-status and cancelled through
+// /api/export-clip-cancel. The server re-checks everything; the dialog
+// only explains. Hidden where no server answers (file:// viewer).
+const joinServed = location.protocol === "http:" || location.protocol === "https:";
+const JOIN_TOLERANCE = 1.0;
+function syncJoinButton() {
+  const btn = document.getElementById("btnJoinSelected");
+  if (!btn) return;
+  btn.hidden = !joinServed;
+  if (btn.dataset.busy === "1") return;
+  const enough = state.selectedIds.size >= 2;
+  btn.disabled = !enough;
+  const key = enough ? "tip.join" : "join.needTwo";
+  if (btn.dataset.i18nTitle !== key) {
+    btn.dataset.i18nTitle = key;
+    btn.title = t(key);
+  }
+}
+// "M분 SS초" / "H시간 MM분 SS초" (the server's summary_text format).
+function fmtJoinDuration(value) {
+  const v = Number(value);
+  if (value == null || !Number.isFinite(v)) return "-";
+  const total = Math.round(v);
+  const pad = n => String(n).padStart(2, "0");
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  return h ? tf("join.dur.hms", { h, m: pad(m), s: pad(s) }) : tf("join.dur.ms", { m, s: pad(s) });
+}
+// Signed seconds of a junction: "+3.0초" (gap) / "−1.0초" (overlap).
+function fmtJoinDelta(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return "-";
+  return tf("join.sec", { v: (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(1) });
+}
+// The server always words each blocking reason / warning (Korean `message`,
+// which may differ per case, e.g. hash-unavailable); this table only covers
+// a reply without one. Unknown codes show the server text or the code.
+const JOIN_CODE_TEXT = {
+  "channel-mixed": "채널이 섞여 있습니다",
+  "stream-mismatch": "영상 스트림 설정이 서로 다릅니다",
+  "audio-presence": "오디오 트랙이 일부에만 있습니다",
+  // R5 (S13): a file with sound but no video stream is refused at planning.
+  "audio-only": "영상 스트림이 없는(소리만 있는) 파일은 이어붙일 수 없습니다",
+  "unknown-duration": "길이를 알 수 없는 파일이 있습니다 — 손상 의심",
+  "duplicate-file": "같은 파일이 두 번 선택되었습니다",
+  "same-start": "시작 시각이 같은 영상이 있습니다",
+  "not-indexed": "색인되지 않은 항목은 이어붙일 수 없습니다",
+  "path-unsupported": "원본 경로에 제어 문자(줄바꿈 등)가 있어 이어붙일 수 없습니다",
+  "path-not-utf8": "원본 경로를 UTF-8로 읽을 수 없어 이어붙일 수 없습니다",
+  "extra-video-streams": "추가 영상 스트림은 결과 파일에 담기지 않습니다",
+  "data-streams-dropped": "데이터·자막 스트림(예: GPS)은 결과 파일에 담기지 않습니다",
+  "extradata-unavailable": "일부 원본의 코덱 설정(extradata)을 비교하지 못했습니다",
+  "channel-unknown": "채널을 확인할 수 없습니다",
+  "order-fallback": "녹화 시각이 일부 없어 파일명 순으로 정렬합니다",
+  "hash-unavailable": "일부 원본의 색인 해시가 없습니다",
+  "vendor-differs": "장치 제조사 판별이 서로 다릅니다",
+  "folders-differ": "원본 폴더가 서로 다릅니다",
+  "avg-frame-rate-differs": "평균 프레임레이트가 서로 다릅니다 (가변 프레임레이트일 수 있음)"
+};
+// Server `message` first (new codes — extra video streams, audio extradata,
+// non-UTF-8 paths, hash variants — arrive worded); a code this table does
+// not know still reads as a sentence, never a bare identifier.
+function joinBlockText(item, warning) {
+  if (!item) return "";
+  const message = String(item.message || "").trim();
+  if (message) return message;
+  if (JOIN_CODE_TEXT[item.code]) return JOIN_CODE_TEXT[item.code];
+  return tf(warning ? "join.code.warn" : "join.code.block", { code: String(item.code || "?") });
+}
+// Dialog body for one plan (§1.6 response). Untrusted strings (file names,
+// server messages) are escaped.
+function joinDialogContent(plan) {
+  const totals = plan.totals || {};
+  const segments = Array.isArray(plan.segments) ? plan.segments : [];
+  const junctions = Array.isArray(plan.junctions) ? plan.junctions : [];
+  const blocking = Array.isArray(plan.blocking) ? plan.blocking : [];
+  const basis = String(plan.order_basis || "");
+  const warnings = (Array.isArray(plan.warnings) ? plan.warnings : [])
+    .filter(w => w && !(w.code === "order-fallback" && basis === "filename-order"));
+  const basisKey = "join.basis." + basis;
+  const notes = [];
+  if (Number(totals.overlaps) > 0) notes.push(t("join.note.overlap"));
+  if (Number(totals.gaps) > 0) notes.push(t("join.note.gap"));
+  if (basis === "filename-order") notes.push(t("join.note.order"));
+  else if (joinJunctionsUnknown(plan)) notes.push(t("join.counts.unknown"));
+  const gapCell = index => {
+    const j = junctions.find(x => Number(x.after_index) === index + 1) || null;
+    if (!j || index === segments.length - 1) return "-";
+    const kind = String(j.kind || "unknown");
+    if (kind === "unknown" || !Number.isFinite(Number(j.delta_seconds))) return t("join.gap.unknown");
+    return `${t("join.gap." + kind)} ${fmtJoinDelta(j.delta_seconds)}`;
+  };
+  const rows = segments.map((seg, i) => `<tr><td class="num">${i + 1}</td><td class="join-file">${escapeHtml(seg.name || seg.id || "")}</td>` +
+    `<td>${escapeHtml(seg.recorded_start_text || "-")}</td><td class="num">${escapeHtml(fmtJoinDuration(seg.duration_seconds))}</td>` +
+    `<td>${escapeHtml(gapCell(i))}</td></tr>`).join("");
+  const wrap = document.createElement("div");
+  wrap.className = "join-dlg";
+  wrap.innerHTML = [
+    `<p class="join-sum">${escapeHtml(plan.summary_text || "")}</p>`,
+    `<p class="join-basis">${escapeHtml(tf("join.basis", { basis: t(basisKey) === basisKey ? basis : t(basisKey), tol: String(Number(plan.tolerance_seconds ?? JOIN_TOLERANCE)) }))}</p>`,
+    ...notes.map(note => `<p class="join-note">${escapeHtml(note)}</p>`),
+    warnings.length ? `<div class="join-warn"><span>${escapeHtml(t("join.warnings"))}</span><ul>${warnings.map(w => `<li>${escapeHtml(joinBlockText(w, true))}</li>`).join("")}</ul></div>` : "",
+    blocking.length ? `<div class="join-block">${ftIcon("warning")}<div><b>${escapeHtml(t("join.blocked"))}</b><ul>${blocking.map(b => `<li>${escapeHtml(joinBlockText(b))}</li>`).join("")}</ul></div></div>` : "",
+    `<details class="join-segs"><summary>${escapeHtml(tf("join.segments", { n: segments.length }))}</summary>` +
+      `<div class="join-segs-scroll" tabindex="0" role="region" aria-label="${escapeHtml(tf("join.segments", { n: segments.length }))}"><table>` +
+      `<thead><tr><th scope="col">#</th><th scope="col">${escapeHtml(t("join.col.file"))}</th><th scope="col">${escapeHtml(t("join.col.time"))}</th>` +
+      `<th scope="col">${escapeHtml(t("join.col.len"))}</th><th scope="col">${escapeHtml(t("join.col.next"))}</th></tr></thead>` +
+      `<tbody>${rows}</tbody></table></div></details>`
+  ].join("");
+  return wrap;
+}
+async function postJoinJson(url, body) {
+  let data;
+  try {
+    data = await viewerPost(url, body);
+  } catch (err) {
+    if (err && err.ftAuth) throw err;
+    throw new Error(t("toast.clipOffline"));
+  }
+  if (!data || !data.ok) throw new Error((data && data.error) || url);
+  return data;
+}
+async function joinSelected(btn) {
+  const ids = selectedRecords().map(record => record.id);
+  if (ids.length < 2) { toast(t("join.needTwo")); return; }
+  let plan = null;
+  await withBusy(btn, async () => {
+    const note = toast(t("join.checking"));
+    try {
+      const data = await postJoinJson("/api/join-check", { ids, tolerance: JOIN_TOLERANCE });
+      plan = data.plan || null;
+      if (!plan) throw new Error("join-check");
+    } finally {
+      dismissToast(note);
+    }
+  }, { fail: err => tf("join.fail", { err: err?.message || "" }) });
+  syncJoinButton();
+  if (!plan) return;
+  const blocking = Array.isArray(plan.blocking) ? plan.blocking : [];
+  const ans = await askDialog({
+    title: t("join.title"),
+    content: joinDialogContent(plan),
+    ok: t("join.go"),
+    okDisabled: blocking.length > 0,
+    okTitle: blocking.length ? joinBlockText(blocking[0]) : "",
+    className: "dlg-join"
+  });
+  if (!ans || blocking.length) return;
+  await withBusy(btn, async () => {
+    const data = await postJoinJson("/api/join", { ids, plan_id: plan.plan_id, tolerance: plan.tolerance_seconds ?? JOIN_TOLERANCE });
+    let job = data.job || null;
+    if (!job) throw new Error("join");
+    if (job.state === "running") {
+      // The host (shell) polls /api/status only every 5 s when idle: tell
+      // it a join is running so it polls fast and knows to offer '새 데이터
+      // 반영' when it ends, even if its poll never saw the job running.
+      emitDerivedJob(job, "started");
+      if (data.deduped) toast(t("join.deduped"));
+      const ui = clipProgressUi(() => cancelExportJob(job, "join.fail"), "join");
+      try { job = await pollExportJob(job, null, ui); } finally { ui.remove(); }
+    }
+    emitDerivedJob(job, job.state);
+    if (job.state === "cancelled") { toast(t("join.cancelled")); return; }
+    if (job.state === "failed") throw new Error(job.error || "join failed");
+    await showJoinDone(job, plan);
+  }, { fail: err => tf("join.fail", { err: err?.message || "" }) });
+  syncJoinButton();
+}
+// Single-button summary of a finished join: output, size, SHA-256,
+// manifest, length against the sources, gaps/overlaps — and a warning line
+// when the probed length disagrees with the sum of the sources.
+// FTViewer "derived-job" {kind, id, state: started|done|failed|cancelled,
+// started_unix}: a job started from this viewer that makes a derived record
+// (a join). The shell sets its '새 데이터 반영' wait on "done" and polls
+// fast after "started" (22-viewer-host.js → 31-progress.js).
+function emitDerivedJob(job, jobState) {
+  if (!job || !jobState) return;
+  FTViewer._emit("derived-job", { kind: String(job.kind || "join"), id: String(job.id || ""), state: String(jobState), started_unix: job.started_unix ?? null });
+}
+// A number only when the server gave one: null/""/absent stay unknown
+// (Number(null) is 0 — a length of "0분 00초" would be a false claim).
+function joinNum(value) {
+  if (value == null || value === "") return null;
+  const v = Number(value);
+  return Number.isFinite(v) ? v : null;
+}
+async function showJoinDone(job, plan) {
+  // The job reply carries no totals: the counts are the checked plan's.
+  const totals = Object.assign({}, plan.totals || {}, job.totals || {});
+  const check = job.duration_check && typeof job.duration_check === "object" ? job.duration_check : null;
+  const observed = check ? joinNum(check.observed) : joinNum(job.duration_seconds);
+  const expected = check && joinNum(check.expected) != null ? joinNum(check.expected) : joinNum(totals.duration_seconds);
+  const fmtLen = v => (v == null ? t("join.len.unknown") : fmtJoinDuration(v));
+  const unknownJunctions = joinJunctionsUnknown(Object.assign({ order_basis: plan.order_basis }, { totals }));
+  const manifest = job.manifest_path || job.manifest || "";
+  const message = [
+    `${t("join.out")}: ${caseAbsPath(job.path || "") || "-"}`,
+    job.size_bytes ? `${t("clip.size")}: ${fmtClipBytes(job.size_bytes)} (${Number(job.size_bytes).toLocaleString()} B)` : "",
+    `SHA-256: ${job.sha256 || t("clip.noSha")}`,
+    `${t("join.manifest")}: ${manifest ? caseAbsPath(manifest) : "-"}`,
+    tf("join.length", { out: fmtLen(observed), src: fmtLen(expected) }),
+    unknownJunctions ? t("join.counts.unknown") : tf("join.counts", { gaps: totals.gaps ?? 0, overlaps: totals.overlaps ?? 0 })
+  ].filter(Boolean).join("\n");
+  const extra = document.createElement("div");
+  extra.className = "join-dlg";
+  const lines = [];
+  if (check && check.ok === false) {
+    const text = observed != null && expected != null
+      ? tf("join.durWarn", { d: Math.abs(observed - expected).toFixed(1) })
+      : t("join.durUnknown");
+    lines.push(`<p class="join-block-line">${ftIcon("warning")}<span>${escapeHtml(text)}</span></p>`);
+  }
+  lines.push(`<p class="join-basis">${escapeHtml(t(ftHosted ? "join.hostedHint" : "join.refreshHint"))}</p>`);
+  extra.innerHTML = lines.join("");
+  await askDialog({ title: t("join.doneTitle"), message, content: extra, single: true, className: "dlg-join" });
+}
+document.getElementById("btnJoinSelected").addEventListener("click", ev => joinSelected(ev.currentTarget));
+syncJoinButton();
 document.getElementById("btnShortcuts").addEventListener("click", () => toggleShortcuts(true));
 document.getElementById("btnShortcutsClose").addEventListener("click", () => toggleShortcuts(false));
 document.getElementById("btnSelectFiltered").addEventListener("click", selectAllFiltered);
@@ -962,6 +1450,7 @@ tagMenuList.addEventListener("click", e => {
 tagMenuList.addEventListener("keydown", e => {
   if (e.key === "Enter" && e.target.id === "tagPresetInput") {
     e.preventDefault();
+    if (imeComposing(e)) return; // A6: the Enter that commits the composition
     addTagPresetFromMenu();
   }
 });
@@ -1296,7 +1785,7 @@ const commandPalette = (() => {
         e.preventDefault();
         if (shown.length) cursor = (cursor + (e.key === "ArrowDown" ? 1 : -1) + shown.length) % shown.length;
         draw();
-      } else if (e.key === "Enter") { e.preventDefault(); run(cursor); }
+      } else if (e.key === "Enter") { e.preventDefault(); if (!imeComposing(e)) run(cursor); }
       else if (e.key === "Tab") e.preventDefault();
       e.stopPropagation(); // app shortcuts (j/k/1/2/space ...) must not fire under the palette
     });
@@ -1304,7 +1793,8 @@ const commandPalette = (() => {
   function open() {
     if (!back) build();
     if (!back.hidden) return;
-    if (ftRoot.querySelector(".modal-backdrop:not([hidden]):not(#cmdPalette)")) return;
+    // A12: never over another viewer modal or a host (shell) modal.
+    if (viewerModalOpen() || hostModalOpen()) return;
     closeAllMenus();
     opener = document.activeElement;
     collect();
@@ -1315,7 +1805,8 @@ const commandPalette = (() => {
     input.focus();
   }
   window.addEventListener("keydown", e => {
-    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || String(e.key).toLowerCase() !== "k") return;
+    // shortcutKey: a Russian layout's Ctrl+"л" is Ctrl+K (U6).
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || shortcutKey(e).toLowerCase() !== "k") return;
     if (document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-keys="off"]')) return;
     e.preventDefault();
     e.stopPropagation();

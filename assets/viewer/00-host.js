@@ -78,14 +78,68 @@ const FTViewer = (() => {
     popupTimer = 0;
   }
 
+  // R8 U1: the case part of every per-case storage key / channel name
+  // (ft.viewer.<key>.*, ft.draft.<key>.*, ft.alive:<key>:*, ft-player:<key>).
+  // case.json's case_id when it was read; otherwise NEVER the literal
+  // "case" (two unreadable cases would share drafts, layout and the pop-out
+  // bridge): "nocase-" + a 64-bit FNV-1a hash of the case folder the server
+  // / bundle names (caseDir), or — a redacted bundle ("<case>") or none —
+  // of this page's address. Pure: the shell (41-finalize / 95-quit draft
+  // counts) derives the same key from records-meta.
+  function caseStorageKey(manifest, caseDir) {
+    const id = manifest && typeof manifest === "object" ? manifest.case_id : null;
+    if ((typeof id === "string" && id.trim()) || (typeof id === "number" && Number.isFinite(id))) return String(id);
+    const dir = typeof caseDir === "string" ? caseDir.trim() : "";
+    // R19 (track S1): the server's drive root `E:\.` keeps the `E:\` key.
+    let seed = dir && dir !== "<case>" ? "dir|" + dir.replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([A-Za-z]:)\/\.$/, "$1") : "";
+    if (!seed) { try { seed = "page|" + location.origin + location.pathname; } catch (e) { seed = "page|?"; } }
+    return keyOfSeed(seed);
+  }
+  function keyOfSeed(seed) {
+    const fnv = (text, h) => {
+      for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+      return h.toString(16).padStart(8, "0");
+    };
+    // Two independent 32-bit halves: the text forwards and backwards.
+    return "nocase-" + fnv(seed, 0x811c9dc5) + fnv([...seed].reverse().join(""), 0x050c5d1f);
+  }
+  // R20 U6: the keys the same folder may have had before the server
+  // normalized it (only for a case without case_id): a trailing `\.`, the
+  // other drive-letter case, doubled separators. Pure; never the current key.
+  function caseStorageKeyAliases(manifest, caseDir) {
+    const id = manifest && typeof manifest === "object" ? manifest.case_id : null;
+    if ((typeof id === "string" && id.trim()) || (typeof id === "number" && Number.isFinite(id))) return [];
+    const dir = typeof caseDir === "string" ? caseDir.trim() : "";
+    if (!dir || dir === "<case>") return [];
+    const now = caseStorageKey(manifest, caseDir);
+    const p = dir.replace(/\\/g, "/").replace(/\/+$/, "").replace(/^([A-Za-z]:)\/\.$/, "$1");
+    const toggled = /^[A-Za-z]:/.test(p) ? (p[0] === p[0].toUpperCase() ? p[0].toLowerCase() : p[0].toUpperCase()) + p.slice(1) : p;
+    const out = [];
+    // R21 (follow-up): R20 bound `\\?\C:\…` as typed; R21 binds it plain,
+    // so the verbatim spelling of the same folder is an old key too.
+    const bases = [p, toggled];
+    for (const b of [p, toggled]) if (/^[A-Za-z]:(\/|$)/.test(b)) bases.push("//?/" + b, "//?/" + b + "/");
+    for (const base of new Set(bases)) {
+      const doubled = base.replace(/\//g, "//");
+      for (const s of new Set([base, base + "/.", doubled, doubled + "/."])) {
+        const key = keyOfSeed("dir|" + s);
+        if (key !== now && !out.includes(key)) out.push(key);
+      }
+    }
+    return out;
+  }
+
   const api = {
     version: 2,
+    caseStorageKey,
+    caseStorageKeyAliases,
     /** Channel names (contract §3.3). ft-review is the shell's (T2);
      *  ft-player:<case_id> is the popup-player bridge (70-player.js). */
     writerToken,
-    channels: Object.freeze({ review: "ft-review", player: caseId => `ft-player:${caseId || "case"}` }),
+    // R9 U8: no case key → this page's own key (caseStorageKey), never "case".
+    channels: Object.freeze({ review: "ft-review", player: caseId => `ft-player:${caseId || caseStorageKey(null, "")}` }),
 
-    async init({ data = null, url = "", embed: wantEmbed = false, host = document, theme = null, locale = null } = {}) {
+    async init({ data = null, url = "", embed: wantEmbed = false, host = document, theme = null, locale = null, restore = null } = {}) {
       if (state !== "idle") throw new Error("FTViewer already mounted");
       const el = findRoot(host);
       if (!el) throw new Error("FTViewer: #ftViewer fragment not found");
@@ -110,7 +164,7 @@ const FTViewer = (() => {
       const mine = ++generation;
       try {
         await ftViewerBoot({
-          data, url, embed, hosted, root: el,
+          data, url, embed, hosted, root: el, restore,
           locale: validLocale(locale),
           signal: ac.signal,
           isCurrent: () => mine === generation && !ac.signal.aborted,
@@ -149,11 +203,17 @@ const FTViewer = (() => {
         impl.refuseReload(blocker);
         return "refused";
       }
+      // U4: the view (filters, search, selection, active card, scroll, undo
+      // journal) is carried over; the save state is not — a reload only
+      // happens with nothing unsaved, and drafts rehydrate from storage.
       if (!hosted) {
+        try { if (impl.stashViewState) impl.stashViewState(); } catch (e) { /* plain reload */ }
         location.reload();
         return "reloaded";
       }
-      const opts = { embed, host: root, theme: api.getTheme(), locale: api.getLocale() };
+      let restore = null;
+      try { restore = impl.viewState ? impl.viewState() : null; } catch (e) { restore = null; }
+      const opts = { embed, host: root, theme: api.getTheme(), locale: api.getLocale(), restore };
       const kept = root ? HOST_CLASSES.filter(c => root.classList.contains(c)) : [];
       const el = root;
       api.destroy();
@@ -175,7 +235,19 @@ const FTViewer = (() => {
     focus() { return impl ? impl.focus() : false; },
     summary() { return impl ? impl.summary() : null; },
     saveState() { return impl ? impl.saveState() : null; },
-    async save() { return impl ? impl.save() : true; },
+    /** save({ timeoutMs }) = hard total; save({ patient: true }) = explicit
+     *  save, 20 s and on while its request progresses; save() = 4 s
+     *  (R7 U1/U5, R8 U2 — 90-sync.js viewerSave). */
+    async save(opts) { return impl ? impl.save(opts) : true; },
+    /** Internal (22-viewer-host.js unmount): resolves true once no marks
+     *  save request is in flight, false after `timeoutMs` (default 15 s). */
+    _whenSaveSettled(timeoutMs = 15000) {
+      if (!impl || !impl.whenSaveSettled) return Promise.resolve(true);
+      return Promise.race([
+        impl.whenSaveSettled().then(() => true),
+        new Promise(resolve => setTimeout(() => resolve(false), timeoutMs)),
+      ]);
+    },
     /** Sets the viewer's examiner (검토자) used in marks payloads — the same
      *  flow as typing into #examinerName. No-op while unmounted. */
     setExaminer(name) { if (impl) impl.setExaminer(name); },
@@ -186,6 +258,8 @@ const FTViewer = (() => {
     /** { live, generation, total, canReload } of the mounted data (same
      *  detail as the "live-state" event); null while unmounted. */
     liveState() { return impl && impl.liveState ? impl.liveState() : null; },
+    // Internal, for harnesses: memo-miss count of the filter, the active id.
+    _debugStats() { return impl && impl.debugStats ? impl.debugStats() : null; },
     popout() { return impl ? impl.popout() : null; },
     closePopout() {
       stopPopupWatch();
@@ -214,6 +288,20 @@ const FTViewer = (() => {
     get _root() { return root; },
     get _apiBase() { return apiBase; },
     _attach(methods) { impl = methods; },
+    // R7 U10: the close flush's texts (hBeforeClose message / warning) in
+    // the viewer's language (i18n "close.*", Korean by default); before a
+    // mount the Korean text.
+    _closeText(key, vars) {
+      if (impl && impl.closeText) return impl.closeText(key, vars);
+      const n = vars && vars.n != null ? vars.n : "";
+      return ({
+        "close.readonlyWarn": "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다.",
+        "close.unsaved": "저장 안 된 편집 " + n + "건",
+        "close.timeout": " (저장 응답 대기 시간 초과)",
+        "close.readonlyBlocked": "판독 기록을 읽지 못해 저장이 막혀 있습니다",
+        "close.notConfirmed": "모든 편집이 저장되었는지 확인하지 못했습니다",
+      })[key] || "";
+    },
     _emit: emit,
     _applyTheme: applyTheme,
     _listens(event) { return (counts.get(event) || 0) > 0; },
@@ -236,3 +324,45 @@ const FTViewer = (() => {
   return api;
 })();
 window.FTViewer = FTViewer;
+// R6 U4 (S ↔ U contract): the desktop shell's close flush (src/shell.rs
+// FLUSH_SCRIPT) prefers window.hBeforeClose() over FTViewer.save(). The
+// workstation shell page has its own (assets/app/95-quit.js); a standalone
+// viewer page (/viewer/, /review/*.html) gets this one — the same answer
+// { ok, pending, state, message, warning }, within `timeoutMs` (4 s: under
+// the shell's 5 s wait). Read-only with nothing held here closes without a
+// confirmation; `warning` says the records were unreadable (also toasted).
+// R7 U1/U8/U10: the same hard total budget as the shell's (the shell
+// calls hBeforeClose(4000)); `message`/`warning` are the viewer's i18n
+// texts (Korean by default — "저장 안 된 편집 N건", never English
+// fragments), and the read-only warning is a warning toast, not an error.
+if (!document.documentElement.hasAttribute("data-ft-host") && typeof window.hBeforeClose !== "function") {
+  window.hBeforeClose = async (timeoutMs = 4000) => {
+    const started = Date.now();
+    const asked = Number(timeoutMs);
+    const ms = Math.max(0, Number.isFinite(asked) ? asked : 4000);
+    let saved = false;
+    let timedOut = false;
+    let timer = 0;
+    const opts = { timeoutMs: Math.max(0, ms - 250) };
+    try {
+      saved = await Promise.race([
+        Promise.resolve(FTViewer.save(opts)).then(v => v === true),
+        new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, Math.max(0, ms - (Date.now() - started) - 100)); }),
+      ]);
+    } catch (e) { saved = false; }
+    clearTimeout(timer);
+    if (opts.timedOut) timedOut = true;
+    let pending = 0;
+    let state = null;
+    try { pending = Number((FTViewer.summary() || {}).pending) || 0; state = FTViewer.saveState(); } catch (e) { pending = 0; }
+    const ok = saved && (state !== "readonly" || pending === 0);
+    const warning = ok && state === "readonly" ? FTViewer._closeText("close.readonlyWarn") : "";
+    if (warning) FTViewer.toast(warning, "warn");
+    const late = timedOut ? FTViewer._closeText("close.timeout") : "";
+    const message = ok ? ""
+      : pending > 0 ? FTViewer._closeText("close.unsaved", { n: pending }) + late
+      : state === "readonly" ? FTViewer._closeText("close.readonlyBlocked")
+      : FTViewer._closeText("close.notConfirmed") + late;
+    return { ok, pending, state, message, warning };
+  };
+}

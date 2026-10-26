@@ -53,6 +53,10 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/records"),
     ("GET", "/api/records-meta"),
     ("GET", "/api/status"),
+    ("GET", "/api/mark-conflicts"),
+    // R4-B6 / R4-B2.
+    ("GET", "/api/marks-pending"),
+    ("POST", "/api/launch-code"),
     ("POST", "/api/start"),
     ("POST", "/api/finalize"),
     ("POST", "/api/recover-deleted"),
@@ -75,8 +79,13 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/preflight"),
     ("GET", "/api/export-clip-status"),
     ("POST", "/api/export-clip-cancel"),
+    ("POST", "/api/join-check"),
+    ("POST", "/api/join"),
+    ("POST", "/api/audio-measure"),
     ("GET", "/api/recent-cases"),
     ("POST", "/api/recent-cases/forget"),
+    // R5-S6.
+    ("POST", "/api/reimport-raw"),
 ];
 
 #[test]
@@ -656,10 +665,12 @@ fn unc_and_device_paths_are_refused_on_every_path_route() {
     for target in [
         r"/media?path=\\evil\share\a.mp4",
         "/media?path=%5C%5Cevil%5Cshare%5Ca.mp4",
-        "/media?path=//evil/share/a.mp4",
+        // A leading `/` is a local path off Windows (S8), so the mixed
+        // spelling stands in for `//` on every OS.
+        r"/media?path=\/evil\share\a.mp4",
         r"/media?path=\\?\UNC\evil\share\a.mp4",
         r"/media?path=\\.\PhysicalDrive0",
-        "/api/browse?path=//evil/share",
+        r"/api/browse?path=\/evil/share",
         r"/api/browse?path=\\evil\share",
         r"/api/case-info?case_dir=\\evil\share\case",
     ] {
@@ -681,7 +692,7 @@ fn unc_and_device_paths_are_refused_on_every_path_route() {
     };
     for (path, body) in [
         ("/api/open-case", r#"{"case_dir":"\\\\evil\\share\\case"}"#),
-        ("/api/open-folder", r#"{"path":"//evil/share"}"#),
+        ("/api/open-folder", r#"{"path":"\\\\evil\\share"}"#),
         (
             "/api/preflight",
             r#"{"source_path":"\\\\.\\PhysicalDrive0"}"#,
@@ -743,7 +754,7 @@ fn typed_unc_policy_per_route() {
         ),
         (
             "/api/preflight",
-            r#"{"source_path":"C:\\ev","case_dir":"//nas/cases/c1"}"#,
+            r#"{"source_path":"C:\\ev","case_dir":"\\\\nas\\cases\\c1"}"#,
         ),
         (
             "/api/start",
@@ -763,7 +774,7 @@ fn typed_unc_policy_per_route() {
     // GET routes: refused without an approved UNC root ...
     for (path, query) in [
         ("/media", "path=%5C%5Cnas%5Cevidence%5Ca.mp4"),
-        ("/api/browse", "path=//nas/evidence"),
+        ("/api/browse", "path=%5C%5Cnas/evidence"),
         ("/api/case-info", "case_dir=%5C%5Cnas%5Ccases%5Cc1"),
     ] {
         assert_eq!(
@@ -788,7 +799,7 @@ fn typed_unc_policy_per_route() {
                 "POST",
                 "/api/open-case",
                 "",
-                r#"{"case_dir":"//nas/cases/c1"}"#
+                r#"{"case_dir":"\\\\nas\\cases\\c1"}"#
             ),
             none
         ),
@@ -804,7 +815,7 @@ fn handlers_refuse_unc_paths_without_the_http_guard() {
     assert!(browse.contains("\"ok\":false"), "{browse}");
     let state: SharedState = Arc::new(Mutex::new(JobState::new()));
     let mut request = req("POST", "/api/open-case");
-    request.body = r#"{"case_dir":"//evil/share/case"}"#.into();
+    request.body = r#"{"case_dir":"\\\\evil\\share\\case"}"#.into();
     let opened = api_open_case(&request, &state);
     assert!(opened.contains("\"ok\":false"), "{opened}");
     assert!(state_lock(&state).case_dir.is_none());

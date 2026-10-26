@@ -14,6 +14,7 @@
 
 use crate::audit;
 use crate::util::run_with_timeout;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -101,23 +102,145 @@ fn locate_stream_start(file: &mut File) -> Result<u64, String> {
     Err("not a DAV container (missing DHAV/DAHUA magic)".to_string())
 }
 
-/// Walks every frame record (streaming, no full buffer) in FFmpeg order.
-pub fn walk_frames(path: &Path) -> Result<Vec<DavFrame>, String> {
+/// Streaming frame iterator (E10): yields one audio/video frame record at
+/// a time in FFmpeg order, holding only the current frame header in
+/// memory — a multi-gigabyte DAV never materializes as a frame list.
+/// The first parse error is yielded as `Err` and ends the iteration.
+pub struct DavFrames {
+    file: File,
+    file_len: u64,
+    pos: u64,
+    done: bool,
+}
+
+/// Opens `path` and positions a [`DavFrames`] iterator at the first frame.
+pub fn frames(path: &Path) -> Result<DavFrames, String> {
     let mut file =
         File::open(path).map_err(|err| format!("failed to open DAV {}: {err}", path.display()))?;
     let file_len = file
         .seek(SeekFrom::End(0))
         .map_err(|err| format!("failed to stat DAV size: {err}"))?;
-    let mut pos = locate_stream_start(&mut file)?;
-    let mut frames = Vec::new();
+    let pos = locate_stream_start(&mut file)?;
+    Ok(DavFrames {
+        file,
+        file_len,
+        pos,
+        done: false,
+    })
+}
 
-    while pos + 20 <= file_len {
+impl Iterator for DavFrames {
+    type Item = Result<DavFrame, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.next_frame() {
+            Ok(Some(frame)) => Some(Ok(frame)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(err) => {
+                self.done = true;
+                Some(Err(err))
+            }
+        }
+    }
+}
+
+/// Collects every frame record. Memory grows with the frame count — use
+/// [`frames`] (streaming) or [`summarize_frames`] (counts only) for large
+/// inputs; kept for callers that need random access to the frame list.
+pub fn walk_frames(path: &Path) -> Result<Vec<DavFrame>, String> {
+    frames(path)?.collect()
+}
+
+/// Per-channel frame counts from one streaming pass (E10).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DavFrameSummary {
+    /// Video (key + non-key) frames per DHAV channel number.
+    pub video_frames_by_channel: BTreeMap<u16, u64>,
+    pub audio_frames: u64,
+    /// Channel of the first video frame — the one the ES fallback pins.
+    pub first_video_channel: Option<u16>,
+}
+
+impl DavFrameSummary {
+    pub fn video_frames(&self) -> u64 {
+        self.video_frames_by_channel.values().sum()
+    }
+
+    /// Video frames of the pinned (first) channel — what an ES-extract
+    /// export actually contains.
+    pub fn pinned_channel_frames(&self) -> u64 {
+        self.first_video_channel
+            .and_then(|channel| self.video_frames_by_channel.get(&channel).copied())
+            .unwrap_or(0)
+    }
+
+    /// `{"1":120,"2":118}` — channel → video frame count.
+    pub fn channels_json(&self) -> String {
+        let body = self
+            .video_frames_by_channel
+            .iter()
+            .map(|(channel, count)| format!("\"{channel}\":{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{{{body}}}")
+    }
+}
+
+/// Counts frames per channel without retaining them. Any walk failure is
+/// an error — a DAV whose frames cannot all be walked must not be logged
+/// as "0 frames" or as a partial count.
+pub fn summarize_frames(path: &Path) -> Result<DavFrameSummary, String> {
+    let mut summary = DavFrameSummary::default();
+    for frame in frames(path)? {
+        let frame = frame?;
+        if is_video_frame(frame.stream_type) {
+            *summary
+                .video_frames_by_channel
+                .entry(frame.channel)
+                .or_insert(0) += 1;
+            summary.first_video_channel.get_or_insert(frame.channel);
+        } else if frame.stream_type == STREAM_AUDIO {
+            summary.audio_frames += 1;
+        }
+    }
+    Ok(summary)
+}
+
+impl DavFrames {
+    fn next_frame(&mut self) -> Result<Option<DavFrame>, String> {
+        let file_len = self.file_len;
+        let file = &mut self.file;
+        loop {
+            let pos = self.pos;
+            if pos + 20 > file_len {
+                return Ok(None);
+            }
+            match Self::read_frame(file, file_len, pos)? {
+                FrameStep::End => return Ok(None),
+                FrameStep::Skip(next) => self.pos = next,
+                FrameStep::Frame(frame, next) => {
+                    self.pos = next;
+                    return Ok(Some(frame));
+                }
+            }
+        }
+    }
+
+    fn read_frame(file: &mut File, file_len: u64, pos: u64) -> Result<FrameStep, String> {
         file.seek(SeekFrom::Start(pos))
             .map_err(|err| format!("failed to seek DAV frame at {pos}: {err}"))?;
         let mut prefix = [0u8; 20];
         match file.read_exact(&mut prefix) {
             Ok(()) => {}
-            Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(FrameStep::End);
+            }
             Err(err) => return Err(format!("failed to read DAV frame header: {err}")),
         }
         if &prefix[0..4] != b"DHAV" {
@@ -142,13 +265,12 @@ pub fn walk_frames(path: &Path) -> Result<Vec<DavFrame>, String> {
         }
 
         if stream_type == STREAM_SKIP {
-            pos = frame_end;
-            continue;
+            return Ok(FrameStep::Skip(frame_end));
         }
 
         let mut cursor = pos + 20;
         if cursor + 4 > file_len {
-            break;
+            return Ok(FrameStep::End);
         }
         let mut meta = [0u8; 4];
         file.seek(SeekFrom::Start(cursor))
@@ -180,19 +302,27 @@ pub fn walk_frames(path: &Path) -> Result<Vec<DavFrame>, String> {
         }
 
         if matches!(stream_type, STREAM_AUDIO | STREAM_VIDEO_P | STREAM_VIDEO_I) {
-            frames.push(DavFrame {
-                offset: pos,
-                stream_type,
-                channel,
-                date,
-                timestamp_ms,
-                payload_offset: cursor,
-                payload_size,
-            });
+            return Ok(FrameStep::Frame(
+                DavFrame {
+                    offset: pos,
+                    stream_type,
+                    channel,
+                    date,
+                    timestamp_ms,
+                    payload_offset: cursor,
+                    payload_size,
+                },
+                frame_end,
+            ));
         }
-        pos = frame_end;
+        Ok(FrameStep::Skip(frame_end))
     }
-    Ok(frames)
+}
+
+enum FrameStep {
+    End,
+    Skip(u64),
+    Frame(DavFrame, u64),
 }
 
 fn is_video_frame(stream_type: u8) -> bool {
@@ -203,37 +333,65 @@ fn is_video_frame(stream_type: u8) -> bool {
 /// elementary stream. Multi-channel recorders interleave frames per
 /// channel; concatenating across channels produces an unplayable mix, so
 /// the first video frame's channel is pinned for the whole stream.
+///
+/// One streaming pass (E10): frames are copied as the walk reaches them,
+/// so memory stays bounded by one 64 KiB copy buffer regardless of the
+/// file's frame count. A walk error mid-file fails the extraction and
+/// removes the partial ES output — it is never returned as a short
+/// "successful" stream.
 pub fn extract_video_es(
     dav_path: &Path,
     es_output: &Path,
 ) -> Result<(u64, usize, Option<u16>), String> {
-    let frames = walk_frames(dav_path)?;
-    let channel = frames
-        .iter()
-        .find(|frame| is_video_frame(frame.stream_type))
-        .map(|frame| frame.channel);
-    let video: Vec<&DavFrame> = frames
-        .iter()
-        .filter(|frame| is_video_frame(frame.stream_type) && Some(frame.channel) == channel)
-        .collect();
-    if video.is_empty() {
-        return Err("DAV contains no video frames".to_string());
-    }
+    let walk = frames(dav_path)?;
     if let Some(parent) = es_output.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create ES output directory: {err}"))?;
     }
+    // R5-P12: the output is created here, never truncated or replaced —
+    // an existing file at that name is refused — so the cleanup below can
+    // only ever remove the file this call made.
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(es_output)
+        .map_err(|err| {
+            format!(
+                "failed to create ES output {} (an existing file is never overwritten): {err}",
+                es_output.display()
+            )
+        })?;
+    let result = copy_pinned_channel(walk, dav_path, output);
+    if result.is_err() {
+        let _ = std::fs::remove_file(es_output);
+    }
+    result
+}
+
+fn copy_pinned_channel(
+    walk: DavFrames,
+    dav_path: &Path,
+    mut output: File,
+) -> Result<(u64, usize, Option<u16>), String> {
     let mut input =
         BufReader::new(File::open(dav_path).map_err(|err| format!("failed to open DAV: {err}"))?);
-    let mut output =
-        File::create(es_output).map_err(|err| format!("failed to create ES output: {err}"))?;
+    let mut channel: Option<u16> = None;
+    let mut copied_frames = 0usize;
     let mut written = 0u64;
-    for frame in &video {
+    let mut chunk = vec![0u8; 64 * 1024];
+    for frame in walk {
+        let frame = frame?;
+        if !is_video_frame(frame.stream_type) {
+            continue;
+        }
+        let pinned = *channel.get_or_insert(frame.channel);
+        if frame.channel != pinned {
+            continue;
+        }
         input
             .seek(SeekFrom::Start(frame.payload_offset))
             .map_err(|err| format!("failed to seek DAV frame: {err}"))?;
         let mut remaining = frame.payload_size;
-        let mut chunk = [0u8; 64 * 1024];
         while remaining > 0 {
             let want = remaining.min(chunk.len() as u64) as usize;
             input
@@ -245,12 +403,16 @@ pub fn extract_video_es(
             written += want as u64;
             remaining -= want as u64;
         }
+        copied_frames += 1;
+    }
+    if copied_frames == 0 {
+        return Err("DAV contains no video frames".to_string());
     }
     output
         .flush()
         .and_then(|_| output.sync_all())
         .map_err(|err| format!("failed to finalize ES output: {err}"))?;
-    Ok((written, video.len(), channel))
+    Ok((written, copied_frames, channel))
 }
 
 /// Prefer FFmpeg's native DHAV demuxer; fall back to ES extract + remux.
@@ -279,7 +441,8 @@ pub fn remux_dav_to_mp4(
     let native_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let _ = std::fs::remove_file(mp4_output);
 
-    let es_path = mp4_output.with_extension("es.bin");
+    // R5-P12: a fresh name next to the output (never an existing file).
+    let es_path = crate::util::unique_available_path(&mp4_output.with_extension("es.bin"));
     let _ = extract_video_es(dav_path, &es_path)?;
     remux_es_to_mp4(&es_path, mp4_output, timeout_secs).map_err(|err| {
         format!("ffmpeg native demux failed ({native_err}); ES remux also failed: {err}")
@@ -442,6 +605,67 @@ mod tests {
         assert_eq!(written, (b"CH1_A".len() + b"CH1_B".len()) as u64);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&es);
+    }
+
+    /// E10: per-channel counts in one streaming pass. The DAV export used
+    /// to log every channel's video frames as "video_frames" next to the
+    /// first channel's number (and 0 when the walk failed); the summary
+    /// keeps channels apart and a walk failure is an error.
+    #[test]
+    fn summary_counts_frames_per_channel_and_fails_on_walk_errors() {
+        let mut bytes = Vec::new();
+        bytes.extend(build_frame(STREAM_VIDEO_I, 2, b"A"));
+        bytes.extend(build_frame(STREAM_VIDEO_I, 1, b"B"));
+        bytes.extend(build_frame(STREAM_AUDIO, 2, b"C"));
+        bytes.extend(build_frame(STREAM_VIDEO_P, 2, b"D"));
+        bytes.extend(build_frame(STREAM_VIDEO_P, 2, b"E"));
+        let path = std::env::temp_dir().join(format!("ft-dav-summary-{}", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let summary = summarize_frames(&path).unwrap();
+        assert_eq!(summary.first_video_channel, Some(2));
+        assert_eq!(summary.video_frames(), 4);
+        assert_eq!(summary.pinned_channel_frames(), 3);
+        assert_eq!(summary.audio_frames, 1);
+        assert_eq!(summary.channels_json(), r#"{"1":1,"2":3}"#);
+
+        // Same file with a corrupted last footer: an error, never a count.
+        let last = bytes.len() - 8;
+        bytes[last] = 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let err = summarize_frames(&path).unwrap_err();
+        assert!(err.contains("corrupted end marker"), "{err}");
+        // The iterator yields the good frames, then the error, then stops.
+        let items: Vec<_> = frames(&path).unwrap().collect();
+        assert_eq!(items.len(), 5);
+        assert!(items[..4].iter().all(Result::is_ok));
+        assert!(items[4].is_err());
+        // ES extraction refuses and leaves no partial output behind.
+        let es = std::env::temp_dir().join(format!("ft-dav-summary-es-{}.bin", std::process::id()));
+        assert!(extract_video_es(&path, &es).is_err());
+        assert!(!es.exists(), "partial ES output must be removed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R5-P12: ES extraction never deletes or truncates a file it did not
+    /// create — an existing file at the output name is refused and kept.
+    #[test]
+    fn es_extract_never_removes_an_existing_file() {
+        let mut bytes = fixture_bytes();
+        let last_magic = bytes.len() - 8;
+        bytes[last_magic] = 0xFF; // walk fails mid-file
+        let path = std::env::temp_dir().join(format!("ft-dav-keep-{}", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let es = std::env::temp_dir().join(format!("ft-dav-keep-es-{}.bin", std::process::id()));
+        std::fs::write(&es, b"examiner's own file").unwrap();
+        assert!(extract_video_es(&path, &es).is_err());
+        assert_eq!(std::fs::read(&es).unwrap(), b"examiner's own file");
+        // Same for a walk that would succeed: refused, not overwritten.
+        let good = fixture_path("ft-dav-keep-good");
+        assert!(extract_video_es(&good, &es).is_err());
+        assert_eq!(std::fs::read(&es).unwrap(), b"examiner's own file");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&es);
+        let _ = std::fs::remove_file(&good);
     }
 
     #[test]

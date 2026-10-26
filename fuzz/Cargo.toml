@@ -42,3 +42,21 @@ name = "creation_time_unix"
 path = "fuzz_targets/creation_time_unix.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "dav_walk_frames"
+path = "fuzz_targets/dav_walk_frames.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rectime_parse"
+path = "fuzz_targets/rectime_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dfxml_export"
+path = "fuzz_targets/dfxml_export.rs"
+test = false
+doc = false

@@ -12,7 +12,11 @@
 // overlay, popup mark/tag/auto-advance/prev-next/rate/keys, orphan
 // warning, and main-window transport controls.
 const CDP = 'http://127.0.0.1:9222';
-const VIEWER = 'http://127.0.0.1:8477/review/evidence-viewer.html';
+// F7: drives a REAL workstation; lib/real-server-guard.mjs (track F)
+// refuses the user's own 8477 unless --i-know.
+const { guardBase } = await import('./lib/real-server-guard.mjs');
+const BASE = guardBase('verify-viewer-popup', process.env.FT_BASE || 'http://127.0.0.1:8477');
+const VIEWER = BASE + '/review/evidence-viewer.html';
 
 let nextId = 1;
 const pending = new Map();

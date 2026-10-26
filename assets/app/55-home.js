@@ -108,6 +108,15 @@ function samePathish(a, b) {
   if (!x || !y) return false;
   return x === y || x.endsWith("/" + y.replace(/^\/+/, "")) || y.endsWith("/" + x.replace(/^\/+/, ""));
 }
+// Pure: a path remembered only by this browser (typed, older builds) and
+// its /api/browse answer → a recent-list entry named by the SERVER's
+// canonical path (R19 track S1: never matched as typed); `legacyPath` is the
+// stored text, for forgetting it. null when it is not a case folder.
+function hLegacyRecentItem(p, browse) {
+  if (!browse || !browse.is_case) return null;
+  const dir = typeof browse.canonical === "string" && browse.canonical ? browse.canonical : p;
+  return { case_dir: dir, name: hBaseName(dir) || dir, exists: true, phase_hint: "", legacy: true, legacyPath: p };
+}
 // Pure: one entry → { state, action: open|resume|progress|forget, label }.
 function recentState(it, st) {
   const live = st && st.case_dir && samePathish(st.case_dir, it.case_dir);
@@ -124,6 +133,9 @@ function recentState(it, st) {
       const what = pct !== null ? `분석 중단 ${pct}%` : done ? `분석 중단 (${done.toLocaleString()}건 처리)` : "분석 중단";
       return { state: what, action: it.source_path ? "resume" : "open", label: it.source_path ? "이어서" : "열기" };
     }
+    // R11 U3: /api/recent-cases sends no package hint (recent.rs: phase_hint
+    // only) — the R10 "finalize-incomplete" branches were dead and are gone;
+    // the opened case says 최종화 미완료 from /api/status.
     case "finalized": return { state: "결과물 생성됨" + counts, action: "open", label: "열기" };
     case "review": return { state: (counts ? counts.slice(3) : "검토 가능"), action: "open", label: "열기" };
     case "partial": return { state: "색인 완료 · 보강 전" + counts, action: "open", label: "열기" };
@@ -145,13 +157,14 @@ async function renderRecentCases() {
         const r = await jget("/api/browse?path=" + encodeURIComponent(p));
         // The server's canonical form dedupes symlinked / differently
         // spelled paths against the (canonical) server list.
-        return r.is_case ? { p, key: normPath(r.canonical || p) } : null;
+        return hLegacyRecentItem(p, r);
       } catch (e) { return null; }
     }));
-    for (const c of checks.filter(Boolean)) {
-      if (known.has(c.key)) continue;
-      known.add(c.key);
-      items.push({ case_dir: c.p, name: hBaseName(c.p) || c.p, exists: true, phase_hint: "", legacy: true });
+    for (const item of checks.filter(Boolean)) {
+      const key = normPath(item.case_dir);
+      if (known.has(key)) continue;
+      known.add(key);
+      items.push(item);
     }
   }
   if (seq !== recentSeq) return;
@@ -176,7 +189,7 @@ function drawRecentList() {
     const s = recentState(it, st);
     const li = document.createElement("li");
     li.className = "rc-row" + (it.exists === false ? " missing" : "");
-    const name = it.name || hBaseName(it.case_dir) || it.case_dir;
+    const name = hCaseName(it.name, it.case_dir);
     const when = fmtWhen(it.last_opened_unix);
     li.innerHTML =
       `<div class="rc-main"><span class="rc-name" title="${esc(it.case_dir)}">${esc(name)}</span>` +
@@ -224,7 +237,7 @@ async function recentAction(i, btn) {
     else toast("목록에서 지웠습니다 — 폴더는 그대로입니다.");
     if (it.legacy) {
       const prefs = loadPrefs();
-      prefs.recentCases = (prefs.recentCases || []).filter(p => normPath(p) !== normPath(it.case_dir));
+      prefs.recentCases = (prefs.recentCases || []).filter(p => normPath(p) !== normPath(it.legacyPath));
       try { localStorage.setItem(LS_KEY, JSON.stringify(prefs)); } catch (e) {}
     }
     renderRecentCases();

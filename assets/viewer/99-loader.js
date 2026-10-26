@@ -144,6 +144,16 @@ async function loaderFetchJson(url) {
       `${url}: ${err && err.message ? err.message : err}`
     );
   }
+  if (res.status === 401) {
+    // The server is up but refused this page's proof (U8): no "server
+    // error" wording — the way back is reopening from the workstation.
+    const error = ViewerLoadError(
+      "인증 오류로 요청이 거부되었습니다 — FrameTrace 앱 창에서 다시 여십시오(같은 컴퓨터의 다른 FrameTrace 창은 닫으십시오). / Request refused (authorization error) — reopen from the FrameTrace app window (close any other FrameTrace window on this computer).",
+      `${url}: HTTP 401`
+    );
+    error.status = 401;
+    throw error;
+  }
   if (!res.ok) {
     const error = ViewerLoadError(
       `서버 응답 오류 (HTTP ${res.status}) / Server error (HTTP ${res.status})`,
@@ -221,6 +231,9 @@ async function loadAllRecordPages(first, ui, live) {
   }
 }
 
+// R10 U5: the data objects built from this server's API (10-boot
+// trustFromBundle) — a bundle cannot claim it by a field of its own.
+const LIVE_TRUST_DATA = new WeakSet();
 async function loadViewerDataFromApi(first, ui) {
   const live = !!(first && first.live);
   const paged = await loadAllRecordPages(first, ui, live);
@@ -232,10 +245,14 @@ async function loadViewerDataFromApi(first, ui) {
       (meta && meta.error) || "/api/records-meta"
     );
   }
-  const scan = (meta && meta.scan) || {};
+  const scan = (meta && meta.scan && typeof meta.scan === "object") ? meta.scan : {};
   scan.videos = paged.videos;
   const data = {
     manifest: meta.manifest || {},
+    // R7: case.json / the scan summary came back null (not valid JSON on
+    // disk) — the viewer says so instead of an unexplained empty case.
+    manifestUnreadable: !meta.manifest || typeof meta.manifest !== "object",
+    scanUnreadable: Object.prototype.hasOwnProperty.call(meta, "scan") && (!meta.scan || typeof meta.scan !== "object"),
     caseDir: meta.caseDir || "",
     scan,
     carveLog: meta.carveLog,
@@ -248,7 +265,20 @@ async function loadViewerDataFromApi(first, ui) {
     deepfake: meta.deepfake,
     telemetry: meta.telemetry,
     proxies: meta.proxies,
+    // R5 U16 (S15): per-record proxy paths {id: path} when the server names
+    // them; the viewer then uses only those (30-records resolveProxyPaths).
+    proxyPaths: meta.proxy_paths || meta.proxyPaths || null,
+    joinLog: meta.joinLog,
+    audioLevels: meta.audioLevels,
+    // A failed read of the measurement log (records-meta reports it beside
+    // an empty map): kept so the viewer never shows it as "not measured".
+    audioLevelsError: meta.audioLevelsError || null,
+    // R10 U3: per-lane chain state ({carveLog|…: {status, entries,
+    // unauthenticated, detail}}); absent from older servers and bundles.
+    logChains: meta.logChains && typeof meta.logChains === "object" ? meta.logChains : null,
   };
+  // R10 U5: trust codes computed by this server just now (not a bundle's).
+  LIVE_TRUST_DATA.add(data);
   if (live) {
     // The index is still growing/enriching: whatever arrived is the
     // current snapshot, not a truncation. The chip tells the examiner.
@@ -323,8 +353,12 @@ async function loadViewerDataOnce(ui) {
 
 async function loadViewerData(mount) {
   const { root = null, signal = null } = mount || {};
-  if (window.__FRAMETRACE_DATA__ && window.__FRAMETRACE_DATA__.manifest) {
-    return window.__FRAMETRACE_DATA__;
+  // R7: an inline bundle whose case.json / index was unreadable carries
+  // `manifest: null` / `scan: null` — it is still THE data (the viewer says
+  // the case files were not read), not a reason to look for another source.
+  const inline = window.__FRAMETRACE_DATA__;
+  if (inline && typeof inline === "object" && (inline.manifest || "manifest" in inline || "scan" in inline)) {
+    return inline;
   }
   const ui = loaderOverlay(root);
   for (;;) {
@@ -433,6 +467,11 @@ function startLiveIndexChip(live, root, signal) {
     if (signal && signal.aborted) return; // the mount is gone
     try {
       const res = await fetch("/api/status", { cache: "no-store" });
+      if (res.status === 401) {
+        note.textContent = "인증 오류로 상태 확인이 거부되었습니다 — FrameTrace 앱 창에서 다시 여십시오. / Status refused (authorization error) — reopen from the FrameTrace app window.";
+        timer = setTimeout(tick, 15000);
+        return;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const st = await res.json();
       failures = 0;
@@ -445,7 +484,7 @@ function startLiveIndexChip(live, root, signal) {
           if (page && page.ok && Number.isFinite(Number(page.total))) newTotal = Number(page.total);
         } catch (e) { /* the count is a hint; the status line still updates */ }
       }
-      if (note.textContent.startsWith("상태 확인 실패")) note.textContent = "";
+      if (note.textContent.startsWith("상태 확인 실패") || note.textContent.startsWith("인증 오류")) note.textContent = "";
     } catch (err) {
       failures += 1;
       note.textContent = `상태 확인 실패 (${failures}회) — 재시도 중 / Status check failed, retrying`;
@@ -464,11 +503,29 @@ function startLiveIndexChip(live, root, signal) {
   return () => { if (timer) clearTimeout(timer); };
 }
 
+// A served standalone viewer (/viewer/?token=…, or the one-time launch
+// code /?launch=… of R4 B2) drops those secrets from the address bar and
+// history once the page has them (the server already planted its cookie on
+// this response). Every other query parameter and the hash stay.
+function loaderStripLaunchSecrets() {
+  try {
+    if (location.protocol !== "http:" && location.protocol !== "https:") return;
+    const url = new URL(location.href);
+    if (!url.searchParams.has("token") && !url.searchParams.has("launch")) return;
+    url.searchParams.delete("token");
+    url.searchParams.delete("launch");
+    history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+  } catch (err) {
+    console.warn("토큰 URL 정리 실패 / could not strip the launch secret from the URL", err);
+  }
+}
+
 // ---- standalone auto-init (docs/ui-rebuild-contract.md §3.1) --------------
 // /review/evidence-viewer.html, /viewer/, the packaged file and the legacy
 // iframe mount themselves; a hosting page (<html data-ft-host>) calls
 // FTViewer.init() when a project opens.
 if (!document.documentElement.hasAttribute("data-ft-host")) {
+  loaderStripLaunchSecrets();
   FTViewer.init({ embed: new URLSearchParams(location.search).has("embed") || window.self !== window.top })
     .catch(err => { console.error("FrameTrace viewer failed to start", err); });
 }

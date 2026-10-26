@@ -1,5 +1,6 @@
 use crate::case_db;
-use crate::util::{html_escape, json_escape, read_to_string, write_text};
+// I14: QA reports land in the packaged report tree; written atomically.
+use crate::util::{html_escape, json_escape, read_to_string, write_text_atomic as write_text};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -495,6 +496,7 @@ fn audit_chain_check(case_dir: &Path, output_dir: &Path) -> Result<PathBuf, Stri
         .unwrap_or_default();
 
     let mut failures = Vec::new();
+    let mut not_verified = Vec::new();
     let mut lanes = serde_json::Map::new();
     let mut lines = Vec::new();
     let mut warnings = Vec::new();
@@ -533,20 +535,53 @@ fn audit_chain_check(case_dir: &Path, output_dir: &Path) -> Result<PathBuf, Stri
                         ));
                     }
                 }
+                // R9-I5: the lane's trust under THIS PC's policy (R8 printed
+                // `integrity` straight from the verifier, bypassing
+                // `lane_trust`). A lane this PC cannot authenticate is NOT
+                // VERIFIED and its anchor is NOT advanced — a stripped or
+                // re-chained lane must never become the new baseline.
+                let trust = result.lane_trust();
                 lines.push(format!(
-                    "{rel}\tentries={}\thead={}\t{}",
+                    "{rel}\tentries={}\thead={}\t{}{}",
                     result.entries,
                     result.last_entry_sha256,
-                    result.integrity.label()
+                    trust.label(),
+                    if trust.reason().is_empty() {
+                        String::new()
+                    } else {
+                        format!("\t{}", trust.reason())
+                    }
                 ));
-                lanes.insert(
-                    rel,
-                    serde_json::json!({
-                        "entries": result.entries,
-                        "head": result.last_entry_sha256,
-                        "integrity": result.integrity.label(),
-                    }),
-                );
+                if trust.passes() {
+                    lanes.insert(
+                        rel,
+                        serde_json::json!({
+                            "entries": result.entries,
+                            "head": result.last_entry_sha256,
+                            "integrity": trust.label(),
+                        }),
+                    );
+                } else {
+                    if let Some((entries, head)) = previous.get(&rel) {
+                        // Keep the last anchor this lane passed with.
+                        lanes.insert(
+                            rel.clone(),
+                            serde_json::json!({"entries": entries, "head": head, "integrity": "anchor-kept"}),
+                        );
+                    }
+                    not_verified.push(format!("{rel}: {}", trust.reason()));
+                }
+            }
+            // R9 P5/I9: an unreadable key configuration is NOT VERIFIED
+            // (not a broken chain); the anchor is kept.
+            Err(err) if crate::audit::is_key_config_error(&err) => {
+                if let Some((entries, head)) = previous.get(&rel) {
+                    lanes.insert(
+                        rel.clone(),
+                        serde_json::json!({"entries": entries, "head": head, "integrity": "anchor-kept"}),
+                    );
+                }
+                not_verified.push(format!("{rel}: {err}"));
             }
             Err(err) => failures.push(format!("{rel}: {err}")),
         }
@@ -583,6 +618,14 @@ fn audit_chain_check(case_dir: &Path, output_dir: &Path) -> Result<PathBuf, Stri
             .unwrap_or_else(|_| "{}".to_string()),
     )
     .map_err(|err| format!("failed to write audit chain anchors: {err}"))?;
+    if !not_verified.is_empty() {
+        // R9-I5: never "PASS" over a lane this PC cannot authenticate.
+        return Err(format!(
+            "audit chain verification NOT VERIFIED (not a tampering verdict): {} lane(s) this PC cannot authenticate — anchors for them were not advanced: {}",
+            not_verified.len(),
+            not_verified.join("; ")
+        ));
+    }
     let report_path = output_dir.join("audit-chain-report.txt");
     write_text(
         &report_path,
@@ -872,6 +915,64 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Plan §3: the join and audio-level lanes are picked up by the QA audit
+    /// sweep without any registration, anchored, and tamper-checked.
+    #[test]
+    fn audit_chain_check_recognizes_join_and_audio_level_lanes() {
+        let root =
+            std::env::temp_dir().join(format!("frametrace-qa-new-lanes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let case_dir = root.join("case");
+        let out = root.join("qa");
+        fs::create_dir_all(&out).unwrap();
+        let join_lane = case_dir.join("artifacts/joined/join-log.jsonl");
+        let audio_lane = case_dir.join("evidence/logs/audio-level-log.jsonl");
+        // Entry bodies built from the plan §1.5 / §2.3 schemas.
+        let join = r#"{"schema_version":1,"event":"join-video","joined_unix":1,"output_path":"artifacts/joined/join_F_20260910-120000_n2.mp4","output_sha256":"aa","segment_count":2,"mode":"stream-copy","gaps":0,"overlaps":1}"#;
+        let audio = r#"{"schema_version":1,"event":"audio-level","measured_unix":1,"method":"ffmpeg-volumedetect","threshold_silent_max_dbfs":-70.0,"results":[{"selector":"vid_1","result":"silent","streams":[]}]}"#;
+        for body in [join, join] {
+            crate::audit::append_chained_jsonl_keyed(&join_lane, body, None).unwrap();
+        }
+        crate::audit::append_chained_jsonl_keyed(&audio_lane, audio, None).unwrap();
+        // A stray temp file next to the lane is not a lane.
+        fs::write(
+            case_dir.join("artifacts/joined/.join-t1.progress.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let report = audit_chain_check(&case_dir, &out).unwrap();
+        let text = fs::read_to_string(report).unwrap();
+        assert!(text.contains("artifacts/joined/join-log.jsonl"), "{text}");
+        assert!(
+            text.contains("evidence/logs/audio-level-log.jsonl"),
+            "{text}"
+        );
+        assert!(text.contains("PASS: 2 log(s) intact"), "{text}");
+        let anchors = fs::read_to_string(out.join(super::AUDIT_ANCHORS_FILE)).unwrap();
+        assert!(anchors.contains("artifacts/joined/join-log.jsonl"));
+        assert!(anchors.contains("evidence/logs/audio-level-log.jsonl"));
+
+        // Dropping the last join entry is caught by the anchor.
+        let original = fs::read_to_string(&join_lane).unwrap();
+        fs::write(
+            &join_lane,
+            format!("{}\n", original.lines().next().unwrap()),
+        )
+        .unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("entry count dropped"), "{err}");
+        fs::write(&join_lane, &original).unwrap();
+        // Deleting the audio-level lane after it was anchored fails.
+        let audio_text = fs::read_to_string(&audio_lane).unwrap();
+        fs::remove_file(&audio_lane).unwrap();
+        let err = audit_chain_check(&case_dir, &out).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+        fs::write(&audio_lane, audio_text).unwrap();
+        audit_chain_check(&case_dir, &out).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn audit_chain_check_warns_on_never_written_empty_lane() {
         let root = std::env::temp_dir().join(format!(
@@ -1039,5 +1140,48 @@ mod tests {
         let korean = r#"{"id":"vid_1","relative_path":"한글.mp4","stale_since_unix":123}"#;
         let normalized = normalize_stale_timestamps(korean);
         assert!(normalized.contains("한글.mp4"), "{normalized}");
+    }
+
+    /// R9-I5: the QA chain check goes through `lane_trust`. On a PC holding
+    /// keys, a lane re-chained without HMACs (longer than its anchor, so
+    /// R8's count/head rules passed it) is NOT VERIFIED, not PASS — and its
+    /// anchor is NOT advanced to the forged state.
+    #[test]
+    fn r9_i5_unauthenticated_lane_never_passes_or_moves_its_anchor() {
+        let root = std::env::temp_dir().join(format!("frametrace-qa-r9-i5-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let case_dir = root.join("case");
+        let out = root.join("qa");
+        fs::create_dir_all(&out).unwrap();
+        let lane = case_dir.join("evidence/logs/scan-log.jsonl");
+        let mine = crate::audit_key::AuditKey::new("mine", &[0x9c; 32]);
+        crate::audit::append_chained_jsonl_keyed(&lane, r#"{"n":1}"#, Some(&mine)).unwrap();
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            audit_chain_check(&case_dir, &out).unwrap();
+        });
+        let anchored = fs::read_to_string(out.join(super::AUDIT_ANCHORS_FILE)).unwrap();
+        // Re-chained from scratch without HMACs, one entry longer.
+        fs::remove_file(&lane).unwrap();
+        for body in [r#"{"n":1}"#, r#"{"n":2}"#] {
+            crate::audit::append_chained_jsonl_keyed(&lane, body, None).unwrap();
+        }
+        crate::audit_key::with_test_keys(std::slice::from_ref(&mine), || {
+            let err = audit_chain_check(&case_dir, &out).unwrap_err();
+            assert!(err.contains("NOT VERIFIED"), "{err}");
+        });
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join(super::AUDIT_ANCHORS_FILE)).unwrap())
+                .unwrap();
+        let before: serde_json::Value = serde_json::from_str(&anchored).unwrap();
+        assert_eq!(
+            after["lanes"]["evidence/logs/scan-log.jsonl"]["head"],
+            before["lanes"]["evidence/logs/scan-log.jsonl"]["head"],
+            "the anchor must keep the last authenticated state"
+        );
+        // Without keys it is self-consistency only and passes (P1).
+        crate::audit_key::with_test_keys(&[], || {
+            audit_chain_check(&case_dir, &out).unwrap();
+        });
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -23,11 +23,82 @@ async function hPendingChanges() {
   if (!FTStore.hasProject()) return 0;
   try {
     const meta = await jget("/api/records-meta");
-    const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
-    const drafts = caseId ? readLs(`ft.viewer.${caseId}.annotations.v1`) : null;
-    return drafts && typeof drafts === "object" ? Object.keys(drafts).length : 0;
+    // R8 U1: the viewer's own storage key of the case (case.json's case_id;
+    // an unreadable case.json: a hash of the case folder — never "case").
+    const caseId = meta && meta.ok !== false && typeof FTViewer === "object" && FTViewer && FTViewer.caseStorageKey
+      ? FTViewer.caseStorageKey(meta.manifest, meta.caseDir)
+      : (meta && meta.manifest && meta.manifest.case_id ? String(meta.manifest.case_id) : null);
+    // Per-id draft keys (ft.draft.<case>.<writer>.<id>) plus any legacy
+    // single-key drafts not yet migrated; null = storage unreadable.
+    return caseId ? (unsavedDraftCount(caseId) || 0) : 0;
   } catch (e) { return 0; }
 }
+// ---- A15 / C15: flush the viewer before the window closes ----
+// The desktop shell (src/shell.rs FLUSH_SCRIPT, C15) runs FTViewer.save()
+// in the page before its window goes (capped at 5 s) and names the unsaved
+// edits in its confirmation. hBeforeClose is the same flush for the page
+// itself (and the harness): FTViewer.save() awaits a save already in flight
+// and pushes what is left; ok:false comes with "저장 안 된 편집 N건".
+// R6 U4 (S ↔ U contract): the desktop shell's FLUSH_SCRIPT prefers
+// window.hBeforeClose() over FTViewer.save() — so the answer must come
+// within the shell's 5 s wait: default 4 s, and the viewer's own busy
+// budget is capped below it (FTViewer.save({ timeoutMs })). A read-only
+// close with nothing held here answers ok + `warning` at once; the
+// warning is shown here too (toast) and carried for the shell's dialog.
+// R7 U1 (S7 ↔ U): the shell calls hBeforeClose(4000) and `timeoutMs` is a
+// HARD TOTAL budget measured from the call: the wait for a save already
+// on the wire, the conflict lookup, the send and any busy retry all fit in
+// it (FTViewer.save({timeoutMs}) is itself a total deadline now, given a
+// little less), and a backstop timer answers at the budget whatever the
+// viewer does. Everything after the race is synchronous.
+const H_CLOSE_TIMEOUT_MS = 4000;
+const H_CLOSE_MARGIN_MS = 250;
+async function hBeforeClose(timeoutMs = H_CLOSE_TIMEOUT_MS) {
+  const started = Date.now();
+  const asked = Number(timeoutMs);
+  const ms = Math.max(0, Number.isFinite(asked) ? asked : H_CLOSE_TIMEOUT_MS);
+  const api = hViewerApi();
+  const mounted = !!(api && FTStore.state.viewer && FTStore.state.viewer.mounted);
+  if (!mounted) return { ok: true, pending: 0, state: null, message: "", warning: "" };
+  let saved = false;
+  let timedOut = false;
+  let timer = 0;
+  const opts = { timeoutMs: Math.max(0, ms - H_CLOSE_MARGIN_MS) };
+  try {
+    saved = await Promise.race([
+      Promise.resolve(api.save(opts)).then(v => v === true),
+      new Promise(resolve => { timer = setTimeout(() => { timedOut = true; resolve(false); }, Math.max(0, ms - (Date.now() - started) - 100)); }),
+    ]);
+  } catch (e) { saved = false; }
+  clearTimeout(timer);
+  if (opts.timedOut) timedOut = true;
+  let pending = 0;
+  let state = null;
+  let cause = "";
+  try {
+    const sm = api.summary() || {};
+    pending = Number(sm.pending) || 0;
+    cause = typeof sm.lockCause === "string" ? sm.lockCause : "";
+    state = api.saveState();
+  } catch (e) { pending = 0; }
+  // A durable server queue counts as saved (it reaches the case DB when the job ends).
+  // R5 U15: read-only with nothing pending here (FTViewer.save() true: no
+  // draft, no edit) loses nothing by closing — no confirmation, a warning only.
+  const readonlyClean = saved && state === "readonly" && pending === 0;
+  const ok = readonlyClean || (saved && !hViewerStateUnsaved(state === "queued" ? "saved" : state, () => pending));
+  const late = timedOut ? " (저장 응답 대기 시간 초과)" : "";
+  const message = ok ? ""
+    : pending > 0 ? `저장 안 된 편집 ${pending}건` + late
+    : state === "readonly" ? (cause === "case" ? "케이스 정보(case.json)를 읽지 못해 저장이 막혀 있습니다" : "판독 기록을 읽지 못해 저장이 막혀 있습니다")
+    : "모든 편집이 저장되었는지 확인하지 못했습니다" + late;
+  // R9 U2: the read-only cause in the words of the viewer (case.json vs the marks).
+  const warning = !readonlyClean ? ""
+    : cause === "case" ? "케이스 정보(case.json)를 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다."
+    : "판독 기록을 읽지 못한 상태였습니다 — 이 창에는 저장 안 된 편집이 없습니다.";
+  if (warning && typeof toast === "function") toast(warning, "warn");
+  return { ok, pending, state, message, warning };
+}
+window.hBeforeClose = hBeforeClose;
 $("hBtnQuit").addEventListener("click", async () => {
   const btn = $("hBtnQuit");
   btn.disabled = true;

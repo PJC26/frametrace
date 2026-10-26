@@ -100,7 +100,12 @@ while (Date.now() < deadline) {
       await browser.close();
       if (!/색인/.test(chip) || errors.length) fail('live chip / page errors: ' + errors.join('; '));
     } else {
-      console.log('playwright not resolvable — browser check skipped');
+      // T7: a skipped browser check must never pass in CI (or when the
+      // caller demands it with FRAMETRACE_REQUIRE_BROWSER=1).
+      if (process.env.CI || process.env.FRAMETRACE_REQUIRE_BROWSER === '1') {
+        fail('playwright not resolvable but a browser check is required (CI / FRAMETRACE_REQUIRE_BROWSER=1)');
+      }
+      console.log('playwright not resolvable — browser check skipped (HTTP-only run; set FRAMETRACE_REQUIRE_BROWSER=1 to forbid)');
     }
   }
   if (['review-ready', 'error'].includes(st.phase) || (st.phase === 'review-partial' && !st.busy)) break;

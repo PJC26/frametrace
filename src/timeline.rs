@@ -15,11 +15,54 @@ use std::path::{Path, PathBuf};
 /// Candidate-grade label: timestamps are recorded metadata, not truth.
 pub const LABEL: &str = "candidate-timeline";
 
+/// R9 P3: the kind of an event taken from an audit-lane entry that may not
+/// be relied on here (not authenticated on a PC holding audit keys,
+/// another PC's key, or past a chain break) — shown, never as what it
+/// claims.
+pub const UNAUTHENTICATED_KIND: &str = "audit-entry-unauthenticated";
+
+/// R10-I2: the kind of an event from a `*.jsonl` that is NOT a chained
+/// lane, on a PC without audit keys (nothing vouches for it; with keys it
+/// is [`UNAUTHENTICATED_KIND`]). R9 emitted these as `audit-event`.
+pub const UNCHAINED_KIND: &str = "unchained-log-entry";
+
+/// R12-I2: the kind of a carve event taken only from
+/// `db/carve_results.json` (outside the audit chain) — no usable
+/// `carve-file` entry of the carve lane names the same `(id,
+/// output_path)`. R11 emitted it as `carved-candidate`, so a carve entry
+/// the lane could not authenticate came back through the snapshot as a
+/// plain candidate.
+pub const CARVED_UNAUDITED_KIND: &str = "carved-candidate-unaudited";
+
+/// R10-I2: why a non-lane log entry is not authenticated where keys are
+/// held.
+const UNCHAINED_NOTE: &str =
+    "체인 레인이 아닌 로그의 항목 — 해시 체인·HMAC이 없어 아무것도 이 항목을 보증하지 않음";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEvent {
     pub ts_unix: u64,
     pub source: &'static str,
     pub kind: &'static str,
+    /// R14 I8: the event's time is not the audit lane's (a carve entry
+    /// without `carved_unix`, timed from `db/carve_results.json`; R15 I8:
+    /// every index event — file mtime, stale mark, ffprobe creation_time —
+    /// read from `db/videos.jsonl`, which no audit chain covers) —
+    /// `"time_unaudited": true` in the JSON (the viewer's badge). R16 I7:
+    /// also every event no chain vouches for — an unchained log's entry,
+    /// an entry not authenticated here, a snapshot-only carve artifact.
+    ///
+    /// R17 I7: an audit-lane entry usable here only by self-consistency
+    /// (trust `sc`: no audit key on this PC, or the documented pre-key
+    /// prefix) stays `false` — its time IS the audit lane's (the viewer
+    /// badge "감사 기록에 없는 시각" would be wrong), but no HMAC vouches for
+    /// it: [`Self::time_self_consistent`] says so.
+    pub time_unaudited: bool,
+    /// R17 I7: `"time_self_consistent": true` — the time comes from an
+    /// audit-lane entry that is usable here by self-consistency only (P1:
+    /// anyone can rewrite such a lane with any time; not authenticated).
+    /// Always `false` when `time_unaudited` is true.
+    pub time_self_consistent: bool,
     pub path: String,
     pub detail: String,
 }
@@ -27,11 +70,13 @@ pub struct TimelineEvent {
 impl TimelineEvent {
     fn to_json(&self) -> String {
         format!(
-            "{{\"label\":\"{}\",\"ts_unix\":{},\"source\":\"{}\",\"kind\":\"{}\",\"path\":\"{}\",\"detail\":\"{}\"}}",
+            "{{\"label\":\"{}\",\"ts_unix\":{},\"source\":\"{}\",\"kind\":\"{}\",\"time_unaudited\":{},\"time_self_consistent\":{},\"path\":\"{}\",\"detail\":\"{}\"}}",
             LABEL,
             self.ts_unix,
             json_escape(self.source),
             json_escape(self.kind),
+            self.time_unaudited,
+            self.time_self_consistent,
             json_escape(&self.path),
             json_escape(&self.detail),
         )
@@ -122,6 +167,9 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
     let mut skipped = 0usize;
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            // E8: an unparseable index line is counted, never dropped
+            // without trace.
+            skipped += 1;
             continue;
         };
         let id = value
@@ -145,6 +193,8 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             events.push(TimelineEvent {
                 ts_unix: mtime,
                 source: "index",
+                time_unaudited: true,
+                time_self_consistent: false,
                 kind: "file-modified",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} filesystem mtime"),
@@ -159,6 +209,8 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             events.push(TimelineEvent {
                 ts_unix: stale_unix,
                 source: "index",
+                time_unaudited: true,
+                time_self_consistent: false,
                 kind: "file-marked-stale",
                 path: source_path.clone(),
                 detail: format!("indexed video {id} marked stale by rescan"),
@@ -168,14 +220,22 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             // A tag that will not parse is excluded, never emitted as 0.
             if let Some((ts, tz_assumed)) = parse_creation_time(&raw) {
                 emitted = true;
+                // E5: the tag comes from the container header (MP4 mvhd /
+                // tkhd / mdhd creation_time as ffprobe reports it), written
+                // from the recorder's own clock. A trailing `Z` is how
+                // ffprobe formats that field, not proof the device clock
+                // ran on UTC — so every such time is labelled device-
+                // recorded with its zone unverified.
                 let caveat = if tz_assumed {
-                    " (tz_assumed: tag has no zone, interpreted as UTC; recorder clocks are often local time)"
+                    " (device-recorded, time zone not verified; tz_assumed: tag has no zone, interpreted as UTC; recorder clocks are often local time)"
                 } else {
-                    ""
+                    " (device-recorded, time zone not verified: container creation_time comes from the recorder clock; a Z/offset in the tag does not prove the clock was set to UTC)"
                 };
                 events.push(TimelineEvent {
                     ts_unix: ts,
                     source: "ffprobe",
+                    time_unaudited: true,
+                    time_self_consistent: false,
                     kind: "media-creation-time",
                     path: source_path.clone(),
                     detail: format!(
@@ -191,14 +251,24 @@ fn index_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
     Ok(skipped)
 }
 
-/// One event per carved artifact stamped with its run's `carved_unix` from
-/// `db/carve_results.json` (the per-artifact carve-log lines carry no
-/// timestamp of their own). Returns how many artifacts were skipped.
+/// One event per carved artifact of EVERY carve run (E4). The append-only
+/// carve log holds all runs; since E4 each `carve-file` line carries its
+/// own `carved_unix`. Older lines have none — their time is taken from
+/// `db/carve_results.json` (which only describes the latest run) when the
+/// (id, output_path) pair matches, otherwise the artifact is counted as
+/// skipped (no timestamp), never stamped 0. Artifacts present only in the
+/// results snapshot (log missing) are still emitted. Returns how many
+/// artifacts were skipped.
+/// R13-I4: the `detail` note of a carve-lane event whose time is NOT the
+/// entry's own (an old entry without `carved_unix`, timed from
+/// `db/carve_results.json`, which no audit lane covers).
+pub const CARVE_TIME_UNAUDITED_NOTE: &str = "시각 감사 안 됨 (time not audited: 이 감사 항목에 carved_unix가 없어 db/carve_results.json의 시각을 씀 — 감사 레인 밖)";
+
 fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usize, String> {
     let path = case_dir.join("db/carve_results.json");
-    let text = match read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+    let snapshot = match read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text).ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             return Err(format!(
                 "failed to read carve results {}: {err}",
@@ -206,45 +276,136 @@ fn carve_events(case_dir: &Path, events: &mut Vec<TimelineEvent>) -> Result<usiz
             ));
         }
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Ok(0); // unparsable snapshot is not fatal to the timeline
+    let snapshot_unix = snapshot
+        .as_ref()
+        .and_then(|value| value.get("carved_unix"))
+        .and_then(serde_json::Value::as_u64);
+    let snapshot_artifacts: Vec<serde_json::Value> = snapshot
+        .as_ref()
+        .and_then(|value| value.get("artifacts"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let field = |value: &serde_json::Value, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
     };
-    let Some(carved_unix) = value.get("carved_unix").and_then(serde_json::Value::as_u64) else {
-        return Ok(0);
-    };
+    let key_of = |value: &serde_json::Value| (field(value, "id"), field(value, "output_path"));
+    let snapshot_keys: std::collections::HashSet<(String, String)> =
+        snapshot_artifacts.iter().map(key_of).collect();
+
+    let log_path = case_dir.join("artifacts/carved/carve-log.jsonl");
+    // R9 P3: rows through the one lane reader, each with its trust.
+    let lane = audit::read_lane_rows(&log_path)
+        .map_err(|err| format!("failed to read carve log {}: {err}", log_path.display()))?;
     let mut skipped = 0usize;
-    let Some(artifacts) = value.get("artifacts").and_then(|v| v.as_array()) else {
-        return Ok(0);
-    };
-    for artifact in artifacts {
-        let output_path = artifact
-            .get("output_path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    // R12-I2: `snapshot` = the artifact comes from db/carve_results.json.
+    // R13-I4: `ts_unaudited` = the lane entry has no `carved_unix` and its
+    // time comes from the snapshot (outside the chain) — said in `detail`.
+    let mut emit = |artifact: &serde_json::Value,
+                    ts: Option<u64>,
+                    ts_unaudited: bool,
+                    unauthenticated: Option<String>,
+                    snapshot: bool,
+                    self_consistent: bool,
+                    skipped: &mut usize| {
+        let (id, output_path) = key_of(artifact);
         if output_path.is_empty() {
-            skipped += 1;
-            continue;
+            *skipped += 1;
+            return;
         }
-        let id = artifact
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let source = artifact
-            .get("source_path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
+        // An unauthenticated entry never claims the artifact's slot. R12-I2:
+        // a snapshot artifact a usable entry already showed is not repeated;
+        // any other is shown as unaudited, never as a carved candidate.
+        if unauthenticated.is_none() && !seen.insert((id.clone(), output_path.clone())) {
+            return; // the same artifact logged again by a resumed run
+        }
+        let Some(ts_unix) = ts else {
+            *skipped += 1;
+            return;
+        };
+        let source = field(artifact, "source_path");
         let offset = artifact
             .get("offset")
             .and_then(serde_json::Value::as_u64)
             .map(|offset| offset.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        events.push(TimelineEvent {
-            ts_unix: carved_unix,
-            source: "carve",
-            kind: "carved-candidate",
-            path: output_path.to_string(),
-            detail: format!("carved candidate {id} from {source} at offset {offset}"),
+        let mut detail = format!("carved candidate {id} from {source} at offset {offset}");
+        if ts_unaudited {
+            detail.push_str(&format!(" — {CARVE_TIME_UNAUDITED_NOTE}"));
+        }
+        events.push(match unauthenticated {
+            // R16 I7: a snapshot-only artifact's time comes from
+            // db/carve_results.json — outside every chain.
+            None if snapshot => TimelineEvent {
+                ts_unix,
+                source: "carve",
+                time_unaudited: true,
+                time_self_consistent: false,
+                kind: CARVED_UNAUDITED_KIND,
+                path: output_path,
+                detail: format!(
+                    "NOT AUDITED (감사 안 됨: db/carve_results.json에만 있고 카빙 감사 레인에 이 PC에서 쓸 수 있는 항목이 없음) — {detail}"
+                ),
+            },
+            None => TimelineEvent {
+                ts_unix,
+                source: "carve",
+                time_unaudited: ts_unaudited,
+                time_self_consistent: self_consistent,
+                kind: "carved-candidate",
+                path: output_path,
+                detail,
+            },
+            // R9 P3: shown, but distinguished — never a carved candidate.
+            // R16 I7: nothing vouches for an unauthenticated entry's time.
+            Some(note) => TimelineEvent {
+                ts_unix,
+                source: "carve",
+                time_unaudited: true,
+                time_self_consistent: false,
+                kind: UNAUTHENTICATED_KIND,
+                path: output_path,
+                detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
+            },
         });
+    };
+    for row in &lane.rows {
+        let value = &row.value;
+        if value.get("event").and_then(serde_json::Value::as_str) != Some("carve-file") {
+            continue;
+        }
+        let own = value.get("carved_unix").and_then(serde_json::Value::as_u64);
+        let ts = own.or_else(|| snapshot_unix.filter(|_| snapshot_keys.contains(&key_of(value))));
+        let unauthenticated = (!row.usable()).then(|| row.note());
+        // R17 I7: a usable entry vouched by self-consistency only (`sc`).
+        let self_consistent = row.usable() && own.is_some() && row.code() == "sc";
+        emit(
+            value,
+            ts,
+            own.is_none() && ts.is_some(),
+            unauthenticated,
+            false,
+            self_consistent,
+            &mut skipped,
+        );
+    }
+    // R12-I2: a lane whose chain does not verify vouches for nothing — the
+    // snapshot (outside the chain) is not used at all then.
+    if lane.failure.is_none() {
+        for artifact in &snapshot_artifacts {
+            let ts = artifact
+                .get("carved_unix")
+                .and_then(serde_json::Value::as_u64)
+                .or(snapshot_unix);
+            emit(artifact, ts, false, None, true, false, &mut skipped);
+        }
+    } else if !snapshot_artifacts.is_empty() {
+        skipped += snapshot_artifacts.len();
     }
     Ok(skipped)
 }
@@ -270,6 +431,12 @@ fn audit_log_events(
     files.sort(); // deterministic input order for the merge
     let output_canonical = output_path.canonicalize().ok();
     let mut skipped = 0usize;
+    // R10-I2: a `*.jsonl` that is not a chained lane has nothing that
+    // vouches for it — never an `audit-event`. Where this PC holds audit
+    // keys (or the key configuration cannot be read: fail closed) it is
+    // "not authenticated"; without keys it is an unchained log entry.
+    let keys_held = audit::trust_policy_here().map_or(true, |(policy, _)| policy.keys_held());
+    let mut seen_lanes = std::collections::BTreeSet::new();
     for file in files {
         if output_canonical
             .as_deref()
@@ -277,26 +444,67 @@ fn audit_log_events(
         {
             continue;
         }
-        let text = match read_to_string(&file) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(format!(
-                    "failed to read audit log {}: {err}",
-                    file.display()
-                ));
-            }
-        };
         let rel = file
             .strip_prefix(case_dir)
             .unwrap_or(&file)
             .to_string_lossy()
             .to_string();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                skipped += 1;
-                continue;
+        // R9 P3: a known chained lane is read through the one lane reader
+        // (each entry with its trust). R10 P6: recognised under any
+        // spelling the file system treats as the lane (letter case on
+        // Windows / macOS) — and read once.
+        let lane_rel = audit::canonical_lane_rel(&rel);
+        // R11-I7: only the canonical lane file (spelled canonically, or the
+        // very file that spelling opens) counts as "the lane" for the
+        // once-per-lane rule; a differently-spelled copy beside it in a
+        // case-sensitive folder is read as itself — the reader reports it
+        // NOT VERIFIED — and never hides the real lane.
+        let identity = lane_rel
+            .clone()
+            .filter(|_| audit::is_canonical_lane_file(case_dir, &rel, &file));
+        if identity
+            .as_ref()
+            .is_some_and(|rel| !seen_lanes.insert(rel.clone()))
+        {
+            continue;
+        }
+        let chained = lane_rel.is_some();
+        // (value, why not usable here, R17 I7: usable by self-consistency only)
+        let rows: Vec<(serde_json::Value, Option<String>, bool)> = if chained {
+            let lane = audit::read_lane_rows(&file)
+                .map_err(|err| format!("failed to read audit log {}: {err}", file.display()))?;
+            lane.rows
+                .into_iter()
+                .map(|row| {
+                    let note = (!row.usable()).then(|| row.note());
+                    let self_consistent = row.usable() && row.code() == "sc";
+                    (row.value, note, self_consistent)
+                })
+                .collect()
+        } else {
+            let text = match read_to_string(&file) {
+                Ok(text) => text,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(format!(
+                        "failed to read audit log {}: {err}",
+                        file.display()
+                    ));
+                }
             };
+            let note = keys_held.then(|| UNCHAINED_NOTE.to_string());
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    (
+                        serde_json::from_str(line).unwrap_or(serde_json::Value::Null),
+                        note.clone(),
+                        false,
+                    )
+                })
+                .collect()
+        };
+        for (value, unauthenticated, self_consistent) in rows {
             let Some(object) = value.as_object() else {
                 skipped += 1;
                 continue;
@@ -329,12 +537,38 @@ fn audit_log_events(
             .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
             .map(str::to_string)
             .unwrap_or_else(|| rel.clone());
-            events.push(TimelineEvent {
-                ts_unix: ts,
-                source: "audit-log",
-                kind: "audit-event",
-                path,
-                detail: format!("audit event '{event}' recorded in {rel} ({ts_key})"),
+            let detail = if chained {
+                format!("audit event '{event}' recorded in {rel} ({ts_key})")
+            } else {
+                format!(
+                    "unchained log entry '{event}' in {rel} ({ts_key}) — not an audit lane (체인 없는 로그)"
+                )
+            };
+            events.push(match unauthenticated {
+                // R16 I7: an unchained log's time is vouched by nothing.
+                None => TimelineEvent {
+                    ts_unix: ts,
+                    source: "audit-log",
+                    time_unaudited: !chained,
+                    time_self_consistent: chained && self_consistent,
+                    kind: if chained {
+                        "audit-event"
+                    } else {
+                        UNCHAINED_KIND
+                    },
+                    path,
+                    detail,
+                },
+                // R16 I7: nor an unauthenticated entry's.
+                Some(note) => TimelineEvent {
+                    ts_unix: ts,
+                    source: "audit-log",
+                    time_unaudited: true,
+                    time_self_consistent: false,
+                    kind: UNAUTHENTICATED_KIND,
+                    path,
+                    detail: format!("UNAUTHENTICATED here (인증 안 됨: {note}) — {detail}"),
+                },
             });
         }
     }
@@ -361,7 +595,9 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String>
         if file_type.is_dir() {
             collect_jsonl_files(&path, out)?;
         } else if file_type.is_file()
-            && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            // R11-I6: `X.JSONL` is a lane on case-insensitive volumes
+            // (R10 P6 identity) — the extension compares the same way.
+            && audit::lane_rel_key(&entry.file_name().to_string_lossy()).ends_with(".jsonl")
         {
             out.push(path);
         }
@@ -537,6 +773,65 @@ mod tests {
             .collect()
     }
 
+    /// E4: every carve run reaches the timeline. The old code read only
+    /// `db/carve_results.json` (latest run), so earlier runs' artifacts —
+    /// still on disk and in the carve log — vanished from the timeline.
+    #[test]
+    fn carve_events_cover_every_run_in_the_log() {
+        let case_dir = temp_case("allruns");
+        fs::write(case_dir.join("case.json"), "{}").unwrap();
+        fs::create_dir_all(case_dir.join("artifacts/carved")).unwrap();
+        crate::audit::test_write_lane(
+            &case_dir.join("artifacts/carved/carve-log.jsonl"),
+            concat!(
+                // legacy run 1: no carved_unix, not in the snapshot → skipped
+                "{\"event\":\"carve-file\",\"id\":\"carve_000001\",\"output_path\":\"/c/old.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":1}\n",
+                // run 2 (E4 ids, own timestamps)
+                "{\"event\":\"carve-file\",\"id\":\"carve_100-abcd_000001\",\"output_path\":\"/c/r2.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":2,\"run_id\":\"100-abcd\",\"carved_unix\":150}\n",
+                // run 3, also the latest snapshot
+                "{\"event\":\"carve-file\",\"id\":\"carve_200-ef01_000001\",\"output_path\":\"/c/r3.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":3,\"run_id\":\"200-ef01\",\"carved_unix\":250}\n",
+            ),
+        );
+        fs::write(
+            case_dir.join("db/carve_results.json"),
+            "{\"carved_unix\":260,\"artifacts\":[{\"id\":\"carve_200-ef01_000001\",\"output_path\":\"/c/r3.mp4\",\"source_path\":\"/ev/i.raw\",\"offset\":3,\"carved_unix\":250}]}",
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let skipped = carve_events(&case_dir, &mut events).unwrap();
+        let paths: Vec<(&str, u64)> = events
+            .iter()
+            .map(|e| (e.path.as_str(), e.ts_unix))
+            .collect();
+        assert_eq!(paths, vec![("/c/r2.mp4", 150), ("/c/r3.mp4", 250)]);
+        assert_eq!(skipped, 1, "legacy entry without any timestamp is counted");
+        let _ = fs::remove_dir_all(&case_dir);
+    }
+
+    /// E5: a `Z`-suffixed MP4 creation_time is a device-recorded clock
+    /// value; the event must not present it as verified UTC.
+    #[test]
+    fn zulu_creation_time_is_labelled_device_recorded() {
+        let case_dir = temp_case("zulu");
+        fs::write(
+            case_dir.join("db/videos.jsonl"),
+            "{\"id\":\"vid_1\",\"source_path\":\"/ev/a.mp4\",\"modified_unix\":0,\"ffprobe\":{\"format\":{\"tags\":{\"creation_time\":\"2021-01-01T00:00:00.000000Z\"}}}}\nnot json\n",
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let skipped = index_events(&case_dir, &mut events).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .detail
+                .contains("device-recorded, time zone not verified"),
+            "{}",
+            events[0].detail
+        );
+        assert_eq!(skipped, 1, "the unparseable index line is counted (E8)");
+        let _ = fs::remove_dir_all(&case_dir);
+    }
+
     #[test]
     fn merges_index_ffprobe_and_carve_sources_sorted_by_ts() {
         let case_dir = temp_case("mixed");
@@ -581,7 +876,9 @@ mod tests {
             .map(|event| event["kind"].as_str().unwrap())
             .collect();
         assert_eq!(kinds[0], "file-modified");
-        assert_eq!(kinds[2], "carved-candidate");
+        // R12-I2: a snapshot-only artifact (no carve lane entry) is
+        // unaudited, never a plain carved candidate.
+        assert_eq!(kinds[2], CARVED_UNAUDITED_KIND);
         assert_eq!(kinds[3], "media-creation-time");
 
         // The run is audit-logged and the chain verifies.
@@ -628,20 +925,18 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(case_dir.join("evidence/logs")).unwrap();
-        fs::write(
-            case_dir.join("evidence/logs/validation-log.jsonl"),
+        crate::audit::test_write_lane(
+            &case_dir.join("evidence/logs/validation-log.jsonl"),
             concat!(
                 "{\"event\":\"validate-artifact\",\"validated_unix\":400,\"target_path\":\"/ev/a.mp4\",\"validation_status\":\"ok\"}\n",
                 "{\"event\":\"no-timestamp-here\",\"selector\":\"vid_9\"}\n",
             ),
-        )
-        .unwrap();
+        );
         fs::create_dir_all(case_dir.join("artifacts/clips")).unwrap();
-        fs::write(
-            case_dir.join("artifacts/clips/export-log.jsonl"),
+        crate::audit::test_write_lane(
+            &case_dir.join("artifacts/clips/export-log.jsonl"),
             "{\"event\":\"export-video\",\"exported_unix\":500,\"source_path\":\"/ev/a.mp4\",\"output_path\":\"/case/artifacts/clips/a.mp4\"}\n",
-        )
-        .unwrap();
+        );
 
         let output = case_dir.join("db/timeline.jsonl");
         let result = generate_timeline(&case_dir, &output).unwrap();

@@ -13,7 +13,7 @@
 const H_REVIEW_PHASES = ["review-partial", "review-ready", "done", "finalized"];
 const FTStore = (() => {
   const state = {
-    project: { caseDir: "", name: "", packageDir: "", restored: false, sourcePath: "" },
+    project: { caseDir: "", name: "", packageDir: "", packageIncomplete: false, restored: false, sourcePath: "" },
     phase: "empty",
     jobs: {
       pipeline: { steps: [], stepNames: [], current: "", progress: null, enrichment: null, warnings: [], logs: [], busy: false, error: "" },
@@ -25,7 +25,7 @@ const FTStore = (() => {
     panels: { jobs: false, finalize: false, project: false, tools: false, help: false },
     popout: { open: false, writer: "main" },
     viewer: { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null, locale: "ko", theme: "light", live: false, liveGeneration: null, canReload: true },
-    server: { instance: "", lost: false, failures: 0 },
+    server: { instance: "", lost: false, auth: false, failures: 0 },
     env: null,
     ui: { home: false },
   };
@@ -96,8 +96,28 @@ const FTStore = (() => {
   };
 })();
 
+// R20 U5: a trailing `\.` is the folder itself (`E:\.` → "E:", never ".").
+// R21 U2 (follow-up): strip trailing separators and single `.` steps with
+// a loop — linear time (the regex form was quadratic on long input). Same
+// result as /[\\/](?:\.?[\\/])*\.?$/ ; a `..` is kept.
+function hTrimTail(text) {
+  const s = String(text || "");
+  const sep = (c) => c === "\\" || c === "/";
+  let end = s.length;
+  for (;;) {
+    if (end > 0 && sep(s[end - 1])) { end--; continue; }
+    if (end > 1 && s[end - 1] === "." && sep(s[end - 2])) { end--; continue; }
+    break;
+  }
+  return s.slice(0, end);
+}
 function hBaseName(dir) {
-  return String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  return hTrimTail(dir).split(/[\\/]/).filter(Boolean).pop() || "";
+}
+// The name a case is shown by: a given name unless it is "." / "..".
+function hCaseName(name, dir) {
+  const n = String(name || "").trim();
+  return n && n !== "." && n !== ".." ? n : hBaseName(dir) || String(dir || "");
 }
 
 
@@ -113,8 +133,18 @@ function hViewerApi() {
 }
 // saveState → unsaved? pendingCount() is only asked for "local".
 function hViewerStateUnsaved(ss, pendingCount) {
-  if (ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued") return true;
+  // readonly (A3: annotations unreadable, saving blocked) and unknown (A5:
+  // conflict lookup failed) are never "saved" either.
+  if (ss === "pending" || ss === "saving" || ss === "failed" || ss === "queued" || ss === "readonly" || ss === "unknown") return true;
   return ss === "local" && (typeof pendingCount === "function" ? pendingCount() : 0) > 0;
+}
+// R9 U6: a patient save ({ patient: true }) that answered false only
+// because its time ran out while the request is still on the wire is
+// "아직 저장 중", not a failed save: `opts.timedOut` + saveState "saving".
+const H_STILL_SAVING = "아직 저장 중입니다 — 끝나면 저장 상태가 ‘저장됨’으로 바뀝니다. 잠시 뒤 다시 시도하십시오.";
+function hSaveStillSaving(opts, api) {
+  if (!opts || !opts.timedOut) return false;
+  try { return !!api && api.saveState() === "saving"; } catch (e) { return false; }
 }
 let hHostedWired = false;
 // A mount that failed is not retried for the same case on every render
@@ -146,7 +176,7 @@ const hViewer = {
     try { hostViewerUnmount(); } catch (e) { console.error("viewer unmount failed:", e); }
     FTStore.set({ viewer: { mounted: false, saveState: null, dirty: 0, selection: 0, activeId: null }, popout: { open: false } });
   },
-  // "saved"|"pending"|"saving"|"failed"|"queued"|"local"|null (null = no viewer).
+  // "saved"|"pending"|"saving"|"failed"|"queued"|"readonly"|"unknown"|"local"|null (null = no viewer).
   saveState() {
     const v = hViewerApi();
     if (!v || !FTStore.state.viewer.mounted) return null;
@@ -165,7 +195,7 @@ const hViewer = {
   save() {
     const v = hViewerApi();
     if (!v || !FTStore.state.viewer.mounted) return false;
-    try { Promise.resolve(v.save()).catch(() => {}); return true; } catch (e) { return false; }
+    try { Promise.resolve(v.save({ patient: true })).catch(() => {}); return true; } catch (e) { return false; }
   },
   summary() {
     const v = hViewerApi();
@@ -206,6 +236,6 @@ function hWireHostedViewer(v) {
   v.on("toast", e => {
     if (!FTStore.state.panels.finalize || !e || typeof e.preventDefault !== "function") return;
     e.preventDefault();
-    toast(String(d(e).message || ""), d(e).kind === "error" ? "err" : "info");
+    toast(String(d(e).message || ""), d(e).kind === "error" ? "err" : d(e).kind === "warn" ? "warn" : "info");
   });
 }

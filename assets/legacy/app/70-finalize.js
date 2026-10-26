@@ -50,13 +50,205 @@ function unsavedMarksChecks({ pendingMarks, saveState, drafts }) {
   if (!out.length) add("ok", "뷰어의 마크·메모가 모두 케이스에 반영되었습니다");
   return out;
 }
+// R14 U1: /api/status `finalize_journal` (same reading as the app shell,
+// assets/app/41-finalize.js finJournalState / finJournalBlocks): a journal
+// that blocks the next finalize is a block row, with the CLI command that
+// sets an unreadable / unpaired one aside.
+const FIN_JOURNAL_HEAD = {
+  unreadable: "이전 최종화 기록을 읽지 못함 — 확인 필요",
+  unpaired: "이전 최종화 기록 짝 없음 — 확인 필요",
+  otherhost: "다른 PC의 최종화 — 차단 중",
+  recovering: "이전 최종화 복구 중",
+  completed: "이전 최종화 완료 — 기록만 남음",
+  closedrecovered: "이전 최종화 복구됨 — 기록만 남음",
+  closedfailed: "이전 최종화 실패 — 기록만 남음",
+  closeddismissed: "이전 최종화 치워짐 — 기록만 남음",
+  closedrefused: "이전 최종화 거부됨 — 기록만 남음",
+  closedsuperseded: "이전 최종화 대체됨 — 기록만 남음",
+  unrecorded: "이전 최종화 완료 — 완료 기록만 빠짐",
+  unrecordedblocked: "이전 최종화 완료 — 완료 기록 못 씀",
+  unrecordedwithheld: "이전 최종화 확인 보류 — 완료 확정 아님",
+  closed: "이전 최종화 끝남 — 확인 필요",
+  inprogress: "다른 FrameTrace에서 최종화 중",
+  otheraccount: "다른 계정의 최종화일 수 있음 — 차단 중",
+  unverifiedwriter: "확인 불가 작성자 — 자동 복구 안 함",
+  check: "이전 최종화 중단됨 — 확인 필요",
+  recovered: "이전 최종화 중단됨 — 복구됨",
+};
+const FIN_JOURNAL_INFO = new Set(["recovering", "completed", "closedrecovered", "unrecorded"]);
+// R14 (track S): `unpaired_code` → the short cause in the head ("로컬 기록
+// 없음" in the reason without a code = no-local-record).
+const FIN_UNPAIRED_SHORT = { "no-local-record": "로컬 기록 없음", "local-mismatch": "로컬 기록 불일치", "local-unreadable": "로컬 기록 읽지 못함", "lane": "서명 레인 확인 불가", "journal-mismatch": "저널 불일치", "legacy-journal": "이전 형식 기록", "host-unknown": "이 PC 식별 불가", "package-changed": "패키지 변경됨", "local-state": "로컬 기록 상태 불일치" };
+function finJournalUnpairedCode(j, reason) {
+  const c = j && j.unpaired_code != null ? String(j.unpaired_code) : "";
+  return c || (String(reason || "").includes("로컬 기록 없음") ? "no-local-record" : "");
+}
+// R18 U3 (track S1, P29): no server command (path a shell could read) →
+// `command_unavailable_reason` instead of any command line (same as the
+// app shell, assets/app/41-finalize.js).
+const FIN_NO_COMMAND = "경로에 특수 문자 — 명령을 직접 입력하십시오";
+function finJournalNoCommand(j) {
+  const v = j && typeof j === "object" ? j.command_unavailable_reason : null;
+  if (v == null || v === false) return "";
+  const r = String(v).trim();
+  return /[^\x00-\x7f]/.test(r) ? r : FIN_NO_COMMAND;
+}
+// R18 U4 (track S2, P31): `blocks_finalize: null` → possibly blocking (warning).
+const FIN_MAYBE_BLOCKS = "확인 필요 — 최종화가 거부될 수 있음";
+function finJournalMaybeBlocks(s) {
+  return !!(s && s.journal && Object.prototype.hasOwnProperty.call(s.journal, "blocks_finalize") && s.journal.blocks_finalize === null && !finJournalBlocks(s));
+}
+// R18 U4: the remembered recovery verdict (`recovery_verdict`: text or {text | reason}).
+// Track S (a9d26a3): `manifest_check: "recovery-verdict"` — the remembered
+// verdict is the `reason` (shown as the body): labelled "기억된 판정".
+function finJournalVerdict(j) {
+  const v = j && typeof j === "object" ? j.recovery_verdict : null;
+  if (typeof v === "string" && v.trim()) return v.trim();
+  if (v && typeof v === "object") { const x = String(v.text != null ? v.text : v.reason != null ? v.reason : "").trim(); if (x) return x; }
+  return j && j.manifest_check === "recovery-verdict" ? FIN_VERDICT_LABEL : "";
+}
+const FIN_VERDICT_LABEL = "기억된 판정(복구가 전체 해시로 확인)";
+// The dismiss command lines (unreadable / unpaired / other-host): the
+// server's PowerShell (single-quoted) and cmd.exe forms when both come, one
+// line when one does. R18 U5 (P29): never built here.
+function finJournalDismissLines(st, kind) {
+  if (!["unreadable", "unpaired", "otherhost"].includes(kind)) return [];
+  const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  if (finJournalNoCommand(j)) return [];
+  const ps = typeof j.dismiss_command === "string" ? j.dismiss_command.trim() : "";
+  const cmd = typeof j.dismiss_command_cmd === "string" ? j.dismiss_command_cmd.trim() : "";
+  if (ps && cmd) return [{ label: "치우기(PowerShell)", cmd: ps }, { label: "치우기(명령 프롬프트)", cmd }];
+  return ps || cmd ? [{ label: "치우기", cmd: ps || cmd }] : [];
+}
+// R16 U4 (track S 2e3a4e4): the `--force` dismiss hint — ONLY the server's
+// `force_dismiss_command` (PowerShell) / `force_dismiss_command_cmd`
+// (cmd.exe) strings; never built here. R17 U3 (track S8): never for a
+// verified live writer (`in_progress_code: "live-writer"` — the server
+// sends null; an older server's string is not shown either); the last line
+// carries the fixed note FIN_FORCE_NOTE.
+const FIN_FORCE_NOTE = "저널만 옮김 — 아무것도 되돌리거나 기록하지 않음(서명·패키지 그대로)";
+function finJournalForceLines(st, kind) {
+  const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  if (j.in_progress_code === "live-writer" || finJournalNoCommand(j)) return [];
+  const ps = typeof j.force_dismiss_command === "string" ? j.force_dismiss_command.trim() : "";
+  const cmd = typeof j.force_dismiss_command_cmd === "string" ? j.force_dismiss_command_cmd.trim() : "";
+  const out = ps && cmd ? [{ label: "확인 뒤 강제 치우기(PowerShell)", cmd: ps }, { label: "확인 뒤 강제 치우기(명령 프롬프트)", cmd }]
+    : ps || cmd ? [{ label: "확인 뒤 강제 치우기", cmd: ps || cmd }] : [];
+  if (out.length) out[out.length - 1].note = FIN_FORCE_NOTE;
+  return out;
+}
+// R17 U5 (track S2): "작성자 없음 확인 시 복구" — ONLY the server's
+// `writer_gone_command` (PowerShell) / `writer_gone_command_cmd` (cmd.exe).
+// R18 U5 (track S7): `--i-am-sure` only ever comes inside these strings.
+function finJournalWriterGoneLines(st) {
+  const j = st && st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : {};
+  if (finJournalNoCommand(j)) return [];
+  const ps = typeof j.writer_gone_command === "string" ? j.writer_gone_command.trim() : "";
+  const cmd = typeof j.writer_gone_command_cmd === "string" ? j.writer_gone_command_cmd.trim() : "";
+  const out = ps && cmd ? [{ label: "작성자 없음 확인 시 복구(PowerShell)", cmd: ps }, { label: "작성자 없음 확인 시 복구(명령 프롬프트)", cmd }]
+    : ps || cmd ? [{ label: "작성자 없음 확인 시 복구", cmd: ps || cmd }] : [];
+  // R18 (track S7): `writer_gone_i_am_sure: true` — the server's command already
+  // carries --i-am-sure (a live process matches the writer): a warning next to it.
+  if (out.length && j.writer_gone_i_am_sure === true) out[out.length - 1].note = FIN_SURE_NOTE;
+  return out;
+}
+const FIN_SURE_NOTE = "이 케이스의 진행 중 최종화가 아닌지 확인";
+// One checklist text of command lines; a line's note follows it in brackets.
+function finJournalCmdText(lines) {
+  return lines.map(l => `${l.label}: ${l.cmd}` + (l.note ? ` (${l.note})` : "")).join(" · ");
+}
+// Tooltip words for `local_record` / `unpaired_code`.
+function finJournalTipExtra(j) {
+  const out = [];
+  if (j && j.local_record === true) out.push("이 PC의 로컬 기록 있음");
+  else if (j && j.local_record === false) out.push("이 PC의 로컬 기록 없음");
+  if (j && j.unpaired_code) out.push("짝 없음 코드 " + String(j.unpaired_code));
+  if (j && j.local_record_state) out.push("로컬 기록 상태 " + String(j.local_record_state));
+  if (j && j.in_progress_code) out.push("진행 중 코드 " + String(j.in_progress_code));
+  return out;
+}
+function finJournalState(st) {
+  if (!st || typeof st !== "object") return null;
+  const j = st.finalize_journal && typeof st.finalize_journal === "object" ? st.finalize_journal : null;
+  const jState = j && j.state != null ? String(j.state) : "";
+  const detail = st.finalize_recovered_detail == null ? "" : String(st.finalize_recovered_detail);
+  const reason = j && j.reason != null ? String(j.reason).trim() : "";
+  if (j && jState === "unreadable") return { kind: "unreadable", journal: j, detail: j.error == null ? "" : String(j.error) };
+  let kind = { "unpaired": "unpaired", "other-host": "otherhost", "recovering": "recovering", "completed": "completed", "in-progress": "inprogress", "completed-unrecorded": "unrecorded" }[jState];
+  if (kind === "completed") {
+    const o = j.outcome == null ? "completed" : String(j.outcome);
+    kind = { completed: "completed", recovered: "closedrecovered", failed: "closedfailed", dismissed: "closeddismissed", refused: "closedrefused", superseded: "closedsuperseded" }[o] || "closed";
+  }
+  // R15 U4 (track S6): the complete record could not be written again — it blocks.
+  if (kind === "unrecorded" && j.blocks_finalize === true) kind = "unrecordedblocked";
+  // R17 (track S9): the manifest was too large to hash on the status path
+  // (`manifest_check: "withheld"`) — "확인 보류", never shown as complete.
+  if ((kind === "unrecorded" || kind === "completed") && j.manifest_check === "withheld") kind = "unrecordedwithheld";
+  // R15 (track S10): maybe another account's FrameTrace — blocks, no dismiss hint.
+  if (kind === "inprogress" && j.in_progress_code === "other-account") kind = "otheraccount";
+  // R16 U4 (track S2, P25): a live process that may be this case's writer — never rolled back automatically.
+  if (kind === "inprogress" && j.in_progress_code === "unverified-writer") kind = "unverifiedwriter";
+  if (j && kind) return { kind, journal: j, detail: reason || detail, code: kind === "unpaired" ? finJournalUnpairedCode(j, reason) : "" };
+  if (j && jState !== "recovered") return { kind: "check", journal: j, detail: reason || detail };
+  if (st.finalize_recovered === true || jState === "recovered") return { kind: "recovered", journal: j, detail };
+  return null;
+}
+function finJournalBlocks(s) {
+  if (!s || !s.journal) return false;
+  if (typeof s.journal.blocks_finalize === "boolean") return s.journal.blocks_finalize;
+  return s.kind === "recovering" || s.kind === "otherhost" || s.kind === "otheraccount" || s.kind === "unverifiedwriter";
+}
+function finJournalHead(s) {
+  if (s && s.kind === "unpaired" && FIN_UNPAIRED_SHORT[s.code]) return `이전 최종화 짝 없음(${FIN_UNPAIRED_SHORT[s.code]}) — 확인 필요`;
+  return FIN_JOURNAL_HEAD[s && s.kind] || FIN_JOURNAL_HEAD.check;
+}
+function finShortDetail(text, max) {
+  const lim = max || 90;
+  const t = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+  return t.length > lim ? t.slice(0, lim - 1).trimEnd() + "…" : t;
+}
+// Checklist rows of the journal: a block row when it blocks (recovering:
+// "이전 최종화 복구 중"), a warning when it does not and is not plain info.
+function finJournalChecks(st) {
+  const s = finJournalState(st);
+  if (!s) return [];
+  const j = s.journal || {};
+  const until = Number(j.blocked_until_unix);
+  const host = s.kind === "otherhost" || s.kind === "otheraccount" || s.kind === "unverifiedwriter" ? [j.host ? "PC " + String(j.host) : "", until > 0 ? new Date(until * 1000).toLocaleString() + "까지 차단" : ""].filter(Boolean).join(" · ") : "";
+  const cmd = finJournalCmdText(finJournalDismissLines(st, s.kind).concat(finJournalWriterGoneLines(st), finJournalForceLines(st, s.kind)));
+  const verdict = finJournalVerdict(j);
+  const sub = [host, s.detail ? finShortDetail(s.detail) : "", verdict ? finShortDetail(verdict) : "", cmd, finJournalNoCommand(j)].filter(Boolean).join(" — ");
+  if (finJournalBlocks(s)) {
+    if (s.kind === "recovering") return [{ level: "block", text: "이전 최종화 복구 중", sub: "끝나면 '다시 확인'을 누르십시오." }];
+    return [{ level: "block", text: "최종화 차단: " + finJournalHead(s), sub: sub || "결과 안내를 확인하십시오.", cmd: !!cmd }];
+  }
+  // R18 U4 (P31): unknown → possibly blocking, a warning (never hidden as info).
+  if (finJournalMaybeBlocks(s)) return [{ level: "warn", text: finJournalHead(s), sub: [FIN_MAYBE_BLOCKS, sub].filter(Boolean).join(" — "), cmd: !!cmd }];
+  if (FIN_JOURNAL_INFO.has(s.kind)) return [];
+  return [{ level: "warn", text: finJournalHead(s), sub, cmd: !!cmd }];
+}
+// R14 U3: the last source re-verification of this page (a newer run's
+// MISMATCH blocks the finalize).
+let lastVerifyVerdict = null;
+function verifyChecks(v) {
+  if (!v) return [];
+  const out = [];
+  if (v.kind === "newermismatch") out.push({ level: "block", text: v.label, sub: v.hint });
+  else if (v.kind === "truncated") out.push({ level: "warn", text: v.label, sub: v.hint });
+  // R15 (track I4): `clock_note` — its own warning row, the result stands.
+  if (v.clock) out.push({ level: "warn", text: "원본 재검증: 시계 이상", sub: v.clock });
+  return out;
+}
 async function gatherFinalizeChecks() {
   const checks = [];
   const add = (level, text, sub) => checks.push({ level, text, sub: sub || "" });
   let st = null;
   try { st = await jget("/api/status"); } catch (e) { st = null; }
+  const journalRows = finJournalChecks(st);
   if (!st) add("block", "서버 상태를 확인할 수 없습니다", "연결이 복구된 뒤 다시 시도하십시오.");
-  else if (st.busy) add("block", "다른 작업이 진행 중입니다", `현재 단계: ${st.phase || "-"} — 끝난 뒤 보고서를 생성하십시오.`);
+  else if (st.busy && !journalRows.some(c => c.text === "이전 최종화 복구 중")) add("block", "다른 작업이 진행 중입니다", `현재 단계: ${st.phase || "-"} — 끝난 뒤 보고서를 생성하십시오.`);
+  journalRows.forEach(c => checks.push(c));
+  verifyChecks(lastVerifyVerdict).forEach(c => checks.push(c));
   let meta = null;
   try { meta = await jget("/api/records-meta"); } catch (e) { meta = null; }
   const caseId = meta && meta.manifest ? (meta.manifest.case_id || "case") : null;
@@ -103,7 +295,7 @@ async function gatherFinalizeChecks() {
 function renderChecklist(checks) {
   const icon = { block: "✕", warn: "!", ok: "✓" };
   return `<ul class="checklist">` + checks.map(c =>
-    `<li class="${c.level}"><span class="ic" aria-hidden="true">${icon[c.level]}</span><span>${esc(c.text)}` +
+    `<li class="${c.level}"${c.cmd ? ' data-journal-cmd="1"' : ""}><span class="ic" aria-hidden="true">${icon[c.level]}</span><span>${esc(c.text)}` +
     (c.sub ? `<small>${esc(c.sub)}</small>` : "") + `</span></li>`).join("") + `</ul>`;
 }
 function currentExaminerName(caseId) {
@@ -193,7 +385,13 @@ $("btnFinalize").addEventListener("click", async () => {
   $("finalHint").textContent = "보고서 생성 중… (원본 해시 재계산 포함 — 소스 크기에 따라 오래 걸릴 수 있습니다)";
   try {
     const res = await jpost("/api/finalize", { examiner: finalizeExaminer });
-    if (!res.ok) { $("finalHint").textContent = "실패: " + (res.error || "알 수 없는 오류"); return; }
+    if (!res.ok) {
+      // R12 (track S): "최종화 차단: …" is a refusal (warning), not a failure.
+      const err = String(res.error || "알 수 없는 오류");
+      if (/^\s*최종화 차단:/.test(err)) { $("finalHint").textContent = err; toast(err, "warn"); }
+      else $("finalHint").textContent = "실패: " + err;
+      return;
+    }
     $("finalHint").textContent = "보고서·패키지 생성 완료. 검토자(입력값 기록): " + (res.examiner || "-") +
       (res.manifest_sha256 ? " · manifest.sha256의 SHA-256: " + res.manifest_sha256 : "");
     $("finalLinks").innerHTML =
@@ -218,24 +416,111 @@ $("btnFinalize").addEventListener("click", async () => {
 // nothing was left uncompared — 0 matched / N not comparable is a warning,
 // never a green pass.
 function verifySourcesVerdict(res) {
-  const matched = Number(res.matched) || 0;
-  const mismatched = Number(res.mismatched) || 0;
-  const notComparable = Number(res.not_comparable) || 0;
-  const counts = `일치 ${matched} · 불일치 ${mismatched} · 비교 불가 ${notComparable}`;
-  if (mismatched > 0) {
-    return { level: "err", toast: `원본 재검증: 불일치 ${mismatched}건`,
-      hint: `원본 재검증 완료 — ${counts} (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)` };
-  }
-  if (matched === 0) {
-    return { level: "warn", toast: "원본 재검증: 비교된 파일 없음 — 재검증되지 않았습니다",
-      hint: `원본 재검증 완료 — ${counts}. 기록된 해시와 비교할 수 있는 파일이 없어 아무것도 재검증되지 않았습니다` +
-        (notComparable ? " (원본에 접근할 수 없거나, 읽을 수 없거나, 해시 없이 색인됨 — 해시 포함으로 다시 분석하십시오)." : ".") };
-  }
-  if (notComparable > 0) {
-    return { level: "warn", toast: `원본 재검증: 일치 ${matched}건, 비교 불가 ${notComparable}건`,
-      hint: `원본 재검증 완료 — ${counts}. 비교 불가 ${notComparable}건은 재검증되지 않았습니다 (접근 불가·읽기 실패·기록된 해시 없음 — 보관 이력서 5절 참조).` };
-  }
-  return { level: "ok", toast: `원본 재검증: ${matched}건 모두 일치`, hint: `원본 재검증 완료 — ${counts}` };
+  // R14 (track I3): `head_status` of the re-verification lane anchor —
+  // every verdict names it in the tooltip.
+  const head = res.head_status == null ? "" : String(res.head_status);
+  const v = (() => {
+    const matched = Number(res.matched) || 0;
+    const mismatched = Number(res.mismatched) || 0;
+    const notComparable = Number(res.not_comparable) || 0;
+    // R11 U4 (track I2): is_result / verified / unauthenticated → never "모두 일치"
+    // (same rule as assets/app/41-finalize.js; absent fields = counts only).
+    const unauth = Number(res.unauthenticated) > 0 ? Number(res.unauthenticated) : 0;
+    const reason = res.not_verified_reason == null ? "" : String(res.not_verified_reason).trim();
+    const counts = `일치 ${matched} · 불일치 ${mismatched} · 비교 불가 ${notComparable}` + (unauth ? ` · 인증 안 됨 ${unauth}` : "");
+    if (mismatched > 0) {
+      return { level: "err", toast: `원본 재검증: 불일치 ${mismatched}건`,
+        hint: `원본 재검증 완료 — ${counts} (불일치 항목은 보관 이력서 5절에서 기록값/관측값을 비교하십시오)` };
+    }
+    // R13 U2 (track I1, P16): a newer usable run without a completion marker
+    // withholds the result — its mismatches are shown, never hidden.
+    const newerMis = Number(res.newer_mismatched) > 0 ? Number(res.newer_mismatched) : 0;
+    const withheld = res.withheld_reason == null ? "" : String(res.withheld_reason).trim();
+    // Several reasons may be joined with "; " (track I 32e88a2); the reason
+    // text repeats in not_verified_reason — each part once.
+    const parts = [];
+    for (const p of [withheld, reason].join("; ").split(/;\s*/)) {
+      const x = p.trim();
+      if (x && !parts.some(q => q.includes(x) || x.includes(q))) parts.push(x);
+    }
+    const why = parts.join(" · ");
+    const NEWER = "표식 없는 더 새 실행 있음";
+    const mis = Array.isArray(res.newer_mismatches) ? res.newer_mismatches.filter(m => m && typeof m === "object") : [];
+    if (newerMis > 0 || mis.length) {
+      const n = Math.max(newerMis, mis.length);
+      const other = parts.filter(x => !x.includes(NEWER)).join(" · ");
+      const runs = Number(res.newer_runs) > 1 ? ` · 실행 ${Number(res.newer_runs)}개` : "";
+      // Each mismatch: id + source path; hashes and run in its tooltip.
+      const items = mis.slice(0, 10).map(m => ({ id: String(m.id == null ? "" : m.id), path: String(m.source_path == null ? "" : m.source_path),
+        tip: [`기록 SHA-256 ${m.recorded_sha256 || "-"}`, `관측 SHA-256 ${m.observed_sha256 || "-"}`, `실행 ${m.run_id || "-"}` + (Number(m.run_unix) > 0 ? ` (${new Date(Number(m.run_unix) * 1000).toLocaleString()})` : "")].join("\n") }));
+      return { level: "err", kind: "newermismatch", label: `원본 재검증: 현재 결과 없음 — 불일치 ${n}건`,
+        toast: `원본 재검증: ${NEWER} — 불일치 ${n}건`,
+        hint: `${NEWER} — 불일치 ${n}건${runs}` + (other ? ` (${other})` : "") + " — 다시 실행하십시오 (보관 이력서 5절).",
+        items, more: Math.max(0, n - items.length),
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
+    // R14 (track I3): the lane is shorter than its anchored head.
+    // R15 U4 (track I5): a head this PC cannot use may be another PC's —
+    // warn, never err (a cut tail named on its own stays err).
+    const OTHER_HEAD = "다른 PC 머리일 수 있음";
+    const otherHead = parts.some(x => x.includes(OTHER_HEAD)) || (head === "unknown" && res.head_reason === "other-pc");
+    if (parts.some(x => x.includes("꼬리 잘림") && !x.includes(OTHER_HEAD)) || head === "truncated" || (head === "rewritten" && !otherHead)) {
+      return { level: "err", kind: "truncated", label: "원본 재검증: 기록 꼬리 잘림 — 현재 결과 없음", toast: "원본 재검증: 기록 꼬리 잘림",
+        hint: `원본 재검증: 기록 꼬리 잘림 — ${why} (보관 이력서 5절 참조).`,
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
+    // R14 (track I3): the re-verification head could not be checked — no result (warn).
+    if (otherHead) {
+      const label = `원본 재검증: ${OTHER_HEAD} — 현재 결과 없음`;
+      return { level: "warn", kind: "headotherpc", label, toast: label, hint: label + (why ? ` — ${why}` : "") + " (보관 이력서 5절 참조).",
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
+    if (head === "unknown" || parts.some(x => x.includes("머리 확인 불가"))) {
+      return { level: "warn", kind: "headunknown", label: "원본 재검증: 머리 확인 불가 — 현재 결과 없음", toast: "원본 재검증: 머리 확인 불가 — 현재 결과 없음",
+        hint: "원본 재검증: 머리 확인 불가 — 현재 결과 없음" + (why ? ` — ${why}` : "") + " (보관 이력서 5절 참조).",
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
+    // R15 (track I3): two completed runs written into each other — no result.
+    if (parts.some(x => x.includes("완료 실행 구간 겹침"))) {
+      const label = "원본 재검증: 완료 실행 겹침 — 현재 결과 없음";
+      return { level: "warn", kind: "overlap", label, toast: label, hint: `${label} — ${why} (보관 이력서 5절 참조).`,
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
+    if (res.is_result === false) {
+      return { level: "warn", toast: "원본 재검증: 현재 결과 없음(결과 아님)",
+        hint: "원본 재검증: 현재 결과 없음(결과 아님)" + (why ? ` — ${why}` : "") + (unauth ? ` · 인증 안 된 줄 ${unauth}개` : "") + " (보관 이력서 5절 참조).",
+        // R12 (track I4): the run this request started vs the lane's result run.
+        tip: res.expected_run_id ? `이번 실행 ${res.expected_run_id} · 결과 실행 ${res.run_id || "없음"}` : "" };
+    }
+    if (res.verified === false || unauth > 0) {
+      return { level: "warn", toast: "원본 재검증: 확인 불가" + (unauth ? ` — 인증 안 된 줄 ${unauth}개` : ""),
+        hint: `원본 재검증: 확인 불가 — ${counts}` + (reason ? `. ${reason}` : "") + ` — "모두 일치"로 쓸 수 없습니다 (보관 이력서 5절 참조).` };
+    }
+    if (matched === 0) {
+      return { level: "warn", toast: "원본 재검증: 비교된 파일 없음 — 재검증되지 않았습니다",
+        hint: `원본 재검증 완료 — ${counts}. 기록된 해시와 비교할 수 있는 파일이 없어 아무것도 재검증되지 않았습니다` +
+          (notComparable ? " (원본에 접근할 수 없거나, 읽을 수 없거나, 해시 없이 색인됨 — 해시 포함으로 다시 분석하십시오)." : ".") };
+    }
+    if (notComparable > 0) {
+      return { level: "warn", toast: `원본 재검증: 일치 ${matched}건, 비교 불가 ${notComparable}건`,
+        hint: `원본 재검증 완료 — ${counts}. 비교 불가 ${notComparable}건은 재검증되지 않았습니다 (접근 불가·읽기 실패·기록된 해시 없음 — 보관 이력서 5절 참조).` };
+    }
+    // R12 U1: no audit key on this PC — the lane is self-consistent only, so
+    // the match is not authenticated: info, never green.
+    if (res.lane_status === "structural") {
+      return { level: "info", kind: "structural", toast: `원본 재검증: ${matched}건 일치 (자기 일관성만 — 인증 아님)`,
+        hint: `원본 재검증 완료 — ${counts}. 자기 일관성만 — 인증 아님 (이 PC에 감사 키 없음).` };
+    }
+    return { level: "ok", toast: `원본 재검증: ${matched}건 모두 일치`, hint: `원본 재검증 완료 — ${counts}` };
+  })();
+  // R15 (track I5): why the head is unknown (`head_reason`), short.
+  const hr = res.head_reason == null ? "" : String(res.head_reason);
+  const hrWord = { "other-pc": "다른 PC 머리일 수 있음", "unusable-line": "쓸 수 없는 줄", "chain-failed": "체인 실패", "repaired": "레인 수리", "malformed": "형식 오류", "own-head-missing": "결과 실행 머리 없음", "unreadable": "읽지 못함", "mixed-version": "이전 버전이 스캔함 — 이 PC에서 다시 스캔하면 해소", "scan-mismatch": "다른 스캔의 머리" }[hr] || hr;
+  if (head) v.tip = [v.tip || "", `재검증 머리 ${head}` + (hrWord ? ` (${hrWord})` : "")].filter(Boolean).join(" · ");
+  // R15 (track I4): "시계 이상" — its own warning, never withholds the result.
+  const clock = typeof res.clock_note === "string" ? res.clock_note.trim() : "";
+  if (clock) v.clock = clock;
+  return v;
 }
 
 $("btnVerifySources").addEventListener("click", async () => {
@@ -244,11 +529,17 @@ $("btnVerifySources").addEventListener("click", async () => {
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   $("finalHint").textContent = "원본 재검증 중… (색인된 모든 원본을 다시 해시합니다 — 소스 크기에 따라 오래 걸릴 수 있습니다)";
+  $("finalHint").title = "";
   try {
     const res = await jpost("/api/verify-sources", {});
     if (!res.ok) { $("finalHint").textContent = "원본 재검증 실패: " + (res.error || "알 수 없는 오류"); return; }
     const verdict = verifySourcesVerdict(res);
-    $("finalHint").textContent = verdict.hint;
+    lastVerifyVerdict = verdict;
+    // R13 (track I1): a newer run's mismatches — id + source path listed,
+    // hashes in the tooltip.
+    const rows = Array.isArray(verdict.items) ? verdict.items : [];
+    $("finalHint").textContent = verdict.hint + rows.map(m => `\n· ${m.id || "-"} ${m.path}`).join("") + (verdict.more > 0 ? `\n· 외 ${verdict.more}건` : "") + (verdict.clock ? "\n" + verdict.clock : "");
+    $("finalHint").title = [verdict.tip || "", ...rows.map(m => `${m.id || "-"}: ${m.tip.replace(/\n/g, " · ")}`)].filter(Boolean).join("\n");
     toast(verdict.toast, verdict.level);
   } catch (err) {
     $("finalHint").textContent = "원본 재검증 실패: " + (err.message || err);

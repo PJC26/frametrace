@@ -1,6 +1,8 @@
 use crate::audit;
 use crate::tool_policy::{command_version, require_case_output_path, resolve_tool_binary};
-use crate::util::{canonicalize_display, json_escape, now_unix, read_to_string, unique_path};
+use crate::util::{
+    canonicalize_display, json_escape, now_unix, read_to_string, unique_available_path,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -96,7 +98,9 @@ pub fn export_video(
         }
         output_path.clone()
     } else {
-        unique_path(&case_dir.join("artifacts/clips").join(format!(
+        // Not reserved (no empty placeholder under the final name): the
+        // clip is written to a `.part` and published without clobbering.
+        unique_available_path(&case_dir.join("artifacts/clips").join(format!(
             "{}_{}.{}",
             sanitize_filename(selector),
             export_unix,
@@ -107,6 +111,12 @@ pub fn export_video(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create output directory: {err}"))?;
+        // Leftovers of an export that was killed long ago (C4).
+        for (path, result) in crate::join::sweep_stale_parts(parent) {
+            if let Err(err) = result {
+                eprintln!("warning: {err} ({})", path.display());
+            }
+        }
     }
 
     let indexed_sha256 = audit::indexed_source_hash(case_dir, selector, &source_path);
@@ -124,7 +134,35 @@ pub fn export_video(
     // hash is the evidence identity.
     let label_sha256 = export_sha256.as_deref().or(indexed_sha256.as_deref());
 
-    run_ffmpeg_export(case_dir, &source_path, &output_path, options, label_sha256)?;
+    // C4: ffmpeg writes a pid-tagged `.part`; only a complete, non-empty
+    // clip ever gets the deliverable's name (a killed export leaves the
+    // `.part`, which the server sweeps).
+    let part = crate::join::pid_part_path(&output_path, std::process::id());
+    if let Err(err) = run_ffmpeg_export(
+        case_dir,
+        &source_path,
+        &output_path,
+        &part,
+        options,
+        label_sha256,
+    ) {
+        let _ = crate::join::remove_file_retry(&part);
+        return Err(err);
+    }
+    match crate::join::publish_part_as(&part, &output_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = crate::join::remove_file_retry(&part);
+            return Err(format!(
+                "output already exists: {} (choose a new --output path)",
+                output_path.display()
+            ));
+        }
+        Err(err) => {
+            let _ = crate::join::remove_file_retry(&part);
+            return Err(err);
+        }
+    }
     write_export_log(
         case_dir,
         selector,
@@ -146,10 +184,18 @@ fn run_ffmpeg_export(
     case_dir: &Path,
     source_path: &Path,
     output_path: &Path,
+    write_path: &Path,
     options: &ExportOptions,
     source_sha256: Option<&str>,
 ) -> Result<(), String> {
-    let args = ffmpeg_export_args(case_dir, source_path, output_path, options, source_sha256);
+    let mut args = ffmpeg_export_args(case_dir, source_path, output_path, options, source_sha256);
+    // The container is named by `-f` (the `.part` name has no usable
+    // extension); ffmpeg writes to the in-progress name.
+    if let Some(last) = args.last_mut() {
+        *last = audit::path_string(write_path);
+    }
+    let final_path = output_path;
+    let output_path = write_path;
     let ffmpeg = resolve_tool_binary("ffmpeg", &["ffmpeg"])
         .map_err(|err| format!("{err} (install FFmpeg and ensure ffmpeg is in PATH)"))?;
     // Windows ffmpeg builds neither accept non-ASCII argv text nor resolve
@@ -160,7 +206,7 @@ fn run_ffmpeg_export(
     // to the clips dir, so no path or label byte crosses argv at all.
     let label_cwd = if let Some(spec) = &options.burn_in {
         let info = burn_in_info_text(case_dir, source_path, spec, source_sha256);
-        let label_path = burn_in_label_path(output_path);
+        let label_path = burn_in_label_path(final_path);
         // A UTF-8 BOM keeps every drawtext build on the UTF-8 path.
         std::fs::write(&label_path, format!("\u{feff}{info}"))
             .map_err(|err| format!("failed to write burn-in label file: {err}"))?;
@@ -293,6 +339,14 @@ fn ffmpeg_export_args(
             );
         }
     }
+    args.push("-f".to_string());
+    args.push(
+        match options.format {
+            ExportFormat::Mp4 => "mp4",
+            ExportFormat::Avi => "avi",
+        }
+        .to_string(),
+    );
     args.push(audit::path_string(output_path));
     args
 }
@@ -410,11 +464,95 @@ fn escape_drawtext(text: &str) -> String {
     out
 }
 
+/// C6: per-thumbnail bound for make-review's ffmpeg frame grab. A damaged
+/// or endlessly-streaming source used to hang make-review (and with it the
+/// whole pipeline) forever.
+pub const REVIEW_THUMB_TIMEOUT_SECS: u64 = 60;
+
+/// C6: grabs one review thumbnail (`seek` seconds in, 288 px wide) from
+/// `source` into `output` through a pid-tagged `.part`, bounded by
+/// `timeout_secs`. Only a complete, non-empty JPEG ever gets the final
+/// name; on any failure (exit, timeout, empty) the `.part` is removed and
+/// the caller shows a placeholder plus a warning.
+pub fn extract_review_thumbnail(
+    ffmpeg: &Path,
+    source: &str,
+    output: &Path,
+    seek: &str,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let mut part = crate::join::pid_part_path(output, std::process::id()).into_os_string();
+    // Keep a `.jpg` suffix so ffmpeg's image2 muxer accepts the name.
+    part.push(".jpg");
+    let part = PathBuf::from(part);
+    let mut command = Command::new(ffmpeg);
+    command
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-ss",
+            seek,
+            "-i",
+            source,
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=288:-2",
+            "-q:v",
+            "5",
+        ])
+        .arg(&part);
+    let result = crate::util::run_with_timeout(&mut command, Some(timeout_secs));
+    let outcome = match result {
+        Ok(out) if out.status.success() => {
+            if std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0) == 0 {
+                Err("ffmpeg wrote no thumbnail bytes".to_string())
+            } else {
+                // Replacing an older thumbnail is intended here (make-review
+                // regenerates stale ones): rename over it atomically.
+                std::fs::rename(&part, output)
+                    .map_err(|err| format!("failed to publish thumbnail: {err}"))
+            }
+        }
+        Ok(out) => Err(format!(
+            "ffmpeg thumbnail failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(err) => Err(err),
+    };
+    if outcome.is_err() {
+        let _ = crate::join::remove_file_retry(&part);
+    }
+    outcome
+}
+
+/// C12: an index record id exactly as the scanner assigns it,
+/// `^vid_\d{6,}$`.
+pub fn is_index_video_id(id: &str) -> bool {
+    id.strip_prefix("vid_")
+        .is_some_and(|digits| digits.len() >= 6 && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn resolve_video_source(case_dir: &Path, selector: &str) -> Result<PathBuf, String> {
+    // C12: anything carrying the `vid_` prefix is an index id and is
+    // resolved through the index ONLY — never as a (relative) path, so
+    // `vid_x/../../f` cannot reach a file outside the index.
+    let id_shaped = selector.starts_with("vid_");
+    if id_shaped && !is_index_video_id(selector) {
+        return Err(format!(
+            "invalid video id {:?}: expected vid_ followed by at least 6 digits",
+            selector.chars().take(64).collect::<String>()
+        ));
+    }
     let direct = PathBuf::from(selector);
-    if direct.is_file() {
+    if !id_shaped && direct.is_file() {
         return canonicalize_display(&direct)
             .map_err(|err| format!("failed to canonicalize source path: {err}"));
+    }
+
+    if let Some(found) = resolve_through_records(case_dir, selector, id_shaped) {
+        return found;
     }
 
     let index_path = case_dir.join("db/video_paths.tsv");
@@ -433,7 +571,12 @@ pub fn resolve_video_source(case_dir: &Path, selector: &str) -> Result<PathBuf, 
         let id = fields[0];
         let source_path = tsv_unescape(fields[1]);
         let relative_path = tsv_unescape(fields[2]);
-        if selector == id || selector == source_path || selector == relative_path {
+        let matched = if id_shaped {
+            selector == id
+        } else {
+            selector == id || selector == source_path || selector == relative_path
+        };
+        if matched {
             let path = PathBuf::from(&source_path);
             if path.is_file() {
                 return canonicalize_display(&path)
@@ -448,6 +591,66 @@ pub fn resolve_video_source(case_dir: &Path, selector: &str) -> Result<PathBuf, 
     Err(format!(
         "video selector not found: {selector} (use an indexed id like vid_000001 or a source path)"
     ))
+}
+
+/// R6-I10: [`resolve_video_source`] through `db/videos.jsonl`, which keeps
+/// the lossless raw form of a non-Unicode name (`source_path_raw_hex`) —
+/// the path index (`video_paths.tsv`) only has the lossy display string,
+/// which names another (usually nonexistent) file. `None` when the records
+/// cannot be read (the TSV fallback then applies) or name no such record.
+/// A display/relative path shared by several records (non-Unicode twins)
+/// is ambiguous — refused, never resolved to the first.
+fn resolve_through_records(
+    case_dir: &Path,
+    selector: &str,
+    id_shaped: bool,
+) -> Option<Result<PathBuf, String>> {
+    let text = read_to_string(&case_dir.join("db/videos.jsonl")).ok()?;
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    let field = |row: &serde_json::Value, key: &str| {
+        row.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let found = match rows
+        .iter()
+        .find(|row| field(row, "id").as_deref() == Some(selector))
+    {
+        Some(row) => row,
+        None if id_shaped => return None,
+        None => {
+            let matches: Vec<&serde_json::Value> = rows
+                .iter()
+                .filter(|row| {
+                    field(row, "source_path").as_deref() == Some(selector)
+                        || field(row, "relative_path").as_deref() == Some(selector)
+                })
+                .collect();
+            match matches.as_slice() {
+                [] => return None,
+                [row] => *row,
+                _ => {
+                    return Some(Err(format!(
+                        "video selector {selector} names {} indexed files (names that differ only in non-Unicode characters) — use the record id (vid_…)",
+                        matches.len()
+                    )));
+                }
+            }
+        }
+    };
+    let path = crate::model::record_os_path(found)?;
+    Some(if path.is_file() {
+        crate::model::canonicalize_lossless(&path)
+            .map_err(|err| format!("failed to canonicalize source path: {err}"))
+    } else {
+        Err(format!(
+            "indexed source file no longer exists: {}",
+            path.display()
+        ))
+    })
 }
 
 fn write_export_log(
@@ -530,6 +733,46 @@ mod tests {
     use super::{ExportFormat, ExportOptions, ffmpeg_export_args, sanitize_filename, tsv_unescape};
     use std::path::Path;
 
+    /// R6-I10: an indexed non-Unicode name resolves to ITS file (the path
+    /// index's lossy display string named another, nonexistent one), and a
+    /// display path shared by twins is refused as ambiguous.
+    #[test]
+    fn resolves_non_unicode_records_losslessly() {
+        let dir =
+            std::env::temp_dir().join(format!("frametrace-i10-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let one = dir.join(crate::audit::test_non_unicode_twin("clip", 0));
+        let two = dir.join(crate::audit::test_non_unicode_twin("clip", 1));
+        if std::fs::write(&two, b"two").is_err() {
+            eprintln!("filesystem refuses non-Unicode names; skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        std::fs::write(&one, b"one").unwrap();
+        let display = two.to_string_lossy().to_string();
+        let row = |id: &str, path: &Path| {
+            serde_json::json!({"id": id, "source_path": path.to_string_lossy(),
+                "relative_path": "clip", "source_path_raw_hex": crate::model::path_raw_hex(path)})
+            .to_string()
+        };
+        std::fs::write(
+            dir.join("db/videos.jsonl"),
+            format!("{}\n{}\n", row("vid_000001", &one), row("vid_000002", &two)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("db/video_paths.tsv"),
+            format!("id\tsource_path\trelative_path\nvid_000001\t{display}\tclip\nvid_000002\t{display}\tclip\n"),
+        )
+        .unwrap();
+        let resolved = super::resolve_video_source(&dir, "vid_000002").unwrap();
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"two");
+        let err = super::resolve_video_source(&dir, &display).unwrap_err();
+        assert!(err.contains("2 indexed files"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn parses_export_formats() {
         assert_eq!(ExportFormat::parse("mp4").unwrap(), ExportFormat::Mp4);
@@ -570,6 +813,119 @@ mod tests {
     #[test]
     fn unescapes_tsv_paths() {
         assert_eq!(tsv_unescape("a\\tb\\\\c"), "a\tb\\c");
+    }
+
+    /// C12: only the scanner's exact id form counts as an index id.
+    #[test]
+    fn index_video_id_table() {
+        use super::is_index_video_id;
+        for ok in ["vid_000001", "vid_123456", "vid_0000001234"] {
+            assert!(is_index_video_id(ok), "{ok}");
+        }
+        for bad in [
+            "vid_1",
+            "vid_00001",
+            "vid_x",
+            "vid_000001/../x",
+            "vid_x\\..\\..\\f.mp4",
+            "vid_000001 ",
+            "vid_",
+            "VID_000001",
+            "carve_000001",
+            "vid_٠٠٠٠٠١",
+        ] {
+            assert!(!is_index_video_id(bad), "{bad}");
+        }
+    }
+
+    /// C12: a `vid_`-prefixed selector is never resolved as a path — the
+    /// traversal form used to reach any file (Windows resolves `..`
+    /// lexically, so `vid_x` need not exist), and a well-formed id is
+    /// looked up in the index only.
+    #[test]
+    fn vid_selectors_resolve_through_the_index_only() {
+        use super::resolve_video_source;
+        let dir = std::env::temp_dir().join(format!("ft-c12-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let target = dir.join("outside.mp4");
+        std::fs::write(&target, b"x").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let depth = cwd.components().count();
+        let mut rel = String::from("vid_x");
+        for _ in 0..depth {
+            rel.push_str("/..");
+        }
+        let tail: std::path::PathBuf = target
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .collect();
+        rel.push('/');
+        rel.push_str(&tail.to_string_lossy().replace('\\', "/"));
+        let err = resolve_video_source(&dir, &rel).unwrap_err();
+        assert!(err.contains("invalid video id"), "{err}");
+        // Well-formed id: index only.
+        let indexed = dir.join("indexed.mp4");
+        std::fs::write(&indexed, b"y").unwrap();
+        std::fs::write(
+            dir.join("db/video_paths.tsv"),
+            format!(
+                "id\tsource_path\trelative_path\nvid_000001\t{}\tindexed.mp4\n",
+                indexed.display()
+            ),
+        )
+        .unwrap();
+        let resolved = resolve_video_source(&dir, "vid_000001").unwrap();
+        assert!(resolved.ends_with("indexed.mp4"), "{resolved:?}");
+        assert!(resolve_video_source(&dir, "vid_000002").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C6: a frame grab that never finishes is killed at the bound and
+    /// leaves neither the thumbnail nor its `.part` behind.
+    #[test]
+    fn review_thumbnail_grab_is_bounded() {
+        use super::extract_review_thumbnail;
+        let dir = std::env::temp_dir().join(format!("ft-c6-thumb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = if cfg!(windows) {
+            let path = dir.join("hang.cmd");
+            // Idle, not a CPU-pinning `goto` loop (parallel tests).
+            std::fs::write(
+                &path,
+                "@echo off\r\n:spin\r\nping -n 2 127.0.0.1 >nul 2>&1\r\ngoto spin\r\n",
+            )
+            .unwrap();
+            path
+        } else {
+            let path = dir.join("hang.sh");
+            std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+        let output = dir.join("vid_000001.jpg");
+        let started = std::time::Instant::now();
+        let result = extract_review_thumbnail(&fake, "in.mp4", &output, "5", 1);
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!output.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

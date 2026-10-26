@@ -41,6 +41,12 @@ fn app_main() -> i32 {
             "FrameTrace failed to start: {error}\n(log: {})",
             log_path.display()
         );
+        // FRAMETRACE_SHELL_SMOKE=1 (CI) has nobody to dismiss a dialog:
+        // report on stderr and exit non-zero instead.
+        if smoke_requested(std::env::var("FRAMETRACE_SHELL_SMOKE").ok().as_deref()) {
+            eprintln!("{message}");
+            return 1;
+        }
         // MessageBoxW + UTF-16: the ANSI variant garbles Korean text
         // (paths, server errors) on a non-Korean code page.
         #[cfg(target_os = "windows")]
@@ -59,6 +65,12 @@ fn app_main() -> i32 {
         return 1;
     }
     0
+}
+
+/// `FRAMETRACE_SHELL_SMOKE=1` (exact contract shared with
+/// `frametrace::shell`): no modal error box in the CI smoke run.
+fn smoke_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
 }
 
 /// Null-terminated UTF-16 for Win32 `W` APIs. Interior NULs cannot occur
@@ -88,6 +100,19 @@ fn run_workstation() -> Result<(), String> {
 }
 
 fn main() {
+    // R9-S7: keep the workstation's per-step token and drop it from the
+    // environment before any thread or tool exists (see `frametrace` main).
+    // SAFETY: first statement of `main`; no other thread exists yet.
+    unsafe { frametrace::util::adopt_step_warning_token() };
+    // R10-I14: the audit key variables too (see `frametrace` main).
+    // SAFETY: still single-threaded process start.
+    unsafe { frametrace::audit_key::adopt_key_env() };
+    // C8: a step child of the workstation dies with it (unix watch pipe).
+    frametrace::serve::watch_parent_from_env();
+    // P7: no modal loader/critical-error dialogs for this process or the
+    // tools it spawns (inherited) — in the windowed app nobody would see
+    // them, and the probe or pipeline step would wait forever.
+    frametrace::util::suppress_os_error_dialogs();
     std::process::exit(frametrace::run_with_large_stack(app_main));
 }
 
